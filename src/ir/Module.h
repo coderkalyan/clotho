@@ -580,9 +580,10 @@ public:
     // Compiled concurrent assertions (LRM 16). Indexed by the monitor id a
     // process body refers to; see AssertionMonitor.
     std::vector<AssertionMonitor> monitors;
-    // The top instance's name, used as the DPI svScope name (LRM 35.5.3). For a
-    // multi-top design it is the first top's name (multi-top DPI export is
-    // guarded; a multi-top context import's scope is an edge case).
+    // The first top instance's name (LRM 35.5.3). Every top gets its own DPI
+    // svScope, registered from `tops()`; this is only the fallback name for a
+    // design with no top instances at all, and the default `name` for a multi-top
+    // module.
     std::string top_name;
     // Module name.
     std::string name;

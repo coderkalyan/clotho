@@ -4,9 +4,12 @@
 #include <string>
 #include <string_view>
 
+#include <llvm/Support/raw_ostream.h>
+
 #include "Lower.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
+#include "ir/LlvmBackend.h"
 #include "runtime/svdpi.h"
 
 using namespace clotho;
@@ -149,6 +152,39 @@ std::string lower_fail(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_FALSE(r.ok);
     return r.diagnostic_text();
+}
+
+// Lower and emit textual LLVM IR. Thunk emission is driven by module_.dpi_exports,
+// so the IR is where per-top export binding is observable — the C-side round trip
+// itself needs a .o and stays the verilator CLI cross-check.
+std::string emit_llvm_text(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*r.module, os));
+    return text;
+}
+
+// The text of one emitted LLVM definition, from its `define` line to the closing
+// brace, so a check can see what a thunk reaches whether or not the optimizer
+// inlined the SV function into it.
+std::string llvm_definition(const std::string& ir_text, std::string_view name) {
+    const std::string needle = "@" + std::string(name) + "(";
+    for (size_t at = ir_text.find(needle); at != std::string::npos; at = ir_text.find(needle, at + 1)) {
+        const size_t nl   = ir_text.rfind('\n', at);
+        const size_t line = nl == std::string::npos ? 0 : nl + 1;
+        if (ir_text.compare(line, 7, "define ") != 0) {
+            continue;
+        }
+        const size_t end = ir_text.find("\n}", at);
+        REQUIRE(end != std::string::npos);
+        return ir_text.substr(line, end - line);
+    }
+    FAIL("no LLVM definition of ", name);
+    return {};
 }
 
 } // namespace
@@ -503,4 +539,75 @@ TEST_CASE("DPI export: unsupported forms are rejected") {
             endmodule)";
         CHECK(lower_fail(src).find("output/inout string") != std::string::npos);
     }
+}
+
+// A multi-top design (LRM 23.3.1) may export from every top. slang hands Clotho one
+// entry per c_identifier, and each is collected by the Lowerer of the top that owns
+// it, so its thunk calls that top's own lowered function. Instance binding is baked
+// into the lowered body — each function addresses its own @clotho.inst.<top>.state
+// global — so nothing is resolved by scope at the C boundary.
+TEST_CASE("DPI export: multi-top design exports from each top") {
+    constexpr std::string_view src = R"(
+        module ta;
+          int va;
+          export "DPI-C" function ta_get;
+          function int ta_get(); return va; endfunction
+          initial begin va = 7; #1 $display("ta %0d", ta_get()); end
+        endmodule
+        module tb;
+          int vb;
+          export "DPI-C" function tb_get;
+          function int tb_get(); return vb; endfunction
+          initial begin vb = 9; #2 $display("tb %0d", tb_get()); end
+        endmodule)";
+    // Both tops lower and run, each function reading its own module's signal.
+    CHECK(run_capture(src) == "ta 7\ntb 9\n");
+
+    // One thunk per export, each reaching only its own top's state. A c_identifier
+    // collected twice would have been renamed `<name>.1` by llvm::Function::Create,
+    // so the absence of a rename is the routing invariant the frontend's duplicate
+    // check also guards.
+    const std::string ir_text = emit_llvm_text(src);
+    CHECK(ir_text.find("@ta_get.1") == std::string::npos);
+    CHECK(ir_text.find("@tb_get.1") == std::string::npos);
+
+    const std::string ta_thunk = llvm_definition(ir_text, "ta_get");
+    CHECK((ta_thunk.find("clotho.inst.ta.state") != std::string::npos ||
+           ta_thunk.find(".fn.ta_get") != std::string::npos));
+    CHECK(ta_thunk.find("clotho.inst.tb.state") == std::string::npos);
+    CHECK(ta_thunk.find(".fn.tb_get") == std::string::npos);
+
+    const std::string tb_thunk = llvm_definition(ir_text, "tb_get");
+    CHECK((tb_thunk.find("clotho.inst.tb.state") != std::string::npos ||
+           tb_thunk.find(".fn.tb_get") != std::string::npos));
+    CHECK(tb_thunk.find("clotho.inst.ta.state") == std::string::npos);
+    CHECK(tb_thunk.find(".fn.ta_get") == std::string::npos);
+}
+
+// A `$unit`- or package-scope export has no instance multiplicity (LRM 6.8): it
+// lowers once through the shared globals Lowerer, so exactly one top may collect it.
+// Collecting it per top would trip the duplicate-c_identifier guard, and unguarded
+// would let llvm::Function::Create rename the second thunk and bind C to whichever
+// won.
+TEST_CASE("DPI export: a $unit-scope export is collected once in a multi-top design") {
+    constexpr std::string_view src = R"(
+        function int u_get(); return 5; endfunction
+        export "DPI-C" function u_get;
+        module ta;
+          int va;
+          export "DPI-C" function ta_get;
+          function int ta_get(); return va + u_get(); endfunction
+          initial begin va = 7; #1 $display("ta %0d", ta_get()); end
+        endmodule
+        module tb;
+          export "DPI-C" function tb_get;
+          function int tb_get(); return u_get() * 2; endfunction
+          initial begin #2 $display("tb %0d", tb_get()); end
+        endmodule)";
+    CHECK(run_capture(src) == "ta 12\ntb 10\n");
+
+    const std::string ir_text = emit_llvm_text(src);
+    CHECK(ir_text.find("@u_get.1") == std::string::npos);
+    // The one $unit thunk belongs to no instance, so it reaches no instance state.
+    CHECK(llvm_definition(ir_text, "u_get").find("clotho.inst.") == std::string::npos);
 }

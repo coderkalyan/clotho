@@ -1406,11 +1406,13 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
 // the DPI return for an allocation-failure report.
 void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site* site);
 
-// Register the single DPI scope (LRM 35.5.3) for the svScope API — the design's
-// hierarchical name. Called once from main when the design uses DPI; also resets
-// the scope's user-data (so a fresh simulation in the same process starts clean).
+// Register one DPI scope (LRM 35.5.3) for the svScope API — a top-level instance's
+// hierarchical name, at its position `index` in the design's top order. Called from
+// main, once per top, when the design uses DPI. `index == 0` clears the table first
+// (so a fresh simulation in the same process starts with no stale user data) and the
+// scope registered there becomes the default svGetScope returns.
 // Implemented in Svdpi.cpp alongside svGetScope / svSetScope / svGetUserData.
-void rt_svdpi_scope_init(const char* name, uint32_t name_len);
+void rt_svdpi_scope_register(const char* name, uint32_t name_len, uint32_t index);
 
 // -- DPI open arrays (LRM 35.5.6.2) --
 //

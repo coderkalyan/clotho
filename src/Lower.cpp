@@ -19252,11 +19252,12 @@ private:
             fail("DPI import tasks are not supported");
         }
         // `context` (LRM 35.5.3) is accepted and lowered identically to a plain
-        // import: its purpose is to let the C call exported SV functions (and
-        // svScope APIs), which Clotho's export thunks already service against the
-        // single flat design-state global — no scope tracking needed for a single
-        // instance. (The svScope C API — svGetScope/svSetScope — is not provided;
-        // C that calls it gets an unresolved-symbol error, the deferred piece.)
+        // import: its purpose is to let the C call exported SV functions (and the
+        // svScope APIs), and an export thunk needs no scope to find its instance —
+        // the lowered SV function it calls already addresses that instance's state
+        // absolutely. The svScope C API is provided (svGetScope / svSetScope /
+        // svGetScopeFromName / user data, exposed as JIT symbols in Jit.cpp) with one
+        // scope per top; a handle naming a nested instance is the deferred piece.
 
         // A DPI import has no body, so slang leaves returnValVar null even for a
         // non-void function; decide void-ness from the declared return type.
@@ -19397,6 +19398,30 @@ private:
         arg_elem_cts.push_back(*ec);
     }
 
+    // The root (top-level) instance whose hierarchy ultimately contains `sub`, or
+    // null when the subroutine sits in no elaborated instance. A module's members
+    // hang off an InstanceBodySymbol whose own parent scope is the *declaration*
+    // site, so climbing a level steps across the body/InstanceSymbol pair through
+    // parentInstance — the same walk control_depth uses.
+    static const InstanceSymbol* owning_top(const SubroutineSymbol& sub) {
+        const InstanceSymbol* top   = nullptr;
+        const Scope*          scope = sub.getParentScope();
+        while (scope != nullptr) {
+            const Symbol& sym = scope->asSymbol();
+            if (sym.kind != SymbolKind::InstanceBody) {
+                scope = sym.getParentScope();
+                continue;
+            }
+            const InstanceSymbol* parent = sym.as<InstanceBodySymbol>().parentInstance;
+            if (parent == nullptr) {
+                return nullptr; // a body slang elaborated without an instance
+            }
+            top   = parent;
+            scope = parent->getParentScope();
+        }
+        return top;
+    }
+
     // Collect `export "DPI-C"` directives (LRM 35.5): for each, force-lower the SV
     // function and record a DpiExport so the backend emits its C-callable thunk.
     // slang resolves the export -> subroutine binding and the c_identifier
@@ -19405,10 +19430,27 @@ private:
     // void return. Deferred (loud-fail): string return (returned-char* lifetime),
     // output/inout string, open-array/unpacked args, tasks. Public: called by
     // lower_compilation.
+    //
+    // getDPIExports is compilation-wide, but every top has its own Lowerer that only
+    // knows its own symbols, and instance binding is baked into the lowered body (the
+    // backend addresses each signal absolutely off that instance's own state global).
+    // So an export must be collected by the Lowerer of the top containing it: `top`
+    // admits this top's module-scope exports, and `collect_globals` — true on exactly
+    // one top — admits the $unit/package exports, which have no instance multiplicity
+    // (LRM 6.8) and lower once through the shared globals Lowerer function_id
+    // delegates to.
 public:
-    void collect_dpi_exports(const slang::ast::Compilation& comp) {
+    void collect_dpi_exports(const slang::ast::Compilation& comp, const InstanceSymbol& top,
+                             bool collect_globals) {
         for (const auto& ex : comp.getDPIExports()) {
             const SubroutineSymbol& sub = *ex.subroutine;
+            if (is_global_subroutine(sub)) {
+                if (!collect_globals) {
+                    continue; // collected once for the design, not once per top
+                }
+            } else if (owning_top(sub) != &top) {
+                continue; // another top's export (or no elaborated instance at all)
+            }
             if (sub.subroutineKind == SubroutineKind::Task) {
                 // TODO: exported tasks — need the timing wheel + coroutine driving
                 // from C (docs/design/dpi-c.md).
@@ -19443,6 +19485,16 @@ public:
                 }
                 arg_cts.push_back(*c);
                 arg_dirs.push_back(to_arg_dir(fa->direction));
+            }
+            // One C symbol cannot name two SV functions: llvm::Function::Create
+            // would silently rename the second thunk to `<name>.1`, leaving C bound
+            // to an arbitrary instance. slang's own c_identifier dedup makes this
+            // unreachable today, but the invariant has to be Clotho's.
+            for (const ir::DpiExport& prev : module_.dpi_exports) {
+                if (prev.extern_name == ex.cIdentifier) {
+                    fail("duplicate DPI export c_identifier '" + ex.cIdentifier +
+                         "' (one C name cannot bind two SystemVerilog functions)");
+                }
             }
             const ir::FunctionId id = function_id(sub); // force-lower the SV function
             module_.dpi_exports.push_back(
@@ -20956,16 +21008,6 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             module->name = std::string(root.topInstances[0]->name);
         }
     }
-    if (!single && !comp.getDPIExports().empty()) {
-        // A context export runs in a specific instance's scope (svScope, LRM
-        // 35.5.3); with several tops there is no single design-state root to bind
-        // the thunk to. Deferred with the rest of svScope.
-        result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
-                                                 .origin   = DiagnosticOrigin::Rejected,
-                                                 .code     = "multi-top-dpi-export",
-                                                 .message  = "DPI export in a multi-top design is not supported" });
-        return result;
-    }
     bool poisoned = false;
     try {
         Lowerer globals(*module, tick_fs, allow_system);
@@ -20978,12 +21020,12 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             lw.set_globals(&globals);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
-            // Exported functions (single-top only, guarded above) resolve in this
-            // top's scope — module-scope functions via `lw`, $unit/package via the
-            // shared `globals` delegation in function_id.
-            if (single) {
-                lw.collect_dpi_exports(comp);
-            }
+            // Exported functions resolve in the scope that owns them: this top's
+            // module-scope functions through `lw` (its own lowered bodies address its
+            // own instance state), $unit/package ones through the shared `globals`
+            // delegation in function_id — those have no instance multiplicity, so
+            // only the first top admits them.
+            lw.collect_dpi_exports(comp, *top, /*collect_globals=*/top == root.topInstances.front());
             const std::span<const Diagnostic> recovered = lw.recovered_diags();
             result.diagnostics.insert(result.diagnostics.end(), recovered.begin(), recovered.end());
             poisoned = poisoned || lw.poisoned();

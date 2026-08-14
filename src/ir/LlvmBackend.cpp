@@ -4626,12 +4626,28 @@ private:
             }
         }
 
-        // Register the single DPI scope (svGetScope / user-data, LRM 35.5.3) before
+        // Register one DPI scope per top (svGetScope / user-data, LRM 35.5.3) before
         // any process runs, so a context import can read it. Only when DPI is used.
+        // Index 0 clears the runtime table, so the first top stays the default scope
+        // and a second simulation in one process starts clean. A design with no top
+        // instances (package-only) still registers one scope so svGetScope is never
+        // null.
         if (design_uses_dpi()) {
-            b_.CreateCall(rt_fn("rt_svdpi_scope_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() }),
-                          { b_.CreateGlobalString(mod_.top_name),
-                            b_.getInt32(static_cast<uint32_t>(mod_.top_name.size())) });
+            const llvm::FunctionCallee reg = rt_fn("rt_svdpi_scope_register", b_.getVoidTy(),
+                                                   { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+            const auto emit_reg = [&](const std::string& name, uint32_t index) {
+                b_.CreateCall(reg, { b_.CreateGlobalString(name),
+                                     b_.getInt32(static_cast<uint32_t>(name.size())),
+                                     b_.getInt32(index) });
+            };
+            if (mod_.tops().empty()) {
+                emit_reg(mod_.top_name, 0);
+            } else {
+                uint32_t index = 0;
+                for (const InstanceScope& top : mod_.tops()) {
+                    emit_reg(top.name, index++);
+                }
+            }
         }
 
         // Timing wheel: the event scheduler. Processes schedule timers on it at
