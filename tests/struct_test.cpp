@@ -1419,18 +1419,215 @@ TEST_CASE("unpacked struct with an array member returned by value") {
     )") == "7 8 9 c=70\n");
 }
 
-TEST_CASE("unpacked struct / aggregate task argument is guarded") {
-    // The task coroutine ABI does not yet marshal aggregates (functions do).
-    const LowerResult r = lower_text(R"(
+TEST_CASE("unpacked aggregate task arguments pass by value (LRM 13.5.1)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } s_t;
+            typedef int arr_t [0:2];
+            s_t   s, s2;
+            arr_t q, q2;
+            task automatic t_in(s_t v);
+                v.a = -1; // the frame copy only
+                $display("in a=%0d b=%0d", v.a, v.b);
+            endtask
+            task automatic t_out(output s_t v);      v.a = 3; v.b = 8'h22; endtask
+            task automatic t_inout(inout s_t v);     v.a = v.a * 2; endtask
+            task automatic t_arr_in(arr_t v);        $display("arr %0d %0d %0d", v[0], v[1], v[2]); endtask
+            task automatic t_arr_out(output arr_t v); v[0] = 1; v[1] = 2; v[2] = 3; endtask
+            task automatic t_arr_inout(inout arr_t v); v[2] = v[2] + 100; endtask
+            initial begin
+                s = '{5, 8'hBB};
+                t_in(s);
+                $display("kept a=%0d", s.a);
+                t_out(s2);   $display("out a=%0d b=%0h", s2.a, s2.b);
+                t_inout(s);  $display("inout a=%0d", s.a);
+                q = '{4, 5, 6};
+                t_arr_in(q);
+                t_arr_out(q2);   $display("arr_out %0d %0d %0d", q2[0], q2[1], q2[2]);
+                t_arr_inout(q);  $display("arr_inout %0d %0d %0d", q[0], q[1], q[2]);
+            end
+        endmodule
+    )") == "in a=-1 b=187\n"
+           "kept a=5\n"
+           "out a=3 b=22\n"
+           "inout a=10\n"
+           "arr 4 5 6\n"
+           "arr_out 1 2 3\n"
+           "arr_inout 4 5 106\n");
+}
+
+TEST_CASE("an aggregate task argument copies out when the task returns, not earlier") {
+    CHECK(run_capture(R"(
         module m;
             typedef struct { int a; } s_t;
-            s_t x;
-            task automatic t(s_t v); $display("%0d", v.a); endtask
-            initial t(x);
+            typedef int arr_t [0:1];
+            s_t   s;
+            arr_t q;
+            task automatic t_slow(inout s_t v, inout arr_t w);
+                #5;
+                v.a  = v.a + 1000;
+                w[1] = w[1] + 1000;
+            endtask
+            initial begin
+                s = '{7};
+                q = '{1, 2};
+                $display("before a=%0d w1=%0d @%0t", s.a, q[1], $time);
+                t_slow(s, q);
+                $display("after  a=%0d w1=%0d @%0t", s.a, q[1], $time);
+            end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("task argument is not supported") != std::string::npos);
+    )") == "before a=7 w1=2 @0\n"
+           "after  a=1007 w1=1002 @5\n");
+}
+
+TEST_CASE("aggregate task arguments nest, recurse, and run concurrently") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int x; } s_t;
+            s_t o, r, f1, f2;
+            task automatic t_inner(inout s_t v);  v.x = v.x + 1; endtask
+            task automatic t_outer(inout s_t v);  #1 t_inner(v); t_inner(v); endtask
+            task automatic t_rec(input int n, inout s_t v);
+                v.x = v.x + n;
+                if (n > 1) t_rec(n - 1, v);
+            endtask
+            task automatic t_fork(inout s_t v, input int d); #(d) v.x = v.x + d; endtask
+            initial begin
+                o = '{7};
+                t_outer(o);  $display("outer x=%0d @%0t", o.x, $time);
+                r = '{0};
+                t_rec(4, r); $display("rec x=%0d", r.x);
+                f1 = '{10}; f2 = '{20};
+                fork
+                    t_fork(f1, 5);
+                    t_fork(f2, 2);
+                join
+                $display("fork %0d %0d @%0t", f1.x, f2.x, $time);
+            end
+        endmodule
+    )") == "outer x=9 @1\n"
+           "rec x=10\n"
+           "fork 15 22 @6\n");
+}
+
+TEST_CASE("aggregate task argument shapes: struct-with-array, array-of-struct, 2-D, slice") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [3:0] f [0:1]; } witharr_t;
+            typedef struct { int x; } small_t;
+            typedef small_t sarr_t [0:1];
+            typedef int m2_t [0:1][0:1];
+            witharr_t wa;
+            sarr_t    sa;
+            m2_t      m2;
+            int       big [0:4];
+            task automatic t_witharr(inout witharr_t v); v.a = v.a + 1; v.f[0] = v.f[0] + 4'h2; endtask
+            task automatic t_sarr(inout sarr_t v);       v[0].x = v[0].x * 10; v[1].x = v[1].x * 100; endtask
+            task automatic t_m2(inout m2_t v);           v[0][1] = 77; endtask
+            task automatic t_slice3(input int v [0:2]);   $display("slice %0d %0d %0d", v[0], v[1], v[2]); endtask
+            initial begin
+                wa = '{5, '{4'h1, 4'h2}};
+                t_witharr(wa); $display("witharr a=%0d f0=%0h f1=%0h", wa.a, wa.f[0], wa.f[1]);
+                sa = '{'{2}, '{3}};
+                t_sarr(sa);    $display("sarr %0d %0d", sa[0].x, sa[1].x);
+                m2 = '{'{1, 2}, '{3, 4}};
+                t_m2(m2);      $display("m2 %0d %0d %0d %0d", m2[0][0], m2[0][1], m2[1][0], m2[1][1]);
+                big = '{10, 11, 12, 13, 14};
+                t_slice3(big[1:3]);
+            end
+        endmodule
+    )") == "witharr a=6 f0=3 f1=2\n"
+           "sarr 20 300\n"
+           "m2 1 77 3 4\n"
+           "slice 11 12 13\n");
+}
+
+TEST_CASE("a class method task takes an inout unpacked struct") {
+    // The `this` handle is spliced as formal 0 and stays a scalar; the aggregate
+    // formal keeps its own storage pointer beside it.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int x; } s_t;
+            class C;
+                int tag;
+                task automatic bump(inout s_t v); v.x = v.x + tag; endtask
+            endclass
+            C   c;
+            s_t v;
+            initial begin
+                c = new; c.tag = 9;
+                v = '{1};
+                c.bump(v);
+                $display("bump x=%0d", v.x);
+            end
+        endmodule
+    )") == "bump x=10\n");
+}
+
+TEST_CASE("an aggregate output argument's copy-out wakes the actual's waiters") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; } s_t;
+            typedef int a2_t [0:1];
+            s_t  s;
+            a2_t q;
+            int  seen_s = 0, seen_q = 0;
+            task automatic t_s(output s_t v);  v.a = 42; endtask
+            function automatic void f_q(output a2_t v); v[0] = 7; v[1] = 8; endfunction
+            always @(s.a)  begin seen_s = seen_s + 1; $display("wake_s a=%0d @%0t", s.a, $time); end
+            always @(q[0]) begin seen_q = seen_q + 1; $display("wake_q q0=%0d @%0t", q[0], $time); end
+            initial begin
+                #1 t_s(s);
+                #1 f_q(q);
+                #1 $display("seen_s=%0d seen_q=%0d", seen_s, seen_q);
+            end
+        endmodule
+    )") == "wake_s a=42 @1\n"
+           "wake_q q0=7 @2\n"
+           "seen_s=1 seen_q=1\n");
+}
+
+TEST_CASE("aggregate subroutine arguments Clotho still refuses loudly") {
+    // Orthogonal, pre-existing gaps, all shared with the function path: a
+    // string-bearing aggregate has no memcpy-able storage, `ref` of an aggregate
+    // needs the alias ABI rather than the storage-pointer one, and a non-lvalue
+    // actual has no storage to point at.
+    SUBCASE("string-bearing aggregate by value") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef struct { string s; int x; } sv_t;
+                sv_t v;
+                task automatic t(sv_t a); $display("%0d", a.x); endtask
+                initial t(v);
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("string-containing aggregate is not supported") !=
+              std::string::npos);
+    }
+    SUBCASE("ref of an unpacked struct") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef struct { int x; } s_t;
+                s_t v;
+                task automatic t(ref s_t a); a.x = 2; endtask
+                initial t(v);
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("ref arguments are only supported") != std::string::npos);
+    }
+    SUBCASE("an assignment-pattern actual") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef struct { int x; } s_t;
+                task automatic t(s_t a); $display("%0d", a.x); endtask
+                initial t('{5});
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("aggregate argument must be a variable") != std::string::npos);
+    }
 }
 
 TEST_CASE("whole unpacked struct as a $display %p operand renders a pattern") {

@@ -17239,7 +17239,11 @@ private:
     // Lower a task enable (LRM 13.3). The backend drives the task coroutine and
     // blocks the caller until it completes. Argument passing (13.5) is shared with
     // function calls: build_call_args prepares each operand and records output /
-    // inout copy-backs, emit_call_copyouts applies them after the call.
+    // inout copy-backs, emit_call_copyouts applies them after the call. An unpacked
+    // struct / whole-array formal passes one storage pointer, exactly as it does for
+    // a function: the task's prologue copies it into the frame Local and its
+    // completion epilogue copies an output / inout Local back through it, so the
+    // copy-out lands when the task returns even if it consumed time.
     void lower_task_call(const CallExpression&    call,
                          const SubroutineSymbol&  sub,
                          ir::Builder&             b,
@@ -17255,16 +17259,6 @@ private:
         const auto           actuals    = call.arguments();
         if (formals.size() != actuals.size()) {
             fail("task argument count mismatch");
-        }
-        for (const FormalArgumentSymbol* fa : formals) {
-            if (is_agg_abi_ref(lower_type(fa->getType()))) {
-                // TODO: aggregate / whole-array task argument (by-pointer copy-in,
-                // plus copy-out for output / inout). The task coroutine ABI does not
-                // yet marshal aggregates by pointer; only functions do (declare_task
-                // has no aggregate param shape), so guard loud to avoid a silent
-                // ABI mismatch.
-                fail("unpacked struct / whole-array task argument is not supported");
-            }
         }
         const ir::SourceLoc     l = loc(call);
         std::vector<CopyOutArg> outs;
@@ -17349,49 +17343,46 @@ private:
                 continue;
             }
             const ir::Ref pty = lower_type(formals[i]->getType());
-            if (contains_struct_ref(pty)) {
-                // A struct-bearing aggregate actual passes by pointer (its lvalue);
-                // its storage is already the canonical aggregate mirror, so the same
-                // pointer serves an In copy-in and an output / inout copy-out (the
-                // callee writes the frame Local back through it at return — no
-                // caller temp or CopyOutArg). slang wraps an output / inout actual
-                // in an AssignmentExpression; unwrap to the bound lvalue.
-                if (!is_trivially_copyable(pty)) {
-                    fail("by-value pass of a string-containing aggregate is not supported");
-                }
-                const Expression* actual = actuals[i];
-                if (actual->kind == ExpressionKind::Assignment) {
-                    actual = &actual->as<AssignmentExpression>().left();
-                }
-                const Expression& src = unwrap_conversion(*actual);
-                if (!is_struct_lvalue_shape(src)) {
-                    // TODO: a `'{...}` / call aggregate actual — materialize a temp.
-                    fail("aggregate argument must be a variable");
-                }
-                args.push_back(lower_lvalue(src, b));
-                continue;
-            }
             if (is_agg_abi_ref(pty)) {
-                // A plain (flat-stored) fixed unpacked array actual. A flat module
-                // array may be may-z-narrowed (z-elided) smaller than the callee's
-                // canonical aggregate formal, so materialize a canonical aggregate
-                // temp and pass it by pointer: copy the actual into it element-wise
-                // (layout-converting) for In / Inout, and copy the callee-written
-                // temp back into the actual after the call for Out / Inout.
+                // An unpacked aggregate actual passes by pointer (LRM 13.5.1 copies at
+                // the boundary; the callee copies the pointee into its frame Local).
+                // slang wraps an output / inout actual in an AssignmentExpression;
+                // unwrap to the bound lvalue.
+                //
+                // A struct-bearing type has canonical aggregate storage already, so an
+                // `input` hands over the actual's own storage. Everything else goes
+                // through a canonical temp:
+                //   - a flat (scalar-element) array's module storage may be
+                //     may-z-narrowed (z-elided) relative to the callee's canonical
+                //     formal, so the copy-in must be layout-converting; and
+                //   - an `output` / `inout` write must reach the actual through the
+                //     ordinary store path (emit_call_copyouts), or the callee's raw
+                //     memcpy through the actual's pointer would leave the signal's
+                //     wait queue unserviced -- `always @(s.a)` would not wake.
+                const bool flat = !contains_struct_ref(pty);
                 if (!is_trivially_copyable(pty)) {
-                    fail("by-value pass of a string- or handle-element array is not supported");
+                    fail(flat ? "by-value pass of a string- or handle-element array is not supported"
+                              : "by-value pass of a string-containing aggregate is not supported");
                 }
                 const Expression* actual = actuals[i];
                 if (actual->kind == ExpressionKind::Assignment) {
                     actual = &actual->as<AssignmentExpression>().left();
                 }
                 const Expression& src = unwrap_conversion(*actual);
-                const bool        array_lvalue =
-                  is_struct_lvalue_shape(src) || (src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src));
-                if (!array_lvalue) {
-                    // TODO: a `'{...}` / call array actual — build the temp from the
-                    // pattern / call result directly.
-                    fail("whole-array argument must be a variable or slice");
+                // A slice is a legal whole-array actual (LRM 7.4.5): same element
+                // count, so it copies element-wise into the temp like any array.
+                const bool lvalue_shape =
+                  is_struct_lvalue_shape(src) ||
+                  (flat && src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src));
+                if (!lvalue_shape) {
+                    // TODO: a `'{...}` / call aggregate actual — materialize a temp
+                    // from the pattern / call result and pass that.
+                    fail(flat ? "whole-array argument must be a variable or slice"
+                              : "aggregate argument must be a variable");
+                }
+                if (dir == slang::ast::ArgumentDirection::In && !flat) {
+                    args.push_back(lower_lvalue(src, b));
+                    continue;
                 }
                 const ir::Index temp = make_canonical_agg_temp(pty, b, l);
                 if (dir != slang::ast::ArgumentDirection::Out) {

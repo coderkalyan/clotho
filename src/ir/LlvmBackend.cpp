@@ -3110,8 +3110,10 @@ private:
     // A task is a switched-resume coroutine. Its signature is:
     //   ptr @<mod>.task.<name>(ptr noalias state, ptr wheel,
     //                          <per formal>, ptr record)
-    // where each input formal contributes (i(2W) mm, iW z) value planes and each
-    // output / inout formal contributes (ptr mm_ptr, ptr z_ptr) into a caller temp.
+    // where each input formal contributes (i(2W) mm, iW z) value planes, each
+    // output / inout formal contributes (ptr mm_ptr, ptr z_ptr) into a caller temp,
+    // and an unpacked aggregate formal contributes ONE storage pointer in every
+    // direction (like a function's, see declare_function).
     // `record` is a { ptr parent } slot: the body stores the completing coroutine's
     // continuation there (see lower_task / lower_task_call_inst). It returns the
     // coroutine handle, like a process.
@@ -3126,6 +3128,13 @@ private:
                 params.push_back(ptr); // one pointer to the actual's packed slot
             } else if (is_handle_type(f.param_types[k])) {
                 params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*), any direction
+            } else if (is_agg_abi(f.param_types[k])) {
+                // An unpacked struct / whole unpacked array: one pointer to the
+                // caller's storage, in every direction. The prologue copies it into
+                // the frame Local (emit_agg_copyin) and the completion epilogue
+                // copies an output / inout Local back through it (emit_copyout), so
+                // the pass-by-value copy straddles the task's suspends.
+                params.push_back(ptr);
             } else if (f.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(f.param_types[k])) {
                     params.push_back(ptr); // rt_string handle
@@ -3160,7 +3169,7 @@ private:
         if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
             return true;
         }
-        // An aggregate is one pointer (In only — out/inout aggregates are guarded).
+        // An aggregate is one storage pointer, in every direction (function or task).
         if (is_agg_abi(f.param_types[k])) {
             return true;
         }
@@ -3400,7 +3409,7 @@ private:
 
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         init_frame();
-        emit_fn_agg_copyin(f);
+        emit_agg_copyin(f);
         build_str_temps();
         build_dynarr_temps();
         bind_ref_formals(f);
@@ -3428,12 +3437,12 @@ private:
         frame_  = nullptr;
     }
 
-    // Copy each aggregate input formal's caller storage (passed by pointer) into
-    // its frame slot at function entry (value semantics). Scalar / string formals
+    // Copy each aggregate input / inout formal's caller storage (passed by pointer)
+    // into its frame slot at entry (LRM 13.5 pass-by-value). Scalar / string formals
     // copy in via the frontend's Store(Local, Arg); an aggregate formal emits no
-    // Arg, so the copy is done here. Aggregate output / inout function formals are
-    // guarded in the frontend, so only inputs occur.
-    void emit_fn_agg_copyin(const Function& f) {
+    // Arg, so the copy is done here. Shared by functions (entry) and tasks (the
+    // body's start block, after the ramp's initial suspend).
+    void emit_agg_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             if (!is_agg_abi(f.param_types[k])) {
                 continue;
@@ -3552,8 +3561,13 @@ private:
         task_epilogue_bb_ = epilogue_bb;
 
         // Body: initialize the frame, copy parameters in (per direction), then run.
+        // The aggregate copy-in belongs here and not in the ramp: it reads the
+        // caller's storage through the passed pointer, which is the call's input
+        // value, and the body starts on the caller's first resume — the same instant
+        // the call is made (LRM 13.5.1 copies in at the call).
         b_.SetInsertPoint(start_bb);
         init_frame();
+        emit_agg_copyin(f);
         build_str_temps();
         build_dynarr_temps();
         bind_ref_formals(f);
@@ -3632,7 +3646,7 @@ private:
     void emit_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             // An aggregate formal is passed by pointer and copied in by
-            // emit_fn_agg_copyin (functions only; aggregate task args are guarded).
+            // emit_agg_copyin (function entry / task body start).
             if (is_agg_abi(f.param_types[k])) {
                 continue;
             }
@@ -3683,10 +3697,11 @@ private:
                 continue;
             }
             const uint32_t base = param_llvm_index_[k];
-            // A struct-bearing aggregate output / inout formal: copy the frame
-            // Local's storage back through the actual's pointer (the reverse of
-            // emit_fn_agg_copyin). Only struct-bearing aggregates reach here — a
-            // plain-array output / inout formal is guarded at the frontend.
+            // An aggregate output / inout formal: copy the frame Local's storage back
+            // through the actual's pointer (the reverse of emit_agg_copyin). For a
+            // struct-bearing formal that pointer is the actual's own storage; for a
+            // plain (flat-stored) array it is the caller's canonical temp, which the
+            // frontend then copies into the actual (emit_call_copyouts).
             if (is_agg_abi(f.param_types[k])) {
                 emit_agg_storage_copy(fn_->getArg(base),
                                       b_.CreateStructGEP(frame_ty_, frame_, k), f.param_types[k]);
@@ -15810,6 +15825,15 @@ private:
                 if (!is_handle_type(tf.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }
+            } else if (is_agg_abi(tf.param_types[k])) {
+                // An unpacked struct / whole unpacked array actual: one storage
+                // pointer for every direction (the frontend emitted it as an lvalue —
+                // the actual itself for a struct-bearing formal, a canonical temp for
+                // a flat array). The callee copies in at its body start and copies an
+                // output / inout back at completion, so the caller must keep the
+                // storage alive across the task's suspends: both shapes are frame
+                // Locals / signals, never a short-lived alloca.
+                argv.push_back(agg_slot_ptr(lvalue_of(args[k])));
             } else if (tf.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(tf.param_types[k])) {
                     argv.push_back(str_of(args[k]));
