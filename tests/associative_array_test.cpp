@@ -173,6 +173,248 @@ TEST_CASE("assoc wildcard cross-width equality") {
     CHECK(run_capture(src) == "num=2 w5=99 w300=7 ex5=1 ex6=0\nafterdel num=1 ex5=0\n");
 }
 
+TEST_CASE("assoc unpacked-struct keys: distinct entries and member-order traversal") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { byte b; int i; } key_t;
+            typedef struct { int hi; byte lo; } sk_t;
+            int   a [key_t];
+            int   s [sk_t];
+            key_t k;
+            sk_t  sk;
+            initial begin
+                k = '{8'd1, 100}; a[k] = 11;
+                k = '{8'd1, 200}; a[k] = 12;
+                k = '{8'd2, 100}; a[k] = 21;
+                k = '{8'd1, 100}; a[k] = 99;       // same key: overwrite
+                $display("num=%0d get=%0d ex=%0d", a.num(), a[k], a.exists(k));
+                k = '{8'd9, 999};
+                $display("absent=%0d ex=%0d", a[k], a.exists(k));
+                foreach (a[kk]) $display("k b=%0d i=%0d v=%0d", kk.b, kk.i, a[kk]);
+                k = '{8'd1, 200}; a.delete(k);
+                $display("del num=%0d ex=%0d", a.num(), a.exists(k));
+                sk = '{-5, 8'd1}; s[sk] = 1;
+                sk = '{3, 8'd1};  s[sk] = 2;
+                sk = '{-5, 8'd7}; s[sk] = 3;
+                foreach (s[x]) $display("s hi=%0d lo=%0d v=%0d", x.hi, x.lo, s[x]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=3 get=99 ex=1\n"
+                              "absent=0 ex=0\n"
+                              "k b=1 i=100 v=99\n"
+                              "k b=1 i=200 v=12\n"
+                              "k b=2 i=100 v=21\n"
+                              "del num=2 ex=0\n"
+                              "s hi=-5 lo=1 v=1\n"
+                              "s hi=-5 lo=7 v=3\n"
+                              "s hi=3 lo=1 v=2\n");
+}
+
+// Nesting composes: a struct member, a fixed unpacked array member, and the
+// first/next readout writing a whole struct key variable back.
+TEST_CASE("assoc struct keys: nested struct, array member, traversal readout") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { byte b; int i; } inner_t;
+            typedef struct { inner_t in; logic [3:0] tag; } nest_t;
+            typedef struct { int a [0:1]; byte b; } witharr_t;
+            int       n [nest_t];
+            int       w [witharr_t];
+            nest_t    nk;
+            witharr_t wk;
+            initial begin
+                nk = '{'{8'd1, 10}, 4'h2}; n[nk] = 1;
+                nk = '{'{8'd1, 11}, 4'h2}; n[nk] = 2;
+                nk = '{'{8'd1, 10}, 4'h3}; n[nk] = 3;
+                $display("nnum=%0d", n.num());
+                foreach (n[k]) $display("n b=%0d i=%0d tag=%0h v=%0d", k.in.b, k.in.i, k.tag, n[k]);
+                if (n.first(nk)) $display("first b=%0d i=%0d tag=%0h", nk.in.b, nk.in.i, nk.tag);
+                if (n.next(nk))  $display("next  b=%0d i=%0d tag=%0h", nk.in.b, nk.in.i, nk.tag);
+                if (n.last(nk))  $display("last  b=%0d i=%0d tag=%0h", nk.in.b, nk.in.i, nk.tag);
+                wk = '{'{1, 2}, 8'd7}; w[wk] = 10;
+                wk = '{'{1, 3}, 8'd7}; w[wk] = 20;
+                foreach (w[k]) $display("w a0=%0d a1=%0d b=%0d v=%0d", k.a[0], k.a[1], k.b, w[k]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "nnum=3\n"
+                              "n b=1 i=10 tag=2 v=1\n"
+                              "n b=1 i=10 tag=3 v=3\n"
+                              "n b=1 i=11 tag=2 v=2\n"
+                              "first b=1 i=10 tag=2\n"
+                              "next  b=1 i=10 tag=3\n"
+                              "last  b=1 i=11 tag=2\n"
+                              "w a0=1 a1=2 b=7 v=10\n"
+                              "w a0=1 a1=3 b=7 v=20\n");
+}
+
+// A `'{...}` pattern is a legal key expression: it has no storage of its own, so
+// it is staged into a canonical temp before serialization.
+TEST_CASE("assoc struct key from an assignment pattern, and a struct value") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { byte b; int i; } key_t;
+            typedef struct { int x; logic [7:0] y; } val_t;
+            val_t a [key_t];
+            key_t k;
+            val_t v;
+            initial begin
+                a['{8'd3, 30}] = '{7, 8'h55};
+                k = '{8'd3, 30};
+                v = a[k];
+                $display("num=%0d x=%0d y=%0h", a.num(), v.x, v.y);
+                a[k].x = 8;
+                $display("upd x=%0d", a[k].x);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=1 x=7 y=55\n"
+                              "upd x=8\n");
+}
+
+// A class-handle key is the handle's identity (LRM 7.8.3): distinct objects are
+// distinct keys, `null` is a valid key, and an index of a DERIVED class is legal.
+// The traversal order is "deterministic but arbitrary" per 7.8.3 -- it is handle
+// order here -- so this checks order-independent facts only.
+TEST_CASE("assoc class-handle keys: identity, null, derived index, traversal") {
+    constexpr std::string_view src = R"(
+        module m;
+            class B; int id; endclass
+            class D extends B; int extra; endclass
+            string a [B];
+            B      b1, b2, kb;
+            D      d1;
+            int    seen, sum;
+            initial begin
+                b1 = new; b1.id = 1;
+                b2 = new; b2.id = 2;
+                d1 = new; d1.id = 3;
+                a[b1] = "one"; a[b2] = "two"; a[d1] = "three"; a[null] = "nul";
+                $display("num=%0d one=%s two=%s three=%s nul=%s",
+                         a.num(), a[b1], a[b2], a[d1], a[null]);
+                $display("ex=%0d exnull=%0d", a.exists(b1), a.exists(null));
+                a[b1] = "uno";
+                $display("ovw=%s num=%0d", a[b1], a.num());
+                // Order-independent: every entry is visited exactly once. A `?:` is
+                // avoided on purpose -- both arms may be evaluated, and one of the
+                // keys is null.
+                seen = 0; sum = 0;
+                if (a.first(kb)) begin
+                    seen = seen + 1;
+                    if (kb == null) sum = sum + 100; else sum = sum + kb.id;
+                    while (a.next(kb)) begin
+                        seen = seen + 1;
+                        if (kb == null) sum = sum + 100; else sum = sum + kb.id;
+                    end
+                end
+                $display("seen=%0d sum=%0d", seen, sum);
+                a.delete(null);
+                $display("del num=%0d exnull=%0d b1=%s", a.num(), a.exists(null), a[b1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=4 one=one two=two three=three nul=nul\n"
+                              "ex=1 exnull=1\n"
+                              "ovw=uno num=4\n"
+                              "seen=4 sum=106\n"
+                              "del num=3 exnull=0 b1=uno\n");
+}
+
+TEST_CASE("assoc invalid (x/z) key: read defaults, write drops, exists is 0") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { logic [3:0] n; logic [7:0] w; } k4_t;
+            int     ik [integer];
+            int     sk [k4_t];
+            integer xi;
+            logic [3:0] zi;
+            k4_t    k;
+            initial begin
+                xi = 'x; ik[xi] = 5;                  // dropped
+                ik[0] = 7;
+                $display("i num=%0d xrd=%0d zero=%0d ex=%0d", ik.num(), ik[xi], ik[0], ik.exists(xi));
+                zi = 4'bz01; ik[zi] = 6;              // dropped (z is invalid too)
+                $display("z num=%0d", ik.num());
+                k = '{4'h3, 8'h55}; sk[k] = 7;
+                $display("s num=%0d ok=%0d", sk.num(), sk[k]);
+                k = '{4'hx, 8'h55}; sk[k] = 9;        // dropped: a member is x
+                $display("s xnum=%0d xrd=%0d ex=%0d", sk.num(), sk[k], sk.exists(k));
+                sk.delete(k);                          // no-op, not a wild delete
+                $display("s del=%0d", sk.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "i num=1 xrd=0 zero=7 ex=0\n"
+                              "z num=1\n"
+                              "s num=1 ok=7\n"
+                              "s xnum=1 xrd=0 ex=0\n"
+                              "s del=1\n");
+}
+
+// Keys are owned by the map, so a struct-keyed array deep-copies like any other.
+TEST_CASE("assoc struct-keyed deep copy independence") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { byte b; int i; } key_t;
+            int   a [key_t];
+            int   c [key_t];
+            key_t k;
+            initial begin
+                k = '{8'd1, 10}; a[k] = 1;
+                k = '{8'd2, 20}; a[k] = 2;
+                c = a;
+                k = '{8'd1, 10}; c[k] = 111;
+                k = '{8'd3, 30}; c[k] = 3;
+                $display("a=%0d c=%0d", a.num(), c.num());
+                k = '{8'd1, 10}; $display("a1=%0d c1=%0d", a[k], c[k]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a=2 c=3\n"
+                              "a1=1 c1=111\n");
+}
+
+// The key-type gates that remain (LRM 7.8.5 allows a string / dynamically sized
+// member; Clotho's fixed-width leaf span does not model one yet).
+TEST_CASE("assoc key types Clotho still refuses loudly") {
+    SUBCASE("struct key with a string member") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial a[k] = 1;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("key type with a string member") != std::string::npos);
+    }
+    SUBCASE("struct key with a queue member") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef struct { int q[$]; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial a[k] = 1;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("queue / dynamic-array member") != std::string::npos);
+    }
+    SUBCASE("event key") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                int a [event];
+                event e;
+                initial a[e] = 1;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("key type is not supported") != std::string::npos);
+    }
+}
+
 // A 4-state value element reads its power-on default X for an absent key
 // (Table 7-1); a 2-state element reads 0.
 TEST_CASE("assoc absent-key element default by domain") {

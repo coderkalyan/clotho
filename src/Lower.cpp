@@ -1667,6 +1667,43 @@ private:
 
     // -- Types --
 
+    // An unpacked struct / fixed unpacked array is a legal associative-array index
+    // type (LRM 7.8.5) when equality is defined for it, which for Clotho's key model
+    // means every leaf must serialize to a fixed-width byte field: integral leaves
+    // only, nested through structs and fixed arrays. A `real` leaf makes the index
+    // type illegal outright ("real or shortreal data types, or a type containing a
+    // real or shortreal, shall be an illegal index type"); a `string` or
+    // dynamically-sized leaf is legal per the LRM but has no fixed width, so it is
+    // refused loudly rather than silently truncated.
+    void guard_agg_key_leaves(const slang::ast::Type& kt, ir::Ref kr) {
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(kr));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            guard_agg_key_leaves(kt, t.element);
+            return;
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
+                guard_agg_key_leaves(kt, f.type);
+            }
+            return;
+        }
+        if (module_.pool.is_float(kr)) {
+            fail("associative array key type containing a real is illegal (LRM 7.8.5)");
+        }
+        if (t.kind == ir::Type::Kind::String) {
+            // TODO: a string leaf inside a struct key — the normalized span would be
+            // variable-length, which the fixed-width leaf layout (and the runtime's
+            // shorter-is-less order) does not model.
+            fail("associative array key type with a string member is not supported");
+        }
+        if (value_cat(kr) != ValueCat::scalar) {
+            // TODO: a queue / dynamic-array / associative-array leaf inside a struct
+            // key (LRM 7.8.5 allows it; the key bytes would be dynamically sized).
+            fail("associative array key type with a queue / dynamic-array member is "
+                 "not supported");
+        }
+    }
+
     ir::Ref lower_type(const slang::ast::Type& type) {
         const slang::ast::Type& ct = type.getCanonicalType();
         if (ct.isVoid()) {
@@ -1784,20 +1821,30 @@ private:
                 t.fields_id = static_cast<uint32_t>(make_int_type(64, false, false));
             } else {
                 const slang::ast::Type& kt = aa->indexType->getCanonicalType();
-                if (kt.isClass()) {
-                    // TODO: class-handle keys (LRM 7.8.3) — ordering is
-                    // unspecified and entangles with class object lifetime.
-                    fail("associative array with a class-handle key is not supported");
+                const ir::Ref           kr = lower_type(*aa->indexType);
+                // A class-handle key (LRM 7.8.3) is its handle word: identity
+                // equality, `null` a valid key, and an ordering that 7.8.3 leaves
+                // "deterministic but arbitrary" -- here the handle's own value,
+                // which is stable for the whole run (objects are never moved or
+                // freed). An unpacked struct / fixed unpacked array key (7.8.5) is
+                // serialized leaf by leaf in the backend. Both fold into the same
+                // normalized byte span as an integral or string key.
+                if (!kt.isClass() && !kt.isIntegral() && !kt.isString() && !is_agg_abi_type(kt)) {
+                    // 7.8.5 makes a real (or real-containing) index type illegal;
+                    // everything else left here (chandle, event, virtual interface)
+                    // has no equality-defined byte form.
+                    fail("associative array key type is not supported (integral, enum, "
+                         "packed, string, class handle, unpacked struct / array, or "
+                         "wildcard [*])");
                 }
-                if (!kt.isIntegral() && !kt.isString()) {
-                    fail("associative array key type is not supported (integral, "
-                         "enum, packed, string, or wildcard [*])");
+                if (is_agg_abi_type(kt)) {
+                    guard_agg_key_leaves(*aa->indexType, kr);
                 }
                 // Typed integral keys of any width normalize via the backend's
                 // per-byte big-endian emit (wide keys included). String keys pass
                 // their bytes through. Both are handled downstream.
                 t.right     = 0;
-                t.fields_id = static_cast<uint32_t>(lower_type(*aa->indexType));
+                t.fields_id = static_cast<uint32_t>(kr);
             }
 
             return module_.pool.put(ir::Item{ t });
@@ -16354,12 +16401,35 @@ private:
         return sel;
     }
 
+    // A key operand of `a[k]` / `exists(k)` / `delete(k)`: an ordinary value for an
+    // integral, class-handle or string key (the backend normalizes the plane), and an
+    // LVALUE for an unpacked struct / array key — an aggregate has no plane value, so
+    // the backend serializes it leaf by leaf from its storage. A non-lvalue aggregate
+    // key (a `'{...}` pattern) is staged into a canonical temp of the key type first.
+    ir::Index lower_assoc_key(const Expression& key, ir::Ref assoc_ty, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Type at = std::get<ir::Type>(module_.pool.get(assoc_ty));
+        if (at.right != 0) {
+            return lower_expr(key, b); // wildcard [*]: any integral value
+        }
+        const auto kr = static_cast<ir::Ref>(at.fields_id);
+        if (!is_agg_abi_ref(kr)) {
+            return lower_expr(key, b);
+        }
+        const Expression& src = unwrap_conversion(key);
+        if (is_struct_lvalue_shape(src)) {
+            return lower_lvalue(src, b);
+        }
+        const ir::Index temp = make_canonical_agg_temp(kr, b, l);
+        emit_agg_store(temp, kr, src, ir::Inst::Tag::Store, b, l);
+        return temp;
+    }
+
     // Element address for an associative array (LRM 7.8): `a[key]` over the
-    // handle lvalue `base`. The key is lowered as an ordinary value expression;
-    // the backend normalizes it and resolves get_ptr (read) / put_ptr (write).
+    // handle lvalue `base`. The backend normalizes the key into its byte span and
+    // resolves get_ptr (read) / put_ptr (write).
     ir::Index var_assoc_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
         const ir::Ref aty = lower_type(*es.value().type);
-        return b.assoc_select(base, lower_expr(es.selector(), b), aty, l);
+        return b.assoc_select(base, lower_assoc_key(es.selector(), aty, b, l), aty, l);
     }
 
     // Materialize a queue-typed rvalue into a handle lvalue Index. A plain queue
@@ -16561,12 +16631,12 @@ private:
             return b.resize(b.assoc_num(a, aty, l), lower_type(*call.type), l);
         }
         if (name == "exists") {
-            return b.resize(b.assoc_exists(a, lower_expr(*args[1], b), aty, l), lower_type(*call.type), l);
+            return b.resize(b.assoc_exists(a, lower_assoc_key(*args[1], aty, b, l), aty, l), lower_type(*call.type), l);
         }
         if (name == "delete") {
             // a.delete() clears all; a.delete(k) removes one entry.
             if (args.size() > 1) {
-                return b.assoc_delete(a, lower_expr(*args[1], b), /*has_key*/ true, aty, l);
+                return b.assoc_delete(a, lower_assoc_key(*args[1], aty, b, l), /*has_key*/ true, aty, l);
             }
             return b.assoc_delete(a, a, /*has_key*/ false, aty, l);
         }
