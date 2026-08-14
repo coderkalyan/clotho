@@ -1785,6 +1785,29 @@ private:
         anchors_[aid].ty = ty;
     }
 
+    // Does a materialized constant table's image carry a z bit? The pool stores
+    // canonical val / xz planes per element, where z is (xz & ~val); a table with
+    // none can drop its z word like any never-z signal.
+    bool const_image_has_z(const SignalInfo& info) const {
+        if (info.const_data == Ref::Invalid) {
+            return false;
+        }
+        const Layout lay = mod_.pool.layout(info.type);
+        if (lay.domain != Domain::Four || lay.width == 0) {
+            return false;
+        }
+        const std::span<const uint8_t> img = mod_.pool.bytes(info.const_data);
+        const uint32_t                 pb  = plane_bytes(lay.width);
+        for (size_t off = 0; off + 2 * pb <= img.size(); off += 2 * pb) {
+            for (uint32_t k = 0; k < pb; ++k) {
+                if ((img[off + pb + k] & ~img[off + k]) != 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     // Build the design's state types: per-signal slot / storage types, one
     // struct per module definition (own signals only — every instance scope
     // owns a separate state global, children own theirs), and the root
@@ -1891,7 +1914,12 @@ private:
             if (!slot.init_z && slot.four_state && !slot.is_array && !pmask.empty()) {
                 slot.undriven_mask.assign(pmask.begin(), pmask.end());
             }
-            slot.has_z       = may_z[i] || ptr_arg[i] || slot.init_z || !slot.undriven_mask.empty();
+            // A materialized constant table has no store anywhere, so the may-z
+            // analysis proves it never-z from an empty seed set — but a parameter
+            // may itself hold z (`localparam logic [3:0] P[0:1] = '{4'bzzzz, 0}`).
+            // Its own image is the authority.
+            slot.has_z = may_z[i] || ptr_arg[i] || slot.init_z || !slot.undriven_mask.empty() ||
+                         const_image_has_z(sigs[i]);
             // A 2-state signal drops the packed must|may word for a genuine iW slot
             // (or `[N x { iW }]` memory). The only requirement is never-z: a 2-state
             // value carries no z, and has_z is forced only by a task out/inout target
@@ -9137,6 +9165,11 @@ private:
     // O(1) emitted instructions instead.
     void init_state() {
         for (const SignalSlot& s : slots_) {
+            if (mod_.signals()[static_cast<size_t>(&s - slots_.data())].const_data != Ref::Invalid) {
+                // A materialized constant table is already its own state
+                // initializer (slot_const); an X-fill would erase it.
+                continue;
+            }
             if (s.is_agg) {
                 std::vector<llvm::Value*> path;
                 emit_agg_init(s.ir_type, storage_ptr(s), path, s.storage_ty);
@@ -9322,12 +9355,59 @@ private:
         return state_init_fields(a.ty, by_field);
     }
 
-    // Power-on constant for one signal's storage. Arrays and string arrays are
-    // zeroinitialized (filled at runtime by `init_state`); a scalar string is
-    // the empty inline handle (`rt_string_init`: byte 31 == str_inline_cap);
-    // a scalar plane is X (4-state) or 0 (2-state) with the z word set for an
-    // undriven-net may-z seed.
+    // One element's slot constant from its canonical val / xz planes: `mm` packs
+    // must | may << W (or the bare value for a narrow 2-state slot), plus the z
+    // plane when the slot keeps one. The compile-time twin of lower_constant's
+    // VPI ingest.
+    llvm::Constant* const_slot(const SignalSlot& s, std::span<const uint8_t> planes) {
+        const uint32_t    pb  = plane_bytes(s.width);
+        const llvm::APInt val = apint_from_bytes(planes.subspan(0, pb), s.width);
+        const llvm::APInt xz  = s.four_state ? apint_from_bytes(planes.subspan(pb, pb), s.width)
+                                             : llvm::APInt(s.width, 0);
+
+        std::vector<llvm::Constant*> fields;
+        if (s.narrow) {
+            fields.push_back(llvm::ConstantInt::get(ctx_, val));
+        } else {
+            const llvm::APInt must = val & ~xz;
+            const llvm::APInt may  = val | xz;
+            fields.push_back(llvm::ConstantInt::get(
+              ctx_, must.zext(2 * s.width) | (may.zext(2 * s.width) << s.width)));
+        }
+        if (s.has_z) {
+            fields.push_back(llvm::ConstantInt::get(ctx_, xz & ~val));
+        }
+        return llvm::ConstantStruct::get(s.slot_ty, fields);
+    }
+
+    // The whole storage image of a materialized constant table (Module.h
+    // SignalInfo::const_data): the pool holds its canonical planes element-major,
+    // so each element decodes independently into this signal's slot layout.
+    llvm::Constant* const_data_init(const SignalSlot& s, Ref const_data) {
+        const std::span<const uint8_t> img = mod_.pool.bytes(const_data);
+        const uint32_t                 el  = (s.four_state ? 2u : 1u) * plane_bytes(s.width);
+        if (!s.is_array) {
+            return const_slot(s, img.subspan(0, el));
+        }
+        std::vector<llvm::Constant*> elems;
+        elems.reserve(s.elem_count);
+        for (uint32_t k = 0; k < s.elem_count; ++k) {
+            elems.push_back(const_slot(s, img.subspan(static_cast<size_t>(k) * el, el)));
+        }
+        return llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(s.storage_ty), elems);
+    }
+
+    // Power-on constant for one signal's storage. A materialized constant table
+    // is its own baked image (nothing ever writes it, so the static initializer
+    // IS the value). Other arrays and string arrays are zeroinitialized (filled
+    // at runtime by `init_state`); a scalar string is the empty inline handle
+    // (`rt_string_init`: byte 31 == str_inline_cap); a scalar plane is X
+    // (4-state) or 0 (2-state) with the z word set for an undriven-net may-z seed.
     llvm::Constant* slot_const(const SignalSlot& s) {
+        const Ref const_data = mod_.signals()[static_cast<size_t>(&s - slots_.data())].const_data;
+        if (const_data != Ref::Invalid) {
+            return const_data_init(s, const_data);
+        }
         if (s.is_array || s.is_agg) {
             // Zeroinitialized; the runtime fill (init_state -> emit_array_init /
             // emit_agg_init) writes X into 4-state leaves and inits string leaves.
@@ -11915,12 +11995,17 @@ private:
         return bit_plane(bit, bit);
     }
 
-    // Build an iW constant from little-endian canonical plane bytes.
-    llvm::ConstantInt* const_from_bytes(std::span<const uint8_t> bytes, uint32_t width) {
+    // Assemble an APInt of `width` bits from little-endian canonical plane bytes.
+    llvm::APInt apint_from_bytes(std::span<const uint8_t> bytes, uint32_t width) {
         const unsigned        words = (width + 63) / 64;
         std::vector<uint64_t> buf(words, 0);
-        std::memcpy(buf.data(), bytes.data(), std::min<size_t>(bytes.size(), words * 8));
-        return llvm::ConstantInt::get(ctx_, llvm::APInt(width, llvm::ArrayRef<uint64_t>(buf.data(), words)));
+        std::memcpy(buf.data(), bytes.data(), std::min<size_t>(bytes.size(), static_cast<size_t>(words) * 8));
+        return llvm::APInt(width, llvm::ArrayRef<uint64_t>(buf.data(), words));
+    }
+
+    // Build an iW constant from little-endian canonical plane bytes.
+    llvm::ConstantInt* const_from_bytes(std::span<const uint8_t> bytes, uint32_t width) {
+        return llvm::ConstantInt::get(ctx_, apint_from_bytes(bytes, width));
     }
 
     // -- State access --

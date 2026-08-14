@@ -60,6 +60,14 @@ struct SignalInfo {
     // Set on a compiler temp that materializes a by-value array actual so its
     // storage is layout-compatible with the callee's canonical aggregate formal.
     bool force_agg = false;
+    // Elaboration-constant contents, as the pool value whose canonical bytes are
+    // this signal's whole image (element-major planes for an array). Set only on
+    // a compiler-materialized constant table: a parameter with an aggregate value
+    // that a runtime index reads (`localparam int P[0:3]; x = P[i]`, LRM 6.20).
+    // Such a signal has no writer anywhere in the design; the backend bakes the
+    // bytes into its state field's static initializer and skips the power-on
+    // fill, so materializing a table costs no instructions at any point.
+    Ref const_data = Ref::Invalid;
 };
 
 // One elaborated instance in the design hierarchy. The frontend flattens every
