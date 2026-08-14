@@ -312,6 +312,183 @@ TEST_CASE("nonblocking unpacked-array slice copy commits deferred") {
     )") == "0 a1 a2 3\n");
 }
 
+TEST_CASE("indexed unpacked-array slice: direction, endianness, and element order") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] q [0:7];   // ascending
+            logic [7:0] d [7:0];   // descending
+            logic [7:0] r2 [0:1];
+            logic [7:0] r1 [0:0];
+            int i;
+            initial begin
+                for (int k = 0; k < 8; k++) begin q[k] = 8'h10 + k; d[k] = 8'ha0 + k; end
+                i = 2; r2 = q[i +: 2]; $display("asc_up   %h %h", r2[0], r2[1]);
+                i = 5; r2 = q[i -: 2]; $display("asc_down %h %h", r2[0], r2[1]);
+                i = 5; r2 = d[i +: 2]; $display("des_up   %h %h", r2[0], r2[1]);
+                i = 5; r2 = d[i -: 2]; $display("des_down %h %h", r2[0], r2[1]);
+                i = 5; r1 = q[i +: 1]; $display("width1   %h", r1[0]);
+            end
+        endmodule
+    )") == "asc_up   12 13\n"
+           "asc_down 14 15\n"
+           "des_up   a6 a5\n"
+           "des_down a5 a4\n"
+           "width1   15\n");
+}
+
+TEST_CASE("indexed unpacked-array slice writes, including `-:` and a descending base") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] q [0:7];
+            logic [7:0] d [7:0];
+            logic [7:0] s2 [0:1];
+            int i;
+            initial begin
+                for (int k = 0; k < 8; k++) begin q[k] = 8'h10 + k; d[k] = 8'ha0 + k; end
+                i = 1; q[i +: 2] = '{8'hf0, 8'hf1};
+                $display("wr_up    %h %h %h %h", q[0], q[1], q[2], q[3]);
+                i = 3; q[i -: 2] = '{8'hb2, 8'hb3};
+                $display("wr_down  %h %h", q[2], q[3]);
+                i = 6; d[i -: 2] = '{8'hc0, 8'hc1};
+                $display("wr_des   %h %h %h", d[7], d[6], d[5]);
+                s2 = '{8'h55, 8'h56};
+                i = 4; q[i +: 2] = s2;                 // array source
+                $display("wr_arr   %h %h", q[4], q[5]);
+                i = 0; q[i +: 2] = q[4 +: 2];          // slice source
+                $display("wr_slice %h %h", q[0], q[1]);
+            end
+        endmodule
+    )") == "wr_up    10 f0 f1 13\n"
+           "wr_down  b2 b3\n"
+           "wr_des   a7 c0 c1\n"
+           "wr_arr   55 56\n"
+           "wr_slice 55 56\n");
+}
+
+TEST_CASE("an overlapping slice copy reads the source's pre-assignment values") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] q [0:7];
+            logic [7:0] p [0:7];
+            int i;
+            initial begin
+                for (int k = 0; k < 8; k++) begin q[k] = 8'h10 + k; p[k] = 8'h10 + k; end
+                q[1:3] = q[0:2];
+                $display("const %h %h %h %h", q[0], q[1], q[2], q[3]);
+                i = 1; p[i +: 3] = p[0 +: 3];
+                $display("idx   %h %h %h %h", p[0], p[1], p[2], p[3]);
+            end
+        endmodule
+    )") == "const 10 10 11 12\n"
+           "idx   10 10 11 12\n");
+}
+
+TEST_CASE("an out-of-range indexed slice reads the element default per position") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] q [0:7];
+            int         n [0:7];
+            logic [7:0] r3 [0:2];
+            int         n2 [0:1];
+            int i;
+            initial begin
+                for (int k = 0; k < 8; k++) begin q[k] = 8'h10 + k; n[k] = k + 1; end
+                i = 6; r3 = q[i +: 3];  $display("part_hi  %h %h %h", r3[0], r3[1], r3[2]);
+                i = 1; r3 = q[i -: 3];  $display("part_lo  %h %h %h", r3[0], r3[1], r3[2]);
+                i = 20; r3 = q[i +: 3]; $display("all_oob  %h %h %h", r3[0], r3[1], r3[2]);
+                i = 7; n2 = n[i +: 2];  $display("two_st   %0d %0d", n2[0], n2[1]);
+                i = 7; q[i +: 2] = '{8'he0, 8'he1};
+                $display("wr_part  %h %h", q[6], q[7]);
+                i = 30; q[i +: 2] = '{8'hd0, 8'hd1};
+                $display("wr_oob   %h %h %h", q[0], q[1], q[7]);
+            end
+        endmodule
+    )") == "part_hi  16 17 xx\n"
+           "part_lo  xx 10 11\n"
+           "all_oob  xx xx xx\n"
+           "two_st   8 0\n"
+           "wr_part  16 e0\n"
+           "wr_oob   10 11 e0\n");
+}
+
+TEST_CASE("an x/z indexed slice base is an invalid index (LRM 7.4.5)") {
+    CHECK(run_capture(R"(
+        module m;
+            logic [7:0] q [0:7];
+            logic [7:0] r2 [0:1];
+            integer     xi;         // 4-state, unlike `int`
+            logic [3:0] zi;
+            initial begin
+                for (int k = 0; k < 8; k++) q[k] = 8'h10 + k;
+                xi = 'x;      r2 = q[xi +: 2]; $display("rd_x     %h %h", r2[0], r2[1]);
+                zi = 4'bz001; r2 = q[zi +: 2]; $display("rd_z     %h %h", r2[0], r2[1]);
+                xi = 'x;      q[xi +: 2] = '{8'hc0, 8'hc1};
+                $display("wr_x     %h %h", q[0], q[1]);
+            end
+        endmodule
+    )") == "rd_x     xx xx\n"
+           "rd_z     xx xx\n"
+           "wr_x     10 11\n");
+}
+
+TEST_CASE("indexed unpacked-array slice in every supported context") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] arr [0:5]; int tag; } s_t;
+            logic [7:0] q  [0:7];
+            logic [7:0] r2 [0:1];
+            int         m4 [0:3][0:1];
+            int         m2 [0:1][0:1];
+            s_t         s;
+            int i, calls = 0;
+            function automatic int base_once(); calls = calls + 1; return 2; endfunction
+            function automatic void f_in(logic [7:0] v [0:1]);
+                $display("arg_in   %h %h", v[0], v[1]);
+            endfunction
+            function automatic void f_out(output logic [7:0] v [0:1]);
+                v[0] = 8'h71; v[1] = 8'h72;
+            endfunction
+            function automatic void f_inout(inout logic [7:0] v [0:1]);
+                v[0] = v[0] + 8'h1; v[1] = v[1] + 8'h2;
+            endfunction
+            initial begin
+                for (int k = 0; k < 8; k++) q[k] = 8'h10 + k;
+                for (int k = 0; k < 4; k++) begin m4[k][0] = k * 10; m4[k][1] = k * 10 + 1; end
+                for (int k = 0; k < 6; k++) s.arr[k] = 8'h50 + k;
+                i = 4; r2 = '{8'h14, 8'h15};
+                $display("eq       %b %b", q[i +: 2] == r2, q[0 +: 2] == r2);
+                i = 2; r2 <= q[i +: 2];
+                q[6 +: 2] <= '{8'ha6, 8'ha7};
+                #1 $display("nba      %h %h | %h %h", r2[0], r2[1], q[6], q[7]);
+                i = 4; f_in(q[i +: 2]);
+                i = 0; f_out(q[i +: 2]);
+                $display("arg_out  %h %h", q[0], q[1]);
+                i = 0; f_inout(q[i +: 2]);
+                $display("arg_io   %h %h", q[0], q[1]);
+                i = 3; r2 = s.arr[i +: 2];
+                $display("member   %h %h", r2[0], r2[1]);
+                i = 1; s.arr[i +: 2] = '{8'h61, 8'h62};
+                $display("mem_wr   %h %h %h", s.arr[0], s.arr[1], s.arr[2]);
+                i = 1; m2 = m4[i +: 2];
+                $display("multidim %0d %0d %0d %0d", m2[0][0], m2[0][1], m2[1][0], m2[1][1]);
+                i = 2; m4[i +: 2] = '{'{77, 78}, '{79, 80}};
+                $display("md_wr    %0d %0d %0d %0d", m4[2][0], m4[2][1], m4[3][0], m4[3][1]);
+                r2 = q[base_once() +: 2];
+                $display("once     %h %h calls=%0d", r2[0], r2[1], calls);
+            end
+        endmodule
+    )") == "eq       1 0\n"
+           "nba      12 13 | a6 a7\n"
+           "arg_in   14 15\n"
+           "arg_out  71 72\n"
+           "arg_io   72 74\n"
+           "member   53 54\n"
+           "mem_wr   50 61 62\n"
+           "multidim 10 11 20 21\n"
+           "md_wr    77 78 79 80\n"
+           "once     12 13 calls=1\n");
+}
+
 TEST_CASE("assignment-pattern lvalue: bare positional destructure of a fixed array") {
     CHECK(run_capture(R"(
         module m;

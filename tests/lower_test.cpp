@@ -633,13 +633,33 @@ TEST_CASE("a fixed-size unpacked array slice lowers in each context") {
         )");
         CHECK(r.ok);
     }
-    SUBCASE("an indexed part-select slice is still guarded") {
+    SUBCASE("an indexed part-select slice lowers in the same contexts") {
+        // `a[i +: 2]` has no anchored sub-array (its first position is a runtime
+        // value), so it expands position-wise instead of becoming an ArrSlice.
         const LowerResult r = lower_text(R"(
             module top;
                 bit [31:0] a [7:0];
                 bit [31:0] b [1:0];
+                logic eq;
                 int i;
-                initial b = a[i +: 2];
+                initial begin
+                    b = a[i +: 2];
+                    a[i -: 2] = b;
+                    a[i +: 2] <= b;
+                    eq = a[i +: 2] == b;
+                end
+            endmodule
+        )");
+        CHECK(r.ok);
+    }
+    SUBCASE("an indexed part-select slice in an unsupported context is guarded") {
+        // A general by-value read (here `%p`) still needs the whole-array rvalue
+        // ABI; the diagnostic names the contexts that do work.
+        const LowerResult r = lower_text(R"(
+            module top;
+                bit [31:0] a [7:0];
+                int i;
+                initial $display("%p", a[i +: 2]);
             endmodule
         )");
         CHECK_FALSE(r.ok);
