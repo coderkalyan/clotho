@@ -60,6 +60,38 @@ void check_libsva_abi() {
     (void)ok;
 }
 
+// The one shape the two attempt-tracking disciplines cannot share, worded once
+// because two places report it: sva_lower returns SVA_ERROR_MODE_MIX for an
+// implication under a shift, and until() catches the same thing itself so the
+// diagnostic can blame the offending operand -- libsva reports a node, and clotho
+// has no map from a node back to source.
+std::string mode_mix_message() {
+    return "an implication sits under an unbounded property operator (`always`, "
+           "`s_eventually` or the `until` family). The two need different "
+           "attempt-tracking disciplines and a monitor has only one, so restructure to "
+           "put the implication on top -- `always (a |=> b)` is already `a |=> b`, "
+           "since an attempt starts every cycle";
+}
+
+// libsva's sva_verdict as clotho's ir::AssertionVerdict. The two are the same
+// three-valued lattice with the same members in the same order, deliberately: this
+// is where it crosses the boundary, and ir::AssertionMonitor has to stay plain data
+// that clotho_ir_core can consume without libsva's header.
+//
+// A switch and not a cast, so adding a member on either side breaks the build here
+// rather than silently renumbering a verdict.
+ir::AssertionVerdict mirrored_verdict(sva_verdict verdict) {
+    switch (verdict) {
+        case SVA_VERDICT_PENDING:
+            return ir::AssertionVerdict::Pending;
+        case SVA_VERDICT_HOLDS:
+            return ir::AssertionVerdict::Holds;
+        case SVA_VERDICT_FAILS:
+            return ir::AssertionVerdict::Fails;
+    }
+    return ir::AssertionVerdict::Pending;
+}
+
 // libsva reports failures against a node; the front-end reports against source.
 // This maps one to the other by remembering, per libsva node, the AssertionExpr
 // that produced it.
@@ -621,25 +653,16 @@ public:
                         return junction(binary, strength, expr);
                     case BinaryAssertionOperator::Iff:
                     case BinaryAssertionOperator::Implies:
-                        // TODO: `implies` and `iff` (LRM 16.12.6) -- both reduce to
-                        // `not` plus `or`, so they land with `not` in phase 4 of
-                        // docs/design/sva-property-layer.md. Note this is the
-                        // property operator `implies` and not `|->`, which is
-                        // handled above.
-                        return reject("the `implies` and `iff` property operators are not "
-                                      "supported yet: both reduce to `not`, which needs the "
-                                      "operand determinised",
-                                      &expr);
+                        // The property operators, not `|->`, which is handled above.
+                        // Both are junctions over `not` (LRM 16.12.6), and libsva
+                        // builds them as junction kinds rather than as a desugaring
+                        // here -- see junction().
+                        return junction(binary, strength, expr);
                     case BinaryAssertionOperator::Until:
                     case BinaryAssertionOperator::SUntil:
                     case BinaryAssertionOperator::UntilWith:
                     case BinaryAssertionOperator::SUntilWith:
-                        // TODO: the `until` family (LRM 16.12.7) -- the obligation
-                        // it raises has no bounded length, so it needs the
-                        // single-state tracking discipline of phase 3.
-                        return reject("the `until` property operators are not supported yet: "
-                                      "the obligation they raise is unbounded",
-                                      &expr);
+                        return until(binary, expr);
                     case BinaryAssertionOperator::Intersect:
                     case BinaryAssertionOperator::Throughout:
                     case BinaryAssertionOperator::Within:
@@ -648,8 +671,15 @@ public:
                 }
                 break;
             }
-            case AssertionExprKind::Unary:
-                return shift(expr.as<slang::ast::UnaryAssertionExpr>(), expr);
+            case AssertionExprKind::Unary: {
+                const auto& unary = expr.as<slang::ast::UnaryAssertionExpr>();
+                if (unary.op == slang::ast::UnaryAssertionOperator::Not) {
+                    // Not a shift: the six shift operators put their operand under a
+                    // cycle range, `not` complements it. They share only the AST node.
+                    return negation(unary, strength, expr);
+                }
+                return shift(unary, expr);
+            }
             case AssertionExprKind::Conditional:
                 return conditional(expr.as<slang::ast::ConditionalAssertionExpr>(), strength,
                                    expr);
@@ -772,9 +802,73 @@ public:
         }
     }
 
-    // The strength a unary property operator forces on its subtree, or nullopt for
-    // `not`, which is not one of them. `strong`/`weak` wrap sequences and not
-    // properties (LRM 16.12.2), so nothing above a shift can override this.
+    // Whether this property subtree contains an `accept_on` / `reject_on` in ANY of
+    // its four spellings -- they are all one AbortAssertionExpr kind, so one arm
+    // covers the `sync_` pair too.
+    //
+    // Only `not` asks. An abort is armed from the unfiltered one-step image of where
+    // its attempt is, so that it covers the cycle its subtree's last thread dies in;
+    // a determinised successor is already valuation-filtered and the complement makes
+    // that state's guard unsatisfiable, so the abort would read as unarmed in exactly
+    // the cycle it exists to fire in. libsva reports the pairing
+    // (SVA_ERROR_UNSUPPORTED_ABORT_SCOPE); mirroring the walk here is what lets the
+    // refusal name `not`, for carries_trigger's reason -- libsva reports a node and
+    // clotho has no map from a node back to source.
+    //
+    // An abort ABOVE the `not` is fine and must stay so: its scope is then the whole
+    // complemented property rather than a state set inside it, which is why this walks
+    // down from the operand rather than up from the abort.
+    static bool carries_abort(const AssertionExpr& expr) {
+        switch (expr.kind) {
+            case AssertionExprKind::Abort:
+                return true;
+            case AssertionExprKind::Binary: {
+                const auto& binary = expr.as<slang::ast::BinaryAssertionExpr>();
+                return carries_abort(binary.left) || carries_abort(binary.right);
+            }
+            case AssertionExprKind::Unary:
+                return carries_abort(expr.as<slang::ast::UnaryAssertionExpr>().expr);
+            case AssertionExprKind::StrongWeak:
+                return carries_abort(expr.as<slang::ast::StrongWeakAssertionExpr>().expr);
+            case AssertionExprKind::Clocking:
+                return carries_abort(expr.as<slang::ast::ClockingAssertionExpr>().expr);
+            case AssertionExprKind::Simple: {
+                const auto& simple = expr.as<slang::ast::SimpleAssertionExpr>();
+                const auto* inst = simple.repetition ? nullptr : as_instance(simple.expr);
+                if (inst == nullptr || !is_property_instance(*inst)) {
+                    return false;
+                }
+                // As carries_trigger: an instance clotho refuses outright is not
+                // walked, so this predicate cannot pre-empt the accurate refusal
+                // instance_supported is about to give.
+                if (inst->isRecursiveProperty || !inst->localVars.empty()) {
+                    return false;
+                }
+                return carries_abort(inst->body);
+            }
+            default:
+                // A sequence-layer node cannot hold an abort: `accept_on` and friends
+                // are property operators, so anything reached through the sequence tail
+                // has none.
+                return false;
+        }
+    }
+
+    // `not` swaps the end-of-trace disposition of what is under it (LRM 16.12.2):
+    // a pending weak property holds when the trace ends, so its negation fails, and
+    // vice versa. This is the one rule negation inverts -- ir::AssertionVerdict and
+    // ir::verdict_at_end_of_trace name the same thing on clotho's side of the
+    // boundary, and libsva's sva_verdict_not is its normative table.
+    static sva_strength invert_strength(sva_strength strength) {
+        return strength == SVA_STRONG ? SVA_WEAK : SVA_STRONG;
+    }
+
+    // The strength a unary property operator forces on its subtree, or nullopt when
+    // it forces none. `strong`/`weak` wrap sequences and not properties (LRM
+    // 16.12.2), so nothing above a shift can override this.
+    //
+    // `not` is deliberately not in the list: it does not FORCE a strength, it
+    // inverts one, which is a different thing and is applied in strength_of.
     static std::optional<sva_strength> shift_strength(slang::ast::UnaryAssertionOperator op) {
         switch (op) {
             case slang::ast::UnaryAssertionOperator::NextTime:
@@ -794,9 +888,10 @@ public:
     // The strength libsva will attach to this operand's plan, given the strength
     // clotho threads into it. Mirrors Glushkov's Plan.strength, which comes from
     // the prop_seq_* LEAF rather than from the operators above it, so the
-    // innermost `strong`/`weak` spelling wins. Only sva_prop_junction cares: it
-    // refuses a pair whose sides disagree, because a pending pair with one weak
-    // and one strong side has no single end-of-trace disposition.
+    // innermost `strong`/`weak` spelling wins, with `not` the one operator that
+    // transforms rather than passes it through. Only the junctions care: they refuse
+    // a pair whose sides do not satisfy the kind's rule, because a monitor carries
+    // ONE end-of-trace bit and a pair needing two has no single disposition.
     static sva_strength strength_of(const AssertionExpr& expr, sva_strength inherited) {
         switch (expr.kind) {
             case AssertionExprKind::StrongWeak:
@@ -819,6 +914,20 @@ public:
             }
             case AssertionExprKind::Unary: {
                 const auto& unary = expr.as<slang::ast::UnaryAssertionExpr>();
+                if (unary.op == slang::ast::UnaryAssertionOperator::Not) {
+                    // One inversion, on the way out. negation() threads the inherited
+                    // strength into the operand UNCHANGED and libsva's prop_not
+                    // inverts the plan strength it produces, so `not p` carries the
+                    // opposite of whatever `p` carries -- `not a` under a weak assert
+                    // is strong, `not strong(q)` is weak.
+                    //
+                    // Not inverted on the way in as well. That would cancel here and
+                    // report `not a` as weak, which is not what the monitor does: the
+                    // whole point of the swap is that `not p` pending resolves the
+                    // opposite way to `p` pending, and this function has to mirror
+                    // libsva or the junction pre-check disagrees with the backstop.
+                    return invert_strength(strength_of(unary.expr, inherited));
+                }
                 const std::optional<sva_strength> own = shift_strength(unary.op);
                 return own ? strength_of(unary.expr, *own) : inherited;
             }
@@ -847,6 +956,15 @@ public:
                         // The antecedent is a sequence; the consequent carries the
                         // strength.
                         return strength_of(binary.right, inherited);
+                    case BinaryAssertionOperator::Until:
+                    case BinaryAssertionOperator::SUntil:
+                    case BinaryAssertionOperator::UntilWith:
+                    case BinaryAssertionOperator::SUntilWith:
+                        // Like a shift, an `until` sets the strength of its own
+                        // subtree (LRM 16.12.11): the `s_` forms owe the `q` that
+                        // ends them and the plain ones do not. Both operands are
+                        // built with that strength, so either answers for the pair.
+                        return strength_of(binary.left, until_strength(binary.op));
                     default:
                         return strength_of(binary.left, inherited);
                 }
@@ -891,6 +1009,55 @@ public:
         return node;
     }
 
+    // `not p` (LRM 16.12.9). The complement of the operand's automaton, which is
+    // why it needs the operand DETERMINISED -- a nondeterministic automaton's
+    // complement is not its state-set complement -- and why it arrived only once
+    // libsva had the total subset construction.
+    //
+    // The strength inverts (16.12.2), and libsva's prop_not does that inversion
+    // inside lowering so sva_monitor_strength keeps reporting the disposition the
+    // whole monitor carries. Nothing to thread here beyond the operand's own
+    // strength: strength_of applies the same inversion when a junction above asks
+    // what this subtree resolves to.
+    std::optional<sva_node> negation(const slang::ast::UnaryAssertionExpr& unary,
+                                     sva_strength strength, const AssertionExpr& blame) {
+        const auto operand = property(unary.expr, strength);
+        if (!operand) {
+            return std::nullopt;
+        }
+        // As for a junction: a complement is taken over the OBLIGATION, and a
+        // trigger is not part of one. `not (a |=> b)` would need the monitor to hold
+        // the antecedent's attempts and the complement of what they oblige, and
+        // there is one trigger. libsva reports it too
+        // (SVA_ERROR_UNSUPPORTED_CONSEQUENT); this is here so the message names
+        // `not` rather than something further in.
+        if (carries_trigger(unary.expr)) {
+            return reject("the operand of the `not` property operator is an implication, "
+                          "which raises an obligation of its own, and a monitor has only "
+                          "one trigger",
+                          &unary.expr);
+        }
+        // An abort below the complement, which libsva refuses for a reason that is
+        // about ARMING rather than about the mask -- see the
+        // SVA_ERROR_UNSUPPORTED_ABORT_SCOPE arm of the status switch, which carries the
+        // derivation. Pre-checked here so the message names `not` and points at the
+        // operand. Do NOT "fix" this by inverting the abort's effect under a
+        // complement: that reading was tried and a differential test disproved it, and
+        // it turns every `accept_on` discharge silently into a failure.
+        if (carries_abort(unary.expr)) {
+            return reject("an `accept_on` / `reject_on` sits below the `not` property "
+                          "operator, whose complement leaves the abort unarmed in the "
+                          "very cycle it exists to fire in, so move the abort above the "
+                          "`not`",
+                          &unary.expr);
+        }
+        sva_node node = 0;
+        if (sva_prop_not(ir_, *operand, &node) != SVA_OK) {
+            return reject("out of memory building an assertion property", &blame);
+        }
+        return node;
+    }
+
     // `nexttime`, `always [m:n]`, `eventually [m:n]` and the three strong forms
     // (LRM 16.12.10-16.12.13). All six are ONE construction: the operand shifted
     // over a cycle range, read disjunctively for `nexttime`/`eventually` and
@@ -898,35 +1065,31 @@ public:
     // `eventually [m:n] p` is `weak(##[m:n] p)` and the `s_` form is the same
     // strong -- which is why the operator's own spelling, and not anything above
     // it, sets the strength of its subtree.
+    //
+    // `not` is routed to negation() before it reaches here; it is the one
+    // UnaryAssertionExpr that is not a shift.
     std::optional<sva_node> shift(const slang::ast::UnaryAssertionExpr& unary,
                                   const AssertionExpr& blame) {
         using Op = slang::ast::UnaryAssertionOperator;
-        if (unary.op == Op::Not) {
-            // TODO: `not` (LRM 16.12.9) -- a complement needs the operand
-            // determinised and it swaps the weak/strong disposition, so it lands
-            // in phase 4 of docs/design/sva-property-layer.md with `implies` and
-            // `iff`.
-            return reject("the `not` property operator is not supported yet: a complement "
-                          "needs the operand determinised",
-                          &blame);
-        }
         const std::optional<sva_strength> inner = shift_strength(unary.op);
         const bool conjunctive = unary.op == Op::Always || unary.op == Op::SAlways;
         const bool nexttime = unary.op == Op::NextTime || unary.op == Op::SNextTime;
 
         // `nexttime p` is `nexttime[1] p` (LRM 16.12.10): one cycle, not zero. For
-        // `always` and `eventually` an absent range is the UNBOUNDED form, and so
-        // is a range whose upper bound is `$`.
+        // `always` and `eventually` an absent range is the UNBOUNDED form -- LRM
+        // 16.12.13 reads `always p` as `always [0:$] p` and `s_eventually p` as
+        // `s_eventually [0:$] p` -- and so is a range whose upper bound is `$`.
         uint32_t lo = 1;
         uint32_t hi = 1;
         if (unary.range) {
             lo = unary.range->min;
-            if (!unary.range->max) {
-                return reject(unbounded_message(conjunctive), &blame);
-            }
-            hi = *unary.range->max;
+            hi = unary.range->max ? *unary.range->max : SVA_UNBOUNDED;
         } else if (!nexttime) {
-            return reject(unbounded_message(conjunctive), &blame);
+            lo = 0;
+            hi = SVA_UNBOUNDED;
+        }
+        if (hi == SVA_UNBOUNDED && !unbounded_shift_exists(unary.op)) {
+            return reject(unbounded_refusal(conjunctive), &blame);
         }
         if (lo > hi) {
             // slang refuses an inverted range itself; sva_prop_shift asserts on
@@ -959,19 +1122,28 @@ public:
         return node;
     }
 
-    // Unbounded `always` / `s_eventually`. libsva builds these and refuses them in
-    // sva_lower, but the message it has for that names the obligation rather than
-    // the operator, so clotho refuses first and says which operator it was.
-    static std::string unbounded_message(bool conjunctive) {
-        // TODO: unbounded `always` / `eventually` and the `until` family (LRM
-        // 16.12.11-16.12.13) -- an obligation with no bounded length needs the
-        // single-state tracking discipline of phase 3 in
-        // docs/design/sva-property-layer.md, because the number of attempts
-        // pending at once is not bounded and no fixed pool tracks them.
-        return std::string("an unbounded `") + (conjunctive ? "always" : "eventually") +
-               "` is not supported yet: the obligation it raises has no bounded length, so "
-               "the number of attempts pending at once is unbounded. Give it a bounded range "
-               "to lower it today";
+    // Which shift operators have an unbounded form at all (LRM 16.12.13), now that
+    // the counted tracking discipline can carry one. The split is not symmetric.
+    // `always p` may run forever because a weak property is never owed a
+    // discharge, and `s_eventually p` may because a strong one owes its witness at
+    // some point but under no deadline. The other two have no reading: an
+    // `s_always [m:$]` would owe a discharge no cycle can deliver, and an
+    // `eventually [m:$]` could never fail. slang diagnoses both, so this is the
+    // backstop that keeps a malformed range out of sva_prop_shift.
+    static bool unbounded_shift_exists(slang::ast::UnaryAssertionOperator op) {
+        using Op = slang::ast::UnaryAssertionOperator;
+        return op == Op::Always || op == Op::SEventually;
+    }
+
+    // Only ever the two operators above admit no unbounded form, so `conjunctive`
+    // picks between exactly `s_always` and `eventually` here.
+    static std::string unbounded_refusal(bool conjunctive) {
+        return std::string("an unbounded `") + (conjunctive ? "s_always" : "eventually") +
+               "` has no meaning: " +
+               (conjunctive ? "a strong obligation under no deadline can never be discharged"
+                            : "a weak one under no deadline can never fail") +
+               ". Give it a bounded range, or write `" +
+               (conjunctive ? "always" : "s_eventually") + "` instead";
     }
 
     // `s #-# p` and `s #=# p` (LRM 16.12.9). The existential dual of implication:
@@ -1007,10 +1179,62 @@ public:
         return node;
     }
 
-    // Property-layer `and` / `or` (LRM 16.12.5-16.12.6), reached only when an
-    // operand is a property; two sequences take the sequence-layer operator.
+    // The operator as the user spelled it, for a diagnostic. `implies` and `iff`
+    // reduce to `not` plus `or`, and libsva builds them from that reduction -- so
+    // without this a refusal would name the `or` or the `not` underneath rather than
+    // what is in the source.
+    static const char* junction_name(BinaryAssertionOperator op) {
+        switch (op) {
+            case BinaryAssertionOperator::And:
+                return "and";
+            case BinaryAssertionOperator::Or:
+                return "or";
+            case BinaryAssertionOperator::Implies:
+                return "implies";
+            case BinaryAssertionOperator::Iff:
+                return "iff";
+            default:
+                return "and";
+        }
+    }
+
+    // Property-layer `and` / `or` (LRM 16.12.5-16.12.6) and `implies` / `iff`
+    // (16.12.6), reached only when an operand is a property; two sequences take the
+    // sequence-layer operator.
+    //
+    // All four are one libsva junction kind, because all four are: `p implies q` is
+    // `(not p) or q` and `p iff q` is the conjunction of both directions. libsva
+    // builds them as kinds rather than clotho desugaring them into prop_not plus
+    // prop_junction, for two reasons. It keeps the reduction in one repository, and
+    // it keeps the state-count accounting -- which is what SVA_ERROR_STATE_LIMIT
+    // reports on, and which a desugaring would attribute to a node the user never
+    // wrote. What clotho keeps is the NAME, so a refusal says `implies`.
+    //
+    // What differs per kind is the strength rule, and only because a monitor carries
+    // ONE end-of-trace bit:
+    //
+    //   and / or   accept when the sides agree. A pending pair with one weak and
+    //              one strong side has no single disposition.
+    //   implies    accepts when they DISAGREE, because the reduction negates the
+    //              left side and prop_not inverts the plan strength with it, so
+    //              opposite spellings are what make the `or`'s two sides agree.
+    //   iff        never accepts. strength(p implies q) is strength(q) and needs
+    //              !sp == sq; the other direction needs !sq == sp; so the outer
+    //              `and` always compares sq against !sq and every assignment mixes.
+    //              Not an implementation gap: libsva reports the same for the direct
+    //              construction, because the five live-state combinations of
+    //              `p iff q` disagree on their end-of-trace disposition for every
+    //              pair of operand strengths.
+    //
+    // TODO: a per-STATE end-of-trace disposition, OR-combined over the live vector
+    // with the conjunction folded in at product construction, lifts all three
+    // refusals and deletes SVA_ERROR_MIXED_STRENGTH. It changes what
+    // sva_monitor_strength means and so what the emitted flush does, so it is a
+    // design of its own rather than part of this one.
     std::optional<sva_node> junction(const slang::ast::BinaryAssertionExpr& binary,
                                      sva_strength strength, const AssertionExpr& blame) {
+        const char* name = junction_name(binary.op);
+
         const auto lhs = property(binary.left, strength);
         if (!lhs) {
             return std::nullopt;
@@ -1025,26 +1249,110 @@ public:
         // operand reports itself first.
         for (const AssertionExpr* side : { &binary.left, &binary.right }) {
             if (carries_trigger(*side)) {
-                return reject("an operand of a property `and`/`or` is an implication, which "
-                              "raises an obligation of its own, and a monitor has only one "
-                              "trigger",
+                return reject("an operand of the property `" + std::string(name) +
+                                  "` operator is an implication, which raises an obligation of "
+                                  "its own, and a monitor has only one trigger",
                               side);
             }
         }
-        // The pair is pending until both sides resolve, and a pending pair with
-        // one weak and one strong side has no single end-of-trace disposition.
-        if (strength_of(binary.left, strength) != strength_of(binary.right, strength)) {
-            return reject("the two operands of a property `and`/`or` have different strength, "
-                          "so the pair has no single end-of-trace disposition",
+        const sva_strength left = strength_of(binary.left, strength);
+        const sva_strength right = strength_of(binary.right, strength);
+        if (binary.op == BinaryAssertionOperator::Iff) {
+            return reject("the property `iff` operator has no single end-of-trace "
+                          "disposition for any pair of operand strengths, because it "
+                          "obliges each operand both ways at once, and a monitor carries "
+                          "one",
+                          &blame);
+        }
+        const bool want_same = binary.op != BinaryAssertionOperator::Implies;
+        if ((left == right) != want_same) {
+            return reject("the two operands of the property `" + std::string(name) +
+                              "` operator " + (want_same ? "have different strength"
+                                                         : "have the same strength, and `implies` "
+                                                           "negates the left one") +
+                              ", so the pair has no single end-of-trace disposition",
                           &blame);
         }
         sva_node node = 0;
-        const sva_junction kind =
-            binary.op == BinaryAssertionOperator::And ? SVA_CONJUNCTION : SVA_DISJUNCTION;
+        const sva_junction kind = junction_kind(binary.op);
         if (sva_prop_junction(ir_, kind, *lhs, *rhs, &node) != SVA_OK) {
             return reject("out of memory building an assertion property", &blame);
         }
         return node;
+    }
+
+    static sva_junction junction_kind(BinaryAssertionOperator op) {
+        switch (op) {
+            case BinaryAssertionOperator::And:
+                return SVA_CONJUNCTION;
+            case BinaryAssertionOperator::Implies:
+                return SVA_IMPLIES;
+            case BinaryAssertionOperator::Iff:
+                return SVA_IFF;
+            default:
+                return SVA_DISJUNCTION;
+        }
+    }
+
+    // `p until q` and its three siblings (LRM 16.12.11). `p` holds in every cycle
+    // up to the one `q` first holds in; the `_with` forms include that cycle too,
+    // and the `s_` forms additionally require that `q` ever holds. Nothing in the
+    // property says when `q` arrives, so the obligation has no bounded longest
+    // match and the monitor is tracked by the COUNTED discipline rather than the
+    // ring -- see ir::AssertionTracking.
+    std::optional<sva_node> until(const slang::ast::BinaryAssertionExpr& binary,
+                                  const AssertionExpr& blame) {
+        // The operator's own spelling sets the strength of its subtree, exactly as
+        // a shift's does, so the strength threaded in from above is not consulted:
+        // `strong`/`weak` wrap sequences and not properties (LRM 16.12.2), so
+        // nothing above an `until` can override it.
+        const sva_strength strength = until_strength(binary.op);
+
+        const auto lhs = property(binary.left, strength);
+        if (!lhs) {
+            return std::nullopt;
+        }
+        const auto rhs = property(binary.right, strength);
+        if (!rhs) {
+            return std::nullopt;
+        }
+        // As a junction: the pair is one obligation running until `q`, neither side
+        // keeps a trigger of its own, and a monitor has nowhere to put a second.
+        // Both checks run after lowering, so a deeper failure in either operand
+        // reports itself first.
+        for (const AssertionExpr* side : { &binary.left, &binary.right }) {
+            if (carries_trigger(*side)) {
+                return reject(mode_mix_message(), side);
+            }
+        }
+        sva_node node = 0;
+        if (sva_prop_until(ir_, until_kind(binary.op), *lhs, *rhs, &node) != SVA_OK) {
+            return reject("out of memory building an assertion property", &blame);
+        }
+        return node;
+    }
+
+    static sva_until until_kind(BinaryAssertionOperator op) {
+        switch (op) {
+            case BinaryAssertionOperator::Until:
+                return SVA_UNTIL_WEAK;
+            case BinaryAssertionOperator::UntilWith:
+                return SVA_UNTIL_WEAK_WITH;
+            case BinaryAssertionOperator::SUntil:
+                return SVA_UNTIL_STRONG;
+            case BinaryAssertionOperator::SUntilWith:
+                return SVA_UNTIL_STRONG_WITH;
+            default:
+                break;
+        }
+        // Unreachable: property() dispatches only those four spellings here.
+        return SVA_UNTIL_WEAK;
+    }
+
+    static sva_strength until_strength(BinaryAssertionOperator op) {
+        return op == BinaryAssertionOperator::SUntil || op == BinaryAssertionOperator::SUntilWith
+                   ? SVA_STRONG
+                   : SVA_WEAK;
     }
 
     // `accept_on` / `reject_on` and their `sync_` forms (LRM 16.12.7), all four
@@ -1055,9 +1363,9 @@ public:
     // essentially every real use writes, and pushing it below is not an
     // equivalent rewrite -- below the implication the abort only arms once the
     // consequent starts, so it misses the attempt's own cycle. libsva carries the
-    // scope instead (sva_monitor_abort_covers_trigger) and refuses the residue it
-    // cannot get right, a trigger whose antecedent takes more than one cycle,
-    // with SVA_ERROR_UNSUPPORTED_ABORT_SCOPE.
+    // scope instead (sva_monitor_abort_covers_trigger), and a multi-cycle antecedent
+    // under one is no longer a residue: the attempt ids count the attempts sitting
+    // part-way through it, which is what the refusal used to be about.
     std::optional<sva_node> abort_on(const slang::ast::AbortAssertionExpr& node,
                                      sva_strength strength, const AssertionExpr& blame) {
         const bool accept = node.action == slang::ast::AbortAssertionExpr::Accept;
@@ -1359,6 +1667,9 @@ void read_automaton(const sva_monitor* monitor, const sva_automaton* from,
                          sva_automaton_guards(from) + into.state_count);
     into.first.assign(sva_automaton_first(from), sva_automaton_first(from) + into.words);
     into.last.assign(sva_automaton_last(from), sva_automaton_last(from) + into.words);
+    // Only meaningful for a determinised obligation, where the construction is
+    // total; a ring-tracked automaton reports an empty mask and nothing reads it.
+    into.dead.assign(sva_automaton_dead(from), sva_automaton_dead(from) + into.words);
 
     into.follow.resize(static_cast<size_t>(into.state_count) * into.words);
     for (uint32_t state = 0; state < into.state_count; state++) {
@@ -1407,51 +1718,6 @@ uint32_t read_root(const sva_ir* ir, sva_node node, Result& out) {
     }
     out.nodes.push_back(built);
     return static_cast<uint32_t>(out.nodes.size() - 1);
-}
-
-// Peel the wrappers that do not change which operator is outermost: an explicit
-// strength, and a named sequence or property, whose body slang has already
-// expanded in place.
-const AssertionExpr& outermost(const AssertionExpr& expr) {
-    if (expr.kind == AssertionExprKind::StrongWeak) {
-        return outermost(expr.as<slang::ast::StrongWeakAssertionExpr>().expr);
-    }
-    if (expr.kind == AssertionExprKind::Simple) {
-        const auto& simple = expr.as<slang::ast::SimpleAssertionExpr>();
-        if (!simple.repetition) {
-            if (const auto* inst = Lowering::as_instance(simple.expr)) {
-                return outermost(inst->body);
-            }
-        }
-    }
-    return expr;
-}
-
-// Whether the consequent of `property` is a sequence `and` at its top level.
-//
-// An `and` runs to the later of its two ends, so it is bounded only when BOTH
-// operands are, while an `intersect` in the same place is bounded as soon as
-// either one is -- an intersection's ends coincide, so the bounded side bounds
-// the pair. That asymmetry is the whole reason `req |=> (ack ##[1:$] done) and
-// rdy` is refused where the same shape under `intersect` is accepted, and no
-// user guesses it from "no bounded longest match" alone.
-//
-// Only a top-level `and` earns the explanation, because there its bound IS the
-// obligation's. Deeper, whatever encloses it sets the bound and naming `and`
-// would point at the wrong operator.
-bool consequent_is_and(const AssertionExpr& property) {
-    const AssertionExpr& top = outermost(property);
-    if (top.kind != AssertionExprKind::Binary) {
-        return false;
-    }
-    const auto& binary = top.as<slang::ast::BinaryAssertionExpr>();
-    if (binary.op != BinaryAssertionOperator::OverlappedImplication &&
-        binary.op != BinaryAssertionOperator::NonOverlappedImplication) {
-        return false;
-    }
-    const AssertionExpr& consequent = outermost(binary.right);
-    return consequent.kind == AssertionExprKind::Binary &&
-           consequent.as<slang::ast::BinaryAssertionExpr>().op == BinaryAssertionOperator::And;
 }
 
 } // namespace
@@ -1511,15 +1777,23 @@ Result lower(const Request& request) {
     if (status != SVA_OK) {
         switch (status) {
             case SVA_ERROR_UNBOUNDED_OBLIGATION:
-                out.error = "the consequent has no bounded longest match, so the number "
-                            "of concurrent obligations is unbounded";
-                if (consequent_is_and(*request.property)) {
-                    // The one shape whose rule a user cannot infer from the
-                    // sentence above; see consequent_is_and.
-                    out.error += ": an `and` matches to the later of its two ends, so BOTH "
-                                 "operands need a bounded match -- unlike `intersect`, whose "
-                                 "ends coincide, where one bounded operand bounds the pair";
-                }
+                // Narrowed by the counted discipline to the shapes counting cannot
+                // reach either. An unbounded obligation on its own is now lowered:
+                // `a |=> ##[1:$] b` and `a |=> b[->2]` both work, because a trigger
+                // is existential and composes with a counted obligation.
+                //
+                // What is left is the UNIVERSAL positions. "p holds at every cycle of
+                // an unbounded window" is a statement about one attempt of p per
+                // cycle, all overlapping, and a counted attempt is a single state
+                // that cannot carry a set of sub-attempts growing with the trace.
+                // When p matches in exactly one cycle each sub-attempt resolves
+                // inside its own cycle and the set never grows, which is why the
+                // rule is a single-cycle operand rather than a bounded one.
+                out.error = "the operand of an unbounded `always`, or the left operand of an "
+                            "`until`, must match in a single cycle. Both are universal over "
+                            "cycles, so a multi-cycle operand is re-attempted every cycle and "
+                            "the overlapping attempts grow without bound, which one counter "
+                            "per state cannot carry";
                 break;
             case SVA_ERROR_UNSUPPORTED_CONSEQUENT:
                 // Reached when a property operator's operand raises an obligation
@@ -1530,26 +1804,54 @@ Result lower(const Request& request) {
                             "trigger";
                 break;
             case SVA_ERROR_MIXED_STRENGTH:
-                out.error = "the two operands of a property `and`/`or` have different "
-                            "strength, so the pair has no single end-of-trace disposition";
+                // The backstop. junction() applies the same rule per operator first,
+                // so a reachable case names `and`, `or`, `implies` or `iff` as
+                // written; this fires only if clotho's mirror of the rule and
+                // libsva's own drift apart.
+                out.error = "the two operands of this property operator have no single "
+                            "end-of-trace disposition between them, and a monitor carries one";
+                break;
+            case SVA_ERROR_UNSUPPORTED_COMPLEMENT:
+                // The two shapes `not` cannot carry. One is an operand that owns a
+                // trigger, which negation() pre-checks so the message can name `not`;
+                // the other is a complement below an operator that RENUMBERS its
+                // operand's states -- a conjunction, an `always [m:n]` range, an
+                // `until`, a followed-by -- where the complemented block does not
+                // survive as a block. A disjunction and a disjunctive range do carry
+                // it, which is what `implies` is built out of.
+                // TODO: carrying a complement through a renumbering operator needs
+                // the complemented states tracked as a set through the product, the
+                // same accounting an abort's mask needs and for the same reason
+                // (SVA_ERROR_UNSUPPORTED_ABORT_SCOPE below).
+                out.error = "a `not` sits below a property operator that cannot carry a "
+                            "complement -- `and`, a cycle range read conjunctively, an "
+                            "`until` or a followed-by. `or` and a disjunctive range can, "
+                            "so restructure to put the `not` above the operator";
                 break;
             case SVA_ERROR_UNSUPPORTED_ABORT_SCOPE:
-                // Two shapes share this code. The second is the residue of the
-                // abort-above-an-implication support: with a multi-cycle
-                // antecedent, several attempts can sit part-way through it when
-                // the condition fires, each owing its own verdict, and the
-                // trigger is their union rather than a per-attempt ring -- so
-                // the count cannot be recovered. A one-cycle antecedent has no
-                // partial match to lose and is exact.
-                // TODO: a multi-cycle antecedent under an abort needs the
-                // trigger tracked per attempt; see phase 2 of
-                // docs/design/sva-property-layer.md.
+                // Two shapes share this code now. A third used to: an abort covering an
+                // implication whose antecedent takes more than one cycle to match, whose
+                // part-matched attempts a union-tracked trigger could not count. The
+                // attempt ids count them, so it lowers --
+                //
+                // The second is an abort under a `not`, and negation() pre-checks it so
+                // the message can name the operator. It is the ARMING that cannot
+                // survive the complement, not the mask, which the determinisation
+                // carries fine: an abort is armed from the UNFILTERED one-step image of
+                // where the attempt is, deliberately, so that it covers the cycle its
+                // subtree's last thread dies in -- which is the cycle `accept_on` exists
+                // for, discharging an attempt the property was about to fail. A
+                // determinised successor is already valuation-filtered, and the
+                // complement then gives a never-satisfiable guard to the very state that
+                // image would be read off, so the abort reads as unarmed exactly when it
+                // ought to fire. Lowering it would turn every such accept silently into
+                // a failure.
                 out.error = "an `accept_on` / `reject_on` sits below an operator that "
                             "renumbers its operand's states -- a property `and`, an "
                             "`always [m:n]` or a followed-by -- so the states the abort "
-                            "names cannot be carried through, or it covers an implication "
-                            "whose antecedent takes more than one cycle to match, whose "
-                            "part-matched attempts cannot be told apart";
+                            "names cannot be carried through, or below a `not`, whose "
+                            "complement leaves the abort unarmed in the cycle it exists "
+                            "to fire in";
                 break;
             case SVA_ERROR_STATE_LIMIT:
                 out.error = "the assertion needs more automaton states than the limit allows";
@@ -1561,6 +1863,50 @@ Result lower(const Request& request) {
             case SVA_ERROR_UNSUPPORTED_REPEAT_OPERAND:
                 out.error = "goto or non-consecutive repetition over a compound sequence";
                 break;
+            case SVA_ERROR_UNBOUNDED_ANTECEDENT:
+                // An implication whose antecedent has no bounded longest match.
+                // LRM 16.14.1 starts an evaluation of the consequent per antecedent
+                // MATCH, so the cycle a match ends in owes a verdict for each match
+                // ending there -- and telling those apart needs an attempt id per live
+                // antecedent thread, which an unbounded antecedent has unboundedly
+                // many of. Answering with the number of matching CYCLES instead is
+                // what one bit gives, and it is short by however many attempts ended
+                // together. Refused in both tracking disciplines:
+                // the obligation's discipline has no bearing on the antecedent.
+                //
+                // The remedy is named because the shape is legal SystemVerilog that
+                // clotho used to accept, so a refusal that only says what is wrong
+                // earns the same question every time it fires. Both routes are exact
+                // rather than approximations: a bounded antecedent is countable, and an
+                // unbounded CONSEQUENT is what the counted discipline exists for.
+                out.error = "the antecedent of an implication has no bounded longest match "
+                            "-- `a ##[1:$] b`, `b[=2]` or `b[->2]` on the left of `|->` or "
+                            "`|=>` -- so the attempts whose matches end in one cycle cannot "
+                            "be counted, and each of them is owed its own verdict. Bound the "
+                            "antecedent: give the cycle range a finite upper bound "
+                            "(`##[1:8]`), or use consecutive repetition (`b[*2]`) in place of "
+                            "`b[->2]` or `b[=2]`. Or move the unbounded part into the "
+                            "consequent, where it is supported";
+                break;
+            case SVA_ERROR_MODE_MIX:
+                // The one shape the two tracking disciplines cannot share. An
+                // unbounded operator -- `always`, `s_eventually`, the `until`
+                // family -- needs the COUNTED discipline, which determinises the
+                // obligation and carries a count per state. An implication needs
+                // the RING, which gives every attempt its own state vector out of a
+                // pool sized by the obligation's longest match. Tracking is chosen
+                // once per monitor (ir::AssertionTracking), so a property wanting
+                // both at once has no monitor to be lowered into.
+                //
+                // The rewrite is always available, and is what the user meant:
+                // `always (a |=> b)` is just `a |=> b`, because LRM 16.12.1 already
+                // starts an attempt of the whole assertion every cycle. The `until`
+                // forms lift the implication out the same way.
+                // TODO: per-subtree tracking modes would lower this shape as
+                // written; explicitly out of scope for phase 3 of
+                // docs/design/sva-property-layer.md.
+                out.error = mode_mix_message();
+                break;
             default:
                 out.error = "the assertion could not be lowered";
                 break;
@@ -1570,9 +1916,35 @@ Result lower(const Request& request) {
 
     ir::AssertionMonitor& built = out.monitor;
     built.kind = static_cast<ir::AssertionKind>(sva_monitor_kind(monitor));
+    // The verdict lattice crosses the boundary here. libsva reports the disposition
+    // of a still-pending attempt two ways -- sva_monitor_strength as the weak/strong
+    // bit and sva_monitor_pending as the three-valued sva_verdict -- and after `not`
+    // they are both the INVERTED value, because prop_not swaps the strength inside
+    // lowering rather than leaving the swap for a backend to remember.
+    //
+    // Only the bit is stored. Carrying both would be two fields that cannot
+    // disagree, and ir::verdict_at_end_of_trace derives the verdict from the bit at
+    // the one place the emitter needs it. What the second accessor is good for is
+    // this equality: it is the boundary check that libsva's inversion and clotho's
+    // reading of it still mean the same thing, and it costs nothing at run time
+    // because the shapes are tiny and this runs once per assertion.
     built.strength = sva_monitor_strength(monitor) == SVA_STRONG ? ir::AssertionStrength::Strong
                                                                  : ir::AssertionStrength::Weak;
+    if (mirrored_verdict(sva_monitor_pending(monitor)) !=
+        ir::verdict_at_end_of_trace(built.strength)) {
+        out.error = "internal: libsva's end-of-trace verdict and its strength disagree";
+        return out;
+    }
     built.depth = sva_monitor_depth(monitor);
+    // How many antecedent attempts the trigger must tell apart. Zero says one bit
+    // answers "did the antecedent match" -- either the antecedent matches in a single
+    // cycle, or all of its matches span the SAME number of cycles, and then distinct
+    // start cycles end in distinct cycles so at most one match can end per cycle.
+    // Taken from libsva rather than derived from the trigger's longest match here:
+    // that second case is invisible to a length alone, and it covers `(a ##1 b) |-> c`.
+    built.trigger_window = sva_monitor_trigger_window(monitor);
+    built.tracking = sva_monitor_mode(monitor) == SVA_MODE_COUNTED ? ir::AssertionTracking::Counted
+                                                                   : ir::AssertionTracking::Ring;
     built.reset_root = sva_monitor_reset(monitor);
     built.overlap = sva_monitor_implication(monitor) == SVA_OVERLAPPING;
     built.has_trigger = sva_monitor_trigger(monitor) != nullptr;

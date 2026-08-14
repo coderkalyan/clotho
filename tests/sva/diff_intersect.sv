@@ -15,7 +15,25 @@ module t;
   // one does not match those same two cycles.
   api: assert property (@(posedge clk) a |=> (b ##1 c) intersect (b[*2]));
 
-  apn: assert property (@(posedge clk) (rst ##1 b[=2]) |=> c);
+  // REMOVED, and the removal is the record. This fixture used to carry
+  //
+  //     apn: assert property (@(posedge clk) (rst ##1 b[=2]) |=> c);
+  //
+  // to exercise non-consecutive repetition in an ANTECEDENT, where the gap
+  // between the two occurrences is the point. That shape no longer lowers:
+  // `b[=2]` has unbounded reach, so unboundedly many attempts can be part-way
+  // through the antecedent at once, and counting the matches that end in one
+  // cycle needs per-attempt identity whose window is the antecedent's longest
+  // match. libsva refuses it with SVA_ERROR_UNBOUNDED_ANTECEDENT rather than
+  // under-report, which is a capability traded for a correct number -- the old
+  // lowering was right whenever no two matches ended together, which is why
+  // this directive used to give the right count.
+  //
+  // The coverage moved rather than vanished: tests/sva_test.cpp asserts the
+  // refusal by name, and asserts the same operator still lowers in a
+  // CONSEQUENT, which is where the counted discipline takes it. The fix that
+  // would bring this line back is determinising the trigger, tracked in
+  // docs/TODO.md; when it lands, restore this directive and re-score the file.
 
   initial begin
     @(posedge clk);

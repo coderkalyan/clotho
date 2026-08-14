@@ -39,6 +39,65 @@ module t;
 endmodule
 )";
 
+// The counted twin of the above: the smallest counted monitor that HAS a trigger.
+// Its antecedent matches in exactly one cycle, which is the shape the counted
+// attempt ids must cost nothing on.
+constexpr std::string_view counted_implication = R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> s_eventually b);
+endmodule
+)";
+
+// A monitor's emitted shape, as a string: its hidden signals by name, then the
+// instruction TAG SEQUENCE of each process it owns plus that process's extra
+// side-table, folded into one digest.
+//
+// This is the guard on refactors of the step. The verdict lattice
+// (ir::AssertionVerdict) was named by pulling the three masks the ring path used
+// to compute inline into one helper, and the whole point of doing it that way was
+// that the emitted IR must not move: the ring's semantics are pinned by the
+// behavioural cases below and by libsva's own differential tests, so any change
+// here is a regression by definition rather than something to re-bless. Tags and
+// the extra table rather than payload words: those two capture emission ORDER and
+// region structure, which is what a reordered fold would disturb, and they carry
+// no union padding to make the digest depend on the build.
+std::string monitor_shape(const ir::Module& m) {
+    std::string out;
+    for (const ir::SignalInfo& s : m.signals()) {
+        if (s.name.find("sva.") != std::string::npos) {
+            out += s.name;
+            out += ' ';
+        }
+    }
+    for (const ir::Process& p : m.processes()) {
+        if (p.activation != ir::Activation::Observed && p.activation != ir::Activation::Final) {
+            continue;
+        }
+        // FNV-1a over the tag sequence and the extra table. A digest and not the
+        // sequence itself only because the sequence is thousands of entries long;
+        // it is byte-exact either way.
+        uint64_t h = 0xcbf29ce484222325ull;
+        const auto eat = [&h](uint64_t word) {
+            h = (h ^ word) * 0x100000001b3ull;
+        };
+        eat(p.ir.inst_count());
+        for (uint32_t i = 0; i < p.ir.inst_count(); ++i) {
+            eat(static_cast<uint64_t>(p.ir.tag(ir::Index{ i })));
+        }
+        for (const uint32_t word : p.ir.extra_raw()) {
+            eat(word);
+        }
+        out += p.activation == ir::Activation::Observed ? "step:" : "final:";
+        out += std::to_string(p.ir.inst_count());
+        out += ':';
+        out += std::to_string(h);
+        out += ' ';
+    }
+
+    return out;
+}
+
 } // namespace
 
 TEST_CASE("a nonoverlapping implication lowers to a trigger and an obligation") {
@@ -100,6 +159,66 @@ TEST_CASE("a nonoverlapping implication lowers to a trigger and an obligation") 
         const uint32_t guard = mon.obligation.guard_of[state];
         CHECK((mon.obligation.guard_states[guard] >> state & 1) == 1);
     }
+}
+
+TEST_CASE("naming the verdict lattice leaves a ring monitor's emitted IR alone") {
+    // The acceptance test for the lattice refactor. `a |=> b` is the smallest ring
+    // monitor there is -- one trigger state, one obligation state, depth 1 -- so its
+    // step is almost entirely the verdict fold that moved, and its digest is the most
+    // sensitive one available.
+    //
+    // Pinned as a literal rather than compared against a second lowering: the claim is
+    // that pulling the ring's three verdict masks into ring_verdict() added no
+    // instruction and reordered none, and only a constant can say that. It was
+    // established by measuring this digest, reverting the helper back to the inline
+    // fold, rebuilding, and getting the same number -- not by reading the diff.
+    //
+    // So if this fires, re-establish it the same way rather than pasting the new
+    // digest in. THREE things legitimately move it: a change to the step's emission
+    // order, which is the regression this exists to catch; a change to libsva's
+    // tables for this property, which reshuffles the guard fold without clotho
+    // touching anything; and a change to `ir::Inst::Tag`'s DECLARATION ORDER, which
+    // renumbers every tag after the insertion point and so rehashes a step that is
+    // otherwise identical instruction for instruction. The COUNT separates the first
+    // from the other two -- it is stable across them and not across it.
+    //
+    // The third one is not hypothetical: "disable: lower a lexically
+    // enclosing target (LRM 9.6.2)" inserted NamedBlock and Disable mid-enum and moved both
+    // digests in this file. Confirmed by moving those two enumerators to the end of
+    // the enum, rebuilding, and watching both literals below match their previous
+    // values again -- which is the same style of experiment as the one above, run
+    // against the renumbering instead of against the refactor.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(implication, r);
+
+    REQUIRE(m.monitors.size() == 1);
+    REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Ring);
+    CHECK(monitor_shape(m) ==
+          "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.pend0 sva.0.occ sva.0.clk "
+          "step:125:8656654477628751033 ");
+}
+
+TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone") {
+    // The zero-cost half of the counted-trigger fix. Several antecedent matches can
+    // end in one cycle, each owing a verdict of its own, so a seed adds the NUMBER of
+    // attempts that matched rather than 1 -- and an antecedent that matches in a
+    // single cycle can never have more than one, so it must pay nothing for the
+    // arithmetic. `a |=> s_eventually b` is the smallest counted monitor with a
+    // trigger, so it is where that costing is visible.
+    //
+    // Two claims, and they take different evidence. That no id STATE is allocated is
+    // the signal list, and the absent `tid`/`fid`/`idn` names below are legible on
+    // their own. That no INSTRUCTION was added is the digest, which only says so
+    // against a number established the way the case above describes -- so if this
+    // fires, re-establish it that way rather than pasting the new digest in.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(counted_implication, r);
+
+    REQUIRE(m.monitors.size() == 1);
+    REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Counted);
+    CHECK(monitor_shape(m) ==
+          "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.cnt1 sva.0.clk "
+          "step:117:1903636621696783129 final:18:14459492915158645094 ");
 }
 
 TEST_CASE("an overlapping implication differs only in when it seeds") {
@@ -520,17 +639,46 @@ void refuses(std::string_view source, std::string_view needle) {
                   r.diagnostic_text());
 }
 
+// The single monitor in a lowered module, for the shape checks below.
+const ir::AssertionMonitor& only_monitor(const ir::Module& m) {
+    REQUIRE(m.monitors.size() == 1);
+    return m.monitors[0];
+}
+
+// One assertion body, wrapped in the smallest module that gives it a clock.
+std::string one_assertion(std::string_view decls, std::string_view body) {
+    return std::string("module t;\n  bit clk;\n  ") + std::string(decls) +
+           "\n  ap: assert property (@(posedge clk) " + std::string(body) + ");\nendmodule\n";
+}
+
 } // namespace
 
-TEST_CASE("an unbounded obligation is refused, naming the cause") {
-    // `##[1:$]` in a consequent has no bounded longest match, so the number of
-    // concurrent obligations is unbounded and the automaton cannot track it.
-    refuses(R"(
+TEST_CASE("an unbounded consequent under a trigger lowers, counted") {
+    // `##[1:$]` in a consequent has no bounded longest match, so no ring can be
+    // sized for it -- but a TRIGGER above it is existential, one state vector for
+    // all of its attempts, and needs no bound of its own. The two therefore
+    // compose: the antecedent stays a trigger and the obligation is counted.
+    //
+    // This is the shape phase 3 exists to unblock; it was refused outright before.
+    // The mode mix that is still refused is an implication INSIDE an unbounded
+    // operator, which is a different arrangement -- see the mode-mix case below.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
 module t;
   bit clk, a, b;
   ap: assert property (@(posedge clk) a |=> ##[1:$] b);
 endmodule
-)", "no bounded longest match");
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+
+    const ir::AssertionMonitor& mon = m.monitors.at(0);
+    CHECK(mon.tracking == ir::AssertionTracking::Counted);
+    CHECK(mon.has_trigger);
+    // The trigger keeps its own state; the obligation has counters and no pool.
+    CHECK(find_signal(m, "sva.0.trig") != nullptr);
+    CHECK(find_signal(m, "sva.0.fired") != nullptr);
+    CHECK(find_signal(m, "sva.0.pend0") == nullptr);
+    CHECK(find_signal(m, "sva.0.occ") == nullptr);
 }
 
 TEST_CASE("a nested implication in a consequent is refused") {
@@ -636,19 +784,11 @@ endmodule
 )", "an event control in an assertion action block");
 }
 
-TEST_CASE("property operators libsva has no tag for are refused") {
-    refuses(R"(
-module t;
-  bit clk, a, b;
-  ap: assert property (@(posedge clk) a until b);
-endmodule
-)", "not supported yet");
-}
-
 TEST_CASE("first_match determinises its operand, in the position where it counts") {
     // `first_match` was the last sequence-layer operator of LRM 16.9 without a
-    // libsva tag, so there is no longer a "no tag" case at the sequence layer to
-    // test -- the property layer keeps its own, above.
+    // libsva tag, and `implies` was the last one at the property layer, so there is
+    // no longer a "no tag" case to test at either layer. What is left is `iff`, which
+    // has a tag and is refused for a reason of its own; see the negation section.
     //
     // The ANTECEDENT is deliberate, and should survive whoever edits this. In a
     // consequent, or as a bare top-level sequence property, `first_match` cannot
@@ -1519,7 +1659,7 @@ endmodule
     CHECK(mon.depth == 2);
 }
 
-TEST_CASE("a bounded repetition range lowers, and an unbounded one does not") {
+TEST_CASE("a repetition range lowers bounded on the ring and unbounded counted") {
     LowerResult r;
     lower_for_monitor(R"(
 module t;
@@ -1529,15 +1669,21 @@ endmodule
 )", r);
     CHECK(r.ok);
 
-    // `[*1:$]` in a consequent has no bounded longest match, so the number of
-    // concurrent obligations is unbounded. This is sva_lower reporting, not a
-    // frontend guard -- the IR is perfectly well formed.
-    refuses(R"(
+    // `[*1:$]` in a consequent has no bounded longest match, so no ring can be
+    // sized -- but a trigger above it needs no bound of its own, so the pair lowers
+    // with a ring-free trigger over a counted obligation. It was refused before
+    // phase 3.
+    LowerResult       open;
+    const ir::Module& om = lower_for_monitor(R"(
 module t;
   bit clk, a, b;
   ap: assert property (@(posedge clk) a |=> b[*1:$]);
 endmodule
-)", "no bounded longest match");
+)", open);
+    REQUIRE_MESSAGE(open.ok, open.diagnostic_text());
+    CHECK(only_monitor(om).tracking == ir::AssertionTracking::Counted);
+    // The bounded one above stays on the ring; only the open bound moves.
+    CHECK(only_monitor(*r.module).tracking == ir::AssertionTracking::Ring);
 }
 
 TEST_CASE("sequence or lowers to the union of both branches") {
@@ -1570,21 +1716,49 @@ endmodule
     CHECK(m.monitors[0].depth == 2);
 }
 
-TEST_CASE("goto and non-consecutive repetition lower in an antecedent") {
-    // The trigger side is existential, so an unbounded match is free there.
-    LowerResult r;
-    lower_for_monitor(R"(
+TEST_CASE("goto and non-consecutive repetition in an antecedent are refused") {
+    // Both have an unbounded longest match, and on the LEFT of an implication that is
+    // a refusal rather than the free ride an existential trigger looks like it should
+    // give. LRM 16.14.1 owes an evaluation of the consequent per antecedent MATCH, so
+    // a cycle several matches end in owes several verdicts -- and an unbounded
+    // antecedent has unboundedly many attempts that could end a match there, so no
+    // fixed ring of attempt ids tells them apart. Answering with the
+    // count of matching CYCLES instead is what one bit gives and is short by however
+    // many attempts ended together, which is what clotho used to do here.
+    const std::string_view goto_left = R"(
 module t;
   bit clk, b, c, rst;
   ap: assert property (@(posedge clk) (rst ##1 b[->2]) |=> c);
+endmodule
+)";
+    refuses(goto_left, "no bounded longest match");
+    // And the refusal names the REMEDY, not just the problem. This is legal
+    // SystemVerilog that clotho used to accept, so a message saying only what is wrong
+    // earns the same question from every user who meets it.
+    refuses(goto_left, "Bound the antecedent");
+    refuses(R"(
+module t;
+  bit clk, b, c, rst;
+  ap: assert property (@(posedge clk) (rst ##1 b[=2]) |=> c);
+endmodule
+)", "no bounded longest match");
+
+    // The CONSEQUENT side is untouched, and saying so is what keeps the refusal above
+    // about the antecedent rather than about the operators: an unbounded obligation is
+    // exactly what the counted discipline exists for, and the same two lower there.
+    LowerResult r;
+    lower_for_monitor(R"(
+module t;
+  bit clk, b, rst;
+  ap: assert property (@(posedge clk) rst |=> b[->2]);
 endmodule
 )", r);
     CHECK(r.ok);
 
     lower_for_monitor(R"(
 module t;
-  bit clk, b, c, rst;
-  ap: assert property (@(posedge clk) (rst ##1 b[=2]) |=> c);
+  bit clk, b, rst;
+  ap: assert property (@(posedge clk) rst |=> b[=2]);
 endmodule
 )", r);
     CHECK(r.ok);
@@ -1658,23 +1832,19 @@ endmodule
 )", "non-consecutive or go-to repetition");
 }
 
-TEST_CASE("a goto repetition in a consequent is refused") {
-    // Legal SystemVerilog, and a well formed IR -- but `b[->2]` has no bounded
-    // longest match, so the obligations it can leave pending are unbounded.
-    // sva_lower reports this one; it is not a frontend guard.
-    refuses(R"(
-module t;
-  bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b[->2]);
-endmodule
-)", "no bounded longest match");
-
-    refuses(R"(
-module t;
-  bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b[=2]);
-endmodule
-)", "no bounded longest match");
+TEST_CASE("a goto repetition in a consequent lowers, counted") {
+    // `b[->2]` and `b[=2]` have no bounded longest match, so the obligations they
+    // leave pending are unbounded and no ring can be sized. Both were refused
+    // before phase 3; both are now tracked by counting, with the antecedent still
+    // an ordinary trigger above them.
+    for (const std::string_view rep : { "b[->2]", "b[=2]" }) {
+        LowerResult       r;
+        const ir::Module& m =
+            lower_for_monitor(one_assertion("bit a, b;", std::string("a |=> ") + std::string(rep)), r);
+        REQUIRE_MESSAGE(r.ok, rep);
+        CHECK_MESSAGE(only_monitor(m).tracking == ir::AssertionTracking::Counted, rep);
+        CHECK_MESSAGE(only_monitor(m).has_trigger, rep);
+    }
 }
 
 TEST_CASE("throughout lowers its left operand as a boolean, not a sequence") {
@@ -1774,50 +1944,59 @@ endmodule
 )", "must be a simple expression");
 }
 
-TEST_CASE("an unbounded and in a consequent names the and/intersect asymmetry") {
+TEST_CASE("the and/intersect asymmetry shows up as the tracking discipline") {
     // Identical operands under the two operators, so only the operator differs.
     //
-    // `and` runs to the later of its two ends, so ONE unbounded operand leaves
-    // the pair unbounded and the obligation untrackable. A user told only "no
-    // bounded longest match" would not guess that is the whole problem, so the
-    // refusal spells the rule out.
-    const LowerResult bad = lower_text(R"(
+    // `and` runs to the later of its two ends, so ONE unbounded operand leaves the
+    // pair unbounded. `intersect` ends where both end together, so the bounded side
+    // bounds the pair. That asymmetry used to be the difference between a refusal
+    // and an acceptance; now that an unbounded obligation under a trigger is
+    // tracked by counting, it is the difference between the two DISCIPLINES -- which
+    // is the same fact, observable instead of fatal.
+    LowerResult       conj;
+    const ir::Module& cm = lower_for_monitor(R"(
 module t;
   bit clk, req, ack, done, rdy, go;
   ap: assert property (@(posedge clk) req |=> ((ack ##[1:$] done) and (rdy ##[1:2] go)));
 endmodule
-)");
-    CHECK_FALSE(bad.ok);
-    const std::string text = bad.diagnostic_text();
-    CHECK(text.find("no bounded longest match") != std::string::npos);
-    CHECK_MESSAGE(text.find("BOTH operands need a bounded match") != std::string::npos,
-                  "the and/intersect asymmetry is unguessable, so it has to be named: ", text);
+)", conj);
+    REQUIRE_MESSAGE(conj.ok, conj.diagnostic_text());
+    CHECK(only_monitor(cm).tracking == ir::AssertionTracking::Counted);
 
-    // The other half, and the reason the message has to name it: an
-    // intersection's ends COINCIDE, so the bounded operand bounds the pair and
-    // the very same shape is accepted.
-    LowerResult       r;
-    const ir::Module& m = lower_for_monitor(R"(
+    LowerResult       meet;
+    const ir::Module& mm = lower_for_monitor(R"(
 module t;
   bit clk, req, ack, done, rdy, go;
   ap: assert property (@(posedge clk) req |=> ((ack ##[1:$] done) intersect (rdy ##[1:2] go)));
 endmodule
-)", r);
-    REQUIRE(r.ok);
-    REQUIRE(m.monitors.size() == 1);
-    // Three cycles, from the bounded side alone.
-    CHECK(m.monitors[0].depth == 3);
+)", meet);
+    REQUIRE_MESSAGE(meet.ok, meet.diagnostic_text());
+    CHECK(only_monitor(mm).tracking == ir::AssertionTracking::Ring);
+    // Three cycles, from the bounded side alone -- the bound the ring is sized by.
+    CHECK(only_monitor(mm).depth == 3);
+}
 
-    // ...and nothing else picked up the explanation on the way past: an
-    // unbounded consequent with no `and` in it keeps the plain refusal.
-    const LowerResult plain = lower_text(R"(
-module t;
-  bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b[->2]);
-endmodule
-)");
-    CHECK_FALSE(plain.ok);
-    CHECK(plain.diagnostic_text().find("BOTH operands") == std::string::npos);
+TEST_CASE("a universal position still needs a single-cycle operand") {
+    // What SVA_ERROR_UNBOUNDED_OBLIGATION narrowed to. `always p` and the left
+    // operand of an `until` are UNIVERSAL over cycles: "p at every cycle of an
+    // unbounded window" is one attempt of p per cycle, all overlapping, and a
+    // counted attempt is a single state that cannot carry a set of sub-attempts
+    // growing with the trace. A single-cycle operand resolves each sub-attempt
+    // inside its own cycle, so the set never grows and the shape is fine.
+    refuses(one_assertion("bit a, b;", "always (a ##1 b)"), "must match in a single cycle");
+    refuses(one_assertion("bit a, b, c;", "(a ##1 b) until c"), "must match in a single cycle");
+
+    // `s_eventually` is EXISTENTIAL -- one witness, not one per cycle -- so it takes
+    // a multi-cycle operand happily. That contrast is why the rule is about the
+    // position and not about unboundedness.
+    LowerResult ok;
+    lower_for_monitor(one_assertion("bit a, b;", "s_eventually (a ##1 b)"), ok);
+    CHECK_MESSAGE(ok.ok, ok.diagnostic_text());
+
+    // And the RIGHT operand of an until is existential in the same way.
+    LowerResult rhs;
+    lower_for_monitor(one_assertion("bit a, b, c;", "a until (b ##1 c)"), rhs);
+    CHECK_MESSAGE(rhs.ok, rhs.diagnostic_text());
 }
 
 namespace {
@@ -1899,6 +2078,18 @@ std::string report_times(std::string_view source, std::string_view marker = "ass
     return times;
 }
 
+// How many times `needle` occurs in `hay`. The pass/cover cases below turn on a
+// report happening ONCE rather than merely happening.
+size_t count_of(std::string_view hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string_view::npos;
+         at = hay.find(needle, at + needle.size())) {
+        ++n;
+    }
+
+    return n;
+}
+
 // How many history ring entries the module holds for `live`. Ring signals are
 // named `sva.<monitor>.past.<variable>.<index>`.
 size_t ring_count(const ir::Module& m, std::string_view live) {
@@ -1908,6 +2099,16 @@ size_t ring_count(const ir::Module& m, std::string_view live) {
         n += s.name.find(needle) != std::string::npos ? 1 : 0;
     }
     return n;
+}
+
+// Substitute one placeholder in a fixture. Several cases below differ only in the
+// body or the task they run, so the trace itself is written once and the case
+// supplies the line -- what a reader has to compare between two expectations is
+// then exactly the difference between the two bodies.
+std::string substituted(std::string_view source, std::string_view token, std::string_view with) {
+    std::string out(source);
+    out.replace(out.find(token), token.size(), with);
+    return out;
 }
 
 } // namespace
@@ -2518,22 +2719,6 @@ endmodule
 // range it passes, and which strength it forces -- plus that every shape still
 // out of reach is refused rather than quietly mislowered.
 
-namespace {
-
-// The single monitor in a lowered module, for the shape checks below.
-const ir::AssertionMonitor& only_monitor(const ir::Module& m) {
-    REQUIRE(m.monitors.size() == 1);
-    return m.monitors[0];
-}
-
-// One assertion body, wrapped in the smallest module that gives it a clock.
-std::string one_assertion(std::string_view decls, std::string_view body) {
-    return std::string("module t;\n  bit clk;\n  ") + std::string(decls) +
-           "\n  ap: assert property (@(posedge clk) " + std::string(body) + ");\nendmodule\n";
-}
-
-} // namespace
-
 TEST_CASE("nexttime[n] shifts its operand by exactly n cycles") {
     // `nexttime[n] p` is `##n p` at the property layer, so the obligation grows one
     // filler state per cycle skipped ahead of the operand's own. n = 1 and n = 2
@@ -2741,45 +2926,691 @@ TEST_CASE("a case property item with several labels matches any of them") {
 
 // -- The refusals the property layer keeps ----------------------------------
 
-TEST_CASE("an unbounded always is refused, naming the operator") {
-    // Phase 3 work: the obligation has no bounded length, so the number of attempts
-    // pending at once is unbounded and no fixed pool tracks them. libsva refuses it
-    // too, but only from sva_lower and with a message about the obligation; clotho
-    // names the operator the user wrote.
-    refuses(one_assertion("bit a;", "always a"), "an unbounded `always`");
+TEST_CASE("an unbounded always lowers to a counted monitor") {
+    // Phase 3. `always p` is `always [0:$] p` (LRM 16.12.13), whose obligation has
+    // no bounded longest match -- so no ring can be sized for it, and the monitor
+    // is tracked by counting attempts per determinised state instead.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(one_assertion("bit a;", "always a"), r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(only_monitor(m).tracking == ir::AssertionTracking::Counted);
 }
 
-TEST_CASE("an unbounded s_eventually is refused, naming the operator") {
-    refuses(one_assertion("bit a;", "s_eventually a"), "an unbounded `eventually`");
+TEST_CASE("an unbounded s_eventually lowers to a counted monitor") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(one_assertion("bit a;", "s_eventually a"), r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(only_monitor(m).tracking == ir::AssertionTracking::Counted);
+    // The strong form, so a pending attempt is a failure at end of trace -- which
+    // for this operator is the ONLY place it can fail.
+    CHECK(only_monitor(m).strength == ir::AssertionStrength::Strong);
 }
 
-TEST_CASE("a property range with an open upper bound is refused") {
-    // `always [2:$]` is the unbounded form written as a range, so it lands in the
-    // same refusal rather than reaching sva_prop_shift with SVA_UNBOUNDED.
-    refuses(one_assertion("bit a;", "always [2:$] a"), "unbounded");
+TEST_CASE("a property range with an open upper bound is the unbounded form") {
+    // `always [2:$]` is `always` written as a range, so it reaches sva_prop_shift
+    // with SVA_UNBOUNDED as its upper bound rather than being refused ahead of it.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(one_assertion("bit a;", "always [2:$] a"), r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(only_monitor(m).tracking == ir::AssertionTracking::Counted);
+
+    // A bounded range is still the ring: nothing about this change moves a
+    // property that can size a pool onto the counted discipline.
+    LowerResult       bounded;
+    const ir::Module& bm = lower_for_monitor(one_assertion("bit a;", "always [2:4] a"), bounded);
+    REQUIRE_MESSAGE(bounded.ok, bounded.diagnostic_text());
+    CHECK(only_monitor(bm).tracking == ir::AssertionTracking::Ring);
 }
 
-TEST_CASE("the not property operator is refused") {
-    // Phase 4: a complement needs the operand determinised and it swaps the
-    // weak/strong disposition.
-    refuses(one_assertion("bit a;", "not a"), "`not` property operator");
+// -- Negation, and the two operators that reduce to it (LRM 16.12.2, 16.12.6) --
+
+TEST_CASE("the not property operator lowers to a complement of its operand") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(one_assertion("bit a, b;", "not (a ##1 b)"), r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+
+    // The complement needs the operand DETERMINISED -- the state-set complement of a
+    // nondeterministic automaton is not its complement -- so the obligation arrives
+    // from the total subset construction and is tracked accordingly. What is checked
+    // here is only that the operand did not survive as itself: a `not` that lowered
+    // to its operand would pass every behavioural case below inverted, and this is
+    // the cheapest thing that separates them.
+    CHECK_FALSE(only_monitor(m).has_trigger);
 }
 
-TEST_CASE("the implies and iff property operators are refused") {
-    // Both reduce to `not` plus `or`, so they land with `not` in phase 4. `implies`
-    // here is the property operator of LRM 16.12.6 and not `|->`.
-    refuses(one_assertion("bit a, b;", "a implies b"), "`implies` and `iff`");
-    refuses(one_assertion("bit a, b;", "a iff b"), "`implies` and `iff`");
-}
-
-TEST_CASE("the until family is refused as an unbounded obligation") {
-    for (const std::string_view op : { "until", "s_until", "until_with", "s_until_with" }) {
-        const LowerResult r =
-            lower_text(one_assertion("bit a, b;", std::string("a ") + std::string(op) + " b"));
-        CHECK_FALSE_MESSAGE(r.ok, op);
-        CHECK_MESSAGE(r.diagnostic_text().find("`until`") != std::string::npos,
-                      r.diagnostic_text());
+TEST_CASE("not swaps the weak and strong end-of-trace disposition") {
+    // LRM 16.12.2 is the whole of this: a pending weak property HOLDS when the trace
+    // ends and a pending strong one FAILS, so negating one gives the other. Reported
+    // through ir::AssertionMonitor::strength, which is what
+    // ir::verdict_at_end_of_trace turns into the lattice member the flush reads.
+    struct Case {
+        std::string_view body;
+        ir::AssertionStrength want;
+    };
+    for (const Case c : {
+           // An `assert property` is weak by default (LRM 16.12.2), so `a` is weak
+           // and its negation is therefore strong. The swap is unconditional: there
+           // is no "unmarked" case that escapes it.
+           Case{ "not a", ir::AssertionStrength::Strong },
+           // `strong`/`weak` wrap the operand, and `not` inverts what they set.
+           Case{ "not strong(a ##1 b)", ir::AssertionStrength::Weak },
+           Case{ "not weak(a ##1 b)", ir::AssertionStrength::Strong },
+           // Two negations are the identity, which is what makes this a SWAP rather
+           // than a one-way forcing -- and what `not (not p)` had better be.
+           Case{ "not (not weak(a ##1 b))", ir::AssertionStrength::Weak },
+           Case{ "not (not strong(a ##1 b))", ir::AssertionStrength::Strong },
+         }) {
+        LowerResult       r;
+        const ir::Module& m =
+          lower_for_monitor(one_assertion("bit a, b;", std::string(c.body)), r);
+        REQUIRE_MESSAGE(r.ok, c.body);
+        CHECK_MESSAGE(only_monitor(m).strength == c.want, c.body);
     }
+}
+
+TEST_CASE("implies lowers only where the operand strengths make one disposition") {
+    // `p implies q` is `(not p) or q`, and the negation inverts the left operand's
+    // end-of-trace disposition along with it -- so the `or`'s two sides agree
+    // exactly when the operands as WRITTEN disagree. A monitor carries one
+    // disposition, so that is the accept condition rather than a preference.
+    LowerResult ok;
+    lower_for_monitor(one_assertion("bit a, b, c;", "strong(a ##1 b) implies c"), ok);
+    CHECK_MESSAGE(ok.ok, ok.diagnostic_text());
+
+    LowerResult flipped;
+    lower_for_monitor(one_assertion("bit a, b, c;", "c implies strong(a ##1 b)"), flipped);
+    CHECK_MESSAGE(flipped.ok, flipped.diagnostic_text());
+
+    // Matching strengths mix, in both directions, and the message says which
+    // operator the user wrote rather than naming the `or` underneath it.
+    refuses(one_assertion("bit a, b;", "a implies b"), "`implies`");
+    refuses(one_assertion("bit a, b;", "strong(a) implies strong(b)"), "`implies`");
+}
+
+TEST_CASE("iff is refused for every pair of operand strengths, naming iff") {
+    // Not a gap in this pass. `p iff q` is the conjunction of both implications:
+    // one direction needs !sp == sq and the other needs !sq == sp, so the outer
+    // `and` always compares sq against !sq. Every assignment mixes, which is why
+    // this is spelled as four cases rather than one.
+    for (const std::string_view body : { "a iff b",
+                                         "strong(a) iff b",
+                                         "a iff strong(b)",
+                                         "strong(a) iff strong(b)" }) {
+        refuses(one_assertion("bit a, b;", body), "`iff`");
+    }
+}
+
+TEST_CASE("an operand of not that raises its own obligation is refused, naming not") {
+    // A complement is taken over the OBLIGATION and a trigger is not part of one,
+    // so `not (a |=> b)` would need the monitor to hold the antecedent's attempts
+    // and the complement of what they oblige. libsva reports it too; clotho checks
+    // first so the diagnostic names the operator in the source.
+    refuses(one_assertion("bit a, b;", "not (a |=> b)"), "`not`");
+}
+
+TEST_CASE("an abort below a not is refused in all four spellings, naming not") {
+    // libsva refuses this and the reason is ARMING, not the state mask, which the
+    // determinisation carries fine. An abort is armed from the UNFILTERED one-step
+    // image of where its attempt is, deliberately, so that it covers the cycle its
+    // subtree's last thread dies in -- which is the cycle `accept_on` exists for,
+    // discharging an attempt the property was about to fail. A determinised successor
+    // is already valuation-filtered, and the complement gives a never-satisfiable
+    // guard to the very state that image would be read off, so the abort reads as
+    // unarmed in exactly the cycle it should fire in.
+    //
+    // Which is why this is a refusal and not an inverted effect. Lowering it -- the
+    // reading that an abort under a complement simply swaps accept for reject -- was
+    // tried and a differential test in libsva disproved it: it turns every such
+    // `accept_on` discharge silently into a failure. Do not "fix" this test by
+    // implementing that.
+    //
+    // All four spellings are one AbortAssertionExpr, so all four are covered by the
+    // one walk and all four are checked here to keep it that way.
+    for (const std::string_view body : { "not (accept_on (c) (a ##1 b))",
+                                         "not (reject_on (c) (a ##1 b))",
+                                         "not (sync_accept_on (c) (a ##1 b))",
+                                         "not (sync_reject_on (c) (a ##1 b))" }) {
+        refuses(one_assertion("bit a, b, c;", body), "`not`");
+    }
+
+    // Nested rather than immediate, so the refusal is the WALK and not a check on the
+    // operand's own top node.
+    refuses(one_assertion("bit a, b, c;", "not (nexttime [1] (accept_on (c) (a ##1 b)))"),
+            "`not`");
+
+    // And the other side of it: an abort ABOVE the `not` lowers. Its scope is then the
+    // whole complemented property rather than a state set inside it, so there is no
+    // renumbering to survive -- which is what makes the refusal above attributable to
+    // the nesting rather than to the pair of operators appearing together.
+    LowerResult above;
+    lower_for_monitor(one_assertion("bit a, b, c;", "accept_on (c) (not (a ##1 b))"), above);
+    CHECK_MESSAGE(above.ok, above.diagnostic_text());
+}
+
+TEST_CASE("not reports where its operand holds and is silent where it fails") {
+    // The observable of a complement. `a` samples 1, 0, 1, 1 at t=5, 15, 25 and 35,
+    // so `a` as a property holds, fails, holds, holds -- and `not a` is the exact
+    // inverse, reporting at every tick but the one `a` failed at.
+    //
+    // The trailing tick before `$finish` is load-bearing in every trace below: the
+    // monitor runs in Observed and `$finish` in the Active region of the same time
+    // step, so the tick that executes `$finish` never steps the monitor. Whatever is
+    // to be observed has to be sampled a tick earlier.
+    //
+    // A `not` that lowered to its operand reads "15" here.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) not a);
+  initial begin
+    @(posedge clk); a <= 0;
+    @(posedge clk); a <= 1;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 25 35");
+}
+
+TEST_CASE("a not still pending at the end of the trace resolves by the SWAPPED strength") {
+    // THE case for LRM 16.12.2, and the one that is easiest to leave untested: while
+    // a property is pending it is neither true nor false, and negating pending is
+    // pending, so the only thing that separates `not weak(p)` from `not strong(p)`
+    // is what the end of the trace does to it.
+    //
+    // `a` samples 0 at t=5, 15 and 25 and 1 at t=35, which is the last tick the
+    // monitor steps in. So `a ##1 b` is seeded four times, fails on its first letter
+    // three times -- which makes `not (a ##1 b)` HOLD, silently, at those ticks --
+    // and is left PENDING exactly once, needing a cycle that never comes. One
+    // pending attempt, one disposition to report, nothing else in the trace to
+    // confuse it with.
+    const auto pending_at_finish = [](std::string_view body) {
+        return report_times(std::string(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 1;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) )") +
+                            std::string(body) + R"();
+  initial begin
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); a <= 1;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)");
+    };
+
+    // The operand is weak, so pending would HOLD for it -- and therefore FAIL for
+    // its negation, which is the end-of-trace report.
+    CHECK(pending_at_finish("not weak(a ##1 b)") == "45");
+
+    // The operand is strong, so pending FAILS for it and HOLDS for its negation:
+    // no report at all. Not vacuous silence -- the attempt exists and is pending,
+    // which is what the case above proves on the same trace.
+    CHECK(pending_at_finish("not strong(a ##1 b)") == "");
+}
+
+TEST_CASE("implies holds vacuously where its antecedent fails") {
+    // Vacuity is the whole content of an implication, and `implies` is the property
+    // operator of LRM 16.12.6 rather than `|->`: with no antecedent match there is
+    // nothing to oblige, so the property holds and reports nothing.
+    //
+    // `a` samples 1 only at t=5, so `a ##1 b` matches once, ending at t=15 -- and
+    // `c` is 0 there, so the consequent fails and the implication with it. Every
+    // other tick has no antecedent match and is silent. Reading vacuity as a
+    // FAILURE instead reads "5 15 25 35".
+    //
+    // `strong(...)` on the antecedent is not decoration: `implies` negates its left
+    // operand, so the pair has one end-of-trace disposition only when the two
+    // operands are spelled with OPPOSITE strengths.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1, b = 1, c = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) strong(a ##1 b) implies c);
+  initial begin
+    @(posedge clk); a <= 0;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "15");
+}
+
+TEST_CASE("an x-valued atom is false in both polarities, and not does not inherit that") {
+    // concurrent-assertions.md 5.2: LRM 16.6 collapses x and z to false, and the
+    // collapse happens at the ATOM. So `a` and `!a` are BOTH false when `a` is x --
+    // the one place SVA booleans stop being two-valued -- and both assertions fail
+    // at every tick.
+    //
+    // `!a` is false because clotho builds guards in negation normal form: the `!`
+    // reaches the leaf and eval_atom applies Lnot to the FOUR-state value, before the
+    // four-to-two collapse. Emitting it as a complement of the collapsed bit instead
+    // would read TRUE under x and the second case below would print nothing.
+    constexpr std::string_view trace = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  logic a = 1'bx;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) BODY);
+  initial begin
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)";
+    const auto with = [&trace](std::string_view body) {
+        return report_times(substituted(trace, "BODY", body));
+    };
+
+    CHECK(with("a") == "5 15");
+    CHECK(with("!a") == "5 15");
+
+    // And the PROPERTY layer does not inherit the collapse, because it is not over
+    // values at all: `not` complements a VERDICT. `a` fails under x, so `not a`
+    // holds, and it holds at every tick -- which is exactly the opposite of what
+    // `!a` does one line above. That difference is the reason negation could not
+    // simply be pushed into the atom and had to wait for the complement.
+    CHECK(with("not a") == "");
+}
+
+TEST_CASE("a determinised cell partitions on the COLLAPSED guard, so x lands in not-a") {
+    // The other half of the rule above, and the half that is easy to get backwards.
+    // libsva's cell splitter appends `.negated = !literal.negated` when it
+    // determinises, so `first_match` carries complemented guard literals today with no
+    // `not` anywhere near it -- and those are NOT the user's `!`.
+    //
+    // A cell literal is the two-valued complement of the collapsed bit, because the
+    // cells exist to PARTITION the valuation space and the thing being partitioned is
+    // the collapsed decision "did the guard hold". `b` is x, so `b` did not hold, so
+    // the not-`b` cell is the one enabled and the attempt stays alive across the
+    // `[1:2]` window before failing.
+    //
+    // Evaluating the cell's negation three-valuedly -- the way the user's `!a` must be
+    // evaluated -- leaves `b` and `!b` BOTH false, which is a gap rather than a
+    // partition: no cell is enabled, the attempt has no successor, and it dies a cycle
+    // early. That mutation reads "15 25 35 45" here instead. So this pins the
+    // distinction rather than either rule on its own, which is why it is worth its own
+    // case: the two negations look identical in the tables and differ only under x.
+    LowerResult probe;
+    lower_for_monitor(one_assertion("bit a; logic b;", "first_match(a ##[1:2] b)"), probe);
+    REQUIRE_MESSAGE(probe.ok, probe.diagnostic_text());
+    // The premise: the determinisation really did emit a complemented literal. Without
+    // this the case below would pass for the trivial reason that there is nothing to
+    // get wrong.
+    bool any_negated = false;
+    for (const ir::AssertionLiteral& lit : only_monitor(*probe.module).literals) {
+        any_negated = any_negated || lit.negated;
+    }
+    CHECK(any_negated);
+
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1;
+  logic b = 1'bx;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) first_match(a ##[1:2] b));
+  initial begin
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "25 35 45");
+}
+
+TEST_CASE("the until family lowers, and its strength comes from its own spelling") {
+    // LRM 16.12.11. All four raise an unbounded obligation -- nothing in the
+    // property says when `q` arrives -- so all four are counted. The `s_` forms owe
+    // that `q` and are strong; the plain ones do not and are weak.
+    struct Case {
+        std::string_view op;
+        ir::AssertionStrength strength;
+    };
+    for (const Case c : { Case{ "until", ir::AssertionStrength::Weak },
+                          Case{ "until_with", ir::AssertionStrength::Weak },
+                          Case{ "s_until", ir::AssertionStrength::Strong },
+                          Case{ "s_until_with", ir::AssertionStrength::Strong } }) {
+        LowerResult       r;
+        const ir::Module& m = lower_for_monitor(
+            one_assertion("bit a, b;", std::string("a ") + std::string(c.op) + " b"), r);
+        REQUIRE_MESSAGE(r.ok, c.op);
+        CHECK_MESSAGE(only_monitor(m).tracking == ir::AssertionTracking::Counted, c.op);
+        CHECK_MESSAGE(only_monitor(m).strength == c.strength, c.op);
+    }
+}
+
+TEST_CASE("an implication under an unbounded operator is refused as a mode mix") {
+    // The one shape the two tracking disciplines cannot share: the implication
+    // wants the ring, the `always` wants the counted states, and tracking is chosen
+    // once per monitor. The refusal has to name the rewrite, because the property
+    // is both legal and idiomatic SystemVerilog -- and `always (a |=> b)` is just
+    // `a |=> b`, since LRM 16.12.1 already starts an attempt every cycle.
+    refuses(one_assertion("bit a, b;", "always (a |=> b)"),
+            "different attempt-tracking disciplines");
+    refuses(one_assertion("bit a, b, c;", "(a |=> b) until c"),
+            "different attempt-tracking disciplines");
+
+    // The rewrite it names must actually lower, or the advice is wrong.
+    LowerResult ok;
+    const ir::Module& m = lower_for_monitor(one_assertion("bit a, b;", "a |=> b"), ok);
+    REQUIRE_MESSAGE(ok.ok, ok.diagnostic_text());
+    CHECK(only_monitor(m).tracking == ir::AssertionTracking::Ring);
+}
+
+// -- The counted tracking discipline ----------------------------------------
+//
+// An unbounded obligation cannot size a ring, so its monitor tracks a COUNT of
+// attempts per state of the determinised obligation instead
+// (ir::AssertionTracking, docs/design/sva-property-layer.md 3). What these check
+// is the part libsva's own tests cannot see: that the ring path is untouched,
+// that the counted path allocates and steps what it should, and above all that
+// several attempts resolving in ONE cycle are reported once EACH. That last one
+// is the entire reason the discipline carries counts rather than a merged state
+// vector -- merging preserves the cycle set and loses the count, measured in
+// ../libsva/test/merge.zig.
+
+namespace {
+
+// Signals whose name contains `needle`. The counted path names one counter per
+// carrying obligation state and the state numbering is libsva's, so a test can
+// pin how MANY there are without pinning which indices survived the prune.
+size_t signal_count(const ir::Module& m, std::string_view needle) {
+    size_t n = 0;
+    for (const ir::SignalInfo& s : m.signals()) {
+        n += s.name.find(needle) != std::string::npos ? 1 : 0;
+    }
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("a ring monitor allocates exactly the state it always has") {
+    // The regression guard for the whole change: adding a second discipline must
+    // not perturb the first. A bounded property still gets its slot vectors and its
+    // occupancy mask, and no counter appears anywhere near it.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(implication, r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+
+    CHECK(only_monitor(m).tracking == ir::AssertionTracking::Ring);
+    CHECK(state_width(m, "sva.0.pend0") == 1);
+    CHECK(state_width(m, "sva.0.occ") == 1);
+    CHECK(state_width(m, "sva.0.trig") == 1);
+    CHECK(state_width(m, "sva.0.fired") == 1);
+    CHECK(signal_count(m, "sva.0.cnt") == 0);
+}
+
+TEST_CASE("a counted monitor allocates counters and none of the ring") {
+    // The mirror image. There is no pool to hold attempts in, so there are no slot
+    // vectors and no occupancy mask -- an attempt's identity IS the state it sits
+    // in, and how many attempts sit there is the counter.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(one_assertion("bit a, b;", "a until b"), r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+
+    CHECK(only_monitor(m).tracking == ir::AssertionTracking::Counted);
+    CHECK(find_signal(m, "sva.0.pend0") == nullptr);
+    CHECK(find_signal(m, "sva.0.occ") == nullptr);
+    // No trigger either: an implication under an unbounded operator is refused
+    // outright, so a counted monitor never has one.
+    CHECK(find_signal(m, "sva.0.trig") == nullptr);
+    CHECK(find_signal(m, "sva.0.fired") == nullptr);
+
+    // At least one state can carry an attempt into the next cycle, or the property
+    // could never be pending at all. A state that resolves on entry -- one in
+    // `last` or in `dead` -- gets no counter, so the numbering has holes and only
+    // the count is pinned here.
+    CHECK(signal_count(m, "sva.0.cnt") > 0);
+    for (const ir::SignalInfo& s : m.signals()) {
+        if (s.name.find("sva.0.cnt") != std::string::npos) {
+            // 64 bits: at the measured tick rate a 32-bit counter wraps within
+            // minutes of wall clock.
+            CHECK(state_width(m, s.name) == 64);
+        }
+    }
+}
+
+TEST_CASE("an unbounded always reports at the first cycle its operand fails") {
+    // `a` samples 1 at t=5 and 0 at t=15. Every attempt is `always a` from its own
+    // start cycle, so at t=15 BOTH the attempt opened at t=5 and the one opened at
+    // t=15 fail -- the latter in the very cycle it starts, which is the seed landing
+    // in a dead state.
+    //
+    // `a` is back to 1 from t=25, so the attempts opened there stay pending, and
+    // `always` is weak, so the end of the trace reports none of them. Reporting the
+    // failure once instead of once per attempt reads "15"; deferring it a cycle
+    // reads "25 25".
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) always a);
+  initial begin
+    @(posedge clk); a <= 0;
+    @(posedge clk); a <= 1;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "15 15");
+}
+
+TEST_CASE("an until reports while it is still waiting for its right operand") {
+    // `a until b`: `a` must hold every cycle up to the one `b` first holds in. `b`
+    // never holds through t=15, and `a` samples 0 there, so the attempt opened at
+    // t=5 fails and so does the one opened at t=15.
+    //
+    // From t=25 `b` holds, and `b` holding in an attempt's FIRST cycle discharges
+    // it without `a` ever being required -- so those attempts match rather than
+    // fail, even though `a` is 0. That is the half of 16.12.11 an implementation
+    // that just required `a` every cycle would get wrong, and it is why the report
+    // set stops at 15 instead of running to the end of the trace.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1, b = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) a until b);
+  initial begin
+    @(posedge clk); a <= 0;
+    @(posedge clk); b <= 1;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "15 15");
+}
+
+TEST_CASE("an s_eventually cannot fail before the end of the trace") {
+    // Nothing mid-trace can refute `s_eventually a`: the witness may always be one
+    // cycle further out. So an attempt that has not seen `a` yet stays pending
+    // rather than failing, and when `a` finally samples 1 at t=25 every attempt
+    // opened so far discharges at once.
+    //
+    // Resolving eagerly -- treating "not yet" as "no" -- would report at 5 and 15.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) s_eventually a);
+  initial begin
+    @(posedge clk); a <= 1;
+    @(posedge clk);
+    @(posedge clk);
+  end
+  initial #38 $finish;
+endmodule
+)") == "");
+}
+
+TEST_CASE("an s_eventually that never sees its operand fails once per attempt at the end") {
+    // The same property with `a` never high. Four clocking edges fall before the
+    // trace ends, so four attempts are open and every one of them is owed a
+    // witness that never came: four failures, all drained by the Final process.
+    //
+    // `$finish` is a plain delay rather than an edge so the last tick is not racing
+    // the teardown -- the number of attempts has to be unambiguous for the count to
+    // mean anything.
+    //
+    // Collapsing the residue to a single report reads 1. That is the end-of-trace
+    // face of the same loss the per-cycle counts prevent.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0;
+  ap: assert property (@(posedge clk) s_eventually a);
+  initial #38 $finish;
+endmodule
+)");
+    CHECK(count_of(out, "assertion failed") == 4);
+}
+
+TEST_CASE("weak and strong until differ only at the end of the trace") {
+    // LRM 16.12.2 on the same trace, run both ways. `b` never holds and `a` always
+    // does, so no attempt of either property can fail during the trace and all four
+    // are still pending when it ends.
+    //
+    // The weak form holds -- it never owed the `b` -- and reports nothing. The
+    // strong form owed it, and owes one failure per pending attempt. If the residue
+    // were resolved by strength but not by count, the strong side would read 1.
+    const auto run = [](std::string_view op) {
+        return sva_run_capture(std::string(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1, b = 0;
+  ap: assert property (@(posedge clk) a )") + std::string(op) + R"( b);
+  initial #38 $finish;
+endmodule
+)");
+    };
+    CHECK(count_of(run("until"), "assertion failed") == 0);
+    CHECK(count_of(run("s_until"), "assertion failed") == 4);
+}
+
+TEST_CASE("a strong cover drains no failures at the end of the trace") {
+    // Regression. A cover counts matches and never reports (LRM 16.12.6), and slang
+    // rejects an `else` on one -- so the end-of-trace drain has nothing to emit for
+    // a cover except the DEFAULT failure report, which is not a verdict a cover
+    // owns. The drain is therefore gated on whether the directive can fail at all
+    // and not on its kind.
+    //
+    // Only reachable once the property is strong, which is why the unbounded
+    // operators surfaced it: `b` never holds, so every attempt of the cover is still
+    // pending when the trace ends. Found on tests/sva/diff_until.sv.
+    const std::string cover = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1, b = 0;
+  cp: cover property (@(posedge clk) a s_until b) $display("HIT");
+  initial #38 $finish;
+endmodule
+)");
+    CHECK(count_of(cover, "assertion failed") == 0);
+
+    // The identical property as an ASSERT does drain, so the silence above is the
+    // cover being exempt and not the trace simply having nothing left pending.
+    const std::string assertion = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1, b = 0;
+  ap: assert property (@(posedge clk) a s_until b);
+  initial #38 $finish;
+endmodule
+)");
+    CHECK(count_of(assertion, "assertion failed") == 4);
+}
+
+TEST_CASE("many attempts resolving in one cycle are reported once each") {
+    // THE case, and the reason the counted discipline carries a count at all.
+    //
+    // `a` samples 1 at t=5..35 and 0 at t=45, so five attempts of `always a` -- the
+    // ones opened at 5, 15, 25, 35 and 45 -- are alive and all fail in that single
+    // cycle. Reports are per attempt, so the answer is
+    // five reports at t=45 and not one.
+    //
+    // This is exactly what one merged state vector cannot do: it preserves the
+    // cycle set and reads "45", because a vector carries at most one verdict per
+    // cycle. Measured over every 6- and 8-cycle trace in ../libsva/test/merge.zig,
+    // which is what put the count in the design.
+    //
+    // `a` returns to 1 afterwards so nothing else fails and the count is only ever
+    // this one cycle's.
+    const std::string source = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 1;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) always a);
+  initial begin
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk); a <= 0;
+    @(posedge clk); a <= 1;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)";
+    CHECK(count_of(sva_run_capture(source), "assertion failed") == 5);
+    // And every one of them in the cycle the operand went low, not spread out.
+    CHECK(report_times(source) == "45 45 45 45 45");
+}
+
+TEST_CASE("a trigger over an unbounded consequent seeds and resolves per match") {
+    // The headline shape: `req |=> s_eventually ack`. The antecedent stays a
+    // trigger -- one state vector, no pool -- and the obligation is counted, so an
+    // attempt is seeded only where `req` matched rather than every cycle.
+    //
+    // `req` samples 1 at t=15 and t=25, so obligations open at t=25 and t=35, and
+    // `ack` never comes. Both are still pending when the trace ends and
+    // `s_eventually` is strong, so both are owed a failure: two, not one, and not
+    // one per tick. Seeding every cycle instead of on the trigger would give five.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit req = 0, ack = 0;
+  ap: assert property (@(posedge clk) req |=> s_eventually ack);
+  initial begin
+    @(posedge clk); req <= 1;
+    @(posedge clk);
+    @(posedge clk); req <= 0;
+  end
+  initial #48 $finish;
+endmodule
+)");
+    CHECK(count_of(out, "assertion failed") == 2);
 }
 
 TEST_CASE("a junction of operands with different strength is refused") {
@@ -2794,7 +3625,7 @@ TEST_CASE("a junction over an implication is refused, naming the operand") {
     // A monitor has one trigger and a junction keeps neither side's, so an operand
     // that raises an obligation of its own has nowhere to put its antecedent.
     refuses(one_assertion("bit a, b, c;", "(a |=> b) and (nexttime [1] c)"),
-            "an operand of a property `and`/`or` is an implication");
+            "an operand of the property `and` operator is an implication");
 }
 
 TEST_CASE("a followed-by whose consequent is an implication is refused") {
@@ -3031,19 +3862,64 @@ endmodule
 )") == "25");
 }
 
-TEST_CASE("an abort over an implication with a multi-cycle antecedent is refused") {
-    // The residue of abort-above-an-implication support, and it stays loud rather
-    // than under-reporting. With a one-cycle antecedent, an antecedent match ending
-    // this cycle is exactly this cycle's one attempt. With a longer one, several
-    // attempts can be part-way through the antecedent when the condition fires;
-    // each owes its own verdict, and the trigger automaton is their union rather
-    // than a per-attempt ring, so the count cannot be recovered.
-    refuses(one_assertion("bit a, b, c, d;", "accept_on (c) ((a ##1 d) |=> b)"),
-            "more than one cycle");
-    refuses(one_assertion("bit a, b, c, d;", "reject_on (c) ((a ##1 d) |=> b)"),
-            "more than one cycle");
+TEST_CASE("an abort over a multi-cycle antecedent resolves every attempt in flight") {
+    // The last residue of abort-above-an-implication support, and it is closed. With a
+    // one-cycle antecedent the match ending this cycle IS this cycle's one attempt, so
+    // one bit answered for the whole abort. With a longer one, several attempts can be
+    // part-way through the antecedent when the condition fires, and LRM 16.12.7 resolves
+    // an attempt wherever it has got to -- so each of them owes its own verdict. The
+    // attempt ids are what tells them apart, which is why this lands with the counting
+    // and not before it.
+    //
+    // `a` is high at ticks 0 and 1, so attempt A starts at 5 and B at 15. `b` never
+    // rises, so at tick 1 A is part-way through `a ##[1:2] b` and B has just started:
+    // two attempts in flight, neither with an obligation yet, and neither would ever
+    // report on its own. `z` is high at tick 1 alone.
+    const auto with = [](std::string_view abort_form, std::string_view action, std::string_view drive = "z <= 1;") {
+        return std::string(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0, z = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) )") + std::string(abort_form) +
+               " (z) ((a ##[1:2] b) |=> ok))" + std::string(action) + R"(;
+  initial begin
+    a <= 1;
+    @(posedge clk);            // 5  (tick0): attempt A starts
+    )" + std::string(drive) + R"(
+    @(posedge clk);            // 15 (tick1): B starts, A is part-matched, z fires
+    a <= 0; z <= 0;
+    @(posedge clk);
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)";
+    };
 
-    // A one-cycle antecedent is exact, and stays supported.
+    // A reject fails both of them, in the one cycle, and the two reports are the claim:
+    // one report is the old union-tracked answer and would be a silent under-count.
+    const std::string rejected = sva_run_capture(with("sync_reject_on", ""));
+    CHECK(count_of(rejected, "assertion failed") == 2);
+    CHECK(report_times(with("sync_reject_on", "")) == "15 15");
+
+    // An accept DISCHARGES both instead -- a pass each, which an `else`-less assert
+    // reports nothing for but a pass action sees. Same count, opposite verdict, so the
+    // two together pin that the abort's effect is carried per attempt and not just its
+    // firing.
+    const std::string accepted = sva_run_capture(with("sync_accept_on", " $display(\"[%0t] AB-PASS\", $time)"));
+    CHECK(count_of(accepted, "assertion failed") == 0);
+    CHECK(count_of(accepted, "AB-PASS") == 2);
+    CHECK(accepted.find("[15] AB-PASS") != std::string::npos);
+
+    // The baseline: with `z` never high neither attempt resolves at all -- `b` never
+    // rises, so there is no antecedent match, no obligation and no verdict. Every report
+    // above is the abort's doing and not the trace's.
+    const std::string quiet = sva_run_capture(with("sync_reject_on", "", ""));
+    CHECK(count_of(quiet, "assertion failed") == 0);
+
+    // A one-cycle antecedent was always exact and stays supported.
     LowerResult ok;
     lower_for_monitor(one_assertion("bit a, b, c;", "accept_on (c) (a |=> b)"), ok);
     CHECK(ok.ok);
@@ -3095,18 +3971,6 @@ endmodule
     // Both, on the same stimulus that reports when only the reject is high. The
     // outer accept overrides it; innermost-wins would read `25`.
     CHECK(reports("#22 x = 1; y = 1;") == "");
-}
-
-// How many times `needle` occurs in `hay`. The pass/cover cases below turn on a
-// report happening ONCE rather than merely happening.
-static size_t count_of(std::string_view hay, std::string_view needle) {
-    size_t n = 0;
-    for (size_t at = hay.find(needle); at != std::string_view::npos;
-         at = hay.find(needle, at + needle.size())) {
-        ++n;
-    }
-
-    return n;
 }
 
 TEST_CASE("a twice-matching attempt reports only its first failing obligation") {
@@ -3452,6 +4316,242 @@ endmodule
 )") == "35 45");
 }
 
+TEST_CASE("three attempts whose antecedent matches share an end cycle each report") {
+    // `a` is high at ticks 0, 1 and 2, so three attempts start. `b` is high at tick
+    // 3 alone, so the `##3` of the first, the `##2` of the second and the `##1` of
+    // the third all end there, and `|->` checks `ok` in that same cycle. Three
+    // attempts, one obligation, `ok` low: three failures owed, all at 35.
+    //
+    // Reporting per obligation reads "35": one report for the slot the three share.
+    const std::string source = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:3] b) |-> ok);
+  initial begin
+    a <= 1;
+    @(posedge clk);            // tick0 (5):  attempt A starts
+    @(posedge clk);            // tick1 (15): attempt B starts
+    @(posedge clk);            // tick2 (25): attempt C starts
+    a <= 0; b <= 1;
+    @(posedge clk);            // tick3 (35): A's ##3, B's ##2 and C's ##1 all end
+    b <= 0;
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)";
+    // The tally and not just the log: three reports, and all three in the one cycle.
+    CHECK(count_of(sva_run_capture(source), "assertion failed") == 3);
+    CHECK(report_times(source) == "35 35 35");
+}
+
+TEST_CASE("two attempts sharing an end cycle report twice") {
+    // The same rule at the smallest multiplicity that can show it. Two is worth
+    // testing beside three because a fix that recovered only the first extra attempt --
+    // reporting per slot plus one -- would pass the three-attempt case at 2 and this
+    // one at 2 as well, so the two together pin the count rather than the delta.
+    const std::string source = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:2] b) |-> ok);
+  initial begin
+    @(posedge clk);            // tick0 (5)
+    a <= 1;
+    @(posedge clk);            // tick1 (15): attempt A starts
+    @(posedge clk);            // tick2 (25): attempt B starts
+    a <= 0; b <= 1;
+    @(posedge clk);            // tick3 (35): A's ##2 and B's ##1 both end
+    b <= 0;
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)";
+    CHECK(count_of(sva_run_capture(source), "assertion failed") == 2);
+    CHECK(report_times(source) == "35 35");
+}
+
+TEST_CASE("attempts of a ranged antecedent resolving in different cycles still report each") {
+    // The control. Same operator, same shape of trace, but `b` is high early enough
+    // that each attempt's FIRST match ends in a cycle of its own -- so the two
+    // attempts never share an obligation and the per-slot reporting this section
+    // exists to fix was already right here. It passed before the fix and has to keep
+    // passing, which is what separates "the count was wrong" from "the reports moved".
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:2] b) |-> ok);
+  initial begin
+    @(posedge clk);            // tick0 (5)
+    a <= 1;
+    @(posedge clk);            // tick1 (15): attempt A starts
+    b <= 1;
+    @(posedge clk);            // tick2 (25): attempt B starts; A's ##1 ends -> FAIL
+    a <= 0;
+    @(posedge clk);            // tick3 (35): B's ##1 ends -> FAIL
+    b <= 0;
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)") == "25 35");
+}
+
+TEST_CASE("a cover counts every attempt sharing an end cycle") {
+    // The tally rather than the log, which is what makes the shared end cycle a wrong
+    // ANSWER and not a cosmetic duplicate-suppression. The three attempts of the first
+    // case with `ok` high, so all three pass and a `cover property` is owed three
+    // hits. Each attempt's hit lands in the cycle it goes quiet -- A and B at 45, C
+    // one cycle later because its `##3` window has not closed until 55 -- so the
+    // count is the claim and the ticks come with it.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ci: cover property (@(posedge clk) (a ##[1:3] b) |-> ok) $display("[%0t] CI-HIT", $time);
+  initial begin
+    a <= 1; ok <= 1;
+    @(posedge clk);            // tick0 (5):  attempt A starts
+    @(posedge clk);            // tick1 (15): attempt B starts
+    @(posedge clk);            // tick2 (25): attempt C starts
+    a <= 0; b <= 1;
+    @(posedge clk);            // tick3 (35): A's ##3, B's ##2 and C's ##1 all end
+    b <= 0;
+    @(posedge clk);            // tick4 (45): A and B can match no more -> two hits
+    @(posedge clk);            // tick5 (55): C's window closes -> the third hit
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "CI-HIT") == 3);
+    CHECK(out.find("[45] CI-HIT") != std::string::npos);
+    CHECK(out.find("[55] CI-HIT") != std::string::npos);
+}
+
+TEST_CASE("a counted obligation seeded by several attempts at once owes each a verdict") {
+    // The same drop reached by the other discipline, and the reason the diagnosis had
+    // to name where the count was lost rather than just make the case above print 3.
+    // A counted monitor holds its pending attempts as a number per state instead of a
+    // slot each, so nothing here reports per slot -- and it was still wrong, because
+    // the SEED added 1 where three antecedent matches had ended. One number too small
+    // from the start.
+    //
+    // `s_eventually` makes the obligation counted and strong, so the three attempts
+    // are still pending when the trace ends and each owes a failure there.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, ok = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:3] b) |-> s_eventually ok);
+  initial begin
+    a <= 1;
+    @(posedge clk);            // tick0 (5):  attempt A starts
+    @(posedge clk);            // tick1 (15): attempt B starts
+    @(posedge clk);            // tick2 (25): attempt C starts
+    a <= 0; b <= 1;
+    @(posedge clk);            // tick3 (35): A's ##3, B's ##2 and C's ##1 all end
+    b <= 0;
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "assertion failed") == 3);
+}
+
+TEST_CASE("one owner of a shared obligation failing does not silence the other") {
+    // The sharp edge of letting one obligation stand for several attempts: what
+    // happens when the attempts stop agreeing. A fails on an EARLIER obligation of its
+    // own while the LATER obligation it shares with B is still pending, and a failure
+    // resolves the whole attempt -- so A's share of that obligation is abandoned. B's
+    // is not, and freeing the slot on the first owner to fail loses B with no verdict
+    // at all.
+    //
+    // `a` at ticks 1 and 2 with `b` at 2 and 3: A matches `a ##1 b` at 25 and
+    // `a ##2 b` at 35, B matches `a ##1 b` at 35. `|=>` puts A's first obligation at
+    // 35..45 and BOTH A's second and B's only at 45..55 -- one slot, two owners. `q`
+    // is low at 45, so A's first obligation fails there; `q` is high at 55, so the
+    // shared one matches and that match is B's.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, p = 0, q = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:2] b) |=> (p ##1 q)) $display("[%0t] MM-PASS", $time);
+  initial begin
+    @(posedge clk);            // tick0 (5)
+    a <= 1;
+    @(posedge clk);            // tick1 (15): attempt A starts
+    b <= 1;
+    @(posedge clk);            // tick2 (25): attempt B starts; A's ##1 match ends
+    a <= 0; p <= 1;
+    @(posedge clk);            // tick3 (35): A's ##2 and B's ##1 end; A's first obligation seeded
+    b <= 0;
+    @(posedge clk);            // tick4 (45): the shared obligation is seeded; A's first FAILS
+    q <= 1;
+    @(posedge clk);            // tick5 (55): the shared obligation matches -- for B
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    // A's one failure, and no second one: the shared obligation is not A's to fail
+    // again.
+    CHECK(count_of(out, "assertion failed") == 1);
+    // B's pass, which abandoning the whole slot swallows.
+    CHECK(count_of(out, "MM-PASS") == 1);
+    CHECK(out.find("[55] MM-PASS") != std::string::npos);
+}
+
+TEST_CASE("both owners of a shared obligation pass when it matches") {
+    // The control for the case above, and the proof that its slot really does have two
+    // owners rather than B never having had an obligation at all. Same trace with `q`
+    // high at 45 too, so A's first obligation MATCHES instead of failing and neither
+    // attempt is resolved early: the shared obligation matches at 55 and both owners
+    // pass off it.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, p = 0, q = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) (a ##[1:2] b) |=> (p ##1 q)) $display("[%0t] MM-PASS", $time);
+  initial begin
+    @(posedge clk);            // tick0 (5)
+    a <= 1;
+    @(posedge clk);            // tick1 (15): attempt A starts
+    b <= 1;
+    @(posedge clk);            // tick2 (25): attempt B starts; A's ##1 match ends
+    a <= 0; p <= 1;
+    @(posedge clk);            // tick3 (35): A's ##2 and B's ##1 end; A's first obligation seeded
+    b <= 0;
+    q <= 1;
+    @(posedge clk);            // tick4 (45): the shared obligation is seeded; A's first MATCHES
+    @(posedge clk);            // tick5 (55): the shared obligation matches
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(count_of(out, "assertion failed") == 0);
+    CHECK(count_of(out, "MM-PASS") == 2);
+}
+
 // -- Assertion control (LRM 20.12) -------------------------------------------
 //
 // One trace serves the first four cases, so that what changes between them is
@@ -3478,16 +4578,6 @@ module t;
   initial #78 $finish;
 endmodule
 )";
-
-// Substitute one placeholder in a fixture. The control cases differ only in the
-// task they run, so the trace itself is written once and the case supplies the
-// line -- what a reader has to compare between two expectations is then exactly
-// the difference between two control tasks.
-std::string substituted(std::string_view source, std::string_view token, std::string_view with) {
-    std::string out(source);
-    out.replace(out.find(token), token.size(), with);
-    return out;
-}
 
 std::string control_run(std::string_view stop, std::string_view start) {
     return report_times(substituted(substituted(control_trace, "CONTROL_OFF", stop), "CONTROL_ON", start));

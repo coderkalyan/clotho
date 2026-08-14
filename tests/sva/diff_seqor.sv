@@ -13,11 +13,22 @@ module t;
   // own branch, and the attempt fails only when NEITHER can.
   apo: assert property (@(posedge clk) a |=> (b ##1 c) or (c ##1 b));
 
-  // Goto repetition, in an ANTECEDENT: `b[->2]` ends exactly on the second b,
-  // however many non-b cycles separate the two. A consequent is not an option
-  // -- there the obligation has no bounded longest match, and clotho refuses
-  // it (tests/sva_test.cpp, "a goto repetition in a consequent is refused").
-  apg: assert property (@(posedge clk) (rst ##1 b[->2]) |=> c);
+  // REMOVED, and the removal is the record. This fixture used to carry
+  //
+  //     apg: assert property (@(posedge clk) (rst ##1 b[->2]) |=> c);
+  //
+  // to exercise goto repetition in an ANTECEDENT, where `b[->2]` ends exactly
+  // on the second b however many non-b cycles separate them. That shape no
+  // longer lowers: an unbounded reach means unboundedly many attempts can be
+  // part-way through the antecedent at once, and counting the matches that end
+  // in one cycle needs per-attempt identity whose window is the antecedent's
+  // longest match. libsva refuses it with SVA_ERROR_UNBOUNDED_ANTECEDENT
+  // rather than under-report.
+  //
+  // The coverage moved: tests/sva_test.cpp asserts the refusal by name and
+  // asserts that the same operator still lowers in a CONSEQUENT on the counted
+  // discipline. Restoring this line needs the trigger determinised, tracked in
+  // docs/TODO.md; re-score the file when it lands.
 
   initial begin
     @(posedge clk);

@@ -212,13 +212,68 @@ struct Process {
 // What to do with a verdict. Mirrors libsva's sva_kind, checked at the boundary.
 enum class AssertionKind : uint8_t { Assert, Assume, Cover, Restrict };
 
+// The verdict lattice (LRM 16.12.2, docs/design/sva-property-layer.md 5).
+//
+// One obligation attempt is in exactly one of these three states after every
+// cycle, and the three are mutually exclusive and exhaustive by construction:
+// Holds is an attempt that reached a `last` state, Fails is one with no live
+// state left, and Pending is one still running. Neither of the resolved two is
+// derivable from the other -- an attempt seeded into a cycle whose first letter
+// does not hold is empty immediately, which is a Fails and not an absence -- so
+// occupancy is tracked rather than inferred (see MonitorState::occupied).
+//
+// Named, rather than left implicit in the three masks the step computes, because
+// `not` is what makes the third member load-bearing: negating Holds is Fails and
+// negating Fails is Holds, but negating Pending is Pending, and only the
+// end-of-trace disposition below tells the two apart.
+enum class AssertionVerdict : uint8_t { Pending, Holds, Fails };
+
 // What a still-pending attempt does when the trace ends (LRM 16.12.2).
 enum class AssertionStrength : uint8_t { Weak, Strong };
 
+// The whole of the weak/strong distinction: which resolved verdict Pending
+// collapses to at the end of the trace. `not` swaps the strength it carries, so
+// this is the one rule negation has to invert -- which is why it is a named
+// function rather than a `strength == Strong` spelled at each of the places that
+// asks (both end-of-trace emitters, and the strength inversion in Sva.cpp).
+constexpr AssertionVerdict verdict_at_end_of_trace(AssertionStrength strength) {
+    return strength == AssertionStrength::Strong ? AssertionVerdict::Fails : AssertionVerdict::Holds;
+}
+
+// How the backend tracks the attempts one assertion has in flight. A monitor
+// uses exactly one of these, chosen by libsva and reported at the boundary; see
+// docs/design/sva-property-layer.md 3.
+//
+// Ring is the bounded discipline. The obligation's longest match bounds how many
+// attempts can overlap, so every attempt gets a state vector of its own out of a
+// pool of `depth`. Exact, and it is what every bounded property uses.
+//
+// Counted is what an UNBOUNDED obligation needs -- `always p`, `s_eventually p`,
+// the `until` family -- where no bound sizes a pool at all. The obligation
+// automaton is DETERMINISED instead, so an attempt occupies exactly one state and
+// two attempts in one state have the same future by construction; the tracker
+// then carries a COUNT per state rather than a vector per attempt. The number of
+// states is fixed, so the storage is too, and only the counts grow.
+//
+// Merging the attempts into one state vector WITHOUT determinising is unsound,
+// which is why this is a second discipline and not a verdict rule: a dead attempt
+// has no state to be seen in, so the union of the live sets hides its failure.
+// Measured exhaustively over every 6- and 8-cycle trace in ../libsva/test/merge.zig,
+// with a two-cycle counterexample on `a ##1 b`.
+enum class AssertionTracking : uint8_t { Ring, Counted };
+
 // One conjunct of a guard: an index into AssertionMonitor::roots, possibly
-// complemented. Clotho's own lowering never sets `negated` -- SVA booleans are
-// three-valued, so negation lives in the atom (concurrent-assertions.md 5.3) --
-// but the field is what libsva reports, so it is carried faithfully.
+// complemented. `negated` is the TWO-VALUED complement of the root's collapsed bit,
+// not the user's `!`.
+//
+// Clotho's own lowering never sets it: libsva's IR requires two-valued atoms, which
+// obliges a three-valued front-end to supply negation normal form with each polarity
+// as its own atom, so clotho's `!a` is an atom over `!a` and collapses x to false
+// there (concurrent-assertions.md 5.2-5.3). What libsva sets it for is its own
+// STRUCTURAL negation -- the determinisation's cell splitter partitions the valuation
+// space into `a` and not-`a` cells -- and that partition is over the collapsed
+// decision "did the guard hold", which is what keeps it total under x. See Lower.cpp's
+// automaton_satisfy.
 struct AssertionLiteral {
     uint32_t root = 0;
     bool negated = false;
@@ -245,6 +300,15 @@ struct AssertionAutomaton {
     // States a match may begin in, and states that complete one. `words` each.
     std::vector<uint64_t> first;
     std::vector<uint64_t> last;
+    // States an attempt has FAILED in. Only meaningful when the obligation is
+    // determinised (AssertionTracking::Counted), where the construction is TOTAL
+    // and a dead attempt sits in a real state instead of vanishing -- which is
+    // exactly what lets a count be read off it.
+    //
+    // Wider than the trap alone: every state with no path left to a `last` one is
+    // in here too. An attempt that can no longer reach an exit has already failed,
+    // and waiting for it to reach the trap would move the failure's cycle.
+    std::vector<uint64_t> dead;
     // cubes.size() * words: per guard, the mask of states carrying it. Lets the
     // satisfied-state mask fold over guards instead of gathering per state.
     std::vector<uint64_t> guard_states;
@@ -328,8 +392,27 @@ struct AssertionMonitor {
     // The property's sequence. One attempt per seeding.
     AssertionAutomaton obligation;
     // Attempts that can be pending at once -- the obligation's longest match, so
-    // the number of state vectors the backend allocates.
+    // the number of state vectors the backend allocates. Meaningful only under
+    // AssertionTracking::Ring. A counted monitor has no pool to size, because its
+    // obligation has no bounded longest match for one to be derived from.
     uint32_t depth = 1;
+    // Antecedent attempts the trigger must tell apart: how many attempt ids a
+    // backend rotates through, one id SET per trigger state. LRM 16.14.1 starts an
+    // evaluation of the consequent per antecedent MATCH, so a cycle several matches
+    // end in owes a verdict per match, and telling them apart is what this sizes.
+    //
+    // ZERO when one bit answers "did the antecedent match" and the whole mechanism
+    // folds away, which is the common case: no trigger at all, an antecedent matching
+    // in a single cycle (`a |=> b`), or one whose matches all span the SAME number of
+    // cycles (`(a ##1 b) |-> c`) -- distinct start cycles then end in distinct cycles,
+    // so at most one match can end per cycle. libsva's number, not derived from the
+    // trigger's longest match, because that last case is invisible to a length.
+    //
+    // Never unbounded: an antecedent with no bounded longest match is refused
+    // (SVA_ERROR_UNBOUNDED_ANTECEDENT), so a non-zero window is always a real bound.
+    uint32_t trigger_window = 0;
+    // Which discipline the backend must emit for this monitor.
+    AssertionTracking tracking = AssertionTracking::Ring;
 
     // Full extent of the assert/cover statement, for the failure report.
     SourceSpan span;
