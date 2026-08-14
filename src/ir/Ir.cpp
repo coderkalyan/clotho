@@ -8,6 +8,7 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
 
     switch (payload_kind(tag)) {
         case Inst::PayloadKind::None:
+        case Inst::PayloadKind::Label:
         case Inst::PayloadKind::Scale:
         case Inst::PayloadKind::Ref:
         case Inst::PayloadKind::Signal:

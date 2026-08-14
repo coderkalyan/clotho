@@ -439,8 +439,12 @@ TEST_CASE("ref actual that is a packed part-select is rejected") {
     CHECK_FALSE(lower_text(src).ok);
 }
 
-TEST_CASE("disable inside a task is rejected") {
-    constexpr std::string_view src = R"(
+// A task target is refused whatever names it: LRM 9.6.2 ends EVERY activation of
+// the task, which no local exit can do (docs/design/disable.md V2). The second
+// case is the LRM's own example 4 shape, so the refusal is not an accident of
+// where the `disable` sits.
+TEST_CASE("disable of a task is rejected") {
+    constexpr std::string_view self = R"(
         module m;
             int x;
             task t;
@@ -449,7 +453,47 @@ TEST_CASE("disable inside a task is rejected") {
             initial t;
         endmodule
     )";
-    CHECK(reject(src).find("disable is not supported") != std::string::npos);
+    CHECK(reject(self).find("disable of a task") != std::string::npos);
+
+    constexpr std::string_view from_process = R"(
+        module m;
+            task t;
+                #5 $display("t");
+            endtask
+            initial t;
+            initial #1 disable t;
+        endmodule
+    )";
+    CHECK(reject(from_process).find("disable of a task") != std::string::npos);
+}
+
+// A named block inside a task or a fork child is not single-activation, so the
+// lexical exit V1 lowers would end only the activation that ran the `disable`.
+TEST_CASE("disable of a block inside a task or fork child is rejected") {
+    constexpr std::string_view in_task = R"(
+        module m;
+            task t;
+                begin : blk
+                    #5 disable blk;
+                end
+            endtask
+            initial t;
+        endmodule
+    )";
+    CHECK(reject(in_task).find("disable inside a function, task or fork child") != std::string::npos);
+
+    constexpr std::string_view in_child = R"(
+        module m;
+            initial begin
+                fork
+                    begin : child
+                        #1 disable child;
+                    end
+                join
+            end
+        endmodule
+    )";
+    CHECK(reject(in_child).find("disable inside a function, task or fork child") != std::string::npos);
 }
 
 // A nonblocking assignment to a module signal from inside a task stages into the

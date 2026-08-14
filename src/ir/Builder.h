@@ -238,6 +238,11 @@ public:
     // break / continue: jump out of / to the next iteration of the innermost loop.
     Index break_(SourceLoc loc);
     Index continue_(SourceLoc loc);
+    // A named sequential block some `disable` targets, and the `disable` itself
+    // (LRM 9.6.2): `disable` leaves the enclosing block carrying `label`,
+    // resuming after it. Only targeted blocks are emitted -- see ir::BlockInfo.
+    Index named_block(ExtraSlice body_region, uint32_t label, SourceLoc loc);
+    Index disable(uint32_t label, SourceLoc loc);
     // Return from a void function / task / fork-child body (no operand).
     Index ret_void(SourceLoc loc);
 

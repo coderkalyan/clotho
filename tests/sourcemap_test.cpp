@@ -96,7 +96,7 @@ module m;
   logic a;
   initial begin : blk
     a = 1;
-    disable blk;
+    disable fork;
   end
 endmodule
 )");

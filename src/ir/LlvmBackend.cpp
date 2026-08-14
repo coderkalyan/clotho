@@ -9233,6 +9233,8 @@ private:
             case Inst::Tag::Loop:
             case Inst::Tag::Break:
             case Inst::Tag::Continue:
+            case Inst::Tag::NamedBlock:
+            case Inst::Tag::Disable:
             case Inst::Tag::HandleDeref:
                 // An lvalue producer (rooted at the object body); no value type.
             case Inst::Tag::Ret:
@@ -10694,6 +10696,16 @@ private:
                 // Terminator: branch to the innermost loop's step block (which
                 // re-tests the predicate via the back-edge).
                 b_.CreateBr(loop_targets_.back().first);
+                return;
+
+            case Inst::Tag::NamedBlock:
+                lower_named_block(i);
+                return;
+            case Inst::Tag::Disable:
+                // Terminator: branch to the end of the enclosing block carrying
+                // this label (LRM 9.6.2). The frontend only emits a Disable for a
+                // block it is lexically inside, so the label is always live here.
+                b_.CreateBr(block_end(p.label));
                 return;
 
             case Inst::Tag::Delay:
@@ -17818,6 +17830,36 @@ private:
         b_.SetInsertPoint(exit_bb);
     }
 
+    // -- Control flow: a named block a `disable` targets (LRM 9.6.2). The block
+    // needs an end block because a `disable` resumes AFTER it, which is a point
+    // in the middle of the enclosing region, not any loop's exit. --
+
+    void lower_named_block(Index i) {
+        const auto bi = ir_->extra_data<BlockInfo>(ir_->payload(i).extra);
+
+        auto* end_bb = llvm::BasicBlock::Create(ctx_, "block.end", fn_);
+
+        block_targets_.push_back({ bi.label, end_bb });
+        lower_region(ir_->region(bi.body));
+        block_targets_.pop_back();
+        branch_to(end_bb); // a `return` / `break` / `disable` already terminated it
+
+        b_.SetInsertPoint(end_bb);
+    }
+
+    // The end block of the enclosing named block with this label. Innermost
+    // first, because a labelled block cannot enclose itself, so the first match
+    // walking down is the one the `disable` names.
+    llvm::BasicBlock* block_end(uint32_t label) const {
+        for (size_t n = block_targets_.size(); n > 0; --n) {
+            if (block_targets_[n - 1].first == label) {
+                return block_targets_[n - 1].second;
+            }
+        }
+
+        throw BackendError{ "internal: disable of a block that does not enclose it" };
+    }
+
     // -- State --
 
     const Module&           mod_;
@@ -17963,6 +18005,10 @@ private:
     // Innermost-first stack of the enclosing loops' (step, exit) blocks; a
     // `continue` branches to `.first`, a `break` to `.second`.
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loop_targets_;
+    // Innermost-first stack of the enclosing named blocks' (label, end) blocks; a
+    // `disable` branches to the end block of the label it carries. Empty unless
+    // the unit contains a `disable` (only a targeted block is emitted at all).
+    std::vector<std::pair<uint32_t, llvm::BasicBlock*>> block_targets_;
     llvm::AllocaInst*       record_           = nullptr;
     // Per-function fork join-record slot { i32 count, ptr parent } (lazy, reused
     // across a coroutine's fork sites — `join` serializes them). Reset per fn.

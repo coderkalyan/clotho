@@ -468,6 +468,16 @@ Index Builder::continue_(SourceLoc loc) {
     return emit({ Inst::Tag::Continue, pay(&Inst::Payload::none, 0u) }, loc);
 }
 
+Index Builder::named_block(ExtraSlice body_region, uint32_t label, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(BlockInfo{ body_region, label });
+
+    return emit({ Inst::Tag::NamedBlock, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
+Index Builder::disable(uint32_t label, SourceLoc loc) {
+    return emit({ Inst::Tag::Disable, pay(&Inst::Payload::label, label) }, loc);
+}
+
 Index Builder::str_putc(Index str, Index index, Index ch, SourceLoc loc) {
     const ExtraIndex extra = add_extra(StrPutcInfo{ index, ch });
 

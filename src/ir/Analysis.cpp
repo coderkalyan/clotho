@@ -174,6 +174,14 @@ TagInfo tag_info(Inst::Tag tag) {
         // -- Everything else: simulation-only, not hardware. --
         // Note the two polarities differ deliberately (see TagInfo): landing here
         // makes an op ineligible for fusion (fail safe) but still thunk-eligible.
+        //
+        // A `disable` and the block it leaves are pure control flow, and sv2v's
+        // jump encoding could carry them, but the legalizer's guard narrowing
+        // models only the two bare jumps today (Break / Continue,
+        // docs/design/process-legalization.md §5.3), so claiming synthesizable
+        // here would silently under-guard the stores after a disable.
+        case Inst::Tag::NamedBlock:
+        case Inst::Tag::Disable:
         case Inst::Tag::ClassNew:
         case Inst::Tag::HandleDeref:
         case Inst::Tag::DynArrayNew:
@@ -1271,6 +1279,8 @@ struct ValueSweep {
                 case Inst::Tag::Loop:
                 case Inst::Tag::Break:
                 case Inst::Tag::Continue:
+                case Inst::Tag::NamedBlock:
+                case Inst::Tag::Disable:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
                 case Inst::Tag::Fork:

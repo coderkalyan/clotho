@@ -170,3 +170,28 @@ TEST_CASE("fork: join_any / join_none / fork-in-subroutine rejected") {
     )",
                    "fork..join inside a function or task");
 }
+
+// The two dynamic process-control statements (LRM 9.6.1 / 9.6.3) both need the
+// live-child set fork V2 owes — `disable fork` kills every descendant, `wait
+// fork` blocks on them — and the join-all count cannot express either. Refused
+// with their own names, not the generic "unsupported statement".
+TEST_CASE("fork: disable fork / wait fork rejected") {
+    check_rejected(R"(
+        module t;
+          initial begin
+            fork #1 $display("x"); join
+            disable fork;
+          end
+        endmodule
+    )",
+                   "disable fork is not supported");
+    check_rejected(R"(
+        module t;
+          initial begin
+            fork #1 $display("x"); join
+            wait fork;
+          end
+        endmodule
+    )",
+                   "wait fork is not supported");
+}

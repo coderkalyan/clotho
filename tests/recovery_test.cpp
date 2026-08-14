@@ -58,15 +58,15 @@ TEST_CASE("every failing behavioural member is reported, not just the first") {
           logic       clk = 0;
           initial begin : blk1
             a = 1;
-            disable blk1;
+            disable fork;
           end
           always @(posedge clk) begin : blk2
             b <= 2;
-            disable blk2;
+            disable fork;
           end
           initial begin : blk3
             c = 3;
-            disable blk3;
+            disable fork;
           end
           initial d = 4;
         endmodule
@@ -97,7 +97,7 @@ TEST_CASE("a poisoned module is analysable but not ok") {
           logic [3:0] a;
           initial begin : blk
             a = 1;
-            disable blk;
+            disable fork;
           end
           initial a = 2;
         endmodule
@@ -165,7 +165,7 @@ TEST_CASE("a structural failure still aborts with no module") {
           if (1) begin : g
             always begin : blk
               a = 1;
-              disable blk;
+              disable fork;
             end
           end
         endmodule

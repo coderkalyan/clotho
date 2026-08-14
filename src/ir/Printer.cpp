@@ -401,6 +401,10 @@ const char* tag_name(Inst::Tag tag) {
             return "break";
         case T::Continue:
             return "continue";
+        case T::NamedBlock:
+            return "named_block";
+        case T::Disable:
+            return "disable";
         case T::Fflush:
             return "fflush";
         case T::System:
@@ -613,7 +617,16 @@ private:
 
         const Inst::Tag      tag = ir_.tag(i);
         const Inst::Payload& p   = ir_.payload(i);
-        // loop shares the Extra payload with concat but renders region blocks.
+        // loop / named_block share the Extra payload with concat but render
+        // region blocks.
+        if (tag == Inst::Tag::NamedBlock) {
+            const BlockInfo bi = ir_.extra_data<BlockInfo>(p.extra);
+            os_ << "L" << bi.label << ") {\n";
+            render_region("body", bi.body, depth);
+            indent(depth);
+            os_ << "}\n";
+            return;
+        }
         if (tag == Inst::Tag::Loop) {
             const LoopInfo lp = ir_.extra_data<LoopInfo>(p.extra);
             ref(lp.pred);
@@ -627,6 +640,9 @@ private:
         }
         switch (payload_kind(tag)) {
             case Inst::PayloadKind::None:
+                break;
+            case Inst::PayloadKind::Label:
+                os_ << "L" << p.label;
                 break;
             case Inst::PayloadKind::Scale:
                 os_ << "scale=" << p.scale;

@@ -577,6 +577,246 @@ TEST_CASE("break outside a loop is rejected") {
     CHECK_FALSE(r.ok);
 }
 
+// -- disable of a named block (LRM 9.6.2). A `disable` naming a block that
+// lexically encloses it is a structured multi-level exit — the only one the
+// language has, since SV has no labelled break — so it belongs beside
+// break/continue. Oracle: iverilog. Everything else about `disable` (a task
+// target, a remote target, `disable fork`) is refused; see task_test.cpp and
+// fork_test.cpp, and docs/design/disable.md for the phasing. --
+
+// LRM 9.6.2 examples 1 and 2: the block ends where it ends, and execution
+// resumes at the statement AFTER it — which is a point in the middle of the
+// enclosing body, not any loop's exit.
+TEST_CASE("disable of the enclosing block resumes after it") {
+    CHECK(run_capture(R"(
+        module m;
+            integer x;
+            initial begin
+                x = 0;
+                begin : b
+                    x = 1;
+                    disable b;
+                    x = 99;
+                end
+                x = x + 1;
+                $display("x=%0d", x);
+            end
+        endmodule
+    )") == "x=2\n");
+}
+
+// LRM 9.6.2 example 3: a loop-body block is the `continue` equivalent — the step
+// still runs, so the loop advances rather than restarting the same iteration.
+TEST_CASE("disable of a loop-body block acts like continue") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i, hits;
+            initial begin
+                hits = 0;
+                for (i = 0; i < 5; i = i + 1) begin : body
+                    if (i % 2 == 0) disable body;
+                    hits = hits + 1;
+                    $display("kept %0d", i);
+                end
+                $display("hits=%0d i=%0d", hits, i);
+            end
+        endmodule
+    )") == "kept 1\nkept 3\nhits=2 i=5\n");
+}
+
+// LRM 9.6.2 example 5: a block ENCLOSING the loop is the `break` equivalent, and
+// it crosses as many regions as it needs to — here two loops and an `if`. The
+// second process proves only the one activation ended.
+TEST_CASE("disable of an enclosing block leaves every loop it names") {
+    CHECK(run_capture(R"(
+        module m;
+            integer i, j;
+            initial begin : top
+                for (i = 0; i < 3; i = i + 1) begin
+                    for (j = 0; j < 3; j = j + 1) begin
+                        if (i == 1 && j == 1) begin
+                            $display("bail i=%0d j=%0d", i, j);
+                            disable top;
+                        end
+                        $display("i=%0d j=%0d", i, j);
+                    end
+                end
+                $display("unreached");
+            end
+            initial #1 $display("second process still runs");
+        endmodule
+    )") == "i=0 j=0\ni=0 j=1\ni=0 j=2\ni=1 j=0\nbail i=1 j=1\nsecond process still runs\n");
+}
+
+// The exit unwinds a `case` arm and a `while` at once: the backend has to reach
+// the block's end block from inside regions that each have their own merge.
+TEST_CASE("disable leaves a case arm and a while loop together") {
+    constexpr std::string_view expect = "zero\ntail i=0 seen=1\nbail from while at i=1\ndflt 2\n"
+                                        "tail i=2 seen=2\ndflt 3\ntail i=3 seen=3\ndone seen=3\n";
+    CHECK(run_capture(R"(
+        module m;
+            integer i, seen;
+            initial begin
+                seen = 0;
+                for (i = 0; i < 4; i = i + 1) begin : outer
+                    case (i)
+                        0: $display("zero");
+                        1: begin
+                             while (1) begin
+                                 $display("bail from while at i=%0d", i);
+                                 disable outer;
+                             end
+                           end
+                        default: $display("dflt %0d", i);
+                    endcase
+                    seen = seen + 1;
+                    $display("tail i=%0d seen=%0d", i, seen);
+                end
+                $display("done seen=%0d", seen);
+            end
+        endmodule
+    )") == expect);
+}
+
+// The target is the whole process body, so leaving it ends the process — the
+// same thing running off the end does.
+TEST_CASE("disable of the process body ends the process") {
+    CHECK(run_capture(R"(
+        module m;
+            integer x;
+            initial begin : whole
+                x = 1;
+                if (x == 1) disable whole;
+                x = 99;
+            end
+            initial #1 $display("x=%0d", x);
+        endmodule
+    )") == "x=1\n");
+}
+
+// LRM 9.6.2 example 7's mechanism: disabling the body of an `always` ends THIS
+// activation only, and the loop re-arms — so the disable fires again every other
+// pass rather than killing the process.
+TEST_CASE("a disabled always body re-arms") {
+    constexpr std::string_view expect = "t=5 tail n=1 log=1\nt=10 disabled at n=2\nt=15 tail n=3 log=2\n"
+                                        "t=20 disabled at n=4\nt=25 tail n=5 log=3\nn=5 log=3\n";
+    CHECK(run_capture_finish(R"(
+        module m;
+            integer n, log;
+            initial begin n = 0; log = 0; end
+            always begin : blk
+                #5 n = n + 1;
+                if (n % 2 == 0) begin
+                    $display("t=%0t disabled at n=%0d", $time, n);
+                    disable blk;
+                end
+                log = log + 1;
+                $display("t=%0t tail n=%0d log=%0d", $time, n, log);
+            end
+            initial #26 begin $display("n=%0d log=%0d", n, log); $finish; end
+        endmodule
+    )") == expect);
+}
+
+// A targeted block becomes an ir::NamedBlock region, which is where %m reads its
+// name from now. Both halves of the name survive the change.
+TEST_CASE("disable leaves %m naming the enclosing blocks") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin : outer
+                begin : inner
+                    $display("%m");
+                    disable inner;
+                end
+                $display("%m after");
+            end
+        endmodule
+    )") == "m.outer.inner\nm.outer after\n");
+}
+
+// The lexical form is the only one lowered, and it is lowered as structure: a
+// labelled region plus a terminator, no flag and no runtime call.
+TEST_CASE("a lexical disable lowers to a named_block region and a disable") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            integer x;
+            initial begin : b
+                x = 1;
+                disable b;
+            end
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::NamedBlock));
+    CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Disable));
+}
+
+// A block that does not enclose the `disable` has to abort an activation other
+// than this one, which needs the scheduler work V2 owes. Both shapes refuse: a
+// sibling block in the same process, and LRM example 3's cross-process form.
+TEST_CASE("disable of a block that does not enclose it is rejected") {
+    const LowerResult sibling = lower_text(R"(
+        module m;
+            integer x;
+            initial begin
+                begin : first
+                    x = 1;
+                end
+                begin : second
+                    disable first;
+                end
+            end
+        endmodule
+    )");
+    CHECK_FALSE(sibling.ok);
+    CHECK(sibling.diagnostic_text().find("does not enclose it") != std::string::npos);
+
+    const LowerResult remote = lower_text(R"(
+        module m;
+            integer x;
+            always begin : always1
+                #5 x = x + 1;
+            end
+            initial #7 disable m.always1;
+        endmodule
+    )");
+    CHECK_FALSE(remote.ok);
+    CHECK(remote.diagnostic_text().find("does not enclose it") != std::string::npos);
+}
+
+// LRM 16.4.4: disabling the outermost scope of a procedure DROPS its pending
+// deferred reports, which this exit does not carry yet. A block nested deeper
+// never flushes, so it stays legal and the report still matures.
+TEST_CASE("disable of an outermost block holding deferred assertions is rejected") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            integer x;
+            initial begin : whole
+                x = 0;
+                assert #0 (x == 1) else $error("bad");
+                disable whole;
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("LRM 16.4.4") != std::string::npos);
+
+    CHECK(run_capture(R"(
+        module m;
+            integer x;
+            initial begin
+                x = 0;
+                begin : inner
+                    assert #0 (x == 1) else $info("deferred fired");
+                    disable inner;
+                    $display("never");
+                end
+                $display("after inner");
+            end
+        endmodule
+    )") == "after inner\n");
+}
+
 // -- foreach (12.7.3). Oracle: iverilog. --
 
 // Single-dimension foreach over a fixed-size unpacked array, ascending

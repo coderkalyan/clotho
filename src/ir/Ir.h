@@ -502,6 +502,20 @@ struct LoopInfo {
     uint32_t bottom_test;
 };
 
+// Extra payload for `named_block`: the block's statements, plus the label a
+// `disable` names it by. Only a named block that some `disable` in the same
+// lowering unit targets gets an instruction at all -- an ordinary begin/end is
+// flattened into its enclosing region, since its name is otherwise only visible
+// to %m -- because `disable` needs a place to branch TO: the end of the block,
+// which can sit in the middle of a region (LRM 9.6.2 example 2).
+struct BlockInfo {
+    // Statements of the block.
+    ExtraSlice body;
+    // Label the Disable insts targeting this block carry. Unique per lowering
+    // unit; a block nested in a loop is re-entered, never nested in itself.
+    uint32_t label;
+};
+
 // Extra payload for one arm of a `switch`: the constant case-value keys that
 // select this arm, and the arm's statement body. `keys` is a run of u64 case
 // values (2 words each; decode with Ir::region); several keys share one body
@@ -1422,6 +1436,17 @@ struct Inst {
         // same region are unreachable. slang rejects either outside a loop.
         Break,
         Continue,
+        // A named sequential block targeted by a `disable` in the same lowering
+        // unit (payload: extra -> BlockInfo). Lowers to its body followed by an
+        // end block, which is where a Disable branches to.
+        NamedBlock,
+        // `disable <named block>` (LRM 9.6.2): leave the enclosing NamedBlock
+        // carrying the same label, resuming at the statement after that block
+        // (payload: label). A terminator, exactly like Break, and it binds
+        // lexically -- the label names an enclosing block of this unit, never a
+        // block in another process, which is the remote form the frontend still
+        // refuses (docs/design/disable.md).
+        Disable,
         // Time delay `#n`: suspend the process for `n` ticks (payload: unary, the
         // tick count). Lowers to a timer scheduled on the wheel plus a coroutine
         // suspend; the wheel resumes the process when the delay elapses.
@@ -1779,6 +1804,8 @@ struct Inst {
     // Which union member a tag activates. Drives payload_kind() / operands().
     enum class PayloadKind : uint8_t {
         None,
+        // The label member: a lexical branch target, not an SSA operand.
+        Label,
         // The u64 scale member (sim_time). No SSA operands.
         Scale,
         Ref,
@@ -1810,6 +1837,10 @@ struct Inst {
     union Payload {
         // Inactive / nullary placeholder.
         uint32_t none;
+        // Label of the enclosing NamedBlock a `disable` leaves (disable). Not an
+        // operand: the target is a lexical region, resolved by the backend
+        // against the stack of blocks it is currently inside.
+        uint32_t label;
         // Time-unit multiplier for sim_time: $time returns the wheel tick count
         // rounded down by this to the calling module's time unit. 1 == unitless.
         uint64_t scale;
@@ -2045,7 +2076,10 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Concat:
         case T::StrengthRes:
         case T::Loop:
+        case T::NamedBlock:
             return K::Extra;
+        case T::Disable:
+            return K::Label;
         case T::Call:
             return K::Call;
         case T::CallVirtual:
@@ -2194,6 +2228,8 @@ constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
         // loop: the predicate and regions are not top-level operands (the
         // predicate is defined inside the cond region, walked via region()).
         case T::Loop:
+        // named_block: a body region and a label, no operands.
+        case T::NamedBlock:
         // fork: the children are FunctionIds, not operands.
         case T::Fork:
         // strobe_pend / monitor_set / reactive_pend: the target is a FunctionId;
