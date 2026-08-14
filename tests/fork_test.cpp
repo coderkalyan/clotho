@@ -312,18 +312,6 @@ TEST_CASE("fork: one task's fork, two concurrent calls, children reading its for
     CHECK(out == "inner d=2 t=4\ninner d=5 t=10\nx=17 y=17 t=10\n");
 }
 
-// Unsupported variants fail loudly (never silently serialized).
-TEST_CASE("fork: join_any / join_none rejected") {
-    check_rejected(R"(
-        module t; initial fork #5 $display("x"); #6 $display("y"); join_any endmodule
-    )",
-                   "join_any");
-    check_rejected(R"(
-        module t; initial fork #5 $display("x"); #6 $display("y"); join_none endmodule
-    )",
-                   "join_none");
-}
-
 // What capture cannot carry. A ref formal is a pointer to a packed slot, so the
 // captures are exactly the ref ABI's own repertoire (docs/design/ref-args.md);
 // anything else is named rather than mis-lowered, and both lift together.
@@ -379,4 +367,281 @@ TEST_CASE("fork: disable fork / wait fork rejected") {
         endmodule
     )",
                    "wait fork is not supported");
+}
+
+// fork … join_none / join_any (LRM 9.3.2). Values cross-checked against Icarus
+// Verilog 13, except where noted: iverilog's vvp aborts on either kind inside an
+// automatic task (vthread.cc:3793, of_JOIN_DETACH assertion), so those cases are
+// pinned from the LRM instead. Same source-order caveat as above — iverilog runs
+// same-instant children in the reverse order, which LRM 9.3.2 permits, so every
+// check below is either order-independent or ordered by delay.
+
+TEST_CASE("fork: join_none does not run its children at the fork") {
+    // The whole point of join_none: the parent does not block, so it reaches its
+    // next statement BEFORE any child body runs. Children start when it blocks.
+    const std::string out = run_capture(R"(
+        module t;
+          initial begin
+            fork
+              $display("child");
+            join_none
+            $display("parent");
+            #1 $display("end");
+          end
+        endmodule
+    )");
+    CHECK(out == "parent\nchild\nend\n");
+}
+
+TEST_CASE("fork: a join_none child outlives the parent that spawned it") {
+    // The parent ends at time 0 with a child still parked on the wheel. The join
+    // record cannot live in the parent's frame for this to work — it is heap and
+    // reference-counted, and the child holds the last reference.
+    const std::string out = run_capture(R"(
+        module t;
+          initial begin
+            fork
+              #5 $display("late@%0t", $time);
+            join_none
+            $display("gone@%0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "gone@0\nlate@5\n");
+}
+
+TEST_CASE("fork: join_none spawns an unbounded number of live children") {
+    // A loop around a join_none accumulates children with no static bound — the
+    // shape the whole capacity argument rests on (docs/design/fork-join.md). 100 of
+    // them are live at one instant, well past the one-slot-per-process baseline.
+    const std::string out = run_capture(R"(
+        module t;
+          int done = 0;
+          task automatic kid;
+            #1 done = done + 1;
+          endtask
+          initial begin
+            for (int i = 0; i < 100; i = i + 1) begin
+              fork
+                kid;
+              join_none
+            end
+            #10 $display("done=%0d", done);
+          end
+        endmodule
+    )");
+    CHECK(out == "done=100\n");
+}
+
+TEST_CASE("fork: unbounded join_none children all fit one signal's wait bucket") {
+    // Every spawned child parks on the same (clk, posedge). The dynamic wait bucket
+    // is sized statically, so an unbounded fork kind has to saturate its bound; a
+    // per-activation count would have reserved one slot for the whole loop.
+    const std::string out = run_capture(R"(
+        module t;
+          bit clk = 0;
+          int hits = 0;
+          always #5 clk = ~clk;
+          task automatic kid;
+            @(posedge clk);
+            hits = hits + 1;
+          endtask
+          initial begin
+            for (int i = 0; i < 40; i = i + 1) begin
+              fork
+                kid;
+              join_none
+            end
+            repeat (3) @(posedge clk);
+            $display("hits=%0d", hits);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "hits=40\n");
+}
+
+TEST_CASE("fork: join_any resumes on the first child and leaves the rest running") {
+    const std::string out = run_capture(R"(
+        module t;
+          initial begin
+            fork
+              begin #10 $display("A@%0t", $time); end
+              begin #5  $display("B@%0t", $time); end
+              begin #20 $display("C@%0t", $time); end
+            join_any
+            $display("resumed@%0t", $time);
+            #30 $display("end@%0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "B@5\nresumed@5\nA@10\nC@20\nend@35\n");
+}
+
+TEST_CASE("fork: join_any does not run the siblings it is not waiting for") {
+    // Both children would complete without blocking. join_any must proceed on the
+    // first one rather than running them all, or it is `join` with extra steps: n is
+    // 1 at the display, not 2. Both children do the same thing, so the check does
+    // not depend on which of them runs first.
+    const std::string out = run_capture(R"(
+        module t;
+          int n = 0;
+          initial begin
+            fork
+              n = n + 1;
+              n = n + 1;
+            join_any
+            $display("n=%0d t=%0t", n, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "n=1 t=0\n");
+}
+
+TEST_CASE("fork: a second fork site does not disturb the first's live children") {
+    // The join_any parent walks on to another fork while its `#9` sibling is still
+    // live. A single record slot reused across sites would have the second fork's
+    // init stomp the first's live count.
+    const std::string out = run_capture(R"(
+        module t;
+          int a = 0, b = 0;
+          initial begin
+            fork
+              begin #1 a = a + 1; end
+              begin #9 a = a + 10; end
+            join_any
+            fork
+              begin #2 b = b + 1; end
+              begin #3 b = b + 2; end
+            join
+            #20 $display("a=%0d b=%0d t=%0t", a, b, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "a=11 b=3 t=24\n");
+}
+
+TEST_CASE("fork: join_none children reach the NBA region") {
+    // A child the parent never waits for still stages into the NBA region — the
+    // classify walk covers fork-child bodies regardless of join kind.
+    const std::string out = run_capture(R"(
+        module t;
+          bit clk = 0;
+          logic [7:0] q = 0;
+          always #5 clk = ~clk;
+          initial begin
+            fork
+              @(posedge clk) q <= q + 8'd3;
+            join_none
+            repeat (2) @(posedge clk);
+            $display("q=%0d", q);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "q=3\n");
+}
+
+TEST_CASE("fork: join_none inside a task returns without blocking the caller") {
+    // LRM-pinned: iverilog's vvp aborts on a detaching fork inside an automatic
+    // task (of_JOIN_DETACH assertion), so it cannot oracle this. join_none never
+    // blocks, so the task returns at time 0 and its child still fires at #2.
+    const std::string out = run_capture(R"(
+        module t;
+          int n = 0;
+          task automatic spawner;
+            fork
+              #2 n = n + 1;
+            join_none
+            $display("spawner returns@%0t", $time);
+          endtask
+          initial begin
+            spawner;
+            #5 $display("n=%0d@%0t", n, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "spawner returns@0\nn=1@5\n");
+}
+
+TEST_CASE("fork: join_any inside a task resumes it on the first completion") {
+    // LRM-pinned for the same reason as above. The task resumes at #1 with n = 1;
+    // its #6 sibling keeps running and has added 10 by #11.
+    const std::string out = run_capture(R"(
+        module t;
+          int n = 0;
+          task automatic pick;
+            fork
+              #1 n = n + 1;
+              #6 n = n + 10;
+            join_any
+          endtask
+          initial begin
+            pick;
+            $display("mid n=%0d@%0t", n, $time);
+            #10 $display("end n=%0d@%0t", n, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "mid n=1@1\nend n=11@11\n");
+}
+
+// The ref-capture ABI hands a child a raw pointer into the enclosing frame, which
+// needs that frame to outlive every child. `join` guarantees it; the detaching
+// kinds do not, so a capture is refused by name rather than dangling. Lifts with
+// V4's per-spawn copies (docs/design/fork-join.md).
+TEST_CASE("fork: a join_any / join_none child capturing a task local is rejected") {
+    check_rejected(R"(
+        module t;
+          task automatic go;
+            int k = 1;
+            fork
+              #1 k = k + 1;
+            join_none
+          endtask
+          initial go;
+        endmodule
+    )",
+                   "fork..join_none child that reads the enclosing task's 'k' is not supported");
+    check_rejected(R"(
+        module t;
+          task automatic go;
+            int k = 1;
+            fork
+              #1 k = k + 1;
+              #2 k = k + 2;
+            join_any
+          endtask
+          initial go;
+        endmodule
+    )",
+                   "fork..join_any child that reads the enclosing task's 'k' is not supported");
+}
+
+TEST_CASE("fork: join_none in an assertion action block queues into Reactive") {
+    // An action block is lowered as a task body and lives in the Reactive region, so
+    // its join_none children have to be queued onto the REACTIVE ring, not the active
+    // one (emit_region_push). The action block still observes none of the child's
+    // effect -- n is 0 there and 1 once the child has run.
+    const std::string out = run_capture(R"(
+        module t;
+          bit clk = 0;
+          int n = 0;
+          bit fail = 0;
+          always #5 clk = ~clk;
+          assert property (@(posedge clk) !fail)
+            else begin
+              fork
+                n = n + 1;
+              join_none
+              $display("action@%0t n=%0d", $time, n);
+            end
+          initial begin
+            #7 fail = 1;
+            #10 $display("done n=%0d", n);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "action@15 n=0\ndone n=1\n");
 }

@@ -518,11 +518,19 @@ struct Function {
     bool is_task = false;
     // True for a synthetic fork-child body (LRM 9.3.2): a coroutine spawned at a
     // `fork`, whose completion epilogue decrements a shared join record and wakes
-    // the parent when the count reaches zero (rather than a task's unconditional
-    // single-parent resume). Its only formals are the enclosing frame locals the
-    // fork captured by reference (ForkInfo::args), so a child of a fork in a
-    // process body is parameterless. Implies is_task.
+    // the parent when the count reaches the record's wake_at (rather than a task's
+    // unconditional single-parent resume). Its only formals are the enclosing frame
+    // locals the fork captured by reference (ForkInfo::args), so a child of a fork
+    // in a process body is parameterless. Implies is_task.
     bool is_fork_child = false;
+    // Join discipline of the fork site that owns this child; only meaningful with
+    // is_fork_child, and identical for every child of a site. The child's epilogue
+    // needs it because the record's OWNERSHIP differs: under `join` the parent
+    // outlives every child, so the record is a slot in the parent's frame and no
+    // child ever frees it; the other two kinds let a child outlive the parent, so
+    // the record is heap-allocated and reference-counted and the last one out frees
+    // it (lower_fork_inst).
+    ForkKind fork_kind = ForkKind::Join;
     // A DPI-C import (LRM 35): the body is native C resolved at JIT link time by
     // extern_name, not lowered from IR. The backend emits an external declaration
     // (dpi_arg_ctypes / dpi_ret_ctype give the native C signature) and marshals

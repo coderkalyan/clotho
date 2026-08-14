@@ -310,23 +310,6 @@ TEST_CASE("array query functions (LRM 20.7): $size/$dimensions/$left/... fold to
           "m2 S4 Sd210 D3 UD2\n");
 }
 
-TEST_CASE("fork..join_any / join_none are rejected, not serialized") {
-    // fork..join itself is now supported (see fork_test.cpp); the unbounded
-    // variants stay guarded until V2's growable ring.
-    constexpr std::string_view any = R"(
-        module t;
-            initial fork #10 $display("A"); #5 $display("B"); join_any
-        endmodule
-    )";
-    CHECK(reject(any).find("join_any") != std::string::npos);
-    constexpr std::string_view none = R"(
-        module t;
-            initial fork #10 $display("A"); #5 $display("B"); join_none
-        endmodule
-    )";
-    CHECK(reject(none).find("join_none") != std::string::npos);
-}
-
 // The `iff` guard (LRM 9.4.2.3) must be honored, not dropped: a posedge with the
 // guard false does not run the body, one with it true does. (This construct was
 // formerly rejected; it is now lowered as `always @(ev) if (cond) body`.)
