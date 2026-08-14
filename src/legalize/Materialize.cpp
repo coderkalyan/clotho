@@ -992,6 +992,63 @@ bool emit_stmts(std::string& os, Renderer& render, const ir::Ir& ir, std::span<c
     return true;
 }
 
+// Append a type's unpacked dimensions, outermost first, as declared.
+//
+// An unpacked array keeps its dimensions in the emitted declaration
+// (`logic [31:0] m [0:3];`), because the renderer emits an element select with the
+// DECLARED index -- `m[5]` for `int m[7:4]`. Declaring from the layout width alone
+// (which reports the LEAF width for an array) flattened every memory to a vector
+// and silently turned each element select into a bit select.
+void unpacked_dims(const ir::InternPool& pool, ir::Ref type, std::string& os) {
+    for (ir::Ref t = type;;) {
+        const ir::Type& ty = std::get<ir::Type>(pool.get(t));
+        if (ty.kind != ir::Type::Kind::UnpackedArray) {
+            return;
+        }
+        os += " [";
+        put_uint(os, ty.left);
+        os += ':';
+        put_uint(os, ty.right);
+        os += ']';
+        t = ty.element;
+    }
+}
+
+// One `<kind> [W-1:0] <name> <dims>;` declaration, or nothing when the type has no
+// SystemVerilog form (see unsynthesizable_type). `kind` carries its own trailing
+// space; the caller has already emitted any indentation.
+bool emit_decl(std::string&          os,
+               const ir::InternPool& pool,
+               ir::Ref               type,
+               std::string_view      kind,
+               std::string_view      name) {
+    if (unsynthesizable_type(pool, type) != nullptr) {
+        return false;
+    }
+    os += kind;
+    if (const uint32_t w = pool.layout(type).width; w > 1) {
+        os += '[';
+        put_uint(os, w - 1);
+        os += ":0] ";
+    }
+    os += name;
+    unpacked_dims(pool, type, os);
+    os += ";\n";
+
+    return true;
+}
+
+// The refusal line that replaces a declaration with no SystemVerilog form. Named
+// rather than dropped: an omitted signal reads as a missing declaration, which is
+// indistinguishable from a writer bug.
+void emit_decl_refusal(std::string& os, const ir::InternPool& pool, ir::Ref type, std::string_view name) {
+    os += "  // ";
+    os += name;
+    os += ": no synthesizable type (";
+    os += unsynthesizable_type(pool, type);
+    os += ")\n";
+}
+
 // A function's SystemVerilog declaration, or nothing when its body is not
 // renderable. Formals and locals share one naming rule (`l<i>`), so the expression
 // renderer needs no notion of which frame it is in.
@@ -999,6 +1056,18 @@ std::optional<std::string> emit_fn(const ir::Module& m, Renderer& render, ir::Fu
     const ir::Function& f = m.function(id);
     std::string         os;
     const auto          width = [&](ir::Ref t) { return m.pool.layout(t).width; };
+    // A frame slot with no hardware form (a string temp, a container local) has no
+    // declaration to write. Refusing the whole function is right rather than
+    // conservative: its body necessarily touches the slot, and a `logic [W-1:0]`
+    // written from a width-0 layout underflows to `[4294967295:0]`.
+    for (const ir::Ref t : f.local_types) {
+        if (unsynthesizable_type(m.pool, t) != nullptr) {
+            return std::nullopt;
+        }
+    }
+    if (f.return_type != ir::Ref::Invalid && unsynthesizable_type(m.pool, f.return_type) != nullptr) {
+        return std::nullopt;
+    }
     // A task has no return type, so it declares as a task. Both take their formals
     // the same way, and both name frame slots `l<i>`. Tasks are emitted rather than
     // skipped because the 1:1 path calls them, and a call to a task that was never
@@ -1021,6 +1090,7 @@ std::optional<std::string> emit_fn(const ir::Module& m, Renderer& render, ir::Fu
         put_uint(os, width(f.param_types[a]) - 1);
         os += ":0] l";
         put_uint(os, a);
+        unpacked_dims(m.pool, f.param_types[a], os);
     }
     os += ");\n";
     for (size_t l = f.param_types.size(); l < f.local_types.size(); ++l) {
@@ -1028,6 +1098,7 @@ std::optional<std::string> emit_fn(const ir::Module& m, Renderer& render, ir::Fu
         put_uint(os, width(f.local_types[l]) - 1);
         os += ":0] l";
         put_uint(os, l);
+        unpacked_dims(m.pool, f.local_types[l], os);
         os += ";\n";
     }
     if (!emit_stmts(os, render, f.ir, f.ir.root(), 2)) {
@@ -1160,12 +1231,21 @@ void emit_module_body(std::string&                    os,
         logic.push_back(k);
     }
 
-    // Header: this scope's own ports, in declaration order.
+    // Header: this scope's own ports, in declaration order. A port whose type has
+    // no SystemVerilog form is left OUT of the header and named in a comment under
+    // it -- the alternative is `input logic q` for a queue, which is a lie the
+    // reader cannot see. Its connections are dropped with it (below), and any
+    // process that touched it was already refused by the legality gate.
     os += "module ";
     os += names.mod[sc.id];
-    bool any_port = false;
+    std::string refused;
+    bool        any_port = false;
     for (const ir::Signal g : sc.signals) {
         if (m.signal(g).dir == ir::SignalInfo::Direction::Internal) {
+            continue;
+        }
+        if (unsynthesizable_type(m.pool, m.signal(g).type) != nullptr) {
+            emit_decl_refusal(refused, m.pool, m.signal(g).type, names.sig[static_cast<uint32_t>(g)]);
             continue;
         }
         os += any_port ? ", " : "(";
@@ -1191,22 +1271,19 @@ void emit_module_body(std::string&                    os,
             os += ":0] ";
         }
         os += names.sig[static_cast<uint32_t>(g)];
+        unpacked_dims(m.pool, m.signal(g).type, os);
     }
     os += any_port ? ");\n" : ";\n";
+    os += refused;
 
     for (const ir::Signal g : sc.signals) {
         if (m.signal(g).dir != ir::SignalInfo::Direction::Internal) {
             continue;
         }
-        const uint32_t w = m.pool.layout(m.signal(g).type).width;
-        os += cfg.target == Target::V2005 ? "  reg " : "  logic ";
-        if (w > 1) {
-            os += '[';
-            put_uint(os, w - 1);
-            os += ":0] ";
+        const std::string_view kind = cfg.target == Target::V2005 ? "  reg " : "  logic ";
+        if (!emit_decl(os, m.pool, m.signal(g).type, kind, names.sig[static_cast<uint32_t>(g)])) {
+            emit_decl_refusal(os, m.pool, m.signal(g).type, names.sig[static_cast<uint32_t>(g)]);
         }
-        os += names.sig[static_cast<uint32_t>(g)];
-        os += ";\n";
     }
 
     // Child instantiations, with the port map put back together.
@@ -1220,6 +1297,11 @@ void emit_module_body(std::string&                    os,
         const auto it    = conns.find(ch.id);
         if (it != conns.end()) {
             for (const PortConn& pc : it->second) {
+                // The port was left out of the child's header, so there is nothing
+                // to connect to.
+                if (unsynthesizable_type(m.pool, m.signal(pc.port).type) != nullptr) {
+                    continue;
+                }
                 if (!first) {
                     os += ", ";
                 }
@@ -1523,18 +1605,13 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
     os += name;
     os += ";\n";
     for (size_t i = 0; i < signals.size(); ++i) {
-        const uint32_t w = module.pool.layout(signals[i].type).width;
         // 2005 has no `logic`: a procedurally assigned signal is a reg, anything
         // else is a wire. Every continuous assign lowered to a process, so "written
         // by some process" is the whole test.
-        os += cfg.target == Target::V2005 ? (written[i] ? "  reg " : "  wire ") : "  logic ";
-        if (w > 1) {
-            os += '[';
-            put_uint(os, w - 1);
-            os += ":0] ";
+        const std::string_view kind = cfg.target == Target::V2005 ? (written[i] ? "  reg " : "  wire ") : "  logic ";
+        if (!emit_decl(os, module.pool, signals[i].type, kind, sig_names[i])) {
+            emit_decl_refusal(os, module.pool, signals[i].type, sig_names[i]);
         }
-        os += sig_names[i];
-        os += ";\n";
     }
 
     // Every function that renders. FnLegality has already refused any that writes

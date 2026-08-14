@@ -1574,3 +1574,100 @@ TEST_CASE("the sidecar reports findings and omits classification without a Resul
     CHECK(bare.find("\"findings\"") == std::string::npos);
     CHECK(bare.find("\"emitted\":") != std::string::npos);
 }
+
+// -- Types with no hardware form ----------------------------------------------
+//
+// `ir::layout()` reports width 0 for a string / container / unpacked struct and 64
+// for a class handle, so a declaration written from the width alone emitted
+// `logic q;` for a queue and rendered `q[0] = x` as a BIT select of it. Neither the
+// legality gate nor the writer may go by the width.
+
+TEST_CASE("a process touching a queue is not synthesizable") {
+    const Run t = run(R"(
+        module m(input [7:0] a, output reg [7:0] q);
+          int fifo[$];
+          always @* begin
+            fifo[0] = a;
+            q = fifo[0][7:0];
+          end
+        endmodule
+    )");
+    CHECK_FALSE(t.all_synthesizable());
+    CHECK(t.has(legalize::Finding::UnsynthesizableOp));
+    // No declaration for it, and nothing that reads as a vector select of it.
+    const std::string text = legalize::materialize(t.mod(), &t.result);
+    CHECK(text.find("// fifo: no synthesizable type (queue)") != std::string::npos);
+    CHECK(text.find("logic fifo") == std::string::npos);
+    CHECK(text.find("fifo[") == std::string::npos);
+}
+
+TEST_CASE("every type with no hardware form is named, not declared") {
+    const Run         t    = run(R"(
+        module m(input [7:0] a, output reg [7:0] q);
+          typedef struct { int f; } s_t;
+          string  str;
+          int     dyn[];
+          int     map[string];
+          int     fifo[$];
+          s_t     agg;
+          real    rr;
+          always @* q = a;
+        endmodule
+    )");
+    const std::string text = legalize::materialize(t.mod(), &t.result);
+    CAPTURE(text);
+    CHECK(text.find("// str: no synthesizable type (string)") != std::string::npos);
+    CHECK(text.find("// dyn: no synthesizable type (dynamic array)") != std::string::npos);
+    CHECK(text.find("// map: no synthesizable type (associative array)") != std::string::npos);
+    CHECK(text.find("// fifo: no synthesizable type (queue)") != std::string::npos);
+    CHECK(text.find("// agg: no synthesizable type (unpacked struct)") != std::string::npos);
+    CHECK(text.find("// rr: no synthesizable type (real)") != std::string::npos);
+    // The representable signals are untouched: `q` is a port here, and its process
+    // still renders.
+    CHECK(text.find("output logic [7:0] q") != std::string::npos);
+    CHECK(text.find("q = a;") != std::string::npos);
+}
+
+TEST_CASE("a memory keeps its unpacked dimensions") {
+    const Run         t    = run(R"(
+        module m(input [7:0] a, output reg [7:0] q);
+          reg [7:0] mem[0:3];
+          reg [7:0] hi[7:4];
+          reg [7:0] two[0:1][0:2];
+          always @* begin
+            mem[0] = a;
+            hi[5]  = a;
+            two[1][2] = a;
+            q = mem[1];
+          end
+        endmodule
+    )");
+    const std::string text = legalize::materialize(t.mod(), &t.result);
+    CAPTURE(text);
+    // Declared bounds, verbatim: the renderer emits the DECLARED index (hi[5]), so
+    // a 0-based or flattened declaration would silently move the element.
+    CHECK(text.find("logic [7:0] mem [0:3];") != std::string::npos);
+    CHECK(text.find("logic [7:0] hi [7:4];") != std::string::npos);
+    CHECK(text.find("logic [7:0] two [0:1] [0:2];") != std::string::npos);
+    CHECK(text.find("hi[32'h5]") != std::string::npos);
+}
+
+TEST_CASE("a port with no hardware form is dropped from the header and named") {
+    const LowerResult r = lower_text(R"(
+        module sub(input int fifo[$], output reg [7:0] y);
+          always @* y = 8'h01;
+        endmodule
+        module m(output reg [7:0] z);
+          int fifo[$];
+          sub s(fifo, z);
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    const std::string text = legalize::materialize(*r.module, nullptr, { .hierarchy = legalize::Hierarchy::Instances });
+    CAPTURE(text);
+    CHECK(text.find("// fifo: no synthesizable type (queue)") != std::string::npos);
+    CHECK(text.find("input logic fifo") == std::string::npos);
+    // Its connection goes with it, so the instantiation stays legal source.
+    CHECK(text.find(".fifo(") == std::string::npos);
+    CHECK(text.find(".y(z)") != std::string::npos);
+}

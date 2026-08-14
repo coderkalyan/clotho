@@ -273,6 +273,24 @@ struct Result {
     }
 };
 
+// -- Type representability -----------------------------------------------------
+
+// Why an IR type has no hardware form, or nullptr when it has one.
+//
+// Synthesis has no representation for a value that does not live in a fixed
+// number of bits: a string, a heap container (queue / dynamic array /
+// associative array -- runtime-sized), an unpacked struct/union (no packed
+// value; its storage is a recursive mirror), a class handle (a heap address) or
+// a real. `ir::layout()` reports width 0 for most of them and 64 for a handle,
+// so a declaration written from the layout alone silently emits `logic x;` for a
+// queue, or a 64-bit wire holding a pointer -- and a process touching one
+// renders as though it were a vector. Both the legality gate (Legalize.cpp) and
+// the writer (Materialize.cpp) consult this instead of the layout width.
+//
+// Unpacked ARRAYS are representable: they keep their dimensions in the emitted
+// declaration, so the classification looks through them to the leaf.
+[[nodiscard]] const char* unsynthesizable_type(const ir::InternPool& pool, ir::Ref type);
+
 // `facts` may be null; absent means the facts-dependent findings are skipped
 // rather than guessed.
 [[nodiscard]] Result run(const ir::Module& module, const ir::DesignFacts* facts, Options options = {});
