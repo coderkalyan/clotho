@@ -3561,9 +3561,9 @@ private:
         wheel_->setName("wheel");
         awaiter_ = nullptr;
         record_  = nullptr;
-        // Reset per llvm::Function, like record_: a task may contain a fork now, and
-        // the slot is an alloca hoisted into THIS coroutine's frame. Keeping a
-        // previous body's alloca would name storage in another function.
+        // Reset per llvm::Function, like record_: a task may contain a fork, and the
+        // slot is an alloca hoisted into THIS coroutine's frame. Keeping a previous
+        // body's alloca would name storage in another function.
         fork_record_ = nullptr;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
@@ -3662,21 +3662,42 @@ private:
         llvm::Value* rec    = fn_->getArg(task_record_param(f));
         auto*        has_bb = llvm::BasicBlock::Create(ctx_, "task.wake", fn_);
         if (f.is_fork_child) {
-            // Fork-child epilogue (LRM 9.3.2): the record is { i32 count, ptr
-            // parent } shared by the fork's children. Decrement the live count;
-            // the child that drops it to zero resumes the joined parent (null
-            // until the parent has spawned all children and suspended — a child
-            // that finishes synchronously during the spawn loop just decrements).
-            auto*        cntp   = b_.CreateStructGEP(fork_record_ty(), rec, 0);
+            // Fork-child epilogue (LRM 9.3.2). Decrement the shared live count, then
+            // resume the parent iff this completion is the one it is waiting for. A
+            // null `parent` means nobody is parked -- the parent has not suspended yet
+            // (a child finishing synchronously inside the spawn loop), has already
+            // been resumed, or never parks at all (`join_none`).
+            //
+            // Under `join` the due completion is the LAST one, so the test is against
+            // a constant 0 and the record needs neither wake_at nor a refcount: it is
+            // a slot in the parent's frame, and the parent is still parked on us.
+            // Under the detaching kinds the record is heap and the due count is
+            // whatever the site stored in wake_at (W-1 for `join_any`, never reached
+            // for `join_none`); since count only decreases, that is true at most once
+            // and needs no claim flag. Those children also drop a reference on the way
+            // out, because the parent may be long gone -- and once dropped, nothing
+            // below may touch the record.
+            const bool   heap   = f.fork_kind != ForkKind::Join;
+            auto*        rty    = fork_record_ty(heap);
+            auto*        cntp   = b_.CreateStructGEP(rty, rec, 0);
             llvm::Value* cnt    = b_.CreateSub(b_.CreateLoad(b_.getInt32Ty(), cntp), b_.getInt32(1));
             b_.CreateStore(cnt, cntp);
-            llvm::Value* parent = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(fork_record_ty(), rec, 1));
-            llvm::Value* last   = b_.CreateICmpEQ(cnt, b_.getInt32(0));
-            llvm::Value* wake   = b_.CreateAnd(last, b_.CreateICmpNE(parent, null));
-            b_.CreateCondBr(wake, has_bb, final_bb);
+            llvm::Value* parent = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(rty, rec, 1));
+            llvm::Value* due    = heap
+              ? b_.CreateICmpEQ(cnt, b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(rty, rec, 2)))
+              : b_.CreateICmpEQ(cnt, b_.getInt32(0));
+            llvm::Value* wake   = b_.CreateAnd(due, b_.CreateICmpNE(parent, null));
+            auto*        after  = heap ? llvm::BasicBlock::Create(ctx_, "fork.child.release", fn_)
+                                       : final_bb;
+            b_.CreateCondBr(wake, has_bb, after);
             b_.SetInsertPoint(has_bb);
             emit_wake_push(b_, parent);
-            b_.CreateBr(final_bb);
+            b_.CreateBr(after);
+            if (heap) {
+                b_.SetInsertPoint(after);
+                emit_fork_record_release(b_, rec);
+                b_.CreateBr(final_bb);
+            }
         } else {
             llvm::Value* parent = b_.CreateLoad(ptr_ty, rec);
             b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
@@ -7094,6 +7115,13 @@ private:
     //   - a virtual task call, followed only to its statically named target (the
     //     bound collect_callees already documents), so a forking override reached
     //     through a handle would otherwise go uncounted.
+    //
+    // A third shape is unbounded in the child rather than in the graph: a
+    // `join_any` / `join_none` site leaves siblings live while the parent walks on,
+    // so a loop around the fork accumulates children with no static limit at all.
+    // Its children (and everything they call) saturate to the ceiling, which is what
+    // sizes every buffer they can occupy -- the rings, the `#0` batches and the
+    // dynamic wait buckets. Past the ceiling the guards report; nothing corrupts.
     struct BodyActivations {
         // Live activations per FunctionId.
         std::vector<size_t> mult;
@@ -7111,6 +7139,9 @@ private:
         // Edges into each function, as (source, callee) pairs. kProcessSource is
         // the source for a process body, whose multiplicity is fixed at one.
         static constexpr uint32_t kProcessSource = ~0u;
+        // Spawned by a fork whose parent does not wait for it, so the number that
+        // can be live at once is a run-time quantity: contributes the ceiling.
+        static constexpr uint32_t kUnboundedSource = ~1u;
         struct Edge {
             uint32_t from;
             uint32_t to;
@@ -7133,11 +7164,19 @@ private:
                         edges.push_back({ from, static_cast<uint32_t>(ir.extra_data<VirtualCallInfo>(p.extra).func) });
                         imprecise = true;
                         break;
-                    case Inst::Tag::Fork:
-                        for (const Index kid : ir.region(ir.extra_data<ForkInfo>(p.extra).children)) {
-                            edges.push_back({ from, static_cast<uint32_t>(kid) });
+                    case Inst::Tag::Fork: {
+                        // `join` blocks the parent until every child is done, so a
+                        // site contributes one live child per activation of the body
+                        // containing it. The other two kinds do not wait, so a loop
+                        // around the fork can have any number live at once.
+                        const auto& info = ir.extra_data<ForkInfo>(p.extra);
+                        const uint32_t src =
+                          info.kind == ForkKind::Join ? from : kUnboundedSource;
+                        for (const Index kid : ir.region(info.children)) {
+                            edges.push_back({ src, static_cast<uint32_t>(kid) });
                         }
                         break;
+                    }
                     default:
                         break;
                 }
@@ -7157,10 +7196,15 @@ private:
         for (size_t f = 0; f < nfn; ++f) {
             from_fork[f] = mod_.function(static_cast<FunctionId>(f)).is_fork_child ? 1 : 0;
         }
+        const auto synthetic = [](uint32_t from) {
+            return from == kProcessSource || from == kUnboundedSource;
+        };
         for (bool grew = true; grew;) {
             grew = false;
             for (const Edge& e : edges) {
-                if (e.from != kProcessSource && from_fork[e.from] != 0 && from_fork[e.to] == 0) {
+                // A child of an unbounded fork is a fork child itself, so it is
+                // already seeded; only real body-to-body edges propagate.
+                if (!synthetic(e.from) && from_fork[e.from] != 0 && from_fork[e.to] == 0) {
                     from_fork[e.to] = 1;
                     grew            = true;
                 }
@@ -7172,7 +7216,9 @@ private:
         for (size_t round = 0; !converged && round <= nfn; ++round) {
             std::vector<size_t> next(nfn, 0);
             for (const Edge& e : edges) {
-                const size_t src = e.from == kProcessSource ? 1 : mult[e.from];
+                const size_t src = e.from == kProcessSource     ? 1
+                                 : e.from == kUnboundedSource   ? kMaxForkRingSlots
+                                                                : mult[e.from];
                 next[e.to]       = std::min(next[e.to] + src, kMaxForkRingSlots);
             }
             converged = next == mult;
@@ -7592,6 +7638,20 @@ private:
             emit_re_inactive_push(b, handle);
         } else {
             emit_inactive_push(b, handle);
+        }
+    }
+
+    // Make a freshly ramped coroutine ready in the region the body doing the
+    // spawning belongs to. Used by a `join_none` fork, whose children must NOT run
+    // at the fork (LRM 9.3.2) and so are queued rather than resumed inline. The
+    // handle is plain, not parked: a ring entry never carries the home tag, and a
+    // child of a reactive body belongs in the reactive ring for the same reason its
+    // parent's `#0` does.
+    void emit_region_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
+        if (reactive_home()) {
+            emit_reactive_push(b, handle);
+        } else {
+            emit_active_push(b, handle);
         }
     }
 
@@ -17272,42 +17332,116 @@ private:
         return record_;
     }
 
-    // The fork join-record type { i32 count, ptr parent }, shared by a fork's
-    // children (see lower_fork_inst and the fork-child epilogue in lower_task).
-    llvm::StructType* fork_record_ty() {
-        if (fork_record_ty_ == nullptr) {
-            fork_record_ty_ = llvm::StructType::create(
-              ctx_, { b_.getInt32Ty(), llvm::PointerType::getUnqual(ctx_) }, "clotho.fork_record");
+    // The fork join-record type, shared by one fork site's children and its parent
+    // (see lower_fork_inst and the fork-child epilogue in lower_task):
+    //
+    //   { i32 count, ptr parent, i32 wake_at, i32 refs }
+    //
+    // `count` starts at the fork width and each child's epilogue decrements it.
+    // `wake_at` is the count value at which the parent is due to be resumed, which
+    // is the ONLY thing that distinguishes the join kinds at run time: 0 for `join`
+    // (the last child wakes the parent), W-1 for `join_any` (the first one does).
+    // `join_none` never parks a parent, so `parent` stays null and no count wakes
+    // anybody. Because `count` decreases strictly, `count == wake_at` is true at
+    // most once and needs no claim flag.
+    //
+    // Fields 0 and 1 are common to both kinds of record, and `join` needs ONLY those
+    // two: it blocks until every child is done, so its parent outlives them all, its
+    // record is a slot in the parent's frame reused across the coroutine's join
+    // sites, and the due completion is always the last one (a constant 0). It
+    // therefore gets the SHORT record, so a design that only ever uses `fork … join`
+    // pays nothing at all for the other two kinds -- not even the frame bytes.
+    //
+    // `join_any` / `join_none` add `wake_at` and `refs`, because their parent does
+    // NOT outlive its children: it can reach a second fork site while the first
+    // site's children are live (which would stomp a reused slot) and it can return
+    // outright (which would free the frame under them). Those records are
+    // heap-allocated per fork SITE and reference-counted by `refs` (the parent plus
+    // one per child); whoever drops the last one frees it.
+    llvm::StructType* fork_record_ty(bool detached) {
+        auto*& cached = detached ? fork_record_ty_detached_ : fork_record_ty_;
+        if (cached == nullptr) {
+            auto* i32 = b_.getInt32Ty();
+            auto* ptr = llvm::PointerType::getUnqual(ctx_);
+            cached    = detached ? llvm::StructType::create(ctx_, { i32, ptr, i32, i32 },
+                                                            "clotho.fork_record.detached")
+                                 : llvm::StructType::create(ctx_, { i32, ptr }, "clotho.fork_record");
         }
-        return fork_record_ty_;
+        return cached;
     }
 
-    // The current coroutine's fork join-record slot: one frame-resident alloca
-    // reused across this coroutine's fork sites (a `join` completes before the
-    // next fork runs). Hoisted to coro.begin so it spills into the frame — it must
-    // outlive both the children's suspends and the parent's join suspend.
+    // The current coroutine's `join` record slot: one frame-resident alloca reused
+    // across this coroutine's `join` sites, which is sound because a `join`
+    // completes before the next fork at the same level runs. Hoisted to coro.begin
+    // so it spills into the frame -- it must outlive both the children's suspends
+    // and the parent's join suspend. Only `join` uses it; see fork_record_ty.
     llvm::Value* fork_record_slot() {
         if (fork_record_ == nullptr) {
             llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
-            fork_record_ = ab.CreateAlloca(fork_record_ty(), nullptr, "fork_record");
+            fork_record_ = ab.CreateAlloca(fork_record_ty(false), nullptr, "fork_record");
         }
         return fork_record_;
     }
 
-    // Lower a `Fork` (LRM 9.3.2, V1 = `join`): spawn each child coroutine sharing
-    // one join record, then suspend the parent until the live count reaches zero.
+    // Drop one reference to a heap fork record, freeing it when the last one goes.
+    // Called once by the parent (at the join point, whichever way it got there) and
+    // once by every child's epilogue. Never emitted for `join`, whose record lives
+    // in the parent's frame. Nothing may touch the record afterwards.
+    void emit_fork_record_release(llvm::IRBuilder<>& b, llvm::Value* rec) {
+        auto*           rty  = fork_record_ty(true);
+        auto*           i32  = b.getInt32Ty();
+        llvm::Value*    rp   = b.CreateStructGEP(rty, rec, 3);
+        llvm::Value*    left = b.CreateSub(b.CreateLoad(i32, rp), b.getInt32(1));
+        b.CreateStore(left, rp);
+        llvm::Function* fn   = b.GetInsertBlock()->getParent();
+        auto*           dead = llvm::BasicBlock::Create(ctx_, "fork.rec.free", fn);
+        auto*           live = llvm::BasicBlock::Create(ctx_, "fork.rec.live", fn);
+        b.CreateCondBr(b.CreateICmpEQ(left, b.getInt32(0)), dead, live);
+        b.SetInsertPoint(dead);
+        b.CreateCall(free_fn(), { rec });
+        b.CreateBr(live);
+        b.SetInsertPoint(live);
+    }
+
+    // Lower a `Fork` (LRM 9.3.2). All three join kinds spawn the same per-child
+    // coroutines over one shared join record; they differ in how the parent leaves.
+    //
+    //   join      — park until every child is done   (record wake_at = 0)
+    //   join_any  — park until the FIRST is done, siblings stay live (wake_at = W-1)
+    //   join_none — do not park at all               (parent never stored)
+    //
+    // and in how a child starts. `join` resumes each child inline at the spawn, which
+    // is a legal order because the parent is about to block on all of them anyway,
+    // and it keeps children off the rings entirely. The other two must not run a
+    // child the parent is not waiting for: LRM 9.3.2 has the parent continue and the
+    // children start when it next blocks or ends. `join_none` therefore queues every
+    // child, and `join_any` runs them only until one completes and queues the rest --
+    // which is also what makes their live count unbounded (docs/design/fork-join.md).
     void lower_fork_inst(Index i) {
         const auto fi     = ir_->extra_data<ForkInfo>(ir_->payload(i).extra);
         const auto kids   = ir_->region(fi.children); // FunctionId u32s
         auto*      ptr_ty = llvm::PointerType::getUnqual(ctx_);
         auto*      null   = llvm::ConstantPointerNull::get(ptr_ty);
         auto*      i32    = b_.getInt32Ty();
-        auto*      rty    = fork_record_ty();
+        const auto width  = static_cast<uint32_t>(kids.size());
+        const bool none   = fi.kind == ForkKind::JoinNone;
+        const bool any    = fi.kind == ForkKind::JoinAny;
+        const bool heap   = fi.kind != ForkKind::Join;
+        auto*      rty    = fork_record_ty(heap);
 
-        // Init the shared record { count = W, parent = null }.
-        llvm::Value* rec = fork_record_slot();
-        b_.CreateStore(b_.getInt32(static_cast<uint32_t>(kids.size())),
-                       b_.CreateStructGEP(rty, rec, 0));
+        // `join` keeps its record in the frame, reused across this coroutine's join
+        // sites; the detaching kinds get one heap record per SITE, reference-counted
+        // by every child plus us, because a child can outlive this frame entirely.
+        llvm::Value* rec = nullptr;
+        if (heap) {
+            const uint64_t rsize = env_->llmod.getDataLayout().getTypeAllocSize(rty);
+            rec                  = b_.CreateCall(alloc_fn(), { b_.getInt64(rsize) });
+            b_.CreateStore(b_.getInt32(any ? width - 1 : 0), b_.CreateStructGEP(rty, rec, 2));
+            b_.CreateStore(b_.getInt32(width + 1), b_.CreateStructGEP(rty, rec, 3));
+        } else {
+            rec = fork_record_slot();
+        }
+        b_.CreateStore(b_.getInt32(width), b_.CreateStructGEP(rty, rec, 0));
         b_.CreateStore(null, b_.CreateStructGEP(rty, rec, 1));
 
         // Ramp arguments, shared by every child: (state, wheel, one pointer per
@@ -17315,7 +17449,8 @@ private:
         // formal of every child (Lower.cpp's lower_fork), passed exactly as
         // lower_task_call_inst passes a ref actual. No signal-waiter snapshot is
         // needed here, unlike there: a capture is always a frame Local of this
-        // coroutine, never a module signal with a wait queue.
+        // coroutine, never a module signal with a wait queue. Only `join` can have
+        // captures at all — the ref ABI needs this frame to outlive the children.
         const std::span<const Index> caps = ir_->region(fi.args);
         std::vector<llvm::Value*>    argv;
         argv.reserve(caps.size() + 3);
@@ -17332,14 +17467,39 @@ private:
         }
         argv.push_back(rec);
 
-        // Spawn each child: ramp -> handle, resume inline to its first suspend or
-        // completion. A child that completes synchronously has already decremented
-        // the count (parent still null -> no wake); destroy its frame. A child that
-        // suspends is parked in the wheel / a wait queue and decrements + wakes on
-        // completion.
         for (const Index kid : kids) {
             llvm::Function* cf  = sym(fn_decls_[static_cast<uint32_t>(kid)]);
             llvm::Value*    hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
+            if (none) {
+                // Ramped and parked at its initial suspend; the drain resumes it (and
+                // destroys it when it completes, like any other ring handle). Pushed
+                // to this body's own region, the way a `#0` is.
+                emit_region_push(b_, hdl);
+                continue;
+            }
+            // `join_any` stops running children the moment one of them has finished:
+            // the parent is due to proceed, and LRM 9.3.2 does not let the remaining
+            // siblings delay it -- `fork n=n+1; n=n+2; join_any` must leave n at 1,
+            // not 3, or join_any is just join with extra steps. Every child is still
+            // CREATED here; the ones not run are queued and start when the parent next
+            // blocks. `count == width` is "nobody has finished yet".
+            llvm::BasicBlock* joined = nullptr;
+            if (any) {
+                llvm::Value* cnt  = b_.CreateLoad(i32, b_.CreateStructGEP(rty, rec, 0));
+                auto*        run  = llvm::BasicBlock::Create(ctx_, "fork.child.run", fn_);
+                auto*        park = llvm::BasicBlock::Create(ctx_, "fork.child.queue", fn_);
+                joined            = llvm::BasicBlock::Create(ctx_, "fork.child.spawned", fn_);
+                b_.CreateCondBr(b_.CreateICmpEQ(cnt, b_.getInt32(width)), run, park);
+                b_.SetInsertPoint(park);
+                emit_region_push(b_, hdl);
+                b_.CreateBr(joined);
+                b_.SetInsertPoint(run);
+            }
+            // Resume inline to the child's first suspend or to completion. A child
+            // that completes synchronously has already decremented the count (parent
+            // still null -> it wakes nobody); destroy its frame here, since it never
+            // reached a ring for the drain to do it. One that suspends is parked in
+            // the wheel / a wait queue and decrements + wakes on completion.
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
             llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
             auto*        dz   = llvm::BasicBlock::Create(ctx_, "fork.child.done", fn_);
@@ -17349,22 +17509,38 @@ private:
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
             b_.CreateBr(nx);
             b_.SetInsertPoint(nx);
+            if (joined != nullptr) {
+                b_.CreateBr(joined);
+                b_.SetInsertPoint(joined);
+            }
         }
 
-        // Join: if every child already finished (count 0), fall through; else park
-        // our handle and suspend — the last child to finish resumes us, into the
-        // ring the parked handle names.
-        llvm::Value* cnt  = b_.CreateLoad(i32, b_.CreateStructGEP(rty, rec, 0));
-        auto*        susp = llvm::BasicBlock::Create(ctx_, "fork.join.suspend", fn_);
-        auto*        cont = llvm::BasicBlock::Create(ctx_, "fork.join.cont", fn_);
-        b_.CreateCondBr(b_.CreateICmpEQ(cnt, b_.getInt32(0)), cont, susp);
+        if (!none) {
+            // Park unless the wake we would be waiting for has already happened:
+            // `join` needs every child done (count 0), `join_any` needs any one of
+            // them (count below the width). Otherwise store our handle and suspend —
+            // the child that brings the count to wake_at resumes us, into the ring
+            // that parked handle names.
+            llvm::Value* cnt  = b_.CreateLoad(i32, b_.CreateStructGEP(rty, rec, 0));
+            auto*        susp = llvm::BasicBlock::Create(ctx_, "fork.join.suspend", fn_);
+            auto*        cont = llvm::BasicBlock::Create(ctx_, "fork.join.cont", fn_);
+            llvm::Value* got  = any ? b_.CreateICmpULT(cnt, b_.getInt32(width))
+                                    : b_.CreateICmpEQ(cnt, b_.getInt32(0));
+            b_.CreateCondBr(got, cont, susp);
 
-        b_.SetInsertPoint(susp);
-        b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(rty, rec, 1));
-        emit_suspend("fork.join.resume");
-        b_.CreateBr(cont);
+            b_.SetInsertPoint(susp);
+            b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(rty, rec, 1));
+            emit_suspend("fork.join.resume");
+            b_.CreateBr(cont);
 
-        b_.SetInsertPoint(cont);
+            b_.SetInsertPoint(cont);
+        }
+        // Past the join point this body never reads the record again, on any path, so
+        // drop our reference — but only for a heap record. A `join` record is a frame
+        // slot with no refcount at all, and its children are all done by now.
+        if (heap) {
+            emit_fork_record_release(b_, rec);
+        }
     }
 
     // Lower a task enable (LRM 13.3). Create the task coroutine, copy inputs in /
@@ -19620,10 +19796,15 @@ private:
     // the unit contains a `disable` (only a targeted block is emitted at all).
     std::vector<std::pair<uint32_t, llvm::BasicBlock*>> block_targets_;
     llvm::AllocaInst*       record_           = nullptr;
-    // Per-function fork join-record slot { i32 count, ptr parent } (lazy, reused
-    // across a coroutine's fork sites — `join` serializes them). Reset per fn.
+    // Per-function `join` record slot { i32 count, ptr parent, ... } (lazy, reused
+    // across a coroutine's join sites — `join` serializes them, and its parent
+    // outlives every child). Reset per fn. join_any / join_none heap-allocate
+    // instead, per fork site (fork_record_ty).
     llvm::AllocaInst*       fork_record_      = nullptr;
-    llvm::StructType*       fork_record_ty_   = nullptr; // module-lived, built once
+    // The record TYPES are module-lived. `join` uses the short { count, parent };
+    // join_any / join_none use { count, parent, wake_at, refs }.
+    llvm::StructType*       fork_record_ty_          = nullptr;
+    llvm::StructType*       fork_record_ty_detached_ = nullptr;
 
     // Per-process scratch, reset in lower_process.
     const Ir*           ir_         = nullptr;

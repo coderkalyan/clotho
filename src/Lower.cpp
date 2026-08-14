@@ -836,7 +836,14 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 // task body, and a child now reaches the enclosing body's locals
                 // through ref formals (lower_fork). What is left is the inlined
                 // copy's missing second resume, which is what suspends() names.
-                if (s.template as<BlockStatement>().blockKind != StatementBlockKind::Sequential) {
+                //
+                // `join_none` is the exception: it never parks the parent, which
+                // walks straight past the fork, so it is not a suspension at all.
+                // Its children DO go through a ring (they are pushed rather than
+                // resumed inline), but each carries its own home region, which is
+                // exactly what the parked-handle tag is for.
+                if (const auto bk = s.template as<BlockStatement>().blockKind;
+                    bk != StatementBlockKind::Sequential && bk != StatementBlockKind::JoinNone) {
                     suspends("a fork");
                 }
                 break;
@@ -6730,22 +6737,13 @@ private:
         b.disable(label, loc(s));
     }
 
-    // Lower `fork … join` (LRM 9.3.2). V1: `join` only, in a process or task body
-    // (an assertion action block is lowered as a task body, so it counts). Each
-    // top-level child statement becomes its own fork-child coroutine; the Fork op
-    // spawns them and suspends the parent until all complete.
-    //
-    // slang refuses `join` and `join_any` inside a FUNCTION itself
-    // (diag::TimingInFuncNotAllowed, its Statement.cpp), so the only fork a
-    // function body can even hand us is `join_none` -- which the kind check below
-    // rejects anyway. Clotho needs no LRM check of its own here.
     void lower_fork(const BlockStatement& blk, ir::Builder& b) {
-        if (blk.blockKind != StatementBlockKind::JoinAll) {
-            // TODO: join_any / join_none (V2) need a growable active ring — a
-            // loop can spawn an unbounded number of concurrently-live children
-            // (docs/design/fork-join.md).
-            fail("fork..join_any / fork..join_none are not supported");
-        }
+        const ir::ForkKind kind = blk.blockKind == StatementBlockKind::JoinAny  ? ir::ForkKind::JoinAny
+                                : blk.blockKind == StatementBlockKind::JoinNone ? ir::ForkKind::JoinNone
+                                                                               : ir::ForkKind::Join;
+        const char* kind_name = kind == ir::ForkKind::JoinAny    ? "fork..join_any"
+                              : kind == ir::ForkKind::JoinNone   ? "fork..join_none"
+                                                                 : "fork..join";
 
         // Children are the fork body's top-level statements (a StatementList),
         // or the single statement / empty body.
@@ -6765,16 +6763,22 @@ private:
         // enclosing task's formals or automatics cannot resolve the way it does in
         // a process (where every parent variable is a module signal). Pass each
         // such symbol in as an ArgDir::Ref formal — the same live-pointer ABI a
-        // `ref` argument uses (docs/design/ref-args.md), whose lifetime rule holds
-        // here for the same reason: a `join` parent outlives all its children, so
-        // the pointer into its frame stays valid for as long as a child can use it.
+        // `ref` argument uses (docs/design/ref-args.md).
+        //
+        // That ABI is a raw pointer into the enclosing frame, so it needs the
+        // enclosing frame to outlive every child. `join` gives that for free. The
+        // other two kinds do not: a `join_none` parent walks straight past the fork
+        // and can return, and a `join_any` parent resumes on the first completion
+        // with siblings still live, so either can free the frame under a child that
+        // is still holding a pointer into it. Refused below rather than mis-lowered;
+        // it lifts with V4's per-spawn copies (docs/design/fork-join.md).
         std::vector<const ValueSymbol*> captures;
         if (fn_ctx_ != nullptr) {
             if (!fn_ctx_->is_task) {
                 // Unreachable through slang, which rejects a timing control in a
                 // function outright; `is_task` is the real discriminator, so say so
                 // rather than trusting the front end's reach.
-                fail("fork..join inside a function is not supported");
+                fail(std::string(kind_name) + " inside a function is not supported");
             }
             ForkCaptureDetector d;
             d.locals = &fn_ctx_->localmap;
@@ -6785,16 +6789,24 @@ private:
                 // TODO: capture of `this` (LRM 8.11 inside 9.3.2) — a child would
                 // need the enclosing method's handle as a ref formal, which the ref
                 // ABI does not carry (it is a packed-slot pointer).
-                fail("fork..join child that reads a class property of the enclosing "
+                fail(std::string(kind_name) +
+                     " child that reads a class property of the enclosing "
                      "method is not supported");
             }
             for (const ValueSymbol* sym : d.captured) {
                 const auto& ct = sym->getType().getCanonicalType();
+                if (kind != ir::ForkKind::Join) {
+                    fail(std::string(kind_name) + " child that reads the enclosing task's '" +
+                         std::string(sym->name) +
+                         "' is not supported (only fork..join can capture an enclosing frame: the "
+                         "parent has to outlive every child for the reference to stay valid)");
+                }
                 if (!ct.isIntegral() && ct.as_if<slang::ast::DynamicArrayType>() == nullptr) {
                     // TODO: capture of an unpacked array / struct / string / real /
                     // queue / class-handle local. Exactly the ref ABI's own gap, so
                     // the two lift together (docs/design/ref-args.md).
-                    fail("fork..join child that reads the enclosing task's '" + std::string(sym->name) +
+                    fail(std::string(kind_name) + " child that reads the enclosing task's '" +
+                         std::string(sym->name) +
                          "' is not supported (only packed integral and dynamic-array "
                          "locals can be captured)");
                 }
@@ -6805,7 +6817,7 @@ private:
         std::vector<ir::FunctionId> ids;
         ids.reserve(children.size());
         for (const Statement* c : children) {
-            ids.push_back(build_fork_child(*c, captures));
+            ids.push_back(build_fork_child(*c, captures, kind));
         }
 
         // The capture actuals, in the order the children took their formals.
@@ -6819,7 +6831,7 @@ private:
         for (const ValueSymbol* sym : captures) {
             args.push_back(value_lvalue(*sym, b, l));
         }
-        b.fork(ids, args, ir::ForkKind::Join, l);
+        b.fork(ids, args, kind, l);
     }
 
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
@@ -19720,7 +19732,9 @@ private:
     // resolve to the formal's Local instead of falling through to signal_of. Every
     // child of one fork takes the same list, so an unused capture costs one dead
     // pointer parameter. Returns the reserved FunctionId.
-    ir::FunctionId build_fork_child(const Statement& body, std::span<const ValueSymbol* const> captures) {
+    ir::FunctionId build_fork_child(const Statement&                      body,
+                                    std::span<const ValueSymbol* const>   captures,
+                                    ir::ForkKind                          kind) {
         const ir::FunctionId id = module_.reserve_function();
 
         FnCtx ctx;
@@ -19753,6 +19767,7 @@ private:
                                            .local_types   = std::move(ctx.local_types),
                                            .is_task       = true,
                                            .is_fork_child = true,
+                                           .fork_kind     = kind,
                                            .ir            = b.finish() });
         return id;
     }
