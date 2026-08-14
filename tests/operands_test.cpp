@@ -80,10 +80,20 @@ constexpr Design kDesigns[] = {
     { "fork",
       R"(
         module m;
+          int g;
+          task automatic tk(input int d);
+            int v;
+            v = d;
+            fork
+              #1 g = v;
+              #2 v = v + 1;
+            join
+          endtask
           initial fork
             #1 $display("a");
             #2 $display("b");
           join
+          initial tk(3);
         endmodule
       )" },
     { "containers",
@@ -385,10 +395,13 @@ TEST_CASE("only concat's extra payload is itself an operand run") {
     using S = ir::ExtraOperandShape;
     CHECK(ir::extra_operand_shape(ir::Inst::Tag::Concat) == S::SliceIsOperands);
     CHECK(ir::extra_operand_shape(ir::Inst::Tag::StrengthRes) == S::StrengthResValues);
+    // fork: its record holds BOTH a FunctionId run (the children) and an operand
+    // run (the frame lvalues the children capture by reference), so the named
+    // slice, not the record, is the operand span.
+    CHECK(ir::extra_operand_shape(ir::Inst::Tag::Fork) == S::ForkArgs);
 
     for (const ir::Inst::Tag t : { ir::Inst::Tag::MonitorSet,
                                    ir::Inst::Tag::StrobePend,
-                                   ir::Inst::Tag::Fork,
                                    ir::Inst::Tag::Loop,
                                    ir::Inst::Tag::Finish,
                                    ir::Inst::Tag::CaseViol,

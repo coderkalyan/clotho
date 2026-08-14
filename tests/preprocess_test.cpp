@@ -157,3 +157,41 @@ endmodule
 )");
     CHECK(run_args({a.string(), b.string()}) == "s=42\n");
 }
+
+// -- mixed / defaulted time scales (LRM 3.14.2.2) -----------------------
+
+// A design element with no time scale, in a design where another element has
+// one, is rejected: nothing says what its delays mean. `--timescale` supplies
+// that missing default, which is what `clotho --loose-timescale` turns on when
+// the operator has not named one (src/main.cpp).
+TEST_CASE("a design mixing timescaled and untimescaled elements needs a default") {
+    ScratchDir dir;
+    // Order matters: `singleUnit` carries a `timescale directive into later
+    // files, so the un-annotated element has to come first to be un-annotated.
+    const auto b = dir.write("b.sv", R"(
+module b;
+  initial begin #5; $display("b %0d", $time); end
+endmodule
+module top; a ai(); b bi(); endmodule
+)");
+    const auto a = dir.write("a.sv", R"(`timescale 1us/1ns
+module a;
+  initial begin #5; $display("a %0d", $time); end
+endmodule
+)");
+
+    SUBCASE("rejected with no default") {
+        const std::string             bp    = b.string();
+        const std::string             ap    = a.string();
+        std::vector<std::string_view> views = { bp, ap, "--top", "top" };
+        const LowerResult             r     = lower_sources(views);
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find("does not have a time scale defined") != std::string::npos,
+                      r.diagnostic_text());
+    }
+
+    // Each scope reports $time in its own units: 5us in a, 5ns in b.
+    SUBCASE("accepted with a default, which scales the un-annotated element") {
+        CHECK(run_args({ b.string(), a.string(), "--top", "top", "--timescale=1ns/1ns" }) == "b 5\na 5\n");
+    }
+}

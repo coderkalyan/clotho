@@ -1251,6 +1251,14 @@ uint64_t rt_wheel_now(const rt_wheel* wheel);
 // wheel itself, so the JIT'd drain loop passes only the wheel pointer.
 [[noreturn]] void rt_oscillation_abort(const rt_wheel* wheel);
 
+// Scheduler ring overrun: more coroutine handles were live at one instant than
+// the statically sized ring holds, so the next push would overwrite a live one.
+// Prints a FATAL diagnostic naming the ring and ends the simulation (never
+// returns). `ring` is 0 for the Active ring and 1 for the Reactive one (LRM
+// 4.4.2); `capacity` is the ring's slot count. Only a miscomputed capacity can
+// reach this -- see the sizing argument in ensure_active_queue.
+[[noreturn]] void rt_ring_overflow(uint32_t ring, uint32_t capacity);
+
 // Non-zero iff the wheel has any timer scheduled. The design's sim loop ticks
 // the wheel until this reports empty.
 int rt_wheel_pending(const rt_wheel* wheel);
@@ -1398,11 +1406,13 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
 // the DPI return for an allocation-failure report.
 void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site* site);
 
-// Register the single DPI scope (LRM 35.5.3) for the svScope API — the design's
-// hierarchical name. Called once from main when the design uses DPI; also resets
-// the scope's user-data (so a fresh simulation in the same process starts clean).
+// Register one DPI scope (LRM 35.5.3) for the svScope API — a top-level instance's
+// hierarchical name, at its position `index` in the design's top order. Called from
+// main, once per top, when the design uses DPI. `index == 0` clears the table first
+// (so a fresh simulation in the same process starts with no stale user data) and the
+// scope registered there becomes the default svGetScope returns.
 // Implemented in Svdpi.cpp alongside svGetScope / svSetScope / svGetUserData.
-void rt_svdpi_scope_init(const char* name, uint32_t name_len);
+void rt_svdpi_scope_register(const char* name, uint32_t name_len, uint32_t index);
 
 // -- DPI open arrays (LRM 35.5.6.2) --
 //

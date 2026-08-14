@@ -487,6 +487,13 @@ struct SignalSlot {
     // deferred records carry a per-write mask (whole-element sites store all-ones).
     // A memory written only whole-element (mem[i] <= x) needs no mask.
     bool     arr_masked    = false;
+    // Nonblocking intra-assignment target (`x <= #d y` / `x <= @e y`) with any
+    // site that writes less than the whole destination: its deferred records
+    // carry a per-write mask and the commit does a read-modify-write. Set by
+    // classify_intra_target, which applies the masking rule of the shape's
+    // plain-NBA sibling (nba_partial for a scalar, arr_masked / agg_masked for an
+    // array element or aggregate leaf).
+    bool     intra_masked  = false;
     uint32_t nba_id        = 0;
     uint32_t sh_mm_field   = 0;
     uint32_t sh_z_field    = 0;
@@ -2092,6 +2099,36 @@ private:
         }
     }
 
+    // Register a nonblocking intra-assignment (or inertial continuous-assign)
+    // target and record how its deferred record must be shaped. The record reuses
+    // plain NBA's lvalue encoding, so each target shape mirrors the masking rule
+    // of its plain-NBA sibling: a scalar select is masked whenever it is not the
+    // whole signal (like nba_partial), while an array element or aggregate leaf is
+    // masked only for a select *below* the element/leaf (like arr_masked /
+    // agg_masked) because a whole-element write replaces the element outright.
+    //
+    // An array target must NOT be marked `nba`: array signals are deliberately
+    // never NBA-metadata targets (they carry no nba_id, so nba_meta indexing and
+    // emit_nba_service would read out of bounds) and instead wake through
+    // service_any_waiters -- see docs/design/static-arr-nba.md. Every other shape
+    // keeps the flag, exactly as a plain NBA to the same target would set it.
+    void classify_intra_target(const Ir& ir, Index lv_idx, const NbaTarget& t) {
+        SignalSlot& s  = slots_[static_cast<uint32_t>(t.sig)];
+        const Ref   ty = mod_.signals()[static_cast<uint32_t>(t.sig)].type;
+        if (contains_struct(ty)) {
+            s.nba          = true;
+            s.intra_masked = s.intra_masked || lvalue_has_subselect(ir, lv_idx);
+        } else if (std::get<Type>(mod_.pool.get(ty)).kind == Type::Kind::UnpackedArray) {
+            s.intra_masked = s.intra_masked || lvalue_has_subselect(ir, lv_idx);
+        } else {
+            s.nba          = true;
+            s.intra_masked = s.intra_masked || !t.whole;
+        }
+        if (std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), t.sig) == intra_nba_sigs_.end()) {
+            intra_nba_sigs_.push_back(t.sig);
+        }
+    }
+
     // Mark NBA-target signals reached by one IR body (a process or a task): set
     // `nba`, `nba_partial` (any bit/part-select site), `nba_dyn` (any runtime-indexed
     // select), and collect unpacked-array targets for the runtime deferred queue.
@@ -2100,19 +2137,14 @@ private:
         for (size_t k = 0; k < ir.inst_count(); ++k) {
             const auto idx = static_cast<Index>(k);
             // A nonblocking intra-assignment delay (`x <= #d y`) or an inertial
-            // continuous-assignment delay (`assign #d x = y`, LRM 10.3.3) targets a
-            // whole integral scalar (frontend-restricted). Its target is a real NBA
-            // target for wake purposes (gets nba_id + meta), but the value is held
-            // in a deferred record on the wheel, not the shadow, so it is tracked
-            // separately for the intra-commit loop.
+            // continuous-assignment delay (`assign #d x = y`, LRM 10.3.3). The
+            // value is held in a deferred record on the wheel, not the shadow, so
+            // the target is tracked separately for the intra-commit loop;
+            // classify_intra_target also decides the record's shape.
             if (ir.tag(idx) == Inst::Tag::StoreNbDelay ||
                 ir.tag(idx) == Inst::Tag::StoreInertialDelay) {
                 const NbaTarget t = nba_target(ir, ir.payload(idx).op_extra.op);
-                slots_[static_cast<uint32_t>(t.sig)].nba = true;
-                if (std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), t.sig) ==
-                    intra_nba_sigs_.end()) {
-                    intra_nba_sigs_.push_back(t.sig);
-                }
+                classify_intra_target(ir, ir.payload(idx).op_extra.op, t);
                 if (ir.tag(idx) == Inst::Tag::StoreInertialDelay &&
                     std::find(inertial_sigs_.begin(), inertial_sigs_.end(), t.sig) ==
                       inertial_sigs_.end()) {
@@ -2126,11 +2158,7 @@ private:
             if (ir.tag(idx) == Inst::Tag::StoreNbEvent) {
                 const auto      info = ir.extra_data<StoreNbEventInfo>(ir.payload(idx).op_extra.extra);
                 const NbaTarget t    = nba_target(ir, ir.payload(idx).op_extra.op);
-                slots_[static_cast<uint32_t>(t.sig)].nba = true;
-                if (std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), t.sig) ==
-                    intra_nba_sigs_.end()) {
-                    intra_nba_sigs_.push_back(t.sig);
-                }
+                classify_intra_target(ir, ir.payload(idx).op_extra.op, t);
                 int32_t& tid = trigger_id_[static_cast<uint32_t>(info.trig)][info.edge];
                 if (tid < 0) {
                     tid = static_cast<int32_t>(n_triggers_++);
@@ -3261,6 +3289,19 @@ private:
             } else if (ir.tag(idx) == Inst::Tag::CallVirtual) {
                 const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
                 mark_packed_args(vci.func, vci.args);
+            } else if (ir.tag(idx) == Inst::Tag::Fork) {
+                // Every fork capture is an ArgDir::Ref formal of every child
+                // (Lower.cpp's lower_fork), and a child GEPs the passed pointer as a
+                // packed slot, so the captured local must keep one. Any child's
+                // arg_dirs would do -- they are identical -- so mark unconditionally
+                // rather than looking one up.
+                const auto fi = ir.extra_data<ForkInfo>(ir.payload(idx).extra);
+                for (const Index a : ir.region(fi.args)) {
+                    const Index root = lvalue_root(ir, a).root;
+                    if (ir.tag(root) == Inst::Tag::Local) {
+                        out[ir.payload(root).local.index] = true;
+                    }
+                }
             }
         }
         return out;
@@ -3520,6 +3561,10 @@ private:
         wheel_->setName("wheel");
         awaiter_ = nullptr;
         record_  = nullptr;
+        // Reset per llvm::Function, like record_: a task may contain a fork now, and
+        // the slot is an alloca hoisted into THIS coroutine's frame. Keeping a
+        // previous body's alloca would name storage in another function.
+        fork_record_ = nullptr;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -4581,12 +4626,28 @@ private:
             }
         }
 
-        // Register the single DPI scope (svGetScope / user-data, LRM 35.5.3) before
+        // Register one DPI scope per top (svGetScope / user-data, LRM 35.5.3) before
         // any process runs, so a context import can read it. Only when DPI is used.
+        // Index 0 clears the runtime table, so the first top stays the default scope
+        // and a second simulation in one process starts clean. A design with no top
+        // instances (package-only) still registers one scope so svGetScope is never
+        // null.
         if (design_uses_dpi()) {
-            b_.CreateCall(rt_fn("rt_svdpi_scope_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() }),
-                          { b_.CreateGlobalString(mod_.top_name),
-                            b_.getInt32(static_cast<uint32_t>(mod_.top_name.size())) });
+            const llvm::FunctionCallee reg = rt_fn("rt_svdpi_scope_register", b_.getVoidTy(),
+                                                   { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+            const auto emit_reg = [&](const std::string& name, uint32_t index) {
+                b_.CreateCall(reg, { b_.CreateGlobalString(name),
+                                     b_.getInt32(static_cast<uint32_t>(name.size())),
+                                     b_.getInt32(index) });
+            };
+            if (mod_.tops().empty()) {
+                emit_reg(mod_.top_name, 0);
+            } else {
+                uint32_t index = 0;
+                for (const InstanceScope& top : mod_.tops()) {
+                    emit_reg(top.name, index++);
+                }
+            }
         }
 
         // Timing wheel: the event scheduler. Processes schedule timers on it at
@@ -6911,7 +6972,8 @@ private:
     // Created once, lazily, so the timer callback (built while
     // lowering a process) and emit_active_run share it.
     // Number of fork-child bodies in the design = Σ fork widths (each fork child
-    // is one Function). Bounds the extra active-ring slots `fork … join` needs.
+    // is one Function). Says whether the design forks at all; the ring bound needs
+    // the per-body activation counts below, not this raw total.
     size_t fork_child_count() const {
         size_t n = 0;
         for (size_t k = 0; k < mod_.function_count(); ++k) {
@@ -6920,6 +6982,128 @@ private:
             }
         }
         return n;
+    }
+
+    // Whether the design forks at all. Memoized: every ring push asks, and the
+    // answer cannot change once the module is built.
+    bool design_forks() {
+        if (!design_forks_.has_value()) {
+            design_forks_ = fork_child_count() != 0;
+        }
+        return *design_forks_;
+    }
+
+    // Ceiling on the fork-child slots the ring reserves. Two shapes have no static
+    // bound at all (below), and a slot is one pointer, so saturating here spends
+    // 8 KiB per ring in exchange for never sizing the ring by guesswork.
+    static constexpr size_t kMaxForkRingSlots = 1024;
+
+    // Peak number of concurrently live fork-child activations: the ring slots
+    // `fork … join` needs beyond the one-per-process baseline.
+    //
+    // A ring entry is the head of one blocked call chain. A process that called a
+    // task, or a fork child that called one, has at most ONE resumable coroutine
+    // at a time (the caller suspends until the callee completes), so the peak
+    // number of live entries is the number of live CHAINS -- and a chain is rooted
+    // either at a process (one activation each; a process is ramped once) or at a
+    // fork-child activation.
+    //
+    // A fork-child body belongs to exactly one fork site in exactly one enclosing
+    // body, and `join` blocks that body until every child of the site is done, so
+    // a site contributes one live child activation per child per live activation
+    // of the body containing it -- never accumulating across loop iterations.
+    // Hence
+    //
+    //     slots = Σ over fork-child bodies c of mult(c)
+    //     mult(process) = 1
+    //     mult(f)       = Σ over call / spawn edges (b -> f) of mult(b)
+    //
+    // where a spawn edge is a Fork naming child f and a call edge is any
+    // Call / TaskCall of f. The sum over edges (not over distinct sources) is what
+    // makes this survive a shared task body: `fork t(); t(); join` gives t two
+    // edges from the same process and so mult(t) = 2, and a width-2 fork inside t
+    // then needs 4 slots, not 2. The previous bound (one slot per child body)
+    // assumed `join` serialized each fork's reuse, which holds for a
+    // single-activation process and is false for a task body shared by several
+    // live callers.
+    //
+    // Relaxed to a fixpoint over the static graph; a DAG converges in at most as
+    // many rounds as it has functions. Two shapes make no finite bound possible,
+    // and both saturate to kMaxForkRingSlots and lean on the emit_active_push
+    // overflow fatal rather than pretending to a number:
+    //   - recursion (a cycle in the graph): unbounded by construction;
+    //   - a virtual task call, followed only to its statically named target (the
+    //     bound collect_callees already documents), so a forking override reached
+    //     through a handle would otherwise go uncounted.
+    size_t fork_ring_slots() const {
+        const size_t nfn = mod_.function_count();
+        if (fork_child_count() == 0) {
+            return 0;
+        }
+        // Edges into each function, as (source, callee) pairs. kProcessSource is
+        // the source for a process body, whose multiplicity is fixed at one.
+        static constexpr uint32_t kProcessSource = ~0u;
+        struct Edge {
+            uint32_t from;
+            uint32_t to;
+        };
+        std::vector<Edge> edges;
+        bool              imprecise = false;
+        const auto        walk      = [&](const Ir& ir, uint32_t from) {
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                const auto           i = static_cast<Index>(k);
+                const Inst::Payload& p = ir.payload(i);
+                switch (ir.tag(i)) {
+                    case Inst::Tag::TaskCall:
+                        edges.push_back({ from, static_cast<uint32_t>(ir.extra_data<TaskCallInfo>(p.extra).func) });
+                        break;
+                    case Inst::Tag::Call:
+                        edges.push_back({ from, static_cast<uint32_t>(ir.extra_data<CallInfo>(p.extra).func) });
+                        break;
+                    case Inst::Tag::TaskCallVirtual:
+                    case Inst::Tag::CallVirtual:
+                        edges.push_back({ from, static_cast<uint32_t>(ir.extra_data<VirtualCallInfo>(p.extra).func) });
+                        imprecise = true;
+                        break;
+                    case Inst::Tag::Fork:
+                        for (const Index kid : ir.region(ir.extra_data<ForkInfo>(p.extra).children)) {
+                            edges.push_back({ from, static_cast<uint32_t>(kid) });
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            walk(p.ir, kProcessSource);
+        }
+        for (size_t f = 0; f < nfn; ++f) {
+            walk(mod_.function(static_cast<FunctionId>(f)).ir, static_cast<uint32_t>(f));
+        }
+
+        std::vector<size_t> mult(nfn, 0);
+        bool                converged = false;
+        for (size_t round = 0; !converged && round <= nfn; ++round) {
+            std::vector<size_t> next(nfn, 0);
+            for (const Edge& e : edges) {
+                const size_t src = e.from == kProcessSource ? 1 : mult[e.from];
+                next[e.to]       = std::min(next[e.to] + src, kMaxForkRingSlots);
+            }
+            converged = next == mult;
+            mult      = std::move(next);
+        }
+        if (!converged || imprecise) {
+            return kMaxForkRingSlots;
+        }
+
+        size_t slots = 0;
+        for (size_t f = 0; f < nfn; ++f) {
+            if (mod_.function(static_cast<FunctionId>(f)).is_fork_child) {
+                slots = std::min(slots + mult[f], kMaxForkRingSlots);
+            }
+        }
+        return slots;
     }
 
     void ensure_active_queue() {
@@ -6936,15 +7120,17 @@ private:
         // with a mask (total pushes per drain are unbounded — a process may be
         // re-woken after it runs — only the live count is bounded).
         //
-        // `fork … join` (LRM 9.3.2) adds live children: a `join` parent blocks
-        // (leaving the ring — its handle sits in the join record), so children
-        // never accumulate across loop iterations or recursion depth. Peak ready
-        // children <= the number of distinct fork-child bodies (Σ fork widths),
-        // since `join` serializes each fork's reuse. Reserve one slot per child
-        // (docs/design/fork-join.md). join_any / join_none are unbounded and
-        // rejected by the frontend until V2's growable ring.
+        // `fork … join` (LRM 9.3.2) adds live children, one ring slot each. How many
+        // can be live at one instant is not the number of child BODIES -- a task
+        // body containing a fork is shared by every call site and can have several
+        // live activations at once -- so fork_ring_slots() counts activations over
+        // the spawn / call graph (its derivation is there, and in
+        // docs/design/fork-join.md). Whatever it returns, emit_active_push checks
+        // the bound at run time and reports rather than overwriting a live handle.
+        // join_any / join_none are unbounded and rejected by the frontend until
+        // V2's growable ring.
         const auto cap =
-          std::bit_ceil(std::max<size_t>(mod_.processes().size() + fork_child_count(), 1));
+          std::bit_ceil(std::max<size_t>(mod_.processes().size() + fork_ring_slots(), 1));
         active_mask_   = static_cast<uint32_t>(cap - 1);
 
         queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
@@ -6979,11 +7165,53 @@ private:
                                                     llvm::ConstantInt::get(i32, 0), "clotho.inactive_top");
     }
 
+    // Ring selectors for rt_ring_overflow's diagnostic. Kept in step with the
+    // names the runtime prints (src/runtime/Runtime.cpp).
+    static constexpr uint32_t kRingActive   = 0;
+    static constexpr uint32_t kRingReactive = 1;
+
+    // The ring-overflow guard the capacity argument above leans on: a ring holding
+    // `cap` live handles cannot take another without overwriting one, and the
+    // overwritten entry is a live coroutine -- corruption with no diagnostic, the
+    // one failure mode the project forbids. Report it and end the simulation instead
+    // (docs/design/fork-join.md, "Defense in depth"). `ring` is the runtime's ring
+    // selector (0 active, 1 reactive), a value rather than a constant because
+    // emit_wake_push picks its ring at run time.
+    //
+    // Monotone counters make `tail - head` the exact live count, so the compare is
+    // unsigned >= cap: an off-by-one elsewhere trips it too, which is the point of
+    // a guard that only ever fires on a bug.
+    //
+    // Emitted only for a design that forks, because only the fork term of the
+    // capacity is an over-approximation. Without a fork the bound is the
+    // one-live-slot-per-process invariant the scheduler has always held (a process
+    // is a single call chain with at most one resumable coroutine, and the
+    // scheduled flag dedupes wakes), so the check could never fire -- and it is not
+    // free: a compare, a branch and a cold block on every push cost ~40% sim time
+    // on a wake-heavy design (combchain) and ~25% of LLVM codegen time.
+    void emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, llvm::Value* tail,
+                              llvm::Value* ring) {
+        if (!design_forks()) {
+            return;
+        }
+        llvm::Function* fn   = b.GetInsertBlock()->getParent();
+        const uint32_t  cap  = active_mask_ + 1;
+        llvm::Value*    live = b.CreateSub(tail, b.CreateLoad(b.getInt32Ty(), head_ptr));
+        auto*           bad  = llvm::BasicBlock::Create(ctx_, "ring.overflow", fn);
+        auto*           ok   = llvm::BasicBlock::Create(ctx_, "ring.push", fn);
+        b.CreateCondBr(b.CreateICmpUGE(live, b.getInt32(cap)), bad, ok);
+        b.SetInsertPoint(bad);
+        b.CreateCall(ring_overflow_fn(), { ring, b.getInt32(cap) });
+        b.CreateUnreachable();
+        b.SetInsertPoint(ok);
+    }
+
     // Push a handle onto the active ring: queue[tail++ & mask] = handle.
     void emit_active_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
         ensure_active_queue();
         auto*        i32  = b.getInt32Ty();
         llvm::Value* tl   = b.CreateLoad(i32, sym(active_tail_gv_));
+        emit_ring_full_check(b, sym(active_head_gv_), tl, b.getInt32(kRingActive));
         llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
         llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(active_gv_), { b.getInt32(0), idx });
         b.CreateStore(handle, slot);
@@ -7060,6 +7288,7 @@ private:
         ensure_reactive_queue();
         auto*        i32  = b.getInt32Ty();
         llvm::Value* tl   = b.CreateLoad(i32, sym(reactive_tail_gv_));
+        emit_ring_full_check(b, sym(reactive_head_gv_), tl, b.getInt32(kRingReactive));
         llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
         llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_gv_), { b.getInt32(0), idx });
         b.CreateStore(handle, slot);
@@ -7213,7 +7442,12 @@ private:
                                              llvm::PointerType::getUnqual(ctx_));
         llvm::Value* arr  = b.CreateSelect(home, sym(reactive_gv_), sym(active_gv_));
         llvm::Value* tp   = b.CreateSelect(home, sym(reactive_tail_gv_), sym(active_tail_gv_));
+        llvm::Value* hp   = b.CreateSelect(home, sym(reactive_head_gv_), sym(active_head_gv_));
         llvm::Value* tl   = b.CreateLoad(i32, tp);
+        // The ring is chosen at run time here, so the guard's selector is too: the
+        // fatal names the ring the handle was actually headed for.
+        emit_ring_full_check(b, hp, tl,
+                             b.CreateSelect(home, b.getInt32(kRingReactive), b.getInt32(kRingActive)));
         llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
         llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, arr, { b.getInt32(0), idx });
         b.CreateStore(hdl, slot);
@@ -8252,14 +8486,22 @@ private:
         return rt_fn("rt_intra_event_fire", b_.getVoidTy(), { b_.getInt32Ty() });
     }
 
-    // Per intra-NBA signal: dense id and the record StructType { ptr timer.next,
-    // ptr timer.on_expire, i32 idx, i32 seq, i32 count, i64 epoch, iMM mm_val,
-    // [iW z_val] }. The rt_timer (fields 0-1) sits at offset 0 so the record base
-    // is the timer pointer handed to the wheel; the runtime reads `idx` (field 2)
-    // to route the fire and owns `seq` (field 3); `count` (field 4) is the `@e`
-    // event countdown (unused by `#d`); `epoch` (field 5) is the inertial
-    // continuous-assign deschedule stamp (unused by transport records). Value
-    // fields: mm=6, z=7. Layout mirrors rt_intra_rec (Runtime.h).
+    // Per intra-NBA signal: dense id and the record StructType. The rt_timer
+    // (fields 0-1) sits at offset 0 so the record base is the timer pointer handed
+    // to the wheel; the runtime reads `idx` (field 2) to route the fire and owns
+    // `seq` (field 3); `count` (field 4) is the `@e` event countdown (unused by
+    // `#d`); `epoch` (field 5) is the inertial continuous-assign deschedule stamp
+    // (unused by transport records). Header layout mirrors rt_intra_rec
+    // (Runtime.h); the runtime never interprets the tail.
+    //
+    // The tail carries whatever the target shape needs, mirroring the plain-NBA
+    // record for the same shape so the two read alike:
+    //   scalar signal { iMM mm_val, [iW z_val], [iW mask] }
+    //   array element { iMM mm_val, [iW z_val], [iW mask], ptr mm_ptr, [ptr z_ptr] }
+    //   aggregate leaf { ptr dst, i32 nbytes, [maxb x i8] payload, [maxb x i8] mask }
+    // A scalar destination is re-derived at commit from storage_ptr (a link-time
+    // constant); an array element or aggregate leaf must carry the pointer that
+    // the select resolved to when the statement executed (LRM 9.4.5).
     uint32_t intra_idx(Signal sig) const {
         const auto it = std::find(intra_nba_sigs_.begin(), intra_nba_sigs_.end(), sig);
         return static_cast<uint32_t>(it - intra_nba_sigs_.begin());
@@ -8268,13 +8510,44 @@ private:
         auto*                    ptr = raw_ptr_ty();
         auto*                    i32 = b_.getInt32Ty();
         auto*                    i64 = b_.getInt64Ty();
-        std::vector<llvm::Type*> f   = { ptr, ptr, i32, i32, i32, i64,
-                                         int_ty(s.narrow ? s.width : 2 * s.width) };
+        std::vector<llvm::Type*> f   = { ptr, ptr, i32, i32, i32, i64 };
+        if (s.is_agg) {
+            // An aggregate has no flat value (s.width / s.slot_ty are unused), and
+            // one signal's leaves differ in width, so the payload is a byte image
+            // of the widest leaf replayed by memcpy -- exactly agg_rec_ty's
+            // width-agnostic encoding.
+            auto* bytes = llvm::ArrayType::get(b_.getInt8Ty(), agg_max_leaf_bytes(s.ir_type));
+            f.push_back(ptr);
+            f.push_back(i32);
+            f.push_back(bytes);
+            if (s.intra_masked) {
+                f.push_back(bytes);
+            }
+            return llvm::StructType::get(ctx_, f);
+        }
+        f.push_back(int_ty(s.narrow ? s.width : 2 * s.width));
         if (s.has_z) {
             f.push_back(int_ty(s.width));
         }
+        if (s.intra_masked) {
+            f.push_back(int_ty(s.width));
+        }
+        if (s.is_array) {
+            f.push_back(ptr);
+            if (s.has_z) {
+                f.push_back(ptr);
+            }
+        }
         return llvm::StructType::get(ctx_, f);
     }
+    // Tail field indices of the scalar / array variant (mm_val=6, z_val=7 are
+    // fixed). Each is meaningful only when the corresponding field exists, like
+    // the arr_rec_* accessors.
+    uint32_t intra_rec_mask(const SignalSlot& s) const { return s.has_z ? 8 : 7; }
+    uint32_t intra_rec_mm_ptr(const SignalSlot& s) const {
+        return intra_rec_mask(s) + (s.intra_masked ? 1 : 0);
+    }
+    uint32_t intra_rec_z_ptr(const SignalSlot& s) const { return intra_rec_mm_ptr(s) + 1; }
 
     // Per array-NBA signal: dense id (buffer index) and the record StructType
     // { ptr mm_ptr, iMM mm_val, [ptr z_ptr, iW z_val], [iW mask] }.
@@ -8601,6 +8874,9 @@ private:
     }
     llvm::FunctionCallee oscillation_abort_fn() {
         return rt_fn("rt_oscillation_abort", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee ring_overflow_fn() {
+        return rt_fn("rt_ring_overflow", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
     }
 
     llvm::FunctionCallee wheel_now_fn() {
@@ -10384,6 +10660,7 @@ private:
             case Inst::Tag::StoreNbDelay: {
                 const auto    info  = ir_->extra_data<StoreNbDelayInfo>(p.op_extra.extra);
                 const LValue& lv    = lvalue_of(p.op_extra.op);
+                emit_bounds_reports(lv, /*is_write=*/true);
                 const Plane   rhs   = value_of(info.value);
                 llvm::Value*  ticks = cast(must_of(value_of(info.delay)), 64, false);
                 emit_intra_nba_arm(lv, rhs, ticks);
@@ -10411,6 +10688,7 @@ private:
             case Inst::Tag::StoreNbEvent: {
                 const auto    info  = ir_->extra_data<StoreNbEventInfo>(p.op_extra.extra);
                 const LValue& lv    = lvalue_of(p.op_extra.op);
+                emit_bounds_reports(lv, /*is_write=*/true);
                 const Plane   rhs   = value_of(info.value);
                 llvm::Value*  count = must_of(value_of(info.count));
                 emit_intra_event_arm(lv, rhs, count,
@@ -13098,23 +13376,150 @@ private:
         return rhs.mm;
     }
 
-    void emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks) {
-        const SignalSlot& s      = slot_of(lv.sig);
+    // Fill a deferred record's payload from the sampled RHS: the value positioned
+    // at the target's bit offset inside its destination word, the write mask when
+    // the target writes less than that word, and -- for an array element or
+    // aggregate leaf -- the destination pointer this select resolves to right now.
+    // LRM 9.4.5 evaluates the LHS index and the RHS when the statement executes and
+    // defers only the update, so both are baked in here rather than recomputed at
+    // commit. Mirrors emit_array_nba / emit_agg_nba, whose plain-NBA records carry
+    // the same fields; positioning each plane separately is why this cannot reuse
+    // intra_pack_mm's already-packed word. Shared by the delay (`<= #d`) and event
+    // (`<= @e`) arms so the two cannot drift.
+    void fill_intra_payload(const LValue& lv, Plane rhs, llvm::StructType* rt, llvm::Value* rec) {
+        const SignalSlot& s = slot_of(lv.sig);
+        if (rhs.fp != nullptr) {
+            // A real rides as its IEEE-754 bit pattern in the narrow slot.
+            rhs = real_to_planes(fp_of(rhs));
+        }
+        if (lv.wide_dyn) {
+            // TODO: a runtime-offset select into storage wider than
+            // wide_dyn_select_bits addresses 64-bit words through rt_wide_ins
+            // (wide_dyn_store_planes is where plain NBA routes one) rather than
+            // building a storage-width mask, which is the only encoding the
+            // deferred record has room for.
+            throw BackendError{ "nonblocking intra-assignment timing on a runtime-offset "
+                                "select of a very wide vector is not supported" };
+        }
+        if (s.is_agg) {
+            fill_intra_agg_payload(lv, rhs, rt, rec);
+            return;
+        }
         const llvm::Align a1{ 1 }; // record lives in an unaligned pooled block
+        const uint32_t    W = lv.store_width;
+        // A whole target's bit_off is a constant zero and its mask folds to
+        // all-ones (and is elided when no site of this signal is partial), so the
+        // hot whole-scalar path keeps emitting a bare plane store. A bounds-checked
+        // dynamic select positions poison-free and restricts to the in-range bits
+        // (LRM 11.5.1).
+        llvm::Value* mm_val;
+        if (s.narrow) {
+            mm_val = place_val(lv, must_of(rhs), W);
+        } else {
+            rhs               = to_four(rhs);
+            llvm::Value* must = place_val(lv, must_of(rhs), W);
+            llvm::Value* may  = place_val(lv, may_of(rhs), W);
+            llvm::Value* zval = place_val(lv, rhs.z, W);
+            mm_val            = packed(must, may, zval).mm; // i2W: must | (may << W)
+        }
+        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
+        if (s.has_z) {
+            // has_z implies a packed (non-narrow) target, so rhs is 4-state here.
+            b_.CreateAlignedStore(place_val(lv, rhs.z, W), b_.CreateStructGEP(rt, rec, 7), a1);
+        }
+        if (s.intra_masked) {
+            b_.CreateAlignedStore(store_mask(lv, W), b_.CreateStructGEP(rt, rec, intra_rec_mask(s)), a1);
+        }
+        if (s.is_array) {
+            b_.CreateAlignedStore(lv_mm_ptr(lv), b_.CreateStructGEP(rt, rec, intra_rec_mm_ptr(s)), a1);
+            if (s.has_z) {
+                b_.CreateAlignedStore(lv_z_ptr(lv), b_.CreateStructGEP(rt, rec, intra_rec_z_ptr(s)), a1);
+            }
+        }
+    }
+
+    // Fill an aggregate-leaf record: the destination slot pointer, its byte count,
+    // and the leaf's byte image (the value, plus a mask when the write is partial)
+    // in slot layout. One aggregate's leaves differ in width, so the payload is the
+    // width-agnostic byte encoding of agg_rec_ty, replayed by memcpy at commit.
+    void fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructType* rt, llvm::Value* rec) {
+        const SignalSlot& s  = slot_of(lv.sig);
+        const uint32_t    W  = lv.store_width;
+        const llvm::Align a1{ 1 };
+        auto*             i8 = b_.getInt8Ty();
+        b_.CreateAlignedStore(agg_slot_ptr(lv), b_.CreateStructGEP(rt, rec, 6), a1);
+        const auto nbytes = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(lv.slot_ty));
+        b_.CreateAlignedStore(b_.getInt32(nbytes), b_.CreateStructGEP(rt, rec, 7), a1);
+
+        // Byte offset of the leaf slot's z field (4-state leaves only).
+        const uint32_t zoff =
+          (!lv.narrow && lv.has_z)
+            ? static_cast<uint32_t>(
+                env_->llmod.getDataLayout().getStructLayout(lv.slot_ty)->getElementOffset(1))
+            : 0;
+        auto put = [&](llvm::Value* region, llvm::Value* v, uint32_t off) {
+            llvm::Value* p = off == 0 ? region : b_.CreateInBoundsGEP(i8, region, { b_.getInt32(off) });
+            b_.CreateAlignedStore(v, p, a1);
+        };
+        llvm::Value* payload = b_.CreateStructGEP(rt, rec, 8);
+        if (lv.narrow) {
+            put(payload, place_val(lv, must_of(rhs), W), 0);
+        } else {
+            const Plane  f  = to_four(rhs);
+            llvm::Value* mm = packed(place_val(lv, must_of(f), W), place_val(lv, may_of(f), W),
+                                     place_val(lv, f.z, W))
+                                .mm;
+            put(payload, mm, 0);
+            if (lv.has_z) {
+                put(payload, place_val(lv, f.z, W), zoff);
+            }
+        }
+        // Padding bytes of the mask stay garbage but only ever gate the
+        // destination slot's own padding, which is never read.
+        if (s.intra_masked) {
+            llvm::Value* mask   = store_mask(lv, W);
+            llvm::Value* mask_p = b_.CreateStructGEP(rt, rec, 9);
+            if (lv.narrow) {
+                put(mask_p, mask, 0);
+            } else {
+                put(mask_p, packed(mask, mask, zero(W)).mm, 0);
+                if (lv.has_z) {
+                    put(mask_p, mask, zoff);
+                }
+            }
+        }
+    }
+
+    void emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks) {
+        if (lv.dyn_inrange != nullptr) {
+            // A variable index outside the declared bound (LRM 7.4.5 / 11.5.1): the
+            // write is a no-op, so arm nothing at all. Otherwise the record would
+            // carry an out-of-bounds destination pointer that the NBA region
+            // dereferences unconditionally when it replays -- and for a scalar
+            // select, an unrestricted mask. Mirrors emit_array_nba.
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* dobb = llvm::BasicBlock::Create(ctx_, "intranba.do", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "intranba.cont", fn);
+            b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
+
+            b_.SetInsertPoint(dobb);
+            LValue clean      = lv;
+            clean.dyn_inrange = nullptr;
+            clean.bounds_checks.clear();
+            emit_intra_nba_arm(clean, rhs, ticks);
+            b_.CreateBr(cont);
+
+            b_.SetInsertPoint(cont);
+            return;
+        }
+        const SignalSlot& s      = slot_of(lv.sig);
         llvm::StructType* rt     = intra_rec_ty(s);
         const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         llvm::Value*      idxv   = intra_id_value(lv.sig);
 
         llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { idxv, b_.getInt32(stride) });
         b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2)); // idx routes the fire
-
-        // Value planes: a whole-scalar target is signal-width (frontend Resize), so
-        // no positioning is needed — store the planes directly.
-        llvm::Value* mm_val = intra_pack_mm(s, rhs);
-        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
-        if (s.has_z) {
-            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 7), a1);
-        }
+        fill_intra_payload(lv, rhs, rt, rec);
 
         // Arm the wheel for `now + ticks`. A zero delay cannot arm the wheel
         // (deadline must be > now) and its update lands in the current instant's
@@ -13171,8 +13576,8 @@ private:
         auto*             mmty   = int_ty(s.narrow ? W : 2 * W);
         auto*             zty    = int_ty(W);
 
-        // Freshly-evaluated RHS planes, in the record's stored form (a whole-scalar
-        // target is signal-width via the frontend Resize, so no positioning).
+        // Freshly-evaluated RHS planes for the decide compare below, unpositioned:
+        // the record's own copy is filled (and positioned) by fill_intra_payload.
         llvm::Value* mm_val;
         if (s.narrow) {
             mm_val = must_of(rhs);
@@ -13204,10 +13609,12 @@ private:
         llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { idxv, b_.getInt32(stride) });
         b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2)); // idx routes the fire
         b_.CreateAlignedStore(ep, b_.CreateStructGEP(rt, rec, 5), a1); // deschedule stamp
-        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
-        if (s.has_z) {
-            b_.CreateAlignedStore(z_val, b_.CreateStructGEP(rt, rec, 7), a1);
-        }
+        // One record contract: the shared filler positions the planes and writes the
+        // mask this signal's record type carries. A continuous-assign target is a
+        // whole net, where positioning folds away and the mask is all-ones -- but a
+        // delayed gate driving one bit of a vector (emit_gate_as_process, LRM 28.16)
+        // reaches here with a bit-select lvalue and does need both.
+        fill_intra_payload(lv, rhs, rt, rec);
 
         // Arm the wheel for `now + ticks` with rt_inertial_cb. A zero delay cannot
         // arm the wheel, so its store lands in the current instant's NBA region via
@@ -13248,8 +13655,24 @@ private:
     // the record down and, at zero, moves it to the target ready list for the NBA
     // region (emit_intra_commit). Same value/plane layout as emit_intra_nba_arm.
     void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count, llvm::Value* trig_id) {
+        if (lv.dyn_inrange != nullptr) {
+            // Out-of-range variable index: register nothing (see emit_intra_nba_arm).
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* dobb = llvm::BasicBlock::Create(ctx_, "intraev.do", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "intraev.cont", fn);
+            b_.CreateCondBr(lv.dyn_inrange, dobb, cont);
+
+            b_.SetInsertPoint(dobb);
+            LValue clean      = lv;
+            clean.dyn_inrange = nullptr;
+            clean.bounds_checks.clear();
+            emit_intra_event_arm(clean, rhs, count, trig_id);
+            b_.CreateBr(cont);
+
+            b_.SetInsertPoint(cont);
+            return;
+        }
         const SignalSlot& s      = slot_of(lv.sig);
-        const llvm::Align a1{ 1 };
         llvm::StructType* rt     = intra_rec_ty(s);
         const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         llvm::Value*      idxv   = intra_id_value(lv.sig);
@@ -13257,22 +13680,26 @@ private:
         llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { idxv, b_.getInt32(stride) });
         b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2));
         b_.CreateStore(cast(count, 32, false), b_.CreateStructGEP(rt, rec, 4)); // event countdown
-
-        llvm::Value* mm_val = intra_pack_mm(s, rhs);
-        b_.CreateAlignedStore(mm_val, b_.CreateStructGEP(rt, rec, 6), a1);
-        if (s.has_z) {
-            b_.CreateAlignedStore(rhs.z, b_.CreateStructGEP(rt, rec, 7), a1);
-        }
+        fill_intra_payload(lv, rhs, rt, rec);
         b_.CreateCall(intra_event_register_fn(), { trig_id, rec });
     }
 
-    // Commit intra-NBA signal `sig`'s fired records in the NBA region: store each
-    // record's sampled planes to the live signal (later fire wins, per the arbitrary
-    // order LRM allows among same-instant updates), then wake edge readers once on
-    // the net old->new change, and return the records to the pool. Mirrors the
-    // whole-signal block-commit body, looped over the ready list.
+    // Commit intra-NBA signal `sig`'s fired records in the NBA region: apply each
+    // record's sampled planes to its destination (ready-list order, so the
+    // last-armed write to a given bit wins, LRM 10.4.2), then wake readers once and
+    // return the records to the pool.
+    //
+    // The destination depends on the target shape. A whole scalar or a select of one
+    // lives at a link-time-constant address, so storage_ptr is hoisted out of the
+    // loop and the wake compares the net old->new value with edge semantics. An
+    // array element's address was resolved when the statement executed and travels
+    // in the record, so it is loaded per record and the wake is level-only.
     void emit_intra_commit(Signal sig) {
-        const SignalSlot& s    = slot_of(sig);
+        const SignalSlot& s = slot_of(sig);
+        if (s.is_agg) {
+            emit_intra_agg_commit(sig);
+            return;
+        }
         const uint32_t    W    = s.width;
         auto*             i32  = b_.getInt32Ty();
         auto*             ptr  = raw_ptr_ty();
@@ -13281,6 +13708,12 @@ private:
         auto*             rt   = intra_rec_ty(s);
         const llvm::Align a1{ 1 };
         const uint32_t    idx  = intra_idx(sig);
+        // A scalar destination is a typed GEP into design state; an array element
+        // pointer arrives opaque from the record, but design state is rt_alloc'd
+        // (64-byte aligned) and elements sit at naturally aligned offsets, so the
+        // ABI alignment holds either way -- emit_array_commit relies on the same.
+        const llvm::Align mm_al = env_->llmod.getDataLayout().getABITypeAlign(mmty);
+        const llvm::Align z_al  = env_->llmod.getDataLayout().getABITypeAlign(zty);
 
         auto* fn    = b_.GetInsertBlock()->getParent();
         auto* run   = llvm::BasicBlock::Create(ctx_, "intra.run", fn);
@@ -13295,12 +13728,18 @@ private:
 
         b_.SetInsertPoint(run);
         llvm::Value* base    = b_.CreateCall(intra_ready_base_fn(), { b_.getInt32(idx) });
-        llvm::Value* live    = storage_ptr(s);
-        llvm::Value* live_mm = b_.CreateStructGEP(s.slot_ty, live, 0);
-        llvm::Value* live_z  = s.has_z ? b_.CreateStructGEP(s.slot_ty, live, 1) : nullptr;
-        llvm::Value* old_mm  = b_.CreateLoad(mmty, live_mm);
-        llvm::Value* old_z   = s.has_z ? b_.CreateLoad(zty, live_z) : nullptr;
-        auto*        pre     = b_.GetInsertBlock();
+        llvm::Value* live_mm = nullptr;
+        llvm::Value* live_z  = nullptr;
+        llvm::Value* old_mm  = nullptr;
+        llvm::Value* old_z   = nullptr;
+        if (!s.is_array) {
+            llvm::Value* live = storage_ptr(s);
+            live_mm           = b_.CreateStructGEP(s.slot_ty, live, 0);
+            live_z            = s.has_z ? b_.CreateStructGEP(s.slot_ty, live, 1) : nullptr;
+            old_mm            = b_.CreateAlignedLoad(mmty, live_mm, mm_al);
+            old_z             = s.has_z ? b_.CreateAlignedLoad(zty, live_z, z_al) : nullptr;
+        }
+        auto* pre = b_.GetInsertBlock();
         b_.CreateBr(head);
 
         b_.SetInsertPoint(head);
@@ -13309,29 +13748,153 @@ private:
         b_.CreateCondBr(b_.CreateICmpULT(i, n), body, after);
 
         b_.SetInsertPoint(body);
-        llvm::Value* recp = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, i));
-        b_.CreateStore(b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 6), a1), live_mm);
+        llvm::Value* recp   = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, i));
+        llvm::Value* dst_mm = live_mm;
+        llvm::Value* dst_z  = live_z;
+        if (s.is_array) {
+            dst_mm = b_.CreateAlignedLoad(ptr, b_.CreateStructGEP(rt, recp, intra_rec_mm_ptr(s)), a1);
+            dst_z  = s.has_z
+                       ? b_.CreateAlignedLoad(ptr, b_.CreateStructGEP(rt, recp, intra_rec_z_ptr(s)), a1)
+                       : nullptr;
+        }
+        llvm::Value* mm_val = b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 6), a1);
+        llvm::Value* mask   = nullptr;
+        if (s.intra_masked) {
+            // A partial write merges into the live word. The mask is one bit per
+            // storage bit, so the packed must|may word needs it doubled.
+            mask               = b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, intra_rec_mask(s)), a1);
+            llvm::Value* mask2 = s.narrow ? mask
+                                          : b_.CreateOr(b_.CreateZExt(mask, mmty),
+                                                        b_.CreateShl(b_.CreateZExt(mask, mmty),
+                                                                     llvm::ConstantInt::get(mmty, W)));
+            llvm::Value* old   = b_.CreateAlignedLoad(mmty, dst_mm, mm_al);
+            b_.CreateAlignedStore(
+              b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask2)), b_.CreateAnd(mm_val, mask2)), dst_mm,
+              mm_al);
+        } else {
+            b_.CreateAlignedStore(mm_val, dst_mm, mm_al);
+        }
         if (s.has_z) {
-            b_.CreateStore(b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, 7), a1), live_z);
+            llvm::Value* z_val = b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, 7), a1);
+            if (s.intra_masked) {
+                llvm::Value* old = b_.CreateAlignedLoad(zty, dst_z, z_al);
+                b_.CreateAlignedStore(
+                  b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), b_.CreateAnd(z_val, mask)), dst_z,
+                  z_al);
+            } else {
+                b_.CreateAlignedStore(z_val, dst_z, z_al);
+            }
         }
         i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), b_.GetInsertBlock());
         b_.CreateBr(head);
 
         b_.SetInsertPoint(after);
-        // Wake edge readers once, on the net change over all committed records.
-        if (signal_has_waiters(sig)) {
-            llvm::Value* new_mm = b_.CreateLoad(mmty, live_mm);
-            llvm::Value* new_z  = s.has_z ? b_.CreateLoad(zty, live_z) : nullptr;
-            llvm::Value* meta   = b_.CreateInBoundsGEP(nba_meta_arr_ty_, sym(nba_meta_gv_),
-                                                       { b_.getInt32(0), b_.getInt32(s.nba_id) });
-            emit_nba_service(sig, meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
+        if (s.is_array) {
+            // An element write carries no edge semantics (slang rejects
+            // @(posedge mem[i])), so wake the array's level readers -- the service
+            // the plain array commit uses. An array signal has no nba_id, so the
+            // edge-aware nba_meta path is not merely unnecessary but invalid: it
+            // would index the meta table out of bounds. `after` is reached only when
+            // a record committed, which is the write-happened guard.
+            if (signal_has_waiters(sig)) {
+                service_any_waiters(sig);
+            }
+            vcd_touch_array(sig);
+        } else {
+            // Wake edge readers once, on the net change over all committed records.
+            if (signal_has_waiters(sig)) {
+                llvm::Value* new_mm = b_.CreateAlignedLoad(mmty, live_mm, mm_al);
+                llvm::Value* new_z  = s.has_z ? b_.CreateAlignedLoad(zty, live_z, z_al) : nullptr;
+                llvm::Value* meta   = b_.CreateInBoundsGEP(nba_meta_arr_ty_, sym(nba_meta_gv_),
+                                                           { b_.getInt32(0), b_.getInt32(s.nba_id) });
+                emit_nba_service(sig, meta, old_mm, new_mm, W, s.narrow, old_z, new_z);
+            }
+            if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
+                emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                    return llvm::SmallVector<llvm::Value*, 2>{ b_.CreateLoad(
+                      i32, b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), sym(nba_vcd_gv_),
+                                                { b_.getInt32(0), b_.getInt32(s.nba_id) })) };
+                });
+            }
         }
-        if (design_uses_vcd_ && nba_vcd_gv_ != nullptr) {
-            emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
-                return llvm::SmallVector<llvm::Value*, 2>{ b_.CreateLoad(
-                  i32, b_.CreateInBoundsGEP(nba_vcd_gv_->getValueType(), sym(nba_vcd_gv_),
-                                            { b_.getInt32(0), b_.getInt32(s.nba_id) })) };
-            });
+        b_.CreateCall(intra_release_fn(), { b_.getInt32(idx) });
+        b_.CreateBr(skip);
+
+        b_.SetInsertPoint(skip);
+    }
+
+    // Commit an aggregate intra-NBA signal's fired records: memcpy each record's
+    // byte payload into the destination slot it captured at arm time, or a
+    // byte-wise masked read-modify-write when the leaf write is partial. Mirrors
+    // emit_agg_array_commit. An aggregate has no flat value, so readers wake
+    // level-only rather than through the edge-aware nba_meta comparison.
+    void emit_intra_agg_commit(Signal sig) {
+        const SignalSlot& s   = slot_of(sig);
+        auto*             i32 = b_.getInt32Ty();
+        auto*             i8  = b_.getInt8Ty();
+        auto*             ptr = raw_ptr_ty();
+        auto*             rt  = intra_rec_ty(s);
+        const llvm::Align a1{ 1 };
+        const uint32_t    idx = intra_idx(sig);
+
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* run   = llvm::BasicBlock::Create(ctx_, "intraagg.run", fn);
+        auto* head  = llvm::BasicBlock::Create(ctx_, "intraagg.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "intraagg.body", fn);
+        auto* after = llvm::BasicBlock::Create(ctx_, "intraagg.after", fn);
+        auto* skip  = llvm::BasicBlock::Create(ctx_, "intraagg.skip", fn);
+
+        llvm::Value* n = b_.CreateCall(intra_ready_count_fn(), { b_.getInt32(idx) });
+        b_.CreateCondBr(b_.CreateICmpNE(n, b_.getInt32(0)), run, skip);
+
+        b_.SetInsertPoint(run);
+        llvm::Value* base = b_.CreateCall(intra_ready_base_fn(), { b_.getInt32(idx) });
+        auto*        pre  = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* k = b_.CreatePHI(i32, 2);
+        k->addIncoming(b_.getInt32(0), pre);
+        b_.CreateCondBr(b_.CreateICmpULT(k, n), body, after);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* recp    = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, k));
+        llvm::Value* dest    = b_.CreateAlignedLoad(ptr, b_.CreateStructGEP(rt, recp, 6), a1);
+        llvm::Value* nbytes  = b_.CreateAlignedLoad(i32, b_.CreateStructGEP(rt, recp, 7), a1);
+        llvm::Value* payload = b_.CreateStructGEP(rt, recp, 8);
+        if (!s.intra_masked) {
+            b_.CreateMemCpy(dest, llvm::MaybeAlign{ 1 }, payload, llvm::MaybeAlign{ 1 }, nbytes);
+        } else {
+            // Byte-wise masked read-modify-write: dest[j] = (dest[j] & ~m) | (val[j] & m).
+            // Width-agnostic -- a mask byte of 0 leaves dest[j] unchanged, so an
+            // unselected bit (or a garbage padding byte gating dest padding) is a
+            // no-op.
+            llvm::Value* mask_r = b_.CreateStructGEP(rt, recp, 9);
+            auto*        bh     = llvm::BasicBlock::Create(ctx_, "intraagg.bh", fn);
+            auto*        bb     = llvm::BasicBlock::Create(ctx_, "intraagg.bb", fn);
+            auto*        bd     = llvm::BasicBlock::Create(ctx_, "intraagg.bd", fn);
+            auto*        bpre   = b_.GetInsertBlock();
+            b_.CreateBr(bh);
+            b_.SetInsertPoint(bh);
+            auto* j = b_.CreatePHI(i32, 2);
+            j->addIncoming(b_.getInt32(0), bpre);
+            b_.CreateCondBr(b_.CreateICmpULT(j, nbytes), bb, bd);
+            b_.SetInsertPoint(bb);
+            llvm::Value* dj  = b_.CreateInBoundsGEP(i8, dest, { j });
+            llvm::Value* m   = b_.CreateLoad(i8, b_.CreateInBoundsGEP(i8, mask_r, { j }));
+            llvm::Value* v   = b_.CreateLoad(i8, b_.CreateInBoundsGEP(i8, payload, { j }));
+            llvm::Value* old = b_.CreateLoad(i8, dj);
+            b_.CreateStore(b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(m)), b_.CreateAnd(v, m)), dj);
+            j->addIncoming(b_.CreateAdd(j, b_.getInt32(1)), b_.GetInsertBlock());
+            b_.CreateBr(bh);
+            b_.SetInsertPoint(bd);
+        }
+        k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(after);
+        if (signal_has_waiters(sig)) {
+            service_any_waiters(sig);
         }
         b_.CreateCall(intra_release_fn(), { b_.getInt32(idx) });
         b_.CreateBr(skip);
@@ -16620,14 +17183,36 @@ private:
                        b_.CreateStructGEP(rty, rec, 0));
         b_.CreateStore(null, b_.CreateStructGEP(rty, rec, 1));
 
-        // Spawn each child: ramp (state, wheel, rec) -> handle, resume inline to its
-        // first suspend or completion. A child that completes synchronously has
-        // already decremented the count (parent still null -> no wake); destroy its
-        // frame. A child that suspends is parked in the wheel / a wait queue and
-        // decrements + wakes on completion.
+        // Ramp arguments, shared by every child: (state, wheel, one pointer per
+        // captured enclosing-frame local, rec). Each capture is an ArgDir::Ref
+        // formal of every child (Lower.cpp's lower_fork), passed exactly as
+        // lower_task_call_inst passes a ref actual. No signal-waiter snapshot is
+        // needed here, unlike there: a capture is always a frame Local of this
+        // coroutine, never a module signal with a wait queue.
+        const std::span<const Index> caps = ir_->region(fi.args);
+        std::vector<llvm::Value*>    argv;
+        argv.reserve(caps.size() + 3);
+        argv.push_back(state_);
+        argv.push_back(wheel_);
+        if (!caps.empty()) {
+            // Every child took the same formal list, so one child's declared types
+            // decide the ABI for all of them.
+            const Function& child = mod_.function(static_cast<FunctionId>(kids[0]));
+            for (uint32_t k = 0; k < caps.size(); ++k) {
+                const LValue& lv = lvalue_of(caps[k]);
+                argv.push_back(is_handle_type(child.param_types[k]) ? lv.base : ref_actual_ptr(lv));
+            }
+        }
+        argv.push_back(rec);
+
+        // Spawn each child: ramp -> handle, resume inline to its first suspend or
+        // completion. A child that completes synchronously has already decremented
+        // the count (parent still null -> no wake); destroy its frame. A child that
+        // suspends is parked in the wheel / a wait queue and decrements + wakes on
+        // completion.
         for (const Index kid : kids) {
             llvm::Function* cf  = sym(fn_decls_[static_cast<uint32_t>(kid)]);
-            llvm::Value*    hdl = b_.CreateCall(cf->getFunctionType(), cf, { state_, wheel_, rec });
+            llvm::Value*    hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
             llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
             auto*        dz   = llvm::BasicBlock::Create(ctx_, "fork.child.done", fn_);
@@ -19000,6 +19585,8 @@ private:
     ankerl::unordered_dense::map<uint32_t, std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*>> expect_queue_;
     llvm::ArrayType*                    queue_arr_ty_      = nullptr;
     uint32_t                            active_mask_       = 0;
+    // Memoized design_forks(); only a forking design pays the ring-overflow check.
+    std::optional<bool>                 design_forks_;
     // Process indices in static-subscription order (compute_subscription_order).
     std::vector<uint32_t>               sub_order_;
     // Blocking-write wake graph (writer -> statically-subscribed reader) and

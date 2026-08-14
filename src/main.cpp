@@ -85,6 +85,7 @@ struct Options {
     std::vector<std::string>   stats;
     std::vector<std::string>   sanitizers;
     std::optional<std::string> allow_system;
+    std::optional<bool>        loose_timescale;
     std::vector<std::string>   dpi_libs;
     std::optional<bool>        perf_jitdump;
     std::optional<std::string> sidecar;
@@ -151,6 +152,10 @@ void register_options(slang::CommandLine& cl, Options& o) {
            "only commands written literally in the source, 'full' allows any command the design "
            "builds while it runs",
            "<tier>");
+    cl.add("--loose-timescale",
+           o.loose_timescale,
+           "Accept a design where some parts declare a time scale and others do not, refused by "
+           "default: the parts that do not take --timescale's value, or 1ns/1ns when it is not given");
     cl.add("--dpi-lib",
            o.dpi_libs,
            "[run] Library holding the C functions this design imports through DPI-C. Give a .o or .a "
@@ -561,6 +566,24 @@ int main(int argc, char** argv) {
                      "clotho: warning: this design may run shell commands ($system enabled with "
                      "--allow-system={})",
                      tier);
+    }
+    // A design element with no time scale, in a design where another element has
+    // one, is an error: its `#5` would otherwise be five of whatever the design's
+    // finest unit happened to be, so the delay a file means depends on which other
+    // files are compiled with it (LRM 3.14.2.2). Loosening that has to supply the
+    // missing unit rather than just mute the complaint, so this flag gives the
+    // un-annotated elements a real default -- --timescale's value if the operator
+    // named one, else 1ns/1ns, which is what slang assumes.
+    // With every element carrying a time scale, the mixed-design check has nothing
+    // left to report.
+    if (options.loose_timescale == true) {
+        if (!driver->options.timeScale.has_value()) {
+            driver->options.timeScale = "1ns/1ns";
+        }
+        std::println(stderr,
+                     "clotho: warning: parts of this design with no time scale of their own are "
+                     "being read as {} (--loose-timescale)",
+                     *driver->options.timeScale);
     }
 
     const bool             want_time = options.time == true;

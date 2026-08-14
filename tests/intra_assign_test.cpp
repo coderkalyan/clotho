@@ -375,15 +375,37 @@ TEST_CASE("nonblocking intra-delay to a real target") {
     CHECK(run_capture_finish(src) == "r=1.5 q=3.25\n");
 }
 
-// A non-whole-scalar target (bit/part-select, array element) needs the masked /
-// array record path (a documented follow-up) and must fail loudly.
-TEST_CASE("nonblocking intra-delay to a part-select target is rejected") {
+// A bit-select target commits through the deferred record's write mask: the rest
+// of the vector is untouched, and the write lands at t=5 (not before). Verified
+// against iverilog 13.
+TEST_CASE("nonblocking intra-delay to a constant bit-select target") {
     constexpr std::string_view src = R"(
         module m;
-            logic [7:0] a;
-            initial a[3:0] <= #5 4'd1;
+            logic [7:0] a = 8'h00;
+            initial begin
+                a[3] <= #5 1'b1;
+                #4 $display("t=%0t a=%b", $time, a);
+                #2 $display("t=%0t a=%b", $time, a);
+                $finish;
+            end
         endmodule)";
-    CHECK(lower_error(src).find("whole integral or real scalar target") != std::string::npos);
+    CHECK(run_capture_finish(src) == "t=4 a=00000000\nt=6 a=00001000\n");
+}
+
+// A constant part-select target: only the selected nibble is replaced, so the
+// upper nibble of a5 survives as af. Verified against iverilog 13.
+TEST_CASE("nonblocking intra-delay to a constant part-select target") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a = 8'hA5;
+            initial begin
+                a[3:0] <= #5 4'hF;
+                #4 $display("t=%0t a=%h", $time, a);
+                #2 $display("t=%0t a=%h", $time, a);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=4 a=a5\nt=6 a=af\n");
 }
 
 // A string / whole-array target with intra-assignment timing is not yet lowered
@@ -396,4 +418,206 @@ TEST_CASE("intra-assignment timing on a string target is rejected") {
             initial s = #5 t;
         endmodule)";
     CHECK(lower_error(src).find("string or array target") != std::string::npos);
+}
+
+// LRM 9.4.5 evaluates the LHS index when the statement executes and defers only
+// the update, so changing `i` right after the arm must not move the target bit:
+// bit 5 is set even though i is 0 by the time the write lands. Verified against
+// iverilog 13.
+TEST_CASE("nonblocking intra-delay to a variable-index bit-select samples the index at arm time") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a = 8'h00;
+            int i;
+            initial begin
+                i = 5;
+                a[i] <= #5 1'b1;
+                i = 0;
+                #6 $display("t=%0t a=%b i=%0d", $time, a, i);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 a=00100000 i=0\n");
+}
+
+// An indexed (`+:`) part-select target, index likewise sampled at arm time: the
+// nibble lands at [7:4] for i=4, not at [15:12] for the later i=12. Verified
+// against iverilog 13.
+TEST_CASE("nonblocking intra-delay to an indexed part-select target") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [15:0] a = 16'h0000;
+            int i;
+            initial begin
+                i = 4;
+                a[i +: 4] <= #5 4'hD;
+                i = 12;
+                #6 $display("t=%0t a=%h", $time, a);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 a=00d0\n");
+}
+
+// An unpacked-array element target: the record carries the element pointer the
+// index resolved to at arm time, so mem[2] takes the write even though i has
+// since changed, and its neighbours are untouched. Verified against iverilog 13.
+TEST_CASE("nonblocking intra-delay to a variable-index unpacked-array element") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] mem [0:3];
+            int i;
+            initial begin
+                mem[0] = 8'h11; mem[1] = 8'h22; mem[2] = 8'h33; mem[3] = 8'h44;
+                i = 2;
+                mem[i] <= #5 8'hAB;
+                i = 0;
+                #6 $display("t=%0t m0=%h m1=%h m2=%h m3=%h", $time, mem[0], mem[1], mem[2], mem[3]);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 m0=11 m1=22 m2=ab m3=44\n");
+}
+
+// LRM 7.4.5: a write through an out-of-range index performs no operation. The arm
+// must stage nothing at all -- a record would otherwise carry a destination
+// pointer past the end of the array that the NBA region dereferences
+// unconditionally. Verified against iverilog 13.
+TEST_CASE("nonblocking intra-delay to an out-of-range array element is a no-op") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] mem [0:3];
+            int i;
+            initial begin
+                mem[0] = 8'h11; mem[1] = 8'h22; mem[2] = 8'h33; mem[3] = 8'h44;
+                i = 9;
+                mem[i] <= #5 8'hAB;
+                #6 $display("t=%0t m0=%h m1=%h m2=%h m3=%h", $time, mem[0], mem[1], mem[2], mem[3]);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 m0=11 m1=22 m2=33 m3=44\n");
+}
+
+// A packed struct field is a part-select of a flat integral signal, so it rides
+// the masked scalar path: writing .lo leaves .hi alone (a5 -> a3). Verified
+// against iverilog 13.
+TEST_CASE("nonblocking intra-delay to a packed struct field") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct packed { logic [3:0] hi; logic [3:0] lo; } pk_t;
+            pk_t p;
+            initial begin
+                p = 8'hA5;
+                p.lo <= #5 4'h3;
+                #4 $display("t=%0t p=%h", $time, p);
+                #2 $display("t=%0t p=%h hi=%h lo=%h", $time, p, p.hi, p.lo);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=4 p=a5\nt=6 p=a3 hi=a lo=3\n");
+}
+
+// An unpacked struct field is an aggregate leaf: the record carries the leaf slot
+// pointer and replays it by memcpy, leaving the sibling field alone. iverilog 13
+// cannot be the oracle here ("sorry: Unpacked structs not supported"), so the
+// expectation is LRM 9.4.5 directly, matching the packed case above which
+// iverilog does confirm.
+TEST_CASE("nonblocking intra-delay to an unpacked struct field") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { logic [7:0] a; logic [7:0] b; } st_t;
+            st_t s;
+            initial begin
+                s.a = 8'h11; s.b = 8'h22;
+                s.b <= #5 8'hEE;
+                #4 $display("t=%0t a=%h b=%h", $time, s.a, s.b);
+                #2 $display("t=%0t a=%h b=%h", $time, s.a, s.b);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=4 a=11 b=22\nt=6 a=11 b=ee\n");
+}
+
+// The event form (`<= @e`) on a part-select target: same masked record, fired by
+// the trigger edge instead of the wheel. Verified against iverilog 13.
+TEST_CASE("nonblocking intra-delay event to a part-select target") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a = 8'h00;
+            logic clk = 0;
+            initial begin
+                a[7:4] <= @(posedge clk) 4'h9;
+                #5 clk = 1;
+                #1 $display("t=%0t a=%h", $time, a);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 a=90\n");
+}
+
+// Two records on one signal firing in the same instant must compose: each masked
+// read-modify-write merges only its own bit, so both survive (0x42). A commit
+// that stored whole words would keep just the last one. Verified against
+// iverilog 13.
+TEST_CASE("two nonblocking intra-delays to different bits of one signal both land") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a = 8'h00;
+            initial begin
+                a[1] <= #5 1'b1;
+                a[6] <= #5 1'b1;
+                #6 $display("t=%0t a=%b", $time, a);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 a=01000010\n");
+}
+
+// The z plane is masked independently of the must|may word, so an x/z payload in
+// a part-select must land bit-exact without disturbing the bits outside the
+// select. Verified against iverilog 13.
+TEST_CASE("nonblocking intra-delay to a part-select carries the x and z planes") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a = 8'h00;
+            initial begin
+                a[3:0] <= #5 4'bz1x0;
+                #6 $display("t=%0t a=%b", $time, a);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 a=0000z1x0\n");
+}
+
+// A within-element part-select under a variable element index exercises the mask
+// and the record-carried destination pointer together: only mem[1]'s low nibble
+// clears. Verified against iverilog 13.
+TEST_CASE("nonblocking intra-delay to a part-select of a variable-index array element") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] mem [0:2];
+            int i;
+            initial begin
+                mem[0] = 8'hFF; mem[1] = 8'hFF; mem[2] = 8'hFF;
+                i = 1;
+                mem[i][3:0] <= #5 4'h0;
+                i = 0;
+                #6 $display("t=%0t m0=%h m1=%h m2=%h", $time, mem[0], mem[1], mem[2]);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 m0=ff m1=f0 m2=ff\n");
+}
+
+// A string target has no plain-NBA lvalue encoding for the deferred record to
+// reuse, so the nonblocking form must still fail loudly (the blocking form is
+// caught by the separate string/array guard above).
+TEST_CASE("nonblocking intra-delay to a string target is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s, t;
+            initial s <= #5 t;
+        endmodule)";
+    CHECK(lower_error(src).find("unpacked-array element, or a struct field") != std::string::npos);
 }

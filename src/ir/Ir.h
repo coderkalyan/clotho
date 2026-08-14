@@ -449,11 +449,23 @@ enum class ForkKind : uint32_t {
 };
 
 // Extra payload for `Fork` (LRM 9.3.2). Each child statement of the fork was
-// lowered into its own argument-less fork-child task (Function::is_fork_child);
-// `children` holds their FunctionIds as raw u32s (one per parallel process).
+// lowered into its own fork-child task (Function::is_fork_child); `children`
+// holds their FunctionIds as raw u32s (one per parallel process).
+//
+// `args` are the lvalues of the enclosing body's frame locals that any child
+// reads or writes -- a fork inside a task, where a child's references to the
+// task's formals and automatics cannot resolve to module signals. Each is passed
+// to EVERY child as an ArgDir::Ref formal, in this order, so formal k of each
+// child aliases args[k]'s storage (Lower.cpp's lower_fork / build_fork_child).
+// The list is shared rather than per-child because a child that never touches a
+// capture only carries one unused pointer parameter, and one list keeps the
+// children's ABIs identical. Empty for a fork in a process body, which is every
+// fork whose parent variables are module signals.
 struct ForkInfo {
     // FunctionIds of the child bodies, stored as u32 (FunctionId is a u32 enum).
     ExtraSlice children;
+    // Captured-lvalue operands, one ref formal per entry in every child.
+    ExtraSlice args;
     ForkKind   kind;
 };
 
@@ -1496,9 +1508,10 @@ struct Inst {
         // not block. The event-controlled form (`->> @(x) e`) is not lowered here.
         EventTriggerNbDelayed,
         // Fork block `fork … join` (payload: extra -> ForkInfo). A statement that
-        // spawns each child body as its own coroutine (an argument-less fork-child
-        // task), then — for `join` — suspends the parent until all children
-        // complete. Only legal inside a coroutine (process or task). LRM 9.3.2.
+        // spawns each child body as its own coroutine (a fork-child task, whose
+        // only formals are the ref captures in ForkInfo::args), then — for `join` —
+        // suspends the parent until all children complete. Only legal inside a
+        // coroutine (process or task). LRM 9.3.2.
         Fork,
 
         // -- String ops (operands are string values unless noted) --
@@ -2195,7 +2208,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::None;
         case T::Fork:
             // Children are FunctionIds (not SSA operands), walked from ForkInfo;
-            // the op has no top-level operands, so it rides the Extra path.
+            // its captured-lvalue operands live in the same record (see
+            // extra_operand_shape), so it rides the Extra path.
             return K::Extra;
         case T::Severity:
             return K::Severity;
@@ -2277,6 +2291,9 @@ enum class ExtraOperandShape : uint8_t {
     SliceIsOperands,
     // `extra` is a StrengthResInfo whose `values` slice is the operand run.
     StrengthResValues,
+    // `extra` is a ForkInfo whose `args` slice is the operand run (the captured
+    // frame lvalues each child aliases); `children` are FunctionIds, not operands.
+    ForkArgs,
 };
 
 // Constexpr for the same reason as payload_kind(): operand walks inline it.
@@ -2288,13 +2305,15 @@ constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
             return S::SliceIsOperands;
         case T::StrengthRes:
             return S::StrengthResValues;
+        // fork: the children are FunctionIds, but the captured frame lvalues a
+        // child aliases through its ref formals ARE operands (ForkInfo::args).
+        case T::Fork:
+            return S::ForkArgs;
         // loop: the predicate and regions are not top-level operands (the
         // predicate is defined inside the cond region, walked via region()).
         case T::Loop:
         // named_block: a body region and a label, no operands.
         case T::NamedBlock:
-        // fork: the children are FunctionIds, not operands.
-        case T::Fork:
         // strobe_pend / monitor_set / reactive_pend: the target is a FunctionId;
         // the deferred body re-evaluates its own args.
         case T::StrobePend:

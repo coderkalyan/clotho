@@ -1296,6 +1296,96 @@ TEST_CASE("$printtimescale prints the scope unit and precision") {
     CHECK(out == "Time scale of (m) is 1ns / 1ps\n");
 }
 
+// LRM §20.4: the optional argument selects another scope, whose timescale may
+// differ from the caller's. Expected text verified against iverilog.
+TEST_CASE("$printtimescale with a child instance reports that child's timescale") {
+    const std::string out = run_capture(R"(`timescale 1us/1ns
+        module sub;
+        endmodule
+        `timescale 1ns/1ps
+        module top;
+            sub u1();
+            initial $printtimescale(u1);
+        endmodule
+    )");
+
+    CHECK(out == "Time scale of (top.u1) is 1us / 1ns\n");
+}
+
+// The argument may name a scope above the caller, so the lookup is genuinely
+// cross-hierarchy, not a downward walk. Verified against iverilog.
+TEST_CASE("$printtimescale reaches a scope above the caller") {
+    const std::string out = run_capture(R"(`timescale 1us/1ns
+        module sub;
+            initial $printtimescale(top);
+        endmodule
+        `timescale 1ns/1ps
+        module top;
+            sub u1();
+        endmodule
+    )");
+
+    CHECK(out == "Time scale of (top) is 1ns / 1ps\n");
+}
+
+// The argument path comes from slang's hierarchical-path formatter while the
+// no-argument path comes from Clotho's own flattened prefix. Naming the same
+// generate-nested instance both ways pins the "[i]" formatting of both, and the
+// two lines are identical, so the check does not depend on process order.
+// Verified against iverilog.
+TEST_CASE("$printtimescale spells a generate-nested instance the same way with and without an argument") {
+    const std::string out = run_capture(R"(`timescale 1us/1ns
+        module sub;
+            initial $printtimescale;
+        endmodule
+        `timescale 1ns/1ps
+        module top;
+            genvar i;
+            generate
+                for (i = 0; i < 1; i = i + 1) begin : g
+                    sub u();
+                end
+            endgenerate
+            initial $printtimescale(g[0].u);
+        endmodule
+    )");
+
+    CHECK(out == "Time scale of (top.g[0].u) is 1us / 1ns\n"
+                 "Time scale of (top.g[0].u) is 1us / 1ns\n");
+}
+
+// A scope with no timescale reports the simulator default rather than failing.
+// Clotho's unitless base is one second per tick, which is also what iverilog
+// prints for this design.
+TEST_CASE("$printtimescale reports the unitless base when the design sets no timescale") {
+    const std::string out = run_capture(R"(
+        module top;
+            initial $printtimescale;
+        endmodule
+    )");
+
+    CHECK(out == "Time scale of (top) is 1s / 1s\n");
+}
+
+// $unit and $root are the two non-instance scopes the argument accepts (LRM
+// §20.4). The compilation unit carries the timeunit/timeprecision declared at
+// file scope; $root declares none of its own, so it reports the unitless base.
+// iverilog rejects both forms, so the text follows Clotho's own shape.
+TEST_CASE("$printtimescale names the $unit and $root scopes") {
+    const std::string out = run_capture(R"(timeunit 1ns;
+        timeprecision 1ps;
+        module top;
+            initial begin
+                $printtimescale($unit);
+                $printtimescale($root);
+            end
+        endmodule
+    )");
+
+    CHECK(out == "Time scale of ($unit) is 1ns / 1ps\n"
+                 "Time scale of ($root) is 1s / 1s\n");
+}
+
 TEST_CASE("%t formats time per $timeformat units, precision, suffix, and width") {
     // Verified against iverilog. $time is 100 ns; changing only the units reprints
     // the same instant in ns then ps, and width right-justifies number + suffix.

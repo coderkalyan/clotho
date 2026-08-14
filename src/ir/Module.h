@@ -516,10 +516,12 @@ struct Function {
     std::vector<Ref> local_types;
     // True for a task: lowered as a coroutine that may suspend on timing controls.
     bool is_task = false;
-    // True for a synthetic fork-child body (LRM 9.3.2): a parameterless coroutine
-    // spawned at a `fork`, whose completion epilogue decrements a shared join
-    // record and wakes the parent when the count reaches zero (rather than a
-    // task's unconditional single-parent resume). Implies is_task.
+    // True for a synthetic fork-child body (LRM 9.3.2): a coroutine spawned at a
+    // `fork`, whose completion epilogue decrements a shared join record and wakes
+    // the parent when the count reaches zero (rather than a task's unconditional
+    // single-parent resume). Its only formals are the enclosing frame locals the
+    // fork captured by reference (ForkInfo::args), so a child of a fork in a
+    // process body is parameterless. Implies is_task.
     bool is_fork_child = false;
     // A DPI-C import (LRM 35): the body is native C resolved at JIT link time by
     // extern_name, not lowered from IR. The backend emits an external declaration
@@ -578,9 +580,10 @@ public:
     // Compiled concurrent assertions (LRM 16). Indexed by the monitor id a
     // process body refers to; see AssertionMonitor.
     std::vector<AssertionMonitor> monitors;
-    // The top instance's name, used as the DPI svScope name (LRM 35.5.3). For a
-    // multi-top design it is the first top's name (multi-top DPI export is
-    // guarded; a multi-top context import's scope is an edge case).
+    // The first top instance's name (LRM 35.5.3). Every top gets its own DPI
+    // svScope, registered from `tops()`; this is only the fallback name for a
+    // design with no top instances at all, and the default `name` for a multi-top
+    // module.
     std::string top_name;
     // Module name.
     std::string name;

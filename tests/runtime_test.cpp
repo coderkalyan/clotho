@@ -614,10 +614,10 @@ TEST_CASE("svdpi logic part-select preserves x/z") {
     CHECK(svGetBitselLogic(&d, 2) == sv_1);
 }
 
-// -- svScope (LRM 35.5.3): single-instance scope + user data --
+// -- svScope (LRM 35.5.3): one scope per top + user data --
 
 TEST_CASE("svdpi scope: get/set, name, and per-key user data") {
-    rt_svdpi_scope_init("top.dut", 7);
+    rt_svdpi_scope_register("top.dut", 7, 0);
     svScope s = svGetScope();
     REQUIRE(s != nullptr);
     CHECK(std::string(svGetNameFromScope(s)) == "top.dut");
@@ -635,10 +635,49 @@ TEST_CASE("svdpi scope: get/set, name, and per-key user data") {
     CHECK(svGetUserData(s, const_cast<char*>("a")) == &a);
     CHECK(svGetUserData(s, const_cast<char*>("b")) == &b);
 
-    // Re-init resets the user data (a fresh simulation starts clean).
-    rt_svdpi_scope_init("m", 1);
+    // Re-registering at index 0 rebuilds the table, so the user data is cleared (a
+    // fresh simulation in the same process starts clean).
+    rt_svdpi_scope_register("m", 1, 0);
     CHECK(svGetUserData(svGetScope(), const_cast<char*>("a")) == nullptr);
     CHECK(std::string(svGetNameFromScope(svGetScope())) == "m");
+}
+
+// A multi-top design registers one scope per top: each resolves by name to its own
+// handle carrying its own user data, the first top is the default active scope, and
+// registering at index 0 again rebuilds the whole table.
+TEST_CASE("svdpi scope: multiple tops each get their own scope handle") {
+    rt_svdpi_scope_register("ta", 2, 0);
+    rt_svdpi_scope_register("tb", 2, 1);
+
+    const svScope a = svGetScopeFromName("ta");
+    const svScope b = svGetScopeFromName("tb");
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK(a != b);
+    CHECK(std::string(svGetNameFromScope(a)) == "ta");
+    CHECK(std::string(svGetNameFromScope(b)) == "tb");
+    CHECK(svGetScopeFromName("tc") == nullptr);
+
+    // The first top registered is the default active scope; svSetScope swaps it.
+    CHECK(svGetScope() == a);
+    CHECK(svSetScope(b) == a);
+    CHECK(svGetScope() == b);
+
+    // User data is per scope, so the same key holds a different value in each.
+    int x = 1, y = 2;
+    svPutUserData(a, const_cast<char*>("k"), &x);
+    svPutUserData(b, const_cast<char*>("k"), &y);
+    CHECK(svGetUserData(a, const_cast<char*>("k")) == &x);
+    CHECK(svGetUserData(b, const_cast<char*>("k")) == &y);
+
+    // Index 0 clears the table: the second top is gone, the user data is reset, and
+    // the newly registered first top is active again.
+    rt_svdpi_scope_register("ta", 2, 0);
+    CHECK(svGetScopeFromName("tb") == nullptr);
+    const svScope fresh = svGetScopeFromName("ta");
+    REQUIRE(fresh != nullptr);
+    CHECK(svGetScope() == fresh);
+    CHECK(svGetUserData(fresh, const_cast<char*>("k")) == nullptr);
 }
 
 // -- svdpi open-array descriptor + element marshal (LRM 35.5.6.2) --

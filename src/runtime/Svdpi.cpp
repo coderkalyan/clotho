@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <unordered_map>
 
@@ -18,37 +19,45 @@
 //   svLogic 0 = (a0,b0)   1 = (a1,b0)   Z(2) = (a0,b1)   X(3) = (a1,b1)
 // so svLogic == aval_bit | (bval_bit << 1).
 
-// -- svScope (LRM 35.5.3): single-instance model --
+// -- svScope (LRM 35.5.3): one scope per top-level instance --
 //
-// Clotho has one flat design state, so there is exactly one DPI scope. It carries
-// the design's hierarchical name and a per-key C user-data map (svPutUserData /
-// svGetUserData). `g_current` is the active scope svGetScope returns and svSetScope
-// swaps — trivial with a single scope, but a context import may save/restore it
-// around export calls. rt_svdpi_scope_init (called from main when the design uses
-// DPI) sets the name and resets state per simulation. Multi-instance scope
-// (mapping a handle to an instance's state sub-region) is deferred with svScope
-// export.
+// A scope carries a design instance's hierarchical name and a per-key C user-data
+// map (svPutUserData / svGetUserData). `g_current` is the active scope svGetScope
+// returns and svSetScope swaps, so a context import can save/restore it around
+// export calls. main registers one scope per top (rt_svdpi_scope_register) before
+// any process runs, and `index == 0` clears the table first so a second simulation
+// in the same process starts with fresh user data. A svScope handle IS an
+// SvScopeObj*, hence the deque: registering a further scope must not move the
+// handles already handed out. Per-instance (non-top) scope handles are deferred.
 
 namespace {
 struct SvScopeObj {
     std::string                      name;
     std::unordered_map<void*, void*> user_data;
 };
-SvScopeObj g_scope;
-void*      g_current = nullptr;
+std::deque<SvScopeObj> g_scopes;
+void*                  g_current = nullptr;
 } // namespace
 
-extern "C" void rt_svdpi_scope_init(const char* name, uint32_t name_len) {
-    g_scope.name.assign(name, name_len);
-    g_scope.user_data.clear();
-    g_current = &g_scope;
+extern "C" void rt_svdpi_scope_register(const char* name, uint32_t name_len, uint32_t index) {
+    if (index == 0) {
+        g_scopes.clear();
+        g_current = nullptr;
+    }
+    g_scopes.emplace_back().name.assign(name, name_len);
+    if (g_current == nullptr) {
+        g_current = &g_scopes.front(); // the first top registered is the default
+    }
 }
 
 extern "C" {
 
 svScope svGetScope(void) {
     if (g_current == nullptr) {
-        g_current = &g_scope; // defensive: a design that did not call the init
+        if (g_scopes.empty()) {
+            g_scopes.emplace_back(); // defensive: a design that registered nothing
+        }
+        g_current = &g_scopes.front();
     }
     return g_current;
 }
@@ -64,7 +73,12 @@ const char* svGetNameFromScope(const svScope scope) {
 }
 
 svScope svGetScopeFromName(const char* scopeName) {
-    return g_scope.name == scopeName ? &g_scope : nullptr;
+    for (SvScopeObj& s : g_scopes) {
+        if (s.name == scopeName) {
+            return &s;
+        }
+    }
+    return nullptr;
 }
 
 int svPutUserData(const svScope scope, void* userKey, void* userData) {

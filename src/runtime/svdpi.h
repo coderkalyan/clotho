@@ -48,9 +48,11 @@ typedef void* svOpenArrayHandle;
 // The implemented DPI standard version.
 const char* svDpiVersion(void);
 
-// Scope (LRM 35.5.3). Clotho is single-instance: one scope carrying the design's
-// name and a per-key user-data map. svGetScope returns the active scope (of the
-// context import currently running); svSetScope swaps it (returns the previous).
+// Scope (LRM 35.5.3). Clotho registers one scope per top-level instance, each
+// carrying that instance's name and a per-key user-data map; svGetScopeFromName
+// resolves any of them. svGetScope returns the active scope (of the context import
+// currently running), defaulting to the first top; svSetScope swaps it (returns the
+// previous). A handle for a non-top instance is not available yet.
 svScope     svGetScope(void);
 svScope     svSetScope(const svScope scope);
 const char* svGetNameFromScope(const svScope scope);

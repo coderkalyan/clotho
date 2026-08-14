@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
@@ -681,6 +682,44 @@ struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
     }
 };
 
+// Collects what a `fork` child body reads or writes out of the ENCLOSING
+// subroutine's frame (LRM 9.3.2 with 13.4.2): a child is lowered into its own
+// coroutine with its own frame, so every such symbol has to be passed in as a
+// ref formal (lower_fork / build_fork_child). Deduped and kept in first-reference
+// order, because that order IS the child's formal order.
+//
+// `implicit_this` is the case a ref formal cannot carry: a bare property
+// reference inside a class method, which value_lvalue resolves through the
+// enclosing frame's `this` handle. An explicit `this.p` needs no separate flag --
+// it reads the `this` local itself, so it lands in `captured` and is refused by
+// the capture type check.
+struct ForkCaptureDetector : ASTVisitor<ForkCaptureDetector, VisitFlags::AllGood> {
+    const ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, uint32_t>* locals;
+    std::vector<const slang::ast::ValueSymbol*>                                   captured;
+    bool                                                                          implicit_this = false;
+
+    void check(const slang::ast::ValueSymbol& sym) {
+        if (const auto* prop = sym.as_if<slang::ast::ClassPropertySymbol>()) {
+            if (prop->lifetime != slang::ast::VariableLifetime::Static) {
+                implicit_this = true;
+                return;
+            }
+        }
+        if (!locals->contains(&sym)) {
+            return; // a module signal or a static local: shared storage already
+        }
+        if (std::find(captured.begin(), captured.end(), &sym) == captured.end()) {
+            captured.push_back(&sym);
+        }
+    }
+    void handle(const NamedValueExpression& nv) {
+        check(nv.symbol);
+    }
+    void handle(const HierarchicalValueExpression& hv) {
+        check(hv.symbol);
+    }
+};
+
 // Detects everything an assertion action block may not contain, for
 // Lowerer::require_reactive_safe and Lowerer::require_finish_inlinable. File
 // scope rather than a local struct: the statement whitelist below has to be a
@@ -789,19 +828,16 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
             case StatementKind::ProceduralDeassign:
                 break;
             case StatementKind::Block:
-                // Not the region any more -- a fork's join record parks the parent
-                // as a handle and its wake carries that handle's region, and a
-                // child is resumed inline at the spawn (lower_fork_inst), so it
-                // never goes through a ring at all. What is left is that clotho
-                // does not lower a fork inside a task or function AT ALL: a child
-                // aliases the enclosing PROCESS's signals, which a task frame's
-                // locals are not (lower_fork), and an action block is lowered as a
-                // task. Named here rather than left to lower_fork, because this
-                // walk runs first and would otherwise blame the wrong thing.
+                // A fork is a suspension and nothing more. Not the region: the join
+                // record parks the parent as a handle and its wake carries that
+                // handle's region, and a child is resumed inline at the spawn
+                // (lower_fork_inst), so a child never goes through a ring at all.
+                // And no longer the frame either: an action block is lowered as a
+                // task body, and a child now reaches the enclosing body's locals
+                // through ref formals (lower_fork). What is left is the inlined
+                // copy's missing second resume, which is what suspends() names.
                 if (s.template as<BlockStatement>().blockKind != StatementBlockKind::Sequential) {
-                    reject("a fork",
-                           "clotho does not lower a fork inside a task or function, and an action "
-                           "block is lowered as a task body");
+                    suspends("a fork");
                 }
                 break;
             case StatementKind::ImmediateAssertion:
@@ -5050,6 +5086,24 @@ private:
         return std::nullopt;
     }
 
+    // Map a built-in MOS switch name (LRM 28.7, Table 28-6) to the TriGate that
+    // describes it; nullopt otherwise. A MOS switch behaves exactly as the
+    // matching bufif gate except that a z data input passes through as z rather
+    // than reading as x: a pass device never manufactures an x from a floating
+    // input. No MOS form inverts. cmos/rcmos are absent here because LRM 28.9
+    // defines them as an nmos and a pmos sharing one output, which is two
+    // drivers, not one (lower_cmos_switch).
+    static std::optional<TriGate> mos_switch_of(std::string_view name) {
+        if (name == "nmos" || name == "rnmos") {
+            return TriGate{ .active_high = true, .invert = false };
+        }
+        if (name == "pmos" || name == "rpmos") {
+            return TriGate{ .active_high = false, .invert = false };
+        }
+
+        return std::nullopt;
+    }
+
     // Map a built-in gate primitive name to its GateOp; nullopt for primitives
     // outside the supported set.
     static std::optional<GateOp> gate_op_of(std::string_view name) {
@@ -5207,15 +5261,22 @@ private:
     GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index) {
         // Constant fold first: literals, parameters, and constant expressions
         // (tie cells) melt into the gate at compile time. The terminal is bound
-        // as 1-bit logic, so bit 0 of the folded value is the input; x and z both
-        // fold to the X plane code (Z reads as X, LRM Table 28-3).
+        // as 1-bit logic, so bit 0 of the folded value is the input. x and z need
+        // distinct codes: every gate but a MOS switch reads z as x (LRM Table
+        // 28-3), while a MOS pass switch propagates it as z (LRM Table 28-6), so
+        // gate_input_value resolves the code per caller.
         {
             slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
             slang::ast::EvalContext    evalCtx(astCtx);
             const slang::ConstantValue cv = e.eval(evalCtx);
             if (cv.isInteger()) {
-                const slang::logic_t bit  = cv.integer()[0];
-                const uint8_t        code = bit.isUnknown() ? 0b10 : (bit.value != 0 ? 0b11 : 0b00);
+                const slang::logic_t bit = cv.integer()[0];
+                // logic_t::operator== is a 4-state compare (x == z yields x), so
+                // z has to be identified by its exact encoding.
+                const uint8_t code = bit.value == slang::logic_t::Z_VALUE ? 0b01
+                                     : bit.isUnknown()                    ? 0b10
+                                     : bit.value != 0                     ? 0b11
+                                                                          : 0b00;
 
                 return GateInput{ .const_code = code, .is_const = true };
             }
@@ -5324,18 +5385,90 @@ private:
         add_continuous_process({}, l, b);
     }
 
+    // A cmos / rcmos switch (LRM 28.9). The LRM defines it purely by
+    // decomposition: `cmos (w, data, ncontrol, pcontrol)` is exactly
+    // `nmos (w, data, ncontrol); pmos (w, data, pcontrol);` — two drivers sharing
+    // one output net, which the existing net resolver already folds. Both passes
+    // must agree on that count: Classify records the output twice so the net
+    // enters resolved_nets_, and Emit stages each half into its own driver slot.
+    // Were Classify to record only one, the net would never resolve, both halves
+    // would take the plain-store path and stomp each other last-write-wins.
+    void lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
+        const auto conns = gi.getPortConnections();
+        if (conns.size() != 4 || conns[0] == nullptr || conns[1] == nullptr || conns[2] == nullptr ||
+            conns[3] == nullptr || conns[0]->kind != ExpressionKind::Assignment) {
+            // slang has already diagnosed a malformed terminal list.
+            fail("malformed cmos/rcmos terminal list");
+        }
+        const Expression& left = conns[0]->as<AssignmentExpression>().left();
+        if (cur_pass_ == Pass::Classify) {
+            // Twice, deliberately: the two halves overlap on the same region, which
+            // is what marks the net resolved.
+            record_net_driver(left);
+            record_net_driver(left);
+            return;
+        }
+        if (cur_pass_ != Pass::Emit) {
+            return;
+        }
+        if (gi.getDelay() != nullptr) {
+            // TODO: cmos/rcmos delays (LRM 28.16) — a cmos always lowers to two
+            // resolved driver slots, and the resolver folds every slot with no
+            // per-driver timing (mirrors the resolved continuous-assign delay gap).
+            fail("gate delay on a multiply-driven (resolved) net is not supported");
+        }
+        const std::optional<ir::Signal> net = resolved_net_of(left);
+        if (!net) {
+            // Classify records two drivers for every cmos rooted at a net, so a
+            // net output is resolved by construction. Anything else (a variable
+            // output, an interface modport proxy record_net_driver skips) would
+            // silently lose one half, so it fails instead.
+            // TODO: cmos/rcmos driving something other than a plain net.
+            fail("cmos/rcmos output must be a net");
+        }
+        const uint16_t      gate_strength = pack_strength(gi.getDriveStrength());
+        const ir::SourceLoc l             = to_source_loc(gi.location);
+        // Terminals are (output, data, ncontrol, pcontrol).
+        const GateInput data  = lower_gate_input(*conns[1], gi.name, 0);
+        const GateInput nctrl = lower_gate_input(*conns[2], gi.name, 1);
+        const GateInput pctrl = lower_gate_input(*conns[3], gi.name, 2);
+        // Each half is an independent driver slot. The n-channel half conducts on
+        // ncontrol == 1, the p-channel half on pcontrol == 0; neither inverts, and
+        // both pass a z data input through as z.
+        const auto emit_half = [&](TriGate tg, const GateInput& ctrl) {
+            ir::Builder                b(module_.pool);
+            std::vector<ir::WaitEvent> wait_events;
+            const ir::Index val = gate_tristate_value(tg, data, ctrl, wait_events, b, l, /*pass_z=*/true);
+            emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, l, gate_strength);
+        };
+        emit_half(TriGate{ .active_high = true, .invert = false }, nctrl);
+        emit_half(TriGate{ .active_high = false, .invert = false }, pctrl);
+    }
+
     void lower_gate(const PrimitiveInstanceSymbol& gi) {
         const PrimitiveSymbol& prim = gi.primitiveType;
         if (prim.name == "pullup" || prim.name == "pulldown") {
             lower_pull_source(gi, prim.name == "pullup");
             return;
         }
+        // LRM 28.9 makes cmos/rcmos two drivers on one net, so it needs its own
+        // two-pass path rather than the single-output loop below.
+        if (prim.name == "cmos" || prim.name == "rcmos") {
+            lower_cmos_switch(gi);
+            return;
+        }
         const auto op  = gate_op_of(prim.name);
         const auto tri = tristate_gate_of(prim.name);
+        const auto mos = mos_switch_of(prim.name);
         const bool supported_kind =
           prim.primitiveKind == PrimitiveSymbol::NInput || prim.primitiveKind == PrimitiveSymbol::NOutput;
-        if (!tri && (!op || !supported_kind)) {
-            // TODO: MOS / bidirectional switches and user-defined primitives.
+        if (!tri && !mos && (!op || !supported_kind)) {
+            // TODO: bidirectional pass switches (tran, rtran, tranif0, tranif1,
+            // rtranif0, rtranif1 — LRM 28.8) and user-defined primitives.
+            // Conditional bidirectional conduction has no representation in the
+            // one-pass driver-slot fold. Note that slang classifies only tran,
+            // tranif0 and tranif1 as BiDiSwitch — rtran and rtranif0/rtranif1 are
+            // Fixed — so this family must be recognized by name, not by kind.
             fail("gate primitive '" + std::string(prim.name) + "' is not supported");
         }
         const TimingControl* gate_delay = gi.getDelay();
@@ -5355,8 +5488,9 @@ private:
 
         // NInput: terminal 0 is the output, the rest are inputs. NOutput (buf /
         // not): the last terminal is the input, the rest are outputs — one
-        // independent process per output terminal. Fixed tri-state (bufif/notif):
-        // terminal 0 is the output, terminals 1..2 are the data and control inputs.
+        // independent process per output terminal. Fixed tri-state (bufif/notif)
+        // and MOS switch (nmos/pmos/rnmos/rpmos): terminal 0 is the output,
+        // terminals 1..2 are the data and control inputs.
         const bool n_output    = prim.primitiveKind == PrimitiveSymbol::NOutput;
         const auto input_span  = n_output ? conns.subspan(conns.size() - 1) : conns.subspan(1);
         const auto output_span = n_output ? conns.subspan(0, conns.size() - 1) : conns.subspan(0, 1);
@@ -5391,8 +5525,10 @@ private:
             // combinational fold does).
             ir::Builder                b(module_.pool);
             std::vector<ir::WaitEvent> wait_events;
-            const ir::Index            val = tri ? gate_tristate_value(*tri, inputs[0], inputs[1], wait_events, b, loc)
-                                                 : gate_folded_value(*op, inputs, wait_events, b, loc);
+            const ir::Index            val =
+              mos   ? gate_tristate_value(*mos, inputs[0], inputs[1], wait_events, b, loc, /*pass_z=*/true)
+              : tri ? gate_tristate_value(*tri, inputs[0], inputs[1], wait_events, b, loc)
+                    : gate_folded_value(*op, inputs, wait_events, b, loc);
 
             if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
                 if (gate_delay != nullptr) {
@@ -5434,8 +5570,10 @@ private:
     // Materialize one gate input terminal as its 1-bit logic value: a load of the
     // input signal bit, or a folded constant. Pool VPI encoding: val=may,
     // xz=may&~must (bytes: val-plane then xz-plane); an X const code is (val=1,
-    // xz=1) and Z already folded to X at input lowering (LRM Table 28-3).
-    ir::Index gate_input_value(const GateInput& in, ir::Builder& b, ir::SourceLoc l) {
+    // xz=1). `pass_z` selects the MOS pass-switch reading of a constant z
+    // terminal, which stays z (LRM Table 28-6); every other gate reads z as x
+    // (LRM Table 28-3).
+    ir::Index gate_input_value(const GateInput& in, ir::Builder& b, ir::SourceLoc l, bool pass_z = false) {
         const ir::Ref logic1 = module_.pool.logic_type;
         if (!in.is_const) {
             return b.unary(ir::Inst::Tag::Load, gate_bit_lvalue(in.sig, in.bit, b, l), l);
@@ -5445,11 +5583,17 @@ private:
                 return b.constant(module_.pool.put_int(logic1, 0), l);
             case 0b11:
                 return b.constant(module_.pool.put_int(logic1, 1), l);
-            default: {
-                const uint8_t xbytes[2] = { 0x01, 0x01 };
-                return b.constant(module_.pool.put_value(logic1, { xbytes, 2 }), l);
-            }
+            case 0b01:
+                if (pass_z) {
+                    return b.constant(z_constant_ref(1), l);
+                }
+                break;
+            default:
+                break;
         }
+        const uint8_t xbytes[2] = { 0x01, 0x01 };
+
+        return b.constant(module_.pool.put_value(logic1, { xbytes, 2 }), l);
     }
 
     // Collect the any-change sensitivity over a gate's unique non-const input
@@ -5502,19 +5646,27 @@ private:
         return b.resize(*acc, logic1, l);
     }
 
-    // Lower a three-state gate (bufif/notif, LRM 28.6, Table 28-5) to its 1-bit
-    // output value. When the control is at the active level the data passes (buf)
-    // or inverts (notif) to the output (a z data bit maps to X — Band-with-1 /
-    // Bnot both clear z); at the inactive level the output is high-Z; an x/z
-    // control yields X. The LRM's weak L/H results for an x/z control (0-or-z,
-    // 1-or-z) collapse to X here: Clotho has no strength model, matching iverilog
-    // on a plain wire.
+    // Lower a three-state gate (bufif/notif, LRM 28.6, Table 28-5) or a MOS pass
+    // switch (nmos/pmos/rnmos/rpmos, LRM 28.7, Table 28-6) to its 1-bit output
+    // value. When the control is at the active level the data passes (buf) or
+    // inverts (notif) to the output; at the inactive level the output is high-Z;
+    // an x/z control yields X. The LRM's weak L/H results for an x/z control
+    // (0-or-z, 1-or-z) collapse to X here: Clotho has no value-strength model,
+    // matching iverilog on a plain wire.
+    //
+    // `pass_z` is the entire difference between Table 28-5 and Table 28-6. A
+    // bufif reads a z data bit as x (the Band-with-1 / Bnot clears the z plane),
+    // but a MOS switch is a pass device and never manufactures an x from a
+    // floating input, so a definite z data bit reaches the output as z for every
+    // control value. Keeping the z plane and pre-empting on `data === z` gives
+    // Table 28-6's DATA=z row exactly and leaves every other cell identical.
     ir::Index gate_tristate_value(TriGate                     tg,
                                   const GateInput&            data,
                                   const GateInput&            ctrl,
                                   std::vector<ir::WaitEvent>& wait_events,
                                   ir::Builder&                b,
-                                  ir::SourceLoc               l) {
+                                  ir::SourceLoc               l,
+                                  bool                        pass_z = false) {
         const ir::Ref   logic1    = module_.pool.logic_type;
         const ir::Index one       = b.constant(module_.pool.put_int(logic1, 1), l);
         const ir::Index zero      = b.constant(module_.pool.put_int(logic1, 0), l);
@@ -5522,10 +5674,13 @@ private:
         const ir::Index x_const   = b.constant(module_.pool.put_value(logic1, { xbytes, 2 }), l);
         const ir::Index z_const   = b.constant(z_constant_ref(1), l);
 
-        const ir::Index data_v = gate_input_value(data, b, l);
+        const ir::Index data_v = gate_input_value(data, b, l, pass_z);
         const ir::Index ctrl_v = gate_input_value(ctrl, b, l);
-        const ir::Index passed =
-          tg.invert ? b.unary(ir::Inst::Tag::Bnot, data_v, l) : b.binary(ir::Inst::Tag::Band, data_v, one, l);
+        // The Band-with-1 exists only to clear the data's z plane; a pass switch
+        // keeps that plane instead.
+        const ir::Index passed = tg.invert ? b.unary(ir::Inst::Tag::Bnot, data_v, l)
+                                 : pass_z  ? data_v
+                                           : b.binary(ir::Inst::Tag::Band, data_v, one, l);
         // Definite (===) tests: control exactly at the active / inactive level.
         const ir::Index active_lvl   = tg.active_high ? one : zero;
         const ir::Index inactive_lvl = tg.active_high ? zero : one;
@@ -5533,7 +5688,13 @@ private:
         const ir::Index is_inactive  = b.binary(ir::Inst::Tag::CaseEq, ctrl_v, inactive_lvl, l);
         // active -> passed data; else inactive -> Z; else (control x/z) -> X.
         const ir::Index inner  = b.select(is_inactive, z_const, x_const, l);
-        const ir::Index result = b.select(is_active, passed, inner, l);
+        ir::Index       result = b.select(is_active, passed, inner, l);
+        if (pass_z) {
+            // A floating data input leaves the output floating for every control
+            // value, which is Table 28-6's all-z DATA=z row.
+            const ir::Index data_is_z = b.binary(ir::Inst::Tag::CaseEq, data_v, z_const, l);
+            result                    = b.select(data_is_z, z_const, result, l);
+        }
 
         collect_gate_sensitivity(std::array<GateInput, 2>{ data, ctrl }, wait_events);
         return b.resize(result, logic1, l);
@@ -6556,21 +6717,21 @@ private:
         b.disable(label, loc(s));
     }
 
-    // Lower `fork … join` (LRM 9.3.2). V1: `join` only, in a process context.
-    // Each top-level child statement becomes its own fork-child coroutine; the
-    // Fork op spawns them and suspends the parent until all complete.
+    // Lower `fork … join` (LRM 9.3.2). V1: `join` only, in a process or task body
+    // (an assertion action block is lowered as a task body, so it counts). Each
+    // top-level child statement becomes its own fork-child coroutine; the Fork op
+    // spawns them and suspends the parent until all complete.
+    //
+    // slang refuses `join` and `join_any` inside a FUNCTION itself
+    // (diag::TimingInFuncNotAllowed, its Statement.cpp), so the only fork a
+    // function body can even hand us is `join_none` -- which the kind check below
+    // rejects anyway. Clotho needs no LRM check of its own here.
     void lower_fork(const BlockStatement& blk, ir::Builder& b) {
         if (blk.blockKind != StatementBlockKind::JoinAll) {
             // TODO: join_any / join_none (V2) need a growable active ring — a
             // loop can spawn an unbounded number of concurrently-live children
             // (docs/design/fork-join.md).
             fail("fork..join_any / fork..join_none are not supported");
-        }
-        if (fn_ctx_ != nullptr) {
-            // TODO: fork inside a task/function (V1 restriction). A child would
-            // need to alias the enclosing subroutine's frame locals, not the
-            // parent-signal path build_fork_child assumes.
-            fail("fork..join inside a function or task is not supported");
         }
 
         // Children are the fork body's top-level statements (a StatementList),
@@ -6587,12 +6748,65 @@ private:
             return; // `fork join` with no children: a no-op.
         }
 
+        // Inside a task, a child body gets its OWN frame, so a reference to the
+        // enclosing task's formals or automatics cannot resolve the way it does in
+        // a process (where every parent variable is a module signal). Pass each
+        // such symbol in as an ArgDir::Ref formal — the same live-pointer ABI a
+        // `ref` argument uses (docs/design/ref-args.md), whose lifetime rule holds
+        // here for the same reason: a `join` parent outlives all its children, so
+        // the pointer into its frame stays valid for as long as a child can use it.
+        std::vector<const ValueSymbol*> captures;
+        if (fn_ctx_ != nullptr) {
+            if (!fn_ctx_->is_task) {
+                // Unreachable through slang, which rejects a timing control in a
+                // function outright; `is_task` is the real discriminator, so say so
+                // rather than trusting the front end's reach.
+                fail("fork..join inside a function is not supported");
+            }
+            ForkCaptureDetector d;
+            d.locals = &fn_ctx_->localmap;
+            for (const Statement* c : children) {
+                c->visit(d);
+            }
+            if (d.implicit_this) {
+                // TODO: capture of `this` (LRM 8.11 inside 9.3.2) — a child would
+                // need the enclosing method's handle as a ref formal, which the ref
+                // ABI does not carry (it is a packed-slot pointer).
+                fail("fork..join child that reads a class property of the enclosing "
+                     "method is not supported");
+            }
+            for (const ValueSymbol* sym : d.captured) {
+                const auto& ct = sym->getType().getCanonicalType();
+                if (!ct.isIntegral() && ct.as_if<slang::ast::DynamicArrayType>() == nullptr) {
+                    // TODO: capture of an unpacked array / struct / string / real /
+                    // queue / class-handle local. Exactly the ref ABI's own gap, so
+                    // the two lift together (docs/design/ref-args.md).
+                    fail("fork..join child that reads the enclosing task's '" + std::string(sym->name) +
+                         "' is not supported (only packed integral and dynamic-array "
+                         "locals can be captured)");
+                }
+            }
+            captures = std::move(d.captured);
+        }
+
         std::vector<ir::FunctionId> ids;
         ids.reserve(children.size());
         for (const Statement* c : children) {
-            ids.push_back(build_fork_child(*c));
+            ids.push_back(build_fork_child(*c, captures));
         }
-        b.fork(ids, ir::ForkKind::Join, loc(blk));
+
+        // The capture actuals, in the order the children took their formals.
+        // Evaluated here, in the ENCLOSING frame (build_fork_child's FnScope is
+        // already unwound): value_lvalue resolves each to its frame Local, which is
+        // the whole, unmasked, zero-offset lvalue the backend's ref_actual_ptr
+        // requires.
+        const ir::SourceLoc    l = loc(blk);
+        std::vector<ir::Index> args;
+        args.reserve(captures.size());
+        for (const ValueSymbol* sym : captures) {
+            args.push_back(value_lvalue(*sym, b, l));
+        }
+        b.fork(ids, args, ir::ForkKind::Join, l);
     }
 
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
@@ -13667,18 +13881,49 @@ private:
     // module; the timescale and path are compile-time constants, so this folds to
     // a literal $display.
     void lower_printtimescale(const CallExpression& call, ir::Builder& b) {
-        // TODO: a hierarchical-name argument selects another scope's timescale;
-        // resolving it needs cross-hierarchy lookup, which Clotho lacks.
+        std::string                     path = instance_path();
+        std::optional<slang::TimeScale> ts   = scope_->getTimeScale();
         if (!call.arguments().empty()) {
-            fail("$printtimescale with a scope argument is not supported");
+            // The argument names another scope. That scope's timescale is one
+            // Scope::getTimeScale() call away and no signal is involved, so the
+            // cross-hierarchy reference never reaches the IR. slang's
+            // PrintTimeScaleTask binds the argument as a symbol reference and
+            // rejects any kind other than Instance / CompilationUnit / Root, so
+            // those three are all that can arrive here.
+            const auto* as = call.arguments()[0]->as_if<slang::ast::ArbitrarySymbolExpression>();
+            if (as == nullptr) {
+                fail("$printtimescale argument must name a module instance, $unit or $root");
+            }
+            const slang::ast::Symbol& sym = *as->symbol;
+            switch (sym.kind) {
+                case SymbolKind::Instance:
+                    ts   = sym.as<InstanceSymbol>().body.getTimeScale();
+                    path = sym.getHierarchicalPath();
+                    break;
+                case SymbolKind::CompilationUnit:
+                    // getHierarchicalPath() spells this scope "$unit"; the symbol
+                    // itself is unnamed.
+                    ts   = sym.as<CompilationUnitSymbol>().timeScale;
+                    path = sym.getHierarchicalPath();
+                    break;
+                case SymbolKind::Root:
+                    // $root declares no timescale of its own, so it reports the
+                    // simulator default. Its path text is spelled out because
+                    // slang's path formatter escapes the leading '$' of the root
+                    // symbol's name into "\$root ".
+                    ts   = scope_->getCompilation().getDefaultTimeScale();
+                    path = "$root";
+                    break;
+                default:
+                    fail("$printtimescale argument must name a module instance, $unit or $root");
+            }
         }
-        const auto ts = scope_->getTimeScale();
-        if (!ts) {
-            // TODO: a scope with no timescale prints the simulator default; Clotho
-            // has no unitless $printtimescale text yet.
-            fail("$printtimescale requires a timescale");
-        }
-        const std::string text = "Time scale of (" + instance_path() + ") is " + ts->toString();
+
+        // A scope with no timescale reports the simulator default, which for
+        // Clotho is the unitless base: one tick is one second (see the tick fold
+        // in lower_compilation). iverilog prints the same "1s / 1s" here.
+        const std::string scale = ts ? ts->toString() : "1s / 1s";
+        const std::string text  = "Time scale of (" + path + ") is " + scale;
         b.display(text, /*newline=*/true, {}, loc(call));
     }
 
@@ -15559,6 +15804,55 @@ private:
         return b.binary(ir::Inst::Tag::Mul, w, mul, l);
     }
 
+    // Whether a nonblocking intra-assignment target's select chain resolves
+    // through storage the deferred record can address. The record reuses plain
+    // NBA's lvalue encoding, so the supported chain is exactly what that
+    // encoding covers: packed bit / part / sub-vector selects, fixed
+    // unpacked-array element selects, and packed or unpacked struct fields. A
+    // container element (string, queue, dynamic or associative array) is
+    // excluded because plain NBA cannot encode one either, so there is nothing
+    // to reuse.
+    static bool intra_nb_target_path(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
+                return true;
+            case ExpressionKind::ElementSelect: {
+                const Expression& base = e.as<ElementSelectExpression>().value();
+                if (!base.type->isIntegral() && !is_unpacked_array(base)) {
+                    return false;
+                }
+                return intra_nb_target_path(base);
+            }
+            case ExpressionKind::RangeSelect: {
+                // A part-select of a packed value. An unpacked-array slice names
+                // several elements, which one record cannot carry.
+                const Expression& base = e.as<RangeSelectExpression>().value();
+                return base.type->isIntegral() && intra_nb_target_path(base);
+            }
+            case ExpressionKind::MemberAccess: {
+                // A packed or unpacked struct field. A class property has no
+                // signal storage and is rejected ahead of the timing block.
+                const MemberAccessExpression& ma = e.as<MemberAccessExpression>();
+                return ma.member.as_if<FieldSymbol>() != nullptr && intra_nb_target_path(ma.value());
+            }
+            default:
+                return false;
+        }
+    }
+
+    // Whether `x <= #d y` / `x <= @e y` can lower to this target (LRM 9.4.5).
+    // One record carries one scalar value, so the target must name a single
+    // integral (a packed struct or union included) or real object; a whole
+    // unpacked array or struct would have to spread the sampled RHS across one
+    // record per leaf.
+    static bool intra_nb_target_supported(const Expression& e) {
+        if ((!e.type->isIntegral() && !e.type->isFloating()) || e.type->isUnpackedArray()) {
+            return false;
+        }
+        return intra_nb_target_path(e);
+    }
+
     // Reject the one nonblocking-assignment target a subroutine (task or function)
     // cannot stage: a frame local or formal argument (both live in localmap). These
     // have no module-signal storage, and nba_target in the backend only walks to a
@@ -15675,7 +15969,14 @@ private:
                 fail("compound assignment to an unpacked struct is not supported");
             }
             if (a.timingControl != nullptr) {
-                fail("intra-assignment timing control (#/@ on an assignment) is not supported");
+                // TODO: intra-assignment timing on a WHOLE unpacked aggregate. A
+                // field of one is supported (each leaf defers its own record); a
+                // whole-object target would have to sample the RHS once and spread
+                // it across one record per decomposed leaf, sharing the single
+                // delay. Selects, struct fields and array elements go through the
+                // nonblocking timing block below instead.
+                fail("intra-assignment timing on a whole unpacked struct or array target "
+                     "is not supported");
             }
             const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
             emit_struct_store(lower_lvalue(a.left(), b), lower_type(*a.left().type), a.right(), tag, b, l);
@@ -15694,18 +15995,19 @@ private:
             // scheduler infrastructure not present yet.
             if (a.isNonBlocking()) {
                 // Nonblocking form: sample now, do not block, commit after the
-                // timing via a detached scheduled store. Only a whole scalar target
-                // (integral or real) is lowered — the record is monomorphized per
-                // whole signal — so selects / concats / aggregates (needing the
-                // masked/array record path) fail loud, a documented follow-up
-                // (docs/design/intra-assignment-timing.md). A real rides its IEEE
-                // pattern through the same narrow record (intra_pack_mm).
-                const bool whole_scalar =
-                  (a.left().kind == ExpressionKind::NamedValue || a.left().kind == ExpressionKind::HierarchicalValue) &&
-                  (a.left().type->isIntegral() || a.left().type->isFloating()) && !a.left().type->isUnpackedArray();
-                if (!whole_scalar) {
+                // timing via a detached scheduled store. The supported target set
+                // mirrors what plain NBA can encode as an lvalue, since the
+                // deferred record reuses that encoding (a positioned value plus a
+                // write mask, and for an array element / aggregate leaf the live
+                // destination pointer resolved at statement-execution time):
+                // a whole integral or real scalar, a bit/part-select of one
+                // (constant or variable), an unpacked-array element, and a packed
+                // or unpacked struct field. A real rides its IEEE pattern through
+                // the same narrow record (intra_pack_mm).
+                if (!intra_nb_target_supported(a.left())) {
                     fail("nonblocking intra-assignment timing is only supported for a whole "
-                         "integral or real scalar target");
+                         "integral or real scalar, a bit/part-select of one, an "
+                         "unpacked-array element, or a struct field");
                 }
                 const TimingControl& tc = *a.timingControl;
                 if (tc.kind == TimingControlKind::Delay) {
@@ -18950,11 +19252,12 @@ private:
             fail("DPI import tasks are not supported");
         }
         // `context` (LRM 35.5.3) is accepted and lowered identically to a plain
-        // import: its purpose is to let the C call exported SV functions (and
-        // svScope APIs), which Clotho's export thunks already service against the
-        // single flat design-state global — no scope tracking needed for a single
-        // instance. (The svScope C API — svGetScope/svSetScope — is not provided;
-        // C that calls it gets an unresolved-symbol error, the deferred piece.)
+        // import: its purpose is to let the C call exported SV functions (and the
+        // svScope APIs), and an export thunk needs no scope to find its instance —
+        // the lowered SV function it calls already addresses that instance's state
+        // absolutely. The svScope C API is provided (svGetScope / svSetScope /
+        // svGetScopeFromName / user data, exposed as JIT symbols in Jit.cpp) with one
+        // scope per top; a handle naming a nested instance is the deferred piece.
 
         // A DPI import has no body, so slang leaves returnValVar null even for a
         // non-void function; decide void-ness from the declared return type.
@@ -19095,6 +19398,30 @@ private:
         arg_elem_cts.push_back(*ec);
     }
 
+    // The root (top-level) instance whose hierarchy ultimately contains `sub`, or
+    // null when the subroutine sits in no elaborated instance. A module's members
+    // hang off an InstanceBodySymbol whose own parent scope is the *declaration*
+    // site, so climbing a level steps across the body/InstanceSymbol pair through
+    // parentInstance — the same walk control_depth uses.
+    static const InstanceSymbol* owning_top(const SubroutineSymbol& sub) {
+        const InstanceSymbol* top   = nullptr;
+        const Scope*          scope = sub.getParentScope();
+        while (scope != nullptr) {
+            const Symbol& sym = scope->asSymbol();
+            if (sym.kind != SymbolKind::InstanceBody) {
+                scope = sym.getParentScope();
+                continue;
+            }
+            const InstanceSymbol* parent = sym.as<InstanceBodySymbol>().parentInstance;
+            if (parent == nullptr) {
+                return nullptr; // a body slang elaborated without an instance
+            }
+            top   = parent;
+            scope = parent->getParentScope();
+        }
+        return top;
+    }
+
     // Collect `export "DPI-C"` directives (LRM 35.5): for each, force-lower the SV
     // function and record a DpiExport so the backend emits its C-callable thunk.
     // slang resolves the export -> subroutine binding and the c_identifier
@@ -19103,10 +19430,27 @@ private:
     // void return. Deferred (loud-fail): string return (returned-char* lifetime),
     // output/inout string, open-array/unpacked args, tasks. Public: called by
     // lower_compilation.
+    //
+    // getDPIExports is compilation-wide, but every top has its own Lowerer that only
+    // knows its own symbols, and instance binding is baked into the lowered body (the
+    // backend addresses each signal absolutely off that instance's own state global).
+    // So an export must be collected by the Lowerer of the top containing it: `top`
+    // admits this top's module-scope exports, and `collect_globals` — true on exactly
+    // one top — admits the $unit/package exports, which have no instance multiplicity
+    // (LRM 6.8) and lower once through the shared globals Lowerer function_id
+    // delegates to.
 public:
-    void collect_dpi_exports(const slang::ast::Compilation& comp) {
+    void collect_dpi_exports(const slang::ast::Compilation& comp, const InstanceSymbol& top,
+                             bool collect_globals) {
         for (const auto& ex : comp.getDPIExports()) {
             const SubroutineSymbol& sub = *ex.subroutine;
+            if (is_global_subroutine(sub)) {
+                if (!collect_globals) {
+                    continue; // collected once for the design, not once per top
+                }
+            } else if (owning_top(sub) != &top) {
+                continue; // another top's export (or no elaborated instance at all)
+            }
             if (sub.subroutineKind == SubroutineKind::Task) {
                 // TODO: exported tasks — need the timing wheel + coroutine driving
                 // from C (docs/design/dpi-c.md).
@@ -19141,6 +19485,16 @@ public:
                 }
                 arg_cts.push_back(*c);
                 arg_dirs.push_back(to_arg_dir(fa->direction));
+            }
+            // One C symbol cannot name two SV functions: llvm::Function::Create
+            // would silently rename the second thunk to `<name>.1`, leaving C bound
+            // to an arbitrary instance. slang's own c_identifier dedup makes this
+            // unreachable today, but the invariant has to be Clotho's.
+            for (const ir::DpiExport& prev : module_.dpi_exports) {
+                if (prev.extern_name == ex.cIdentifier) {
+                    fail("duplicate DPI export c_identifier '" + ex.cIdentifier +
+                         "' (one C name cannot bind two SystemVerilog functions)");
+                }
             }
             const ir::FunctionId id = function_id(sub); // force-lower the SV function
             module_.dpi_exports.push_back(
@@ -19336,21 +19690,40 @@ private:
                                            .ir          = b.finish() });
     }
 
-    // Lower one `fork` child statement (LRM 9.3.2) into a synthetic argument-less
-    // fork-child task: a coroutine spawned at the fork, whose completion decrements
-    // the shared join record. Mirrors build_task, but takes a bare Statement (no
-    // formals) and runs in the *parent's* scope context (scope_ / prefix_ /
-    // time_mul_ unchanged) so the child's references to parent variables resolve to
-    // the parent's signals, while the child's own declared locals get per-spawn
-    // frame slots (value_lvalue: localmap first, then signal_of). Returns the
-    // reserved FunctionId.
-    ir::FunctionId build_fork_child(const Statement& body) {
+    // Lower one `fork` child statement (LRM 9.3.2) into a synthetic fork-child
+    // task: a coroutine spawned at the fork, whose completion decrements the shared
+    // join record. Mirrors build_task, but takes a bare Statement and runs in the
+    // *parent's* scope context (scope_ / prefix_ / time_mul_ unchanged) so the
+    // child's references to parent variables resolve to the parent's signals, while
+    // the child's own declared locals get per-spawn frame slots (value_lvalue:
+    // localmap first, then signal_of).
+    //
+    // `captures` are the enclosing subroutine's frame symbols the fork's children
+    // touch (lower_fork collected them). Each becomes an ArgDir::Ref formal
+    // aliasing the enclosing frame's slot, registered in this child's localmap
+    // under the SAME ValueSymbol -- which is what makes the child's reference to it
+    // resolve to the formal's Local instead of falling through to signal_of. Every
+    // child of one fork takes the same list, so an unused capture costs one dead
+    // pointer parameter. Returns the reserved FunctionId.
+    ir::FunctionId build_fork_child(const Statement& body, std::span<const ValueSymbol* const> captures) {
         const ir::FunctionId id = module_.reserve_function();
 
         FnCtx ctx;
         ctx.name_prefix = "fork.child.";
         ctx.is_task     = true;
         const FnScope fn_scope(*this, &ctx);
+
+        // Formals first, so formal k == Local k (the invariant build_task maintains
+        // and the backend's prologue / ref binding rely on).
+        std::vector<ir::Ref>    param_types;
+        std::vector<ir::ArgDir> arg_dirs;
+        param_types.reserve(captures.size());
+        arg_dirs.reserve(captures.size());
+        for (const ValueSymbol* sym : captures) {
+            param_types.push_back(lower_type(sym->getType()));
+            arg_dirs.push_back(ir::ArgDir::Ref);
+            fn_local(*sym);
+        }
 
         ir::Builder b(module_.pool);
         lower_stmt(body, b);
@@ -19360,8 +19733,8 @@ private:
         module_.set_function(id,
                              ir::Function{ .name          = "fork.child",
                                            .return_type   = module_.pool.void_type,
-                                           .param_types   = {},
-                                           .arg_dirs      = {},
+                                           .param_types   = std::move(param_types),
+                                           .arg_dirs      = std::move(arg_dirs),
                                            .local_types   = std::move(ctx.local_types),
                                            .is_task       = true,
                                            .is_fork_child = true,
@@ -20635,16 +21008,6 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             module->name = std::string(root.topInstances[0]->name);
         }
     }
-    if (!single && !comp.getDPIExports().empty()) {
-        // A context export runs in a specific instance's scope (svScope, LRM
-        // 35.5.3); with several tops there is no single design-state root to bind
-        // the thunk to. Deferred with the rest of svScope.
-        result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
-                                                 .origin   = DiagnosticOrigin::Rejected,
-                                                 .code     = "multi-top-dpi-export",
-                                                 .message  = "DPI export in a multi-top design is not supported" });
-        return result;
-    }
     bool poisoned = false;
     try {
         Lowerer globals(*module, tick_fs, allow_system);
@@ -20657,12 +21020,12 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             lw.set_globals(&globals);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
-            // Exported functions (single-top only, guarded above) resolve in this
-            // top's scope — module-scope functions via `lw`, $unit/package via the
-            // shared `globals` delegation in function_id.
-            if (single) {
-                lw.collect_dpi_exports(comp);
-            }
+            // Exported functions resolve in the scope that owns them: this top's
+            // module-scope functions through `lw` (its own lowered bodies address its
+            // own instance state), $unit/package ones through the shared `globals`
+            // delegation in function_id — those have no instance multiplicity, so
+            // only the first top admits them.
+            lw.collect_dpi_exports(comp, *top, /*collect_globals=*/top == root.topInstances.front());
             const std::span<const Diagnostic> recovered = lw.recovered_diags();
             result.diagnostics.insert(result.diagnostics.end(), recovered.begin(), recovered.end());
             poisoned = poisoned || lw.poisoned();

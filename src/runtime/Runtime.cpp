@@ -3177,6 +3177,30 @@ extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
     std::exit(1);
 }
 
+extern "C" void rt_ring_overflow(uint32_t ring, uint32_t capacity) {
+    // The scheduler's Active / Reactive rings are sized statically from the
+    // design (ensure_active_queue): one slot per process plus one per
+    // concurrently-live `fork` child. Reaching this means that count was too
+    // small -- an unbounded shape the static bound saturates on (recursion into a
+    // forking task), or a bug in the bound itself. The alternative to reporting
+    // is queue[tail & mask] overwriting a live coroutine handle, which corrupts
+    // the scheduler and surfaces as a hang or a wrong answer with no diagnostic.
+    const uint64_t now = rt_diag_now();
+    std::fflush(stdout);
+    std::string line = "FATAL: the ";
+    line += ring == 0 ? "active" : "reactive";
+    line += " scheduler ring overflowed at ";
+    append_finish_time(line, now);
+    line += fmt::format(" (capacity {} coroutine handles)\n", capacity);
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+    rt_vcd_close();
+    rt_finishing = 1;
+    // Same reasoning as rt_oscillation_abort: there is no settled state to hand
+    // back mid-instant, so this path ends the process with a nonzero status.
+    std::exit(1);
+}
+
 // ---- Observed region (LRM 4.4.2.4) deferred reports ----
 //
 // A report produced while the Active/NBA regions settle an instant is not

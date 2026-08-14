@@ -209,6 +209,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_defer_flush_observed", &rt_defer_flush_observed);
     expose("rt_defer_flush_final", &rt_defer_flush_final);
     expose("rt_oscillation_abort", &rt_oscillation_abort);
+    expose("rt_ring_overflow", &rt_ring_overflow);
     expose("rt_queue_assign_dynarr", &rt_queue_assign_dynarr);
     expose("rt_severity", &rt_severity);
     expose("rt_bounds_report", &rt_bounds_report);
@@ -337,7 +338,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("svGetScopeFromName", &svGetScopeFromName);
     expose("svPutUserData", &svPutUserData);
     expose("svGetUserData", &svGetUserData);
-    expose("rt_svdpi_scope_init", &rt_svdpi_scope_init);
+    expose("rt_svdpi_scope_register", &rt_svdpi_scope_register);
     expose("svDimensions", &svDimensions);
     expose("svSize", &svSize);
     expose("svLeft", &svLeft);
@@ -459,6 +460,17 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
                 return -1;
             }
         } else {
+            // A .so cannot satisfy an export round trip: Load dlopen's it, which
+            // binds its undefined symbols against the process at load time, so the
+            // C's `foo` can never reach the JIT-emitted thunk living in ORC-managed
+            // memory. Fail loudly rather than leave the C calling into nothing.
+            if (!m.dpi_exports.empty()) {
+                llvm::errs() << "jit: DPI library '" << lib
+                             << "' is a shared object, but this design has export \"DPI-C\" "
+                                "functions; export needs a relocatable object (--dpi-lib "
+                                "<file>.o or .a) that can be linked into the JIT\n";
+                return -1;
+            }
             auto gen = llvm::orc::DynamicLibrarySearchGenerator::Load(
               lib.c_str(), (*jit)->getDataLayout().getGlobalPrefix());
             if (!gen) {
