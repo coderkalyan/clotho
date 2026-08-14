@@ -189,25 +189,115 @@ TEST_CASE("a constant table is not dumped as a design variable") {
     CHECK(dumped == 2);
 }
 
-// An element type with no plane image (string, unpacked struct, class handle)
-// has no constant-table form and must fail loudly rather than lower wrongly.
-TEST_CASE("a constant table of an unsupported element type is rejected") {
-    constexpr std::string_view strings = R"(
+// An unpacked struct has no pooled plane layout of its own, so its image is
+// written and read back leaf-major through the aggregate storage mirror. Nested
+// arrays, 4-state members and a runtime index into a member array all exercise
+// that walk.
+TEST_CASE("unpacked-struct constant tables bake leaf-major") {
+    constexpr std::string_view src = R"(
+        typedef struct { int a; logic [3:0] b; } s_t;
+        typedef struct { int v[0:1]; logic [3:0] f; } n_t;
         module t;
-            localparam string S[0:1] = '{"a","b"};
-            int i;
-            initial begin i = 1; $display("%s", S[i]); end
+            localparam s_t P[0:1] = '{'{1, 4'bx01z}, '{3, 4'hF}};
+            localparam n_t N[0:1] = '{'{'{1,2}, 4'h5}, '{'{3,4}, 4'h6}};
+            localparam n_t ONE    = '{'{7,8}, 4'h9};
+            int i, j;
+            initial begin
+                for (i = 0; i < 2; i = i + 1) $display("s %0d %b", P[i].a, P[i].b);
+                i = 1; j = 1; $display("n %0d %h", N[i].v[j], N[i].f);
+                j = 0; $display("one %0d %h", ONE.v[j], ONE.f);
+            end
         endmodule
     )";
-    CHECK(reject(strings).find("constant table") != std::string::npos);
+    CHECK(run_capture(src) ==
+          "s 1 x01z\n"
+          "s 3 1111\n"
+          "n 4 6\n"
+          "one 7 9\n");
+}
 
-    constexpr std::string_view structs = R"(
-        typedef struct { int a; int b; } s_t;
+// A value holding a heap-backed leaf (string / queue / dynamic array /
+// associative array) cannot be baked — only the runtime can build those handles
+// — so it is seeded once into the PreInit process instead. Element values are
+// the LRM 7.8 / 7.9 / 6.16 ones; iverilog cannot oracle these (it rejects
+// unpacked-array parameters, has no string-keyed associative arrays, and reports
+// 3 for `"bb".len()` read out of a string array), so each shape is pinned
+// against the equivalent variable form clotho's own container tests cover.
+TEST_CASE("heap-backed constant tables are seeded at time zero") {
+    constexpr std::string_view src = R"(
+        typedef struct { string n; int v; } kv_t;
         module t;
-            localparam s_t S[0:1] = '{'{1,2},'{3,4}};
-            int i;
-            initial begin i = 1; $display("%0d", S[i].a); end
+            localparam string S[0:2] = '{"aa","bb","cc"};
+            localparam string LONG   = "a string that is definitely longer than thirty bytes";
+            localparam string L[0:0] = '{"another string well past the inline capacity limit"};
+            localparam int    Q[$]   = '{1,2,3};
+            localparam string D[]    = '{"x","yy"};
+            localparam int    A[string] = '{default:9, "a":1, "b":2};
+            localparam string M[int] = '{1:"one", 2:"two"};
+            localparam kv_t   KV[0:1] = '{'{"one",1},'{"two",2}};
+            int    i;
+            string k;
+            initial begin
+                for (i = 0; i < 3; i = i + 1) $write("%s%0d ", S[i], S[i].len());
+                $write("\n");
+                $display("long %0d %0d", LONG.len(), L[0].len());
+                i = 1; $display("q %0d %0d", Q[i], Q.size());
+                i = 1; $display("d %s %0d", D[i], D.size());
+                k = "b"; $display("a %0d %0d %0d", A[k], A["zz"], A.num());
+                i = 2; $display("m %s", M[i]);
+                i = 1; $display("kv %s %0d", KV[i].n, KV[i].v);
+            end
         endmodule
     )";
-    CHECK(reject(structs).find("constant table") != std::string::npos);
+    CHECK(run_capture(src) ==
+          "aa2 bb2 cc2 \n"
+          "long 52 50\n"
+          "q 2 3\n"
+          "d yy 2\n"
+          "a 2 9 2\n"
+          "m two\n"
+          "kv two 2\n");
+}
+
+// A `string` / `null` parameter is a scalar constant, not a table: it folds like
+// any other value once lower_constant knows the shape.
+TEST_CASE("string and null parameters fold") {
+    constexpr std::string_view src = R"(
+        class C; int x; endclass
+        module t;
+            localparam string NAME = "abc";
+            localparam C      H    = null;
+            string s;
+            initial begin
+                s = NAME;
+                $display("%s %0d %0d %0d", s, NAME.len(), s == "abc", H == null);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "abc 3 1 1\n");
+}
+
+// What still has no constant-table form: an associative array whose key type is
+// a wildcard (no declared type to intern the key against, and the runtime keys
+// on the byte span), and a container whose element is itself an aggregate (one
+// entry op carries one value, not an lvalue to build into).
+TEST_CASE("constant tables with no representable form are rejected") {
+    constexpr std::string_view wildcard = R"(
+        module t;
+            localparam int A[*] = '{1:10};
+            int k;
+            initial begin k = 1; $display("%0d", A[k]); end
+        endmodule
+    )";
+    CHECK(reject(wildcard).find("wildcard index") != std::string::npos);
+
+    constexpr std::string_view agg_value = R"(
+        typedef struct { int a; } s_t;
+        module t;
+            localparam s_t A[int] = '{1:'{5}};
+            int k;
+            initial begin k = 1; $display("%0d", A[k].a); end
+        endmodule
+    )";
+    CHECK(reject(agg_value).find("aggregate or container elements") != std::string::npos);
 }

@@ -9355,37 +9355,82 @@ private:
         return state_init_fields(a.ty, by_field);
     }
 
-    // One element's slot constant from its canonical val / xz planes: `mm` packs
+    // One leaf's slot constant from its canonical val / xz planes: `mm` packs
     // must | may << W (or the bare value for a narrow 2-state slot), plus the z
     // plane when the slot keeps one. The compile-time twin of lower_constant's
     // VPI ingest.
-    llvm::Constant* const_slot(const SignalSlot& s, std::span<const uint8_t> planes) {
-        const uint32_t    pb  = plane_bytes(s.width);
-        const llvm::APInt val = apint_from_bytes(planes.subspan(0, pb), s.width);
-        const llvm::APInt xz  = s.four_state ? apint_from_bytes(planes.subspan(pb, pb), s.width)
-                                             : llvm::APInt(s.width, 0);
+    llvm::Constant* const_leaf(llvm::StructType* slot_ty, uint32_t width, bool four_state, bool narrow,
+                               bool has_z, std::span<const uint8_t> planes) {
+        const uint32_t    pb  = plane_bytes(width);
+        const llvm::APInt val = apint_from_bytes(planes.subspan(0, pb), width);
+        const llvm::APInt xz =
+          four_state ? apint_from_bytes(planes.subspan(pb, pb), width) : llvm::APInt(width, 0);
 
         std::vector<llvm::Constant*> fields;
-        if (s.narrow) {
+        if (narrow) {
             fields.push_back(llvm::ConstantInt::get(ctx_, val));
         } else {
             const llvm::APInt must = val & ~xz;
             const llvm::APInt may  = val | xz;
             fields.push_back(llvm::ConstantInt::get(
-              ctx_, must.zext(2 * s.width) | (may.zext(2 * s.width) << s.width)));
+              ctx_, must.zext(2 * width) | (may.zext(2 * width) << width)));
         }
-        if (s.has_z) {
+        if (has_z) {
             fields.push_back(llvm::ConstantInt::get(ctx_, xz & ~val));
         }
-        return llvm::ConstantStruct::get(s.slot_ty, fields);
+        return llvm::ConstantStruct::get(slot_ty, fields);
+    }
+
+    llvm::Constant* const_slot(const SignalSlot& s, std::span<const uint8_t> planes) {
+        return const_leaf(s.slot_ty, s.width, s.four_state, s.narrow, s.has_z, planes);
+    }
+
+    // Recursive baked image for an aggregate constant table, walking the IR type
+    // and the signal's own storage type in lockstep and consuming the pool image
+    // leaf-major (the order append_const_image wrote it). The storage type is
+    // threaded rather than rebuilt because agg_storage_ty mints a fresh
+    // StructType per call, so only the signal's own types have the right
+    // identity. An aggregate leaf slot always carries its z plane
+    // (agg_leaf_slot_ty), which is why the flags here are type-derived.
+    llvm::Constant* const_agg(Ref type, llvm::Type* storage, std::span<const uint8_t>& cursor) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            auto*                        at = llvm::cast<llvm::ArrayType>(storage);
+            std::vector<llvm::Constant*> elems;
+            elems.reserve(at->getNumElements());
+            for (uint64_t k = 0; k < at->getNumElements(); ++k) {
+                elems.push_back(const_agg(t.element, at->getElementType(), cursor));
+            }
+            return llvm::ConstantArray::get(at, elems);
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            auto*                        st = llvm::cast<llvm::StructType>(storage);
+            std::vector<llvm::Constant*> fields;
+            uint32_t                     f = 0;
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                fields.push_back(const_agg(fld.type, st->getElementType(f++), cursor));
+            }
+            return llvm::ConstantStruct::get(st, fields);
+        }
+        const Layout   lay  = mod_.pool.layout(type);
+        const uint32_t w    = lay.width == 0 ? 1 : lay.width;
+        const bool     four = lay.domain == Domain::Four;
+        const uint32_t used = (four ? 2u : 1u) * plane_bytes(w);
+        llvm::Constant* leaf =
+          const_leaf(llvm::cast<llvm::StructType>(storage), w, four, !four, four, cursor.subspan(0, used));
+        cursor = cursor.subspan(used);
+        return leaf;
     }
 
     // The whole storage image of a materialized constant table (Module.h
-    // SignalInfo::const_data): the pool holds its canonical planes element-major,
-    // so each element decodes independently into this signal's slot layout.
+    // SignalInfo::const_data): the pool holds its canonical planes leaf-major, so
+    // each leaf decodes independently into this signal's slot layout.
     llvm::Constant* const_data_init(const SignalSlot& s, Ref const_data) {
-        const std::span<const uint8_t> img = mod_.pool.bytes(const_data);
-        const uint32_t                 el  = (s.four_state ? 2u : 1u) * plane_bytes(s.width);
+        std::span<const uint8_t> img = mod_.pool.bytes(const_data);
+        if (s.is_agg) {
+            return const_agg(s.ir_type, s.storage_ty, img);
+        }
+        const uint32_t el = (s.four_state ? 2u : 1u) * plane_bytes(s.width);
         if (!s.is_array) {
             return const_slot(s, img.subspan(0, el));
         }
