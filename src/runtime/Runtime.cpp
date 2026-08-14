@@ -3178,20 +3178,27 @@ extern "C" void rt_oscillation_abort(const rt_wheel* wheel) {
 }
 
 extern "C" void rt_ring_overflow(uint32_t ring, uint32_t capacity) {
-    // The scheduler's Active / Reactive rings are sized statically from the
-    // design (ensure_active_queue): one slot per process plus one per
-    // concurrently-live `fork` child. Reaching this means that count was too
-    // small -- an unbounded shape the static bound saturates on (recursion into a
-    // forking task), or a bug in the bound itself. The alternative to reporting
-    // is queue[tail & mask] overwriting a live coroutine handle, which corrupts
-    // the scheduler and surfaces as a hang or a wrong answer with no diagnostic.
+    // The scheduler's queues are sized statically from the design
+    // (ensure_active_queue, wait_counts): one slot per process, plus one per
+    // concurrently-live `fork` child. Reaching this means that count was too small
+    // -- an unbounded shape the static bound saturates on (recursion into a forking
+    // task), or a bug in the bound itself. The alternative to reporting is a store
+    // past the end of the buffer, overwriting a live coroutine handle or whatever
+    // global follows it, which corrupts the scheduler and surfaces as a hang or a
+    // wrong answer with no diagnostic.
+    //
+    // Selector order matches the kRing* constants in src/ir/LlvmBackend.cpp.
+    static constexpr const char* kNames[] = {
+        "active scheduler ring", "reactive scheduler ring", "inactive (#0) batch",
+        "reactive inactive (#0) batch", "event wait queue",
+    };
     const uint64_t now = rt_diag_now();
     std::fflush(stdout);
     std::string line = "FATAL: the ";
-    line += ring == 0 ? "active" : "reactive";
-    line += " scheduler ring overflowed at ";
+    line += ring < std::size(kNames) ? kNames[ring] : "scheduler queue";
+    line += " overflowed at ";
     append_finish_time(line, now);
-    line += fmt::format(" (capacity {} coroutine handles)\n", capacity);
+    line += fmt::format(" (capacity {} entries)\n", capacity);
     std::fputs(line.c_str(), stderr);
     std::fflush(stderr);
     rt_vcd_close();

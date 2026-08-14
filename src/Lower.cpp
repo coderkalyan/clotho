@@ -2276,6 +2276,16 @@ private:
                 introduce(p.name, p.subroutineKind, p.getReturnType(), p.flags.has(slang::ast::MethodFlags::Pure));
             }
         }
+        // A polymorphic class also carries a shallow-copy thunk (LRM 8.12), so
+        // `new src` through a base-typed handle allocates the source's own class.
+        // The slot lives in the same name-keyed map under a name no method can have,
+        // so it inherits down the hierarchy like any other slot and a derived class's
+        // own virtuals number after it. Reserved only when the class already has a
+        // vtable: giving one to a non-polymorphic class would add an object-body
+        // header word to every class in the language.
+        if (size != 0 && !slots.contains(kCopySlot)) {
+            slots.emplace(kCopySlot, size++);
+        }
         class_vslot_[&clt] = slots;
         if (size == 0) {
             return; // non-polymorphic: no vtable, no object-body header
@@ -2294,6 +2304,9 @@ private:
                 filled[it->second] = true;
             }
         }
+        const uint32_t copy_slot = slots.at(kCopySlot);
+        table[copy_slot]         = copy_thunk_id(clt, class_ref);
+        filled[copy_slot]        = true;
         // Un-overridden slots: a pure virtual in an abstract class. Fill with a
         // prototype-built stub (the slot's signature source).
         for (const auto& [name, s] : slots) {
@@ -17534,6 +17547,8 @@ private:
             }
             case ExpressionKind::NewClass:
                 return lower_new_class(expr.as<slang::ast::NewClassExpression>(), b);
+            case ExpressionKind::CopyClass:
+                return lower_copy_class(expr.as<slang::ast::CopyClassExpression>(), b);
             case ExpressionKind::Assignment: {
                 // Assignment used as an rvalue (`y = (x += 1)`, `y = (x = 5)`). Its
                 // value is the LHS after the store, truncated to the LHS type (LRM
@@ -19947,6 +19962,107 @@ private:
         return handle;
     }
 
+    // Lower a class shallow copy (LRM 8.12): `dst = new src`. Allocates a second
+    // object and copies every non-static property of `src` into it member-wise. Per
+    // 8.12's three steps the constructor does NOT run and neither do declaration
+    // initializers, which is the whole difference from lower_new_class above.
+    //
+    // What each property does is already decided by its type: emit_class_body_copy
+    // routes through emit_agg_copy, so a string / queue / dynamic array /
+    // associative array property (a value type that owns a heap buffer) deep-copies
+    // and a class-handle property copies as a handle -- 8.12's "objects, however,
+    // are not copied, only their handles".
+    //
+    // The object allocated must be of the SOURCE's dynamic type, not of the
+    // expression's static type: `new b` where `b` is a base-typed handle holding a
+    // derived object copies the derived object. For a polymorphic class that is
+    // observable through a virtual call on the copy, so the copy dispatches through
+    // the source's own vtable to its class's synthesized copy thunk. A
+    // non-polymorphic hierarchy has no dispatch to get wrong and no way to reach the
+    // sliced-off part (a derived handle needs $cast), so it copies the
+    // static type inline.
+    ir::Index lower_copy_class(const slang::ast::CopyClassExpression& cc, ir::Builder& b) {
+        const ir::SourceLoc l         = loc(cc);
+        const auto&         clt       = cc.type->getCanonicalType().as<slang::ast::ClassType>();
+        const ir::Ref       class_ref = lower_type(*cc.type);
+        const ir::Index     src       = lower_expr(cc.sourceExpr(), b);
+        if (module_.vtable_for(class_ref) != nullptr) {
+            const ir::FunctionId sig  = copy_thunk_id(clt, class_ref);
+            const uint32_t       slot = class_vslot_.at(&clt).at(kCopySlot);
+            return b.call_virtual(sig, slot, class_ref, std::array<ir::Index, 1>{ src }, l);
+        }
+        const ir::Index dst = b.class_new(class_ref, l);
+        emit_class_body_copy(dst, src, class_ref, b, l);
+        return dst;
+    }
+
+    // Copy every property of object `src` into object `dst`, both of class
+    // `class_ref` (LRM 8.12 step 2). lower_class_type flattens the inheritance chain
+    // into one field table with the base's properties as a prefix, so this single
+    // flat loop covers inherited and own properties in body order; static properties
+    // are not in the body (they are shared, LRM 8.9) and so are correctly untouched.
+    void emit_class_body_copy(ir::Index dst, ir::Index src, ir::Ref class_ref, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Index dst_body = b.handle_deref(dst, class_ref, l);
+        const ir::Index src_body = b.handle_deref(src, class_ref, l);
+        const ir::Type  t        = std::get<ir::Type>(module_.pool.get(class_ref));
+        const auto      n        = static_cast<uint32_t>(module_.pool.struct_fields(t.fields_id).size());
+        for (uint32_t i = 0; i < n; ++i) {
+            // Re-read the row each iteration: emit_agg_copy can intern a type and
+            // reallocate the field table underneath a held span (Lower.cpp's
+            // emit_agg_store documents the same hazard).
+            const ir::Ref field_ty = module_.pool.struct_fields(t.fields_id)[i].type;
+            emit_agg_copy(b.member_select(dst_body, i, class_ref, l),
+                          b.member_select(src_body, i, class_ref, l),
+                          field_ty,
+                          ir::Inst::Tag::Store,
+                          b,
+                          l);
+        }
+    }
+
+    // The FunctionId of class `clt`'s shallow-copy thunk: `(src handle) -> handle`,
+    // allocating and filling an object of exactly `clt`. One per polymorphic class,
+    // installed in its vtable's reserved kCopySlot by compute_vtable, so `new src`
+    // through a base-typed handle reaches the concrete class's thunk and allocates
+    // the concrete size. Cached per class.
+    ir::FunctionId copy_thunk_id(const slang::ast::ClassType& clt, ir::Ref class_ref) {
+        const auto it = copy_thunk_.find(&clt);
+        if (it != copy_thunk_.end()) {
+            return it->second;
+        }
+        const ir::FunctionId id = module_.reserve_function();
+        copy_thunk_[&clt]       = id;
+        build_copy_thunk(clt, class_ref, id);
+        return id;
+    }
+
+    // Build the copy thunk body. Takes the source handle as its one parameter (the
+    // receiver slot every vtable dispatch passes, so the thunk's LLVM signature is
+    // the same `(i64) -> i64` in every class of the hierarchy) and returns the new
+    // object's handle. An abstract class gets one too: its vtable is never
+    // materialized because it is never instantiated, so the body is unreachable, and
+    // filling the slot uniformly keeps the numbering identical across the hierarchy.
+    void build_copy_thunk(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
+        // The parameter occupies frame Local 0, as in build_pure_stub / build_function.
+        std::vector<ir::Ref>    param_types{ class_ref };
+        std::vector<ir::ArgDir> arg_dirs{ ir::ArgDir::In };
+        std::vector<ir::Ref>    local_types{ class_ref };
+        ir::Builder             b(module_.pool);
+        const ir::SourceLoc     el  = to_source_loc(clt.location);
+        const ir::Index         src = b.unary(ir::Inst::Tag::Load, b.local(0, class_ref, el), el);
+        const ir::Index         dst = b.class_new(class_ref, el);
+        emit_class_body_copy(dst, src, class_ref, b, el);
+        b.unary(ir::Inst::Tag::Ret, dst, el);
+        module_.set_function(id,
+                             ir::Function{ .name        = std::string(clt.name) + ".copy",
+                                           .return_type = class_ref,
+                                           .param_types = std::move(param_types),
+                                           .arg_dirs    = std::move(arg_dirs),
+                                           .local_types = std::move(local_types),
+                                           .span        = span_of(clt),
+                                           .ir          = b.finish() });
+    }
+
     // Run class `clt`'s constructor `ctor` (may be null) against object `handle`
     // with the given actual argument expressions (LRM 8.7). A non-null ctor is
     // called directly; its OWN base construction is emitted at its entry (implicit)
@@ -20595,6 +20711,11 @@ private:
     using VtableSlots = ankerl::unordered_dense::map<std::string_view, uint32_t>;
     ankerl::unordered_dense::map<const slang::ast::ClassType*, VtableSlots>                class_vslot_;
     ankerl::unordered_dense::map<const slang::ast::MethodPrototypeSymbol*, ir::FunctionId> pure_stub_;
+    // The reserved vtable slot name of a class's shallow-copy thunk (LRM 8.12). Not
+    // a legal method name, so it cannot collide with a virtual method's slot.
+    static constexpr std::string_view kCopySlot = "$copy";
+    // Polymorphic class -> the FunctionId of its shallow-copy thunk (copy_thunk_id).
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> copy_thunk_;
     // The shared Lowerer that owns package/$unit-scope subroutine bodies (see
     // set_globals / function_id). Null on the shared Lowerer itself and on any
     // Lowerer built without one (e.g. tests that lower a single module with no

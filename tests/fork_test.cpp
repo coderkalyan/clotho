@@ -152,6 +152,67 @@ TEST_CASE("fork: single-child and empty forks") {
     CHECK(out == "solo\nafter\n");
 }
 
+// The two statically-sized structures a fork child reaches whose capacity used to
+// ignore fork width entirely. Both overran silently: the wait bucket was sized by
+// the PROCESS count (a width-4 fork already stored past the end and resumed a
+// garbage handle), and the `#0` batch is a bump allocator with no bounds check.
+// Values cross-checked against Icarus Verilog 13.
+
+TEST_CASE("fork: children waiting on one edge fit the dynamic wait bucket") {
+    // Eight children park on (clk, posedge) at the same instant. `wait_counts`
+    // reserved `mod_.processes().size()` slots for ALL task waits together — three
+    // here — so this stored four entries past the end of clotho.wait.clk.dyn.pos.
+    // Blocking adds to one variable, so the total is order-independent.
+    const std::string out = run_capture(R"(
+        module t;
+          bit clk = 0;
+          int hits = 0;
+          always #5 clk = ~clk;
+          initial begin
+            fork
+              begin @(posedge clk); hits = hits + 1; end
+              begin @(posedge clk); hits = hits + 1; end
+              begin @(posedge clk); hits = hits + 1; end
+              begin @(posedge clk); hits = hits + 1; end
+              begin @(posedge clk); hits = hits + 1; end
+              begin @(posedge clk); hits = hits + 1; end
+              begin @(posedge clk); hits = hits + 1; end
+              begin @(posedge clk); hits = hits + 1; end
+            join
+            $display("hits=%0d t=%0t", hits, $time);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "hits=8 t=5\n");
+}
+
+TEST_CASE("fork: children parked on #0 fit the inactive batch") {
+    // Every child parks on the inactive (#0) batch at once, so the batch has to be
+    // sized by fork width like the ring is. Overrunning it is silent: the push is a
+    // bump store with no mask, and its guard is emitted only for a design that
+    // forks.
+    const std::string out = run_capture(R"(
+        module t;
+          int n = 0;
+          initial begin
+            fork
+              #0 n = n + 1;
+              #0 n = n + 1;
+              #0 n = n + 1;
+              #0 n = n + 1;
+              #0 n = n + 1;
+              #0 n = n + 1;
+              #0 n = n + 1;
+              #0 n = n + 1;
+            join
+            $display("n=%0d t=%0t", n, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "n=8 t=0\n");
+}
+
 // fork … join inside a TASK body (LRM 9.3.2 with 13.4.2). slang itself rejects
 // `join` / `join_any` inside a function, so a task is the only subroutine that can
 // reach the lowering. Values cross-checked against Icarus Verilog 13.

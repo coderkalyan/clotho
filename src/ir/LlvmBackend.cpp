@@ -4032,26 +4032,33 @@ private:
     // that wakes it knows whether to push it onto the active or the reactive
     // ring.
     //
-    // No bounds check — capacity is the count of distinct processes that
-    // intra-body-wait on the signal, plus one process-chain's worth for every
-    // (signal, edge) a task waits on, and a process holds at most one dynamic
-    // slot per signal at a time (wait_counts).
+    // Capacity is the count of distinct processes that intra-body-wait on the
+    // signal, plus one process-chain's worth for every (signal, edge) a task waits
+    // on, plus the fork-child activations that are not process chains at all
+    // (wait_counts). A process holds at most one dynamic slot per signal at a time.
     //
-    // TODO: an action block pended by a concurrent assertion is the one waiter
-    // that is not a process chain -- lower_reactive_pend builds a FRESH frame per
-    // failing attempt, and nothing serializes them, so N attempts that each park
-    // on the same (signal, edge) hold N slots at once. wait_counts reserves
-    // mod_.processes().size() of them for all task waits together, which is a
-    // bound on chains, not on pends. Exceeding it overruns the bucket. Sizing
-    // that correctly needs a growable bucket (the same thing join_any / join_none
-    // wait on), so it is named here rather than guessed at; it cannot be refused
-    // at compile time without refusing every action block that blocks at all.
+    // Guarded, because two waiters are not process chains and the capacity for them
+    // is an over-approximation rather than an exact count. A fork child is one (a
+    // width-N fork whose children all wait on the same edge parks N frames here);
+    // wait_counts now counts those by activation over the spawn / call graph, and
+    // this check is what makes a miscount a located FATAL instead of a store past
+    // the end of the bucket. Gated on design_forks(), so a design with no fork
+    // emits nothing: `len` is loaded for the push regardless.
+    //
+    // TODO: the other non-chain waiter is an action block pended by a concurrent
+    // assertion -- lower_reactive_pend builds a FRESH frame per failing attempt,
+    // and nothing serializes them, so N attempts that each park on the same
+    // (signal, edge) hold N slots at once, which no static count bounds. That one
+    // still needs a growable bucket, and in a design without a fork it is
+    // unguarded. Sizing it to a constant would only move the cliff.
     void emit_dynamic_register(Signal sig, uint32_t edge) {
         const auto   i       = static_cast<uint32_t>(sig);
         llvm::Value* len_ptr = wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i);
         llvm::Value* q       = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
         auto*        i32     = b_.getInt32Ty();
         llvm::Value* len     = b_.CreateLoad(i32, len_ptr);
+        emit_len_full_check(b_, len, static_cast<uint32_t>(wait_dyn_ty_[i][edge]->getNumElements()),
+                            kRingWaitDynamic);
         emit_entry(wait_dyn_ty_[i][edge], q, len, parked_handle(b_, hdl_), sched_ptr_);
         b_.CreateStore(b_.CreateAdd(len, b_.getInt32(1)), len_ptr);
     }
@@ -4761,6 +4768,56 @@ private:
                     if (task_waits[s][e]) {
                         c.dyn[s][e] += chains;
                     }
+                }
+            }
+        }
+
+        // A fork child is NOT a process chain, and neither is a task it calls, so
+        // the chain term above does not cover either: it bounds task frames by the
+        // number of single-call-stack process chains, which is exactly the invariant
+        // a fork breaks by construction (the same one the active ring had to stop
+        // assuming -- see body_activations). A width-N fork whose children all
+        // `@(posedge clk)` parks N frames on one bucket while `chains` reserved
+        // `mod_.processes().size()`, and emit_dynamic_register's store past the end
+        // corrupts whatever global follows.
+        //
+        // So count the frames the chain term misses the way the ring counts them --
+        // by activations over the call / spawn graph -- and add them per
+        // (signal, edge). Restricted to bodies reachable from a fork child, because
+        // everything else is already covered by `chains`; additive rather than a
+        // replacement, so a design without a fork keeps exactly its previous
+        // capacities and cannot regress.
+        if (fork_child_count() != 0) {
+            const BodyActivations            act = body_activations();
+            std::vector<std::array<size_t, 3>> fork_dyn(n, { 0, 0, 0 });
+            for (size_t fi = 0; fi < mod_.function_count(); ++fi) {
+                const Function& f = mod_.function(static_cast<FunctionId>(fi));
+                if (!f.is_task || act.from_fork[fi] == 0) {
+                    continue;
+                }
+                // One frame parks at one wait at a time, so each DISTINCT
+                // (signal, edge) this body waits on costs mult[fi] slots -- the same
+                // per-body dedup the process loop above does.
+                std::vector<std::pair<Signal, uint32_t>> seen;
+                for (size_t i = 0; i < f.ir.inst_count(); ++i) {
+                    const auto idx = static_cast<Index>(i);
+                    if (f.ir.tag(idx) != Inst::Tag::Wait) {
+                        continue;
+                    }
+                    for (const WaitEdge& we : f.ir.wait_edges(f.ir.payload(idx).extra)) {
+                        const std::pair<Signal, uint32_t> key{ we.signal, we.edge };
+                        if (std::ranges::contains(seen, key)) {
+                            continue;
+                        }
+                        seen.push_back(key);
+                        auto& slot = fork_dyn[static_cast<uint32_t>(we.signal)][we.edge];
+                        slot       = std::min(slot + act.mult[fi], kMaxForkRingSlots);
+                    }
+                }
+            }
+            for (uint32_t s = 0; s < n; ++s) {
+                for (uint32_t e = 0; e < 3; ++e) {
+                    c.dyn[s][e] += static_cast<uint32_t>(fork_dyn[s][e]);
                 }
             }
         }
@@ -6998,8 +7055,11 @@ private:
     // 8 KiB per ring in exchange for never sizing the ring by guesswork.
     static constexpr size_t kMaxForkRingSlots = 1024;
 
-    // Peak number of concurrently live fork-child activations: the ring slots
-    // `fork … join` needs beyond the one-per-process baseline.
+    // Peak number of simultaneously live activations of each function body,
+    // relaxed over the static call / spawn graph. Shared by the two bounds that
+    // have to stop assuming "one process is one call chain": the active ring's
+    // fork-child slots (fork_ring_slots) and the dynamic wait bucket's capacity
+    // (wait_counts).
     //
     // A ring entry is the head of one blocked call chain. A process that called a
     // task, or a fork child that called one, has at most ONE resumable coroutine
@@ -7014,7 +7074,6 @@ private:
     // of the body containing it -- never accumulating across loop iterations.
     // Hence
     //
-    //     slots = Σ over fork-child bodies c of mult(c)
     //     mult(process) = 1
     //     mult(f)       = Σ over call / spawn edges (b -> f) of mult(b)
     //
@@ -7022,24 +7081,33 @@ private:
     // Call / TaskCall of f. The sum over edges (not over distinct sources) is what
     // makes this survive a shared task body: `fork t(); t(); join` gives t two
     // edges from the same process and so mult(t) = 2, and a width-2 fork inside t
-    // then needs 4 slots, not 2. The previous bound (one slot per child body)
-    // assumed `join` serialized each fork's reuse, which holds for a
-    // single-activation process and is false for a task body shared by several
-    // live callers.
+    // then needs 4 slots, not 2. A bound of one slot per child body would assume
+    // `join` serialized each fork's reuse, which holds for a single-activation
+    // process and is false for a task body shared by several live callers.
     //
     // Relaxed to a fixpoint over the static graph; a DAG converges in at most as
     // many rounds as it has functions. Two shapes make no finite bound possible,
-    // and both saturate to kMaxForkRingSlots and lean on the emit_active_push
-    // overflow fatal rather than pretending to a number:
+    // and both report `exact = false` with every entry saturated to
+    // kMaxForkRingSlots, leaning on the runtime overflow checks rather than
+    // pretending to a number:
     //   - recursion (a cycle in the graph): unbounded by construction;
     //   - a virtual task call, followed only to its statically named target (the
     //     bound collect_callees already documents), so a forking override reached
     //     through a handle would otherwise go uncounted.
-    size_t fork_ring_slots() const {
+    struct BodyActivations {
+        // Live activations per FunctionId.
+        std::vector<size_t> mult;
+        // Reachable from a fork child through call / spawn edges (a fork child
+        // itself included). These are exactly the frames the process-chain bound
+        // does not already account for, so a capacity that has a chain term adds
+        // only these.
+        std::vector<uint8_t> from_fork;
+        // False when no finite bound exists and `mult` is saturated throughout.
+        bool exact = false;
+    };
+
+    BodyActivations body_activations() const {
         const size_t nfn = mod_.function_count();
-        if (fork_child_count() == 0) {
-            return 0;
-        }
         // Edges into each function, as (source, callee) pairs. kProcessSource is
         // the source for a process body, whose multiplicity is fixed at one.
         static constexpr uint32_t kProcessSource = ~0u;
@@ -7082,6 +7150,23 @@ private:
             walk(mod_.function(static_cast<FunctionId>(f)).ir, static_cast<uint32_t>(f));
         }
 
+        // Reachable-from-a-fork-child, relaxed over the same edge set. Seeded with
+        // the fork children themselves; a body a child calls is just as uncounted
+        // by the process-chain bound as the child is.
+        std::vector<uint8_t> from_fork(nfn, 0);
+        for (size_t f = 0; f < nfn; ++f) {
+            from_fork[f] = mod_.function(static_cast<FunctionId>(f)).is_fork_child ? 1 : 0;
+        }
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (const Edge& e : edges) {
+                if (e.from != kProcessSource && from_fork[e.from] != 0 && from_fork[e.to] == 0) {
+                    from_fork[e.to] = 1;
+                    grew            = true;
+                }
+            }
+        }
+
         std::vector<size_t> mult(nfn, 0);
         bool                converged = false;
         for (size_t round = 0; !converged && round <= nfn; ++round) {
@@ -7094,13 +7179,25 @@ private:
             mult      = std::move(next);
         }
         if (!converged || imprecise) {
+            return { std::vector<size_t>(nfn, kMaxForkRingSlots), std::move(from_fork), false };
+        }
+        return { std::move(mult), std::move(from_fork), true };
+    }
+
+    // The ring slots `fork … join` needs beyond the one-per-process baseline:
+    // Σ over fork-child bodies of their live activations (see body_activations).
+    size_t fork_ring_slots() const {
+        if (fork_child_count() == 0) {
+            return 0;
+        }
+        const BodyActivations act = body_activations();
+        if (!act.exact) {
             return kMaxForkRingSlots;
         }
-
         size_t slots = 0;
-        for (size_t f = 0; f < nfn; ++f) {
+        for (size_t f = 0; f < mod_.function_count(); ++f) {
             if (mod_.function(static_cast<FunctionId>(f)).is_fork_child) {
-                slots = std::min(slots + mult[f], kMaxForkRingSlots);
+                slots = std::min(slots + act.mult[f], kMaxForkRingSlots);
             }
         }
         return slots;
@@ -7165,10 +7262,13 @@ private:
                                                     llvm::ConstantInt::get(i32, 0), "clotho.inactive_top");
     }
 
-    // Ring selectors for rt_ring_overflow's diagnostic. Kept in step with the
+    // Buffer selectors for rt_ring_overflow's diagnostic. Kept in step with the
     // names the runtime prints (src/runtime/Runtime.cpp).
-    static constexpr uint32_t kRingActive   = 0;
-    static constexpr uint32_t kRingReactive = 1;
+    static constexpr uint32_t kRingActive      = 0;
+    static constexpr uint32_t kRingReactive    = 1;
+    static constexpr uint32_t kRingInactive    = 2;
+    static constexpr uint32_t kRingReInactive  = 3;
+    static constexpr uint32_t kRingWaitDynamic = 4;
 
     // The ring-overflow guard the capacity argument above leans on: a ring holding
     // `cap` live handles cannot take another without overwriting one, and the
@@ -7206,6 +7306,31 @@ private:
         b.SetInsertPoint(ok);
     }
 
+    // The same guard for a buffer whose index IS its live count: the two `#0`
+    // batches (a bump-allocated `top`, drained whole and reset to zero) and a
+    // dynamic wait bucket (`.len`). `len` is a value the caller already had to load
+    // for the push itself, and the `design_forks()` gate is checked before anything
+    // is emitted, so a non-forking design pays exactly nothing.
+    //
+    // These were unguarded until the bound below stopped covering them. Without a
+    // fork every one of them is provably within capacity -- a process is a single
+    // call chain, so it can hold at most one `#0` and one wait entry at a time, and
+    // capacity is at least the process count. A fork child is an extra chain, which
+    // is what breaks that and why the check appears exactly when a fork does.
+    void emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, uint32_t cap, uint32_t which) {
+        if (!design_forks()) {
+            return;
+        }
+        llvm::Function* fn  = b.GetInsertBlock()->getParent();
+        auto*           bad = llvm::BasicBlock::Create(ctx_, "ring.overflow", fn);
+        auto*           ok  = llvm::BasicBlock::Create(ctx_, "ring.push", fn);
+        b.CreateCondBr(b.CreateICmpUGE(len, b.getInt32(cap)), bad, ok);
+        b.SetInsertPoint(bad);
+        b.CreateCall(ring_overflow_fn(), { b.getInt32(which), b.getInt32(cap) });
+        b.CreateUnreachable();
+        b.SetInsertPoint(ok);
+    }
+
     // Push a handle onto the active ring: queue[tail++ & mask] = handle.
     void emit_active_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
         ensure_active_queue();
@@ -7223,6 +7348,7 @@ private:
         ensure_inactive_queue();
         auto*        i32  = b.getInt32Ty();
         llvm::Value* sp   = b.CreateLoad(i32, sym(inactive_top_gv_));
+        emit_len_full_check(b, sp, active_mask_ + 1, kRingInactive);
         llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(inactive_gv_), { b.getInt32(0), sp });
         b.CreateStore(handle, slot);
         b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), sym(inactive_top_gv_));
@@ -7300,6 +7426,7 @@ private:
         ensure_re_inactive_queue();
         auto*        i32  = b.getInt32Ty();
         llvm::Value* sp   = b.CreateLoad(i32, sym(re_inactive_top_gv_));
+        emit_len_full_check(b, sp, active_mask_ + 1, kRingReInactive);
         llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(re_inactive_gv_), { b.getInt32(0), sp });
         b.CreateStore(handle, slot);
         b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), sym(re_inactive_top_gv_));
