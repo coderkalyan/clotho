@@ -2964,6 +2964,18 @@ private:
             }
             return;
         }
+        if (value_cat(type) == ValueCat::string && tag != ir::Inst::Tag::Store) {
+            // TODO: nonblocking copy of a string member. A string's value is a heap
+            // handle, so it has no plane-shaped shadow to stage into, and the
+            // whole-container record path this pass built stages a CONTAINER handle
+            // (HandleCopyNb), which an rt_string is not.
+            //
+            // Guarded rather than gapped: falling through to the plane StoreNb below
+            // reached the backend with a string lvalue and no string path, which
+            // crashed codegen instead of reporting anything.
+            fail("nonblocking assignment to an aggregate with a string member is not "
+                 "supported");
+        }
         b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
     }
 

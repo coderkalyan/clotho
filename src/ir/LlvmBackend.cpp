@@ -2697,11 +2697,17 @@ private:
     // plane slot, a managed handle, or an aggregate image. A bit / part selection
     // is not a place a pointer can name, so it is rejected — the frontend guards
     // it too (is_whole_ref_actual), and this is the defensive backstop.
-    RefBinding ref_actual_arg(const LValue& lv, const SourceText& at, std::string_view formal) {
-        RefBinding rb;
-        rb.site = ref_site_global(at, formal, ref_container_name(lv));
+    RefBinding ref_actual_arg(const LValue& raw, const SourceText& at, std::string_view formal) {
+        // An associative-array element is a DEFERRED place, and a `ref` is its third
+        // consumer alongside Load and Store: it needs the address itself. Resolve it
+        // with put_ptr, because LRM 13.5.2 binds the formal to a VARIABLE — there is
+        // no variable to alias until the entry exists, so forming the ref creates it,
+        // exactly as a mutating method on `a[k]` does.
+        const LValue lv = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
+        RefBinding   rb;
+        rb.site = ref_site_global(at, formal, ref_container_name(raw));
         // A stable place has no epoch to watch; pointing at the compile-time zero
-        // word keeps the callee's check uniform and lets the optimizer delete it.
+        // word keeps the callee's check uniform.
         if (lv.epoch_ptr != nullptr) {
             rb.epoch  = lv.epoch_ptr;
             rb.expect = b_.CreateLoad(b_.getInt64Ty(), lv.epoch_ptr, "ref.epoch.at.call");
@@ -15430,9 +15436,20 @@ private:
     // void rt_ref_stale(ptr site, i64 expect, i64 actual, i64 now) — reports the
     // dangling ref; fatal by default, a once-per-site warning under
     // --loose-stale-ref, so it CAN return (see Runtime.h).
+    //
+    // Declared as touching only memory the design cannot reach (it writes a
+    // diagnostic and a per-site suppression set, both runtime-private). Without
+    // that, GVN has to assume the call on the FAILING path clobbers the epoch, and
+    // refuses to CSE the epoch load of a second dereference in the same block — so
+    // N accesses through one ref formal paid N loads and N compares instead of one.
     llvm::FunctionCallee ref_stale_fn() {
-        return rt_fn("rt_ref_stale", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+        auto callee = rt_fn("rt_ref_stale", b_.getVoidTy(),
+                            { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+        if (auto* fn = llvm::dyn_cast<llvm::Function>(callee.getCallee())) {
+            fn->setMemoryEffects(llvm::MemoryEffects::inaccessibleMemOnly());
+            fn->setDoesNotThrow();
+        }
+        return callee;
     }
 
     // void rt_ref_epoch_regress(ptr site, i64 expect, i64 actual, i64 now) —
