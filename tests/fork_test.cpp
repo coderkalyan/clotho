@@ -617,3 +617,31 @@ TEST_CASE("fork: a join_any / join_none child capturing a task local is rejected
     )",
                    "fork..join_any child that reads the enclosing task's 'k' is not supported");
 }
+
+TEST_CASE("fork: join_none in an assertion action block queues into Reactive") {
+    // An action block is lowered as a task body and lives in the Reactive region, so
+    // its join_none children have to be queued onto the REACTIVE ring, not the active
+    // one (emit_region_push). The action block still observes none of the child's
+    // effect -- n is 0 there and 1 once the child has run.
+    const std::string out = run_capture(R"(
+        module t;
+          bit clk = 0;
+          int n = 0;
+          bit fail = 0;
+          always #5 clk = ~clk;
+          assert property (@(posedge clk) !fail)
+            else begin
+              fork
+                n = n + 1;
+              join_none
+              $display("action@%0t n=%0d", $time, n);
+            end
+          initial begin
+            #7 fail = 1;
+            #10 $display("done n=%0d", n);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "action@15 n=0\ndone n=1\n");
+}
