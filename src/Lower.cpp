@@ -13667,18 +13667,49 @@ private:
     // module; the timescale and path are compile-time constants, so this folds to
     // a literal $display.
     void lower_printtimescale(const CallExpression& call, ir::Builder& b) {
-        // TODO: a hierarchical-name argument selects another scope's timescale;
-        // resolving it needs cross-hierarchy lookup, which Clotho lacks.
+        std::string                     path = instance_path();
+        std::optional<slang::TimeScale> ts   = scope_->getTimeScale();
         if (!call.arguments().empty()) {
-            fail("$printtimescale with a scope argument is not supported");
+            // The argument names another scope. That scope's timescale is one
+            // Scope::getTimeScale() call away and no signal is involved, so the
+            // cross-hierarchy reference never reaches the IR. slang's
+            // PrintTimeScaleTask binds the argument as a symbol reference and
+            // rejects any kind other than Instance / CompilationUnit / Root, so
+            // those three are all that can arrive here.
+            const auto* as = call.arguments()[0]->as_if<slang::ast::ArbitrarySymbolExpression>();
+            if (as == nullptr) {
+                fail("$printtimescale argument must name a module instance, $unit or $root");
+            }
+            const slang::ast::Symbol& sym = *as->symbol;
+            switch (sym.kind) {
+                case SymbolKind::Instance:
+                    ts   = sym.as<InstanceSymbol>().body.getTimeScale();
+                    path = sym.getHierarchicalPath();
+                    break;
+                case SymbolKind::CompilationUnit:
+                    // getHierarchicalPath() spells this scope "$unit"; the symbol
+                    // itself is unnamed.
+                    ts   = sym.as<CompilationUnitSymbol>().timeScale;
+                    path = sym.getHierarchicalPath();
+                    break;
+                case SymbolKind::Root:
+                    // $root declares no timescale of its own, so it reports the
+                    // simulator default. Its path text is spelled out because
+                    // slang's path formatter escapes the leading '$' of the root
+                    // symbol's name into "\$root ".
+                    ts   = scope_->getCompilation().getDefaultTimeScale();
+                    path = "$root";
+                    break;
+                default:
+                    fail("$printtimescale argument must name a module instance, $unit or $root");
+            }
         }
-        const auto ts = scope_->getTimeScale();
-        if (!ts) {
-            // TODO: a scope with no timescale prints the simulator default; Clotho
-            // has no unitless $printtimescale text yet.
-            fail("$printtimescale requires a timescale");
-        }
-        const std::string text = "Time scale of (" + instance_path() + ") is " + ts->toString();
+
+        // A scope with no timescale reports the simulator default, which for
+        // Clotho is the unitless base: one tick is one second (see the tick fold
+        // in lower_compilation). iverilog prints the same "1s / 1s" here.
+        const std::string scale = ts ? ts->toString() : "1s / 1s";
+        const std::string text  = "Time scale of (" + path + ") is " + scale;
         b.display(text, /*newline=*/true, {}, loc(call));
     }
 
