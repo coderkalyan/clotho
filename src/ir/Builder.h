@@ -328,7 +328,9 @@ public:
     Index task_call_virtual(FunctionId func, uint32_t slot, Ref class_ref, std::span<const Index> args, SourceLoc loc);
 
     // Enable task `func`. `args` has one operand per formal in order: an rvalue for
-    // an input formal, an lvalue leaf (a caller temp) for an output / inout formal.
+    // an input formal, an lvalue leaf (a caller temp) for an output / inout formal,
+    // and an aggregate lvalue for an unpacked struct / whole-array formal in any
+    // direction (the callee copies it in / out through that one pointer).
     // A statement, never a value; the caller blocks until the task completes.
     Index task_call(FunctionId func, std::span<const Index> args, SourceLoc loc);
 

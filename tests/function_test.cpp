@@ -568,3 +568,38 @@ TEST_CASE("unpacked array as a function frame local") {
         endmodule
     )") == "46\n");
 }
+
+TEST_CASE("unpacked array and struct as output / inout function arguments") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } s_t;
+            function automatic void fill(output int a [0:2]);
+                a[0] = 10; a[1] = 20; a[2] = 30;
+            endfunction
+            function automatic void bump(inout int a [0:2]);
+                a[1] = a[1] + 5;
+            endfunction
+            function automatic void mk(output s_t v);
+                v.a = 7; v.b = 8'h11;
+            endfunction
+            function automatic void inc(inout s_t v);
+                v.a = v.a + 1;
+            endfunction
+            int q [0:2];
+            s_t s;
+            initial begin
+                fill(q);
+                $display("fill %0d %0d %0d", q[0], q[1], q[2]);
+                bump(q);
+                $display("bump %0d %0d %0d", q[0], q[1], q[2]);
+                mk(s);
+                $display("mk a=%0d b=%0h", s.a, s.b);
+                inc(s);
+                $display("inc a=%0d", s.a);
+            end
+        endmodule
+    )") == "fill 10 20 30\n"
+           "bump 10 25 30\n"
+           "mk a=7 b=11\n"
+           "inc a=8\n");
+}
