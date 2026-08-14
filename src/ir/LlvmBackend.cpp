@@ -39,6 +39,7 @@
 #include "ir/Analysis.h"
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
+#include "ir/TypeModel.h"
 #include "runtime/Runtime.h"
 
 // LLVM backend rationale.
@@ -1166,12 +1167,12 @@ private:
 
     // Whether a type is a dynamic array (LRM 7.5).
     bool is_dynarr_type(Ref type) const {
-        return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::DynArray;
+        return types::is_dynarr(mod_.pool, type);
     }
 
     // Whether a type is an associative array (LRM 7.8/7.9).
     bool is_assoc_type(Ref type) const {
-        return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::Assoc;
+        return types::is_assoc(mod_.pool, type);
     }
 
     // Per-element slot facts for a dynamic array's element (a POD scalar in phase
@@ -1503,14 +1504,14 @@ private:
 
     // Whether a type is a queue (LRM 7.10).
     bool is_queue_type(Ref type) const {
-        return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::Queue;
+        return types::is_queue(mod_.pool, type);
     }
 
     // A heap-backed handle value type (dynamic array, queue, or associative
     // array): all share the by-pointer, deep-copy subroutine ABI, differing only
     // in the runtime slot struct and the copy / free functions.
     bool is_handle_type(Ref type) const {
-        return is_dynarr_type(type) || is_queue_type(type) || is_assoc_type(type);
+        return types::is_container(mod_.pool, type);
     }
     llvm::StructType* handle_slot_ty(Ref type) {
         if (is_assoc_type(type)) {
@@ -1605,42 +1606,25 @@ private:
 
     // Whether a type is a string, or an unpacked array whose leaf element is.
     bool is_string_type(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            return is_string_type(t.element);
-        }
-        return t.kind == Type::Kind::String;
+        return types::is_string_leaf_array(mod_.pool, type);
     }
 
     // The scalar leaf type of a (possibly nested) unpacked-array type.
     Ref leaf_type(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            return leaf_type(t.element);
-        }
-        return type;
+        return types::leaf_type(mod_.pool, type);
     }
 
     // Total leaf-element count of an unpacked-array type (product of all
     // dimensions); 1 for a scalar leaf.
     uint32_t array_leaf_count(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
-            return count * array_leaf_count(t.element);
-        }
-        return 1;
+        return types::array_leaf_count(mod_.pool, type);
     }
 
     // Whether a type contains an unpacked struct anywhere (at any array/struct
     // nesting depth). Such a signal is routed through the recursive aggregate
     // storage / addressing / init path, not the flat scalar-or-array fast paths.
     bool contains_struct(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            return contains_struct(t.element);
-        }
-        return t.kind == Type::Kind::Struct && !t.is_packed;
+        return types::contains_struct(mod_.pool, type);
     }
 
     // Whether a type is an unpacked aggregate passed / stored via the recursive
@@ -1651,8 +1635,7 @@ private:
     // -compatible with the caller's canonical actual (a flat module array may be
     // z-elided narrower, so the caller materializes a canonical temp first).
     bool is_agg_abi(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        return t.kind == Type::Kind::UnpackedArray || (t.kind == Type::Kind::Struct && !t.is_packed);
+        return types::is_agg_abi(mod_.pool, type);
     }
 
     // Whether a type takes the recursive aggregate storage mirror: it contains
@@ -1661,49 +1644,18 @@ private:
     // recursive walks provide. Flat string arrays keep the dedicated
     // string-array path (is_string_type is tested first at both call sites).
     bool needs_agg_storage(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            const Type::Kind ek = std::get<Type>(mod_.pool.get(t.element)).kind;
-            if (ek == Type::Kind::DynArray || ek == Type::Kind::Queue ||
-                ek == Type::Kind::Assoc) {
-                return true;
-            }
-            return needs_agg_storage(t.element);
-        }
-        return t.kind == Type::Kind::Struct && !t.is_packed;
+        return types::needs_agg_storage(mod_.pool, type);
     }
 
     // Whether a type owns heap anywhere (string / dynamic array / queue leaf
     // at any nesting depth), so its aggregate storage needs a deinit walk.
     bool has_heap_leaf(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        switch (t.kind) {
-            case Type::Kind::String:
-            case Type::Kind::DynArray:
-            case Type::Kind::Queue:
-            case Type::Kind::Assoc:
-                return true;
-            case Type::Kind::UnpackedArray:
-                return has_heap_leaf(t.element);
-            case Type::Kind::Struct: {
-                if (t.is_packed) {
-                    return false;
-                }
-                for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
-                    if (has_heap_leaf(f.type)) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            default:
-                return false;
-        }
+        return types::has_heap_leaf(mod_.pool, type);
     }
 
     // Element count of one unpacked-array dimension.
     uint32_t array_dim(const Type& t) const {
-        return (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+        return types::array_dim(t);
     }
 
     // Leaf slot type for a scalar / real aggregate leaf. A 4-state leaf carries a
@@ -1903,8 +1855,7 @@ private:
     // Whether an IR type is a scalar / string / real leaf (as opposed to an
     // unpacked struct or array that a select must descend further).
     bool is_leaf_type(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        return t.kind != Type::Kind::UnpackedArray && !(t.kind == Type::Kind::Struct && !t.is_packed);
+        return !types::is_aggregate(mod_.pool, type);
     }
 
     // Derive member `field_index`'s lvalue from an aggregate lvalue: push the

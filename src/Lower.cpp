@@ -70,6 +70,7 @@
 #include "SourceMap.h"
 #include "Sva.h"
 #include "ir/Builder.h"
+#include "ir/TypeModel.h"
 #include "runtime/Format.h"
 
 namespace clotho {
@@ -3045,36 +3046,30 @@ private:
         aggregate, // unpacked struct / fixed unpacked array: decomposes per leaf
     };
     ValueCat value_cat(ir::Ref type) const {
-        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-        switch (t.kind) {
-            case ir::Type::Kind::String:
-                return ValueCat::string;
-            case ir::Type::Kind::DynArray:
-            case ir::Type::Kind::Queue:
-            case ir::Type::Kind::Assoc:
-                return ValueCat::handle;
-            case ir::Type::Kind::UnpackedArray:
+        switch (ir::types::storage_class(module_.pool, type)) {
+            case ir::types::StorageClass::Managed:
+                // `string` and the three containers differ only in whose deep-copy
+                // verb applies, which is exactly the split ValueCat draws.
+                return ir::types::is_string(module_.pool, type) ? ValueCat::string
+                                                                : ValueCat::handle;
+            case ir::types::StorageClass::Aggregate:
                 return ValueCat::aggregate;
-            case ir::Type::Kind::Struct:
-                return t.is_packed ? ValueCat::scalar : ValueCat::aggregate;
-            default:
+            case ir::types::StorageClass::Plane:
+            case ir::types::StorageClass::Void:
                 return ValueCat::scalar;
         }
+        return ValueCat::scalar;
     }
 
     // Whether an interned IR type is a scalar / string / real / handle leaf.
     bool is_leaf_ref(ir::Ref type) const {
-        return value_cat(type) != ValueCat::aggregate;
+        return !ir::types::is_aggregate(module_.pool, type);
     }
 
     // Whether an interned IR type contains an unpacked struct at any nesting depth
     // (backed by the recursive aggregate model; passed / returned by pointer).
     bool contains_struct_ref(ir::Ref type) const {
-        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-        if (t.kind == ir::Type::Kind::UnpackedArray) {
-            return contains_struct_ref(t.element);
-        }
-        return t.kind == ir::Type::Kind::Struct && !t.is_packed;
+        return ir::types::contains_struct(module_.pool, type);
     }
 
     // Whether an interned IR type is an unpacked aggregate passed / returned by
@@ -3082,8 +3077,7 @@ private:
     // unpacked struct (mirrors the backend is_agg_abi). Broader than
     // contains_struct_ref, which is false for a plain scalar-element array.
     bool is_agg_abi_ref(ir::Ref type) const {
-        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-        return t.kind == ir::Type::Kind::UnpackedArray || (t.kind == ir::Type::Kind::Struct && !t.is_packed);
+        return ir::types::is_agg_abi(module_.pool, type);
     }
 
     // Whether a whole-object copy of the type may be a single memcpy of its
@@ -3096,26 +3090,7 @@ private:
     // (ring growth, insert/delete shifts) even for heap-owning element types;
     // only memcpy DUPLICATION is what this predicate gates.
     bool is_trivially_copyable(ir::Ref type) const {
-        switch (value_cat(type)) {
-            case ValueCat::string:
-            case ValueCat::handle:
-                return false;
-            case ValueCat::scalar:
-                return true;
-            case ValueCat::aggregate: {
-                const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-                if (t.kind == ir::Type::Kind::UnpackedArray) {
-                    return is_trivially_copyable(t.element);
-                }
-                for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
-                    if (!is_trivially_copyable(f.type)) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-        }
-        return false;
+        return ir::types::is_trivially_copyable(module_.pool, type);
     }
 
     // A pattern/concatenation-lvalue element that is itself a variable_lvalue
@@ -3281,24 +3256,19 @@ private:
     // True if an interned IR type is the string type, or an unpacked array whose
     // leaf element is.
     bool is_string_ref(ir::Ref ty) const {
-        const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
-        if (t.kind == ir::Type::Kind::UnpackedArray) {
-            return is_string_ref(t.element);
-        }
-        return t.kind == ir::Type::Kind::String;
+        return ir::types::is_string_leaf_array(module_.pool, ty);
     }
 
     // True if an interned IR type is a dynamic array (LRM 7.5).
     bool is_dyn_array_ref(ir::Ref ty) const {
-        return std::get<ir::Type>(module_.pool.get(ty)).kind == ir::Type::Kind::DynArray;
+        return ir::types::is_dynarr(module_.pool, ty);
     }
 
     // True if an interned IR type is a heap-handle value type — a dynamic array,
     // queue, or associative array — which share the by-pointer, deep-copy
     // subroutine ABI.
     bool is_handle_ref(ir::Ref ty) const {
-        const ir::Type::Kind k = std::get<ir::Type>(module_.pool.get(ty)).kind;
-        return k == ir::Type::Kind::DynArray || k == ir::Type::Kind::Queue || k == ir::Type::Kind::Assoc;
+        return ir::types::is_container(module_.pool, ty);
     }
 
     // True if an expression is a dynamic array, queue, or associative array (a
@@ -3602,10 +3572,15 @@ private:
                         // event aliasing (Tier 2, docs/design/named-events.md).
                         fail("event ports are not supported");
                     }
-                    if (info.dir != ir::SignalInfo::Direction::Internal && is_string_ref(info.type)) {
-                        // TODO: string module ports (needs string-aware port
-                        // copies and change propagation).
-                        fail("string module ports are not supported");
+                    if (info.dir != ir::SignalInfo::Direction::Internal &&
+                        ir::types::contains_string(module_.pool, info.type)) {
+                        // TODO: string module ports (needs string-aware port copies
+                        // and change propagation). The predicate walks struct members
+                        // and container elements as well as array dimensions, so a
+                        // struct-with-string port and a queue-of-string port are
+                        // caught too -- the old array-only walk let both through.
+                        fail("string module ports are not supported, including a string "
+                             "reached through a struct member or a container element");
                     }
 
                     const ir::Signal sig = register_signal(std::move(info));
@@ -5851,6 +5826,22 @@ private:
             const ir::SourceLoc        l         = to_source_loc(p.location);
             ir::Builder                b(module_.pool);
             std::vector<ir::WaitEvent> sens;
+            // A connected container port. The port copy is a continuous assignment,
+            // so it would have to deep-copy the handle whenever the source changes
+            // (value semantics, LRM 7.5 / 7.9 / 7.10) and detect that change through
+            // a heap buffer rather than a plane compare. Neither exists.
+            //
+            // Guarded here rather than at the declaration: an UNCONNECTED container
+            // port lowers fine and the synthesis path deliberately reports it as a
+            // type with no hardware form, so refusing the declaration would take that
+            // away. Guarded at all because the plane-copy path below would otherwise
+            // reach the backend as a plane load of a handle, which throws there —
+            // a backend error with no source location instead of a diagnostic.
+            // TODO: container module ports (a handle-aware continuous copy).
+            if (ir::types::is_container(module_.pool, lower_type(p.internalSymbol->as<ValueSymbol>().getType()))) {
+                fail("a dynamic-array, queue or associative-array module port "
+                     "connection is not supported");
+            }
             if (expr->kind == ExpressionKind::Assignment) {
                 // Output: parent_target = child_net. slang gives an assignment whose
                 // LHS is the parent target and whose RHS is an EmptyArgument

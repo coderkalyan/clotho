@@ -1653,6 +1653,35 @@ TEST_CASE("a memory keeps its unpacked dimensions") {
 }
 
 TEST_CASE("a port with no hardware form is dropped from the header and named") {
+    // `real` stands in for the whole unsynthesizable set (Legalize.cpp's
+    // unsynthesizable_type: string, queue, dynamic array, associative array, class
+    // handle, real, unpacked struct). It is the one that still LOWERS as a
+    // connected port -- a container port connection is refused at lowering, because
+    // its copy would have to deep-copy a handle on every source change.
+    const LowerResult r = lower_text(R"(
+        module sub(input real gain, output reg [7:0] y);
+          always @* y = 8'h01;
+        endmodule
+        module m(output reg [7:0] z);
+          real gain;
+          sub s(gain, z);
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    const std::string text = legalize::materialize(*r.module, nullptr, { .hierarchy = legalize::Hierarchy::Instances });
+    CAPTURE(text);
+    CHECK(text.find("// gain: no synthesizable type (real)") != std::string::npos);
+    CHECK(text.find("input logic gain") == std::string::npos);
+    // Its connection goes with it, so the instantiation stays legal source.
+    CHECK(text.find(".gain(") == std::string::npos);
+    CHECK(text.find(".y(z)") != std::string::npos);
+}
+
+TEST_CASE("a container port connection is refused at lowering") {
+    // A port copy is a continuous assignment, so a container port would have to
+    // deep-copy its handle on every change of the source and detect that change
+    // through a heap buffer. Refused loudly rather than reaching the backend as a
+    // plane load of a handle, which would throw with no source location.
     const LowerResult r = lower_text(R"(
         module sub(input int fifo[$], output reg [7:0] y);
           always @* y = 8'h01;
@@ -1662,12 +1691,6 @@ TEST_CASE("a port with no hardware form is dropped from the header and named") {
           sub s(fifo, z);
         endmodule
     )");
-    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
-    const std::string text = legalize::materialize(*r.module, nullptr, { .hierarchy = legalize::Hierarchy::Instances });
-    CAPTURE(text);
-    CHECK(text.find("// fifo: no synthesizable type (queue)") != std::string::npos);
-    CHECK(text.find("input logic fifo") == std::string::npos);
-    // Its connection goes with it, so the instantiation stays legal source.
-    CHECK(text.find(".fifo(") == std::string::npos);
-    CHECK(text.find(".y(z)") != std::string::npos);
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("module port connection is not supported") != std::string::npos);
 }
