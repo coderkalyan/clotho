@@ -6984,6 +6984,15 @@ private:
         return n;
     }
 
+    // Whether the design forks at all. Memoized: every ring push asks, and the
+    // answer cannot change once the module is built.
+    bool design_forks() {
+        if (!design_forks_.has_value()) {
+            design_forks_ = fork_child_count() != 0;
+        }
+        return *design_forks_;
+    }
+
     // Ceiling on the fork-child slots the ring reserves. Two shapes have no static
     // bound at all (below), and a slot is one pointer, so saturating here spends
     // 8 KiB per ring in exchange for never sizing the ring by guesswork.
@@ -7172,8 +7181,19 @@ private:
     // Monotone counters make `tail - head` the exact live count, so the compare is
     // unsigned >= cap: an off-by-one elsewhere trips it too, which is the point of
     // a guard that only ever fires on a bug.
+    //
+    // Emitted only for a design that forks, because only the fork term of the
+    // capacity is an over-approximation. Without a fork the bound is the
+    // one-live-slot-per-process invariant the scheduler has always held (a process
+    // is a single call chain with at most one resumable coroutine, and the
+    // scheduled flag dedupes wakes), so the check could never fire -- and it is not
+    // free: a compare, a branch and a cold block on every push cost ~40% sim time
+    // on a wake-heavy design (combchain) and ~25% of LLVM codegen time.
     void emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, llvm::Value* tail,
                               llvm::Value* ring) {
+        if (!design_forks()) {
+            return;
+        }
         llvm::Function* fn   = b.GetInsertBlock()->getParent();
         const uint32_t  cap  = active_mask_ + 1;
         llvm::Value*    live = b.CreateSub(tail, b.CreateLoad(b.getInt32Ty(), head_ptr));
@@ -19565,6 +19585,8 @@ private:
     ankerl::unordered_dense::map<uint32_t, std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*>> expect_queue_;
     llvm::ArrayType*                    queue_arr_ty_      = nullptr;
     uint32_t                            active_mask_       = 0;
+    // Memoized design_forks(); only a forking design pays the ring-overflow check.
+    std::optional<bool>                 design_forks_;
     // Process indices in static-subscription order (compute_subscription_order).
     std::vector<uint32_t>               sub_order_;
     // Blocking-write wake graph (writer -> statically-subscribed reader) and
