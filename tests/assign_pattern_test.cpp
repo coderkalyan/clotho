@@ -636,9 +636,12 @@ TEST_CASE("assignment-pattern lvalue: element count mismatch is rejected") {
 // container path; the shapes that path does not implement fail loudly instead of
 // being dropped, which is how the initializer used to be lost silently.
 TEST_CASE("associative array literal: unsupported shapes are rejected") {
-    // A nonblocking whole-array literal needs handle-aware NBA staging.
+    // A whole-array copy `a <= b` now stages through HandleCopyNb; a LITERAL right
+    // -hand side still cannot, because it builds entries in place rather than
+    // deep-copying a handle the NBA region can move.
     CHECK(reject("module m; int a[int]; initial a <= '{default:1}; endmodule")
-            .find("nonblocking assignment to an associative array") != std::string::npos);
+            .find("nonblocking assignment of a literal into an associative array") !=
+          std::string::npos);
     // An aggregate value element needs a per-leaf store per entry.
     CHECK(reject(R"(
         module m;

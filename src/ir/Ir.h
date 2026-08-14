@@ -1151,11 +1151,19 @@ struct Inst {
         // payload: op_extra -> QueueArg, whose arg is the source handle
         // lvalue; op is the destination handle lvalue).
         QueueCopy,
-        // Nonblocking `dst <= src` deep copy (payload: op_extra -> QueueArg, arg
-        // is the source handle; op is the dst handle lvalue). Stages a deep copy
-        // of src in the Active region; the NBA region moves it into dst (LRM
-        // 7.10 / 10.4.2).
-        QueueCopyNb,
+        // Nonblocking `dst <= src` deep copy of a whole CONTAINER handle -- a queue,
+        // a dynamic array or an associative array (payload: op_extra -> QueueArg,
+        // arg is the source handle lvalue, op is the dst handle lvalue, and
+        // queue_type is the container's interned type, which selects the kind).
+        //
+        // A container's value is a heap handle, not a plane slot, so it has no
+        // per-signal shadow to stage into the way a scalar nonblocking assignment
+        // does. Instead the Active region deep-copies the source into a staging
+        // handle in a per-signal record buffer, and the NBA region MOVES that
+        // buffer into the live handle -- an ownership transfer, so the commit costs
+        // no second copy and the target's prior elements are freed exactly once
+        // (LRM 7.5 / 7.9 / 7.10, 10.4.2).
+        HandleCopyNb,
         // q = d: deep copy of a dynamic array into a queue (LRM 7.10; payload:
         // op_extra -> QueueArg, whose arg is the SOURCE dynarray handle lvalue,
         // op is the destination queue handle lvalue). Distinct from QueueCopy
@@ -2236,7 +2244,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::QueueInsert:
         case T::QueueDeleteIdx:
         case T::QueueCopy:
-        case T::QueueCopyNb:
+        case T::HandleCopyNb:
         case T::QueueCopyDyn:
         case T::QueueAppendRange:
         case T::AssocSelect:

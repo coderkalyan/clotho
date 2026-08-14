@@ -2412,14 +2412,14 @@ private:
                 }
                 continue;
             }
-            // A whole-queue nonblocking assignment (`q <= rhs`, its own op): the
-            // target queue signal defers a staged deep copy into a per-queue
-            // buffer, moved into the live handle in the NBA region.
-            if (ir.tag(idx) == Inst::Tag::QueueCopyNb) {
+            // A whole-container nonblocking assignment (`q <= rhs`, `d <= rhs`,
+            // `a <= rhs` -- its own op): the target signal defers a staged deep copy
+            // into a per-signal buffer, moved into the live handle in the NBA region.
+            if (ir.tag(idx) == Inst::Tag::HandleCopyNb) {
                 const NbaTarget t = nba_target(ir, ir.payload(idx).op_extra.op);
-                if (std::find(queue_nba_sigs_.begin(), queue_nba_sigs_.end(), t.sig) ==
-                    queue_nba_sigs_.end()) {
-                    queue_nba_sigs_.push_back(t.sig);
+                if (std::find(handle_nba_sigs_.begin(), handle_nba_sigs_.end(), t.sig) ==
+                    handle_nba_sigs_.end()) {
+                    handle_nba_sigs_.push_back(t.sig);
                 }
                 continue;
             }
@@ -7968,7 +7968,7 @@ private:
     llvm::Value* emit_nba_any_staged() {
         auto*        ptr_ty = llvm::PointerType::getUnqual(ctx_);
         llvm::Value* any    = b_.getFalse();
-        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty()) {
             // rt_nba_arr_any is the total across the shared array + aggregate +
             // queue buffers.
             any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_any_fn(), {}), b_.getInt32(0)));
@@ -8017,15 +8017,15 @@ private:
         // Deferred writes through a runtime array index: replay each array's
         // typed records and each aggregate's memcpy records (both from the
         // shared rt_nba_arr_* buffers), waking Any-edge readers, then reset.
-        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty()) {
             for (const Signal sig : array_nba_sigs_) {
                 emit_array_commit(sig, state);
             }
             for (const Signal sig : agg_nba_sigs_) {
                 emit_agg_array_commit(sig, state);
             }
-            for (const Signal sig : queue_nba_sigs_) {
-                emit_queue_whole_commit(sig);
+            for (const Signal sig : handle_nba_sigs_) {
+                emit_handle_whole_commit(sig);
             }
             // VCD: touch each dumped array that took an NBA write this instant,
             // so the flush scans its elements only on write instants (not every
@@ -8116,7 +8116,7 @@ private:
         // The array-NBA record buffers are process-global; clear any state a prior
         // simulation in this process left staged (e.g. a $finish between staging and
         // the NBA commit) so this run starts empty.
-        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty()) {
             b_.CreateCall(nba_arr_reset_fn(), {});
         }
         // Same for the deferred intra-assignment record pools — reclaim any records
@@ -8253,7 +8253,7 @@ private:
         // re-drains the active queue at the SAME instant; otherwise it falls through
         // to the wheel. So active and NBA iterate until both settle before time moves.
         const bool has_nba = !array_nba_sigs_.empty() || !agg_nba_sigs_.empty() ||
-                             !queue_nba_sigs_.empty() || !block_commits_.empty() ||
+                             !handle_nba_sigs_.empty() || !block_commits_.empty() ||
                              !nb_event_sigs_.empty() || !intra_nba_sigs_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
@@ -9940,7 +9940,7 @@ private:
             case Inst::Tag::QueueDeleteIdx:
             case Inst::Tag::QueueDeleteAll:
             case Inst::Tag::QueueCopy:
-            case Inst::Tag::QueueCopyNb:
+            case Inst::Tag::HandleCopyNb:
             case Inst::Tag::QueueCopyDyn:
             case Inst::Tag::QueueAppendRange:
                 // size() is a definite 2-state int; the rest are statements
@@ -11150,8 +11150,8 @@ private:
             case Inst::Tag::QueueCopyDyn:
                 lower_queue_copy_dynarr(i);
                 return;
-            case Inst::Tag::QueueCopyNb:
-                emit_queue_whole_nba(i);
+            case Inst::Tag::HandleCopyNb:
+                emit_handle_whole_nba(i);
                 return;
             case Inst::Tag::QueueAppendRange:
                 lower_queue_append_range(i);
@@ -13518,58 +13518,72 @@ private:
                static_cast<uint32_t>(it - agg_nba_sigs_.begin());
     }
 
-    // Runtime buffer index of a whole-queue NBA signal — after the array and
+    // Runtime buffer index of a whole-container NBA signal — after the array and
     // aggregate buffers in the shared rt_nba_arr_* index space.
-    uint32_t queue_buf_idx(Signal sig) const {
-        const auto it = std::find(queue_nba_sigs_.begin(), queue_nba_sigs_.end(), sig);
+    uint32_t handle_buf_idx(Signal sig) const {
+        const auto it = std::find(handle_nba_sigs_.begin(), handle_nba_sigs_.end(), sig);
         return static_cast<uint32_t>(array_nba_sigs_.size() + agg_nba_sigs_.size()) +
-               static_cast<uint32_t>(it - queue_nba_sigs_.begin());
+               static_cast<uint32_t>(it - handle_nba_sigs_.begin());
     }
 
-    // Deferred whole-queue NBA record: { ptr dest_handle, rt_queue staged }. The
-    // rt_queue mirror is { base, head, len, cap } (four i64), matching the runtime
-    // layout; the staged buffer's ownership moves to dest_handle at commit.
-    llvm::StructType* queue_rec_ty() {
-        auto* i64 = b_.getInt64Ty();
-        return llvm::StructType::get(ctx_, { raw_ptr_ty(), i64, i64, i64, i64 });
+    // Deferred whole-container NBA record: { ptr dest_handle, <handle slot> staged }.
+    // The staged field is the container's own runtime handle struct, so one record
+    // shape covers a queue, a dynamic array and an associative array; its
+    // ownership moves to dest_handle at commit.
+    llvm::StructType* handle_rec_ty(Ref container_type) {
+        return llvm::StructType::get(ctx_, { raw_ptr_ty(), handle_slot_ty(container_type) });
     }
 
-    // Stage a whole-queue nonblocking assignment: reserve a record, capture the
-    // live dest handle pointer (stable — the signal slot never moves), zero the
-    // staged rt_queue, and deep-copy the RHS handle into it. The NBA region moves
-    // the staged buffer into dest.
-    void emit_queue_whole_nba(Index i) {
+    // Move one staged container handle into a live one (the NBA commit): ownership
+    // transfer, so the destination's prior elements are freed and no second deep
+    // copy happens.
+    void emit_handle_move(llvm::Value* dst, llvm::Value* src, Ref type) {
+        if (is_assoc_type(type)) {
+            b_.CreateCall(assoc_move_fn(), { dst, src, elem_ops_global(type) });
+            return;
+        }
+        b_.CreateCall(is_queue_type(type) ? queue_move_fn() : dynarr_move_fn(),
+                      { dst, src, elem_ops_global(type) });
+    }
+
+    // Stage a whole-container nonblocking assignment: reserve a record, capture the
+    // live dest handle pointer (stable — the signal slot never moves, only its heap
+    // buffer does, which the commit's move handles), zero the staged handle to the
+    // empty image, and deep-copy the RHS into it. The NBA region moves the staged
+    // buffer into dest.
+    void emit_handle_whole_nba(Index i) {
         const auto&       p    = ir_->payload(i).op_extra;
         const auto        qa   = ir_->extra_data<QueueArg>(p.extra);
         const LValue      dlv  = lvalue_of(p.op);
-        auto*             rt   = queue_rec_ty();
+        auto*             rt   = handle_rec_ty(qa.queue_type);
         const auto        strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         llvm::Value*      rec  = b_.CreateCall(nba_arr_slot_fn(),
-                                               { b_.getInt32(queue_buf_idx(dlv.sig)), b_.getInt32(strd) });
+                                               { b_.getInt32(handle_buf_idx(dlv.sig)), b_.getInt32(strd) });
         b_.CreateAlignedStore(lv_handle_ptr(dlv), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
-        // The staged rt_queue starts at record field 1 (an aligned {i64 x4}).
+        // Every container handle's empty image is all-zero, so a memset constructs
+        // the staging handle the deep copy below then assigns into.
         llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
-        b_.CreateMemSet(staged, b_.getInt8(0), b_.getInt64(4 * 8), llvm::MaybeAlign{ 1 });
-        b_.CreateCall(queue_assign_fn(), { staged, lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false),
-                                           elem_ops_global(qa.queue_type),
-                                           alloc_site_global(loc_text(i), "queue") });
+        const auto   hsz    = env_->llmod.getDataLayout().getTypeAllocSize(handle_slot_ty(qa.queue_type));
+        b_.CreateMemSet(staged, b_.getInt8(0), b_.getInt64(hsz), llvm::MaybeAlign{ 1 });
+        emit_handle_assign(staged, lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false),
+                           qa.queue_type);
     }
 
-    // Replay a queue's deferred whole-NBA records: move each staged buffer into
+    // Replay a container's deferred whole-NBA records: move each staged handle into
     // its dest handle (push order, later write wins), then wake Any-edge readers.
-    void emit_queue_whole_commit(Signal sig) {
-        auto*        rt    = queue_rec_ty();
-        const auto   strd  = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
-        auto*        i8    = b_.getInt8Ty();
-        llvm::Value* ops   = elem_ops_global(slot_of(sig).ir_type);
-        const uint32_t idx = queue_buf_idx(sig);
-        llvm::Value* base  = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
-        llvm::Value* count = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
+    void emit_handle_whole_commit(Signal sig) {
+        const Ref      type = slot_of(sig).ir_type;
+        auto*          rt   = handle_rec_ty(type);
+        const auto     strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
+        auto*          i8   = b_.getInt8Ty();
+        const uint32_t idx  = handle_buf_idx(sig);
+        llvm::Value*   base  = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
+        llvm::Value*   count = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
 
         auto* fn    = b_.GetInsertBlock()->getParent();
-        auto* head  = llvm::BasicBlock::Create(ctx_, "qnba.head", fn);
-        auto* body  = llvm::BasicBlock::Create(ctx_, "qnba.body", fn);
-        auto* done  = llvm::BasicBlock::Create(ctx_, "qnba.done", fn);
+        auto* head  = llvm::BasicBlock::Create(ctx_, "hnba.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "hnba.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "hnba.done", fn);
         auto* entry = b_.GetInsertBlock();
         b_.CreateBr(head);
         b_.SetInsertPoint(head);
@@ -13580,14 +13594,14 @@ private:
         llvm::Value* rec    = b_.CreateInBoundsGEP(i8, base, { b_.CreateMul(k, b_.getInt32(strd)) });
         llvm::Value* dest   = b_.CreateAlignedLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
         llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
-        b_.CreateCall(queue_move_fn(), { dest, staged, ops });
+        emit_handle_move(dest, staged, type);
         k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
         b_.CreateBr(head);
         b_.SetInsertPoint(done);
 
         if (signal_has_waiters(sig)) {
-            auto* svc  = llvm::BasicBlock::Create(ctx_, "qnba.svc", fn);
-            auto* cont = llvm::BasicBlock::Create(ctx_, "qnba.cont", fn);
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "hnba.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "hnba.cont", fn);
             b_.CreateCondBr(b_.CreateICmpNE(count, b_.getInt32(0)), svc, cont);
             b_.SetInsertPoint(svc);
             service_any_waiters(sig);
@@ -20490,7 +20504,7 @@ private:
     // runtime buffer (indexed after the array + aggregate buffers) in the Active
     // region; the NBA region moves that buffer into the live handle and wakes the
     // signal (Any-edge). See docs/design/queue-nba-and-nonpod.md.
-    std::vector<Signal>     queue_nba_sigs_;
+    std::vector<Signal>     handle_nba_sigs_;
 
     // Whole-scalar targets of a nonblocking intra-assignment delay (`x <= #d y`,
     // StoreNbDelay). Each gets a dense id; a per-target record (rt_intra_*) holds

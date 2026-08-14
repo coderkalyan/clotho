@@ -16237,23 +16237,12 @@ private:
             check_subroutine_nba_target(a.left());
         }
         if (is_dyn_array(a.left())) {
-            if (a.isNonBlocking()) {
-                // TODO: nonblocking assignment to a dynamic array (needs a
-                // handle-aware NBA staging path; the per-signal shadow is
-                // plane-shaped).
-                fail("nonblocking assignment to a dynamic array is not supported");
-            }
             return lower_dyn_array_assign(a, b);
         }
         if (is_queue(a.left())) {
             return lower_queue_assign(a, b);
         }
         if (is_assoc(a.left())) {
-            if (a.isNonBlocking()) {
-                // TODO: nonblocking assignment to an associative array (needs a
-                // handle-aware NBA staging path).
-                fail("nonblocking assignment to an associative array is not supported");
-            }
             return lower_assoc_assign(a, b);
         }
         if (is_unpacked_array(a.left())) {
@@ -16383,6 +16372,23 @@ private:
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       aty = lower_type(*a.left().type);
+        if (a.isNonBlocking()) {
+            // `d <= other` (LRM 7.5, 10.4.2): a container's value is a heap handle,
+            // so there is no plane-shaped shadow to stage into. The Active region
+            // deep-copies the source into a staging handle and the NBA region moves
+            // that into the live one -- HandleCopyNb, shared with queues and
+            // associative arrays.
+            if (!is_dyn_array(a.right()) || !is_struct_lvalue_shape(unwrap_conversion(a.right()))) {
+                // TODO: a `'{...}` literal or a `new[n]` on the right of a
+                // nonblocking assignment. Both build their value in place rather
+                // than deep-copying a handle, so neither can stage into the record
+                // buffer without first materializing a temp handle.
+                fail("nonblocking assignment to a dynamic array is only supported from "
+                     "another dynamic-array variable");
+            }
+            b.handle_copy_nb(dst, lower_lvalue(unwrap_conversion(a.right()), b), aty, l);
+            return dst;
+        }
         // `d = '{e0, e1, ...}` (LRM 10.9): the source is an assignment-pattern
         // literal, not another handle — materialize it element-wise rather than
         // deep-copying a handle (emit_handle_literal_init allocates + stores).
@@ -17008,7 +17014,7 @@ private:
             // Whole-queue NBA: stage a deep copy now, move it into dst in the NBA
             // region (LRM 10.4.2). The target is a module signal (task/process
             // NBA is module-signal-only; function NBA is rejected above).
-            b.queue_copy_nb(dst, src, qty, l);
+            b.handle_copy_nb(dst, src, qty, l);
             return dst;
         }
         b.queue_copy(dst, src, qty, l);
@@ -17023,6 +17029,15 @@ private:
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       aty = lower_type(*a.left().type);
+        if (a.isNonBlocking() && as_assignment_pattern(a.right()) != nullptr) {
+            // TODO: a `'{key:value}` / `'{default:v}` literal on the right of a
+            // nonblocking assignment. The literal builds its entries in place rather
+            // than deep-copying a handle, so staging it needs a temp map first. Must
+            // be refused BEFORE the pattern branch below, which would otherwise
+            // silently apply the literal as a BLOCKING assignment.
+            fail("nonblocking assignment of a literal into an associative array is "
+                 "not supported");
+        }
         if (as_assignment_pattern(a.right()) != nullptr) {
             emit_assoc_literal_init(dst, aty, unwrap_conversion(a.right()), ir::Inst::Tag::Store, b, l);
             return dst;
@@ -17034,6 +17049,13 @@ private:
             // TODO: associative-array assignment from any other rvalue shape (there
             // is none in LRM 7.9 beyond a variable, a call result and a literal).
             fail("associative array assignment from a non-variable value is not supported");
+        }
+        if (a.isNonBlocking()) {
+            // `a <= other` (LRM 7.9, 10.4.2): staged deep copy in the Active region,
+            // moved into the live map in the NBA region -- the same HandleCopyNb a
+            // queue and a dynamic array take.
+            b.handle_copy_nb(dst, lower_lvalue(a.right(), b), aty, l);
+            return dst;
         }
         b.assoc_copy(dst, lower_lvalue(a.right(), b), aty, l);
         return dst;

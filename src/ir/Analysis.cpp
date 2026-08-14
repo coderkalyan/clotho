@@ -203,7 +203,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::QueueDeleteIdx:
         case Inst::Tag::QueueDeleteAll:
         case Inst::Tag::QueueCopy:
-        case Inst::Tag::QueueCopyNb:
+        case Inst::Tag::HandleCopyNb:
         case Inst::Tag::QueueCopyDyn:
         case Inst::Tag::QueueAppendRange:
         case Inst::Tag::DynArrayReverse:
@@ -991,7 +991,7 @@ struct ValueSweep {
                 case Inst::Tag::QueueDeleteIdx:
                 case Inst::Tag::QueueDeleteAll:
                 case Inst::Tag::QueueCopy:
-                case Inst::Tag::QueueCopyNb:
+                case Inst::Tag::HandleCopyNb:
                 case Inst::Tag::QueueCopyDyn:
                 case Inst::Tag::QueueAppendRange:
                 case Inst::Tag::DynArrayReverse:
