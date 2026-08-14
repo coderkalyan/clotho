@@ -940,3 +940,220 @@ TEST_CASE("built-in std classes are refused in the frontend") {
                 " mailbox g; initial begin g = new(); t(g); end endmodule")
             .find("the built-in 'mailbox' class is not supported") != std::string::npos);
 }
+
+// -- shallow copy, `dst = new src` (LRM 8.12) ---------------------------------
+
+TEST_CASE("class shallow copy: values are independent, handles are shared") {
+    constexpr std::string_view src = R"(
+        module m;
+            class baseA; integer j = 5; endclass
+            class B;
+                integer i = 1;
+                baseA a = new;
+            endclass
+            initial begin
+                B b1, b2;
+                b1 = new;
+                b2 = new b1;
+                b2.i = 10;
+                b2.a.j = 50;
+                $display("%0d %0d %0d %b", b1.i, b1.a.j, b2.i, b1.a == b2.a);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 50 10 1\n");
+}
+
+TEST_CASE("class shallow copy: no constructor, no declaration initializers") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                int i = 1;
+                function new(); $display("ctor"); endfunction
+            endclass
+            initial begin
+                C c1, c2;
+                c1 = new;
+                c1.i = 99;
+                c2 = new c1;
+                $display("%0d", c2.i);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "ctor\n99\n");
+}
+
+TEST_CASE("class shallow copy: string, queue, dynamic and associative members copy by value") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Bag;
+                string s;
+                int    q[$];
+                int    d[];
+                int    a[string];
+            endclass
+            initial begin
+                Bag g1, g2;
+                g1 = new;
+                g1.s = "abc";
+                g1.q.push_back(7);
+                g1.d = new[2];
+                g1.d[0] = 3;
+                g1.a["k"] = 4;
+                g2 = new g1;
+                g2.s = "xyz";
+                g2.q.push_back(8);
+                g2.d[0] = 30;
+                g2.a["k"] = 40;
+                $display("%s %0d %0d %0d", g1.s, g1.q.size(), g1.d[0], g1.a["k"]);
+                $display("%s %0d %0d %0d", g2.s, g2.q.size(), g2.d[0], g2.a["k"]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "abc 1 3 4\nxyz 2 30 40\n");
+}
+
+TEST_CASE("class shallow copy: through a base handle copies the derived object") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Base;
+                int bi = 1;
+                virtual function string who(); return "Base"; endfunction
+            endclass
+            class Derived extends Base;
+                int di = 2;
+                virtual function string who(); return "Derived"; endfunction
+            endclass
+            initial begin
+                Base    pb, pc;
+                Derived d1;
+                d1 = new;
+                d1.bi = 11;
+                d1.di = 22;
+                pb = d1;
+                pc = new pb;
+                $display("%s %0d", pc.who(), pc.bi);
+                pc.bi = 111;
+                $display("%0d %0d", d1.bi, pc.bi);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "Derived 11\n11 111\n");
+}
+
+TEST_CASE("class shallow copy: through an abstract handle reaches the concrete class") {
+    constexpr std::string_view src = R"(
+        module m;
+            virtual class Abs;
+                int ai = 1;
+                pure virtual function int tag();
+            endclass
+            class Mid extends Abs;
+                int mi = 2;
+                virtual function int tag(); return 20; endfunction
+            endclass
+            class Leaf extends Mid;
+                virtual function int tag(); return 30; endfunction
+            endclass
+            initial begin
+                Abs  ah, ac;
+                Leaf lf;
+                lf = new;
+                lf.ai = 11;
+                lf.mi = 12;
+                ah = lf;
+                ac = new ah;
+                $display("%0d %0d", ac.tag(), ac.ai);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "30 11\n");
+}
+
+TEST_CASE("class shallow copy: `new this` in a method, aggregate members, self-reference") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int x; int y; } pt_t;
+            class Agg;
+                pt_t p;
+                int  arr[3];
+                Agg  peer;
+                function Agg dup(); return new this; endfunction
+            endclass
+            initial begin
+                Agg a1, a2;
+                a1 = new;
+                a1.p.x = 1;
+                a1.p.y = 2;
+                a1.arr[0] = 5;
+                a1.arr[2] = 6;
+                a1.peer = a1;
+                a2 = a1.dup();
+                a2.p.x = 100;
+                a2.arr[0] = 500;
+                $display("%0d %0d %0d %0d", a1.p.x, a1.p.y, a1.arr[0], a1.arr[2]);
+                $display("%0d %0d %0d %b", a2.p.x, a2.p.y, a2.arr[0], a2.peer == a1);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 5 6\n100 2 500 1\n");
+}
+
+TEST_CASE("class shallow copy: as a declaration initializer") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; int i; endclass
+            initial begin
+                C c1;
+                c1 = new;
+                c1.i = 4;
+                begin
+                    automatic C c2 = new c1;
+                    c2.i = 5;
+                    $display("%0d %0d", c1.i, c2.i);
+                end
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 5\n");
+}
+
+TEST_CASE("class shallow copy: a null source is a located fatal") {
+    constexpr std::string_view plain = "module m;\n"
+                                       "    class C;\n"
+                                       "        int i;\n"
+                                       "    endclass\n"
+                                       "    initial begin\n"
+                                       "        C p, q;\n"
+                                       "        $display(\"before\");\n"
+                                       "        q = new p;\n"
+                                       "        $display(\"after\");\n"
+                                       "    end\n"
+                                       "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(plain);
+    CHECK(run.out == "before\n");
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("fatal: dereference of a null class handle") != std::string::npos);
+    CHECK(run.err.find("8 |         q = new p;\n") != std::string::npos);
+
+    constexpr std::string_view poly = "module m;\n"
+                                      "    class V;\n"
+                                      "        int i;\n"
+                                      "        virtual function int f();\n"
+                                      "            return i;\n"
+                                      "        endfunction\n"
+                                      "    endclass\n"
+                                      "    initial begin\n"
+                                      "        V p, q;\n"
+                                      "        $display(\"before\");\n"
+                                      "        q = new p;\n"
+                                      "        $display(\"after\");\n"
+                                      "    end\n"
+                                      "endmodule\n";
+
+    const test::DesignRun vrun = test::run_design_captured(poly);
+    CHECK(vrun.out == "before\n");
+    CHECK(test::design_exit_code(vrun) != 0);
+    CHECK(vrun.err.find("fatal: dereference of a null class handle") != std::string::npos);
+}
