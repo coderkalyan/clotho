@@ -5050,6 +5050,24 @@ private:
         return std::nullopt;
     }
 
+    // Map a built-in MOS switch name (LRM 28.7, Table 28-6) to the TriGate that
+    // describes it; nullopt otherwise. A MOS switch behaves exactly as the
+    // matching bufif gate except that a z data input passes through as z rather
+    // than reading as x: a pass device never manufactures an x from a floating
+    // input. No MOS form inverts. cmos/rcmos are absent here because LRM 28.9
+    // defines them as an nmos and a pmos sharing one output, which is two
+    // drivers, not one (lower_cmos_switch).
+    static std::optional<TriGate> mos_switch_of(std::string_view name) {
+        if (name == "nmos" || name == "rnmos") {
+            return TriGate{ .active_high = true, .invert = false };
+        }
+        if (name == "pmos" || name == "rpmos") {
+            return TriGate{ .active_high = false, .invert = false };
+        }
+
+        return std::nullopt;
+    }
+
     // Map a built-in gate primitive name to its GateOp; nullopt for primitives
     // outside the supported set.
     static std::optional<GateOp> gate_op_of(std::string_view name) {
@@ -5207,15 +5225,22 @@ private:
     GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index) {
         // Constant fold first: literals, parameters, and constant expressions
         // (tie cells) melt into the gate at compile time. The terminal is bound
-        // as 1-bit logic, so bit 0 of the folded value is the input; x and z both
-        // fold to the X plane code (Z reads as X, LRM Table 28-3).
+        // as 1-bit logic, so bit 0 of the folded value is the input. x and z need
+        // distinct codes: every gate but a MOS switch reads z as x (LRM Table
+        // 28-3), while a MOS pass switch propagates it as z (LRM Table 28-6), so
+        // gate_input_value resolves the code per caller.
         {
             slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
             slang::ast::EvalContext    evalCtx(astCtx);
             const slang::ConstantValue cv = e.eval(evalCtx);
             if (cv.isInteger()) {
-                const slang::logic_t bit  = cv.integer()[0];
-                const uint8_t        code = bit.isUnknown() ? 0b10 : (bit.value != 0 ? 0b11 : 0b00);
+                const slang::logic_t bit = cv.integer()[0];
+                // logic_t::operator== is a 4-state compare (x == z yields x), so
+                // z has to be identified by its exact encoding.
+                const uint8_t code = bit.value == slang::logic_t::Z_VALUE ? 0b01
+                                     : bit.isUnknown()                    ? 0b10
+                                     : bit.value != 0                     ? 0b11
+                                                                          : 0b00;
 
                 return GateInput{ .const_code = code, .is_const = true };
             }
@@ -5324,18 +5349,90 @@ private:
         add_continuous_process({}, l, b);
     }
 
+    // A cmos / rcmos switch (LRM 28.9). The LRM defines it purely by
+    // decomposition: `cmos (w, data, ncontrol, pcontrol)` is exactly
+    // `nmos (w, data, ncontrol); pmos (w, data, pcontrol);` — two drivers sharing
+    // one output net, which the existing net resolver already folds. Both passes
+    // must agree on that count: Classify records the output twice so the net
+    // enters resolved_nets_, and Emit stages each half into its own driver slot.
+    // Were Classify to record only one, the net would never resolve, both halves
+    // would take the plain-store path and stomp each other last-write-wins.
+    void lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
+        const auto conns = gi.getPortConnections();
+        if (conns.size() != 4 || conns[0] == nullptr || conns[1] == nullptr || conns[2] == nullptr ||
+            conns[3] == nullptr || conns[0]->kind != ExpressionKind::Assignment) {
+            // slang has already diagnosed a malformed terminal list.
+            fail("malformed cmos/rcmos terminal list");
+        }
+        const Expression& left = conns[0]->as<AssignmentExpression>().left();
+        if (cur_pass_ == Pass::Classify) {
+            // Twice, deliberately: the two halves overlap on the same region, which
+            // is what marks the net resolved.
+            record_net_driver(left);
+            record_net_driver(left);
+            return;
+        }
+        if (cur_pass_ != Pass::Emit) {
+            return;
+        }
+        if (gi.getDelay() != nullptr) {
+            // TODO: cmos/rcmos delays (LRM 28.16) — a cmos always lowers to two
+            // resolved driver slots, and the resolver folds every slot with no
+            // per-driver timing (mirrors the resolved continuous-assign delay gap).
+            fail("gate delay on a multiply-driven (resolved) net is not supported");
+        }
+        const std::optional<ir::Signal> net = resolved_net_of(left);
+        if (!net) {
+            // Classify records two drivers for every cmos rooted at a net, so a
+            // net output is resolved by construction. Anything else (a variable
+            // output, an interface modport proxy record_net_driver skips) would
+            // silently lose one half, so it fails instead.
+            // TODO: cmos/rcmos driving something other than a plain net.
+            fail("cmos/rcmos output must be a net");
+        }
+        const uint16_t      gate_strength = pack_strength(gi.getDriveStrength());
+        const ir::SourceLoc l             = to_source_loc(gi.location);
+        // Terminals are (output, data, ncontrol, pcontrol).
+        const GateInput data  = lower_gate_input(*conns[1], gi.name, 0);
+        const GateInput nctrl = lower_gate_input(*conns[2], gi.name, 1);
+        const GateInput pctrl = lower_gate_input(*conns[3], gi.name, 2);
+        // Each half is an independent driver slot. The n-channel half conducts on
+        // ncontrol == 1, the p-channel half on pcontrol == 0; neither inverts, and
+        // both pass a z data input through as z.
+        const auto emit_half = [&](TriGate tg, const GateInput& ctrl) {
+            ir::Builder                b(module_.pool);
+            std::vector<ir::WaitEvent> wait_events;
+            const ir::Index val = gate_tristate_value(tg, data, ctrl, wait_events, b, l, /*pass_z=*/true);
+            emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, l, gate_strength);
+        };
+        emit_half(TriGate{ .active_high = true, .invert = false }, nctrl);
+        emit_half(TriGate{ .active_high = false, .invert = false }, pctrl);
+    }
+
     void lower_gate(const PrimitiveInstanceSymbol& gi) {
         const PrimitiveSymbol& prim = gi.primitiveType;
         if (prim.name == "pullup" || prim.name == "pulldown") {
             lower_pull_source(gi, prim.name == "pullup");
             return;
         }
+        // LRM 28.9 makes cmos/rcmos two drivers on one net, so it needs its own
+        // two-pass path rather than the single-output loop below.
+        if (prim.name == "cmos" || prim.name == "rcmos") {
+            lower_cmos_switch(gi);
+            return;
+        }
         const auto op  = gate_op_of(prim.name);
         const auto tri = tristate_gate_of(prim.name);
+        const auto mos = mos_switch_of(prim.name);
         const bool supported_kind =
           prim.primitiveKind == PrimitiveSymbol::NInput || prim.primitiveKind == PrimitiveSymbol::NOutput;
-        if (!tri && (!op || !supported_kind)) {
-            // TODO: MOS / bidirectional switches and user-defined primitives.
+        if (!tri && !mos && (!op || !supported_kind)) {
+            // TODO: bidirectional pass switches (tran, rtran, tranif0, tranif1,
+            // rtranif0, rtranif1 — LRM 28.8) and user-defined primitives.
+            // Conditional bidirectional conduction has no representation in the
+            // one-pass driver-slot fold. Note that slang classifies only tran,
+            // tranif0 and tranif1 as BiDiSwitch — rtran and rtranif0/rtranif1 are
+            // Fixed — so this family must be recognized by name, not by kind.
             fail("gate primitive '" + std::string(prim.name) + "' is not supported");
         }
         const TimingControl* gate_delay = gi.getDelay();
@@ -5355,8 +5452,9 @@ private:
 
         // NInput: terminal 0 is the output, the rest are inputs. NOutput (buf /
         // not): the last terminal is the input, the rest are outputs — one
-        // independent process per output terminal. Fixed tri-state (bufif/notif):
-        // terminal 0 is the output, terminals 1..2 are the data and control inputs.
+        // independent process per output terminal. Fixed tri-state (bufif/notif)
+        // and MOS switch (nmos/pmos/rnmos/rpmos): terminal 0 is the output,
+        // terminals 1..2 are the data and control inputs.
         const bool n_output    = prim.primitiveKind == PrimitiveSymbol::NOutput;
         const auto input_span  = n_output ? conns.subspan(conns.size() - 1) : conns.subspan(1);
         const auto output_span = n_output ? conns.subspan(0, conns.size() - 1) : conns.subspan(0, 1);
@@ -5391,8 +5489,10 @@ private:
             // combinational fold does).
             ir::Builder                b(module_.pool);
             std::vector<ir::WaitEvent> wait_events;
-            const ir::Index            val = tri ? gate_tristate_value(*tri, inputs[0], inputs[1], wait_events, b, loc)
-                                                 : gate_folded_value(*op, inputs, wait_events, b, loc);
+            const ir::Index            val =
+              mos   ? gate_tristate_value(*mos, inputs[0], inputs[1], wait_events, b, loc, /*pass_z=*/true)
+              : tri ? gate_tristate_value(*tri, inputs[0], inputs[1], wait_events, b, loc)
+                    : gate_folded_value(*op, inputs, wait_events, b, loc);
 
             if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
                 if (gate_delay != nullptr) {
@@ -5434,8 +5534,10 @@ private:
     // Materialize one gate input terminal as its 1-bit logic value: a load of the
     // input signal bit, or a folded constant. Pool VPI encoding: val=may,
     // xz=may&~must (bytes: val-plane then xz-plane); an X const code is (val=1,
-    // xz=1) and Z already folded to X at input lowering (LRM Table 28-3).
-    ir::Index gate_input_value(const GateInput& in, ir::Builder& b, ir::SourceLoc l) {
+    // xz=1). `pass_z` selects the MOS pass-switch reading of a constant z
+    // terminal, which stays z (LRM Table 28-6); every other gate reads z as x
+    // (LRM Table 28-3).
+    ir::Index gate_input_value(const GateInput& in, ir::Builder& b, ir::SourceLoc l, bool pass_z = false) {
         const ir::Ref logic1 = module_.pool.logic_type;
         if (!in.is_const) {
             return b.unary(ir::Inst::Tag::Load, gate_bit_lvalue(in.sig, in.bit, b, l), l);
@@ -5445,11 +5547,17 @@ private:
                 return b.constant(module_.pool.put_int(logic1, 0), l);
             case 0b11:
                 return b.constant(module_.pool.put_int(logic1, 1), l);
-            default: {
-                const uint8_t xbytes[2] = { 0x01, 0x01 };
-                return b.constant(module_.pool.put_value(logic1, { xbytes, 2 }), l);
-            }
+            case 0b01:
+                if (pass_z) {
+                    return b.constant(z_constant_ref(1), l);
+                }
+                break;
+            default:
+                break;
         }
+        const uint8_t xbytes[2] = { 0x01, 0x01 };
+
+        return b.constant(module_.pool.put_value(logic1, { xbytes, 2 }), l);
     }
 
     // Collect the any-change sensitivity over a gate's unique non-const input
@@ -5502,19 +5610,27 @@ private:
         return b.resize(*acc, logic1, l);
     }
 
-    // Lower a three-state gate (bufif/notif, LRM 28.6, Table 28-5) to its 1-bit
-    // output value. When the control is at the active level the data passes (buf)
-    // or inverts (notif) to the output (a z data bit maps to X — Band-with-1 /
-    // Bnot both clear z); at the inactive level the output is high-Z; an x/z
-    // control yields X. The LRM's weak L/H results for an x/z control (0-or-z,
-    // 1-or-z) collapse to X here: Clotho has no strength model, matching iverilog
-    // on a plain wire.
+    // Lower a three-state gate (bufif/notif, LRM 28.6, Table 28-5) or a MOS pass
+    // switch (nmos/pmos/rnmos/rpmos, LRM 28.7, Table 28-6) to its 1-bit output
+    // value. When the control is at the active level the data passes (buf) or
+    // inverts (notif) to the output; at the inactive level the output is high-Z;
+    // an x/z control yields X. The LRM's weak L/H results for an x/z control
+    // (0-or-z, 1-or-z) collapse to X here: Clotho has no value-strength model,
+    // matching iverilog on a plain wire.
+    //
+    // `pass_z` is the entire difference between Table 28-5 and Table 28-6. A
+    // bufif reads a z data bit as x (the Band-with-1 / Bnot clears the z plane),
+    // but a MOS switch is a pass device and never manufactures an x from a
+    // floating input, so a definite z data bit reaches the output as z for every
+    // control value. Keeping the z plane and pre-empting on `data === z` gives
+    // Table 28-6's DATA=z row exactly and leaves every other cell identical.
     ir::Index gate_tristate_value(TriGate                     tg,
                                   const GateInput&            data,
                                   const GateInput&            ctrl,
                                   std::vector<ir::WaitEvent>& wait_events,
                                   ir::Builder&                b,
-                                  ir::SourceLoc               l) {
+                                  ir::SourceLoc               l,
+                                  bool                        pass_z = false) {
         const ir::Ref   logic1    = module_.pool.logic_type;
         const ir::Index one       = b.constant(module_.pool.put_int(logic1, 1), l);
         const ir::Index zero      = b.constant(module_.pool.put_int(logic1, 0), l);
@@ -5522,10 +5638,13 @@ private:
         const ir::Index x_const   = b.constant(module_.pool.put_value(logic1, { xbytes, 2 }), l);
         const ir::Index z_const   = b.constant(z_constant_ref(1), l);
 
-        const ir::Index data_v = gate_input_value(data, b, l);
+        const ir::Index data_v = gate_input_value(data, b, l, pass_z);
         const ir::Index ctrl_v = gate_input_value(ctrl, b, l);
-        const ir::Index passed =
-          tg.invert ? b.unary(ir::Inst::Tag::Bnot, data_v, l) : b.binary(ir::Inst::Tag::Band, data_v, one, l);
+        // The Band-with-1 exists only to clear the data's z plane; a pass switch
+        // keeps that plane instead.
+        const ir::Index passed = tg.invert ? b.unary(ir::Inst::Tag::Bnot, data_v, l)
+                                 : pass_z  ? data_v
+                                           : b.binary(ir::Inst::Tag::Band, data_v, one, l);
         // Definite (===) tests: control exactly at the active / inactive level.
         const ir::Index active_lvl   = tg.active_high ? one : zero;
         const ir::Index inactive_lvl = tg.active_high ? zero : one;
@@ -5533,7 +5652,13 @@ private:
         const ir::Index is_inactive  = b.binary(ir::Inst::Tag::CaseEq, ctrl_v, inactive_lvl, l);
         // active -> passed data; else inactive -> Z; else (control x/z) -> X.
         const ir::Index inner  = b.select(is_inactive, z_const, x_const, l);
-        const ir::Index result = b.select(is_active, passed, inner, l);
+        ir::Index       result = b.select(is_active, passed, inner, l);
+        if (pass_z) {
+            // A floating data input leaves the output floating for every control
+            // value, which is Table 28-6's all-z DATA=z row.
+            const ir::Index data_is_z = b.binary(ir::Inst::Tag::CaseEq, data_v, z_const, l);
+            result                    = b.select(data_is_z, z_const, result, l);
+        }
 
         collect_gate_sensitivity(std::array<GateInput, 2>{ data, ctrl }, wait_events);
         return b.resize(result, logic1, l);

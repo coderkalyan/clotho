@@ -362,6 +362,32 @@ TEST_CASE("gate primitives resolve as drivers of a multiply-driven net") {
     CHECK(out == "0\n1\nx\nx\n");
 }
 
+// A cmos is two drivers, not one (LRM 28.9 defines it as an nmos plus a pmos
+// sharing one output), so on a net that already carries a third driver each half
+// gets its own slot and all three fold through the wire resolver — exactly as if
+// the two halves had been written out longhand. This is also the check that the
+// Classify pass records both halves: with only one recorded driver the net would
+// never resolve and the halves would stomp each other. Oracle: iverilog 13.
+TEST_CASE("a cmos switch shares a resolved net with another driver") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic d, nc, pc, a, en;
+          wire  w;
+          cmos   c0(w, d, nc, pc);
+          bufif1 b0(w, a, en);
+          initial begin
+            d=0; nc=0; pc=1; a=1; en=0; #1; $display("%b", w); // cmos off, bufif off -> z
+            pc=0;                       #1; $display("%b", w); // pmos half passes 0
+            en=1;                       #1; $display("%b", w); // 0 vs 1 -> x
+            pc=1;                       #1; $display("%b", w); // cmos off, bufif drives 1
+            nc=1; pc=0; d=1;            #1; $display("%b", w); // all three agree on 1
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "z\n0\nx\n1\n1\n");
+}
+
 TEST_CASE("strong beats weak, either polarity") {
     const std::string out = run_capture(R"(
         module top;

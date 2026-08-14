@@ -167,11 +167,18 @@ TEST_CASE("gates lower inside generate blocks and child instances") {
     CHECK(gate_procs >= 2);
 }
 
-TEST_CASE("MOS / bidirectional switch primitives are reported as unsupported") {
+TEST_CASE("bidirectional pass switch primitives are reported as unsupported") {
     // Terminals are nets: tran-family inout terminals reject variables in slang
-    // before clotho's own check would run. (bufif/notif and pullup/pulldown are
-    // now supported.)
-    for (const char* inst : { "nmos g(y, a, b);", "pmos g(y, a, b);", "tran g(y, a);" }) {
+    // before clotho's own check would run. (bufif/notif, pullup/pulldown and the
+    // MOS switches nmos/pmos/rnmos/rpmos/cmos/rcmos are now supported; only the
+    // bidirectional family remains. slang classifies rtran/rtranif0/rtranif1 as
+    // Fixed rather than BiDiSwitch, so all six have to be named explicitly.)
+    for (const char* inst : { "tran g(y, a);",
+                              "rtran g(y, a);",
+                              "tranif0 g(y, a, b);",
+                              "tranif1 g(y, a, b);",
+                              "rtranif0 g(y, a, b);",
+                              "rtranif1 g(y, a, b);" }) {
         const LowerResult r = lower_text("module m;\n wire y;\n wire a, b;\n " + std::string(inst) + "\nendmodule");
         CHECK_FALSE(r.ok);
         CHECK_MESSAGE(r.diagnostic_text().find("is not supported") != std::string::npos, r.diagnostic_text(), " for ", inst);
@@ -405,6 +412,91 @@ TEST_CASE("a three-state bus resolves multiple bufif drivers") {
         endmodule
     )");
     CHECK(out == "z\n0\n1\nx\n1\n");
+}
+
+TEST_CASE("MOS switch truth tables match LRM table 28-6, including the z pass-through") {
+    // Data d and control c sweep 0/1/x/z. A MOS switch is a pass device: unlike a
+    // bufif (Table 28-5) it never manufactures an x from a floating input, so the
+    // whole DATA=z row is z. Every other cell is character-identical to Table
+    // 28-5, the weak L/H results for an x/z control collapsing to X (Clotho has
+    // no value-strength model). rnmos/rpmos are indistinguishable from
+    // nmos/pmos: the LRM 28.14 strength reduction is not modeled.
+    // Oracle: iverilog 13.
+    const std::string out = run_capture(R"(
+        module top;
+            logic d, c;
+            wire nm, pm, rn, rp;
+            nmos  g0(nm, d, c);
+            pmos  g1(pm, d, c);
+            rnmos g2(rn, d, c);
+            rpmos g3(rp, d, c);
+            function logic bit4(int k);
+                case (k) 0: bit4 = 1'b0; 1: bit4 = 1'b1; 2: bit4 = 1'bx; default: bit4 = 1'bz; endcase
+            endfunction
+            initial begin
+                for (int di = 0; di < 4; di++) begin
+                    for (int ci = 0; ci < 4; ci++) begin
+                        d = bit4(di); c = bit4(ci); #1;
+                        $display("%b%b %b%b%b%b", d, c, nm, pm, rn, rp);
+                    end
+                end
+            end
+        endmodule
+    )");
+    CHECK(out == "00 z0z0\n01 0z0z\n0x xxxx\n0z xxxx\n"
+                 "10 z1z1\n11 1z1z\n1x xxxx\n1z xxxx\n"
+                 "x0 zxzx\nx1 xzxz\nxx xxxx\nxz xxxx\n"
+                 "z0 zzzz\nz1 zzzz\nzx zzzz\nzz zzzz\n");
+}
+
+TEST_CASE("a constant z data terminal passes through a MOS switch as z") {
+    // A constant terminal folds at compile time, so the z has to survive as its
+    // own code: a MOS switch propagates it (Table 28-6) where every other gate
+    // reads z as x (Table 28-3). A constant x still reads as x. Oracle: iverilog 13.
+    const std::string out = run_capture(R"(
+        module top;
+            wire y0, y1, y2, y3;
+            nmos g0(y0, 1'bz, 1'b1);
+            pmos g1(y1, 1'bz, 1'b0);
+            nmos g2(y2, 1'b1, 1'b1);
+            nmos g3(y3, 1'bx, 1'b1);
+            initial begin
+                #1;
+                $display("%b%b%b%b", y0, y1, y2, y3);
+            end
+        endmodule
+    )");
+    CHECK(out == "zz1x\n");
+}
+
+TEST_CASE("a cmos switch drives its output from both halves independently") {
+    // LRM 28.9 defines cmos(w, d, nc, pc) as nmos(w, d, nc) + pmos(w, d, pc), so
+    // it is two drivers on one net. The nc=0/pc=0 rows are the ones that matter:
+    // the nmos half is off (z) while the pmos half conducts, and the data value
+    // must survive the resolver rather than blending to x. It only does if the
+    // Classify pass recorded two drivers so the net actually resolved — with one
+    // recorded driver both halves take the plain-store path and stomp each other.
+    // rcmos behaves identically (no strength reduction).
+    // Oracle: iverilog 13.
+    const std::string out = run_capture(R"(
+        module top;
+            logic d, nc, pc;
+            wire  y, ry;
+            cmos  c0(y, d, nc, pc);
+            rcmos c1(ry, d, nc, pc);
+            initial begin
+                d = 1'b0; nc = 1'b0; pc = 1'b0; #1; $display("%b%b", y, ry); // nmos off, pmos passes 0
+                d = 1'b1; nc = 1'b0; pc = 1'b0; #1; $display("%b%b", y, ry); // nmos off, pmos passes 1
+                d = 1'b1; nc = 1'b1; pc = 1'b0; #1; $display("%b%b", y, ry); // both halves agree
+                d = 1'b0; nc = 1'b1; pc = 1'b0; #1; $display("%b%b", y, ry);
+                d = 1'b1; nc = 1'b0; pc = 1'b1; #1; $display("%b%b", y, ry); // both off -> floats
+                d = 1'b0; nc = 1'b1; pc = 1'b1; #1; $display("%b%b", y, ry); // nmos passes 0, pmos off
+                d = 1'b1; nc = 1'b1; pc = 1'b1; #1; $display("%b%b", y, ry); // nmos passes 1, pmos off
+                d = 1'bz; nc = 1'b1; pc = 1'b0; #1; $display("%b%b", y, ry); // z passes through both
+            end
+        endmodule
+    )");
+    CHECK(out == "00\n11\n11\n00\nzz\n00\n11\nzz\n");
 }
 
 TEST_CASE("n-input gates fold over all inputs") {
