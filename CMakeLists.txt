@@ -578,6 +578,7 @@ add_executable(clotho_test
   tests/preprocess_test.cpp
   tests/interface_test.cpp
   tests/concat_select_test.cpp
+  tests/wide_select_test.cpp
   tests/force_release_test.cpp
   tests/system_test.cpp
   tests/lsp_test.cpp

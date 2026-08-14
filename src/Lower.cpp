@@ -7925,10 +7925,7 @@ private:
         FnCtx ctx;
         ctx.name_prefix = std::string(name) + ".";
         ctx.is_task     = true;
-        FnCtx* saved    = fn_ctx_;
-        fn_ctx_         = &ctx;
-        std::vector<OpenBlock> saved_blocks;
-        saved_blocks.swap(named_blocks_);
+        const FnScope fn_scope(*this, &ctx);
 
         ir::Builder b(module_.pool);
         lower_stmt(body, b);
@@ -7943,8 +7940,6 @@ private:
                                            .local_types = std::move(ctx.local_types),
                                            .is_task     = true,
                                            .ir          = b.finish() });
-        named_blocks_.swap(saved_blocks);
-        fn_ctx_ = saved;
         return id;
     }
 
@@ -10924,10 +10919,8 @@ private:
             // expression, so it needs no function frame; clear fn_ctx_ so a stray
             // non-constant reference fails loudly rather than mis-resolving to a
             // frame local.
-            FnCtx* saved = fn_ctx_;
-            fn_ctx_      = nullptr;
+            const Restore<FnCtx*> no_frame(fn_ctx_, nullptr);
             lower_var_initializer(vs);
-            fn_ctx_ = saved;
             return;
         }
         if (const Expression* init = vs.getInitializer()) {
@@ -18636,6 +18629,45 @@ private:
         ir::Ref  this_class = ir::Ref::Invalid;
     };
 
+    // Restore a saved piece of Lowerer state when the scope exits — on the throwing
+    // path too. A lowering failure is an exception that `recover` catches per member
+    // and then keeps going, so a restore written after a call that can fail is
+    // skipped exactly when it matters: `fn_ctx_` would keep pointing at build_task's
+    // dead stack frame, and the next member's value_lvalue would search its localmap
+    // and segfault (ivtest pr224a). Anything saved across a fail-capable call belongs
+    // in one of these.
+    template <typename T>
+    class Restore {
+    public:
+        // Save `slot` and install `next` for the scope's lifetime.
+        Restore(T& slot, T next) : slot_(slot), saved_(std::move(slot)) { slot_ = std::move(next); }
+        // Save `slot` for callees that overwrite it in place (the time scale).
+        explicit Restore(T& slot) : slot_(slot), saved_(slot) {}
+        ~Restore() { slot_ = std::move(saved_); }
+        Restore(const Restore&)            = delete;
+        Restore& operator=(const Restore&) = delete;
+
+    private:
+        T& slot_;
+        T  saved_;
+    };
+
+    // One entry of the named-block stack `disable` resolves against (declared in
+    // full further down, next to the statement lowering that pushes it).
+    struct OpenBlock;
+
+    // The two pieces of state every subroutine / action / fork-child body swaps: its
+    // own frame context, and a fresh named-block stack (a `disable` inside the body
+    // may only name blocks the body itself opened).
+    class FnScope {
+    public:
+        FnScope(Lowerer& l, FnCtx* ctx) : ctx_(l.fn_ctx_, ctx), blocks_(l.named_blocks_, {}) {}
+
+    private:
+        Restore<FnCtx*>                ctx_;
+        Restore<std::vector<OpenBlock>> blocks_;
+    };
+
     // Get (creating if needed) the frame Local index for a function-local symbol.
     uint32_t fn_local(const ValueSymbol& vs) {
         const auto it = fn_ctx_->localmap.find(&vs);
@@ -19133,11 +19165,8 @@ private:
 
     ir::FunctionId function_id(const SubroutineSymbol& sub) {
         if (globals_ != nullptr && this != globals_ && is_global_subroutine(sub)) {
-            const Scope* saved_scope = globals_->scope_;
-            globals_->scope_         = sub.getParentScope();
-            const ir::FunctionId id  = globals_->function_id(sub);
-            globals_->scope_         = saved_scope;
-            return id;
+            const Restore<const Scope*> scope(globals_->scope_, sub.getParentScope());
+            return globals_->function_id(sub);
         }
 
         const auto cached = fnmap_.find(&sub);
@@ -19185,8 +19214,8 @@ private:
         // caller could ever be right. Scope::getTimeScale walks out to the
         // enclosing module / package / compilation unit, so a class method picks
         // up its declaring unit's scale too.
-        const uint64_t saved_mul  = time_mul_;
-        const uint64_t saved_prec = prec_over_tick_;
+        const Restore<uint64_t> mul(time_mul_);
+        const Restore<uint64_t> prec(prec_over_tick_);
         if (tick_fs_ != 0) {
             if (const Scope* decl = sub.getParentScope()) {
                 apply_time_scale(*decl);
@@ -19197,8 +19226,6 @@ private:
         } else {
             build_function(sub, id);
         }
-        time_mul_       = saved_mul;
-        prec_over_tick_ = saved_prec;
 
         return id;
     }
@@ -19273,10 +19300,7 @@ private:
         FnCtx ctx;
         ctx.name_prefix = std::string(sub.name) + ".";
         ctx.is_task     = true;
-        FnCtx* saved    = fn_ctx_;
-        fn_ctx_         = &ctx;
-        std::vector<OpenBlock> saved_blocks;
-        saved_blocks.swap(named_blocks_);
+        const FnScope fn_scope(*this, &ctx);
         ir::Builder             b(module_.pool);
         std::vector<ir::Ref>    param_types;
         std::vector<ir::ArgDir> arg_dirs;
@@ -19310,8 +19334,6 @@ private:
                                            .is_task     = true,
                                            .span        = span_of(sub),
                                            .ir          = b.finish() });
-        named_blocks_.swap(saved_blocks);
-        fn_ctx_ = saved;
     }
 
     // Lower one `fork` child statement (LRM 9.3.2) into a synthetic argument-less
@@ -19328,10 +19350,7 @@ private:
         FnCtx ctx;
         ctx.name_prefix = "fork.child.";
         ctx.is_task     = true;
-        FnCtx* saved    = fn_ctx_;
-        fn_ctx_         = &ctx;
-        std::vector<OpenBlock> saved_blocks;
-        saved_blocks.swap(named_blocks_);
+        const FnScope fn_scope(*this, &ctx);
 
         ir::Builder b(module_.pool);
         lower_stmt(body, b);
@@ -19347,8 +19366,6 @@ private:
                                            .is_task       = true,
                                            .is_fork_child = true,
                                            .ir            = b.finish() });
-        named_blocks_.swap(saved_blocks);
-        fn_ctx_ = saved;
         return id;
     }
 
@@ -19379,10 +19396,7 @@ private:
         FnCtx ctx;
         ctx.name_prefix = monitor ? "monitor." : "strobe.";
         ctx.is_task     = true;
-        FnCtx* saved    = fn_ctx_;
-        fn_ctx_         = &ctx;
-        std::vector<OpenBlock> saved_blocks;
-        saved_blocks.swap(named_blocks_);
+        const FnScope fn_scope(*this, &ctx);
 
         ir::Builder b(module_.pool);
         // $display / $strobe target the standard-output MCD (descriptor 1); the $f*
@@ -19415,8 +19429,6 @@ private:
                                            .local_types = std::move(ctx.local_types),
                                            .is_task     = true,
                                            .ir          = b.finish() });
-        named_blocks_.swap(saved_blocks);
-        fn_ctx_ = saved;
         return id;
     }
 
@@ -19434,10 +19446,7 @@ private:
 
         FnCtx ctx;
         ctx.name_prefix = std::string(sub.name) + ".";
-        FnCtx* saved    = fn_ctx_;
-        fn_ctx_         = &ctx;
-        std::vector<OpenBlock> saved_blocks;
-        saved_blocks.swap(named_blocks_);
+        const FnScope fn_scope(*this, &ctx);
         ir::Builder             b(module_.pool);
         std::vector<ir::Ref>    param_types;
         std::vector<ir::ArgDir> arg_dirs;
@@ -19529,8 +19538,6 @@ private:
                                            .local_types = std::move(ctx.local_types),
                                            .span        = span_of(sub),
                                            .ir          = b.finish() });
-        named_blocks_.swap(saved_blocks);
-        fn_ctx_ = saved;
     }
 
     // Lower a class `new` expression (LRM 8.7): allocate + power-on the object body

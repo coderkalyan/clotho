@@ -212,6 +212,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_queue_assign_dynarr", &rt_queue_assign_dynarr);
     expose("rt_severity", &rt_severity);
     expose("rt_bounds_report", &rt_bounds_report);
+    expose("rt_wide_sel", &rt_wide_sel);
+    expose("rt_wide_ins", &rt_wide_ins);
     expose("rt_null_handle", &rt_null_handle);
     expose("rt_tagged_access", &rt_tagged_access);
     expose("rt_tagged_format_p", &rt_tagged_format_p);

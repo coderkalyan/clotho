@@ -255,6 +255,30 @@ typedef struct rt_bounds_site {
 void rt_bounds_report(const rt_bounds_site* site, int64_t index, int64_t extent, uint32_t flags,
                       uint64_t now);
 
+// -- Runtime-offset bit / part select of a very wide vector (LRM 11.5.1) --
+
+// Read (rt_wide_sel) or write (rt_wide_ins) the `n` bits at storage bit offset
+// `off` of a `width`-bit slot, clamped to the container [base, base+cwidth) the
+// select sits in. `four` selects the packed 4-state layout (must in bits [0,width),
+// may in [width,2*width) of `mm`, z a separate `width`-bit field); `has_z` says
+// whether the z field exists. `unknown` marks an x/z index, which 11.5.1 makes
+// wholly out of range: the read is all-x and the write a no-op. Bits outside the
+// container read x (2-state: 0) and are never written.
+//
+// The selection's own planes are little-endian word buffers of ceil(n/64) words,
+// matching the in-memory layout of an i(n), so the JIT spills / reloads them
+// directly. Storage planes are the same layout at `width` / 2*`width` bits.
+//
+// These index the containing 64-bit word rather than shifting the whole vector,
+// which is what keeps a dynamic select on a 65 Kbit vector from taking O(width^2)
+// JIT time (see the comment on the definitions).
+void rt_wide_sel(const void* mm, const void* z, uint32_t width, int64_t base, uint32_t cwidth,
+                 int64_t off, uint32_t n, uint32_t four, uint32_t has_z, uint32_t unknown,
+                 uint64_t* out_must, uint64_t* out_may, uint64_t* out_z);
+void rt_wide_ins(void* mm, void* z, uint32_t width, int64_t base, uint32_t cwidth, int64_t off,
+                 uint32_t n, uint32_t four, uint32_t has_z, uint32_t unknown,
+                 const uint64_t* must, const uint64_t* may, const uint64_t* z_bits);
+
 // -- Null class-handle dereference (LRM 8.4) --
 
 // The site of one guarded class-handle use — a property dereference or a virtual

@@ -285,6 +285,13 @@ struct BoundsCheck {
     llvm::Constant* site = nullptr;
 };
 
+// Storage width above which a runtime-offset bit / part select is done by the
+// runtime (word-indexed) instead of inline (whole-value variable shift). See
+// wide_dyn_storage for the measurements behind the number: the inline form is
+// linear-ish to a few thousand bits and then quadratic, so this sits an octave
+// inside the safe region.
+constexpr uint32_t wide_dyn_select_bits = 4096;
+
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` slot somewhere in
 // typed storage (the module state struct for a signal, or the per-call frame
 // struct for a function local) plus a bit offset / width selecting part of it.
@@ -319,6 +326,16 @@ struct LValue {
     // check applies (whole storage, or a constant in-range select). A read forces
     // x/0 outside it and a write is restricted to it.
     llvm::Value* range_mask = nullptr;
+    // A runtime-offset select on storage too wide to shift inline: the load / store
+    // goes through rt_wide_sel / rt_wide_ins, which index the containing 64-bit word.
+    // `sel_base` / `sel_cwidth` are the container the selection is clamped to (the
+    // whole slot for a direct select, the inner select's span for a nested one) and
+    // `sel_unknown` is the i1 "the index has an x/z bit" flag. Set instead of
+    // `range_mask`, whose construction is itself O(storage width).
+    bool         wide_dyn    = false;
+    llvm::Value* sel_base    = nullptr;
+    uint32_t     sel_cwidth  = 0;
+    llvm::Value* sel_unknown = nullptr;
     // A module signal (not a frame local): its store services wait queues. `sig`
     // is meaningful only then.
     bool   is_signal = false;
@@ -11500,6 +11517,13 @@ private:
     Plane lower_load(const LValue& lv) {
         const uint32_t w  = lv.store_width;
 
+        // A runtime-offset select on storage too wide to shift: the runtime reads the
+        // containing word (rt_wide_sel), which also applies LRM 11.5.1's per-bit
+        // out-of-range rule, so no storage-width mask is ever built.
+        if (lv.wide_dyn) {
+            return wide_dyn_load(lv);
+        }
+
         // Narrow 2-state slot: the stored word IS the iW value.
         if (lv.narrow) {
             llvm::Value* v = b_.CreateLoad(int_ty(w), lv_mm_ptr(lv));
@@ -11542,6 +11566,105 @@ private:
         return packed(cast(b_.CreateLShr(must_of(full), off), lv.width, false),
                       cast(b_.CreateLShr(may_of(full), off), lv.width, false),
                       cast(b_.CreateLShr(z, off), lv.width, false));
+    }
+
+    // The shared leading arguments of the two wide-select helpers, for the planes of
+    // one `width`-bit slot: where they live, the container the selection clamps to,
+    // the signed storage offset, the selected width, and the plane layout facts.
+    // `zp` null means the slot has no z plane; `four` false means it is 2-state (`mmp`
+    // is `width` value bits, not the packed must|may pair).
+    //
+    // Taking the planes as parameters is what lets the NBA path stage into the shadow
+    // slot -- and its dirty mask, a 2-state plane of the same width -- with the same
+    // two calls the live store uses.
+    std::vector<llvm::Value*> wide_dyn_args(const LValue& lv, llvm::Value* mmp, llvm::Value* zp,
+                                            uint32_t width, bool four) {
+        auto* null = llvm::Constant::getNullValue(raw_ptr_ty());
+        return { mmp,
+                 zp != nullptr ? zp : null,
+                 b_.getInt32(width),
+                 lv.sel_base,
+                 b_.getInt32(lv.sel_cwidth),
+                 b_.CreateSExt(lv.bit_off, b_.getInt64Ty()),
+                 b_.getInt32(lv.width),
+                 b_.getInt32(four ? 1 : 0),
+                 b_.getInt32(zp != nullptr ? 1 : 0),
+                 b_.CreateZExt(lv.sel_unknown, b_.getInt32Ty()) };
+    }
+
+    // The live storage planes of a select lvalue.
+    std::vector<llvm::Value*> wide_dyn_args(const LValue& lv) {
+        return wide_dyn_args(lv, lv_mm_ptr(lv), lv.has_z ? lv_z_ptr(lv) : nullptr, lv.store_width,
+                             !lv.narrow);
+    }
+
+    // A selection plane's spill width: `n` rounded up to whole 64-bit words, which is
+    // both what the helpers index and the in-memory layout of an i(n), so one store /
+    // load moves a whole plane. Rounding up (rather than using i(n) itself) keeps
+    // every byte of the buffer defined.
+    static uint32_t sel_buf_bits(uint32_t n) { return ((n + 63) / 64) * 64; }
+
+    llvm::AllocaInst* sel_plane_buf(uint32_t n, const char* name) {
+        return entry_alloca(int_ty(sel_buf_bits(n)), name);
+    }
+
+    // Read a runtime-offset selection out of very wide storage.
+    Plane wide_dyn_load(const LValue& lv) {
+        const uint32_t n  = lv.width;
+        auto*          bt = int_ty(sel_buf_bits(n));
+        auto*          om = sel_plane_buf(n, "wsel.must");
+        auto*          oy = sel_plane_buf(n, "wsel.may");
+        auto*          oz = sel_plane_buf(n, "wsel.z");
+
+        std::vector<llvm::Value*> args = wide_dyn_args(lv);
+        args.push_back(om);
+        args.push_back(oy);
+        args.push_back(oz);
+        b_.CreateCall(wide_sel_fn(), args);
+
+        llvm::Value* must = cast(b_.CreateLoad(bt, om), n, false);
+        if (lv.narrow) {
+            return two_val(must);
+        }
+        return packed(must, cast(b_.CreateLoad(bt, oy), n, false),
+                      cast(b_.CreateLoad(bt, oz), n, false));
+    }
+
+    // Write a runtime-offset selection into one wide slot's planes: the runtime merges
+    // the bits into the containing words and drops the ones outside the container, so
+    // there is no read-modify-write of the whole vector here either. `four` / `zp`
+    // describe the target planes (the live slot, or an NBA shadow of the same shape).
+    void wide_dyn_store_planes(const LValue& lv, llvm::Value* mmp, llvm::Value* zp, uint32_t width,
+                               bool four, Plane rhs) {
+        const uint32_t n  = lv.width;
+        auto*          bt = int_ty(sel_buf_bits(n));
+        // Spill each plane zero-extended to the buffer's word count.
+        const auto spill = [&](llvm::Value* v, const char* name) -> llvm::Value* {
+            auto* buf = sel_plane_buf(n, name);
+            b_.CreateStore(cast(v, sel_buf_bits(n), false), buf);
+            return buf;
+        };
+
+        std::vector<llvm::Value*> args = wide_dyn_args(lv, mmp, zp, width, four);
+        if (!four) {
+            auto* zbuf = sel_plane_buf(n, "wins.zero");
+            b_.CreateStore(llvm::ConstantInt::get(bt, 0), zbuf);
+            args.push_back(spill(must_of(rhs), "wins.must"));
+            args.push_back(zbuf);
+            args.push_back(zbuf);
+        } else {
+            const Plane f = to_four(rhs);
+            args.push_back(spill(must_of(f), "wins.must"));
+            args.push_back(spill(may_of(f), "wins.may"));
+            args.push_back(spill(f.z != nullptr ? f.z : zero(n), "wins.z"));
+        }
+        b_.CreateCall(wide_ins_fn(), args);
+    }
+
+    // The live-storage form: what a blocking store to a wide dynamic select does.
+    void wide_dyn_store(const LValue& lv, Plane rhs) {
+        wide_dyn_store_planes(lv, lv_mm_ptr(lv), lv.has_z ? lv_z_ptr(lv) : nullptr, lv.store_width,
+                              !lv.narrow, rhs);
     }
 
     // Bounds-checked load of a dynamic-array element (LRM 7.5.1): in range, load
@@ -12377,6 +12500,14 @@ private:
         if (rhs.fp != nullptr) {
             rhs = real_to_planes(fp_of(rhs));
         }
+        // A runtime-offset select on storage too wide to read-modify-write inline:
+        // the runtime merges into the containing word (rt_wide_ins) and drops the
+        // bits outside the container (LRM 11.5.1).
+        if (lv.wide_dyn) {
+            wide_dyn_store(lv, rhs);
+            return;
+        }
+
         const uint32_t s_width = lv.store_width;
         llvm::Value*   mp      = lv_mm_ptr(lv);
 
@@ -12453,6 +12584,19 @@ private:
             return;
         }
 
+        // A runtime-offset select on storage too wide to read-modify-write inline:
+        // stage into the shadow through rt_wide_ins, and record the same bits in the
+        // dirty mask, which is itself one 2-state plane of the signal's width -- so
+        // the same call stages it, and the commit's word-wise merge is unchanged.
+        if (lv.wide_dyn) {
+            wide_dyn_store_planes(lv, shadow_ptr(s, s.sh_mm_field),
+                                  s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr, s.width,
+                                  !s.narrow, rhs);
+            wide_dyn_stage_mask(lv, s);
+            register_block_store(lv, s);
+            return;
+        }
+
         llvm::Value* mp = shadow_ptr(s, s.sh_mm_field);
 
         // Narrow 2-state target: stage the single iW value into the iW shadow. No z.
@@ -12509,6 +12653,20 @@ private:
         }
         llvm::Value* maskp = shadow_ptr(s, s.sh_mask_field);
         b_.CreateStore(b_.CreateOr(b_.CreateLoad(int_ty(s.width), maskp), bmask), maskp);
+    }
+
+    // The wide-select form of stage_dyn_mask: set the selected in-range bits of the
+    // dirty mask instead of OR-ing a storage-width value into it, whose construction
+    // is the O(width^2) shift this path exists to avoid. The mask is one `s.width`-bit
+    // 2-state plane, so rt_wide_ins addresses it like any other; writing all-ones over
+    // exactly the bits the site wrote is the same accumulation, since the helper only
+    // touches those bits and never clears one.
+    void wide_dyn_stage_mask(const LValue& lv, const SignalSlot& s) {
+        if (!s.nba_dyn) {
+            return; // A dynamic site always makes the signal nba_dyn; belt and braces.
+        }
+        wide_dyn_store_planes(lv, shadow_ptr(s, s.sh_mask_field), /*zp=*/nullptr, s.width,
+                              /*four=*/false, two_val(ones(lv.width)));
     }
 
     // Compile-time mask (signal-width APInt) of the bits this static site writes:
@@ -13347,22 +13505,58 @@ private:
         llvm::Value*   end   = b_.CreateAdd(base, llvm::ConstantInt::get(i64t, cwidth));
         llvm::Value*   off   = b_.CreateSExt(lv.bit_off, i64t);
         llvm::Value*   top   = b_.CreateAdd(off, llvm::ConstantInt::get(i64t, selw));
-        llvm::Value*   lo    = smax(smin(off, end), base);
-        llvm::Value*   hi    = smax(smin(top, end), base);
-        llvm::Value*   mask  = range_bits(sw, b_.CreateTrunc(lo, int_ty(32)), b_.CreateTrunc(hi, int_ty(32)));
-        lv.range_mask        = b_.CreateSelect(idx_unknown, zero(sw), mask);
 
         SelectVerdict v;
         v.fully = b_.CreateAnd(b_.CreateAnd(b_.CreateICmpSGE(off, base), b_.CreateICmpSLE(top, end)),
                                b_.CreateNot(idx_unknown));
+        // Storage too wide to shift inline: hand the container to the runtime helper
+        // (which clamps per bit) instead of building an sw-bit mask, whose own
+        // construction is the O(sw^2) legalization this path exists to avoid.
+        if (wide_dyn_storage(sw)) {
+            lv.wide_dyn    = true;
+            lv.sel_base    = base;
+            lv.sel_cwidth  = cwidth;
+            lv.sel_unknown = idx_unknown;
+            // Some bit landed inside: compares only, no mask to count.
+            v.partial = selw == 1 ? nullptr
+                                  : b_.CreateAnd(b_.CreateNot(v.fully),
+                                                 b_.CreateAnd(b_.CreateAnd(b_.CreateICmpSLT(off, end),
+                                                                           b_.CreateICmpSGT(top, base)),
+                                                              b_.CreateNot(idx_unknown)));
+            return v;
+        }
+        llvm::Value* lo   = smax(smin(off, end), base);
+        llvm::Value* hi   = smax(smin(top, end), base);
+        llvm::Value* mask = range_bits(sw, b_.CreateTrunc(lo, int_ty(32)), b_.CreateTrunc(hi, int_ty(32)));
+        lv.range_mask     = b_.CreateSelect(idx_unknown, zero(sw), mask);
+
         v.partial =
           selw == 1 ? nullptr
                     : b_.CreateAnd(b_.CreateNot(v.fully), b_.CreateICmpNE(lv.range_mask, zero(sw)));
         return v;
     }
 
+    // Whether a runtime-offset select into `sw`-bit storage takes the runtime
+    // word-indexed path rather than shifting the whole value inline.
+    //
+    // The inline form asks LLVM for a variable shift on an i(2*sw) SSA value, which
+    // legalizes into O(sw/64) selects per word: measured JIT time for one dynamic bit
+    // select is 0.2 s at 4 Kbit, 1.1 s at 8 Kbit, 21 s at 12 Kbit and over half an
+    // hour at 64 Kbit (ivtest pr722). Below the threshold the inline form is both
+    // cheaper and better optimizable, so it stays; above it the cost is a call whose
+    // work is O(selw) and independent of the vector's width. The selection's own
+    // width is unrestricted: its planes travel as ceil(selw/64)-word buffers, so
+    // `[i +: 128]` of a 64 Kbit vector is as cheap as `[i]`.
+    static bool wide_dyn_storage(uint32_t sw) {
+        return sw > wide_dyn_select_bits;
+    }
+
     // Storage-width write mask for a partial store: the range-restricted mask for
     // a bounds-checked dynamic select, or the naive shifted mask otherwise.
+    //
+    // A wide dynamic select never reaches here: both the blocking store and the NBA
+    // staging route to rt_wide_ins, which addresses words instead of needing a mask
+    // this wide -- building one is the O(width^2) legalization that path avoids.
     llvm::Value* store_mask(const LValue& lv, uint32_t sw) {
         if (lv.range_mask != nullptr) {
             return lv.range_mask;
@@ -13897,6 +14091,27 @@ private:
         auto* i64 = b_.getInt64Ty();
         return rt_fn("rt_bounds_report", b_.getVoidTy(),
                      { raw_ptr_ty(), i64, i64, b_.getInt32Ty(), i64 });
+    }
+    // void rt_wide_sel(const void* mm, const void* z, u32 width, i64 base, u32 cwidth,
+    //                  i64 off, u32 n, u32 four, u32 has_z, u32 unknown,
+    //                  u64* must, u64* may, u64* z_out)
+    llvm::FunctionCallee wide_sel_fn() {
+        auto* i32 = b_.getInt32Ty();
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_wide_sel", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), i32, i64, i32, i64, i32, i32, i32, i32,
+                       raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+
+    // void rt_wide_ins(void* mm, void* z, u32 width, i64 base, u32 cwidth, i64 off,
+    //                  u32 n, u32 four, u32 has_z, u32 unknown, const u64* must,
+    //                  const u64* may, const u64* z)
+    llvm::FunctionCallee wide_ins_fn() {
+        auto* i32 = b_.getInt32Ty();
+        auto* i64 = b_.getInt64Ty();
+        return rt_fn("rt_wide_ins", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), i32, i64, i32, i64, i32, i32, i32, i32,
+                       raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
 
     // Record an array-element check on `target` (the lvalue the select produces)
