@@ -181,6 +181,19 @@ struct SimulationConfig {
     // emitted. This is a security boundary, not an optimization knob — running a
     // shell command is arbitrary code execution, gated on an explicit opt-in.
     SystemAccess allow_system = SystemAccess::Off;
+    // Report a `ref` whose actual storage moved out from under it as a warning
+    // and keep simulating, instead of the located fatal
+    // (`--loose-stale-ref`). A `ref` formal binds to the actual's storage
+    // (LRM 13.5.2), so restructuring the container that storage lives in --
+    // pushing onto the queue an element `ref` points into, say -- leaves the
+    // formal aimed at bytes that are no longer that element; the epoch check
+    // (docs/design/data-model.md §3) catches exactly that. Fatal by default
+    // because every subsequent read and write through the formal is then
+    // reading or corrupting an unrelated object, so continuing computes a
+    // result no part of the LRM describes. Loosening it is for triage: it
+    // reports each such ref once, with its location, so a design with several
+    // of them names them all in one run rather than one per rebuild.
+    bool loose_stale_ref = false;
     // Statistics to report (`--stat=<list>`): a mask of `Stat` bits, tested
     // with stat_on. Zero reports nothing.
     uint32_t stats = 0;

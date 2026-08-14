@@ -217,6 +217,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_wide_ins", &rt_wide_ins);
     expose("rt_null_handle", &rt_null_handle);
     expose("rt_tagged_access", &rt_tagged_access);
+    expose("rt_ref_stale", &rt_ref_stale);
+    expose("rt_ref_epoch_regress", &rt_ref_epoch_regress);
     expose("rt_tagged_format_p", &rt_tagged_format_p);
     expose("rt_alloc_checked", &rt_alloc_checked);
     expose("rt_alloc_elems_checked", &rt_alloc_elems_checked);
@@ -276,6 +278,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_dynarr_new_copy", &rt_dynarr_new_copy);
     expose("rt_dynarr_delete", &rt_dynarr_delete);
     expose("rt_dynarr_assign", &rt_dynarr_assign);
+    expose("rt_dynarr_move", &rt_dynarr_move);
     expose("rt_dynarr_reverse", &rt_dynarr_reverse);
     expose("rt_dynarr_sort", &rt_dynarr_sort);
     expose("rt_dynarr_shuffle", &rt_dynarr_shuffle);
@@ -307,6 +310,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_assoc_next", &rt_assoc_next);
     expose("rt_assoc_prev", &rt_assoc_prev);
     expose("rt_assoc_assign", &rt_assoc_assign);
+    expose("rt_assoc_move", &rt_assoc_move);
     expose("rt_intra_alloc", &rt_intra_alloc);
     expose("rt_intra_cb", &rt_intra_cb);
     expose("rt_intra_ready_base", &rt_intra_ready_base);
@@ -356,6 +360,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_string_init", &rt_string_init);
     expose("rt_string_deinit", &rt_string_deinit);
     expose("rt_string_assign", &rt_string_assign);
+    expose("rt_string_move", &rt_string_move);
     expose("rt_string_assign_bytes", &rt_string_assign_bytes);
     expose("rt_string_len", &rt_string_len);
     expose("rt_string_data", &rt_string_data);
@@ -632,6 +637,12 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // compile-time gate in lowering is primary; this mirrors the operator's
     // opt-in into the runtime so a bypassed gate still refuses to exec.
     rt_system_set_access(static_cast<int32_t>(config.allow_system));
+
+    // Arm the dangling-ref reporting mode. The epoch check the backend emits is
+    // unconditional; this only selects what rt_ref_stale does when one trips --
+    // the located fatal, or a once-per-site warning that returns and lets the
+    // design keep running (--loose-stale-ref).
+    rt_ref_stale_warn(config.loose_stale_ref ? 1 : 0);
 
     // Simulation phase: run the compiled design. A $finish no longer unwinds
     // anything here — it returns through the design's own frames and the drain

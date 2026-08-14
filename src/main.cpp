@@ -86,6 +86,7 @@ struct Options {
     std::vector<std::string>   sanitizers;
     std::optional<std::string> allow_system;
     std::optional<bool>        loose_timescale;
+    std::optional<bool>        loose_stale_ref;
     std::vector<std::string>   dpi_libs;
     std::optional<bool>        perf_jitdump;
     std::optional<std::string> sidecar;
@@ -156,6 +157,12 @@ void register_options(slang::CommandLine& cl, Options& o) {
            o.loose_timescale,
            "Accept a design where some parts declare a time scale and others do not, refused by "
            "default: the parts that do not take --timescale's value, or 1ns/1ns when it is not given");
+    cl.add("--loose-stale-ref",
+           o.loose_stale_ref,
+           "[run] Report and keep simulating when a ref argument no longer refers to the variable it "
+           "was bound to, which stops the run by default: growing or reordering an array or queue "
+           "while a ref refers to an element of it leaves that ref on something else entirely, so "
+           "nothing after the first one means anything. For naming every such ref in one run");
     cl.add("--dpi-lib",
            o.dpi_libs,
            "[run] Library holding the C functions this design imports through DPI-C. Give a .o or .a "
@@ -282,6 +289,7 @@ bool check_scope(const Options& o, Command command, int& status) {
         { o.out.has_value(), "-o", Command::Build, Command::Synth },
         { !o.dpi_libs.empty(), "--dpi-lib", Command::Run },
         { o.perf_jitdump.has_value(), "--perf-jitdump", Command::Run },
+        { o.loose_stale_ref.has_value(), "--loose-stale-ref", Command::Run },
         { o.sidecar.has_value(), "--sidecar", Command::Synth, Command::Synth },
         { o.target.has_value(), "--target", Command::Synth, Command::Synth },
         { o.hierarchy.has_value(), "--hierarchy", Command::Synth, Command::Synth },
@@ -585,6 +593,14 @@ int main(int argc, char** argv) {
                      "being read as {} (--loose-timescale)",
                      *driver->options.timeScale);
     }
+    // The other two loosenings above announce themselves at startup, because
+    // nothing else would ever say the design was read permissively. This one
+    // needs no banner: it changes only what happens when a ref does go stale,
+    // and that case reports itself, with a location, every time it happens
+    // (rt_ref_stale). A run that never has one is unaffected, so a banner would
+    // only be noise. The mode is armed on the runtime at simulation start
+    // (run_jit in src/ir/Jit.cpp).
+    config.loose_stale_ref = options.loose_stale_ref == true;
 
     const bool             want_time = options.time == true;
     clotho::Timings        timings;

@@ -399,6 +399,7 @@ struct Structural {
     // Per-signal.
     std::vector<bool> driven;  // any driver at all (inverted into `undriven`)
     std::vector<bool> ptr_arg; // passed as a non-In actual somewhere
+    std::vector<bool> ref_arg; // passed as a `ref` actual somewhere (aliased, not copied)
     // Partial-undriven bookkeeping, per candidate signal only.
     std::vector<bool>                  partial_candidate;
     std::vector<uint32_t>              partial_width;
@@ -487,6 +488,9 @@ struct Structural {
             }
             const Signal s                    = ir.payload(root).signal;
             ptr_arg[static_cast<uint32_t>(s)] = true;
+            if (callee.arg_dirs[a] == ArgDir::Ref) {
+                ref_arg[static_cast<uint32_t>(s)] = true;
+            }
             if (!copy_out) {
                 continue;
             }
@@ -1507,6 +1511,7 @@ DesignFacts analyze(const Module& m) {
     Structural st{ .m = m };
     st.driven.assign(nsig, false);
     st.ptr_arg.assign(nsig, false);
+    st.ref_arg.assign(nsig, false);
     st.partial_candidate.assign(nsig, false);
     st.partial_width.assign(nsig, 0);
     st.partial_touched.assign(nsig, false);
@@ -1549,6 +1554,7 @@ DesignFacts analyze(const Module& m) {
     facts.undriven = st.driven;
     facts.undriven.flip();
     facts.ptr_arg = std::move(st.ptr_arg);
+    facts.ref_arg = std::move(st.ref_arg);
     facts.uses    = st.uses;
 
     // Flatten the per-signal partial masks. A signal gets a mask only when it is a

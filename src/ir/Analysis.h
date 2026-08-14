@@ -212,6 +212,16 @@ struct DesignFacts {
     // fact, which is why it is a separate bit.
     std::vector<bool> ptr_arg;
 
+    // Passed as a `ref` actual somewhere. Stronger than ptr_arg: a `ref` formal
+    // ALIASES this storage rather than copying through it, so for an unpacked
+    // aggregate the two sides' layouts must be IDENTICAL, not merely both
+    // readable. The callee's formal always has the canonical (never-narrowed)
+    // aggregate mirror, so the actual must take it too — a flat array signal's
+    // per-signal z-elision would otherwise give the callee a different element
+    // stride, and a write through the ref would land in a neighbouring element's
+    // z word.
+    std::vector<bool> ref_arg;
+
     // Per-bit undriven mask for a PARTIALLY driven packed 4-state net -- the
     // refinement of `undriven`, which is whole-signal (`w[3:0] = ...` marks all of
     // `w` driven, so its remaining bits would wrongly power on x instead of z).

@@ -1593,10 +1593,11 @@ TEST_CASE("an aggregate output argument's copy-out wakes the actual's waiters") 
 }
 
 TEST_CASE("aggregate subroutine arguments Clotho still refuses loudly") {
-    // Orthogonal, pre-existing gaps, all shared with the function path: a
-    // string-bearing aggregate has no memcpy-able storage, `ref` of an aggregate
-    // needs the alias ABI rather than the storage-pointer one, and a non-lvalue
-    // actual has no storage to point at.
+    // Orthogonal, pre-existing gaps, both shared with the function path: a
+    // string-bearing aggregate has no memcpy-able storage for the by-value copy,
+    // and a non-lvalue actual has no storage to point at. (`ref` of an aggregate
+    // is no longer among them — it aliases through the fat ref, covered in
+    // task_test.cpp.)
     SUBCASE("string-bearing aggregate by value") {
         const LowerResult r = lower_text(R"(
             module m;
@@ -1609,18 +1610,6 @@ TEST_CASE("aggregate subroutine arguments Clotho still refuses loudly") {
         CHECK_FALSE(r.ok);
         CHECK(r.diagnostic_text().find("string-containing aggregate is not supported") !=
               std::string::npos);
-    }
-    SUBCASE("ref of an unpacked struct") {
-        const LowerResult r = lower_text(R"(
-            module m;
-                typedef struct { int x; } s_t;
-                s_t v;
-                task automatic t(ref s_t a); a.x = 2; endtask
-                initial t(v);
-            endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("ref arguments are only supported") != std::string::npos);
     }
     SUBCASE("an assignment-pattern actual") {
         const LowerResult r = lower_text(R"(

@@ -19750,16 +19750,19 @@ private:
             const auto dir = fa->direction;
             if (dir == slang::ast::ArgumentDirection::Ref) {
                 // ref / const ref (LRM 13.5.2): the formal aliases the actual's live
-                // storage through a passed pointer (see build_function / build_task
-                // and the backend ref ABI). Supported for packed integral formals
-                // (scalar / packed vector) and dynamic arrays (the handle pointer is
-                // aliased directly).
-                const auto& ct = fa->getType().getCanonicalType();
-                if (!ct.isIntegral() && ct.as_if<slang::ast::DynamicArrayType>() == nullptr) {
-                    // TODO: ref of unpacked array / struct / string / real — needs a
-                    // handle pass or offset plumbing, not the packed-slot pointer ABI.
-                    fail("ref arguments are only supported for packed integral types "
-                         "and dynamic arrays");
+                // storage through a fat pointer carrying the storage address, the
+                // relocation epoch of the container the actual is rooted in, and the
+                // report site (docs/design/data-model.md §3). Every storage class
+                // passes the same way — a plane slot, a managed handle, an aggregate
+                // image — so there is no per-type restriction here.
+                //
+                // An `event` formal is the one exclusion: an event has no value and
+                // its trigger state is a separate static timestamp, so there is
+                // nothing for a pointer to alias.
+                if (fa->getType().getCanonicalType().isEvent()) {
+                    // TODO: ref of an event (LRM 15.5) needs event reference
+                    // semantics, which is a scheduler change, not a data-model one.
+                    fail("ref argument of an event type is not supported");
                 }
                 continue;
             }
@@ -20431,6 +20434,14 @@ private:
                 args.push_back(lower_lvalue(unwrap_conversion(*actual), b));
                 continue;
             }
+            // A `ref` actual is decided by DIRECTION, not by type: every storage
+            // class aliases through the same fat ref, so this must precede the
+            // by-value aggregate and handle paths below (which would otherwise
+            // capture a ref aggregate / container formal and copy it).
+            if (dir == slang::ast::ArgumentDirection::Ref) {
+                args.push_back(lower_ref_actual(*actuals[i], b));
+                continue;
+            }
             const ir::Ref pty = lower_type(formals[i]->getType());
             if (is_agg_abi_ref(pty)) {
                 // An unpacked aggregate actual passes by pointer (LRM 13.5.1 copies at
@@ -20503,10 +20514,6 @@ private:
                 args.push_back(lower_lvalue(*actual, b));
                 continue;
             }
-            if (dir == slang::ast::ArgumentDirection::Ref) {
-                args.push_back(lower_ref_actual(*actuals[i], b));
-                continue;
-            }
             if (dir == slang::ast::ArgumentDirection::In) {
                 // A string actual passes as-is (no width to resize to); the callee's
                 // copy-in gives value semantics.
@@ -20557,31 +20564,46 @@ private:
         }
     }
 
-    // A legal ref actual (LRM 13.5.2) Clotho supports: a whole variable, or a whole
-    // element of an unpacked array (`arr[i]`, possibly nested). Each is one complete
-    // `{ i(2W), iW }` slot, so the backend passes its slot pointer. slang already
-    // rejects a packed bit/part-select as a ref actual ("only variables, class
-    // properties, and members of unpacked structs and arrays are allowed"); an
-    // unpacked-struct member needs struct support, still unimplemented.
+    // Whether an expression names a whole PLACE a `ref` can alias (LRM 13.5.2), as
+    // opposed to a partial selection of one. A place is a named variable, an
+    // element of an unpacked array / dynamic array / queue / associative array, a
+    // member of an unpacked struct, or a class property — composed to any depth.
+    //
+    // The exclusion is a bit or part select of a packed value: that is a sub-slot
+    // bit range, not an addressable object, so no pointer can name it. slang
+    // already rejects it ("only variables, class properties, and members of
+    // unpacked structs and arrays are allowed"); this is the backstop.
     bool is_whole_ref_actual(const Expression& a) {
         switch (a.kind) {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue:
                 return true;
             case ExpressionKind::ElementSelect: {
-                // Only an unpacked-array element is a whole slot; a select of a
-                // packed value is a bit/part-select (a partial ref, unsupported).
+                // An element of any unpacked collection is a whole place; a select of
+                // a PACKED value is a bit select, which is not.
                 const auto& es = a.as<ElementSelectExpression>();
-                return is_unpacked_array(es.value()) && is_whole_ref_actual(es.value());
+                return is_unpacked_container(*es.value().type) && is_whole_ref_actual(es.value());
+            }
+            case ExpressionKind::MemberAccess: {
+                // An unpacked-struct member or a class property is a whole place. A
+                // PACKED struct / union member is a part select of the flat value, so
+                // it is not.
+                const auto& ma = a.as<MemberAccessExpression>();
+                if (ma.member.kind == SymbolKind::ClassProperty) {
+                    // The object body is reached through the handle, so the handle
+                    // expression itself need not be a place.
+                    return true;
+                }
+                return is_unpacked_struct(*ma.value().type) && is_whole_ref_actual(ma.value());
             }
             default:
                 return false;
         }
     }
 
-    // Lower a ref actual (LRM 13.5.2) to its lvalue leaf: the backend passes one
-    // pointer to the actual's slot (a scalar's slot, or one array-element slot) and
-    // the callee aliases it live.
+    // Lower a ref actual (LRM 13.5.2) to its lvalue: the backend turns that lvalue
+    // into the fat ref the callee aliases live (ref_actual_arg), including the
+    // relocation epoch when the place is rooted inside a container's heap storage.
     ir::Index lower_ref_actual(const Expression& actual, ir::Builder& b) {
         const Expression* a = &actual;
         // slang may wrap a ref actual in an AssignmentExpression (as for out/inout);
@@ -20590,9 +20612,11 @@ private:
             a = &a->as<AssignmentExpression>().left();
         }
         if (!is_whole_ref_actual(*a)) {
-            // TODO: ref actual that is a packed bit/part-select or unpacked-struct
-            // member (needs sub-slot offset plumbing / struct support).
-            fail("ref argument actual must be a whole variable or unpacked-array element");
+            // A bit / part select of a packed value is a bit range, not an object a
+            // pointer can name. There is nothing to implement here: LRM 13.5.2 does
+            // not allow it and slang rejects it first.
+            fail("ref argument actual must be a whole variable, element, member or "
+                 "class property, not a bit or part select");
         }
         return lower_lvalue(*a, b);
     }
