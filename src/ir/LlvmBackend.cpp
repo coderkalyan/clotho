@@ -347,6 +347,10 @@ struct LValue {
     // body). Addressed via lv_handle_ptr by the queue / dynamic-array ops;
     // plane Load/Store on it traps (the frontend never emits one).
     bool is_handle = false;
+    // The element / leaf type behind `is_handle`, needed to reach its rt_elem_ops
+    // and its out-of-range sink. Only set for a container ELEMENT (where
+    // dyn_inrange applies); a handle leaf inside an aggregate leaves it invalid.
+    Ref handle_type{};
     // Recursive aggregate addressing (a signal whose type contains an unpacked
     // struct). `root_ty` is the signal's whole storage type; `agg_path` is the
     // GEP index vector from `base` to the current sub-object (a leaf slot once a
@@ -671,6 +675,9 @@ struct ModuleEnv {
     // its own copies.
     ankerl::unordered_dense::map<uint32_t, llvm::Constant*> elem_ops;
     llvm::GlobalVariable* str_sink = nullptr;
+    // Write-only sink handles for out-of-range nested-container elements, keyed by
+    // element type Ref (handle_sink_global).
+    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> handle_sinks;
 };
 
 // Builds the shared state struct and lowers every process. One instance per
@@ -1065,15 +1072,34 @@ private:
         return ty;
     }
 
-    // The opaque rt_string handle slot type (`%clotho.string = { [32 x i8] }`),
-    // memoized. A struct wrapper keeps GEP paths and array-of-slot addressing
-    // uniform with the plane slots.
+    // The opaque rt_string handle slot type
+    // (`%clotho.string = { i64, [sizeof(rt_string) - 8 x i8] }`), memoized. A struct
+    // wrapper keeps GEP paths and array-of-slot addressing uniform with the plane
+    // slots.
+    //
+    // The leading i64 is what carries the runtime type's alignment: rt_string is
+    // `alignas(8)`, and a plain `{ [32 x i8] }` mirror is align 1, so a string leaf
+    // inside an aggregate landed at whatever offset the preceding field left it (an
+    // `int` puts it at +4) and every runtime access to it was misaligned -- UB that
+    // UBSan reports on a struct-with-string signal and on a container element alike.
+    // The trailing bytes stay a byte array so the empty-string image (whose only
+    // non-zero byte is the inline capacity, at the end) is expressible without
+    // endianness games.
     llvm::StructType* str_slot_ty() {
         if (str_slot_ty_ == nullptr) {
+            static_assert(sizeof(rt_string) > 8 && sizeof(rt_string) % 8 == 0);
             str_slot_ty_ = llvm::StructType::create(
-              ctx_, { llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_string)) }, "clotho.string");
+              ctx_, { b_.getInt64Ty(), llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_string) - 8) }, "clotho.string");
         }
         return str_slot_ty_;
+    }
+
+    // The empty (owned, inline) rt_string image as a typed constant: all zero bytes
+    // but the trailing inline-capacity byte.
+    llvm::Constant* str_empty_const() {
+        std::vector<uint8_t> bytes(sizeof(rt_string) - 8, 0);
+        bytes[bytes.size() - 1] = static_cast<uint8_t>(rt_string_inline_cap);
+        return llvm::ConstantStruct::get(str_slot_ty(), { b_.getInt64(0), llvm::ConstantDataArray::get(ctx_, bytes) });
     }
 
     // The opaque rt_dynarr handle slot type (`%clotho.dynarr = { ptr, i64 }`),
@@ -1127,11 +1153,13 @@ private:
         llvm::Type* agg_ty = nullptr;
         Ref         elem_type{};
     };
-    DynElem dynarr_elem(Ref array_type) {
-        const Type& at = std::get<Type>(mod_.pool.get(array_type));
+    // One element's storage classification, from the ELEMENT type. Keyed on the
+    // element rather than the container because a nested container's leaf descriptor
+    // needs the same answer with no container Ref to hand (collect_elem_leaves).
+    DynElem elem_desc(Ref elem_type) {
         DynElem     e;
-        e.elem_type    = at.element;
-        const Type& et = std::get<Type>(mod_.pool.get(at.element));
+        e.elem_type    = elem_type;
+        const Type& et = std::get<Type>(mod_.pool.get(elem_type));
         if (et.kind == Type::Kind::String) {
             e.is_string = true;
             e.slot_ty   = str_slot_ty();
@@ -1140,23 +1168,26 @@ private:
         if (et.kind == Type::Kind::DynArray || et.kind == Type::Kind::Queue ||
             et.kind == Type::Kind::Assoc) {
             e.is_handle = true;
-            e.slot_ty   = handle_slot_ty(at.element);
+            e.slot_ty   = handle_slot_ty(elem_type);
             return e;
         }
-        if (!is_leaf_type(at.element)) {
+        if (!is_leaf_type(elem_type)) {
             // Unpacked struct / fixed unpacked array value: the slot is the flat
             // recursive aggregate image, addressed via the is_agg lvalue path.
             e.is_agg = true;
-            e.agg_ty = agg_storage_ty(at.element);
+            e.agg_ty = agg_storage_ty(elem_type);
             return e;
         }
-        const Layout lay = mod_.pool.layout(at.element);
+        const Layout lay = mod_.pool.layout(elem_type);
         e.width      = lay.width == 0 ? 1 : lay.width;
         e.four_state = lay.domain == Domain::Four;
         e.has_z      = e.four_state;
         e.narrow     = !e.four_state; // 2-state / real element -> single iW slot
         e.slot_ty    = slot_type(e.width, e.four_state, e.has_z, e.narrow);
         return e;
+    }
+    DynElem dynarr_elem(Ref array_type) {
+        return elem_desc(std::get<Type>(mod_.pool.get(array_type)).element);
     }
 
     // Byte size of one element slot (the runtime stride).
@@ -1217,13 +1248,13 @@ private:
     // The element power-on byte image as a typed constant: X planes for a
     // 4-state scalar, zero for 2-state / real, the empty inline handle for a
     // string, the null handle for a nested container.
-    // Power-on constant for a POD (trivially-copyable) aggregate storage image:
-    // X planes for a 4-state scalar leaf, 0 for 2-state / real, recursively over
-    // the unpacked struct / array. Built against the exact `storage` LLVM type so
-    // the constant's type matches the target global / GEP source -- agg_storage_ty
-    // mints a fresh (structurally-equal but distinct) StructType per call, so the
-    // constant must reuse the caller's instance, not a new one. Only reached for a
-    // trivially-copyable aggregate (frontend guard), so no string / container leaf.
+    // Power-on constant for an aggregate storage image: X planes for a 4-state
+    // scalar leaf, 0 for 2-state / real, the empty inline handle for a string leaf
+    // and the null handle for a nested container leaf, recursively over the unpacked
+    // struct / array. Built against the exact `storage` LLVM type so the constant's
+    // type matches the target global / GEP source -- agg_storage_ty mints a fresh
+    // (structurally-equal but distinct) StructType per call, so the constant must
+    // reuse the caller's instance, not a new one.
     llvm::Constant* agg_proto_const(Ref type, llvm::Type* storage) {
         const Type& t = std::get<Type>(mod_.pool.get(type));
         if (t.kind == Type::Kind::UnpackedArray) {
@@ -1240,6 +1271,13 @@ private:
                 fields.push_back(agg_proto_const(flds[k].type, st->getElementType(k)));
             }
             return llvm::ConstantStruct::get(st, fields);
+        }
+        if (t.kind == Type::Kind::String || t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue ||
+            t.kind == Type::Kind::Assoc) {
+            // A managed leaf powers on empty / null, which is also what makes the
+            // image safe to rt_elem_init a fresh slot with: the runtime then
+            // deep-assigns into a valid empty leaf.
+            return elem_proto_const(elem_desc(type));
         }
         const Layout   lay  = mod_.pool.layout(type);
         const uint32_t w    = lay.width == 0 ? 1 : lay.width;
@@ -1266,10 +1304,7 @@ private:
             return agg_proto_const(e.elem_type, e.agg_ty);
         }
         if (e.is_string) {
-            std::vector<uint8_t> bytes(sizeof(rt_string), 0);
-            bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
-            return llvm::ConstantStruct::get(
-              e.slot_ty, { llvm::ConstantDataArray::get(ctx_, bytes) });
+            return str_empty_const();
         }
         if (e.is_handle) {
             return llvm::Constant::getNullValue(e.slot_ty);
@@ -1282,40 +1317,100 @@ private:
         return llvm::ConstantStruct::get(e.slot_ty, fields);
     }
 
-    // The constant rt_elem_ops descriptor for a container's element type,
-    // memoized per element type Ref. Nested containers chain through `inner`
-    // (finite: type nesting is a DAG). A trivially-copyable aggregate element is
-    // kind 0 (POD): memcpy copy over the proto image, no per-leaf lifecycle -- a
-    // managed-leaf aggregate (kind-4 leaf table) is frontend-guarded.
-    llvm::Constant* elem_ops_global(Ref container_type) {
-        const Type& at = std::get<Type>(mod_.pool.get(container_type));
-        if (const auto it = env_->elem_ops.find(static_cast<uint32_t>(at.element));
-            it != env_->elem_ops.end()) {
+    // The rt_elem_leaf mirror type: { i64 offset, ptr ops }.
+    llvm::StructType* elem_leaf_ty() {
+        if (elem_leaf_ty_ == nullptr) {
+            elem_leaf_ty_ = llvm::StructType::create(ctx_, { b_.getInt64Ty(), raw_ptr_ty() }, "clotho.elemleaf");
+        }
+        return elem_leaf_ty_;
+    }
+
+    // The heap-owning leaves of an aggregate element type as { byte offset, ops }
+    // pairs, appended in ASCENDING offset order.
+    //
+    // The order is a runtime contract, not a convenience: rt_elem_copy deep-assigns
+    // each leaf and then raw-copies the POD gaps *between* consecutive leaves
+    // (Runtime.cpp), so an unsorted table would copy a leaf's bytes as if they were
+    // POD -- shallow-copying a string handle into a slot that then double-frees.
+    // The walk is in declaration / index order, which IS ascending offset for both
+    // an LLVM struct (fields laid out in order) and an array.
+    void collect_elem_leaves(Ref type, uint64_t base, llvm::Type* storage, std::vector<llvm::Constant*>& out) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            auto*          arr    = llvm::cast<llvm::ArrayType>(storage);
+            const uint64_t stride = env_->llmod.getDataLayout().getTypeAllocSize(arr->getElementType());
+            for (uint64_t k = 0; k < arr->getNumElements(); ++k) {
+                collect_elem_leaves(t.element, base + k * stride, arr->getElementType(), out);
+            }
+            return;
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            auto*       st = llvm::cast<llvm::StructType>(storage);
+            const auto* sl = env_->llmod.getDataLayout().getStructLayout(st);
+            uint32_t    f  = 0;
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                collect_elem_leaves(fld.type, base + sl->getElementOffset(f), st->getElementType(f), out);
+                ++f;
+            }
+            return;
+        }
+        if (t.kind != Type::Kind::String && t.kind != Type::Kind::DynArray && t.kind != Type::Kind::Queue &&
+            t.kind != Type::Kind::Assoc) {
+            return;
+        }
+        out.push_back(llvm::ConstantStruct::get(elem_leaf_ty(), { b_.getInt64(base), elem_ops_for(type) }));
+    }
+
+    // The constant rt_elem_ops descriptor for one element type, memoized.
+    //
+    // Nested containers chain through `inner` (finite: type nesting is a DAG). An
+    // aggregate element is kind 0 (POD) when every leaf is plain bytes -- memcpy
+    // copy over the proto image, no per-element lifecycle -- and kind 4 when it owns
+    // a string / container leaf, which the leaf table then makes the runtime
+    // deep-copy and free.
+    llvm::Constant* elem_ops_for(Ref elem_type) {
+        if (const auto it = env_->elem_ops.find(static_cast<uint32_t>(elem_type)); it != env_->elem_ops.end()) {
             return it->second;
         }
-        const DynElem e     = dynarr_elem(container_type);
-        uint32_t      kind  = 0;
+        const DynElem   e       = elem_desc(elem_type);
+        uint32_t        kind    = 0;
         llvm::Constant* inner = llvm::Constant::getNullValue(raw_ptr_ty());
+        llvm::Constant* leaves  = llvm::Constant::getNullValue(raw_ptr_ty());
+        uint32_t        nleaves = 0;
         if (e.is_string) {
             kind = 1;
         } else if (e.is_handle) {
-            const Type& et = std::get<Type>(mod_.pool.get(at.element));
+            const Type& et = std::get<Type>(mod_.pool.get(elem_type));
             kind  = et.kind == Type::Kind::DynArray ? 2 : 3;
-            inner = elem_ops_global(at.element);
+            inner          = elem_ops_for(et.element);
+        } else if (e.is_agg && has_heap_leaf(elem_type)) {
+            std::vector<llvm::Constant*> table;
+            collect_elem_leaves(elem_type, 0, e.agg_ty, table);
+            auto* arr_ty = llvm::ArrayType::get(elem_leaf_ty(), table.size());
+            leaves       = new llvm::GlobalVariable(env_->llmod,
+                                                    arr_ty,
+                                                    /*isConstant=*/true,
+                                                    llvm::GlobalValue::InternalLinkage,
+                                                    llvm::ConstantArray::get(arr_ty, table),
+                                                    "clotho.elem.leaves");
+            nleaves      = static_cast<uint32_t>(table.size());
+            kind         = 4;
         }
         llvm::Type* proto_ty = e.is_agg ? e.agg_ty : e.slot_ty;
         auto* proto = new llvm::GlobalVariable(env_->llmod, proto_ty, /*isConstant=*/true,
                                                llvm::GlobalValue::InternalLinkage,
                                                elem_proto_const(e), "clotho.elem.proto");
-        auto* init = llvm::ConstantStruct::get(
+        auto*       init     = llvm::ConstantStruct::get(
           elem_ops_ty(),
-          { b_.getInt32(kind), b_.getInt32(0), b_.getInt64(dynarr_stride(e)), proto, inner,
-            llvm::Constant::getNullValue(raw_ptr_ty()) });
+          { b_.getInt32(kind), b_.getInt32(nleaves), b_.getInt64(dynarr_stride(e)), proto, inner, leaves });
         auto* gv = new llvm::GlobalVariable(env_->llmod, elem_ops_ty(), /*isConstant=*/true,
                                             llvm::GlobalValue::InternalLinkage, init,
                                             "clotho.elem.ops");
-        env_->elem_ops.emplace(static_cast<uint32_t>(at.element), gv);
+        env_->elem_ops.emplace(static_cast<uint32_t>(elem_type), gv);
         return gv;
+    }
+    llvm::Constant* elem_ops_global(Ref container_type) {
+        return elem_ops_for(std::get<Type>(mod_.pool.get(container_type)).element);
     }
 
     // Sort comparator descriptor for the element of `array_type` (LRM 7.12.2
@@ -1391,11 +1486,49 @@ private:
         b_.CreateCall(is_queue_type(type) ? queue_delete_all_fn() : dynarr_delete_fn(),
                       { handle, elem_ops_global(type) });
     }
+    // The shared out-of-range sink for a nested-container element: a writable
+    // handle global per element type, emptied before every use.
+    //
+    // Mirrors the string-element sink (lv_string_ptr): with it, an out-of-range
+    // `q[i]` where the element is itself a queue / dynamic array reads as an EMPTY
+    // container (the Table 7-1 default, so `q[99].size()` is 0) and an out-of-range
+    // mutating method lands in the sink and is discarded (LRM 7.4.5), instead of
+    // addressing the heap buffer past its length.
+    llvm::Value* handle_sink_global(Ref elem_type) {
+        const auto key = static_cast<uint32_t>(elem_type);
+        if (const auto it = env_->handle_sinks.find(key); it != env_->handle_sinks.end()) {
+            return it->second;
+        }
+        auto* slot = handle_slot_ty(elem_type);
+        auto* gv   = new llvm::GlobalVariable(env_->llmod,
+                                              slot,
+                                              /*isConstant=*/false,
+                                              llvm::GlobalValue::InternalLinkage,
+                                              llvm::ConstantAggregateZero::get(slot),
+                                              "clotho.handle.sink");
+        env_->handle_sinks.emplace(key, gv);
+        return gv;
+    }
+
     // Pointer to the rt handle slot an lvalue designates: the resolved
     // aggregate leaf slot for a struct-member / class-property / array-element
     // handle, or the bare base for a whole signal / frame local.
+    //
+    // A handle reached THROUGH a dynamic element index (`q[i]` where the element is
+    // itself a container, or `q[i].inner` where the element is a struct with a
+    // container member) redirects out of range to the sink, so the heap buffer is
+    // never addressed past its live length.
     llvm::Value* lv_handle_ptr(const LValue& lv) {
-        return lv.is_agg ? agg_slot_ptr(lv) : lv.base;
+        llvm::Value* ptr = lv.is_agg ? agg_slot_ptr(lv) : lv.base;
+        if (lv.dyn_inrange == nullptr || !lv.is_handle) {
+            return ptr;
+        }
+        if (lv.handle_type == Ref::Invalid) {
+            throw BackendError{ "internal: bounds-checked handle lvalue with no element type" };
+        }
+        llvm::Value* sink = handle_sink_global(lv.handle_type);
+        emit_handle_delete(sink, lv.handle_type);
+        return b_.CreateSelect(lv.dyn_inrange, ptr, sink);
     }
 
     // Whether a type is a string, or an unpacked array whose leaf element is.
@@ -1639,8 +1772,9 @@ private:
             // associative-array ops (which address it via lv_handle_ptr) and by
             // ElemSelect / AssocSelect descent; a plane Load/Store on it is a
             // lowering bug and traps.
-            lv.is_handle = true;
-            lv.slot_ty   = handle_slot_ty(leaf_type);
+            lv.is_handle   = true;
+            lv.handle_type = leaf_type;
+            lv.slot_ty     = handle_slot_ty(leaf_type);
             return;
         }
         const Layout   lay  = mod_.pool.layout(leaf_type);
@@ -2697,6 +2831,7 @@ private:
                 str_vals_.assign(ir_->inst_count(), nullptr);
                 build_str_temps();
                 build_dynarr_temps();
+                build_agg_elem_temps();
                 lower_region(ir_->root());
                 deinit_body_strings();
                 b_.CreateRetVoid();
@@ -2748,6 +2883,7 @@ private:
                 str_vals_.assign(ir_->inst_count(), nullptr);
                 build_str_temps();
                 build_dynarr_temps();
+                build_agg_elem_temps();
                 lower_region(ir_->root());
                 deinit_body_strings();
             }
@@ -2832,13 +2968,16 @@ private:
         // always-loop group never reaches.)
         std::vector<std::vector<llvm::Value*>> member_strs;
         std::vector<std::vector<llvm::Value*>> member_dynarr;
+        std::vector<std::vector<llvm::Value*>> member_agg_elem;
         for (const uint32_t m : members) {
             select_member(m); // sizes the type cache build_str_temps consults
             str_vals_.assign(ir_->inst_count(), nullptr);
             build_str_temps();
             build_dynarr_temps();
+            build_agg_elem_temps();
             member_strs.push_back(str_vals_);
             member_dynarr.push_back(dynarr_ret_);
+            member_agg_elem.push_back(agg_elem_ret_);
         }
         ir_ = &proc.ir;
 
@@ -2913,8 +3052,9 @@ private:
             emit_defer_gen_bump(); // activation start = deferred-assertion flush point
             for (size_t i = 0; i < members.size(); ++i) {
                 select_member(members[i]);
-                str_vals_   = member_strs[i];
-                dynarr_ret_ = member_dynarr[i];
+                str_vals_     = member_strs[i];
+                dynarr_ret_   = member_dynarr[i];
+                agg_elem_ret_ = member_agg_elem[i];
                 lower_region(ir_->root());              // member body (per trigger)
             }
             b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
@@ -2927,8 +3067,9 @@ private:
             // Never fused: a non-always (or sensitivity-less) group is a singleton.
             emit_defer_gen_bump(); // single-shot body: one activation, one flush point
             select_member(proc_index);
-            str_vals_   = member_strs.front();
-            dynarr_ret_ = member_dynarr.front();
+            str_vals_     = member_strs.front();
+            dynarr_ret_   = member_dynarr.front();
+            agg_elem_ret_ = member_agg_elem.front();
             lower_region(ir_->root());
         }
 
@@ -3437,6 +3578,20 @@ private:
         for (const auto& [temp, type] : dynarr_temp_list_) {
             emit_handle_delete(temp, type);
         }
+        for (const auto& [temp, type] : agg_elem_temp_list_) {
+            // A popped element was RELOCATED into this buffer, so whatever heap
+            // storage it carries is ours to free: a nested container's buffer, or an
+            // aggregate's string / container leaves (a POD-leaf element owns nothing).
+            if (is_handle_type(type)) {
+                emit_handle_delete(temp, type);
+                continue;
+            }
+            if (!has_heap_leaf(type)) {
+                continue;
+            }
+            std::vector<llvm::Value*> path;
+            emit_agg_deinit(type, temp, path, agg_storage_ty(type));
+        }
     }
 
     // Lower a function body into its (already declared) LLVM function. Reuses the
@@ -3478,6 +3633,7 @@ private:
         emit_agg_copyin(f);
         build_str_temps();
         build_dynarr_temps();
+        build_agg_elem_temps();
         bind_ref_formals(f);
         emit_copyin(f);
 
@@ -3644,6 +3800,7 @@ private:
         emit_agg_copyin(f);
         build_str_temps();
         build_dynarr_temps();
+        build_agg_elem_temps();
         bind_ref_formals(f);
         emit_copyin(f);
         lower_region(ir_->root());
@@ -9139,13 +9296,10 @@ private:
             return llvm::ConstantAggregateZero::get(s.storage_ty);
         }
         if (s.is_string) {
-            // Empty inline handle (mirrors rt_string_init): the length-marker byte
-            // (index sizeof(rt_string)-1) holds rt_string_inline_cap for len 0, and
-            // byte[0] is the NUL terminator (already 0 from the zero-fill).
-            std::vector<uint8_t> bytes(sizeof(rt_string), 0);
-            bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
-            return llvm::ConstantStruct::get(
-              s.slot_ty, { llvm::ConstantDataArray::get(ctx_, bytes) });
+            // Empty inline handle (mirrors rt_string_init): the trailing length-marker
+            // byte holds rt_string_inline_cap for len 0, and byte[0] is the NUL
+            // terminator (already 0 from the zero-fill).
+            return str_empty_const();
         }
         llvm::Constant* mm =
           s.narrow ? zero(s.width) : (s.four_state ? x_mm(s.width) : zero(2 * s.width));
@@ -9926,10 +10080,7 @@ private:
     // that powers on owned-empty and is reset before every use (lv_string_ptr).
     llvm::Value* str_sink_global() {
         if (env_->str_sink == nullptr) {
-            std::vector<uint8_t> bytes(sizeof(rt_string), 0);
-            bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
-            auto* init = llvm::ConstantStruct::get(
-              str_slot_ty(), { llvm::ConstantDataArray::get(ctx_, bytes) });
+            llvm::Constant* init = str_empty_const();
             env_->str_sink = new llvm::GlobalVariable(env_->llmod, str_slot_ty(), /*isConstant=*/false,
                                                  llvm::GlobalValue::InternalLinkage, init,
                                                  "clotho.str.sink");
@@ -10063,6 +10214,48 @@ private:
         }
     }
 
+    // Alloca a result buffer for each aggregate-element queue pop in the current
+    // body, power-on-initialized so an empty pop reads the element default.
+    //
+    // Body-lifetime rather than per-site scratch for the same reason a string temp
+    // is: `rt_queue_pop_*` RELOCATES the element into the buffer, so the buffer owns
+    // whatever heap leaves the element had, and someone has to free them. The pop
+    // site releases the previous contents before reusing it (a pop in a loop), and
+    // deinit_body_strings releases the last one at every body exit.
+    void build_agg_elem_temps() {
+        agg_elem_temp_list_.clear();
+        agg_elem_ret_.assign(ir_->inst_count(), nullptr);
+        for (size_t k = 0; k < ir_->inst_count(); ++k) {
+            const auto i = static_cast<Index>(k);
+            if (ir_->tag(i) != Inst::Tag::QueuePopBack && ir_->tag(i) != Inst::Tag::QueuePopFront) {
+                continue;
+            }
+            const DynElem e = dynarr_elem(ir_->payload(i).op_type.type);
+            if (e.is_agg) {
+                auto* temp = b_.CreateAlloca(e.agg_ty, nullptr, "q.pop.agg");
+                emit_agg_proto_fill(temp, e);
+                agg_elem_ret_[k] = temp;
+                agg_elem_temp_list_.push_back({ temp, e.elem_type });
+                continue;
+            }
+            if (e.is_handle) {
+                // A nested container element pops as a handle the runtime relocates
+                // into this buffer, so the buffer owns that container's heap storage
+                // exactly as an aggregate buffer owns its leaves.
+                auto* temp = b_.CreateAlloca(e.slot_ty, nullptr, "q.pop.handle");
+                b_.CreateStore(llvm::Constant::getNullValue(e.slot_ty), temp);
+                agg_elem_ret_[k] = temp;
+                agg_elem_temp_list_.push_back({ temp, e.elem_type });
+            }
+        }
+    }
+
+    // Overwrite an element buffer with the element type's power-on image.
+    void emit_agg_proto_fill(llvm::Value* dst, const DynElem& e) {
+        const uint64_t size = env_->llmod.getDataLayout().getTypeAllocSize(e.agg_ty);
+        b_.CreateMemCpy(dst, llvm::MaybeAlign(), agg_proto_global(e.elem_type), llvm::MaybeAlign(), b_.getInt64(size));
+    }
+
     // -- Instruction dispatch --
 
     void lower_inst(Index i) {
@@ -10172,6 +10365,12 @@ private:
                         set_lvalue(i, sel);
                         return;
                     }
+                    if (e.is_agg || e.is_handle) {
+                        LValue sel = dyn_agg_elem_lvalue(lv, e, dataptr, idx64, inrange);
+                        add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
+                        set_lvalue(i, sel);
+                        return;
+                    }
                     LValue       el;
                     el.base          = dataptr;
                     el.slot_ty       = e.slot_ty;
@@ -10229,6 +10428,12 @@ private:
                         sel.sig           = lv.sig;
                         sel.dyn_inrange   = inrange;
                         sel.bounds_checks = lv.bounds_checks;
+                        add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
+                        set_lvalue(i, sel);
+                        return;
+                    }
+                    if (e.is_agg || e.is_handle) {
+                        LValue sel = dyn_agg_elem_lvalue(lv, e, baseptr, phys, inrange);
                         add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
                         set_lvalue(i, sel);
                         return;
@@ -12072,6 +12277,42 @@ private:
         return ab.CreateAlloca(ty, nullptr, name);
     }
 
+    // The element lvalue of an aggregate-element dynamic array / queue: a
+    // heap-anchored aggregate root at logical slot `slot_index` of `data`.
+    //
+    // `base` is advanced to the element itself because agg_slot_ptr GEPs `root_ty`
+    // from `base` and ignores `elem_idx`. A following MemberSelect / ElemSelect then
+    // descends it exactly as it descends a module signal's aggregate (agg_member /
+    // agg_elem only push the GEP path, never touch the base), which is what makes
+    // `q[i].f` and `q[i][j]` fall out with no container-specific code. `dyn_inrange`
+    // carries LRM 7.4.5: an out-of-range leaf read yields the element default, a
+    // write is dropped, and the heap is never addressed past the live length.
+    LValue dyn_agg_elem_lvalue(const LValue&  container,
+                               const DynElem& e,
+                               llvm::Value*   data,
+                               llvm::Value*   slot_index,
+                               llvm::Value*   inrange) {
+        LValue sel;
+        sel.base = b_.CreateInBoundsGEP(b_.getInt8Ty(), data, b_.CreateMul(slot_index, b_.getInt64(dynarr_stride(e))));
+        if (e.is_handle) {
+            // A nested container element: the slot holds ITS handle, so the element
+            // lvalue is a handle lvalue whose base is that slot. Out-of-range access
+            // redirects to the sink (lv_handle_ptr), which is why the predicate has to
+            // travel with it.
+            sel.is_handle   = true;
+            sel.handle_type = e.elem_type;
+            sel.slot_ty     = e.slot_ty;
+        } else {
+            sel.is_agg  = true;
+            sel.root_ty = e.agg_ty;
+        }
+        sel.is_signal     = container.is_signal;
+        sel.sig           = container.sig;
+        sel.dyn_inrange   = inrange;
+        sel.bounds_checks = container.bounds_checks;
+        return sel;
+    }
+
     // An lvalue addressing a single element slot at raw pointer `ptr` (a scratch
     // alloca), for the shared lower_load / lower_store plane machinery.
     LValue elem_scratch_lvalue(llvm::Value* ptr, const DynElem& e) {
@@ -12127,6 +12368,18 @@ private:
                             alloc_site_global(loc_text(i), "queue") });
             return;
         }
+        if (e.is_agg || e.is_handle) {
+            // Aggregate / nested-container element: the runtime takes `elem` by
+            // pointer and deep-copies out of it (rt_elem_copy never retains it), so
+            // the source's own storage image -- or its handle -- is handed over
+            // directly. The frontend guarantees an lvalue operand here
+            // (lower_container_element_value), staging a '{...} pattern into a
+            // canonical aggregate temp when needed.
+            llvm::Value* src = e.is_agg ? agg_slot_ptr(lvalue_of(qa.arg)) : lv_handle_ptr(lvalue_of(qa.arg));
+            b_.CreateCall(queue_push_fn(front),
+                          { lv_handle_ptr(lvalue_of(p.op)), ops, bound, src, alloc_site_global(loc_text(i), "queue") });
+            return;
+        }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
         lower_store(elem_scratch_lvalue(scratch, e), value_of(qa.arg));
         b_.CreateCall(queue_push_fn(front), { lv_handle_ptr(lvalue_of(p.op)), ops, bound, scratch,
@@ -12149,6 +12402,44 @@ private:
             b_.CreateCall(str_deinit_fn(), { out });
             b_.CreateCall(str_init_fn(), { out });
             b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
+            return;
+        }
+        if (e.is_agg) {
+            // Aggregate element: the runtime RELOCATES the popped element into a
+            // body-lifetime buffer (build_agg_elem_temps), which therefore owns any
+            // heap leaves it carries. Release the previous contents first -- a pop in
+            // a loop reuses the buffer -- then restore the power-on image so an empty
+            // pop yields the Table 7-1 default rather than the last value. The
+            // buffer's lvalue is the result, the same safe-temp shape an
+            // aggregate-returning call hands back.
+            llvm::Value* out = agg_elem_ret_[static_cast<uint32_t>(i)];
+            if (has_heap_leaf(e.elem_type)) {
+                std::vector<llvm::Value*> path;
+                emit_agg_deinit(e.elem_type, out, path, e.agg_ty);
+            }
+            emit_agg_proto_fill(out, e);
+            b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
+            LValue lv{};
+            lv.base    = out;
+            lv.root_ty = e.agg_ty;
+            lv.is_agg  = true;
+            set_lvalue(i, lv);
+            return;
+        }
+        if (e.is_handle) {
+            // Nested container element: same relocation shape as the aggregate case.
+            // Empty the buffer first (a pop in a loop reuses it, and an empty-queue pop
+            // leaves it untouched -- which is then the empty container Table 7-1 asks
+            // for), then hand its lvalue back as a handle.
+            llvm::Value* out = agg_elem_ret_[static_cast<uint32_t>(i)];
+            emit_handle_delete(out, e.elem_type);
+            b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
+            LValue lv{};
+            lv.base        = out;
+            lv.slot_ty     = e.slot_ty;
+            lv.is_handle   = true;
+            lv.handle_type = e.elem_type;
+            set_lvalue(i, lv);
             return;
         }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
@@ -12178,6 +12469,11 @@ private:
         if (e.is_string) {
             b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, str_of(qi.val),
                                                alloc_site_global(loc_text(i), "queue") });
+            return;
+        }
+        if (e.is_agg || e.is_handle) {
+            llvm::Value* src = e.is_agg ? agg_slot_ptr(lvalue_of(qi.val)) : lv_handle_ptr(lvalue_of(qi.val));
+            b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, src, alloc_site_global(loc_text(i), "queue") });
             return;
         }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
@@ -15924,10 +16220,12 @@ private:
         if (info.name.empty()) {
             return;
         }
-        const SignalSlot& s = slot_of(sig);
-        if (s.is_string) {
-            return;   // never registers (emit_vcd_var loud-fails on a string)
+        if (vcd_unrepresentable(info.type) != nullptr) {
+            // Never registers: emit_vcd_var refuses a declared one and skips a
+            // compiler-synthesized one, so neither consumes a dump-var index.
+            return;
         }
+        const SignalSlot& s = slot_of(sig);
         if (s.is_array) {
             // Record the first element's dump-var index; element k is base + k. An
             // element write touches base + normalized index (blocking) or the whole
@@ -16096,14 +16394,44 @@ private:
         b_.CreateCall(vcd_upscope_fn(), {});
     }
 
+    // Why a signal's type has no $var form, or nullptr when it has one. Mirrors
+    // Lower.cpp's vcd_unrepresentable, which is where a declared signal is actually
+    // refused; this keeps the crash impossible if a path ever reaches codegen
+    // without that check (an aggregate has no leaf slot type, so the scalar $var
+    // path below would dereference null).
+    const char* vcd_unrepresentable(Ref type) const {
+        Ref leaf = type;
+        while (std::get<Type>(mod_.pool.get(leaf)).kind == Type::Kind::UnpackedArray) {
+            leaf = std::get<Type>(mod_.pool.get(leaf)).element;
+        }
+        const Type& t = std::get<Type>(mod_.pool.get(leaf));
+        switch (t.kind) {
+            case Type::Kind::String:
+                return "string";
+            case Type::Kind::Queue:
+                return "queue";
+            case Type::Kind::DynArray:
+                return "dynamic array";
+            case Type::Kind::Assoc:
+                return "associative array";
+            case Type::Kind::Class:
+                return "class handle";
+            case Type::Kind::Struct:
+                return t.is_packed ? nullptr : "unpacked struct";
+            default:
+                return nullptr;
+        }
+    }
+
     // Register one dumped signal: leaf name, width/flags, and live plane pointers.
     // An unpacked array expands to one $var per element (rt_vcd_array); a real /
     // shortreal carries RT_VCD_FLAG_REAL and dumps as `$var real` (the runtime
     // formats the slot's IEEE-754 bit pattern as a decimal); a named event carries
     // RT_VCD_FLAG_EVENT and dumps as `$var event` (see below). A whole-design dump
     // must represent every declared signal, so an unrepresentable one (string,
-    // multidimensional array) loud-fails rather than being silently omitted; an unnamed compiler temporary is not a declared variable and is
-    // skipped.
+    // container, aggregate, class handle, multidimensional array) loud-fails rather
+    // than being silently omitted; an unnamed compiler temporary is not
+    // a declared variable and is skipped.
     void emit_vcd_var(Signal sig) {
         const SignalInfo& info = mod_.signal(sig);
         if (info.name.empty()) {
@@ -16127,8 +16455,17 @@ private:
             return;
         }
         const SignalSlot& s = slot_of(sig);
-        if (s.is_string) {
-            throw BackendError{ "VCD dump of string signal '" + info.name + "' is not supported" };
+        // Second line of defence behind the frontend's whole-design check
+        // (vcd_unrepresentable in Lower.cpp): a string / container / aggregate /
+        // class-handle signal has no $var form. A DECLARED one is refused; a
+        // compiler-synthesized one (SourceLoc{0}: a gate input net, a materialized
+        // container temp) is not design state and is simply not dumped, which is
+        // also why the frontend check skips it.
+        if (const char* what = vcd_unrepresentable(info.type); what != nullptr) {
+            if (info.loc == SourceLoc{ 0 }) {
+                return;
+            }
+            throw BackendError{ std::string("VCD dump of ") + what + " signal '" + info.name + "' is not supported" };
         }
         // Flag bits mirror RT_VCD_FLAG_* (Runtime.h): four-state, net, narrow,
         // real; the event bit is set on the branch above.
@@ -18631,6 +18968,95 @@ private:
         return { mm, zero(1) };
     }
 
+    // The live element count of a container handle, and its heap data base.
+    std::pair<llvm::Value*, llvm::Value*> container_len_base(llvm::Value* handle, Ref type) {
+        if (is_queue_type(type)) {
+            return { b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2)),
+                     b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 0)) };
+        }
+        return { b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1)),
+                 b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 0)) };
+    }
+
+    // The lvalue of logical element `idx` of a container, with no bounds predicate:
+    // for callers that already walk within the live length. A queue's logical index
+    // wraps through its ring (head + i) mod cap.
+    LValue container_elem_lvalue(llvm::Value* handle, llvm::Value* data, Ref type, const DynElem& e, llvm::Value* idx) {
+        llvm::Value* phys = idx;
+        if (is_queue_type(type)) {
+            llvm::Value* head = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 1));
+            llvm::Value* cap  = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 3));
+            llvm::Value* safe = b_.CreateSelect(b_.CreateICmpEQ(cap, b_.getInt64(0)), b_.getInt64(1), cap);
+            phys              = b_.CreateURem(b_.CreateAdd(head, idx), safe);
+        }
+        if (e.is_agg || e.is_handle) {
+            return dyn_agg_elem_lvalue(LValue{}, e, data, phys, /*inrange=*/nullptr);
+        }
+        // A plane element: the same `[0 x slot]` shape the ElemSelect arms build, with
+        // no bounds predicate (the caller walks within the live length).
+        LValue el;
+        el.base        = data;
+        el.slot_ty     = e.slot_ty;
+        el.has_z       = e.has_z;
+        el.narrow      = e.narrow;
+        el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
+        el.elem_idx    = cast(phys, 32, false);
+        el.store_width = e.width;
+        el.bit_off     = b_.getInt32(0);
+        el.width       = e.width;
+        return el;
+    }
+
+    // `a == b` over a container whose elements are aggregates or nested containers
+    // (LRM 11.4.5 / 7.10): equal sizes and every element pair equal, X-propagating
+    // through the same Land reduction the struct / array cases use.
+    //
+    // A loop rather than the flat runtime comparator because the element has no
+    // single-word value image: each pair recurses through lower_agg_eq, which is
+    // also what gives a queue of queues (or of structs holding queues) a compare at
+    // all. The must / may accumulators live in allocas so the loop needs no PHI
+    // plumbing; LLVM promotes them.
+    Plane emit_container_eq_loop(const LValue& lhs, const LValue& rhs, Ref type, const DynElem& e) {
+        llvm::Value* ha      = lv_handle_ptr(lhs);
+        llvm::Value* hb      = lv_handle_ptr(rhs);
+        const auto [la, ba]  = container_len_base(ha, type);
+        const auto [lb, bb]  = container_len_base(hb, type);
+        llvm::Value* size_eq = b_.CreateICmpEQ(la, lb);
+
+        auto* i1   = b_.getInt1Ty();
+        auto* must = entry_alloca(i1, "ceq.must");
+        auto* may  = entry_alloca(i1, "ceq.may");
+        auto* idx  = entry_alloca(b_.getInt64Ty(), "ceq.idx");
+        b_.CreateStore(size_eq, must);
+        b_.CreateStore(size_eq, may);
+        b_.CreateStore(b_.getInt64(0), idx);
+
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* head = llvm::BasicBlock::Create(ctx_, "ceq.head", fn);
+        auto* body = llvm::BasicBlock::Create(ctx_, "ceq.body", fn);
+        auto* done = llvm::BasicBlock::Create(ctx_, "ceq.done", fn);
+        // Sizes differing is already a definite 0, so the element walk is skipped.
+        b_.CreateCondBr(size_eq, head, done);
+
+        b_.SetInsertPoint(head);
+        llvm::Value* i = b_.CreateLoad(b_.getInt64Ty(), idx);
+        b_.CreateCondBr(b_.CreateICmpULT(i, la), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* k    = b_.CreateLoad(b_.getInt64Ty(), idx);
+        const Plane  e_eq = lower_agg_eq(
+          container_elem_lvalue(ha, ba, type, e, k), container_elem_lvalue(hb, bb, type, e, k), e.elem_type);
+        const Plane acc =
+          lower_logical(Inst::Tag::Land, bit_plane(b_.CreateLoad(i1, must), b_.CreateLoad(i1, may)), e_eq);
+        b_.CreateStore(b_.CreateTrunc(must_of(acc), i1), must);
+        b_.CreateStore(b_.CreateTrunc(may_of(acc), i1), may);
+        b_.CreateStore(b_.CreateAdd(k, b_.getInt64(1)), idx);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+        return bit_plane(b_.CreateLoad(i1, must), b_.CreateLoad(i1, may));
+    }
+
     // Whole-aggregate `==` (LRM 11.2.2): recursively AND-reduce per-leaf
     // logical equality over the member walk. Any definite member mismatch is
     // 0, else X if any member is unknown, else 1 — the Land reduction carries
@@ -18665,10 +19091,20 @@ private:
             return bit_plane(bit, bit);
         }
         if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
-            // A queue / dynamic-array leaf compares element-wise at runtime with
-            // §11.4.5 x-propagation; the runtime tristate (0 unequal, 1 equal,
-            // 2 ambiguous) maps to a 1-bit 4-state plane (may = ts != 0, must =
-            // ts == 1, so 2 -> must=0/may=1 = x).
+            const DynElem e = dynarr_elem(type);
+            if (e.is_agg || e.is_handle || e.width > 64) {
+                // The runtime comparator reads one element word from a flat
+                // descriptor, which an aggregate / nested-container element does not
+                // have and a wider-than-a-word element does not fit, so the walk
+                // happens here: sizes must match, then each element pair compares with
+                // this same recursion (which is also what makes a queue of queues
+                // work).
+                return emit_container_eq_loop(lhs, rhs, type, e);
+            }
+            // A queue / dynamic-array leaf of scalar elements compares element-wise
+            // at runtime with §11.4.5 x-propagation; the runtime tristate (0 unequal,
+            // 1 equal, 2 ambiguous) maps to a 1-bit 4-state plane (may = ts != 0,
+            // must = ts == 1, so 2 -> must=0/may=1 = x).
             const ContainerFmt cf = container_fmt(type);
             llvm::Value*       ts =
               b_.CreateCall(container_eq_fn(),
@@ -19763,6 +20199,15 @@ private:
     // coroutine body lowering resets lvals_ via select_member, so the mapping
     // cannot live there.
     std::vector<llvm::Value*> dynarr_ret_;
+    // Owning result buffers for aggregate-element queue pops in the current body,
+    // with the element type each holds: released at every body exit
+    // (build_agg_elem_temps).
+    std::vector<std::pair<llvm::Value*, Ref>> agg_elem_temp_list_;
+    // Per-pop-instruction result buffer (null for a non-aggregate element), snapshot
+    // per fused member exactly like dynarr_ret_.
+    std::vector<llvm::Value*> agg_elem_ret_;
+    // Memoized rt_elem_leaf mirror type ({ i64 offset, ptr ops }).
+    llvm::StructType* elem_leaf_ty_ = nullptr;
     // Memoized `%clotho.queue` handle slot type ({ ptr base, i64 head, len, cap }).
     llvm::StructType* queue_slot_ty_ = nullptr;
     // Memoized `%clotho.assoc` handle slot type ({ ptr impl }).

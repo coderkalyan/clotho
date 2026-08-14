@@ -741,3 +741,101 @@ TEST_CASE("vcd: a checkpoint with nothing to checkpoint writes no time marker") 
     )";
     CHECK(body_of(run_vcd(src)) == "#5\n1!\n");
 }
+
+// -- Signals with no $var form -------------------------------------------------
+//
+// A whole-design dump has to represent every declared signal. A string, a heap
+// container, an unpacked struct and a class handle have no fixed-width value, and
+// `layout()` reports width 0 for all but the handle -- so before this check a
+// queue dumped as `$var reg 1 ! q $end` aliased to its ring pointer (never
+// changing), and an unpacked struct crashed codegen on its null leaf slot type.
+
+namespace {
+
+void reject_dump(std::string_view decl, std::string_view needle) {
+    std::string src = "module top;\n  ";
+    src += decl;
+    src += "\n  initial begin\n    $dumpfile(\"/dev/null\");\n    $dumpvars(0, top);\n    #1 $finish;\n"
+           "  end\nendmodule\n";
+    const LowerResult r = lower_text(src);
+    CHECK_FALSE(r.ok);
+    CAPTURE(r.diagnostic_text());
+    CHECK(r.diagnostic_text().find(needle) != std::string::npos);
+}
+
+} // namespace
+
+TEST_CASE("vcd: a signal with no $var form is refused, naming the signal") {
+    SUBCASE("queue") {
+        reject_dump("int q[$];", "$dumpvars cannot dump 'q': queue has no VCD representation");
+    }
+    SUBCASE("dynamic array") {
+        reject_dump("int d[];", "$dumpvars cannot dump 'd': dynamic array has no VCD representation");
+    }
+    SUBCASE("associative array") {
+        reject_dump("int a[string];", "$dumpvars cannot dump 'a': associative array has no VCD representation");
+    }
+    SUBCASE("string") {
+        reject_dump("string s;", "$dumpvars cannot dump 's': string has no VCD representation");
+    }
+    SUBCASE("unpacked struct") {
+        reject_dump("struct { int f; logic [3:0] g; } st;",
+                    "$dumpvars cannot dump 'st': unpacked struct has no VCD representation");
+    }
+    SUBCASE("array of unpacked structs") {
+        reject_dump("struct { int f; } sa[2];",
+                    "$dumpvars cannot dump 'sa': unpacked struct has no VCD representation");
+    }
+    SUBCASE("class handle") {
+        const LowerResult r = lower_text(R"(
+            class C;
+              int x;
+            endclass
+            module top;
+              C h;
+              initial begin
+                $dumpfile("/dev/null");
+                $dumpvars(0, top);
+                #1 $finish;
+              end
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("$dumpvars cannot dump 'h': class handle has no VCD representation") !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("vcd: an undumped design may still declare a container") {
+    // The refusal is a property of the DUMP, not of the type: the same design
+    // without $dumpvars simulates.
+    const LowerResult r = lower_text(R"(
+        module top;
+          int q[$];
+          initial begin
+            q.push_back(7);
+            if (q[0] != 7) $fatal(1, "bad");
+          end
+        endmodule
+    )");
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
+}
+
+TEST_CASE("vcd: a packed struct signal dumps as the vector it is") {
+    // Only the UNPACKED aggregate has no value image; a packed struct is a vector
+    // and must keep dumping.
+    const std::string src = R"(
+        module top;
+          struct packed { logic [3:0] hi; logic [3:0] lo; } ps;
+          initial begin
+            $dumpfile("OUT.vcd");
+            $dumpvars;
+            #5 ps = 8'hA5;
+            #5 $finish;
+          end
+        endmodule
+    )";
+    const std::string vcd = run_vcd(src);
+    CHECK(contains(vcd, "$var reg 8 ! ps $end"));
+    CHECK(contains(body_of(vcd), "b10100101 !"));
+}

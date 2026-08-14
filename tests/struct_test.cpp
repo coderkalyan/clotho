@@ -708,21 +708,22 @@ TEST_CASE("unique / unique0 if accepts a pattern condition (LRM 12.4.2 + 12.6.2)
     )") == "v 5\ninv\nsmall 5\n");
 }
 
-TEST_CASE("%p of a queue of tagged unions is rejected loudly") {
-    // The runtime container descriptor carries no member-name table, so it could
-    // only print the raw bit-vector where LRM 21.2.1.6 requires `tag:value`.
-    const LowerResult r = lower_text(R"(
+TEST_CASE("%p of a queue of tagged unions names the tag") {
+    // LRM 21.2.1.6 requires `tag:value` for a tagged union, which the flat runtime
+    // container descriptor cannot express (it carries no member names). Such a
+    // container renders through the frontend's own element loop instead, so the
+    // member-named form is the same one a bare tagged union prints.
+    CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void Invalid; int Valid; } opt_t;
             opt_t q[$];
             initial begin
                 q.push_back(tagged Valid (1));
+                q.push_back(tagged Invalid);
                 $display("%p", q);
             end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("%p of a queue / dynamic array of tagged unions") != std::string::npos);
+    )") == "'{'{Valid:1}, '{Invalid}}\n");
 }
 
 TEST_CASE("blocking read and write of unpacked struct members") {

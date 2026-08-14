@@ -47,6 +47,14 @@ std::string run_capture(std::string_view source) {
     return out;
 }
 
+// A design the frontend must refuse, and the guard text it must name.
+void expect_fail(std::string_view source, std::string_view needle) {
+    const LowerResult r = lower_text(source);
+    CHECK_FALSE(r.ok);
+    CAPTURE(r.diagnostic_text());
+    CHECK(r.diagnostic_text().find(needle) != std::string::npos);
+}
+
 } // namespace
 
 // push_back / push_front append at the tail / head; size() counts; q[i] reads
@@ -764,4 +772,844 @@ TEST_CASE("nonblocking whole-queue register and managed elements") {
           "c1 1 10\n"
           "c2 2 20 30\n"
           "t 2 aa bb\n");
+}
+
+// -- Class-handle elements (LRM 7.10 with 8.3) ---------------------------------
+//
+// A handle element needs no lifecycle: the value IS the 64-bit handle, objects are
+// never freed (docs/design/classes.md §7), copying a queue copies handles (not
+// objects), and `==` on two handles is identity. So the POD element path carries it
+// as-is -- only the element-type gate had to admit it.
+
+TEST_CASE("queue of class handles: push, index, and reference semantics") {
+    constexpr std::string_view src = R"(
+        class Item;
+            int v;
+            function new(int v_);
+                v = v_;
+            endfunction
+        endclass
+        module m;
+            Item q[$];
+            Item a, b;
+            initial begin
+                a = new(7);
+                b = new(9);
+                q.push_back(a);
+                q.push_back(b);
+                q.push_front(a);
+                $display("n=%0d %0d %0d %0d", q.size(), q[0].v, q[1].v, q[2].v);
+                // The queue holds handles, so mutating through the element is
+                // visible through the original variable.
+                q[1].v = 70;
+                $display("a=%0d", a.v);
+                // Identity, not value: q[0] and q[1] are the same object.
+                $display("same=%0b other=%0b", q[0] == q[1], q[0] == q[2]);
+                q.delete(0);
+                $display("after n=%0d %0d", q.size(), q[0].v);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "n=3 7 7 9\n"
+                              "a=70\n"
+                              "same=1 other=0\n"
+                              "after n=2 70\n");
+}
+
+TEST_CASE("queue of class handles: null default, whole-queue copy, foreach") {
+    constexpr std::string_view src = R"(
+        class Item;
+            int v;
+        endclass
+        module m;
+            Item q[$], c[$];
+            Item x;
+            int  sum;
+            initial begin
+                // An out-of-range read yields the element default, which for a
+                // handle is null (LRM Table 7-1).
+                x = q[0];
+                $display("empty null=%0b", x == null);
+                for (int i = 0; i < 3; i++) begin
+                    Item it = new;
+                    it.v    = i + 1;
+                    q.push_back(it);
+                end
+                // A whole-queue copy is a value copy of the HANDLES: the copy is
+                // independent as a container, but shares the objects.
+                c = q;
+                c.push_back(null);
+                q[0].v = 100;
+                foreach (c[i]) begin
+                    if (c[i] != null) sum += c[i].v;
+                end
+                $display("q=%0d c=%0d sum=%0d", q.size(), c.size(), sum);
+                $display("tail null=%0b", c[$] == null);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "empty null=1\n"
+                              "q=3 c=4 sum=105\n"
+                              "tail null=1\n");
+}
+
+TEST_CASE("dynamic array of class handles") {
+    constexpr std::string_view src = R"(
+        class Item;
+            int v;
+        endclass
+        module m;
+            Item d[];
+            initial begin
+                d = new[2];
+                $display("null0=%0b", d[0] == null);
+                d[0] = new;
+                d[0].v = 5;
+                d[1] = d[0];
+                d[1].v = 6;
+                $display("n=%0d v=%0d", d.size(), d[0].v);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "null0=1\n"
+                              "n=2 v=6\n");
+}
+
+TEST_CASE("%p of a container of class handles is rejected loudly") {
+    expect_fail(R"(
+        class Item;
+            int v;
+        endclass
+        module m;
+            Item q[$];
+            initial $display("%p", q);
+        endmodule
+    )",
+                "%p of a queue / dynamic array of class handles is not supported");
+}
+
+TEST_CASE("an event element is still refused") {
+    // Not a lifecycle question: an event's trigger state is per-signal static, so
+    // an element has nowhere to keep it (LRM 15.5).
+    expect_fail(R"(
+        module m;
+            event e[$];
+            initial $display("%0d", e.size());
+        endmodule
+    )",
+                "queue element type is not supported");
+}
+
+TEST_CASE("queue of unpacked structs: element, member, and whole-element access") {
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int         id;
+            logic [3:0] tag;
+        } pkt_t;
+        module m;
+            pkt_t q[$];
+            pkt_t p, r;
+            initial begin
+                p.id  = 1;
+                p.tag = 4'hA;
+                q.push_back(p);
+                q.push_back('{id: 2, tag: 4'hB});
+                q.push_front('{id: 9, tag: 4'hC});
+                $display("n=%0d", q.size());
+                $display("e %0d %0h %0d %0h %0d %0h", q[0].id, q[0].tag, q[1].id, q[1].tag, q[2].id, q[2].tag);
+                // Whole-element read, then write.
+                r = q[1];
+                q[2] = r;
+                $display("r %0d %0h e2 %0d %0h", r.id, r.tag, q[2].id, q[2].tag);
+                // Member write through the element.
+                q[0].id = 77;
+                $display("m %0d", q[0].id);
+                // q[$] is the last element.
+                $display("last %0d", q[$].id);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "n=3\n"
+                              "e 9 c 1 a 2 b\n"
+                              "r 1 a e2 1 a\n"
+                              "m 77\n"
+                              "last 1\n");
+}
+
+TEST_CASE("queue of unpacked structs: pop, insert, delete, foreach") {
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int a;
+            int b;
+        } pair_t;
+        module m;
+            pair_t q[$];
+            pair_t r;
+            int    sum;
+            initial begin
+                q.push_back('{a: 1, b: 10});
+                q.push_back('{a: 2, b: 20});
+                q.push_back('{a: 3, b: 30});
+                // A pop yields the whole element by value.
+                r = q.pop_front();
+                $display("pop %0d %0d n=%0d", r.a, r.b, q.size());
+                r = q.pop_back();
+                $display("pop %0d %0d n=%0d", r.a, r.b, q.size());
+                q.insert(0, '{a: 7, b: 70});
+                q.insert(2, '{a: 8, b: 80});
+                foreach (q[i]) begin
+                    sum += q[i].a + q[i].b;
+                    $display("fe %0d %0d %0d", i, q[i].a, q[i].b);
+                end
+                $display("sum=%0d", sum);
+                q.delete(1);
+                $display("del n=%0d %0d %0d", q.size(), q[0].a, q[1].a);
+                q.delete();
+                $display("clr n=%0d", q.size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "pop 1 10 n=2\n"
+                              "pop 3 30 n=1\n"
+                              "fe 0 7 70\n"
+                              "fe 1 2 20\n"
+                              "fe 2 8 80\n"
+                              "sum=187\n"
+                              "del n=2 7 8\n"
+                              "clr n=0\n");
+}
+
+TEST_CASE("queue of unpacked structs: out-of-range and empty-pop defaults") {
+    // LRM 7.10.2 / Table 7-1: an invalid element read yields the element type's
+    // power-on image, per leaf -- 0 for a 2-state leaf, x for a 4-state one -- and
+    // an out-of-range write is dropped. An empty pop yields the same image.
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int         two;
+            logic [3:0] four;
+        } mix_t;
+        module m;
+            mix_t q[$];
+            mix_t r;
+            initial begin
+                r = q[0];
+                $display("empty %0d %0h", r.two, r.four);
+                r = q.pop_front();
+                $display("pop %0d %0h", r.two, r.four);
+                q.push_back('{two: 5, four: 4'h5});
+                r = q[99];
+                $display("oob %0d %0h", r.two, r.four);
+                // Dropped, not a heap write past the live length.
+                q[99] = '{two: 6, four: 4'h6};
+                q[99].two = 7;
+                $display("kept %0d %0h n=%0d", q[0].two, q[0].four, q.size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "empty 0 x\n"
+                              "pop 0 x\n"
+                              "oob 0 x\n"
+                              "kept 5 5 n=1\n");
+}
+
+TEST_CASE("queue of unpacked structs: nested array member and deep copy") {
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int         v;
+            logic [7:0] b[2];
+        } nest_t;
+        module m;
+            nest_t q[$], c[$];
+            nest_t n;
+            initial begin
+                n.v    = 7;
+                n.b[0] = 8'h11;
+                n.b[1] = 8'h22;
+                q.push_back(n);
+                // An element select INSIDE the element: two GEP levels over one
+                // heap-anchored root.
+                q[0].b[1] = 8'h33;
+                $display("q %0d %0h %0h", q[0].v, q[0].b[0], q[0].b[1]);
+                // A whole-queue copy is a deep copy: the copy's elements are its own.
+                c = q;
+                c[0].b[0] = 8'hFF;
+                c[0].v    = 8;
+                $display("q %0d %0h c %0d %0h", q[0].v, q[0].b[0], c[0].v, c[0].b[0]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "q 7 11 33\n"
+                              "q 7 11 c 8 ff\n");
+}
+
+TEST_CASE("queue of unpacked structs: bound, slice, concat, and literals") {
+    constexpr std::string_view src = R"(
+        typedef struct { int a; } t;
+        module m;
+            t q[$], s[$];
+            t bq[$:1];
+            initial begin
+                q = '{t'{a: 1}, t'{a: 2}, t'{a: 3}};
+                $display("lit %0d %0d %0d %0d", q.size(), q[0].a, q[1].a, q[2].a);
+                s = q[1:2];
+                $display("sl %0d %0d %0d", s.size(), s[0].a, s[1].a);
+                q = {q, t'{a: 4}};
+                $display("cc %0d %0d", q.size(), q[3].a);
+                bq.push_back(t'{a: 1});
+                bq.push_back(t'{a: 2});
+                bq.push_back(t'{a: 3});
+                $display("bd %0d %0d", bq.size(), bq[$].a);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "lit 3 1 2 3\n"
+                              "sl 2 2 3\n"
+                              "cc 4 4\n"
+                              "bd 2 2\n");
+}
+
+TEST_CASE("queue of unpacked structs: subroutine ABI, class property, struct member") {
+    constexpr std::string_view src = R"(
+        typedef struct { int a; } t;
+        typedef struct {
+            t   q[$];
+            int n;
+        } outer_t;
+        class C;
+            t q[$];
+        endclass
+        module m;
+            t       src[$];
+            outer_t o;
+            C       c;
+            function automatic int total(t f[$]);
+                int s = 0;
+                foreach (f[i]) s += f[i].a;
+                return s;
+            endfunction
+            task automatic append(inout t f[$]);
+                f.push_back(t'{a: 100});
+            endtask
+            initial begin
+                src.push_back(t'{a: 5});
+                src.push_back(t'{a: 6});
+                $display("total=%0d", total(src));
+                append(src);
+                $display("io %0d %0d", src.size(), src[2].a);
+                o.q.push_back(t'{a: 3});
+                o.q[0].a = 4;
+                $display("mem %0d %0d", o.q.size(), o.q[0].a);
+                c = new;
+                c.q.push_back(t'{a: 1});
+                c.q[0].a = 9;
+                $display("prop %0d %0d", c.q.size(), c.q[0].a);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "total=11\n"
+                              "io 3 100\n"
+                              "mem 1 4\n"
+                              "prop 1 9\n");
+}
+
+TEST_CASE("nonblocking whole-queue assignment with aggregate elements") {
+    constexpr std::string_view src = R"(
+        typedef struct { int a; } t;
+        module m;
+            t     q[$], d[$];
+            logic clk = 0;
+            initial begin
+                d.push_back(t'{a: 2});
+                #1 clk = 1;
+                #1 $display("nba %0d %0d", q.size(), q[0].a);
+                $finish;
+            end
+            always @(posedge clk) q <= d;
+        endmodule
+    )";
+    CHECK(run_capture(src) == "nba 1 2\n");
+}
+
+// -- Aggregate elements with managed leaves (rt_elem_ops kind 4) ----------------
+//
+// A string (or, later, container) leaf inside an element is heap-owning, so the
+// element cannot be copied or freed as bytes. The backend emits an offset-sorted
+// leaf table beside the element descriptor and the runtime deep-copies each leaf
+// and raw-copies the gaps between them. Run under ASan/LSan, so a missed free or a
+// double free fails the case rather than passing quietly.
+
+TEST_CASE("queue of structs with a string member") {
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int    id;
+            string name;
+        } rec_t;
+        module m;
+            rec_t q[$];
+            rec_t r;
+            initial begin
+                q.push_back('{id: 1, name: "alpha"});
+                q.push_back('{id: 2, name: "beta"});
+                $display("n=%0d %0d %s %0d %s", q.size(), q[0].id, q[0].name, q[1].id, q[1].name);
+                // A string leaf written through the element.
+                q[0].name = "ALPHA";
+                $display("w %s", q[0].name);
+                // A whole-element read is a deep copy: the copy's string is its own.
+                r = q[1];
+                r.name = "local";
+                $display("r %s q1 %s", r.name, q[1].name);
+                // ... and so is a whole-element write.
+                q[0] = r;
+                r.name = "changed";
+                $display("q0 %s r %s", q[0].name, r.name);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "n=2 1 alpha 2 beta\n"
+                              "w ALPHA\n"
+                              "r local q1 beta\n"
+                              "q0 local r changed\n");
+}
+
+TEST_CASE("popping a managed element repeatedly frees what it replaces") {
+    // The runtime RELOCATES a popped element into a body-lifetime buffer, so the
+    // buffer owns its string: the next pop must free the previous one, and the last
+    // must be freed at the body's exit. LSan is the assertion.
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int    id;
+            string name;
+        } rec_t;
+        module m;
+            rec_t q[$];
+            rec_t r;
+            initial begin
+                for (int i = 0; i < 4; i++) begin
+                    q.push_back('{id: i, name: $sformatf("item-%0d-with-a-heap-tail", i)});
+                end
+                while (q.size() > 0) begin
+                    r = q.pop_front();
+                    $display("pop %0d %s", r.id, r.name);
+                end
+                // An empty pop yields the element default, not the last value.
+                r = q.pop_back();
+                $display("empty %0d [%s]", r.id, r.name);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "pop 0 item-0-with-a-heap-tail\n"
+                              "pop 1 item-1-with-a-heap-tail\n"
+                              "pop 2 item-2-with-a-heap-tail\n"
+                              "pop 3 item-3-with-a-heap-tail\n"
+                              "empty 0 []\n");
+}
+
+TEST_CASE("managed leaves survive copy, delete and an array-of-strings member") {
+    constexpr std::string_view src = R"(
+        typedef struct {
+            string tags[2];
+            int    n;
+        } tags_t;
+        module m;
+            tags_t t[$], c[$];
+            initial begin
+                t.push_back('{tags: '{"x", "y"}, n: 2});
+                // One leaf-table entry per array element, in ascending offset order.
+                t[0].tags[1] = "a-much-longer-tag-that-heap-allocates";
+                $display("t %s %s %0d", t[0].tags[0], t[0].tags[1], t[0].n);
+                // A whole-queue copy deep-copies every leaf of every element.
+                c = t;
+                c[0].tags[0] = "replaced";
+                $display("t %s c %s", t[0].tags[0], c[0].tags[0]);
+                // Clearing frees each element's leaves.
+                c.delete();
+                t.delete();
+                $display("n=%0d %0d", t.size(), c.size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "t x a-much-longer-tag-that-heap-allocates 2\n"
+                              "t x c replaced\n"
+                              "n=0 0\n");
+}
+
+TEST_CASE("dynamic array of structs with a string member") {
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int    id;
+            string name;
+        } rec_t;
+        module m;
+            rec_t d[];
+            initial begin
+                d = new[2];
+                // A fresh element's string leaf powers on empty, not garbage.
+                $display("init %0d [%s]", d[0].id, d[0].name);
+                d[0] = '{id: 9, name: "dyn-element-with-a-heap-tail"};
+                d[1].name = "second";
+                $display("d %0d %s %s", d.size(), d[0].name, d[1].name);
+                d.delete();
+                $display("del %0d", d.size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "init 0 []\n"
+                              "d 2 dyn-element-with-a-heap-tail second\n"
+                              "del 0\n");
+}
+
+// -- Nested container elements (LRM 7.10 with 7.5) -----------------------------
+//
+// `int q[$][$]`: the element slot holds the inner container's handle and the
+// element descriptor chains through rt_elem_ops::inner, so the runtime deep-copies
+// and frees the inner container per element. `q[i]` is a handle lvalue, so the
+// inner container's own methods work on it unchanged.
+
+TEST_CASE("queue of queues: copy semantics, nested access, nested foreach") {
+    constexpr std::string_view src = R"(
+        module m;
+            int qq[$][$];
+            int inner[$];
+            int row[$];
+            initial begin
+                inner.push_back(1);
+                inner.push_back(2);
+                qq.push_back(inner);
+                inner.push_back(3);
+                qq.push_back(inner);
+                // Each push took a deep copy, so the two elements differ and the
+                // source is independent of both.
+                $display("n=%0d %0d %0d src=%0d", qq.size(), qq[0].size(), qq[1].size(), inner.size());
+                $display("e %0d %0d %0d", qq[0][0], qq[1][1], qq[1][2]);
+                // A method on the inner container mutates the element in place.
+                qq[0].push_back(99);
+                $display("m %0d %0d src=%0d", qq[0].size(), qq[0][$], inner.size());
+                // A whole-element read is a deep copy too.
+                row = qq[1];
+                row.push_back(7);
+                $display("row %0d qq1 %0d", row.size(), qq[1].size());
+                foreach (qq[i]) begin
+                    foreach (qq[i][j]) $display("fe %0d %0d %0d", i, j, qq[i][j]);
+                end
+                qq.delete();
+                $display("clr %0d", qq.size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "n=2 2 3 src=3\n"
+                              "e 1 2 3\n"
+                              "m 3 99 src=3\n"
+                              "row 4 qq1 3\n"
+                              "fe 0 0 1\n"
+                              "fe 0 1 2\n"
+                              "fe 0 2 99\n"
+                              "fe 1 0 1\n"
+                              "fe 1 1 2\n"
+                              "fe 1 2 3\n"
+                              "clr 0\n");
+}
+
+TEST_CASE("an out-of-range nested container element is empty, and writes to it vanish") {
+    // LRM 7.4.5 through a container-valued element: the read is the type's default
+    // (an EMPTY container), and a mutating method on it must not touch the heap
+    // buffer past its length. Both ride the per-element-type sink handle.
+    constexpr std::string_view src = R"(
+        module m;
+            int qq[$][$];
+            int inner[$];
+            initial begin
+                inner.push_back(1);
+                qq.push_back(inner);
+                $display("oob %0d", qq[9].size());
+                qq[9].push_back(5);
+                // Still empty, and the live element is untouched.
+                $display("after %0d %0d %0d", qq[9].size(), qq.size(), qq[0].size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "oob 0\n"
+                              "after 0 1 1\n");
+}
+
+TEST_CASE("popping a nested container hands back its handle and frees the old one") {
+    constexpr std::string_view src = R"(
+        module m;
+            int qq[$][$];
+            int row[$];
+            initial begin
+                // `tmp` is cleared per row rather than redeclared: a block-scoped
+                // container local is not re-initialized on re-entry (a separate gap),
+                // and this case is about the pops.
+                int tmp[$];
+                for (int k = 0; k < 3; k++) begin
+                    tmp.delete();
+                    for (int j = 0; j <= k; j++) tmp.push_back(j);
+                    qq.push_back(tmp);
+                end
+                while (qq.size() > 0) begin
+                    row = qq.pop_front();
+                    $display("pop %0d %0d", row.size(), row[$]);
+                end
+                // An empty pop yields an empty container, not the last one.
+                row = qq.pop_back();
+                $display("empty %0d", row.size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "pop 1 0\n"
+                              "pop 2 1\n"
+                              "pop 3 2\n"
+                              "empty 0\n");
+}
+
+TEST_CASE("mixed nesting: queue of dynamic arrays, dynamic array of queues, three deep") {
+    constexpr std::string_view src = R"(
+        module m;
+            int qd[$][];
+            int dq[][$];
+            int q3[$][$][$];
+            int d[];
+            int q[$];
+            int i2[$][$];
+            int i1[$];
+            initial begin
+                d = new[2];
+                d[0] = 5;
+                d[1] = 6;
+                qd.push_back(d);
+                qd[0][1] = 9;
+                $display("qd %0d %0d %0d %0d", qd.size(), qd[0].size(), qd[0][1], d[1]);
+                dq = new[2];
+                q.push_back(3);
+                dq[0] = q;
+                dq[0].push_back(4);
+                $display("dq %0d %0d %0d %0d", dq.size(), dq[0].size(), dq[0][1], dq[1].size());
+                i1.push_back(7);
+                i2.push_back(i1);
+                q3.push_back(i2);
+                $display("q3 %0d %0d %0d %0d", q3.size(), q3[0].size(), q3[0][0].size(), q3[0][0][0]);
+                q3.delete();
+                qd.delete();
+                dq.delete();
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "qd 1 2 9 6\n"
+                              "dq 2 2 4 0\n"
+                              "q3 1 1 1 7\n");
+}
+
+TEST_CASE("a struct element with a queue member deep-copies that member") {
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int n;
+            int q[$];
+        } t;
+        module m;
+            t outer[$];
+            initial begin
+                t x;
+                x.n = 1;
+                x.q.push_back(5);
+                outer.push_back(x);
+                $display("o %0d %0d %0d %0d", outer.size(), outer[0].n, outer[0].q.size(), outer[0].q[0]);
+                // The element's queue is its own: pushing to it leaves x alone.
+                outer[0].q.push_back(6);
+                $display("m %0d %0d", outer[0].q.size(), x.q.size());
+                // And out of range it vanishes, rather than writing past the buffer.
+                outer[9].q.push_back(7);
+                $display("oob %0d %0d", outer[9].q.size(), outer.size());
+                outer.delete();
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "o 1 1 1 5\n"
+                              "m 2 1\n"
+                              "oob 0 1\n");
+}
+
+TEST_CASE("an associative-array element is still refused") {
+    // The runtime element descriptor has no rt_elem_assoc kind, so its lifecycle
+    // cannot be driven at all.
+    expect_fail(R"(
+        module m;
+            int q[$][string];
+            initial $display("%0d", q.size());
+        endmodule
+    )",
+                "queue element type is not supported");
+}
+
+// -- Operations over a non-scalar element --------------------------------------
+
+TEST_CASE("locator and reduction methods over struct elements, keyed by a clause") {
+    // 7.12.1 / 7.12.3 through an aggregate element: the clause supplies the key, the
+    // iterator variable binds by aggregate copy, and a locator's result queue
+    // receives whole elements.
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int a;
+            int b;
+        } t;
+        module m;
+            t   q[$], r[$];
+            int idx[$];
+            initial begin
+                q.push_back('{a: 1, b: 10});
+                q.push_back('{a: 5, b: 50});
+                q.push_back('{a: 3, b: 30});
+                r = q.find(x) with (x.a > 2);
+                $display("find %0d %0d %0d", r.size(), r[0].a, r[1].a);
+                idx = q.find_index(x) with (x.a == 3);
+                $display("idx %0d %0d", idx.size(), idx[0]);
+                r = q.find_first(x) with (x.b > 5);
+                $display("first %0d %0d", r.size(), r[0].a);
+                r = q.min(x) with (x.a);
+                $display("min %0d %0d", r.size(), r[0].a);
+                r = q.max(x) with (x.b);
+                $display("max %0d %0d", r.size(), r[0].b);
+                $display("sum %0d", q.sum(x) with (x.a));
+                // Dedup by the clause's key: two elements share key 1.
+                r = q.unique(x) with (x.a > 2);
+                $display("uniq %0d %0d %0d", r.size(), r[0].a, r[1].a);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "find 2 5 3\n"
+                              "idx 1 2\n"
+                              "first 1 1\n"
+                              "min 1 1\n"
+                              "max 1 50\n"
+                              "sum 9\n"
+                              "uniq 2 1 5\n");
+}
+
+TEST_CASE("equality of containers with aggregate, nested and wide elements") {
+    // LRM 11.4.5 / 7.10: equal sizes and equal elements, X-propagating. The flat
+    // runtime comparator cannot read any of these element shapes, so the walk is
+    // built per element pair.
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int         a;
+            logic [3:0] f;
+        } t;
+        module m;
+            t            p[$], q[$];
+            int          n1[$][$], n2[$][$];
+            int          r[$];
+            logic [95:0] w1[$], w2[$];
+            initial begin
+                p.push_back('{a: 1, f: 4'h2});
+                q.push_back('{a: 1, f: 4'h2});
+                $display("agg %0b", p == q);
+                q[0].a = 9;
+                $display("ne %0b %0b", p == q, p != q);
+                q[0].a = 1;
+                q.push_back('{a: 2, f: 4'h3});
+                $display("size %0b", p == q);
+                // An unknown leaf makes the whole compare x, not 0.
+                q.delete();
+                q.push_back('{a: 1, f: 4'hx});
+                $display("x %0b", p == q);
+                r.push_back(5);
+                n1.push_back(r);
+                n2.push_back(r);
+                $display("nest %0b", n1 == n2);
+                n2[0].push_back(6);
+                $display("nest2 %0b", n1 == n2);
+                w1.push_back(96'hdead_beef_cafe_babe_1234_5678);
+                w2.push_back(96'hdead_beef_cafe_babe_1234_5678);
+                $display("wide %0b", w1 == w2);
+                w2[0] = 96'h1;
+                $display("wide2 %0b", w1 == w2);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "agg 1\n"
+                              "ne 0 1\n"
+                              "size 0\n"
+                              "x x\n"
+                              "nest 1\n"
+                              "nest2 0\n"
+                              "wide 1\n"
+                              "wide2 0\n");
+}
+
+TEST_CASE("%p of a container with a non-scalar or wide element") {
+    // LRM 21.2.1.6 over the live element count. The runtime formatter renders from a
+    // flat descriptor (one word, no member names), so an aggregate, a nested
+    // container, a wide element and a tagged union render through the frontend loop
+    // instead -- reusing the ordinary aggregate expansion, hence the member names.
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int         a;
+            logic [3:0] f;
+            string      s;
+        } t;
+        typedef union tagged packed {
+            logic [7:0] i;
+            logic [7:0] f;
+        } tu_t;
+        module m;
+            t            q[$];
+            int          n[$][$];
+            int          r[$], e[$];
+            logic [95:0] w[$];
+            tu_t         u[$];
+            initial begin
+                q.push_back('{a: 1, f: 4'h2, s: "hi"});
+                q.push_back('{a: -3, f: 4'hx, s: ""});
+                $display("q=%p", q);
+                r.push_back(5);
+                r.push_back(6);
+                n.push_back(r);
+                n.push_back(e);
+                $display("n=%p", n);
+                $display("empty=%p", e);
+                w.push_back(96'h1_0000_0000_0000_0000);
+                $display("w=%p", w);
+                u.push_back(tagged i 8'h7);
+                $display("u=%p", u);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "q='{'{a:1, f:2, s:\"hi\"}, '{a:-3, f:x, s:\"\"}}\n"
+                              "n='{'{5, 6}, '{}}\n"
+                              "empty='{}\n"
+                              "w='{18446744073709551616}\n"
+                              "u='{'{i:7}}\n");
+}
+
+TEST_CASE("a keyless locator over an aggregate element is refused") {
+    // With no clause the key is the element itself (7.12.1), and an unpacked
+    // aggregate has no ordering to sort or fold by.
+    expect_fail(R"(
+        module m;
+            typedef struct { int a; } t;
+            t q[$], r[$];
+            initial r = q.unique();
+        endmodule
+    )",
+                "needs a `with` clause");
 }
