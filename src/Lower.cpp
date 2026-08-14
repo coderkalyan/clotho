@@ -1204,6 +1204,17 @@ private:
                     time_mul_ = self_mul;
                     break;
                 }
+                // A clocking block (LRM 14). Not inert: it owns a clocking event,
+                // per-clockvar sampled storage and one Observed-region process, and
+                // an interface body reaches this same walk, so an interface-scoped
+                // block (LRM 14.9 / 25.5.5) lowers here too.
+                case SymbolKind::ClockingBlock:
+                    if (pass == Pass::Collect) {
+                        recover([&] { collect_clocking_block(m.as<ClockingBlockSymbol>()); });
+                    } else if (emit) {
+                        recover([&] { lower_clocking_block(m.as<ClockingBlockSymbol>()); });
+                    }
+                    break;
                 // Known-inert members: elaboration artifacts and declarations
                 // that bear no simulation behavior of their own. Ports are wired
                 // by wire_ports; parameters/types/genvars are resolved by slang;
@@ -5879,9 +5890,24 @@ private:
             // servicing; string stores skip edge detection).
             fail("string in an event control is not supported");
         }
+        if (e.kind == ExpressionKind::ArbitrarySymbol) {
+            // `@(cb)`: waiting on a clocking block (LRM 14.15) waits on the event
+            // the block triggers at its clocking event, NOT on the clock itself --
+            // that is what puts the waiter after the block's samples are updated
+            // (LRM 14.13). slang binds the reference as a void-typed
+            // ArbitrarySymbolExpression, so it would otherwise reach the integral
+            // check below.
+            const Symbol& sym = *e.as<ArbitrarySymbolExpression>().symbol;
+            if (sym.kind == SymbolKind::ClockingBlock) {
+                return clocking_state(sym.as<ClockingBlockSymbol>()).event;
+            }
+        }
         if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
             // Waiting on a hierarchical signal (`@(posedge top.dut.clk)`, LRM 23.6)
-            // subscribes to the target instance's signal directly.
+            // subscribes to the target instance's signal directly. A clockvar
+            // (`@(posedge cb.sig)`, LRM 14.15) resolves the same way and lands on
+            // its sampled storage, so the edge seen is the edge of the sampled
+            // value stream, which is what 14.15 specifies.
             return signal_of(e.as<ValueExpressionBase>().symbol);
         }
         // A non-simple event expression (struct/union member, array element,
@@ -10405,6 +10431,14 @@ private:
     // as a bit would resolve `i` at sample time rather than at evaluation time.
     // See docs/design/concurrent-assertions.md 4.
     ir::Signal sva_shadow_of(ir::Signal live) {
+        return sampled_shadow_of(live, "a concurrent assertion");
+    }
+
+    // The Preponed shadow of `live`, allocated once per live signal and shared by
+    // every reader. `what` names the construct doing the sampling, for the two
+    // refusals below: an assertion (LRM 16.5) and a clocking block input whose
+    // skew is `#1step` (LRM 14.4) want the identical value and so share one copy.
+    ir::Signal sampled_shadow_of(ir::Signal live, std::string_view what) {
         const auto key = static_cast<uint32_t>(live);
         if (const auto it = sva_shadows_.find(key); it != sva_shadows_.end()) {
             return it->second;
@@ -10420,9 +10454,9 @@ private:
         // and its copy placed in the declaring scope and read across the boundary.
         if (scope_stack_.empty() ||
             std::ranges::find(scope_stack_.back()->signals, live) == scope_stack_.back()->signals.end()) {
-            fail("a concurrent assertion may only sample variables of the instance "
-                 "that declares it; a hierarchical or package reference is not "
-                 "supported");
+            fail(std::string(what) + " may only sample variables of the instance "
+                                     "that declares it; a hierarchical or package reference is not "
+                                     "supported");
         }
 
         const ir::SignalInfo& live_info = module_.signal(live);
@@ -10432,9 +10466,9 @@ private:
         // an unpacked aggregate would need a per-leaf copy.
         // TODO: sample an aggregate / container variable leaf-wise.
         if (live_info.is_event || value_cat(live_info.type) != ValueCat::scalar) {
-            fail("a concurrent assertion may only sample a variable with a packed "
-                 "value; a string, an event, an unpacked aggregate, and a dynamic "
-                 "array / queue / associative array are not supported");
+            fail(std::string(what) + " may only sample a variable with a packed "
+                                     "value; a string, an event, an unpacked aggregate, and a dynamic "
+                                     "array / queue / associative array are not supported");
         }
 
         ir::SignalInfo info;
@@ -10532,6 +10566,262 @@ private:
         }
         module_.add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = b.finish() });
         sva_shadow_pairs_.clear();
+    }
+
+    // -- Clocking blocks (LRM 14) --
+    //
+    // A clocking block is a process, not just a declaration: LRM 14.7 makes it
+    // "both a declaration and an instance of that declaration ... one copy is
+    // created for each instance of the block containing the declaration (like an
+    // always procedure)".
+    //
+    // That process does two things at every clocking event, in this order: update
+    // the sampled value of each input clockvar, then trigger the event named by the
+    // block (LRM 14.13, 14.10). Both belong to the Observed region (LRM 4.4.2.5),
+    // and putting them there is what makes the rest fall out with no new scheduler
+    // machinery:
+    //
+    //  * An Observed body's stores are ordinary design writes, and the time-slot
+    //    loop re-settles the active set after the Observed run (LlvmBackend's
+    //    emit_active_run), so a process waiting on the block or on one of its
+    //    clockvars runs in the first Active region after the Observed region --
+    //    exactly what LRM 14.10 specifies for a clocking block event. `@(cb)`,
+    //    `@(cb.sig)` and `@(posedge cb.sig)` are therefore ordinary waits on
+    //    ordinary signals.
+    //  * 14.13's ordering ("update its sampled values before triggering the
+    //    clocking block event") is source order inside one body.
+    //  * An input skew of `#1step` is "the signal's last value immediately before
+    //    the corresponding clock edge" (14.4), which LRM 4.4.2.1 equates to a
+    //    Preponed sample of this time step -- the shadow the assertion sampler
+    //    already maintains. An explicit `#0` skew is sampled in Observed, which is
+    //    where 14.4 puts it.
+    //  * Re-entering Observed within one time slot must not resample a `#0` input
+    //    (14.13). It cannot: the clock latch is advanced on the first pass, so the
+    //    second sees no edge.
+    //
+    // A clockvar is its own storage, NOT an alias of the signal it samples -- the
+    // opposite of a modport port, which canonical_value_symbol collapses onto the
+    // underlying signal. Reading a clockvar yields the value sampled at the most
+    // recent clocking event, which differs from the live signal for most of every
+    // cycle. The storage is registered under the ClockVarSymbol in sigmap_, so
+    // every read of `cb.sig` resolves through the ordinary signal_of path and
+    // expression lowering needs no clocking-specific code at all.
+    struct ClockVarState {
+        const ClockVarSymbol* sym = nullptr;
+        // The sampled value `cb.sig` reads.
+        ir::Signal sampled{ 0 };
+        // Set for an explicit `#0` input skew, which samples the live signal in the
+        // Observed region; cleared for `#1step` (the LRM 14.4 default), which
+        // samples the Preponed shadow of the step before.
+        bool zero_skew = false;
+    };
+
+    struct ClockingBlockState {
+        // The clocking block event of LRM 14.10, as a hidden one-bit signal the
+        // Observed body toggles. A toggle rather than a named event because every
+        // waiter is level-sensitive (`@(cb)` carries no edge -- slang rejects one
+        // with ClockingBlockEventEdge), and one toggle per clocking event wakes
+        // exactly the processes an event trigger would, through the wait queues
+        // that already exist.
+        ir::Signal event{ 0 };
+        // One-slot history of the clocking signal, so the Observed body can detect
+        // its own edge: it is resumed once per settled instant, never woken.
+        ir::Signal clkprev{ 0 };
+        // Input clockvars in declaration order.
+        std::vector<ClockVarState> vars;
+    };
+
+    // The (clock, edge) a clocking block steps on. LRM 14.3 allows any event
+    // expression; supported here is one posedge or negedge of one signal -- the
+    // same subset an assertion clock is held to, for the same reason: the Observed
+    // body detects its own edge from a one-slot history, which a level-sensitive
+    // clock, an `edge` clock, an `iff` guard or a multi-signal list has no single
+    // answer for.
+    const SignalEventControl& clocking_event(const ClockingBlockSymbol& cb) {
+        const TimingControl& tc = cb.getEvent();
+        if (tc.kind != TimingControlKind::SignalEvent) {
+            // TODO: a multi-signal clocking event, or one naming another clocking
+            // block (LRM 14.3 / 14.6), which shares its synchronization event.
+            fail("only a single-signal clocking event is supported");
+        }
+        const SignalEventControl& ev = tc.as<SignalEventControl>();
+        if (ev.iffCondition != nullptr) {
+            fail("an `iff` qualifier on a clocking event is not supported");
+        }
+        if (ev.edge != slang::ast::EdgeKind::PosEdge && ev.edge != slang::ast::EdgeKind::NegEdge) {
+            // TODO: a level-sensitive (`@(clk)`) or `edge` clocking event. Both step
+            // the block on more than one kind of transition, and 14.4's edge-based
+            // skews are defined against them.
+            fail("a clocking event must be a posedge or a negedge");
+        }
+        return ev;
+    }
+
+    // Whether this input clockvar's effective skew is an explicit `#0`. LRM 14.4's
+    // built-in default is `#1step`, a block-level `default input` item overrides
+    // that, and the item's own skew overrides both; slang folds neither fallback
+    // into ClockVarSymbol, which carries only what its own item wrote.
+    bool zero_input_skew(const ClockingBlockSymbol& cb, const ClockVarSymbol& cv) {
+        const ClockingSkew skew = cv.inputSkew.hasValue() ? cv.inputSkew : cb.getDefaultInputSkew();
+        if (!skew.hasValue()) {
+            return false;
+        }
+        if (skew.edge != slang::ast::EdgeKind::None) {
+            // TODO: an edge-based skew (`input posedge`, LRM 14.4): the sample is
+            // taken on the named edge of the clocking signal, a second event for the
+            // block to step on.
+            fail("an edge-based clocking skew is not supported");
+        }
+        if (skew.delay->kind == TimingControlKind::OneStepDelay) {
+            return false;
+        }
+        if (skew.delay->kind == TimingControlKind::Delay && const_uint(skew.delay->as<DelayControl>().expr) == 0) {
+            return true;
+        }
+        // TODO: a nonzero input skew other than `#1step`. The value sampled is the
+        // one the signal held `skew` time units before the clocking event (LRM
+        // 14.13), which is not knowable when the edge arrives: it needs a
+        // per-clockvar history keyed by time, not a one-step Preponed shadow.
+        fail("an input skew other than `#1step` or `#0` is not supported");
+    }
+
+    // Collect: the block's own state, and storage for each input clockvar.
+    // Registered here rather than in Emit for the reason collect_signals registers
+    // ordinary variables there -- the InstanceScope tree is frozen after Collect,
+    // and a reader in another scope (`@(bus.cb)`, `bus.cb.sig`) resolves against
+    // storage that must already exist.
+    void collect_clocking_block(const ClockingBlockSymbol& cb) {
+        if (cb.isGlobal) {
+            // TODO: `global clocking` and `$global_clock` (LRM 14.14). Needs the
+            // upward instance-scope resolution of 14.14, and beside another clock in
+            // an assertion it needs multiclock support.
+            fail("`global clocking` is not supported");
+        }
+        // Checked in Collect so an unsupported clock is reported before any reader
+        // resolves a clockvar of this block. The signal itself resolves in Emit,
+        // once every scope has been collected.
+        clocking_event(cb);
+
+        ClockingBlockState st;
+        st.event   = declare_temp(mask_type(1), "clocking_ev");
+        st.clkprev = declare_temp(mask_type(1), "clocking_clk");
+        // Only a `default` block may be unnamed, and an unnamed block's members
+        // cannot be referenced (LRM 14.3), so this name reaches nothing but the
+        // state field and the dump.
+        const std::string base =
+          cb.name.empty() ? "__clocking" + std::to_string(temp_id_++) : std::string(cb.name);
+        for (const Symbol& m : cb.members()) {
+            if (m.kind != SymbolKind::ClockVar) {
+                // TODO: an `assertion_item_declaration` inside a clocking block
+                // (LRM 14.3), which takes the block's event as its leading clocking
+                // event under the restrictions of LRM 16.16(b).
+                fail("a " + std::string(toString(m.kind)) + " declared inside a clocking block is not supported");
+            }
+            const ClockVarSymbol& cv = m.as<ClockVarSymbol>();
+            if (cv.direction != slang::ast::ArgumentDirection::In) {
+                // TODO: synchronous drives (LRM 14.16). An output clockvar drives its
+                // signal in the Re-NBA region of the clocking event's time step,
+                // which needs the deferred-record path plus a commit gated to that
+                // region -- neither is a sampling problem, so both land separately.
+                fail("a clocking block `output` / `inout` is not supported");
+            }
+            const Expression* init = cv.getInitializer();
+            if (init == nullptr ||
+                (init->kind != ExpressionKind::NamedValue && init->kind != ExpressionKind::HierarchicalValue)) {
+                // TODO: a hierarchical expression, slice or concatenation as a
+                // clocking item (LRM 14.5). slang binds the plain `input a;` form to
+                // the enclosing scope's `a` as a value reference, so anything else is
+                // an explicit `= expression` binding.
+                fail("a clocking item bound to an expression rather than to a signal is not supported");
+            }
+            const ir::Ref type = lower_type(cv.getType());
+            if (value_cat(type) != ValueCat::scalar) {
+                // TODO: a clockvar of string / unpacked aggregate / container type.
+                // The sample is one whole-signal Load feeding one whole-signal Store,
+                // so the type must have a flat plane value.
+                fail("a clocking item must have a packed value");
+            }
+            ir::SignalInfo info;
+            info.name = prefix_ + base + "." + std::string(cv.name);
+            info.loc  = to_source_loc(cv.location);
+            info.type = type;
+            info.dir  = ir::SignalInfo::Direction::Internal;
+
+            const ir::Signal sampled = register_signal(std::move(info));
+            sigmap_[&cv]             = sampled;
+            st.vars.push_back(
+              ClockVarState{ .sym = &cv, .sampled = sampled, .zero_skew = zero_input_skew(cb, cv) });
+        }
+        clocking_.emplace(&cb, std::move(st));
+    }
+
+    // Emit: the block's process. One per instance of the enclosing module, in the
+    // Observed region.
+    void lower_clocking_block(const ClockingBlockSymbol& cb) {
+        const auto it = clocking_.find(&cb);
+        if (it == clocking_.end()) {
+            // Collect refused this block and recorded the diagnostic; emitting a
+            // process against storage that does not exist would crash on top of it.
+            return;
+        }
+        const ClockingBlockState& st = it->second;
+        const SignalEventControl&  ev = clocking_event(cb);
+        const ir::SourceLoc        l  = to_source_loc(cb.location);
+        const ir::Signal           clock = event_signal(ev.expr);
+        const ir::Edge             edge  = to_edge(ev.edge);
+
+        ir::Builder b(module_.pool);
+        // This slot's clocking signal against the value it held at the previous
+        // slot's Observed point -- the detection a monitor uses, for the same
+        // reason. Taking it at the settled point is what makes the block step once
+        // per cycle however many deltas the clock's own driver needed.
+        const ir::Index clk_now = b.resize(load_signal(clock, b, l), module_.pool.bit_type, l);
+        const ir::Index clk_was = load_signal(st.clkprev, b, l);
+        const ir::Index fired   = edge == ir::Edge::Positive
+                                    ? b.binary(ir::Inst::Tag::Band, clk_now, bit_not(clk_was, b, l), l)
+                                    : b.binary(ir::Inst::Tag::Band, clk_was, bit_not(clk_now, b, l), l);
+        b.binary(ir::Inst::Tag::Store, b.signal(st.clkprev, l), clk_now, l);
+
+        b.open_region();
+        for (const ClockVarState& cv : st.vars) {
+            const ir::Signal live = signal_of(cv.sym->getInitializer()->as<ValueExpressionBase>().symbol);
+            // #1step reads the shadow of the step before; an explicit #0 reads the
+            // live signal, here in Observed (LRM 14.4, 14.13).
+            const ir::Signal src = cv.zero_skew ? live : sampled_shadow_of(live, "a clocking block");
+            b.binary(ir::Inst::Tag::Store, b.signal(cv.sampled, l), load_signal(src, b, l), l);
+        }
+        // Last, after every sample above: LRM 14.13 guarantees a process that waits
+        // for the clocking block reads the updated values.
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(st.event, l),
+                 bit_not(load_signal(st.event, b, l), b, l),
+                 l);
+        const ir::ExtraSlice then_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_r = b.close_region(); // empty
+        b.cond(fired, then_r, else_r, l);
+
+        module_.add_process(ir::Process{ .activation = ir::Activation::Observed,
+                                         // Not a subscription: an Observed process is resumed once per
+                                         // time slot, never woken by a net event. Kept as the record of
+                                         // which event steps this block, which is what the edge
+                                         // detection above is derived from.
+                                         .wait_events = { ir::WaitEvent{ .signal = clock, .edge = edge } },
+                                         .self_start  = false,
+                                         .span        = ir::SourceSpan{ l, l },
+                                         .ir          = b.finish(),
+                                         .scope       = cur_scope_id() });
+    }
+
+    // The lowered state of a clocking block, for a reader outside it (`@(cb)`).
+    // Collect fills the table for the whole design before Emit begins, so a
+    // missing entry means the block was refused and this reader is unreachable.
+    const ClockingBlockState& clocking_state(const ClockingBlockSymbol& cb) {
+        const auto it = clocking_.find(&cb);
+        if (it == clocking_.end()) {
+            fail("reference to a clocking block that could not be lowered");
+        }
+        return it->second;
     }
 
     // for-loop. The initialization runs once in the enclosing region; the
@@ -18776,6 +19066,10 @@ private:
     ankerl::unordered_dense::map<uint32_t, ir::Signal> sva_shadows_;
     // In creation order, so the sampling process copies them deterministically.
     std::vector<std::pair<ir::Signal, ir::Signal>> sva_shadow_pairs_;
+    // Each clocking block (LRM 14) of the design, by its symbol. Filled in
+    // Collect (storage, which must exist before any process reads it) and read in
+    // Emit (the sample-and-trigger process, and `@(cb)`).
+    ankerl::unordered_dense::map<const Symbol*, ClockingBlockState> clocking_;
     // Set while lowering one sampled assertion atom, so value_lvalue resolves
     // through sva_shadow_of. Scoped by SampledScope, never assigned bare.
     bool sva_sampled_ = false;

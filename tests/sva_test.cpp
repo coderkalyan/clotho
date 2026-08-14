@@ -1205,21 +1205,21 @@ endmodule
     CHECK(i.cubes.size() == e.cubes.size());
 }
 
-TEST_CASE("a default clocking block still refuses, ahead of any inference") {
+TEST_CASE("a default clocking block elaborates, but does not yet clock an assertion") {
     // The other half of 16.14.6: with no candidate event in the procedure, the
     // scope's `default clocking` supplies one (LRM 14.12) and slang hands it back
-    // through the same channel as a procedural inference. Clotho cannot lower a
-    // clocking block at all yet, so the member walk refuses the design before the
-    // assertion is reached -- which is the right order. This pins that it is the
-    // clocking block being refused and not the assertion being silently
-    // mis-clocked; it flips to a positive test when clocking blocks land.
+    // through the same channel as a procedural inference. The clocking block itself
+    // now elaborates (LRM 14, tests/clocking_test.cpp), so what is left is the
+    // resolution step: the inference verdict names the block's event, and clotho
+    // has no instance-local TimingControl to match it against the events this
+    // procedure waits on -- none, here. Refused rather than clocked on a guess.
     refuses(R"(
 module t;
   bit clk, a, b;
   default clocking cb @(posedge clk); endclocking
   initial assert property (a |=> b);
 endmodule
-)", "kind=ClockingBlock");
+)", "the clocking event inferred for this assertion is not one the enclosing procedure waits on");
 }
 
 // -- Named sequences, properties and lets (LRM 16.8, 16.12) -----------------
