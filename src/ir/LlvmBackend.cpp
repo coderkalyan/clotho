@@ -8482,12 +8482,12 @@ private:
     }
     // void rt_enum_name(rt_string* dst, const u8* val, u32 vbytes, u32 count,
     //                   const u8* values, const char* const* names, const u32* lens,
-    //                   u32 width, u32 fmt_fallback, const rt_alloc_site*)
+    //                   u32 width, u32 fmt_fallback, u32 is_signed, const rt_alloc_site*)
     llvm::FunctionCallee enum_name_fn() {
         auto* i32 = b_.getInt32Ty();
         return rt_fn("rt_enum_name", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), i32, i32, raw_ptr_ty(), raw_ptr_ty(),
-                       raw_ptr_ty(), i32, i32, raw_ptr_ty() });
+                       raw_ptr_ty(), i32, i32, i32, raw_ptr_ty() });
     }
     // void rt_container_format_p(rt_string* out, const void* handle, i32 is_queue,
     //   i32 kind, i32 width, i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride,
@@ -8500,12 +8500,12 @@ private:
     }
     // void rt_tagged_format_p(rt_string* dst, const rt_arg* v, u32 width, u32 tag_bits,
     //                         u32 count, const char* const* names, const u32* name_lens,
-    //                         const u32* widths, const rt_alloc_site*)
+    //                         const u32* widths, const u32* signs, const rt_alloc_site*)
     llvm::FunctionCallee tagged_fmt_p_fn() {
         auto* i32 = b_.getInt32Ty();
         return rt_fn("rt_tagged_format_p", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty(), raw_ptr_ty(),
-                       raw_ptr_ty(), raw_ptr_ty() });
+                       raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
     // i8 rt_container_eq(const void* a, const void* b, i32 is_queue, i32 kind, i32 width,
     //   i32 is_signed, i32 four_state, i32 has_z, i32 z_off, i64 stride)
@@ -10883,6 +10883,7 @@ private:
                                                 b_.getInt32(count), vg, ng, lg,
                                                 b_.getInt32(type_of(p.op_extra.op).width),
                                                 b_.getInt32(info.fmt_fallback),
+                                                b_.getInt32(type_of(p.op_extra.op).is_signed ? 1 : 0),
                                                 alloc_site_global(loc_text(i), "string") });
                 return;
             }
@@ -10910,13 +10911,14 @@ private:
 
                 constexpr uint32_t stride = sizeof(TaggedFmtEntry) / sizeof(uint32_t);
                 llvm::Type* const  i32    = b_.getInt32Ty();
-                std::vector<llvm::Constant*> names, lens, widths;
+                std::vector<llvm::Constant*> names, lens, widths, signs;
                 for (uint32_t w = static_cast<uint32_t>(info.members.start);
                      w < static_cast<uint32_t>(info.members.end); w += stride) {
                     const auto e = ir_->extra_data<TaggedFmtEntry>(static_cast<ExtraIndex>(w));
                     names.push_back(b_.CreateGlobalString(ir_->extra_bytes(e.name_at, e.name_len)));
                     lens.push_back(llvm::ConstantInt::get(i32, e.name_len));
                     widths.push_back(llvm::ConstantInt::get(i32, e.width));
+                    signs.push_back(llvm::ConstantInt::get(i32, e.is_signed));
                 }
                 const auto count = static_cast<uint32_t>(names.size());
 
@@ -10934,10 +10936,14 @@ private:
                                                            llvm::GlobalValue::PrivateLinkage,
                                                            llvm::ConstantArray::get(uty, widths),
                                                            "clotho.tagfmt.widths");
+                auto* const sg  = new llvm::GlobalVariable(env_->llmod, uty, /*isConstant=*/true,
+                                                           llvm::GlobalValue::PrivateLinkage,
+                                                           llvm::ConstantArray::get(uty, signs),
+                                                           "clotho.tagfmt.signs");
 
                 b_.CreateCall(tagged_fmt_p_fn(),
                               { str_of(i), arr, b_.getInt32(info.width), b_.getInt32(info.tag_bits),
-                                b_.getInt32(count), ng, lg, wg,
+                                b_.getInt32(count), ng, lg, wg, sg,
                                 alloc_site_global(loc_text(i), "string") });
                 return;
             }

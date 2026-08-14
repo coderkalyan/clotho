@@ -846,7 +846,7 @@ struct EnumNameEntry {
 struct EnumNameInfo {
     // The member rows, as back-to-back EnumNameEntry records.
     ExtraSlice entries;
-    // 1 when a value matching no member renders as a `'h<hex>` leaf rather than ""
+    // 1 when a value matching no member renders as a decimal leaf rather than ""
     // — LRM 21.2.1.6's rule for `%p` of an enum, against LRM 6.19.2's "" for
     // `.name()`.
     uint32_t fmt_fallback;
@@ -888,6 +888,9 @@ struct TaggedFmtEntry {
     // ("the currently valid element") rather than the union's full payload region.
     // Zero for a `void` member, whose tag prints with no `:value` at all.
     uint32_t width;
+    // Nonzero when the member's type is signed, so its decimal payload prints with
+    // a sign (21.2.1.6 prints a singular element as it would print unformatted).
+    uint32_t is_signed;
 };
 
 // Extra payload for `tagged_fmt_p`: what the runtime needs to render a tagged

@@ -571,7 +571,8 @@ Index Builder::tagged_fmt_p(Index                         value,
 
     const auto start = static_cast<ExtraIndex>(extra_.size());
     for (size_t k = 0; k < members.size(); ++k) {
-        add_extra(TaggedFmtEntry{ packed[k].first, packed[k].second, members[k].width });
+        add_extra(TaggedFmtEntry{ packed[k].first, packed[k].second, members[k].width,
+                                  members[k].is_signed ? 1u : 0u });
     }
     const auto end = static_cast<ExtraIndex>(extra_.size());
 

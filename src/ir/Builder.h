@@ -261,7 +261,7 @@ public:
     // e.name(): a new string value naming the enum member whose value equals
     // `val`. `members` is the value/source-name table in declaration order; the
     // runtime byte-compares `val`'s must plane against each row. With
-    // `fmt_fallback` set, a value matching no member renders as a `'h<hex>` leaf
+    // `fmt_fallback` set, a value matching no member renders as a decimal leaf
     // instead of "" — LRM 21.2.1.6's rule for `%p` of an enum, as against LRM
     // 6.19.2's "" for `.name()`.
     Index enum_name(Index val, std::span<const EnumNameRow> members, bool fmt_fallback, SourceLoc loc);
@@ -277,11 +277,12 @@ public:
                        std::string_view                  member,
                        std::span<const std::string_view> names,
                        SourceLoc                         loc);
-    // One member of the tagged_fmt_p table: its source name and its own payload
-    // width in bits (0 for a `void` member).
+    // One member of the tagged_fmt_p table: its source name, its own payload width
+    // in bits (0 for a `void` member), and whether that payload is signed.
     struct TaggedFmtRow {
         std::string_view name;
         uint32_t         width;
+        bool             is_signed;
     };
     // %p of a tagged union (LRM 21.2.1.6): a new string value holding
     // `tag:value` for whichever member `value`'s tag selects. `width` is the flat

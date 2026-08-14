@@ -623,10 +623,6 @@ TEST_CASE("queue slice/concat into a bounded queue drops the tail") {
     CHECK(run_capture(src) == "s=4 1 2 3 4\n");
 }
 
-// %p (LRM 21.2.1.6) renders '{e0, e1, ...} over the runtime element count:
-// integral leaves as 'h<hex> (minimal, with x/z digits), reals as %g, strings
-// quoted, empty as '{}. Format matches verilator (the only %p oracle here);
-// nested-in-struct reuses the same runtime path.
 TEST_CASE("%p of a queue") {
     constexpr std::string_view src = R"(
         module m;
@@ -650,11 +646,11 @@ TEST_CASE("%p of a queue") {
         endmodule
     )";
     CHECK(run_capture(src) ==
-          "'{'ha, 'h14, 'h1e}\n"
+          "'{10, 20, 30}\n"
           "'{\"ab\", \"cd\"}\n"
-          "'{'ha, 'hz5, 'hff}\n"
+          "'{10, Z, 255}\n"
           "'{}\n"
-          "'{a:'h1, q:'{'h4, 'h5}}\n");
+          "'{a:1, q:'{4, 5}}\n");
 }
 
 // Whole-queue == / != (LRM 11.2.2, 11.4.5): different sizes are a definite 0;

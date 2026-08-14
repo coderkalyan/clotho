@@ -14913,11 +14913,26 @@ private:
     // per-leaf value args. An unpacked array / struct renders `'{e0, e1, ...}`
     // recursively; the clause's four named singular cases (tagged union, plain
     // union, packed struct, enum) render through expand_p_packed; anything else is
-    // an integral / real leaf. The slang type is threaded alongside the lowered one
-    // because taggedness, member names, and enum membership live only in the AST —
-    // `ir::Type` keeps a tagged union indistinguishable from a plain packed union
-    // by design (docs/design/tagged-unions.md).
+    // an integral / real / string leaf. The slang type is threaded alongside the
+    // lowered one because taggedness, member names, and enum membership live only in
+    // the AST — `ir::Type` keeps a tagged union indistinguishable from a plain packed
+    // union by design (docs/design/tagged-unions.md).
     void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args, ir::Builder& b) {
+        if (const Expression& src = unwrap_conversion(arg); src.kind == ExpressionKind::StringLiteral) {
+            // "A string data type or string literal shall print its value as a string
+            // enclosed in quotes." A bare literal is an integral packed value (LRM
+            // 5.9), so without this it would print as one decimal number; its text is
+            // known here, so splice it, doubling any `%` so it stays literal.
+            frag += '"';
+            for (const char c : src.as<StringLiteral>().getValue()) {
+                frag += c;
+                if (c == '%') {
+                    frag += '%';
+                }
+            }
+            frag += '"';
+            return;
+        }
         const ir::Ref           ty        = lower_type(*arg.type);
         const ir::Type::Kind    k         = std::get<ir::Type>(module_.pool.get(ty)).kind;
         const bool              container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray;
@@ -14925,12 +14940,11 @@ private:
         const ir::SourceLoc     l         = loc(arg);
         if (!is_agg_abi_ref(ty) && !container) {
             // A singular operand: take it as an rvalue, so an arbitrary expression
-            // (a call, a concat) works and not just an addressable variable.
-            if (expand_p_packed(lower_expr(arg, b), sty, frag, args, b, l)) {
-                return;
-            }
-            frag += "%0d";
-            args.push_back(lower_expr(arg, b));
+            // (a call, a concat) works and not just an addressable variable. Lowered
+            // exactly once — a call operand must not be evaluated twice. The last
+            // paragraph of 21.2.1.6 formats it "as an element of an aggregate
+            // expression", which is what expand_p_scalar renders.
+            expand_p_scalar(lower_expr(arg, b), sty, frag, args, b, l);
             return;
         }
         expand_p_lvalue(lower_lvalue(unwrap_conversion(arg), b), ty, &sty, frag, args, b, l);
@@ -15001,17 +15015,12 @@ private:
                          ir::SourceLoc           l) {
         const slang::ast::Type& ct = sty.getCanonicalType();
         if (ct.isTaggedUnion()) {
-            // "In the case of a tagged union, it shall print "tag:value" along with
-            // the currently valid element." Which member that is only the run-time
-            // tag knows, so this is the one %p shape that renders in the runtime
-            // rather than expanding to literal text here.
             std::vector<ir::Builder::TaggedFmtRow> rows;
             for (const auto& f : union_scope(ct).membersOfType<FieldSymbol>()) {
                 const slang::ast::Type& mt = f.getType();
-                rows.push_back(
-                  { f.name, mt.isVoid() ? 0u : static_cast<uint32_t>(mt.getBitWidth()) });
+                rows.push_back({ f.name, mt.isVoid() ? 0u : static_cast<uint32_t>(mt.getBitWidth()), mt.isSigned() });
             }
-            frag += "%s";
+            frag += "'{%s}";
             args.push_back(b.tagged_fmt_p(v, module_.pool.layout(lower_type(sty)).width,
                                           union_tag_bits(ct), rows, l));
             return true;
@@ -15069,7 +15078,10 @@ private:
     }
 
     // A `%p` element that is already an rvalue: one of the four named singular
-    // cases, else the ordinary integral / real leaf.
+    // cases, else the per-element leaf rules that close LRM 21.2.1.6's list. An
+    // integral leaf prints "as [it] would unformatted", i.e. minimal decimal signed
+    // with the operand's own signedness (21.2.1.1); a real the same way (%g, note
+    // 26); a string "as a string enclosed in quotes".
     void expand_p_scalar(ir::Index               v,
                          const slang::ast::Type& sty,
                          std::string&            frag,
@@ -15079,7 +15091,21 @@ private:
         if (expand_p_packed(v, sty, frag, args, b, l)) {
             return;
         }
-        frag += module_.pool.is_float(lower_type(sty)) ? "%g" : "'h%0h";
+        const ir::Ref lty = lower_type(sty);
+        if (module_.pool.is_float(lty)) {
+            frag += "%g";
+        } else if (value_cat(lty) == ValueCat::string) {
+            frag += "\"%s\"";
+        } else if (!sty.isIntegral()) {
+            // TODO: %p of a class / chandle / event / virtual-interface handle. The
+            // clause wants an implementation-defined form with `null` for a null
+            // handle; Clotho has no handle rendering, and printing the raw pointer
+            // word as a decimal (what this used to do) is silently wrong.
+            fail("%p of a class / chandle / event / virtual interface handle is not "
+                 "supported");
+        } else {
+            frag += "%0d";
+        }
         args.push_back(v);
     }
 
@@ -15119,8 +15145,8 @@ private:
         }
         if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
             // `'{field:val, ...}` — LRM 21.2.1.6 requires the member names for an
-            // unpacked struct ("an assignment pattern with named elements"); the leaf
-            // radix and white space it leaves implementation-defined.
+            // unpacked struct ("an assignment pattern with named elements"); only the
+            // white space between them is implementation-defined.
             frag += "'{";
             const auto fields = module_.pool.struct_fields(t.fields_id);
             // Field order is declaration order on both sides, so the slang members
@@ -15153,19 +15179,22 @@ private:
             args.push_back(b.container_fmt_p(lv, ty, l));
             return;
         }
-        if (value_cat(ty) != ValueCat::scalar) {
-            // TODO: %p of a string leaf (needs the element string rendering path).
-            fail("%p of a string aggregate leaf is not supported");
+        if (value_cat(ty) != ValueCat::scalar && value_cat(ty) != ValueCat::string) {
+            // Assoc arrays are the only handle left (a queue / dynamic array took the
+            // branch above).
+            // TODO: %p of an associative-array leaf (its runtime table carries no
+            // ordered element walk for the formatter).
+            fail("%p of an associative-array aggregate leaf is not supported");
         }
         // A singular leaf. With the slang type in hand this may still be one of LRM
         // 21.2.1.6's named cases (a nested tagged union, packed struct, plain union,
-        // or enum); otherwise it is an integral / real leaf.
+        // or enum); otherwise it is an integral / real / string leaf.
         const ir::Index v = b.unary(ir::Inst::Tag::Load, lv, l);
         if (sty != nullptr) {
             expand_p_scalar(v, *sty, frag, args, b, l);
             return;
         }
-        frag += module_.pool.is_float(ty) ? "%g" : "'h%0h";
+        frag += module_.pool.is_float(ty) ? "%g" : value_cat(ty) == ValueCat::string ? "\"%s\"" : "%0d";
         args.push_back(v);
     }
 
