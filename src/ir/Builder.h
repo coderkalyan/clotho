@@ -336,8 +336,14 @@ public:
 
     // Fork `fork … join` (LRM 9.3.2): spawn each child body as a concurrent
     // coroutine, then join per `kind`. `children` are the fork-child task
-    // FunctionIds. A statement, never a value.
-    Index fork(std::span<const FunctionId> children, ForkKind kind, SourceLoc loc);
+    // FunctionIds. `captures` are the enclosing frame lvalues every child aliases
+    // through an ArgDir::Ref formal, in formal order (empty for a fork in a
+    // process, whose parent variables are module signals). A statement, never a
+    // value.
+    Index fork(std::span<const FunctionId> children,
+               std::span<const Index>     captures,
+               ForkKind                   kind,
+               SourceLoc                  loc);
 
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for

@@ -769,23 +769,45 @@ endmodule
     }
 }
 
+// A fork was refused here for two reasons, and both are gone. The region was
+// never one: the join record parks the parent as a handle whose wake carries its
+// home region, and a child is resumed inline at the spawn. What remained was that
+// an action block is lowered as a TASK body and clotho did not lower a fork inside
+// a task at all; it does now, with a child reaching the enclosing body's locals
+// through ref formals (lower_fork). So the pended copy takes one.
+TEST_CASE("a fork in an action block lowers into the pended copy") {
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b) else fork $error("late"); join
+endmodule
+)",
+                                           r);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(has_tag(monitor_process(m), ir::Inst::Tag::ReactivePend));
+    CHECK(any_function_has_tag(m, ir::Inst::Tag::Fork));
+
+    // The inlined copy still has no second resume, so the FAIL action of a STRONG
+    // property may not fork -- the parent's join-suspend would drop the rest of the
+    // body. That is the same rule every other suspension in this file follows, and
+    // it is now what refuses a fork rather than a missing lowering.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> strong(##[1:$] b))
+      else fork $error("late"); join
+endmodule
+)",
+            "a fork in the action block of a strong assertion is not supported");
+}
+
 TEST_CASE("the action-block whitelist keeps refusing what no region can help with") {
     // The rejections that were never about which ring a wake pushes onto, so the
     // wake carrying a destination region does not touch them. Each one's message
     // is pinned because the message IS the reason: a user who meets it needs to
     // know what would have to be built, and a reason that quietly stops being true
     // is worse than no reason at all.
-
-    // A fork: the region is no longer the obstacle -- the join record parks the
-    // parent as a handle, and a child is resumed inline at the spawn -- but an
-    // action block is lowered as a task body, and a fork inside a task is not
-    // lowered at all.
-    refuses(R"(
-module t;
-  bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b) else fork $error("late"); join
-endmodule
-)", "clotho does not lower a fork inside a task or function");
 
     // `wait fork` and `wait_order` have no lowering anywhere, reactive or not.
     refuses(R"(

@@ -642,15 +642,20 @@ Index Builder::task_call_virtual(FunctionId             func,
     return emit({ Inst::Tag::TaskCallVirtual, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::fork(std::span<const FunctionId> children, ForkKind kind, SourceLoc loc) {
+Index Builder::fork(std::span<const FunctionId> children,
+                    std::span<const Index>      captures,
+                    ForkKind                    kind,
+                    SourceLoc                   loc) {
     // FunctionId is a u32 enum; store the child ids in the extra arena as raw u32s
     // (the same encoding add_slice uses for Index operands).
     const auto start = static_cast<ExtraIndex>(extra_.size());
     for (const FunctionId c : children) {
         extra_.push_back(static_cast<uint32_t>(c));
     }
-    const ExtraSlice slice{ start, static_cast<ExtraIndex>(extra_.size()) };
-    const ExtraIndex extra = add_extra(ForkInfo{ slice, kind });
+    const ExtraSlice slice = { start, static_cast<ExtraIndex>(extra_.size()) };
+    // Appended after the children, so the two runs never overlap.
+    const ExtraSlice args  = add_slice(captures);
+    const ExtraIndex extra = add_extra(ForkInfo{ slice, args, kind });
 
     return emit({ Inst::Tag::Fork, pay(&Inst::Payload::extra, extra) }, loc);
 }

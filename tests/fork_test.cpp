@@ -152,8 +152,107 @@ TEST_CASE("fork: single-child and empty forks") {
     CHECK(out == "solo\nafter\n");
 }
 
+// fork … join inside a TASK body (LRM 9.3.2 with 13.4.2). slang itself rejects
+// `join` / `join_any` inside a function, so a task is the only subroutine that can
+// reach the lowering. Values cross-checked against Icarus Verilog 13.
+
+TEST_CASE("fork: join inside a task blocks the caller until the last child") {
+    const std::string out = run_capture(R"(
+        module t;
+          logic [7:0] a = 0, b = 0;
+          task run;
+            fork
+              begin #10 a = 8'd11; end
+              begin #5  b = 8'd22; end
+            join
+            $display("a=%0d b=%0d t=%0t", a, b, $time);
+          endtask
+          initial begin
+            run;
+            $display("after t=%0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "a=11 b=22 t=10\nafter t=10\n");
+}
+
+TEST_CASE("fork: a task containing a fork survives concurrent activations") {
+    // The ring-capacity case. One task body, three live activations at once, each
+    // forking three children that all mature at the same instant: nine child
+    // handles ready together, where counting child BODIES would have reserved
+    // three (ensure_active_queue's derivation). Blocking adds to one variable, so
+    // the total is order-independent and the check does not assume a child order.
+    const std::string out = run_capture(R"(
+        module t;
+          int c = 0;
+          task automatic bump;
+            fork
+              begin #5 c = c + 1; end
+              begin #5 c = c + 10; end
+              begin #5 c = c + 100; end
+            join
+          endtask
+          initial begin
+            fork
+              bump;
+              bump;
+              bump;
+            join
+            $display("c=%0d t=%0t", c, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "c=333 t=5\n");
+}
+
+TEST_CASE("fork: a child reads and writes the enclosing task's formal and local") {
+    // The capture path: `n` is a formal, `m` an automatic local, and both live only
+    // in the task's frame. Each child takes them as ArgDir::Ref formals, so the
+    // second child's write to `m` is visible to the task after the join.
+    const std::string out = run_capture(R"(
+        module t;
+          task automatic show(input int n);
+            int m;
+            m = n * 2;
+            fork
+              begin #1 $display("child n=%0d m=%0d", n, m); end
+              begin #2 m = m + 1; end
+            join
+            $display("after m=%0d t=%0t", m, $time);
+          endtask
+          initial show(3);
+        endmodule
+    )");
+    CHECK(out == "child n=3 m=6\nafter m=7 t=2\n");
+}
+
+TEST_CASE("fork: one task's fork, two concurrent calls, children reading its formals") {
+    // Multiple activations AND capture at once: each activation's children must see
+    // their own frame's `d` and `v`, not the other's.
+    const std::string out = run_capture(R"(
+        module t;
+          logic [7:0] x = 0, y = 0;
+          task automatic inner(input int d, input logic [7:0] v);
+            fork
+              begin #(d)     x = x + v; end
+              begin #(2 * d) y = y + v; end
+            join
+            $display("inner d=%0d t=%0t", d, $time);
+          endtask
+          initial begin
+            fork
+              inner(5, 8'd1);
+              inner(2, 8'd16);
+            join
+            $display("x=%0d y=%0d t=%0t", x, y, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "inner d=2 t=4\ninner d=5 t=10\nx=17 y=17 t=10\n");
+}
+
 // Unsupported variants fail loudly (never silently serialized).
-TEST_CASE("fork: join_any / join_none / fork-in-subroutine rejected") {
+TEST_CASE("fork: join_any / join_none rejected") {
     check_rejected(R"(
         module t; initial fork #5 $display("x"); #6 $display("y"); join_any endmodule
     )",
@@ -162,13 +261,38 @@ TEST_CASE("fork: join_any / join_none / fork-in-subroutine rejected") {
         module t; initial fork #5 $display("x"); #6 $display("y"); join_none endmodule
     )",
                    "join_none");
+}
+
+// What capture cannot carry. A ref formal is a pointer to a packed slot, so the
+// captures are exactly the ref ABI's own repertoire (docs/design/ref-args.md);
+// anything else is named rather than mis-lowered, and both lift together.
+TEST_CASE("fork: a child reading an uncapturable task local is rejected by name") {
     check_rejected(R"(
         module t;
-          task run; fork $display("x"); $display("y"); join endtask
-          initial run;
+          task automatic show;
+            string s = "hi";
+            fork
+              #1 $display("%s", s);
+            join
+          endtask
+          initial show;
         endmodule
     )",
-                   "fork..join inside a function or task");
+                   "reads the enclosing task's 's' is not supported");
+    check_rejected(R"(
+        module t;
+          class C;
+            int v;
+            task go(); fork #1 v = 5; join endtask
+          endclass
+          initial begin
+            C c;
+            c = new();
+            c.go();
+          end
+        endmodule
+    )",
+                   "reads a class property of the enclosing method is not supported");
 }
 
 // The two dynamic process-control statements (LRM 9.6.1 / 9.6.3) both need the

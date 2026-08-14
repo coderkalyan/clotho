@@ -1283,6 +1283,31 @@ struct ValueSweep {
                     break;
                 }
 
+                case Inst::Tag::Fork: {
+                    // A fork child aliases each captured enclosing local through a
+                    // ref formal (Lower.cpp's lower_fork), so it reads that storage
+                    // on entry and writes whatever x/z it produces straight back --
+                    // exactly an inout/ref task actual, and handled the same way.
+                    // Every child takes the same capture list, so arg k feeds
+                    // formal k of every child.
+                    const ForkInfo               fi   = ir.extra_data<ForkInfo>(p.extra);
+                    const std::span<const Index> args = ir.region(fi.args);
+                    for (const Index kid : ir.region(fi.children)) {
+                        FnState& cs = fns[static_cast<uint32_t>(kid)];
+                        for (size_t k = 0; k < args.size(); ++k) {
+                            if (storage_z(ir, fn, args[k])) {
+                                mark(cs.param_z[k]);
+                            }
+                            if (storage_x(ir, fn, args[k])) {
+                                mark(cs.param_x[k]);
+                            }
+                            store_into(ir, fn, args[k], cs.local_z[k] != 0, cs.local_x[k] != 0);
+                        }
+                    }
+                    val_x[raw] = 0;
+                    break;
+                }
+
                 // Valueless / always-known: no x or z effect. Region bodies are
                 // swept flatly by this same loop (their stores land through the
                 // Store cases), so only the node itself is nil here.
@@ -1295,7 +1320,6 @@ struct ValueSweep {
                 case Inst::Tag::Disable:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
-                case Inst::Tag::Fork:
                 case Inst::Tag::Display:
                 case Inst::Tag::FDisplay:
                 case Inst::Tag::StrobePend:

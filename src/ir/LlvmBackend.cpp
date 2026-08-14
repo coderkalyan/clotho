@@ -3289,6 +3289,19 @@ private:
             } else if (ir.tag(idx) == Inst::Tag::CallVirtual) {
                 const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
                 mark_packed_args(vci.func, vci.args);
+            } else if (ir.tag(idx) == Inst::Tag::Fork) {
+                // Every fork capture is an ArgDir::Ref formal of every child
+                // (Lower.cpp's lower_fork), and a child GEPs the passed pointer as a
+                // packed slot, so the captured local must keep one. Any child's
+                // arg_dirs would do -- they are identical -- so mark unconditionally
+                // rather than looking one up.
+                const auto fi = ir.extra_data<ForkInfo>(ir.payload(idx).extra);
+                for (const Index a : ir.region(fi.args)) {
+                    const Index root = lvalue_root(ir, a).root;
+                    if (ir.tag(root) == Inst::Tag::Local) {
+                        out[ir.payload(root).local.index] = true;
+                    }
+                }
             }
         }
         return out;
@@ -3548,6 +3561,10 @@ private:
         wheel_->setName("wheel");
         awaiter_ = nullptr;
         record_  = nullptr;
+        // Reset per llvm::Function, like record_: a task may contain a fork now, and
+        // the slot is an alloca hoisted into THIS coroutine's frame. Keeping a
+        // previous body's alloca would name storage in another function.
+        fork_record_ = nullptr;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -6939,7 +6956,8 @@ private:
     // Created once, lazily, so the timer callback (built while
     // lowering a process) and emit_active_run share it.
     // Number of fork-child bodies in the design = Σ fork widths (each fork child
-    // is one Function). Bounds the extra active-ring slots `fork … join` needs.
+    // is one Function). Says whether the design forks at all; the ring bound needs
+    // the per-body activation counts below, not this raw total.
     size_t fork_child_count() const {
         size_t n = 0;
         for (size_t k = 0; k < mod_.function_count(); ++k) {
@@ -6948,6 +6966,119 @@ private:
             }
         }
         return n;
+    }
+
+    // Ceiling on the fork-child slots the ring reserves. Two shapes have no static
+    // bound at all (below), and a slot is one pointer, so saturating here spends
+    // 8 KiB per ring in exchange for never sizing the ring by guesswork.
+    static constexpr size_t kMaxForkRingSlots = 1024;
+
+    // Peak number of concurrently live fork-child activations: the ring slots
+    // `fork … join` needs beyond the one-per-process baseline.
+    //
+    // A ring entry is the head of one blocked call chain. A process that called a
+    // task, or a fork child that called one, has at most ONE resumable coroutine
+    // at a time (the caller suspends until the callee completes), so the peak
+    // number of live entries is the number of live CHAINS -- and a chain is rooted
+    // either at a process (one activation each; a process is ramped once) or at a
+    // fork-child activation.
+    //
+    // A fork-child body belongs to exactly one fork site in exactly one enclosing
+    // body, and `join` blocks that body until every child of the site is done, so
+    // a site contributes one live child activation per child per live activation
+    // of the body containing it -- never accumulating across loop iterations.
+    // Hence
+    //
+    //     slots = Σ over fork-child bodies c of mult(c)
+    //     mult(process) = 1
+    //     mult(f)       = Σ over call / spawn edges (b -> f) of mult(b)
+    //
+    // where a spawn edge is a Fork naming child f and a call edge is any
+    // Call / TaskCall of f. The sum over edges (not over distinct sources) is what
+    // makes this survive a shared task body: `fork t(); t(); join` gives t two
+    // edges from the same process and so mult(t) = 2, and a width-2 fork inside t
+    // then needs 4 slots, not 2. The previous bound (one slot per child body)
+    // assumed `join` serialized each fork's reuse, which holds for a
+    // single-activation process and is false for a task body shared by several
+    // live callers.
+    //
+    // Relaxed to a fixpoint over the static graph; a DAG converges in at most as
+    // many rounds as it has functions. Two shapes make no finite bound possible,
+    // and both saturate to kMaxForkRingSlots and lean on the emit_active_push
+    // overflow fatal rather than pretending to a number:
+    //   - recursion (a cycle in the graph): unbounded by construction;
+    //   - a virtual task call, followed only to its statically named target (the
+    //     bound collect_callees already documents), so a forking override reached
+    //     through a handle would otherwise go uncounted.
+    size_t fork_ring_slots() const {
+        const size_t nfn = mod_.function_count();
+        if (fork_child_count() == 0) {
+            return 0;
+        }
+        // Edges into each function, as (source, callee) pairs. kProcessSource is
+        // the source for a process body, whose multiplicity is fixed at one.
+        static constexpr uint32_t kProcessSource = ~0u;
+        struct Edge {
+            uint32_t from;
+            uint32_t to;
+        };
+        std::vector<Edge> edges;
+        bool              imprecise = false;
+        const auto        walk      = [&](const Ir& ir, uint32_t from) {
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                const auto           i = static_cast<Index>(k);
+                const Inst::Payload& p = ir.payload(i);
+                switch (ir.tag(i)) {
+                    case Inst::Tag::TaskCall:
+                        edges.push_back({ from, static_cast<uint32_t>(ir.extra_data<TaskCallInfo>(p.extra).func) });
+                        break;
+                    case Inst::Tag::Call:
+                        edges.push_back({ from, static_cast<uint32_t>(ir.extra_data<CallInfo>(p.extra).func) });
+                        break;
+                    case Inst::Tag::TaskCallVirtual:
+                    case Inst::Tag::CallVirtual:
+                        edges.push_back({ from, static_cast<uint32_t>(ir.extra_data<VirtualCallInfo>(p.extra).func) });
+                        imprecise = true;
+                        break;
+                    case Inst::Tag::Fork:
+                        for (const Index kid : ir.region(ir.extra_data<ForkInfo>(p.extra).children)) {
+                            edges.push_back({ from, static_cast<uint32_t>(kid) });
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            walk(p.ir, kProcessSource);
+        }
+        for (size_t f = 0; f < nfn; ++f) {
+            walk(mod_.function(static_cast<FunctionId>(f)).ir, static_cast<uint32_t>(f));
+        }
+
+        std::vector<size_t> mult(nfn, 0);
+        bool                converged = false;
+        for (size_t round = 0; !converged && round <= nfn; ++round) {
+            std::vector<size_t> next(nfn, 0);
+            for (const Edge& e : edges) {
+                const size_t src = e.from == kProcessSource ? 1 : mult[e.from];
+                next[e.to]       = std::min(next[e.to] + src, kMaxForkRingSlots);
+            }
+            converged = next == mult;
+            mult      = std::move(next);
+        }
+        if (!converged || imprecise) {
+            return kMaxForkRingSlots;
+        }
+
+        size_t slots = 0;
+        for (size_t f = 0; f < nfn; ++f) {
+            if (mod_.function(static_cast<FunctionId>(f)).is_fork_child) {
+                slots = std::min(slots + mult[f], kMaxForkRingSlots);
+            }
+        }
+        return slots;
     }
 
     void ensure_active_queue() {
@@ -6964,15 +7095,17 @@ private:
         // with a mask (total pushes per drain are unbounded — a process may be
         // re-woken after it runs — only the live count is bounded).
         //
-        // `fork … join` (LRM 9.3.2) adds live children: a `join` parent blocks
-        // (leaving the ring — its handle sits in the join record), so children
-        // never accumulate across loop iterations or recursion depth. Peak ready
-        // children <= the number of distinct fork-child bodies (Σ fork widths),
-        // since `join` serializes each fork's reuse. Reserve one slot per child
-        // (docs/design/fork-join.md). join_any / join_none are unbounded and
-        // rejected by the frontend until V2's growable ring.
+        // `fork … join` (LRM 9.3.2) adds live children, one ring slot each. How many
+        // can be live at one instant is not the number of child BODIES -- a task
+        // body containing a fork is shared by every call site and can have several
+        // live activations at once -- so fork_ring_slots() counts activations over
+        // the spawn / call graph (its derivation is there, and in
+        // docs/design/fork-join.md). Whatever it returns, emit_active_push checks
+        // the bound at run time and reports rather than overwriting a live handle.
+        // join_any / join_none are unbounded and rejected by the frontend until
+        // V2's growable ring.
         const auto cap =
-          std::bit_ceil(std::max<size_t>(mod_.processes().size() + fork_child_count(), 1));
+          std::bit_ceil(std::max<size_t>(mod_.processes().size() + fork_ring_slots(), 1));
         active_mask_   = static_cast<uint32_t>(cap - 1);
 
         queue_arr_ty_ = llvm::ArrayType::get(ptr_ty, cap);
@@ -7007,11 +7140,42 @@ private:
                                                     llvm::ConstantInt::get(i32, 0), "clotho.inactive_top");
     }
 
+    // Ring selectors for rt_ring_overflow's diagnostic. Kept in step with the
+    // names the runtime prints (src/runtime/Runtime.cpp).
+    static constexpr uint32_t kRingActive   = 0;
+    static constexpr uint32_t kRingReactive = 1;
+
+    // The ring-overflow guard the capacity argument above leans on: a ring holding
+    // `cap` live handles cannot take another without overwriting one, and the
+    // overwritten entry is a live coroutine -- corruption with no diagnostic, the
+    // one failure mode the project forbids. Report it and end the simulation instead
+    // (docs/design/fork-join.md, "Defense in depth"). `ring` is the runtime's ring
+    // selector (0 active, 1 reactive), a value rather than a constant because
+    // emit_wake_push picks its ring at run time.
+    //
+    // Monotone counters make `tail - head` the exact live count, so the compare is
+    // unsigned >= cap: an off-by-one elsewhere trips it too, which is the point of
+    // a guard that only ever fires on a bug.
+    void emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, llvm::Value* tail,
+                              llvm::Value* ring) {
+        llvm::Function* fn   = b.GetInsertBlock()->getParent();
+        const uint32_t  cap  = active_mask_ + 1;
+        llvm::Value*    live = b.CreateSub(tail, b.CreateLoad(b.getInt32Ty(), head_ptr));
+        auto*           bad  = llvm::BasicBlock::Create(ctx_, "ring.overflow", fn);
+        auto*           ok   = llvm::BasicBlock::Create(ctx_, "ring.push", fn);
+        b.CreateCondBr(b.CreateICmpUGE(live, b.getInt32(cap)), bad, ok);
+        b.SetInsertPoint(bad);
+        b.CreateCall(ring_overflow_fn(), { ring, b.getInt32(cap) });
+        b.CreateUnreachable();
+        b.SetInsertPoint(ok);
+    }
+
     // Push a handle onto the active ring: queue[tail++ & mask] = handle.
     void emit_active_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
         ensure_active_queue();
         auto*        i32  = b.getInt32Ty();
         llvm::Value* tl   = b.CreateLoad(i32, sym(active_tail_gv_));
+        emit_ring_full_check(b, sym(active_head_gv_), tl, b.getInt32(kRingActive));
         llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
         llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(active_gv_), { b.getInt32(0), idx });
         b.CreateStore(handle, slot);
@@ -7088,6 +7252,7 @@ private:
         ensure_reactive_queue();
         auto*        i32  = b.getInt32Ty();
         llvm::Value* tl   = b.CreateLoad(i32, sym(reactive_tail_gv_));
+        emit_ring_full_check(b, sym(reactive_head_gv_), tl, b.getInt32(kRingReactive));
         llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
         llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, sym(reactive_gv_), { b.getInt32(0), idx });
         b.CreateStore(handle, slot);
@@ -7241,7 +7406,12 @@ private:
                                              llvm::PointerType::getUnqual(ctx_));
         llvm::Value* arr  = b.CreateSelect(home, sym(reactive_gv_), sym(active_gv_));
         llvm::Value* tp   = b.CreateSelect(home, sym(reactive_tail_gv_), sym(active_tail_gv_));
+        llvm::Value* hp   = b.CreateSelect(home, sym(reactive_head_gv_), sym(active_head_gv_));
         llvm::Value* tl   = b.CreateLoad(i32, tp);
+        // The ring is chosen at run time here, so the guard's selector is too: the
+        // fatal names the ring the handle was actually headed for.
+        emit_ring_full_check(b, hp, tl,
+                             b.CreateSelect(home, b.getInt32(kRingReactive), b.getInt32(kRingActive)));
         llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
         llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, arr, { b.getInt32(0), idx });
         b.CreateStore(hdl, slot);
@@ -8668,6 +8838,9 @@ private:
     }
     llvm::FunctionCallee oscillation_abort_fn() {
         return rt_fn("rt_oscillation_abort", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee ring_overflow_fn() {
+        return rt_fn("rt_ring_overflow", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
     }
 
     llvm::FunctionCallee wheel_now_fn() {
@@ -16974,14 +17147,36 @@ private:
                        b_.CreateStructGEP(rty, rec, 0));
         b_.CreateStore(null, b_.CreateStructGEP(rty, rec, 1));
 
-        // Spawn each child: ramp (state, wheel, rec) -> handle, resume inline to its
-        // first suspend or completion. A child that completes synchronously has
-        // already decremented the count (parent still null -> no wake); destroy its
-        // frame. A child that suspends is parked in the wheel / a wait queue and
-        // decrements + wakes on completion.
+        // Ramp arguments, shared by every child: (state, wheel, one pointer per
+        // captured enclosing-frame local, rec). Each capture is an ArgDir::Ref
+        // formal of every child (Lower.cpp's lower_fork), passed exactly as
+        // lower_task_call_inst passes a ref actual. No signal-waiter snapshot is
+        // needed here, unlike there: a capture is always a frame Local of this
+        // coroutine, never a module signal with a wait queue.
+        const std::span<const Index> caps = ir_->region(fi.args);
+        std::vector<llvm::Value*>    argv;
+        argv.reserve(caps.size() + 3);
+        argv.push_back(state_);
+        argv.push_back(wheel_);
+        if (!caps.empty()) {
+            // Every child took the same formal list, so one child's declared types
+            // decide the ABI for all of them.
+            const Function& child = mod_.function(static_cast<FunctionId>(kids[0]));
+            for (uint32_t k = 0; k < caps.size(); ++k) {
+                const LValue& lv = lvalue_of(caps[k]);
+                argv.push_back(is_handle_type(child.param_types[k]) ? lv.base : ref_actual_ptr(lv));
+            }
+        }
+        argv.push_back(rec);
+
+        // Spawn each child: ramp -> handle, resume inline to its first suspend or
+        // completion. A child that completes synchronously has already decremented
+        // the count (parent still null -> no wake); destroy its frame. A child that
+        // suspends is parked in the wheel / a wait queue and decrements + wakes on
+        // completion.
         for (const Index kid : kids) {
             llvm::Function* cf  = sym(fn_decls_[static_cast<uint32_t>(kid)]);
-            llvm::Value*    hdl = b_.CreateCall(cf->getFunctionType(), cf, { state_, wheel_, rec });
+            llvm::Value*    hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
             llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
             auto*        dz   = llvm::BasicBlock::Create(ctx_, "fork.child.done", fn_);

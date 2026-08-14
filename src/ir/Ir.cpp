@@ -72,6 +72,12 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                     const auto slice = extra_data<ExtraSlice>(p.extra);
                     return index_slice(slice);
                 }
+                case ExtraOperandShape::ForkArgs: {
+                    // fork: the captured frame lvalues each child aliases through a
+                    // ref formal are the SSA operands; the children are FunctionIds.
+                    const auto info = extra_data<ForkInfo>(p.extra);
+                    return index_slice(info.args);
+                }
                 case ExtraOperandShape::NotExtra:
                     break;
             }

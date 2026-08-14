@@ -1251,6 +1251,14 @@ uint64_t rt_wheel_now(const rt_wheel* wheel);
 // wheel itself, so the JIT'd drain loop passes only the wheel pointer.
 [[noreturn]] void rt_oscillation_abort(const rt_wheel* wheel);
 
+// Scheduler ring overrun: more coroutine handles were live at one instant than
+// the statically sized ring holds, so the next push would overwrite a live one.
+// Prints a FATAL diagnostic naming the ring and ends the simulation (never
+// returns). `ring` is 0 for the Active ring and 1 for the Reactive one (LRM
+// 4.4.2); `capacity` is the ring's slot count. Only a miscomputed capacity can
+// reach this -- see the sizing argument in ensure_active_queue.
+[[noreturn]] void rt_ring_overflow(uint32_t ring, uint32_t capacity);
+
 // Non-zero iff the wheel has any timer scheduled. The design's sim loop ticks
 // the wheel until this reports empty.
 int rt_wheel_pending(const rt_wheel* wheel);

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
@@ -681,6 +682,44 @@ struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
     }
 };
 
+// Collects what a `fork` child body reads or writes out of the ENCLOSING
+// subroutine's frame (LRM 9.3.2 with 13.4.2): a child is lowered into its own
+// coroutine with its own frame, so every such symbol has to be passed in as a
+// ref formal (lower_fork / build_fork_child). Deduped and kept in first-reference
+// order, because that order IS the child's formal order.
+//
+// `implicit_this` is the case a ref formal cannot carry: a bare property
+// reference inside a class method, which value_lvalue resolves through the
+// enclosing frame's `this` handle. An explicit `this.p` needs no separate flag --
+// it reads the `this` local itself, so it lands in `captured` and is refused by
+// the capture type check.
+struct ForkCaptureDetector : ASTVisitor<ForkCaptureDetector, VisitFlags::AllGood> {
+    const ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, uint32_t>* locals;
+    std::vector<const slang::ast::ValueSymbol*>                                   captured;
+    bool                                                                          implicit_this = false;
+
+    void check(const slang::ast::ValueSymbol& sym) {
+        if (const auto* prop = sym.as_if<slang::ast::ClassPropertySymbol>()) {
+            if (prop->lifetime != slang::ast::VariableLifetime::Static) {
+                implicit_this = true;
+                return;
+            }
+        }
+        if (!locals->contains(&sym)) {
+            return; // a module signal or a static local: shared storage already
+        }
+        if (std::find(captured.begin(), captured.end(), &sym) == captured.end()) {
+            captured.push_back(&sym);
+        }
+    }
+    void handle(const NamedValueExpression& nv) {
+        check(nv.symbol);
+    }
+    void handle(const HierarchicalValueExpression& hv) {
+        check(hv.symbol);
+    }
+};
+
 // Detects everything an assertion action block may not contain, for
 // Lowerer::require_reactive_safe and Lowerer::require_finish_inlinable. File
 // scope rather than a local struct: the statement whitelist below has to be a
@@ -789,19 +828,16 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
             case StatementKind::ProceduralDeassign:
                 break;
             case StatementKind::Block:
-                // Not the region any more -- a fork's join record parks the parent
-                // as a handle and its wake carries that handle's region, and a
-                // child is resumed inline at the spawn (lower_fork_inst), so it
-                // never goes through a ring at all. What is left is that clotho
-                // does not lower a fork inside a task or function AT ALL: a child
-                // aliases the enclosing PROCESS's signals, which a task frame's
-                // locals are not (lower_fork), and an action block is lowered as a
-                // task. Named here rather than left to lower_fork, because this
-                // walk runs first and would otherwise blame the wrong thing.
+                // A fork is a suspension and nothing more. Not the region: the join
+                // record parks the parent as a handle and its wake carries that
+                // handle's region, and a child is resumed inline at the spawn
+                // (lower_fork_inst), so a child never goes through a ring at all.
+                // And no longer the frame either: an action block is lowered as a
+                // task body, and a child now reaches the enclosing body's locals
+                // through ref formals (lower_fork). What is left is the inlined
+                // copy's missing second resume, which is what suspends() names.
                 if (s.template as<BlockStatement>().blockKind != StatementBlockKind::Sequential) {
-                    reject("a fork",
-                           "clotho does not lower a fork inside a task or function, and an action "
-                           "block is lowered as a task body");
+                    suspends("a fork");
                 }
                 break;
             case StatementKind::ImmediateAssertion:
@@ -6681,21 +6717,21 @@ private:
         b.disable(label, loc(s));
     }
 
-    // Lower `fork … join` (LRM 9.3.2). V1: `join` only, in a process context.
-    // Each top-level child statement becomes its own fork-child coroutine; the
-    // Fork op spawns them and suspends the parent until all complete.
+    // Lower `fork … join` (LRM 9.3.2). V1: `join` only, in a process or task body
+    // (an assertion action block is lowered as a task body, so it counts). Each
+    // top-level child statement becomes its own fork-child coroutine; the Fork op
+    // spawns them and suspends the parent until all complete.
+    //
+    // slang refuses `join` and `join_any` inside a FUNCTION itself
+    // (diag::TimingInFuncNotAllowed, its Statement.cpp), so the only fork a
+    // function body can even hand us is `join_none` -- which the kind check below
+    // rejects anyway. Clotho needs no LRM check of its own here.
     void lower_fork(const BlockStatement& blk, ir::Builder& b) {
         if (blk.blockKind != StatementBlockKind::JoinAll) {
             // TODO: join_any / join_none (V2) need a growable active ring — a
             // loop can spawn an unbounded number of concurrently-live children
             // (docs/design/fork-join.md).
             fail("fork..join_any / fork..join_none are not supported");
-        }
-        if (fn_ctx_ != nullptr) {
-            // TODO: fork inside a task/function (V1 restriction). A child would
-            // need to alias the enclosing subroutine's frame locals, not the
-            // parent-signal path build_fork_child assumes.
-            fail("fork..join inside a function or task is not supported");
         }
 
         // Children are the fork body's top-level statements (a StatementList),
@@ -6712,12 +6748,65 @@ private:
             return; // `fork join` with no children: a no-op.
         }
 
+        // Inside a task, a child body gets its OWN frame, so a reference to the
+        // enclosing task's formals or automatics cannot resolve the way it does in
+        // a process (where every parent variable is a module signal). Pass each
+        // such symbol in as an ArgDir::Ref formal — the same live-pointer ABI a
+        // `ref` argument uses (docs/design/ref-args.md), whose lifetime rule holds
+        // here for the same reason: a `join` parent outlives all its children, so
+        // the pointer into its frame stays valid for as long as a child can use it.
+        std::vector<const ValueSymbol*> captures;
+        if (fn_ctx_ != nullptr) {
+            if (!fn_ctx_->is_task) {
+                // Unreachable through slang, which rejects a timing control in a
+                // function outright; `is_task` is the real discriminator, so say so
+                // rather than trusting the front end's reach.
+                fail("fork..join inside a function is not supported");
+            }
+            ForkCaptureDetector d;
+            d.locals = &fn_ctx_->localmap;
+            for (const Statement* c : children) {
+                c->visit(d);
+            }
+            if (d.implicit_this) {
+                // TODO: capture of `this` (LRM 8.11 inside 9.3.2) — a child would
+                // need the enclosing method's handle as a ref formal, which the ref
+                // ABI does not carry (it is a packed-slot pointer).
+                fail("fork..join child that reads a class property of the enclosing "
+                     "method is not supported");
+            }
+            for (const ValueSymbol* sym : d.captured) {
+                const auto& ct = sym->getType().getCanonicalType();
+                if (!ct.isIntegral() && ct.as_if<slang::ast::DynamicArrayType>() == nullptr) {
+                    // TODO: capture of an unpacked array / struct / string / real /
+                    // queue / class-handle local. Exactly the ref ABI's own gap, so
+                    // the two lift together (docs/design/ref-args.md).
+                    fail("fork..join child that reads the enclosing task's '" + std::string(sym->name) +
+                         "' is not supported (only packed integral and dynamic-array "
+                         "locals can be captured)");
+                }
+            }
+            captures = std::move(d.captured);
+        }
+
         std::vector<ir::FunctionId> ids;
         ids.reserve(children.size());
         for (const Statement* c : children) {
-            ids.push_back(build_fork_child(*c));
+            ids.push_back(build_fork_child(*c, captures));
         }
-        b.fork(ids, ir::ForkKind::Join, loc(blk));
+
+        // The capture actuals, in the order the children took their formals.
+        // Evaluated here, in the ENCLOSING frame (build_fork_child's FnScope is
+        // already unwound): value_lvalue resolves each to its frame Local, which is
+        // the whole, unmasked, zero-offset lvalue the backend's ref_actual_ptr
+        // requires.
+        const ir::SourceLoc    l = loc(blk);
+        std::vector<ir::Index> args;
+        args.reserve(captures.size());
+        for (const ValueSymbol* sym : captures) {
+            args.push_back(value_lvalue(*sym, b, l));
+        }
+        b.fork(ids, args, ir::ForkKind::Join, l);
     }
 
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
@@ -19549,21 +19638,40 @@ private:
                                            .ir          = b.finish() });
     }
 
-    // Lower one `fork` child statement (LRM 9.3.2) into a synthetic argument-less
-    // fork-child task: a coroutine spawned at the fork, whose completion decrements
-    // the shared join record. Mirrors build_task, but takes a bare Statement (no
-    // formals) and runs in the *parent's* scope context (scope_ / prefix_ /
-    // time_mul_ unchanged) so the child's references to parent variables resolve to
-    // the parent's signals, while the child's own declared locals get per-spawn
-    // frame slots (value_lvalue: localmap first, then signal_of). Returns the
-    // reserved FunctionId.
-    ir::FunctionId build_fork_child(const Statement& body) {
+    // Lower one `fork` child statement (LRM 9.3.2) into a synthetic fork-child
+    // task: a coroutine spawned at the fork, whose completion decrements the shared
+    // join record. Mirrors build_task, but takes a bare Statement and runs in the
+    // *parent's* scope context (scope_ / prefix_ / time_mul_ unchanged) so the
+    // child's references to parent variables resolve to the parent's signals, while
+    // the child's own declared locals get per-spawn frame slots (value_lvalue:
+    // localmap first, then signal_of).
+    //
+    // `captures` are the enclosing subroutine's frame symbols the fork's children
+    // touch (lower_fork collected them). Each becomes an ArgDir::Ref formal
+    // aliasing the enclosing frame's slot, registered in this child's localmap
+    // under the SAME ValueSymbol -- which is what makes the child's reference to it
+    // resolve to the formal's Local instead of falling through to signal_of. Every
+    // child of one fork takes the same list, so an unused capture costs one dead
+    // pointer parameter. Returns the reserved FunctionId.
+    ir::FunctionId build_fork_child(const Statement& body, std::span<const ValueSymbol* const> captures) {
         const ir::FunctionId id = module_.reserve_function();
 
         FnCtx ctx;
         ctx.name_prefix = "fork.child.";
         ctx.is_task     = true;
         const FnScope fn_scope(*this, &ctx);
+
+        // Formals first, so formal k == Local k (the invariant build_task maintains
+        // and the backend's prologue / ref binding rely on).
+        std::vector<ir::Ref>    param_types;
+        std::vector<ir::ArgDir> arg_dirs;
+        param_types.reserve(captures.size());
+        arg_dirs.reserve(captures.size());
+        for (const ValueSymbol* sym : captures) {
+            param_types.push_back(lower_type(sym->getType()));
+            arg_dirs.push_back(ir::ArgDir::Ref);
+            fn_local(*sym);
+        }
 
         ir::Builder b(module_.pool);
         lower_stmt(body, b);
@@ -19573,8 +19681,8 @@ private:
         module_.set_function(id,
                              ir::Function{ .name          = "fork.child",
                                            .return_type   = module_.pool.void_type,
-                                           .param_types   = {},
-                                           .arg_dirs      = {},
+                                           .param_types   = std::move(param_types),
+                                           .arg_dirs      = std::move(arg_dirs),
                                            .local_types   = std::move(ctx.local_types),
                                            .is_task       = true,
                                            .is_fork_child = true,
