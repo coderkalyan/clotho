@@ -1251,12 +1251,14 @@ uint64_t rt_wheel_now(const rt_wheel* wheel);
 // wheel itself, so the JIT'd drain loop passes only the wheel pointer.
 [[noreturn]] void rt_oscillation_abort(const rt_wheel* wheel);
 
-// Scheduler ring overrun: more coroutine handles were live at one instant than
-// the statically sized ring holds, so the next push would overwrite a live one.
-// Prints a FATAL diagnostic naming the ring and ends the simulation (never
-// returns). `ring` is 0 for the Active ring and 1 for the Reactive one (LRM
-// 4.4.2); `capacity` is the ring's slot count. Only a miscomputed capacity can
-// reach this -- see the sizing argument in ensure_active_queue.
+// Scheduler queue overrun: more entries were live at one instant than the
+// statically sized buffer holds, so the next push would overwrite a live one.
+// Prints a FATAL diagnostic naming the buffer and ends the simulation (never
+// returns). `ring` selects the buffer -- 0 Active ring, 1 Reactive ring (LRM
+// 4.4.2), 2 inactive `#0` batch, 3 reactive inactive batch, 4 event wait queue --
+// and must stay in step with the kRing* constants in src/ir/LlvmBackend.cpp;
+// `capacity` is that buffer's slot count. Only a miscomputed capacity can reach
+// this -- see the sizing arguments in ensure_active_queue and wait_counts.
 [[noreturn]] void rt_ring_overflow(uint32_t ring, uint32_t capacity);
 
 // Non-zero iff the wheel has any timer scheduled. The design's sim loop ticks
