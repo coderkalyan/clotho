@@ -672,6 +672,14 @@ Index Builder::reactive_pend(FunctionId func, SourceLoc loc) {
     return emit({ Inst::Tag::ReactivePend, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) }, loc);
 }
 
+Index Builder::expect_wait(uint32_t monitor, SourceLoc loc) {
+    return emit({ Inst::Tag::ExpectWait, pay(&Inst::Payload::extra, add_extra(ExpectInfo{ monitor })) }, loc);
+}
+
+Index Builder::expect_wake(Index resolved, uint32_t monitor, SourceLoc loc) {
+    return emit({ Inst::Tag::ExpectWake, Inst::Payload{ .op_imm = { resolved, monitor } } }, loc);
+}
+
 Index Builder::monitor_set(FunctionId func, SourceLoc loc) {
     return emit({ Inst::Tag::MonitorSet, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) }, loc);
 }

@@ -1759,7 +1759,14 @@ Result lower(const Request& request) {
 
     sva_directive directive{};
     directive.id = 0;
-    directive.kind = static_cast<sva_kind>(request.kind);
+    // An `expect` is compiled as an assert: libsva has no expect kind, and needs
+    // none -- LRM 16.17 gives an `expect`'s property exactly an assert's
+    // semantics, and everything that makes it an `expect` (the one-shot seed, the
+    // blocking wait) is clotho's own side of the boundary. So the mirror the cast
+    // relies on stops at Restrict, and Expect is mapped rather than punned.
+    directive.kind = request.kind == ir::AssertionKind::Expect
+                       ? SVA_ASSERT
+                       : static_cast<sva_kind>(request.kind);
     directive.clock = SVA_CLOCK_NONE;
     directive.reset = disable;
     directive.property = *property;
@@ -1916,6 +1923,14 @@ Result lower(const Request& request) {
 
     ir::AssertionMonitor& built = out.monitor;
     built.kind = static_cast<ir::AssertionKind>(sva_monitor_kind(monitor));
+    if (request.kind == ir::AssertionKind::Expect) {
+        // The one kind that does not round trip, because libsva was never told
+        // about it: what came back is the SVA_ASSERT it was compiled as. Restored
+        // from the request rather than inferred downstream -- emit_monitor decides
+        // the seeding and the wait off this field, and an expect that arrived as an
+        // assert would silently start an attempt every cycle and park nobody.
+        built.kind = ir::AssertionKind::Expect;
+    }
     // The verdict lattice crosses the boundary here. libsva reports the disposition
     // of a still-pending attempt two ways -- sva_monitor_strength as the weak/strong
     // bit and sva_monitor_pending as the three-valued sva_verdict -- and after `not`

@@ -225,8 +225,17 @@ struct Process {
 // arbitrary-precision LLVM constant, so `words` is a transport detail rather than
 // a codegen one.
 
-// What to do with a verdict. Mirrors libsva's sva_kind, checked at the boundary.
-enum class AssertionKind : uint8_t { Assert, Assume, Cover, Restrict };
+// What to do with a verdict. The first four mirror libsva's sva_kind and are
+// checked at the boundary.
+//
+// Expect is clotho's own and deliberately last: libsva has no expect kind and
+// needs none -- an `expect`'s PROPERTY semantics are exactly an assert's, so it
+// is compiled as SVA_ASSERT and the directive distinction is carried here, the
+// way `cover_matches` carries the one libsva's single cover kind cannot. What it
+// selects is the SEEDING and the blocking wait (LRM 16.17): an attempt starts
+// when the statement executes rather than every cycle, and the executing process
+// is parked until that attempt resolves. See Inst::Tag::ExpectWait.
+enum class AssertionKind : uint8_t { Assert, Assume, Cover, Restrict, Expect };
 
 // The verdict lattice (LRM 16.12.2, docs/design/sva-property-layer.md 5).
 //

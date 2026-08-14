@@ -1791,6 +1791,7 @@ private:
         // partially-driven packed net powers its undriven bits z per this mask.
         const std::vector<bool>& undriven = facts_.undriven;
 
+
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
             const Type&  ty  = std::get<Type>(mod_.pool.get(sigs[i].type));
@@ -2743,6 +2744,10 @@ private:
         // A program block's `initial` (LRM 24.3). Drives the region-restoring
         // resume in emit_suspend and the 24.6 implicit finish below.
         in_program_body_ = proc.activation == Activation::Reactive;
+        // An `expect` in this body moves the thread to Reactive for good, so its
+        // home has to be read at each park rather than folded (see home_ptr).
+        body_home_is_runtime_ = ir_has_expect_wait(proc.ir);
+        home_ptr_             = nullptr;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -2938,6 +2943,8 @@ private:
         b_.SetInsertPoint(trap_bb);
         b_.CreateUnreachable();
         in_program_body_ = false;
+        body_home_is_runtime_ = false;
+        home_ptr_             = nullptr;
         return fn_;
     }
 
@@ -3381,6 +3388,8 @@ private:
         cur_fn_           = &f;
         in_reactive_body_ = is_reactive_fn(id);
         in_program_fn_    = is_program_fn(id);
+        body_home_is_runtime_ = ir_has_expect_wait(f.ir);
+        home_ptr_         = nullptr;
         cur_is_task_      = false;
         param_llvm_index_ = param_indices(f);
         build_frame_layout(f);
@@ -3425,6 +3434,8 @@ private:
         cur_fn_ = nullptr;
         in_reactive_body_ = false;
         in_program_fn_    = false;
+        body_home_is_runtime_ = false;
+        home_ptr_ = nullptr;
         frame_  = nullptr;
     }
 
@@ -3463,6 +3474,8 @@ private:
         cur_fn_           = &f;
         in_reactive_body_ = is_reactive_fn(id);
         in_program_fn_    = is_program_fn(id);
+        body_home_is_runtime_ = ir_has_expect_wait(f.ir);
+        home_ptr_         = nullptr;
         cur_is_task_      = true;
         param_llvm_index_ = param_indices(f);
         build_frame_layout(f);
@@ -3566,7 +3579,8 @@ private:
         // suspend. In the synchronous path the caller never wrote a parent (it reads
         // the task `done` and resumes inline), so the load is null and nothing is
         // enqueued; in the blocked path the caller stored its handle before
-        // suspending, so we push it onto the active queue here.
+        // suspending, so we push it onto the ring that handle names -- the caller
+        // may be reactive code, and emit_wake_push is what reads which.
         b_.SetInsertPoint(epilogue_bb);
         emit_copyout(f);
         deinit_body_strings(); // string locals + temps die with the call
@@ -3586,13 +3600,13 @@ private:
             llvm::Value* wake   = b_.CreateAnd(last, b_.CreateICmpNE(parent, null));
             b_.CreateCondBr(wake, has_bb, final_bb);
             b_.SetInsertPoint(has_bb);
-            emit_active_push(b_, parent);
+            emit_wake_push(b_, parent);
             b_.CreateBr(final_bb);
         } else {
             llvm::Value* parent = b_.CreateLoad(ptr_ty, rec);
             b_.CreateCondBr(b_.CreateICmpNE(parent, null), has_bb, final_bb);
             b_.SetInsertPoint(has_bb);
-            emit_active_push(b_, parent);
+            emit_wake_push(b_, parent);
             b_.CreateBr(final_bb);
         }
 
@@ -3608,6 +3622,8 @@ private:
         cur_fn_           = nullptr;
         in_reactive_body_ = false;
         in_program_fn_    = false;
+        body_home_is_runtime_ = false;
+        home_ptr_         = nullptr;
         cur_is_task_      = false;
         frame_            = nullptr;
         task_epilogue_bb_ = nullptr;
@@ -3774,6 +3790,10 @@ private:
         return native_cb_trampoline("clotho.inertial_cb", inertial_cb_fn(), inertial_cb_tramp_);
     }
 
+    // The wheel-expiry callback for a process #delay: pull the handle the awaiter
+    // parked and wake it into the ring it named. One trampoline serves every
+    // timer in the design, so the region cannot be baked in here -- a program
+    // `initial` and an ordinary always block both come through this function.
     llvm::Function* enqueue_trampoline() {
         if (enqueue_fn_ != nullptr) {
             return sym(enqueue_fn_);
@@ -3786,7 +3806,7 @@ private:
         tb.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", enqueue_fn_));
         llvm::Value* hp  = tb.CreateStructGEP(awaiter_ty(), enqueue_fn_->getArg(0), 2);
         llvm::Value* hdl = tb.CreateLoad(ptr, hp);
-        emit_active_push(tb, hdl);
+        emit_wake_push(tb, hdl);
         tb.CreateRetVoid();
         return sym(enqueue_fn_);
     }
@@ -3806,36 +3826,38 @@ private:
         b_.SetInsertPoint(resume);
     }
 
-    // Suspend, and come back in the region the body belongs to.
+    // Suspend. Coming back in the right region is the parked handle's business,
+    // not this function's: every site that records a handle for a later wake
+    // records it through parked_handle, and every site that wakes one reads the
+    // region back out through emit_wake_push.
     //
-    // Whoever wakes a sleeper pushes it onto the ACTIVE ring: a wheel timer, an
-    // event scan, the inactive promote. None of them knows the region their
-    // sleeper belongs to, and teaching all of them would put a branch on the
-    // hot wake path of every design. A program `initial` (LRM 24.3) has to
-    // resume in Reactive instead, so it does the correction itself -- it wakes
-    // in Active, immediately re-queues onto the reactive ring and suspends
-    // again, and the reactive drain of the SAME time slot runs the body. The
-    // extra resume does nothing observable, which is why the region order still
-    // reads Active-then-Reactive from the design's point of view.
-    //
-    // This is what makes a program initial able to suspend at all: unlike an
-    // assertion action block (a zero-time thunk with no frame), it is a real
-    // process, so `@`, `wait` and a nonzero `#delay` all work and come back in
-    // the right region.
+    // A program `initial` (LRM 24.3) used to correct its own region after the
+    // fact -- wake in Active, re-queue onto the reactive ring, suspend a second
+    // time, and let the reactive drain of the same time slot run the body. That
+    // cost a resume per suspend and, worse, put the body BEHIND whatever the
+    // instant had already queued reactively, because it only joined the ring
+    // once Active had already reached it. The tag puts it straight onto the
+    // reactive ring at wake time, in wake order, so the correction is gone.
     void emit_suspend(const char* label) {
-        if (in_program_fn_) {
-            // TODO: a task called from a program block. The trampoline below
-            // would push the TASK's handle onto the reactive ring, not the
-            // calling process's, which is untested. Refused rather than resumed
-            // in the wrong region behind the user's back.
+        // A fork child is exempt: it is a piece of THIS body that the frontend
+        // split out, it has no caller to resume inline (it signals completion by
+        // decrementing the shared join record), and suspending is the entire
+        // point of forking. It is never shared either -- one child body per fork
+        // site -- so its home region is unambiguous.
+        if (in_program_fn_ && (cur_fn_ == nullptr || !cur_fn_->is_fork_child)) {
+            // TODO: a task called from a program block. The wake routing would
+            // now handle it -- the task's own handle would be tagged, and the
+            // caller's handle in the task record already is -- but build_program_fns
+            // computes no shared set, unlike build_reactive_fns: a task reachable
+            // from both a program `initial` and an ordinary process is lowered
+            // once, and one lowering can record only one home region. Refused
+            // until that classification exists, rather than resuming an ordinary
+            // caller's task in Reactive behind its back.
             throw BackendError{ "suspending inside a task called from a `program` block is not "
-                                "supported: it would resume in the Active region" };
+                                "supported: the task body is lowered once and cannot record two "
+                                "home regions" };
         }
         emit_suspend_raw(label);
-        if (in_program_body_) {
-            emit_reactive_push(b_, hdl_);
-            emit_suspend_raw("program.reactive");
-        }
     }
 
     // Lower a #delay, then suspend; execution continues in a fresh resume block.
@@ -3848,12 +3870,16 @@ private:
     // taken path; otherwise we branch at runtime (covers a delay expression that
     // happens to evaluate to 0, which is also inactive).
     //
-    // Reactive code parks in the re-inactive batch instead -- its own region's
-    // dual (LRM 4.4.2.7) -- so an action block that yields comes back in Reactive
-    // rather than Active. Only a #0 can be routed that way: a timer wake pushes
-    // onto the active ring, so a nonzero delay would resume reactive code in the
-    // wrong region of a later slot, and a runtime amount cannot be proven zero.
-    // Both are rejected rather than mis-scheduled.
+    // Reactive code parks a #0 in the re-inactive batch instead -- its own
+    // region's dual (LRM 4.4.2.7) -- so a body that yields comes back in
+    // Reactive rather than Active; emit_zero_delay_push picks. A nonzero delay
+    // needs nothing special either: the awaiter records a parked handle, and the
+    // wheel's expiry trampoline wakes it into the ring that handle names. The
+    // later time slot runs its regions in order (the tick branches to the active
+    // drain, which settles into NBA, then Observed, then the reactive drain), so
+    // a reactive-home sleeper delivered by the wheel at the TOP of that slot is
+    // resumed in that slot's Reactive region -- which is where LRM 4.4.2.6 puts
+    // it.
     void lower_delay(Index amount) {
         llvm::Value* ticks = cast(must_of(value_of(amount)), 64, false);
 
@@ -3861,23 +3887,22 @@ private:
             if (c->isZero()) {
                 emit_zero_delay_push(b_, hdl_);
             } else {
-                reject_reactive_delay("a nonzero delay");
+                // A nonzero delay is region-aware through the awaiter, above.
                 emit_delay_timer(ticks);
             }
             emit_suspend("coro.resume");
             return;
         }
 
-        reject_reactive_delay("a delay by a runtime amount");
-
-        // Runtime amount: branch on zero. Both arms fall through to one suspend.
+        // Runtime amount: branch on zero. Both arms fall through to one suspend,
+        // and the zero arm parks region-aware exactly as the constant one does.
         auto* zero  = llvm::BasicBlock::Create(ctx_, "delay.zero", fn_);
         auto* timer = llvm::BasicBlock::Create(ctx_, "delay.timer", fn_);
         auto* susp  = llvm::BasicBlock::Create(ctx_, "delay.susp", fn_);
         b_.CreateCondBr(b_.CreateICmpEQ(ticks, b_.getInt64(0)), zero, timer);
 
         b_.SetInsertPoint(zero);
-        emit_inactive_push(b_, hdl_);
+        emit_zero_delay_push(b_, hdl_);
         b_.CreateBr(susp);
 
         b_.SetInsertPoint(timer);
@@ -3888,25 +3913,13 @@ private:
         emit_suspend("coro.resume");
     }
 
-    // TODO: reactive code can only be resumed into Reactive through the
-    // re-inactive batch, which holds a #0 and nothing else. Resuming it from a
-    // wheel timer would need the timer callback (emit_delay_timer -> enqueue_fn_)
-    // to carry a destination region. No-op outside reactive code.
-    void reject_reactive_delay(const char* what) {
-        if (in_reactive_body_) {
-            throw BackendError{ std::string(what) +
-                                " in reactive code (the action block of a concurrent assertion) is "
-                                "not supported: only #0, which parks in the Re-Inactive region, can "
-                                "be resumed back into Reactive" };
-        }
-    }
-
     // Schedule a wheel timer for `now + ticks` that resumes this coroutine: stash
     // the handle in the awaiter so the timer callback can find it, then arm the
-    // wheel. Caller emits the suspend.
+    // wheel. Parked, so the trampoline knows which ring to wake it into. Caller
+    // emits the suspend.
     void emit_delay_timer(llvm::Value* ticks) {
         auto* aw = awaiter();
-        b_.CreateStore(hdl_, b_.CreateStructGEP(awaiter_ty(), aw, 2));
+        b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(awaiter_ty(), aw, 2));
         // Schedule-relative: the runtime adds `now` so this #delay crosses the ABI
         // once (rt_wheel_schedule_rel) rather than twice (rt_wheel_now then
         // rt_wheel_schedule).
@@ -3939,16 +3952,31 @@ private:
     }
 
     // One-shot (intra-body @(sig)) registration: append this coroutine to the
-    // signal's dynamic queue, bumping .dyn.len. No bounds check — capacity is the
-    // count of distinct processes that intra-body-wait on the signal, and a process
-    // holds at most one dynamic slot per signal at a time.
+    // signal's dynamic queue, bumping .dyn.len. The entry is parked, so the scan
+    // that wakes it knows whether to push it onto the active or the reactive
+    // ring.
+    //
+    // No bounds check — capacity is the count of distinct processes that
+    // intra-body-wait on the signal, plus one process-chain's worth for every
+    // (signal, edge) a task waits on, and a process holds at most one dynamic
+    // slot per signal at a time (wait_counts).
+    //
+    // TODO: an action block pended by a concurrent assertion is the one waiter
+    // that is not a process chain -- lower_reactive_pend builds a FRESH frame per
+    // failing attempt, and nothing serializes them, so N attempts that each park
+    // on the same (signal, edge) hold N slots at once. wait_counts reserves
+    // mod_.processes().size() of them for all task waits together, which is a
+    // bound on chains, not on pends. Exceeding it overruns the bucket. Sizing
+    // that correctly needs a growable bucket (the same thing join_any / join_none
+    // wait on), so it is named here rather than guessed at; it cannot be refused
+    // at compile time without refusing every action block that blocks at all.
     void emit_dynamic_register(Signal sig, uint32_t edge) {
         const auto   i       = static_cast<uint32_t>(sig);
         llvm::Value* len_ptr = wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i);
         llvm::Value* q       = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
         auto*        i32     = b_.getInt32Ty();
         llvm::Value* len     = b_.CreateLoad(i32, len_ptr);
-        emit_entry(wait_dyn_ty_[i][edge], q, len, hdl_, sched_ptr_);
+        emit_entry(wait_dyn_ty_[i][edge], q, len, parked_handle(b_, hdl_), sched_ptr_);
         b_.CreateStore(b_.CreateAdd(len, b_.getInt32(1)), len_ptr);
     }
 
@@ -4183,9 +4211,14 @@ private:
         return sym(program_live_gv_);
     }
 
-    // Every function this body enables or calls, appended to `work`. Virtual
-    // dispatch contributes its statically named target only -- see the bound
-    // documented on build_reactive_fns.
+    // Every function this body enables, calls or forks, appended to `work`.
+    // Virtual dispatch contributes its statically named target only -- see the
+    // bound documented on build_reactive_fns.
+    //
+    // Fork children count. They are bodies of this one, split out by the
+    // frontend, and they suspend on their own account (that is what a fork is
+    // for), so leaving them out would let a child of an action block or of a
+    // program `initial` park a handle with no home region and resume in Active.
     static void collect_callees(const Ir& ir, std::vector<FunctionId>& work) {
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             const auto           i = static_cast<Index>(k);
@@ -4200,6 +4233,11 @@ private:
                 case Inst::Tag::TaskCallVirtual:
                 case Inst::Tag::CallVirtual:
                     work.push_back(ir.extra_data<VirtualCallInfo>(p.extra).func);
+                    break;
+                case Inst::Tag::Fork:
+                    for (const Index kid : ir.region(ir.extra_data<ForkInfo>(p.extra).children)) {
+                        work.push_back(static_cast<FunctionId>(kid));
+                    }
                     break;
                 default:
                     break;
@@ -4282,59 +4320,95 @@ private:
                 reject_resume_once(p.ir, "Observed", "property evaluation, LRM 4.4.2.5");
             } else if (p.activation == Activation::ReNba) {
                 reject_resume_once(p.ir, "Re-NBA", "clocking block drives, LRM 4.4.2.8");
+            } else if (p.activation == Activation::Reactive) {
+                // A program `initial` (LRM 24.3) is reactive-home too, and its #0
+                // parks in the re-inactive batch exactly as an action block's does.
+                // Noted here, before ensure_re_inactive_queue runs, so the batch
+                // exists whatever order the bodies lower in -- lower_finish empties
+                // whichever queues were created and must see this one.
+                for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
+                    if (p.ir.tag(static_cast<Index>(k)) == Inst::Tag::Delay) {
+                        reactive_has_delay_ = true;
+                        break;
+                    }
+                }
             }
         }
     }
 
+    // A body reached both as reactive code and from ordinary code cannot
+    // suspend. The home region a parked handle carries is decided when the body
+    // is LOWERED (parked_handle reads in_reactive_body_), and a shared body is
+    // lowered exactly once, so one of its two callers would always get the wrong
+    // ring. Refused rather than resumed in a region the caller did not ask for.
+    //
+    // TODO: the fix is one lowering per region -- emit the body twice and let
+    // each call site pick -- which is a code-duplication policy decision, not a
+    // scheduler one, so it is not made here.
+    void reject_shared_reactive_suspend(const std::string& where, bool shared, const char* what) {
+        if (shared) {
+            throw BackendError{ std::string(what) + " in '" + where +
+                                "', which is reached both as reactive code (a concurrent assertion "
+                                "action block) and from ordinary code, is not supported: the body is "
+                                "lowered once and can record only one home region" };
+        }
+    }
+
     // What reactive code may not contain. Every rejection here is a hole in the
-    // region set, not a source error, so each names the region that is missing.
+    // region set, not a source error, so each names what is missing. The
+    // frontend's ReactiveSafetyChecker refuses the same shapes with a source
+    // location; this is the backend's independent backstop and the two are kept
+    // in agreement deliberately.
     void reject_unsupported_reactive(const std::string& where, const Ir& ir, bool shared) {
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             switch (ir.tag(static_cast<Index>(k))) {
                 case Inst::Tag::StoreNbDelay:
                 case Inst::Tag::StoreNbEvent:
                 case Inst::Tag::StoreInertialDelay:
-                    // TODO: a plain `x <= y` commits in Re-NBA (re_nba.commit in
-                    // emit_active_run), but these three carry their own timing. The
-                    // suspension lives inside the assignment's own record and the
-                    // wake that releases it pushes onto the active ring, so the
-                    // store would come back in the wrong region set. Needs that
-                    // wake parameterized over a destination region, as Wait/Fork
-                    // below do.
+                    // TODO: no longer a wake-path problem -- none of these three
+                    // suspends the issuing process, so the parked handle has
+                    // nothing to say about them. What is unsettled is the COMMIT
+                    // region. A plain `x <= y` issued in Reactive commits in
+                    // Re-NBA (re_nba.commit in emit_active_run). These carry their
+                    // own timing, so the update lands in a LATER time slot, where
+                    // emit_intra_commit runs it in that slot's ordinary NBA region
+                    // -- not its Re-NBA one. LRM 4.4.2.8 describes Re-NBA as the
+                    // region for nonblocking updates issued from the reactive
+                    // region set, without saying which slot's region a delayed one
+                    // belongs to, and the LRM does not settle it. Refused rather than
+                    // guessed.
                     throw BackendError{ "a delayed or event-controlled nonblocking assignment in "
                                         "reactive code (the action block of a concurrent assertion, "
                                         "here in '" +
                                         where + "') is not supported" };
-                case Inst::Tag::EventTriggerNb:
-                case Inst::Tag::EventTriggerNbDelayed:
-                    // TODO: the region machinery for this already exists --
-                    // re_nba.commit fires a pending `->> e`, and the reactive drain
-                    // re-settles the active set afterwards, so its waiters run in
-                    // this time slot. What is missing is a frontend decision:
-                    // ReactiveSafetyChecker refuses every event trigger in an action
-                    // block, `->` and `->>` alike, and lifting just the nonblocking
-                    // one belongs with that change rather than here.
-                    throw BackendError{ "a nonblocking event trigger in reactive code (the action "
-                                        "block of a concurrent assertion, here in '" +
-                                        where + "') is not supported" };
-                case Inst::Tag::Wait:
-                case Inst::Tag::Fork:
-                    // TODO: reactive code that blocks on an event or forks has to be
-                    // resumed back into Reactive, but every wake path (static
-                    // subscription, wheel timer, join record) pushes onto the active
-                    // ring. Needs those sites parameterized over a destination region.
-                    throw BackendError{ "an event control or fork in reactive code (the action block "
-                                        "of a concurrent assertion, here in '" +
-                                        where + "') is not supported" };
+                case Inst::Tag::ExpectWait:
+                    // Owned by the `expect` lowering (ExpectStmt); recorded here
+                    // because this function is the backend's single backstop for
+                    // what reactive code may contain. ExpectWake needs no case: it
+                    // is emitted only by emit_monitor into its own Observed
+                    // process and can never appear in a body a user wrote.
+                    throw BackendError{ "an `expect` inside reactive code (the action block of a "
+                                        "concurrent assertion) is not supported: it blocks the "
+                                        "executing process until its property completes, and an "
+                                        "action block is a zero-time thunk the reactive drain "
+                                        "resumes exactly once" };
                 case Inst::Tag::Delay:
-                    if (shared) {
-                        // TODO: one lowering per region. Only the call site knows
-                        // whether this body's #0 parks in Inactive or Re-Inactive.
-                        throw BackendError{ "a delay in '" + where +
-                                            "', which is reached both as reactive code (a concurrent "
-                                            "assertion action block) and from ordinary code, is not supported" };
-                    }
+                    reject_shared_reactive_suspend(where, shared, "a delay");
+                    // A #0 in reactive code parks in the re-inactive batch, which
+                    // has to exist before any body lowers (see run()).
                     reactive_has_delay_ = true;
+                    break;
+                case Inst::Tag::Wait:
+                    reject_shared_reactive_suspend(where, shared, "an event control");
+                    break;
+                case Inst::Tag::Fork:
+                    reject_shared_reactive_suspend(where, shared, "a fork");
+                    break;
+                case Inst::Tag::TaskCall:
+                case Inst::Tag::TaskCallVirtual:
+                    // A task enable parks the CALLER's handle in the task record
+                    // whenever the task consumes time, so it is a suspend site too.
+                    reject_shared_reactive_suspend(where, shared, "a task enable");
                     break;
                 default:
                     break;
@@ -5092,6 +5166,7 @@ private:
         return false;
     }
 
+
     // Comb-fusion eligibility (analysis only — grouping lands with the comb
     // fusion phase). A member of a union-sensitivity fused group can be run
     // when its own trigger did NOT fire. Such a spurious run is unobservable —
@@ -5102,6 +5177,7 @@ private:
     // downstream can tell the run happened. The verdict enumerates exactly the
     // conditions that argument needs; purity is a whitelist, so a new IR tag
     // defaults to ineligible.
+
 
     // Comb-fusion coverage probe: verdict histogram over Always processes plus
     // the count V1 fusion left in singleton groups (the comb-fusion
@@ -6739,8 +6815,10 @@ private:
     // Compacting removal of this coroutine's entries from one (signal, edge)
     // dynamic bucket, used on resume from a multi-signal wait: the firing bucket
     // already cleared us, but the others still hold our now-stale entry. Slides
-    // every entry whose handle != hdl_ down to fill the gaps and trims the length:
-    //   w = 0; for i in 0..len: if Q[i].handle != hdl_ { Q[w++] = Q[i] } ; len = w
+    // every entry that is not ours down to fill the gaps and trims the length:
+    //   w = 0; for i in 0..len: if Q[i].handle != mine { Q[w++] = Q[i] } ; len = w
+    // `mine` is the PARKED form of this handle -- what emit_dynamic_register
+    // wrote -- so the comparison matches for reactive code too.
     void emit_dynamic_remove(Signal sig, uint32_t edge) {
         const auto        i      = static_cast<uint32_t>(sig);
         llvm::Value*      q      = wait_base(wait_slot_dyn_[i][edge], wait_dyn_gv_[i][edge], i);
@@ -6771,7 +6849,7 @@ private:
         llvm::Value* src  = b_.CreateInBoundsGEP(arr_ty, q, { b_.getInt32(0), idx });
         llvm::Value* h    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 0));
         llvm::Value* f    = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(elem, src, 1));
-        llvm::Value* mine = b_.CreateICmpEQ(h, hdl_);
+        llvm::Value* mine = b_.CreateICmpEQ(h, parked_handle(b_, hdl_));
         b_.CreateCondBr(mine, cont, keep); // ours -> drop; else -> keep
 
         b_.SetInsertPoint(keep);
@@ -6894,10 +6972,22 @@ private:
     }
 
     // The reactive ring (LRM 4.4.2.6): where a concurrent assertion's action
-    // block runs. Same shape, capacity and mask as the active ring, and the same
-    // bound justifies it -- a pend ramps one frame, and the ring is drained to
-    // empty within the instant that filled it, before time can advance. Created
-    // once, lazily, and only for a design that has reactive code.
+    // block runs, and where a program `initial` (LRM 24.3) lives. Same shape,
+    // capacity and mask as the active ring, and mostly the same bound justifies
+    // it: a program `initial` is a Process, so it is already counted in the
+    // capacity, and a pend ramps one frame that the drain empties before time
+    // can advance.
+    //
+    // TODO: that last clause is no longer the whole story. An action block may
+    // now block (an event control, a fork, a #delay), so a frame pended at one
+    // instant can still be parked when the next attempt pends another, and the
+    // peak number of READY reactive frames is bounded by how many attempts fail
+    // while one is blocked -- which is not a static quantity. Overrunning the
+    // ring corrupts it silently. The same growable ring that join_any / join_none
+    // are waiting on is what fixes this; it is named here rather than guessed at,
+    // because sizing it to a constant would only move the cliff.
+    //
+    // Created once, lazily, and only for a design that has reactive code.
     void ensure_reactive_queue() {
         if (reactive_gv_ != nullptr) {
             return;
@@ -6957,15 +7047,158 @@ private:
         b.CreateStore(b.CreateAdd(sp, b.getInt32(1)), sym(re_inactive_top_gv_));
     }
 
-    // A #0 parks in the inactive queue, or in its reactive dual when the body
-    // running it is reactive code (LRM 4.4.2.7): a suspended action block has to
-    // come back in Reactive, not Active, or the rest of the region order is wrong.
-    void emit_zero_delay_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
-        if (in_program_body_) {
-            throw BackendError{ "a #0 delay inside a `program` block is not supported: it would resume "
-                                "through the Inactive region rather than Re-Inactive" };
+    // -- Where a parked coroutine comes back --
+    //
+    // A handle parked for a later wake carries its own destination region, in
+    // bit 1 of the pointer. Reactive code that blocks -- an action block on an
+    // event, a program `initial` on a #delay -- has to be resumed into the
+    // REACTIVE ring, and the sites that do the waking cannot work that out for
+    // themselves: one static subscription array, one wheel timer callback and
+    // one join record each hold handles belonging to bodies with different home
+    // regions, so no statically specialized wake site is possible. The
+    // suspending body, on the other hand, knows the answer at lowering time.
+    //
+    // A bit in the pointer rather than a field beside it. The record that
+    // decides this is wait_elem_ty: there is one entry per subscription per
+    // edge across the whole design, statically sized, so widening it spends
+    // real memory in every design -- including every design with no reactive
+    // code at all, which is nearly all of them. The tag spends nothing to
+    // store, and one `and`, one `icmp` and three `select`s to read, all on a
+    // pointer the wake site has already loaded.
+    //
+    // Bit 1, because bit 0 already means "thunk, not coroutine" (the seed loop
+    // in emit_active_run, and the thunk split in both drains). The two tags are
+    // mutually exclusive by construction -- a thunk group is elided ordinary
+    // code, never reactive -- so the test below is for bit 1 set AND bit 0
+    // clear, and the mask is applied only when that holds. A thunk's function
+    // pointer therefore never reads as reactive and never has its low bits
+    // rewritten, which keeps this free of any alignment assumption beyond the
+    // bit-0 one the thunk tag already makes. Coroutine frames come from
+    // rt_alloc, whose low three bits are free.
+    static constexpr uint64_t kReactiveHomeTag = 2;
+
+    // Whether the body being lowered must come back in Reactive when something
+    // wakes it: a concurrent assertion's action block, a program `initial` (LRM
+    // 24.3), or a subroutine / fork child of either. All live in the reactive
+    // region set.
+    //
+    // in_program_fn_ is safe to include even though build_program_fns computes no
+    // shared set: the only program-reachable body that can reach a park site is a
+    // fork child (emit_suspend refuses every other one), and a fork child belongs
+    // to exactly one fork site, so it is never shared.
+    bool reactive_home() const { return in_reactive_body_ || in_program_body_ || in_program_fn_; }
+
+    // The body's home region as a RUNTIME value: an i8 spilled into the
+    // coroutine frame, holding 0 for Active or kReactiveHomeTag for Reactive, so
+    // it can be OR'd straight into a handle with no select.
+    //
+    // Almost every body's home is a lexical constant and parked_handle folds it.
+    // `expect` (LRM 16.17) is the exception: it resumes the executing process
+    // into Reactive, and LRM 24.3.1 makes the region a property of the THREAD
+    // from then on -- "all subsequent blocking statements in that thread are
+    // scheduled in the Reactive region" -- so a body that executes one has to
+    // carry a home that can change under it. Created only for such a body
+    // (body_home_is_runtime_), so no other design pays a load per park.
+    //
+    // In the frame rather than in a per-process global: a frame alloca is
+    // per-instance for free, which a global indexed by process is not under
+    // module dedup (see the anchor bookkeeping in build_sched_flags), and it
+    // serves a task body on the same terms as a process body. Hoisted to
+    // coro.begin, like the awaiter and the fork record, because it must outlive
+    // every suspend.
+    llvm::Value* home_ptr() {
+        if (home_ptr_ == nullptr) {
+            llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+            home_ptr_ = ab.CreateAlloca(ab.getInt8Ty(), nullptr, "home_region");
+            // Seeded with the lexical answer, so a body that never reaches its
+            // expect behaves exactly as the folded form would.
+            ab.CreateStore(ab.getInt8(reactive_home() ? kReactiveHomeTag : 0), home_ptr_);
         }
-        if (in_reactive_body_) {
+        return home_ptr_;
+    }
+
+    // The value to record when parking this coroutine for a later wake. Folded at
+    // lowering time unless the body can migrate region under an `expect`, so
+    // ordinary code emits the bare handle and every wake of it reads Active with
+    // no tag ever materialized.
+    llvm::Value* parked_handle(llvm::IRBuilder<>& b, llvm::Value* handle) {
+        auto* i64 = b.getInt64Ty();
+        // Tie the tag to the exact flag emit_wake_push tests before masking it
+        // off. A tag emitted while that path is compiled out would never be
+        // stripped, and the ring would hold a handle two bytes past its frame --
+        // a crash, not merely a wrong region. Both sides read design_uses_reactive_
+        // so the pair cannot drift; a body can only be reactive-home, or run an
+        // expect, in a design where this is already true.
+        if (!design_uses_reactive_) {
+            return handle;
+        }
+        if (body_home_is_runtime_) {
+            llvm::Value* tag = b.CreateZExt(b.CreateLoad(b.getInt8Ty(), home_ptr()), i64);
+            return b.CreateIntToPtr(b.CreateOr(b.CreatePtrToInt(handle, i64), tag),
+                                    llvm::PointerType::getUnqual(ctx_));
+        }
+        if (!reactive_home()) {
+            return handle;
+        }
+        return b.CreateIntToPtr(
+          b.CreateOr(b.CreatePtrToInt(handle, i64), llvm::ConstantInt::get(i64, kReactiveHomeTag)),
+          llvm::PointerType::getUnqual(ctx_));
+    }
+
+    // Whether `ir` executes an `expect`, i.e. whether its home region can change
+    // while it runs. Direct occurrences only: an expect inside a task would need
+    // the region to travel up the call chain to the process's frame, which this
+    // per-frame slot cannot do, and the `expect` lowering refuses that shape.
+    static bool ir_has_expect_wait(const Ir& ir) {
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            if (ir.tag(static_cast<Index>(k)) == Inst::Tag::ExpectWait) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Wake a parked handle into the ring it named when it parked. Branch-free
+    // like the rest of the scheduler: the two rings share queue_arr_ty_ and
+    // active_mask_, so only the array and the tail counter differ and both are
+    // selected. Replaces emit_active_push at every site that wakes somebody
+    // else's handle -- the two wait-queue scans, the wheel timer trampoline and
+    // the task / fork-join epilogue. The seed loop still pushes directly: it
+    // creates the handles, so it knows their region without asking.
+    void emit_wake_push(llvm::IRBuilder<>& b, llvm::Value* parked) {
+        if (!design_uses_reactive_) {
+            // No body in this design can be reactive-home, so nothing was ever
+            // tagged and the reactive ring does not exist. Same code as before.
+            emit_active_push(b, parked);
+            return;
+        }
+        ensure_active_queue();
+        ensure_reactive_queue();
+        auto*        i64  = b.getInt64Ty();
+        auto*        i32  = b.getInt32Ty();
+        llvm::Value* addr = b.CreatePtrToInt(parked, i64);
+        llvm::Value* home = b.CreateICmpEQ(b.CreateAnd(addr, llvm::ConstantInt::get(i64, 3)),
+                                           llvm::ConstantInt::get(i64, kReactiveHomeTag));
+        llvm::Value* bare = b.CreateAnd(addr, llvm::ConstantInt::get(i64, ~kReactiveHomeTag));
+        llvm::Value* hdl  = b.CreateIntToPtr(b.CreateSelect(home, bare, addr),
+                                             llvm::PointerType::getUnqual(ctx_));
+        llvm::Value* arr  = b.CreateSelect(home, sym(reactive_gv_), sym(active_gv_));
+        llvm::Value* tp   = b.CreateSelect(home, sym(reactive_tail_gv_), sym(active_tail_gv_));
+        llvm::Value* tl   = b.CreateLoad(i32, tp);
+        llvm::Value* idx  = b.CreateAnd(tl, b.getInt32(active_mask_));
+        llvm::Value* slot = b.CreateInBoundsGEP(queue_arr_ty_, arr, { b.getInt32(0), idx });
+        b.CreateStore(hdl, slot);
+        b.CreateStore(b.CreateAdd(tl, b.getInt32(1)), tp);
+    }
+
+    // A #0 parks in the inactive queue, or in its reactive dual when the body
+    // running it belongs to the reactive region set (LRM 4.4.2.7): a suspended
+    // action block, or a suspended program `initial`, has to come back in
+    // Reactive, not Active, or the rest of the region order is wrong. The batch
+    // promotes into the reactive ring untagged, exactly as it is pushed here --
+    // a ring entry is a plain handle, never a parked one.
+    void emit_zero_delay_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
+        if (reactive_home()) {
             emit_re_inactive_push(b, handle);
         } else {
             emit_inactive_push(b, handle);
@@ -7023,7 +7256,7 @@ private:
         b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0)), cont, wake);
 
         b_.SetInsertPoint(wake);
-        emit_active_push(b_, h);
+        emit_wake_push(b_, h);
         b_.CreateStore(b_.getInt32(1), fptr);
         b_.CreateBr(cont);
 
@@ -7067,7 +7300,7 @@ private:
         b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0)), cont, wake);
 
         b_.SetInsertPoint(wake);
-        emit_active_push(b_, h);
+        emit_wake_push(b_, h);
         b_.CreateStore(b_.getInt32(1), fptr);
         b_.CreateBr(cont);
 
@@ -9303,6 +9536,8 @@ private:
             case Inst::Tag::FDisplay:
             case Inst::Tag::StrobePend:
             case Inst::Tag::ReactivePend:
+            case Inst::Tag::ExpectWait:
+            case Inst::Tag::ExpectWake:
             case Inst::Tag::MonitorSet:
             case Inst::Tag::MonitorEmit:
             case Inst::Tag::MonitorOn:
@@ -10818,6 +11053,12 @@ private:
             case Inst::Tag::ReactivePend:
                 lower_reactive_pend(i);
                 return;
+            case Inst::Tag::ExpectWait:
+                lower_expect_wait(i);
+                return;
+            case Inst::Tag::ExpectWake:
+                lower_expect_wake(i);
+                return;
             case Inst::Tag::MonitorSet:
                 b_.CreateCall(monitor_set_fn(),
                               { sym(fn_decls_[static_cast<uint32_t>(
@@ -12065,6 +12306,7 @@ private:
         }
     }
 
+
     // Deferred-buffer index for an aggregate NBA signal: the aggregate buffers
     // follow the array buffers in the shared runtime index space (rt_nba_arr_*).
     uint32_t agg_buf_idx(Signal sig) const {
@@ -13019,6 +13261,130 @@ private:
 
         llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, { state_, wheel_, reactive_record_slot() });
         emit_reactive_push(b_, hdl);
+    }
+
+    // The waiter queue of one `expect` (LRM 16.17): an array of parked handles and
+    // a count, created on first use and keyed by monitor index -- which is what
+    // both halves of an expect name, the wait to push and the wake to drain.
+    //
+    // Shaped like the inactive batch rather than like a ring, because a cohort is
+    // drained whole and never partially: the count goes back to zero in the same
+    // step that empties it, so there is no wraparound to mask for.
+    std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*> expect_queue(uint32_t monitor) {
+        if (const auto it = expect_queue_.find(monitor); it != expect_queue_.end()) {
+            return it->second;
+        }
+        // queue_arr_ty_ is shared by every queue, and the drain pushes onto the
+        // reactive ring, so both must exist before the first waiter parks.
+        ensure_reactive_queue();
+        auto*             i32  = llvm::Type::getInt32Ty(ctx_);
+        const std::string base = "clotho.expect" + std::to_string(monitor);
+        auto*             arr  = new llvm::GlobalVariable(env_->llmod, queue_arr_ty_, false,
+                                                          llvm::GlobalValue::InternalLinkage,
+                                                          llvm::ConstantAggregateZero::get(queue_arr_ty_), base);
+        auto*             top  = new llvm::GlobalVariable(env_->llmod, i32, false,
+                                                          llvm::GlobalValue::InternalLinkage,
+                                                          llvm::ConstantInt::get(i32, 0), base + "_top");
+        const std::pair   entry{ arr, top };
+        expect_queue_.emplace(monitor, entry);
+        return entry;
+    }
+
+    // Lower an `expect_wait` (LRM 16.17): park this process in the monitor's
+    // waiter queue and suspend. The request store that asks the monitor for an
+    // attempt is a separate Store the frontend already emitted above this.
+    //
+    // emit_suspend_raw and not emit_suspend: the wake pushes straight onto the
+    // reactive ring (lower_expect_wake), so there is no region to correct on the
+    // way back in -- the handle is already where it belongs. For the same reason
+    // the handle is stored bare rather than through parked_handle: a home-region
+    // tag would have to be masked off again before the push, and an expect's
+    // destination is not its home region anyway. It is the verdict's region.
+    void lower_expect_wait(Index i) {
+        if (cur_fn_ != nullptr) {
+            // A task's epilogue resumes its caller through the caller's own wake
+            // path, so an `expect` in here would resolve in Reactive and then hand
+            // the rest of the CALLER's statement back in whatever region that path
+            // chooses -- Active, for an ordinary process. The blocking is right and
+            // the region is not, which is a divergence with no diagnostic, so it is
+            // refused instead.
+            // TODO: `expect` inside a task (LRM 16.17 puts no restriction on where
+            // the statement appears). Needs the resume region to travel with the
+            // REASON for the wake rather than with the parked body, so that a task
+            // returning into a blocked caller can carry it up the chain.
+            throw BackendError{ "an `expect` inside a task or function is not supported: the process it "
+                                "blocks would resume in the Active region" };
+        }
+        const auto info      = ir_->extra_data<ExpectInfo>(ir_->payload(i).extra);
+        const auto [arr, top] = expect_queue(info.monitor);
+
+        auto*        i32  = b_.getInt32Ty();
+        llvm::Value* sp   = b_.CreateLoad(i32, sym(top));
+        llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, sym(arr), { b_.getInt32(0), sp });
+        b_.CreateStore(hdl_, slot);
+        b_.CreateStore(b_.CreateAdd(sp, b_.getInt32(1)), sym(top));
+        // Armed for the same reason a `wait` arms: while parked here this process
+        // sits in no other queue, so the flag must say "not scheduled" or a later
+        // event wake would be dropped as a duplicate.
+        b_.CreateStore(b_.getInt32(0), sched_ptr_);
+        emit_suspend_raw("expect.resume");
+
+        // Past the resume point, so this thread is now running in the Reactive
+        // region -- and by LRM 24.3.1 it stays there: "all subsequent blocking
+        // statements in that thread are scheduled in the Reactive region". So the
+        // home region is updated for every LATER park in this body, and deliberately
+        // not before the suspend above, which would have moved the park we just took.
+        // Without this, the next `@` or `#delay` in the process would park with home
+        // = Active and silently migrate the thread back one statement later.
+        b_.CreateStore(b_.getInt8(kReactiveHomeTag), home_ptr());
+    }
+
+    // Lower an `expect_wake`: when the operand says this monitor's attempt reached
+    // a verdict this cycle, move every waiter it holds onto the reactive ring.
+    //
+    // The whole cohort, unconditionally, because the whole cohort belongs to the
+    // attempt that just resolved -- the frontend refuses a process that tries to
+    // join while an attempt is in flight, so the queue can hold nobody else.
+    //
+    // Emitted from the monitor's Observed process, after the same step pended the
+    // pass/fail action blocks: the ring drains in push order, so an `expect`'s own
+    // action runs before the statements that follow the `expect`.
+    void lower_expect_wake(Index i) {
+        const auto&  p        = ir_->payload(i).op_imm;
+        const auto [arr, top] = expect_queue(p.imm);
+        auto*        i32      = b_.getInt32Ty();
+        auto*        ptr_ty   = llvm::PointerType::getUnqual(ctx_);
+
+        auto* drain = llvm::BasicBlock::Create(ctx_, "expect.drain", fn_);
+        auto* head  = llvm::BasicBlock::Create(ctx_, "expect.drain.head", fn_);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "expect.drain.body", fn_);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "expect.drain.done", fn_);
+
+        // must=1 holds only for a definite 1, so an x verdict bit cannot resolve
+        // anybody -- the same reading lower_cond gives every condition.
+        b_.CreateCondBr(b_.CreateICmpNE(must_of(value_of(p.op)), zero(1)), drain, done);
+
+        b_.SetInsertPoint(drain);
+        llvm::Value* n = b_.CreateLoad(i32, sym(top));
+        // Emptied before the pushes, not after: a woken process may execute this
+        // very `expect` again once it runs, and that push must land in an empty
+        // queue rather than be swallowed by this drain's own store.
+        b_.CreateStore(b_.getInt32(0), sym(top));
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        llvm::PHINode* idx = b_.CreatePHI(i32, 2, "waiter");
+        idx->addIncoming(b_.getInt32(0), drain);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* slot = b_.CreateInBoundsGEP(queue_arr_ty_, sym(arr), { b_.getInt32(0), idx });
+        emit_reactive_push(b_, b_.CreateLoad(ptr_ty, slot));
+        llvm::Value* next = b_.CreateAdd(idx, b_.getInt32(1));
+        idx->addIncoming(next, b_.GetInsertBlock());
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
     }
 
     // The task-call record a reactive pend hands its action block. Unlike a
@@ -15809,15 +16175,16 @@ private:
             b_.SetInsertPoint(nx);
         }
 
-        // Join: if every child already finished (count 0), fall through; else record
-        // our handle and suspend — the last child to finish resumes us.
+        // Join: if every child already finished (count 0), fall through; else park
+        // our handle and suspend — the last child to finish resumes us, into the
+        // ring the parked handle names.
         llvm::Value* cnt  = b_.CreateLoad(i32, b_.CreateStructGEP(rty, rec, 0));
         auto*        susp = llvm::BasicBlock::Create(ctx_, "fork.join.suspend", fn_);
         auto*        cont = llvm::BasicBlock::Create(ctx_, "fork.join.cont", fn_);
         b_.CreateCondBr(b_.CreateICmpEQ(cnt, b_.getInt32(0)), cont, susp);
 
         b_.SetInsertPoint(susp);
-        b_.CreateStore(hdl_, b_.CreateStructGEP(rty, rec, 1));
+        b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(rty, rec, 1));
         emit_suspend("fork.join.resume");
         b_.CreateBr(cont);
 
@@ -15912,11 +16279,12 @@ private:
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { task_hdl });
         b_.CreateBr(cont_bb);
 
-        // Blocked: record our handle so the task resumes us when it completes, then
-        // suspend. The task drives itself through the wheel / wait queues and the
-        // scheduler destroys it on completion (coro.done in the drain loop).
+        // Blocked: park our handle so the task resumes us, into the ring that
+        // handle names, when it completes; then suspend. The task drives itself
+        // through the wheel / wait queues and the scheduler destroys it on
+        // completion (coro.done in the drain loop).
         b_.SetInsertPoint(async_bb);
-        b_.CreateStore(hdl_, record);
+        b_.CreateStore(parked_handle(b_, hdl_), record);
         emit_suspend("task.resume");
         b_.CreateBr(cont_bb);
 
@@ -18097,6 +18465,14 @@ private:
     // The current coroutine's scheduled flag: &clotho.proc_sched[this process] for
     // a process (a Constant GEP), or a frame-resident i32 alloca for a task.
     llvm::Value*        sched_ptr_       = nullptr;
+    // The body's runtime home-region slot (home_ptr), an i8 alloca spilled into
+    // the coroutine frame. Null unless body_home_is_runtime_ -- almost every body
+    // folds its home at lowering time instead.
+    llvm::Value*        home_ptr_        = nullptr;
+    // Whether the body currently lowering executes an `expect`, whose resume
+    // moves the thread into the Reactive region for good (LRM 24.3.1). Such a
+    // body reads its home from home_ptr_ at every park instead of folding it.
+    bool                body_home_is_runtime_ = false;
     // Deferred def-relative sched addressing chosen by lower_group (see
     // materialize_sched_ptr); no_anchor when the absolute constant is used.
     // sched_group_ is the fusion-group index currently lowering (feeds the
@@ -18140,6 +18516,15 @@ private:
     llvm::GlobalVariable*               re_inactive_gv_    = nullptr;
     llvm::GlobalVariable*               re_inactive_top_gv_ = nullptr;
     llvm::GlobalVariable*               reactive_record_gv_ = nullptr;
+    // Per-`expect` waiter queues (LRM 16.17), keyed by monitor index and created
+    // on demand by expect_queue: {array of parked handles, count}. Same shape as
+    // the inactive batch -- push at the top, drain the whole thing -- because an
+    // expect's cohort is drained in one go and never partially.
+    //
+    // Sized like the rings, and the same bound justifies it exactly: a process can
+    // be parked on at most one `expect` at a time, so one slot per process is
+    // enough for every waiter one monitor can hold.
+    ankerl::unordered_dense::map<uint32_t, std::pair<llvm::GlobalVariable*, llvm::GlobalVariable*>> expect_queue_;
     llvm::ArrayType*                    queue_arr_ty_      = nullptr;
     uint32_t                            active_mask_       = 0;
     // Process indices in static-subscription order (compute_subscription_order).

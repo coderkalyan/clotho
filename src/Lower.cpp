@@ -682,47 +682,85 @@ struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
 };
 
 // Detects everything an assertion action block may not contain, for
-// Lowerer::require_reactive_safe. File scope rather than a local struct: the
-// statement whitelist below has to be a member template, and a local class may
-// not have one ([temp.mem]).
+// Lowerer::require_reactive_safe and Lowerer::require_finish_inlinable. File
+// scope rather than a local struct: the statement whitelist below has to be a
+// member template, and a local class may not have one ([temp.mem]).
 struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::AllGood> {
-    // Why a construct cannot appear in reactive code. Every rejection names one,
-    // because "not supported" alone does not tell the reader which region is
-    // missing and therefore what would have to be built.
-    static constexpr std::string_view kWrongRegion =
-      "every path that would wake it -- the timer wheel, a static subscription, a join "
-      "record -- pushes onto the Active ring, so the body would resume in the wrong region";
+    // An action block is lowered TWICE, into two contexts that can run different
+    // things, so this walk runs once per copy and is told which one it is looking
+    // at. That split is the shape of the whole check: suspending used to
+    // disqualify a construct outright, and now disqualifies it in one copy only.
+    //
+    //  * `Pended` is the copy a verdict hands to the Reactive region as its own
+    //    coroutine (build_action_body, emit_action_pends). It MAY suspend. A
+    //    parked coroutine records the region it parked from, and every wake path
+    //    -- a static subscription, the timer wheel, a join record -- pushes the
+    //    handle onto the ring that handle names rather than onto the Active one
+    //    (emit_wake_push, src/ir/LlvmBackend.cpp), so a body that blocks on an
+    //    event comes back in Reactive. LRM 24.3.1 asks for exactly that, and asks
+    //    it of the THREAD rather than of the wake site -- said there of the region
+    //    set's other inhabitant, a program block, which clotho already runs this
+    //    way; 4.4.2.6 makes an action block a thread of the same region set, and
+    //    4.4.2.7 is the special case of it for `#0`.
+    //
+    //  * `Inlined` is the end-of-trace copy of the FAIL action, and only a STRONG
+    //    property has one: LRM 16.12.2 makes an attempt the trace ended
+    //    underneath a failure, and Final is past the last time slot's Reactive
+    //    drain, so emit_monitor_finish lowers the action straight into a Final
+    //    process instead of pending a body nothing would resume. That process is
+    //    resumed exactly once and then destroyed (emit_finals_run in
+    //    LlvmBackend.cpp), and no later region exists to bring it back -- so a
+    //    suspension there drops everything after it without a word, which is the
+    //    one outcome the project forbids outright.
+    //
+    // A nonblocking assignment and a nonblocking event trigger are the two
+    // constructs that survive into the inlined copy while doing nothing there.
+    // Both are correct rather than dropped: the region they would commit in is
+    // past, and LRM 9.2.3 gives a `final` block the same deal, so an NBA cannot
+    // commit there either.
+    enum class Copy : uint8_t { Pended, Inlined };
 
-    // The enclosing scope, for constant-folding a delay amount.
-    const Scope* scope = nullptr;
+    // Which of the two copies this walk is checking.
+    Copy copy = Copy::Pended;
     // The first offending construct, empty while the walk stays clean.
     std::string reason;
 
+    // Why a construct cannot appear in the copy being walked. Every rejection
+    // names one, because "not supported" alone does not tell the reader what is
+    // missing and therefore what would have to be built.
+
+    // A suspension in the inlined copy. The remedy is spelled out because the
+    // cause is not where the user is looking: the action block is fine, and it is
+    // the property's STRENGTH that gives it a second home in Final.
+    static constexpr std::string_view kFinalCopy =
+      "a strong property makes an attempt still pending at the end of the trace a failure (LRM "
+      "16.12.2), and that failure runs its action inside a `final` process, which is resumed "
+      "exactly once and then destroyed -- so everything after the suspension would be dropped "
+      "silently. Weaken the property or take the suspension out of the action block";
+
     void reject(std::string_view what, std::string_view why) {
         if (reason.empty()) {
-            reason = std::string(what).append(" in an assertion action block is not supported: ").append(why);
+            reason = std::string(what)
+                       .append(copy == Copy::Pended ? " in an assertion action block is not supported: "
+                                                    : " in the action block of a strong assertion is not supported: ")
+                       .append(why);
         }
     }
 
-    // True for a `#0` whose amount folds to a literal zero. LRM 4.4.2.7 makes that
-    // legal in reactive code: it parks in Re-Inactive and is promoted back into
-    // Reactive at the same instant, so it consumes no time and stays in the region
-    // set the action block belongs to. Gated on the amount being zero rather than
-    // on the construct being a delay, so `#5` and a run-time amount still fail --
-    // both would resume through the wheel, which pushes onto the Active ring.
-    bool is_zero_delay(const TimingControl& tc) const {
-        if (tc.kind != TimingControlKind::Delay) {
-            return false;
+    // A construct that suspends and nothing more. Legal in the pended copy, where
+    // the wake carries the handle's home region -- and a delay is now one of them:
+    // a wheel timer records its target as a parked handle, so it fires into the
+    // reactive ring of the slot it matures in and that slot's drain resumes it
+    // there (emit_delay_timer / emit_wake_push in LlvmBackend.cpp). Never legal in
+    // the inlined copy, which has no second resume at all.
+    //
+    // So `#0`, `#5` and a run-time `#d` are one case here rather than three. They
+    // used to be told apart by constant-folding the amount, because only `#0` had
+    // a region to come back through; the fold is gone with the distinction.
+    void suspends(std::string_view what) {
+        if (copy == Copy::Inlined) {
+            reject(what, kFinalCopy);
         }
-        slang::ast::ASTContext     actx(*scope, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ectx(actx);
-        const slang::ConstantValue cv = tc.as<DelayControl>().expr.eval(ectx);
-        if (!cv.isInteger()) {
-            return false;
-        }
-        const auto v = cv.integer().as<uint64_t>();
-
-        return v.has_value() && *v == 0;
     }
 
     // Templated on the concrete leaf type rather than taking a plain
@@ -751,9 +789,19 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
             case StatementKind::ProceduralDeassign:
                 break;
             case StatementKind::Block:
-                // A `fork` spawns processes that outlive the thunk.
+                // Not the region any more -- a fork's join record parks the parent
+                // as a handle and its wake carries that handle's region, and a
+                // child is resumed inline at the spawn (lower_fork_inst), so it
+                // never goes through a ring at all. What is left is that clotho
+                // does not lower a fork inside a task or function AT ALL: a child
+                // aliases the enclosing PROCESS's signals, which a task frame's
+                // locals are not (lower_fork), and an action block is lowered as a
+                // task. Named here rather than left to lower_fork, because this
+                // walk runs first and would otherwise blame the wrong thing.
                 if (s.template as<BlockStatement>().blockKind != StatementBlockKind::Sequential) {
-                    reject("a fork", kWrongRegion);
+                    reject("a fork",
+                           "clotho does not lower a fork inside a task or function, and an action "
+                           "block is lowered as a task body");
                 }
                 break;
             case StatementKind::ImmediateAssertion:
@@ -763,34 +811,82 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                            "past, so the report would never be flushed");
                 }
                 break;
-            case StatementKind::Timed: {
-                const TimingControl& tc = s.template as<TimedStatement>().timing;
-                if (tc.kind != TimingControlKind::Delay) {
-                    reject("an event control", kWrongRegion);
-                } else if (!is_zero_delay(tc)) {
-                    reject("a nonzero delay", kWrongRegion);
-                }
+            case StatementKind::Timed:
+                // Both flavours park the body as a handle, so both wakes know to
+                // come back into Reactive: an event control (`@(posedge clk)`, `@e`,
+                // `@(a or b)`) through an ordinary signal subscription, a delay
+                // through the wheel. LRM 24.3.1 says the region travels with the
+                // THREAD rather than with the wake site, which is what this relies
+                // on; 4.4.2.7 is the special case of it for `#0`.
+                suspends(s.template as<TimedStatement>().timing.kind == TimingControlKind::Delay
+                           ? "a delay"
+                           : "an event control");
                 break;
-            }
             case StatementKind::Wait:
+                // `wait (cond)` lowers to a level-sensitive park on every signal the
+                // condition reads (lower_wait_stmt) -- subscriptions like any other,
+                // so the wake knows where to come back to. An already-true condition
+                // does not suspend at all, but this cannot tell which, and the
+                // pended copy allows both.
+                suspends("a wait");
+                break;
             case StatementKind::WaitOrder:
             case StatementKind::WaitFork:
-                reject("a wait", kWrongRegion);
+                // Nothing to do with the region: clotho lowers neither anywhere.
+                // `wait fork` needs the live-child set a fork does not keep and
+                // `wait_order` has no lowering at all (lower_stmt). Named here for
+                // the reason the fork case is: this walk runs first.
+                reject("a wait fork or a wait_order",
+                       "clotho does not lower either one, in reactive code or outside it");
                 break;
             case StatementKind::ForeverLoop:
+                // Still refused, and still not a region matter -- but the old reason
+                // (a reactive body is resumed once) is no longer why. A body may now
+                // be resumed as often as it suspends; what it may not do is never
+                // finish. With no timing control inside it, the drain that resumed
+                // it never gets control back at all; with one, the activation never
+                // completes, so its coroutine frame is never released -- and there
+                // is one activation per verdict that pends it.
                 reject("a forever loop",
-                       "it never returns, and a reactive body is resumed once and must run to "
-                       "completion");
+                       "it never returns, so the region drain that resumed it never regains "
+                       "control and the body's frame is never released");
                 break;
             case StatementKind::EventTrigger:
-                reject("an event trigger", kWrongRegion);
+                // Allowed, both spellings. Neither suspends the process that writes
+                // it, so neither needs a region of its own: `-> e` fires now and its
+                // waiters land on the rings their own handles name, and `->> e`
+                // stages a pending trigger that Re-NBA fires (re_nba.commit) with
+                // the drain re-settling the Active set afterwards, so a waiter woken
+                // by either still runs inside this time slot.
                 break;
             case StatementKind::Disable:
             case StatementKind::DisableFork:
-                reject("a disable", kWrongRegion);
+                // Not the region either: a `disable` suspends nothing, so no wake is
+                // involved. clotho lowers it as a LEXICAL exit from a block of the
+                // process body that encloses it (lower_disable), and neither copy of
+                // an action block is that -- the pended one is a task body, the
+                // inlined one is a fresh Final process. `disable fork` needs the
+                // live-child set as well, like `wait fork` above.
+                reject("a disable",
+                       "clotho lowers it as a lexical exit from an enclosing block of a process "
+                       "body, and an action block is neither");
                 break;
             default:
-                reject("this statement", "clotho cannot prove it is zero-time, and reactive code must be");
+                // The whitelist's floor, and what it now asks. Suspending is no
+                // longer disqualifying, so "clotho cannot prove it is zero-time" is
+                // no longer the requirement: what is left is that every suspension
+                // the body reaches must park somewhere a reactive region brings it
+                // back from, and that the inlined copy reaches none at all. An
+                // unrecognized statement kind may fail either, and "the walk did not
+                // recognize it" is no evidence that it does not.
+                if (copy == Copy::Inlined) {
+                    reject("a statement clotho cannot prove suspension-free", kFinalCopy);
+                } else {
+                    reject("this statement",
+                           "clotho cannot tell whether it suspends, and a suspension is correct in "
+                           "reactive code only where the wake that ends it names the region to come "
+                           "back into");
+                }
                 break;
         }
         visitDefault(s);
@@ -799,25 +895,43 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
     void handle(const AssignmentExpression& a) {
         // A plain `x <= y` is fine: LRM 4.4.2.8 gives the reactive region set its
         // own update region, and the backend commits it there (re_nba.commit).
-        // An intra-assignment delay is not, even `= #0` -- the bare-`#0`
-        // relaxation above is for a statement whose suspension the Re-Inactive
-        // batch catches, whereas this one suspends inside the assignment's own
-        // record.
+        //
+        // A DELAYED or event-controlled one is not, and the reason is the commit
+        // and not the wake -- none of the three forms suspends the process that
+        // issues it, so the parked handle has nothing to say about them. The update
+        // lands in a LATER time slot, where emit_intra_commit runs it in that slot's
+        // ordinary NBA region rather than its Re-NBA one, and 4.4.2.8 scopes Re-NBA
+        // to updates issued from the reactive region set without saying which
+        // slot's region a delayed one belongs to. The LRM does not settle it, so it
+        // is refused rather than guessed; the backend refuses the same
+        // three tags with the same reason.
         if (a.timingControl != nullptr) {
-            reject("an intra-assignment delay", kWrongRegion);
+            reject("an intra-assignment delay",
+                   "the update commits in a later time slot's ordinary NBA region rather than that "
+                   "slot's Re-NBA region, and which of the two LRM 4.4.2.8 means for an assignment "
+                   "issued from reactive code is not settled");
         }
         visitDefault(a);
     }
 
     void handle(const CallExpression& c) {
         // A system task ($display / $error / ...) is zero-time by construction. A
-        // user task is not -- it may hold a delay, and clotho does not trace the
-        // body to find out. A user *function* needs no check at all: LRM 13.4.4
-        // forbids a timing control in one, so calling it cannot consume time.
+        // user task is not, and clotho does not trace the body -- so it cannot rule
+        // out a construct this walk would have refused had the user written it in
+        // the action block itself: a `forever`, an intra-assignment delay, a
+        // deferred immediate assertion. Suspending is no longer among them, so this
+        // is no longer "the call might consume time". Nor can it tell whether the
+        // same task is called from ordinary code as well, which the backend refuses
+        // separately: a body records one home region and is lowered once.
+        //
+        // A user *function* needs no check at all: LRM 13.4.4 forbids a timing
+        // control in one, so calling it cannot suspend, and a function that cannot
+        // suspend is safe to share between reactive and ordinary callers.
         if (c.subroutine.index() == 0 && std::get<0>(c.subroutine)->subroutineKind == SubroutineKind::Task) {
             reject("a task call",
-                   "clotho does not trace the body, so it cannot prove the call consumes no "
-                   "time");
+                   "clotho does not trace the body, so it cannot rule out a construct there that "
+                   "would be refused if it were written here, nor tell whether ordinary code calls "
+                   "the same task");
         }
         // Arguments only, rather than visitDefault: a call's other child nodes are
         // the `with` constraint block of a randomize(), which is declarative and
@@ -5663,8 +5777,19 @@ private:
         // keys on the statement rather than on isFromAssertion alone.
         const Statement& item = unwrap_blocks(sym.getBody());
         if (sym.isFromAssertion && item.kind == StatementKind::ConcurrentAssertion) {
+            const auto& directive = item.as<slang::ast::ConcurrentAssertionStatement>();
+            if (directive.assertionKind == slang::ast::AssertionKind::Expect) {
+                // An `expect` is procedural: LRM 16.17 puts it "anywhere a wait
+                // statement can appear", which a module item is not, and slang
+                // rejects one here. The builder below is a throwaway -- a module-item
+                // directive emits only its monitor's own process -- so an `expect`
+                // arriving here would have its request store and its wait DROPPED
+                // with the builder and block its process forever. Checked rather than
+                // trusted, because the cost of being wrong is silence.
+                fail("internal: an `expect` as a module item");
+            }
             ir::Builder b(module_.pool);
-            lower_concurrent_assertion(item.as<slang::ast::ConcurrentAssertionStatement>(), b);
+            lower_concurrent_assertion(directive, b);
             return;
         }
 
@@ -7076,9 +7201,32 @@ private:
                 return 2;
             case slang::ast::AssertionKind::Assume:
                 return 4;
-            default:
+            case slang::ast::AssertionKind::Expect:
+                // Not a directive_type at all: LRM Table 20-7 defines only assert,
+                // cover and assume, and an expect is selected by assertion_type bit
+                // 16 instead (Table 20-6). Zero here is what keeps every control
+                // write off an expect's state -- the site loop tests
+                // `directive_bit(kind) & dtype`, and no dtype can select 0 -- and bit
+                // 16 itself is refused in lower_assert_control. Spelled out rather
+                // than left to the default arm, because it is the whole of why an
+                // $assertoff cannot silently gate an expect's seed.
+                return 0;
+            case slang::ast::AssertionKind::Restrict:
+                // No verdict, so nothing to switch off (LRM 16.12).
                 return 0;
         }
+
+        return 0;
+    }
+
+    // Whether the design contains an `expect`, for the assertion-control refusal.
+    // Read from the Collect-pass site table rather than a flag of its own: that walk
+    // has already visited every concurrent directive by the time any control task is
+    // lowered, and a second flag could only ever disagree with it.
+    bool expect_seen() const {
+        return std::any_of(sites_.begin(), sites_.end(), [](const AssertSite& site) {
+            return site.kind == slang::ast::AssertionKind::Expect;
+        });
     }
 
     // One of an assertion control task's integer arguments, constant-folded. A
@@ -7222,14 +7370,29 @@ private:
             // at the `if` / `case` -- so gating them is a different mechanism.
             fail("'" + std::string(name) + "' over unique/unique0/priority violation checks is not supported");
         }
-        if ((atype & (2 | 4 | 8 | 16)) != 0 && immediate_assertion_seen_) {
-            // TODO: assertion control over immediate, deferred and `expect`
-            // assertions (LRM Table 20-6, bits 2/4/8/16). They lower inline into
-            // the process that holds them, with no per-assertion state for a
-            // control task to write, so an enable would have to be threaded
-            // through lower_immediate_assertion instead.
+        if ((atype & (2 | 4 | 8)) != 0 && immediate_assertion_seen_) {
+            // TODO: assertion control over immediate and deferred assertions (LRM
+            // Table 20-6, bits 2/4/8). They lower inline into the process that holds
+            // them, with no per-assertion state for a control task to write, so an
+            // enable would have to be threaded through lower_immediate_assertion
+            // instead.
             fail("'" + std::string(name) +
                  "' over immediate assertions is not supported; select concurrent assertions alone with "
+                 "$assertcontrol(<control_type>, 1, ...)");
+        }
+        if ((atype & 16) != 0 && expect_seen()) {
+            // Bit 16 is the `expect` (LRM Table 20-6), and it is the reason the nine
+            // named tasks pass 15 rather than 31. An expect HAS per-assertion state
+            // now, so this is no longer covered by the immediate-assertion refusal
+            // above -- and it cannot be waved through either: `$assertkill` on an
+            // expect would abandon an attempt a process is blocked on, and the seed
+            // gate an $assertoff writes is the same one the request drives.
+            // TODO: assertion control over an `expect` (LRM 20.12 with
+            // assertion_type bit 16, which 16.17 explicitly extends to an expect's
+            // pass and fail statements). Needs a disposition for a blocked process
+            // whose attempt is killed, which is the `disable iff` question again.
+            fail("'" + std::string(name) +
+                 "' over `expect` statements is not supported; select concurrent assertions alone with "
                  "$assertcontrol(<control_type>, 1, ...)");
         }
 
@@ -7291,7 +7454,23 @@ private:
     // What comes back is an ir::AssertionMonitor: two automata over interned
     // guard cubes, plus the obligation tracking a property needs. See
     // docs/design/concurrent-assertions.md.
-    void lower_concurrent_assertion(const slang::ast::ConcurrentAssertionStatement& a, ir::Builder&) {
+
+    // The two hidden signals an `expect`'s STATEMENT needs from its monitor (LRM
+    // 16.17), and the only part of MonitorState that leaves emit_monitor: the
+    // monitor's state is allocated in there, while the statement that stores the
+    // request is emitted by the caller into the executing process. Declared up here
+    // rather than beside MonitorState because it appears in emit_expect_wait's
+    // signature, which an in-class declaration cannot forward-reference.
+    //
+    // Both Signal{0} for every other directive, which is also what makes a misuse
+    // loud rather than silent: storing into signal 0 is not a quiet no-op, it is a
+    // write to a real signal, so the emptiness is checked where it is read.
+    struct ExpectPorts {
+        ir::Signal req{ 0 };
+        ir::Signal busy{ 0 };
+    };
+
+    void lower_concurrent_assertion(const slang::ast::ConcurrentAssertionStatement& a, ir::Builder& b) {
         using AK  = slang::ast::AssertionKind;
         using AEK = slang::ast::AssertionExprKind;
 
@@ -7318,14 +7497,17 @@ private:
                 // report and the action pend -- see the switch there.
                 kind = ir::AssertionKind::Restrict;
                 break;
-            default:
-                // `expect` by elimination: slang's AssertionKind has six members
-                // and the five above are handled.
-                // TODO: `expect` (LRM 16.17) suspends the enclosing process until
-                // the property completes, so it needs a blocking wait driven from
-                // the reactive region set -- a scheduler change rather than a
-                // lowering one.
-                fail("concurrent expect is not supported");
+            case AK::Expect:
+                // LRM 16.17. A procedural, BLOCKING directive: the same property
+                // layer as an assert, plus a one-shot seed and a wait. slang binds
+                // it as a ConcurrentAssertionStatement and dispatches it as a
+                // statement, so what arrives here is indistinguishable from an
+                // `assert property` until this point -- and everything downstream of
+                // the monitor is what tells them apart (bare_seed_gate,
+                // emit_expect_step, and the wait emitted at the bottom of this
+                // function).
+                kind = ir::AssertionKind::Expect;
+                break;
         }
         // `cover sequence` counts every MATCH of the sequence where `cover
         // property` counts the attempts that succeeded (LRM 16.12.6). Same
@@ -7504,6 +7686,10 @@ private:
         // is clotho's own choice and this is where the choice is recorded.
         monitor.cover_matches = cover_matches;
 
+        if (kind == ir::AssertionKind::Expect) {
+            expect_shape_check(monitor, disable);
+        }
+
         // Shadow every variable the assertion samples, before anything reads one.
         sva_sample_roots(lowered);
 
@@ -7511,8 +7697,113 @@ private:
         // so `monitor.roots` stays empty: it indexes instructions of a body the
         // monitor would own, and there is none -- the roots are ordinary values
         // inside the process emitted here.
-        emit_monitor(lowered, monitor, static_cast<uint32_t>(module_.monitors.size()), actions, control_for(a));
+        const uint32_t    id    = static_cast<uint32_t>(module_.monitors.size());
+        const ExpectPorts ports = emit_monitor(lowered, monitor, id, actions, control_for(a));
         module_.monitors.push_back(std::move(monitor));
+
+        if (kind == ir::AssertionKind::Expect) {
+            emit_expect_wait(id, ports, a, b);
+        }
+    }
+
+    // The two property shapes an `expect` cannot be given a verdict for, refused
+    // before any of it is emitted. Both refusals are about the same thing: the
+    // process is only ever unblocked by a verdict, so a shape that can finish
+    // WITHOUT one parks it for the rest of the run.
+    void expect_shape_check(const ir::AssertionMonitor& monitor, const Expression* disable) {
+        if (monitor.has_trigger) {
+            // An implication whose antecedent never matches is a VACUOUS success,
+            // and emit_monitor deliberately produces no verdict bit for one (see the
+            // pass report there): an attempt that never reached its obligation has
+            // nothing to report. For an assert that is exactly right; for an expect
+            // it is a process that never wakes.
+            // TODO: `expect` over an implication (LRM 16.17 accepts "the same syntax
+            // used to assert a property"). Needs the vacuous success of an
+            // antecedent that failed to match to become a real verdict bit, which is
+            // a change to the assert path shared with every other directive.
+            fail("an `expect` over an implication is not supported: a vacuous success "
+                 "produces no verdict, and the process would never unblock");
+        }
+        if (disable != nullptr) {
+            // LRM 16.15 ABANDONS the attempts a disable covers: no verdict, by
+            // design. An assert simply reports nothing for them; an expect's process
+            // would wait forever on the verdict that was abandoned.
+            // TODO: `disable iff` on an `expect`. Needs a disposition for an
+            // abandoned attempt that has a process blocked on it -- resume it with
+            // neither action, or leave it blocked -- which LRM 16.17 does not settle.
+            fail("a `disable iff` on an `expect` is not supported: an abandoned "
+                 "attempt produces no verdict, and the process would never unblock");
+        }
+    }
+
+    // The statement half of an `expect` (LRM 16.17), emitted into the process that
+    // executes it. Two instructions and a guard.
+    //
+    // The request is stored BEFORE the wait, and that order is the protocol: the
+    // store lands in whatever region this process runs in, the monitor reads it at
+    // its next clocking edge in Observed, and Observed follows every active-region
+    // store of the same time slot. So an `expect` executed at t=1 with a posedge at
+    // t=5 starts its attempt at t=5 -- "the first evaluation shall take place on the
+    // next clocking event", which is the offset tests/sva/diff_expect.sv measures.
+    //
+    // The guard is the one shape this design cannot serve. Every waiter in a
+    // monitor's queue is woken by the same verdict, which is exact for a cohort that
+    // joined before the same seeding edge -- attempts starting on one edge see one
+    // signal history, so they cannot disagree -- and wrong for anyone who joins
+    // while an earlier attempt is still running. `expect_busy` is precisely "an
+    // earlier attempt is still running", and it is read HERE rather than in the
+    // monitor because this is where the process still exists to be told.
+    void emit_expect_wait(uint32_t                                        id,
+                          const ExpectPorts&                             ports,
+                          const slang::ast::ConcurrentAssertionStatement& a,
+                          ir::Builder&                                    b) {
+        if (ports.req == ir::Signal{ 0 } || ports.busy == ir::Signal{ 0 }) {
+            fail("internal: an `expect` monitor without its request state");
+        }
+        if (fn_ctx_ != nullptr) {
+            // An expect resumes its process into Reactive and LRM 24.3.1 keeps the
+            // thread there for every later blocking statement. The home region that
+            // carries that lives in the resumed body's own frame, so a task can
+            // change its OWN and not its caller's: the caller would come back
+            // through the task's completion handshake into Active, and every
+            // statement after the call would be in the wrong region with no
+            // diagnostic. Refused here rather than only in the backend so the
+            // message names the construct instead of the lowering.
+            // TODO: `expect` inside a task or function (LRM 16.17 puts it "anywhere
+            // a wait statement can appear", which includes one). Needs the resume
+            // region to travel with the REASON for the wake up the call chain,
+            // rather than with the frame that parked.
+            fail("an `expect` inside a task or function is not supported: the process "
+                 "it blocks would resume in the Active region");
+        }
+        const ir::SourceLoc l = to_source_loc(a.sourceRange.start());
+
+        // TODO: two attempts of one `expect` in flight at once, which is two
+        // processes reaching it in different cycles, or one re-executing it before
+        // its previous attempt resolved. Each attempt would have to carry which
+        // waiters belong to it -- an attempt id per obligation slot, matched against
+        // a generation recorded with each parked handle -- and under
+        // AssertionTracking::Counted there are no slots to hang one on at all. Loud
+        // at run time rather than refused at compile time because two processes
+        // reaching one statement is not a static property of the source.
+        b.open_region();
+        const std::string banner = banner_at(a.sourceRange.start());
+        b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
+                   banner,
+                   "an `expect` whose previous attempt is still in flight is not supported",
+                   {},
+                   l);
+        b.finish(banner + "expect", 1, l);
+        const ir::ExtraSlice then_region = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_region = b.close_region();
+        b.cond(load_signal(ports.busy, b, l), then_region, else_region, l, /*unlikely=*/true);
+
+        // One bit, set: the monitor's next edge consumes it and clears it. Several
+        // processes storing it before that edge are one cohort and share the attempt,
+        // which is exact rather than an approximation -- see the guard above.
+        b.binary(ir::Inst::Tag::Store, b.signal(ports.req, l), true_const(b, l), l);
+        b.expect_wait(id, l);
     }
 
     // The action blocks of one concurrent assertion (LRM 16.14), as slang
@@ -7524,23 +7815,51 @@ private:
         const Statement* fail = nullptr;
     };
 
-    // An action block is pended into the Reactive region as a thunk (LRM 4.4.2.5)
-    // and the drain resumes it exactly once. That makes zero-time-ness a
-    // correctness requirement rather than a style rule: anything that suspends
-    // would resume through a wake path that pushes onto the Active ring. Two
-    // suspension-free cases the region set does handle are allowed through -- a
-    // nonblocking assignment, which commits in Re-NBA (LRM 4.4.2.8), and a bare
-    // `#0`, which LRM 4.4.2.7 parks in Re-Inactive and promotes back into
-    // Reactive at the same instant.
+    // An action block is pended into the Reactive region as its own coroutine (LRM
+    // 4.4.2.6) and the drain resumes it there. It may suspend: a parked handle
+    // carries the region it parked from and every wake path pushes it back onto
+    // that ring, so a delay, an event control or a `wait` in an action block comes
+    // back in Reactive rather than Active. LRM 24.3.1 says that of the region set's
+    // other inhabitant and says it of the THREAD rather than of the wake site, and
+    // an action block is a thread of the same region set by 4.4.2.6.
     //
-    // Whitelisted, not blacklisted. A statement kind not positively known to be
-    // zero-time is refused -- the project forbids silently accepting a construct
-    // that is not correctly lowered, and "the walker did not recognize it" is no
-    // evidence that it is safe.
+    // What is refused is what no wake can fix: a body that never returns, a report
+    // that matures in a region already past, an update whose commit region is
+    // unsettled, and a construct clotho does not lower inside a task at all. See
+    // ReactiveSafetyChecker for the case-by-case reason.
+    //
+    // Whitelisted, not blacklisted. A statement kind this walk does not recognize
+    // is refused -- the project forbids silently accepting a construct that is not
+    // correctly lowered, and "the walker did not recognize it" is no evidence that
+    // it is safe.
     void require_reactive_safe(const Statement& action) {
         ReactiveSafetyChecker checker;
-        // Needed to constant-fold a delay amount, to tell `#0` from `#5`.
-        checker.scope = scope_;
+        action.visit(checker);
+        if (!checker.reason.empty()) {
+            fail(checker.reason);
+        }
+    }
+
+    // The second, tighter check, for the copy of the fail action that
+    // emit_monitor_finish lowers INLINE into a Final process. Only a strong
+    // property gets that copy, so only a strong property pays for it: this runs
+    // from emit_monitor_finish rather than beside require_reactive_safe above,
+    // which is bound before the property's strength is known.
+    //
+    // A Final process is resumed exactly once and then destroyed, so the inlined
+    // copy may not suspend at all -- not even on the `#0` the pended copy is
+    // allowed. Without this check that `#0` was accepted and its tail silently
+    // dropped at the end of the trace, which is exactly the outcome the whitelist
+    // exists to prevent.
+    //
+    // The same rule a USER `final` block already lives under -- LRM 9.2.3, checked
+    // over the emitted IR in lower_procedural_block -- reaching the other producer
+    // of a Final process. Checked over the AST instead of the IR here because this
+    // one is a source-level refusal a user has to act on, so it wants the statement
+    // named and a source location, not a tag.
+    void require_finish_inlinable(const Statement& action) {
+        ReactiveSafetyChecker checker;
+        checker.copy = ReactiveSafetyChecker::Copy::Inlined;
         action.visit(checker);
         if (!checker.reason.empty()) {
             fail(checker.reason);
@@ -7670,6 +7989,28 @@ private:
         ir::Signal passing{ 0 };
         // Match tally, for `cover property`.
         ir::Signal covered{ 0 };
+        // -- `expect` only (LRM 16.17), both absent for every other directive. --
+        //
+        // The pending REQUEST: a process executing the statement sets it, and the
+        // next clocking edge consumes it as the seed. This is what makes an
+        // `expect` a one-shot without a second mechanism -- a bare sequence starts
+        // an attempt every cycle, and gating the seed is exactly how $assertoff
+        // stops that (see the seed in emit_monitor), so the request rides the same
+        // gate from the other side. One bit and not a count: several processes
+        // reaching the statement before the same edge are one cohort, because
+        // attempts starting on one edge see one signal history and so owe one
+        // verdict.
+        //
+        // Cleared only on an edge that really seeds. A request the disable
+        // condition or an $assertoff held back is still owed an attempt, and
+        // clearing it there would park the process forever.
+        ir::Signal expect_req{ 0 };
+        // Whether an attempt of this expect is in flight: set by the edge that
+        // seeds one, cleared by the one that resolves it. Read by the STATEMENT,
+        // not by the step -- it is what makes a second cohort's arrival refusable
+        // (see lower_concurrent_assertion), which is what keeps the waiter queue
+        // exactly the cohort of the next attempt to resolve.
+        ir::Signal expect_busy{ 0 };
         // One per ASYNCHRONOUS abort, empty entry for a `sync_` one: whether its
         // condition has been seen high since the last clocking edge. An
         // asynchronous abort is read live and LRM 16.12.7 evaluates it at the
@@ -7776,6 +8117,14 @@ private:
             // flag into a signed target would sign-extend it to -1 (a Resize takes
             // its signedness from the target type).
             st.covered = new_monitor_state(base + "cov", mask_type(32), l);
+        }
+        if (mon.kind == ir::AssertionKind::Expect) {
+            // Written from the process that executes the statement, in the Active
+            // region, and read by this monitor at its next edge in Observed. An
+            // ordinary hidden signal is exactly the right carrier for that: the
+            // $assertkill request already crosses the same gap the same way.
+            st.expect_req  = new_monitor_state(base + "req", mask_type(1), l);
+            st.expect_busy = new_monitor_state(base + "flight", mask_type(1), l);
         }
         st.abort_seen.resize(mon.aborts.size());
         for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
@@ -8793,11 +9142,14 @@ private:
     // libsva's own reference. Two things are expressed differently because a code
     // generator has no run-time loop: a reset is a select on every store rather
     // than an early return, and the free-slot search is unrolled.
-    void emit_monitor(const sva::Result&          lowered,
-                      const ir::AssertionMonitor& mon,
-                      uint32_t                    id,
-                      const AssertionActions&     act,
-                      const MonitorControl*       ctl) {
+    // Returns the two ports an `expect` statement needs (see ExpectPorts), and an
+    // empty pair for every other directive: the monitor's hidden state is allocated
+    // in here, while the statement that drives it is emitted by the caller.
+    ExpectPorts emit_monitor(const sva::Result&          lowered,
+                            const ir::AssertionMonitor& mon,
+                            uint32_t                    id,
+                            const AssertionActions&     act,
+                            const MonitorControl*       ctl) {
         // Does this directive say anything? `restrict` is the one that does not,
         // and that is the whole of its simulation semantics: LRM 16.12 defines it
         // as a constraint on the input space a FORMAL tool may explore and gives
@@ -8812,6 +9164,11 @@ private:
         switch (mon.kind) {
             case ir::AssertionKind::Assert:
             case ir::AssertionKind::Assume:
+            // An `expect` reports and acts exactly as an assert does (LRM 16.17
+            // defines its action blocks by reference to 16.14, so an `else`-less
+            // one still gets the default failure report). What differs is the
+            // seeding and the blocking wait, both below -- not the verdict.
+            case ir::AssertionKind::Expect:
                 verdicts = true;
                 break;
             case ir::AssertionKind::Cover:
@@ -8941,6 +9298,7 @@ private:
         if (mon.tracking == ir::AssertionTracking::Counted) {
             emit_counted_step(mon,
                               st,
+                              id,
                               act,
                               verdicts,
                               pass_body,
@@ -8953,7 +9311,7 @@ private:
                               hist,
                               b,
                               l);
-            return;
+            return { st.expect_req, st.expect_busy };
         }
 
         // Per-attempt grouping. Width 0 switches it off and
@@ -9125,13 +9483,8 @@ private:
         ir::Index seeding = true_const(b, l);
         if (mon.has_trigger) {
             seeding = mon.overlap ? fires : load_signal(st.fired, b, l);
-        } else if (st.ctl != nullptr) {
-            // With no antecedent an attempt starts every cycle, so the seed IS
-            // the start and takes the same $assertoff gate the trigger's first
-            // states take above. With an antecedent it must NOT: seeding is then
-            // an attempt already in flight reaching its obligation, and LRM
-            // 20.12 lets that one run to its verdict.
-            seeding = bit_not(load_signal(st.ctl->off, b, l), b, l);
+        } else {
+            seeding = bare_seed_gate(mon, st, b, l);
         }
         const ir::Index seed =
           b.binary(ir::Inst::Tag::Band, b.constant(mask_const(mon.obligation.first, obl), l), sat_o, l);
@@ -9506,6 +9859,11 @@ private:
                               b,
                               l);
         }
+        if (mon.kind == ir::AssertionKind::Expect) {
+            // After the pends, so an expect's own action block reaches the reactive
+            // ring before the process whose statement it belongs to.
+            emit_expect_step(st, id, seeding, active, any_verdict(report_pass, report_fail, b, l), b, l);
+        }
 
         // Last in the body, after every root above has read the pre-shift rings.
         // See emit_history_shift: this ordering is what makes $past(v) the
@@ -9538,9 +9896,28 @@ private:
         // And `verdict_at_end_of_trace` rather than `strength == Strong` spelled
         // here: which resolved verdict a Pending attempt collapses to IS the
         // strength, and it is the one rule `not` inverts.
-        if (ir::verdict_at_end_of_trace(mon.strength) == ir::AssertionVerdict::Fails && verdicts) {
+        //
+        // AN EXPECT IS EXCLUDED, and this is a semantic choice rather than an
+        // omission. An expect's pass and fail statements are statements of the
+        // PROCESS it blocked, and LRM 16.17 can only schedule them "after processing
+        // the Observed region in which the property completes its evaluation". When
+        // the trace ends with the attempt still pending, no such region ever comes:
+        // the process stays blocked, so neither its action block nor the statement
+        // after the `expect` runs. That is derivation (a) of the three
+        // tests/sva/diff_expect.sv sets out; (b) would run the fail action here on
+        // the strength argument of LRM 16.12.2, and the reason it is not taken is
+        // that emit_monitor_finish lowers the action INLINE into a Final process,
+        // which would run an expect's action block in a process that never blocked
+        // and never unblocks -- a verdict delivered to nobody.
+        //
+        // It also means an expect's action block needs no require_finish_inlinable:
+        // it has no end-of-trace copy to constrain.
+        if (ir::verdict_at_end_of_trace(mon.strength) == ir::AssertionVerdict::Fails && verdicts &&
+            mon.kind != ir::AssertionKind::Expect) {
             emit_monitor_finish(mon, st, act);
         }
+
+        return { st.expect_req, st.expect_busy };
     }
 
     // A counted monitor's whole per-cycle step, plus the process it lives in.
@@ -9554,6 +9931,9 @@ private:
     // only loops emitted are the report ones (emit_counted_pends).
     void emit_counted_step(const ir::AssertionMonitor&   mon,
                            const MonitorState&           st,
+                           // For expect_wake, which names the monitor whose waiters it
+                           // drains. Unused by every other directive.
+                           uint32_t                      id,
                            const AssertionActions&       act,
                            bool                          verdicts,
                            std::optional<ir::FunctionId> pass_body,
@@ -9826,10 +10206,8 @@ private:
         ir::Index seeding;
         if (mon.has_trigger) {
             seeding = ids ? mask_any(seed_ids, b, l) : (mon.overlap ? fires : load_signal(st.fired, b, l));
-        } else if (st.ctl != nullptr) {
-            seeding = bit_not(load_signal(st.ctl->off, b, l), b, l);
         } else {
-            seeding = true_const(b, l);
+            seeding = bare_seed_gate(mon, st, b, l);
         }
 
         const ir::Index one = int_const(1, counter_bits, b, l);
@@ -9968,6 +10346,16 @@ private:
         if (pass_body.has_value()) {
             emit_counted_pends(matches, *pass_body, active, st.ctl != nullptr ? &st.ctl->poff : nullptr, b, l);
         }
+        if (mon.kind == ir::AssertionKind::Expect) {
+            // A pass and a failure are counts here rather than bits, so "did the one
+            // attempt in flight resolve" is whether either count is nonzero. Only one
+            // attempt can be in flight, so the count can only ever be 0 or 1 -- the
+            // fold is what makes that independent of the discipline rather than an
+            // assumption about it.
+            const ir::Index verdict =
+              b.binary(ir::Inst::Tag::Bor, mask_any(matches, b, l), mask_any(failures, b, l), l);
+            emit_expect_step(st, id, seeding, active, verdict, b, l);
+        }
 
         // Last in the body, for emit_monitor's reason: every root above has already
         // read the pre-shift rings.
@@ -9981,8 +10369,11 @@ private:
                                          .scope       = cur_scope_id() });
 
         // `verdicts` and not the kind, for emit_monitor's reason: a cover has no
-        // failure to drain, and a counted cover is the shape that exposed it.
-        if (ir::verdict_at_end_of_trace(mon.strength) == ir::AssertionVerdict::Fails && verdicts) {
+        // failure to drain, and a counted cover is the shape that exposed it. An
+        // expect is excluded for emit_monitor's reason too: its verdict belongs to a
+        // process that can no longer be scheduled.
+        if (ir::verdict_at_end_of_trace(mon.strength) == ir::AssertionVerdict::Fails && verdicts &&
+            mon.kind != ir::AssertionKind::Expect) {
             emit_monitor_finish(mon, st, act);
         }
     }
@@ -10073,6 +10464,121 @@ private:
         }
     }
 
+    // The gate on a bare sequence's seed, shared by both disciplines.
+    //
+    // With no antecedent an attempt starts every cycle, so the seed IS the start
+    // and takes the same $assertoff gate the trigger's first states take. With an
+    // antecedent it must NOT: seeding is then an attempt already in flight reaching
+    // its obligation, and LRM 20.12 lets that one run to its verdict.
+    //
+    // An `expect` narrows the same gate from the other side. LRM 16.17 starts "a
+    // single thread of evaluation for the given property on the subsequent clocking
+    // event", so its attempt begins because the STATEMENT executed, and the pending
+    // request is what says so. Deliberately the same gate rather than a second
+    // mechanism: "may an attempt start this cycle" already has an owner, and an
+    // expect is one more reason for the answer to be no.
+    //
+    // An expect's `off` bit can never be set, because LRM Table 20-6 makes an
+    // expect assertion_type 16 rather than the concurrent-assertion bit 1 and
+    // lower_assert_control refuses 16 outright. It is still read: the term costs one
+    // fold of a signal that is provably zero, and leaving it out would make this
+    // read as though the interaction had been forgotten rather than decided.
+    ir::Index bare_seed_gate(const ir::AssertionMonitor& mon,
+                             const MonitorState&         st,
+                             ir::Builder&                b,
+                             ir::SourceLoc               l) {
+        ir::Index gate = st.ctl != nullptr ? bit_not(load_signal(st.ctl->off, b, l), b, l) : true_const(b, l);
+        if (mon.kind == ir::AssertionKind::Expect) {
+            gate = b.binary(ir::Inst::Tag::Band, gate, load_signal(st.expect_req, b, l), l);
+        }
+
+        return gate;
+    }
+
+    // The `expect`-only tail of one monitor step (LRM 16.17), shared by both
+    // disciplines. This is the whole of what makes an `expect` more than an assert
+    // over the same property: the request is consumed, the attempt in flight is
+    // tracked, and the cohort waiting on it is woken.
+    //
+    // `seeding` is the gate the seed above used, passed in rather than recomputed
+    // so that the request is cleared in exactly the cycle it was consumed. A
+    // request the disable condition or an $assertoff held back is still owed an
+    // attempt, and clearing it there would park its processes for good.
+    //
+    // `resolved` is one bit -- did the attempt in flight reach a verdict this cycle
+    // -- and one bit suffices BECAUSE only one attempt can be in flight: the
+    // statement refuses to join while `expect_busy` is set, so the waiter queue is
+    // always exactly the cohort of the next attempt to resolve. Nothing here needs
+    // attempt ids, and that is not luck about this monitor's shape: it is the
+    // invariant that refusal buys.
+    //
+    // Called after the action pends, which is what orders an `expect`'s own
+    // pass/fail block before the statements that follow the `expect` -- both land
+    // in the Reactive region of this slot and the ring drains in push order. That
+    // is the order LRM 16.17 describes and the order tests/sva/diff_expect.sv
+    // measures (EXP 2 before EXP 4).
+    void emit_expect_step(const MonitorState& st,
+                          uint32_t            id,
+                          ir::Index           seeding,
+                          ir::Index           active,
+                          ir::Index           verdict,
+                          ir::Builder&        b,
+                          ir::SourceLoc       l) {
+        const ir::Index started = b.binary(ir::Inst::Tag::Band, active, seeding, l);
+        // `active` and not the bare verdict bits, and this is load bearing rather
+        // than defensive. The verdicts are COMBINATIONAL over state the step stores
+        // only at an edge, and the monitor body runs in every time slot -- so
+        // between two ticks they read this slot's satisfied mask against the last
+        // tick's pending states and can perfectly well come out high. Every other
+        // consumer is already gated: the state stores through store_gated, the
+        // action pends through emit_action_pends' own `active` term. Ungated here,
+        // the first slot after a seed woke the process a whole half-cycle early
+        // (t=10 rather than t=15 on tests/sva/diff_expect.sv), which is the OFFSET
+        // that fixture exists to measure.
+        const ir::Index resolved = b.binary(ir::Inst::Tag::Band, active, verdict, l);
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(st.expect_req, l),
+                 b.select(started, zero_mask(1, b, l), load_signal(st.expect_req, b, l), l),
+                 l);
+
+        // Set by the edge that seeds and cleared by the one that resolves, and the
+        // two can be the SAME edge: a one-cycle property is seeded and matched in
+        // one step, because the seed runs before the verdicts. Clearing last is what
+        // makes that land on 0 instead of latching an attempt that is already done.
+        //
+        // Ungated by `active`, unlike the automaton's own state: both terms already
+        // carry it, and a plain store keeps this readable as the two-line state
+        // machine it is.
+        b.binary(ir::Inst::Tag::Store,
+                 b.signal(st.expect_busy, l),
+                 b.binary(ir::Inst::Tag::Band,
+                          b.binary(ir::Inst::Tag::Bor, load_signal(st.expect_busy, b, l), started, l),
+                          bit_not(resolved, b, l),
+                          l),
+                 l);
+
+        b.expect_wake(resolved, id, l);
+    }
+
+    // Whether any of these verdict bits is set: one cycle's verdicts folded into
+    // the single "the attempt in flight resolved" bit emit_expect_step wants. A
+    // pass and a failure are both resolutions, which is why the two vectors fold
+    // together rather than being told apart here -- what to DO about a verdict is
+    // the action pends' business, and they have already read them.
+    ir::Index any_verdict(const std::vector<ir::Index>& pass,
+                          const std::vector<ir::Index>& fail,
+                          ir::Builder&                  b,
+                          ir::SourceLoc                 l) {
+        ir::Index any = zero_mask(1, b, l);
+        for (const std::vector<ir::Index>* side : { &pass, &fail }) {
+            for (const ir::Index bit : *side) {
+                any = b.binary(ir::Inst::Tag::Bor, any, bit, l);
+            }
+        }
+
+        return any;
+    }
+
     // End of trace (LRM 16.12.2), libsva's emitted_finish. A weak attempt that
     // never completed holds, so it reports nothing; a strong one is a failure. The
     // state teardown emitted_finish also does is dropped: a Final process runs
@@ -10081,11 +10587,18 @@ private:
     // The fail action runs here too, but lowered inline rather than pended: Final
     // is past the last time slot's Reactive drain, so a pend would queue a body
     // that nothing will ever resume -- exactly the silent drop the project forbids.
-    // Inlining is sound precisely because require_reactive_safe proved the action
-    // zero-time, so it needs no coroutine of its own.
+    // Inlining costs the action a restriction the pended copy does not carry, and
+    // require_finish_inlinable is where that is charged: a Final process is
+    // resumed once and destroyed, so this copy may not suspend at all. Only the
+    // FAIL action is inlined, so only it is checked -- a pass action has no
+    // end-of-trace copy to constrain.
     void emit_monitor_finish(const ir::AssertionMonitor& mon, const MonitorState& st, const AssertionActions& act) {
         const ir::SourceLoc l = mon.span.start;
         ir::Builder         b(module_.pool);
+
+        if (act.fail != nullptr) {
+            require_finish_inlinable(*act.fail);
+        }
 
         if (mon.tracking == ir::AssertionTracking::Counted) {
             emit_counted_finish(mon, st, act, b, l);

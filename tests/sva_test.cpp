@@ -742,46 +742,223 @@ endmodule
     CHECK(has_tag(monitor_process(m), ir::Inst::Tag::ReactivePend));
 }
 
-TEST_CASE("a nonzero delay in an action block is refused, but a #0 is not") {
-    // Reactive code may suspend only where a reactive region can resume it. LRM
-    // 4.4.2.7 gives `#0` Re-Inactive, which promotes back into Reactive at the
-    // same instant; `#5` would come back through the wheel, which pushes onto the
-    // Active ring. So the gate is on the amount being zero, not on it being a
-    // delay -- the two must not be conflated.
-    refuses(R"(
-module t;
-  bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b) else #5 $error("late");
-endmodule
-)", "a nonzero delay in an assertion action block");
-
-    // A run-time amount is refused for the same reason: it is not provably zero.
-    refuses(R"(
+TEST_CASE("every delay shape in an action block lowers, whatever its amount") {
+    // `#0`, `#5` and a run-time `#d` used to be three cases, told apart by
+    // constant-folding the amount, because only `#0` had a region to come back
+    // through. They are one case now: a wheel timer records its target as a parked
+    // handle, so it fires into the reactive ring of the slot it matures in.
+    //
+    // Pinning all three together is the point. Reinstating the fold as a
+    // "conservative" guard would pass a test written for `#0` alone.
+    for (std::string_view amount : { "#0", "#5", "#d" }) {
+        LowerResult       r;
+        const ir::Module& m = lower_for_monitor(std::string(R"(
 module t;
   bit clk, a, b;
   int d;
-  ap: assert property (@(posedge clk) a |=> b) else #d $error("late");
+  ap: assert property (@(posedge clk) a |=> b) else )")
+                                                 .append(amount)
+                                                 .append(R"( $error("late");
 endmodule
-)", "a nonzero delay in an assertion action block");
-
-    LowerResult       r;
-    const ir::Module& m = lower_for_monitor(R"(
-module t;
-  bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b) else #0 $error("late");
-endmodule
-)", r);
-    CHECK(r.ok);
-    CHECK(has_tag(monitor_process(m), ir::Inst::Tag::ReactivePend));
+)"), r);
+        CHECK_MESSAGE(r.ok, r.diagnostic_text());
+        // Still pended into Reactive: what changed is where the suspension inside
+        // the pended body comes back, not how the body gets there.
+        CHECK(has_tag(monitor_process(m), ir::Inst::Tag::ReactivePend));
+        CHECK(any_function_has_tag(m, ir::Inst::Tag::Delay));
+    }
 }
 
-TEST_CASE("an event control in an action block is refused") {
+TEST_CASE("the action-block whitelist keeps refusing what no region can help with") {
+    // The rejections that were never about which ring a wake pushes onto, so the
+    // wake carrying a destination region does not touch them. Each one's message
+    // is pinned because the message IS the reason: a user who meets it needs to
+    // know what would have to be built, and a reason that quietly stops being true
+    // is worse than no reason at all.
+
+    // A fork: the region is no longer the obstacle -- the join record parks the
+    // parent as a handle, and a child is resumed inline at the spawn -- but an
+    // action block is lowered as a task body, and a fork inside a task is not
+    // lowered at all.
     refuses(R"(
 module t;
   bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b) else @(posedge clk) $error("late");
+  ap: assert property (@(posedge clk) a |=> b) else fork $error("late"); join
 endmodule
-)", "an event control in an assertion action block");
+)", "clotho does not lower a fork inside a task or function");
+
+    // `wait fork` and `wait_order` have no lowering anywhere, reactive or not.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b) else wait fork;
+endmodule
+)", "a wait fork or a wait_order in an assertion action block");
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  event e1, e2;
+  ap: assert property (@(posedge clk) a |=> b) else wait_order(e1, e2);
+endmodule
+)", "a wait fork or a wait_order in an assertion action block");
+
+    // A `forever` loop. The old reason -- a reactive body is resumed once -- is
+    // gone: a body may now be resumed as often as it suspends. What is left is
+    // that this one never finishes, so the drain never gets control back and the
+    // activation's frame is never released.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b) else forever $error("late");
+endmodule
+)", "a forever loop in an assertion action block is not supported: it never returns");
+
+    // A `disable` suspends nothing at all, so no wake was ever involved: clotho
+    // lowers it as a lexical exit from an enclosing block of a PROCESS body, and
+    // neither copy of an action block is one.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b) else disable blk;
+  initial begin : blk
+    #10 $display("done");
+  end
+endmodule
+)", "clotho lowers it as a lexical exit");
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b) else disable fork;
+endmodule
+)", "a disable in an assertion action block");
+
+    // A deferred immediate assertion matures in Observed, and reactive code is
+    // downstream of Observed in every time slot -- a region order no wake can
+    // reverse.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b) else assert #0 (b);
+endmodule
+)", "it matures in the Observed region");
+
+    // A user TASK: clotho does not trace the body, so it cannot rule out the very
+    // constructs above hiding inside it. A user FUNCTION is fine and must stay
+    // fine -- LRM 13.4.4 forbids a timing control in one, so it cannot suspend.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  task automatic warn(); $display("late"); endtask
+  ap: assert property (@(posedge clk) a |=> b) else warn();
+endmodule
+)", "a task call in an assertion action block");
+
+    LowerResult r;
+    lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  function automatic int tag(); return 7; endfunction
+  ap: assert property (@(posedge clk) a |=> b) else $error("late %0d", tag());
+endmodule
+)", r);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
+
+    // An intra-assignment delay, even `= #0`: the suspension lives inside the
+    // assignment's own timing record, which carries no home region.
+    refuses(R"(
+module t;
+  bit clk, a, b, flag;
+  ap: assert property (@(posedge clk) a |=> b) else flag <= #1 1'b1;
+endmodule
+)", "an intra-assignment delay in an assertion action block");
+
+    // And the catch-all. `randcase` is in fact zero-time, and refusing it is the
+    // whitelist working as designed: this walk does not recognize the kind, and
+    // not recognizing it is no evidence about what it does.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> b)
+      else randcase 1: $error("x"); 1: $error("y"); endcase
+endmodule
+)", "this statement in an assertion action block is not supported: clotho cannot tell whether it "
+   "suspends");
+}
+
+TEST_CASE("a suspension in the action block of a strong assertion is refused") {
+    // The action block of a STRONG property is lowered twice: pended into Reactive
+    // per failing attempt, and again INLINE into a Final process for the
+    // end-of-trace failure LRM 16.12.2 owes for an attempt the trace ended
+    // underneath. A Final process is resumed exactly once and then destroyed, and
+    // no later region exists to bring it back, so the inlined copy may not suspend
+    // at all -- not even on the `#0` the pended copy is free to use.
+    //
+    // This was a silent drop before the check existed: the same source with `#0`
+    // lowered, ran, and printed the report without ever printing the statement
+    // after the `#0`.
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> strong(##[1:$] b))
+      else begin
+        $error("late");
+        #0 $display("tail");
+      end
+endmodule
+)", "a delay in the action block of a strong assertion is not supported");
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> strong(##[1:$] b))
+      else begin
+        $error("late");
+        @(posedge clk) $display("tail");
+      end
+endmodule
+)", "an event control in the action block of a strong assertion is not supported");
+    refuses(R"(
+module t;
+  bit clk, a, b, gate;
+  ap: assert property (@(posedge clk) a |=> strong(##[1:$] b))
+      else begin
+        $error("late");
+        wait (gate) $display("tail");
+      end
+endmodule
+)", "a wait in the action block of a strong assertion is not supported");
+
+    // The remedy the message names has to work, or the advice is wrong: the same
+    // action block on the WEAK spelling of the same property lowers. A weak
+    // attempt still pending at the end of the trace holds and reports nothing, so
+    // there is no Final copy to constrain.
+    LowerResult weak;
+    lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> ##[1:$] b)
+      else begin
+        $error("late");
+        #0 $display("tail");
+      end
+endmodule
+)", weak);
+    CHECK_MESSAGE(weak.ok, weak.diagnostic_text());
+
+    // Only the FAIL action is inlined into Final, so only it is constrained. A
+    // suspending PASS action on a strong property still lowers, and pinning that
+    // keeps the check from being widened into "strong assertions may not suspend".
+    LowerResult pass;
+    lower_for_monitor(R"(
+module t;
+  bit clk, a, b;
+  ap: assert property (@(posedge clk) a |=> strong(##[1:$] b))
+      begin
+        $display("hit");
+        #0 $display("tail");
+      end
+endmodule
+)", pass);
+    CHECK_MESSAGE(pass.ok, pass.diagnostic_text());
 }
 
 TEST_CASE("first_match determinises its operand, in the position where it counts") {
@@ -2141,6 +2318,264 @@ std::string substituted(std::string_view source, std::string_view token, std::st
 }
 
 } // namespace
+
+// -- What an action block may do once suspended -------------------------------
+//
+// A pended action block runs in the Reactive region of the slot whose verdict
+// pended it, and it comes back in Reactive after suspending too, because a parked
+// coroutine carries the region it parked from. Neither fact shows up in a
+// module's shape, only in the ORDER of prints inside one time slot, so these run
+// the design.
+//
+// The discriminator throughout is a counter advanced by a nonblocking assignment
+// on every tick. NBA commits after Active and before Reactive, so the value the
+// action block reads says which REGION resumed it and not merely which tick: the
+// tick's own Active print shows the pre-commit count, and reactive code sees the
+// post-commit one. A resume onto the Active ring -- which is where every wake
+// pushed before the handle named its home region -- reads the pre-commit count
+// instead, and that is the mutation these cases exist to catch.
+
+namespace {
+
+// Where `needle` is in `hay`, required to be there at all. These cases compare
+// positions, so a line that never printed has to fail as a missing line rather
+// than as npos compared against npos.
+size_t at_of(std::string_view hay, std::string_view needle) {
+    const size_t at = hay.find(needle);
+    // Concatenated into one string first: doctest's message operator binds tighter
+    // than `+`, so an expression built inline would try to append to the builder.
+    const std::string why = std::string(needle).append(" is missing from:\n").append(hay);
+    REQUIRE_MESSAGE(at != std::string_view::npos, why);
+    return at;
+}
+
+} // namespace
+
+TEST_CASE("an event control in an action block resumes in Reactive, a tick later") {
+    // `a` sampled high at t=15 with no `b` at t=25 fails there. The action prints
+    // once immediately and then blocks on the next posedge, and where that second
+    // print lands is the whole observable: in Reactive of t=35 it reads cyc == 4,
+    // after that tick's Active print of 3. On the Active ring it would read 3.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0;
+  int unsigned cyc = 0;
+  always @(posedge clk) begin
+    cyc <= cyc + 1;
+    $display("[%0t] cyc=%0d", $time, cyc);
+  end
+
+  ap: assert property (@(posedge clk) a |=> b)
+      else begin
+        $display("[%0t] FAIL now cyc=%0d", $time, cyc);
+        @(posedge clk) $display("[%0t] FAIL resumed cyc=%0d", $time, cyc);
+      end
+
+  initial begin
+    @(posedge clk);
+    a <= 1;
+    @(posedge clk);
+    a <= 0;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    // Pended into Reactive of the failing tick: the NBA of t=25 has committed.
+    CHECK(at_of(out, "[25] FAIL now cyc=3") > at_of(out, "[25] cyc=2"));
+    // Resumed into Reactive of the NEXT tick, not into its Active region.
+    CHECK(at_of(out, "[35] FAIL resumed cyc=4") > at_of(out, "[35] cyc=3"));
+    // Once. The subscription is the body's own, not a standing one that would fire
+    // again on every later edge.
+    CHECK(count_of(out, "FAIL resumed") == 1);
+}
+
+TEST_CASE("a nonzero delay in an action block resumes in Reactive, off the wheel") {
+    // The third wake path, and the one where routing the resumed handle to the
+    // active ring looks most natural: a timer matures at the TOP of a later time
+    // slot, before that slot's Active region has run. So a handle put on the active
+    // ring would be processed before the NBA commit of the slot it wakes in, and
+    // reads cyc == 4 where the reactive ring reads 5.
+    //
+    // The `#0` after the timer resume is not decoration: it checks the thread is
+    // still REACTIVE after the timer brought it back, since LRM 4.4.2.7 can only
+    // round-trip it through Re-Inactive and land it at the same instant if the
+    // timer put it in Reactive to begin with. Woken into Active instead, that `#0`
+    // parks in ordinary Inactive and prints before the tick's `@(cyc)` chain.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0;
+  int unsigned cyc = 0;
+  always @(posedge clk) begin
+    cyc <= cyc + 1;
+    $display("[%0t] cyc=%0d", $time, cyc);
+  end
+  // Woken only once cyc's nonblocking increment has committed, so this is the
+  // LAST active-region line of its tick and a reactive line has to sort after it.
+  always @(cyc) $display("[%0t] nba cyc=%0d", $time, cyc);
+
+  ap: assert property (@(posedge clk) a |=> b)
+      else begin
+        $display("[%0t] FAIL now cyc=%0d", $time, cyc);
+        #10 $display("[%0t] FAIL after #10 cyc=%0d", $time, cyc);
+        #0 $display("[%0t] FAIL after #0 cyc=%0d", $time, cyc);
+      end
+
+  initial begin
+    @(posedge clk);
+    a <= 1;
+    @(posedge clk);
+    a <= 0;
+    @(posedge clk);
+    @(posedge clk);
+    @(posedge clk);
+    #1 $finish;
+  end
+endmodule
+)");
+    // Failed at t=25 and delayed 10, so the timer matures at t=35 -- and Reactive of
+    // t=35 is after that slot's NBA commit, which the `@(cyc)` line marks the end of.
+    CHECK(at_of(out, "[35] FAIL after #10 cyc=4") > at_of(out, "[35] nba cyc=4"));
+    // Still reactive afterwards: the `#0` round trip lands at the same instant,
+    // through Re-Inactive rather than through the ordinary inactive queue.
+    CHECK(at_of(out, "[35] FAIL after #0 cyc=4") > at_of(out, "[35] FAIL after #10 cyc=4"));
+    CHECK(count_of(out, "FAIL after") == 2);
+}
+
+TEST_CASE("a wait in an action block resumes in Reactive when its condition turns true") {
+    // The same trace and the same discriminator with the suspension
+    // level-sensitive rather than edge-triggered: `wait (gate)` parks on any change
+    // of `gate`, and `gate` is raised by a nonblocking assignment at t=35. So this
+    // wake comes off an NBA commit rather than off a clock edge, and the body must
+    // still land in Reactive of that slot -- cyc == 4, after the t=35 Active print.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, gate = 0;
+  int unsigned cyc = 0;
+  always @(posedge clk) begin
+    cyc <= cyc + 1;
+    $display("[%0t] cyc=%0d gate=%b", $time, cyc, gate);
+  end
+
+  ap: assert property (@(posedge clk) a |=> b)
+      else begin
+        $display("[%0t] FAIL now gate=%b", $time, gate);
+        wait (gate) $display("[%0t] FAIL after gate cyc=%0d", $time, cyc);
+      end
+
+  initial begin
+    @(posedge clk);
+    a <= 1;
+    @(posedge clk);
+    a <= 0;
+    @(posedge clk);
+    @(posedge clk);
+    gate <= 1;
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    // Blocked at t=25 on a gate that is still low there.
+    CHECK(at_of(out, "[25] FAIL now gate=0") > at_of(out, "[25] cyc=2 gate=0"));
+    // Released by the NBA of t=35, into Reactive of that same slot.
+    CHECK(at_of(out, "[35] FAIL after gate cyc=4") > at_of(out, "[35] cyc=3 gate=0"));
+    CHECK(count_of(out, "FAIL after gate") == 1);
+}
+
+TEST_CASE("both event triggers work from an action block, waking their waiters in the slot") {
+    // Neither `->` nor `->>` suspends the process that writes it, so neither needs
+    // a region for itself -- but where their WAITERS run is a region fact, and that
+    // is what this pins. `-> e` fires inside the Reactive drain; `->> e` stages a
+    // trigger Re-NBA commits. Either way the drain re-settles the Active set
+    // afterwards, so a waiter runs in this same time slot and reads the count
+    // already committed here rather than a later tick's.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0;
+  int unsigned cyc = 0;
+  event eb, enb;
+  always @(posedge clk) begin
+    cyc <= cyc + 1;
+    $display("[%0t] cyc=%0d", $time, cyc);
+  end
+  always @(eb) $display("[%0t] blocking trigger seen, cyc=%0d", $time, cyc);
+  always @(enb) $display("[%0t] nonblocking trigger seen, cyc=%0d", $time, cyc);
+
+  ap: assert property (@(posedge clk) a |=> b)
+      else begin
+        $display("[%0t] FAIL now", $time);
+        -> eb;
+        ->> enb;
+      end
+
+  initial begin
+    @(posedge clk);
+    a <= 1;
+    @(posedge clk);
+    a <= 0;
+    @(posedge clk);
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(at_of(out, "[25] blocking trigger seen, cyc=3") > at_of(out, "[25] FAIL now"));
+    CHECK(at_of(out, "[25] nonblocking trigger seen, cyc=3") > at_of(out, "[25] FAIL now"));
+    // Two waiters, each woken once: a trigger is an event and not a level, so
+    // neither may fire again on a later tick.
+    CHECK(count_of(out, "trigger seen") == 2);
+    // And in that order rather than either order: `-> eb` fires inside the Reactive
+    // drain, `->> enb` only once Re-NBA commits the pending trigger, and Re-NBA is
+    // downstream of Reactive in the same region set.
+    CHECK(at_of(out, "[25] nonblocking trigger seen") > at_of(out, "[25] blocking trigger seen"));
+}
+
+TEST_CASE("a strong assertion still runs its action block at the end of the trace") {
+    // The positive half of the check that refuses a SUSPENSION in this copy, and the
+    // half that keeps that check honest: a suspension-free action block on a strong
+    // property must still be inlined into the Final process and must still run.
+    // Widening the refusal to "a strong assertion may not have an action block"
+    // would satisfy every case in the refusal test above and lose this line.
+    //
+    // `##[1:$] b` under `strong` can never resolve on a trace where `b` stays low,
+    // so the attempt is still pending when the trace ends and LRM 16.12.2 owes one
+    // failure for it -- reported after the $finish banner, which is what Final means.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0;
+  always @(posedge clk) $display("[%0t] tick", $time);
+
+  ap: assert property (@(posedge clk) a |=> strong(##[1:$] b))
+      else $display("[%0t] END-OF-TRACE FAIL", $time);
+
+  initial begin
+    @(posedge clk);
+    a <= 1;
+    @(posedge clk);
+    a <= 0;
+    @(posedge clk);
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)");
+    CHECK(at_of(out, "END-OF-TRACE FAIL") > at_of(out, "$finish called"));
+    // One attempt was armed, so one report -- not one per tick it stayed pending.
+    CHECK(count_of(out, "END-OF-TRACE FAIL") == 1);
+}
 
 TEST_CASE("history advances per clock tick, not per time step") {
     // THE case. `noise` toggles every 3 with the clock at every 5, so most time
@@ -4898,4 +5333,237 @@ endmodule
     // The monitor's own state is untouched by any of it.
     CHECK(state_width(cm, "sva.0.pend0") == 1);
     CHECK(state_width(cm, "sva.0.clk") == 1);
+}
+
+// -- `expect` (LRM 16.17) -----------------------------------------------------
+//
+// An `expect` is scored by FULL OUTPUT rather than by a report set, and that is
+// forced by what it is: a procedural blocking statement whose observable is the
+// TIME and the ORDER of what its process does next. report_times reduces a run to
+// the ticks a marker appeared on, which cannot see either.
+//
+// Every fixture here carries the same two-line-per-tick region ruler as
+// tests/sva/diff_expect.sv, and for its reason: `ACT edge` runs in the Active
+// region and `ACT nba` is an `always @(cyc)` that cannot be woken until the
+// nonblocking increment commits in NBA, so `ACT nba` is the LAST active-region
+// line of a tick. A continuation LRM 16.17 schedules "after processing the
+// Observed region in which the property completes its evaluation" must sort after
+// it, and a process resumed through the ordinary active path sorts before it. So
+// the wrong region is a transposition of two lines at one time stamp, which is
+// why these compare whole strings.
+
+// The ruler plus a clock, with `d` high from cyc1 on when `raise` is set. Body is
+// the process under test; it runs at t=1, an off-edge time, so an attempt seeded
+// on "the next clocking event" starts at t=5 and a `##1` property resolves at
+// t=15 -- the OFFSET requirement, visible in a time stamp alone.
+// `finish_at` ends the run on a fixed schedule from a process of its OWN, at an
+// off-edge time, so the tail of the output does not depend on when the body under
+// test happens to unblock -- which is the very thing each case is measuring.
+std::string expect_run(std::string_view body, bool raise = true, int finish_at = 21) {
+    const std::string src = std::string(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit          d   = 0;
+  int unsigned cyc = 0;
+  always @(posedge clk) begin
+    $display("[%0t] ACT edge cyc=%0d d=%0d", $time, cyc, d);
+    cyc <= cyc + 1;
+    if ()") + (raise ? "cyc == 0" : "0") + R"() d <= 1;
+  end
+  always @(cyc) $display("[%0t] ACT nba  cyc=%0d", $time, cyc);
+  initial #)" + std::to_string(finish_at) + R"( $finish;
+  initial begin
+    #1;
+)" + std::string(body) + R"(
+  end
+endmodule
+)";
+    std::string out = sva_run_capture(src);
+    // The $finish banner names a temp path and a time neither of which is the
+    // measurement; every case here is about the lines before it.
+    if (const size_t banner = out.find("$finish called"); banner != std::string::npos) {
+        out.resize(out.rfind('\n', banner) + 1);
+    }
+    return out;
+}
+
+TEST_CASE("an expect blocks its process until the property resolves") {
+    // The whole of LRM 16.17 in one string, and each line of it is a measurement.
+    //
+    // BLOCKING: a whole clock tick (cyc0, both its ACT lines) passes between
+    // "before" at t=1 and anything else the process does. An expect that does not
+    // block prints "after" at t=1.
+    //
+    // OFFSET: the resolution is at t=15, not t=5. `##1 d` seeded at t=5 tests `d`
+    // at the SECOND clocking event after the statement executed.
+    //
+    // REGION: both continuation lines sort after `ACT nba cyc=2`, so the process
+    // came back through the reactive region set of t=15 rather than through the
+    // active path of that slot.
+    //
+    // ACTION BEFORE CONTINUATION: the pass action is pended before the waiter is
+    // woken, so an expect's own action block runs before the statement that
+    // follows the expect. Both are Reactive; the reactive ring drains in push
+    // order, and this is the order that ordering choice produces.
+    CHECK(expect_run(R"(
+    $display("[%0t] EXP before", $time);
+    expect (@(posedge clk) ##1 d) $display("[%0t] EXP pass", $time);
+    else $display("[%0t] EXP fail", $time);
+    $display("[%0t] EXP after", $time);
+)") == "[1] EXP before\n"
+       "[5] ACT edge cyc=0 d=0\n"
+       "[5] ACT nba  cyc=1\n"
+       "[15] ACT edge cyc=1 d=1\n"
+       "[15] ACT nba  cyc=2\n"
+       "[15] EXP pass\n"
+       "[15] EXP after\n");
+}
+
+TEST_CASE("a failing expect runs its fail action and unblocks all the same") {
+    // LATENCY IS NOT THE VERDICT: the same property, the same offset, the same
+    // region, and the only difference from the case above is WHICH branch of the
+    // action block runs. A process is unblocked by a failure exactly as it is by a
+    // success -- 16.17 unblocks on "succeeds or fails" -- so "after" still prints,
+    // and at the same time it printed for the pass.
+    CHECK(expect_run(R"(
+    $display("[%0t] EXP before", $time);
+    expect (@(posedge clk) ##1 d) $display("[%0t] EXP pass", $time);
+    else $display("[%0t] EXP fail", $time);
+    $display("[%0t] EXP after", $time);
+)",
+                     /*raise=*/false) == "[1] EXP before\n"
+                                         "[5] ACT edge cyc=0 d=0\n"
+                                         "[5] ACT nba  cyc=1\n"
+                                         "[15] ACT edge cyc=1 d=0\n"
+                                         "[15] ACT nba  cyc=2\n"
+                                         "[15] EXP fail\n"
+                                         "[15] EXP after\n");
+}
+
+TEST_CASE("an expect leaves its thread in the Reactive region for later waits") {
+    // LRM 24.3.1, and the reason the home region is a mutable property of the
+    // THREAD rather than a lexical property of the body: "Once a program process
+    // starts a thread of execution, all subsequent blocking statements in that
+    // thread are scheduled in the Reactive region", and "a section of sequential
+    // code anywhere in the design or testbench inherits the scheduling region of
+    // the thread that calls it".
+    //
+    // So the `@(posedge clk)` AFTER the expect must also resume in Reactive, in a
+    // process whose lexical home is Active -- a module `initial`. The evidence is
+    // the same ruler: "EXP edge" lands after `ACT nba cyc=3` at t=25. Were the
+    // region a property of the park site instead, this wait would park with home =
+    // Active and print between `ACT edge cyc=2` and `ACT nba cyc=3`, silently
+    // migrating the thread back one statement after the expect.
+    CHECK(expect_run(R"(
+    expect (@(posedge clk) ##1 d) ;
+    $display("[%0t] EXP after", $time);
+    @(posedge clk);
+    $display("[%0t] EXP edge", $time);
+)",
+                     /*raise=*/true,
+                     /*finish_at=*/31) == "[5] ACT edge cyc=0 d=0\n"
+       "[5] ACT nba  cyc=1\n"
+       "[15] ACT edge cyc=1 d=1\n"
+       "[15] ACT nba  cyc=2\n"
+       "[15] EXP after\n"
+       "[25] ACT edge cyc=2 d=1\n"
+       "[25] ACT nba  cyc=3\n"
+       "[25] EXP edge\n");
+}
+
+TEST_CASE("re-executing an expect starts a second attempt of its own") {
+    // The re-entrancy this design supports, and the SINGLE requirement measured
+    // from the other side. One monitor, one request bit, executed twice: each
+    // execution owes exactly one attempt and one verdict, and the second attempt
+    // cannot start before the first resolved because the process is blocked until
+    // it does. So the second attempt cannot start at the tick that resolved the
+    // first either: that execution happens in the REACTIVE region of t=15, and the
+    // monitor's Observed step for t=15 has already run by then -- so the "next
+    // clocking event" LRM 16.17 starts the evaluation on is t=25, and a `##1`
+    // property resolves at t=35. Exactly the offset the first attempt had from its
+    // own execution at t=1, measured from where the second one really executes.
+    //
+    // Each action line appears exactly once per execution, which is the SINGLE
+    // requirement measured from the other side. An implementation that reused the
+    // concurrent-assert seeding would print one at every tick from cyc1 on; one
+    // whose request survived the edge that consumed it would resolve the second
+    // attempt a tick early.
+    CHECK(expect_run(R"(
+    for (int i = 0; i < 2; i++) begin
+      expect (@(posedge clk) ##1 d) $display("[%0t] EXP pass %0d", $time, i);
+      $display("[%0t] EXP after %0d", $time, i);
+    end
+)",
+                     /*raise=*/true,
+                     /*finish_at=*/41) == "[5] ACT edge cyc=0 d=0\n"
+                                          "[5] ACT nba  cyc=1\n"
+                                          "[15] ACT edge cyc=1 d=1\n"
+                                          "[15] ACT nba  cyc=2\n"
+                                          "[15] EXP pass 0\n"
+                                          "[15] EXP after 0\n"
+                                          "[25] ACT edge cyc=2 d=1\n"
+                                          "[25] ACT nba  cyc=3\n"
+                                          "[35] ACT edge cyc=3 d=1\n"
+                                          "[35] ACT nba  cyc=4\n"
+                                          "[35] EXP pass 1\n"
+                                          "[35] EXP after 1\n");
+}
+
+TEST_CASE("an expect keeps its monitor, minus the trigger and plus the request") {
+    // The tables the backend reads. `kind` is clotho's own -- libsva has no expect
+    // kind and compiles it as an assert -- so the round trip through the boundary
+    // is what this pins: an expect that came back as an Assert would start an
+    // attempt every cycle and park nobody.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, d;
+  initial expect (@(posedge clk) ##1 d);
+endmodule
+)",
+                                           r);
+    REQUIRE(r.ok);
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(m.monitors[0].kind == ir::AssertionKind::Expect);
+    // No antecedent: an expect's one-shot is the seed GATE, not a trigger.
+    CHECK(m.monitors[0].has_trigger == false);
+    // The two hidden signals the statement drives, and the ones no other
+    // directive gets.
+    CHECK(state_width(m, "sva.0.req") == 1);
+    CHECK(state_width(m, "sva.0.flight") == 1);
+}
+
+TEST_CASE("the expect shapes with no verdict to unblock on are refused") {
+    // Each of these can FINISH without producing a verdict bit, and a verdict bit
+    // is the only thing that ever unblocks the process. Lowering them would park a
+    // process for the rest of the run with no diagnostic, so each is refused by
+    // name instead. All three refusals name their own TODO in the source.
+    const auto refusal = [](std::string_view body) {
+        const std::string src = std::string(R"(
+module t;
+  bit clk, a, b, rst;
+  task automatic tk();
+    expect (@(posedge clk) ##1 b);
+  endtask
+  initial begin
+)") + std::string(body) + R"(
+  end
+endmodule
+)";
+        const LowerResult r = lower_text(src);
+        CHECK_FALSE(r.ok);
+        return r.diagnostic_text();
+    };
+
+    // An implication whose antecedent never matches is a VACUOUS success, and
+    // emit_monitor produces no verdict bit for one.
+    CHECK(refusal("    expect (@(posedge clk) a |=> b);").find("implication") != std::string::npos);
+    // LRM 16.15 ABANDONS a disabled attempt: no verdict, by design.
+    CHECK(refusal("    expect (@(posedge clk) disable iff (rst) ##1 b);").find("disable iff") !=
+          std::string::npos);
+    // The home region is per frame, so a task cannot carry Reactive back up to the
+    // process it was called from -- the caller would resume in Active, which is the
+    // migration the case above exists to prevent.
+    CHECK(refusal("    tk();").find("task") != std::string::npos);
 }

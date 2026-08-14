@@ -618,6 +618,18 @@ struct StrobePendInfo {
     FunctionId func;
 };
 
+// Extra payload for `expect_wait`: which monitor's attempt the executing process
+// is about to block on (LRM 16.17). An index into Module::monitors, which is what
+// the backend keys the monitor's waiter queue by.
+//
+// The verdict is deliberately NOT here. An `expect`'s pass and fail code are
+// ordinary Reactive-region action blocks the monitor pends (Tag::ReactivePend),
+// exactly as an assert's are, so the process that resumes needs to know only THAT
+// its attempt resolved -- never how.
+struct ExpectInfo {
+    uint32_t monitor = 0;
+};
+
 // Severity level of a `severity` instruction. Selects the diagnostic label the
 // runtime prints (LRM 20.10); Fatal is `$fatal` (the frontend follows the report
 // with a Finish carrying the finish number, so the report itself never
@@ -960,6 +972,7 @@ static_assert(ExtraPayload<DisplayInfo>);
 static_assert(ExtraPayload<FinishInfo>);
 static_assert(ExtraPayload<CaseViolInfo>);
 static_assert(ExtraPayload<StrobePendInfo>);
+static_assert(ExtraPayload<ExpectInfo>);
 static_assert(ExtraPayload<SeverityInfo>);
 static_assert(ExtraPayload<FseekInfo>);
 static_assert(ExtraPayload<RealMathBinaryInfo>);
@@ -1799,6 +1812,48 @@ struct Inst {
         // nonzero; otherwise leaves the lvalue untouched and returns 0. Lowers
         // to an rt_value_plusargs call.
         ValuePlusArgs,
+        // -- Appended, and deliberately: a tag's numeric value is part of every IR
+        // digest tests/sva_test.cpp pins, so a new opcode goes at the END rather
+        // than beside its relatives. Inserting one mid-enum renumbers every tag
+        // after it and re-hashes every body containing one, with the instruction
+        // count untouched -- a diff that looks like a lowering change and is not. --
+        // `expect` (LRM 16.17): block the executing process until the monitor
+        // named by the payload (extra -> ExpectInfo) resolves the attempt this
+        // execution asked for, then resume it in the REACTIVE region.
+        //
+        // Three parts, and only the middle one is this instruction. The REQUEST is
+        // an ordinary Store the frontend emits just before this, into the monitor's
+        // hidden request signal: it is what turns a monitor whose property starts an
+        // attempt every cycle into the one-shot LRM 16.17 asks for, consumed by the
+        // next clocking edge's seed. This instruction PARKS the caller in that
+        // monitor's waiter queue and suspends. The WAKE is ExpectWake, emitted into
+        // the monitor's own Observed process.
+        //
+        // Reactive and not the parked body's own region: the verdict exists only
+        // once the property has been evaluated in Observed, and LRM 4.4.2.5 hands
+        // everything a property decides to the Reactive region of that same time
+        // slot. So the destination is a property of `expect` itself, which is why
+        // this suspension point does not consult the home region the way a wheel
+        // timer or an event scan has to.
+        //
+        // A process containing this tag is forced to a coroutine (see
+        // is_simple_always): it has a suspension point, and the handle the waiter
+        // queue holds is that coroutine's.
+        ExpectWait,
+        // The wake half of an `expect` (payload: op_imm — op is a 1-bit value that
+        // is high in the cycle the attempt resolved, imm the monitor index). Drains
+        // that monitor's waiter queue onto the reactive ring.
+        //
+        // Emitted by emit_monitor into the monitor's Observed process and nowhere
+        // else, so unlike ExpectWait it can never appear in a body a user wrote --
+        // no reactive-safety rule needs to mention it.
+        //
+        // Every waiter in the queue belongs to the attempt that just resolved, and
+        // that is an invariant the frontend maintains rather than something checked
+        // here: a process may only join the queue while no attempt is in flight (see
+        // the refusal in lower_concurrent_assertion), so the queue is always exactly
+        // the cohort of the next attempt to resolve.
+        ExpectWake,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2102,6 +2157,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StreamReverse:
         case T::NetPull:
         case T::System:
+        // expect_wake: op is the resolved bit, imm the monitor index.
+        case T::ExpectWake:
             return K::OpImm;
         case T::TimeFormat:
             return K::TimeFormat;
@@ -2124,6 +2181,9 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrobePend:
         case T::ReactivePend:
         case T::MonitorSet:
+        // expect_wait: extra -> ExpectInfo, the monitor whose queue holds the
+        // parked handle. No operands -- the request store is a separate Store.
+        case T::ExpectWait:
             return K::Extra;
         case T::MonitorEmit:
             return K::FDisplay; // op = descriptor, extra = DisplayInfo
@@ -2237,6 +2297,8 @@ constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
         case T::StrobePend:
         case T::ReactivePend:
         case T::MonitorSet:
+        // expect_wait: a monitor index only.
+        case T::ExpectWait:
         // finish / case_viol / test_plusargs: banner / query bytes only.
         case T::Finish:
         case T::CaseViol:

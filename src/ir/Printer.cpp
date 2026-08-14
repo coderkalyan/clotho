@@ -383,6 +383,10 @@ const char* tag_name(Inst::Tag tag) {
             return "strobe_pend";
         case T::ReactivePend:
             return "reactive_pend";
+        case T::ExpectWait:
+            return "expect_wait";
+        case T::ExpectWake:
+            return "expect_wake";
         case T::MonitorSet:
             return "monitor_set";
         case T::MonitorEmit:
@@ -746,6 +750,11 @@ private:
                 if (tag == Inst::Tag::StrobePend || tag == Inst::Tag::ReactivePend) {
                     const auto info = ir_.extra_data<StrobePendInfo>(p.extra);
                     os_ << "fn" << static_cast<uint32_t>(info.func);
+                    break;
+                }
+                if (tag == Inst::Tag::ExpectWait) {
+                    const auto info = ir_.extra_data<ExpectInfo>(p.extra);
+                    os_ << "mon" << info.monitor;
                     break;
                 }
                 // concat: variadic operands.

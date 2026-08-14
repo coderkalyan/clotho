@@ -354,19 +354,83 @@ TEST_CASE("$exit is rejected") {
     )", "$exit");
 }
 
-// TODO: a #0 inside a program would come back through Inactive rather than
-// Re-Inactive, ordering it against other reactive work at the instant
-// differently from LRM 4.4.2.7. Not verified, so refused.
-TEST_CASE("a #0 inside a program is rejected") {
-    check_backend_rejected(R"(
-        module t; bit clk = 0; always #5 clk = ~clk; p pi(); initial #40 $finish; endmodule
-        program p; initial begin @(posedge t.clk); #0 $display("zero"); end endprogram
-    )", "#0 delay inside a `program` block is not supported");
+TEST_CASE("a #0 in a program initial resumes in Reactive at the same instant") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          always #5 clk = ~clk;
+          always @(posedge clk) $display("[%0t] MODULE active", $time);
+          pa ia();
+          pb ib();
+          initial #40 $finish;
+        endmodule
+
+        program pa;
+          initial begin
+            @(posedge t.clk);
+            $display("[%0t] A before #0", $time);
+            #0;
+            $display("[%0t] A after #0", $time);
+          end
+        endprogram
+
+        program pb;
+          initial begin
+            @(posedge t.clk);
+            $display("[%0t] B reactive", $time);
+          end
+        endprogram
+    )") == "[5] MODULE active\n[5] A before #0\n[5] B reactive\n[5] A after #0\n");
 }
 
-// TODO: a task called from a program is a coroutine of its own; the reactive
-// re-entry would push the task's handle rather than the calling process's.
-// A task that does not suspend is fine and is covered above.
+// A fork inside a program initial. Each child parks on the wheel, and the last
+// one to finish resumes the joined parent -- through the join record, which is
+// the third wake path (after a signal subscription and a wheel timer) that has
+// to name a destination region.
+//
+// Every reactive print must land after the Active-region output of the slot it
+// wakes in, and both wake paths are measured in slots that HAVE Active work: the
+// wheel delivers a child at the very top of its slot, before the active drain
+// runs, so a child pushed onto the active ring would print first instead of
+// last. The two children are given different delays so each lands in its own
+// slot, which also pins that `join` waits for the later one -- and keeps the
+// test off the wheel's within-bucket firing order, which is not a region fact.
+//
+// Simulation ends at 25 rather than at the module's `#40 $finish`: the program
+// initial completes there, and LRM 24.6 stops the run when the last one does.
+TEST_CASE("a fork inside a program initial rejoins in Reactive") {
+    CHECK(run_capture(R"(
+        module t;
+          bit clk = 0;
+          always #5 clk = ~clk;
+          always @(posedge clk) $display("[%0t] MODULE active", $time);
+          p pi();
+          initial #40 $finish;
+        endmodule
+
+        program p;
+          initial begin
+            @(posedge t.clk);
+            fork
+              begin #10 $display("[%0t] P child 1", $time); end
+              begin #20 $display("[%0t] P child 2", $time); end
+            join
+            $display("[%0t] P after join", $time);
+          end
+        endprogram
+    )") == "[5] MODULE active\n"
+           "[15] MODULE active\n[15] P child 1\n"
+           "[25] MODULE active\n[25] P child 2\n[25] P after join\n");
+}
+
+// TODO: a task called from a program block. The wake routing handles it now --
+// the task parks its own handle with a Reactive home, and the caller's handle in
+// the task record carries one too -- but build_program_fns computes no shared
+// set, so a task reachable from both a program `initial` and an ordinary process
+// is lowered once and can record only one home region. A task that does not
+// suspend is fine and is covered above; a FORK CHILD of a program initial is
+// exempt and covered above too, because a child body belongs to one fork site
+// and so is never shared.
 TEST_CASE("a suspending task called from a program is rejected") {
     check_backend_rejected(R"(
         module t; bit clk = 0; always #5 clk = ~clk; p pi(); initial #40 $finish; endmodule

@@ -353,6 +353,14 @@ public:
     // body, which evaluates the property but may not run its pass/fail code
     // itself. A statement, never a value.
     Index reactive_pend(FunctionId func, SourceLoc loc);
+    // `expect` (LRM 16.17): park the executing process in `monitor`'s waiter queue
+    // until the attempt it just requested resolves, then resume it in the Reactive
+    // region. The request itself is a Store the caller emits first. A statement.
+    Index expect_wait(uint32_t monitor, SourceLoc loc);
+    // The wake half: `resolved` high means `monitor`'s in-flight attempt reached a
+    // verdict this cycle, so every waiter it holds goes onto the reactive ring.
+    // Emitted into the monitor's own Observed process. A statement.
+    Index expect_wake(Index resolved, uint32_t monitor, SourceLoc loc);
     // $monitor / $fmonitor (LRM 21.2.2): register `func` as the single active
     // monitor body (replacing any prior one), enabled, running each subsequent
     // time step in the Postponed region. A statement.

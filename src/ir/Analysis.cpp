@@ -144,6 +144,11 @@ TagInfo tag_info(Inst::Tag tag) {
         // reactive pend ramps its action block through that same record ABI.
         case Inst::Tag::StrobePend:
         case Inst::Tag::ReactivePend:
+        // An `expect` is a suspension point (ExpectWait) and its wake pushes onto
+        // the reactive ring from an Observed body (ExpectWake) -- neither is a pure
+        // function of the signals a thunk reads.
+        case Inst::Tag::ExpectWait:
+        case Inst::Tag::ExpectWake:
             return blocks;
 
         // -- Synthesizable but not pure: the assignments, and the aggregate
@@ -596,6 +601,13 @@ struct Structural {
                     uses.strobe = true;
                     break;
                 case Inst::Tag::ReactivePend:
+                // An `expect` needs the whole region set for the same reason: its
+                // wake pushes onto the reactive ring, and the wait's RESUME comes
+                // back off it. Both halves say so -- the wait's home process is not
+                // the monitor's, so neither one implies the other's presence in the
+                // body being scanned.
+                case Inst::Tag::ExpectWait:
+                case Inst::Tag::ExpectWake:
                     uses.reactive = true;
                     break;
                 case Inst::Tag::MonitorSet:
@@ -1288,6 +1300,8 @@ struct ValueSweep {
                 case Inst::Tag::FDisplay:
                 case Inst::Tag::StrobePend:
                 case Inst::Tag::ReactivePend:
+                case Inst::Tag::ExpectWait:
+                case Inst::Tag::ExpectWake:
                 case Inst::Tag::MonitorSet:
                 case Inst::Tag::MonitorEmit:
                 case Inst::Tag::MonitorOn:
