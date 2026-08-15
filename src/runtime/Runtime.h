@@ -325,11 +325,30 @@ typedef struct rt_ref_site {
     int32_t line_no;
     int32_t column;
     int32_t end_column;
-    // Declared name of the `ref` formal, and of the container the actual was an
-    // element of, for the diagnostic text. Never null.
+    // Declared name of the `ref` formal, for the diagnostic text. Never null.
+    //
+    // No container name: which container went stale is answered by the epoch
+    // pointer the guard was checking, through rt_ref_names below, rather than
+    // recorded per call site.
     const char* formal;
-    const char* container;
 } rt_ref_site;
+
+// One container's relocation epoch and the name it was declared under.
+typedef struct rt_container_name {
+    const void* epoch;
+    const char* name;
+} rt_container_name;
+
+// Register the design's epoch-to-name table, once, before it runs. The backend
+// emits one entry per container whose handle sits at a statically known address
+// (a module-scope signal, or a local hoisted into design state), which is exactly
+// the set whose name a report could ever state: a container inside a class body,
+// or inside another container's buffer, has no fixed address to key on and is
+// reported without a name rather than under a guessed one.
+//
+// Consulted only from a staleness report, so the lookup is a linear scan rather
+// than an index that would have to be built during startup.
+void rt_ref_names(const rt_container_name* table, uint64_t count);
 
 // Dereferencing a `ref` formal whose actual was an element of a container that
 // has since been restructured (a push, an insert, a delete, a resize, a whole
@@ -343,14 +362,20 @@ typedef struct rt_ref_site {
 // nonzero status. `--loose-stale-ref` downgrades it to a once-per-site warning
 // and returns, which is the escape hatch for a design that relies on the
 // stale-pointer behaviour.
-void rt_ref_stale(const rt_ref_site* site, uint64_t expect, uint64_t actual, uint64_t now);
+//
+// `epoch` is the pointer the guard was watching; the report resolves it to the
+// container's declared name through the rt_ref_names table. Passing it costs
+// nothing at the call that formed the ref — it is already live here, on a path
+// taken once per run at most.
+void rt_ref_stale(const rt_ref_site* site, const void* epoch, uint64_t expect, uint64_t actual,
+                  uint64_t now);
 
 // A ref's expected epoch ahead of its container's. Epochs are monotone and only
 // ever advance, so this is unreachable without a codegen bug in the epoch
 // plumbing itself. Aborts unconditionally — `--loose-stale-ref` does not apply,
 // because the invariant being violated is Clotho's, not the design's.
-[[noreturn]] void rt_ref_epoch_regress(const rt_ref_site* site, uint64_t expect, uint64_t actual,
-                                       uint64_t now);
+[[noreturn]] void rt_ref_epoch_regress(const rt_ref_site* site, const void* epoch,
+                                       uint64_t expect, uint64_t actual, uint64_t now);
 
 // Select the stale-ref mode: nonzero downgrades rt_ref_stale to a once-per-site
 // warning that returns, zero (the default) leaves it fatal. Owned by the CLI's

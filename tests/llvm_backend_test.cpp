@@ -4035,6 +4035,9 @@ TEST_CASE("a ref to a container element keeps the epoch words") {
         endmodule
     )");
     CHECK(ir.find("i64 %ref.epoch.at.call") != std::string::npos);
+    // The site record is the callee's, built at the guard, so it is not an operand
+    // of the call; the container's name reaches the report through the epoch table.
+    CHECK(ir.find("@clotho.ref.names") != std::string::npos);
     CHECK(ir.find("@clotho.ref.site") != std::string::npos);
 }
 
@@ -4056,7 +4059,7 @@ TEST_CASE("one ref formal reached by both actual shapes stays fat at every call"
     const std::string          ir  = emit_raw(src);
     // The sentinel appears as a call OPERAND (the global's own definition line
     // matches the bare name too, hence the surrounding argument text).
-    CHECK(count_substr(ir, ", ptr @clotho.ref.noepoch, i64 0,") == 1);
+    CHECK(count_substr(ir, ", ptr @clotho.ref.noepoch, i64 0)") == 1);
     CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.inst.m.state)") == 0);
     CHECK(run_capture(src) == "2 6\n");
 }
@@ -4084,13 +4087,11 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     )";
     const std::string          ir  = emit_raw(src);
     // Both bodies take the same parameter list: state, the object handle pair, then
-    // the four ref words.
-    CHECK(count_substr(ir,
-                       "@m.fn.g(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, "
-                       "i64 %4, ptr %5)") == 1);
-    CHECK(count_substr(ir,
-                       "@m.fn.g.1(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, "
-                       "i64 %4, ptr %5)") == 1);
+    // the three ref words.
+    CHECK(count_substr(
+            ir, "@m.fn.g(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, i64 %4)") == 1);
+    CHECK(count_substr(
+            ir, "@m.fn.g.1(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, i64 %4)") == 1);
     CHECK(run_capture(src) == "2 7\n");
 
     // And with no heap-rooted actual at either site, the whole slot narrows.

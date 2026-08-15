@@ -672,11 +672,14 @@ struct FrameSlot {
 // `clotho.ref.noepoch` zero word when the actual was a stable place; `expect` is
 // that epoch's value at the call. Every dereference re-reads `epoch` and reports
 // through `site` if it has moved on.
+// A `ref` formal's binding inside the callee. `slot`/`epoch`/`expect` are the
+// passed words; `formal` is the callee's own name for the binding, used to build
+// the per-dereference site record a staleness report prints (§3.3).
 struct RefBinding {
     llvm::Value* slot   = nullptr;
     llvm::Value* epoch  = nullptr;
     llvm::Value* expect = nullptr;
-    llvm::Value* site   = nullptr;
+    std::string  formal;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -2694,17 +2697,21 @@ private:
         return llvm::ConstantStruct::get(slot_ty, fields);
     }
 
-    // The four words a `ref` actual passes (docs/design/data-model.md §3): the
-    // aliased storage pointer, the relocation epoch of the container the place is
-    // rooted in, that epoch's value now, and the site record the callee reports
-    // through. Built at the call, because only the caller knows which container
-    // the actual came out of.
+    // The words a `ref` actual passes (docs/design/data-model.md §3): the aliased
+    // storage pointer, and — only for a formal bound somewhere to a container
+    // element (§3.0) — the relocation epoch of the container the place is rooted in
+    // and that epoch's value now.
+    //
+    // No site record. A staleness report needs the formal's name, which is the
+    // callee's own, and the container's name, which the runtime recovers from the
+    // epoch pointer (§3.3) — so nothing about the report is caller knowledge that
+    // has to be shipped per call.
     //
     // `slot` is the whole storage of the selected place, whatever its class: a
     // plane slot, a managed handle, or an aggregate image. A bit / part selection
     // is not a place a pointer can name, so it is rejected — the frontend guards
     // it too (is_whole_ref_actual), and this is the defensive backstop.
-    RefBinding ref_actual_arg(const LValue& raw, const SourceText& at, std::string_view formal) {
+    RefBinding ref_actual_arg(const LValue& raw) {
         // An associative-array element is a DEFERRED place, and a `ref` is its third
         // consumer alongside Load and Store: it needs the address itself. Resolve it
         // with put_ptr, because LRM 13.5.2 binds the formal to a VARIABLE — there is
@@ -2712,7 +2719,6 @@ private:
         // exactly as a mutating method on `a[k]` does.
         const LValue lv = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
         RefBinding   rb;
-        rb.site = ref_site_global(at, formal, ref_container_name(raw));
         // A stable place has no epoch to watch; pointing at the compile-time zero
         // word keeps the callee's check uniform.
         if (lv.epoch_ptr != nullptr) {
@@ -2724,14 +2730,6 @@ private:
         }
         rb.slot = ref_actual_ptr(lv);
         return rb;
-    }
-
-    // Name of the container or signal a ref actual was taken out of, for the
-    // staleness report. A module signal knows its declared name; a frame local or
-    // a call-result temp has none, and the site's source line already shows the
-    // expression, so an empty name is honest rather than invented.
-    std::string ref_container_name(const LValue& lv) const {
-        return lv.is_signal ? mod_.signal(lv.sig).name : std::string{};
     }
 
     // Pointer to a ref actual's storage: the aliased place the callee holds.
@@ -3366,7 +3364,6 @@ private:
                 if (ref_needs_epoch(f, k)) {
                     params.push_back(ptr);             // &epoch
                     params.push_back(b_.getInt64Ty()); // expected epoch
-                    params.push_back(ptr);             // const rt_ref_site*
                 }
                 continue;
             }
@@ -3432,7 +3429,6 @@ private:
                 if (ref_needs_epoch(f, k)) {
                     params.push_back(ptr);             // &epoch
                     params.push_back(b_.getInt64Ty()); // expected epoch
-                    params.push_back(ptr);             // const rt_ref_site*
                 }
             } else if (is_handle_type(f.param_types[k])) {
                 params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*), any direction
@@ -3488,7 +3484,7 @@ private:
 
     uint32_t formal_param_count(const Function& f, size_t k) const {
         if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-            return ref_needs_epoch(f, k) ? 4u : 1u;
+            return ref_needs_epoch(f, k) ? 3u : 1u;
         }
         // An aggregate is one storage pointer, in every direction (function or task).
         if (is_agg_abi(f.param_types[k])) {
@@ -4030,8 +4026,10 @@ private:
             if (ref_needs_epoch(f, k)) {
                 ref_ptr_[k].epoch  = fn_->getArg(p + 1);
                 ref_ptr_[k].expect = fn_->getArg(p + 2);
-                ref_ptr_[k].site   = fn_->getArg(p + 3);
             }
+            // `formal` names the binding in a staleness report. It is a property of
+            // the CALLEE, so it is held here rather than shipped per call.
+            ref_ptr_[k].formal = f.name + " argument " + std::to_string(k + 1);
         }
     }
 
@@ -4945,6 +4943,8 @@ private:
                 b_.CreateStore(sym(a.shadow_gv), sym(a.shadow_base_gv));
             }
         }
+
+        emit_ref_name_table();
 
         // Register one DPI scope per top (svGetScope / user-data, LRM 35.5.3) before
         // any process runs, so a context import can read it. Only when DPI is used.
@@ -10530,6 +10530,9 @@ private:
     // -- Instruction dispatch --
 
     void lower_inst(Index i) {
+        // The dereference guard below (emit_ref_epoch_check) reports against the
+        // access that faulted, which is this instruction; nothing else reads it.
+        cur_inst_              = i;
         const Inst::Payload& p = ir_->payload(i);
         switch (ir_->tag(i)) {
             // Lvalue derivation: record a descriptor, emit no value.
@@ -15561,15 +15564,14 @@ private:
     llvm::StructType* ref_site_ty() {
         auto* i32 = b_.getInt32Ty();
         return llvm::StructType::get(
-          ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty(), raw_ptr_ty() });
+          ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty() });
     }
 
-    // The site record for one ref actual, built at the CALL, not at the
-    // dereference: the caller is what knows which container the actual came out
-    // of, and that is the fact a staleness report has to name. `container` is the
-    // actual's root name where one exists (a module signal), else empty.
-    llvm::Constant* ref_site_global(const SourceText& at, std::string_view formal,
-                                    std::string_view container) {
+    // The site record for one dereference of a ref formal, built in the CALLEE:
+    // where the stale access is, and the callee's name for the formal. The
+    // container's name is not here — the runtime resolves it from the epoch pointer
+    // (rt_ref_names, §3.3), so no part of the report rides on the call.
+    llvm::Constant* ref_site_global(const SourceText& at, std::string_view formal) {
         auto* const i32  = b_.getInt32Ty();
         auto* const rec  = ref_site_ty();
         auto*       init = llvm::ConstantStruct::get(
@@ -15577,8 +15579,7 @@ private:
                  b_.CreateGlobalString(at.line, "ref.src"),
                  llvm::ConstantInt::get(i32, at.line_no), llvm::ConstantInt::get(i32, at.column),
                  llvm::ConstantInt::get(i32, at.end_column),
-                 b_.CreateGlobalString(formal, "ref.formal"),
-                 b_.CreateGlobalString(container, "ref.container") });
+                 b_.CreateGlobalString(formal, "ref.formal") });
         return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
                                         llvm::GlobalValue::PrivateLinkage, init,
                                         "clotho.ref.site");
@@ -15594,8 +15595,9 @@ private:
     // refuses to CSE the epoch load of a second dereference in the same block — so
     // N accesses through one ref formal paid N loads and N compares instead of one.
     llvm::FunctionCallee ref_stale_fn() {
-        auto callee = rt_fn("rt_ref_stale", b_.getVoidTy(),
-                            { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+        auto callee =
+          rt_fn("rt_ref_stale", b_.getVoidTy(),
+                { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
         if (auto* fn = llvm::dyn_cast<llvm::Function>(callee.getCallee())) {
             fn->setMemoryEffects(llvm::MemoryEffects::inaccessibleMemOnly());
             fn->setDoesNotThrow();
@@ -15603,11 +15605,60 @@ private:
         return callee;
     }
 
-    // void rt_ref_epoch_regress(ptr site, i64 expect, i64 actual, i64 now) —
-    // an epoch that went backwards is a Clotho bug; aborts unconditionally.
+    // void rt_ref_epoch_regress(ptr site, ptr epoch, i64 expect, i64 actual, i64 now)
+    // — an epoch that went backwards is a Clotho bug; aborts unconditionally.
     llvm::FunctionCallee ref_epoch_regress_fn() {
-        return rt_fn("rt_ref_epoch_regress", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+        return rt_fn(
+          "rt_ref_epoch_regress", b_.getVoidTy(),
+          { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+    }
+
+    // Register the design's epoch-to-name table before any process runs
+    // (docs/design/data-model.md §3.3). One entry per container signal, keyed by
+    // the address of its relocation epoch, which is the only handle a staleness
+    // report holds. Signals only: their handles live in the state global at a fixed
+    // address, whereas a container in a class body or inside another container's
+    // buffer has none to key on and is reported unnamed.
+    //
+    // Emitted only for a design that can actually produce a report -- one with a
+    // ref formal carrying an epoch -- so the ordinary design pays nothing.
+    void emit_ref_name_table() {
+        if (facts_.ref_epoch_formals.empty()) {
+            return;
+        }
+        auto* const                  rec = ref_name_ty();
+        std::vector<llvm::Constant*> rows;
+        for (uint32_t i = 0; i < mod_.signals().size(); ++i) {
+            const auto        sig  = static_cast<Signal>(i);
+            const SignalInfo& info = mod_.signal(sig);
+            if (!is_handle_type(info.type)) {
+                continue;
+            }
+            auto* const epoch = llvm::dyn_cast<llvm::Constant>(b_.CreateStructGEP(
+              handle_slot_ty(info.type), signal_lvalue(sig).base, handle_epoch_field(info.type)));
+            // A signal reached through a runtime anchor load has no constant
+            // address; it cannot be a table key, and is reported unnamed.
+            if (epoch == nullptr) {
+                continue;
+            }
+            rows.push_back(llvm::ConstantStruct::get(
+              rec, { epoch, b_.CreateGlobalString(info.name, "ref.container") }));
+        }
+        if (rows.empty()) {
+            return;
+        }
+        auto* const arr = llvm::ArrayType::get(rec, rows.size());
+        auto* const gv =
+          new llvm::GlobalVariable(env_->llmod, arr, /*isConstant=*/true,
+                                   llvm::GlobalValue::PrivateLinkage,
+                                   llvm::ConstantArray::get(arr, rows), "clotho.ref.names");
+        b_.CreateCall(rt_fn("rt_ref_names", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() }),
+                      { gv, b_.getInt64(rows.size()) });
+    }
+
+    // { ptr epoch, ptr name } -- must match rt_container_name in Runtime.h.
+    llvm::StructType* ref_name_ty() {
+        return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty() });
     }
 
     // Guard one dereference of a `ref` formal against its actual's container
@@ -15615,6 +15666,10 @@ private:
     // §3). Emitted by local_lvalue, so it covers every read and write through the
     // formal, including those that straddle a task's suspend — which is exactly
     // when a container can move under a live ref.
+    //
+    // The site record is built HERE, in the callee, and names this dereference:
+    // both of its fields are callee knowledge (the formal's name, and where the
+    // stale access happens), so no site travels with the call.
     //
     // Hot path is one load, one compare and a not-taken branch weighted so both
     // cold blocks sink out of line; repeated accesses through the same formal
@@ -15627,6 +15682,7 @@ private:
             // nothing to check.
             return;
         }
+        llvm::Constant* const site = ref_site_global(loc_text(cur_inst_), rb.formal);
         auto* fn      = b_.GetInsertBlock()->getParent();
         auto* bad     = llvm::BasicBlock::Create(ctx_, "ref.moved", fn);
         auto* regress = llvm::BasicBlock::Create(ctx_, "ref.regress", fn);
@@ -15652,13 +15708,13 @@ private:
 
         b_.SetInsertPoint(regress);
         auto* rcall =
-          b_.CreateCall(ref_epoch_regress_fn(), { rb.site, rb.expect, cur, report_now() });
+          b_.CreateCall(ref_epoch_regress_fn(), { site, rb.epoch, rb.expect, cur, report_now() });
         rcall->addFnAttr(llvm::Attribute::NoReturn);
         rcall->addFnAttr(llvm::Attribute::Cold);
         b_.CreateUnreachable();
 
         b_.SetInsertPoint(stale);
-        b_.CreateCall(ref_stale_fn(), { rb.site, rb.expect, cur, report_now() })
+        b_.CreateCall(ref_stale_fn(), { site, rb.epoch, rb.expect, cur, report_now() })
           ->addFnAttr(llvm::Attribute::Cold);
         b_.CreateBr(cont);
 
@@ -17145,13 +17201,11 @@ private:
                 // Every storage class goes through here — a plane slot, a managed
                 // handle, an aggregate image — so `ref` has one shape.
                 const LValue&    lv = lvalue_of(a);
-                const RefBinding rb =
-                  ref_actual_arg(lv, loc_text(i), f.name + " argument " + std::to_string(k + 1));
+                const RefBinding rb = ref_actual_arg(lv);
                 argv.push_back(rb.slot);
                 if (ref_needs_epoch(f, k)) {
                     argv.push_back(rb.epoch);
                     argv.push_back(rb.expect);
-                    argv.push_back(rb.site);
                 }
                 if (!is_handle_type(f.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
@@ -18022,14 +18076,11 @@ private:
                 // A fork capture is a ref to an enclosing frame local, which is a
                 // stable place: the parent's frame outlives every child (the join
                 // waits for them), so the epoch is the compile-time zero word.
-                const RefBinding rb = ref_actual_arg(
-                  lvalue_of(caps[k]), loc_text(i),
-                  child.name + " capture " + std::to_string(k + 1));
+                const RefBinding rb = ref_actual_arg(lvalue_of(caps[k]));
                 argv.push_back(rb.slot);
                 if (ref_needs_epoch(child, k)) {
                     argv.push_back(rb.epoch);
                     argv.push_back(rb.expect);
-                    argv.push_back(rb.site);
                 }
             }
         }
@@ -18119,13 +18170,11 @@ private:
                 // where the epoch earns its keep — it can suspend, and the container
                 // can be restructured by another process while the ref stays live.
                 const LValue&    lv = lvalue_of(args[k]);
-                const RefBinding rb =
-                  ref_actual_arg(lv, loc_text(i), tf.name + " argument " + std::to_string(k + 1));
+                const RefBinding rb = ref_actual_arg(lv);
                 argv.push_back(rb.slot);
                 if (ref_needs_epoch(tf, k)) {
                     argv.push_back(rb.epoch);
                     argv.push_back(rb.expect);
-                    argv.push_back(rb.site);
                 }
                 if (!is_handle_type(tf.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
@@ -20394,6 +20443,9 @@ private:
 
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
+    // Instruction currently being lowered; the ref dereference guard reports
+    // against it. Set by lower_inst, read only by emit_ref_epoch_check.
+    Index cur_inst_ = Index{ 0 };
     std::vector<llvm::Function*> fn_decls_;
     // &Function -> FunctionId, for the ABI helpers that only receive a reference.
     ankerl::unordered_dense::map<const Function*, uint32_t> fn_ids_;

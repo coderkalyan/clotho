@@ -905,21 +905,62 @@ TEST_CASE("a push_back under a live ref to a queue element is a located fatal") 
     CHECK(run.out == "before\n");
     CHECK(test::design_exit_code(run) != 0);
     // The headline names the ref formal, then the container that moved under it,
-    // then both epochs. The formal's rendered spelling and the epoch counts are
-    // left out: the first is filled by the frontend's rt_ref_site and the second
-    // depends on how many bumping ops ran, neither of which this case is about.
+    // then both epochs. The container's name is not shipped with the call: the
+    // runtime recovers 'q' from the epoch pointer the guard was watching (§3.3).
     CHECK(run.err.find("fatal: ref '") != std::string::npos);
     CHECK(run.err.find("' is stale: 'q' was restructured (epoch ") != std::string::npos);
     CHECK(run.err.find(", ref formed at epoch ") != std::string::npos);
-    // Located where the ref was FORMED — the call site that bound the formal to
-    // the element — not at the deref inside the callee. That is the actionable
-    // line: the deref is correct code, and the binding is what went stale.
-    CHECK(run.err.find("11 |             bump_slow(q[0]);\n") != std::string::npos);
-    CHECK(run.err.find("   |             ^\n") != std::string::npos);
+    // Located at the DEREFERENCE, inside the callee -- the site record is the
+    // callee's own, so it points at the access that faulted. The formal's name in
+    // the headline is what ties that back to the binding.
+    CHECK(run.err.find("5 |         a = a + 1;\n") != std::string::npos);
+    CHECK(run.err.find("bump_slow argument 1") != std::string::npos);
     // And it names the operation that invalidated the pointer, and the fix.
     CHECK(run.err.find("moved the element ") != std::string::npos);
     CHECK(run.err.find("do not restructure 'q' while the ref is live") != std::string::npos);
     CHECK(run.err.find("(LRM 13.5.2)") != std::string::npos);
+}
+
+// §3.3: the container's name is recovered from the epoch pointer, through a table
+// the design emits once. That table can only key on containers whose handle has a
+// fixed address -- a signal. A queue that is a CLASS PROPERTY lives in a heap
+// object body, so its epoch address is a runtime value and the lookup misses.
+//
+// The report must then describe the container rather than name it. Naming is not
+// merely unavailable here, it would be wrong: the only name in scope is the
+// object's, and the object did not move -- its queue's buffer did.
+TEST_CASE("a stale ref to a container with no static address is reported unnamed") {
+    constexpr std::string_view src = "class C;\n"
+                                     "    int q[$];\n"
+                                     "endclass\n"
+                                     "module m;\n"
+                                     "    task automatic bump_slow(ref int a);\n"
+                                     "        #2;\n"
+                                     "        a = a + 1;\n"
+                                     "    endtask\n"
+                                     "    initial begin\n"
+                                     "        C c;\n"
+                                     "        c = new;\n"
+                                     "        c.q.push_back(41);\n"
+                                     "        fork\n"
+                                     "            bump_slow(c.q[0]);\n"
+                                     "            begin #1; c.q.push_back(7); end\n"
+                                     "        join\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+    CHECK(test::design_exit_code(run) != 0);
+    // Still fatal, still located, still names the formal -- only the container's
+    // name is missing, and it is described instead of guessed at or left blank.
+    CHECK(run.err.find("is stale: its container was restructured (epoch ") != std::string::npos);
+    CHECK(run.err.find("bump_slow argument 1") != std::string::npos);
+    CHECK(run.err.find("7 |         a = a + 1;\n") != std::string::npos);
+    CHECK(run.err.find("do not restructure its container while the ref is live") !=
+          std::string::npos);
+    // No empty quotes anywhere: the old shape passed "" for this case and printed
+    // `'' was restructured`.
+    CHECK(run.err.find("''") == std::string::npos);
 }
 
 // §3: a `ref` formal's frame slot and the actual's storage slot must agree on

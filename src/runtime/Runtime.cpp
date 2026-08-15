@@ -3750,8 +3750,33 @@ extern "C" void rt_ref_stale_warn(int32_t enable) {
     g_ref_stale_warn = enable;
 }
 
-extern "C" void rt_ref_stale(const rt_ref_site* site, uint64_t expect, uint64_t actual,
-                             uint64_t now) {
+// The design's epoch-to-name table, registered once before it runs.
+const rt_container_name* g_ref_names       = nullptr;
+uint64_t                 g_ref_names_count = 0;
+
+extern "C" void rt_ref_names(const rt_container_name* table, uint64_t count) {
+    g_ref_names       = table;
+    g_ref_names_count = count;
+}
+
+// Declared name of the container whose relocation epoch lives at `epoch`, or null
+// when it has no statically known address -- a container inside a class body or
+// inside another container's buffer. Naming nothing beats naming the wrong one:
+// for `outer[0][0]` the epoch is the INNER queue's, so reporting the outer
+// container's name would point at a place that did not move.
+//
+// Linear: reached at most once per run, from a report that is about to print.
+const char* ref_container_name(const void* epoch) {
+    for (uint64_t i = 0; i < g_ref_names_count; ++i) {
+        if (g_ref_names[i].epoch == epoch) {
+            return g_ref_names[i].name;
+        }
+    }
+    return nullptr;
+}
+
+extern "C" void rt_ref_stale(const rt_ref_site* site, const void* epoch, uint64_t expect,
+                             uint64_t actual, uint64_t now) {
     // Reached only from the guard the backend plants ahead of every dereference
     // through a `ref` formal, and only in the `actual > expect` direction -- the
     // guard routes the impossible one to rt_ref_epoch_regress instead. The
@@ -3777,13 +3802,18 @@ extern "C" void rt_ref_stale(const rt_ref_site* site, uint64_t expect, uint64_t 
 
     std::string when;
     append_finish_time(when, now);
+    // The container is named when its handle has a fixed address; otherwise it is
+    // described rather than guessed at (see ref_container_name).
+    const char* const named = ref_container_name(epoch);
+    const std::string what  = named != nullptr ? fmt::format("'{}'", named)
+                                               : std::string("its container");
     // Each styled run stops short of the newline: fmt closes a style after
     // everything it formatted, and a reset that lands past the line break leaves
     // the style live across it.
     fmt::print(stderr, label, "{}", warn ? "warning:" : "fatal:");
     fmt::print(stderr, head,
-               " ref '{}' is stale: '{}' was restructured (epoch {}, ref formed at epoch {})",
-               site->formal, site->container, actual, expect);
+               " ref '{}' is stale: {} was restructured (epoch {}, ref formed at epoch {})",
+               site->formal, what, actual, expect);
     fmt::print(stderr, "\n");
     fmt::print(stderr, loc, "{}", site->where);
     fmt::print(stderr, "\n");
@@ -3796,8 +3826,8 @@ extern "C" void rt_ref_stale(const rt_ref_site* site, uint64_t expect, uint64_t 
     }
     fmt::print(stderr, tag, "  note:");
     fmt::print(stderr, body, " a push, insert, delete, resize, reorder or whole-value assignment "
-                             "to '{}' by {} moved the element '{}' was bound to",
-               site->container, when, site->formal);
+                             "to {} by {} moved the element '{}' was bound to",
+               what, when, site->formal);
     fmt::print(stderr, "\n");
     if (warn) {
         fmt::print(stderr, tag, "  note:");
@@ -3808,9 +3838,9 @@ extern "C" void rt_ref_stale(const rt_ref_site* site, uint64_t expect, uint64_t 
         return;
     }
     fmt::print(stderr, tag, "  note:");
-    fmt::print(stderr, body, " do not restructure '{}' while the ref is live, or pass the element "
+    fmt::print(stderr, body, " do not restructure {} while the ref is live, or pass the element "
                              "by value instead (LRM 13.5.2)",
-               site->container);
+               what);
     fmt::print(stderr, "\n");
     std::fflush(stderr);
 
@@ -3822,8 +3852,8 @@ extern "C" void rt_ref_stale(const rt_ref_site* site, uint64_t expect, uint64_t 
     std::exit(1);
 }
 
-extern "C" void rt_ref_epoch_regress(const rt_ref_site* site, uint64_t expect, uint64_t actual,
-                                     uint64_t now) {
+extern "C" void rt_ref_epoch_regress(const rt_ref_site* site, const void* epoch,
+                                     uint64_t expect, uint64_t actual, uint64_t now) {
     // The guard reached this because the container's epoch is BELOW the one the
     // ref recorded. Every bump is a ++ and no path resets the field, so a
     // container's epoch can only ever climb: no design can produce this. It means
@@ -3843,12 +3873,14 @@ extern "C" void rt_ref_epoch_regress(const rt_ref_site* site, uint64_t expect, u
 
     std::string when;
     append_finish_time(when, now);
+    const char* const named = ref_container_name(epoch);
+    const std::string what =
+      named != nullptr ? fmt::format("'{}'", named) : std::string("its container");
     // Each styled run stops short of the newline: fmt closes a style after
     // everything it formatted, and a reset that lands past the line break leaves
     // the style live across it.
     fmt::print(stderr, label, "fatal:");
-    fmt::print(stderr, head, " internal error: the relocation epoch of '{}' ran backwards",
-               site->container);
+    fmt::print(stderr, head, " internal error: the relocation epoch of {} ran backwards", what);
     fmt::print(stderr, "\n");
     fmt::print(stderr, loc, "{}", site->where);
     fmt::print(stderr, "\n");
@@ -3860,8 +3892,8 @@ extern "C" void rt_ref_epoch_regress(const rt_ref_site* site, uint64_t expect, u
                       loc, caret);
     }
     fmt::print(stderr, tag, "  note:");
-    fmt::print(stderr, body, " '{}' is at epoch {} but ref '{}' was formed at epoch {}, at {}",
-               site->container, actual, site->formal, expect, when);
+    fmt::print(stderr, body, " {} is at epoch {} but ref '{}' was formed at epoch {}, at {}",
+               what, actual, site->formal, expect, when);
     fmt::print(stderr, "\n");
     fmt::print(stderr, tag, "  note:");
     fmt::print(stderr, body, " this is a bug in Clotho's epoch plumbing, not an error in the "
