@@ -22,6 +22,25 @@ using namespace clotho;
 
 namespace {
 
+// Parameter list of every `define` whose symbol contains `needle`, in emission
+// order. Lets a case assert the ABI SHAPE of a set of functions without pinning
+// LLVM's uniquing suffixes, which shift when unrelated functions are added.
+std::vector<std::string> define_params(const std::string& ir, std::string_view needle) {
+    std::vector<std::string> out;
+    for (size_t p = ir.find("define "); p != std::string::npos; p = ir.find("define ", p + 1)) {
+        const std::string line = ir.substr(p, ir.find('\n', p) - p);
+        const size_t      open = line.find('(');
+        const size_t      close = line.rfind(')');
+        if (open == std::string::npos || close == std::string::npos || close < open) {
+            continue;
+        }
+        if (line.substr(0, open).find(needle) != std::string::npos) {
+            out.push_back(line.substr(open, close - open + 1));
+        }
+    }
+    return out;
+}
+
 // Lower SystemVerilog text to a Module and emit LLVM IR as a string.
 std::string emit(std::string_view source) {
     const LowerResult result = lower_text(source);
@@ -4086,12 +4105,14 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
         endmodule
     )";
     const std::string          ir  = emit_raw(src);
-    // Both bodies take the same parameter list: state, the object handle pair, then
-    // the three ref words.
-    CHECK(count_substr(
-            ir, "@m.fn.g(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, i64 %4)") == 1);
-    CHECK(count_substr(
-            ir, "@m.fn.g.1(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, i64 %4)") == 1);
+    // Both bodies take the SAME parameter list: state, the object handle pair, then
+    // the three ref words. Compared as lists rather than as whole symbol names --
+    // LLVM's uniquing suffix on the second `g` shifts as the module gains unrelated
+    // functions, and that is not what this case is about.
+    const std::vector<std::string> sigs = define_params(ir, "fn.g");
+    REQUIRE(sigs.size() == 2);
+    CHECK(sigs[0] == sigs[1]);
+    CHECK(sigs[0] == "(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, i64 %4)");
     CHECK(run_capture(src) == "2 7\n");
 
     // And with no heap-rooted actual at either site, the whole slot narrows.
@@ -4108,6 +4129,8 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
             end
         endmodule
     )");
-    CHECK(count_substr(narrow, "@m.fn.g(ptr noalias %state, i128 %0, i64 %1, ptr %2)") == 1);
-    CHECK(count_substr(narrow, "@m.fn.g.1(ptr noalias %state, i128 %0, i64 %1, ptr %2)") == 1);
+    const std::vector<std::string> nsigs = define_params(narrow, "fn.g");
+    REQUIRE(nsigs.size() == 2);
+    CHECK(nsigs[0] == nsigs[1]);
+    CHECK(nsigs[0] == "(ptr noalias %state, i128 %0, i64 %1, ptr %2)");
 }

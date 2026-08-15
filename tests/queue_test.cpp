@@ -832,8 +832,12 @@ TEST_CASE("queue of class handles: null default, whole-queue copy, foreach") {
                 x = q[0];
                 $display("empty null=%0b", x == null);
                 for (int i = 0; i < 3; i++) begin
-                    Item it = new;
-                    it.v    = i + 1;
+                    // `automatic` is load-bearing: a block declaration defaults to
+                    // STATIC lifetime, whose initializer runs once before time zero
+                    // (LRM 6.21), so a static `it` would be ONE object pushed three
+                    // times and every element would read back the same v.
+                    automatic Item it = new;
+                    it.v = i + 1;
                     q.push_back(it);
                 end
                 // A whole-queue copy is a value copy of the HANDLES: the copy is

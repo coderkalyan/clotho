@@ -2413,6 +2413,15 @@ private:
                 if (std::find(handle_nba_sigs_.begin(), handle_nba_sigs_.end(), t.sig) ==
                     handle_nba_sigs_.end()) {
                     handle_nba_sigs_.push_back(t.sig);
+                    // The CONTAINER's type, taken from the op the way staging does.
+                    // Deriving it from the signal instead does not work: the signal
+                    // may be a fixed array OF containers, or a struct with a
+                    // container member, and then its type is the array or the
+                    // struct. The commit sizes its record and picks its move
+                    // function from this, so a mismatch reads a queue's 32 bytes
+                    // out of an 8-byte assoc handle.
+                    handle_nba_types_.push_back(
+                      ir.extra_data<QueueArg>(ir.payload(idx).op_extra.extra).queue_type);
                 }
                 continue;
             }
@@ -14122,10 +14131,15 @@ private:
 
     // Runtime buffer index of a whole-container NBA signal — after the array and
     // aggregate buffers in the shared rt_nba_arr_* index space.
-    uint32_t handle_buf_idx(Signal sig) const {
+    // Position of a signal within handle_nba_sigs_ / handle_nba_types_.
+    uint32_t handle_nba_slot(Signal sig) const {
         const auto it = std::find(handle_nba_sigs_.begin(), handle_nba_sigs_.end(), sig);
+        return static_cast<uint32_t>(it - handle_nba_sigs_.begin());
+    }
+
+    uint32_t handle_buf_idx(Signal sig) const {
         return static_cast<uint32_t>(array_nba_sigs_.size() + agg_nba_sigs_.size()) +
-               static_cast<uint32_t>(it - handle_nba_sigs_.begin());
+               handle_nba_slot(sig);
     }
 
     // Deferred whole-container NBA record: { ptr dest_handle, <handle slot> staged }.
@@ -14174,13 +14188,13 @@ private:
     // Replay a container's deferred whole-NBA records: move each staged handle into
     // its dest handle (push order, later write wins), then wake Any-edge readers.
     void emit_handle_whole_commit(Signal sig) {
-        // The container LEAF, not the signal's type: a signal may be a fixed
-        // unpacked array OF containers (`int fa[2][string]`), and `fa[0] <= w`
-        // stages one element. Staging sizes its record from the element type, so a
-        // commit reading the array type would take the wrong stride and dispatch
-        // the wrong move -- rt_dynarr_move over an 8-byte assoc handle, which
-        // overran the staging buffer.
-        const Ref      type = leaf_type(slot_of(sig).ir_type);
+        // The CONTAINER's type, as recorded when this signal was registered --
+        // never re-derived from the signal. `int fa[2][string]` is an array of
+        // assocs and `struct { int a[string]; }` is a struct with one, so the
+        // signal's type is the array or the struct in those cases while staging
+        // sized its record from the assoc. The mismatch made the commit take the
+        // wrong stride and dispatch rt_dynarr_move over an 8-byte assoc handle.
+        const Ref      type = handle_nba_types_[handle_nba_slot(sig)];
         auto*          rt   = handle_rec_ty(type);
         const auto     strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         auto*          i8   = b_.getInt8Ty();
@@ -21643,6 +21657,9 @@ private:
     // region; the NBA region moves that buffer into the live handle and wakes the
     // signal (Any-edge). See docs/design/queue-nba-and-nonpod.md.
     std::vector<Signal>     handle_nba_sigs_;
+    // Container type of each handle_nba_sigs_ entry, parallel to it. Recorded from
+    // the op rather than re-derived from the signal; see the registration comment.
+    std::vector<Ref>        handle_nba_types_;
 
     // Whole-scalar targets of a nonblocking intra-assignment delay (`x <= #d y`,
     // StoreNbDelay). Each gets a dense id; a per-target record (rt_intra_*) holds
