@@ -6694,14 +6694,6 @@ private:
             fail("disable of a task is not supported yet (every activation of the task has to "
                  "end, not just the caller's)");
         }
-        if (fn_ctx_ != nullptr) {
-            // TODO: a task, fork child or action block can have several live
-            // activations, and neither form covers that: a lexical exit would end
-            // only the one running, and the occupant slot holds one handle.
-            fail("disable inside a function, task or fork child is not supported yet (only a "
-                 "process body is single-activation)");
-        }
-
         bool     found = false;
         uint32_t label = kNoBlockLabel;
         for (size_t n = named_blocks_.size(); n > 0 && !found; --n) {
@@ -6715,26 +6707,39 @@ private:
         if (it == disable_targets_.end()) {
             fail("internal: disable target was not labelled in the Collect pass");
         }
+        if (found && fn_ctx_ != nullptr) {
+            // The lexical form ends the one activation running it, and a task, fork
+            // child or action block can have several inside the same block at once.
+            // (`named_blocks_` is swapped per body, so a hit here means the target is
+            // a block this body itself opened.)
+            //
+            // TODO: LRM 9.6.2 wants every activation ended, which is the per-target
+            // epoch plus the activation list — see docs/design/disable.md V2b.
+            fail("a disable of a block that encloses it, inside a function, task or fork child, "
+                 "is not supported yet (several activations can be inside that block, and a "
+                 "lexical exit ends only the one running)");
+        }
         if (!found) {
-            // The remote form. The target's own process is the one that unwinds, so
-            // everything that makes an activation identifiable has to hold there.
-            if (disable_forked_.contains(&target)) {
-                // TODO: a target inside a fork child. Each spawn is its own
-                // activation with its own frame, so one occupant slot cannot name
-                // them all — the same frame list a task target needs.
-                fail("disable of a block inside a fork child is not supported yet (each spawn is "
-                     "a separate activation)");
+            // The remote form. It does not care where the DISABLER runs — it marks an
+            // occupant and pushes a handle — so a task, function or action block may
+            // carry one. What has to hold is on the target side.
+            if (disable_multi_.contains(&target)) {
+                // TODO: a target inside a fork child or a subroutine. Each activation
+                // is its own occupant with its own frame, so one slot cannot name
+                // them all — the same activation list a task target needs (V2b).
+                fail("disable of a block inside a fork child or a subroutine is not supported "
+                     "yet (each activation is a separate occupant)");
             }
             if (disable_hard_.contains(&target)) {
                 // TODO: a remote target whose region can park behind something the
-                // abort cannot neutralize — a `#0` (the inactive batch has no
-                // per-entry mark), a task call or a fork (the process would be
-                // resumed a second time by that activation's completion), or an
-                // `expect`. A `#delay` and an `@event` wait are supported: the timer
-                // is abandoned and the wait compacts itself out of its buckets.
-                fail("disable of a block whose body contains a #0, a task call, a fork or an "
-                     "expect is not supported yet from outside the block (the abort cannot "
-                     "cancel that park)");
+                // abort cannot claim — a `#0` or a runtime-valued delay (the inactive
+                // batch has no per-entry claim), a time-consuming task call or a fork
+                // (the process would be resumed a second time by that activation's
+                // completion), or an `expect`. A `#delay` and an `@event` wait are
+                // supported, as is a task call that consumes no time.
+                fail("disable of a block whose body can park on a #0, a time-consuming task "
+                     "call, a fork or an expect is not supported yet from outside the block "
+                     "(the abort cannot claim that park)");
             }
             if (disable_roots_.contains(&target) && disable_flushes_.contains(&target)) {
                 // TODO: LRM 16.4.4 for a REMOTE target. The bump has to land on the
@@ -7326,24 +7331,27 @@ private:
     // (LRM 16.4.4). All of it has to be known before Emit, because a block lowers
     // BEFORE the `disable` nested inside it: only a targeted block is emitted as
     // an ir::NamedBlock, and whether it carries occupant bookkeeping is decided at
-    // the block, not at the `disable`. Calls are deliberately not followed — a
-    // `disable` inside a subroutine is refused outright (lower_disable), so a
-    // target reachable only through one can never be lowered.
+    // the block, not at the `disable`.
     //
     // The scan keeps its own enclosing-block stack rather than reusing
     // named_blocks_, which does not exist yet at Collect. A `disable` whose target
     // is on that stack is the lexical form; anything else is remote, including a
-    // sibling block in this same process. A target inside a `fork` child is
-    // recorded as such: the child is a second activation with its own frame, so it
-    // is not the single-occupant shape the remote form lowers.
+    // sibling block in this same process.
+    //
+    // Calls ARE followed, because the remote form works from anywhere: a `disable`
+    // inside a task does not care where it runs, it marks an occupant and pushes.
+    // What matters is where the TARGET lives, so a block declared inside a
+    // subroutine or a fork child is recorded as such — each activation of one is a
+    // separate occupant, which the single slot cannot name.
     void scan_disable_targets(const ProceduralBlockSymbol& blk) {
         struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
             // Targets named lexically (the `disable` is inside the target) and
             // remotely (it is not). A block can be in both.
             std::vector<const Symbol*> lexical;
             std::vector<const Symbol*> remote;
-            // Named blocks whose nearest enclosing block boundary is a fork child.
-            std::vector<const Symbol*> forked;
+            // Named blocks that cannot have a single live occupant: one inside a fork
+            // child, or one declared in a subroutine body (any number of activations).
+            std::vector<const Symbol*> multi;
             // Every named block seen, with its body, so the enclosing Lowerer can ask
             // whether the body parks in a way an abort cannot neutralize.
             std::vector<std::pair<const Symbol*, const Statement*>> bodies;
@@ -7352,17 +7360,38 @@ private:
             // drop rather than let mature.
             bool flushes = false;
 
-            std::vector<const Symbol*> open;
-            uint32_t                   fork_depth = 0;
+            std::vector<const Symbol*>                       open;
+            uint32_t                                         fork_depth = 0;
+            uint32_t                                         sub_depth  = 0;
+            ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
 
+            // Follow a user subroutine once. `sub_depth` marks everything found
+            // inside as multi-activation; `open` is swapped empty, because a
+            // `disable` in the body can only name blocks the body itself opened.
+            void handle(const CallExpression& c) {
+                visitDefault(c);
+                if (c.isSystemCall() || !std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
+                    return;
+                }
+                const auto* sub = std::get<const SubroutineSymbol*>(c.subroutine);
+                if (sub == nullptr || !entered.insert(sub).second) {
+                    return; // recursion, or already walked
+                }
+                std::vector<const Symbol*> saved;
+                saved.swap(open);
+                ++sub_depth;
+                sub->getBody().visit(*this);
+                --sub_depth;
+                open.swap(saved);
+            }
             void handle(const BlockStatement& s) {
                 const bool forks  = s.blockKind != StatementBlockKind::Sequential;
                 const bool named  = s.blockSymbol != nullptr && !s.blockSymbol->name.empty();
                 fork_depth       += forks ? 1 : 0;
                 if (named) {
                     open.push_back(s.blockSymbol);
-                    if (fork_depth != 0) {
-                        forked.push_back(s.blockSymbol);
+                    if (fork_depth != 0 || sub_depth != 0) {
+                        multi.push_back(s.blockSymbol);
                     }
                     bodies.emplace_back(s.blockSymbol, &s.body);
                 }
@@ -7394,8 +7423,8 @@ private:
         // procedure is not the one being lowered, so the 16.4.4 question has to be
         // answerable from the target alone.
         const Symbol* root = outermost_named_block(blk.getBody());
-        for (const Symbol* t : v.forked) {
-            disable_forked_.insert(t);
+        for (const Symbol* t : v.multi) {
+            disable_multi_.insert(t);
         }
         for (const auto& [sym, body] : v.bodies) {
             if (hard_park(*body)) {
@@ -7431,8 +7460,9 @@ private:
     // `@event` wait are fine: a `disable` claims the delay's park record, so the
     // timer that fires later wakes nobody, and the wait compacts itself out of its
     // buckets on resume. The rest are not, each for its own reason -- a `#0` parks
-    // in the inactive batch, which has no per-entry claim; a task call or a fork
-    // parks the process behind ANOTHER activation's completion, which would resume it
+    // in the inactive batch, which has no per-entry claim; a TIME-CONSUMING task call
+    // or a fork parks the process behind ANOTHER activation's completion, which
+    // would resume it
     // a second time; an `expect` parks on a reactive verdict. Refused rather than
     // silently double-woken.
     bool hard_park(const Statement& body) {
@@ -7464,7 +7494,11 @@ private:
             void handle(const CallExpression& c) {
                 if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
                     const auto* sub = std::get<const SubroutineSymbol*>(c.subroutine);
-                    found           = found || (sub != nullptr && sub->subroutineKind == SubroutineKind::Task);
+                    // Only a call that can PARK matters. A task that consumes no time
+                    // runs to completion inside the call, so the process is never
+                    // suspended behind it and there is nothing to double-wake — which
+                    // is most helper tasks, and refusing them was over-broad.
+                    found = found || (sub != nullptr && self->subroutine_parks(*sub));
                 }
                 visitDefault(c);
             }
@@ -7472,6 +7506,58 @@ private:
         Park p;
         p.self = this;
         body.visit(p);
+
+        return p.found;
+    }
+
+    // Whether calling this subroutine can suspend the caller: a timing control, a
+    // wait, a fork or an `expect` anywhere in its body, transitively through the
+    // calls it makes. Memoized, and a recursive cycle answers "no" on the way back
+    // in — the cycle itself parks only if some member does, which that member
+    // reports.
+    bool subroutine_parks(const SubroutineSymbol& sub) {
+        if (const auto it = sub_parks_.find(&sub); it != sub_parks_.end()) {
+            return it->second;
+        }
+        // Provisional false breaks recursion; overwritten below.
+        sub_parks_.emplace(&sub, false);
+
+        struct Park : ASTVisitor<Park, VisitFlags::AllGood> {
+            Lowerer* self  = nullptr;
+            bool     found = false;
+
+            void handle(const slang::ast::TimedStatement& s) {
+                found = true;
+                visitDefault(s);
+            }
+            void handle(const slang::ast::WaitStatement& s) {
+                found = true;
+                visitDefault(s);
+            }
+            void handle(const slang::ast::WaitForkStatement& s) {
+                found = true;
+                visitDefault(s);
+            }
+            void handle(const BlockStatement& s) {
+                found = found || s.blockKind != StatementBlockKind::Sequential;
+                visitDefault(s);
+            }
+            void handle(const slang::ast::ConcurrentAssertionStatement& s) {
+                found = found || s.assertionKind == slang::ast::AssertionKind::Expect;
+                visitDefault(s);
+            }
+            void handle(const CallExpression& c) {
+                if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
+                    const auto* callee = std::get<const SubroutineSymbol*>(c.subroutine);
+                    found = found || (callee != nullptr && self->subroutine_parks(*callee));
+                }
+                visitDefault(c);
+            }
+        };
+        Park p;
+        p.self = this;
+        sub.getBody().visit(p);
+        sub_parks_[&sub] = p.found;
 
         return p.found;
     }
@@ -19118,16 +19204,20 @@ private:
     // full further down, next to the statement lowering that pushes it).
     struct OpenBlock;
 
-    // The two pieces of state every subroutine / action / fork-child body swaps: its
-    // own frame context, and a fresh named-block stack (a `disable` inside the body
-    // may only name blocks the body itself opened).
+    // The three pieces of state every subroutine / action / fork-child body swaps:
+    // its own frame context, a fresh named-block stack (a `disable` inside the body
+    // may only name blocks the body itself opened), and no procedure root — a body
+    // is built at its first call site, whose enclosing procedure is not its own, so
+    // the 16.4.4 outermost-scope question has no answer here.
     class FnScope {
     public:
-        FnScope(Lowerer& l, FnCtx* ctx) : ctx_(l.fn_ctx_, ctx), blocks_(l.named_blocks_, {}) {}
+        FnScope(Lowerer& l, FnCtx* ctx)
+            : ctx_(l.fn_ctx_, ctx), blocks_(l.named_blocks_, {}), root_(l.proc_root_block_, nullptr) {}
 
     private:
-        Restore<FnCtx*>                ctx_;
+        Restore<FnCtx*>                 ctx_;
         Restore<std::vector<OpenBlock>> blocks_;
+        Restore<const Symbol*>          root_;
     };
 
     // Get (creating if needed) the frame Local index for a function-local symbol.
@@ -20754,14 +20844,17 @@ private:
     // place 16.4.4's flush applies. Recorded per target, not per procedure, so a
     // remote `disable` can answer the question about a procedure it is not in.
     ankerl::unordered_dense::set<const Symbol*> disable_roots_;
-    // The subset sitting inside a `fork` child. A child is a second activation
-    // with its own frame, so such a block has no single occupant and the remote
-    // form refuses it.
-    ankerl::unordered_dense::set<const Symbol*> disable_forked_;
-    // Named blocks whose body can park in a way the abort cannot neutralize (a `#0`,
-    // a task call, a fork, an `expect`); see hard_park. The remote form refuses one,
-    // the lexical form does not care -- it never leaves a park behind.
+    // The subset that cannot have a single live occupant: a block inside a `fork`
+    // child, or one declared in a subroutine body. Each activation is its own
+    // occupant with its own frame, so the remote form refuses these.
+    ankerl::unordered_dense::set<const Symbol*> disable_multi_;
+    // Named blocks whose body can park in a way the abort cannot claim (a `#0` or
+    // runtime-valued delay, a time-consuming task call, a fork, an `expect`); see
+    // hard_park. The remote form refuses one, the lexical form does not care -- it
+    // never leaves a park behind.
     ankerl::unordered_dense::set<const Symbol*> disable_hard_;
+    // Memoized "calling this can suspend the caller", see subroutine_parks.
+    ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_parks_;
     // The named block that is the current procedure's outermost scope, or null;
     // see outermost_named_block. Set per procedural block, read by lower_disable.
     const Symbol* proc_root_block_ = nullptr;

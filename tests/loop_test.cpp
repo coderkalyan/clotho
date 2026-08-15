@@ -875,8 +875,50 @@ TEST_CASE("disable of a procedure's outermost block drops its deferred reports")
     )") == "after inner\n");
 }
 
+// The remote form does not care where the DISABLER runs — it marks an occupant and
+// pushes a handle — so a task may carry one. Only the TARGET has to be a
+// single-occupant block in a process body. Oracle: iverilog.
+TEST_CASE("a disable inside a task can end a block in a process") {
+    CHECK(run_capture(R"(
+        module m;
+            task killer;
+                #5 disable blk;
+                $display("killed at %0t", $time);
+            endtask
+            initial begin
+                begin : blk
+                    #100 $display("never");
+                end
+                $display("after blk at %0t", $time);
+            end
+            initial killer();
+        endmodule
+    )") == "killed at 5\nafter blk at 5\n");
+}
+
+// A task call that consumes no time runs to completion inside the call, so the
+// process is never parked behind it and there is nothing to double-wake. Refusing
+// every task call was over-broad; only a time-consuming one is a park.
+TEST_CASE("a target that calls a zero-time task is still a legal remote target") {
+    CHECK(run_capture(R"(
+        module m;
+            task quiet(input integer v);
+                $display("helper %0d at %0t", v, $time);
+            endtask
+            initial begin
+                begin : blk
+                    quiet(1);
+                    #100 $display("never");
+                end
+                $display("after blk at %0t", $time);
+            end
+            initial #5 disable blk;
+        endmodule
+    )") == "helper 1 at 0\nafter blk at 5\n");
+}
+
 // What the remote form still refuses, each by its own reason: a park it cannot
-// cancel, and a target that is not single-occupant.
+// claim, and a target that is not single-occupant.
 TEST_CASE("the remote disable forms that are still refused name their reason") {
     const LowerResult task_park = lower_text(R"(
         module m;
@@ -890,7 +932,7 @@ TEST_CASE("the remote disable forms that are still refused name their reason") {
         endmodule
     )");
     CHECK_FALSE(task_park.ok);
-    CHECK(task_park.diagnostic_text().find("cannot cancel that park") != std::string::npos);
+    CHECK(task_park.diagnostic_text().find("cannot claim that park") != std::string::npos);
 
     const LowerResult zero_delay = lower_text(R"(
         module m;
@@ -903,7 +945,7 @@ TEST_CASE("the remote disable forms that are still refused name their reason") {
         endmodule
     )");
     CHECK_FALSE(zero_delay.ok);
-    CHECK(zero_delay.diagnostic_text().find("cannot cancel that park") != std::string::npos);
+    CHECK(zero_delay.diagnostic_text().find("cannot claim that park") != std::string::npos);
 
     const LowerResult in_fork = lower_text(R"(
         module m;
@@ -918,7 +960,25 @@ TEST_CASE("the remote disable forms that are still refused name their reason") {
         endmodule
     )");
     CHECK_FALSE(in_fork.ok);
-    CHECK(in_fork.diagnostic_text().find("separate activation") != std::string::npos);
+    CHECK(in_fork.diagnostic_text().find("separate occupant") != std::string::npos);
+
+    // A block declared inside a subroutine is guarded the same way, though slang
+    // does not resolve a hierarchical name to one, so the guard is defensive.
+
+    // And the lexical form inside a subroutine, which ends only the activation
+    // running it.
+    const LowerResult lexical_in_task = lower_text(R"(
+        module m;
+            task t;
+                begin : blk
+                    disable blk;
+                end
+            endtask
+            initial t();
+        endmodule
+    )");
+    CHECK_FALSE(lexical_in_task.ok);
+    CHECK(lexical_in_task.diagnostic_text().find("only the one running") != std::string::npos);
 }
 
 // -- foreach (12.7.3). Oracle: iverilog. --

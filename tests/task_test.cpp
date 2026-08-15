@@ -468,7 +468,9 @@ TEST_CASE("disable of a task is rejected") {
 }
 
 // A named block inside a task or a fork child is not single-activation, so the
-// lexical exit V1 lowers would end only the activation that ran the `disable`.
+// lexical exit ends only the activation that ran the `disable`. The remote form is
+// allowed from inside a subroutine (tests/loop_test.cpp); it is the LEXICAL one
+// that a multi-activation body cannot have.
 TEST_CASE("disable of a block inside a task or fork child is rejected") {
     constexpr std::string_view in_task = R"(
         module m;
@@ -480,7 +482,7 @@ TEST_CASE("disable of a block inside a task or fork child is rejected") {
             initial t;
         endmodule
     )";
-    CHECK(reject(in_task).find("disable inside a function, task or fork child") != std::string::npos);
+    CHECK(reject(in_task).find("only the one running") != std::string::npos);
 
     constexpr std::string_view in_child = R"(
         module m;
@@ -493,7 +495,7 @@ TEST_CASE("disable of a block inside a task or fork child is rejected") {
             end
         endmodule
     )";
-    CHECK(reject(in_child).find("disable inside a function, task or fork child") != std::string::npos);
+    CHECK(reject(in_child).find("only the one running") != std::string::npos);
 }
 
 // A nonblocking assignment to a module signal from inside a task stages into the
