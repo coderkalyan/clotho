@@ -534,6 +534,7 @@ add_executable(clotho_test
   tests/generate_test.cpp
   tests/instance_array_test.cpp
   tests/packed_range_test.cpp
+  tests/const_table_test.cpp
   tests/z_elision_test.cpp
   tests/analysis_test.cpp
   tests/recovery_test.cpp

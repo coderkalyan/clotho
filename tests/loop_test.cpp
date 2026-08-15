@@ -1355,3 +1355,144 @@ TEST_CASE("a process-level repeat still uses module-signal storage") {
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Signal));
     CHECK_FALSE(any_process_has_tag(*r.module, ir::Inst::Tag::Local));
 }
+
+// -- Block-local lifetime (LRM 6.21) -------------------------------------------
+//
+// A declaration in a procedural block defaults to STATIC lifetime: one instance,
+// initialized once before time zero. An `automatic` one has the lifetime of the
+// BLOCK and is initialized on every entry to it -- with its initializer if it has
+// one, else with the type's default (LRM 6.8, Table 6-7).
+//
+// Neither reset happened: an automatic declaration with no initializer kept the
+// previous entry's value, and a static one re-ran its initializer on every entry, so
+// both lifetimes behaved the same way and neither matched the LRM.
+
+TEST_CASE("the LRM 6.21 lifetime example prints what the LRM says it prints") {
+    // Verbatim from LRM 6.21 (module top_legal), including its two expected lines.
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                for (int i = 0; i < 3; i++) begin
+                    automatic int loop3 = 0;   // executes every loop
+                    for (int j = 0; j < 3; j++) begin
+                        loop3++;
+                        $write("%0d ", loop3);
+                    end
+                end
+                $display("");
+                for (int i = 0; i < 3; i++) begin
+                    static int loop2 = 0;      // executes once at time zero
+                    for (int j = 0; j < 3; j++) begin
+                        loop2++;
+                        $write("%0d ", loop2);
+                    end
+                end
+                $display("");
+            end
+        endmodule
+    )") == "1 2 3 1 2 3 1 2 3 \n"
+           "1 2 3 4 5 6 7 8 9 \n");
+}
+
+TEST_CASE("an automatic block local with no initializer starts at its type default") {
+    // Table 6-7: x for a 4-state integral, 0 for 2-state, 0.0 for real, "" for a
+    // string, null for a class handle, empty for a container, per leaf for an
+    // aggregate. Each line reads the variable BEFORE assigning it, so a value from
+    // the previous entry would show.
+    CHECK(run_capture(R"(
+        typedef struct {
+            int         a;
+            logic [3:0] f;
+        } t;
+        class C;
+            int v;
+        endclass
+        module m;
+            initial begin
+                for (int k = 0; k < 2; k++) begin
+                    automatic logic [3:0] y;
+                    automatic int         n;
+                    automatic real        r;
+                    automatic string      s;
+                    automatic C           h;
+                    automatic t           st;
+                    automatic int         arr[2];
+                    automatic int         q[$];
+                    automatic int         d[];
+                    automatic int         a[string];
+                    $display("k%0d y=%0h n=%0d r=%0g s=[%s] null=%0b st=%0d,%0h arr=%0d q=%0d d=%0d a=%0d",
+                             k, y, n, r, s, h == null, st.a, st.f, arr[1], q.size(), d.size(), a.num());
+                    y   = 4'h5;
+                    n   = 7;
+                    r   = 1.5;
+                    s   = "x";
+                    h   = new;
+                    st  = '{a: 1, f: 4'h2};
+                    arr = '{9, 9};
+                    q.push_back(1);
+                    d = new[3];
+                    a["k"] = 1;
+                end
+            end
+        endmodule
+    )") == "k0 y=x n=0 r=0 s=[] null=1 st=0,x arr=0 q=0 d=0 a=0\n"
+           "k1 y=x n=0 r=0 s=[] null=1 st=0,x arr=0 q=0 d=0 a=0\n");
+}
+
+TEST_CASE("a static block local keeps its value across entries, a container included") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                for (int k = 0; k < 3; k++) begin
+                    static int q[$];
+                    static int n = 100;
+                    q.push_back(k);
+                    n++;
+                    $display("k%0d n=%0d size=%0d last=%0d", k, n, q.size(), q[$]);
+                end
+            end
+        endmodule
+    )") == "k0 n=101 size=1 last=0\n"
+           "k1 n=102 size=2 last=1\n"
+           "k2 n=103 size=3 last=2\n");
+}
+
+TEST_CASE("a block re-entered within one call resets its automatic locals") {
+    // The frame is per CALL, so a block inside it needs its own reset -- a queue
+    // local in a loop body would otherwise accumulate across iterations of one call.
+    CHECK(run_capture(R"(
+        module m;
+            function automatic int rows(int n);
+                int total = 0;
+                for (int k = 0; k < n; k++) begin
+                    automatic int q[$];
+                    automatic int seen;
+                    for (int j = 0; j <= k; j++) q.push_back(j);
+                    seen  = q.size();
+                    total = total + seen;
+                    $display("row %0d size=%0d", k, seen);
+                end
+                return total;
+            endfunction
+            initial $display("total=%0d", rows(3));
+        endmodule
+    )") == "row 0 size=1\n"
+           "row 1 size=2\n"
+           "row 2 size=3\n"
+           "total=6\n");
+}
+
+TEST_CASE("a static local in an automatic subroutine still initializes once") {
+    CHECK(run_capture(R"(
+        module m;
+            function automatic int tick();
+                static int n = 0;
+                automatic int fresh = 0;
+                n++;
+                fresh++;
+                return n * 10 + fresh;
+            endfunction
+            initial $display("%0d %0d %0d", tick(), tick(), tick());
+        endmodule
+    )") == "11 21 31\n");
+}
