@@ -266,8 +266,13 @@ public:
                         // handled above, so what lands here is a property-layer
                         // one that reached a sequence position through
                         // property()'s fall-through -- `until`, `implies`, or an
-                        // implication nested where a sequence belongs.
-                        return reject("this sequence operator is not supported yet", &expr);
+                        // implication nested where a sequence belongs. The grammar
+                        // of 16.12 does not admit that, so slang's parser rejects
+                        // it first; this is the backstop, and it is a source error
+                        // rather than a gap.
+                        return reject("a property operator is not legal where a sequence is "
+                                      "required (LRM 16.9 lists the sequence operators)",
+                                      &expr);
                 }
                 // Both operands are sequences, so this recurses through
                 // sequence() and never through property(): these are
@@ -326,8 +331,12 @@ public:
                 // What lands here is a property-layer node that reached a
                 // sequence position -- `not`/`nexttime`/`always`/`eventually`
                 // (Unary), `strong`/`weak` (StrongWeak), `accept_on` and its
-                // family (Abort), and the case / if-else property forms.
-                return reject("this sequence operator is not supported yet", &expr);
+                // family (Abort), and the case / if-else property forms. As in
+                // the Binary arm above, the grammar does not admit one, so this
+                // backstops slang's parser and names a source error, not a gap.
+                return reject("a property operator is not legal where a sequence is "
+                              "required (LRM 16.9 lists the sequence operators)",
+                              &expr);
         }
     }
 
