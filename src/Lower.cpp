@@ -456,7 +456,10 @@ enum class SensitivityMode : uint8_t {
 //
 // The AST is walked rather than the lowered IR so reads are seen at the source
 // level, before any temporaries the IR introduces. Symbols not in `sigmap`
-// (parameters, genvars, other constants) carry no sensitivity and are skipped.
+// (genvars, enum members) carry no sensitivity and are skipped, as are
+// parameters — a parameter is not a variable (9.2.2.2, 9.4.2.2), and one that a
+// runtime index forced into storage (Lowerer::const_table_signal) is in `sigmap`
+// but still never changes.
 struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGood> {
     using SigMap = ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>;
 
@@ -474,6 +477,9 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
       , mode(mode) {}
 
     void record_read(const ValueSymbol& sym) {
+        if (sym.kind == SymbolKind::Parameter || sym.kind == SymbolKind::Specparam) {
+            return;
+        }
         const auto it = sigmap.find(&canonical_value_symbol(sym));
         if (it == sigmap.end()) {
             return;
@@ -3401,8 +3407,8 @@ private:
     // Lower a slang compile-time constant (a resolved parameter value or a
     // folded constant-required expression) into a pooled IR constant.
     //
-    // TODO: string/struct/array/enum constant parameters (depends on the
-    // matching runtime types — see docs/TODO.md Tier 3).
+    // An aggregate constant has no single pooled value; a runtime reference to
+    // one is materialized as a constant table instead (const_table_signal).
     ir::Ref lower_constant(const slang::ConstantValue& cv, const slang::ast::Type& type) {
         // Real / shortreal parameters (LRM 6.20), including untyped
         // `parameter r = 5.7`, whose type slang resolves to real.
@@ -3412,10 +3418,282 @@ private:
         if (cv.isShortReal()) {
             return module_.pool.put_real(lower_type(type), static_cast<double>(cv.shortReal()));
         }
+        if (cv.isString()) {
+            // A `string` parameter (LRM 6.20.2) is the same value a string
+            // literal folds to: its characters, interned once and assigned into
+            // the reader's handle like any string constant.
+            return string_value_ref(cv.str());
+        }
+        if (cv.isNullHandle()) {
+            // The only elaboration-time value of a class / chandle / event type
+            // (no object exists before simulation): the null handle, a 2-state
+            // zero in the handle's own 64-bit slot.
+            return module_.pool.put_int(lower_type(type), 0);
+        }
         if (!cv.isInteger()) {
-            fail("only integral and real constant parameters are supported");
+            fail("only integral, real, string and null constant parameters are supported");
         }
         return svint_to_ref(cv.integer(), lower_type(type));
+    }
+
+    // Append one integral constant's canonical plane bytes to `out`: the val
+    // plane, then the xz plane for a 4-state type. Same VPI convention and same
+    // packing as svint_to_ref, but writing into a larger image instead of
+    // interning a value of its own.
+    void append_svint_bytes(const slang::SVInt& src, ir::Ref ty, std::vector<uint8_t>& out) {
+        const ir::Layout   lay = module_.pool.layout(ty);
+        const slang::SVInt v   = src.getBitWidth() == lay.width ? src : src.resize(lay.width);
+
+        const uint32_t        words = (lay.width + 63) / 64;
+        const uint64_t*       raw   = v.getRawPtr();
+        const bool            unk   = v.hasUnknown();
+        std::vector<uint64_t> planes(static_cast<size_t>(words) * 2, 0);
+        for (uint32_t i = 0; i < words; ++i) {
+            planes[i]         = unk ? (raw[i] ^ raw[words + i]) : raw[i];
+            planes[words + i] = unk ? raw[words + i] : 0;
+        }
+
+        const uint32_t pb    = ir::plane_bytes(lay.width);
+        const size_t   start = out.size();
+        out.resize(start + lay.byte_count, 0);
+        std::memcpy(out.data() + start, planes.data(), pb);
+        if (lay.domain == ir::Domain::Four) {
+            std::memcpy(out.data() + start + pb, planes.data() + words, pb);
+        }
+    }
+
+    // Flatten an elaboration constant into the canonical image of `ty`,
+    // leaf-major: an unpacked array is its elements' images back to back (what
+    // InternPool::compute_layout sizes an UnpackedArray value at), an unpacked
+    // struct is its fields' images in declaration order (the aggregate storage
+    // mirror's walk order — such a type has no pooled layout of its own, so the
+    // image is only ever read back through the same walk), a leaf its planes.
+    // Heap-backed leaves (string, queue, dynamic / associative array) have no
+    // static image at all and never reach here: const_table_signal routes a type
+    // containing one to the seeded path instead.
+    void append_const_image(const slang::ConstantValue& cv, ir::Ref ty, std::vector<uint8_t>& out) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            if (!cv.isUnpacked() || cv.elements().size() != count) {
+                fail("constant table value does not match its array type");
+            }
+            for (const slang::ConstantValue& e : cv.elements()) {
+                append_const_image(e, t.element, out);
+            }
+            return;
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            if (!cv.isUnpacked() || cv.elements().size() != fields.size()) {
+                fail("constant table value does not match its struct type");
+            }
+            uint32_t f = 0;
+            for (const slang::ConstantValue& e : cv.elements()) {
+                append_const_image(e, fields[f++].type, out);
+            }
+            return;
+        }
+
+        const ir::Layout lay = module_.pool.layout(ty);
+        if (lay.byte_count == 0) {
+            fail("a constant table of this element type is not supported");
+        }
+        const size_t start = out.size();
+        if (cv.isNullHandle()) {
+            // The only elaboration-time value of a class / chandle leaf: a null
+            // handle, which is the zero the resize below already wrote.
+            out.resize(start + lay.byte_count, 0);
+            return;
+        }
+        if (module_.pool.is_float(ty)) {
+            if (!cv.isReal() && !cv.isShortReal()) {
+                fail("constant table value does not match its element type");
+            }
+            const double d = cv.isReal() ? static_cast<double>(cv.real()) : static_cast<double>(cv.shortReal());
+            out.resize(start + lay.byte_count, 0);
+            if (lay.width == 64) {
+                const uint64_t pat = std::bit_cast<uint64_t>(d);
+                std::memcpy(out.data() + start, &pat, 8);
+            } else {
+                const uint32_t pat = std::bit_cast<uint32_t>(static_cast<float>(d));
+                std::memcpy(out.data() + start, &pat, 4);
+            }
+            return;
+        }
+        if (!cv.isInteger()) {
+            fail("constant table value does not match its element type");
+        }
+        append_svint_bytes(cv.integer(), ty, out);
+    }
+
+    // Does `ty` hold a heap-backed leaf (string / queue / dynamic array /
+    // associative array) anywhere? Such a value lives behind a runtime handle
+    // that only the runtime can construct, so a constant of this type cannot be
+    // baked into a static image and must be seeded at time zero instead.
+    bool has_heap_leaf(ir::Ref ty) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        switch (t.kind) {
+            case ir::Type::Kind::String:
+            case ir::Type::Kind::DynArray:
+            case ir::Type::Kind::Queue:
+            case ir::Type::Kind::Assoc:
+                return true;
+            case ir::Type::Kind::UnpackedArray:
+                return has_heap_leaf(t.element);
+            case ir::Type::Kind::Struct: {
+                if (t.is_packed) {
+                    return false;
+                }
+                for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
+                    if (has_heap_leaf(f.type)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            default:
+                return false;
+        }
+    }
+
+    // Can this type's value be carried by one element op (a queue push, an
+    // associative-array entry store)? A plane, a real, or a string handle can; an
+    // aggregate or nested container has to be built element-wise through an
+    // lvalue, which those ops do not take.
+    bool is_scalar_element(ir::Ref ty) {
+        const ir::Type& t = std::get<ir::Type>(module_.pool.get(ty));
+        switch (t.kind) {
+            case ir::Type::Kind::UnpackedArray:
+            case ir::Type::Kind::DynArray:
+            case ir::Type::Kind::Queue:
+            case ir::Type::Kind::Assoc:
+                return false;
+            case ir::Type::Kind::Struct:
+                return t.is_packed;
+            default:
+                return true;
+        }
+    }
+
+    // Write an elaborated constant into storage, one store per leaf, for a value
+    // whose type holds a heap-backed leaf (string / queue / dynamic array /
+    // associative array). Only the runtime can construct those handles, so such a
+    // constant table has no static image and is instead seeded once in the
+    // run-once PreInit process — the same shape a `const` variable declaration of
+    // the type already lowers to.
+    //
+    // It walks the elaborated ConstantValue rather than the parameter's
+    // initializer expression because the expression is not always the value: a
+    // defparam / config / command-line override installs a value with no
+    // initializer at all, and an instance override's expression is bound in the
+    // instantiating scope rather than the one being lowered (slang
+    // ParameterBuilder::createParam).
+    void emit_const_seed(ir::Index                   lhs,
+                         ir::Ref                     ty,
+                         const slang::ast::Type&     sv_type,
+                         const slang::ConstantValue& cv,
+                         ir::Builder&                b,
+                         ir::SourceLoc               l) {
+        // By value: interning a constant below can reallocate the pool's items.
+        const ir::Type          t  = std::get<ir::Type>(module_.pool.get(ty));
+        const slang::ast::Type& ct = sv_type.getCanonicalType();
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            if (!cv.isUnpacked() || cv.elements().size() != count) {
+                fail("constant table value does not match its array type");
+            }
+            const slang::ast::Type& et = *ct.getArrayElementType();
+            for (uint32_t k = 0; k < count; ++k) {
+                const int32_t coord =
+                  t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
+                const ir::Index idx = b.constant(
+                  module_.pool.put_int(make_int_type(32, false, true),
+                                       static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                  l);
+                emit_const_seed(b.elem_select(lhs, idx, ty, l), t.element, et, cv.elements()[k], b, l);
+            }
+            return;
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            if (!cv.isUnpacked()) {
+                fail("constant table value does not match its struct type");
+            }
+            uint32_t i = 0;
+            for (const auto& f : ct.as<slang::ast::UnpackedStructType>().membersOfType<slang::ast::FieldSymbol>()) {
+                if (i >= cv.elements().size()) {
+                    fail("constant table value does not match its struct type");
+                }
+                // Re-fetch the row each step: lowering a field can intern a new
+                // struct's field table and invalidate a held span.
+                const ir::Field fld = module_.pool.struct_fields(t.fields_id)[i];
+                emit_const_seed(b.member_select(lhs, i, ty, l), fld.type, f.getType(), cv.elements()[i], b, l);
+                ++i;
+            }
+            return;
+        }
+        if (t.kind == ir::Type::Kind::DynArray) {
+            if (!cv.isUnpacked()) {
+                fail("constant table value does not match its dynamic array type");
+            }
+            const auto              n  = static_cast<uint32_t>(cv.elements().size());
+            const slang::ast::Type& et = *ct.getArrayElementType();
+            const ir::Index         sz = b.constant(module_.pool.put_int(make_int_type(32, false, false), n), l);
+            b.dyn_array_new(lhs, sz, lhs, /*has_init=*/false, ty, l);
+            for (uint32_t k = 0; k < n; ++k) {
+                const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
+                emit_const_seed(b.elem_select(lhs, idx, ty, l), t.element, et, cv.elements()[k], b, l);
+            }
+            return;
+        }
+        if (t.kind == ir::Type::Kind::Queue) {
+            if (!cv.isQueue()) {
+                fail("constant table value does not match its queue type");
+            }
+            const slang::ast::Type& et = *ct.getArrayElementType();
+            if (!is_scalar_element(t.element)) {
+                // A push takes one element VALUE, so an element that is itself a
+                // container or an aggregate would need a temp built per entry.
+                fail("a constant queue of aggregate or container elements is not supported");
+            }
+            b.queue_delete(lhs, lhs, /*has_idx=*/false, ty, l);
+            for (const slang::ConstantValue& e : *cv.queue()) {
+                b.queue_push(lhs, b.constant(lower_constant(e, et), l), /*front=*/false, ty, l);
+            }
+            return;
+        }
+        if (t.kind == ir::Type::Kind::Assoc) {
+            if (!cv.isMap()) {
+                fail("constant table value does not match its associative array type");
+            }
+            const auto& at = ct.as<slang::ast::AssociativeArrayType>();
+            if (at.hasWildcardIndexType()) {
+                // TODO: `int a[*]` as a constant — a wildcard key has no declared
+                // type to intern the key constant against, and the runtime keys on
+                // the byte span, so a mismatched width would never be found.
+                fail("a constant associative array with a wildcard index is not supported");
+            }
+            if (!is_scalar_element(t.element)) {
+                fail("a constant associative array of aggregate or container elements is not supported");
+            }
+            b.assoc_reset(lhs, ty, l);
+            const slang::ConstantValue& dflt = cv.map()->defaultValue;
+            if (!dflt.bad()) {
+                b.binary(ir::Inst::Tag::Store, b.assoc_default(lhs, ty, l),
+                         b.constant(lower_constant(dflt, at.elementType), l), l);
+            }
+            for (const auto& [key, val] : *cv.map()) {
+                const ir::Index k = b.constant(lower_constant(key, *at.indexType), l);
+                b.binary(ir::Inst::Tag::Store, b.assoc_select(lhs, k, ty, l),
+                         b.constant(lower_constant(val, at.elementType), l), l);
+            }
+            return;
+        }
+
+        // A leaf: a plane value, a real, or a string handle — a Store of the
+        // pooled constant, which the backend routes to a deep string assign when
+        // the destination is a string.
+        b.binary(ir::Inst::Tag::Store, lhs, b.constant(lower_constant(cv, sv_type), l), l);
     }
 
     // -- Signals --
@@ -3679,6 +3957,77 @@ private:
 
         const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&vs]         = sig;
+
+        return sig;
+    }
+
+    // A parameter / specparam (LRM 6.20, 23.10) whose value a runtime index has
+    // to address: `localparam int P[0:3] = '{...}; x = P[i]`. Neither route an
+    // ordinary reference takes works — an elaboration constant has no storage to
+    // address, and a non-constant selector defeats the fold — so the value is
+    // materialized as a read-only table instead. Genvars and enum members are
+    // deliberately excluded: an enum member always folds, and a genvar's symbol
+    // is shared across loop iterations, so one baked value would be wrong.
+    static bool is_const_table_symbol(const ValueSymbol& s) {
+        return s.kind == SymbolKind::Parameter || s.kind == SymbolKind::Specparam;
+    }
+
+    // Materialize such a constant as a signal whose whole image is interned once
+    // (SignalInfo::const_data); the backend bakes it into the state field's
+    // static initializer, so the table costs no instructions at elaboration or
+    // at time zero and every reader is an ordinary indexed load. Idempotent.
+    //
+    // Registered unscoped, like package-scope state: the table belongs to no
+    // instance's hierarchy (nothing writes it, nothing dumps it, and its value is
+    // fixed at elaboration), and keeping it out of the InstanceScope tree leaves
+    // per-scope signal order — and so the backend's state layout — exactly as the
+    // Collect pass built it, which is what lets this run lazily during Emit.
+    ir::Signal const_table_signal(const ValueSymbol& vs) {
+        const auto it = sigmap_.find(&vs);
+        if (it != sigmap_.end()) {
+            return it->second;
+        }
+
+        const slang::ConstantValue* cv = nullptr;
+        if (const auto* p = vs.as_if<slang::ast::ParameterSymbol>()) {
+            cv = &p->getValue();
+        } else if (const auto* sp = vs.as_if<slang::ast::SpecparamSymbol>()) {
+            cv = &sp->getValue();
+        }
+        if (cv == nullptr || cv->bad()) {
+            fail("reference to unknown signal '" + std::string(vs.name) + "'");
+        }
+
+        const ir::Ref  ty     = lower_type(vs.getType());
+        const bool     seeded = has_heap_leaf(ty);
+        ir::SignalInfo info;
+        info.name = prefix_ + std::string(vs.name);
+        info.loc  = to_source_loc(vs.location);
+        info.type = ty;
+        info.dir  = ir::SignalInfo::Direction::Internal;
+        if (!seeded) {
+            std::vector<uint8_t> image;
+            image.reserve(module_.pool.layout(ty).byte_count);
+            append_const_image(*cv, ty, image);
+            info.const_data = module_.pool.put_value(ty, image);
+        }
+
+        const ir::Signal sig = module_.add_signal(std::move(info));
+        sigmap_[&vs]         = sig;
+
+        if (seeded) {
+            // The handles this value needs only exist at run time, so the table is
+            // built once in PreInit instead of baked. PreInit stores service no
+            // wait queue and run before every process, so the table is settled
+            // before the first reader — including a declaration initializer that
+            // reads it, whose own store is appended after these.
+            if (!preinit_) {
+                preinit_.emplace(module_.pool);
+            }
+            ir::Builder&        pb = *preinit_;
+            const ir::SourceLoc pl = to_source_loc(vs.location);
+            emit_const_seed(pb.signal(sig, pl), ty, vs.getType(), *cv, pb, pl);
+        }
 
         return sig;
     }
@@ -19228,6 +19577,13 @@ private:
                     return class_member_lvalue(handle, *prop, fn_ctx_->this_class, b, l);
                 }
             }
+        }
+
+        if (is_const_table_symbol(vs)) {
+            // An elaboration constant reached as an lvalue root: every fold-only
+            // route (a constant select, a whole reference) resolved earlier, so
+            // this reference genuinely needs an address. Materialize the value.
+            return b.signal(const_table_signal(vs), l);
         }
 
         return b.signal(signal_of(vs), l);
