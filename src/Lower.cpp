@@ -6116,6 +6116,19 @@ private:
                 }
             }
         }
+        // LRM 16.4.4: a REMOTE `disable` of this procedure's outermost scope has to
+        // bump THIS procedure's deferred generation, so the target has to be able to
+        // name the process it belongs to.
+        if (proc_root_block_ != nullptr && disable_flushes_.contains(proc_root_block_) &&
+            disable_roots_.contains(proc_root_block_)) {
+            const auto id = disable_targets_.find(proc_root_block_);
+            if (id != disable_targets_.end()) {
+                if (module_.disable_flush_proc.size() < module_.disable_targets) {
+                    module_.disable_flush_proc.resize(module_.disable_targets, ir::Module::no_flush_proc);
+                }
+                module_.disable_flush_proc[id->second] = static_cast<uint32_t>(module_.processes().size());
+            }
+        }
         module_.add_process(ir::Process{ .activation  = activation,
                                          .wait_events = std::move(wait_events),
                                          .self_start  = self_start,
@@ -6758,13 +6771,10 @@ private:
                      "(the abort cannot claim that park)");
             }
             if (disable_roots_.contains(&target) && disable_flushes_.contains(&target)) {
-                // TODO: LRM 16.4.4 for a REMOTE target. The bump has to land on the
-                // TARGET process's generation counter, and defer_gen_ptr is scoped
-                // to the group being lowered — so this needs the target's group
-                // threaded through, which the lexical case below never needs.
-                fail("disable of the outermost block of another process holding deferred or "
-                     "concurrent assertions is not supported yet (LRM 16.4.4 requires dropping "
-                     "that process's pending reports)");
+                // LRM 16.4.4: this is the target procedure's OUTERMOST scope, so its
+                // pending deferred reports are dropped. The bump names the target,
+                // because the counter to move is the target procedure's, not ours.
+                b.defer_flush(it->second, loc(s));
             }
             b.disable_remote(it->second, loc(s));
             return;
@@ -6777,7 +6787,7 @@ private:
             // drops its pending deferred reports. Lexically that procedure IS this
             // one, so the generation counter to bump is this group's own — one
             // instruction, immediately before the exit.
-            b.defer_flush(loc(s));
+            b.defer_flush(ir::kNoDisableTarget, loc(s));
         }
 
         b.disable(label, loc(s));
@@ -7438,7 +7448,16 @@ private:
         // rather than per procedure: a remote `disable` reaches a target whose
         // procedure is not the one being lowered, so the 16.4.4 question has to be
         // answerable from the target alone.
+        // Recorded for EVERY procedure, not only one that contains a `disable`: a
+        // remote disabler asks these questions about a procedure it is not in, and
+        // that procedure may hold no `disable` of its own.
         const Symbol* root = outermost_named_block(blk.getBody());
+        if (root != nullptr) {
+            disable_roots_.insert(root);
+            if (v.flushes) {
+                disable_flushes_.insert(root);
+            }
+        }
         for (const Symbol* t : v.multi) {
             disable_multi_.insert(t);
         }
@@ -7474,12 +7493,6 @@ private:
                 if (set == &v.remote) {
                     disable_remote_.insert(t);
                 }
-                if (v.flushes) {
-                    disable_flushes_.insert(t);
-                }
-                if (t == root) {
-                    disable_roots_.insert(t);
-                }
             }
         }
     }
@@ -7509,17 +7522,12 @@ private:
                 found = found || s.assertionKind == slang::ast::AssertionKind::Expect;
                 visitDefault(s);
             }
-            void handle(const slang::ast::TimedStatement& s) {
-                if (s.timing.kind == slang::ast::TimingControlKind::Delay) {
-                    // A constant nonzero delay is a wheel timer, which is abandonable.
-                    // Zero, or an amount only known at runtime (which may BE zero),
-                    // can reach the inactive batch instead.
-                    const std::optional<int32_t> n =
-                      self->try_const_int(s.timing.as<slang::ast::DelayControl>().expr);
-                    found = found || !n.has_value() || *n == 0;
-                }
-                visitDefault(s);
-            }
+            // A delay of any amount is fine. A nonzero one is a wheel timer, whose
+            // park record the disabler claims. A `#0` parks in the inactive batch,
+            // which has no claim -- and needs none: mid-body the scheduled flag is
+            // SET, so the disabler stands down and the batch's own promotion, which
+            // happens later in the same instant, delivers the single wake. The poll
+            // then sees the mark. That is also why the batch never double-wakes.
             void handle(const CallExpression& c) {
                 if (!c.isSystemCall() && std::holds_alternative<const SubroutineSymbol*>(c.subroutine)) {
                     const auto* sub = std::get<const SubroutineSymbol*>(c.subroutine);

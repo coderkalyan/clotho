@@ -7702,6 +7702,18 @@ private:
     // promotes into the reactive ring untagged, exactly as it is pushed here --
     // a ring entry is a plain handle, never a parked one.
     void emit_zero_delay_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
+        // A batch entry has no claim field, and it does not need one: the batch's own
+        // promotion later in this instant IS the wake. What it does need is to say so
+        // -- a `disable` arriving meanwhile must stand down rather than push a second
+        // copy of a handle the promotion will deliver, which resumed the activation
+        // twice and, once it had finished, jumped through a dead coroutine.
+        //
+        // The scheduled flag is exactly that statement, and setting it here is also
+        // the truth: a `#0`-parked activation is already scheduled. The promotion
+        // does not consult the flag, so it still lands.
+        if (design_uses_disable_ && sched_ptr_ != nullptr) {
+            b.CreateStore(b.getInt32(1), sched_ptr_);
+        }
         if (reactive_home()) {
             emit_re_inactive_push(b, handle);
         } else {
@@ -11578,8 +11590,14 @@ private:
             case Inst::Tag::DeferFlush:
                 // LRM 16.4.4: disabling a procedure's outermost scope drops its
                 // pending deferred reports. Same generation bump an activation start
-                // does, so a report queued before this point never matures.
-                emit_defer_gen_bump();
+                // does, so a report queued before this point never matures. A target
+                // id names ANOTHER procedure's counter -- the remote case, where the
+                // reports to drop are not this group's.
+                if (p.label == kNoDisableTarget) {
+                    emit_defer_gen_bump();
+                } else {
+                    emit_defer_gen_bump_at(defer_gen_ptr_for(group_of_[mod_.disable_flush_proc[p.label]]));
+                }
                 return;
             case Inst::Tag::DisableAbort:
                 // Terminator: this activation was named by a `disable` it ran itself
@@ -16138,19 +16156,23 @@ private:
     // assertion. Bumped once per activation and read at each deferred report to
     // tag it; see lower_group / emit_defer_gen_bump / lower_severity.
     llvm::Value* defer_gen_ptr() {
-        if (cur_defer_group_ < 0) {
-            return nullptr;
-        }
-        const auto g = static_cast<size_t>(cur_defer_group_);
+        return cur_defer_group_ < 0 ? nullptr : defer_gen_ptr_for(static_cast<uint32_t>(cur_defer_group_));
+    }
+
+    // The same counter named by GROUP rather than by "the one being lowered", which
+    // is what a `disable` of another procedure's outermost scope needs (LRM 16.4.4):
+    // the bump has to land on the TARGET's counter. Created in the root unit so
+    // either side can be lowered first and still get the same global.
+    llvm::Value* defer_gen_ptr_for(uint32_t g) {
         if (defer_gen_gv_.size() <= g) {
             defer_gen_gv_.resize(g + 1, nullptr);
         }
         if (defer_gen_gv_[g] == nullptr) {
             defer_gen_gv_[g] = new llvm::GlobalVariable(
-              env_->llmod, b_.getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
+              root_env_->llmod, b_.getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
               b_.getInt64(0), "clotho.defer.gen." + std::to_string(g));
         }
-        return defer_gen_gv_[g];
+        return sym(defer_gen_gv_[g]);
     }
 
     // Bump the current group's deferred-assertion generation at an activation
@@ -16158,7 +16180,10 @@ private:
     // carry a stale generation and are dropped at maturation. A no-op for a group
     // without deferred assertions.
     void emit_defer_gen_bump() {
-        llvm::Value* gen = defer_gen_ptr();
+        emit_defer_gen_bump_at(defer_gen_ptr());
+    }
+
+    void emit_defer_gen_bump_at(llvm::Value* gen) {
         if (gen == nullptr) {
             return;
         }

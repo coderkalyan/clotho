@@ -875,6 +875,42 @@ TEST_CASE("disable of a procedure's outermost block drops its deferred reports")
     )") == "after inner\n");
 }
 
+// The same rule reached from ANOTHER process, which is the case that needs the bump
+// to land on the target's generation counter rather than the disabler's. The
+// `disable` has to run in the same time slot as the assert and after it, or the
+// report has already matured and there is nothing pending to drop -- so the
+// disabler yields with `#0` (the inactive region runs after Active, before
+// Observed).
+TEST_CASE("a remote disable of an outermost block drops that process's reports") {
+    CHECK(run_capture(R"(
+        module m;
+            integer x;
+            initial begin : whole
+                x = 0;
+                assert #0 (x == 1) else $error("should be dropped");
+                #10 $display("never");
+            end
+            initial begin
+                #0 disable whole;
+                $display("disabled at %0t", $time);
+            end
+        endmodule
+    )") == "disabled at 0\n");
+
+    // Without the disable the same report matures normally, which is what makes the
+    // case above evidence of a drop rather than of a report that never existed.
+    CHECK(run_capture(R"(
+        module m;
+            integer x;
+            initial begin : whole
+                x = 0;
+                assert #0 (x == 1) else $info("fired");
+                #10 $display("reached %0t", $time);
+            end
+        endmodule
+    )") == "reached 10\n");
+}
+
 // The remote form does not care where the DISABLER runs — it marks an occupant and
 // pushes a handle — so a task may carry one. Only the TARGET has to be a
 // single-occupant block in a process body. Oracle: iverilog.
@@ -934,18 +970,6 @@ TEST_CASE("the remote disable forms that are still refused name their reason") {
     CHECK_FALSE(task_park.ok);
     CHECK(task_park.diagnostic_text().find("cannot claim that park") != std::string::npos);
 
-    const LowerResult zero_delay = lower_text(R"(
-        module m;
-            initial begin
-                begin : blk
-                    #0 $display("x");
-                end
-            end
-            initial #5 disable blk;
-        endmodule
-    )");
-    CHECK_FALSE(zero_delay.ok);
-    CHECK(zero_delay.diagnostic_text().find("cannot claim that park") != std::string::npos);
 
     const LowerResult in_fork = lower_text(R"(
         module m;
@@ -979,6 +1003,32 @@ TEST_CASE("the remote disable forms that are still refused name their reason") {
     )");
     CHECK_FALSE(lexical_in_task.ok);
     CHECK(lexical_in_task.diagnostic_text().find("only the one running") != std::string::npos);
+}
+
+// A `#0` inside a target parks in the inactive batch, which has no claim field. It
+// needs none: the batch's own promotion later in the same instant is the wake, and
+// the park marks itself scheduled so a `disable` arriving meanwhile stands down
+// instead of pushing a second copy of the same handle. Two `#0`s and a `#0`
+// disabler is the shape that double-woke before the mark, so it is the one pinned.
+// Oracle: iverilog.
+TEST_CASE("a #0 inside a disabled block is woken exactly once") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                begin : blk
+                    #0 $display("z1 at %0t", $time);
+                    #0 $display("z2 at %0t", $time);
+                    #50 $display("never");
+                end
+                $display("after blk at %0t", $time);
+                #1 $display("done at %0t", $time);
+            end
+            initial begin
+                #0 disable blk;
+                $display("disabled at %0t", $time);
+            end
+        endmodule
+    )") == "z1 at 0\ndisabled at 0\nafter blk at 0\ndone at 1\n");
 }
 
 // -- foreach (12.7.3). Oracle: iverilog. --

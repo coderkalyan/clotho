@@ -1499,10 +1499,11 @@ struct Inst {
         // 9.6.2 example 4: the activation running the `disable` is one of the ones
         // that has to end, and it is the only one no force-wake can reach.
         DisableAbort,
-        // Drop this process's pending deferred-assertion reports (LRM 16.4.4):
-        // bump its generation counter, exactly as an activation start does
-        // (payload: none). Emitted immediately before a `disable` of the
-        // procedure's own outermost scope.
+        // Drop a procedure's pending deferred-assertion reports (LRM 16.4.4): bump
+        // its generation counter, exactly as an activation start does (payload:
+        // label -- kNoDisableTarget for the procedure being lowered, else the
+        // `disable` target id whose owning procedure is flushed). Emitted
+        // immediately before a `disable` of that procedure's outermost scope.
         DeferFlush,
         // Time delay `#n`: suspend the process for `n` ticks (payload: unary, the
         // tick count). Lowers to a timer scheduled on the wheel plus a coroutine
@@ -2180,6 +2181,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Extra;
         case T::Disable:
         case T::DisableRemote:
+        case T::DeferFlush:
             return K::Label;
         case T::Call:
             return K::Call;
@@ -2210,7 +2212,6 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::TimeFormat;
         case T::Break:
         case T::Continue:
-        case T::DeferFlush:
         case T::DisableAbort:
         case T::RetVoid:
         case T::DumpVars:

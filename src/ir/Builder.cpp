@@ -482,8 +482,8 @@ Index Builder::disable_remote(uint32_t target, SourceLoc loc) {
     return emit({ Inst::Tag::DisableRemote, pay(&Inst::Payload::label, target) }, loc);
 }
 
-Index Builder::defer_flush(SourceLoc loc) {
-    return emit({ Inst::Tag::DeferFlush, Inst::Payload{ .none = 0 } }, loc);
+Index Builder::defer_flush(uint32_t target, SourceLoc loc) {
+    return emit({ Inst::Tag::DeferFlush, pay(&Inst::Payload::label, target) }, loc);
 }
 
 Index Builder::disable_abort(SourceLoc loc) {

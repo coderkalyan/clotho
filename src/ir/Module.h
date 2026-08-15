@@ -608,6 +608,12 @@ public:
     // target is aborted through its activation list, a block target through its
     // single occupant slot, and the id alone does not say which.
     std::vector<uint8_t> disable_target_is_task;
+    // For a target that IS its procedure's outermost scope and whose procedure holds
+    // deferred assertions: that procedure's process index, so a REMOTE `disable` can
+    // bump the target's generation counter rather than its own (LRM 16.4.4). Filled
+    // as processes are created; `no_flush_proc` where the rule does not apply.
+    static constexpr uint32_t no_flush_proc = ~0u;
+    std::vector<uint32_t>     disable_flush_proc;
 
     // Number of `disable` target ids allocated (LRM 9.6.2). One id per targeted
     // named block per elaborated instance, so this is the length of the backend's
