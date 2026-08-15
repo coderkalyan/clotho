@@ -130,6 +130,26 @@ TEST_CASE("blocking intra-assignment repeat-event waits N edges then stores the 
     CHECK(run_capture_finish(src) == "e=1 t=25\n");
 }
 
+// A real repeat count rounds half away from zero (LRM 6.12.1), so 2.4 waits two
+// edges (t=15) and 2.5 waits three (t=25) -- the two differ by one edge, which is
+// what pins the rounding rather than a truncation. A count that rounds negative is
+// 9.4.5's "the assignment occurs as if there is no repeat construct": no wait at
+// all, so the store lands at t=0. Each expectation is the integral count it rounds
+// to, run against iverilog 13 (which cannot compile the real form itself).
+TEST_CASE("blocking intra-assignment repeat-event rounds a real count") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b, c;
+            logic clk = 0;
+            always #5 clk = ~clk;
+            initial begin a = repeat(2.4)  @(posedge clk) 8'd7; $display("a=%0d t=%0t", a, $time); end
+            initial begin b = repeat(2.5)  @(posedge clk) 8'd9; $display("b=%0d t=%0t", b, $time); end
+            initial begin c = repeat(-0.6) @(posedge clk) 8'd5; $display("c=%0d t=%0t", c, $time); end
+            initial #40 $finish;
+        endmodule)";
+    CHECK(run_capture_finish(src) == "c=5 t=0\na=7 t=15\nb=9 t=25\n");
+}
+
 // -- Nonblocking intra-assignment delay (`x <= #d y`, LRM 9.4.5) --
 //
 // The process does not block: the RHS is sampled now and the update is committed
@@ -306,6 +326,23 @@ TEST_CASE("nonblocking intra-delay repeat-event stores after N edges") {
             initial begin #48; $display("r=%0d", r); $finish; end
         endmodule)";
     CHECK(run_capture_finish(src) == "r=42\n");
+}
+
+// The nonblocking form rounds its real count the same way (LRM 6.12.1): 1.6 rounds
+// to 2, so the record commits at the SECOND posedge after the arm at t=1. The pair
+// of samples straddles that edge -- r is still 0 at t=14 and 42 at t=16 -- which a
+// truncated count of 1 would have committed at t=5 instead. Times pinned against
+// iverilog 13 with the integral count 1.6 rounds to.
+TEST_CASE("nonblocking intra-delay repeat-event rounds a real count") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] r;
+            logic       clk = 0;
+            always #5 clk = ~clk;
+            initial begin r = 0; #1 r <= repeat(1.6) @(posedge clk) 8'd42; end
+            initial begin #14 $display("t=%0t r=%0d", $time, r); #2 $display("t=%0t r=%0d", $time, r); $finish; end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=14 r=0\nt=16 r=42\n");
 }
 
 // The trigger edge may come from an NBA commit (`clk <= ~clk`), not just a
@@ -620,4 +657,45 @@ TEST_CASE("nonblocking intra-delay to a string target is rejected") {
             initial s <= #5 t;
         endmodule)";
     CHECK(lower_error(src).find("unpacked-array element, or a struct field") != std::string::npos);
+}
+
+// A real target on the EVENT form. The delay form already worked, and both arms
+// fill the same deferred record through fill_intra_payload, whose first act is
+// real_to_planes -- so the frontend guard that named an "event arm/fire path"
+// real gap described a drift that never existed. Values verified against
+// iverilog 13: the store lands at the posedge (t=10), not when the statement ran.
+TEST_CASE("nonblocking intra-assignment event timing to a real target") {
+    constexpr std::string_view src = R"(
+        module m;
+            real r;
+            logic clk = 0;
+            initial begin
+                r = 1.5;
+                #1 r <= @(posedge clk) 2.75;
+                #5 $display("t=%0t r=%0.2f", $time, r);
+                #5 clk = 1;
+                #1 $display("t=%0t r=%0.2f", $time, r);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 r=1.50\nt=12 r=2.75\n");
+}
+
+// The repeat-event form on a real target: the countdown rides the same record,
+// so the store lands on the SECOND posedge (t=15), matching iverilog 13.
+TEST_CASE("nonblocking intra-assignment repeat-event timing to a real target") {
+    constexpr std::string_view src = R"(
+        module m;
+            real r;
+            logic clk = 0;
+            initial forever #5 clk = ~clk;
+            initial begin
+                r = 1.0;
+                r <= repeat (2) @(posedge clk) 3.25;
+                #7  $display("t=%0t r=%0.2f", $time, r);
+                #10 $display("t=%0t r=%0.2f", $time, r);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=7 r=1.00\nt=17 r=3.25\n");
 }

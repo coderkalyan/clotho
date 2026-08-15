@@ -1416,3 +1416,96 @@ TEST_CASE("unique pattern case: two matching items report an overlap") {
     // First-match execution is unchanged: only the first Valid item runs.
     CHECK(run_capture(src) == "a 5\n");
 }
+
+// An integral label against a real selector converts to real (11.8.1), so `2`
+// matches 2.0; -0.0 and 0.0 are the same IEEE-754 value; a multi-label item ORs
+// its labels.
+TEST_CASE("case with a real selector compares by value") {
+    const std::string out = run_capture(R"(
+        module m;
+            real r;
+            initial begin
+                r = 2.0;
+                case (r) 1.5: $display("a"); 2: $display("int-label"); default: $display("d"); endcase
+                r = -0.0;
+                case (r) 0.0: $display("negzero"); default: $display("nz-d"); endcase
+                r = 2.5;
+                case (r) 1.5, 2.5, 3.5: $display("multi"); default: $display("md"); endcase
+                r = 9.0;
+                case (r) 1.5: $display("x"); 2.5: $display("y"); default: $display("dflt"); endcase
+            end
+        endmodule
+    )");
+    CHECK(out == "int-label\nnegzero\nmulti\ndflt\n");
+}
+
+TEST_CASE("a real case stops the search at the first match") {
+    const std::string out = run_capture(R"(
+        module m;
+            real r;
+            int  hit;
+            function automatic real bump();
+                hit = hit + 1;
+                return 9.0;
+            endfunction
+            initial begin
+                hit = 0;
+                r = 1.0;
+                case (r) 1.0: $display("first"); bump(): $display("second"); default: $display("dd"); endcase
+                $display("bump calls=%0d", hit);
+            end
+        endmodule
+    )");
+    CHECK(out == "first\nbump calls=0\n");
+}
+
+TEST_CASE("case inside with real ranges and members") {
+    const std::string out = run_capture(R"(
+        module m;
+            real r;
+            initial begin
+                r = 1.25;
+                case (r) inside [1.0:2.0]: $display("in-range"); default: $display("out"); endcase
+                r = 5.5;
+                case (r) inside [1.0:2.0], 5.5: $display("in-set"); default: $display("out2"); endcase
+                r = 3.0;
+                case (r) inside [1.0:2.0], 5.5: $display("in3"); default: $display("out3"); endcase
+                r = 2.0;
+                case (r) inside [1.0:2.0]: $display("closed-hi"); default: $display("open-hi"); endcase
+            end
+        endmodule
+    )");
+    CHECK(out == "in-range\nin-set\nout3\nclosed-hi\n");
+}
+
+// unique/unique0 keep their 12.5.3 checks on the real path: the per-item
+// predicates that feed the overlap sum are the same ones dispatch uses.
+TEST_CASE("unique case on a real reports an overlap and runs the first match") {
+    constexpr std::string_view src = R"(
+        module m;
+            real r;
+            initial begin
+                r = 1.5;
+                unique case (r) 1.5: $display("a"); 1.5: $display("b"); endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("not unique") != std::string::npos);
+    CHECK(run_capture(src) == "a\n");
+}
+
+// A default-less priority case over reals that matches nothing reports the
+// no-match violation, exactly as the integral path does.
+TEST_CASE("priority case on a real reports a no-match") {
+    constexpr std::string_view src = R"(
+        module m;
+            real r;
+            initial begin
+                r = 7.25;
+                priority case (r) 1.5: $display("a"); 2.5: $display("b"); endcase
+            end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src).find("no condition is true") != std::string::npos);
+    CHECK(run_capture(src).empty());
+}

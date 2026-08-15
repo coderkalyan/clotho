@@ -365,6 +365,30 @@ TEST_CASE("repeat loop nesting") {
     )") == "y\ny\ny\ny\ny\ny\n");
 }
 
+// A real count is legal (12.7.2 requires only a numeric expression) and converts
+// to an integer by rounding half away from zero (LRM 6.12.1), so 2.5 runs the
+// body three times where 2.4 runs it twice; a negative one rounds to a negative
+// and runs it none, which is 12.7.2's negative-is-zero rule. The runtime-valued
+// pair at the end is the same conversion outside a folded literal. Every count
+// pinned against iverilog 13.
+TEST_CASE("repeat loop with a real count rounds half away from zero") {
+    CHECK(run_capture(R"(
+        module m;
+            int  c;
+            real r;
+            initial begin
+                c = 0; repeat (2.7) c = c + 1; $display("%0d", c);
+                c = 0; repeat (2.4) c = c + 1; $display("%0d", c);
+                c = 0; repeat (2.5) c = c + 1; $display("%0d", c);
+                c = 0; repeat (3.5) c = c + 1; $display("%0d", c);
+                c = 0; repeat (-0.6) c = c + 1; $display("%0d", c);
+                r = 1.5;  c = 0; repeat (r) c = c + 1; $display("%0d", c);
+                r = -2.7; c = 0; repeat (r) c = c + 1; $display("%0d", c);
+            end
+        endmodule
+    )") == "3\n2\n3\n4\n0\n2\n0\n");
+}
+
 // A sensitivity-less `always` is an implicit forever loop around its body (LRM
 // 9.2.2): `always #5 clk = ~clk;` is a free-running clock. Each toggle drives a
 // posedge-sensitive process that counts edges and stops the run.

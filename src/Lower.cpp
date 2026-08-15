@@ -2277,36 +2277,17 @@ private:
         const slang::ast::ClassType* base  = base_class_of(clt);
         VtableSlots                  slots = base != nullptr ? class_vslot_[base] : VtableSlots{};
         uint32_t                     size  = static_cast<uint32_t>(slots.size());
-        const auto                   introduce =
-          [&](std::string_view name, slang::ast::SubroutineKind kind, const slang::ast::Type& ret, bool is_pure) {
-              if (kind == slang::ast::SubroutineKind::Task && is_pure) {
-                  // A pure virtual task's abstract-class slot would need a task-shaped
-                  // (coroutine) stub, not the function stub build_pure_stub emits.
-                  // TODO: pure virtual task.
-                  fail("pure virtual task is not supported");
-              }
-              if (is_pure) {
-                  // A pure slot's signature source is a stub (below); a non-scalar
-                  // return would need the full aggregate/handle return ABI in that
-                  // never-called stub. Guard until that is wired.
-                  const ir::Ref rt = lower_type(ret);
-                  if (is_agg_abi_ref(rt) || is_handle_ref(rt) || ret.getCanonicalType().isString()) {
-                      // TODO: pure virtual method with a non-scalar return.
-                      fail("pure virtual method with a non-scalar return is not supported");
-                  }
-              }
-              if (!slots.contains(name)) {
-                  slots.emplace(name, size++);
-              }
-          };
         for (const auto& m : clt.membersOfType<slang::ast::SubroutineSymbol>()) {
-            if (is_user_virtual(m)) {
-                introduce(m.name, m.subroutineKind, m.getReturnType(), /*is_pure=*/false);
+            if (is_user_virtual(m) && !slots.contains(m.name)) {
+                slots.emplace(m.name, size++);
             }
         }
         for (const auto& p : clt.membersOfType<slang::ast::MethodPrototypeSymbol>()) {
-            if (p.isVirtual()) { // a pure (or extern) virtual prototype
-                introduce(p.name, p.subroutineKind, p.getReturnType(), p.flags.has(slang::ast::MethodFlags::Pure));
+            // A pure (or extern) virtual prototype. A pure slot needs no shape
+            // restriction here: build_pure_stub rebuilds every signature the concrete
+            // override can have — function or task, scalar or non-scalar result.
+            if (p.isVirtual() && !slots.contains(p.name)) {
+                slots.emplace(p.name, size++);
             }
         }
         // A polymorphic class also carries a shallow-copy thunk (LRM 8.12), so
@@ -2372,9 +2353,11 @@ private:
     }
 
     // Build a bodiless stub matching a pure virtual's signature (this + formals ->
-    // scalar return, LRM 8.21). The signature comes from the PROTOTYPE, not slang's
+    // result, LRM 8.21). The signature comes from the PROTOTYPE, not slang's
     // degenerate associated subroutine (null thisVar / returnValVar, empty args). It
-    // returns X and is never called — it only supplies the CallVirtual FunctionType /
+    // yields whatever an override that never assigns its return variable would (X, an
+    // empty string, an empty container — init_frame's per-call state) and is never
+    // called: it only supplies the CallVirtual / TaskCallVirtual FunctionType and
     // result type for a dispatch resolved to the pure method on an abstract handle.
     void build_pure_stub(const slang::ast::MethodPrototypeSymbol& proto, ir::FunctionId id) {
         const auto&             owner = proto.getParentScope()->asSymbol().as<slang::ast::ClassType>();
@@ -2393,6 +2376,15 @@ private:
             arg_dirs.push_back(to_arg_dir(fa->direction));
             local_types.push_back(pt);
         }
+        // A task carries no return value (LRM 13.3) — slang gives its prototype the
+        // void type, so the void path below already emits the right body — but it is a
+        // coroutine, and `is_task` on the Function record is what selects the task ABI
+        // (state, wheel, <formals>, record) over the function one in declare_task.
+        // This stub IS the FunctionType a TaskCallVirtual on an abstract handle drives
+        // the concrete override's ramp through (lower_task_call_inst), so the flag has
+        // to mirror build_task's or the call site and the override disagree on the
+        // signature.
+        const bool          is_task     = proto.subroutineKind == slang::ast::SubroutineKind::Task;
         const bool          is_void     = proto.getReturnType().isVoid();
         const ir::Ref       return_type = is_void ? module_.pool.void_type : lower_type(proto.getReturnType());
         ir::Builder         b(module_.pool);
@@ -2400,10 +2392,23 @@ private:
         if (is_void) {
             b.ret_void(el);
         } else {
+            const bool agg = is_agg_abi_type(proto.getReturnType());
+            if (agg && !is_trivially_copyable(return_type)) {
+                // TODO: by-value return of a string-containing aggregate / array — the
+                // same gap build_function guards for a concrete body, repeated here so
+                // the prototype is rejected even when no override is ever lowered.
+                fail("by-value return of a string-containing aggregate is not supported");
+            }
             const uint32_t rl = static_cast<uint32_t>(local_types.size());
             local_types.push_back(return_type);
             const ir::Index rv = b.local(rl, return_type, el);
-            b.unary(ir::Inst::Tag::Ret, b.unary(ir::Inst::Tag::Load, rv, el), el);
+            // The Ret operand takes build_function's fall-through shape, so the stub's
+            // signature is the one a real override produces: an aggregate's and a
+            // container's result travels as its frame lvalue (the backend copies the
+            // storage out through the trailing return out-param), while a scalar, a
+            // string handle and a class handle travel as a loaded value.
+            const bool by_lvalue = agg || is_handle_ref(return_type);
+            b.unary(ir::Inst::Tag::Ret, by_lvalue ? rv : b.unary(ir::Inst::Tag::Load, rv, el), el);
         }
         module_.set_function(id,
                              ir::Function{ .name        = std::string(proto.name) + ".pure",
@@ -2411,6 +2416,7 @@ private:
                                            .param_types = std::move(param_types),
                                            .arg_dirs    = std::move(arg_dirs),
                                            .local_types = std::move(local_types),
+                                           .is_task     = is_task,
                                            .span        = span_of(proto),
                                            .ir          = b.finish() });
     }
@@ -4586,7 +4592,7 @@ private:
     // resolution identity — in every other bit, so the resolver folds each bit
     // only across the drivers that actually reach it. `driven` is the already-
     // lowered right-hand value. Shapes V2 cannot slot (dynamic index, unpacked
-    // element, or a 2-state net that cannot hold the Z background) fail loudly.
+    // element) fail loudly.
     ir::Index build_driver_slot_value(ir::Signal        net,
                                       const Expression& left,
                                       ir::Index         driven,
@@ -4617,9 +4623,15 @@ private:
             fail("dynamic or unpacked-array partial driver of a multiply-driven net is not supported");
         }
         if (module_.pool.layout(net_ty).domain != ir::Domain::Four) {
-            // TODO: 2-state resolved nets have no Z to mark undriven bits, so a
-            // partial driver cannot leave an identity background.
-            fail("partial driver of a 2-state multiply-driven net is not supported");
+            // Not a gap: LRM 6.7.1 restricts a built-in net type's data type to a
+            // 4-state integral type (or an unpacked aggregate of such), so every
+            // net's storage can hold the Z background this builds — slang rejects
+            // `wire bit [7:0] w;` outright (InvalidNetType), and a user-defined
+            // nettype, the only way to declare a 2-state net (6.6.7 b), is refused
+            // in collect_scope_signals. A 2-state MEMBER of a 4-state packed net
+            // (`struct packed { bit [3:0] lo; logic [3:0] hi; }`) is a partial
+            // driver of a 4-state net and takes the path below.
+            fail("internal: resolved net storage is not 4-state");
         }
         const uint32_t  region_w = reg.bit_hi - reg.bit_lo + 1;
         const ir::Index rhs      = b.resize(driven, make_int_type(region_w, true, false), l);
@@ -4657,18 +4669,61 @@ private:
         }
     }
 
+    // Stage one driver's full-width value into its slot, honouring a per-driver
+    // net delay. LRM 10.3.3 (`assign #d`) and LRM 28.16 (gate `#d`) put the delay
+    // on the DRIVER, ahead of resolution: the driver's own contribution
+    // transitions inertially and emit_wire_resolvers re-folds when any slot
+    // changes. Delaying the resolved net instead would smear every driver's
+    // timing together, so the delay always rides this slot store.
+    void store_driver_slot(ir::Signal        net,
+                           const Expression& left,
+                           ir::Signal        slot,
+                           ir::Index         val,
+                           const Expression* delay_expr,
+                           ir::Builder&      b,
+                           ir::SourceLoc     l) {
+        const ir::Index lv = b.signal(slot, l);
+        if (delay_expr == nullptr) {
+            b.binary(ir::Inst::Tag::Store, lv, val, l);
+            return;
+        }
+        if (!is_whole_net_lvalue(left)) {
+            // A partial driver's slot carries a Z background in the bits it does
+            // not drive, but a slot powers up all-x and a delayed driver does not
+            // write it until `now + d` — so the undriven bits would fold as x for
+            // the whole initial window instead of z. iverilog (`assign #5 v[1:0]`
+            // beside `assign v[3:2]`) shows `v=11xx` there, which needs a Z-seeded
+            // slot power-up value Clotho has no representation for.
+            // TODO: delayed partial driver of a multiply-driven net — seed the
+            // slot's power-up value with the Z background.
+            fail("delay on a partial driver of a multiply-driven (resolved) net is not supported");
+        }
+        // The inertial decide compares both value planes as i64 (emit_inertial_arm),
+        // so the mm plane must fit 64 bits; a 4-state slot packs must|may, halving
+        // the usable width to 32. The slot always carries the net's own type.
+        // TODO: inertial delay on a net wider than 64 value bits.
+        const auto     ly       = module_.pool.layout(module_.signal(net).type);
+        const uint32_t mm_width = ly.domain == ir::Domain::Four ? 2 * ly.width : ly.width;
+        if (mm_width > 64) {
+            fail("inertial delay on a net wider than 64 value bits is not supported");
+        }
+        b.store_inertial_delay(lv, val, scaled_delay(*delay_expr, b), l);
+    }
+
     // Emit one continuous-assign driver of a resolved net: stage its value (whole
     // net, or a constant packed sub-range with a Z background) into this driver's
-    // slot, sensitive to the RHS reads.
+    // slot, sensitive to the RHS reads. A non-null `delay_expr` (`assign #d`, LRM
+    // 10.3.3) makes that slot store inertial, so this driver alone is delayed.
     void emit_resolved_driver(ir::Signal                  net,
                               const AssignmentExpression& a,
                               const Expression&           left,
                               ir::Builder&                b,
                               ir::SourceLoc               l,
-                              uint16_t                    strength = 0x0303) {
+                              uint16_t                    strength   = 0x0303,
+                              const Expression*           delay_expr = nullptr) {
         const ir::Index  val  = build_driver_slot_value(net, left, lower_expr(a.right(), b), b, l);
         const ir::Signal slot = alloc_driver_slot(net, l, strength);
-        b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
+        store_driver_slot(net, left, slot, val, delay_expr, b, l);
         add_continuous_process(continuous_events(a), l, b);
     }
 
@@ -4849,15 +4904,13 @@ private:
         ir::Builder         b(module_.pool);
         const ir::SourceLoc l = to_source_loc(sym.location);
         if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
-            if (delay != nullptr) {
-                // TODO: per-driver inertial delay before multi-driver net
-                // resolution (LRM 10.3.3) — the resolver folds every driver's slot
-                // with no per-driver timing.
-                fail("delay on a multiply-driven (resolved) net is not supported");
-            }
             // Multiply-driven net: this driver stages its value into its own
             // slot; the resolver folds every driver's slot (emit_wire_resolvers).
-            emit_resolved_driver(*net, a, left, b, l, strength);
+            // An `assign #d` here is a PER-DRIVER inertial delay (LRM 10.3.3) — it
+            // delays this driver's contribution, and the resolver re-runs when the
+            // slot lands — so it rides the slot store, never the resolved net.
+            emit_resolved_driver(
+              *net, a, left, b, l, strength, delay != nullptr ? &delay->as<DelayControl>().expr : nullptr);
             return;
         }
         // A concatenation lvalue has no single root, so resolved_net_of misses
@@ -5159,21 +5212,65 @@ private:
         return pred;
     }
 
-    // An ordinary blocking/nonblocking write to a forced/assigned variable:
-    // evaluate the RHS (side effects run regardless, LRM), then store only while
-    // neither a force nor an assign is active.
+    // An ordinary blocking/nonblocking write to a forced/assigned variable, of any
+    // lvalue shape rooted at it: the whole variable, a bit/part/element-select of
+    // it, or a packed struct/union member. LRM 10.6.2 suppresses the *update*, not
+    // the statement, so the lvalue and the RHS are evaluated (their side effects
+    // run) and only the store is gated on "neither a force nor an assign active".
+    // A select's store is narrowing over live storage that already holds the forced
+    // value, so dropping it leaves exactly the forced value in place — the same
+    // shape-agnostic gate the whole-variable write uses.
     ir::Index gated_store(const AssignmentExpression& a, const ForceInfo& fi, ir::Builder& b) {
-        const ir::SourceLoc l    = loc(a);
-        const ir::Inst::Tag tag  = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
-        const ir::Index     rhs  = lower_expr(a.right(), b);
-        const ir::Index     pred = not_forced(fi, /*also_assign=*/true, b, l);
+        const ir::SourceLoc l   = loc(a);
+        const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
+        ir::Index           lv  = ir::Index{};
+        ir::Index           rhs = ir::Index{};
+        if (a.isCompound()) {
+            // `x op= e` (LRM 11.4.1, always blocking): bind the lvalue first, then
+            // lower slang's `op(LValueReference, e)` through it — the read sees the
+            // forced value (it is what storage holds), and only the write-back is
+            // gated, so a forced target keeps its value. Evaluation order matches
+            // lower_compound_assign so a side-effecting index behaves identically.
+            lv  = lower_lvalue(a.left(), b, /*is_write=*/true);
+            rhs = lower_compound_rhs(a, lv, b);
+        } else {
+            rhs = lower_expr(a.right(), b);
+            lv  = lower_lvalue(a.left(), b, /*is_write=*/true);
+        }
+        store_or_gate(&fi, tag, lv, rhs, b, l);
+        return rhs;
+    }
+
+    // The force / `assign` site state governing writes to an lvalue, keyed on its
+    // root: null when that root is not a procedural-continuous-assignment target
+    // anywhere in the design, i.e. when the write needs no gate at all.
+    ForceInfo* pca_info_of_lvalue(const Expression& lhs) {
+        const ValueSymbol* root = lvalue_root(lhs);
+        return root == nullptr ? nullptr : force_info_of(*root);
+    }
+
+    // The update half of an ordinary procedural write: a plain store when the
+    // target is no force/assign target (`fi` null), else a store dropped while an
+    // override owns the target. LRM 10.6.2 suppresses the update alone — whatever
+    // the statement already evaluated (RHS, lvalue selectors, the read of a
+    // read-modify-write) stands, and the override's value survives untouched.
+    void store_or_gate(const ForceInfo* fi,
+                       ir::Inst::Tag    tag,
+                       ir::Index        lv,
+                       ir::Index        v,
+                       ir::Builder&     b,
+                       ir::SourceLoc    l) {
+        if (fi == nullptr) {
+            b.binary(tag, lv, v, l);
+            return;
+        }
+        const ir::Index pred = not_forced(*fi, /*also_assign=*/true, b, l);
         b.open_region();
-        b.binary(tag, lower_lvalue(a.left(), b, /*is_write=*/true), rhs, l);
+        b.binary(tag, lv, v, l);
         const ir::ExtraSlice then_r = b.close_region();
         b.open_region();
         const ir::ExtraSlice else_r = b.close_region();
         b.cond(pred, then_r, else_r, l);
-        return rhs;
     }
 
     // Common target resolution for force / assign / release / deassign: the whole
@@ -5714,18 +5811,22 @@ private:
 
     // Lower one gate output terminal. slang wraps each output connection in an
     // AssignmentExpression whose left() is the driven lvalue; only a static 1-bit
-    // location on a 4-state signal is accepted (a gate can drive X, which a
-    // 2-state slot cannot hold).
+    // packed location is accepted (gate_static_term), which rules out every
+    // non-integral target (a real is 32/64 bits wide, a string 0).
+    //
+    // The target's domain does not matter here. A 2-state target is legal: LRM
+    // 10.3.2 lets one primitive output drive a variable, so `bit q; and (q, a, b);`
+    // is a lone driver of 2-state storage, and a 2-state member of a 4-state packed
+    // net (`struct packed { bit [3:0] lo; logic [3:0] hi; }`) is another. Either way
+    // gate_output_value has already applied LRM 6.11.2's 4-state -> 2-state
+    // conversion (x and z become 0), so the store carries nothing the target cannot
+    // hold.
     GateTerm lower_gate_output(const Expression& conn) {
         if (conn.kind != ExpressionKind::Assignment) {
             fail("malformed gate output terminal");
         }
-        const Expression& lhs = conn.as<AssignmentExpression>().left();
-        if (!lhs.type->isFourState()) {
-            // TODO: gate outputs on 2-state nets need an X-coercion policy.
-            fail("gate output on a 2-state net is not supported");
-        }
-        const auto term = gate_static_term(lhs);
+        const Expression& lhs  = conn.as<AssignmentExpression>().left();
+        const auto        term = gate_static_term(lhs);
         if (!term) {
             // TODO: concatenation / part-select / unpacked-element gate output
             // lvalues (rare in netlists).
@@ -5808,11 +5909,12 @@ private:
         if (cur_pass_ != Pass::Emit) {
             return;
         }
-        if (gi.getDelay() != nullptr) {
-            // TODO: cmos/rcmos delays (LRM 28.16) — a cmos always lowers to two
-            // resolved driver slots, and the resolver folds every slot with no
-            // per-driver timing (mirrors the resolved continuous-assign delay gap).
-            fail("gate delay on a multiply-driven (resolved) net is not supported");
+        const TimingControl* cmos_delay = gi.getDelay();
+        if (cmos_delay != nullptr && cmos_delay->kind != TimingControlKind::Delay) {
+            // TODO: cmos/rcmos rise/fall/turn-off delay triples #(a,b,c) (LRM 28.16)
+            // — needs the per-transition delay selection Clotho has no
+            // representation for. A single #d is lowered onto each half below.
+            fail("gate rise/fall/turn-off delays (#(a,b,c)) are not supported");
         }
         const std::optional<ir::Signal> net = resolved_net_of(left);
         if (!net) {
@@ -5831,12 +5933,24 @@ private:
         const GateInput pctrl = lower_gate_input(*conns[3], gi.name, 2);
         // Each half is an independent driver slot. The n-channel half conducts on
         // ncontrol == 1, the p-channel half on pcontrol == 0; neither inverts, and
-        // both pass a z data input through as z.
+        // both pass a z data input through as z. A `cmos #d` delay lands on each
+        // half's own slot store: LRM 28.9's decomposition gives the two halves the
+        // device's delay, and both fold to the same output timing as one delayed
+        // device (confirmed against iverilog 13: `cmos #5` and `nmos #5` + `pmos #5`
+        // produce identical waveforms).
         const auto emit_half = [&](TriGate tg, const GateInput& ctrl) {
             ir::Builder                b(module_.pool);
             std::vector<ir::WaitEvent> wait_events;
-            const ir::Index val = gate_tristate_value(tg, data, ctrl, wait_events, b, l, /*pass_z=*/true);
-            emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, l, gate_strength);
+            const ir::Index            folded = gate_tristate_value(tg, data, ctrl, wait_events, b, l, /*pass_z=*/true);
+            const ir::Index            val    = gate_output_value(left, folded, b, l);
+            emit_gate_resolved_driver(left,
+                                      *net,
+                                      val,
+                                      std::move(wait_events),
+                                      b,
+                                      l,
+                                      gate_strength,
+                                      cmos_delay != nullptr ? &cmos_delay->as<DelayControl>().expr : nullptr);
         };
         emit_half(TriGate{ .active_high = true, .invert = false }, nctrl);
         emit_half(TriGate{ .active_high = false, .invert = false }, pctrl);
@@ -5922,19 +6036,25 @@ private:
             // combinational fold does).
             ir::Builder                b(module_.pool);
             std::vector<ir::WaitEvent> wait_events;
-            const ir::Index            val =
+            const ir::Index            folded =
               mos   ? gate_tristate_value(*mos, inputs[0], inputs[1], wait_events, b, loc, /*pass_z=*/true)
               : tri ? gate_tristate_value(*tri, inputs[0], inputs[1], wait_events, b, loc)
                     : gate_folded_value(*op, inputs, wait_events, b, loc);
+            const ir::Index val = gate_output_value(left, folded, b, loc);
 
             if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
-                if (gate_delay != nullptr) {
-                    // TODO: gate delay on a multiply-driven (resolved) net — the
-                    // resolver folds every driver's slot with no per-driver timing
-                    // (mirrors the resolved continuous-assign delay gap, LRM 28.16).
-                    fail("gate delay on a multiply-driven (resolved) net is not supported");
-                }
-                emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, loc, gate_strength);
+                // A gate delay on a driver of a resolved net is PER DRIVER (LRM
+                // 28.16): this gate's own contribution transitions inertially and
+                // the resolver re-runs when the slot lands, so it rides the slot
+                // store rather than the resolved net.
+                emit_gate_resolved_driver(left,
+                                          *net,
+                                          val,
+                                          std::move(wait_events),
+                                          b,
+                                          loc,
+                                          gate_strength,
+                                          gate_delay != nullptr ? &gate_delay->as<DelayControl>().expr : nullptr);
             } else {
                 const GateTerm output = lower_gate_output(*out);
                 if (gate_delay != nullptr && module_.pool.layout(module_.signal(output.sig).type).width != 1) {
@@ -5962,6 +6082,24 @@ private:
         }
         const ir::Ref u32 = make_int_type(32, false, false);
         return b.binary(ir::Inst::Tag::BitSelect, s, b.constant(module_.pool.put_int(u32, bit), l), l);
+    }
+
+    // Adapt a gate's folded output to the domain of the terminal it drives. Every
+    // gate folds its output as 1-bit logic (LRM 28.4 Table 28-1 and friends are
+    // defined over 0/1/x/z), but the driven terminal may be declared 2-state: a
+    // variable, which LRM 10.3.2 allows exactly one primitive output to drive
+    // (`bit q; and (q, a, b);`), or a 2-state member of a 4-state packed net
+    // (`wire struct packed { bit [3:0] lo; logic [3:0] hi; } s;` driven at
+    // `s.lo[0]`). LRM 6.11.2 makes the automatic 4-state -> 2-state conversion turn
+    // x and z into 0; slang inserts that conversion on a continuous assign's
+    // right-hand side, but a gate's value is synthesized here, so apply it here —
+    // otherwise `and (s.lo[0], a, b)` would leave an x in the net where the
+    // equivalent `assign s.lo[0] = a & b;` leaves a 0.
+    ir::Index gate_output_value(const Expression& left, ir::Index val, ir::Builder& b, ir::SourceLoc l) {
+        if (left.type->isFourState()) {
+            return val;
+        }
+        return b.resize(val, make_int_type(1, /*is_four=*/false, /*is_signed=*/false), l);
     }
 
     // Materialize one gate input terminal as its 1-bit logic value: a load of the
@@ -6121,23 +6259,23 @@ private:
     // pre-folded 1-bit value `val` into this driver's own slot (whole net, or a
     // constant sub-range with a Z background) so the net's resolver folds it
     // against the other drivers — exactly like a resolved continuous assign
-    // (emit_resolved_driver). `left` is the output lvalue.
+    // (emit_resolved_driver). `left` is the output lvalue; a 2-state one (a member
+    // of a 4-state packed net) already arrived through gate_output_value, and the
+    // slot itself is net-typed, hence 4-state (LRM 6.7.1), so it can hold the Z
+    // background a partial driver needs. A non-null `delay_expr` (`buf #d`, LRM
+    // 28.16) makes that slot store inertial, delaying this gate's own contribution
+    // ahead of resolution.
     void emit_gate_resolved_driver(const Expression&          left,
                                    ir::Signal                 net,
                                    ir::Index                  val,
                                    std::vector<ir::WaitEvent> wait_events,
                                    ir::Builder&               b,
                                    ir::SourceLoc              l,
-                                   uint16_t                   strength = 0x0303) {
-        if (!left.type->isFourState()) {
-            // Mirrors lower_gate_output: a gate can drive X, which a 2-state slot
-            // cannot hold. TODO: gate outputs on 2-state nets need an X-coercion
-            // policy (and build_driver_slot_value already rejects 2-state partials).
-            fail("gate output on a 2-state net is not supported");
-        }
+                                   uint16_t                   strength   = 0x0303,
+                                   const Expression*          delay_expr = nullptr) {
         const ir::Index  slot_val = build_driver_slot_value(net, left, val, b, l);
         const ir::Signal slot     = alloc_driver_slot(net, l, strength);
-        b.binary(ir::Inst::Tag::Store, b.signal(slot, l), slot_val, l);
+        store_driver_slot(net, left, slot, slot_val, delay_expr, b, l);
         add_continuous_process(std::move(wait_events), l, b);
     }
 
@@ -6810,13 +6948,19 @@ private:
                 if (!is_event_control(rec.event)) {
                     fail("repeat intra-assignment timing requires an event control");
                 }
-                if (rec.expr.type->isFloating()) {
-                    fail("repeat with a real count is not supported");
-                }
-                const ir::Ref    ty      = lower_type(*rec.expr.type);
+                // A real count is counted in a signed 64-bit type, rounded into it
+                // half away from zero (LRM 6.12.1's real -> integral conversion, the
+                // FtoI coerce ends in) -- signed and 64-bit for the same reasons as
+                // the repeat statement (lower_repeat). 9.4.5's "the assignment occurs
+                // as if there is no repeat construct" for a count <= 0 then falls out
+                // of the Lt below unchanged: a negative bound waits zero times, so
+                // the caller's store happens immediately.
+                const ir::Ref ty =
+                  rec.expr.type->isFloating() ? make_int_type(64, false, true) : lower_type(*rec.expr.type);
                 const TempCell bound   = make_temp_cell(ty, "repeat_bound");
                 const TempCell counter = make_temp_cell(ty, "repeat_count");
-                b.binary(ir::Inst::Tag::Store, bound.lv(b, l), b.resize(lower_expr(rec.expr, b), ty, l), l);
+                b.binary(
+                  ir::Inst::Tag::Store, bound.lv(b, l), coerce(lower_expr(rec.expr, b), *rec.expr.type, ty, b, l), l);
                 b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.constant(module_.pool.put_int(ty, 0), l), l);
 
                 b.open_region();
@@ -9812,7 +9956,8 @@ private:
 
     // One sampled value function (LRM 16.9.3). All six read SAMPLED values, so
     // every one is built from the Preponed shadow and the per-tick history ring
-    // and none of them touches live state.
+    // and none of them touches live state -- which is also what lets $sampled
+    // stand in a root that is evaluated live, as the refusal below explains.
     ir::Index lower_sampled_value(std::string_view name, const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
         if (sva_history_ == nullptr) {
             // LRM 16.9.3 also allows these in some procedural contexts, but
@@ -9822,16 +9967,6 @@ private:
             // need a clock from `default clocking` (LRM 14.12) and a sampling
             // process keyed to it.
             fail(std::string(name) + " is only supported inside a concurrent assertion expression");
-        }
-        if (!sva_sampled_) {
-            // The unsampled roots are the `disable iff` condition, which LRM 16.15
-            // deliberately evaluates from live values, and an asynchronous abort's
-            // condition, which LRM 16.12.7 puts on the same footing -- so there is
-            // no sampled value underneath either for these to be built from.
-            // TODO: sampled value functions in a `disable iff` or asynchronous
-            // `accept_on` / `reject_on` condition.
-            fail(std::string(name) + " is not supported in a `disable iff` or asynchronous `accept_on` / "
-                                     "`reject_on` condition, which are evaluated from live values");
         }
 
         const auto args = call.arguments();
@@ -9848,6 +9983,29 @@ private:
             // second edge, in a process that does not exist.
             // TODO: an explicit clocking argument on a sampled value function.
             fail("an explicit clocking argument on " + std::string(name) + " is not supported");
+        }
+        if (!sva_sampled_ && name != "$sampled") {
+            // An unsampled root -- the `disable iff` condition (LRM 16.15) or an
+            // asynchronous abort's (16.12.7) -- carries no clock into the functions
+            // written inside it, and LRM 16.9.3's inference rules have no fallback
+            // for that position: "if called in a disable condition or a clock
+            // expression in an assertion, sequence, or property, it shall be
+            // explicitly clocked". 16.12.14 says the same of an abort condition in
+            // as many words: "when sampled value functions other than $sampled are
+            // used in the abort condition, the clock argument shall be explicitly
+            // specified". So the only legal spelling of the other five here is the
+            // explicitly clocked one, which is the gap refused just above; an
+            // unclocked one is illegal source. slang diagnoses that for a disable
+            // condition itself (analysis/ClockInference.cpp, checkSampledValueFuncs)
+            // and lets it through for an abort condition, so this is where the abort
+            // half stops -- no TODO, because there is nothing legal left to support.
+            //
+            // $sampled uses no clocking event at all (16.9.3) and is expressly
+            // blessed here: "the use of $sampled in a disable iff clause is
+            // meaningful since the disable condition by default is not sampled".
+            // It reads the shadow and nothing else, so it falls through unchanged.
+            fail(std::string(name) + " must be given an explicit clocking argument in a `disable iff` or "
+                                     "asynchronous `accept_on` / `reject_on` condition");
         }
 
         uint32_t          ticks = 1;
@@ -10018,9 +10176,15 @@ private:
         const slang::ast::Type& sel   = *atom.expr->type;
         const slang::ast::Type& label = *atom.match->type;
         if (sel.isFloating() || label.isFloating()) {
-            // As common_case_type: 12.5 matches with === semantics, which Table
-            // 11-1 leaves undefined for reals.
-            fail("a case property with a real selector or item label is not supported");
+            // As the case STATEMENT (lower_case_real): 12.5's bit-for-bit `===`
+            // is defined only for integral operands, and a real has no x/z for
+            // the 4-state rule to be about, so the match is IEEE-754 equality.
+            // Both sides widen to `real` -- a shortreal widens exactly (6.12.2).
+            const ir::Ref rty = module_.pool.real_type;
+            return b.binary(ir::Inst::Tag::FEq,
+                            coerce(lower_expr(*atom.expr, b), sel, rty, b, l),
+                            coerce(lower_expr(*atom.match, b), label, rty, b, l),
+                            l);
         }
         if (!sel.isIntegral() || !label.isIntegral()) {
             fail("a case property over a non-integral selector or item label is not supported");
@@ -12052,10 +12216,11 @@ private:
     // Register a shadow for every variable the assertion's boolean roots read.
     // The roots root_reads_live names are skipped -- `disable iff` and the
     // asynchronous aborts read live values, so a variable appearing only there
-    // needs no shadow and must not pay for one. Atom lowering resolves a read
-    // through sva_shadow_of as well, so this pass is not what makes a shadow
-    // exist -- it fixes the copy order to the source's atom order rather than to
-    // the order the monitor happens to emit in.
+    // needs no shadow and must not pay for one -- unless a $sampled names it,
+    // which is the one read in such a root that IS sampled (LRM 16.9.3). Atom
+    // lowering resolves a read through sva_shadow_of as well, so this pass is not
+    // what makes a shadow exist -- it fixes the copy order to the source's atom
+    // order rather than to the order the monitor happens to emit in.
     void sva_sample_roots(const sva::Result& lowered) {
         ankerl::unordered_dense::set<uint32_t> atoms;
         ankerl::unordered_dense::set<uint32_t> seen;
@@ -12532,10 +12697,17 @@ private:
     // `##0` is the special case: it suspends only if the clocking event has not
     // already occurred in this time step, and falls through if it has. The count is
     // tested at run time rather than folded, so a non-constant one behaves the same.
+    //
+    // Unlike a repeat count, the count here can only be integral: 14.11 says it
+    // "can be any SystemVerilog expression that evaluates to a non-negative integer
+    // value", and slang enforces that at bind time (CycleDelayControl::fromSyntax
+    // calls requireIntegral, so `##(2.5)` is diag::ExprMustBeIntegral and never
+    // reaches lowering). A real here would be a clotho bug, not a source error,
+    // and would silently intern a float type into the counter cells below.
     void lower_cycle_delay(const CycleDelayControl& cd, ir::Builder& b, ir::SourceLoc l) {
         const ClockingBlockState& st = default_clocking_state();
         if (cd.expr.type->isFloating()) {
-            fail("a cycle delay with a real count is not supported");
+            fail("internal: a real cycle delay count reached lowering");
         }
         const std::vector<ir::WaitEdge> edges{ ir::WaitEdge{ st.event, static_cast<uint32_t>(ir::Edge::Any) } };
         const ir::Ref                   ty      = lower_type(*cd.expr.type);
@@ -12822,13 +12994,15 @@ private:
     // so a negative signed count yields zero iterations (0 < negative is false),
     // and an X/Z count yields zero iterations (the Lt predicate is non-definite-1,
     // which the backend's definite-1 loop rule treats as exit).
+    //
+    // A real count is counted in a signed 64-bit type instead, rounded into it
+    // half away from zero (LRM 6.12.1's real -> integral conversion, which coerce
+    // ends in an FtoI): signed keeps 12.7.2's negative-is-zero rule (`repeat
+    // (-0.6)` rounds to -1 and runs the body zero times), and 64 bits is where
+    // FtoI saturates, so a huge real cannot wrap into a small positive count.
     void lower_repeat(const RepeatLoopStatement& r, ir::Builder& b) {
         const ir::SourceLoc l = loc(r);
-        if (r.count.type->isFloating()) {
-            // LRM 12.7.2: a real repeat count would round; not yet lowered.
-            fail("repeat with a real count is not supported");
-        }
-        const ir::Ref ty = lower_type(*r.count.type);
+        const ir::Ref ty      = r.count.type->isFloating() ? make_int_type(64, false, true) : lower_type(*r.count.type);
 
         // Hidden bound holds the once-evaluated count; hidden counter starts at 0.
         // Both live in the enclosing region, like a for-loop's init, and both are
@@ -12836,7 +13010,7 @@ private:
         // or concurrently-invoked task keeps its own count.
         const TempCell bound   = make_temp_cell(ty, "repeat_bound");
         const TempCell counter = make_temp_cell(ty, "repeat_count");
-        b.binary(ir::Inst::Tag::Store, bound.lv(b, l), b.resize(lower_expr(r.count, b), ty, l), l);
+        b.binary(ir::Inst::Tag::Store, bound.lv(b, l), coerce(lower_expr(r.count, b), *r.count.type, ty, b, l), l);
         b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.constant(module_.pool.put_int(ty, 0), l), l);
 
         b.open_region();
@@ -13309,19 +13483,8 @@ private:
     // longest of the selector and every item label, four-state if any operand is,
     // signed only if all are (IEEE 1800-2023 12.5).
     CaseCompareType common_case_type(const CaseStatement& c) {
-        // TODO: case with a real selector or label. LRM 12.5 defines matching
-        // with === semantics, which Table 11-1 leaves undefined for reals
-        // (iverilog compares with ==). Loud-fail until the semantics call.
-        if (c.expr.type->isFloating()) {
-            fail("case on a real selector is not supported");
-        }
-        for (const CaseStatement::ItemGroup& item : c.items) {
-            for (const Expression* e : item.expressions) {
-                if (e->type->isFloating()) {
-                    fail("case with a real item label is not supported");
-                }
-            }
-        }
+        // A real operand never reaches here: lower_case routes the whole
+        // statement to lower_case_real, which compares without a common width.
         uint32_t width = c.expr.type->getBitWidth();
         bool     four  = c.expr.type->isFourState();
         bool     signd = c.expr.type->isSigned();
@@ -13355,16 +13518,11 @@ private:
     // bounds guard loudly here (TODO: LRM 11.4.13 defines both, but neither
     // is exercised by ranged case-inside labels yet).
     CaseCompareType common_inside_type(const CaseStatement& c) {
-        if (c.expr.type->isFloating()) {
-            fail("case on a real selector is not supported");
-        }
         uint32_t width = c.expr.type->getBitWidth();
         bool     four  = c.expr.type->isFourState();
         bool     signd = c.expr.type->isSigned();
         auto     fold  = [&](const Expression& e) {
-            if (e.type->isFloating()) {
-                fail("case with a real item label is not supported");
-            }
+            // Real operands are routed away in lower_case (lower_case_real).
             width = std::max(width, e.type->getBitWidth());
             four  = four || e.type->isFourState();
             signd = signd && e.type->isSigned();
@@ -13523,6 +13681,145 @@ private:
         }
         const std::vector<std::vector<char>> keep = case_dedup(c, ct.width, astCtx);
         lower_case_inside_item(c, 0, sel, ty, ct.width, key_width, keep, astCtx, no_match_report, b);
+    }
+
+    // Whether any operand of a case statement -- the selector, an item label, or
+    // a `case ... inside` range bound -- is real or shortreal.
+    static bool has_real_case_operand(const CaseStatement& c) {
+        if (c.expr.type->isFloating()) {
+            return true;
+        }
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            for (const Expression* e : item.expressions) {
+                if (e->kind == ExpressionKind::ValueRange) {
+                    const auto& vr = e->as<ValueRangeExpression>();
+                    if (vr.left().type->isFloating() || vr.right().type->isFloating()) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (e->type->isFloating()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    ir::Index real_case_label_pred(const Expression& label, ir::Index sel, ir::Ref rty, ir::Builder& b) {
+        if (label.kind == ExpressionKind::ValueRange) {
+            // `case ... inside` range member (12.5.4 / 11.4.13): membership is the
+            // pair of relational comparisons, which Table 11-1 DOES define for
+            // reals, so this arm needs no interpretation beyond 11.4.13's own.
+            const auto& vr = label.as<ValueRangeExpression>();
+            if (vr.rangeKind != ValueRangeKind::Simple) {
+                // TODO: absolute/relative tolerance ranges (LRM 11.4.13), as for
+                // the integral path in common_inside_type.
+                fail("case ... inside tolerance ranges ('+/-' / '+%-') are not supported");
+            }
+            if (is_unbounded_bound(vr.left()) || is_unbounded_bound(vr.right())) {
+                // TODO: `$` bounds on a real range (LRM 11.4.13), as for the
+                // integral path.
+                fail("case ... inside with a '$' range bound is not supported");
+            }
+            const ir::Index lo = coerce(lower_expr(vr.left(), b), *vr.left().type, rty, b, loc(vr.left()));
+            const ir::Index hi = coerce(lower_expr(vr.right(), b), *vr.right().type, rty, b, loc(vr.right()));
+            const ir::Index ge = b.binary(ir::Inst::Tag::FGe, sel, lo, loc(label));
+            const ir::Index le = b.binary(ir::Inst::Tag::FLe, sel, hi, loc(label));
+            return b.binary(ir::Inst::Tag::Land, ge, le, loc(label));
+        }
+        const ir::Index val = coerce(lower_expr(label, b), *label.type, rty, b, loc(label));
+        return b.binary(ir::Inst::Tag::FEq, sel, val, loc(label));
+    }
+
+    // OR of one case_item's label predicates, as the integral paths build it.
+    ir::Index real_case_item_pred(const CaseStatement::ItemGroup& item, ir::Index sel, ir::Ref rty, ir::Builder& b) {
+        ir::Index pred = real_case_label_pred(*item.expressions[0], sel, rty, b);
+        for (size_t j = 1; j < item.expressions.size(); j++) {
+            const Expression* e   = item.expressions[j];
+            const ir::Index   one = real_case_label_pred(*e, sel, rty, b);
+            pred                  = b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e));
+        }
+        return pred;
+    }
+
+    // Lazy first-match chain for a real case, mirroring lower_case_item without
+    // its jump-table attempt (a real has no integral key) and without case_dedup
+    // (which compares labels as SVInt constants). Item k's predicate is built in
+    // the enclosing else region, so a later label -- and any side effect in it --
+    // is evaluated only if every earlier item missed (12.5).
+    void lower_case_real_item(const CaseStatement& c,
+                              size_t               k,
+                              ir::Index            sel,
+                              ir::Ref              rty,
+                              bool                 report_viol,
+                              ir::Builder&         b) {
+        if (k == c.items.size()) {
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            } else if (report_viol) {
+                b.case_violation(case_banner(c), 0, loc(c));
+            }
+            return;
+        }
+        const ir::Index pred = real_case_item_pred(c.items[k], sel, rty, b);
+
+        b.open_region();
+        lower_stmt(*c.items[k].stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        lower_case_real_item(c, k + 1, sel, rty, report_viol, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, loc(*c.items[k].stmt));
+    }
+
+    // `case` / `casez` / `casex` / `case ... inside` with a real operand. The
+    // integral machinery above is packed-only end to end -- a common compare
+    // width, an SVInt dedup, a jump table keyed on the selector -- so a real
+    // statement takes its own comparison chain instead (see real_case_label_pred
+    // for the matching rule).
+    //
+    // The `(* full_case *)` / `(* parallel_case *)` analysis is skipped: it
+    // enumerates the selector's integral value space, which a real does not have.
+    // unique / unique0 / priority keep their LRM 12.5.3 violation checks, built
+    // from the same per-item predicates the integral eager path uses.
+    void lower_case_real(const CaseStatement& c, ir::Builder& b) {
+        using Check = slang::ast::UniquePriorityCheck;
+        const bool no_match_report =
+          (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
+        const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
+
+        // Both sides compare at `real`: a shortreal widens exactly (LRM 6.12.2),
+        // so the wider type is always the safe common one.
+        const ir::Ref   rty = module_.pool.real_type;
+        const ir::Index sel = coerce(lower_expr(c.expr, b), *c.expr.type, rty, b, loc(c.expr));
+
+        if (!needs_overlap) {
+            lower_case_real_item(c, 0, sel, rty, no_match_report, b);
+            return;
+        }
+        // unique / unique0 evaluate every item's predicate once up front (12.5.3
+        // permits it), share them with the overlap check, and dispatch off the
+        // same temps.
+        std::vector<ir::Index> preds;
+        preds.reserve(c.items.size());
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            preds.push_back(real_case_item_pred(item, sel, rty, b));
+        }
+        emit_overlap_check(preds, case_banner(c), loc(c), b);
+        slang::ast::ASTContext astCtx(*scope_, slang::ast::LookupLocation::max);
+        dispatch_preds(c,
+                       0,
+                       sel,
+                       /*width=*/0,
+                       /*key_width=*/0,
+                       astCtx,
+                       preds,
+                       no_match_report,
+                       b,
+                       /*allow_switch=*/false);
     }
 
     // Priority-order case dedup (LRM 12.5). The first matching case_item wins,
@@ -13916,6 +14213,12 @@ private:
             // common-type/resize machinery below is packed-only).
             fail("case statement over strings is not supported");
         }
+        if (has_real_case_operand(c)) {
+            // Real selector or real label, `inside` included: its own comparison
+            // chain (lower_case_real), because everything below is packed-only.
+            lower_case_real(c, b);
+            return;
+        }
         if (c.condition == CaseStatementCondition::Inside) {
             lower_case_inside(c, b);
             return;
@@ -14059,6 +14362,10 @@ private:
     // dropped duplicate there would be a swallowed overlap violation) -- the
     // overlap itself is still reported by the separate, already-computed
     // `preds` sum regardless of which items a run's switch absorbs.
+    //
+    // `allow_switch` is false for a real selector, whose predicates are IEEE-754
+    // comparisons: there is no integral key for find_switch_run to build a jump
+    // table from, and `width` / `key_width` carry no meaning there.
     void dispatch_preds(const CaseStatement&          c,
                         size_t                        k,
                         ir::Index                     sel,
@@ -14067,7 +14374,8 @@ private:
                         const slang::ast::ASTContext& astCtx,
                         const std::vector<ir::Index>& preds,
                         bool                          no_match_report,
-                        ir::Builder&                  b) {
+                        ir::Builder&                  b,
+                        bool                          allow_switch = true) {
         if (k == c.items.size()) {
             if (c.defaultCase != nullptr) {
                 lower_stmt(*c.defaultCase, b);
@@ -14077,14 +14385,15 @@ private:
             return;
         }
 
-        if (std::optional<SwitchRun> run = find_switch_run(c, k, width, key_width, /*keep=*/nullptr, astCtx)) {
+        if (std::optional<SwitchRun> run =
+              allow_switch ? find_switch_run(c, k, width, key_width, /*keep=*/nullptr, astCtx) : std::nullopt) {
             if (run->arms.empty()) {
-                dispatch_preds(c, k + run->len, sel, width, key_width, astCtx, preds, no_match_report, b);
+                dispatch_preds(c, k + run->len, sel, width, key_width, astCtx, preds, no_match_report, b, allow_switch);
                 return;
             }
             const std::vector<ir::Builder::SwitchArmBuild> arms = lower_switch_arm_bodies(run->arms, b);
             b.open_region();
-            dispatch_preds(c, k + run->len, sel, width, key_width, astCtx, preds, no_match_report, b);
+            dispatch_preds(c, k + run->len, sel, width, key_width, astCtx, preds, no_match_report, b, allow_switch);
             const ir::ExtraSlice default_region = b.close_region();
             // four-state is exactly `key_width != width`: the key encoding doubles
             // only for a 4-state selector.
@@ -14097,7 +14406,7 @@ private:
         const ir::ExtraSlice then_region = b.close_region();
 
         b.open_region();
-        dispatch_preds(c, k + 1, sel, width, key_width, astCtx, preds, no_match_report, b);
+        dispatch_preds(c, k + 1, sel, width, key_width, astCtx, preds, no_match_report, b, allow_switch);
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(preds[k], then_region, else_region, loc(*c.items[k].stmt));
@@ -16422,15 +16731,28 @@ private:
                 if (fl && !real_conv) {
                     switch (conv) {
                         case 'd':
-                            // A real under %d prints its rounded integer value
-                            // (LRM 6.12.1 conversion; matches iverilog).
+                        case 'h':
+                        case 'x': // check_specifier keeps %x/%X as a hex alias
+                        case 'o':
+                        case 'b':
+                            // A real under %d/%h/%x/%o/%b prints its rounded
+                            // integer value in the requested base: Table 21-1
+                            // gives these specifiers a common integral operand,
+                            // and LRM 21.2.1.2 converts a real argument to that
+                            // operand by the LRM 6.12.1 real-to-integer rule
+                            // (round half away from zero). Only the base
+                            // differs, so width/zero-padding/sign stay on the
+                            // shared integer path below. Signed 64-bit keeps
+                            // negatives printing as two's complement (matches
+                            // iverilog: -3.7 under %h is fffffffffffffffc).
                             v = b.float_cvt(ir::Inst::Tag::FtoI, v, make_int_type(64, false, true), al);
                             break;
                         case 't':
                             break; // scale_to_ticks below has the real path
                         default:
-                            // %h / %o / %b / %c take integral operands only
-                            // (LRM 21.2.1.1).
+                            // TODO: %c of a real (would need the rounded integer
+                            // truncated to a character code), and %u / %z of a
+                            // real (unformatted raw bits, LRM 21.2.1.3).
                             fail(std::string("%") + conv + " with a real argument is not supported");
                     }
                 } else if (!fl && real_conv) {
@@ -16745,9 +17067,11 @@ private:
     // `y = (x = 5)`) can recover its value; the caller truncates to the LHS type.
     // Statement callers discard the return.
     ir::Index lower_assign(const AssignmentExpression& a, ir::Builder& b) {
-        // Gate ordinary writes to a forced variable (LRM 10.6.2). Only a whole-var
-        // write is gated in Phase 1; a select-write to a force target, or a
-        // compound update, is guarded loud.
+        // Gate ordinary writes to a forced/assigned variable (LRM 10.6.2). The write
+        // predicate is "is this lvalue's root a force target?" — the root, not the
+        // written shape, carries the site state, so a whole-variable write, a
+        // bit/part/element-select of it, a packed struct/union member of it, and a
+        // compound update all take the same gate.
         if (const ValueSymbol* root = lvalue_root(a.left())) {
             if (root->kind == SymbolKind::ClockVar) {
                 // A synchronous drive (LRM 14.16), which is neither an ordinary store
@@ -16759,12 +17083,15 @@ private:
                 return ir::Index{};
             }
             if (ForceInfo* fi = force_info_of(*root)) {
-                if (force_target_var(a.left()) == nullptr) {
-                    fail("assignment to a bit/part/element-select of a force-target "
-                         "variable is not supported (Phase 2)");
-                }
-                if (a.isCompound()) {
-                    fail("compound assignment to a force-target variable is not supported");
+                if (a.timingControl != nullptr) {
+                    // TODO: intra-assignment timing (`x = #5 e` / `x <= @e2 e`) on a
+                    // write to a force target. LRM 10.6.2 suppresses the update, which
+                    // for a delayed assignment is decided when it commits, not when the
+                    // RHS is sampled; the gate here would have to ride the deferred
+                    // record (store_nb_delay / store_nb_event have no predicate hook)
+                    // and gated_store would otherwise silently drop the timing control.
+                    fail("intra-assignment timing on a write to a force-target variable "
+                         "is not supported");
                 }
                 return gated_store(a, *fi, b);
             }
@@ -16883,22 +17210,25 @@ private:
                 // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.
                 // Sample the value (and N) now; store after N occurrences of the
                 // trigger edge. Only a single (signal, edge) trigger is lowered.
-                if (a.left().type->isFloating()) {
-                    // TODO: real target on the event form of intra-assignment timing
-                    // (the delay form works via intra_pack_mm; the event arm/fire path
-                    // has a real-value gap).
-                    fail("nonblocking intra-assignment event timing on a real target is "
-                         "not supported");
-                }
                 const TimingControl* evt   = &tc;
                 ir::Index            count = ir::Index{};
                 if (tc.kind == TimingControlKind::RepeatedEvent) {
                     const RepeatedEventControl& rec = tc.as<RepeatedEventControl>();
-                    if (rec.expr.type->isFloating()) {
-                        fail("repeat with a real count is not supported");
-                    }
                     evt   = &rec.event;
                     count = lower_expr(rec.expr, b);
+                    if (rec.expr.type->isFloating()) {
+                        // A real count rounds half away from zero into the countdown
+                        // (LRM 6.12.1's real -> integral conversion, which coerce ends
+                        // in), in the same signed 64-bit type the repeat statement
+                        // counts a real in (lower_repeat); the deferred record's own
+                        // 32-bit countdown then narrows it exactly as it narrows an
+                        // integral longint count.
+                        count = coerce(count, *rec.expr.type, make_int_type(64, false, true), b, loc(a));
+                    }
+                    // TODO: LRM 9.4.5 makes a count <= 0 (rounded or integral) assign
+                    // as if there were no repeat construct, but the record countdown is
+                    // unsigned, so a non-positive count waits 2**32 edges instead. A
+                    // pre-existing gap of the integral path, shared by the real one.
                 } else {
                     // Plain `@e` waits for one occurrence.
                     count = b.constant(module_.pool.put_int(make_int_type(32, false, false), 1), loc(a));
@@ -17927,6 +18257,19 @@ private:
         fail("associative array method '" + std::string(name) + "' is not supported");
     }
 
+    // Lower the right-hand side slang synthesized for `lhs op= rhs` (LRM 11.4.1)
+    // against an already-bound LHS lvalue: `a.right()` is `op(LValueReference,
+    // rhs)`, and the embedded LValueReference reads back through `lv`, so the
+    // lvalue is evaluated exactly once. Shared with the force-gated write path,
+    // which needs the same read-modify-write with only the store-back gated.
+    ir::Index lower_compound_rhs(const AssignmentExpression& a, ir::Index lv, ir::Builder& b) {
+        const std::optional<ir::Index> saved = compound_lv_;
+        compound_lv_                         = lv;
+        const ir::Index rhs                  = lower_expr(a.right(), b);
+        compound_lv_                         = saved;
+        return rhs;
+    }
+
     // Compound assignment `lhs op= rhs` (LRM 11.4.1, always blocking). slang has
     // rewritten a.right() into `BinaryExpression(LValueReference, rhs, op)` with
     // width/sign/conversion already resolved, so lowering it after binding the
@@ -17949,11 +18292,8 @@ private:
         }
         // A compound assignment reads then writes the same member, so one guard
         // covers both; the write wording is the more specific of the two.
-        const ir::Index                lv    = lower_lvalue(a.left(), b, /*is_write=*/true);
-        const std::optional<ir::Index> saved = compound_lv_;
-        compound_lv_                         = lv;
-        const ir::Index rhs                  = lower_expr(a.right(), b);
-        compound_lv_                         = saved;
+        const ir::Index lv  = lower_lvalue(a.left(), b, /*is_write=*/true);
+        const ir::Index rhs = lower_compound_rhs(a, lv, b);
         b.binary(ir::Inst::Tag::Store, lv, rhs, l);
         return rhs;
     }
@@ -18004,7 +18344,11 @@ private:
                 }
                 store_concat_ops(nested->elements(), val, tag, b, l);
             } else {
-                b.binary(tag, lower_lvalue(op, b, /*is_write=*/true), val, l);
+                // Each operand carries its own force/assign state, so the scatter
+                // gates per operand: a forced operand keeps its forced value while
+                // its siblings still take their slice (LRM 10.6.2, matching
+                // iverilog 13). Unforced operands lower to a plain store.
+                store_or_gate(pca_info_of_lvalue(op), tag, lower_lvalue(op, b, /*is_write=*/true), val, b, l);
             }
             offset += op.type->getBitWidth();
         }
@@ -18551,16 +18895,23 @@ private:
             const bool      pre = u.op == U::Preincrement || u.op == U::Predecrement;
             const ir::Index lv  = lower_lvalue(u.operand(), b);
             const ir::Index cur = b.unary(T::Load, lv, l);
+            // `i++` is the read-modify-write `i = i + 1`, so a forced/assigned
+            // target drops the update while keeping the expression's value (LRM
+            // 10.6.2 suppresses the update alone): the read already saw the forced
+            // value, so post yields it and pre yields it plus one, and the variable
+            // stays forced. Byte-identical to iverilog 13. Null for the ordinary
+            // (never force/assign target) case, which stores unconditionally.
+            const ForceInfo* fi = pca_info_of_lvalue(u.operand());
             if (u.operand().type->isFloating()) {
                 // ++ / -- on a real add / subtract 1.0 (LRM 11.4.2).
                 const ir::Index one = b.constant(module_.pool.put_real(lower_type(*u.operand().type), 1.0), l);
                 const ir::Index nv  = b.binary(inc ? T::FAdd : T::FSub, cur, one, l);
-                b.binary(T::Store, lv, nv, l);
+                store_or_gate(fi, T::Store, lv, nv, b, l);
                 return pre ? nv : cur;
             }
             const ir::Index one = b.constant(module_.pool.put_int(lower_type(*u.operand().type), 1), l);
             const ir::Index nv  = b.binary(inc ? T::Add : T::Sub, cur, one, l);
-            b.binary(T::Store, lv, nv, l);
+            store_or_gate(fi, T::Store, lv, nv, b, l);
             return pre ? nv : cur;
         }
         const ir::Index op = lower_expr(u.operand(), b);
@@ -20026,22 +20377,44 @@ private:
         const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&prop]       = sig;
 
-        // Queue the initializer once (this is the first-access path). A non-scalar
-        // initializer is deferred loud — most static-property initializers are
-        // constants / parameters.
+        // Queue the initializer once (this is the first-access path). LRM 8.9's own
+        // example initializes a static property with `$fopen("data", "r")`, so this
+        // is not restricted to constant expressions.
         if (const Expression* init = prop.getInitializer()) {
-            if (is_aggregate(prop.getType()) || is_unpacked_container(prop.getType())) {
-                // TODO: aggregate / container static-property initializer (per-leaf
-                // PreInit store, or the container literal build).
-                fail("aggregate or container static class property initializer is not supported");
-            }
             if (!preinit_) {
                 preinit_.emplace(module_.pool);
             }
             ir::Builder&        pb = *preinit_;
             const ir::SourceLoc il = loc(*init);
-            pb.binary(
-              ir::Inst::Tag::Store, pb.signal(sig, il), coerce(lower_expr(*init, pb), *init->type, pty, pb, il), il);
+            // A static property's initializer is class scope, not any method's
+            // frame: LRM 8.11 permits `this` only inside a non-static method, so
+            // nothing here may bind to a frame local or to an object. First access
+            // can happen from inside an unrelated method body or another class's
+            // property initializer, so drop both handles — a stray non-static
+            // reference then fails loudly instead of silently reading whichever
+            // frame / object happened to be mid-lowering.
+            const Restore<FnCtx*>                  no_frame(fn_ctx_, nullptr);
+            const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
+            if (is_aggregate(prop.getType()) || is_unpacked_container(prop.getType())) {
+                // The shared slot is ordinary aggregate signal storage (register_signal
+                // with the lowered type, exactly like a module-level variable), so an
+                // unpacked array / queue / dynamic array / associative array
+                // initializer builds into it through the same element-wise,
+                // handle-aware path a module-level declaration initializer takes
+                // (lower_var_initializer). A plain scalar Store would bit-blast the
+                // container's handle instead.
+                emit_struct_store(pb.signal(sig, il), pty, *init, ir::Inst::Tag::Store, pb, il);
+            } else if (prop.getType().getCanonicalType().isString()) {
+                // A string assigns as a whole handle, never through coerce: its
+                // Resize rejects a string value outright (Resize truncates/extends
+                // planes). Mirrors emit_class_property_inits' string case.
+                pb.binary(ir::Inst::Tag::Store, pb.signal(sig, il), lower_expr(*init, pb), il);
+            } else {
+                pb.binary(ir::Inst::Tag::Store,
+                          pb.signal(sig, il),
+                          coerce(lower_expr(*init, pb), *init->type, pty, pb, il),
+                          il);
+            }
         }
         return sig;
     }
@@ -20106,6 +20479,18 @@ private:
         if (const auto* prop = vs.as_if<slang::ast::ClassPropertySymbol>()) {
             if (prop->lifetime == slang::ast::VariableLifetime::Static) {
                 return b.signal(declare_static_prop(*prop), l);
+            }
+        }
+        if (ctor_this_) {
+            if (const auto* prop = vs.as_if<slang::ast::ClassPropertySymbol>()) {
+                // A property initializer runs as part of construction (LRM 8.7), so a
+                // bare property reference in it is `this`-relative to the object being
+                // BUILT. Resolved ahead of the frame path below, which would hand back
+                // the enclosing method's `this` when the `new` sits inside another
+                // class's method -- silently reading a different object's property of
+                // the same name (and, outside a method, failing as an unknown signal).
+                // Same precedence, and the same reason, as resolve_method_this.
+                return class_member_lvalue(ctor_this_->handle, *prop, ctor_this_->cls, b, l);
             }
         }
         if (fn_ctx_ != nullptr) {
@@ -20674,6 +21059,12 @@ private:
         ctx.name_prefix = std::string(sub.name) + ".";
         ctx.is_task     = true;
         ctx.sym         = &sub;
+        // A body may be lowered lazily from inside a property initializer, where
+        // `ctor_this_` names the object under construction as an ir::Index of the
+        // CONSTRUCTOR's builder. Inside this body that Index belongs to another
+        // builder entirely, and the body's own `this` formal is the correct handle,
+        // so the ctor scope stops at the call boundary.
+        const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
         const FnScope fn_scope(*this, &ctx);
         ir::Builder             b(module_.pool);
         std::vector<ir::Ref>    param_types;
@@ -20849,6 +21240,10 @@ private:
         FnCtx ctx;
         ctx.name_prefix = std::string(sub.name) + ".";
         const FnScope fn_scope(*this, &ctx);
+        // Stops the enclosing construction's `this` at the call boundary, as
+        // build_task does and for the same reason (the handle is another builder's
+        // Index; this body's own `this` formal is the right one).
+        const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
         ir::Builder             b(module_.pool);
         std::vector<ir::Ref>    param_types;
         std::vector<ir::ArgDir> arg_dirs;
@@ -21146,13 +21541,19 @@ private:
 
     // Apply a class's non-static property default initializers to a freshly-new'd
     // object `handle` (LRM 8.8): a store per property that has an initializer, in
-    // declaration order. Lowered in the enclosing context (the `new` site), so an
-    // initializer that references `this` or another property fails loudly via
-    // signal_of — a documented V1 gap (most initializers are constants / params).
+    // declaration order. Lowered at the `new` site rather than inside a constructor
+    // body, so `ctor_this_` carries the object under construction for the duration:
+    // LRM 8.7 runs these initializers as part of construction, which makes a bare
+    // `f()` here an ordinary call on `this` (resolve_method_this). A bare reference
+    // to ANOTHER property is still a documented V1 gap, failing loudly via signal_of.
     void emit_class_property_inits(const slang::ast::ClassType& clt,
                                    ir::Index                    handle,
                                    ir::Ref                      class_ref,
                                    ir::Builder&                 b) {
+        // Re-installed identically by the base-class recursion below, and restored on
+        // the throwing path, so a nested `new` in an initializer (whose own inits run
+        // against ITS object) cannot leak the wrong handle back out.
+        const Restore<std::optional<CtorThis>> ctor(ctor_this_, CtorThis{ .handle = handle, .cls = class_ref });
         // Base-class defaults first (LRM 8.8 / 8.13 declaration order runs the base
         // part before the derived part). `class_ref` stays the *derived* (allocated)
         // type so class_member_lvalue derefs the full body; an inherited property's
@@ -21223,11 +21624,7 @@ private:
         // base method. The receiver's static class type selects the vtable layout.
         ir::Index c;
         if (is_virtual) {
-            // Receiver's static class type selects the vtable layout: an explicit
-            // receiver (`obj.f()`) is call.thisClass(); a bare in-method call (`f()`)
-            // dispatches through the enclosing method's own `this`.
-            const ir::Ref recv =
-              call.thisClass() != nullptr ? lower_type(*call.thisClass()->type) : fn_ctx_->this_class;
+            const ir::Ref recv = virtual_recv_class(call);
             c = b.call_virtual(virtual_sig_id(sub), virtual_slot_of(sub), recv, args, l);
         } else {
             c = b.call(direct_id, args, l);
@@ -21256,10 +21653,11 @@ private:
                          ir::Builder&             b,
                          std::optional<ir::Index> this_val = std::nullopt) {
         // A virtual task invoked through a handle dispatches dynamically (LRM 8.20),
-        // like a virtual function but over the task (coroutine) ABI. A pure virtual
-        // task is guarded (compute_vtable), so a virtual-task callee always has a
-        // concrete signature — function_id(sub) is only skipped to mirror the
-        // function path's vtable sourcing.
+        // like a virtual function but over the task (coroutine) ABI. Skipping
+        // function_id(sub) is load-bearing, exactly as on the function path: a PURE
+        // virtual task's callee is slang's degenerate associated subroutine, which has
+        // no body to lower — its prototype stub supplies the signature instead
+        // (virtual_sig_id).
         const bool           is_virtual = this_val && is_user_virtual(sub) && !is_super_call(call);
         const ir::FunctionId id         = is_virtual ? ir::FunctionId{} : function_id(sub);
         const auto           formals    = sub.getArguments();
@@ -21274,8 +21672,7 @@ private:
             args.insert(args.begin(), *this_val);
         }
         if (is_virtual) {
-            const ir::Ref recv =
-              call.thisClass() != nullptr ? lower_type(*call.thisClass()->type) : fn_ctx_->this_class;
+            const ir::Ref recv = virtual_recv_class(call);
             b.task_call_virtual(virtual_sig_id(sub), virtual_slot_of(sub), recv, args, l);
         } else {
             b.task_call(id, args, l);
@@ -21283,10 +21680,28 @@ private:
         emit_call_copyouts(outs, b, l);
     }
 
+    // The receiver class type that selects a virtual call's vtable layout (LRM 8.20).
+    // Mirrors resolve_method_this' three receiver shapes IN THE SAME PRECEDENCE, so
+    // the handle it returns and the layout chosen here always describe one object:
+    // an explicit `obj.f()`, else the object under construction in a property
+    // initializer, else the enclosing method's own `this`. Only reached when
+    // resolve_method_this produced a handle, so one of the three holds — which is
+    // what makes the final fn_ctx_ deref safe.
+    ir::Ref virtual_recv_class(const CallExpression& call) {
+        if (call.thisClass() != nullptr) {
+            return lower_type(*call.thisClass()->type);
+        }
+        if (ctor_this_) {
+            return ctor_this_->cls;
+        }
+        return fn_ctx_->this_class;
+    }
+
     // Resolve the `this` object handle for a possible method call (LRM 8.11). An
-    // explicit receiver (`obj.method()`) is call.thisClass(); a bare in-method call
-    // (`method()`) uses the enclosing method's `this` Local. Returns nullopt for a
-    // free subroutine (no thisVar).
+    // explicit receiver (`obj.method()`) is call.thisClass(); a bare call uses the
+    // enclosing `this` — a method's own `this` Local, or the object under
+    // construction when the call sits in a property declaration initializer.
+    // Returns nullopt for a free subroutine (no thisVar).
     std::optional<ir::Index> resolve_method_this(const CallExpression&   call,
                                                  const SubroutineSymbol& sub,
                                                  ir::Builder&            b) {
@@ -21299,6 +21714,15 @@ private:
         // has neither a thisVar nor virtualness).
         if (sub.thisVar == nullptr && !is_user_virtual(sub)) {
             return std::nullopt;
+        }
+        if (ctor_this_) {
+            // A bare method call in a property declaration initializer (`int a =
+            // f();`). The initializer runs as part of construction (LRM 8.7), so the
+            // object being constructed IS `this` — but it is lowered at the `new`
+            // site, so the handle comes from there rather than from a frame Local.
+            // Checked BEFORE the frame: when the `new` sits inside some other
+            // method, that method's `this` is a different object entirely.
+            return ctor_this_->handle;
         }
         if (fn_ctx_ == nullptr || !fn_ctx_->has_this) {
             fail("class method call without an object handle is not supported");
@@ -21475,7 +21899,16 @@ private:
                 continue;
             }
             const ir::Index tv = b.unary(ir::Inst::Tag::Load, oc.temp, l);
-            b.binary(ir::Inst::Tag::Store, dst, coerce(tv, *oc.formal_ty, oc.actual_ty, b, l), l);
+            // The copy-back is an ordinary procedural write to the actual, so a
+            // forced / `assign`-driven actual drops it and keeps the override's
+            // value (LRM 10.6.2, matching iverilog 13); the call itself and the
+            // callee's write to its own temp are unaffected.
+            store_or_gate(pca_info_of_lvalue(*oc.actual),
+                          ir::Inst::Tag::Store,
+                          dst,
+                          coerce(tv, *oc.formal_ty, oc.actual_ty, b, l),
+                          b,
+                          l);
         }
     }
 
@@ -21793,6 +22226,20 @@ private:
     // the LValueReferenceExpression slang embeds in its rewritten RHS. Null
     // outside a compound assignment.
     std::optional<ir::Index> compound_lv_;
+    // The object under construction while a non-static property's DECLARATION
+    // initializer is lowered, plus the allocated class type that selects its vtable
+    // layout. LRM 8.7 runs those initializers as part of construction ("each
+    // property defined in the class shall be initialized to its explicit default
+    // value"), so `this` is in scope there and a bare `f()` in an initializer is an
+    // ordinary method call. emit_class_property_inits lowers them at the `new` site
+    // though, which has no method frame to carry `this` — and whose frame `this`, if
+    // it has one, belongs to a DIFFERENT object. Nullopt outside a property
+    // initializer; scoped by Restore, never assigned bare.
+    struct CtorThis {
+        ir::Index handle;
+        ir::Ref   cls;
+    };
+    std::optional<CtorThis> ctor_this_;
     // Monotonic counter naming anonymous output / inout task-argument temps created
     // in a process body (where temps are module signals, not frame locals).
     uint32_t task_temp_seq_ = 0;

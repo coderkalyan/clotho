@@ -144,6 +144,93 @@ TEST_CASE("property default initializers") {
     CHECK(run_capture(src) == "100 ctr 200\n7 9\n");
 }
 
+TEST_CASE("property initializer calling a method of the same class") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                int a = f();
+                int x = 3;
+                int y = g();
+                function int f(); return 7; endfunction
+                function int g(); return x + 4; endfunction
+            endclass
+            initial begin
+                C o;
+                o = new();
+                $display("%0d %0d %0d", o.a, o.x, o.y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "7 3 7\n");
+}
+
+// The handle such an initializer calls through is the object UNDER CONSTRUCTION, not
+// whatever `this` the enclosing scope happens to have. Here the `new` sits inside
+// Maker's method, so Maker's own `this` is live at the call site; C::g must still
+// read C's `x` (3), never Maker's same-named property (100).
+TEST_CASE("property initializer method call from inside another object's method") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                int x = 3;
+                int y = g();
+                function int g(); return x + 4; endfunction
+            endclass
+            class Maker;
+                int x = 100;
+                function C make();
+                    C c;
+                    c = new();
+                    return c;
+                endfunction
+            endclass
+            initial begin
+                Maker mk;
+                C o;
+                mk = new();
+                o = mk.make();
+                $display("%0d %0d", o.x, o.y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 7\n");
+}
+
+// The same rule for a property initializer that READS a sibling property instead
+// of calling a method (LRM 8.7: the initializer runs during construction, so a
+// bare name is `this`-relative to the object being built). Both constructions
+// are exercised, because they used to fail differently: at module scope the read
+// had no frame `this` at all and died as an unknown signal, while inside Maker's
+// method it silently read MAKER's `a` and printed 101. iverilog 13 prints 5/6 for
+// both.
+TEST_CASE("property initializer reading a sibling property of the same object") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                int a = 5;
+                int b = a + 1;
+            endclass
+            class Maker;
+                int a = 100;
+                function C make();
+                    C c;
+                    c = new();
+                    return c;
+                endfunction
+            endclass
+            initial begin
+                Maker mk;
+                C direct, viamk;
+                mk = new();
+                direct = new();
+                viamk = mk.make();
+                $display("%0d %0d %0d %0d", direct.a, direct.b, viamk.a, viamk.b);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "5 6 5 6\n");
+}
+
 // Methods: implicit and explicit `this`, one method calling another, and recursion
 // (LRM 8.11). Cross-checked vs iverilog.
 TEST_CASE("methods: this, method-to-method, recursion") {
@@ -364,6 +451,29 @@ TEST_CASE("class static property: no instance, const, local") {
     CHECK(run_capture(src) == "43 99 7\n");
 }
 
+TEST_CASE("class static property: aggregate and container initializers") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a; int b; } P;
+            class C;
+                static int arr[4] = '{1,2,3,4};
+                static string s = "hi";
+                static P st = '{11,22};
+                static int q[$] = '{5,6};
+                static int d[] = '{7,8,9};
+            endclass
+            initial begin
+                C o;
+                o = new();
+                $display("%0d %0d %0d %0d %s", C::arr[0], C::arr[1], C::arr[2], C::arr[3], C::s);
+                $display("%0d %0d %0d %0d %0d %0d %0d",
+                         C::st.a, C::st.b, C::q[0], C::q[1], C::d[0], C::d[1], C::d[2]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 3 4 hi\n11 22 5 6 7 8 9\n");
+}
+
 TEST_CASE("class virtual dispatch: override, inherit, internal call, super") {
     constexpr std::string_view src = R"(
         module m;
@@ -485,17 +595,31 @@ TEST_CASE("class virtual task: dynamic dispatch, time-consuming") {
     CHECK(run_capture(src) == "base run\nbase step 5\nder run\nder step 15\n");
 }
 
-// Pure virtual task's abstract-class slot would need a coroutine-shaped stub
-// (deferred); it must fail loudly.
-TEST_CASE("class pure virtual task fails loudly") {
-    const std::string d = fails(R"(
+TEST_CASE("pure virtual task: dynamic dispatch, time-consuming") {
+    constexpr std::string_view src = R"(
         module m;
-            virtual class Base; pure virtual task t(); endclass
-            class Der extends Base; task t(); #1; endtask endclass
-            initial begin Der x; x = new(); end
+            virtual class Base;
+                pure virtual task t(int x);
+                task go(); t(3); $display("go %0t", $time); endtask
+            endclass
+            class Der extends Base;
+                virtual task t(int x); #(x) $display("der t %0d %0t", x, $time); endtask
+            endclass
+            class Twice extends Base;
+                virtual task t(int x); #(x*2) $display("twice t %0d %0t", x, $time); endtask
+            endclass
+            initial begin
+                Base  b;
+                Der   d = new();
+                Twice w = new();
+                b = d; b.t(4);
+                b = w; b.t(4);
+                b = d; b.go();
+            end
         endmodule
-    )");
-    CHECK(d.find("pure virtual task is not supported") != std::string::npos);
+    )";
+    // Der t(4): #4 -> t=4. Twice t(4): #8 -> t=12. go: dispatched t(3), #3 -> t=15.
+    CHECK(run_capture(src) == "der t 4 4\ntwice t 4 12\nder t 3 15\ngo 15\n");
 }
 
 TEST_CASE("abstract class: concrete virtual dispatch through the base") {
@@ -602,17 +726,96 @@ TEST_CASE("pure virtual: multi-level abstract, implicit override") {
     CHECK(run_capture(src) == "7\n7 100\n");
 }
 
-// A pure virtual returning a non-scalar needs the aggregate/handle return ABI in
-// the never-called signature stub (deferred); it must fail loudly.
-TEST_CASE("pure virtual with non-scalar return fails loudly") {
+TEST_CASE("pure virtual: string return") {
+    constexpr std::string_view src = R"(
+        module m;
+            virtual class Named;
+                pure virtual function string name();
+                function string shout(); return {name(), "!"}; endfunction
+            endclass
+            class Dog extends Named; virtual function string name(); return "dog"; endfunction endclass
+            class Cat extends Named; function string name(); return "cat"; endfunction endclass
+            initial begin
+                Named n;
+                Dog   d = new();
+                Cat   c = new();
+                n = d; $display("%s %s", n.name(), n.shout());
+                n = c; $display("%s %s", n.name(), n.shout());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "dog dog!\ncat cat!\n");
+}
+
+TEST_CASE("pure virtual: unpacked struct return") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int x; int y; } pt;
+            virtual class Maker;
+                pure virtual function pt make();
+            endclass
+            class Origin extends Maker;
+                virtual function pt make(); pt p; p.x = 0; p.y = 0; return p; endfunction
+            endclass
+            class Shifted extends Maker;
+                virtual function pt make(); pt p; p.x = 10; p.y = 20; return p; endfunction
+            endclass
+            initial begin
+                Maker   mk;
+                Origin  o = new();
+                Shifted s = new();
+                pt      r;
+                mk = o; r = mk.make(); $display("%0d %0d", r.x, r.y);
+                mk = s; r = mk.make(); $display("%0d %0d", r.x, r.y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 0\n10 20\n");
+}
+
+TEST_CASE("pure virtual: queue return") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef int q_t[$];
+            virtual class Src;
+                pure virtual function q_t items();
+                function int total(); q_t v; int s; s = 0; v = items(); foreach (v[i]) s += v[i]; return s; endfunction
+            endclass
+            class Two extends Src;
+                virtual function q_t items(); q_t r; r.push_back(1); r.push_back(2); return r; endfunction
+            endclass
+            class Three extends Src;
+                virtual function q_t items(); q_t r; r.push_back(7); r.push_back(8); r.push_back(9); return r; endfunction
+            endclass
+            initial begin
+                Src   s;
+                Two   a = new();
+                Three b = new();
+                q_t   v;
+                s = a; v = s.items(); $display("%0d %0d %0d", v.size(), v[1], s.total());
+                s = b; v = s.items(); $display("%0d %0d %0d", v.size(), v[2], s.total());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 2 3\n3 9 24\n");
+}
+
+// The one pure virtual return shape still deferred: an aggregate that owns heap (a
+// string member) returns by value, which needs a per-leaf deep copy rather than the
+// memcpy the return ABI emits. build_pure_stub guards it exactly as build_function
+// guards a concrete body, so the declaration is rejected whichever is lowered first.
+TEST_CASE("pure virtual returning a string-containing aggregate fails loudly") {
     const std::string d = fails(R"(
         module m;
-            virtual class Base; pure virtual function string name(); endclass
-            class Derived extends Base; function string name(); return "d"; endfunction endclass
-            initial begin Derived dd; dd = new(); $display("%s", dd.name()); end
+            typedef struct { string s; int i; } rec;
+            virtual class Base; pure virtual function rec f(); endclass
+            class Der extends Base;
+                virtual function rec f(); rec r; r.s = "x"; r.i = 1; return r; endfunction
+            endclass
+            initial begin Der d; d = new(); end
         endmodule
     )");
-    CHECK(d.find("pure virtual method with a non-scalar return is not supported") != std::string::npos);
+    CHECK(d.find("by-value return of a string-containing aggregate is not supported") != std::string::npos);
 }
 
 TEST_CASE("parameterized class: type + value params, param-sized array") {

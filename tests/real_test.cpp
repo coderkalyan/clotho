@@ -207,6 +207,29 @@ TEST_CASE("%d of a real rounds; %e/%f/%g of an integral converts") {
     CHECK(out == "5\n-5\n7\n");
 }
 
+TEST_CASE("%h / %o / %b / %x of a real round like %d, then format in that base") {
+    // Table 21-1 gives %d/%h/%x/%o/%b a common integral operand, and LRM
+    // 21.2.1.2 converts a real argument to it by the LRM 6.12.1 rule: round
+    // half away from zero (NOT truncation -- 3.7 is 4, not 3). Only the base
+    // differs, so all four print the same rounded value. Oracle-matched
+    // against iverilog.
+    const std::string out = run_capture(R"(
+        module t;
+            initial begin
+                $display("%0d %0h %0o %0b", 3.7, 3.7, 3.7, 3.7);
+                $display("%0d %0h", -3.7, -3.7);
+                $display("%0d %0h %0x %0X %0H", 1e12, 1e12, 1e12, 1e12, 1e12);
+            end
+        endmodule
+    )");
+    // The rounded integer is a signed 64-bit value, so a negative prints as
+    // its two's complement in the non-decimal bases, exactly as %d's operand
+    // would. %x/%X are clotho's hex aliases for %h.
+    CHECK(out == "4 4 4 100\n"
+                 "-4 fffffffffffffffc\n"
+                 "1000000000000 e8d4a51000 e8d4a51000 e8d4a51000 e8d4a51000\n");
+}
+
 TEST_CASE("real ++/-- steps by 1.0 in for loops") {
     // LRM 11.4.2: increment / decrement on a real adds / subtracts 1.0.
     const std::string out = run_capture(R"(
@@ -244,13 +267,21 @@ TEST_CASE("real nets, edge events, and casts slang rejects") {
     expect_reject("module m; real r; int i; initial i = signed'(r); endmodule", "");
 }
 
-TEST_CASE("case on a real selector is rejected loudly") {
+TEST_CASE("casez / casex over a real is rejected") {
     expect_reject(R"(
         module m;
             real r;
-            initial case (r) 1.0: ; default: ; endcase
+            initial casez (r) 1.0: ; default: ; endcase
         endmodule
-    )", "case on a real selector is not supported");
+    )",
+                  "invalid type 'real' for casez expression");
+    expect_reject(R"(
+        module m;
+            real r;
+            initial casex (r) 1.0: ; default: ; endcase
+        endmodule
+    )",
+                  "invalid type 'real' for casex expression");
 }
 
 // Real (fractional) `#delay` (LRM 3.14 / 22.7): rounds to the module precision,
@@ -313,9 +344,11 @@ TEST_CASE("real delay in a submodule, integer-only parent") {
     CHECK(out == "sub 1.5000\ntop 3.0000\n");
 }
 
-TEST_CASE("%h of a real is rejected loudly") {
-    expect_reject(R"(module m; initial $display("%h", 1.5); endmodule)",
-                  "%h with a real argument is not supported");
+TEST_CASE("%c of a real is still rejected loudly") {
+    // %h/%o/%b/%x of a real now round-and-format (see the base-conversion case
+    // above), but %c has no defined real operand conversion in Table 21-1, so
+    // it stays guarded rather than silently picking a character code.
+    expect_reject(R"(module m; initial $display("%c", 1.5); endmodule)", "%c with a real argument is not supported");
 }
 
 TEST_CASE("LRM 20.5 conversion system functions") {

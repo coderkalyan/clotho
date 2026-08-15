@@ -590,3 +590,56 @@ TEST_CASE("undriven bits of a partially-driven net power on z, not x") {
     )");
     CHECK(out == "zz10zz11 zzzz1zz1 zzzzzzzz\n");
 }
+
+// -- 2-state driver regions --
+//
+// A driver slot is cut from the NET's type, so it is always 4-state and always
+// holds the Z background a partial driver needs: LRM 6.7.1 restricts a built-in
+// net type's data type to a 4-state integral type (slang rejects `wire bit [7:0]
+// w;` outright), and a user-defined nettype — the only way to declare a 2-state
+// net, LRM 6.6.7 b — is refused at signal collection. What a design CAN write is
+// a 2-state MEMBER of a 4-state packed net, whose own 2-state view converts each
+// driver's value (LRM 6.11.2: x and z become 0) before it reaches the resolver.
+//
+// Line 3 is the discriminating one: the `lo` driver's x converts to 0 and then
+// AGREES with `hi`'s 0, so bit 0 resolves 0 — an x reaching the resolver would
+// make it x, as line 2 and line 4 show for a genuine 0-vs-1 conflict.
+TEST_CASE("a 2-state member of a 4-state packed net converts before resolving") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic a, b, c, d;
+          wire union packed { bit [3:0] lo; logic [3:0] hi; } u;
+          assign u.lo[0] = a & b;
+          assign u.hi[0] = c & d;
+          initial begin
+            a=1; b=1; c=1; d=1; #1; $display("%b", u);
+            b=0;                #1; $display("%b", u);
+            a=1'bx; b=1; d=0;   #1; $display("%b", u);
+            d=1;                #1; $display("%b", u);
+            $finish;
+          end
+        endmodule
+    )");
+    // u[3:1] undriven -> z. bit 0: 1 vs 1 -> 1; 0 vs 1 -> x; 0 vs 0 -> 0; 0 vs 1 -> x.
+    CHECK(out == "zzz1\nzzzx\nzzz0\nzzzx\n");
+}
+
+// The 2-state analogue of a partially driven net is a 2-state VARIABLE, which LRM
+// 10.3.2 allows one continuous assign to drive: disjoint constant sub-ranges each
+// have a single driver, so nothing is multiply driven and no slot or resolver is
+// involved. Oracle: iverilog 13 prints `v=a5` for this source.
+TEST_CASE("disjoint partial continuous assigns to a 2-state variable") {
+    const std::string out = run_capture(R"(
+        module top;
+          logic [3:0] x, y;
+          bit [7:0] v;
+          assign v[3:0] = x;
+          assign v[7:4] = y;
+          initial begin
+            x=4'h5; y=4'hA; #1; $display("v=%h", v);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "v=a5\n");
+}
