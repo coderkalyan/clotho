@@ -19293,7 +19293,10 @@ private:
             case B::ArithmeticShiftRight:
                 return b.binary(T::Sra, lhs, rhs, l);
             default:
-                fail("unsupported binary operator");
+                // The three short-circuit operators returned at the top of this
+                // function, and the other 25 BinaryOperator enumerators each have an
+                // arm above, so this is an invariant rather than a gap.
+                fail("internal: unhandled binary operator");
         }
     }
 
