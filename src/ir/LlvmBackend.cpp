@@ -9533,8 +9533,31 @@ private:
         if (lv.elem_idx == nullptr) {
             return lv.base;
         }
+        if (lv.array_ty != nullptr) {
+            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), lv.elem_idx });
+        }
         return b_.CreateInBoundsGEP(slot_of(lv.sig).storage_ty, lv.base,
                                     { b_.getInt32(0), lv.elem_idx });
+    }
+
+    // THE resolver for "a pointer to this place's whole storage image", whichever
+    // storage model it is in: the recursive aggregate mirror, or flat `[N x slot]`.
+    //
+    // A fixed unpacked array has two storage models -- flat with per-signal
+    // z-elision, and the canonical mirror when anything struct- or container-
+    // bearing is involved -- so a whole-object copy can legitimately have one model
+    // on each side (`v.m = tmp`, a struct member assigned a plain array). Every
+    // caller that resolved only one of them crashed on the other: agg_slot_ptr
+    // dereferences a null root_ty for a flat lvalue.
+    llvm::Value* agg_image_ptr(const LValue& lv) {
+        return lv.is_agg ? agg_slot_ptr(lv) : flat_elem_ptr(lv);
+    }
+
+    // The per-element slot type of a whole-array place, per its storage model. Two
+    // places of the same array TYPE agree byte for byte exactly when these agree,
+    // which is what decides memcpy vs an element-wise copy.
+    llvm::StructType* image_elem_slot(const LValue& lv, Ref type) {
+        return lv.is_agg ? agg_leaf_slot_ty(leaf_type(type)) : slot_of(lv.sig).slot_ty;
     }
 
     // A read-only image of what an out-of-range whole-object read must yield
@@ -9563,43 +9586,43 @@ private:
     // no operation) without the gate having to thread through every exit.
     void emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const LValue& slv,
                        llvm::Value* src_override) {
-        llvm::Value* dst;
-        llvm::Value* src;
-        llvm::Type*  st;
-        if (dlv.is_agg) {
-            // An aggregate (contains a struct) uses the recursive storage,
-            // which is deterministic by type — both sides share the layout.
-            dst = agg_slot_ptr(dlv);
-            src = src_override != nullptr ? src_override : agg_slot_ptr(slv);
-            st  = agg_storage_ty(info.type);
+        // Both sides resolve through the ONE image resolver, so either may be in
+        // either storage model. That matters because a whole-object copy can
+        // legitimately mix them: `v.m = tmp` assigns a plain array into a struct
+        // member, and the member is in the canonical mirror while `tmp` is flat.
+        llvm::Value* const dst = agg_image_ptr(dlv);
+        llvm::Value* const src =
+          src_override != nullptr ? src_override : agg_image_ptr(slv);
+        llvm::Type* st = nullptr;
+        // Which storage model a place is in is decided by its TYPE for everything
+        // struct- or container-bearing (needs_agg_storage), so both sides of such a
+        // copy are necessarily in the canonical mirror and its own type is the
+        // memcpy shape. Only a PLAIN scalar-leaf array can differ between the two
+        // sides, and only in its per-element slot, which is may-z-analysed per
+        // signal in the flat model and type-derived in the mirror.
+        if (needs_agg_storage(info.type) || !is_agg_abi(info.type)) {
+            st = agg_storage_ty(info.type);
         } else {
-            // A plain unpacked array. The per-element slot layout is may-z-
-            // analysed per signal, but a copy couples the two signals' z
-            // through this very store, so their element slots match; a
-            // genuine per-element mismatch is rejected rather than miscopied.
-            // The copy count comes from the copy TYPE, not the whole signal:
-            // a multi-dim element-select (`arr[i][j]`) addresses a SUB-array,
-            // whose flat leaf offset is carried in elem_idx (base still
-            // points at the whole `[N x slot]` storage) and applied here.
-            const SignalSlot& ds    = slot_of(dlv.sig);
-            const SignalSlot& ss    = slot_of(slv.sig);
-            const uint32_t    count = array_leaf_count(info.type);
-            llvm::Value*      d_base = flat_elem_ptr(dlv);
-            llvm::Value*      s_base = src_override != nullptr ? src_override : flat_elem_ptr(slv);
-            if (ds.slot_ty != ss.slot_ty) {
-                // z-elision gave the two same-typed arrays different per-
-                // element layouts (the dest is may-z from other writes, this
-                // source proven never-z, so their z-word presence differs).
-                // The mm plane is an identical i(2W); copy element-wise,
-                // filling the dest z (0 when the source is never-z).
-                emit_array_zdiff_copy(d_base, s_base, ds, ss, count, dlv.sig,
+            llvm::StructType* const d_slot = image_elem_slot(dlv, info.type);
+            llvm::StructType* const s_slot =
+              src_override != nullptr ? d_slot : image_elem_slot(slv, info.type);
+            if (d_slot != s_slot) {
+                // The two element layouts differ only in the z word's presence (the
+                // mm plane is an identical i(2W)), so copy element-wise, filling the
+                // dest z with 0 when the source is never-z. The leaf facts come from
+                // the TYPE, so this works whichever model each side is in.
+                const Layout lay = mod_.pool.layout(leaf_type(info.type));
+                emit_array_zdiff_copy(dst, src, d_slot, s_slot, lay.width == 0 ? 1 : lay.width,
+                                      lay.domain == Domain::Four, array_leaf_count(info.type),
+                                      dlv.sig,
                                       !silent_stores_ && dlv.is_signal &&
                                         signal_has_waiters(dlv.sig));
                 return;
             }
-            dst = d_base;
-            src = s_base;
-            st  = llvm::ArrayType::get(ds.slot_ty, count);
+            // The count comes from the copy TYPE, not the whole signal: a multi-dim
+            // element select (`arr[i][j]`) addresses a SUB-array, whose flat leaf
+            // offset the resolver above has already applied.
+            st = llvm::ArrayType::get(d_slot, array_leaf_count(info.type));
         }
         const auto sz = env_->llmod.getDataLayout().getTypeAllocSize(st);
         const auto al = env_->llmod.getDataLayout().getABITypeAlign(st);
@@ -9638,16 +9661,90 @@ private:
     // and, into a z-capable dest, its z word (0 when the source is never-z).
     // `d_base` / `s_base` point at the first copied element (already offset for a
     // sub-array). `service` wakes the dest's Any-edge readers on any change.
-    void emit_array_zdiff_copy(llvm::Value* d_base, llvm::Value* s_base, const SignalSlot& ds,
-                               const SignalSlot& ss, uint32_t count, Signal dsig, bool service) {
-        if (!ds.four_state || !ss.four_state || ds.narrow || ss.narrow || ds.width != ss.width) {
-            throw BackendError{ "whole-array copy between arrays of differing "
-                                "storage layout is not supported" };
+    // Element-wise whole-(sub-)array copy between two storage images whose element
+    // slots differ in SHAPE, not just in the z word's presence: one side narrow
+    // (a single iW value word), the other the packed must|may pair, or a 2-state
+    // pair of differing widths. A memcpy and even a word move are both wrong here,
+    // so each element goes through the ordinary lower_load / lower_store pair, which
+    // is where narrow <-> packed conversion already lives and is already exercised
+    // by every scalar assignment between differently-shaped slots.
+    //
+    // Reached when the two models meet: a class property or struct member is always
+    // in the canonical, type-derived mirror while a module-scope array signal's
+    // element slot is may-z-analysed and may be independently widened.
+    void emit_array_convert_copy(llvm::Value* d_base, llvm::Value* s_base,
+                                 llvm::StructType* d_slot, llvm::StructType* s_slot,
+                                 bool d_narrow, bool s_narrow, uint32_t leaf_width,
+                                 uint32_t count, Signal dsig, bool service) {
+        auto* dst_arr = llvm::ArrayType::get(d_slot, count);
+        auto* src_arr = llvm::ArrayType::get(s_slot, count);
+
+        const auto elem_lv = [&](llvm::Value* base, llvm::ArrayType* arr,
+                                 llvm::StructType* slot, bool narrow,
+                                 llvm::Value* idx) {
+            LValue lv;
+            lv.base        = base;
+            lv.slot_ty     = slot;
+            lv.narrow      = narrow;
+            lv.has_z       = !narrow && slot->getNumElements() > 1;
+            lv.array_ty    = arr;
+            lv.elem_idx    = idx;
+            lv.store_width = leaf_width;
+            lv.bit_off     = b_.getInt32(0);
+            lv.width       = leaf_width;
+            return lv;
+        };
+
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "cvcopy.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "cvcopy.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "cvcopy.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(b_.getInt32Ty(), 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(count)), body, done);
+
+        b_.SetInsertPoint(body);
+        lower_store(elem_lv(d_base, dst_arr, d_slot, d_narrow, idx),
+                    lower_load(elem_lv(s_base, src_arr, s_slot, s_narrow, idx)));
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+        // A converting copy cannot cheaply prove nothing changed (the two images are
+        // not comparable word for word), so it wakes unconditionally. Correct, and
+        // only reachable for the model-crossing shapes above.
+        if (service) {
+            service_any_waiters(dsig);
         }
-        auto* dst_arr = llvm::ArrayType::get(ds.slot_ty, count);
-        auto* src_arr = llvm::ArrayType::get(ss.slot_ty, count);
-        auto* mm_ty   = int_ty(2 * ds.width);
-        auto* z_ty    = int_ty(ds.width);
+    }
+
+    void emit_array_zdiff_copy(llvm::Value* d_base, llvm::Value* s_base,
+                               llvm::StructType* d_slot, llvm::StructType* s_slot,
+                               uint32_t leaf_width, bool four_state, uint32_t count, Signal dsig,
+                               bool service) {
+        // A NARROW slot's single word is the value itself, not a must|may pair, so
+        // when the two sides disagree about narrowness the mm words are different
+        // widths and no word move is sound. Route those through the ordinary
+        // load/store pair, which is exactly where narrow <-> packed conversion
+        // already lives; the word-move loop below then only ever sees two packed
+        // slots differing in the z word's presence.
+        const bool d_narrow = d_slot->getNumElements() == 1 &&
+                              d_slot->getElementType(0) == int_ty(leaf_width);
+        const bool s_narrow = s_slot->getNumElements() == 1 &&
+                              s_slot->getElementType(0) == int_ty(leaf_width);
+        if (d_narrow != s_narrow || !four_state) {
+            emit_array_convert_copy(d_base, s_base, d_slot, s_slot, d_narrow, s_narrow,
+                                    leaf_width, count, dsig, service);
+            return;
+        }
+        auto* dst_arr = llvm::ArrayType::get(d_slot, count);
+        auto* src_arr = llvm::ArrayType::get(s_slot, count);
+        auto* mm_ty   = int_ty(2 * leaf_width);
+        auto* z_ty    = int_ty(leaf_width);
         auto* i32     = b_.getInt32Ty();
 
         llvm::AllocaInst* changed = nullptr;
@@ -9672,11 +9769,11 @@ private:
         auto* s_mm     = b_.CreateLoad(
           mm_ty, b_.CreateInBoundsGEP(src_arr, s_base, { b_.getInt32(0), idx, b_.getInt32(0) }));
         llvm::Value* s_z =
-          ss.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(
+          s_slot->getNumElements() > 1 ? static_cast<llvm::Value*>(b_.CreateLoad(
                        z_ty, b_.CreateInBoundsGEP(src_arr, s_base, { b_.getInt32(0), idx, b_.getInt32(1) })))
-                   : zero(ds.width);
+                   : zero(leaf_width);
         llvm::Value* d_z_ptr =
-          ds.has_z ? b_.CreateInBoundsGEP(dst_arr, d_base, { b_.getInt32(0), idx, b_.getInt32(1) }) : nullptr;
+          d_slot->getNumElements() > 1 ? b_.CreateInBoundsGEP(dst_arr, d_base, { b_.getInt32(0), idx, b_.getInt32(1) }) : nullptr;
         if (service) {
             llvm::Value* diff = b_.CreateICmpNE(b_.CreateLoad(mm_ty, d_mm_ptr), s_mm);
             if (d_z_ptr != nullptr) {
@@ -10736,6 +10833,11 @@ private:
                 el.has_z       = e.has_z;
                 el.narrow      = e.narrow;
                 el.store_width = e.width;
+                // A selection offset of zero, not a null one: a bit or part select
+                // stacked on this deferred place ADDS to bit_off, and PartSelect's
+                // unconditional CreateAdd crashed codegen on a null base. A packed
+                // struct or union value element reaches exactly that path.
+                el.bit_off     = b_.getInt32(0);
                 el.width       = e.width;
                 set_lvalue(i, el);
                 return;
@@ -10766,6 +10868,11 @@ private:
                 el.has_z       = e.has_z;
                 el.narrow      = e.narrow;
                 el.store_width = e.width;
+                // A selection offset of zero, not a null one: a bit or part select
+                // stacked on this deferred place ADDS to bit_off, and PartSelect's
+                // unconditional CreateAdd crashed codegen on a null base. A packed
+                // struct or union value element reaches exactly that path.
+                el.bit_off     = b_.getInt32(0);
                 el.width       = e.width;
                 set_lvalue(i, el);
                 return;
@@ -13141,8 +13248,18 @@ private:
         el.array_ty    = llvm::ArrayType::get(lv.slot_ty, 0);
         el.elem_idx    = b_.getInt32(0);
         el.store_width = lv.store_width;
-        el.bit_off     = b_.getInt32(0);
+        // Carry the SELECTION the chain accumulated on the deferred lvalue rather
+        // than resetting it. `a[k]` can have a bit or part select stacked on top --
+        // a packed-struct or packed-union member of the value element lowers to a
+        // PartSelect -- and its offset, width and in-range mask all live here.
+        // Zeroing bit_off silently read the value's low bits instead of the member.
+        el.bit_off     = lv.bit_off;
         el.width       = lv.width;
+        el.range_mask  = lv.range_mask;
+        el.wide_dyn    = lv.wide_dyn;
+        el.sel_base    = lv.sel_base;
+        el.sel_cwidth  = lv.sel_cwidth;
+        el.sel_unknown = lv.sel_unknown;
         return el;
     }
 
@@ -13609,6 +13726,16 @@ private:
 
     // Pointer to the leaf SLOT an aggregate lvalue designates (its agg_path,
     // without the final mm/z field select).
+    // Pointer to a whole aggregate ARGUMENT's storage image. An `input` actual may
+    // be an associative-array value, which is a deferred place: resolve it with
+    // get_ptr, because passing by value only reads it and LRM 7.8.6 forbids a read
+    // creating the entry. An out / inout aggregate actual is a caller temp
+    // (Lower.cpp's make_canonical_agg_temp), so it never arrives deferred.
+    llvm::Value* agg_arg_ptr(const LValue& lv) {
+        return lv.is_assoc ? agg_image_ptr(assoc_elem_lvalue(lv, /*for_write=*/false))
+                           : agg_image_ptr(lv);
+    }
+
     llvm::Value* agg_slot_ptr(const LValue& lv) {
         if (lv.is_assoc) {
             // Every supported aggregate-assoc access resolves the map slot (base)
@@ -17022,7 +17149,7 @@ private:
                 // every direction (the frontend emitted it as an lvalue): In copies
                 // it in, a struct-bearing out / inout copies the frame Local back
                 // out through the same pointer.
-                argv.push_back(agg_slot_ptr(lvalue_of(a)));
+                argv.push_back(agg_arg_ptr(lvalue_of(a)));
             } else if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
             } else {
@@ -17985,7 +18112,7 @@ private:
                 // output / inout back at completion, so the caller must keep the
                 // storage alive across the task's suspends: both shapes are frame
                 // Locals / signals, never a short-lived alloca.
-                argv.push_back(agg_slot_ptr(lvalue_of(args[k])));
+                argv.push_back(agg_arg_ptr(lvalue_of(args[k])));
             } else if (tf.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(tf.param_types[k])) {
                     argv.push_back(str_of(args[k]));

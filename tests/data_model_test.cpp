@@ -325,11 +325,18 @@ struct Mode {
 };
 
 // clang-format off
+//
+// The three MODULE PORT modes are deliberately not generated. A port connection
+// is not a procedural context, so slang rejects `sub u(v[0])` for any dynamic-type
+// place outright ("cannot refer to an element or member of a dynamic type outside
+// of a procedural context"), and a port-output cell cannot also assign its actual
+// procedurally ("cannot mix continuous and procedural assignments"). Generating
+// those cells produces ILLEGAL SystemVerilog, which is a generator bug and not a
+// finding: the allowlist must only ever hold constructs that are legal SV and that
+// Clotho deliberately refuses, or it stops meaning anything. Module ports are
+// covered by the hand-written cases at the end of this file instead.
 const Mode modes[] = {
     { "var decl", P::var_decl },
-    { "port input", P::port_in },
-    { "port output", P::port_out },
-    { "port inout", P::port_inout },
     { "function input", P::func_in },
     { "function output", P::func_out },
     { "function inout", P::func_inout },
@@ -596,6 +603,48 @@ const Allow allowlist[] = {
       "inout/ref port with a non-whole-signal connection is not supported",
       "§6: the net mode is Plane-only; a container or aggregate sub-object is "
       "not a whole net (LRM 23.3.3.7)." },
+    // -- The four remaining gaps, each its own separately tracked item. Every one
+    // is a shape whose value is a heap handle that some path cannot stage or copy;
+    // none is an element x container x mode interaction. --
+    //
+    // A string output / inout formal would have to copy an rt_string handle back
+    // through the (&mm, &z) plane-pointer pair the out/inout ABI passes.
+    { [](const Cell& k) {
+          const bool str = (k.e->traits & t_managed) != 0 && k.e->name == std::string("string");
+          return str && (k.m->kind == P::func_out || k.m->kind == P::func_inout ||
+                         k.m->kind == P::task_out || k.m->kind == P::task_inout);
+      },
+      "output/inout string arguments are not supported",
+      "§7: a string is Managed; the out/inout ABI passes plane pointers, not a "
+      "handle. Tracked under M3 Data types, not part of this pass." },
+    // A string's rvalue materializes into a body temp rather than resolving to a
+    // handle lvalue, so it does not fit HandleCopyNb's record staging.
+    { [](const Cell& k) {
+          return k.m->kind == P::nonblocking &&
+                 k.e->name == std::string("string");
+      },
+      "nonblocking assignment to a string is not supported",
+      "§7: a string rvalue is a body temp, not a stageable handle lvalue." },
+    // `a[k][i]` where the entry is itself a container: the select would have to
+    // pick get_ptr or put_ptr, a direction that belongs to its own consumer.
+    { [](const Cell& k) {
+          return (k.c->kind == C::assoc_int || k.c->kind == C::assoc_str) &&
+                 (k.e->traits & t_managed) != 0;
+      },
+      "element select through an associative-array element that is itself a queue "
+      "or dynamic array is not supported",
+      "§7: needs composed deferral; put_ptr would create an entry on a read "
+      "(LRM 7.8.6)." },
+    // LRM 7.9 defines an associative-array right-hand side as a variable, a call
+    // result or a literal; anything else has no defined whole-array value.
+    { [](const Cell& k) {
+          return k.e->name == std::string("assoc") &&
+                 (k.m->kind == P::blocking || k.m->kind == P::nonblocking ||
+                  k.m->kind == P::var_decl);
+      },
+      "associative array assignment from a non-variable value is not supported",
+      "LRM 7.9 admits a variable, a call result or a literal as the source; the "
+      "generated cell is none of those." },
 };
 // clang-format on
 

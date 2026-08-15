@@ -17045,12 +17045,20 @@ private:
             emit_assoc_literal_init(dst, aty, unwrap_conversion(a.right()), ir::Inst::Tag::Store, b, l);
             return dst;
         }
-        const bool src_is_var = is_assoc(a.right()) && (a.right().kind == ExpressionKind::NamedValue ||
-                                                        a.right().kind == ExpressionKind::HierarchicalValue ||
-                                                        a.right().kind == ExpressionKind::Call);
-        if (!src_is_var) {
-            // TODO: associative-array assignment from any other rvalue shape (there
-            // is none in LRM 7.9 beyond a variable, a call result and a literal).
+        // LRM 7.9 admits a variable, a call result or a literal as the source. A
+        // "variable" here is any PLACE holding an associative array, not just a
+        // named one: an assoc that lives in a struct member, an array element, a
+        // container element or a class property is equally a handle lvalue, and the
+        // deep copy below reaches it through the same resolver. Restricting this to
+        // NamedValue / HierarchicalValue refused `outer.m = inner`, `arr[i] = inner`
+        // and every other nested shape for no reason.
+        const bool src_is_place =
+          is_assoc(a.right()) &&
+          (is_struct_lvalue_shape(a.right()) || a.right().kind == ExpressionKind::Call);
+        if (!src_is_place) {
+            // TODO: an associative-array source that is none of those three shapes.
+            // LRM 7.9 defines no other whole-array value, so this is a defensive
+            // guard rather than a known gap.
             fail("associative array assignment from a non-variable value is not supported");
         }
         if (a.isNonBlocking()) {
@@ -17096,11 +17104,23 @@ private:
             return lower_expr(val, b);
         }
         const Expression& src = unwrap_conversion(val);
-        if (is_struct_lvalue_shape(src)) {
+        // The element crosses the rt_* ABI as a pointer to a CANONICAL aggregate
+        // image, because that is the layout `rt_elem_ops::stride` was computed from.
+        // A struct-bearing actual already has that layout; a plain (scalar-element)
+        // array signal has FLAT storage whose element slot may be independently
+        // z-widened, so its image is a different size and handing its pointer over
+        // would make the runtime copy the wrong byte count. Stage those through a
+        // canonical temp, exactly as a by-value array argument does
+        // (build_call_args), and let a non-lvalue actual take the same path.
+        if (is_struct_lvalue_shape(src) && contains_struct_ref(er)) {
             return lower_lvalue(src, b);
         }
         const ir::Index temp = make_canonical_agg_temp(er, b, l);
-        emit_agg_store(temp, er, src, ir::Inst::Tag::Store, b, l);
+        if (is_struct_lvalue_shape(src)) {
+            emit_agg_copy(temp, lower_lvalue(src, b), er, ir::Inst::Tag::Store, b, l);
+        } else {
+            emit_agg_store(temp, er, src, ir::Inst::Tag::Store, b, l);
+        }
         return temp;
     }
 
