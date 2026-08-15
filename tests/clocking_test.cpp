@@ -704,3 +704,20 @@ TEST_CASE("a cycle delay count may be a run-time expression") {
         endmodule
     )") == "[15] after ##n\n");
 }
+
+// The other half of that sentence: "a non-negative INTEGER value". A real count is
+// illegal rather than unimplemented, and slang rejects it when it binds the control
+// (CycleDelayControl::fromSyntax calls requireIntegral), so clotho's lowering of a
+// cycle delay only ever sees an integral count -- unlike a repeat count, which LRM
+// 12.7.2 admits as real and rounds per 6.12.1.
+TEST_CASE("a cycle delay with a real count is illegal") {
+    check_rejected(R"(
+        module t;
+          bit clk = 0;
+          default clocking cb @(posedge clk); endclocking
+          always #5 clk = ~clk;
+          initial begin ##(2.5); $finish; end
+        endmodule
+    )",
+                   "is not integral");
+}

@@ -3104,15 +3104,179 @@ endmodule
 )", "only supported inside a concurrent assertion expression");
 }
 
-TEST_CASE("a sampled value function in a disable iff condition is refused") {
-    // LRM 16.15 evaluates the disable condition from LIVE values, so there is no
-    // sampled value underneath it for these to be built from.
+TEST_CASE("$sampled is the one sampled value function a live root may carry") {
+    // The unsampled roots -- a `disable iff` condition (LRM 16.15) and an
+    // asynchronous abort's (16.12.7) -- carry no clock into the functions written
+    // inside them, and LRM 16.9.3's inference rules have no fallback for that
+    // position: called "in a disable condition or a clock expression in an
+    // assertion, sequence, or property, it shall be explicitly clocked". 16.12.14
+    // says the same of an abort condition. $sampled is the exception at both
+    // clauses, because it uses no clocking event at all: "the use of $sampled in a
+    // disable iff clause is meaningful since the disable condition by default is
+    // not sampled".
+    //
+    // Unclocked in a disable condition is therefore illegal source, and slang
+    // diagnoses it before clotho ever lowers the assertion.
     refuses(R"(
 module t;
   bit clk, a, b, rst;
   ap: assert property (@(posedge clk) disable iff ($rose(rst)) a |=> b);
 endmodule
-)", "disable iff");
+)",
+            "could not determine clocking event for '$rose'");
+
+    // Clocked, so legal -- and refused by the explicit-clocking-argument gap that
+    // holds in every position, not by anything about the disable condition.
+    refuses(R"(
+module t;
+  bit clk, a, b, rst;
+  ap: assert property (@(posedge clk) disable iff ($rose(rst, @(posedge clk))) a |=> b);
+endmodule
+)",
+            "an explicit clocking argument on $rose is not supported");
+
+    // An abort condition is where slang lets the unclocked spelling through, so
+    // clotho is what has to stop it.
+    refuses(R"(
+module t;
+  bit clk, a, b, c;
+  ap: assert property (@(posedge clk) accept_on ($past(c)) (a |=> b));
+endmodule
+)",
+            "$past must be given an explicit clocking argument");
+
+    // $sampled lowers, and reads the shadow where the plain `disable iff (rst)` of
+    // the sampling cases above reads the live signal and pays for no shadow at all.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk, rst, a, b;
+  ap: assert property (@(posedge clk) disable iff ($sampled(rst)) a |=> b);
+endmodule
+)",
+                                            r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    const ir::Process& p = monitor_process(m);
+    CHECK(touches(m, p, "sva.shadow.rst"));
+    CHECK_FALSE(touches(m, p, "rst"));
+    // $sampled is the shadow itself, so it still deepens no history ring.
+    CHECK(ring_count(m, "rst") == 0);
+}
+
+TEST_CASE("a disable iff on $sampled disables on the sampled value, not the live one") {
+    // The trace is built so the two channels disagree at one tick: `rst <= 1` at
+    // t=25 commits in that tick's NBA region, which is AFTER its Preponed sample
+    // (LRM 16.5.1 samples before any body of the time step runs) and BEFORE the
+    // monitor's Observed step. So at t=25 rst is live 1 and sampled 0, and 0 is
+    // what an ordinary operand of the same assertion would have read there -- which
+    // is the whole point of $sampled being allowed in a clause that is otherwise
+    // evaluated live.
+    //
+    // `a` is sampled high at t=15 alone, so exactly one attempt owes a `b` at t=25
+    // and `b` never rises.
+    constexpr std::string_view late = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, rst = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) disable iff (COND) a |=> b);
+  initial begin
+    @(posedge clk); a <= 1;
+    @(posedge clk); a <= 0;
+    @(posedge clk); rst <= 1;
+    @(posedge clk); rst <= 0;
+    @(posedge clk); $finish;
+  end
+endmodule
+)";
+    // Live: the NBA has landed by Observed, so t=25 is disabled and the attempt is
+    // abandoned with no verdict (LRM 16.15).
+    CHECK(report_times(substituted(late, "COND", "rst")).empty());
+    // Sampled: t=25's sample of rst is the value it held before that tick, 0, so
+    // nothing is disabled and the obligation fails where it always would have.
+    CHECK(report_times(substituted(late, "COND", "$sampled(rst)")) == "25");
+
+    // The other direction, so the case above is not just $sampled never disabling
+    // anything: the same assignment one tick earlier IS in t=25's sample, and then
+    // the attempt is abandoned exactly as the live form abandoned it. Control
+    // first, so the silence is the disable working and not the trace failing to
+    // fail.
+    constexpr std::string_view early = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, rst = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) COND a |=> b);
+  initial begin
+    @(posedge clk); a <= 1;
+    @(posedge clk); a <= 0; rst <= 1;
+    @(posedge clk); rst <= 0;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)";
+    CHECK(report_times(substituted(early, "COND", "")) == "25");
+    CHECK(report_times(substituted(early, "COND", "disable iff ($sampled(rst))")).empty());
+}
+
+TEST_CASE("an asynchronous abort condition may read $sampled") {
+    // The accept trace above, with the condition read through $sampled. `c` rises
+    // at t=22, strictly between tick 1 (t=15) and tick 2 (t=25), so t=25's Preponed
+    // sample of it is 1 and the accept discharges the attempt tick 1 seeded: no
+    // failure, and the pass action fires.
+    const std::string out = sva_run_capture(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, c = 0;
+  ac: assert property (@(posedge clk) accept_on ($sampled(c)) (a |=> b)) $display("ACCEPT-PASS");
+  initial begin
+    @(posedge clk);
+    a <= 1;
+    @(posedge clk);
+    a <= 0;
+    @(posedge clk);
+    @(posedge clk);
+    $finish;
+  end
+  initial begin
+    #22 c = 1;
+    #10 c = 0;
+  end
+endmodule
+)");
+    CHECK(out.find("ACCEPT-PASS") != std::string::npos);
+    CHECK(out.find("assertion failed") == std::string::npos);
+
+    // And the value is the preponed one here too, which is what separates it from
+    // the live read the plain form does at the same slot: with `c` rising inside
+    // tick 2's own time step it is live high when the monitor steps in Observed,
+    // but its sample there is still 0. So the accept does not arrive in time and
+    // the obligation fails, where `accept_on (c)` discharges it.
+    constexpr std::string_view at_tick = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  bit a = 0, b = 0, c = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+  ac: assert property (@(posedge clk) accept_on (COND) (a |=> b));
+  initial begin
+    @(posedge clk);
+    a <= 1;
+    @(posedge clk);
+    a <= 0;
+    @(posedge clk);
+    @(posedge clk);
+    $finish;
+  end
+  initial #25 c = 1;
+endmodule
+)";
+    CHECK(report_times(substituted(at_tick, "COND", "c")).empty());
+    CHECK(report_times(substituted(at_tick, "COND", "$sampled(c)")) == "25");
 }
 
 // -- A disable iff declared in a named property (LRM 16.12) ------------------
@@ -5592,4 +5756,32 @@ endmodule
     // process it was called from -- the caller would resume in Active, which is the
     // migration the case above exists to prevent.
     CHECK(refusal("    tk();").find("task") != std::string::npos);
+}
+
+TEST_CASE("a case property selects on a real by value") {
+    // Sampled r is 1.5 only at t=5, where the selected property `a` is 0 and the
+    // assertion fails. At t=15 the sampled r is 2.5, so the default (true) runs;
+    // at t=25 r is 1.5 again but a is 1, so the selected property holds.
+    CHECK(report_times(R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  real r = 1.5;
+  bit  a = 0;
+  always @(posedge clk) $display("[%0t]", $time);
+
+  ap: assert property (@(posedge clk) case (r) 1.5: a; default: 1'b1; endcase);
+
+  initial begin
+    @(posedge clk);        // t=5:  r=1.5, a=0 -> fails
+    r <= 2.5;
+    @(posedge clk);        // t=15: r=2.5     -> default, holds
+    r <= 1.5;
+    a <= 1;
+    @(posedge clk);        // t=25: r=1.5, a=1 -> holds
+    @(posedge clk);
+    $finish;
+  end
+endmodule
+)") == "5");
 }

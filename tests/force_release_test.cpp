@@ -356,14 +356,197 @@ TEST_CASE("force/assign: real variable") {
     CHECK(run_capture_finish(src) == "f=0\nf=2\nf=1.5\nf=7.25\nf=1.5\nf=3\n");
 }
 
-// -- Loud guards (Phase 1 boundaries) --
+// LRM 10.6.2 suppresses the procedural UPDATE, whatever its shape: a bit select,
+// a part select and a read-modify-write of a forced variable all leave the
+// forced value standing, and each takes effect again after `release`.
+// Byte-identical to iverilog 13 (a5, a5, a5, a5, a4, 34, 36).
+TEST_CASE("force: bit-select, part-select and compound writes are suppressed") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a;
+            initial begin
+                a = 8'h00;
+                force a = 8'hA5;
+                #1 $display("t=%0t a=%h", $time, a);
+                a[0] = 1'b0;
+                a[7:4] = 4'h0;
+                #1 $display("t=%0t a=%h", $time, a);
+                a += 8'd1;
+                #1 $display("t=%0t a=%h", $time, a);
+                release a;
+                #1 $display("t=%0t a=%h", $time, a);
+                a[0] = 1'b0;
+                #1 $display("t=%0t a=%h", $time, a);
+                a[7:4] = 4'h3;
+                #1 $display("t=%0t a=%h", $time, a);
+                a += 8'd2;
+                #1 $display("t=%0t a=%h", $time, a);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=1 a=a5\nt=2 a=a5\nt=3 a=a5\nt=4 a=a5\nt=5 a=a4\nt=6 a=34\nt=7 a=36\n");
+}
 
-TEST_CASE("select-write to a forced variable is rejected (Phase 2)") {
+// The gate keys off the lvalue's ROOT, so every shape rooted at a forced
+// variable is covered: a packed-array element, a packed-struct member, and the
+// nonblocking form of either. Matches iverilog 13.
+TEST_CASE("force: packed-array element, struct member and NBA select writes") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct packed { logic [3:0] hi; logic [3:0] lo; } sp_t;
+            logic [3:0][7:0] pk;
+            sp_t s;
+            initial begin
+                pk = 32'h1122_3344;
+                s  = 8'h5A;
+                force pk = 32'hDEAD_BEEF;
+                force s  = 8'h77;
+                #1 $display("pk=%h s=%h", pk, s);
+                pk[2] = 8'h00;
+                s.lo  = 4'h0;
+                #1 $display("pk=%h s=%h", pk, s);
+                pk[1] <= 8'hFF;
+                #1 $display("pk=%h s=%h", pk, s);
+                release pk;
+                release s;
+                pk[2] = 8'h00;
+                s.lo  = 4'h0;
+                #1 $display("pk=%h s=%h", pk, s);
+                pk[1] <= 8'hFF;
+                #1 $display("pk=%h s=%h", pk, s);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "pk=deadbeef s=77\npk=deadbeef s=77\npk=deadbeef s=77\n"
+                                     "pk=de00beef s=70\npk=de00ffef s=70\n");
+}
+
+// The `assign` layer (LRM 10.6.1) outranks ordinary procedural writes the same
+// way, so it suppresses a select write and a compound update too; `deassign`
+// lets both through again (the variable holds 10 at that point). Matches
+// iverilog 13.
+TEST_CASE("assign: select and compound writes are suppressed until deassign") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b;
+            initial begin
+                b = 8'h10;
+                a = 8'h01;
+                assign a = b;
+                #1 $display("a=%h", a);
+                a[3:0] = 4'hF;
+                a += 8'd1;
+                #1 $display("a=%h", a);
+                deassign a;
+                a[3:0] = 4'hF;
+                a += 8'd1;
+                #1 $display("a=%h", a);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "a=10\na=10\na=20\n");
+}
+
+// `i++` is the read-modify-write `i = i + 1` (LRM 11.4.2), so the update is
+// dropped while the target is forced but the expression's value still stands:
+// post yields the forced value, pre yields it plus one. Byte-identical to
+// iverilog 13.
+TEST_CASE("force: increment drops the update, keeps the expression value") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] x, y, z;
+            initial begin
+                x = 8'd1;
+                force x = 8'd5;
+                #1 x++;
+                $display("a x=%0d", x);
+                y = x++;
+                $display("b x=%0d y=%0d", x, y);
+                z = ++x;
+                $display("c x=%0d z=%0d", x, z);
+                release x;
+                x++;
+                $display("d x=%0d", x);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "a x=5\nb x=5 y=5\nc x=5 z=6\nd x=6\n");
+}
+
+// A concatenation lvalue has no single root: each operand carries its own force
+// state, so a forced operand keeps its value while its siblings take their
+// slice of the right-hand side. Matches iverilog 13.
+TEST_CASE("force: a concatenation lvalue is gated per operand") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a, b;
+            initial begin
+                a = 4'h0; b = 4'h0;
+                force a = 4'hA;
+                #1 {a, b} = 8'h56;
+                $display("a=%h b=%h", a, b);
+                release a;
+                {a, b} = 8'h78;
+                $display("a=%h b=%h", a, b);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "a=a b=6\na=7 b=8\n");
+}
+
+// An output argument's copy-back is an ordinary procedural write to the actual
+// (LRM 13.5.1), so a forced actual drops it; the call itself still runs.
+// Matches iverilog 13.
+TEST_CASE("force: a task output copy-back to a forced actual is suppressed") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] x;
+            task automatic t(output logic [7:0] o);
+                o = 8'd9;
+            endtask
+            initial begin
+                x = 8'd1;
+                force x = 8'd5;
+                #1 t(x);
+                $display("a x=%0d", x);
+                release x;
+                t(x);
+                $display("b x=%0d", x);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "a x=5\nb x=9\n");
+}
+
+// -- Loud guards (the remaining force/assign gaps) --
+
+// The gate decides at store time, but an intra-assignment delay commits later,
+// so the write path cannot yet carry it (see the TODO in lower_assign).
+TEST_CASE("intra-assignment timing on a write to a forced variable is rejected") {
     constexpr std::string_view src = R"(
         module m; logic [7:0] a;
-            initial begin force a = 8'd1; a[0] = 1'b0; end
+            initial begin force a = 8'd1; a = #5 8'd2; end
         endmodule)";
-    CHECK(lower_error(src).find("select of a force-target variable") != std::string::npos);
+    CHECK(lower_error(src).find("intra-assignment timing on a write to a force-target") != std::string::npos);
+}
+
+// A partial force of a VARIABLE stays rejected — the site state is per whole
+// variable, and LRM 10.6.2 permits a partial force only on a net. slang flags
+// the lvalue (-Wbad-procedural-force) and leaves the statement unbound, so the
+// rejection surfaces as the generic unsupported-statement guard rather than the
+// force-specific one. iverilog 13 refuses the unpacked-array word form too
+// ("cannot %force/vec4 to the word of a variable array").
+TEST_CASE("force of a variable bit-select or array word is rejected") {
+    constexpr std::string_view bit_sel = R"(
+        module m; logic [7:0] a;
+            initial begin force a[0] = 1'b1; end
+        endmodule)";
+    CHECK(lower_error(bit_sel).find("unsupported statement") != std::string::npos);
+    constexpr std::string_view arr_word = R"(
+        module m; logic [7:0] mem [0:3];
+            initial begin force mem[1] = 8'd9; end
+        endmodule)";
+    CHECK(lower_error(arr_word).find("unsupported statement") != std::string::npos);
 }
 
 TEST_CASE("release: reestablishes a continuous assignment on the variable") {

@@ -233,6 +233,100 @@ TEST_CASE("gate delay on a bit-addressed output is reported as unsupported") {
     CHECK(r.diagnostic_text().find("whole scalar output") != std::string::npos);
 }
 
+// LRM 28.16 puts a gate delay on the DRIVER, ahead of net resolution: `buf #5`
+// beside a plain continuous assign on the same net delays only the gate's own
+// contribution, and the resolver re-folds when the gate's slot lands. The
+// undelayed driver therefore still conflicts at its own instant (t=13 x), and
+// the gate keeps inertial pulse rejection (the 2-wide pulse at t=14 is swallowed).
+// Byte-identical to iverilog 13.
+TEST_CASE("gate delay on a multiply-driven net is per driver (LRM 28.16)") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic a, b;
+            wire  w;
+            buf #5 g (w, a);
+            assign   w = b;
+            initial begin
+                a = 0; b = 1'bz;
+                #1 $display("t=%0t w=%b", $time, w);  // gate's slot powers up x
+                #5 $display("t=%0t w=%b", $time, w);  // 0 landed at t=5
+                a = 1;
+                #4 $display("t=%0t w=%b", $time, w);  // t=10, lands at t=11
+                #2 $display("t=%0t w=%b", $time, w);  // t=12, resolved 1
+                b = 0;
+                #1 $display("t=%0t w=%b", $time, w);  // undelayed conflict -> x
+                b = 1'bz;
+                #1 $display("t=%0t w=%b", $time, w);
+                a = 0; #2 a = 1;                      // 2-wide pulse < 5: rejected
+                #8 $display("t=%0t w=%b", $time, w);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "t=1 w=x\nt=6 w=0\nt=10 w=0\nt=12 w=1\nt=13 w=x\nt=14 w=1\nt=24 w=1\n");
+}
+
+// A cmos is two drivers on one net (LRM 28.9), so `cmos #5` delays each half's
+// own slot. Both halves conduct while ncontrol==1 and pcontrol==0; flipping both
+// at t=12 floats the switch at t=17, and re-enabling at t=19 makes the delayed
+// 1 conflict with the plain driver's 0 at t=24. Byte-identical to iverilog 13,
+// which also matches `nmos #5` + `pmos #5` written out by hand.
+TEST_CASE("cmos delay on a multiply-driven net delays each half (LRM 28.9, 28.16)") {
+    const std::string out = run_capture(R"(
+        module m;
+            logic d, nc, pc, b;
+            wire  w;
+            cmos #5 c (w, d, nc, pc);
+            assign    w = b;
+            initial begin
+                d = 0; nc = 1; pc = 0; b = 1'bz;
+                #1 $display("t=%0t w=%b", $time, w);  // both halves power up x
+                #5 $display("t=%0t w=%b", $time, w);  // conducting 0, landed t=5
+                d = 1;
+                #6 $display("t=%0t w=%b", $time, w);  // t=12, conducting 1
+                nc = 0; pc = 1;
+                #6 $display("t=%0t w=%b", $time, w);  // t=18, both off -> z at 17
+                b = 0;
+                #1 $display("t=%0t w=%b", $time, w);  // only the plain driver
+                nc = 1; pc = 0;
+                #6 $display("t=%0t w=%b", $time, w);  // t=25, 1 vs 0 -> x
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "t=1 w=x\nt=6 w=0\nt=12 w=1\nt=18 w=z\nt=19 w=0\nt=25 w=x\n");
+}
+
+// Guard: cmos shares the gate rise/fall/turn-off gap (LRM 28.16); its own path
+// must reject the triple rather than lower only the first value.
+TEST_CASE("cmos rise/fall/turn-off delay triples are reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            wire y;
+            reg d, nc, pc;
+            cmos #(1,2) c (y, d, nc, pc);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("rise/fall/turn-off") != std::string::npos);
+}
+
+// Guard: a delayed PARTIAL driver of a resolved net would fold as x rather than
+// z in the bits it does not drive for the whole initial window, because the slot
+// powers up all-x and the delay defers its first Z-background store.
+TEST_CASE("gate delay on a bit of a multiply-driven net is reported as unsupported") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            wire [3:0] y;
+            reg a, b, c;
+            and #2 g1 (y[1], a, b);
+            and    g2 (y[1], a, c);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("partial driver of a multiply-driven") != std::string::npos);
+}
+
 TEST_CASE("gate drive strengths lower (resolution covered in net_resolution_test)") {
     const LowerResult r = lower_ok(R"(
         module m;
@@ -273,7 +367,8 @@ TEST_CASE("user-defined primitives are reported as unsupported") {
 }
 
 TEST_CASE("unsupported gate output lvalues are rejected") {
-    // Concatenation output.
+    // Concatenation output: no single (signal, bit) terminal to store into, and
+    // no single net to stage a driver slot for.
     const LowerResult r1 = lower_text(R"(
         module m;
             wire y;
@@ -283,17 +378,6 @@ TEST_CASE("unsupported gate output lvalues are rejected") {
     )");
     CHECK_FALSE(r1.ok);
     CHECK(r1.diagnostic_text().find("gate output") != std::string::npos);
-
-    // 2-state output net: a gate can drive X, which the slot cannot hold.
-    const LowerResult r2 = lower_text(R"(
-        module m;
-            bit y;
-            reg a, b;
-            and g(y, a, b);
-        endmodule
-    )");
-    CHECK_FALSE(r2.ok);
-    CHECK(r2.diagnostic_text().find("2-state") != std::string::npos);
 }
 
 // Module instance arrays (LRM 23.3.6) share InstanceArraySymbol with gate
@@ -704,4 +788,84 @@ TEST_CASE("gate instance arrays evaluate per sliced bit") {
         endmodule
     )");
     CHECK(out == "1000\n");
+}
+
+// -- 2-state gate output terminals --
+//
+// LRM 10.3.2 lets exactly one primitive output drive a variable, so a `bit`
+// target is legal, and LRM 6.11.2 makes the automatic 4-state -> 2-state
+// conversion turn x and z into 0. iverilog 13 refuses every primitive-driven
+// variable (2-state or not), so the oracle is the LRM-equivalent continuous
+// assign of each gate, which iverilog does accept: `assign q = a & b;`,
+// `assign t = en ? a : 1'bz;` and `assign v = ~a;` on the same `bit` targets
+// print 110 / 010 / 000 / 000 for the stimulus below (the 4-state net form of
+// the same three assigns prints 110 / 010 / 0z0 / xxx, i.e. exactly these
+// values before the conversion).
+
+TEST_CASE("gate outputs on 2-state targets convert x and z to 0") {
+    const std::string out = run_capture(R"(
+        module top;
+            logic a, b, en;
+            bit   q, t;
+            bit [7:0] v;
+            and    g0(q, a, b);
+            bufif1 g1(t, a, en);
+            not    g2(v[3], a);
+            initial begin
+                a = 1; b = 1; en = 1;   #1 $display("%b%b%b", q, t, v[3]);
+                b = 0;                  #1 $display("%b%b%b", q, t, v[3]);
+                en = 0;                 #1 $display("%b%b%b", q, t, v[3]);
+                a = 1'bx; b = 1; en = 1; #1 $display("%b%b%b", q, t, v[3]);
+            end
+        endmodule
+    )");
+    CHECK(out == "110\n010\n000\n000\n");
+}
+
+// A 2-state member of a 4-state packed net is the only 2-state net-driver shape
+// that exists: LRM 6.7.1 restricts a net's data type to a 4-state integral type,
+// so the net (and every driver slot cut from its type) is 4-state and holds the Z
+// background of a partial driver, while the member's own 2-state view converts
+// the driver's value. Both gates below drive bit 0 of the union, so the net is
+// multiply driven and folds through WireRes.
+//
+// This case is not cross-checked as a whole, so the expectation is composed from two
+// iverilog-checked halves: the 2-state driver conversion (see above) and the
+// WireRes fold of the surviving definite values (net_resolution_test.cpp). The
+// third line is the discriminating one: the `bit` member's driver converts its x
+// to 0 and then AGREES with the 4-state member's 0, so bit 0 resolves 0 — had the
+// x reached the resolver the bit would be x.
+TEST_CASE("gate driving a 2-state member of a 4-state packed net resolves") {
+    const std::string out = run_capture(R"(
+        module top;
+            logic a, b, c, d;
+            wire union packed { bit [3:0] lo; logic [3:0] hi; } u;
+            and g0(u.lo[0], a, b);
+            and g1(u.hi[0], c, d);
+            initial begin
+                a = 1; b = 1; c = 1; d = 1; #1 $display("%b", u);
+                b = 0;                      #1 $display("%b", u);
+                a = 1'bx; b = 1; d = 0;     #1 $display("%b", u);
+                d = 1;                      #1 $display("%b", u);
+            end
+        endmodule
+    )");
+    // u[3:1] undriven (z). bit 0: 1&1 vs 1&1 agree -> 1; 0 vs 1 conflict -> x;
+    // (x&1 -> bit -> 0) vs 0 agree -> 0; 0 vs 1 conflict -> x.
+    CHECK(out == "zzz1\nzzzx\nzzz0\nzzzx\n");
+}
+
+// The remaining gate-output shapes stay guarded loud: a struct/union MEMBER is
+// not a static (signal, bit) terminal, so a lone gate driving one has no slot to
+// stage into and no bit-addressed store path.
+TEST_CASE("a single gate driving a packed-net member is rejected") {
+    const LowerResult r = lower_text(R"(
+        module top;
+            logic a, b;
+            wire struct packed { bit [3:0] lo; logic [3:0] hi; } s;
+            and g0(s.lo[0], a, b);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("unsupported gate output terminal") != std::string::npos);
 }

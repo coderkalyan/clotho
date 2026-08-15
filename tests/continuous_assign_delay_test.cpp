@@ -124,3 +124,54 @@ TEST_CASE("inertial CA delay: net wider than 64 value bits is rejected") {
         module m; logic [40:0] a, y; assign #5 y = a; endmodule)");
     CHECK(err.find("wider than 64 value bits") != std::string::npos);
 }
+
+// LRM 10.3.3: on a multiply-driven net the delay belongs to the DRIVER, ahead of
+// resolution. `assign #5 w = a` beside `assign w = b` delays only the first
+// driver's contribution; the resolver re-folds when that driver's slot lands, so
+// the undelayed driver still conflicts at its own instant (t=13 x). The delayed
+// driver keeps inertial pulse rejection: the 2-wide 1->0->1 pulse at t=14 never
+// reaches w. Byte-identical to iverilog 13.
+TEST_CASE("inertial CA delay: delayed driver of a multiply-driven net") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b;
+            wire  w;
+            assign #5 w = a;
+            assign    w = b;
+            initial begin
+                a = 0; b = 1'bz;
+                #1 $display("t=%0t w=%b", $time, w);  // driver's slot powers up x
+                #5 $display("t=%0t w=%b", $time, w);  // 0 landed at t=5
+                a = 1;
+                #4 $display("t=%0t w=%b", $time, w);  // t=10, lands at t=11
+                #2 $display("t=%0t w=%b", $time, w);  // t=12, resolved 1
+                b = 0;
+                #1 $display("t=%0t w=%b", $time, w);  // undelayed conflict -> x
+                b = 1'bz;
+                #1 $display("t=%0t w=%b", $time, w);  // back to the delayed 1
+                a = 0; #2 a = 1;                      // 2-wide pulse < 5: rejected
+                #8 $display("t=%0t w=%b", $time, w);
+                #5 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=1 w=x\nt=6 w=0\nt=10 w=0\nt=12 w=1\nt=13 w=x\nt=14 w=1\nt=24 w=1\n");
+}
+
+// Guard: a delayed PARTIAL driver of a resolved net would fold as x (not z) in
+// its undriven bits for the whole initial window, because its slot powers up
+// all-x and the delay defers the first Z-background store.
+TEST_CASE("inertial CA delay: partial driver of a resolved net is rejected") {
+    const std::string err = lower_error(R"(
+        module m; logic [1:0] a, b; wire [3:0] v;
+        assign #5 v[1:0] = a; assign v[1:0] = b; endmodule)");
+    CHECK(err.find("partial driver of a multiply-driven") != std::string::npos);
+}
+
+// Guard: the width limit applies to a resolved net too — the slot carries the
+// net's type, so a 41-bit 4-state net packs to 82 mm-plane bits.
+TEST_CASE("inertial CA delay: wide multiply-driven net is rejected") {
+    const std::string err = lower_error(R"(
+        module m; logic [40:0] a, b; wire [40:0] y;
+        assign #5 y = a; assign y = b; endmodule)");
+    CHECK(err.find("wider than 64 value bits") != std::string::npos);
+}
