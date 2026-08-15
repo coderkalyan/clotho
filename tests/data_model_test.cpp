@@ -681,6 +681,11 @@ void run_cell(const Cell& k, std::vector<Bad>& bad) {
         return;
     }
 
+    // Out of process, so this asserts the child's exit code. Under an ASan build
+    // that leaves leak detection on, LeakSanitizer exits non-zero for the two
+    // documented positions ($finish's longjmp out of live coroutine frames, and
+    // class objects, which have no GC by direction) and every cell reports here.
+    // Run the matrix with ASAN_OPTIONS=detect_leaks=0; the walk itself is clean.
     const test::DesignRun run = test::run_design_captured(src);
     if (test::design_exit_code(run) != 0) {
         bad.push_back({ cell_name(k), "lowered, but the run did not exit cleanly",

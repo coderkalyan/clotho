@@ -780,6 +780,13 @@ public:
         // including recursion and forward references), then lower their bodies. A
         // task is a coroutine (lower_task); a function is a plain call.
         const size_t nf = mod_.function_count();
+        // Identify functions by address: the ABI helpers below take a `const
+        // Function&` and need its id to ask the analysis about a formal. The
+        // function table is a deque, so these addresses are stable.
+        fn_ids_.reserve(nf);
+        for (uint32_t i = 0; i < nf; ++i) {
+            fn_ids_.emplace(&mod_.function(static_cast<FunctionId>(i)), i);
+        }
         fn_decls_.assign(nf, nullptr);
         for (uint32_t i = 0; i < nf; ++i) {
             fn_decls_[i] = declare_function(static_cast<FunctionId>(i));
@@ -3351,14 +3358,16 @@ private:
             const Ref     pt  = f.param_types[k];
             const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
             if (dir == ArgDir::Ref) {
-                // A fat ref (docs/design/data-model.md §3): the actual's storage
-                // pointer, the relocation epoch of the container it is rooted in
-                // (or &rt_ref_no_epoch), the epoch value observed when the ref was
-                // formed, and the site record for the staleness report.
-                params.push_back(ptr);          // &actual storage
-                params.push_back(ptr);          // &epoch
-                params.push_back(b_.getInt64Ty()); // expected epoch
-                params.push_back(ptr);          // const rt_ref_site*
+                // The actual's storage pointer, plus -- only when some call site
+                // binds this formal to a place inside a container's heap buffer --
+                // the relocation epoch of that container, its value at the call, and
+                // the site record for the staleness report (§3.0).
+                params.push_back(ptr);                 // &actual storage
+                if (ref_needs_epoch(f, k)) {
+                    params.push_back(ptr);             // &epoch
+                    params.push_back(b_.getInt64Ty()); // expected epoch
+                    params.push_back(ptr);             // const rt_ref_site*
+                }
                 continue;
             }
             // A dynamic array or queue is one handle pointer regardless of
@@ -3418,11 +3427,13 @@ private:
         params.push_back(ptr); // wheel
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             if (f.arg_dirs[k] == ArgDir::Ref) {
-                // The fat ref, exactly as declare_function builds it.
-                params.push_back(ptr);             // &actual storage
-                params.push_back(ptr);             // &epoch
-                params.push_back(b_.getInt64Ty()); // expected epoch
-                params.push_back(ptr);             // const rt_ref_site*
+                // The same shape declare_function builds, narrow or fat.
+                params.push_back(ptr);                 // &actual storage
+                if (ref_needs_epoch(f, k)) {
+                    params.push_back(ptr);             // &epoch
+                    params.push_back(b_.getInt64Ty()); // expected epoch
+                    params.push_back(ptr);             // const rt_ref_site*
+                }
             } else if (is_handle_type(f.param_types[k])) {
                 params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*), any direction
             } else if (is_agg_abi(f.param_types[k])) {
@@ -3464,9 +3475,20 @@ private:
     //       input handle (each one pointer in every direction it is allowed in)
     //   2 — everything else: the (must|may, z) plane pair, or the
     //       (&mm, &z) out / inout pointer pair
+    // Whether ref formal k of `f` carries the relocation-epoch words. Only a formal
+    // some call site binds to a place inside a container's heap buffer does; a ref
+    // to a variable, a fixed-array element, a struct member, a class property or a
+    // whole container HANDLE aliases storage that cannot move, so it is one plain
+    // pointer and the callee emits no check (docs/design/data-model.md §3.0).
+    bool ref_needs_epoch(const Function& f, size_t k) const {
+        const auto it = fn_ids_.find(&f);
+        // A function the map has not seen cannot be reasoned about; keep the guard.
+        return it == fn_ids_.end() || facts_.ref_needs_epoch(it->second, k);
+    }
+
     uint32_t formal_param_count(const Function& f, size_t k) const {
         if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-            return 4;
+            return ref_needs_epoch(f, k) ? 4u : 1u;
         }
         // An aggregate is one storage pointer, in every direction (function or task).
         if (is_agg_abi(f.param_types[k])) {
@@ -4004,10 +4026,12 @@ private:
                 continue;
             }
             const uint32_t p = param_llvm_index_[k];
-            ref_ptr_[k]      = RefBinding{ .slot   = fn_->getArg(p),
-                                           .epoch  = fn_->getArg(p + 1),
-                                           .expect = fn_->getArg(p + 2),
-                                           .site   = fn_->getArg(p + 3) };
+            ref_ptr_[k].slot = fn_->getArg(p);
+            if (ref_needs_epoch(f, k)) {
+                ref_ptr_[k].epoch  = fn_->getArg(p + 1);
+                ref_ptr_[k].expect = fn_->getArg(p + 2);
+                ref_ptr_[k].site   = fn_->getArg(p + 3);
+            }
         }
     }
 
@@ -17124,9 +17148,11 @@ private:
                 const RefBinding rb =
                   ref_actual_arg(lv, loc_text(i), f.name + " argument " + std::to_string(k + 1));
                 argv.push_back(rb.slot);
-                argv.push_back(rb.epoch);
-                argv.push_back(rb.expect);
-                argv.push_back(rb.site);
+                if (ref_needs_epoch(f, k)) {
+                    argv.push_back(rb.epoch);
+                    argv.push_back(rb.expect);
+                    argv.push_back(rb.site);
+                }
                 if (!is_handle_type(f.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }
@@ -18000,9 +18026,11 @@ private:
                   lvalue_of(caps[k]), loc_text(i),
                   child.name + " capture " + std::to_string(k + 1));
                 argv.push_back(rb.slot);
-                argv.push_back(rb.epoch);
-                argv.push_back(rb.expect);
-                argv.push_back(rb.site);
+                if (ref_needs_epoch(child, k)) {
+                    argv.push_back(rb.epoch);
+                    argv.push_back(rb.expect);
+                    argv.push_back(rb.site);
+                }
             }
         }
         argv.push_back(rec);
@@ -18094,9 +18122,11 @@ private:
                 const RefBinding rb =
                   ref_actual_arg(lv, loc_text(i), tf.name + " argument " + std::to_string(k + 1));
                 argv.push_back(rb.slot);
-                argv.push_back(rb.epoch);
-                argv.push_back(rb.expect);
-                argv.push_back(rb.site);
+                if (ref_needs_epoch(tf, k)) {
+                    argv.push_back(rb.epoch);
+                    argv.push_back(rb.expect);
+                    argv.push_back(rb.site);
+                }
                 if (!is_handle_type(tf.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }
@@ -20365,6 +20395,8 @@ private:
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
     std::vector<llvm::Function*> fn_decls_;
+    // &Function -> FunctionId, for the ABI helpers that only receive a reference.
+    ankerl::unordered_dense::map<const Function*, uint32_t> fn_ids_;
     // Set while lowering a function or task body (null during a process). `frame_`
     // is the current call's frame; `frame_slots_` / `frame_ty_` its layout.
     // `cur_is_task_` selects the coroutine return path (epilogue) for Ret.

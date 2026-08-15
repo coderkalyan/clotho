@@ -400,6 +400,9 @@ struct Structural {
     std::vector<bool> driven;  // any driver at all (inverted into `undriven`)
     std::vector<bool> ptr_arg; // passed as a non-In actual somewhere
     std::vector<bool> ref_arg; // passed as a `ref` actual somewhere (aliased, not copied)
+    // `(fid << 32) | formal` of every ref formal that some call site binds to a
+    // place inside a container's heap buffer. See DesignFacts::ref_epoch_formals.
+    ankerl::unordered_dense::set<uint64_t> ref_epoch_formals;
     // Partial-undriven bookkeeping, per candidate signal only.
     std::vector<bool>                  partial_candidate;
     std::vector<uint32_t>              partial_width;
@@ -474,6 +477,47 @@ struct Structural {
         }
     }
 
+    // Whether an lvalue's storage sits inside a container's HEAP buffer, rather
+    // than in design state or a frame: any element select over a dynamic array or
+    // queue, or any associative-array entry, anywhere in the select chain. A
+    // further member / element / bit step off such a place stays heap-rooted, so
+    // the walk continues to the root rather than stopping at the first select.
+    //
+    // Deliberately its own walk, not ir::lvalue_root: that one stops at
+    // AssocSelect (it is not in its switch) and answers a different question.
+    bool heap_rooted(const Ir& ir, Index lv) const {
+        for (;;) {
+            switch (ir.tag(lv)) {
+                case Inst::Tag::AssocSelect:
+                    return true;
+                case Inst::Tag::ElemSelect: {
+                    const auto       es = ir.extra_data<ElemSelect>(ir.payload(lv).op_extra.extra);
+                    const Type::Kind k  = std::get<Type>(m.pool.get(es.array_type)).kind;
+                    if (k == Type::Kind::DynArray || k == Type::Kind::Queue) {
+                        return true;
+                    }
+                    lv = ir.payload(lv).op_extra.op;
+                    break;
+                }
+                case Inst::Tag::PartSelect:
+                case Inst::Tag::DynPartSelect:
+                case Inst::Tag::ArrSlice:
+                case Inst::Tag::MemberSelect:
+                    lv = ir.payload(lv).op_extra.op;
+                    break;
+                case Inst::Tag::BitSelect:
+                    lv = ir.payload(lv).binary.l;
+                    break;
+                case Inst::Tag::HandleDeref:
+                    // A class body is heap storage, but it never moves and is never
+                    // freed, so a place inside one cannot go stale.
+                    return false;
+                default:
+                    return false;
+            }
+        }
+    }
+
     // Record every non-In actual of a call as written (copy-out) and pointer-passed.
     void call_actuals(const Ir& ir, FunctionId fid, ExtraSlice argslice, bool copy_out, std::vector<Signal>* writes) {
         const Function& callee = m.function(fid);
@@ -481,6 +525,14 @@ struct Structural {
         for (size_t a = 0; a < args.size(); ++a) {
             if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In) {
                 continue;
+            }
+            // A ref formal earns the fat (epoch-checked) form from its ACTUALS: only
+            // a place inside a container's heap buffer can be moved out from under
+            // the alias. Recorded before the Signal-root filter below, because the
+            // root of `q[i]` is the queue's own signal but the root of a frame-local
+            // container's element is a Local, and both are heap-rooted places.
+            if (callee.arg_dirs[a] == ArgDir::Ref && heap_rooted(ir, args[a])) {
+                ref_epoch_formals.insert((static_cast<uint64_t>(fid) << 32) | a);
             }
             const Index root = lvalue_root(ir, args[a]).root;
             if (ir.tag(root) != Inst::Tag::Signal) {
@@ -1555,7 +1607,46 @@ DesignFacts analyze(const Module& m) {
     facts.undriven.flip();
     facts.ptr_arg = std::move(st.ptr_arg);
     facts.ref_arg = std::move(st.ref_arg);
-    facts.uses    = st.uses;
+    // Virtual dispatch picks the body out of a vtable SLOT at run time, so every
+    // function that can occupy a slot must agree with its callers about the ref ABI.
+    // Union across each slot index: one override bound to a container element makes
+    // that formal fat for every sibling in that slot, and for the declaration the
+    // call site actually named.
+    facts.ref_epoch_formals = std::move(st.ref_epoch_formals);
+    {
+        // slot index -> formal index -> needs the epoch.
+        std::vector<std::vector<bool>> slot_needs;
+        const auto                     note = [&](size_t slot, size_t k, bool v) {
+            if (slot_needs.size() <= slot) {
+                slot_needs.resize(slot + 1);
+            }
+            if (slot_needs[slot].size() <= k) {
+                slot_needs[slot].resize(k + 1, false);
+            }
+            slot_needs[slot][k] = slot_needs[slot][k] || v;
+        };
+        for (const Vtable& vt : m.vtables()) {
+            for (size_t slot = 0; slot < vt.slots.size(); ++slot) {
+                const auto      fid = static_cast<uint32_t>(vt.slots[slot]);
+                const Function& f   = m.function(vt.slots[slot]);
+                for (size_t k = 0; k < f.param_types.size(); ++k) {
+                    note(slot, k, facts.ref_needs_epoch(fid, k));
+                }
+            }
+        }
+        for (const Vtable& vt : m.vtables()) {
+            for (size_t slot = 0; slot < vt.slots.size(); ++slot) {
+                const auto      fid = static_cast<uint32_t>(vt.slots[slot]);
+                const Function& f   = m.function(vt.slots[slot]);
+                for (size_t k = 0; k < f.param_types.size() && k < slot_needs[slot].size(); ++k) {
+                    if (slot_needs[slot][k] && !f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+                        facts.ref_epoch_formals.insert((static_cast<uint64_t>(fid) << 32) | k);
+                    }
+                }
+            }
+        }
+    }
+    facts.uses = st.uses;
 
     // Flatten the per-signal partial masks. A signal gets a mask only when it is a
     // candidate that was touched, has some driven bits, was never written whole,

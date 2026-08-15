@@ -3978,3 +3978,135 @@ TEST_CASE("time-zero stores do not overflow the active queue via self-start re-w
     )");
     CHECK(out == "y=1\n");
 }
+
+// ---- The `ref` ABI shape: narrow by default, fat only where it is load-bearing.
+
+// Matching the four-word form to the actual is a silent-corruption seam: a caller
+// and callee disagreeing about the arity write past each other's arguments, and no
+// test that only checks values would notice. So these assert the emitted shape
+// directly, in both directions, alongside the behaviour.
+
+TEST_CASE("a ref to a place that cannot move is one pointer, with no epoch check") {
+    // A ref formal carries the relocation epoch only when some call site binds it
+    // inside a container's heap buffer (docs/design/data-model.md §3). A plain
+    // variable's storage never moves, so the fat form would be three dead words and
+    // a branch that can never be taken.
+    const std::string ir = emit_raw(R"(
+        module m;
+            int v;
+            function automatic void f(ref int r); r = r + 1; endfunction
+            initial begin v = 5; f(v); $display("%0d", v); end
+        endmodule
+    )");
+    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.inst.m.state)") == 1);
+    CHECK(count_substr(ir, "rt_ref_stale") == 0);
+    CHECK(run_capture(R"(
+        module m;
+            int v;
+            function automatic void f(ref int r); r = r + 1; endfunction
+            initial begin v = 5; f(v); $display("%0d", v); end
+        endmodule
+    )") == "6\n");
+}
+
+TEST_CASE("a ref to a whole container handle is one pointer") {
+    // The handle POD is design state: it never moves, only the buffer it points at
+    // does. So a `ref` to the WHOLE queue needs no epoch even though a ref to one of
+    // its elements does -- the two cases differ by which allocation is aliased.
+    const std::string ir = emit_raw(R"(
+        module m;
+            int q[$];
+            function automatic void f(ref int r[$]); r.push_back(9); endfunction
+            initial begin q.push_back(5); f(q); $display("%0d", q.size()); end
+        endmodule
+    )");
+    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.inst.m.state)") == 1);
+}
+
+TEST_CASE("a ref to a container element keeps the epoch words") {
+    // The one shape that earns them: `slot` is an interior pointer into the heap
+    // ring, and the epoch it is checked against lives in the handle -- a different
+    // allocation, which is exactly why a stale pointer cannot reach its own witness.
+    const std::string ir = emit_raw(R"(
+        module m;
+            int q[$];
+            function automatic void f(ref int r); r = r + 1; endfunction
+            initial begin q.push_back(5); f(q[0]); $display("%0d", q[0]); end
+        endmodule
+    )");
+    CHECK(ir.find("i64 %ref.epoch.at.call") != std::string::npos);
+    CHECK(ir.find("@clotho.ref.site") != std::string::npos);
+}
+
+TEST_CASE("one ref formal reached by both actual shapes stays fat at every call") {
+    // The fact is per FORMAL, not per call site: one heap-rooted actual anywhere
+    // makes the formal fat, and the variable call site then passes the no-epoch
+    // sentinel rather than a shorter argument list.
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$]; int v;
+            function automatic void f(ref int r); r = r + 1; endfunction
+            initial begin
+                q.push_back(5); v = 1;
+                f(v); f(q[0]);
+                $display("%0d %0d", v, q[0]);
+            end
+        endmodule
+    )";
+    const std::string          ir  = emit_raw(src);
+    // The sentinel appears as a call OPERAND (the global's own definition line
+    // matches the bare name too, hence the surrounding argument text).
+    CHECK(count_substr(ir, ", ptr @clotho.ref.noepoch, i64 0,") == 1);
+    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.inst.m.state)") == 0);
+    CHECK(run_capture(src) == "2 6\n");
+}
+
+TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
+    // Dispatch picks the body at run time, so the caller cannot know which override
+    // it reaches. If one sibling took the fat form and another the narrow one, an
+    // indirect call would write three arguments the callee never declared. The
+    // analysis unions the answer across the slot: here only D::g is passed a queue
+    // element, and that must widen B::g too.
+    constexpr std::string_view src = R"(
+        class B; virtual function void g(ref int r); r = r + 1; endfunction endclass
+        class D extends B; virtual function void g(ref int r); r = r + 2; endfunction endclass
+        module m;
+            int q[$]; int v;
+            initial begin
+                B b; D d;
+                q.push_back(5); v = 1;
+                b = new; d = new;
+                b.g(v);
+                d.g(q[0]);
+                $display("%0d %0d", v, q[0]);
+            end
+        endmodule
+    )";
+    const std::string          ir  = emit_raw(src);
+    // Both bodies take the same parameter list: state, the object handle pair, then
+    // the four ref words.
+    CHECK(count_substr(ir,
+                       "@m.fn.g(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, "
+                       "i64 %4, ptr %5)") == 1);
+    CHECK(count_substr(ir,
+                       "@m.fn.g.1(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, "
+                       "i64 %4, ptr %5)") == 1);
+    CHECK(run_capture(src) == "2 7\n");
+
+    // And with no heap-rooted actual at either site, the whole slot narrows.
+    const std::string narrow = emit_raw(R"(
+        class B; virtual function void g(ref int r); r = r + 1; endfunction endclass
+        class D extends B; virtual function void g(ref int r); r = r + 2; endfunction endclass
+        module m;
+            int v;
+            initial begin
+                B b; D d;
+                v = 1; b = new; d = new;
+                b.g(v); d.g(v);
+                $display("%0d", v);
+            end
+        endmodule
+    )");
+    CHECK(count_substr(narrow, "@m.fn.g(ptr noalias %state, i128 %0, i64 %1, ptr %2)") == 1);
+    CHECK(count_substr(narrow, "@m.fn.g.1(ptr noalias %state, i128 %0, i64 %1, ptr %2)") == 1);
+}
