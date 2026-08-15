@@ -157,7 +157,7 @@ public:
     Index queue_copy(Index dst, Index src, Ref queue_type, SourceLoc loc);
     // dst <= src: nonblocking deep copy (staged in Active, moved into dst in the
     // NBA region).
-    Index queue_copy_nb(Index dst, Index src, Ref queue_type, SourceLoc loc);
+    Index handle_copy_nb(Index dst, Index src, Ref queue_type, SourceLoc loc);
     // dst = src: deep copy of a dynamic array into a queue (src is a dynarray
     // handle lvalue).
     Index queue_copy_dynarr(Index dst, Index src, Ref queue_type, SourceLoc loc);

@@ -158,8 +158,8 @@ const char* tag_name(Inst::Tag tag) {
             return "queue_delete_all";
         case T::QueueCopy:
             return "queue_copy";
-        case T::QueueCopyNb:
-            return "queue_copy_nb";
+        case T::HandleCopyNb:
+            return "handle_copy_nb";
         case T::QueueCopyDyn:
             return "queue_copy_dynarr";
         case T::QueueAppendRange:

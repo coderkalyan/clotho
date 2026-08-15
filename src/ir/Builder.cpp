@@ -303,10 +303,10 @@ Index Builder::queue_copy(Index dst, Index src, Ref queue_type, SourceLoc loc) {
     return emit({ Inst::Tag::QueueCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
-Index Builder::queue_copy_nb(Index dst, Index src, Ref queue_type, SourceLoc loc) {
+Index Builder::handle_copy_nb(Index dst, Index src, Ref queue_type, SourceLoc loc) {
     const ExtraIndex extra = add_extra(QueueArg{ src, queue_type });
 
-    return emit({ Inst::Tag::QueueCopyNb, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+    return emit({ Inst::Tag::HandleCopyNb, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
 Index Builder::queue_copy_dynarr(Index dst, Index src, Ref queue_type, SourceLoc loc) {

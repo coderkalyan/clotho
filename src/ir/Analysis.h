@@ -33,6 +33,8 @@
 #include <span>
 #include <vector>
 
+#include <ankerl/unordered_dense.h>
+
 #include "Ir.h"
 
 namespace clotho::ir {
@@ -217,6 +219,16 @@ struct DesignFacts {
     // fact, which is why it is a separate bit.
     std::vector<bool> ptr_arg;
 
+    // Passed as a `ref` actual somewhere. Stronger than ptr_arg: a `ref` formal
+    // ALIASES this storage rather than copying through it, so for an unpacked
+    // aggregate the two sides' layouts must be IDENTICAL, not merely both
+    // readable. The callee's formal always has the canonical (never-narrowed)
+    // aggregate mirror, so the actual must take it too — a flat array signal's
+    // per-signal z-elision would otherwise give the callee a different element
+    // stride, and a write through the ref would land in a neighbouring element's
+    // z word.
+    std::vector<bool> ref_arg;
+
     // Per-bit undriven mask for a PARTIALLY driven packed 4-state net -- the
     // refinement of `undriven`, which is whole-signal (`w[3:0] = ...` marks all of
     // `w` driven, so its remaining bits would wrongly power on x instead of z).
@@ -228,6 +240,28 @@ struct DesignFacts {
     // Offsets into `undriven_bits`, size signals+1. Signal s owns
     // [undriven_off[s], undriven_off[s+1]); an empty range means no mask.
     std::vector<uint32_t> undriven_off;
+
+    // `ref` formals whose actual, at some call site, is a place inside a container's
+    // HEAP storage — a dynamic-array / queue element, an associative-array entry, or
+    // a member or element reached through one. Keyed `(fid << 32) | formal index`.
+    //
+    // Only those formals need the relocation-epoch words of the fat ref
+    // (docs/design/data-model.md §3): the epoch detects that the buffer moved out
+    // from under an interior pointer, and it necessarily lives in the handle rather
+    // than the buffer, since a stale pointer must not be what reads its own witness.
+    // A ref to anything else — a variable, a fixed-array element, a struct member, a
+    // class property, or a whole container handle — aliases storage that cannot
+    // move, so its formal is one plain pointer and the callee emits no check.
+    //
+    // Conservative by construction: a formal is absent only when EVERY call site was
+    // seen and none was container-rooted, and the answer is unioned across each
+    // virtual-dispatch slot so an override can never disagree with its caller.
+    ankerl::unordered_dense::set<uint64_t> ref_epoch_formals;
+
+    // Whether ref formal `k` of `fid` carries the epoch words.
+    [[nodiscard]] bool ref_needs_epoch(uint32_t fid, size_t k) const {
+        return ref_epoch_formals.contains((static_cast<uint64_t>(fid) << 32) | k);
+    }
 
     // ---- Per-body. ----
     std::vector<ProcessFacts> processes; // indexed as Module::processes()

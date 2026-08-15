@@ -708,21 +708,22 @@ TEST_CASE("unique / unique0 if accepts a pattern condition (LRM 12.4.2 + 12.6.2)
     )") == "v 5\ninv\nsmall 5\n");
 }
 
-TEST_CASE("%p of a queue of tagged unions is rejected loudly") {
-    // The runtime container descriptor carries no member-name table, so it could
-    // only print the raw bit-vector where LRM 21.2.1.6 requires `tag:value`.
-    const LowerResult r = lower_text(R"(
+TEST_CASE("%p of a queue of tagged unions names the tag") {
+    // LRM 21.2.1.6 requires `tag:value` for a tagged union, which the flat runtime
+    // container descriptor cannot express (it carries no member names). Such a
+    // container renders through the frontend's own element loop instead, so the
+    // member-named form is the same one a bare tagged union prints.
+    CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void Invalid; int Valid; } opt_t;
             opt_t q[$];
             initial begin
                 q.push_back(tagged Valid (1));
+                q.push_back(tagged Invalid);
                 $display("%p", q);
             end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("%p of a queue / dynamic array of tagged unions") != std::string::npos);
+    )") == "'{'{Valid:1}, '{Invalid}}\n");
 }
 
 TEST_CASE("blocking read and write of unpacked struct members") {
@@ -1592,10 +1593,11 @@ TEST_CASE("an aggregate output argument's copy-out wakes the actual's waiters") 
 }
 
 TEST_CASE("aggregate subroutine arguments Clotho still refuses loudly") {
-    // Orthogonal, pre-existing gaps, all shared with the function path: a
-    // string-bearing aggregate has no memcpy-able storage, `ref` of an aggregate
-    // needs the alias ABI rather than the storage-pointer one, and a non-lvalue
-    // actual has no storage to point at.
+    // Orthogonal, pre-existing gaps, both shared with the function path: a
+    // string-bearing aggregate has no memcpy-able storage for the by-value copy,
+    // and a non-lvalue actual has no storage to point at. (`ref` of an aggregate
+    // is no longer among them — it aliases through the fat ref, covered in
+    // task_test.cpp.)
     SUBCASE("string-bearing aggregate by value") {
         const LowerResult r = lower_text(R"(
             module m;
@@ -1608,18 +1610,6 @@ TEST_CASE("aggregate subroutine arguments Clotho still refuses loudly") {
         CHECK_FALSE(r.ok);
         CHECK(r.diagnostic_text().find("string-containing aggregate is not supported") !=
               std::string::npos);
-    }
-    SUBCASE("ref of an unpacked struct") {
-        const LowerResult r = lower_text(R"(
-            module m;
-                typedef struct { int x; } s_t;
-                s_t v;
-                task automatic t(ref s_t a); a.x = 2; endtask
-                initial t(v);
-            endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("ref arguments are only supported") != std::string::npos);
     }
     SUBCASE("an assignment-pattern actual") {
         const LowerResult r = lower_text(R"(

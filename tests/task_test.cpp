@@ -403,26 +403,91 @@ TEST_CASE("ref to an unpacked-array element") {
           "a1=201\na=101 202 1 401\npa2=9\nm2=6\nmid=51\na2=61\n");
 }
 
+TEST_CASE("ref of an unpacked array aliases the actual") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic void f(ref int a[4]);
+                a[0] = 1;
+                a[3] = a[1] + 40;
+            endfunction
+            int x[4];
+            initial begin
+                x[0] = 9; x[1] = 2; x[2] = 3; x[3] = 4;
+                f(x);
+                $display("%0d %0d %0d %0d", x[0], x[1], x[2], x[3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 3 42\n");
+}
+
+TEST_CASE("ref of a string aliases the actual") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic void f(ref string s);
+                s = {s, " world"};
+            endfunction
+            string t;
+            initial begin
+                t = "hello";
+                f(t);
+                $display("%s", t);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "hello world\n");
+}
+
+TEST_CASE("ref of a queue aliases the actual, mutations included") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic push(ref int q[$], input int v);
+                q.push_back(v);
+            endtask
+            int q[$];
+            initial begin
+                q.push_back(1);
+                push(q, 2);
+                push(q, 3);
+                $display("size=%0d last=%0d", q.size(), q[$]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "size=3 last=3\n");
+}
+
+TEST_CASE("ref of an unpacked struct aliases the actual") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int x; string s; } s_t;
+            function automatic void bump(ref s_t v);
+                v.x = v.x + 1;
+                v.s = "set";
+            endfunction
+            s_t a;
+            initial begin
+                a.x = 41;
+                bump(a);
+                $display("%0d %s", a.x, a.s);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "42 set\n");
+}
+
 // -- Guarded gaps: must fail loudly, not silently miscompile. --
 
-TEST_CASE("ref of a non-integral type is rejected") {
-    constexpr std::string_view arr = R"(
+// An event has no value and its trigger state is a separate static timestamp, so
+// there is nothing for a pointer to alias (docs/design/data-model.md §7).
+TEST_CASE("ref of an event is rejected") {
+    constexpr std::string_view src = R"(
         module m;
-            function automatic void f(ref int a[4]); a[0] = 1; endfunction
-            int x[4];
-            initial f(x);
+            function automatic void f(ref event e); endfunction
+            event ev;
+            initial f(ev);
         endmodule
     )";
-    CHECK(reject(arr).find("ref arguments are only supported for packed integral") != std::string::npos);
-
-    constexpr std::string_view str = R"(
-        module m;
-            function automatic void f(ref string s); s = "hi"; endfunction
-            string t;
-            initial f(t);
-        endmodule
-    )";
-    CHECK(reject(str).find("ref arguments are only supported for packed integral") != std::string::npos);
+    CHECK(reject(src).find("ref argument of an event type is not supported") != std::string::npos);
 }
 
 // A packed bit/part-select is not a whole slot, so it is not a legal ref actual —

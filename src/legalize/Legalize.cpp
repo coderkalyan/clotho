@@ -272,14 +272,16 @@ public:
     // folds under the pin descends only into the taken arm -- which is exactly
     // §4A.5's "pin the trigger and fold", and it makes must_assign report
     // completeness in the PINNED world rather than the general one.
-    Walker(uint32_t                proc_index,
+    Walker(const ir::Module&       module,
+           uint32_t                proc_index,
            std::vector<GuardNode>& guards,
            std::vector<Note>&      notes,
            ir::Eval*               eval,
            FnLegality&             fns,
            bool                    honour_full,
            bool                    honour_parallel)
-      : proc_(proc_index)
+      : module_(module)
+      , proc_(proc_index)
       , guards_(guards)
       , notes_(notes)
       , eval_(eval)
@@ -507,6 +509,17 @@ private:
                     return;
                 }
             }
+            // A signal whose TYPE has no hardware form makes the process
+            // unsynthesizable however it is touched. The tag gate below cannot see
+            // it: Signal / Load / Store are ordinary opcodes, and it is the type
+            // that has no meaning. Without this, `q[0] = x` over a queue passed
+            // legalization (ElemSelect is a perfectly good hardware select) and the
+            // writer emitted a bit-select of a 1-bit `logic q`.
+            if (tag == ir::Inst::Tag::Signal &&
+                unsynthesizable_type(module_.pool, module_.signal(ir.payload(i).signal).type) != nullptr) {
+                reject(Finding::UnsynthesizableOp, tag, {});
+                continue;
+            }
             switch (tag) {
                 case ir::Inst::Tag::Store:
                 case ir::Inst::Tag::StoreNb: {
@@ -646,6 +659,7 @@ private:
         }
     }
 
+    const ir::Module&       module_;
     uint32_t                proc_;
     std::vector<GuardNode>& guards_;
     std::vector<Note>&      notes_;
@@ -778,6 +792,33 @@ bool trigger_in_guards(const ir::Ir& ir, const std::vector<GuardNode>& arena, co
 
 } // namespace
 
+const char* unsynthesizable_type(const ir::InternPool& pool, ir::Ref type) {
+    ir::Ref leaf = type;
+    while (std::get<ir::Type>(pool.get(leaf)).kind == ir::Type::Kind::UnpackedArray) {
+        leaf = std::get<ir::Type>(pool.get(leaf)).element;
+    }
+    const ir::Type& t = std::get<ir::Type>(pool.get(leaf));
+    switch (t.kind) {
+        case ir::Type::Kind::String:
+            return "string";
+        case ir::Type::Kind::Queue:
+            return "queue";
+        case ir::Type::Kind::DynArray:
+            return "dynamic array";
+        case ir::Type::Kind::Assoc:
+            return "associative array";
+        case ir::Type::Kind::Class:
+            return "class handle";
+        case ir::Type::Kind::Real:
+        case ir::Type::Kind::ShortReal:
+            return "real";
+        case ir::Type::Kind::Struct:
+            return t.is_packed ? nullptr : "unpacked struct";
+        default:
+            return nullptr;
+    }
+}
+
 Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options options) {
     Result result;
     result.processes.reserve(module.processes().size());
@@ -791,7 +832,8 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
         // Guards are always built: classification needs them to find the clock.
         // They are only HANDED BACK when the caller asked.
         const size_t                     arena_base = guards.size();
-        Walker                           w(static_cast<uint32_t>(k),
+        Walker                           w(module,
+                                           static_cast<uint32_t>(k),
                                            guards,
                                            result.notes,
                                            nullptr,
@@ -823,7 +865,8 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
             for (const ir::WaitEvent& t : triggers) {
                 const uint64_t asserted = t.edge == ir::Edge::Negative ? 0u : 1u;
                 ir::Eval       ev(module, ir, t.signal, asserted);
-                Walker         pw(static_cast<uint32_t>(k),
+                Walker         pw(module,
+                                  static_cast<uint32_t>(k),
                                   guards,
                                   ignored,
                                   &ev,
@@ -956,7 +999,8 @@ Result run(const ir::Module& module, const ir::DesignFacts* /*facts*/, Options o
                     }
                     std::vector<Note> ignored;
                     ir::Eval          ev(module, ir, off);
-                    Walker            pw(static_cast<uint32_t>(k),
+                    Walker            pw(module,
+                                         static_cast<uint32_t>(k),
                                          guards,
                                          ignored,
                                          &ev,

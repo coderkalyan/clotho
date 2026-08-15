@@ -310,6 +310,79 @@ typedef struct rt_null_site {
 // diagnostic and ends the simulation with a nonzero status. Never returns.
 [[noreturn]] void rt_null_handle(const rt_null_site* site, uint64_t now);
 
+// -- A `ref` whose actual's container was restructured under it (LRM 13.5.2) --
+
+// The site of one guarded `ref` dereference, emitted by the backend as a
+// constant global beside the check. Everything except the two epoch values is
+// compile-time. Field order and types mirror the LLVM struct the backend
+// builds: { ptr, ptr, i32 x3, ptr, ptr }.
+typedef struct rt_ref_site {
+    // "<file>:<line>:<col>" of the dereference, or "<unknown>".
+    const char* where;
+    // The source line that dereference starts on, verbatim, no newline.
+    const char* line;
+    // 1-based line / column of the dereference, and one past its last column.
+    int32_t line_no;
+    int32_t column;
+    int32_t end_column;
+    // Declared name of the `ref` formal, for the diagnostic text. Never null.
+    //
+    // No container name: which container went stale is answered by the epoch
+    // pointer the guard was checking, through rt_ref_names below, rather than
+    // recorded per call site.
+    const char* formal;
+} rt_ref_site;
+
+// One container's relocation epoch and the name it was declared under.
+typedef struct rt_container_name {
+    const void* epoch;
+    const char* name;
+} rt_container_name;
+
+// Register the design's epoch-to-name table, once, before it runs. The backend
+// emits one entry per container whose handle sits at a statically known address
+// (a module-scope signal, or a local hoisted into design state), which is exactly
+// the set whose name a report could ever state: a container inside a class body,
+// or inside another container's buffer, has no fixed address to key on and is
+// reported without a name rather than under a guessed one.
+//
+// Consulted only from a staleness report, so the lookup is a linear scan rather
+// than an index that would have to be built during startup.
+void rt_ref_names(const rt_container_name* table, uint64_t count);
+
+// Dereferencing a `ref` formal whose actual was an element of a container that
+// has since been restructured (a push, an insert, a delete, a resize, a whole
+// -value assignment, a sort). The interior pointer the ref holds no longer names
+// that element, and may point outside the buffer entirely, so LRM 13.5.2's
+// "the formal refers to the actual" no longer holds.
+//
+// The LRM does not define this case; an unchecked implementation would dereference the
+// stale pointer. Clotho reports it instead: prints a located diagnostic naming
+// the formal, the container and both epochs, and ends the simulation with a
+// nonzero status. `--loose-stale-ref` downgrades it to a once-per-site warning
+// and returns, which is the escape hatch for a design that relies on the
+// stale-pointer behaviour.
+//
+// `epoch` is the pointer the guard was watching; the report resolves it to the
+// container's declared name through the rt_ref_names table. Passing it costs
+// nothing at the call that formed the ref — it is already live here, on a path
+// taken once per run at most.
+void rt_ref_stale(const rt_ref_site* site, const void* epoch, uint64_t expect, uint64_t actual,
+                  uint64_t now);
+
+// A ref's expected epoch ahead of its container's. Epochs are monotone and only
+// ever advance, so this is unreachable without a codegen bug in the epoch
+// plumbing itself. Aborts unconditionally — `--loose-stale-ref` does not apply,
+// because the invariant being violated is Clotho's, not the design's.
+[[noreturn]] void rt_ref_epoch_regress(const rt_ref_site* site, const void* epoch,
+                                       uint64_t expect, uint64_t actual, uint64_t now);
+
+// Select the stale-ref mode: nonzero downgrades rt_ref_stale to a once-per-site
+// warning that returns, zero (the default) leaves it fatal. Owned by the CLI's
+// --loose-stale-ref and set once before the design runs. Does not affect
+// rt_ref_epoch_regress, which aborts in either mode.
+void rt_ref_stale_warn(int32_t enable);
+
 // -- Tagged-union member access inconsistent with the current tag (LRM 11.9) --
 
 // The site of one guarded tagged-union member access, emitted by the backend as
@@ -808,6 +881,7 @@ enum {
     rt_elem_dynarr    = 2, // one rt_dynarr handle; `inner` describes ITS element
     rt_elem_queue     = 3, // one rt_queue handle; `inner` describes ITS element
     rt_elem_aggregate = 4, // fixed byte image with `nleaves` heap leaves
+    rt_elem_assoc     = 5, // one rt_assoc handle; `inner` describes ITS value element
 };
 
 struct rt_elem_ops {
@@ -815,9 +889,36 @@ struct rt_elem_ops {
     uint32_t            nleaves; // rt_elem_aggregate only
     uint64_t            stride;  // element slot bytes
     const void*         proto;   // power-on byte image, `stride` bytes
-    const rt_elem_ops*  inner;   // rt_elem_dynarr / rt_elem_queue only
+    const rt_elem_ops*  inner;   // rt_elem_dynarr / rt_elem_queue / rt_elem_assoc only
     const rt_elem_leaf* leaves;  // rt_elem_aggregate only
 };
+
+// -- The relocation epoch --
+//
+// Every container handle carries a monotone `epoch`, bumped by each operation
+// that can change the mapping from a logical index to a byte address: a
+// reallocation, a reindexing insert / delete, a length change, or a whole-value
+// replacement. Writing an existing element does NOT bump it.
+//
+// Its purpose is `ref` safety (docs/design/data-model.md §3). A `ref` whose
+// actual is a container element is a fat pointer carrying `&handle->epoch` plus
+// the epoch observed when the ref was formed; every dereference in the callee
+// re-reads the field and compares. A mismatch means the container was
+// restructured while the ref was live, so the interior pointer is dangling —
+// reported as a located fatal instead of corrupting memory.
+//
+// The epoch belongs to the handle rather than a side table so that it survives
+// assign / move correctly: the destination's epoch ADVANCES, and is never
+// copied from the source. It is deliberately not reset by a delete, so an epoch
+// is never reused within a run.
+//
+// A stable (non-relocatable) place — a module signal, a frame local, a fixed
+// unpacked array element, a class property — has no epoch to check, so a ref
+// formed through one points at a compile-time zero word and expects 0. That
+// keeps the callee's check unconditional rather than paying a null test, means
+// such a ref can never be reported stale, and lets the optimizer fold the check
+// away entirely when it can see the caller. That zero word is emitted by the
+// backend (`clotho.ref.noepoch`) rather than exported from here.
 
 // NOTE: the element lifecycle helpers (init / deinit / copy over an
 // rt_elem_ops descriptor) are internal to Runtime.cpp — the backend inlines
@@ -827,16 +928,19 @@ struct rt_elem_ops {
 // -- SystemVerilog dynamic arrays --
 //
 // The dynamic array type (LRM §7.5): a runtime-sized vector of a fixed-width
-// element. The value lives in a 16-byte caller-owned handle embedded in design
+// element. The value lives in a 24-byte caller-owned handle embedded in design
 // state (same ownership model as rt_string): `data` points at one heap buffer of
 // `len` elements, each `stride` bytes (the backend's per-element slot size),
 // malloc-owned by the handle. Copies are eager deep copies; handles never share
-// storage. A handle powers on zeroed — { null, 0 } is the empty array — and is
+// storage. A handle powers on zeroed — { null, 0, 0 } is the empty array — and is
 // released with rt_dynarr_delete. The per-element record layout is defined by the
 // backend; the runtime owns only the raw byte buffer.
 typedef struct rt_dynarr {
     void*    data;
     uint64_t len;
+    // Relocation epoch: bumped by new / new_copy / delete / assign / move and by
+    // reverse / sort / shuffle (which reindex without reallocating).
+    uint64_t epoch;
 } rt_dynarr;
 
 // arr = new[n]: (re)allocate `h` to `n` elements, constructing each from the
@@ -863,45 +967,70 @@ void rt_dynarr_delete(rt_dynarr* h, const rt_elem_ops* ops);
 void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_elem_ops* ops,
                       const rt_alloc_site* site);
 
+// Move `src`'s buffer into `dst` (ownership transfer): destroy `dst`'s elements
+// and buffer, take `src`'s, leave `src` empty. Both epochs advance. The
+// nonblocking-assignment commit path, where the RHS was already deep-copied
+// into `src` in the Active region. A no-op when dst == src.
+void rt_dynarr_move(rt_dynarr* dst, rt_dynarr* src, const rt_elem_ops* ops);
+
 // -- Array ordering methods (LRM 7.12.2) --
 //
 // `kind` selects the sort comparator over an element's `width`-bit value:
 // 0 = unsigned integral, 1 = signed integral, 2 = IEEE real (double). The
 // frontend restricts sort()/rsort() to a 2-state integral (width <= 64) or real
 // element; reverse() is element-agnostic (whole-slot move) and takes no kind.
+//
+// All three take the element descriptor rather than a bare stride: they reindex
+// the container, so they bump the relocation epoch, and taking `ops` keeps every
+// container entry point on one signature shape.
 
 // arr.reverse(): reverse the element order in place.
-void rt_dynarr_reverse(rt_dynarr* h, uint64_t stride);
+void rt_dynarr_reverse(rt_dynarr* h, const rt_elem_ops* ops);
 
 // arr.sort() (rev == 0) / arr.rsort() (rev == 1): order elements ascending /
 // descending by value.
-void rt_dynarr_sort(rt_dynarr* h, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev);
+void rt_dynarr_sort(rt_dynarr* h, const rt_elem_ops* ops, uint32_t kind, uint32_t width,
+                    uint32_t rev);
 
 // arr.shuffle() (LRM 7.12.2): randomize element order in place via `rng`, the
 // process's 256-bit xoshiro256++ frame state (LRM 18.13); advances that state.
-void rt_dynarr_shuffle(rt_dynarr* h, uint64_t stride, uint64_t* rng);
+void rt_dynarr_shuffle(rt_dynarr* h, const rt_elem_ops* ops, uint64_t* rng);
 
 // -- SystemVerilog queues --
 //
 // The queue type (LRM §7.10): a runtime-sized double-ended vector of a
-// fixed-width element. The value lives in a 32-byte caller-owned handle embedded
+// fixed-width element. The value lives in a 40-byte caller-owned handle embedded
 // in design state (same ownership model as rt_string / rt_dynarr): `base` points
 // at one heap ring buffer of `cap` elements, each `stride` bytes; the `len` live
 // elements occupy physical slots (head + i) mod cap for i in [0, len). Copies are
 // eager deep copies; handles never share storage. A handle powers on zeroed —
-// { null, 0, 0, 0 } is the empty queue — and is released with rt_queue_delete_all.
-// The per-element record layout is defined by the backend; the runtime owns only
-// the raw byte buffer.
+// { null, 0, 0, 0, 0 } is the empty queue — and is released with
+// rt_queue_delete_all. The per-element record layout is defined by the backend;
+// the runtime owns only the raw byte buffer.
 typedef struct rt_queue {
     void*    base;
     uint64_t head;
     uint64_t len;
     uint64_t cap;
+    // Relocation epoch: bumped by every push / pop / insert / delete / assign /
+    // move / append_range and by reverse / sort / shuffle. A ring grow relocates
+    // the buffer and an insert or delete reindexes it, and even a push that fits
+    // changes `len` — hence the meaning of `q[$]` — so every mutation bumps.
+    uint64_t epoch;
 } rt_queue;
 
 // Bounded-queue max size argument for the push helpers: `bound` is the `[$:N]`
-// maximum index (max size N+1); 0 means unbounded (LRM §7.10.4). An overflowing
-// push drops the element at the opposite end.
+// maximum index (max size N+1); 0 means unbounded (LRM §7.10.4).
+//
+// An overflowing push keeps the first `bound + 1` elements, i.e. it always drops
+// from the TAIL. The two directions therefore lose different elements, and the
+// difference is deliberate rather than incidental:
+//   - push_front lands the new element at the head, so the dropped one is the
+//     old tail -- the end opposite the push.
+//   - push_back lands the new element at the tail, so the dropped one is the
+//     element just pushed: pushing onto a full bounded queue has no effect.
+// The same rule governs insert(). LRM 7.10.4 does not pin which end an
+// overflowing push sacrifices.
 //
 // q.push_back(e) / q.push_front(e): append `elem` (a `stride`-byte element slot)
 // to the tail / head, growing the ring as needed. `site` is the push's source
@@ -986,14 +1115,15 @@ uint8_t rt_container_eq(const void* a, const void* b, int32_t is_queue, int32_t 
 
 // q.reverse() / q.sort() / q.rsort() (LRM 7.12.2). `kind` / `width` / `rev` match
 // the rt_dynarr_* ordering entry points; operates on the ring's logical order.
-void rt_queue_reverse(rt_queue* h, uint64_t stride);
-void rt_queue_sort(rt_queue* h, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev);
-void rt_queue_shuffle(rt_queue* h, uint64_t stride, uint64_t* rng);
+void rt_queue_reverse(rt_queue* h, const rt_elem_ops* ops);
+void rt_queue_sort(rt_queue* h, const rt_elem_ops* ops, uint32_t kind, uint32_t width,
+                   uint32_t rev);
+void rt_queue_shuffle(rt_queue* h, const rt_elem_ops* ops, uint64_t* rng);
 
 // -- SystemVerilog associative arrays --
 //
 // The associative-array type (LRM §7.8/7.9): a runtime-sized key->value map. The
-// value lives in an 8-byte caller-owned handle embedded in design state (same
+// value lives in a 16-byte caller-owned handle embedded in design state (same
 // ownership model as the other containers): `impl` is null for the empty map,
 // else points at a heap AssocMap (an ankerl map of normalized-key-bytes ->
 // element slot bytes, plus a lazily-rebuilt sorted key index for ordered
@@ -1003,6 +1133,11 @@ void rt_queue_shuffle(rt_queue* h, uint64_t stride, uint64_t* rng);
 // lexicographically. Copies are eager deep copies; handles never share storage.
 typedef struct rt_assoc {
     void* impl;
+    // Relocation epoch: bumped by an entry-creating put / default_ptr and by
+    // delete_key / delete_all / reset / assign / move. An element slot's address
+    // is stable while its entry lives (the value buffer is separately owned), so
+    // a plain overwrite of an existing key does not bump.
+    uint64_t epoch;
 } rt_assoc;
 
 // a[key] read: pointer to the element slot for `key`; when the key is absent,
@@ -1057,6 +1192,11 @@ int rt_assoc_prev(rt_assoc* h, const uint8_t* cur_ptr, uint32_t cur_len, const u
 // allocation-failure report.
 void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_elem_ops* ops, const rt_alloc_site* site);
 
+// Move `src`'s map into `dst` (ownership transfer): destroy `dst`'s entries and
+// pattern default, take `src`'s map, leave `src` empty. Both epochs advance. The
+// nonblocking-assignment commit path. A no-op when dst == src.
+void rt_assoc_move(rt_assoc* dst, rt_assoc* src, const rt_elem_ops* ops);
+
 // -- SystemVerilog string objects --
 //
 // The dynamic `string` type (LRM §6.16). A string value lives in a fixed
@@ -1088,6 +1228,16 @@ void rt_string_deinit(rt_string* s);
 // dst = src (deep copy). dst == src is a no-op. `site` locates the assignment
 // for an allocation-failure report.
 void rt_string_assign(rt_string* dst, const rt_string* src, const rt_alloc_site* site);
+
+// Move `src` into `dst` (ownership transfer): release `dst`'s buffer, take
+// `src`'s handle image, leave `src` a valid empty string. The
+// nonblocking-assignment commit path, where the RHS was already deep-copied
+// into `src` in the Active region. A no-op when dst == src.
+//
+// A string handle has no epoch: it is not indexable by a stable identity, so no
+// interior pointer outlives an operation on it (a character `ref` is not
+// expressible in SV).
+void rt_string_move(rt_string* dst, rt_string* src);
 
 // dst = the `n` bytes at `p`. `p` is a raw byte sequence, not NUL-terminated;
 // it may alias dst's own buffer. `site` locates the assignment for an

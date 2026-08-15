@@ -39,6 +39,7 @@
 #include "ir/Analysis.h"
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
+#include "ir/TypeModel.h"
 #include "runtime/Runtime.h"
 
 // LLVM backend rationale.
@@ -347,6 +348,10 @@ struct LValue {
     // body). Addressed via lv_handle_ptr by the queue / dynamic-array ops;
     // plane Load/Store on it traps (the frontend never emits one).
     bool is_handle = false;
+    // The element / leaf type behind `is_handle`, needed to reach its rt_elem_ops
+    // and its out-of-range sink. Only set for a container ELEMENT (where
+    // dyn_inrange applies); a handle leaf inside an aggregate leaves it invalid.
+    Ref handle_type{};
     // Recursive aggregate addressing (a signal whose type contains an unpacked
     // struct). `root_ty` is the signal's whole storage type; `agg_path` is the
     // GEP index vector from `base` to the current sub-object (a leaf slot once a
@@ -379,6 +384,17 @@ struct LValue {
     // lowering into rt_bounds_report calls; purely a report channel, the LRM's
     // own out-of-range behaviour stays driven by `dyn_inrange` above.
     std::vector<BoundsCheck> bounds_checks;
+    // Pointer to the relocation epoch of the container this place is rooted
+    // inside, or null when the place is stable (a module signal, a frame local, a
+    // fixed unpacked array element, a class property).
+    //
+    // Only `ref` consumes it: forming a ref through a heap-rooted place records
+    // this pointer and the epoch's current value in the fat ref, so the callee
+    // detects a restructuring that happened while the ref was live
+    // (docs/design/data-model.md §3.1). Set at the container element select and
+    // carried unchanged by every subsequent member / element / bit step, since
+    // those only extend `agg_path` and `bit_off`.
+    llvm::Value* epoch_ptr = nullptr;
     // An associative-array element target (LRM 7.8/7.9). Unlike dyn/queue the
     // element pointer is not yet resolved: the get_ptr (read) vs put_ptr (write)
     // choice depends on Load/Store context, so it is deferred. `assoc_handle` is
@@ -649,6 +665,23 @@ struct FrameSlot {
     bool is_ref = false;
 };
 
+// A `ref` formal's fat pointer, as bound from the callee's parameters
+// (docs/design/data-model.md §3). `slot` aliases the actual's storage — a plane
+// slot, a managed handle, or an aggregate image. `epoch` addresses the
+// relocation epoch of the container the actual was rooted in, or the
+// `clotho.ref.noepoch` zero word when the actual was a stable place; `expect` is
+// that epoch's value at the call. Every dereference re-reads `epoch` and reports
+// through `site` if it has moved on.
+// A `ref` formal's binding inside the callee. `slot`/`epoch`/`expect` are the
+// passed words; `formal` is the callee's own name for the binding, used to build
+// the per-dereference site record a staleness report prints (§3.3).
+struct RefBinding {
+    llvm::Value* slot   = nullptr;
+    llvm::Value* epoch  = nullptr;
+    llvm::Value* expect = nullptr;
+    std::string  formal;
+};
+
 // Raised on a construct the backend cannot lower; caught at the top level.
 struct BackendError {
     std::string message;
@@ -671,6 +704,12 @@ struct ModuleEnv {
     // its own copies.
     ankerl::unordered_dense::map<uint32_t, llvm::Constant*> elem_ops;
     llvm::GlobalVariable* str_sink = nullptr;
+    // Write-only sink handles for out-of-range nested-container elements, keyed by
+    // element type Ref (handle_sink_global).
+    ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> handle_sinks;
+    // The shared zero word a `ref` through a stable place aims its epoch at
+    // (no_epoch_global).
+    llvm::GlobalVariable* no_epoch = nullptr;
 };
 
 // Builds the shared state struct and lowers every process. One instance per
@@ -748,6 +787,13 @@ public:
         // including recursion and forward references), then lower their bodies. A
         // task is a coroutine (lower_task); a function is a plain call.
         const size_t nf = mod_.function_count();
+        // Identify functions by address: the ABI helpers below take a `const
+        // Function&` and need its id to ask the analysis about a formal. The
+        // function table is a deque, so these addresses are stable.
+        fn_ids_.reserve(nf);
+        for (uint32_t i = 0; i < nf; ++i) {
+            fn_ids_.emplace(&mod_.function(static_cast<FunctionId>(i)), i);
+        }
         fn_decls_.assign(nf, nullptr);
         for (uint32_t i = 0; i < nf; ++i) {
             fn_decls_[i] = declare_function(static_cast<FunctionId>(i));
@@ -1069,44 +1115,78 @@ private:
         return ty;
     }
 
-    // The opaque rt_string handle slot type (`%clotho.string = { [32 x i8] }`),
-    // memoized. A struct wrapper keeps GEP paths and array-of-slot addressing
-    // uniform with the plane slots.
+    // The opaque rt_string handle slot type
+    // (`%clotho.string = { i64, [sizeof(rt_string) - 8 x i8] }`), memoized. A struct
+    // wrapper keeps GEP paths and array-of-slot addressing uniform with the plane
+    // slots.
+    //
+    // The leading i64 is what carries the runtime type's alignment: rt_string is
+    // `alignas(8)`, and a plain `{ [32 x i8] }` mirror is align 1, so a string leaf
+    // inside an aggregate landed at whatever offset the preceding field left it (an
+    // `int` puts it at +4) and every runtime access to it was misaligned -- UB that
+    // UBSan reports on a struct-with-string signal and on a container element alike.
+    // The trailing bytes stay a byte array so the empty-string image (whose only
+    // non-zero byte is the inline capacity, at the end) is expressible without
+    // endianness games.
     llvm::StructType* str_slot_ty() {
         if (str_slot_ty_ == nullptr) {
+            static_assert(sizeof(rt_string) > 8 && sizeof(rt_string) % 8 == 0);
             str_slot_ty_ = llvm::StructType::create(
-              ctx_, { llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_string)) }, "clotho.string");
+              ctx_, { b_.getInt64Ty(), llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_string) - 8) }, "clotho.string");
         }
         return str_slot_ty_;
     }
 
-    // The opaque rt_dynarr handle slot type (`%clotho.dynarr = { ptr, i64 }`),
-    // memoized. Must mirror the runtime rt_dynarr layout ({ void* data, u64 len }).
+    // The empty (owned, inline) rt_string image as a typed constant: all zero bytes
+    // but the trailing inline-capacity byte.
+    llvm::Constant* str_empty_const() {
+        std::vector<uint8_t> bytes(sizeof(rt_string) - 8, 0);
+        bytes[bytes.size() - 1] = static_cast<uint8_t>(rt_string_inline_cap);
+        return llvm::ConstantStruct::get(str_slot_ty(), { b_.getInt64(0), llvm::ConstantDataArray::get(ctx_, bytes) });
+    }
+
+    // The opaque rt_dynarr handle slot type
+    // (`%clotho.dynarr = { ptr, i64, i64 }`), memoized. Must mirror the runtime
+    // rt_dynarr layout ({ void* data, u64 len, u64 epoch }).
     llvm::StructType* dynarr_slot_ty() {
         if (dynarr_slot_ty_ == nullptr) {
-            dynarr_slot_ty_ =
-              llvm::StructType::create(ctx_, { raw_ptr_ty(), b_.getInt64Ty() }, "clotho.dynarr");
+            dynarr_slot_ty_ = llvm::StructType::create(
+              ctx_, { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty() }, "clotho.dynarr");
         }
         return dynarr_slot_ty_;
     }
 
-    // The opaque rt_assoc handle slot type (`%clotho.assoc = { ptr }`), memoized.
-    // Must mirror the runtime rt_assoc layout ({ void* impl }).
+    // The opaque rt_assoc handle slot type (`%clotho.assoc = { ptr, i64 }`),
+    // memoized. Must mirror the runtime rt_assoc layout
+    // ({ void* impl, u64 epoch }).
     llvm::StructType* assoc_slot_ty() {
         if (assoc_slot_ty_ == nullptr) {
-            assoc_slot_ty_ = llvm::StructType::create(ctx_, { raw_ptr_ty() }, "clotho.assoc");
+            assoc_slot_ty_ =
+              llvm::StructType::create(ctx_, { raw_ptr_ty(), b_.getInt64Ty() }, "clotho.assoc");
         }
         return assoc_slot_ty_;
     }
 
+    // Field index of the relocation epoch inside each container's handle slot
+    // (docs/design/data-model.md §3.1). A `ref` formed through a place rooted in
+    // one of these carries `&handle[epoch_field]` so the callee can detect a
+    // restructuring that happened while the ref was live.
+    uint32_t handle_epoch_field(Ref type) const {
+        if (is_assoc_type(type)) {
+            return 1; // { impl, epoch }
+        }
+        return is_queue_type(type) ? 4u  // { base, head, len, cap, epoch }
+                                   : 2u; // { data, len, epoch }
+    }
+
     // Whether a type is a dynamic array (LRM 7.5).
     bool is_dynarr_type(Ref type) const {
-        return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::DynArray;
+        return types::is_dynarr(mod_.pool, type);
     }
 
     // Whether a type is an associative array (LRM 7.8/7.9).
     bool is_assoc_type(Ref type) const {
-        return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::Assoc;
+        return types::is_assoc(mod_.pool, type);
     }
 
     // Per-element slot facts for a dynamic array's element (a POD scalar in phase
@@ -1131,11 +1211,13 @@ private:
         llvm::Type* agg_ty = nullptr;
         Ref         elem_type{};
     };
-    DynElem dynarr_elem(Ref array_type) {
-        const Type& at = std::get<Type>(mod_.pool.get(array_type));
+    // One element's storage classification, from the ELEMENT type. Keyed on the
+    // element rather than the container because a nested container's leaf descriptor
+    // needs the same answer with no container Ref to hand (collect_elem_leaves).
+    DynElem elem_desc(Ref elem_type) {
         DynElem     e;
-        e.elem_type    = at.element;
-        const Type& et = std::get<Type>(mod_.pool.get(at.element));
+        e.elem_type    = elem_type;
+        const Type& et = std::get<Type>(mod_.pool.get(elem_type));
         if (et.kind == Type::Kind::String) {
             e.is_string = true;
             e.slot_ty   = str_slot_ty();
@@ -1144,23 +1226,26 @@ private:
         if (et.kind == Type::Kind::DynArray || et.kind == Type::Kind::Queue ||
             et.kind == Type::Kind::Assoc) {
             e.is_handle = true;
-            e.slot_ty   = handle_slot_ty(at.element);
+            e.slot_ty   = handle_slot_ty(elem_type);
             return e;
         }
-        if (!is_leaf_type(at.element)) {
+        if (!is_leaf_type(elem_type)) {
             // Unpacked struct / fixed unpacked array value: the slot is the flat
             // recursive aggregate image, addressed via the is_agg lvalue path.
             e.is_agg = true;
-            e.agg_ty = agg_storage_ty(at.element);
+            e.agg_ty = agg_storage_ty(elem_type);
             return e;
         }
-        const Layout lay = mod_.pool.layout(at.element);
+        const Layout lay = mod_.pool.layout(elem_type);
         e.width      = lay.width == 0 ? 1 : lay.width;
         e.four_state = lay.domain == Domain::Four;
         e.has_z      = e.four_state;
         e.narrow     = !e.four_state; // 2-state / real element -> single iW slot
         e.slot_ty    = slot_type(e.width, e.four_state, e.has_z, e.narrow);
         return e;
+    }
+    DynElem dynarr_elem(Ref array_type) {
+        return elem_desc(std::get<Type>(mod_.pool.get(array_type)).element);
     }
 
     // Byte size of one element slot (the runtime stride).
@@ -1221,13 +1306,13 @@ private:
     // The element power-on byte image as a typed constant: X planes for a
     // 4-state scalar, zero for 2-state / real, the empty inline handle for a
     // string, the null handle for a nested container.
-    // Power-on constant for a POD (trivially-copyable) aggregate storage image:
-    // X planes for a 4-state scalar leaf, 0 for 2-state / real, recursively over
-    // the unpacked struct / array. Built against the exact `storage` LLVM type so
-    // the constant's type matches the target global / GEP source -- agg_storage_ty
-    // mints a fresh (structurally-equal but distinct) StructType per call, so the
-    // constant must reuse the caller's instance, not a new one. Only reached for a
-    // trivially-copyable aggregate (frontend guard), so no string / container leaf.
+    // Power-on constant for an aggregate storage image: X planes for a 4-state
+    // scalar leaf, 0 for 2-state / real, the empty inline handle for a string leaf
+    // and the null handle for a nested container leaf, recursively over the unpacked
+    // struct / array. Built against the exact `storage` LLVM type so the constant's
+    // type matches the target global / GEP source -- agg_storage_ty mints a fresh
+    // (structurally-equal but distinct) StructType per call, so the constant must
+    // reuse the caller's instance, not a new one.
     llvm::Constant* agg_proto_const(Ref type, llvm::Type* storage) {
         const Type& t = std::get<Type>(mod_.pool.get(type));
         if (t.kind == Type::Kind::UnpackedArray) {
@@ -1244,6 +1329,13 @@ private:
                 fields.push_back(agg_proto_const(flds[k].type, st->getElementType(k)));
             }
             return llvm::ConstantStruct::get(st, fields);
+        }
+        if (t.kind == Type::Kind::String || t.kind == Type::Kind::DynArray || t.kind == Type::Kind::Queue ||
+            t.kind == Type::Kind::Assoc) {
+            // A managed leaf powers on empty / null, which is also what makes the
+            // image safe to rt_elem_init a fresh slot with: the runtime then
+            // deep-assigns into a valid empty leaf.
+            return elem_proto_const(elem_desc(type));
         }
         const Layout   lay  = mod_.pool.layout(type);
         const uint32_t w    = lay.width == 0 ? 1 : lay.width;
@@ -1270,10 +1362,7 @@ private:
             return agg_proto_const(e.elem_type, e.agg_ty);
         }
         if (e.is_string) {
-            std::vector<uint8_t> bytes(sizeof(rt_string), 0);
-            bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
-            return llvm::ConstantStruct::get(
-              e.slot_ty, { llvm::ConstantDataArray::get(ctx_, bytes) });
+            return str_empty_const();
         }
         if (e.is_handle) {
             return llvm::Constant::getNullValue(e.slot_ty);
@@ -1286,40 +1375,116 @@ private:
         return llvm::ConstantStruct::get(e.slot_ty, fields);
     }
 
-    // The constant rt_elem_ops descriptor for a container's element type,
-    // memoized per element type Ref. Nested containers chain through `inner`
-    // (finite: type nesting is a DAG). A trivially-copyable aggregate element is
-    // kind 0 (POD): memcpy copy over the proto image, no per-leaf lifecycle -- a
-    // managed-leaf aggregate (kind-4 leaf table) is frontend-guarded.
-    llvm::Constant* elem_ops_global(Ref container_type) {
-        const Type& at = std::get<Type>(mod_.pool.get(container_type));
-        if (const auto it = env_->elem_ops.find(static_cast<uint32_t>(at.element));
-            it != env_->elem_ops.end()) {
+    // The rt_elem_leaf mirror type: { i64 offset, ptr ops }.
+    llvm::StructType* elem_leaf_ty() {
+        if (elem_leaf_ty_ == nullptr) {
+            elem_leaf_ty_ = llvm::StructType::create(ctx_, { b_.getInt64Ty(), raw_ptr_ty() }, "clotho.elemleaf");
+        }
+        return elem_leaf_ty_;
+    }
+
+    // The heap-owning leaves of an aggregate element type as { byte offset, ops }
+    // pairs, appended in ASCENDING offset order.
+    //
+    // The order is a runtime contract, not a convenience: rt_elem_copy deep-assigns
+    // each leaf and then raw-copies the POD gaps *between* consecutive leaves
+    // (Runtime.cpp), so an unsorted table would copy a leaf's bytes as if they were
+    // POD -- shallow-copying a string handle into a slot that then double-frees.
+    // The walk is in declaration / index order, which IS ascending offset for both
+    // an LLVM struct (fields laid out in order) and an array.
+    void collect_elem_leaves(Ref type, uint64_t base, llvm::Type* storage, std::vector<llvm::Constant*>& out) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            auto*          arr    = llvm::cast<llvm::ArrayType>(storage);
+            const uint64_t stride = env_->llmod.getDataLayout().getTypeAllocSize(arr->getElementType());
+            for (uint64_t k = 0; k < arr->getNumElements(); ++k) {
+                collect_elem_leaves(t.element, base + k * stride, arr->getElementType(), out);
+            }
+            return;
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            auto*       st = llvm::cast<llvm::StructType>(storage);
+            const auto* sl = env_->llmod.getDataLayout().getStructLayout(st);
+            uint32_t    f  = 0;
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                collect_elem_leaves(fld.type, base + sl->getElementOffset(f), st->getElementType(f), out);
+                ++f;
+            }
+            return;
+        }
+        if (t.kind != Type::Kind::String && t.kind != Type::Kind::DynArray && t.kind != Type::Kind::Queue &&
+            t.kind != Type::Kind::Assoc) {
+            return;
+        }
+        out.push_back(llvm::ConstantStruct::get(elem_leaf_ty(), { b_.getInt64(base), elem_ops_for(type) }));
+    }
+
+    // The constant rt_elem_ops descriptor for one element type, memoized.
+    //
+    // Nested containers chain through `inner` (finite: type nesting is a DAG). An
+    // aggregate element is kind 0 (POD) when every leaf is plain bytes -- memcpy
+    // copy over the proto image, no per-element lifecycle -- and kind 4 when it owns
+    // a string / container leaf, which the leaf table then makes the runtime
+    // deep-copy and free.
+    llvm::Constant* elem_ops_for(Ref elem_type) {
+        if (const auto it = env_->elem_ops.find(static_cast<uint32_t>(elem_type)); it != env_->elem_ops.end()) {
             return it->second;
         }
-        const DynElem e     = dynarr_elem(container_type);
-        uint32_t      kind  = 0;
+        const DynElem   e       = elem_desc(elem_type);
+        uint32_t        kind    = 0;
         llvm::Constant* inner = llvm::Constant::getNullValue(raw_ptr_ty());
+        llvm::Constant* leaves  = llvm::Constant::getNullValue(raw_ptr_ty());
+        uint32_t        nleaves = 0;
         if (e.is_string) {
             kind = 1;
         } else if (e.is_handle) {
-            const Type& et = std::get<Type>(mod_.pool.get(at.element));
-            kind  = et.kind == Type::Kind::DynArray ? 2 : 3;
-            inner = elem_ops_global(at.element);
+            // A nested container element: the slot holds ITS handle, and the
+            // descriptor chains through `inner`, which describes the inner
+            // container's own element (its value element, for an assoc). Each
+            // container kind needs its own descriptor kind because the runtime
+            // reads a different handle struct out of the slot.
+            const Type& et = std::get<Type>(mod_.pool.get(elem_type));
+            switch (et.kind) {
+                case Type::Kind::DynArray:
+                    kind = 2;
+                    break;
+                case Type::Kind::Queue:
+                    kind = 3;
+                    break;
+                default:
+                    assert(et.kind == Type::Kind::Assoc && "handle element must be a container");
+                    kind = 5;
+                    break;
+            }
+            inner = elem_ops_for(et.element);
+        } else if (e.is_agg && has_heap_leaf(elem_type)) {
+            std::vector<llvm::Constant*> table;
+            collect_elem_leaves(elem_type, 0, e.agg_ty, table);
+            auto* arr_ty = llvm::ArrayType::get(elem_leaf_ty(), table.size());
+            leaves       = new llvm::GlobalVariable(env_->llmod,
+                                                    arr_ty,
+                                                    /*isConstant=*/true,
+                                                    llvm::GlobalValue::InternalLinkage,
+                                                    llvm::ConstantArray::get(arr_ty, table),
+                                                    "clotho.elem.leaves");
+            nleaves      = static_cast<uint32_t>(table.size());
+            kind         = 4;
         }
         llvm::Type* proto_ty = e.is_agg ? e.agg_ty : e.slot_ty;
         auto* proto = new llvm::GlobalVariable(env_->llmod, proto_ty, /*isConstant=*/true,
                                                llvm::GlobalValue::InternalLinkage,
                                                elem_proto_const(e), "clotho.elem.proto");
-        auto* init = llvm::ConstantStruct::get(
+        auto*       init     = llvm::ConstantStruct::get(
           elem_ops_ty(),
-          { b_.getInt32(kind), b_.getInt32(0), b_.getInt64(dynarr_stride(e)), proto, inner,
-            llvm::Constant::getNullValue(raw_ptr_ty()) });
+          { b_.getInt32(kind), b_.getInt32(nleaves), b_.getInt64(dynarr_stride(e)), proto, inner, leaves });
         auto* gv = new llvm::GlobalVariable(env_->llmod, elem_ops_ty(), /*isConstant=*/true,
                                             llvm::GlobalValue::InternalLinkage, init,
                                             "clotho.elem.ops");
-        env_->elem_ops.emplace(static_cast<uint32_t>(at.element), gv);
+        env_->elem_ops.emplace(static_cast<uint32_t>(elem_type), gv);
         return gv;
+    }
+    llvm::Constant* elem_ops_global(Ref container_type) {
+        return elem_ops_for(std::get<Type>(mod_.pool.get(container_type)).element);
     }
 
     // Sort comparator descriptor for the element of `array_type` (LRM 7.12.2
@@ -1337,27 +1502,30 @@ private:
     }
 
     // The opaque rt_queue ring handle slot type
-    // (`%clotho.queue = { ptr, i64, i64, i64 }`), memoized. Must mirror the
-    // runtime rt_queue layout ({ void* base, u64 head, u64 len, u64 cap }).
+    // (`%clotho.queue = { ptr, i64, i64, i64, i64 }`), memoized. Must mirror the
+    // runtime rt_queue layout
+    // ({ void* base, u64 head, u64 len, u64 cap, u64 epoch }).
     llvm::StructType* queue_slot_ty() {
         if (queue_slot_ty_ == nullptr) {
-            queue_slot_ty_ = llvm::StructType::create(
-              ctx_, { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() },
-              "clotho.queue");
+            queue_slot_ty_ = llvm::StructType::create(ctx_,
+                                                      { raw_ptr_ty(), b_.getInt64Ty(),
+                                                        b_.getInt64Ty(), b_.getInt64Ty(),
+                                                        b_.getInt64Ty() },
+                                                      "clotho.queue");
         }
         return queue_slot_ty_;
     }
 
     // Whether a type is a queue (LRM 7.10).
     bool is_queue_type(Ref type) const {
-        return std::get<Type>(mod_.pool.get(type)).kind == Type::Kind::Queue;
+        return types::is_queue(mod_.pool, type);
     }
 
     // A heap-backed handle value type (dynamic array, queue, or associative
     // array): all share the by-pointer, deep-copy subroutine ABI, differing only
     // in the runtime slot struct and the copy / free functions.
     bool is_handle_type(Ref type) const {
-        return is_dynarr_type(type) || is_queue_type(type) || is_assoc_type(type);
+        return types::is_container(mod_.pool, type);
     }
     llvm::StructType* handle_slot_ty(Ref type) {
         if (is_assoc_type(type)) {
@@ -1395,51 +1563,82 @@ private:
         b_.CreateCall(is_queue_type(type) ? queue_delete_all_fn() : dynarr_delete_fn(),
                       { handle, elem_ops_global(type) });
     }
+    // The shared out-of-range sink for a nested-container element: a writable
+    // handle global per element type, emptied before every use.
+    //
+    // Mirrors the string-element sink (lv_string_ptr): with it, an out-of-range
+    // `q[i]` where the element is itself a queue / dynamic array reads as an EMPTY
+    // container (the Table 7-1 default, so `q[99].size()` is 0) and an out-of-range
+    // mutating method lands in the sink and is discarded (LRM 7.4.5), instead of
+    // addressing the heap buffer past its length.
+    llvm::Value* handle_sink_global(Ref elem_type) {
+        const auto key = static_cast<uint32_t>(elem_type);
+        if (const auto it = env_->handle_sinks.find(key); it != env_->handle_sinks.end()) {
+            return it->second;
+        }
+        auto* slot = handle_slot_ty(elem_type);
+        auto* gv   = new llvm::GlobalVariable(env_->llmod,
+                                              slot,
+                                              /*isConstant=*/false,
+                                              llvm::GlobalValue::InternalLinkage,
+                                              llvm::ConstantAggregateZero::get(slot),
+                                              "clotho.handle.sink");
+        env_->handle_sinks.emplace(key, gv);
+        return gv;
+    }
+
     // Pointer to the rt handle slot an lvalue designates: the resolved
     // aggregate leaf slot for a struct-member / class-property / array-element
     // handle, or the bare base for a whole signal / frame local.
-    llvm::Value* lv_handle_ptr(const LValue& lv) {
-        return lv.is_agg ? agg_slot_ptr(lv) : lv.base;
+    //
+    // A handle reached THROUGH a dynamic element index (`q[i]` where the element is
+    // itself a container, or `q[i].inner` where the element is a struct with a
+    // container member) redirects out of range to the sink, so the heap buffer is
+    // never addressed past its live length.
+    //
+    // `a[k]` where the assoc VALUE is a container is a deferred place, so it is
+    // resolved here, and the direction decides which way: a mutating method
+    // (`a[k].push_back(x)`) must create the entry, because LRM 7.10's methods
+    // operate on a queue variable and there is no variable until the entry exists;
+    // a query (`a[k].size()`) must not (LRM 7.8.6 -- reading a nonexistent element
+    // creates nothing), and reads the empty-container default out of the sink.
+    llvm::Value* lv_handle_ptr(const LValue& lv, bool for_write = true) {
+        if (lv.is_assoc) {
+            return lv_handle_ptr(assoc_elem_lvalue(lv, for_write), for_write);
+        }
+        llvm::Value* ptr = lv.is_agg ? agg_slot_ptr(lv) : lv.base;
+        if (lv.dyn_inrange == nullptr || !lv.is_handle) {
+            return ptr;
+        }
+        if (lv.handle_type == Ref::Invalid) {
+            throw BackendError{ "internal: bounds-checked handle lvalue with no element type" };
+        }
+        llvm::Value* sink = handle_sink_global(lv.handle_type);
+        emit_handle_delete(sink, lv.handle_type);
+        return b_.CreateSelect(lv.dyn_inrange, ptr, sink);
     }
 
     // Whether a type is a string, or an unpacked array whose leaf element is.
     bool is_string_type(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            return is_string_type(t.element);
-        }
-        return t.kind == Type::Kind::String;
+        return types::is_string_leaf_array(mod_.pool, type);
     }
 
     // The scalar leaf type of a (possibly nested) unpacked-array type.
     Ref leaf_type(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            return leaf_type(t.element);
-        }
-        return type;
+        return types::leaf_type(mod_.pool, type);
     }
 
     // Total leaf-element count of an unpacked-array type (product of all
     // dimensions); 1 for a scalar leaf.
     uint32_t array_leaf_count(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            const uint32_t count = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
-            return count * array_leaf_count(t.element);
-        }
-        return 1;
+        return types::array_leaf_count(mod_.pool, type);
     }
 
     // Whether a type contains an unpacked struct anywhere (at any array/struct
     // nesting depth). Such a signal is routed through the recursive aggregate
     // storage / addressing / init path, not the flat scalar-or-array fast paths.
     bool contains_struct(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            return contains_struct(t.element);
-        }
-        return t.kind == Type::Kind::Struct && !t.is_packed;
+        return types::contains_struct(mod_.pool, type);
     }
 
     // Whether a type is an unpacked aggregate passed / stored via the recursive
@@ -1450,8 +1649,7 @@ private:
     // -compatible with the caller's canonical actual (a flat module array may be
     // z-elided narrower, so the caller materializes a canonical temp first).
     bool is_agg_abi(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        return t.kind == Type::Kind::UnpackedArray || (t.kind == Type::Kind::Struct && !t.is_packed);
+        return types::is_agg_abi(mod_.pool, type);
     }
 
     // Whether a type takes the recursive aggregate storage mirror: it contains
@@ -1460,49 +1658,18 @@ private:
     // recursive walks provide. Flat string arrays keep the dedicated
     // string-array path (is_string_type is tested first at both call sites).
     bool needs_agg_storage(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        if (t.kind == Type::Kind::UnpackedArray) {
-            const Type::Kind ek = std::get<Type>(mod_.pool.get(t.element)).kind;
-            if (ek == Type::Kind::DynArray || ek == Type::Kind::Queue ||
-                ek == Type::Kind::Assoc) {
-                return true;
-            }
-            return needs_agg_storage(t.element);
-        }
-        return t.kind == Type::Kind::Struct && !t.is_packed;
+        return types::needs_agg_storage(mod_.pool, type);
     }
 
     // Whether a type owns heap anywhere (string / dynamic array / queue leaf
     // at any nesting depth), so its aggregate storage needs a deinit walk.
     bool has_heap_leaf(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        switch (t.kind) {
-            case Type::Kind::String:
-            case Type::Kind::DynArray:
-            case Type::Kind::Queue:
-            case Type::Kind::Assoc:
-                return true;
-            case Type::Kind::UnpackedArray:
-                return has_heap_leaf(t.element);
-            case Type::Kind::Struct: {
-                if (t.is_packed) {
-                    return false;
-                }
-                for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
-                    if (has_heap_leaf(f.type)) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            default:
-                return false;
-        }
+        return types::has_heap_leaf(mod_.pool, type);
     }
 
     // Element count of one unpacked-array dimension.
     uint32_t array_dim(const Type& t) const {
-        return (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+        return types::array_dim(t);
     }
 
     // Leaf slot type for a scalar / real aggregate leaf. A 4-state leaf carries a
@@ -1643,8 +1810,9 @@ private:
             // associative-array ops (which address it via lv_handle_ptr) and by
             // ElemSelect / AssocSelect descent; a plane Load/Store on it is a
             // lowering bug and traps.
-            lv.is_handle = true;
-            lv.slot_ty   = handle_slot_ty(leaf_type);
+            lv.is_handle   = true;
+            lv.handle_type = leaf_type;
+            lv.slot_ty     = handle_slot_ty(leaf_type);
             return;
         }
         const Layout   lay  = mod_.pool.layout(leaf_type);
@@ -1701,8 +1869,7 @@ private:
     // Whether an IR type is a scalar / string / real leaf (as opposed to an
     // unpacked struct or array that a select must descend further).
     bool is_leaf_type(Ref type) const {
-        const Type& t = std::get<Type>(mod_.pool.get(type));
-        return t.kind != Type::Kind::UnpackedArray && !(t.kind == Type::Kind::Struct && !t.is_packed);
+        return !types::is_aggregate(mod_.pool, type);
     }
 
     // Derive member `field_index`'s lvalue from an aggregate lvalue: push the
@@ -1871,7 +2038,17 @@ private:
             // ArrayType / leaf slots), addressed by a composed GEP path. Its
             // scalar/string leaves reachable by a static (struct-field-only) path
             // are enumerated for nonblocking staging.
-            if (needs_agg_storage(sigs[i].type) || (sigs[i].force_agg && is_agg_abi(sigs[i].type))) {
+            //
+            // A `ref` actual of plain array type deliberately does NOT switch models:
+            // it keeps flat storage and only its ELEMENT SHAPE is canonicalized
+            // below. That is sufficient, because a flat `[N x slot]` over canonical
+            // element slots is byte-identical to the canonical mirror (row-major,
+            // same leaf slot type) — only the GEP shape differs, and both sides
+            // compute the same address. Switching models here instead would leave a
+            // ref-actual array and an ordinary one of the SAME type with different
+            // storage, which a whole-array copy between the two cannot express.
+            if (needs_agg_storage(sigs[i].type) ||
+                (sigs[i].force_agg && is_agg_abi(sigs[i].type))) {
                 slot.is_agg     = true;
                 slot.has_z      = false;
                 slot.storage_ty = agg_storage_ty(sigs[i].type);
@@ -1931,6 +2108,18 @@ private:
             // keep the packed word. Every other 2-state path (scalar/array NBA
             // shadow + commit, $readmem via rt_readmem) is width-driven off `narrow`.
             slot.narrow = !slot.four_state && !slot.has_z;
+            // A `ref` actual overrides all of that with the CANONICAL type-derived
+            // shape: a ref formal ALIASES this storage rather than copying through
+            // it, and the formal's own shape is fixed by its type (the same rule an
+            // aggregate leaf follows), so the two only agree if the actual is shaped
+            // by type as well. Safe to override ptr_arg here because a user signal
+            // becomes ptr_arg ONLY by being a ref actual — an out / inout actual is
+            // passed as a compiler-materialized temp, never the variable itself
+            // (Lower.cpp's make_arg_temp), and a temp is never a ref actual.
+            if (facts_.ref_arg[i]) {
+                slot.has_z  = slot.four_state;
+                slot.narrow = !slot.four_state;
+            }
             slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z, slot.narrow);
             if (ty.kind == Type::Kind::UnpackedArray) {
                 slot.is_array   = true;
@@ -2216,14 +2405,14 @@ private:
                 }
                 continue;
             }
-            // A whole-queue nonblocking assignment (`q <= rhs`, its own op): the
-            // target queue signal defers a staged deep copy into a per-queue
-            // buffer, moved into the live handle in the NBA region.
-            if (ir.tag(idx) == Inst::Tag::QueueCopyNb) {
+            // A whole-container nonblocking assignment (`q <= rhs`, `d <= rhs`,
+            // `a <= rhs` -- its own op): the target signal defers a staged deep copy
+            // into a per-signal buffer, moved into the live handle in the NBA region.
+            if (ir.tag(idx) == Inst::Tag::HandleCopyNb) {
                 const NbaTarget t = nba_target(ir, ir.payload(idx).op_extra.op);
-                if (std::find(queue_nba_sigs_.begin(), queue_nba_sigs_.end(), t.sig) ==
-                    queue_nba_sigs_.end()) {
-                    queue_nba_sigs_.push_back(t.sig);
+                if (std::find(handle_nba_sigs_.begin(), handle_nba_sigs_.end(), t.sig) ==
+                    handle_nba_sigs_.end()) {
+                    handle_nba_sigs_.push_back(t.sig);
                 }
                 continue;
             }
@@ -2540,16 +2729,60 @@ private:
         return llvm::ConstantStruct::get(slot_ty, fields);
     }
 
-    // Pointer to a ref actual's slot, passed to the callee as the aliased storage.
-    // A whole scalar is its slot pointer; an unpacked-array element is `&array[idx]`
-    // (its element slot). The selection must be a whole element — the callee GEPs it
-    // as a packed `{ i(2W), iW }` slot, with no bit/part offset. The frontend guards
-    // to these shapes (is_whole_ref_actual); this rejects anything else defensively.
+    // The words a `ref` actual passes (docs/design/data-model.md §3): the aliased
+    // storage pointer, and — only for a formal bound somewhere to a container
+    // element (§3.0) — the relocation epoch of the container the place is rooted in
+    // and that epoch's value now.
+    //
+    // No site record. A staleness report needs the formal's name, which is the
+    // callee's own, and the container's name, which the runtime recovers from the
+    // epoch pointer (§3.3) — so nothing about the report is caller knowledge that
+    // has to be shipped per call.
+    //
+    // `slot` is the whole storage of the selected place, whatever its class: a
+    // plane slot, a managed handle, or an aggregate image. A bit / part selection
+    // is not a place a pointer can name, so it is rejected — the frontend guards
+    // it too (is_whole_ref_actual), and this is the defensive backstop.
+    RefBinding ref_actual_arg(const LValue& raw) {
+        // An associative-array element is a DEFERRED place, and a `ref` is its third
+        // consumer alongside Load and Store: it needs the address itself. Resolve it
+        // with put_ptr, because LRM 13.5.2 binds the formal to a VARIABLE — there is
+        // no variable to alias until the entry exists, so forming the ref creates it,
+        // exactly as a mutating method on `a[k]` does.
+        const LValue lv = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
+        RefBinding   rb;
+        // A stable place has no epoch to watch; pointing at the compile-time zero
+        // word keeps the callee's check uniform.
+        if (lv.epoch_ptr != nullptr) {
+            rb.epoch  = lv.epoch_ptr;
+            rb.expect = b_.CreateLoad(b_.getInt64Ty(), lv.epoch_ptr, "ref.epoch.at.call");
+        } else {
+            rb.epoch  = no_epoch_global();
+            rb.expect = b_.getInt64(0);
+        }
+        rb.slot = ref_actual_ptr(lv);
+        return rb;
+    }
+
+    // Pointer to a ref actual's storage: the aliased place the callee holds.
+    // A whole scalar is its slot pointer; an unpacked-array or container element is
+    // `&array[idx]`; an aggregate is its image pointer; a managed value is its
+    // handle pointer.
     llvm::Value* ref_actual_ptr(const LValue& lv) {
-        const bool whole = !lv.is_string && lv.range_mask == nullptr &&
-                           is_zero_const(lv.bit_off) && lv.width == lv.store_width;
+        if (lv.is_agg) {
+            // An aggregate (or a managed leaf inside one) is addressed by its GEP
+            // path; the ABI guarantees the canonical layout on both sides.
+            return agg_slot_ptr(lv);
+        }
+        if (lv.is_string || lv.is_handle) {
+            // A managed place: the ref aliases the handle itself, so the callee's
+            // deep-copy / mutation lands on the actual.
+            return lv.is_string ? lv_string_ptr(lv) : lv_handle_ptr(lv);
+        }
+        const bool whole =
+          lv.range_mask == nullptr && is_zero_const(lv.bit_off) && lv.width == lv.store_width;
         if (!whole) {
-            throw BackendError{ "ref actual must be a whole variable or unpacked-array element" };
+            throw BackendError{ "ref actual must be a whole variable, element or member" };
         }
         if (lv.array_ty == nullptr) {
             return lv.base;
@@ -2729,6 +2962,7 @@ private:
                 str_vals_.assign(ir_->inst_count(), nullptr);
                 build_str_temps();
                 build_dynarr_temps();
+                build_agg_elem_temps();
                 lower_region(ir_->root());
                 deinit_body_strings();
                 b_.CreateRetVoid();
@@ -2783,6 +3017,7 @@ private:
                 str_vals_.assign(ir_->inst_count(), nullptr);
                 build_str_temps();
                 build_dynarr_temps();
+                build_agg_elem_temps();
                 lower_region(ir_->root());
                 deinit_body_strings();
             }
@@ -2868,13 +3103,16 @@ private:
         // always-loop group never reaches.)
         std::vector<std::vector<llvm::Value*>> member_strs;
         std::vector<std::vector<llvm::Value*>> member_dynarr;
+        std::vector<std::vector<llvm::Value*>> member_agg_elem;
         for (const uint32_t m : members) {
             select_member(m); // sizes the type cache build_str_temps consults
             str_vals_.assign(ir_->inst_count(), nullptr);
             build_str_temps();
             build_dynarr_temps();
+            build_agg_elem_temps();
             member_strs.push_back(str_vals_);
             member_dynarr.push_back(dynarr_ret_);
+            member_agg_elem.push_back(agg_elem_ret_);
         }
         ir_ = &proc.ir;
 
@@ -2949,8 +3187,9 @@ private:
             emit_defer_gen_bump(); // activation start = deferred-assertion flush point
             for (size_t i = 0; i < members.size(); ++i) {
                 select_member(members[i]);
-                str_vals_   = member_strs[i];
-                dynarr_ret_ = member_dynarr[i];
+                str_vals_     = member_strs[i];
+                dynarr_ret_   = member_dynarr[i];
+                agg_elem_ret_ = member_agg_elem[i];
                 lower_region(ir_->root());              // member body (per trigger)
             }
             b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
@@ -2963,8 +3202,9 @@ private:
             // Never fused: a non-always (or sensitivity-less) group is a singleton.
             emit_defer_gen_bump(); // single-shot body: one activation, one flush point
             select_member(proc_index);
-            str_vals_   = member_strs.front();
-            dynarr_ret_ = member_dynarr.front();
+            str_vals_     = member_strs.front();
+            dynarr_ret_   = member_dynarr.front();
+            agg_elem_ret_ = member_agg_elem.front();
             lower_region(ir_->root());
         }
 
@@ -3152,7 +3392,15 @@ private:
             const Ref     pt  = f.param_types[k];
             const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
             if (dir == ArgDir::Ref) {
-                params.push_back(ptr); // one pointer to the actual's packed slot
+                // The actual's storage pointer, plus -- only when some call site
+                // binds this formal to a place inside a container's heap buffer --
+                // the relocation epoch of that container, its value at the call, and
+                // the site record for the staleness report (§3.0).
+                params.push_back(ptr);                 // &actual storage
+                if (ref_needs_epoch(f, k)) {
+                    params.push_back(ptr);             // &epoch
+                    params.push_back(b_.getInt64Ty()); // expected epoch
+                }
                 continue;
             }
             // A dynamic array or queue is one handle pointer regardless of
@@ -3212,7 +3460,12 @@ private:
         params.push_back(ptr); // wheel
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             if (f.arg_dirs[k] == ArgDir::Ref) {
-                params.push_back(ptr); // one pointer to the actual's packed slot
+                // The same shape declare_function builds, narrow or fat.
+                params.push_back(ptr);                 // &actual storage
+                if (ref_needs_epoch(f, k)) {
+                    params.push_back(ptr);             // &epoch
+                    params.push_back(b_.getInt64Ty()); // expected epoch
+                }
             } else if (is_handle_type(f.param_types[k])) {
                 params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*), any direction
             } else if (is_agg_abi(f.param_types[k])) {
@@ -3244,28 +3497,43 @@ private:
         return fn;
     }
 
-    // LLVM param index of formal k's first parameter (state, wheel, then 2 per
-    // formal). The record slot follows all formals.
     // LLVM arg index of each formal's first parameter for `f`'s signature shape:
-    // functions start after `state`, tasks after `state, wheel`; a string input
-    // formal is one ptr, everything else two params. Replaces a fixed
-    // 1 + 2k / 2 + 2k stride, which string formals break.
-    // Whether formal k occupies a single LLVM parameter (a ref pointer, or a
-    // string input handle) rather than the (mm, z) pair every other formal uses.
-    bool one_param_formal(const Function& f, size_t k) const {
+    // functions start after `state`, tasks after `state, wheel`. The record slot
+    // follows all formals.
+
+    // How many LLVM parameters formal k occupies:
+    //   4 — a `ref` fat pointer { &storage, &epoch, expect, site }
+    //   1 — an aggregate storage pointer, a container handle pointer, or a string
+    //       input handle (each one pointer in every direction it is allowed in)
+    //   2 — everything else: the (must|may, z) plane pair, or the
+    //       (&mm, &z) out / inout pointer pair
+    // Whether ref formal k of `f` carries the relocation-epoch words. Only a formal
+    // some call site binds to a place inside a container's heap buffer does; a ref
+    // to a variable, a fixed-array element, a struct member, a class property or a
+    // whole container HANDLE aliases storage that cannot move, so it is one plain
+    // pointer and the callee emits no check (docs/design/data-model.md §3.0).
+    bool ref_needs_epoch(const Function& f, size_t k) const {
+        const auto it = fn_ids_.find(&f);
+        // A function the map has not seen cannot be reasoned about; keep the guard.
+        return it == fn_ids_.end() || facts_.ref_needs_epoch(it->second, k);
+    }
+
+    uint32_t formal_param_count(const Function& f, size_t k) const {
         if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-            return true;
+            return ref_needs_epoch(f, k) ? 3u : 1u;
         }
         // An aggregate is one storage pointer, in every direction (function or task).
         if (is_agg_abi(f.param_types[k])) {
-            return true;
+            return 1;
         }
-        // A dynamic array or queue is one handle pointer in every direction (input /
-        // output / inout all pass &actual; the callee copies in/out through it).
+        // A container handle is one pointer in every direction (input / output /
+        // inout all pass &actual; the callee copies in/out through it).
         if (is_handle_type(f.param_types[k])) {
-            return true;
+            return 1;
         }
-        return is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In);
+        const bool str_one =
+          is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In);
+        return str_one ? 1u : 2u;
     }
 
     std::vector<uint32_t> param_indices(const Function& f) const {
@@ -3273,7 +3541,7 @@ private:
         uint32_t              cur = f.is_task ? 2 : 1;
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             idx[k] = cur;
-            cur += one_param_formal(f, k) ? 1 : 2;
+            cur += formal_param_count(f, k);
         }
         return idx;
     }
@@ -3284,17 +3552,22 @@ private:
         if (idx.empty()) {
             return 2;
         }
-        return idx.back() + (one_param_formal(f, f.param_types.size() - 1) ? 1 : 2);
+        return idx.back() + formal_param_count(f, f.param_types.size() - 1);
     }
 
     // Build a function's frame struct: one slot field per local, in Local-handle
     // order (a Local's index is its GEP field index).
     // Locals that cannot use the narrow iW slot (they stay packed `{ i(2W), iW }`):
-    //   - passed as a task-call output / inout argument (the callee writes them back
-    //     through the packed-word pointer ABI), or
-    //   - passed as a ref argument to a function or task (the callee GEPs the passed
-    //     pointer with a packed slot type; the actual's storage must match).
-    // A plain function's own outputs are by-value and dropped, so only these apply.
+    // a local passed as a task-call output / inout argument, because the callee
+    // writes it back through the packed-word (&mm, &z) pointer ABI.
+    //
+    // A `ref` actual is deliberately NOT marked. A ref formal's own slot takes the
+    // canonical type-derived shape (narrow for 2-state, packed for 4-state), the
+    // same rule an aggregate leaf follows, so forcing the actual packed would
+    // instead GUARANTEE a mismatch — which is what a fixed-array element ref
+    // actual hit: the callee wrote an i64 through a narrow i32 element slot and
+    // overran into its neighbour. Matching by type on both sides is the invariant;
+    // see docs/design/data-model.md §3.
     std::vector<bool> frame_out_targets(const Function& f) const {
         std::vector<bool> out(f.local_types.size(), false);
         const Ir&         ir = f.ir;
@@ -3302,7 +3575,8 @@ private:
             const Function& callee = mod_.function(fid);
             const auto      args   = ir.region(argslice);
             for (size_t a = 0; a < args.size(); ++a) {
-                if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In) {
+                if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In ||
+                    callee.arg_dirs[a] == ArgDir::Ref) {
                     continue;
                 }
                 const Index root = lvalue_root(ir, args[a]).root;
@@ -3327,17 +3601,10 @@ private:
                 mark_packed_args(vci.func, vci.args);
             } else if (ir.tag(idx) == Inst::Tag::Fork) {
                 // Every fork capture is an ArgDir::Ref formal of every child
-                // (Lower.cpp's lower_fork), and a child GEPs the passed pointer as a
-                // packed slot, so the captured local must keep one. Any child's
-                // arg_dirs would do -- they are identical -- so mark unconditionally
-                // rather than looking one up.
-                const auto fi = ir.extra_data<ForkInfo>(ir.payload(idx).extra);
-                for (const Index a : ir.region(fi.args)) {
-                    const Index root = lvalue_root(ir, a).root;
-                    if (ir.tag(root) == Inst::Tag::Local) {
-                        out[ir.payload(root).local.index] = true;
-                    }
-                }
+                // (Lower.cpp's lower_fork), so like any other ref actual the capture
+                // keeps its canonical type-derived slot rather than being forced
+                // packed -- the child's formal takes the same shape. Nothing to mark.
+                continue;
             }
         }
         return out;
@@ -3346,7 +3613,7 @@ private:
     void build_frame_layout(const Function& f) {
         const size_t n = f.local_types.size();
         frame_slots_.assign(n, FrameSlot{});
-        ref_ptr_.assign(n, nullptr);
+        ref_ptr_.assign(n, RefBinding{});
         const std::vector<bool>  out_target = frame_out_targets(f);
         std::vector<llvm::Type*> fields(n);
         for (uint32_t i = 0; i < n; ++i) {
@@ -3359,42 +3626,54 @@ private:
             // actual pointer. The redirect GEPs a packed slot, so force one here.
             const bool is_ref_formal = i < f.arg_dirs.size() && f.arg_dirs[i] == ArgDir::Ref;
             frame_slots_[i].is_ref   = is_ref_formal;
-            // A plain fixed unpacked array frame local / by-value formal takes the
-            // canonical aggregate storage mirror too, so its element addressing and
-            // copy-in reuse the aggregate path. Struct-bearing types keep their
-            // exact prior treatment (needs_agg_storage); a ref array formal keeps
-            // the dead-field redirect (handled below).
-            if (needs_agg_storage(f.local_types[i]) ||
-                (!is_ref_formal && is_agg_abi(f.local_types[i]))) {
+            // A fixed unpacked array or unpacked struct — including a ref formal of
+            // one — takes the canonical aggregate storage mirror, so element and
+            // member addressing, copy-in and whole-object copies all reuse the
+            // aggregate path. For a ref formal the frame field stays dead and
+            // local_lvalue re-bases onto the passed pointer, which the ABI
+            // guarantees has this exact canonical layout.
+            if (needs_agg_storage(f.local_types[i]) || is_agg_abi(f.local_types[i])) {
                 frame_slots_[i].is_agg     = true;
                 frame_slots_[i].storage_ty = agg_storage_ty(f.local_types[i]);
                 fields[i]                  = frame_slots_[i].storage_ty;
                 continue;
             }
+            // A ref string formal aliases the caller's handle rather than owning
+            // one, so it must not be init'd or deinit'd as a body string; the
+            // is_string shape is still what load / store needs, and init_frame /
+            // deinit_body_strings already skip every is_ref local.
             if (is_string_type(f.local_types[i])) {
                 frame_slots_[i].is_string = true;
                 frame_slots_[i].slot_ty   = str_slot_ty();
                 fields[i]                 = frame_slots_[i].slot_ty;
                 continue;
             }
-            // A ref dynamic-array / queue formal aliases the caller's handle (no
-            // owned frame slot, no init/copy/free): fall through to the dead-field
-            // path, and local_lvalue redirects its base to the passed pointer.
-            if (is_handle_type(f.local_types[i]) && !is_ref_formal) {
-                frame_slots_[i].is_dynarr    = is_dynarr_type(f.local_types[i]);
-                frame_slots_[i].is_queue     = is_queue_type(f.local_types[i]);
-                frame_slots_[i].is_assoc     = is_assoc_type(f.local_types[i]);
-                frame_slots_[i].handle_type  = f.local_types[i];
-                frame_slots_[i].slot_ty      = handle_slot_ty(f.local_types[i]);
-                fields[i]                    = frame_slots_[i].slot_ty;
+            // A container local, including a ref formal of one: the ref's frame
+            // field stays dead and local_lvalue re-bases onto the passed handle
+            // pointer, but the handle slot shape is still what every consumer
+            // needs. init_frame and deinit_body_strings skip every is_ref local, so
+            // a borrowed handle is neither emptied on entry nor freed on exit.
+            if (is_handle_type(f.local_types[i])) {
+                frame_slots_[i].is_dynarr   = is_dynarr_type(f.local_types[i]);
+                frame_slots_[i].is_queue    = is_queue_type(f.local_types[i]);
+                frame_slots_[i].is_assoc    = is_assoc_type(f.local_types[i]);
+                frame_slots_[i].handle_type = f.local_types[i];
+                frame_slots_[i].slot_ty     = handle_slot_ty(f.local_types[i]);
+                fields[i]                   = frame_slots_[i].slot_ty;
                 continue;
             }
             // A 2-state local uses the genuine iW slot; the packed-word ABI wire is
             // bridged by copy-in/out. A 4-state local keeps its z field (the ABI and
             // copy-in/out use it; LLVM folds the zero-z traffic on its own). A local
-            // passed as a task out/inout target — or a ref formal / ref actual — stays
-            // packed (the packed-word pointer ABI writes it back / aliases it).
-            frame_slots_[i].narrow  = !frame_slots_[i].four_state && !out_target[i] && !is_ref_formal;
+            // passed as a task out/inout target stays packed — the callee writes it
+            // back through the (mm, z) pointer ABI.
+            //
+            // A ref formal takes the CANONICAL type-derived shape, i.e. exactly what
+            // an aggregate leaf of the same type gets (agg_leaf_slot_ty). That is the
+            // one rule that makes both sides of an alias agree without either side
+            // knowing the other: the actual is forced to the same shape (see
+            // DesignFacts::ref_arg and frame_out_targets).
+            frame_slots_[i].narrow = !frame_slots_[i].four_state && !out_target[i];
             // A non-narrow slot keeps its z field: a 4-state local needs it, and a
             // packed 2-state out-target local is written back through the (mm, z)
             // pointer ABI. A narrow local has no z.
@@ -3450,6 +3729,12 @@ private:
     // a task's completion epilogue, and before a process's final suspend.
     void deinit_body_strings() {
         for (uint32_t i = 0; i < frame_slots_.size(); ++i) {
+            // A ref formal owns nothing: it borrows the actual's storage, which the
+            // caller still owns and will release itself. Freeing through it would
+            // destroy a live caller value.
+            if (frame_slots_[i].is_ref) {
+                continue;
+            }
             if (frame_slots_[i].is_string) {
                 b_.CreateCall(str_deinit_fn(), { b_.CreateStructGEP(frame_ty_, frame_, i) });
             } else if (frame_slots_[i].is_dynarr || frame_slots_[i].is_queue ||
@@ -3458,8 +3743,7 @@ private:
                 // storage (value semantics): free it at every body exit.
                 emit_handle_delete(b_.CreateStructGEP(frame_ty_, frame_, i),
                                    frame_slots_[i].handle_type);
-            } else if (frame_slots_[i].is_agg && !frame_slots_[i].is_ref &&
-                       has_heap_leaf(frame_slots_[i].ir_type)) {
+            } else if (frame_slots_[i].is_agg && has_heap_leaf(frame_slots_[i].ir_type)) {
                 // An aggregate local with string / handle leaves owns their heap
                 // buffers at any nesting depth: recursive teardown.
                 std::vector<llvm::Value*> path;
@@ -3472,6 +3756,20 @@ private:
         }
         for (const auto& [temp, type] : dynarr_temp_list_) {
             emit_handle_delete(temp, type);
+        }
+        for (const auto& [temp, type] : agg_elem_temp_list_) {
+            // A popped element was RELOCATED into this buffer, so whatever heap
+            // storage it carries is ours to free: a nested container's buffer, or an
+            // aggregate's string / container leaves (a POD-leaf element owns nothing).
+            if (is_handle_type(type)) {
+                emit_handle_delete(temp, type);
+                continue;
+            }
+            if (!has_heap_leaf(type)) {
+                continue;
+            }
+            std::vector<llvm::Value*> path;
+            emit_agg_deinit(type, temp, path, agg_storage_ty(type));
         }
     }
 
@@ -3510,11 +3808,15 @@ private:
         state_->setName("state");
 
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
+        // Ref formals bind FIRST: they emit no code, but build_str_temps resolves
+        // local lvalues (to forward a concat straight into its target handle), and
+        // a ref local's address is the passed pointer rather than a frame field.
+        bind_ref_formals(f);
         init_frame();
         emit_agg_copyin(f);
         build_str_temps();
         build_dynarr_temps();
-        bind_ref_formals(f);
+        build_agg_elem_temps();
         emit_copyin(f);
 
         lower_region(ir_->root());
@@ -3549,6 +3851,11 @@ private:
     void emit_agg_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             if (!is_agg_abi(f.param_types[k])) {
+                continue;
+            }
+            // A ref formal has no frame storage to seed: it aliases the actual, so
+            // there is nothing to copy either way.
+            if (f.arg_dirs[k] == ArgDir::Ref) {
                 continue;
             }
             // An output formal is written by the body, not seeded from the caller
@@ -3682,11 +3989,12 @@ private:
         // value, and the body starts on the caller's first resume — the same instant
         // the call is made (LRM 13.5.1 copies in at the call).
         b_.SetInsertPoint(start_bb);
+        bind_ref_formals(f);
         init_frame();
         emit_agg_copyin(f);
         build_str_temps();
         build_dynarr_temps();
-        bind_ref_formals(f);
+        build_agg_elem_temps();
         emit_copyin(f);
         // On the target's activation list before the body can park, off it again in
         // the epilogue: a `disable` must see every activation that is live, and none
@@ -3790,14 +4098,24 @@ private:
         task_epilogue_bb_ = nullptr;
     }
 
-    // Record each ref formal's passed actual pointer into ref_ptr_ (Local k == formal
-    // k), so local_lvalue aliases the actual's storage live. Called in the callee
-    // prologue of both functions and tasks. A ref formal takes no copy-in / copy-out.
+    // Record each ref formal's fat pointer into ref_ptr_ (Local k == formal k), so
+    // local_lvalue aliases the actual's storage live and can check the actual's
+    // container epoch on every access. Called in the callee prologue of both
+    // functions and tasks. A ref formal takes no copy-in / copy-out.
     void bind_ref_formals(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
-            if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-                ref_ptr_[k] = fn_->getArg(param_llvm_index_[k]);
+            if (f.arg_dirs.empty() || f.arg_dirs[k] != ArgDir::Ref) {
+                continue;
             }
+            const uint32_t p = param_llvm_index_[k];
+            ref_ptr_[k].slot = fn_->getArg(p);
+            if (ref_needs_epoch(f, k)) {
+                ref_ptr_[k].epoch  = fn_->getArg(p + 1);
+                ref_ptr_[k].expect = fn_->getArg(p + 2);
+            }
+            // `formal` names the binding in a staleness report. It is a property of
+            // the CALLEE, so it is held here rather than shipped per call.
+            ref_ptr_[k].formal = f.name + " argument " + std::to_string(k + 1);
         }
     }
 
@@ -4788,6 +5106,8 @@ private:
                 b_.CreateStore(sym(a.shadow_gv), sym(a.shadow_base_gv));
             }
         }
+
+        emit_ref_name_table();
 
         // Register one DPI scope per top (svGetScope / user-data, LRM 35.5.3) before
         // any process runs, so a context import can read it. Only when DPI is used.
@@ -7993,7 +8313,7 @@ private:
     llvm::Value* emit_nba_any_staged() {
         auto*        ptr_ty = llvm::PointerType::getUnqual(ctx_);
         llvm::Value* any    = b_.getFalse();
-        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty()) {
             // rt_nba_arr_any is the total across the shared array + aggregate +
             // queue buffers.
             any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_any_fn(), {}), b_.getInt32(0)));
@@ -8042,15 +8362,15 @@ private:
         // Deferred writes through a runtime array index: replay each array's
         // typed records and each aggregate's memcpy records (both from the
         // shared rt_nba_arr_* buffers), waking Any-edge readers, then reset.
-        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty()) {
             for (const Signal sig : array_nba_sigs_) {
                 emit_array_commit(sig, state);
             }
             for (const Signal sig : agg_nba_sigs_) {
                 emit_agg_array_commit(sig, state);
             }
-            for (const Signal sig : queue_nba_sigs_) {
-                emit_queue_whole_commit(sig);
+            for (const Signal sig : handle_nba_sigs_) {
+                emit_handle_whole_commit(sig);
             }
             // VCD: touch each dumped array that took an NBA write this instant,
             // so the flush scans its elements only on write instants (not every
@@ -8141,7 +8461,7 @@ private:
         // The array-NBA record buffers are process-global; clear any state a prior
         // simulation in this process left staged (e.g. a $finish between staging and
         // the NBA commit) so this run starts empty.
-        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !queue_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty()) {
             b_.CreateCall(nba_arr_reset_fn(), {});
         }
         // Same for the deferred intra-assignment record pools — reclaim any records
@@ -8278,7 +8598,7 @@ private:
         // re-drains the active queue at the SAME instant; otherwise it falls through
         // to the wheel. So active and NBA iterate until both settle before time moves.
         const bool has_nba = !array_nba_sigs_.empty() || !agg_nba_sigs_.empty() ||
-                             !queue_nba_sigs_.empty() || !block_commits_.empty() ||
+                             !handle_nba_sigs_.empty() || !block_commits_.empty() ||
                              !nb_event_sigs_.empty() || !intra_nba_sigs_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
@@ -8932,46 +9252,48 @@ private:
         return rt_fn("rt_dynarr_new_copy", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_dynarr_delete(rt_dynarr*)
     // void rt_dynarr_delete(rt_dynarr*, const rt_elem_ops*)
     llvm::FunctionCallee dynarr_delete_fn() {
         return rt_fn("rt_dynarr_delete", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, i64 stride)
     // void rt_dynarr_assign(rt_dynarr*, const rt_dynarr*, const rt_elem_ops*, const rt_alloc_site*)
     llvm::FunctionCallee dynarr_assign_fn() {
         return rt_fn("rt_dynarr_assign", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_dynarr_reverse(rt_dynarr*, i64 stride)  (LRM 7.12.2)
-    llvm::FunctionCallee dynarr_reverse_fn() {
-        return rt_fn("rt_dynarr_reverse", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+    // void rt_dynarr_move(rt_dynarr* dst, rt_dynarr* src, const rt_elem_ops*)
+    llvm::FunctionCallee dynarr_move_fn() {
+        return rt_fn("rt_dynarr_move", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_dynarr_sort(rt_dynarr*, i64 stride, i32 kind, i32 width, i32 rev)
+    // void rt_dynarr_reverse(rt_dynarr*, const rt_elem_ops*)  (LRM 7.12.2)
+    llvm::FunctionCallee dynarr_reverse_fn() {
+        return rt_fn("rt_dynarr_reverse", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // void rt_dynarr_sort(rt_dynarr*, const rt_elem_ops*, i32 kind, i32 width, i32 rev)
     llvm::FunctionCallee dynarr_sort_fn() {
         return rt_fn("rt_dynarr_sort", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(),
+                       b_.getInt32Ty() });
     }
-    // void rt_dynarr_shuffle(rt_dynarr*, i64 stride, i64* rng)  (LRM 7.12.2)
+    // void rt_dynarr_shuffle(rt_dynarr*, const rt_elem_ops*, i64* rng)  (LRM 7.12.2)
     llvm::FunctionCallee dynarr_shuffle_fn() {
-        return rt_fn("rt_dynarr_shuffle", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+        return rt_fn("rt_dynarr_shuffle", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
 
     // -- Queue runtime (rt_queue_*, LRM 7.10) --
-    // void rt_queue_push_{back,front}(rt_queue*, i64 stride, i64 bound, const void* elem)
     // void rt_queue_push_{back,front}(rt_queue*, const rt_elem_ops*, u64 bound, const void* elem,
     //                                 const rt_alloc_site*)
     llvm::FunctionCallee queue_push_fn(bool front) {
         return rt_fn(front ? "rt_queue_push_front" : "rt_queue_push_back", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_queue_pop_{back,front}(rt_queue*, i64 stride, void* out)
     // void rt_queue_pop_{back,front}(rt_queue*, const rt_elem_ops*, void* out)
     llvm::FunctionCallee queue_pop_fn(bool front) {
         return rt_fn(front ? "rt_queue_pop_front" : "rt_queue_pop_back", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_queue_insert(rt_queue*, i64 stride, i64 bound, i64 i, const void* elem)
     // void rt_queue_insert(rt_queue*, const rt_elem_ops*, u64 bound, u64 i, const void* elem,
     //                      const rt_alloc_site*)
     llvm::FunctionCallee queue_insert_fn() {
@@ -8979,13 +9301,11 @@ private:
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty(),
                        raw_ptr_ty() });
     }
-    // void rt_queue_delete_idx(rt_queue*, i64 stride, i64 i)
     // void rt_queue_delete_idx(rt_queue*, const rt_elem_ops*, u64 i)
     llvm::FunctionCallee queue_delete_idx_fn() {
         return rt_fn("rt_queue_delete_idx", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
     }
-    // void rt_queue_delete_all(rt_queue*)
     // void rt_queue_delete_all(rt_queue*, const rt_elem_ops*)
     llvm::FunctionCallee queue_delete_all_fn() {
         return rt_fn("rt_queue_delete_all", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
@@ -9014,18 +9334,20 @@ private:
                      { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(),
                        b_.getInt64Ty(), raw_ptr_ty() });
     }
-    // void rt_queue_reverse(rt_queue*, i64 stride)  (LRM 7.12.2)
+    // void rt_queue_reverse(rt_queue*, const rt_elem_ops*)  (LRM 7.12.2)
     llvm::FunctionCallee queue_reverse_fn() {
-        return rt_fn("rt_queue_reverse", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+        return rt_fn("rt_queue_reverse", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
-    // void rt_queue_sort(rt_queue*, i64 stride, i32 kind, i32 width, i32 rev)
+    // void rt_queue_sort(rt_queue*, const rt_elem_ops*, i32 kind, i32 width, i32 rev)
     llvm::FunctionCallee queue_sort_fn() {
         return rt_fn("rt_queue_sort", b_.getVoidTy(),
-                     { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(),
+                       b_.getInt32Ty() });
     }
-    // void rt_queue_shuffle(rt_queue*, i64 stride, i64* rng)  (LRM 7.12.2)
+    // void rt_queue_shuffle(rt_queue*, const rt_elem_ops*, i64* rng)  (LRM 7.12.2)
     llvm::FunctionCallee queue_shuffle_fn() {
-        return rt_fn("rt_queue_shuffle", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
+        return rt_fn("rt_queue_shuffle", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
 
     // -- Associative-array runtime entry points (LRM 7.8/7.9). Keys pass as a
@@ -9084,6 +9406,11 @@ private:
         return rt_fn("rt_assoc_assign", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
+    // void rt_assoc_move(rt_assoc* dst, rt_assoc* src, const rt_elem_ops*)
+    llvm::FunctionCallee assoc_move_fn() {
+        return rt_fn("rt_assoc_move", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
 
     llvm::FunctionCallee str_init_fn() {
         return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
@@ -9093,6 +9420,10 @@ private:
     }
     llvm::FunctionCallee str_assign_fn() {
         return rt_fn("rt_string_assign", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // void rt_string_move(rt_string* dst, rt_string* src)
+    llvm::FunctionCallee str_move_fn() {
+        return rt_fn("rt_string_move", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
     // void rt_string_assign_bytes(rt_string*, const char* bytes, i64 len, const rt_alloc_site*)
     llvm::FunctionCallee str_assign_bytes_fn() {
@@ -9600,13 +9931,10 @@ private:
             return llvm::ConstantAggregateZero::get(s.storage_ty);
         }
         if (s.is_string) {
-            // Empty inline handle (mirrors rt_string_init): the length-marker byte
-            // (index sizeof(rt_string)-1) holds rt_string_inline_cap for len 0, and
-            // byte[0] is the NUL terminator (already 0 from the zero-fill).
-            std::vector<uint8_t> bytes(sizeof(rt_string), 0);
-            bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
-            return llvm::ConstantStruct::get(
-              s.slot_ty, { llvm::ConstantDataArray::get(ctx_, bytes) });
+            // Empty inline handle (mirrors rt_string_init): the trailing length-marker
+            // byte holds rt_string_inline_cap for len 0, and byte[0] is the NUL
+            // terminator (already 0 from the zero-fill).
+            return str_empty_const();
         }
         llvm::Constant* mm =
           s.narrow ? zero(s.width) : (s.four_state ? x_mm(s.width) : zero(2 * s.width));
@@ -9690,8 +10018,31 @@ private:
         if (lv.elem_idx == nullptr) {
             return lv.base;
         }
+        if (lv.array_ty != nullptr) {
+            return b_.CreateInBoundsGEP(lv.array_ty, lv.base, { b_.getInt32(0), lv.elem_idx });
+        }
         return b_.CreateInBoundsGEP(slot_of(lv.sig).storage_ty, lv.base,
                                     { b_.getInt32(0), lv.elem_idx });
+    }
+
+    // THE resolver for "a pointer to this place's whole storage image", whichever
+    // storage model it is in: the recursive aggregate mirror, or flat `[N x slot]`.
+    //
+    // A fixed unpacked array has two storage models -- flat with per-signal
+    // z-elision, and the canonical mirror when anything struct- or container-
+    // bearing is involved -- so a whole-object copy can legitimately have one model
+    // on each side (`v.m = tmp`, a struct member assigned a plain array). Every
+    // caller that resolved only one of them crashed on the other: agg_slot_ptr
+    // dereferences a null root_ty for a flat lvalue.
+    llvm::Value* agg_image_ptr(const LValue& lv) {
+        return lv.is_agg ? agg_slot_ptr(lv) : flat_elem_ptr(lv);
+    }
+
+    // The per-element slot type of a whole-array place, per its storage model. Two
+    // places of the same array TYPE agree byte for byte exactly when these agree,
+    // which is what decides memcpy vs an element-wise copy.
+    llvm::StructType* image_elem_slot(const LValue& lv, Ref type) {
+        return lv.is_agg ? agg_leaf_slot_ty(leaf_type(type)) : slot_of(lv.sig).slot_ty;
     }
 
     // A read-only image of what an out-of-range whole-object read must yield
@@ -9720,43 +10071,43 @@ private:
     // no operation) without the gate having to thread through every exit.
     void emit_agg_copy(const AggCopyInfo& info, const LValue& dlv, const LValue& slv,
                        llvm::Value* src_override) {
-        llvm::Value* dst;
-        llvm::Value* src;
-        llvm::Type*  st;
-        if (dlv.is_agg) {
-            // An aggregate (contains a struct) uses the recursive storage,
-            // which is deterministic by type — both sides share the layout.
-            dst = agg_slot_ptr(dlv);
-            src = src_override != nullptr ? src_override : agg_slot_ptr(slv);
-            st  = agg_storage_ty(info.type);
+        // Both sides resolve through the ONE image resolver, so either may be in
+        // either storage model. That matters because a whole-object copy can
+        // legitimately mix them: `v.m = tmp` assigns a plain array into a struct
+        // member, and the member is in the canonical mirror while `tmp` is flat.
+        llvm::Value* const dst = agg_image_ptr(dlv);
+        llvm::Value* const src =
+          src_override != nullptr ? src_override : agg_image_ptr(slv);
+        llvm::Type* st = nullptr;
+        // Which storage model a place is in is decided by its TYPE for everything
+        // struct- or container-bearing (needs_agg_storage), so both sides of such a
+        // copy are necessarily in the canonical mirror and its own type is the
+        // memcpy shape. Only a PLAIN scalar-leaf array can differ between the two
+        // sides, and only in its per-element slot, which is may-z-analysed per
+        // signal in the flat model and type-derived in the mirror.
+        if (needs_agg_storage(info.type) || !is_agg_abi(info.type)) {
+            st = agg_storage_ty(info.type);
         } else {
-            // A plain unpacked array. The per-element slot layout is may-z-
-            // analysed per signal, but a copy couples the two signals' z
-            // through this very store, so their element slots match; a
-            // genuine per-element mismatch is rejected rather than miscopied.
-            // The copy count comes from the copy TYPE, not the whole signal:
-            // a multi-dim element-select (`arr[i][j]`) addresses a SUB-array,
-            // whose flat leaf offset is carried in elem_idx (base still
-            // points at the whole `[N x slot]` storage) and applied here.
-            const SignalSlot& ds    = slot_of(dlv.sig);
-            const SignalSlot& ss    = slot_of(slv.sig);
-            const uint32_t    count = array_leaf_count(info.type);
-            llvm::Value*      d_base = flat_elem_ptr(dlv);
-            llvm::Value*      s_base = src_override != nullptr ? src_override : flat_elem_ptr(slv);
-            if (ds.slot_ty != ss.slot_ty) {
-                // z-elision gave the two same-typed arrays different per-
-                // element layouts (the dest is may-z from other writes, this
-                // source proven never-z, so their z-word presence differs).
-                // The mm plane is an identical i(2W); copy element-wise,
-                // filling the dest z (0 when the source is never-z).
-                emit_array_zdiff_copy(d_base, s_base, ds, ss, count, dlv.sig,
+            llvm::StructType* const d_slot = image_elem_slot(dlv, info.type);
+            llvm::StructType* const s_slot =
+              src_override != nullptr ? d_slot : image_elem_slot(slv, info.type);
+            if (d_slot != s_slot) {
+                // The two element layouts differ only in the z word's presence (the
+                // mm plane is an identical i(2W)), so copy element-wise, filling the
+                // dest z with 0 when the source is never-z. The leaf facts come from
+                // the TYPE, so this works whichever model each side is in.
+                const Layout lay = mod_.pool.layout(leaf_type(info.type));
+                emit_array_zdiff_copy(dst, src, d_slot, s_slot, lay.width == 0 ? 1 : lay.width,
+                                      lay.domain == Domain::Four, array_leaf_count(info.type),
+                                      dlv.sig,
                                       !silent_stores_ && dlv.is_signal &&
                                         signal_has_waiters(dlv.sig));
                 return;
             }
-            dst = d_base;
-            src = s_base;
-            st  = llvm::ArrayType::get(ds.slot_ty, count);
+            // The count comes from the copy TYPE, not the whole signal: a multi-dim
+            // element select (`arr[i][j]`) addresses a SUB-array, whose flat leaf
+            // offset the resolver above has already applied.
+            st = llvm::ArrayType::get(d_slot, array_leaf_count(info.type));
         }
         const auto sz = env_->llmod.getDataLayout().getTypeAllocSize(st);
         const auto al = env_->llmod.getDataLayout().getABITypeAlign(st);
@@ -9795,16 +10146,90 @@ private:
     // and, into a z-capable dest, its z word (0 when the source is never-z).
     // `d_base` / `s_base` point at the first copied element (already offset for a
     // sub-array). `service` wakes the dest's Any-edge readers on any change.
-    void emit_array_zdiff_copy(llvm::Value* d_base, llvm::Value* s_base, const SignalSlot& ds,
-                               const SignalSlot& ss, uint32_t count, Signal dsig, bool service) {
-        if (!ds.four_state || !ss.four_state || ds.narrow || ss.narrow || ds.width != ss.width) {
-            throw BackendError{ "whole-array copy between arrays of differing "
-                                "storage layout is not supported" };
+    // Element-wise whole-(sub-)array copy between two storage images whose element
+    // slots differ in SHAPE, not just in the z word's presence: one side narrow
+    // (a single iW value word), the other the packed must|may pair, or a 2-state
+    // pair of differing widths. A memcpy and even a word move are both wrong here,
+    // so each element goes through the ordinary lower_load / lower_store pair, which
+    // is where narrow <-> packed conversion already lives and is already exercised
+    // by every scalar assignment between differently-shaped slots.
+    //
+    // Reached when the two models meet: a class property or struct member is always
+    // in the canonical, type-derived mirror while a module-scope array signal's
+    // element slot is may-z-analysed and may be independently widened.
+    void emit_array_convert_copy(llvm::Value* d_base, llvm::Value* s_base,
+                                 llvm::StructType* d_slot, llvm::StructType* s_slot,
+                                 bool d_narrow, bool s_narrow, uint32_t leaf_width,
+                                 uint32_t count, Signal dsig, bool service) {
+        auto* dst_arr = llvm::ArrayType::get(d_slot, count);
+        auto* src_arr = llvm::ArrayType::get(s_slot, count);
+
+        const auto elem_lv = [&](llvm::Value* base, llvm::ArrayType* arr,
+                                 llvm::StructType* slot, bool narrow,
+                                 llvm::Value* idx) {
+            LValue lv;
+            lv.base        = base;
+            lv.slot_ty     = slot;
+            lv.narrow      = narrow;
+            lv.has_z       = !narrow && slot->getNumElements() > 1;
+            lv.array_ty    = arr;
+            lv.elem_idx    = idx;
+            lv.store_width = leaf_width;
+            lv.bit_off     = b_.getInt32(0);
+            lv.width       = leaf_width;
+            return lv;
+        };
+
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "cvcopy.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "cvcopy.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "cvcopy.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(b_.getInt32Ty(), 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(count)), body, done);
+
+        b_.SetInsertPoint(body);
+        lower_store(elem_lv(d_base, dst_arr, d_slot, d_narrow, idx),
+                    lower_load(elem_lv(s_base, src_arr, s_slot, s_narrow, idx)));
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+        // A converting copy cannot cheaply prove nothing changed (the two images are
+        // not comparable word for word), so it wakes unconditionally. Correct, and
+        // only reachable for the model-crossing shapes above.
+        if (service) {
+            service_any_waiters(dsig);
         }
-        auto* dst_arr = llvm::ArrayType::get(ds.slot_ty, count);
-        auto* src_arr = llvm::ArrayType::get(ss.slot_ty, count);
-        auto* mm_ty   = int_ty(2 * ds.width);
-        auto* z_ty    = int_ty(ds.width);
+    }
+
+    void emit_array_zdiff_copy(llvm::Value* d_base, llvm::Value* s_base,
+                               llvm::StructType* d_slot, llvm::StructType* s_slot,
+                               uint32_t leaf_width, bool four_state, uint32_t count, Signal dsig,
+                               bool service) {
+        // A NARROW slot's single word is the value itself, not a must|may pair, so
+        // when the two sides disagree about narrowness the mm words are different
+        // widths and no word move is sound. Route those through the ordinary
+        // load/store pair, which is exactly where narrow <-> packed conversion
+        // already lives; the word-move loop below then only ever sees two packed
+        // slots differing in the z word's presence.
+        const bool d_narrow = d_slot->getNumElements() == 1 &&
+                              d_slot->getElementType(0) == int_ty(leaf_width);
+        const bool s_narrow = s_slot->getNumElements() == 1 &&
+                              s_slot->getElementType(0) == int_ty(leaf_width);
+        if (d_narrow != s_narrow || !four_state) {
+            emit_array_convert_copy(d_base, s_base, d_slot, s_slot, d_narrow, s_narrow,
+                                    leaf_width, count, dsig, service);
+            return;
+        }
+        auto* dst_arr = llvm::ArrayType::get(d_slot, count);
+        auto* src_arr = llvm::ArrayType::get(s_slot, count);
+        auto* mm_ty   = int_ty(2 * leaf_width);
+        auto* z_ty    = int_ty(leaf_width);
         auto* i32     = b_.getInt32Ty();
 
         llvm::AllocaInst* changed = nullptr;
@@ -9829,11 +10254,11 @@ private:
         auto* s_mm     = b_.CreateLoad(
           mm_ty, b_.CreateInBoundsGEP(src_arr, s_base, { b_.getInt32(0), idx, b_.getInt32(0) }));
         llvm::Value* s_z =
-          ss.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(
+          s_slot->getNumElements() > 1 ? static_cast<llvm::Value*>(b_.CreateLoad(
                        z_ty, b_.CreateInBoundsGEP(src_arr, s_base, { b_.getInt32(0), idx, b_.getInt32(1) })))
-                   : zero(ds.width);
+                   : zero(leaf_width);
         llvm::Value* d_z_ptr =
-          ds.has_z ? b_.CreateInBoundsGEP(dst_arr, d_base, { b_.getInt32(0), idx, b_.getInt32(1) }) : nullptr;
+          d_slot->getNumElements() > 1 ? b_.CreateInBoundsGEP(dst_arr, d_base, { b_.getInt32(0), idx, b_.getInt32(1) }) : nullptr;
         if (service) {
             llvm::Value* diff = b_.CreateICmpNE(b_.CreateLoad(mm_ty, d_mm_ptr), s_mm);
             if (d_z_ptr != nullptr) {
@@ -10063,7 +10488,7 @@ private:
             case Inst::Tag::QueueDeleteIdx:
             case Inst::Tag::QueueDeleteAll:
             case Inst::Tag::QueueCopy:
-            case Inst::Tag::QueueCopyNb:
+            case Inst::Tag::HandleCopyNb:
             case Inst::Tag::QueueCopyDyn:
             case Inst::Tag::QueueAppendRange:
                 // size() is a definite 2-state int; the rest are statements
@@ -10399,10 +10824,7 @@ private:
     // that powers on owned-empty and is reset before every use (lv_string_ptr).
     llvm::Value* str_sink_global() {
         if (env_->str_sink == nullptr) {
-            std::vector<uint8_t> bytes(sizeof(rt_string), 0);
-            bytes[sizeof(rt_string) - 1] = static_cast<uint8_t>(rt_string_inline_cap);
-            auto* init = llvm::ConstantStruct::get(
-              str_slot_ty(), { llvm::ConstantDataArray::get(ctx_, bytes) });
+            llvm::Constant* init = str_empty_const();
             env_->str_sink = new llvm::GlobalVariable(env_->llmod, str_slot_ty(), /*isConstant=*/false,
                                                  llvm::GlobalValue::InternalLinkage, init,
                                                  "clotho.str.sink");
@@ -10536,9 +10958,54 @@ private:
         }
     }
 
+    // Alloca a result buffer for each aggregate-element queue pop in the current
+    // body, power-on-initialized so an empty pop reads the element default.
+    //
+    // Body-lifetime rather than per-site scratch for the same reason a string temp
+    // is: `rt_queue_pop_*` RELOCATES the element into the buffer, so the buffer owns
+    // whatever heap leaves the element had, and someone has to free them. The pop
+    // site releases the previous contents before reusing it (a pop in a loop), and
+    // deinit_body_strings releases the last one at every body exit.
+    void build_agg_elem_temps() {
+        agg_elem_temp_list_.clear();
+        agg_elem_ret_.assign(ir_->inst_count(), nullptr);
+        for (size_t k = 0; k < ir_->inst_count(); ++k) {
+            const auto i = static_cast<Index>(k);
+            if (ir_->tag(i) != Inst::Tag::QueuePopBack && ir_->tag(i) != Inst::Tag::QueuePopFront) {
+                continue;
+            }
+            const DynElem e = dynarr_elem(ir_->payload(i).op_type.type);
+            if (e.is_agg) {
+                auto* temp = b_.CreateAlloca(e.agg_ty, nullptr, "q.pop.agg");
+                emit_agg_proto_fill(temp, e);
+                agg_elem_ret_[k] = temp;
+                agg_elem_temp_list_.push_back({ temp, e.elem_type });
+                continue;
+            }
+            if (e.is_handle) {
+                // A nested container element pops as a handle the runtime relocates
+                // into this buffer, so the buffer owns that container's heap storage
+                // exactly as an aggregate buffer owns its leaves.
+                auto* temp = b_.CreateAlloca(e.slot_ty, nullptr, "q.pop.handle");
+                b_.CreateStore(llvm::Constant::getNullValue(e.slot_ty), temp);
+                agg_elem_ret_[k] = temp;
+                agg_elem_temp_list_.push_back({ temp, e.elem_type });
+            }
+        }
+    }
+
+    // Overwrite an element buffer with the element type's power-on image.
+    void emit_agg_proto_fill(llvm::Value* dst, const DynElem& e) {
+        const uint64_t size = env_->llmod.getDataLayout().getTypeAllocSize(e.agg_ty);
+        b_.CreateMemCpy(dst, llvm::MaybeAlign(), agg_proto_global(e.elem_type), llvm::MaybeAlign(), b_.getInt64(size));
+    }
+
     // -- Instruction dispatch --
 
     void lower_inst(Index i) {
+        // The dereference guard below (emit_ref_epoch_check) reports against the
+        // access that faulted, which is this instruction; nothing else reads it.
+        cur_inst_              = i;
         const Inst::Payload& p = ir_->payload(i);
         switch (ir_->tag(i)) {
             // Lvalue derivation: record a descriptor, emit no value.
@@ -10607,6 +11074,25 @@ private:
                 LValue         lv     = lvalue_of(p.op_extra.op);
                 const auto     es     = ir_->extra_data<ElemSelect>(p.op_extra.extra);
                 const Type&    at     = std::get<Type>(mod_.pool.get(es.array_type));
+                const bool inner_container =
+                  at.kind == Type::Kind::DynArray || at.kind == Type::Kind::Queue;
+                if (lv.is_assoc && inner_container) {
+                    // `a[k][i]` where the assoc value is itself a container. The
+                    // element address needs the entry's slot, but resolving it here
+                    // would have to pick get_ptr or put_ptr WITHOUT knowing whether
+                    // the consumer reads or writes -- and picking put_ptr would
+                    // create an entry on a read, which LRM 7.8.6 forbids.
+                    //
+                    // TODO: compose the deferral. An AssocSelect already defers to
+                    // its Load / Store; an ElemSelect on top of one has to defer
+                    // too, carrying the pending index alongside the pending key, so
+                    // the direction stays the consumer's to choose. Whole-value
+                    // assignment and the container methods on `a[k]` work today
+                    // because each is unambiguously one direction.
+                    throw BackendError{ "element select through an associative-array "
+                                        "element that is itself a container is not "
+                                        "supported" };
+                }
                 if (at.kind == Type::Kind::DynArray) {
                     // Dynamic array (LRM 7.5): the base lvalue addresses the
                     // { data, len } handle. Load the heap data pointer and length,
@@ -10620,6 +11106,11 @@ private:
                       raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 0));
                     llvm::Value* len = b_.CreateLoad(
                       b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
+                    // The element place is rooted in this handle's heap buffer, so
+                    // a `ref` formed through it records the handle's relocation
+                    // epoch (docs/design/data-model.md §3.1).
+                    llvm::Value* epoch = b_.CreateStructGEP(
+                      dynarr_slot_ty(), handle, handle_epoch_field(es.array_type));
                     // LRM 7.4.5 covers "an unpacked array of any kind": an x/z
                     // index is invalid exactly like one past the end, so the
                     // unknown term belongs in the gate and not only in the report.
@@ -10641,11 +11132,20 @@ private:
                         sel.sig           = lv.sig;
                         sel.dyn_inrange   = inrange;
                         sel.bounds_checks = lv.bounds_checks;
+                        sel.epoch_ptr     = epoch;
+                        add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
+                        set_lvalue(i, sel);
+                        return;
+                    }
+                    if (e.is_agg || e.is_handle) {
+                        LValue sel      = dyn_agg_elem_lvalue(lv, e, dataptr, idx64, inrange);
+                        sel.epoch_ptr   = epoch;
                         add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
                         set_lvalue(i, sel);
                         return;
                     }
                     LValue       el;
+                    el.epoch_ptr     = epoch;
                     el.base          = dataptr;
                     el.slot_ty       = e.slot_ty;
                     el.has_z         = e.has_z;
@@ -10681,6 +11181,11 @@ private:
                       b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
                     llvm::Value* cap = b_.CreateLoad(
                       b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 3));
+                    // A place rooted in this ring buffer records the handle's
+                    // relocation epoch, so a `ref` formed through it detects a later
+                    // push / pop / insert / delete (docs/design/data-model.md §3.1).
+                    llvm::Value* epoch = b_.CreateStructGEP(
+                      queue_slot_ty(), handle, handle_epoch_field(es.array_type));
                     // An x/z index is invalid for an unpacked array of any kind
                     // (LRM 7.4.5), so it gates the access, not just the report.
                     const Plane  idxp    = value_of(es.index);
@@ -10702,6 +11207,14 @@ private:
                         sel.sig           = lv.sig;
                         sel.dyn_inrange   = inrange;
                         sel.bounds_checks = lv.bounds_checks;
+                        sel.epoch_ptr     = epoch;
+                        add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
+                        set_lvalue(i, sel);
+                        return;
+                    }
+                    if (e.is_agg || e.is_handle) {
+                        LValue sel    = dyn_agg_elem_lvalue(lv, e, baseptr, phys, inrange);
+                        sel.epoch_ptr = epoch;
                         add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
                         set_lvalue(i, sel);
                         return;
@@ -10720,6 +11233,7 @@ private:
                     el.sig           = lv.sig;
                     el.dyn_inrange   = inrange;
                     el.bounds_checks = lv.bounds_checks;
+                    el.epoch_ptr     = epoch;
                     add_elem_bounds_check(el, i, lv, es.index, inrange, unknown, len);
                     set_lvalue(i, el);
                     return;
@@ -10785,6 +11299,11 @@ private:
                 LValue el;
                 el.is_assoc          = true;
                 el.assoc_handle      = lv_handle_ptr(hlv);
+                // An entry's slot lives until that entry is erased, so a `ref`
+                // through it records the map's relocation epoch
+                // (docs/design/data-model.md §3.1).
+                el.epoch_ptr         = b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
+                                                          handle_epoch_field(aa.assoc_type));
                 el.assoc_key_ptr     = kptr;
                 el.assoc_key_len     = klen;
                 // An x/z key is an invalid index (LRM 7.8.4 / 7.8.5): gate the
@@ -10809,11 +11328,17 @@ private:
                 // Managed value elements carry only the slot type (a string / a
                 // container handle); the plane facts below are meaningless for
                 // them and are lifted per-kind in assoc_elem_lvalue.
-                el.slot_ty       = e.slot_ty;
-                el.has_z         = e.has_z;
-                el.narrow        = e.narrow;
-                el.store_width   = e.width;
-                el.width         = e.width;
+                el.slot_ty     = e.slot_ty;
+                el.handle_type = e.elem_type;
+                el.has_z       = e.has_z;
+                el.narrow      = e.narrow;
+                el.store_width = e.width;
+                // A selection offset of zero, not a null one: a bit or part select
+                // stacked on this deferred place ADDS to bit_off, and PartSelect's
+                // unconditional CreateAdd crashed codegen on a null base. A packed
+                // struct or union value element reaches exactly that path.
+                el.bit_off     = b_.getInt32(0);
+                el.width       = e.width;
                 set_lvalue(i, el);
                 return;
             }
@@ -10827,6 +11352,8 @@ private:
                 el.is_assoc         = true;
                 el.assoc_default    = true;
                 el.assoc_handle     = lv_handle_ptr(lvalue_of(pt.op));
+                el.epoch_ptr        = b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
+                                                        handle_epoch_field(pt.type));
                 el.assoc_ops        = elem_ops_global(pt.type);
                 el.assoc_val_string = e.is_string;
                 el.assoc_val_handle = e.is_handle;
@@ -10837,9 +11364,15 @@ private:
                     return;
                 }
                 el.slot_ty     = e.slot_ty;
+                el.handle_type = e.elem_type;
                 el.has_z       = e.has_z;
                 el.narrow      = e.narrow;
                 el.store_width = e.width;
+                // A selection offset of zero, not a null one: a bit or part select
+                // stacked on this deferred place ADDS to bit_off, and PartSelect's
+                // unconditional CreateAdd crashed codegen on a null base. A packed
+                // struct or union value element reaches exactly that path.
+                el.bit_off     = b_.getInt32(0);
                 el.width       = e.width;
                 set_lvalue(i, el);
                 return;
@@ -10914,42 +11447,35 @@ private:
             }
 
             case Inst::Tag::Load: {
-                const LValue& lv = lvalue_of(p.unary);
-                emit_bounds_reports(lv, /*is_write=*/false);
+                const LValue& raw = lvalue_of(p.unary);
+                emit_bounds_reports(raw, /*is_write=*/false);
+                // An assoc element resolves its base FIRST (get_ptr for a read: an
+                // absent key yields no slot and no entry is created, LRM 7.8.6), and
+                // only then dispatches on the selected place's storage class. Doing
+                // it in this order is what lets a MANAGED LEAF of an aggregate value
+                // work -- `a[k].name` where `name` is a string reaches here with both
+                // is_assoc and is_string set, and the leaf pointer cannot be formed
+                // until the entry's slot is known.
+                const LValue lv = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/false) : raw;
                 if (lv.is_handle) {
-                    // Defense in depth: a queue / dynamic-array handle has no
-                    // plane value; every legal consumer goes through the
-                    // dedicated ops (frontend value_cat dispatch).
-                    throw BackendError{ "plane load of a queue / dynamic-array handle" };
+                    // Defense in depth: a container handle has no plane value; every
+                    // legal consumer goes through the dedicated ops (frontend
+                    // value_cat dispatch) rather than a Load.
+                    throw BackendError{ "plane load of a container handle" };
                 }
                 if (lv.is_string) {
                     // A string load is the storage handle pointer, not a copy:
                     // every mutation point (Store, string ops) deep-copies, and
-                    // producers write into distinct temps.
+                    // producers write into distinct temps. Out of range (or an absent
+                    // key) lv_string_ptr redirects to the owned-empty sink, so the
+                    // read yields "".
                     set_str(i, lv_string_ptr(lv));
                     return;
                 }
-                if (lv.is_assoc && (lv.assoc_val_string || lv.assoc_val_handle)) {
-                    // Managed assoc value: resolve the slot (get_ptr; absent key ->
-                    // null, redirected to the owned-empty string sink so the read
-                    // yields "" / the container default) and route the handle load.
-                    const LValue el = assoc_elem_lvalue(lv, /*for_write=*/false);
-                    if (el.is_string) {
-                        set_str(i, lv_string_ptr(el));
-                        return;
-                    }
-                    // TODO: nested-container (queue / dynamic / assoc) value read.
-                    throw BackendError{ "associative array with a nested-container value "
-                                        "element read is not supported" };
-                }
                 const ValType t = type_of(i);
-                // An assoc read resolves the element via get_ptr (absent key ->
-                // element default through the dyn_inrange=false path, no entry
-                // created); dyn/queue elements ride the same in-range machinery.
-                Plane         v =
-                  lv.is_assoc ? dyn_elem_load(assoc_elem_lvalue(lv, /*for_write=*/false))
-                  : lv.dyn_inrange != nullptr ? dyn_elem_load(lv)
-                                              : lower_load(lv);
+                // A gated place (an out-of-range element index, or an absent assoc
+                // key) reads the element default rather than its storage.
+                Plane v = lv.dyn_inrange != nullptr ? dyn_elem_load(lv) : lower_load(lv);
                 if (t.is_real) {
                     v = real_plane(planes_to_real(v, t.width));
                 }
@@ -10961,15 +11487,23 @@ private:
                 // wait queue: any process waiting for an edge this store produced
                 // is woken. Snapshot the old value first so the transition can be
                 // detected from old -> new.
-                const LValue& lv      = lvalue_of(p.binary.l);
-                emit_bounds_reports(lv, /*is_write=*/true);
+                const LValue& raw = lvalue_of(p.binary.l);
+                emit_bounds_reports(raw, /*is_write=*/true);
+                // As in Load, an assoc element resolves its base before anything
+                // dispatches on the place's storage class -- put_ptr here, which
+                // creates and proto-inits the entry (LRM 7.8: a write to a
+                // nonexistent element adds it). Resolving first is what makes a
+                // managed LEAF of an aggregate value writable.
+                const bool   deferred = raw.is_assoc;
+                const LValue lv       = deferred ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
                 if (lv.is_handle) {
-                    throw BackendError{ "plane store to a queue / dynamic-array handle" };
+                    throw BackendError{ "plane store to a container handle" };
                 }
                 if (lv.is_string) {
                     // A forwarded concat already built its result in the target
-                    // (build_str_temps handed it the target's handle).
-                    if (forwarded_string_store(i)) {
+                    // (build_str_temps handed it the target's handle). Only a Signal
+                    // or Local target can be forwarded, so an assoc element never is.
+                    if (!deferred && forwarded_string_store(i)) {
                         return;
                     }
                     // Deep copy. Strings are guarded out of sensitivity lists in
@@ -10978,33 +11512,16 @@ private:
                                                      alloc_site_global(loc_text(i), "string") });
                     return;
                 }
-                if (lv.is_assoc && (lv.assoc_val_string || lv.assoc_val_handle)) {
-                    // a[key] = <managed> (LRM 7.8): put_ptr creates + proto-inits
-                    // the entry (owned-empty string / null container), then the
-                    // value deep-copies into it. Assoc string stores never take the
-                    // forwarding path (that only fires for Signal / Local targets).
-                    const LValue el = assoc_elem_lvalue(lv, /*for_write=*/true);
-                    if (el.is_string) {
-                        b_.CreateCall(str_assign_fn(), { lv_string_ptr(el), str_of(p.binary.r),
-                                                         alloc_site_global(loc_text(i), "string") });
-                        return;
-                    }
-                    // TODO: nested-container (queue / dynamic / assoc) value write.
-                    throw BackendError{ "associative array with a nested-container value "
-                                        "element write is not supported" };
-                }
-                if (lv.is_assoc) {
-                    // a[key] = v (LRM 7.8): put_ptr creates + proto-inits the
-                    // entry, then the value stores into it. Assoc elements are
-                    // guarded out of sensitivity lists, so no wait servicing. An
-                    // aggregate leaf reached through a runtime element index into a
-                    // fixed-array member carries a bounds gate (dyn_inrange); an
-                    // out-of-range write is a no-op (LRM 7.4.5).
-                    const LValue el = assoc_elem_lvalue(lv, /*for_write=*/true);
-                    if (el.dyn_inrange != nullptr) {
-                        dyn_elem_store(el, value_of(p.binary.r));
+                if (deferred) {
+                    // Assoc elements are guarded out of sensitivity lists, so no wait
+                    // servicing. An aggregate leaf reached through a runtime element
+                    // index into a fixed-array member carries a bounds gate; an
+                    // out-of-range write is a no-op (LRM 7.4.5), as is a write under
+                    // an invalid (x/z) key (7.8.6).
+                    if (lv.dyn_inrange != nullptr) {
+                        dyn_elem_store(lv, value_of(p.binary.r));
                     } else {
-                        lower_store(el, value_of(p.binary.r));
+                        lower_store(lv, value_of(p.binary.r));
                     }
                     return;
                 }
@@ -11197,8 +11714,8 @@ private:
             case Inst::Tag::QueueCopyDyn:
                 lower_queue_copy_dynarr(i);
                 return;
-            case Inst::Tag::QueueCopyNb:
-                emit_queue_whole_nba(i);
+            case Inst::Tag::HandleCopyNb:
+                emit_handle_whole_nba(i);
                 return;
             case Inst::Tag::QueueAppendRange:
                 lower_queue_append_range(i);
@@ -11658,7 +12175,7 @@ private:
                 const auto&        pt = p.op_type;
                 const ContainerFmt cf = container_fmt(pt.type);
                 b_.CreateCall(container_fmt_p_fn(),
-                              { str_of(i), lv_handle_ptr(lvalue_of(pt.op)), b_.getInt32(cf.is_queue),
+                              { str_of(i), lv_handle_ptr(lvalue_of(pt.op), /*for_write=*/false), b_.getInt32(cf.is_queue),
                                 b_.getInt32(cf.kind), b_.getInt32(cf.width), b_.getInt32(cf.is_signed),
                                 b_.getInt32(cf.four), b_.getInt32(cf.has_z), b_.getInt32(cf.z_off),
                                 b_.getInt64(cf.stride),
@@ -12248,19 +12765,30 @@ private:
     }
 
     // Whole-storage lvalue for a function-frame local (per-call frame struct). A ref
-    // formal has no frame storage: its base is the passed actual pointer (recorded
-    // in ref_ptr_ by the prologue), through which every load / store is live.
+    // formal has no frame storage: its base is the borrowed actual pointer from the
+    // fat ref (bound by bind_ref_formals), through which every load / store is live.
+    //
+    // Resolving a ref local emits the relocation-epoch check first, so an access
+    // through a ref whose actual was a container element that has since moved is
+    // reported rather than performed (docs/design/data-model.md §3).
     LValue local_lvalue(uint32_t index) {
-        const FrameSlot& s = frame_slots_[index];
+        const FrameSlot& s    = frame_slots_[index];
+        llvm::Value*     base = nullptr;
+        if (s.is_ref) {
+            emit_ref_epoch_check(ref_ptr_[index]);
+            base = ref_ptr_[index].slot;
+        }
         if (s.is_agg) {
             LValue lv{};
-            lv.base      = b_.CreateStructGEP(frame_ty_, frame_, index);
+            lv.base      = base != nullptr ? base : b_.CreateStructGEP(frame_ty_, frame_, index);
             lv.root_ty   = s.storage_ty;
             lv.is_agg    = true;
             lv.is_signal = false;
             return lv;
         }
-        llvm::Value* base = s.is_ref ? ref_ptr_[index] : b_.CreateStructGEP(frame_ty_, frame_, index);
+        if (base == nullptr) {
+            base = b_.CreateStructGEP(frame_ty_, frame_, index);
+        }
         return LValue{ .base        = base,
                        .slot_ty     = s.slot_ty,
                        .has_z       = !s.narrow,
@@ -12495,7 +13023,6 @@ private:
     void lower_dyn_array_new(Index i) {
         const auto&   p  = ir_->payload(i).op_extra;
         const auto    da = ir_->extra_data<DynArrayArg>(p.extra);
-        const DynElem e  = dynarr_elem(da.array_type);
         // A signed count sign-extends so the runtime sees the negative the design
         // actually wrote and can reject it (LRM 7.5.1); zero-extending would turn
         // `new[-1]` on a 32-bit int into a 4294967295-element request. An unsigned
@@ -12509,17 +13036,17 @@ private:
     void lower_dyn_array_new_init(Index i) {
         const auto&   p  = ir_->payload(i).op_extra;
         const auto    da = ir_->extra_data<DynArrayNewInitInfo>(p.extra);
-        const DynElem e  = dynarr_elem(da.array_type);
         // Sign-extend a signed count, as in lower_dyn_array_new.
         llvm::Value* n = cast(must_of(value_of(da.size)), 64, type_of(da.size).is_signed);
         b_.CreateCall(dynarr_new_copy_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(da.array_type), n,
-                        lv_handle_ptr(lvalue_of(da.src)),
+                        lv_handle_ptr(lvalue_of(da.src), /*for_write=*/false),
                         alloc_site_global(loc_text(i), "dynamic array") });
     }
 
     void lower_dyn_array_size(Index i) {
-        llvm::Value* handle = lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op));
+        llvm::Value* handle =
+          lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op), /*for_write=*/false);
         llvm::Value* len =
           b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1));
         set_value(i, two_val(cast(len, 32, false)));
@@ -12529,7 +13056,7 @@ private:
         const auto& p  = ir_->payload(i).op_extra;
         const auto  da = ir_->extra_data<DynArrayArg>(p.extra);
         b_.CreateCall(dynarr_assign_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(da.arg)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(da.arg), /*for_write=*/false),
                         elem_ops_global(da.array_type),
                         alloc_site_global(loc_text(i), "dynamic array") });
     }
@@ -12538,29 +13065,32 @@ private:
     // interned type (op_type payload). Reverse is element-agnostic; Sort/Rsort
     // pass the value comparator descriptor derived from the element type;
     // Shuffle threads the process frame RNG slot.
+    //
+    // All three resolve the handle through lv_handle_ptr, so a struct-member,
+    // class-property or container-element dynamic array orders in place rather
+    // than addressing its parent aggregate's root.
     void lower_dyn_array_reverse(Index i) {
-        const auto&   p = ir_->payload(i).op_type;
-        const DynElem e = dynarr_elem(p.type);
-        b_.CreateCall(dynarr_reverse_fn(), { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)) });
+        const auto& p = ir_->payload(i).op_type;
+        b_.CreateCall(dynarr_reverse_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(p.type) });
     }
 
     void lower_dyn_array_sort(Index i, bool reversed) {
         const auto&    p = ir_->payload(i).op_type;
-        const DynElem  e = dynarr_elem(p.type);
         const SortDesc d = dynarr_sort_desc(p.type);
-        b_.CreateCall(dynarr_sort_fn(), { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)),
-                                          b_.getInt32(d.kind), b_.getInt32(d.width),
-                                          b_.getInt32(reversed ? 1 : 0) });
+        b_.CreateCall(dynarr_sort_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(p.type),
+                        b_.getInt32(d.kind), b_.getInt32(d.width),
+                        b_.getInt32(reversed ? 1 : 0) });
     }
 
     void lower_dyn_array_shuffle(Index i) {
-        const auto&   p = ir_->payload(i).op_type;
-        const DynElem e = dynarr_elem(p.type);
+        const auto& p = ir_->payload(i).op_type;
         // rng_slot_ is non-null: process_uses_urandom flags a shuffling process,
         // so lower_group allocates and seeds the frame RNG.
         assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
         b_.CreateCall(dynarr_shuffle_fn(),
-                      { lvalue_of(p.op).base, b_.getInt64(dynarr_stride(e)), rng_slot_ });
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(p.type), rng_slot_ });
     }
 
     // An alloca placed at the top of the current function's entry block (not the
@@ -12571,6 +13101,42 @@ private:
         auto&             eb = fn->getEntryBlock();
         llvm::IRBuilder<> ab(&eb, eb.getFirstInsertionPt());
         return ab.CreateAlloca(ty, nullptr, name);
+    }
+
+    // The element lvalue of an aggregate-element dynamic array / queue: a
+    // heap-anchored aggregate root at logical slot `slot_index` of `data`.
+    //
+    // `base` is advanced to the element itself because agg_slot_ptr GEPs `root_ty`
+    // from `base` and ignores `elem_idx`. A following MemberSelect / ElemSelect then
+    // descends it exactly as it descends a module signal's aggregate (agg_member /
+    // agg_elem only push the GEP path, never touch the base), which is what makes
+    // `q[i].f` and `q[i][j]` fall out with no container-specific code. `dyn_inrange`
+    // carries LRM 7.4.5: an out-of-range leaf read yields the element default, a
+    // write is dropped, and the heap is never addressed past the live length.
+    LValue dyn_agg_elem_lvalue(const LValue&  container,
+                               const DynElem& e,
+                               llvm::Value*   data,
+                               llvm::Value*   slot_index,
+                               llvm::Value*   inrange) {
+        LValue sel;
+        sel.base = b_.CreateInBoundsGEP(b_.getInt8Ty(), data, b_.CreateMul(slot_index, b_.getInt64(dynarr_stride(e))));
+        if (e.is_handle) {
+            // A nested container element: the slot holds ITS handle, so the element
+            // lvalue is a handle lvalue whose base is that slot. Out-of-range access
+            // redirects to the sink (lv_handle_ptr), which is why the predicate has to
+            // travel with it.
+            sel.is_handle   = true;
+            sel.handle_type = e.elem_type;
+            sel.slot_ty     = e.slot_ty;
+        } else {
+            sel.is_agg  = true;
+            sel.root_ty = e.agg_ty;
+        }
+        sel.is_signal     = container.is_signal;
+        sel.sig           = container.sig;
+        sel.dyn_inrange   = inrange;
+        sel.bounds_checks = container.bounds_checks;
+        return sel;
     }
 
     // An lvalue addressing a single element slot at raw pointer `ptr` (a scratch
@@ -12608,7 +13174,8 @@ private:
     // the value in; pop copies out). Handles resolve through lv_handle_ptr so a
     // struct-member / class-property queue works too.
     void lower_queue_size(Index i) {
-        llvm::Value* handle = lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op));
+        llvm::Value* handle =
+          lv_handle_ptr(lvalue_of(ir_->payload(i).op_type.op), /*for_write=*/false);
         llvm::Value* len =
           b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2));
         set_value(i, two_val(cast(len, 32, false)));
@@ -12626,6 +13193,18 @@ private:
             b_.CreateCall(queue_push_fn(front),
                           { lv_handle_ptr(lvalue_of(p.op)), ops, bound, str_of(qa.arg),
                             alloc_site_global(loc_text(i), "queue") });
+            return;
+        }
+        if (e.is_agg || e.is_handle) {
+            // Aggregate / nested-container element: the runtime takes `elem` by
+            // pointer and deep-copies out of it (rt_elem_copy never retains it), so
+            // the source's own storage image -- or its handle -- is handed over
+            // directly. The frontend guarantees an lvalue operand here
+            // (lower_container_element_value), staging a '{...} pattern into a
+            // canonical aggregate temp when needed.
+            llvm::Value* src = e.is_agg ? agg_slot_ptr(lvalue_of(qa.arg)) : lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false);
+            b_.CreateCall(queue_push_fn(front),
+                          { lv_handle_ptr(lvalue_of(p.op)), ops, bound, src, alloc_site_global(loc_text(i), "queue") });
             return;
         }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
@@ -12650,6 +13229,44 @@ private:
             b_.CreateCall(str_deinit_fn(), { out });
             b_.CreateCall(str_init_fn(), { out });
             b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
+            return;
+        }
+        if (e.is_agg) {
+            // Aggregate element: the runtime RELOCATES the popped element into a
+            // body-lifetime buffer (build_agg_elem_temps), which therefore owns any
+            // heap leaves it carries. Release the previous contents first -- a pop in
+            // a loop reuses the buffer -- then restore the power-on image so an empty
+            // pop yields the Table 7-1 default rather than the last value. The
+            // buffer's lvalue is the result, the same safe-temp shape an
+            // aggregate-returning call hands back.
+            llvm::Value* out = agg_elem_ret_[static_cast<uint32_t>(i)];
+            if (has_heap_leaf(e.elem_type)) {
+                std::vector<llvm::Value*> path;
+                emit_agg_deinit(e.elem_type, out, path, e.agg_ty);
+            }
+            emit_agg_proto_fill(out, e);
+            b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
+            LValue lv{};
+            lv.base    = out;
+            lv.root_ty = e.agg_ty;
+            lv.is_agg  = true;
+            set_lvalue(i, lv);
+            return;
+        }
+        if (e.is_handle) {
+            // Nested container element: same relocation shape as the aggregate case.
+            // Empty the buffer first (a pop in a loop reuses it, and an empty-queue pop
+            // leaves it untouched -- which is then the empty container Table 7-1 asks
+            // for), then hand its lvalue back as a handle.
+            llvm::Value* out = agg_elem_ret_[static_cast<uint32_t>(i)];
+            emit_handle_delete(out, e.elem_type);
+            b_.CreateCall(queue_pop_fn(front), { handle, ops, out });
+            LValue lv{};
+            lv.base        = out;
+            lv.slot_ty     = e.slot_ty;
+            lv.is_handle   = true;
+            lv.handle_type = e.elem_type;
+            set_lvalue(i, lv);
             return;
         }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
@@ -12681,6 +13298,11 @@ private:
                                                alloc_site_global(loc_text(i), "queue") });
             return;
         }
+        if (e.is_agg || e.is_handle) {
+            llvm::Value* src = e.is_agg ? agg_slot_ptr(lvalue_of(qi.val)) : lv_handle_ptr(lvalue_of(qi.val), /*for_write=*/false);
+            b_.CreateCall(queue_insert_fn(), { handle, ops, bound, idx, src, alloc_site_global(loc_text(i), "queue") });
+            return;
+        }
         auto* scratch = entry_alloca(e.slot_ty, "q.elem");
         lower_store(elem_scratch_lvalue(scratch, e), value_of(qi.val));
         b_.CreateCall(queue_insert_fn(),
@@ -12706,7 +13328,7 @@ private:
         const auto& p  = ir_->payload(i).op_extra;
         const auto  qa = ir_->extra_data<QueueArg>(p.extra);
         b_.CreateCall(queue_assign_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false),
                         elem_ops_global(qa.queue_type), alloc_site_global(loc_text(i), "queue") });
     }
 
@@ -12716,7 +13338,7 @@ private:
         const auto& p  = ir_->payload(i).op_extra;
         const auto  qa = ir_->extra_data<QueueArg>(p.extra);
         b_.CreateCall(queue_assign_dynarr_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false),
                         elem_ops_global(qa.queue_type), alloc_site_global(loc_text(i), "queue") });
     }
 
@@ -12728,7 +13350,7 @@ private:
         llvm::Value* lo = cast(must_of(value_of(qs.lo)), 64, /*sign=*/true);
         llvm::Value* hi = cast(must_of(value_of(qs.hi)), 64, /*sign=*/true);
         b_.CreateCall(queue_append_range_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qs.src)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(qs.src), /*for_write=*/false),
                         elem_ops_global(qs.queue_type), bound, lo, hi,
                         alloc_site_global(loc_text(i), "queue") });
     }
@@ -12736,24 +13358,25 @@ private:
     // Queue ordering methods (LRM 7.12.2) — same shape as the dynarr variants
     // over the ring's logical order (op_type payload: handle lvalue + type).
     void lower_queue_reverse(Index i) {
-        const auto&  p      = ir_->payload(i).op_type;
-        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(p.type)));
-        b_.CreateCall(queue_reverse_fn(), { lvalue_of(p.op).base, stride });
+        const auto& p = ir_->payload(i).op_type;
+        b_.CreateCall(queue_reverse_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(p.type) });
     }
 
     void lower_queue_sort(Index i, bool reversed) {
-        const auto&    p      = ir_->payload(i).op_type;
-        llvm::Value*   stride = b_.getInt64(dynarr_stride(dynarr_elem(p.type)));
-        const SortDesc d      = dynarr_sort_desc(p.type);
-        b_.CreateCall(queue_sort_fn(), { lvalue_of(p.op).base, stride, b_.getInt32(d.kind),
-                                         b_.getInt32(d.width), b_.getInt32(reversed ? 1 : 0) });
+        const auto&    p = ir_->payload(i).op_type;
+        const SortDesc d = dynarr_sort_desc(p.type);
+        b_.CreateCall(queue_sort_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(p.type),
+                        b_.getInt32(d.kind), b_.getInt32(d.width),
+                        b_.getInt32(reversed ? 1 : 0) });
     }
 
     void lower_queue_shuffle(Index i) {
-        const auto&  p      = ir_->payload(i).op_type;
-        llvm::Value* stride = b_.getInt64(dynarr_stride(dynarr_elem(p.type)));
+        const auto& p = ir_->payload(i).op_type;
         assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
-        b_.CreateCall(queue_shuffle_fn(), { lvalue_of(p.op).base, stride, rng_slot_ });
+        b_.CreateCall(queue_shuffle_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(p.type), rng_slot_ });
     }
 
     // -- Associative arrays (LRM 7.8/7.9). The value element rides the dynarr
@@ -13131,6 +13754,9 @@ private:
         LValue el;
         el.base        = slot;
         el.dyn_inrange = gate(nonnull);
+        // An entry's slot dies with the entry, so a `ref` formed through it carries
+        // the map's relocation epoch exactly as a queue element does.
+        el.epoch_ptr   = lv.epoch_ptr;
         // Managed value elements (string / nested container): the resolved slot
         // IS the handle. put_ptr proto-inits a fresh entry (owned-empty string /
         // null container), so a write never sees null; a read of an absent key
@@ -13139,6 +13765,9 @@ private:
             el.is_string = lv.assoc_val_string;
             el.is_handle = lv.assoc_val_handle;
             el.slot_ty   = lv.slot_ty;
+            // The sink redirect lv_handle_ptr / lv_string_ptr apply when the key is
+            // absent needs the element's own type to pick the empty image.
+            el.handle_type = lv.handle_type;
             return el;
         }
         el.slot_ty     = lv.slot_ty;
@@ -13147,14 +13776,24 @@ private:
         el.array_ty    = llvm::ArrayType::get(lv.slot_ty, 0);
         el.elem_idx    = b_.getInt32(0);
         el.store_width = lv.store_width;
-        el.bit_off     = b_.getInt32(0);
+        // Carry the SELECTION the chain accumulated on the deferred lvalue rather
+        // than resetting it. `a[k]` can have a bit or part select stacked on top --
+        // a packed-struct or packed-union member of the value element lowers to a
+        // PartSelect -- and its offset, width and in-range mask all live here.
+        // Zeroing bit_off silently read the value's low bits instead of the member.
+        el.bit_off     = lv.bit_off;
         el.width       = lv.width;
+        el.range_mask  = lv.range_mask;
+        el.wide_dyn    = lv.wide_dyn;
+        el.sel_base    = lv.sel_base;
+        el.sel_cwidth  = lv.sel_cwidth;
+        el.sel_unknown = lv.sel_unknown;
         return el;
     }
 
     void lower_assoc_num(Index i) {
         const auto&  p   = ir_->payload(i).op_type;
-        llvm::Value* n   = b_.CreateCall(assoc_num_fn(), { lv_handle_ptr(lvalue_of(p.op)) });
+        llvm::Value* n   = b_.CreateCall(assoc_num_fn(), { lv_handle_ptr(lvalue_of(p.op), /*for_write=*/false) });
         set_value(i, two_val(cast(n, 32, false)));
     }
 
@@ -13164,7 +13803,7 @@ private:
         const auto&  p    = ir_->payload(i).op_extra;
         const auto   aa   = ir_->extra_data<AssocArg>(p.extra);
         const auto   span = normalize_assoc_key_value(aa.arg, aa.assoc_type);
-        llvm::Value* r    = b_.CreateCall(assoc_exists_fn(), { lv_handle_ptr(lvalue_of(p.op)), span.ptr, span.len });
+        llvm::Value* r    = b_.CreateCall(assoc_exists_fn(), { lv_handle_ptr(lvalue_of(p.op), /*for_write=*/false), span.ptr, span.len });
         if (span.valid != nullptr) {
             r = b_.CreateSelect(span.valid, r, zero(32));
         }
@@ -13213,7 +13852,7 @@ private:
         const auto& p  = ir_->payload(i).op_extra;
         const auto  aa = ir_->extra_data<AssocArg>(p.extra);
         b_.CreateCall(assoc_assign_fn(),
-                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(aa.arg)),
+                      { lv_handle_ptr(lvalue_of(p.op)), lv_handle_ptr(lvalue_of(aa.arg), /*for_write=*/false),
                         elem_ops_global(aa.assoc_type),
                         alloc_site_global(loc_text(i), "associative array") });
     }
@@ -13481,58 +14120,78 @@ private:
                static_cast<uint32_t>(it - agg_nba_sigs_.begin());
     }
 
-    // Runtime buffer index of a whole-queue NBA signal — after the array and
+    // Runtime buffer index of a whole-container NBA signal — after the array and
     // aggregate buffers in the shared rt_nba_arr_* index space.
-    uint32_t queue_buf_idx(Signal sig) const {
-        const auto it = std::find(queue_nba_sigs_.begin(), queue_nba_sigs_.end(), sig);
+    uint32_t handle_buf_idx(Signal sig) const {
+        const auto it = std::find(handle_nba_sigs_.begin(), handle_nba_sigs_.end(), sig);
         return static_cast<uint32_t>(array_nba_sigs_.size() + agg_nba_sigs_.size()) +
-               static_cast<uint32_t>(it - queue_nba_sigs_.begin());
+               static_cast<uint32_t>(it - handle_nba_sigs_.begin());
     }
 
-    // Deferred whole-queue NBA record: { ptr dest_handle, rt_queue staged }. The
-    // rt_queue mirror is { base, head, len, cap } (four i64), matching the runtime
-    // layout; the staged buffer's ownership moves to dest_handle at commit.
-    llvm::StructType* queue_rec_ty() {
-        auto* i64 = b_.getInt64Ty();
-        return llvm::StructType::get(ctx_, { raw_ptr_ty(), i64, i64, i64, i64 });
+    // Deferred whole-container NBA record: { ptr dest_handle, <handle slot> staged }.
+    // The staged field is the container's own runtime handle struct, so one record
+    // shape covers a queue, a dynamic array and an associative array; its
+    // ownership moves to dest_handle at commit.
+    llvm::StructType* handle_rec_ty(Ref container_type) {
+        return llvm::StructType::get(ctx_, { raw_ptr_ty(), handle_slot_ty(container_type) });
     }
 
-    // Stage a whole-queue nonblocking assignment: reserve a record, capture the
-    // live dest handle pointer (stable — the signal slot never moves), zero the
-    // staged rt_queue, and deep-copy the RHS handle into it. The NBA region moves
-    // the staged buffer into dest.
-    void emit_queue_whole_nba(Index i) {
+    // Move one staged container handle into a live one (the NBA commit): ownership
+    // transfer, so the destination's prior elements are freed and no second deep
+    // copy happens.
+    void emit_handle_move(llvm::Value* dst, llvm::Value* src, Ref type) {
+        if (is_assoc_type(type)) {
+            b_.CreateCall(assoc_move_fn(), { dst, src, elem_ops_global(type) });
+            return;
+        }
+        b_.CreateCall(is_queue_type(type) ? queue_move_fn() : dynarr_move_fn(),
+                      { dst, src, elem_ops_global(type) });
+    }
+
+    // Stage a whole-container nonblocking assignment: reserve a record, capture the
+    // live dest handle pointer (stable — the signal slot never moves, only its heap
+    // buffer does, which the commit's move handles), zero the staged handle to the
+    // empty image, and deep-copy the RHS into it. The NBA region moves the staged
+    // buffer into dest.
+    void emit_handle_whole_nba(Index i) {
         const auto&       p    = ir_->payload(i).op_extra;
         const auto        qa   = ir_->extra_data<QueueArg>(p.extra);
         const LValue      dlv  = lvalue_of(p.op);
-        auto*             rt   = queue_rec_ty();
+        auto*             rt   = handle_rec_ty(qa.queue_type);
         const auto        strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         llvm::Value*      rec  = b_.CreateCall(nba_arr_slot_fn(),
-                                               { b_.getInt32(queue_buf_idx(dlv.sig)), b_.getInt32(strd) });
+                                               { b_.getInt32(handle_buf_idx(dlv.sig)), b_.getInt32(strd) });
         b_.CreateAlignedStore(lv_handle_ptr(dlv), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
-        // The staged rt_queue starts at record field 1 (an aligned {i64 x4}).
+        // Every container handle's empty image is all-zero, so a memset constructs
+        // the staging handle the deep copy below then assigns into.
         llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
-        b_.CreateMemSet(staged, b_.getInt8(0), b_.getInt64(4 * 8), llvm::MaybeAlign{ 1 });
-        b_.CreateCall(queue_assign_fn(), { staged, lv_handle_ptr(lvalue_of(qa.arg)),
-                                           elem_ops_global(qa.queue_type),
-                                           alloc_site_global(loc_text(i), "queue") });
+        const auto   hsz    = env_->llmod.getDataLayout().getTypeAllocSize(handle_slot_ty(qa.queue_type));
+        b_.CreateMemSet(staged, b_.getInt8(0), b_.getInt64(hsz), llvm::MaybeAlign{ 1 });
+        emit_handle_assign(staged, lv_handle_ptr(lvalue_of(qa.arg), /*for_write=*/false),
+                           qa.queue_type);
     }
 
-    // Replay a queue's deferred whole-NBA records: move each staged buffer into
+    // Replay a container's deferred whole-NBA records: move each staged handle into
     // its dest handle (push order, later write wins), then wake Any-edge readers.
-    void emit_queue_whole_commit(Signal sig) {
-        auto*        rt    = queue_rec_ty();
-        const auto   strd  = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
-        auto*        i8    = b_.getInt8Ty();
-        llvm::Value* ops   = elem_ops_global(slot_of(sig).ir_type);
-        const uint32_t idx = queue_buf_idx(sig);
-        llvm::Value* base  = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
-        llvm::Value* count = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
+    void emit_handle_whole_commit(Signal sig) {
+        // The container LEAF, not the signal's type: a signal may be a fixed
+        // unpacked array OF containers (`int fa[2][string]`), and `fa[0] <= w`
+        // stages one element. Staging sizes its record from the element type, so a
+        // commit reading the array type would take the wrong stride and dispatch
+        // the wrong move -- rt_dynarr_move over an 8-byte assoc handle, which
+        // overran the staging buffer.
+        const Ref      type = leaf_type(slot_of(sig).ir_type);
+        auto*          rt   = handle_rec_ty(type);
+        const auto     strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
+        auto*          i8   = b_.getInt8Ty();
+        const uint32_t idx  = handle_buf_idx(sig);
+        llvm::Value*   base  = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
+        llvm::Value*   count = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
 
         auto* fn    = b_.GetInsertBlock()->getParent();
-        auto* head  = llvm::BasicBlock::Create(ctx_, "qnba.head", fn);
-        auto* body  = llvm::BasicBlock::Create(ctx_, "qnba.body", fn);
-        auto* done  = llvm::BasicBlock::Create(ctx_, "qnba.done", fn);
+        auto* head  = llvm::BasicBlock::Create(ctx_, "hnba.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "hnba.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "hnba.done", fn);
         auto* entry = b_.GetInsertBlock();
         b_.CreateBr(head);
         b_.SetInsertPoint(head);
@@ -13543,14 +14202,14 @@ private:
         llvm::Value* rec    = b_.CreateInBoundsGEP(i8, base, { b_.CreateMul(k, b_.getInt32(strd)) });
         llvm::Value* dest   = b_.CreateAlignedLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
         llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
-        b_.CreateCall(queue_move_fn(), { dest, staged, ops });
+        emit_handle_move(dest, staged, type);
         k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
         b_.CreateBr(head);
         b_.SetInsertPoint(done);
 
         if (signal_has_waiters(sig)) {
-            auto* svc  = llvm::BasicBlock::Create(ctx_, "qnba.svc", fn);
-            auto* cont = llvm::BasicBlock::Create(ctx_, "qnba.cont", fn);
+            auto* svc  = llvm::BasicBlock::Create(ctx_, "hnba.svc", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "hnba.cont", fn);
             b_.CreateCondBr(b_.CreateICmpNE(count, b_.getInt32(0)), svc, cont);
             b_.SetInsertPoint(svc);
             service_any_waiters(sig);
@@ -13601,6 +14260,16 @@ private:
 
     // Pointer to the leaf SLOT an aggregate lvalue designates (its agg_path,
     // without the final mm/z field select).
+    // Pointer to a whole aggregate ARGUMENT's storage image. An `input` actual may
+    // be an associative-array value, which is a deferred place: resolve it with
+    // get_ptr, because passing by value only reads it and LRM 7.8.6 forbids a read
+    // creating the entry. An out / inout aggregate actual is a caller temp
+    // (Lower.cpp's make_canonical_agg_temp), so it never arrives deferred.
+    llvm::Value* agg_arg_ptr(const LValue& lv) {
+        return lv.is_assoc ? agg_image_ptr(assoc_elem_lvalue(lv, /*for_write=*/false))
+                           : agg_image_ptr(lv);
+    }
+
     llvm::Value* agg_slot_ptr(const LValue& lv) {
         if (lv.is_assoc) {
             // Every supported aggregate-assoc access resolves the map slot (base)
@@ -15379,6 +16048,186 @@ private:
         b_.SetInsertPoint(cont);
     }
 
+    // The zero word a `ref` through a STABLE place points its epoch at: a module
+    // signal, a frame local, a fixed unpacked array element or a class property
+    // never moves, so there is nothing to compare against.
+    //
+    // Internal and constant rather than a runtime export, so that where the
+    // optimizer can see the caller it constant-folds the callee's load to 0, the
+    // compare to true, and deletes the check outright. A ref through such a place
+    // therefore costs nothing once inlined or argument-specialized.
+    llvm::Constant* no_epoch_global() {
+        if (env_->no_epoch == nullptr) {
+            env_->no_epoch = new llvm::GlobalVariable(
+              env_->llmod, b_.getInt64Ty(), /*isConstant=*/true,
+              llvm::GlobalValue::InternalLinkage, b_.getInt64(0), "clotho.ref.noepoch");
+        }
+        return env_->no_epoch;
+    }
+
+    // The rt_ref_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
+    // i32 column, i32 end_column, ptr formal, ptr container }. Field order and
+    // types mirror the C struct exactly, so the two change together.
+    llvm::StructType* ref_site_ty() {
+        auto* i32 = b_.getInt32Ty();
+        return llvm::StructType::get(
+          ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty() });
+    }
+
+    // The site record for one dereference of a ref formal, built in the CALLEE:
+    // where the stale access is, and the callee's name for the formal. The
+    // container's name is not here — the runtime resolves it from the epoch pointer
+    // (rt_ref_names, §3.3), so no part of the report rides on the call.
+    llvm::Constant* ref_site_global(const SourceText& at, std::string_view formal) {
+        auto* const i32  = b_.getInt32Ty();
+        auto* const rec  = ref_site_ty();
+        auto*       init = llvm::ConstantStruct::get(
+          rec, { b_.CreateGlobalString(at.where, "ref.at"),
+                 b_.CreateGlobalString(at.line, "ref.src"),
+                 llvm::ConstantInt::get(i32, at.line_no), llvm::ConstantInt::get(i32, at.column),
+                 llvm::ConstantInt::get(i32, at.end_column),
+                 b_.CreateGlobalString(formal, "ref.formal") });
+        return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
+                                        llvm::GlobalValue::PrivateLinkage, init,
+                                        "clotho.ref.site");
+    }
+
+    // void rt_ref_stale(ptr site, i64 expect, i64 actual, i64 now) — reports the
+    // dangling ref; fatal by default, a once-per-site warning under
+    // --loose-stale-ref, so it CAN return (see Runtime.h).
+    //
+    // Declared as touching only memory the design cannot reach (it writes a
+    // diagnostic and a per-site suppression set, both runtime-private). Without
+    // that, GVN has to assume the call on the FAILING path clobbers the epoch, and
+    // refuses to CSE the epoch load of a second dereference in the same block — so
+    // N accesses through one ref formal paid N loads and N compares instead of one.
+    llvm::FunctionCallee ref_stale_fn() {
+        auto callee =
+          rt_fn("rt_ref_stale", b_.getVoidTy(),
+                { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+        if (auto* fn = llvm::dyn_cast<llvm::Function>(callee.getCallee())) {
+            fn->setMemoryEffects(llvm::MemoryEffects::inaccessibleMemOnly());
+            fn->setDoesNotThrow();
+        }
+        return callee;
+    }
+
+    // void rt_ref_epoch_regress(ptr site, ptr epoch, i64 expect, i64 actual, i64 now)
+    // — an epoch that went backwards is a Clotho bug; aborts unconditionally.
+    llvm::FunctionCallee ref_epoch_regress_fn() {
+        return rt_fn(
+          "rt_ref_epoch_regress", b_.getVoidTy(),
+          { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+    }
+
+    // Register the design's epoch-to-name table before any process runs
+    // (docs/design/data-model.md §3.3). One entry per container signal, keyed by
+    // the address of its relocation epoch, which is the only handle a staleness
+    // report holds. Signals only: their handles live in the state global at a fixed
+    // address, whereas a container in a class body or inside another container's
+    // buffer has none to key on and is reported unnamed.
+    //
+    // Emitted only for a design that can actually produce a report -- one with a
+    // ref formal carrying an epoch -- so the ordinary design pays nothing.
+    void emit_ref_name_table() {
+        if (facts_.ref_epoch_formals.empty()) {
+            return;
+        }
+        auto* const                  rec = ref_name_ty();
+        std::vector<llvm::Constant*> rows;
+        for (uint32_t i = 0; i < mod_.signals().size(); ++i) {
+            const auto        sig  = static_cast<Signal>(i);
+            const SignalInfo& info = mod_.signal(sig);
+            if (!is_handle_type(info.type)) {
+                continue;
+            }
+            auto* const epoch = llvm::dyn_cast<llvm::Constant>(b_.CreateStructGEP(
+              handle_slot_ty(info.type), signal_lvalue(sig).base, handle_epoch_field(info.type)));
+            // A signal reached through a runtime anchor load has no constant
+            // address; it cannot be a table key, and is reported unnamed.
+            if (epoch == nullptr) {
+                continue;
+            }
+            rows.push_back(llvm::ConstantStruct::get(
+              rec, { epoch, b_.CreateGlobalString(info.name, "ref.container") }));
+        }
+        if (rows.empty()) {
+            return;
+        }
+        auto* const arr = llvm::ArrayType::get(rec, rows.size());
+        auto* const gv =
+          new llvm::GlobalVariable(env_->llmod, arr, /*isConstant=*/true,
+                                   llvm::GlobalValue::PrivateLinkage,
+                                   llvm::ConstantArray::get(arr, rows), "clotho.ref.names");
+        b_.CreateCall(rt_fn("rt_ref_names", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() }),
+                      { gv, b_.getInt64(rows.size()) });
+    }
+
+    // { ptr epoch, ptr name } -- must match rt_container_name in Runtime.h.
+    llvm::StructType* ref_name_ty() {
+        return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty() });
+    }
+
+    // Guard one dereference of a `ref` formal against its actual's container
+    // having been restructured since the ref was formed (docs/design/data-model.md
+    // §3). Emitted by local_lvalue, so it covers every read and write through the
+    // formal, including those that straddle a task's suspend — which is exactly
+    // when a container can move under a live ref.
+    //
+    // The site record is built HERE, in the callee, and names this dereference:
+    // both of its fields are callee knowledge (the formal's name, and where the
+    // stale access happens), so no site travels with the call.
+    //
+    // Hot path is one load, one compare and a not-taken branch weighted so both
+    // cold blocks sink out of line; repeated accesses through the same formal
+    // within a block fold to one check, and a ref through a stable place folds
+    // away entirely (no_epoch_global). rt_ref_stale may return (warn mode), so
+    // the stale block rejoins rather than trapping.
+    void emit_ref_epoch_check(const RefBinding& rb) {
+        if (rb.epoch == nullptr) {
+            // A fork child's captured formals are bound before any actual exists;
+            // nothing to check.
+            return;
+        }
+        llvm::Constant* const site = ref_site_global(loc_text(cur_inst_), rb.formal);
+        auto* fn      = b_.GetInsertBlock()->getParent();
+        auto* bad     = llvm::BasicBlock::Create(ctx_, "ref.moved", fn);
+        auto* regress = llvm::BasicBlock::Create(ctx_, "ref.regress", fn);
+        auto* stale   = llvm::BasicBlock::Create(ctx_, "ref.stale", fn);
+        auto* cont    = llvm::BasicBlock::Create(ctx_, "ref.ok", fn);
+
+        llvm::Value* cur = b_.CreateLoad(b_.getInt64Ty(), rb.epoch, "ref.epoch");
+        auto*        br  = b_.CreateCondBr(b_.CreateICmpNE(cur, rb.expect), bad, cont);
+        br->setMetadata(llvm::LLVMContext::MD_prof,
+                        llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+
+        // Epochs only ever advance, so a current value BELOW the expected one means
+        // the epoch plumbing itself is wrong, not the design.
+        b_.SetInsertPoint(bad);
+        b_.CreateCondBr(b_.CreateICmpULT(cur, rb.expect), regress, stale);
+
+        // The time each report stamps is read in its own cold block: reading it
+        // before the branch would put a wheel call on the hot path.
+        const auto report_now = [&]() -> llvm::Value* {
+            return has_wheel() ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                               : static_cast<llvm::Value*>(b_.getInt64(0));
+        };
+
+        b_.SetInsertPoint(regress);
+        auto* rcall =
+          b_.CreateCall(ref_epoch_regress_fn(), { site, rb.epoch, rb.expect, cur, report_now() });
+        rcall->addFnAttr(llvm::Attribute::NoReturn);
+        rcall->addFnAttr(llvm::Attribute::Cold);
+        b_.CreateUnreachable();
+
+        b_.SetInsertPoint(stale);
+        b_.CreateCall(ref_stale_fn(), { site, rb.epoch, rb.expect, cur, report_now() })
+          ->addFnAttr(llvm::Attribute::Cold);
+        b_.CreateBr(cont);
+
+        b_.SetInsertPoint(cont);
+    }
+
     // The rt_tagged_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
     // i32 column, i32 end_column, ptr member, ptr names, ptr name_lens, i32 count,
     // i32 is_write }. Field order and types mirror the C struct exactly, so the two
@@ -16432,10 +17281,12 @@ private:
         if (info.name.empty()) {
             return;
         }
-        const SignalSlot& s = slot_of(sig);
-        if (s.is_string) {
-            return;   // never registers (emit_vcd_var loud-fails on a string)
+        if (vcd_unrepresentable(info.type) != nullptr) {
+            // Never registers: emit_vcd_var refuses a declared one and skips a
+            // compiler-synthesized one, so neither consumes a dump-var index.
+            return;
         }
+        const SignalSlot& s = slot_of(sig);
         if (s.is_array) {
             // Record the first element's dump-var index; element k is base + k. An
             // element write touches base + normalized index (blocking) or the whole
@@ -16604,14 +17455,44 @@ private:
         b_.CreateCall(vcd_upscope_fn(), {});
     }
 
+    // Why a signal's type has no $var form, or nullptr when it has one. Mirrors
+    // Lower.cpp's vcd_unrepresentable, which is where a declared signal is actually
+    // refused; this keeps the crash impossible if a path ever reaches codegen
+    // without that check (an aggregate has no leaf slot type, so the scalar $var
+    // path below would dereference null).
+    const char* vcd_unrepresentable(Ref type) const {
+        Ref leaf = type;
+        while (std::get<Type>(mod_.pool.get(leaf)).kind == Type::Kind::UnpackedArray) {
+            leaf = std::get<Type>(mod_.pool.get(leaf)).element;
+        }
+        const Type& t = std::get<Type>(mod_.pool.get(leaf));
+        switch (t.kind) {
+            case Type::Kind::String:
+                return "string";
+            case Type::Kind::Queue:
+                return "queue";
+            case Type::Kind::DynArray:
+                return "dynamic array";
+            case Type::Kind::Assoc:
+                return "associative array";
+            case Type::Kind::Class:
+                return "class handle";
+            case Type::Kind::Struct:
+                return t.is_packed ? nullptr : "unpacked struct";
+            default:
+                return nullptr;
+        }
+    }
+
     // Register one dumped signal: leaf name, width/flags, and live plane pointers.
     // An unpacked array expands to one $var per element (rt_vcd_array); a real /
     // shortreal carries RT_VCD_FLAG_REAL and dumps as `$var real` (the runtime
     // formats the slot's IEEE-754 bit pattern as a decimal); a named event carries
     // RT_VCD_FLAG_EVENT and dumps as `$var event` (see below). A whole-design dump
     // must represent every declared signal, so an unrepresentable one (string,
-    // multidimensional array) loud-fails rather than being silently omitted; an unnamed compiler temporary is not a declared variable and is
-    // skipped.
+    // container, aggregate, class handle, multidimensional array) loud-fails rather
+    // than being silently omitted; an unnamed compiler temporary is not
+    // a declared variable and is skipped.
     void emit_vcd_var(Signal sig) {
         const SignalInfo& info = mod_.signal(sig);
         if (info.name.empty()) {
@@ -16635,8 +17516,17 @@ private:
             return;
         }
         const SignalSlot& s = slot_of(sig);
-        if (s.is_string) {
-            throw BackendError{ "VCD dump of string signal '" + info.name + "' is not supported" };
+        // Second line of defence behind the frontend's whole-design check
+        // (vcd_unrepresentable in Lower.cpp): a string / container / aggregate /
+        // class-handle signal has no $var form. A DECLARED one is refused; a
+        // compiler-synthesized one (SourceLoc{0}: a gate input net, a materialized
+        // container temp) is not design state and is simply not dumped, which is
+        // also why the frontend check skips it.
+        if (const char* what = vcd_unrepresentable(info.type); what != nullptr) {
+            if (info.loc == SourceLoc{ 0 }) {
+                return;
+            }
+            throw BackendError{ std::string("VCD dump of ") + what + " signal '" + info.name + "' is not supported" };
         }
         // Flag bits mirror RT_VCD_FLAG_* (Runtime.h): four-state, net, narrow,
         // real; the event bit is set on the branch above.
@@ -16736,8 +17626,11 @@ private:
         if (is_handle_type(cur_fn_->return_type)) {
             // Deep-copy the returned handle (an lvalue) into the caller's result
             // handle (the trailing out-param), before freeing the body's handles
-            // (the value may be a frame local or a call result temp).
-            emit_handle_assign(fn_->getArg(fn_->arg_size() - 1), lvalue_of(value).base,
+            // (the value may be a frame local or a call result temp). Resolved
+            // through lv_handle_ptr so returning a struct member, class property
+            // or container element copies THAT handle, not its parent's root.
+            emit_handle_assign(fn_->getArg(fn_->arg_size() - 1),
+                               lv_handle_ptr(lvalue_of(value), /*for_write=*/false),
                                cur_fn_->return_type);
             deinit_body_strings();
             b_.CreateRetVoid();
@@ -16816,19 +17709,26 @@ private:
         size_t k = 0;
         for (Index a : ir_->region(arg_slice)) {
             const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
-            if (is_handle_type(f.param_types[k]) && dir != ArgDir::Ref) {
-                // A dynamic array / queue passes one handle pointer (the actual) in
-                // every by-value direction; the callee copies in / out through it.
-                // (A ref handle falls to the Ref branch below, aliasing the pointer.)
-                argv.push_back(lvalue_of(a).base);
-            } else if (dir == ArgDir::Ref) {
-                // Pass one pointer to the actual's slot (scalar, array element, or a
-                // dynamic-array / queue handle); the callee aliases it.
-                const LValue& lv = lvalue_of(a);
-                argv.push_back(is_handle_type(f.param_types[k]) ? lv.base : ref_actual_ptr(lv));
+            if (dir == ArgDir::Ref) {
+                // The fat ref: aliased storage, the actual's container epoch, that
+                // epoch now, and the site the callee reports a stale ref through.
+                // Every storage class goes through here — a plane slot, a managed
+                // handle, an aggregate image — so `ref` has one shape.
+                const LValue&    lv = lvalue_of(a);
+                const RefBinding rb = ref_actual_arg(lv);
+                argv.push_back(rb.slot);
+                if (ref_needs_epoch(f, k)) {
+                    argv.push_back(rb.epoch);
+                    argv.push_back(rb.expect);
+                }
                 if (!is_handle_type(f.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }
+            } else if (is_handle_type(f.param_types[k])) {
+                // A dynamic array / queue / associative array passes one handle
+                // pointer (the actual) in every by-value direction; the callee
+                // copies in / out through it.
+                argv.push_back(lv_handle_ptr(lvalue_of(a)));
             } else if ((dir == ArgDir::Out || dir == ArgDir::Inout) &&
                        !is_agg_abi(f.param_types[k])) {
                 // An output / inout scalar temp: pass pointers to its mm and z
@@ -16843,7 +17743,7 @@ private:
                 // every direction (the frontend emitted it as an lvalue): In copies
                 // it in, a struct-bearing out / inout copies the frame Local back
                 // out through the same pointer.
-                argv.push_back(agg_slot_ptr(lvalue_of(a)));
+                argv.push_back(agg_arg_ptr(lvalue_of(a)));
             } else if (is_string_type(f.param_types[k])) {
                 argv.push_back(str_of(a));
             } else {
@@ -17762,8 +18662,15 @@ private:
             // decide the ABI for all of them.
             const Function& child = mod_.function(static_cast<FunctionId>(kids[0]));
             for (uint32_t k = 0; k < caps.size(); ++k) {
-                const LValue& lv = lvalue_of(caps[k]);
-                argv.push_back(is_handle_type(child.param_types[k]) ? lv.base : ref_actual_ptr(lv));
+                // A fork capture is a ref to an enclosing frame local, which is a
+                // stable place: the parent's frame outlives every child (the join
+                // waits for them), so the epoch is the compile-time zero word.
+                const RefBinding rb = ref_actual_arg(lvalue_of(caps[k]));
+                argv.push_back(rb.slot);
+                if (ref_needs_epoch(child, k)) {
+                    argv.push_back(rb.epoch);
+                    argv.push_back(rb.expect);
+                }
             }
         }
         argv.push_back(rec);
@@ -17887,18 +18794,25 @@ private:
         // runtime wake keyed by signal id); TODO once that exists.
         std::vector<std::pair<LValue, ServiceSnapshot>> ref_svc;
         for (uint32_t k = 0; k < args.size(); ++k) {
-            if (is_handle_type(tf.param_types[k]) && tf.arg_dirs[k] != ArgDir::Ref) {
-                // One handle pointer for every by-value direction; callee copies
-                // in / out through it.
-                argv.push_back(lvalue_of(args[k]).base);
-            } else if (tf.arg_dirs[k] == ArgDir::Ref) {
-                // Pass one pointer to the actual's slot (scalar, array element, or a
-                // dynamic-array / queue handle); the callee aliases it.
-                const LValue& lv = lvalue_of(args[k]);
-                argv.push_back(is_handle_type(tf.param_types[k]) ? lv.base : ref_actual_ptr(lv));
+            if (tf.arg_dirs[k] == ArgDir::Ref) {
+                // The fat ref, as at a function call: aliased storage, the actual's
+                // container epoch, that epoch now, and the report site. A task is
+                // where the epoch earns its keep — it can suspend, and the container
+                // can be restructured by another process while the ref stays live.
+                const LValue&    lv = lvalue_of(args[k]);
+                const RefBinding rb = ref_actual_arg(lv);
+                argv.push_back(rb.slot);
+                if (ref_needs_epoch(tf, k)) {
+                    argv.push_back(rb.epoch);
+                    argv.push_back(rb.expect);
+                }
                 if (!is_handle_type(tf.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }
+            } else if (is_handle_type(tf.param_types[k])) {
+                // One handle pointer for every by-value direction; callee copies
+                // in / out through it.
+                argv.push_back(lv_handle_ptr(lvalue_of(args[k])));
             } else if (is_agg_abi(tf.param_types[k])) {
                 // An unpacked struct / whole unpacked array actual: one storage
                 // pointer for every direction (the frontend emitted it as an lvalue —
@@ -17907,7 +18821,7 @@ private:
                 // output / inout back at completion, so the caller must keep the
                 // storage alive across the task's suspends: both shapes are frame
                 // Locals / signals, never a short-lived alloca.
-                argv.push_back(agg_slot_ptr(lvalue_of(args[k])));
+                argv.push_back(agg_arg_ptr(lvalue_of(args[k])));
             } else if (tf.arg_dirs[k] == ArgDir::In) {
                 if (is_string_type(tf.param_types[k])) {
                     argv.push_back(str_of(args[k]));
@@ -19255,6 +20169,95 @@ private:
         return { mm, zero(1) };
     }
 
+    // The live element count of a container handle, and its heap data base.
+    std::pair<llvm::Value*, llvm::Value*> container_len_base(llvm::Value* handle, Ref type) {
+        if (is_queue_type(type)) {
+            return { b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 2)),
+                     b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 0)) };
+        }
+        return { b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 1)),
+                 b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 0)) };
+    }
+
+    // The lvalue of logical element `idx` of a container, with no bounds predicate:
+    // for callers that already walk within the live length. A queue's logical index
+    // wraps through its ring (head + i) mod cap.
+    LValue container_elem_lvalue(llvm::Value* handle, llvm::Value* data, Ref type, const DynElem& e, llvm::Value* idx) {
+        llvm::Value* phys = idx;
+        if (is_queue_type(type)) {
+            llvm::Value* head = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 1));
+            llvm::Value* cap  = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 3));
+            llvm::Value* safe = b_.CreateSelect(b_.CreateICmpEQ(cap, b_.getInt64(0)), b_.getInt64(1), cap);
+            phys              = b_.CreateURem(b_.CreateAdd(head, idx), safe);
+        }
+        if (e.is_agg || e.is_handle) {
+            return dyn_agg_elem_lvalue(LValue{}, e, data, phys, /*inrange=*/nullptr);
+        }
+        // A plane element: the same `[0 x slot]` shape the ElemSelect arms build, with
+        // no bounds predicate (the caller walks within the live length).
+        LValue el;
+        el.base        = data;
+        el.slot_ty     = e.slot_ty;
+        el.has_z       = e.has_z;
+        el.narrow      = e.narrow;
+        el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
+        el.elem_idx    = cast(phys, 32, false);
+        el.store_width = e.width;
+        el.bit_off     = b_.getInt32(0);
+        el.width       = e.width;
+        return el;
+    }
+
+    // `a == b` over a container whose elements are aggregates or nested containers
+    // (LRM 11.4.5 / 7.10): equal sizes and every element pair equal, X-propagating
+    // through the same Land reduction the struct / array cases use.
+    //
+    // A loop rather than the flat runtime comparator because the element has no
+    // single-word value image: each pair recurses through lower_agg_eq, which is
+    // also what gives a queue of queues (or of structs holding queues) a compare at
+    // all. The must / may accumulators live in allocas so the loop needs no PHI
+    // plumbing; LLVM promotes them.
+    Plane emit_container_eq_loop(const LValue& lhs, const LValue& rhs, Ref type, const DynElem& e) {
+        llvm::Value* ha      = lv_handle_ptr(lhs, /*for_write=*/false);
+        llvm::Value* hb      = lv_handle_ptr(rhs, /*for_write=*/false);
+        const auto [la, ba]  = container_len_base(ha, type);
+        const auto [lb, bb]  = container_len_base(hb, type);
+        llvm::Value* size_eq = b_.CreateICmpEQ(la, lb);
+
+        auto* i1   = b_.getInt1Ty();
+        auto* must = entry_alloca(i1, "ceq.must");
+        auto* may  = entry_alloca(i1, "ceq.may");
+        auto* idx  = entry_alloca(b_.getInt64Ty(), "ceq.idx");
+        b_.CreateStore(size_eq, must);
+        b_.CreateStore(size_eq, may);
+        b_.CreateStore(b_.getInt64(0), idx);
+
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* head = llvm::BasicBlock::Create(ctx_, "ceq.head", fn);
+        auto* body = llvm::BasicBlock::Create(ctx_, "ceq.body", fn);
+        auto* done = llvm::BasicBlock::Create(ctx_, "ceq.done", fn);
+        // Sizes differing is already a definite 0, so the element walk is skipped.
+        b_.CreateCondBr(size_eq, head, done);
+
+        b_.SetInsertPoint(head);
+        llvm::Value* i = b_.CreateLoad(b_.getInt64Ty(), idx);
+        b_.CreateCondBr(b_.CreateICmpULT(i, la), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* k    = b_.CreateLoad(b_.getInt64Ty(), idx);
+        const Plane  e_eq = lower_agg_eq(
+          container_elem_lvalue(ha, ba, type, e, k), container_elem_lvalue(hb, bb, type, e, k), e.elem_type);
+        const Plane acc =
+          lower_logical(Inst::Tag::Land, bit_plane(b_.CreateLoad(i1, must), b_.CreateLoad(i1, may)), e_eq);
+        b_.CreateStore(b_.CreateTrunc(must_of(acc), i1), must);
+        b_.CreateStore(b_.CreateTrunc(may_of(acc), i1), may);
+        b_.CreateStore(b_.CreateAdd(k, b_.getInt64(1)), idx);
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
+        return bit_plane(b_.CreateLoad(i1, must), b_.CreateLoad(i1, may));
+    }
+
     // Whole-aggregate `==` (LRM 11.2.2): recursively AND-reduce per-leaf
     // logical equality over the member walk. Any definite member mismatch is
     // 0, else X if any member is unknown, else 1 — the Land reduction carries
@@ -19289,14 +20292,24 @@ private:
             return bit_plane(bit, bit);
         }
         if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
-            // A queue / dynamic-array leaf compares element-wise at runtime with
-            // §11.4.5 x-propagation; the runtime tristate (0 unequal, 1 equal,
-            // 2 ambiguous) maps to a 1-bit 4-state plane (may = ts != 0, must =
-            // ts == 1, so 2 -> must=0/may=1 = x).
+            const DynElem e = dynarr_elem(type);
+            if (e.is_agg || e.is_handle || e.width > 64) {
+                // The runtime comparator reads one element word from a flat
+                // descriptor, which an aggregate / nested-container element does not
+                // have and a wider-than-a-word element does not fit, so the walk
+                // happens here: sizes must match, then each element pair compares with
+                // this same recursion (which is also what makes a queue of queues
+                // work).
+                return emit_container_eq_loop(lhs, rhs, type, e);
+            }
+            // A queue / dynamic-array leaf of scalar elements compares element-wise
+            // at runtime with §11.4.5 x-propagation; the runtime tristate (0 unequal,
+            // 1 equal, 2 ambiguous) maps to a 1-bit 4-state plane (may = ts != 0,
+            // must = ts == 1, so 2 -> must=0/may=1 = x).
             const ContainerFmt cf = container_fmt(type);
             llvm::Value*       ts =
               b_.CreateCall(container_eq_fn(),
-                            { lv_handle_ptr(lhs), lv_handle_ptr(rhs), b_.getInt32(cf.is_queue),
+                            { lv_handle_ptr(lhs, /*for_write=*/false), lv_handle_ptr(rhs, /*for_write=*/false), b_.getInt32(cf.is_queue),
                               b_.getInt32(cf.kind), b_.getInt32(cf.width), b_.getInt32(cf.is_signed),
                               b_.getInt32(cf.four), b_.getInt32(cf.has_z), b_.getInt32(cf.z_off),
                               b_.getInt64(cf.stride) });
@@ -20367,7 +21380,12 @@ private:
 
     // Function declarations, indexed by FunctionId; filled before any body is
     // lowered so calls (including recursive / forward) resolve.
+    // Instruction currently being lowered; the ref dereference guard reports
+    // against it. Set by lower_inst, read only by emit_ref_epoch_check.
+    Index cur_inst_ = Index{ 0 };
     std::vector<llvm::Function*> fn_decls_;
+    // &Function -> FunctionId, for the ABI helpers that only receive a reference.
+    ankerl::unordered_dense::map<const Function*, uint32_t> fn_ids_;
     // Set while lowering a function or task body (null during a process). `frame_`
     // is the current call's frame; `frame_slots_` / `frame_ty_` its layout.
     // `cur_is_task_` selects the coroutine return path (epilogue) for Ret.
@@ -20384,12 +21402,13 @@ private:
     // Renders a SourceLoc for a sanitizer report baked into the emitted code.
     // Empty for a caller with no SourceContext (the tests); see loc_text.
     const LocResolver&      resolve_;
-    llvm::Value*            frame_       = nullptr;
-    std::vector<FrameSlot>  frame_slots_;
-    // Per-ref-formal actual pointer, indexed by Local index; null for non-ref
-    // locals. Bound in the callee prologue (bind_ref_formals) from the passed
-    // pointer parameter, then read by local_lvalue to alias the actual live.
-    std::vector<llvm::Value*> ref_ptr_;
+    llvm::Value*           frame_ = nullptr;
+    std::vector<FrameSlot> frame_slots_;
+    // Per-ref-formal fat pointer, indexed by Local index; all-null for a non-ref
+    // local. Bound in the callee prologue (bind_ref_formals) from the four passed
+    // parameters, then read by local_lvalue to alias the actual live and check its
+    // container's relocation epoch.
+    std::vector<RefBinding> ref_ptr_;
     // The current function's frame struct (one field per Local, in order).
     llvm::StructType*       frame_ty_    = nullptr;
     // While lowering a task: the shared copy-out + caller-resume epilogue block a
@@ -20623,7 +21642,7 @@ private:
     // runtime buffer (indexed after the array + aggregate buffers) in the Active
     // region; the NBA region moves that buffer into the live handle and wakes the
     // signal (Any-edge). See docs/design/queue-nba-and-nonpod.md.
-    std::vector<Signal>     queue_nba_sigs_;
+    std::vector<Signal>     handle_nba_sigs_;
 
     // Whole-scalar targets of a nonblocking intra-assignment delay (`x <= #d y`,
     // StoreNbDelay). Each gets a dense id; a per-target record (rt_intra_*) holds
@@ -20716,6 +21735,15 @@ private:
     // coroutine body lowering resets lvals_ via select_member, so the mapping
     // cannot live there.
     std::vector<llvm::Value*> dynarr_ret_;
+    // Owning result buffers for aggregate-element queue pops in the current body,
+    // with the element type each holds: released at every body exit
+    // (build_agg_elem_temps).
+    std::vector<std::pair<llvm::Value*, Ref>> agg_elem_temp_list_;
+    // Per-pop-instruction result buffer (null for a non-aggregate element), snapshot
+    // per fused member exactly like dynarr_ret_.
+    std::vector<llvm::Value*> agg_elem_ret_;
+    // Memoized rt_elem_leaf mirror type ({ i64 offset, ptr ops }).
+    llvm::StructType* elem_leaf_ty_ = nullptr;
     // Memoized `%clotho.queue` handle slot type ({ ptr base, i64 head, len, cap }).
     llvm::StructType* queue_slot_ty_ = nullptr;
     // Memoized `%clotho.assoc` handle slot type ({ ptr impl }).

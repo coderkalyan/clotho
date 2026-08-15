@@ -714,6 +714,12 @@ public:
         return nullptr;
     }
 
+    // Every registered vtable. Whole-design analyses need the slot layout to reason
+    // about virtual dispatch, which can reach any function occupying a slot.
+    [[nodiscard]] std::span<const Vtable> vtables() const {
+        return vtables_;
+    }
+
 private:
     // Signal table; index == Signal handle.
     std::vector<SignalInfo> signals_;

@@ -582,3 +582,85 @@ TEST_CASE("an allocation the system refuses is a located fatal") {
     CHECK(run.err.find("out of memory for this dynamic array") != std::string::npos);
     CHECK(run.err.find("source:6:9") != std::string::npos);
 }
+
+// -- Aggregate elements (LRM 7.5 with 7.2) -------------------------------------
+//
+// Same element capability as a queue: both drive rt_elem_ops, and the element slot
+// presents the same heap-anchored aggregate lvalue.
+
+TEST_CASE("dynamic array of unpacked structs") {
+    constexpr std::string_view src = R"(
+        typedef struct {
+            int         a;
+            logic [3:0] f;
+        } t;
+        module m;
+            t d[], e[];
+            t r;
+            initial begin
+                d = new[2];
+                // A fresh element is its power-on image, per leaf.
+                $display("init %0d %0h", d[0].a, d[0].f);
+                d[0].a = 1;
+                d[0].f = 4'h2;
+                d[1]   = '{a: 3, f: 4'h4};
+                $display("d %0d %0h %0d %0h", d[0].a, d[0].f, d[1].a, d[1].f);
+                r = d[1];
+                $display("r %0d %0h", r.a, r.f);
+                // new[n](src) copies the old elements and defaults the rest.
+                e = new[3](d);
+                $display("e %0d %0d %0d %0h", e.size(), e[1].a, e[2].a, e[2].f);
+                // A whole-array copy is independent.
+                e = d;
+                e[0].a = 9;
+                $display("cp %0d %0d", d[0].a, e[0].a);
+                // An out-of-range read is the element default; the write is dropped.
+                r = d[99];
+                d[99].a = 5;
+                $display("oob %0d %0h size=%0d", r.a, r.f, d.size());
+                d.delete();
+                $display("del %0d", d.size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "init 0 x\n"
+                              "d 1 2 3 4\n"
+                              "r 3 4\n"
+                              "e 3 3 0 x\n"
+                              "cp 1 9\n"
+                              "oob 0 x size=2\n"
+                              "del 0\n");
+}
+
+TEST_CASE("dynamic array of class handles and of struct with an array member") {
+    constexpr std::string_view src = R"(
+        class C;
+            int v;
+        endclass
+        typedef struct {
+            int         v;
+            logic [7:0] b[2];
+        } nest_t;
+        module m;
+            C      h[];
+            nest_t n[];
+            initial begin
+                h = new[2];
+                $display("null=%0b", h[0] == null);
+                h[0] = new;
+                h[0].v = 4;
+                h[1] = h[0];
+                h[1].v = 5;
+                $display("h %0d %0d", h.size(), h[0].v);
+                n = new[1];
+                n[0].b[1] = 8'hAB;
+                $display("n %0h %0h", n[0].b[0], n[0].b[1]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "null=1\n"
+                              "h 2 5\n"
+                              "n xx ab\n");
+}

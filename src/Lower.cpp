@@ -70,6 +70,7 @@
 #include "SourceMap.h"
 #include "Sva.h"
 #include "ir/Builder.h"
+#include "ir/TypeModel.h"
 #include "runtime/Format.h"
 
 namespace clotho {
@@ -1234,6 +1235,14 @@ public:
         return poisoned_;
     }
 
+    // Whether this Lowerer lowered a $dumpvars. A whole-design dump has to be
+    // able to represent every declared signal, and that is only answerable once
+    // every top is lowered, so lower_compilation collects this and runs the
+    // per-signal check itself (guard_vcd_representable).
+    [[nodiscard]] bool dumps_vcd() const {
+        return dumps_vcd_;
+    }
+
 private:
     // Lower the non-signal members of a scope (an instance body or a generate
     // block) into processes: continuous assigns, procedural blocks, child
@@ -1756,6 +1765,50 @@ private:
         }
     }
 
+    // The element types a dynamic array / queue admits, with a loud refusal for the
+    // rest. Both share DynElem and the rt_elem_ops descriptor, so their element
+    // capability is identical by construction; `what` only names the container in
+    // the diagnostic.
+    void guard_container_element(const slang::ast::Type& et, ir::Ref er, std::string_view what) {
+        if (et.isIntegral() || et.isFloating() || et.isString()) {
+            return;
+        }
+        // A class handle is a plain 64-bit word: objects are never freed
+        // (docs/design/classes.md §7), so an element needs no lifecycle beyond the
+        // POD copy rt_elem_ops already does, `null` is the all-zero power-on default
+        // Table 7-1 asks for, and `==` on two handles is the identity compare a word
+        // compare gives. Nothing else is required of it.
+        if (et.isClass()) {
+            return;
+        }
+        // An unpacked struct / union or fixed unpacked array element: the slot holds
+        // the recursive storage image and `q[i]` is a heap-anchored aggregate lvalue
+        // (dyn_agg_elem_lvalue), so member / element selects and whole-element copies
+        // reuse the ordinary aggregate machinery. A string or nested-container leaf
+        // inside it rides the kind-4 rt_elem_ops leaf table, which the runtime uses
+        // to deep-copy and free that leaf per element.
+        if (is_agg_abi_ref(er)) {
+            return;
+        }
+        // A nested container element (queue, dynamic array or associative array):
+        // the slot holds ITS handle, and the element descriptor chains through
+        // rt_elem_ops::inner — rt_elem_dynarr / rt_elem_queue / rt_elem_assoc — so
+        // the runtime deep-copies and frees the inner container per element. `q[i]`
+        // is a handle lvalue, so the inner container's own methods and element
+        // selects work on it unchanged.
+        const ir::Type e = std::get<ir::Type>(module_.pool.get(er));
+        if (e.kind == ir::Type::Kind::Queue || e.kind == ir::Type::Kind::DynArray ||
+            e.kind == ir::Type::Kind::Assoc) {
+            return;
+        }
+        // An event has no value and its trigger state is a separate static
+        // timestamp, so there is no per-element storage to give it
+        // (docs/design/data-model.md §7). Every other kind is admitted above.
+        // TODO: event elements would need per-element trigger state (LRM 15.5),
+        // which is a scheduler change rather than a data-model one.
+        fail(std::string(what) + " element type is not supported (an event has no value to store)");
+    }
+
     ir::Ref lower_type(const slang::ast::Type& type) {
         const slang::ast::Type& ct = type.getCanonicalType();
         if (ct.isVoid()) {
@@ -1788,43 +1841,25 @@ private:
             return module_.pool.put(ir::Item{ t });
         }
         if (const auto* da = ct.as_if<slang::ast::DynamicArrayType>()) {
-            // Dynamic array (LRM 7.5): a heap-backed rt_dynarr handle. Phase 1
-            // restricts the element to a POD scalar (integral or real) — a single
-            // per-element slot; string / aggregate / nested variable-size elements
-            // need per-element deinit/copy and are a documented follow-up.
-            const slang::ast::Type& et = da->elementType.getCanonicalType();
-            if (!et.isIntegral() && !et.isFloating() && !et.isString()) {
-                // TODO: dynamic array of struct / array / nested dynamic-array /
-                // queue / associative element. The rt_elem_ops runtime lifecycle
-                // already supports nested containers; the remaining work is the
-                // element-select lvalue plumbing (handle-element OOB semantics)
-                // and, for aggregates, whole-element rvalue staging.
-                fail("dynamic array element type is not supported (only integral / "
-                     "real / string elements)");
-            }
+            // Dynamic array (LRM 7.5): a heap-backed rt_dynarr handle. Elements ride
+            // the rt_elem_ops descriptor, which is why the admitted set is shared
+            // with a queue (guard_container_element).
+            const ir::Ref er = lower_type(da->elementType);
+            guard_container_element(da->elementType.getCanonicalType(), er, "dynamic array");
             ir::Type t;
             t.kind    = ir::Type::Kind::DynArray;
-            t.element = lower_type(da->elementType);
+            t.element = er;
 
             return module_.pool.put(ir::Item{ t });
         }
         if (const auto* qt = ct.as_if<slang::ast::QueueType>()) {
-            // Queue (LRM 7.10): a heap-backed rt_queue ring handle. Phase-1
-            // restricts the element to a POD scalar (integral or real), same as
-            // dynamic arrays — managed elements need per-element lifecycle.
-            const slang::ast::Type& et = qt->elementType.getCanonicalType();
-            if (!et.isIntegral() && !et.isFloating() && !et.isString()) {
-                // TODO: queue of struct / array / nested dynamic-array / queue /
-                // associative element. The rt_elem_ops runtime lifecycle already
-                // supports nested containers; the remaining work is the
-                // element-select lvalue plumbing (handle-element OOB semantics)
-                // and, for aggregates, whole-element rvalue staging.
-                fail("queue element type is not supported (only integral / real / "
-                     "string elements)");
-            }
+            // Queue (LRM 7.10): a heap-backed rt_queue ring handle. Same element
+            // capability as a dynamic array -- both drive rt_elem_ops.
+            const ir::Ref er = lower_type(qt->elementType);
+            guard_container_element(qt->elementType.getCanonicalType(), er, "queue");
             ir::Type t;
             t.kind    = ir::Type::Kind::Queue;
-            t.element = lower_type(qt->elementType);
+            t.element = er;
             // maxBound is the `[$:N]` max index (0 == unbounded); stored in left.
             t.left = qt->maxBound;
 
@@ -1832,36 +1867,23 @@ private:
         }
         if (const auto* aa = ct.as_if<slang::ast::AssociativeArrayType>()) {
             // Associative array (LRM 7.8/7.9): a heap-backed rt_assoc handle
-            // (ankerl map + lazy sorted key index). The value element rides the
-            // rt_elem_ops descriptor; keys reach the runtime as normalized
-            // byte spans built in the backend (docs/design/dynamic-arrays.md
-            // §4a). Value element supports integral / real / string and a
-            // trivially-copyable (POD-leaf) unpacked struct / fixed array; the
-            // a[k] read/write routes a string handle through the OOB sink and an
-            // aggregate value through its per-leaf select path. Keys of every kind
-            // are supported.
+            // (ankerl map + lazy sorted key index). The value element rides the same
+            // rt_elem_ops descriptor a queue / dynamic-array element does, so it
+            // admits the same set (guard_container_element); keys reach the runtime
+            // as normalized order-preserving byte spans built in the backend
+            // (docs/design/dynamic-arrays.md §4a).
+            //
+            // What is special about an assoc value is only that `a[k]` is a DEFERRED
+            // place: the entry's slot address depends on whether the access reads
+            // (get_ptr, which must not create the entry — LRM 7.8.6) or writes
+            // (put_ptr, which must). Load / Store and the container-method surface
+            // each know their own direction, so every whole-value form works; the one
+            // shape that does not is a further ELEMENT SELECT through a
+            // container-valued entry (`a[k][i]`), which would have to defer twice.
+            // The backend names that case precisely.
             const slang::ast::Type& et = aa->elementType.getCanonicalType();
             const ir::Ref           er = lower_type(aa->elementType);
-            bool                    ok = et.isIntegral() || et.isFloating() || et.isString();
-            if (!ok && is_agg_abi_ref(er)) {
-                if (is_trivially_copyable(er)) {
-                    ok = true;
-                } else {
-                    // TODO: an unpacked struct / array value with a string or
-                    // nested-container leaf needs the kind-4 rt_elem_ops leaf table
-                    // plus a per-leaf deep-copy a[k] path.
-                    fail("associative array value element that is an unpacked struct "
-                         "or array with a string or nested-container leaf is not "
-                         "supported");
-                }
-            }
-            if (!ok) {
-                // TODO: associative array with a nested variable-size (queue /
-                // dynamic / assoc) value element; class-handle values are excluded.
-                fail("associative array value element type is not supported (only "
-                     "integral / real / string / trivially-copyable unpacked struct "
-                     "or array elements)");
-            }
+            guard_container_element(et, er, "associative array value");
             ir::Type t;
             t.kind    = ir::Type::Kind::Assoc;
             t.element = er;
@@ -2765,7 +2787,13 @@ private:
             return;
         }
         if (src.kind == ExpressionKind::Call) {
-            const std::optional<ir::Index> cv = lower_user_call(src.as<CallExpression>(), b);
+            const CallExpression& call = src.as<CallExpression>();
+            // A user function returns an aggregate through a caller safe-temp whose
+            // lvalue IS the call's value; a SYSTEM call that yields an aggregate --
+            // today a queue pop of an aggregate element -- produces the same shape,
+            // so both copy identically.
+            const std::optional<ir::Index> cv =
+              call.subroutine.index() == 0 ? lower_user_call(call, b) : std::optional<ir::Index>{ lower_expr(src, b) };
             if (!cv) {
                 fail("aggregate assignment from a void call");
             }
@@ -2821,13 +2849,19 @@ private:
             b.dyn_array_new(lhs, size, lhs, /*has_init*/ false, type, l);
             for (uint32_t k = 0; k < count; ++k) {
                 const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
+                if (is_agg_abi_ref(t.element)) {
+                    // An aggregate element is copied into the slot, not stored as a
+                    // value: the slot IS its storage image.
+                    emit_agg_store(b.elem_select(lhs, idx, type, l), t.element, *elems[k % n], tag, b, l);
+                    continue;
+                }
                 b.binary(ir::Inst::Tag::Store, b.elem_select(lhs, idx, type, l), lower_expr(*elems[k % n], b), l);
             }
             return;
         }
         b.queue_delete(lhs, lhs, /*has_idx*/ false, type, l);
         for (uint32_t k = 0; k < count; ++k) {
-            b.queue_push(lhs, lower_expr(*elems[k % n], b), /*front*/ false, type, l);
+            b.queue_push(lhs, lower_container_element_value(*elems[k % n], type, b, l), /*front*/ false, type, l);
         }
     }
 
@@ -2959,6 +2993,18 @@ private:
             }
             return;
         }
+        if (value_cat(type) == ValueCat::string && tag != ir::Inst::Tag::Store) {
+            // TODO: nonblocking copy of a string member. A string's value is a heap
+            // handle, so it has no plane-shaped shadow to stage into, and the
+            // whole-container record path this pass built stages a CONTAINER handle
+            // (HandleCopyNb), which an rt_string is not.
+            //
+            // Guarded rather than gapped: falling through to the plane StoreNb below
+            // reached the backend with a string lvalue and no string path, which
+            // crashed codegen instead of reporting anything.
+            fail("nonblocking assignment to an aggregate with a string member is not "
+                 "supported");
+        }
         b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
     }
 
@@ -3041,36 +3087,30 @@ private:
         aggregate, // unpacked struct / fixed unpacked array: decomposes per leaf
     };
     ValueCat value_cat(ir::Ref type) const {
-        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-        switch (t.kind) {
-            case ir::Type::Kind::String:
-                return ValueCat::string;
-            case ir::Type::Kind::DynArray:
-            case ir::Type::Kind::Queue:
-            case ir::Type::Kind::Assoc:
-                return ValueCat::handle;
-            case ir::Type::Kind::UnpackedArray:
+        switch (ir::types::storage_class(module_.pool, type)) {
+            case ir::types::StorageClass::Managed:
+                // `string` and the three containers differ only in whose deep-copy
+                // verb applies, which is exactly the split ValueCat draws.
+                return ir::types::is_string(module_.pool, type) ? ValueCat::string
+                                                                : ValueCat::handle;
+            case ir::types::StorageClass::Aggregate:
                 return ValueCat::aggregate;
-            case ir::Type::Kind::Struct:
-                return t.is_packed ? ValueCat::scalar : ValueCat::aggregate;
-            default:
+            case ir::types::StorageClass::Plane:
+            case ir::types::StorageClass::Void:
                 return ValueCat::scalar;
         }
+        return ValueCat::scalar;
     }
 
     // Whether an interned IR type is a scalar / string / real / handle leaf.
     bool is_leaf_ref(ir::Ref type) const {
-        return value_cat(type) != ValueCat::aggregate;
+        return !ir::types::is_aggregate(module_.pool, type);
     }
 
     // Whether an interned IR type contains an unpacked struct at any nesting depth
     // (backed by the recursive aggregate model; passed / returned by pointer).
     bool contains_struct_ref(ir::Ref type) const {
-        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-        if (t.kind == ir::Type::Kind::UnpackedArray) {
-            return contains_struct_ref(t.element);
-        }
-        return t.kind == ir::Type::Kind::Struct && !t.is_packed;
+        return ir::types::contains_struct(module_.pool, type);
     }
 
     // Whether an interned IR type is an unpacked aggregate passed / returned by
@@ -3078,8 +3118,7 @@ private:
     // unpacked struct (mirrors the backend is_agg_abi). Broader than
     // contains_struct_ref, which is false for a plain scalar-element array.
     bool is_agg_abi_ref(ir::Ref type) const {
-        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-        return t.kind == ir::Type::Kind::UnpackedArray || (t.kind == ir::Type::Kind::Struct && !t.is_packed);
+        return ir::types::is_agg_abi(module_.pool, type);
     }
 
     // Whether a whole-object copy of the type may be a single memcpy of its
@@ -3092,26 +3131,7 @@ private:
     // (ring growth, insert/delete shifts) even for heap-owning element types;
     // only memcpy DUPLICATION is what this predicate gates.
     bool is_trivially_copyable(ir::Ref type) const {
-        switch (value_cat(type)) {
-            case ValueCat::string:
-            case ValueCat::handle:
-                return false;
-            case ValueCat::scalar:
-                return true;
-            case ValueCat::aggregate: {
-                const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-                if (t.kind == ir::Type::Kind::UnpackedArray) {
-                    return is_trivially_copyable(t.element);
-                }
-                for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
-                    if (!is_trivially_copyable(f.type)) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-        }
-        return false;
+        return ir::types::is_trivially_copyable(module_.pool, type);
     }
 
     // A pattern/concatenation-lvalue element that is itself a variable_lvalue
@@ -3190,8 +3210,17 @@ private:
     void guard_agg_eq_members(ir::Ref type) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
-            // A queue / dynamic-array leaf compares element-wise at runtime
-            // (rt_container_eq); its element must be one the runtime handles.
+            // A queue / dynamic-array leaf compares element-wise. An aggregate, a
+            // nested container or an element wider than one word walks in the backend
+            // (emit_container_eq_loop, which recurses through this same compare, so
+            // only the element's own shape has to be checked here); a narrower scalar
+            // element goes through the flat runtime comparator, which is what still
+            // restricts the element kinds it can read.
+            if (is_agg_abi_ref(t.element) || value_cat(t.element) == ValueCat::handle ||
+                module_.pool.layout(t.element).width > 64) {
+                guard_agg_eq_members(t.element);
+                return;
+            }
             guard_container_p_element(t.element, /*sty=*/nullptr);
             return;
         }
@@ -3268,24 +3297,19 @@ private:
     // True if an interned IR type is the string type, or an unpacked array whose
     // leaf element is.
     bool is_string_ref(ir::Ref ty) const {
-        const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
-        if (t.kind == ir::Type::Kind::UnpackedArray) {
-            return is_string_ref(t.element);
-        }
-        return t.kind == ir::Type::Kind::String;
+        return ir::types::is_string_leaf_array(module_.pool, ty);
     }
 
     // True if an interned IR type is a dynamic array (LRM 7.5).
     bool is_dyn_array_ref(ir::Ref ty) const {
-        return std::get<ir::Type>(module_.pool.get(ty)).kind == ir::Type::Kind::DynArray;
+        return ir::types::is_dynarr(module_.pool, ty);
     }
 
     // True if an interned IR type is a heap-handle value type — a dynamic array,
     // queue, or associative array — which share the by-pointer, deep-copy
     // subroutine ABI.
     bool is_handle_ref(ir::Ref ty) const {
-        const ir::Type::Kind k = std::get<ir::Type>(module_.pool.get(ty)).kind;
-        return k == ir::Type::Kind::DynArray || k == ir::Type::Kind::Queue || k == ir::Type::Kind::Assoc;
+        return ir::types::is_container(module_.pool, ty);
     }
 
     // True if an expression is a dynamic array, queue, or associative array (a
@@ -3861,10 +3885,15 @@ private:
                         // event aliasing (Tier 2, docs/design/named-events.md).
                         fail("event ports are not supported");
                     }
-                    if (info.dir != ir::SignalInfo::Direction::Internal && is_string_ref(info.type)) {
-                        // TODO: string module ports (needs string-aware port
-                        // copies and change propagation).
-                        fail("string module ports are not supported");
+                    if (info.dir != ir::SignalInfo::Direction::Internal &&
+                        ir::types::contains_string(module_.pool, info.type)) {
+                        // TODO: string module ports (needs string-aware port copies
+                        // and change propagation). The predicate walks struct members
+                        // and container elements as well as array dimensions, so a
+                        // struct-with-string port and a queue-of-string port are
+                        // caught too -- the old array-only walk let both through.
+                        fail("string module ports are not supported, including a string "
+                             "reached through a struct member or a container element");
                     }
 
                     const ir::Signal sig = register_signal(std::move(info));
@@ -6181,6 +6210,22 @@ private:
             const ir::SourceLoc        l         = to_source_loc(p.location);
             ir::Builder                b(module_.pool);
             std::vector<ir::WaitEvent> sens;
+            // A connected container port. The port copy is a continuous assignment,
+            // so it would have to deep-copy the handle whenever the source changes
+            // (value semantics, LRM 7.5 / 7.9 / 7.10) and detect that change through
+            // a heap buffer rather than a plane compare. Neither exists.
+            //
+            // Guarded here rather than at the declaration: an UNCONNECTED container
+            // port lowers fine and the synthesis path deliberately reports it as a
+            // type with no hardware form, so refusing the declaration would take that
+            // away. Guarded at all because the plane-copy path below would otherwise
+            // reach the backend as a plane load of a handle, which throws there —
+            // a backend error with no source location instead of a diagnostic.
+            // TODO: container module ports (a handle-aware continuous copy).
+            if (ir::types::is_container(module_.pool, lower_type(p.internalSymbol->as<ValueSymbol>().getType()))) {
+                fail("a dynamic-array, queue or associative-array module port "
+                     "connection is not supported");
+            }
             if (expr->kind == ExpressionKind::Assignment) {
                 // Output: parent_target = child_net. slang gives an assignment whose
                 // LHS is the parent target and whose RHS is an EmptyArgument
@@ -14519,6 +14564,7 @@ private:
                 }
             }
         }
+        dumps_vcd_ = true;
         b.dump_vars(loc(call));
     }
 
@@ -15974,6 +16020,9 @@ private:
         if (e.kind == ir::Type::Kind::String || module_.pool.is_float(elem)) {
             return;
         }
+        if (e.kind == ir::Type::Kind::Class) {
+            fail("%p of a queue / dynamic array of class handles is not supported");
+        }
         if (value_cat(elem) == ValueCat::scalar) {
             if (module_.pool.layout(elem).width > 64) {
                 // TODO: %p of a queue / dynamic array element wider than 64 bits
@@ -16175,10 +16224,24 @@ private:
             return;
         }
         if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
-            // A queue / dynamic-array leaf renders at runtime over its live element
-            // count (LRM 21.2.1.6), spliced in as a `%s` string argument.
-            guard_container_p_element(t.element, sty);
+            // A queue / dynamic-array leaf renders over its live element count (LRM
+            // 21.2.1.6), spliced in as a `%s` string argument. The runtime formatter
+            // does it from a flat descriptor, which covers exactly a single-word
+            // integral, a real and a string element; everything else -- an aggregate
+            // or nested container (no flat image), an element wider than one word (the
+            // runtime extraction is single-word), and a tagged union (the descriptor
+            // carries no member names) -- renders through the loop here, where each
+            // element goes through the ordinary aggregate expansion.
             frag += "%s";
+            const slang::ast::Type* est = sty != nullptr ? sty->getCanonicalType().getArrayElementType() : nullptr;
+            const bool              loop_render = value_cat(t.element) != ValueCat::scalar ||
+                                                  module_.pool.layout(t.element).width > 64 ||
+                                                  (est != nullptr && est->isTaggedUnion());
+            if (loop_render && value_cat(t.element) != ValueCat::string) {
+                args.push_back(build_container_p_string(lv, ty, t, sty, b, l));
+                return;
+            }
+            guard_container_p_element(t.element, sty);
             args.push_back(b.container_fmt_p(lv, ty, l));
             return;
         }
@@ -16199,6 +16262,71 @@ private:
         }
         frag += module_.pool.is_float(ty) ? "%g" : value_cat(ty) == ValueCat::string ? "\"%s\"" : "%0d";
         args.push_back(v);
+    }
+
+    // `%p` of a container whose element is an aggregate or a nested container, as a
+    // string value (LRM 21.2.1.6's `'{e0, e1, ...}` over the live element count).
+    //
+    // The runtime formatter renders an element from a flat descriptor (width, domain,
+    // stride), which an unpacked struct / array or a nested handle simply does not
+    // have -- and the frontend cannot unroll a runtime length the way it unrolls a
+    // fixed array. So the render is a loop built here: each element goes through the
+    // ORDINARY aggregate expansion (so member names, nested arrays, tagged unions and
+    // string leaves all render exactly as they do outside a container) into one
+    // $sformatf, and the pieces concatenate into a string cell.
+    ir::Index build_container_p_string(ir::Index               lv,
+                                       ir::Ref                 ty,
+                                       const ir::Type&         t,
+                                       const slang::ast::Type* sty,
+                                       ir::Builder&            b,
+                                       ir::SourceLoc           l) {
+        using T                           = ir::Inst::Tag;
+        const slang::ast::Type* est       = sty != nullptr ? sty->getCanonicalType().getArrayElementType() : nullptr;
+        const ir::Ref           i32       = make_int_type(32, false, true);
+        const TempCell          out       = make_temp_cell(module_.pool.string_type, "pstr");
+        const TempCell          idx       = make_temp_cell(i32, "pstr_idx");
+        const TempCell          bound     = make_temp_cell(i32, "pstr_n");
+        const bool              is_q      = t.kind == ir::Type::Kind::Queue;
+        const auto              str_const = [&](std::string_view s) { return b.constant(string_value_ref(s), l); };
+        const auto              append    = [&](ir::Index piece) {
+            const std::array<ir::Index, 2> parts{ b.unary(T::Load, out.lv(b, l), l), piece };
+            b.binary(T::Store, out.lv(b, l), b.concat(parts, l), l);
+        };
+
+        b.binary(T::Store, out.lv(b, l), str_const("'{"), l);
+        b.binary(
+          T::Store, bound.lv(b, l), b.resize(is_q ? b.queue_size(lv, ty, l) : b.dyn_array_size(lv, ty, l), i32, l), l);
+        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+
+        b.open_region();
+        const ir::Index pred =
+          b.binary(T::Lt, b.unary(T::Load, idx.lv(b, l), l), b.unary(T::Load, bound.lv(b, l), l), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        const ir::Index k = b.unary(T::Load, idx.lv(b, l), l);
+        b.open_region();
+        append(str_const(", "));
+        const ir::ExtraSlice sep_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice nosep_r = b.close_region();
+        b.cond(b.binary(T::Ne, k, b.constant(module_.pool.put_int(i32, 0), l), l), sep_r, nosep_r, l);
+        std::string            efrag;
+        std::vector<ir::Index> eargs;
+        expand_p_lvalue(b.elem_select(lv, k, ty, l), t.element, est, efrag, eargs, b, l);
+        append(b.sformatf(efrag, eargs, l));
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        b.binary(T::Store,
+                 idx.lv(b, l),
+                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
+                 l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+        append(str_const("}"));
+        return b.unary(T::Load, out.lv(b, l), l);
     }
 
     // Offset of the first `%p` in `fmt` that is a real conversion, skipping any
@@ -16829,23 +16957,12 @@ private:
             check_subroutine_nba_target(a.left());
         }
         if (is_dyn_array(a.left())) {
-            if (a.isNonBlocking()) {
-                // TODO: nonblocking assignment to a dynamic array (needs a
-                // handle-aware NBA staging path; the per-signal shadow is
-                // plane-shaped).
-                fail("nonblocking assignment to a dynamic array is not supported");
-            }
             return lower_dyn_array_assign(a, b);
         }
         if (is_queue(a.left())) {
             return lower_queue_assign(a, b);
         }
         if (is_assoc(a.left())) {
-            if (a.isNonBlocking()) {
-                // TODO: nonblocking assignment to an associative array (needs a
-                // handle-aware NBA staging path).
-                fail("nonblocking assignment to an associative array is not supported");
-            }
             return lower_assoc_assign(a, b);
         }
         if (is_unpacked_array(a.left())) {
@@ -16975,6 +17092,23 @@ private:
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       aty = lower_type(*a.left().type);
+        if (a.isNonBlocking()) {
+            // `d <= other` (LRM 7.5, 10.4.2): a container's value is a heap handle,
+            // so there is no plane-shaped shadow to stage into. The Active region
+            // deep-copies the source into a staging handle and the NBA region moves
+            // that into the live one -- HandleCopyNb, shared with queues and
+            // associative arrays.
+            if (!is_dyn_array(a.right()) || !is_struct_lvalue_shape(unwrap_conversion(a.right()))) {
+                // TODO: a `'{...}` literal or a `new[n]` on the right of a
+                // nonblocking assignment. Both build their value in place rather
+                // than deep-copying a handle, so neither can stage into the record
+                // buffer without first materializing a temp handle.
+                fail("nonblocking assignment to a dynamic array is only supported from "
+                     "another dynamic-array variable");
+            }
+            b.handle_copy_nb(dst, lower_lvalue(unwrap_conversion(a.right()), b), aty, l);
+            return dst;
+        }
         // `d = '{e0, e1, ...}` (LRM 10.9): the source is an assignment-pattern
         // literal, not another handle — materialize it element-wise rather than
         // deep-copying a handle (emit_handle_literal_init allocates + stores).
@@ -17206,6 +17340,17 @@ private:
 
         const bool      queue = is_queue(recv);
         const ir::Ref   aty   = lower_type(*recv.type);
+        const ir::Ref   elem_ref = std::get<ir::Type>(module_.pool.get(aty)).element;
+        const bool      agg_elem = is_agg_abi_ref(elem_ref);
+        // With no `with` clause the key IS the element (7.12.1 defines the bare form
+        // as `with (item)`), and an unpacked aggregate has no ordering, no bit-exact
+        // dedup compare and no fold -- so those forms need a scalar clause. A
+        // find*'s clause is mandatory anyway, and its predicate is already scalar.
+        if (agg_elem && iter_expr == nullptr) {
+            fail("array method '" + std::string(name) +
+                 "' on a container with an unpacked struct or array element needs a `with` clause "
+                 "(the element itself is not a key)");
+        }
         const ir::Ref   i32   = make_int_type(32, false, true);
         const ir::Ref   bit1  = make_int_type(1, false, false);
         const ir::Index one1  = b.constant(module_.pool.put_int(bit1, 1), l);
@@ -17225,11 +17370,25 @@ private:
         // The key is the clause's value, or the element itself when the clause is
         // omitted -- 7.12.1 defines the bare form as "as if a with(item) clause
         // were specified". A find* predicate reduces the same clause to one bit.
-        const auto elem_at = [&](ir::Index k) { return b.unary(T::Load, b.elem_select(arr, k, aty, l), l); };
+        // The element at k: an ordinary value for a scalar element, and the element
+        // LVALUE for an aggregate one -- which is what both an aggregate copy and
+        // queue_push (whose element crosses by pointer) want.
+        const auto elem_lv = [&](ir::Index k) { return b.elem_select(arr, k, aty, l); };
+        const auto elem_at = [&](ir::Index k) { return agg_elem ? elem_lv(k) : b.unary(T::Load, elem_lv(k), l); };
         const auto bind    = [&](ir::Index k) {
-            if (iter_var != nullptr) {
-                b.binary(T::Store, value_lvalue(*iter_var, b, l), elem_at(k), l);
+            if (iter_var == nullptr) {
+                return;
             }
+            const ir::Index dst = value_lvalue(*iter_var, b, l);
+            if (!agg_elem) {
+                b.binary(T::Store, dst, elem_at(k), l);
+                return;
+            }
+            if (is_trivially_copyable(elem_ref)) {
+                b.agg_copy(dst, elem_lv(k), elem_ref, l);
+                return;
+            }
+            emit_agg_copy(dst, elem_lv(k), elem_ref, T::Store, b, l);
         };
         const auto key_of = [&](ir::Index k) {
             return iter_expr != nullptr ? lower_expr(*iter_expr, b) : elem_at(k);
@@ -17398,6 +17557,21 @@ private:
     // last element, index size-1; size-1 == -1 selects the OOB default on an
     // empty queue).
     ir::Index var_elem_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
+        if (is_assoc_element_select(es.value()) && is_handle_expr(es.value())) {
+            // `a[k][i]`: the inner container is an associative-array ENTRY, whose
+            // slot address depends on the access direction (get_ptr must not create
+            // the entry, LRM 7.8.6; put_ptr must), and that direction belongs to the
+            // consumer of this select, not to the select itself.
+            //
+            // TODO: compose the deferral so an ElemSelect over a deferred AssocSelect
+            // stays deferred, carrying the pending index alongside the pending key.
+            // Whole-value assignment (`a[k] = q`, `q = a[k]`) and the container's own
+            // methods (`a[k].push_back(v)`, `a[k].size()`) all work today, each being
+            // unambiguously one direction.
+            fail("an element select through an associative-array element that is "
+                 "itself a queue or dynamic array is not supported (whole-value "
+                 "assignment and its own methods are)");
+        }
         const ir::Ref arr_ty = lower_type(*es.value().type);
         if (is_queue(es.value()) && es.selector().type->isUnbounded()) {
             const ir::Ref   i32  = make_int_type(32, false, true);
@@ -17455,7 +17629,11 @@ private:
         const Expression&   e = unwrap_conversion(expr);
         const ir::SourceLoc l = loc(e);
         if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue ||
-            e.kind == ExpressionKind::Call) {
+            e.kind == ExpressionKind::Call ||
+            // A queue that IS an element or a member of something -- a nested queue
+            // element, a struct member, a class property -- already has a handle
+            // lvalue, so it needs no temp either.
+            e.kind == ExpressionKind::ElementSelect || e.kind == ExpressionKind::MemberAccess) {
             return lower_lvalue(e, b);
         }
         const ir::Ref   qty = lower_type(*expr.type);
@@ -17518,7 +17696,7 @@ private:
                      "is not supported");
             }
             // A single element operand.
-            b.queue_push(dst, lower_expr(*op, b), /*front=*/false, qty, l);
+            b.queue_push(dst, lower_container_element_value(*op, qty, b, l), /*front=*/false, qty, l);
         }
     }
 
@@ -17556,7 +17734,7 @@ private:
             // Whole-queue NBA: stage a deep copy now, move it into dst in the NBA
             // region (LRM 10.4.2). The target is a module signal (task/process
             // NBA is module-signal-only; function NBA is rejected above).
-            b.queue_copy_nb(dst, src, qty, l);
+            b.handle_copy_nb(dst, src, qty, l);
             return dst;
         }
         b.queue_copy(dst, src, qty, l);
@@ -17571,20 +17749,96 @@ private:
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       aty = lower_type(*a.left().type);
+        if (a.isNonBlocking() && as_assignment_pattern(a.right()) != nullptr) {
+            // TODO: a `'{key:value}` / `'{default:v}` literal on the right of a
+            // nonblocking assignment. The literal builds its entries in place rather
+            // than deep-copying a handle, so staging it needs a temp map first. Must
+            // be refused BEFORE the pattern branch below, which would otherwise
+            // silently apply the literal as a BLOCKING assignment.
+            fail("nonblocking assignment of a literal into an associative array is "
+                 "not supported");
+        }
         if (as_assignment_pattern(a.right()) != nullptr) {
             emit_assoc_literal_init(dst, aty, unwrap_conversion(a.right()), ir::Inst::Tag::Store, b, l);
             return dst;
         }
-        const bool src_is_var = is_assoc(a.right()) && (a.right().kind == ExpressionKind::NamedValue ||
-                                                        a.right().kind == ExpressionKind::HierarchicalValue ||
-                                                        a.right().kind == ExpressionKind::Call);
-        if (!src_is_var) {
-            // TODO: associative-array assignment from any other rvalue shape (there
-            // is none in LRM 7.9 beyond a variable, a call result and a literal).
+        // LRM 7.9 admits a variable, a call result or a literal as the source. A
+        // "variable" here is any PLACE holding an associative array, not just a
+        // named one: an assoc that lives in a struct member, an array element, a
+        // container element or a class property is equally a handle lvalue, and the
+        // deep copy below reaches it through the same resolver. Restricting this to
+        // NamedValue / HierarchicalValue refused `outer.m = inner`, `arr[i] = inner`
+        // and every other nested shape for no reason.
+        const bool src_is_place =
+          is_assoc(a.right()) &&
+          (is_struct_lvalue_shape(a.right()) || a.right().kind == ExpressionKind::Call);
+        if (!src_is_place) {
+            // TODO: an associative-array source that is none of those three shapes.
+            // LRM 7.9 defines no other whole-array value, so this is a defensive
+            // guard rather than a known gap.
             fail("associative array assignment from a non-variable value is not supported");
+        }
+        if (a.isNonBlocking()) {
+            // `a <= other` (LRM 7.9, 10.4.2): staged deep copy in the Active region,
+            // moved into the live map in the NBA region -- the same HandleCopyNb a
+            // queue and a dynamic array take.
+            b.handle_copy_nb(dst, lower_lvalue(a.right(), b), aty, l);
+            return dst;
         }
         b.assoc_copy(dst, lower_lvalue(a.right(), b), aty, l);
         return dst;
+    }
+
+    // One element value on its way into a container, in the form the backend wants:
+    // an ordinary value for a scalar / string / handle element, and an LVALUE Index
+    // for an aggregate element, which crosses the rt_queue_* ABI as a pointer to its
+    // storage image. A non-lvalue aggregate actual (a `'{...}` pattern) is staged
+    // into a canonical aggregate temp first -- the same shape an aggregate
+    // associative-array key takes (lower_assoc_key).
+    ir::Index lower_container_element_value(const Expression& val,
+                                            ir::Ref           container_ty,
+                                            ir::Builder&      b,
+                                            ir::SourceLoc     l) {
+        const ir::Ref er = std::get<ir::Type>(module_.pool.get(container_ty)).element;
+        if (value_cat(er) == ValueCat::handle) {
+            // A nested container element crosses as a pointer to ITS handle, which the
+            // runtime then deep-copies. A queue value that is not already a handle
+            // lvalue (a '{...} pattern, a concatenation, a slice) materializes into a
+            // temp handle first, exactly as a whole-queue assignment source does.
+            if (std::get<ir::Type>(module_.pool.get(er)).kind == ir::Type::Kind::Queue) {
+                return materialize_queue_rvalue(val, b);
+            }
+            const Expression& src = unwrap_conversion(val);
+            if (!is_struct_lvalue_shape(src) && src.kind != ExpressionKind::Call) {
+                // TODO: a non-variable dynamic-array element value (`new[n]` / a
+                // pattern), which needs the dynamic-array twin of
+                // materialize_queue_rvalue.
+                fail("this dynamic-array value as a container element is not supported");
+            }
+            return lower_lvalue(src, b);
+        }
+        if (!is_agg_abi_ref(er)) {
+            return lower_expr(val, b);
+        }
+        const Expression& src = unwrap_conversion(val);
+        // The element crosses the rt_* ABI as a pointer to a CANONICAL aggregate
+        // image, because that is the layout `rt_elem_ops::stride` was computed from.
+        // A struct-bearing actual already has that layout; a plain (scalar-element)
+        // array signal has FLAT storage whose element slot may be independently
+        // z-widened, so its image is a different size and handing its pointer over
+        // would make the runtime copy the wrong byte count. Stage those through a
+        // canonical temp, exactly as a by-value array argument does
+        // (build_call_args), and let a non-lvalue actual take the same path.
+        if (is_struct_lvalue_shape(src) && contains_struct_ref(er)) {
+            return lower_lvalue(src, b);
+        }
+        const ir::Index temp = make_canonical_agg_temp(er, b, l);
+        if (is_struct_lvalue_shape(src)) {
+            emit_agg_copy(temp, lower_lvalue(src, b), er, ir::Inst::Tag::Store, b, l);
+        } else {
+            emit_agg_store(temp, er, src, ir::Inst::Tag::Store, b, l);
+        }
+        return temp;
     }
 
     // A queue built-in method used as an rvalue or statement (LRM 7.10.2). The
@@ -17597,13 +17851,14 @@ private:
             return b.resize(b.queue_size(q, qty, l), lower_type(*call.type), l);
         }
         if (name == "push_back" || name == "push_front") {
-            return b.queue_push(q, lower_expr(*args[1], b), name == "push_front", qty, l);
+            return b.queue_push(q, lower_container_element_value(*args[1], qty, b, l), name == "push_front", qty, l);
         }
         if (name == "pop_back" || name == "pop_front") {
             return b.queue_pop(q, name == "pop_front", qty, l);
         }
         if (name == "insert") {
-            return b.queue_insert(q, lower_index(*args[1], b), lower_expr(*args[2], b), qty, l);
+            return b.queue_insert(
+              q, lower_index(*args[1], b), lower_container_element_value(*args[2], qty, b, l), qty, l);
         }
         if (name == "delete") {
             // q.delete() clears all; q.delete(i) removes one element.
@@ -20280,16 +20535,19 @@ private:
             const auto dir = fa->direction;
             if (dir == slang::ast::ArgumentDirection::Ref) {
                 // ref / const ref (LRM 13.5.2): the formal aliases the actual's live
-                // storage through a passed pointer (see build_function / build_task
-                // and the backend ref ABI). Supported for packed integral formals
-                // (scalar / packed vector) and dynamic arrays (the handle pointer is
-                // aliased directly).
-                const auto& ct = fa->getType().getCanonicalType();
-                if (!ct.isIntegral() && ct.as_if<slang::ast::DynamicArrayType>() == nullptr) {
-                    // TODO: ref of unpacked array / struct / string / real — needs a
-                    // handle pass or offset plumbing, not the packed-slot pointer ABI.
-                    fail("ref arguments are only supported for packed integral types "
-                         "and dynamic arrays");
+                // storage through a fat pointer carrying the storage address, the
+                // relocation epoch of the container the actual is rooted in, and the
+                // report site (docs/design/data-model.md §3). Every storage class
+                // passes the same way — a plane slot, a managed handle, an aggregate
+                // image — so there is no per-type restriction here.
+                //
+                // An `event` formal is the one exclusion: an event has no value and
+                // its trigger state is a separate static timestamp, so there is
+                // nothing for a pointer to alias.
+                if (fa->getType().getCanonicalType().isEvent()) {
+                    // TODO: ref of an event (LRM 15.5) needs event reference
+                    // semantics, which is a scheduler change, not a data-model one.
+                    fail("ref argument of an event type is not supported");
                 }
                 continue;
             }
@@ -21072,6 +21330,14 @@ private:
                 args.push_back(lower_lvalue(unwrap_conversion(*actual), b));
                 continue;
             }
+            // A `ref` actual is decided by DIRECTION, not by type: every storage
+            // class aliases through the same fat ref, so this must precede the
+            // by-value aggregate and handle paths below (which would otherwise
+            // capture a ref aggregate / container formal and copy it).
+            if (dir == slang::ast::ArgumentDirection::Ref) {
+                args.push_back(lower_ref_actual(*actuals[i], b));
+                continue;
+            }
             const ir::Ref pty = lower_type(formals[i]->getType());
             if (is_agg_abi_ref(pty)) {
                 // An unpacked aggregate actual passes by pointer (LRM 13.5.1 copies at
@@ -21144,10 +21410,6 @@ private:
                 args.push_back(lower_lvalue(*actual, b));
                 continue;
             }
-            if (dir == slang::ast::ArgumentDirection::Ref) {
-                args.push_back(lower_ref_actual(*actuals[i], b));
-                continue;
-            }
             if (dir == slang::ast::ArgumentDirection::In) {
                 // A string actual passes as-is (no width to resize to); the callee's
                 // copy-in gives value semantics.
@@ -21198,31 +21460,46 @@ private:
         }
     }
 
-    // A legal ref actual (LRM 13.5.2) Clotho supports: a whole variable, or a whole
-    // element of an unpacked array (`arr[i]`, possibly nested). Each is one complete
-    // `{ i(2W), iW }` slot, so the backend passes its slot pointer. slang already
-    // rejects a packed bit/part-select as a ref actual ("only variables, class
-    // properties, and members of unpacked structs and arrays are allowed"); an
-    // unpacked-struct member needs struct support, still unimplemented.
+    // Whether an expression names a whole PLACE a `ref` can alias (LRM 13.5.2), as
+    // opposed to a partial selection of one. A place is a named variable, an
+    // element of an unpacked array / dynamic array / queue / associative array, a
+    // member of an unpacked struct, or a class property — composed to any depth.
+    //
+    // The exclusion is a bit or part select of a packed value: that is a sub-slot
+    // bit range, not an addressable object, so no pointer can name it. slang
+    // already rejects it ("only variables, class properties, and members of
+    // unpacked structs and arrays are allowed"); this is the backstop.
     bool is_whole_ref_actual(const Expression& a) {
         switch (a.kind) {
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue:
                 return true;
             case ExpressionKind::ElementSelect: {
-                // Only an unpacked-array element is a whole slot; a select of a
-                // packed value is a bit/part-select (a partial ref, unsupported).
+                // An element of any unpacked collection is a whole place; a select of
+                // a PACKED value is a bit select, which is not.
                 const auto& es = a.as<ElementSelectExpression>();
-                return is_unpacked_array(es.value()) && is_whole_ref_actual(es.value());
+                return is_unpacked_container(*es.value().type) && is_whole_ref_actual(es.value());
+            }
+            case ExpressionKind::MemberAccess: {
+                // An unpacked-struct member or a class property is a whole place. A
+                // PACKED struct / union member is a part select of the flat value, so
+                // it is not.
+                const auto& ma = a.as<MemberAccessExpression>();
+                if (ma.member.kind == SymbolKind::ClassProperty) {
+                    // The object body is reached through the handle, so the handle
+                    // expression itself need not be a place.
+                    return true;
+                }
+                return is_unpacked_struct(*ma.value().type) && is_whole_ref_actual(ma.value());
             }
             default:
                 return false;
         }
     }
 
-    // Lower a ref actual (LRM 13.5.2) to its lvalue leaf: the backend passes one
-    // pointer to the actual's slot (a scalar's slot, or one array-element slot) and
-    // the callee aliases it live.
+    // Lower a ref actual (LRM 13.5.2) to its lvalue: the backend turns that lvalue
+    // into the fat ref the callee aliases live (ref_actual_arg), including the
+    // relocation epoch when the place is rooted inside a container's heap storage.
     ir::Index lower_ref_actual(const Expression& actual, ir::Builder& b) {
         const Expression* a = &actual;
         // slang may wrap a ref actual in an AssignmentExpression (as for out/inout);
@@ -21231,9 +21508,11 @@ private:
             a = &a->as<AssignmentExpression>().left();
         }
         if (!is_whole_ref_actual(*a)) {
-            // TODO: ref actual that is a packed bit/part-select or unpacked-struct
-            // member (needs sub-slot offset plumbing / struct support).
-            fail("ref argument actual must be a whole variable or unpacked-array element");
+            // A bit / part select of a packed value is a bit range, not an object a
+            // pointer can name. There is nothing to implement here: LRM 13.5.2 does
+            // not allow it and slang rejects it first.
+            fail("ref argument actual must be a whole variable, element, member or "
+                 "class property, not a bit or part select");
         }
         return lower_lvalue(*a, b);
     }
@@ -21535,6 +21814,8 @@ private:
     // behaviour, so it MUST NOT reach codegen. lower_compilation turns this into
     // LowerResult::ok == false, which is the gate.
     bool poisoned_ = false;
+    // Set when $dumpvars is lowered: the design asks for a whole-design VCD dump.
+    bool dumps_vcd_ = false;
 };
 
 // Map slang's severity scale onto Clotho's. slang's Ignored never reaches here (an
@@ -21693,6 +21974,61 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
             engine.setSeverity(slang::diag::InferredLatch, slang::DiagnosticSeverity::Warning);
             engine.setSeverity(slang::diag::InferredComb, slang::DiagnosticSeverity::Warning);
             break;
+    }
+}
+
+const char* vcd_unrepresentable(const ir::InternPool& pool, ir::Ref type) {
+    ir::Ref leaf = type;
+    while (std::get<ir::Type>(pool.get(leaf)).kind == ir::Type::Kind::UnpackedArray) {
+        leaf = std::get<ir::Type>(pool.get(leaf)).element;
+    }
+    const ir::Type& t = std::get<ir::Type>(pool.get(leaf));
+    switch (t.kind) {
+        case ir::Type::Kind::String:
+            return "string";
+        case ir::Type::Kind::Queue:
+            return "queue";
+        case ir::Type::Kind::DynArray:
+            return "dynamic array";
+        case ir::Type::Kind::Assoc:
+            return "associative array";
+        case ir::Type::Kind::Class:
+            return "class handle";
+        case ir::Type::Kind::Struct:
+            return t.is_packed ? nullptr : "unpacked struct";
+        default:
+            return nullptr;
+    }
+}
+
+// Refuse a whole-design $dumpvars that would have to dump a signal with no VCD
+// form. Walks exactly the set the backend registers (each top's scope tree, in
+// order), so it neither misses a dumped signal nor rejects one that is never
+// dumped -- a package-scope variable belongs to no instance scope, for instance.
+//
+// A compiler-synthesized signal (SourceLoc{0}: a gate input net, a materialized
+// container temp) is skipped rather than reported: it is not a declared variable,
+// the backend skips it too, and naming it in a diagnostic would point at no
+// source.
+void check_vcd_scope(const ir::Module& m, const ir::InstanceScope& sc, std::vector<Diagnostic>& out) {
+    for (const ir::Signal sig : sc.signals) {
+        const ir::SignalInfo& info = m.signal(sig);
+        if (info.name.empty() || info.is_event || info.loc == ir::SourceLoc{ 0 }) {
+            continue;
+        }
+        const char* what = vcd_unrepresentable(m.pool, info.type);
+        if (what == nullptr) {
+            continue;
+        }
+        out.push_back(
+          Diagnostic{ .severity = Severity::Error,
+                      .origin   = DiagnosticOrigin::Unsupported,
+                      .code     = "unsupported-construct",
+                      .message  = "$dumpvars cannot dump '" + info.name + "': " + what + " has no VCD representation",
+                      .span     = ir::SourceSpan{ info.loc, info.loc } });
+    }
+    for (const ir::InstanceScope& child : sc.children) {
+        check_vcd_scope(m, child, out);
     }
 }
 
@@ -21889,7 +22225,8 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             module->name = std::string(root.topInstances[0]->name);
         }
     }
-    bool poisoned = false;
+    bool poisoned  = false;
+    bool dumps_vcd = false;
     try {
         Lowerer globals(*module, tick_fs, allow_system);
         globals.lower_globals(comp, root);
@@ -21909,11 +22246,13 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             lw.collect_dpi_exports(comp, *top, /*collect_globals=*/top == root.topInstances.front());
             const std::span<const Diagnostic> recovered = lw.recovered_diags();
             result.diagnostics.insert(result.diagnostics.end(), recovered.begin(), recovered.end());
-            poisoned = poisoned || lw.poisoned();
+            poisoned  = poisoned || lw.poisoned();
+            dumps_vcd = dumps_vcd || lw.dumps_vcd();
         }
         const std::span<const Diagnostic> global_diags = globals.recovered_diags();
         result.diagnostics.insert(result.diagnostics.end(), global_diags.begin(), global_diags.end());
-        poisoned = poisoned || globals.poisoned();
+        poisoned  = poisoned || globals.poisoned();
+        dumps_vcd = dumps_vcd || globals.dumps_vcd();
     } catch (const LowerError& e) {
         // A structural failure (an instance, generate block or instance array),
         // which the member walk deliberately does not recover from because
@@ -21924,6 +22263,15 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
                                                  .message  = e.message,
                                                  .span     = e.span });
         return result;
+    }
+    // The dump has to represent every declared signal, and the answer needs the
+    // whole design, so it is checked here rather than at the $dumpvars call.
+    if (dumps_vcd) {
+        const size_t before = result.diagnostics.size();
+        for (const ir::InstanceScope& top : module->tops()) {
+            check_vcd_scope(*module, top, result.diagnostics);
+        }
+        poisoned = poisoned || result.diagnostics.size() != before;
     }
     if (timings != nullptr) {
         timings->analysis_ms += ms_since(t_an);

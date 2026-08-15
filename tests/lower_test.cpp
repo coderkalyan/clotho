@@ -711,10 +711,13 @@ TEST_CASE("an associative array lowers") {
     CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
-TEST_CASE("an associative array with a class-handle value element fails loudly") {
-    // Class handles as a value element are deliberately excluded (object lifetime
-    // / GC semantics). integral / real / string / aggregate / nested-container
-    // values are supported; a class value must still fail loudly.
+TEST_CASE("an associative array with a class-handle value element lowers") {
+    // A class handle is a plain 64-bit word: objects are never freed
+    // (docs/design/classes.md §7), so an entry needs no lifecycle beyond the POD
+    // copy, `null` is the all-zero Table 7-1 default, and `==` is the identity
+    // compare a word compare gives. That is the same reasoning a queue / dynamic
+    // -array element of class-handle type already relies on, so the assoc value
+    // element admits exactly the set guard_container_element does.
     const LowerResult r = lower_text(R"(
         class C; int x; endclass
         module top;
@@ -722,8 +725,7 @@ TEST_CASE("an associative array with a class-handle value element fails loudly")
             initial a[0] = null;
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("value element") != std::string::npos);
+    CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
 TEST_CASE("nonblocking whole-struct copy with a queue member fails loudly") {
@@ -1019,19 +1021,18 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
 TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
     // Binding a type parameter to a not-yet-lowered type must hit the same loud
     // guard as a direct declaration, not silently accept it. (`event`,
-    // `chandle`, and `class` were prior examples here; all are lowered now —
-    // named event LRM 15.5, chandle as a 2-state i64 handle LRM 6.14, class LRM 8.)
-    // An associative array with a class-handle VALUE element is still guarded, so
-    // it stands in as the example.
+    // `chandle`, `class`, and an associative array with a class-handle value were
+    // all prior examples here; every one of them lowers now.) An associative array
+    // of EVENT stands in: an event carries no value, so there is no per-entry
+    // storage to give it (docs/design/data-model.md §7).
     const LowerResult r = lower_text(R"(
-        class C; int x; endclass
-        typedef C AA[int];
+        typedef event AA[int];
         module m #(parameter type T = AA);
             T v;
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostic_text().find("value element") != std::string::npos);
+    CHECK(r.diagnostic_text().find("has no value to store") != std::string::npos);
 }
 
 TEST_CASE("a class type parameter lowers as a handle") {

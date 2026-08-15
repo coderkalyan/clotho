@@ -1061,6 +1061,9 @@ void rt_elem_deinit(const rt_elem_ops* o, void* p) {
         case rt_elem_queue:
             rt_queue_delete_all(static_cast<rt_queue*>(p), o->inner);
             return;
+        case rt_elem_assoc:
+            rt_assoc_reset(static_cast<rt_assoc*>(p), o->inner);
+            return;
         case rt_elem_aggregate:
             for (uint32_t i = 0; i < o->nleaves; ++i) {
                 rt_elem_deinit(o->leaves[i].ops,
@@ -1087,6 +1090,10 @@ void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src, const rt_all
             return;
         case rt_elem_queue:
             rt_queue_assign(static_cast<rt_queue*>(dst), static_cast<const rt_queue*>(src),
+                            o->inner, site);
+            return;
+        case rt_elem_assoc:
+            rt_assoc_assign(static_cast<rt_assoc*>(dst), static_cast<const rt_assoc*>(src),
                             o->inner, site);
             return;
         case rt_elem_aggregate:
@@ -1222,6 +1229,10 @@ extern "C" void rt_dynarr_delete(rt_dynarr* h, const rt_elem_ops* ops) {
     std::free(h->data);
     h->data = nullptr;
     h->len  = 0;
+    // Advanced, never zeroed, so an epoch is never reused within a run. new,
+    // new_copy and assign each funnel through here exactly once, which is where
+    // their single bump comes from.
+    ++h->epoch;
 }
 
 extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_elem_ops* ops,
@@ -1247,6 +1258,25 @@ extern "C" void rt_dynarr_assign(rt_dynarr* dst, const rt_dynarr* src, const rt_
     }
     dst->data = buf;
     dst->len  = src->len;
+}
+
+// Move `src`'s buffer into `dst` (ownership transfer): destroy `dst`'s current
+// elements + buffer, take `src`'s, and leave `src` the empty array. Used by the
+// nonblocking-assignment commit -- the RHS was deep-copied into `src` in the
+// Active region, so the NBA region just hands that buffer to `dst` with no
+// second copy. A no-op when dst == src.
+extern "C" void rt_dynarr_move(rt_dynarr* dst, rt_dynarr* src, const rt_elem_ops* ops) {
+    if (dst == src) {
+        return;
+    }
+    // dst's epoch advances inside rt_dynarr_delete, which is the single bump
+    // this move owes it; src's is bumped here because it is left empty.
+    rt_dynarr_delete(dst, ops);
+    dst->data = src->data;
+    dst->len  = src->len;
+    src->data = nullptr;
+    src->len  = 0;
+    ++src->epoch;
 }
 
 // -- Array ordering methods (LRM 7.12.2) --
@@ -1357,20 +1387,35 @@ void sort_run(uint8_t* data, uint64_t n, uint64_t stride, uint32_t kind, uint32_
 
 } // namespace
 
-extern "C" void rt_dynarr_reverse(rt_dynarr* h, uint64_t stride) {
-    reverse_run(static_cast<uint8_t*>(h->data), h->len, stride);
-}
-
-extern "C" void rt_dynarr_sort(rt_dynarr* h, uint64_t stride, uint32_t kind, uint32_t width,
-                               uint32_t rev) {
-    sort_run(static_cast<uint8_t*>(h->data), h->len, stride, kind, width, rev);
-}
-
-extern "C" void rt_dynarr_shuffle(rt_dynarr* h, uint64_t stride, uint64_t* rng) {
+// The three ordering entry points take the element descriptor rather than a
+// bare stride: they reindex the container, so each bumps the relocation epoch,
+// and `ops` keeps every container entry point on one signature shape. The
+// reverse_run / sort_run / swap_slots helpers above stay on a bare stride --
+// they move slots and know nothing about epochs. Fewer than two elements is a
+// genuine no-op, so it reorders nothing and leaves the epoch alone.
+extern "C" void rt_dynarr_reverse(rt_dynarr* h, const rt_elem_ops* ops) {
     if (h->len < 2) {
         return;
     }
-    auto*                data = static_cast<uint8_t*>(h->data);
+    reverse_run(static_cast<uint8_t*>(h->data), h->len, ops->stride);
+    ++h->epoch;
+}
+
+extern "C" void rt_dynarr_sort(rt_dynarr* h, const rt_elem_ops* ops, uint32_t kind, uint32_t width,
+                               uint32_t rev) {
+    if (h->len < 2) {
+        return;
+    }
+    sort_run(static_cast<uint8_t*>(h->data), h->len, ops->stride, kind, width, rev);
+    ++h->epoch;
+}
+
+extern "C" void rt_dynarr_shuffle(rt_dynarr* h, const rt_elem_ops* ops, uint64_t* rng) {
+    if (h->len < 2) {
+        return;
+    }
+    const uint64_t       stride = ops->stride;
+    auto*                data   = static_cast<uint8_t*>(h->data);
     std::vector<uint8_t> tmp(static_cast<size_t>(stride));
     // Fisher-Yates. The LRM does not fix the permutation (18.13-class
     // tool-private), only that it draw from the process RNG; a modulo index
@@ -1379,6 +1424,7 @@ extern "C" void rt_dynarr_shuffle(rt_dynarr* h, uint64_t stride, uint64_t* rng) 
         const uint64_t j = xoshiro_next(rng) % (i + 1);
         swap_slots(data + i * stride, data + j * stride, stride, tmp.data());
     }
+    ++h->epoch;
 }
 
 // -- Queues (LRM 7.10) --
@@ -1468,6 +1514,15 @@ void intra_ready_push(rt_intra_rec* rec) {
 
 // Drop elements past the bounded-queue limit, destroying managed ones
 // (LRM 7.10.4: keep the first `bound + 1` elements; bound == 0 is unbounded).
+//
+// Truncation is always from the TAIL, so the two push directions lose different
+// elements when a full bounded queue overflows:
+//   - push_front puts the new element at logical 0, so what gets dropped is the
+//     old tail -- the end opposite the push.
+//   - push_back puts the new element at logical len, so what gets dropped is the
+//     element just pushed, and the push has no visible effect.
+// Both fall out of "keep the first bound + 1"; neither direction is special-
+// cased below. LRM 7.10.4 does not pin the choice.
 static void q_apply_bound_ops(rt_queue* h, const rt_elem_ops* ops, uint64_t bound) {
     if (bound == 0 || h->len <= bound + 1) {
         return;
@@ -1480,8 +1535,12 @@ static void q_apply_bound_ops(rt_queue* h, const rt_elem_ops* ops, uint64_t boun
     h->len = bound + 1;
 }
 
-extern "C" void rt_queue_push_back(rt_queue* h, const rt_elem_ops* ops, uint64_t bound,
-                                   const void* elem, const rt_alloc_site* site) {
+// Append one element at the tail WITHOUT touching the epoch. The bump is left to
+// the caller so that appending a whole range costs one epoch step instead of one
+// per element: rt_queue_push_back bumps once, rt_queue_append_range bumps once
+// for the range it appended.
+static void q_push_back_raw(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, const void* elem,
+                            const rt_alloc_site* site) {
     const uint64_t stride = ops->stride;
     q_reserve(h, stride, h->len + 1, site);
     void* slot = q_elem(h, stride, h->len);
@@ -1493,6 +1552,14 @@ extern "C" void rt_queue_push_back(rt_queue* h, const rt_elem_ops* ops, uint64_t
     }
     h->len += 1;
     q_apply_bound_ops(h, ops, bound);
+}
+
+extern "C" void rt_queue_push_back(rt_queue* h, const rt_elem_ops* ops, uint64_t bound,
+                                   const void* elem, const rt_alloc_site* site) {
+    q_push_back_raw(h, ops, bound, elem, site);
+    // Bumped even when the ring did not have to grow: `len` changed, so q[$]
+    // names a different element than it did before.
+    ++h->epoch;
 }
 
 extern "C" void rt_queue_push_front(rt_queue* h, const rt_elem_ops* ops, uint64_t bound,
@@ -1509,6 +1576,9 @@ extern "C" void rt_queue_push_front(rt_queue* h, const rt_elem_ops* ops, uint64_
     }
     h->len += 1;
     q_apply_bound_ops(h, ops, bound);
+    // Every live element's logical index shifted up by one, so this reindexes
+    // the whole queue even when the ring did not move.
+    ++h->epoch;
 }
 
 extern "C" void rt_queue_pop_back(rt_queue* h, const rt_elem_ops* ops, void* out) {
@@ -1519,6 +1589,7 @@ extern "C" void rt_queue_pop_back(rt_queue* h, const rt_elem_ops* ops, void* out
     // vacated slot is not destroyed.
     h->len -= 1;
     std::memcpy(out, q_elem(h, ops->stride, h->len), static_cast<size_t>(ops->stride));
+    ++h->epoch;
 }
 
 extern "C" void rt_queue_pop_front(rt_queue* h, const rt_elem_ops* ops, void* out) {
@@ -1528,6 +1599,7 @@ extern "C" void rt_queue_pop_front(rt_queue* h, const rt_elem_ops* ops, void* ou
     std::memcpy(out, q_elem(h, ops->stride, 0), static_cast<size_t>(ops->stride));
     h->head = (h->head + 1) % h->cap;
     h->len -= 1;
+    ++h->epoch;
 }
 
 extern "C" void rt_queue_insert(rt_queue* h, const rt_elem_ops* ops, uint64_t bound, uint64_t i,
@@ -1550,6 +1622,7 @@ extern "C" void rt_queue_insert(rt_queue* h, const rt_elem_ops* ops, uint64_t bo
     }
     h->len += 1;
     q_apply_bound_ops(h, ops, bound);
+    ++h->epoch;
 }
 
 extern "C" void rt_queue_delete_idx(rt_queue* h, const rt_elem_ops* ops, uint64_t i) {
@@ -1565,6 +1638,7 @@ extern "C" void rt_queue_delete_idx(rt_queue* h, const rt_elem_ops* ops, uint64_
         std::memcpy(q_elem(h, stride, j), q_elem(h, stride, j + 1), static_cast<size_t>(stride));
     }
     h->len -= 1;
+    ++h->epoch;
 }
 
 extern "C" void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops) {
@@ -1578,6 +1652,10 @@ extern "C" void rt_queue_delete_all(rt_queue* h, const rt_elem_ops* ops) {
     h->head = 0;
     h->len  = 0;
     h->cap  = 0;
+    // Advanced, never zeroed, so an epoch is never reused within a run. assign,
+    // assign_dynarr and move each call this exactly once, which is where their
+    // single bump comes from.
+    ++h->epoch;
 }
 
 extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops,
@@ -1592,7 +1670,7 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
     const uint64_t stride = ops->stride;
     auto* buf = static_cast<uint8_t*>(
         rt_alloc_elems_checked(src->len, stride, site, rt_diag_now()));
-    if (ops->kind == rt_elem_pod) {
+    if (!elem_managed(ops)) {
         for (uint64_t i = 0; i < src->len; ++i) {
             std::memcpy(buf + i * stride, q_elem(src, stride, i), static_cast<size_t>(stride));
         }
@@ -1614,6 +1692,10 @@ extern "C" void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_ele
 // source clears the queue to size 0.
 extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
                                        const rt_elem_ops* ops, const rt_alloc_site* site) {
+    // No dst == src guard, unlike every sibling assign: the operands are an
+    // rt_queue and an rt_dynarr: distinct handle types that can never name the
+    // same object, so the comparison could only ever be false. A comment costs
+    // less than a check that is dead by construction.
     rt_queue_delete_all(dst, ops);
     if (src->len == 0) {
         return;
@@ -1622,7 +1704,7 @@ extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
     const auto*    sdata  = static_cast<const uint8_t*>(src->data);
     auto* buf = static_cast<uint8_t*>(
         rt_alloc_elems_checked(src->len, stride, site, rt_diag_now()));
-    if (ops->kind == rt_elem_pod) {
+    if (!elem_managed(ops)) {
         std::memcpy(buf, sdata, static_cast<size_t>(src->len * stride));
     } else {
         for (uint64_t i = 0; i < src->len; ++i) {
@@ -1649,12 +1731,15 @@ extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
     if (hi > last) {
         hi = last;
     }
-    // Each source element is deep-copied through the ordinary push path (which
+    // Each source element is deep-copied through the shared push body (which
     // deinit/copy-constructs a managed element). dst never aliases src, so
-    // growing dst cannot relocate src's buffer mid-loop.
+    // growing dst cannot relocate src's buffer mid-loop. The raw form is used so
+    // the whole append advances the epoch once rather than once per element.
     for (int64_t i = lo; i <= hi; ++i) {
-        rt_queue_push_back(dst, ops, bound, q_elem(src, ops->stride, static_cast<uint64_t>(i)),
-                           site);
+        q_push_back_raw(dst, ops, bound, q_elem(src, ops->stride, static_cast<uint64_t>(i)), site);
+    }
+    if (lo <= hi) {
+        ++dst->epoch;
     }
 }
 
@@ -1900,6 +1985,8 @@ extern "C" void rt_queue_move(rt_queue* dst, rt_queue* src, const rt_elem_ops* o
     if (dst == src) {
         return;
     }
+    // dst's epoch advances inside rt_queue_delete_all, which is the single bump
+    // this move owes it; src's is bumped here because it is left empty.
     rt_queue_delete_all(dst, ops);
     dst->base = src->base;
     dst->head = src->head;
@@ -1909,24 +1996,28 @@ extern "C" void rt_queue_move(rt_queue* dst, rt_queue* src, const rt_elem_ops* o
     src->head = 0;
     src->len  = 0;
     src->cap  = 0;
+    ++src->epoch;
 }
 
-extern "C" void rt_queue_reverse(rt_queue* h, uint64_t stride) {
+extern "C" void rt_queue_reverse(rt_queue* h, const rt_elem_ops* ops) {
     if (h->len < 2) {
         return;
     }
+    const uint64_t       stride = ops->stride;
     std::vector<uint8_t> tmp(static_cast<size_t>(stride));
     for (uint64_t i = 0, j = h->len - 1; i < j; ++i, --j) {
         swap_slots(q_elem(h, stride, i), q_elem(h, stride, j), stride, tmp.data());
     }
+    ++h->epoch;
 }
 
-extern "C" void rt_queue_sort(rt_queue* h, uint64_t stride, uint32_t kind, uint32_t width,
+extern "C" void rt_queue_sort(rt_queue* h, const rt_elem_ops* ops, uint32_t kind, uint32_t width,
                               uint32_t rev) {
     if (h->len < 2) {
         return;
     }
-    const uint64_t n = h->len;
+    const uint64_t stride = ops->stride;
+    const uint64_t n      = h->len;
     // Gather the ring's logical order into a contiguous scratch, sort there, then
     // scatter back into the same ring positions (head unchanged).
     std::vector<uint8_t> buf(static_cast<size_t>(n * stride));
@@ -1937,17 +2028,20 @@ extern "C" void rt_queue_sort(rt_queue* h, uint64_t stride, uint32_t kind, uint3
     for (uint64_t i = 0; i < n; ++i) {
         std::memcpy(q_elem(h, stride, i), buf.data() + i * stride, static_cast<size_t>(stride));
     }
+    ++h->epoch;
 }
 
-extern "C" void rt_queue_shuffle(rt_queue* h, uint64_t stride, uint64_t* rng) {
+extern "C" void rt_queue_shuffle(rt_queue* h, const rt_elem_ops* ops, uint64_t* rng) {
     if (h->len < 2) {
         return;
     }
+    const uint64_t       stride = ops->stride;
     std::vector<uint8_t> tmp(static_cast<size_t>(stride));
     for (uint64_t i = h->len - 1; i > 0; --i) {
         const uint64_t j = xoshiro_next(rng) % (i + 1);
         swap_slots(q_elem(h, stride, i), q_elem(h, stride, j), stride, tmp.data());
     }
+    ++h->epoch;
 }
 
 // -- Associative arrays (LRM 7.8/7.9) --
@@ -1976,15 +2070,63 @@ struct AssocKeyLess {
     bool operator()(std::string_view a, const std::string* b) const { return less(a, *b); }
 };
 
+// The alloc site of the associative-array operation currently in flight. A
+// std::vector reaches its allocator with no room for an extra argument, so the
+// slot allocator below reads the site from here rather than carrying it. Single
+// writer -- the simulation thread -- which is the assumption g_diag_wheel makes
+// too.
+const rt_alloc_site* g_assoc_site = nullptr;
+
+// Scoped set/restore of g_assoc_site. Restoring rather than clearing is what
+// keeps the innermost site reporting when an element copy recurses into a
+// nested associative array.
+struct AssocSiteScope {
+    const rt_alloc_site* prev;
+
+    explicit AssocSiteScope(const rt_alloc_site* s) : prev(g_assoc_site) { g_assoc_site = s; }
+    ~AssocSiteScope() { g_assoc_site = prev; }
+    AssocSiteScope(const AssocSiteScope&)            = delete;
+    AssocSiteScope& operator=(const AssocSiteScope&) = delete;
+};
+
+// std::vector allocator that routes an element-slot buffer through the runtime's
+// checked allocator, so an associative array's element heap fails the way every
+// other container's does -- a located fatal naming the statement -- instead of
+// raising std::bad_alloc inside an entry point reached across a C ABI that has
+// no unwind tables to carry it out. Stateless (the site comes from
+// g_assoc_site), so slot vectors stay swappable and the map may relocate them.
+template <class T>
+struct CheckedAlloc {
+    using value_type = T;
+
+    CheckedAlloc() = default;
+    template <class U>
+    constexpr CheckedAlloc(const CheckedAlloc<U>& /*other*/) noexcept {}
+
+    T* allocate(std::size_t n) {
+        return static_cast<T*>(rt_alloc_elems_checked(n, sizeof(T), g_assoc_site, rt_diag_now()));
+    }
+    void deallocate(T* p, std::size_t /*n*/) noexcept { std::free(p); }
+
+    template <class U>
+    bool operator==(const CheckedAlloc<U>& /*other*/) const noexcept {
+        return true;
+    }
+};
+
+// One element's slot bytes: `stride` of them, owning whatever managed handles
+// the element descriptor places inside.
+using SlotVec = std::vector<uint8_t, CheckedAlloc<uint8_t>>;
+
 struct AssocMap {
-    ankerl::unordered_dense::map<std::string, std::vector<uint8_t>> entries;
-    std::vector<const std::string*>                                sorted;
-    bool                                                           sorted_valid = false;
+    ankerl::unordered_dense::map<std::string, SlotVec> entries;
+    std::vector<const std::string*>                    sorted;
+    bool                                               sorted_valid = false;
     // The `'{default: v}` value (LRM 7.9.11), returned by a read of an absent
     // key. Per-array state rather than an entry, so it is invisible to
     // num/exists/first/next and survives a.delete().
-    std::vector<uint8_t> default_slot;
-    bool                 has_default = false;
+    SlotVec default_slot;
+    bool    has_default = false;
 
     void invalidate() { sorted_valid = false; }
 
@@ -2004,6 +2146,18 @@ struct AssocMap {
 
 AssocMap* assoc_impl(rt_assoc* h) { return static_cast<AssocMap*>(h->impl); }
 
+// Allocate and construct one AssocMap through the checked allocator. A bare
+// `new` raises std::bad_alloc, which cannot propagate out of a runtime entry
+// point reached across a C ABI with no unwind tables; this reports the same
+// located fatal a dynamic array's failed allocation does. The map's interior --
+// ankerl's own arrays and the key strings -- still uses std::allocator: routing
+// those would mean changing the key type and threading a site through ankerl's
+// allocator parameter, a larger change than the remaining exposure justifies.
+AssocMap* assoc_new(const rt_alloc_site* site) {
+    void* raw = rt_alloc_checked(sizeof(AssocMap), site, rt_diag_now());
+    return new (raw) AssocMap();
+}
+
 // Deinit every element value through the descriptor, then drop the map.
 void assoc_free(AssocMap* m, const rt_elem_ops* ops) {
     if (m == nullptr) {
@@ -2017,7 +2171,10 @@ void assoc_free(AssocMap* m, const rt_elem_ops* ops) {
             rt_elem_deinit(ops, m->default_slot.data());
         }
     }
-    delete m;
+    // Matches assoc_new: the storage came from the checked allocator, so it is
+    // destroyed by hand and returned to free() rather than to operator delete.
+    m->~AssocMap();
+    std::free(m);
 }
 
 // Drop every entry but keep the map alive, so the pattern default survives.
@@ -2055,35 +2212,49 @@ extern "C" void* rt_assoc_get_ptr(rt_assoc* h, const uint8_t* kptr, uint32_t kle
 }
 
 extern "C" void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr,
-                                  uint32_t klen, const rt_alloc_site* /*site*/) {
-    AssocMap* m = assoc_impl(h);
+                                  uint32_t klen, const rt_alloc_site* site) {
+    const AssocSiteScope scope(site);
+    AssocMap*            m = assoc_impl(h);
     if (m == nullptr) {
-        m       = new AssocMap();
+        m       = assoc_new(site);
         h->impl = m;
     }
     std::string key(reinterpret_cast<const char*>(kptr), static_cast<size_t>(klen));
     const auto  it = m->entries.find(key);
     if (it != m->entries.end()) {
+        // The entry already exists, so nothing about the array's shape changes:
+        // a plain overwrite of a present key is the one write that leaves every
+        // ref valid, and it does not touch the epoch.
         return it->second.data();
     }
     auto& slot = m->entries[std::move(key)];
     slot.resize(static_cast<size_t>(ops->stride));
     rt_elem_init(ops, slot.data());
     m->invalidate();
+    // Creating an entry changes num(), the first/next traversal order and which
+    // keys resolve. Slot buffers are separately owned and do not move, so the
+    // bump is conservative -- but a ref's guard checks the container, not one
+    // slot (docs/design/data-model.md section 3.1).
+    ++h->epoch;
     return slot.data();
 }
 
 extern "C" void* rt_assoc_default_ptr(rt_assoc* h, const rt_elem_ops* ops,
-                                      const rt_alloc_site* /*site*/) {
-    AssocMap* m = assoc_impl(h);
+                                      const rt_alloc_site* site) {
+    const AssocSiteScope scope(site);
+    AssocMap*            m = assoc_impl(h);
     if (m == nullptr) {
-        m       = new AssocMap();
+        m       = assoc_new(site);
         h->impl = m;
     }
     if (!m->has_default) {
         m->default_slot.resize(static_cast<size_t>(ops->stride));
         rt_elem_init(ops, m->default_slot.data());
         m->has_default = true;
+        // Creating the default changes what a read of an absent key resolves to.
+        // Writing through the returned pointer afterwards does not, so only the
+        // call that creates the slot bumps.
+        ++h->epoch;
     }
     return m->default_slot.data();
 }
@@ -2115,13 +2286,18 @@ extern "C" void rt_assoc_delete_key(rt_assoc* h, const rt_elem_ops* ops, const u
     }
     m->entries.erase(it);
     m->invalidate();
+    // Reached only when an entry really was erased -- an absent key returned
+    // above without touching the epoch.
+    ++h->epoch;
 }
 
 extern "C" void rt_assoc_delete_all(rt_assoc* h, const rt_elem_ops* ops) {
     AssocMap* m = assoc_impl(h);
     if (m == nullptr) {
+        // Already empty: nothing is destroyed, so the epoch stays put.
         return;
     }
+    ++h->epoch;
     if (m->has_default) {
         // The pattern default outlives the entries (LRM 7.9.11 keeps it
         // independent of the array's contents), so the map has to stay.
@@ -2135,6 +2311,11 @@ extern "C" void rt_assoc_delete_all(rt_assoc* h, const rt_elem_ops* ops) {
 extern "C" void rt_assoc_reset(rt_assoc* h, const rt_elem_ops* ops) {
     assoc_free(assoc_impl(h), ops);
     h->impl = nullptr;
+    // Advanced, never zeroed, so an epoch is never reused within a run: a ref
+    // formed against the discarded contents stays distinguishable from one
+    // formed against whatever replaces them. assign and move each call this
+    // exactly once, which is where their single bump comes from.
+    ++h->epoch;
 }
 
 extern "C" uint64_t rt_assoc_num(rt_assoc* h) {
@@ -2200,16 +2381,17 @@ extern "C" void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_ele
     if (dst == src) {
         return;
     }
+    const AssocSiteScope scope(site);
     rt_assoc_reset(dst, ops);
     AssocMap* sm = assoc_impl(const_cast<rt_assoc*>(src));
     if (sm == nullptr || (sm->entries.empty() && !sm->has_default)) {
         return;
     }
-    auto* dm  = new AssocMap();
+    auto* dm  = assoc_new(site);
     dst->impl = dm;
     dm->entries.reserve(sm->entries.size());
     const bool managed = ops->kind != rt_elem_pod;
-    const auto copy_in = [&](std::vector<uint8_t>& slot, const uint8_t* from) {
+    const auto copy_in = [&](SlotVec& slot, const uint8_t* from) {
         slot.resize(static_cast<size_t>(ops->stride));
         if (managed) {
             rt_elem_init(ops, slot.data());
@@ -2225,6 +2407,23 @@ extern "C" void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_ele
         copy_in(dm->default_slot, sm->default_slot.data());
         dm->has_default = true;
     }
+}
+
+// Move `src`'s map into `dst` (ownership transfer): destroy `dst`'s entries and
+// pattern default, take `src`'s map, and leave `src` the empty array. Used by
+// the nonblocking-assignment commit -- the RHS was deep-copied into `src` in the
+// Active region, so the NBA region just hands that map over with no second copy.
+// A no-op when dst == src.
+extern "C" void rt_assoc_move(rt_assoc* dst, rt_assoc* src, const rt_elem_ops* ops) {
+    if (dst == src) {
+        return;
+    }
+    // dst's epoch advances inside rt_assoc_reset, which is the single bump this
+    // move owes it; src's is bumped here because it is left empty.
+    rt_assoc_reset(dst, ops);
+    dst->impl = src->impl;
+    src->impl = nullptr;
+    ++src->epoch;
 }
 
 extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
@@ -3536,6 +3735,188 @@ extern "C" void rt_null_handle(const rt_null_site* site, uint64_t now) {
     std::exit(1);
 }
 
+// ---- Stale `ref` through a restructured container (LRM 13.5.2) ----
+
+namespace {
+
+// Whether a stale `ref` dereference warns and continues instead of ending the
+// run (--loose-stale-ref). Process-wide like g_system_access: the host sets it
+// once before the design runs, and the simulation thread only reads it.
+int g_ref_stale_warn = 0;
+
+// Dereference sites that have already warned. A stale deref inside an always
+// block re-fires on every activation, and an unbounded stream of identical
+// lines buries both the first report and the design's own output. Keyed on the
+// rt_ref_site global's address: the backend emits one per guarded dereference
+// and it is stable for the run. Only ever reached under --loose-stale-ref.
+ankerl::unordered_dense::set<const void*> g_ref_stale_seen;
+
+} // namespace
+
+extern "C" void rt_ref_stale_warn(int32_t enable) {
+    g_ref_stale_warn = enable;
+}
+
+// The design's epoch-to-name table, registered once before it runs.
+const rt_container_name* g_ref_names       = nullptr;
+uint64_t                 g_ref_names_count = 0;
+
+extern "C" void rt_ref_names(const rt_container_name* table, uint64_t count) {
+    g_ref_names       = table;
+    g_ref_names_count = count;
+}
+
+// Declared name of the container whose relocation epoch lives at `epoch`, or null
+// when it has no statically known address -- a container inside a class body or
+// inside another container's buffer. Naming nothing beats naming the wrong one:
+// for `outer[0][0]` the epoch is the INNER queue's, so reporting the outer
+// container's name would point at a place that did not move.
+//
+// Linear: reached at most once per run, from a report that is about to print.
+const char* ref_container_name(const void* epoch) {
+    for (uint64_t i = 0; i < g_ref_names_count; ++i) {
+        if (g_ref_names[i].epoch == epoch) {
+            return g_ref_names[i].name;
+        }
+    }
+    return nullptr;
+}
+
+extern "C" void rt_ref_stale(const rt_ref_site* site, const void* epoch, uint64_t expect,
+                             uint64_t actual, uint64_t now) {
+    // Reached only from the guard the backend plants ahead of every dereference
+    // through a `ref` formal, and only in the `actual > expect` direction -- the
+    // guard routes the impossible one to rt_ref_epoch_regress instead. The
+    // container was restructured while the ref was live, so the interior pointer
+    // no longer names the actual and LRM 13.5.2's "the formal refers to the
+    // actual" has stopped holding. Same layout as the null-handle fatal, except
+    // that --loose-stale-ref downgrades this one to a once-per-site warning.
+    const bool warn = g_ref_stale_warn != 0;
+    if (warn && !g_ref_stale_seen.insert(site).second) {
+        return;
+    }
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::terminal_color accent =
+        warn ? fmt::terminal_color::yellow : fmt::terminal_color::red;
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(accent));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(accent));
+
+    std::string when;
+    append_finish_time(when, now);
+    // The container is named when its handle has a fixed address; otherwise it is
+    // described rather than guessed at (see ref_container_name).
+    const char* const named = ref_container_name(epoch);
+    const std::string what  = named != nullptr ? fmt::format("'{}'", named)
+                                               : std::string("its container");
+    // Each styled run stops short of the newline: fmt closes a style after
+    // everything it formatted, and a reset that lands past the line break leaves
+    // the style live across it.
+    fmt::print(stderr, label, "{}", warn ? "warning:" : "fatal:");
+    fmt::print(stderr, head,
+               " ref '{}' is stale: {} was restructured (epoch {}, ref formed at epoch {})",
+               site->formal, what, actual, expect);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        const std::string text = snippet_text(site->line);
+        print_snippet(text, site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column),
+                                     '^' } },
+                      loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " a push, insert, delete, resize, reorder or whole-value assignment "
+                             "to {} by {} moved the element '{}' was bound to",
+               what, when, site->formal);
+    fmt::print(stderr, "\n");
+    if (warn) {
+        fmt::print(stderr, tag, "  note:");
+        fmt::print(stderr, body, " --loose-stale-ref: proceeding through the stale pointer anyway, "
+                                 "and further reports from this dereference are suppressed");
+        fmt::print(stderr, "\n");
+        std::fflush(stderr);
+        return;
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " do not restructure {} while the ref is live, or pass the element "
+                             "by value instead (LRM 13.5.2)",
+               what);
+    fmt::print(stderr, "\n");
+    std::fflush(stderr);
+
+    rt_vcd_close();
+    rt_finishing = 1;
+    // Same reasoning as rt_null_handle: there is no defined state to hand back to
+    // the host mid-instant, and std::exit keeps the nonzero status that
+    // distinguishes this from a clean run.
+    std::exit(1);
+}
+
+extern "C" void rt_ref_epoch_regress(const rt_ref_site* site, const void* epoch,
+                                     uint64_t expect, uint64_t actual, uint64_t now) {
+    // The guard reached this because the container's epoch is BELOW the one the
+    // ref recorded. Every bump is a ++ and no path resets the field, so a
+    // container's epoch can only ever climb: no design can produce this. It means
+    // the epoch plumbing itself is wrong -- a missing bump, a handle whose epoch
+    // was copied rather than advanced, or a wrong value captured when the ref was
+    // formed. --loose-stale-ref deliberately does not apply, because the invariant
+    // being violated is Clotho's and not the design's.
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+
+    std::string when;
+    append_finish_time(when, now);
+    const char* const named = ref_container_name(epoch);
+    const std::string what =
+      named != nullptr ? fmt::format("'{}'", named) : std::string("its container");
+    // Each styled run stops short of the newline: fmt closes a style after
+    // everything it formatted, and a reset that lands past the line break leaves
+    // the style live across it.
+    fmt::print(stderr, label, "fatal:");
+    fmt::print(stderr, head, " internal error: the relocation epoch of {} ran backwards", what);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        const std::string text = snippet_text(site->line);
+        print_snippet(text, site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column),
+                                     '^' } },
+                      loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " {} is at epoch {} but ref '{}' was formed at epoch {}, at {}",
+               what, actual, site->formal, expect, when);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " this is a bug in Clotho's epoch plumbing, not an error in the "
+                             "design -- please report it with the source line above "
+                             "(docs/design/data-model.md section 3)");
+    fmt::print(stderr, "\n");
+    std::fflush(stderr);
+
+    rt_vcd_close();
+    rt_finishing = 1;
+    // Same reasoning as rt_null_handle: there is no defined state to hand back to
+    // the host mid-instant, and std::exit keeps the nonzero status that
+    // distinguishes this from a clean run.
+    std::exit(1);
+}
+
 extern "C" void rt_tagged_access(const rt_tagged_site* site, uint64_t tag, uint32_t tag_unknown,
                                  uint64_t now) {
     // Reached only from the guard the backend plants ahead of every tagged-union
@@ -4588,6 +4969,21 @@ extern "C" void rt_string_assign(rt_string* dst, const rt_string* src, const rt_
         return;
     }
     str_assign(dst, str_data(src), str_len(src), site);
+}
+
+extern "C" void rt_string_move(rt_string* dst, rt_string* src) {
+    if (dst == src) {
+        return;
+    }
+    // Ownership transfer, not a copy: release dst's own buffer, then take src's
+    // handle image whole. The 32 bytes encode either form -- inline text or a
+    // heap {ptr,len,cap} -- so one memcpy moves the value and, with it, ownership
+    // of any buffer. src is re-initialized rather than left aliasing that buffer,
+    // so its own later deinit stays correct and the moved value is freed once.
+    // No epoch: a string handle has no interior pointer for a ref to hold.
+    rt_string_deinit(dst);
+    std::memcpy(dst->storage, src->storage, sizeof(src->storage));
+    rt_string_init(src);
 }
 
 extern "C" void rt_string_assign_bytes(rt_string* dst, const char* p, uint64_t n, const rt_alloc_site* site) {
