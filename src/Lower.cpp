@@ -896,16 +896,19 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 // by either still runs inside this time slot.
                 break;
             case StatementKind::Disable:
+                // Not the region, and no longer a form problem either: a `disable`
+                // suspends nothing, so no wake is involved, and the remote form does
+                // not care where it runs -- it marks the activations on a target's
+                // list and pushes their handles. Both copies of an action block are
+                // ordinary bodies to it (the pended one a task body, the inlined one a
+                // Final process), and a block the action block itself opens is on the
+                // same list footing as one in a task. lower_disable still refuses what
+                // it refuses everywhere else.
+                break;
             case StatementKind::DisableFork:
-                // Not the region either: a `disable` suspends nothing, so no wake is
-                // involved. clotho lowers it as a LEXICAL exit from a block of the
-                // process body that encloses it (lower_disable), and neither copy of
-                // an action block is that -- the pended one is a task body, the
-                // inlined one is a fresh Final process. `disable fork` needs the
-                // live-child set as well, like `wait fork` above.
-                reject("a disable",
-                       "clotho lowers it as a lexical exit from an enclosing block of a process "
-                       "body, and an action block is neither");
+                // `disable fork` needs the live-child set, like `wait fork` above.
+                reject("a disable fork",
+                       "clotho does not lower it: it needs the live-child set fork owes");
                 break;
             default:
                 // The whitelist's floor, and what it now asks. Suspending is no

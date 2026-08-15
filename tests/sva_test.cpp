@@ -845,24 +845,18 @@ module t;
 endmodule
 )", "a forever loop in an assertion action block is not supported: it never returns");
 
-    // A `disable` suspends nothing at all, so no wake was ever involved: clotho
-    // lowers it as a lexical exit from an enclosing block of a PROCESS body, and
-    // neither copy of an action block is one.
-    refuses(R"(
-module t;
-  bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b) else disable blk;
-  initial begin : blk
-    #10 $display("done");
-  end
-endmodule
-)", "clotho lowers it as a lexical exit");
+    // A plain `disable` is no longer refused here: it suspends nothing, so no wake
+    // is involved, and the remote form does not care where it runs -- it marks the
+    // activations on a target's list and pushes their handles. Both copies of an
+    // action block are ordinary bodies to it. Pinned as behaviour in
+    // tests/loop_test.cpp; what stays refused is `disable fork`, for the reason
+    // `wait fork` is.
     refuses(R"(
 module t;
   bit clk, a, b;
   ap: assert property (@(posedge clk) a |=> b) else disable fork;
 endmodule
-)", "a disable in an assertion action block");
+)", "it needs the live-child set fork owes");
 
     // A deferred immediate assertion matures in Observed, and reactive code is
     // downstream of Observed in every time slot -- a region order no wake can

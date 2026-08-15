@@ -1044,6 +1044,27 @@ TEST_CASE("a target that parks on a time-consuming call is still refused") {
     CHECK(task_park.diagnostic_text().find("cannot claim that park") != std::string::npos);
 }
 
+// An assertion action block is an ordinary body to the remote form: it marks the
+// target's activations and pushes their handles, which needs no coroutine of its
+// own and no region correction. The failing attempt at the first posedge ends the
+// victim block there.
+TEST_CASE("an assertion action block can disable a block") {
+    CHECK(run_capture(R"(
+        module m;
+            reg clk = 0, a = 0;
+            always #5 clk = ~clk;
+            initial begin
+                begin : victim
+                    #1000 $display("victim never");
+                end
+                $display("victim ended at %0t", $time);
+            end
+            assert property (@(posedge clk) a) else disable victim;
+            initial #40 $finish;
+        endmodule
+    )") == "victim ended at 5\n");
+}
+
 // A `#0` inside a target parks in the inactive batch, which has no claim field. It
 // needs none: the batch's own promotion later in the same instant is the wake, and
 // the park marks itself scheduled so a `disable` arriving meanwhile stands down
