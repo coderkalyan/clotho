@@ -531,6 +531,11 @@ struct Function {
     // locals the fork captured by reference (ForkInfo::args), so a child of a fork
     // in a process body is parameterless. Implies is_task.
     bool is_fork_child = false;
+    // The `disable` target id naming this task (LRM 9.6.2), or kNoDisableTarget.
+    // A targeted task links each activation onto the target's list at entry and
+    // unlinks in the epilogue, so a `disable` can end EVERY activation, which is
+    // what 9.6.2 requires and what a single occupant slot cannot express.
+    uint32_t disable_target = kNoDisableTarget;
     // Join discipline of the fork site that owns this child; only meaningful with
     // is_fork_child, and identical for every child of a site. The child's epilogue
     // needs it because the record's OWNERSHIP differs: under `join` the parent
@@ -615,6 +620,21 @@ public:
     uint32_t alloc_scope_id() {
         return next_scope_id_++;
     }
+    // Which `disable` target ids name a TASK rather than a named block. A task
+    // target is aborted through its activation list, a block target through its
+    // single occupant slot, and the id alone does not say which.
+    std::vector<uint8_t> disable_target_is_task;
+    // For a target that IS its procedure's outermost scope and whose procedure holds
+    // deferred assertions: that procedure's process index, so a REMOTE `disable` can
+    // bump the target's generation counter rather than its own (LRM 16.4.4). Filled
+    // as processes are created; `no_flush_proc` where the rule does not apply.
+    static constexpr uint32_t no_flush_proc = ~0u;
+    std::vector<uint32_t>     disable_flush_proc;
+
+    // Number of `disable` target ids allocated (LRM 9.6.2). One id per targeted
+    // named block per elaborated instance, so this is the length of the backend's
+    // per-target occupant tables. Zero for a design with no `disable`.
+    uint32_t disable_targets = 0;
 
     // Append a signal; the returned Signal handle is its index in `signals`.
     Signal add_signal(SignalInfo info) {

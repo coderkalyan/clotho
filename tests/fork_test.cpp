@@ -369,6 +369,51 @@ TEST_CASE("fork: disable fork / wait fork rejected") {
                    "wait fork is not supported");
 }
 
+// `disable` reaching INTO a detached child (LRM 9.6.2 × 9.3.2). A `join_none` child
+// can outlive its parent, so its blocks are the case a single occupant slot could
+// never have covered: the block keeps a list of the activations inside it, and one
+// `disable` ends every one. Oracle: iverilog.
+TEST_CASE("fork: a detached child's block can be disabled from another process") {
+    CHECK(run_capture(R"(
+        module t;
+          initial begin
+            fork
+              begin : detached
+                #10 $display("never at %0t", $time);
+              end
+            join_none
+            $display("past join_none at %0t", $time);
+          end
+          initial #5 disable detached;
+          initial #30 $finish;
+        endmodule
+    )") == "past join_none at 0\n");
+}
+
+// Two detached activations of one task, both inside the same block, ended by one
+// statement -- both callers then run their own continuation.
+TEST_CASE("fork: one disable ends the same block in every detached activation") {
+    CHECK(run_capture(R"(
+        module t;
+          task worker;
+            begin : blk
+              #10 $display("never at %0t", $time);
+            end
+            $display("worker done at %0t", $time);
+          endtask
+          initial begin
+            fork
+              worker;
+              worker;
+            join_none
+            $display("spawned at %0t", $time);
+          end
+          initial #5 disable t.worker.blk;
+          initial #30 $finish;
+        endmodule
+    )") == "spawned at 0\nworker done at 5\nworker done at 5\n");
+}
+
 // fork … join_none / join_any (LRM 9.3.2). Values cross-checked against Icarus
 // Verilog 13, except where noted: iverilog's vvp aborts on either kind inside an
 // automatic task (vthread.cc:3793, of_JOIN_DETACH assertion), so those cases are

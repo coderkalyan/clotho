@@ -16,6 +16,7 @@
 #include "PosixIo.h"
 #include "ir/Jit.h"
 #include "ir/Module.h"
+#include "ir/Printer.h"
 
 using namespace clotho;
 
@@ -83,7 +84,12 @@ std::string monitor_shape(const ir::Module& m) {
         };
         eat(p.ir.inst_count());
         for (uint32_t i = 0; i < p.ir.inst_count(); ++i) {
-            eat(static_cast<uint64_t>(p.ir.tag(ir::Index{ i })));
+            // The tag's NAME, not its ordinal: inserting a tag anywhere but the end
+            // of the enum renumbers every later one, which would break this digest
+            // without moving a single emitted instruction.
+            for (const char* c = ir::tag_name(p.ir.tag(ir::Index{ i })); *c != '\0'; ++c) {
+                eat(static_cast<uint64_t>(*c));
+            }
         }
         for (const uint32_t word : p.ir.extra_raw()) {
             eat(word);
@@ -193,9 +199,13 @@ TEST_CASE("naming the verdict lattice leaves a ring monitor's emitted IR alone")
 
     REQUIRE(m.monitors.size() == 1);
     REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Ring);
+    // Re-established once when monitor_shape moved from hashing tag ORDINALS to
+    // hashing tag names: inserting ir::Inst::Tag::DisableRemote mid-enum renumbered
+    // every later tag and broke this digest without moving an instruction. The
+    // instruction count, which is the claim that matters, did not change (125).
     CHECK(monitor_shape(m) ==
           "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.pend0 sva.0.occ sva.0.clk "
-          "step:125:8656654477628751033 ");
+          "step:125:1287345960479790596 ");
 }
 
 TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone") {
@@ -218,7 +228,7 @@ TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone"
     REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Counted);
     CHECK(monitor_shape(m) ==
           "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.cnt1 sva.0.clk "
-          "step:117:1903636621696783129 final:18:14459492915158645094 ");
+          "step:117:3562075382750980208 final:18:9716285231543666394 ");
 }
 
 TEST_CASE("an overlapping implication differs only in when it seeds") {
@@ -835,24 +845,18 @@ module t;
 endmodule
 )", "a forever loop in an assertion action block is not supported: it never returns");
 
-    // A `disable` suspends nothing at all, so no wake was ever involved: clotho
-    // lowers it as a lexical exit from an enclosing block of a PROCESS body, and
-    // neither copy of an action block is one.
-    refuses(R"(
-module t;
-  bit clk, a, b;
-  ap: assert property (@(posedge clk) a |=> b) else disable blk;
-  initial begin : blk
-    #10 $display("done");
-  end
-endmodule
-)", "clotho lowers it as a lexical exit");
+    // A plain `disable` is no longer refused here: it suspends nothing, so no wake
+    // is involved, and the remote form does not care where it runs -- it marks the
+    // activations on a target's list and pushes their handles. Both copies of an
+    // action block are ordinary bodies to it. Pinned as behaviour in
+    // tests/loop_test.cpp; what stays refused is `disable fork`, for the reason
+    // `wait fork` is.
     refuses(R"(
 module t;
   bit clk, a, b;
   ap: assert property (@(posedge clk) a |=> b) else disable fork;
 endmodule
-)", "a disable in an assertion action block");
+)", "it needs the live-child set fork owes");
 
     // A deferred immediate assertion matures in Observed, and reactive code is
     // downstream of Observed in every time slot -- a region order no wake can

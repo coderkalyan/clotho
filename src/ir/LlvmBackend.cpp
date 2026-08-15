@@ -717,6 +717,10 @@ public:
         design_uses_monitor_  = facts_.uses.monitor;
         design_uses_observed_ = facts_.uses.observed; // gates the Observed-region flush
         design_uses_defer_    = facts_.uses.defer;    // gates the deferred-assertion flushes
+        // Gates the remote-`disable` occupant tables, the force-wake and the poll
+        // after each suspend inside a targeted region -- and widens the
+        // ring-overflow guard, which was fork-only until force-wake existed.
+        design_uses_disable_  = facts_.uses.disable;
         // The reactive region set (LRM 4.4.2.5 - 4.4.2.7): wanted when there is
         // pass/fail code to schedule, a process in Observed that could schedule
         // some, or a program block, whose `initial` procedures run in Reactive
@@ -2761,6 +2765,9 @@ private:
             awaiter_          = nullptr;
             record_           = nullptr;
             fork_record_      = nullptr;
+            disable_node_     = nullptr;
+        block_nodes_.clear();
+            block_nodes_.clear();
             cur_is_task_      = false;
             silent_stores_ = false;
             hdl_              = nullptr;
@@ -2806,6 +2813,7 @@ private:
         awaiter_          = nullptr;
         record_           = nullptr;
         fork_record_      = nullptr;
+        disable_node_     = nullptr;
         cur_is_task_      = false;
         // PreInit applies declaration initializers and Preponed captures sampled
         // values; neither is a design-visible write, so neither may wake a
@@ -3593,6 +3601,8 @@ private:
         // slot is an alloca hoisted into THIS coroutine's frame. Keeping a previous
         // body's alloca would name storage in another function.
         fork_record_ = nullptr;
+        disable_node_ = nullptr;
+        block_nodes_.clear();
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -3629,6 +3639,10 @@ private:
         sched_ptr_ = b_.CreateAlloca(b_.getInt32Ty(), nullptr, "task_sched");
         sched_anchor_      = SignalSlot::no_anchor;
         group_first_block_ = -1;
+        // And, for a task some `disable` names, this activation's list node — same
+        // placement and for the same reason: a `disable` reads it while we are parked.
+        disable_node_ = f.disable_target != kNoDisableTarget
+          ? b_.CreateAlloca(disable_node_ty(), nullptr, "disable_node") : nullptr;
 
         auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
         auto* free_bb    = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
@@ -3674,6 +3688,12 @@ private:
         build_dynarr_temps();
         bind_ref_formals(f);
         emit_copyin(f);
+        // On the target's activation list before the body can park, off it again in
+        // the epilogue: a `disable` must see every activation that is live, and none
+        // that is not (LRM 9.6.2).
+        if (f.disable_target != kNoDisableTarget) {
+            emit_disable_link(f.disable_target, disable_node_);
+        }
         lower_region(ir_->root());
         branch_to(epilogue_bb);
 
@@ -3685,7 +3705,24 @@ private:
         // suspending, so we push it onto the ring that handle names -- the caller
         // may be reactive code, and emit_wake_push is what reads which.
         b_.SetInsertPoint(epilogue_bb);
-        emit_copyout(f);
+        if (f.disable_target != kNoDisableTarget) {
+            emit_disable_unlink(f.disable_target, disable_node_);
+            // A disabled activation skips copy-out and nothing else: LRM 9.6.2 leaves
+            // "results of output and inout arguments" unspecified, and the caller
+            // resume this epilogue owes is exactly what 9.6.2 asks for -- execution
+            // continues after the task-enabling statement.
+            auto* skip = llvm::BasicBlock::Create(ctx_, "task.copyout.skip", fn_);
+            auto* copy = llvm::BasicBlock::Create(ctx_, "task.copyout", fn_);
+            llvm::Value* aborted =
+              b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), disable_node_, 5));
+            b_.CreateCondBr(b_.CreateICmpNE(aborted, b_.getInt32(0)), skip, copy);
+            b_.SetInsertPoint(copy);
+            emit_copyout(f);
+            b_.CreateBr(skip);
+            b_.SetInsertPoint(skip);
+        } else {
+            emit_copyout(f);
+        }
         deinit_body_strings(); // string locals + temps die with the call
         llvm::Value* rec    = fn_->getArg(task_record_param(f));
         auto*        has_bb = llvm::BasicBlock::Create(ctx_, "task.wake", fn_);
@@ -3847,26 +3884,48 @@ private:
         }
     }
 
-    // The awaiter embedded in the coroutine frame for #delay: an rt_timer
-    // ({ next, on_expire }) followed by the coroutine handle. &awaiter aliases the
-    // rt_timer the wheel links; the resume trampoline recovers the handle from
-    // field 2. One per process, reused across delays (a process waits on at most
-    // one timer at a time).
+    // The awaiter for a process #delay: an rt_timer ({ next, on_expire }) followed
+    // by the coroutine handle. &awaiter aliases the rt_timer the wheel links; the
+    // resume trampoline recovers the handle from field 2.
+    //
+    // { Timer(next, on_expire), parked handle } — and, when the design has a remote
+    // `disable`, two more fields that let the wheel and a `disable` compete for the
+    // same park without ever waking it twice: the frame slot naming the live record,
+    // and a `state` claim (0 = armed, 1 = claimed by whoever is waking us).
+    //
+    // Without a remote `disable` this is one record per process, reused across
+    // delays, because a process waits on at most one timer at a time. With one, a
+    // force-woken process can carry on while its old timer is still armed, so the
+    // records must not alias: each arm gets a fresh heap record, and the wheel frees
+    // it when it finally fires.
+    //
+    // The claim is what the scheduled flag cannot be: mid-body that flag is SET, on
+    // purpose, so the process's own sensitivity cannot re-wake it -- so a `disable`
+    // must not read it as "already queued", and must not clear it either.
     llvm::StructType* awaiter_ty() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llvm::StructType::get(ctx_, { ptr, ptr, ptr });
+        if (!design_uses_disable_) {
+            return llvm::StructType::get(ctx_, { ptr, ptr, ptr });
+        }
+        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, ptr, b_.getInt32Ty() });
     }
 
     // Lazily allocate the awaiter, placed just after coro.begin so CoroSplit spills
     // it into the frame (its address escapes to the wheel and it is live across the
-    // suspend).
+    // suspend). With a remote `disable` in the design the frame instead holds a
+    // POINTER to the live heap record, for the aliasing reason above.
     llvm::Value* awaiter() {
         if (awaiter_ == nullptr) {
             // Insert right after coro.begin — using the block + iterator form so it
             // works even when coro.begin is the last instruction so far (a #delay as
             // the process's first statement).
             llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
-            awaiter_ = ab.CreateAlloca(awaiter_ty(), nullptr, "awaiter");
+            if (design_uses_disable_) {
+                awaiter_ = ab.CreateAlloca(llvm::PointerType::getUnqual(ctx_), nullptr, "park_rec");
+                ab.CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)), awaiter_);
+            } else {
+                awaiter_ = ab.CreateAlloca(awaiter_ty(), nullptr, "awaiter");
+            }
         }
         return awaiter_;
     }
@@ -3929,9 +3988,37 @@ private:
 
         llvm::IRBuilder<> tb(ctx_);
         tb.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", enqueue_fn_));
-        llvm::Value* hp  = tb.CreateStructGEP(awaiter_ty(), enqueue_fn_->getArg(0), 2);
-        llvm::Value* hdl = tb.CreateLoad(ptr, hp);
-        emit_wake_push(tb, hdl);
+        if (!design_uses_disable_) {
+            llvm::Value* hp  = tb.CreateStructGEP(awaiter_ty(), enqueue_fn_->getArg(0), 2);
+            llvm::Value* hdl = tb.CreateLoad(ptr, hp);
+            emit_wake_push(tb, hdl);
+            tb.CreateRetVoid();
+            return sym(enqueue_fn_);
+        }
+        // A design with a remote `disable` owns each record on the heap, and a
+        // `disable` may already have claimed this park to wake the activation early.
+        // Whoever claims it pushes; the loser only frees. A claimed-but-not-fired
+        // record is exactly how an abandoned timer stays harmless: the activation has
+        // long since walked away, and this never touches its frame again.
+        auto*        rec   = enqueue_fn_->getArg(0);
+        auto*        aw    = awaiter_ty();
+        auto*        fn    = enqueue_fn_;
+        auto*        mine  = llvm::BasicBlock::Create(ctx_, "timer.claim", fn);
+        auto*        done  = llvm::BasicBlock::Create(ctx_, "timer.done", fn);
+        llvm::Value* state = tb.CreateLoad(tb.getInt32Ty(), tb.CreateStructGEP(aw, rec, 4));
+        tb.CreateCondBr(tb.CreateICmpEQ(state, tb.getInt32(0)), mine, done);
+
+        tb.SetInsertPoint(mine);
+        tb.CreateStore(tb.getInt32(1), tb.CreateStructGEP(aw, rec, 4));
+        // Tell the activation it is no longer parked, so a later `disable` looks at
+        // its scheduled flag instead of at a record that is about to be freed.
+        tb.CreateStore(llvm::ConstantPointerNull::get(ptr),
+                       tb.CreateLoad(ptr, tb.CreateStructGEP(aw, rec, 3)));
+        emit_wake_push(tb, tb.CreateLoad(ptr, tb.CreateStructGEP(aw, rec, 2)));
+        tb.CreateBr(done);
+
+        tb.SetInsertPoint(done);
+        tb.CreateCall(free_fn(), { rec });
         tb.CreateRetVoid();
         return sym(enqueue_fn_);
     }
@@ -4042,9 +4129,25 @@ private:
     // the handle in the awaiter so the timer callback can find it, then arm the
     // wheel. Parked, so the trampoline knows which ring to wake it into. Caller
     // emits the suspend.
+    //
+    // With a remote `disable` in the design the record is a fresh heap allocation per
+    // arm, remembered in the frame slot so a `disable` can find and claim it; the
+    // wheel frees it when it eventually fires. Fresh per arm because a force-woken
+    // process can carry on with its old timer still armed, so one reused record would
+    // have two owners. The scheduled flag is deliberately left alone: mid-body it is
+    // set so the process's own sensitivity cannot re-wake it, and that must stay true.
     void emit_delay_timer(llvm::Value* ticks) {
-        auto* aw = awaiter();
-        b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(awaiter_ty(), aw, 2));
+        auto*        aw_ty = awaiter_ty();
+        auto*        slot  = awaiter();
+        llvm::Value* aw    = slot;
+        if (design_uses_disable_) {
+            const uint64_t size = env_->llmod.getDataLayout().getTypeAllocSize(aw_ty);
+            aw                  = b_.CreateCall(alloc_fn(), { b_.getInt64(size) });
+            b_.CreateStore(slot, b_.CreateStructGEP(aw_ty, aw, 3));
+            b_.CreateStore(b_.getInt32(0), b_.CreateStructGEP(aw_ty, aw, 4));
+            b_.CreateStore(aw, slot);
+        }
+        b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(aw_ty, aw, 2));
         // Schedule-relative: the runtime adds `now` so this #delay crosses the ABI
         // once (rt_wheel_schedule_rel) rather than twice (rt_wheel_now then
         // rt_wheel_schedule).
@@ -4142,7 +4245,11 @@ private:
         }
         b_.CreateStore(b_.getInt32(0), sched_ptr_); // arm: ready to be woken
         emit_wait_suspend();                        // park until any event fires
-        if (events.size() > 1) {
+        // A remote `disable` is a second way to be resumed here, and it neither
+        // fires nor clears the bucket we are in -- so with one in the design a
+        // single-signal wait has to compact itself out too, or its stale entry would
+        // wake us later at some unrelated suspend point.
+        if (events.size() > 1 || design_uses_disable_) {
             for (const WaitEdge& e : events) {
                 emit_dynamic_remove(e.signal, e.edge);
             }
@@ -7365,7 +7472,7 @@ private:
     // on a wake-heavy design (combchain) and ~25% of LLVM codegen time.
     void emit_ring_full_check(llvm::IRBuilder<>& b, llvm::Value* head_ptr, llvm::Value* tail,
                               llvm::Value* ring) {
-        if (!design_forks()) {
+        if (!ring_guard_wanted()) {
             return;
         }
         llvm::Function* fn   = b.GetInsertBlock()->getParent();
@@ -7392,7 +7499,7 @@ private:
     // capacity is at least the process count. A fork child is an extra chain, which
     // is what breaks that and why the check appears exactly when a fork does.
     void emit_len_full_check(llvm::IRBuilder<>& b, llvm::Value* len, uint32_t cap, uint32_t which) {
-        if (!design_forks()) {
+        if (!ring_guard_wanted()) {
             return;
         }
         llvm::Function* fn  = b.GetInsertBlock()->getParent();
@@ -7403,6 +7510,16 @@ private:
         b.CreateCall(ring_overflow_fn(), { b.getInt32(which), b.getInt32(cap) });
         b.CreateUnreachable();
         b.SetInsertPoint(ok);
+    }
+
+    // Whether the overflow guards are emitted at all. A fork child is an extra call
+    // chain, which is what breaks the one-live-slot-per-process bound the capacity
+    // rests on. A remote `disable` is the second reason: its force-wake makes a
+    // handle ready from outside the wake paths the bound was reasoned about, so the
+    // guard has to cover a design that disables but never forks -- which it did not
+    // when the gate was `design_forks()` alone.
+    bool ring_guard_wanted() {
+        return design_forks() || design_uses_disable_;
     }
 
     // Push a handle onto the active ring: queue[tail++ & mask] = handle.
@@ -7662,6 +7779,18 @@ private:
     // promotes into the reactive ring untagged, exactly as it is pushed here --
     // a ring entry is a plain handle, never a parked one.
     void emit_zero_delay_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
+        // A batch entry has no claim field, and it does not need one: the batch's own
+        // promotion later in this instant IS the wake. What it does need is to say so
+        // -- a `disable` arriving meanwhile must stand down rather than push a second
+        // copy of a handle the promotion will deliver, which resumed the activation
+        // twice and, once it had finished, jumped through a dead coroutine.
+        //
+        // The scheduled flag is exactly that statement, and setting it here is also
+        // the truth: a `#0`-parked activation is already scheduled. The promotion
+        // does not consult the flag, so it still lands.
+        if (design_uses_disable_ && sched_ptr_ != nullptr) {
+            b.CreateStore(b.getInt32(1), sched_ptr_);
+        }
         if (reactive_home()) {
             emit_re_inactive_push(b, handle);
         } else {
@@ -9748,9 +9877,18 @@ private:
         // must not span a conditional body). See block_register / cur_seg_epoch_.
         ++cur_seg_epoch_;
         for (Index i : region) {
+            const Inst::Tag t = ir_->tag(i);
             lower_inst(i);
             if (b_.GetInsertBlock()->getTerminator() != nullptr) {
                 break;
+            }
+            // Back from a park: a remote `disable` may have landed on an enclosing
+            // block while we were suspended (LRM 9.6.2). Emitted only inside a
+            // remotely-named block, and only after an op that can park, so nothing
+            // else in the design pays for it.
+            if (design_uses_disable_ && tag_suspends(t)) {
+                emit_disable_poll();
+                emit_task_abort_poll();
             }
         }
         ++cur_seg_epoch_;
@@ -10142,6 +10280,9 @@ private:
             case Inst::Tag::Continue:
             case Inst::Tag::NamedBlock:
             case Inst::Tag::Disable:
+            case Inst::Tag::DisableRemote:
+            case Inst::Tag::DisableAbort:
+            case Inst::Tag::DeferFlush:
             case Inst::Tag::HandleDeref:
                 // An lvalue producer (rooted at the object body); no value type.
             case Inst::Tag::Ret:
@@ -11628,6 +11769,29 @@ private:
                 // this label (LRM 9.6.2). The frontend only emits a Disable for a
                 // block it is lexically inside, so the label is always live here.
                 b_.CreateBr(block_end(p.label));
+                return;
+            case Inst::Tag::DisableRemote:
+                // Not a terminator: the disabling process carries on, and the target
+                // activation aborts itself at its own poll point (LRM 9.6.2).
+                lower_disable_remote(i);
+                return;
+            case Inst::Tag::DeferFlush:
+                // LRM 16.4.4: disabling a procedure's outermost scope drops its
+                // pending deferred reports. Same generation bump an activation start
+                // does, so a report queued before this point never matures. A target
+                // id names ANOTHER procedure's counter -- the remote case, where the
+                // reports to drop are not this group's.
+                if (p.label == kNoDisableTarget) {
+                    emit_defer_gen_bump();
+                } else {
+                    emit_defer_gen_bump_at(defer_gen_ptr_for(group_of_[mod_.disable_flush_proc[p.label]]));
+                }
+                return;
+            case Inst::Tag::DisableAbort:
+                // Terminator: this activation was named by a `disable` it ran itself
+                // (LRM 9.6.2 example 4). Leave through the epilogue, which sees the
+                // abort mark and skips copy-out.
+                b_.CreateBr(task_epilogue_bb_);
                 return;
 
             case Inst::Tag::Delay:
@@ -16185,19 +16349,23 @@ private:
     // assertion. Bumped once per activation and read at each deferred report to
     // tag it; see lower_group / emit_defer_gen_bump / lower_severity.
     llvm::Value* defer_gen_ptr() {
-        if (cur_defer_group_ < 0) {
-            return nullptr;
-        }
-        const auto g = static_cast<size_t>(cur_defer_group_);
+        return cur_defer_group_ < 0 ? nullptr : defer_gen_ptr_for(static_cast<uint32_t>(cur_defer_group_));
+    }
+
+    // The same counter named by GROUP rather than by "the one being lowered", which
+    // is what a `disable` of another procedure's outermost scope needs (LRM 16.4.4):
+    // the bump has to land on the TARGET's counter. Created in the root unit so
+    // either side can be lowered first and still get the same global.
+    llvm::Value* defer_gen_ptr_for(uint32_t g) {
         if (defer_gen_gv_.size() <= g) {
             defer_gen_gv_.resize(g + 1, nullptr);
         }
         if (defer_gen_gv_[g] == nullptr) {
             defer_gen_gv_[g] = new llvm::GlobalVariable(
-              env_->llmod, b_.getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
+              root_env_->llmod, b_.getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
               b_.getInt64(0), "clotho.defer.gen." + std::to_string(g));
         }
-        return defer_gen_gv_[g];
+        return sym(defer_gen_gv_[g]);
     }
 
     // Bump the current group's deferred-assertion generation at an activation
@@ -16205,7 +16373,10 @@ private:
     // carry a stale generation and are dropped at maturation. A no-op for a group
     // without deferred assertions.
     void emit_defer_gen_bump() {
-        llvm::Value* gen = defer_gen_ptr();
+        emit_defer_gen_bump_at(defer_gen_ptr());
+    }
+
+    void emit_defer_gen_bump_at(llvm::Value* gen) {
         if (gen == nullptr) {
             return;
         }
@@ -19755,12 +19926,311 @@ private:
 
         auto* end_bb = llvm::BasicBlock::Create(ctx_, "block.end", fn_);
 
-        block_targets_.push_back({ bi.label, end_bb });
+        // A remotely-named block puts THIS activation on the target's list while it
+        // is inside the region, so a `disable` anywhere can find and wake it. The
+        // list, rather than one slot per target, is what lets the block sit in a body
+        // that has several activations at once -- a task, a fork child -- where "the
+        // occupant" is not a single thing. A process body simply never has more than
+        // one node on it.
+        //
+        // A thunk-elided group links nothing: it has no handle to record and, having
+        // no suspend, cannot be inside the region while any other process runs -- so
+        // the list stays empty and a `disable` naming its block is the no-op LRM
+        // 9.6.2 already prescribes for a block that is not currently executing.
+        const uint32_t remote = bi.remote != 0 && hdl_ != nullptr ? bi.label : kNoDisableTarget;
+        llvm::Value*   node   = nullptr;
+        if (remote != kNoDisableTarget) {
+            node = block_node(bi.label);
+            // awaiter() is forced here rather than at the first #delay: the node
+            // publishes the park slot, and a delay inside the body would create it
+            // too late for that.
+            emit_disable_link(remote, node);
+        }
+
+        block_targets_.push_back({ bi.label, remote, node, end_bb });
         lower_region(ir_->region(bi.body));
         block_targets_.pop_back();
         branch_to(end_bb); // a `return` / `break` / `disable` already terminated it
 
         b_.SetInsertPoint(end_bb);
+        // Leaving the region, normally or by a disable: this activation is no longer
+        // inside it, and its mark must not survive into a later entry.
+        if (remote != kNoDisableTarget) {
+            emit_disable_unlink(remote, node);
+            b_.CreateStore(b_.getInt32(0), b_.CreateStructGEP(disable_node_ty(), node, 5));
+        }
+    }
+
+    // The frame-resident list node for one targeted block in the body being lowered.
+    // One per block per activation: a block cannot be inside itself, so a single
+    // activation is never on the same block's list twice, and re-entering it in a
+    // loop links and unlinks the same node in turn.
+    llvm::Value* block_node(uint32_t label) {
+        auto [it, fresh] = block_nodes_.try_emplace(label, nullptr);
+        if (fresh) {
+            llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+            it->second = ab.CreateAlloca(disable_node_ty(), nullptr, "block_node");
+        }
+        return it->second;
+    }
+
+    // `disable <block in another process>` (LRM 9.6.2, remote form). Mark the
+    // activation inside the target region and make it ready; it aborts itself at its
+    // own poll point, in its own frame, so nothing is destroyed from outside.
+    //
+    // Waking it exactly once is the whole difficulty, because the source it is parked
+    // on will still fire later. Two cases, and the occupant table carries what each
+    // needs:
+    //
+    // - Parked on a #delay. Its park record is live, so CLAIM it: the wheel's
+    //   trampoline pushes only if it finds the claim clear, so the timer that fires
+    //   afterwards frees the record and wakes nobody. The scheduled flag is set
+    //   mid-body on purpose and says nothing about being queued, so it is not
+    //   consulted here.
+    // - Parked on an event, or already queued. Then there is no live record, and the
+    //   scheduled flag is the design's existing one-wake-per-process token: push only
+    //   if it is clear, exactly as a wait-queue scan does. That is also what keeps the
+    //   ring bound intact -- an occupant is a process already counted in `nproc`.
+    void lower_disable_remote(Index i) {
+        lower_disable_list(ir_->payload(i).label);
+    }
+
+    // `disable <task>` (LRM 9.6.2): end EVERY activation, "whether the processes
+    // were forked by the calling thread or not". Walk the target's activation list,
+    // mark each node and wake it the same two ways a block occupant is woken —
+    // claim its park record if it is on a #delay, else its scheduled flag.
+    //
+    // The activation running this statement is skipped: it is not parked, so there
+    // is nothing to wake, and pushing its handle would resume a coroutine that goes
+    // on to finish. It ends through the DisableAbort the frontend emits after this.
+    void lower_disable_list(uint32_t target) {
+        auto* nty    = disable_node_ty();
+        auto* aw     = awaiter_ty();
+        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        auto* null   = llvm::ConstantPointerNull::get(ptr_ty);
+        auto* fn     = b_.GetInsertBlock()->getParent();
+
+        auto* head  = llvm::BasicBlock::Create(ctx_, "disable.walk", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "disable.node", fn);
+        auto* self  = llvm::BasicBlock::Create(ctx_, "disable.node.wake", fn);
+        auto* timed = llvm::BasicBlock::Create(ctx_, "disable.node.timed", fn);
+        auto* take  = llvm::BasicBlock::Create(ctx_, "disable.node.claim", fn);
+        auto* evt   = llvm::BasicBlock::Create(ctx_, "disable.node.evented", fn);
+        auto* push  = llvm::BasicBlock::Create(ctx_, "disable.node.push", fn);
+        auto* step  = llvm::BasicBlock::Create(ctx_, "disable.node.next", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "disable.walk.done", fn);
+
+        llvm::Value* first = b_.CreateLoad(ptr_ty, disable_head_ptr(b_, target));
+        auto*        entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        llvm::PHINode* n = b_.CreatePHI(ptr_ty, 2);
+        n->addIncoming(first, entry);
+        b_.CreateCondBr(b_.CreateICmpNE(n, null), body, done);
+
+        // Read `next` before marking: the node is frame-resident and the activation
+        // may unlink itself as soon as it runs, which cannot happen before we
+        // suspend, but keeping the load first makes that independent of scheduling.
+        b_.SetInsertPoint(body);
+        llvm::Value* next = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, n, 0));
+        b_.CreateStore(b_.getInt32(1), b_.CreateStructGEP(nty, n, 5));
+        llvm::Value* hdl = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, n, 2));
+        // Skip ourselves, when this `disable` runs inside one of the activations.
+        llvm::Value* mine = hdl_ != nullptr ? b_.CreateICmpEQ(hdl, parked_handle(b_, hdl_)) : b_.getFalse();
+        b_.CreateCondBr(mine, step, self);
+
+        b_.SetInsertPoint(self);
+        llvm::Value* slot = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, n, 3));
+        llvm::Value* rec  = b_.CreateLoad(ptr_ty, slot);
+        b_.CreateCondBr(b_.CreateICmpNE(rec, null), timed, evt);
+
+        b_.SetInsertPoint(timed);
+        llvm::Value* claim = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(aw, rec, 4));
+        b_.CreateCondBr(b_.CreateICmpEQ(claim, b_.getInt32(0)), take, step);
+
+        b_.SetInsertPoint(take);
+        b_.CreateStore(b_.getInt32(1), b_.CreateStructGEP(aw, rec, 4));
+        b_.CreateStore(null, slot);
+        b_.CreateBr(push);
+
+        b_.SetInsertPoint(evt);
+        llvm::Value* flag = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, n, 4));
+        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(b_.getInt32Ty(), flag), b_.getInt32(0)), push, step);
+
+        b_.SetInsertPoint(push);
+        emit_wake_push(b_, hdl);
+        b_.CreateStore(b_.getInt32(1), b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, n, 4)));
+        b_.CreateBr(step);
+
+        b_.SetInsertPoint(step);
+        b_.CreateBr(head);
+        n->addIncoming(next, step);
+
+        b_.SetInsertPoint(done);
+    }
+
+    // Back from a park inside a targeted task: if a `disable` marked this
+    // activation, leave through the epilogue, which skips copy-out for it.
+    void emit_task_abort_poll() {
+        if (disable_node_ == nullptr) {
+            return;
+        }
+        auto*        fn    = b_.GetInsertBlock()->getParent();
+        llvm::Value* abort = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), disable_node_, 5));
+        auto*        cont  = llvm::BasicBlock::Create(ctx_, "disable.task.resume", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(abort, b_.getInt32(0)), task_epilogue_bb_, cont);
+        b_.SetInsertPoint(cont);
+    }
+
+    // After a suspend inside one or more remotely-named blocks: if a `disable`
+    // landed while we were parked, leave that block now. Outermost-first, because
+    // leaving an outer block subsumes leaving every inner one, and the branch is
+    // the same structured exit the lexical form uses -- so the end block's own
+    // bookkeeping clears the mark and the occupant slot.
+    //
+    // Emitted only after a suspending instruction, and only while some enclosing
+    // block is remotely named, so a design without a remote `disable` emits none of
+    // it. It runs after the suspending op's own resume bookkeeping (a multi-signal
+    // `wait` compacts itself out of its buckets first), which is why the hook is
+    // here and not inside emit_suspend.
+    void emit_disable_poll() {
+        auto* fn = b_.GetInsertBlock()->getParent();
+        for (const OpenNamedBlock& blk : block_targets_) {
+            if (blk.remote == kNoDisableTarget) {
+                continue;
+            }
+            llvm::Value* pend =
+              b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), blk.node, 5));
+            auto* cont = llvm::BasicBlock::Create(ctx_, "disable.resume", fn);
+            b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt32(0)), blk.end, cont);
+
+            b_.SetInsertPoint(cont);
+        }
+    }
+
+    // Whether an instruction of this tag can park the process, so a remote
+    // `disable` may have landed by the time it returns.
+    static bool tag_suspends(Inst::Tag t) {
+        switch (t) {
+            case Inst::Tag::Delay:
+            case Inst::Tag::Wait:
+            case Inst::Tag::TaskCall:
+            case Inst::Tag::TaskCallVirtual:
+            case Inst::Tag::Fork:
+            case Inst::Tag::ExpectWait:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // The per-target tables the remote form needs, sized by the frontend's target
+    // count and emitted only for a design that has a remote `disable`. Flat arrays,
+    // not the per-instance anchored shape proc_sched uses: an id is allocated per
+    // targeted block symbol and slang gives every elaborated instance its own, so
+    // one id already names one block in one instance.
+    llvm::GlobalVariable* disable_table(llvm::GlobalVariable*& gv, const char* name, llvm::Type* elem,
+                                        llvm::Constant* init) {
+        if (gv == nullptr) {
+            const auto n  = static_cast<size_t>(mod_.disable_targets);
+            auto*      ty = llvm::ArrayType::get(elem, n);
+            // Defined in the root unit and referenced through sym(), like every
+            // other cross-unit global. A group holding either half of the remote
+            // form is forced to a real coroutine (is_simple_always), and only a
+            // thunk group is ever shared across instances, so a baked per-instance
+            // target id can never reach a shared body.
+            gv = new llvm::GlobalVariable(root_env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
+                                          llvm::ConstantArray::get(ty, std::vector<llvm::Constant*>(n, init)),
+                                          std::string("clotho.disable.") + name);
+        }
+        return gv;
+    }
+
+    llvm::Value* disable_slot(llvm::IRBuilder<>& b, llvm::GlobalVariable*& gv, const char* name,
+                              llvm::Type* elem, llvm::Constant* init, uint32_t target) {
+        auto* ty = llvm::ArrayType::get(elem, static_cast<size_t>(mod_.disable_targets));
+        return b.CreateInBoundsGEP(ty, sym(disable_table(gv, name, elem, init)),
+                                   { b.getInt32(0), b.getInt32(target) });
+    }
+
+    // One live activation of a `disable`-targeted task (LRM 9.6.2), frame-resident
+    // and doubly linked so the epilogue can unlink in constant time:
+    //   { ptr next, ptr prev, ptr handle, ptr park_slot, ptr sched_flag, i32 abort }
+    // The list, not a single slot, is what "disabling a task shall disable all
+    // activations of the task" needs -- and it is the only thing a task target needs
+    // that a block target does not, because the caller resume it owes is the one the
+    // ordinary epilogue already does.
+    llvm::StructType* disable_node_ty() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, ptr, ptr, b_.getInt32Ty() });
+    }
+
+    // Head of target `t`'s activation list.
+    llvm::Value* disable_head_ptr(llvm::IRBuilder<>& b, uint32_t t) {
+        auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
+        return disable_slot(b, disable_head_gv_, "head", ptr_ty, llvm::ConstantPointerNull::get(ptr_ty), t);
+    }
+
+    // Link this activation at the head of its target's list. Emitted in the task
+    // prologue, right after the frame exists.
+    void emit_disable_link(uint32_t target, llvm::Value* node) {
+        auto* nty  = disable_node_ty();
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+
+        llvm::Value* head = disable_head_ptr(b_, target);
+        llvm::Value* old  = b_.CreateLoad(ptr, head);
+        b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(nty, node, 2));
+        b_.CreateStore(awaiter(), b_.CreateStructGEP(nty, node, 3));
+        b_.CreateStore(sched_ptr_, b_.CreateStructGEP(nty, node, 4));
+        b_.CreateStore(b_.getInt32(0), b_.CreateStructGEP(nty, node, 5));
+        b_.CreateStore(old, b_.CreateStructGEP(nty, node, 0));
+        b_.CreateStore(null, b_.CreateStructGEP(nty, node, 1));
+
+        auto* has  = llvm::BasicBlock::Create(ctx_, "disable.link.prev", fn);
+        auto* done = llvm::BasicBlock::Create(ctx_, "disable.link.done", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(old, null), has, done);
+        b_.SetInsertPoint(has);
+        b_.CreateStore(node, b_.CreateStructGEP(nty, old, 1));
+        b_.CreateBr(done);
+        b_.SetInsertPoint(done);
+        b_.CreateStore(node, head);
+    }
+
+    // Unlink it again. Emitted at the top of the epilogue, so an activation is off
+    // the list before it can be woken by a `disable` that arrives while it finishes.
+    void emit_disable_unlink(uint32_t target, llvm::Value* node) {
+        auto* nty  = disable_node_ty();
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+
+        llvm::Value* next = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, 0));
+        llvm::Value* prev = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, 1));
+
+        auto* has_prev = llvm::BasicBlock::Create(ctx_, "disable.unlink.prev", fn);
+        auto* no_prev  = llvm::BasicBlock::Create(ctx_, "disable.unlink.head", fn);
+        auto* tail     = llvm::BasicBlock::Create(ctx_, "disable.unlink.next", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(prev, null), has_prev, no_prev);
+
+        b_.SetInsertPoint(has_prev);
+        b_.CreateStore(next, b_.CreateStructGEP(nty, prev, 0));
+        b_.CreateBr(tail);
+
+        b_.SetInsertPoint(no_prev);
+        b_.CreateStore(next, disable_head_ptr(b_, target));
+        b_.CreateBr(tail);
+
+        b_.SetInsertPoint(tail);
+        auto* has_next = llvm::BasicBlock::Create(ctx_, "disable.unlink.back", fn);
+        auto* done     = llvm::BasicBlock::Create(ctx_, "disable.unlink.done", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(next, null), has_next, done);
+        b_.SetInsertPoint(has_next);
+        b_.CreateStore(prev, b_.CreateStructGEP(nty, next, 1));
+        b_.CreateBr(done);
+        b_.SetInsertPoint(done);
     }
 
     // The end block of the enclosing named block with this label. Innermost
@@ -19768,8 +20238,8 @@ private:
     // walking down is the one the `disable` names.
     llvm::BasicBlock* block_end(uint32_t label) const {
         for (size_t n = block_targets_.size(); n > 0; --n) {
-            if (block_targets_[n - 1].first == label) {
-                return block_targets_[n - 1].second;
+            if (block_targets_[n - 1].label == label) {
+                return block_targets_[n - 1].end;
             }
         }
 
@@ -19789,6 +20259,10 @@ private:
     // identity (one unit per elaborated definition content).
     std::vector<std::unique_ptr<ModuleEnv>>                       unit_envs_;
     std::vector<std::unique_ptr<llvm::Module>>                    unit_modules_;
+    // The one per-target table the remote `disable` form needs (LRM 9.6.2), lazily
+    // created in the root unit and indexed by target id: the head of the list of
+    // activations currently inside that block, or running that task.
+    llvm::GlobalVariable*   disable_head_gv_  = nullptr;
     ankerl::unordered_dense::map<llvm::StructType*, ModuleEnv*>   unit_env_of_;
     // Root-defined integer-id value globals (abs_id_const): name -> global.
     ankerl::unordered_dense::map<std::string, llvm::GlobalVariable*> idval_gvs_;
@@ -19853,6 +20327,10 @@ private:
     bool design_uses_monitor_  = false;
     bool design_uses_observed_ = false;
     bool design_uses_defer_    = false;
+    // Any remote `disable` (LRM 9.6.2). Gates the per-target occupant tables, the
+    // force-wake, the post-suspend poll, and the ring-overflow guard's second
+    // reason to exist.
+    bool design_uses_disable_  = false;
     // Any ReactivePend, or any process that runs in Observed. Gates the entire
     // reactive region set: both queues, the drain blocks, and the Observed run.
     // A design with neither emits none of it.
@@ -19921,11 +20399,26 @@ private:
     // Innermost-first stack of the enclosing loops' (step, exit) blocks; a
     // `continue` branches to `.first`, a `break` to `.second`.
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loop_targets_;
-    // Innermost-first stack of the enclosing named blocks' (label, end) blocks; a
-    // `disable` branches to the end block of the label it carries. Empty unless
-    // the unit contains a `disable` (only a targeted block is emitted at all).
-    std::vector<std::pair<uint32_t, llvm::BasicBlock*>> block_targets_;
+    // Innermost-first stack of the enclosing named blocks' end blocks; a `disable`
+    // branches to the end block of the id it carries. Empty unless the unit
+    // contains a `disable` (only a targeted block is emitted at all). `remote` is
+    // the same id when some `disable` names the block from outside, and
+    // kNoDisableTarget otherwise: only a remotely-named block is polled after a
+    // suspend, so a purely lexical target costs exactly what it did in V1.
+    struct OpenNamedBlock {
+        uint32_t          label;
+        uint32_t          remote;
+        llvm::Value*      node;
+        llvm::BasicBlock* end;
+    };
+    std::vector<OpenNamedBlock> block_targets_;
     llvm::AllocaInst*       record_           = nullptr;
+    // This activation's node on its task's `disable` list, or null when the task
+    // being lowered is not a target. Frame-resident (hoisted after coro.begin).
+    llvm::Value*            disable_node_     = nullptr;
+    // Per targeted named block in the body being lowered: its frame-resident list
+    // node. Reset per function alongside disable_node_.
+    ankerl::unordered_dense::map<uint32_t, llvm::Value*> block_nodes_;
     // Per-function `join` record slot { i32 count, ptr parent, ... } (lazy, reused
     // across a coroutine's join sites — `join` serializes them, and its parent
     // outlives every child). Reset per fn. join_any / join_none heap-allocate

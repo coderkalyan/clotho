@@ -751,44 +751,100 @@ TEST_CASE("a lexical disable lowers to a named_block region and a disable") {
     CHECK(any_process_has_tag(*r.module, ir::Inst::Tag::Disable));
 }
 
-// A block that does not enclose the `disable` has to abort an activation other
-// than this one, which needs the scheduler work V2 owes. Both shapes refuse: a
-// sibling block in the same process, and LRM example 3's cross-process form.
-TEST_CASE("disable of a block that does not enclose it is rejected") {
-    const LowerResult sibling = lower_text(R"(
+// The REMOTE form: a `disable` naming a block it is not inside. Both shapes lower —
+// a sibling block in the same process, and LRM example 3's cross-process form —
+// and the sibling one is also the LRM's "if the block is not currently executing,
+// the disable has no effect", because a process is never inside two of its own
+// sibling blocks at once. Oracle: iverilog.
+TEST_CASE("disable of a sibling block is a no-op, its target not being live") {
+    CHECK(run_capture(R"(
         module m;
             integer x;
             initial begin
+                x = 0;
                 begin : first
                     x = 1;
                 end
                 begin : second
                     disable first;
                 end
+                $display("x=%0d", x);
             end
         endmodule
-    )");
-    CHECK_FALSE(sibling.ok);
-    CHECK(sibling.diagnostic_text().find("does not enclose it") != std::string::npos);
+    )") == "x=1\n");
+}
 
-    const LowerResult remote = lower_text(R"(
+// LRM example 3's shape: the target is parked mid-body in ANOTHER process. The
+// disable ends that activation at the instant it runs — the always block re-arms
+// and its next completion is a full period after the disable, not after the
+// #5 it was parked on. iverilog agrees step for step (the only difference is the
+// order of two processes woken at the same instant, which the LRM leaves open).
+TEST_CASE("disable of a block in another process ends that activation now") {
+    CHECK(run_capture(R"(
         module m;
             integer x;
+            initial x = 0;
             always begin : always1
                 #5 x = x + 1;
+                $display("t=%0t x=%0d", $time, x);
             end
-            initial #7 disable m.always1;
+            initial begin
+                #7 disable m.always1;
+                $display("disabled at %0t", $time);
+                #19 $finish;
+            end
         endmodule
-    )");
-    CHECK_FALSE(remote.ok);
-    CHECK(remote.diagnostic_text().find("does not enclose it") != std::string::npos);
+    )") == "t=5 x=1\ndisabled at 7\nt=12 x=2\nt=17 x=3\nt=22 x=4\n");
+}
+
+// The abort has to abandon the park it walked away from. Here the target is parked
+// on a #50 when the disable lands at t=5; that timer still fires at t=50, by which
+// point the process is parked on a later delay of its own. If the stale timer were
+// allowed to wake it, the second delay would end early — so this pins the timing of
+// everything AFTER the abort, not just the abort.
+TEST_CASE("a disabled activation is not resumed by the timer it abandoned") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                begin : blk
+                    #50 $display("never");
+                end
+                $display("after blk at %0t", $time);
+                #20 $display("second at %0t", $time);
+                #100 $display("third at %0t", $time);
+            end
+            initial #5 disable blk;
+        endmodule
+    )") == "after blk at 5\nsecond at 25\nthird at 125\n");
+}
+
+// Every elaborated instance gets its own StatementBlockSymbol, so a target id names
+// one block IN one instance and `disable u1.blk` cannot reach u2's copy.
+TEST_CASE("a remote disable reaches one instance's block, not the definition's") {
+    CHECK(run_capture(R"(
+        module sub;
+            initial begin
+                begin : blk
+                    #100 $display("%m never");
+                end
+                $display("%m after at %0t", $time);
+            end
+        endmodule
+        module m;
+            sub u1();
+            sub u2();
+            initial #5 disable u1.blk;
+        endmodule
+    )") == "m.u1 after at 5\nm.u2.blk never\nm.u2 after at 100\n");
 }
 
 // LRM 16.4.4: disabling the outermost scope of a procedure DROPS its pending
-// deferred reports, which this exit does not carry yet. A block nested deeper
-// never flushes, so it stays legal and the report still matures.
-TEST_CASE("disable of an outermost block holding deferred assertions is rejected") {
-    const LowerResult r = lower_text(R"(
+// deferred reports — "cancelled", "cleared", never reported. The
+// exit carries the same generation bump an activation start does, so the queued
+// report never matures. No oracle: iverilog does not implement deferred
+// assertions.
+TEST_CASE("disable of a procedure's outermost block drops its deferred reports") {
+    CHECK(run_capture(R"(
         module m;
             integer x;
             initial begin : whole
@@ -796,11 +852,13 @@ TEST_CASE("disable of an outermost block holding deferred assertions is rejected
                 assert #0 (x == 1) else $error("bad");
                 disable whole;
             end
+            initial #1 $display("still alive");
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("LRM 16.4.4") != std::string::npos);
+    )") == "still alive\n");
 
+    // And the other direction, which is a different rule rather than a weaker case
+    // of the same one: a block nested deeper is NOT the outermost scope, so 16.4.4
+    // does not flush and the report still matures.
     CHECK(run_capture(R"(
         module m;
             integer x;
@@ -815,6 +873,222 @@ TEST_CASE("disable of an outermost block holding deferred assertions is rejected
             end
         endmodule
     )") == "after inner\n");
+}
+
+// The same rule reached from ANOTHER process, which is the case that needs the bump
+// to land on the target's generation counter rather than the disabler's. The
+// `disable` has to run in the same time slot as the assert and after it, or the
+// report has already matured and there is nothing pending to drop -- so the
+// disabler yields with `#0` (the inactive region runs after Active, before
+// Observed).
+TEST_CASE("a remote disable of an outermost block drops that process's reports") {
+    CHECK(run_capture(R"(
+        module m;
+            integer x;
+            initial begin : whole
+                x = 0;
+                assert #0 (x == 1) else $error("should be dropped");
+                #10 $display("never");
+            end
+            initial begin
+                #0 disable whole;
+                $display("disabled at %0t", $time);
+            end
+        endmodule
+    )") == "disabled at 0\n");
+
+    // Without the disable the same report matures normally, which is what makes the
+    // case above evidence of a drop rather than of a report that never existed.
+    CHECK(run_capture(R"(
+        module m;
+            integer x;
+            initial begin : whole
+                x = 0;
+                assert #0 (x == 1) else $info("fired");
+                #10 $display("reached %0t", $time);
+            end
+        endmodule
+    )") == "reached 10\n");
+}
+
+// The remote form does not care where the DISABLER runs — it marks an occupant and
+// pushes a handle — so a task may carry one. Only the TARGET has to be a
+// single-occupant block in a process body. Oracle: iverilog.
+TEST_CASE("a disable inside a task can end a block in a process") {
+    CHECK(run_capture(R"(
+        module m;
+            task killer;
+                #5 disable blk;
+                $display("killed at %0t", $time);
+            endtask
+            initial begin
+                begin : blk
+                    #100 $display("never");
+                end
+                $display("after blk at %0t", $time);
+            end
+            initial killer();
+        endmodule
+    )") == "killed at 5\nafter blk at 5\n");
+}
+
+// A task call that consumes no time runs to completion inside the call, so the
+// process is never parked behind it and there is nothing to double-wake. Refusing
+// every task call was over-broad; only a time-consuming one is a park.
+TEST_CASE("a target that calls a zero-time task is still a legal remote target") {
+    CHECK(run_capture(R"(
+        module m;
+            task quiet(input integer v);
+                $display("helper %0d at %0t", v, $time);
+            endtask
+            initial begin
+                begin : blk
+                    quiet(1);
+                    #100 $display("never");
+                end
+                $display("after blk at %0t", $time);
+            end
+            initial #5 disable blk;
+        endmodule
+    )") == "helper 1 at 0\nafter blk at 5\n");
+}
+
+// A block in a body that can have SEVERAL activations at once. A bare branch would
+// end only the one running it; LRM 9.6.2 ends them all, so the block keeps a list
+// of the activations currently inside it, exactly as a task target does. Two
+// activations of one task, both inside the block, ended by one `disable`. Oracle:
+// iverilog.
+TEST_CASE("disable of a block in a task ends every activation inside it") {
+    CHECK(run_capture(R"(
+        module m;
+            task worker;
+                begin : loop
+                    #10 $display("tick at %0t", $time);
+                    #100 $display("never");
+                end
+                $display("done at %0t", $time);
+            endtask
+            initial worker;
+            initial #2 worker;
+            initial #20 disable m.worker.loop;
+        endmodule
+    )") == "tick at 10\ntick at 12\ndone at 20\ndone at 20\n");
+}
+
+// The same block used as a labelled break INSIDE the task, which is the common
+// idiom and the one V1's lexical form could not have in a multi-activation body.
+// It now marks every activation and then takes the ordinary structured exit out of
+// its own.
+TEST_CASE("a disable of an enclosing block inside a task exits it") {
+    CHECK(run_capture(R"(
+        module m;
+            task t(input integer n);
+                begin : blk
+                    if (n > 1) disable blk;
+                    $display("n=%0d not skipped", n);
+                end
+                $display("t done");
+            endtask
+            initial begin t(1); t(2); end
+        endmodule
+    )") == "n=1 not skipped\nt done\nt done\n");
+}
+
+// A fork child is a second activation of the enclosing body, and its blocks are on
+// the same footing: reachable from another process, and usable as a labelled exit
+// from inside the child. Either way the `join` completes when the child ends.
+TEST_CASE("a block inside a fork child can be disabled from either side") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                fork
+                    begin : child
+                        #10 $display("never at %0t", $time);
+                    end
+                join
+                $display("join done at %0t", $time);
+            end
+            initial #5 disable child;
+        endmodule
+    )") == "join done at 5\n");
+
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                fork
+                    begin : child
+                        #1 disable child;
+                        $display("never");
+                    end
+                join
+                $display("join done at %0t", $time);
+            end
+        endmodule
+    )") == "join done at 1\n");
+}
+
+// What is still refused, and it is now only ever a park the abort cannot claim.
+TEST_CASE("a target that parks on a time-consuming call is still refused") {
+    const LowerResult task_park = lower_text(R"(
+        module m;
+            task t; #10; endtask
+            initial begin
+                begin : blk
+                    t();
+                end
+            end
+            initial #5 disable blk;
+        endmodule
+    )");
+    CHECK_FALSE(task_park.ok);
+    CHECK(task_park.diagnostic_text().find("cannot claim that park") != std::string::npos);
+}
+
+// An assertion action block is an ordinary body to the remote form: it marks the
+// target's activations and pushes their handles, which needs no coroutine of its
+// own and no region correction. The failing attempt at the first posedge ends the
+// victim block there.
+TEST_CASE("an assertion action block can disable a block") {
+    CHECK(run_capture(R"(
+        module m;
+            reg clk = 0, a = 0;
+            always #5 clk = ~clk;
+            initial begin
+                begin : victim
+                    #1000 $display("victim never");
+                end
+                $display("victim ended at %0t", $time);
+            end
+            assert property (@(posedge clk) a) else disable victim;
+            initial #40 $finish;
+        endmodule
+    )") == "victim ended at 5\n");
+}
+
+// A `#0` inside a target parks in the inactive batch, which has no claim field. It
+// needs none: the batch's own promotion later in the same instant is the wake, and
+// the park marks itself scheduled so a `disable` arriving meanwhile stands down
+// instead of pushing a second copy of the same handle. Two `#0`s and a `#0`
+// disabler is the shape that double-woke before the mark, so it is the one pinned.
+// Oracle: iverilog.
+TEST_CASE("a #0 inside a disabled block is woken exactly once") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                begin : blk
+                    #0 $display("z1 at %0t", $time);
+                    #0 $display("z2 at %0t", $time);
+                    #50 $display("never");
+                end
+                $display("after blk at %0t", $time);
+                #1 $display("done at %0t", $time);
+            end
+            initial begin
+                #0 disable blk;
+                $display("disabled at %0t", $time);
+            end
+        endmodule
+    )") == "z1 at 0\ndisabled at 0\nafter blk at 0\ndone at 1\n");
 }
 
 // -- foreach (12.7.3). Oracle: iverilog. --

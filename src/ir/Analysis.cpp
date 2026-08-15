@@ -187,6 +187,9 @@ TagInfo tag_info(Inst::Tag tag) {
         // here would silently under-guard the stores after a disable.
         case Inst::Tag::NamedBlock:
         case Inst::Tag::Disable:
+        case Inst::Tag::DisableRemote:
+        case Inst::Tag::DisableAbort:
+        case Inst::Tag::DeferFlush:
         case Inst::Tag::ClassNew:
         case Inst::Tag::HandleDeref:
         case Inst::Tag::DynArrayNew:
@@ -615,6 +618,14 @@ struct Structural {
                     break;
                 case Inst::Tag::CaseViol:
                     uses.observed = true;
+                    break;
+                case Inst::Tag::DisableRemote:
+                    // The remote form is the only one with a runtime cost: the
+                    // occupant slots, the force-wake, and the poll after every
+                    // suspend inside a targeted region. The lexical form is a bare
+                    // branch, so it deliberately does NOT set the fact -- a design
+                    // using only V1's form keeps paying nothing.
+                    uses.disable = true;
                     break;
                 case Inst::Tag::Severity:
                     // Deferred assertions are processes-only: the frontend rejects
@@ -1318,6 +1329,9 @@ struct ValueSweep {
                 case Inst::Tag::Continue:
                 case Inst::Tag::NamedBlock:
                 case Inst::Tag::Disable:
+                case Inst::Tag::DisableRemote:
+                case Inst::Tag::DisableAbort:
+                case Inst::Tag::DeferFlush:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
                 case Inst::Tag::Display:
@@ -1430,6 +1444,20 @@ bool is_simple_always(const Process& p) {
                     return false;
                 }
                 break;
+            case Inst::Tag::NamedBlock:
+                // A block some `disable` names from OUTSIDE has to record the handle
+                // of whoever is inside it, and a thunk has none. A purely lexical
+                // target is a bare region plus a branch and stays eligible, which is
+                // what keeps V1's form free.
+                if (p.ir.extra_data<BlockInfo>(p.ir.payload(idx).extra).remote != 0) {
+                    return false;
+                }
+                break;
+            case Inst::Tag::DisableRemote:
+                // The disabler side is forced too, for a different reason: the target
+                // id it carries is per-INSTANCE, and only a thunk group is ever
+                // shared across instances, so a shared body would bake the wrong id.
+                return false;
             case Inst::Tag::Store: {
                 // A blocking write to a signal in the process's own sensitivity
                 // list would self-retrigger, which an elided coroutine cannot

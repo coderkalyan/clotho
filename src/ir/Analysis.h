@@ -172,6 +172,11 @@ struct DesignUses {
     bool defer = false;
     // Any $dumpfile / $dumpvars / $dump* control, in processes or functions.
     bool vcd = false;
+    // A remote `disable` (LRM 9.6.2) anywhere: in processes or functions, unlike
+    // `defer`. Gates the per-target occupant slots, the force-wake, and the poll
+    // after each suspend inside a targeted region -- a design with no remote
+    // `disable` emits none of it.
+    bool disable = false;
 };
 
 // Everything analyze() knows about a Module.
