@@ -528,35 +528,23 @@ TEST_CASE("disable of a task that parks on a nested call is rejected") {
     CHECK(reject(nested).find("cannot claim that park") != std::string::npos);
 }
 
-// A named block inside a task or a fork child is not single-activation, so the
-// lexical exit ends only the activation that ran the `disable`. The remote form is
-// allowed from inside a subroutine (tests/loop_test.cpp); it is the LEXICAL one
-// that a multi-activation body cannot have.
-TEST_CASE("disable of a block inside a task or fork child is rejected") {
-    constexpr std::string_view in_task = R"(
+// A named block inside a task is not single-activation, so a `disable` naming it
+// marks every activation on the block's list and then takes the ordinary structured
+// exit out of the one running. The block still behaves as a labelled break for that
+// activation, which is what the idiom is for. Oracle: iverilog.
+TEST_CASE("disable of an enclosing block inside a task leaves that block") {
+    CHECK(run_capture(R"(
         module m;
             task t;
                 begin : blk
                     #5 disable blk;
+                    $display("never");
                 end
+                $display("t done at %0t", $time);
             endtask
             initial t;
         endmodule
-    )";
-    CHECK(reject(in_task).find("only the one running") != std::string::npos);
-
-    constexpr std::string_view in_child = R"(
-        module m;
-            initial begin
-                fork
-                    begin : child
-                        #1 disable child;
-                    end
-                join
-            end
-        endmodule
-    )";
-    CHECK(reject(in_child).find("only the one running") != std::string::npos);
+    )") == "t done at 5\n");
 }
 
 // A nonblocking assignment to a module signal from inside a task stages into the

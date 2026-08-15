@@ -953,9 +953,82 @@ TEST_CASE("a target that calls a zero-time task is still a legal remote target")
     )") == "helper 1 at 0\nafter blk at 5\n");
 }
 
-// What the remote form still refuses, each by its own reason: a park it cannot
-// claim, and a target that is not single-occupant.
-TEST_CASE("the remote disable forms that are still refused name their reason") {
+// A block in a body that can have SEVERAL activations at once. A bare branch would
+// end only the one running it; LRM 9.6.2 ends them all, so the block keeps a list
+// of the activations currently inside it, exactly as a task target does. Two
+// activations of one task, both inside the block, ended by one `disable`. Oracle:
+// iverilog.
+TEST_CASE("disable of a block in a task ends every activation inside it") {
+    CHECK(run_capture(R"(
+        module m;
+            task worker;
+                begin : loop
+                    #10 $display("tick at %0t", $time);
+                    #100 $display("never");
+                end
+                $display("done at %0t", $time);
+            endtask
+            initial worker;
+            initial #2 worker;
+            initial #20 disable m.worker.loop;
+        endmodule
+    )") == "tick at 10\ntick at 12\ndone at 20\ndone at 20\n");
+}
+
+// The same block used as a labelled break INSIDE the task, which is the common
+// idiom and the one V1's lexical form could not have in a multi-activation body.
+// It now marks every activation and then takes the ordinary structured exit out of
+// its own.
+TEST_CASE("a disable of an enclosing block inside a task exits it") {
+    CHECK(run_capture(R"(
+        module m;
+            task t(input integer n);
+                begin : blk
+                    if (n > 1) disable blk;
+                    $display("n=%0d not skipped", n);
+                end
+                $display("t done");
+            endtask
+            initial begin t(1); t(2); end
+        endmodule
+    )") == "n=1 not skipped\nt done\nt done\n");
+}
+
+// A fork child is a second activation of the enclosing body, and its blocks are on
+// the same footing: reachable from another process, and usable as a labelled exit
+// from inside the child. Either way the `join` completes when the child ends.
+TEST_CASE("a block inside a fork child can be disabled from either side") {
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                fork
+                    begin : child
+                        #10 $display("never at %0t", $time);
+                    end
+                join
+                $display("join done at %0t", $time);
+            end
+            initial #5 disable child;
+        endmodule
+    )") == "join done at 5\n");
+
+    CHECK(run_capture(R"(
+        module m;
+            initial begin
+                fork
+                    begin : child
+                        #1 disable child;
+                        $display("never");
+                    end
+                join
+                $display("join done at %0t", $time);
+            end
+        endmodule
+    )") == "join done at 1\n");
+}
+
+// What is still refused, and it is now only ever a park the abort cannot claim.
+TEST_CASE("a target that parks on a time-consuming call is still refused") {
     const LowerResult task_park = lower_text(R"(
         module m;
             task t; #10; endtask
@@ -969,40 +1042,6 @@ TEST_CASE("the remote disable forms that are still refused name their reason") {
     )");
     CHECK_FALSE(task_park.ok);
     CHECK(task_park.diagnostic_text().find("cannot claim that park") != std::string::npos);
-
-
-    const LowerResult in_fork = lower_text(R"(
-        module m;
-            initial begin
-                fork
-                    begin : blk
-                        #10 $display("x");
-                    end
-                join
-            end
-            initial #5 disable blk;
-        endmodule
-    )");
-    CHECK_FALSE(in_fork.ok);
-    CHECK(in_fork.diagnostic_text().find("separate occupant") != std::string::npos);
-
-    // A block declared inside a subroutine is guarded the same way, though slang
-    // does not resolve a hierarchical name to one, so the guard is defensive.
-
-    // And the lexical form inside a subroutine, which ends only the activation
-    // running it.
-    const LowerResult lexical_in_task = lower_text(R"(
-        module m;
-            task t;
-                begin : blk
-                    disable blk;
-                end
-            endtask
-            initial t();
-        endmodule
-    )");
-    CHECK_FALSE(lexical_in_task.ok);
-    CHECK(lexical_in_task.diagnostic_text().find("only the one running") != std::string::npos);
 }
 
 // A `#0` inside a target parks in the inactive batch, which has no claim field. It

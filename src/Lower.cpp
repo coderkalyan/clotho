@@ -6737,28 +6737,17 @@ private:
         }
 
         if (found && fn_ctx_ != nullptr) {
-            // The lexical form ends the one activation running it, and a task, fork
-            // child or action block can have several inside the same block at once.
-            // (`named_blocks_` is swapped per body, so a hit here means the target is
-            // a block this body itself opened.)
-            //
-            // TODO: LRM 9.6.2 wants every activation ended, which is the per-target
-            // epoch plus the activation list — see docs/design/disable.md V2b.
-            fail("a disable of a block that encloses it, inside a function, task or fork child, "
-                 "is not supported yet (several activations can be inside that block, and a "
-                 "lexical exit ends only the one running)");
+            // A block that encloses this statement inside a body that can have
+            // several activations. A bare branch would end only the one running it,
+            // and LRM 9.6.2 ends them all — so mark every activation on the list
+            // first (the walk skips this one, which is running, not parked) and then
+            // take the ordinary structured exit out of our own copy.
+            b.disable_remote(it->second, loc(s));
         }
         if (!found) {
             // The remote form. It does not care where the DISABLER runs — it marks an
             // occupant and pushes a handle — so a task, function or action block may
             // carry one. What has to hold is on the target side.
-            if (disable_multi_.contains(&target)) {
-                // TODO: a target inside a fork child or a subroutine. Each activation
-                // is its own occupant with its own frame, so one slot cannot name
-                // them all — the same activation list a task target needs (V2b).
-                fail("disable of a block inside a fork child or a subroutine is not supported "
-                     "yet (each activation is a separate occupant)");
-            }
             if (disable_hard_.contains(&target)) {
                 // TODO: a remote target whose region can park behind something the
                 // abort cannot claim — a `#0` or a runtime-valued delay (the inactive
@@ -7429,7 +7418,12 @@ private:
             }
             void handle(const slang::ast::DisableStatement& s) {
                 const Symbol* t = &*s.target.as<slang::ast::ArbitrarySymbolExpression>().symbol;
-                (std::find(open.begin(), open.end(), t) != open.end() ? lexical : remote).push_back(t);
+                // Lexical only when the target encloses it AND one activation is all
+                // there can be. Inside a task or a fork child there may be several
+                // inside the same block at once, and LRM 9.6.2 ends all of them, so
+                // that use needs the list exactly as a remote one does.
+                const bool encloses = std::find(open.begin(), open.end(), t) != open.end();
+                (encloses && sub_depth == 0 && fork_depth == 0 ? lexical : remote).push_back(t);
                 visitDefault(s);
             }
             void handle(const ImmediateAssertionStatement& s) {
