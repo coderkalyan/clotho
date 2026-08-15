@@ -13673,7 +13673,13 @@ private:
     // Replay a container's deferred whole-NBA records: move each staged handle into
     // its dest handle (push order, later write wins), then wake Any-edge readers.
     void emit_handle_whole_commit(Signal sig) {
-        const Ref      type = slot_of(sig).ir_type;
+        // The container LEAF, not the signal's type: a signal may be a fixed
+        // unpacked array OF containers (`int fa[2][string]`), and `fa[0] <= w`
+        // stages one element. Staging sizes its record from the element type, so a
+        // commit reading the array type would take the wrong stride and dispatch
+        // the wrong move -- rt_dynarr_move over an 8-byte assoc handle, which
+        // overran the staging buffer.
+        const Ref      type = leaf_type(slot_of(sig).ir_type);
         auto*          rt   = handle_rec_ty(type);
         const auto     strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         auto*          i8   = b_.getInt8Ty();

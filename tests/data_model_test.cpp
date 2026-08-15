@@ -18,7 +18,7 @@ using namespace clotho;
 //
 //   axis E  the inner element type          (19 rows, `elems`)
 //   axis C  the aggregate or container       (8 rows, `conts`)
-//   axis P  the passing mode                (18 rows, `modes`)
+//   axis P  the passing mode                (16 rows, `modes`)
 //
 // 19 x 8 x 18 = 2736 cells. Each cell is one complete SystemVerilog design, and
 // each cell has exactly one of two acceptable outcomes:
@@ -316,6 +316,7 @@ enum class P {
     func_return,
     blocking,
     nonblocking,
+    nba_target,
     foreach_read,
 };
 
@@ -350,6 +351,7 @@ const Mode modes[] = {
     { "function return", P::func_return },
     { "blocking assign", P::blocking },
     { "nonblocking assign", P::nonblocking },
+    { "nonblocking target", P::nba_target },
     { "foreach read", P::foreach_read },
 };
 // clang-format on
@@ -492,6 +494,14 @@ std::string build_cell(const Cell& k) {
             decls = "    ET w;\n";
             act   = "w <= " + acc + ";\n#1;\n" + subst(e.show, "w") + "\n";
             break;
+        // The place under test as the nonblocking TARGET, not the source. A
+        // separate mode because the two exercise different machinery entirely:
+        // reading stages nothing, while writing has to shadow the place through the
+        // NBA region and commit it, which every container kind does differently.
+        case P::nba_target:
+            decls = "    ET w;\n";
+            act   = "w = " + acc + ";\n" + acc + " <= w;\n#1;\n" + subst(e.show, acc) + "\n";
+            break;
         case P::foreach_read:
             if (std::string_view(c.iter).empty()) {
                 // A bare element, a struct member and a class property are not
@@ -620,11 +630,18 @@ const Allow allowlist[] = {
     // A string's rvalue materializes into a body temp rather than resolving to a
     // handle lvalue, so it does not fit HandleCopyNb's record staging.
     { [](const Cell& k) {
-          return k.m->kind == P::nonblocking &&
+          return (k.m->kind == P::nonblocking || k.m->kind == P::nba_target) &&
                  k.e->name == std::string("string");
       },
       "nonblocking assignment to a string is not supported",
       "§7: a string rvalue is a body temp, not a stageable handle lvalue." },
+    // Every NBA staging buffer -- the scalar shadow slot, the aggregate image and
+    // the container-handle record -- is indexed by Signal. An object body is a heap
+    // block with no signal, so a class property reaches none of them.
+    { [](const Cell& k) { return k.m->kind == P::nba_target && k.c->kind == C::cprop; },
+      "nonblocking assignment to a class property is not supported",
+      "§7: NBA staging is signal-keyed; a per-object shadow does not exist "
+      "(docs/design/classes.md §8)." },
     // `a[k][i]` where the entry is itself a container: the select would have to
     // pick get_ptr or put_ptr, a direction that belongs to its own consumer.
     { [](const Cell& k) {
@@ -712,6 +729,17 @@ const std::vector<Bad>& column(const Cont& c) {
     std::vector<Bad>& bad = memo[&c];
     for (const Elem& e : elems) {
         for (const Mode& m : modes) {
+            // LRM 10.4.2 forbids a nonblocking assignment to an element of a
+            // dynamically sized array, and slang rejects it outright. Generating
+            // these would be ILLEGAL SystemVerilog, which is a generator bug rather
+            // than a finding -- the same rule that keeps the port modes out (above).
+            // Whole-container NBA (`q <= r`) IS legal and is covered by the
+            // hand-written cases; it is the element form that is not.
+            const bool dyn_elem = c.kind == C::dynarr || c.kind == C::queue ||
+                                  c.kind == C::assoc_int || c.kind == C::assoc_str;
+            if (m.kind == P::nba_target && dyn_elem) {
+                continue;
+            }
             run_cell(Cell{ &e, &c, &m }, bad);
         }
     }
