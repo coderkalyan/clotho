@@ -1923,11 +1923,6 @@ private:
 
             return module_.pool.put(ir::Item{ t });
         }
-        if (ct.isUnpackedArray()) {
-            // TODO: associative arrays are handled above; any other unpacked
-            // array kind reaching here is unhandled.
-            fail("associative arrays are not supported");
-        }
         if (ct.isString()) {
             return module_.pool.string_type;
         }
@@ -2777,11 +2772,12 @@ private:
         if (t.kind == ir::Type::Kind::UnpackedArray && src.kind == ExpressionKind::StringLiteral) {
             if (!is_leaf_ref(t.element) || module_.pool.is_float(t.element) ||
                 module_.pool.layout(t.element).width != 8) {
-                // TODO: string literal assigned to an unpacked array whose element
-                // isn't an 8-bit byte -- LRM 5.9 only defines this for "an
-                // unpacked array of bytes".
-                fail("string literal assignment to an unpacked array of non-byte "
-                     "elements is not supported");
+                // LRM 5.9 defines a string literal assignment only for "an
+                // unpacked array of bytes", and slang's implicit conversion fires
+                // only for Type::isByteArray() -- a `byte` element -- so a
+                // non-byte element is rejected upstream and this is defensive.
+                fail("a string literal is only assignable to an unpacked array of "
+                     "bytes (LRM 5.9)");
             }
             emit_string_literal_array_store(lhs, type, t, src.as<StringLiteral>().getValue(), tag, b, l);
             return;
@@ -14956,7 +14952,10 @@ private:
             return res;
         }
 
-        fail("enum method '" + std::string(name) + "' is not supported");
+        // LRM 6.19.2-6.19.5 defines six enum methods -- first, last, next, prev,
+        // name, num -- and all six are handled above. slang binds no other name on
+        // an enum receiver, so this is an invariant, not a feature gap.
+        fail("internal: unhandled enum method '" + std::string(name) + "'");
     }
 
     std::string format_typename(const slang::ast::Type& type) {
@@ -15814,7 +15813,10 @@ private:
             const ir::Index str = lower_lvalue(*args[0], b);
             return b.binary(T::StrRealtoa, str, lower_expr(*args[1], b), l);
         }
-        fail("string method '" + std::string(name) + "' is not supported");
+        // LRM 6.16 defines eighteen string methods and all eighteen are handled
+        // above. slang binds no other name on a string receiver, so this is an
+        // invariant, not a feature gap.
+        fail("internal: unhandled string method '" + std::string(name) + "'");
     }
 
     // Build the combined format string and value-arg list of a $display-family
@@ -16788,10 +16790,7 @@ private:
             // would otherwise misroute into the ordinary whole-object paths and
             // hit lower_lvalue's default case (a pattern has no single address).
             if (a.left().kind != ExpressionKind::SimpleAssignmentPattern) {
-                // "the positional notation shall be required" — a keyed or
-                // replicated pattern is illegal as an lvalue.
-                fail("keyed or replicated assignment pattern is not supported as an "
-                     "lvalue");
+                fail_keyed_pattern_lvalue();
             }
             if (a.isCompound()) {
                 fail("compound assignment to an assignment-pattern lvalue is not "
@@ -17189,7 +17188,8 @@ private:
         if (is_locator_method(name) || is_reduction_method(name)) {
             return lower_array_iter_method(name, call, arr, b, l);
         }
-        // TODO: sort/rsort `with` clause (LRM 7.12.2), and 4-state / wide sort.
+        // TODO: `map` (LRM 7.12.5), the sort/rsort `with` clause (7.12.2), and
+        // 4-state / wide sort.
         fail("dynamic array method '" + std::string(name) + "' is not supported");
     }
 
@@ -17881,7 +17881,8 @@ private:
         if (is_locator_method(name) || is_reduction_method(name)) {
             return lower_array_iter_method(name, call, q, b, l);
         }
-        // TODO: sort/rsort `with` clause (LRM 7.12.2), and 4-state / wide sort.
+        // TODO: `map` (LRM 7.12.5), the sort/rsort `with` clause (7.12.2), and
+        // 4-state / wide sort.
         fail("queue method '" + std::string(name) + "' is not supported");
     }
 
@@ -17921,7 +17922,8 @@ private:
             return b.resize(b.assoc_traverse(a, key_lv, step, aty, l), lower_type(*call.type), l);
         }
         // TODO: find/find_index/min/max/unique/sum reduction & locator methods
-        // (need iterator-clause lowering, shared with the queue/dynarr gap above).
+        // (need iterator-clause lowering, shared with the queue/dynarr gap above),
+        // and `map` (LRM 7.12.5).
         fail("associative array method '" + std::string(name) + "' is not supported");
     }
 
@@ -17998,8 +18000,7 @@ private:
                 store_concat(op.as<ConcatenationExpression>(), val, tag, b, l);
             } else if (const auto* nested = as_assignment_pattern(op)) {
                 if (op.kind != ExpressionKind::SimpleAssignmentPattern) {
-                    fail("keyed or replicated assignment pattern is not supported as an "
-                         "lvalue");
+                    fail_keyed_pattern_lvalue();
                 }
                 store_concat_ops(nested->elements(), val, tag, b, l);
             } else {
@@ -18009,14 +18010,25 @@ private:
         }
     }
 
+    // LRM 10.9 on an assignment pattern in an lvalue: "the positional notation
+    // shall be required". A keyed or replicated pattern there is illegal source,
+    // not a gap. Three positions reach it -- a top-level pattern lvalue, one
+    // inside an lvalue concatenation, and one nested in another pattern -- and
+    // they share the sentence.
+    [[noreturn]] void fail_keyed_pattern_lvalue() {
+        fail("a keyed or replicated assignment pattern is not legal as an lvalue "
+             "(LRM 10.9 requires positional notation)");
+    }
+
     ir::Index lower_pattern_assign(const slang::ast::AssignmentPatternExpressionBase& pat,
                                    const Expression&                                  rhs_expr,
                                    ir::Inst::Tag                                      tag,
                                    ir::Builder&                                       b,
                                    ir::SourceLoc                                      l) {
         if (is_queue(rhs_expr) || is_dyn_array(rhs_expr) || is_assoc(rhs_expr)) {
-            fail("assignment-pattern lvalue from a queue, dynamic array, or "
-                 "associative array right-hand value is not supported");
+            fail("an assignment-pattern lvalue is not legal with a queue, dynamic "
+                 "array or associative array right-hand value (no statically known "
+                 "element count)");
         }
         const ir::Ref rty = lower_type(*rhs_expr.type);
         if (!is_agg_abi_ref(rty)) {
@@ -18087,8 +18099,7 @@ private:
                             ir::SourceLoc     l) {
         if (const auto* nested = as_assignment_pattern(member)) {
             if (member.kind != ExpressionKind::SimpleAssignmentPattern) {
-                fail("keyed or replicated assignment pattern is not supported as an "
-                     "lvalue");
+                fail_keyed_pattern_lvalue();
             }
             store_pattern(*nested, rhs_elem_addr, elem_ty, tag, b, l);
             return;
@@ -18566,7 +18577,8 @@ private:
                 default:
                     // Bitwise / reduction operators are illegal on reals (LRM
                     // Table 11-1); slang rejects them upstream.
-                    fail("unsupported unary operator on a real operand");
+                    fail("this unary operator is not legal on a real operand (LRM "
+                         "Table 11-1)");
             }
         }
         switch (u.op) {
@@ -18596,7 +18608,8 @@ private:
                 return b.binary(T::Sub, zero, op, l);
             }
             default:
-                fail("unsupported unary operator");
+                // ++ / -- returned above, and every other UnaryOperator has an arm.
+                fail("internal: unhandled unary operator");
         }
     }
 
@@ -18661,7 +18674,7 @@ private:
                 combine_tag = T::Limplies;
                 break;
             default:
-                fail("unsupported short-circuit operator"); // unreachable: see call site.
+                fail("internal: not a short-circuit operator"); // unreachable: see call site.
         }
 
         b.open_region();
@@ -18780,7 +18793,8 @@ private:
             default:
                 // %, bitwise, shifts, ===, ==? are illegal on reals (LRM Table
                 // 11-1); slang rejects them upstream.
-                fail("unsupported binary operator on real operands");
+                fail("this binary operator is not legal on real operands (LRM Table "
+                     "11-1)");
         }
     }
 
@@ -18861,7 +18875,10 @@ private:
                 case B::GreaterThanEqual:
                     return b.binary(T::Ge, lhs, rhs, l);
                 default:
-                    fail("unsupported binary operator on strings");
+                    // Only comparison, concatenation and replication apply to a
+                    // string (LRM 6.16); slang rejects the rest upstream.
+                    fail("this binary operator is not legal on string operands (LRM "
+                         "6.16)");
             }
         }
         if (bin.left().type->isFloating() || bin.right().type->isFloating()) {
@@ -20279,9 +20296,9 @@ private:
         std::vector<ir::DpiCType> arg_elem_cts;
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             if (fa->direction == slang::ast::ArgumentDirection::Ref) {
-                // DPI-C has no `ref` formals (slang rejects DPIRefArg); guard
-                // defensively in case a future slang change lets one through.
-                fail("DPI ref arguments are not supported");
+                // DPI-C has no `ref` formals (LRM 35.5.6); slang rejects DPIRefArg,
+                // so this is defensive against a future slang change.
+                fail("a DPI import argument cannot be `ref` (LRM 35.5.6)");
             }
             // Open array (LRM 35.5.6.2): an unsized `[]` formal arrives as an
             // svOpenArrayHandle. The element's own DpiCType is recorded separately;
@@ -20469,7 +20486,9 @@ public:
             std::vector<ir::ArgDir>   arg_dirs;
             for (const FormalArgumentSymbol* fa : sub.getArguments()) {
                 if (fa->direction == slang::ast::ArgumentDirection::Ref) {
-                    fail("DPI export ref arguments are not supported");
+                    // As for an import: illegal per LRM 35.5.6 and already rejected
+                    // by slang, guarded defensively here.
+                    fail("a DPI export argument cannot be `ref` (LRM 35.5.6)");
                 }
                 const auto c = dpi_ctype(fa->getType());
                 if (!c.has_value()) {
