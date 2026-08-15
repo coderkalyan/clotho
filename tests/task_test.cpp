@@ -439,32 +439,93 @@ TEST_CASE("ref actual that is a packed part-select is rejected") {
     CHECK_FALSE(lower_text(src).ok);
 }
 
-// A task target is refused whatever names it: LRM 9.6.2 ends EVERY activation of
-// the task, which no local exit can do (docs/design/disable.md V2). The second
-// case is the LRM's own example 4 shape, so the refusal is not an accident of
-// where the `disable` sits.
-TEST_CASE("disable of a task is rejected") {
-    constexpr std::string_view self = R"(
+// A task target ends EVERY activation of the task (LRM 9.6.2), whatever names it,
+// and each caller resumes at the statement after its task-enabling statement —
+// which is exactly what the ordinary epilogue already does, so the abort takes that
+// epilogue with copy-out skipped. Oracle: iverilog.
+TEST_CASE("disable of a task ends its activation and resumes the caller") {
+    CHECK(run_capture(R"(
         module m;
-            int x;
-            task t;
-                #5 disable t;
+            task slow;
+                #100 $display("never at %0t", $time);
             endtask
-            initial t;
+            initial begin
+                slow;
+                $display("after slow at %0t", $time);
+            end
+            initial #5 disable slow;
         endmodule
-    )";
-    CHECK(reject(self).find("disable of a task") != std::string::npos);
+    )") == "after slow at 5\n");
+}
 
-    constexpr std::string_view from_process = R"(
+// LRM 9.6.2 example 4: a task disabling ITSELF. The activation running the
+// statement is one of the ones that has to end, and it is the only one the
+// force-wake cannot reach — it is running, not parked — so the frontend follows the
+// mark with an explicit abort.
+TEST_CASE("a task disabling itself ends that activation and returns") {
+    CHECK(run_capture(R"(
         module m;
-            task t;
-                #5 $display("t");
+            task selfkill;
+                #5 disable selfkill;
+                $display("never at %0t", $time);
             endtask
-            initial t;
-            initial #1 disable t;
+            initial begin
+                selfkill();
+                $display("returned at %0t", $time);
+            end
+        endmodule
+    )") == "returned at 5\n");
+}
+
+// "If a task is enabled more than once, then disabling such a task shall disable
+// all activations" (LRM 9.6.2). Two concurrent activations, one `disable`, and both
+// callers resume. The two resumptions land in the same instant, whose order the LRM
+// leaves unspecified, so the two callers are told apart by time rather than by
+// print order.
+TEST_CASE("disable of a task ends every activation of it") {
+    CHECK(run_capture(R"(
+        module m;
+            task slow(input integer id);
+                #100 $display("never %0d", id);
+            endtask
+            initial begin
+                slow(1);
+                #1 $display("caller 1 back, now %0t", $time);
+            end
+            initial begin
+                #1 slow(2);
+                #2 $display("caller 2 back, now %0t", $time);
+            end
+            initial #5 disable slow;
+        endmodule
+    )") == "caller 1 back, now 6\ncaller 2 back, now 7\n");
+}
+
+// No live activation means no effect, for a task exactly as for a block: the list
+// is empty, so the walk touches nothing.
+TEST_CASE("disable of a task that is not running has no effect") {
+    CHECK(run_capture(R"(
+        module m;
+            task later;
+                #10 $display("later ran at %0t", $time);
+            endtask
+            initial #5 disable later;
+            initial #20 later;
+        endmodule
+    )") == "later ran at 30\n");
+}
+
+// Still refused: a task whose body can park where the abort cannot claim the park.
+TEST_CASE("disable of a task that parks on a nested call is rejected") {
+    constexpr std::string_view nested = R"(
+        module m;
+            task inner; #5; endtask
+            task outer; inner(); endtask
+            initial outer;
+            initial #1 disable outer;
         endmodule
     )";
-    CHECK(reject(from_process).find("disable of a task") != std::string::npos);
+    CHECK(reject(nested).find("cannot claim that park") != std::string::npos);
 }
 
 // A named block inside a task or a fork child is not single-activation, so the

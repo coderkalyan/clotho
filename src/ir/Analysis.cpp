@@ -188,6 +188,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::NamedBlock:
         case Inst::Tag::Disable:
         case Inst::Tag::DisableRemote:
+        case Inst::Tag::DisableAbort:
         case Inst::Tag::DeferFlush:
         case Inst::Tag::ClassNew:
         case Inst::Tag::HandleDeref:
@@ -1329,6 +1330,7 @@ struct ValueSweep {
                 case Inst::Tag::NamedBlock:
                 case Inst::Tag::Disable:
                 case Inst::Tag::DisableRemote:
+                case Inst::Tag::DisableAbort:
                 case Inst::Tag::DeferFlush:
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:

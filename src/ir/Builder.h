@@ -249,6 +249,7 @@ public:
     Index disable(uint32_t label, SourceLoc loc);
     Index disable_remote(uint32_t target, SourceLoc loc);
     Index defer_flush(SourceLoc loc);
+    Index disable_abort(SourceLoc loc);
     // Return from a void function / task / fork-child body (no operand).
     Index ret_void(SourceLoc loc);
 

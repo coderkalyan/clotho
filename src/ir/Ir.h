@@ -1484,13 +1484,21 @@ struct Inst {
         // block (payload: label). A terminator, exactly like Break, and it binds
         // lexically -- the id names an enclosing block of this unit.
         Disable,
-        // `disable <named block>` (LRM 9.6.2), remote form: mark the activation
-        // currently inside the target region as disabled and force-wake it
-        // (payload: label, here the target id rather than an enclosing label).
-        // NOT a terminator -- the disabling process carries on -- and a no-op when
-        // nothing is inside the region, which is LRM 9.6.2's "if the block is not
-        // currently executing, the disable has no effect".
+        // `disable <named block>` / `disable <task>` (LRM 9.6.2), remote form: mark
+        // the activation(s) the target names as disabled and force-wake them
+        // (payload: label, here the target id rather than an enclosing label). A
+        // block target has one occupant slot; a task target has an activation list,
+        // because 9.6.2 ends EVERY activation. NOT a terminator -- the disabling
+        // process carries on -- and a no-op when nothing is executing the target,
+        // which is 9.6.2's "if the block is not currently executing, the disable has
+        // no effect".
         DisableRemote,
+        // Leave THIS task activation through its epilogue, skipping copy-out (LRM
+        // 9.6.2 leaves output/inout results unspecified on a disable). A terminator,
+        // emitted after a DisableRemote whose target is the enclosing task, which is
+        // 9.6.2 example 4: the activation running the `disable` is one of the ones
+        // that has to end, and it is the only one no force-wake can reach.
+        DisableAbort,
         // Drop this process's pending deferred-assertion reports (LRM 16.4.4):
         // bump its generation counter, exactly as an activation start does
         // (payload: none). Emitted immediately before a `disable` of the
@@ -2203,6 +2211,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Break:
         case T::Continue:
         case T::DeferFlush:
+        case T::DisableAbort:
         case T::RetVoid:
         case T::DumpVars:
         case T::DumpOff:

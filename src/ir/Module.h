@@ -523,6 +523,11 @@ struct Function {
     // fork captured by reference (ForkInfo::args), so a child of a fork in a
     // process body is parameterless. Implies is_task.
     bool is_fork_child = false;
+    // The `disable` target id naming this task (LRM 9.6.2), or kNoDisableTarget.
+    // A targeted task links each activation onto the target's list at entry and
+    // unlinks in the epilogue, so a `disable` can end EVERY activation, which is
+    // what 9.6.2 requires and what a single occupant slot cannot express.
+    uint32_t disable_target = kNoDisableTarget;
     // A DPI-C import (LRM 35): the body is native C resolved at JIT link time by
     // extern_name, not lowered from IR. The backend emits an external declaration
     // (dpi_arg_ctypes / dpi_ret_ctype give the native C signature) and marshals
@@ -599,6 +604,10 @@ public:
     uint32_t alloc_scope_id() {
         return next_scope_id_++;
     }
+    // Which `disable` target ids name a TASK rather than a named block. A task
+    // target is aborted through its activation list, a block target through its
+    // single occupant slot, and the id alone does not say which.
+    std::vector<uint8_t> disable_target_is_task;
 
     // Number of `disable` target ids allocated (LRM 9.6.2). One id per targeted
     // named block per elaborated instance, so this is the length of the backend's

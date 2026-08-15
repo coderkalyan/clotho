@@ -6686,13 +6686,33 @@ private:
     void lower_disable(const slang::ast::DisableStatement& s, ir::Builder& b) {
         const Symbol& target = *s.target.as<slang::ast::ArbitrarySymbolExpression>().symbol;
 
+        const auto it = disable_targets_.find(&target);
+        if (it == disable_targets_.end()) {
+            fail("internal: disable target was not labelled in the Collect pass");
+        }
+
         if (target.kind != SymbolKind::StatementBlock) {
-            // TODO: disable of a task must end EVERY activation of it, including
-            // ones this process never started (LRM 9.6.2), so it needs the
-            // per-activation frame list, not the single occupant slot a process
-            // body's block has.
-            fail("disable of a task is not supported yet (every activation of the task has to "
-                 "end, not just the caller's)");
+            // A task target (LRM 9.6.2): every activation ends, including ones this
+            // process never started, so the abort walks the task's activation list
+            // rather than a single occupant slot.
+            if (disable_hard_.contains(&target)) {
+                // TODO: a task whose body can park where the abort cannot claim the
+                // park -- a `#0` or runtime-valued delay, a time-consuming call it
+                // makes, a fork, an `expect`. The nested-call case additionally needs
+                // the callee's activation ended too (9.6.2 disables downward along
+                // the enable chain), which is a second list walk this does not have.
+                fail("disable of a task whose body can park on a #0, a time-consuming call, a "
+                     "fork or an expect is not supported yet (the abort cannot claim that "
+                     "park)");
+            }
+            b.disable_remote(it->second, loc(s));
+            // LRM 9.6.2 example 4: a task disabling ITSELF. The activation running
+            // this statement is one of the ones that has to end, and it is the only
+            // one the force-wake above cannot reach -- it is running, not parked.
+            if (fn_ctx_ != nullptr && fn_ctx_->sym == &target) {
+                b.disable_abort(loc(s));
+            }
+            return;
         }
         bool     found = false;
         uint32_t label = kNoBlockLabel;
@@ -6703,10 +6723,6 @@ private:
             }
         }
 
-        const auto it = disable_targets_.find(&target);
-        if (it == disable_targets_.end()) {
-            fail("internal: disable target was not labelled in the Collect pass");
-        }
         if (found && fn_ctx_ != nullptr) {
             // The lexical form ends the one activation running it, and a task, fork
             // child or action block can have several inside the same block at once.
@@ -7433,14 +7449,27 @@ private:
         }
         for (const std::vector<const Symbol*>* set : { &v.lexical, &v.remote }) {
             for (const Symbol* t : *set) {
-                if (t->kind != SymbolKind::StatementBlock) {
-                    continue; // a task target never becomes a labelled region
+                const bool is_task = t->kind == SymbolKind::Subroutine;
+                if (!is_task && t->kind != SymbolKind::StatementBlock) {
+                    continue; // slang admits nothing else as a target
                 }
                 // Design-unique, not per-Lowerer: a multi-top design gives every
                 // top its own Lowerer sharing one Module, so the id has to come
                 // from the module the way a scope id does.
                 if (disable_targets_.try_emplace(t, module_.disable_targets).second) {
                     ++module_.disable_targets;
+                    module_.disable_target_is_task.push_back(is_task ? 1 : 0);
+                }
+                if (is_task) {
+                    // A task target is always "remote" in the sense that matters: it
+                    // ends every activation, never just the one running. Its parks
+                    // are checked against the task's own body.
+                    const auto& sub = t->as<SubroutineSymbol>();
+                    disable_remote_.insert(t);
+                    if (hard_park(sub.getBody())) {
+                        disable_hard_.insert(t);
+                    }
+                    continue;
                 }
                 if (set == &v.remote) {
                     disable_remote_.insert(t);
@@ -19169,6 +19198,10 @@ private:
         // True while lowering a task body (a coroutine): unlike a function, timing
         // controls and $time are allowed.
         bool is_task = false;
+        // The subroutine this body belongs to, or null for a synthetic body (a fork
+        // child, an action block, a print thunk). Read by lower_disable to spot LRM
+        // 9.6.2 example 4: a task naming ITSELF as the disable target.
+        const SubroutineSymbol* sym = nullptr;
         // Class method context (valid iff has_this): `this` is spliced as frame
         // Local 0, `this_class` is its Kind::Class handle type. A bare property
         // reference inside the body roots at this Local (value_lvalue).
@@ -19904,6 +19937,7 @@ private:
         FnCtx ctx;
         ctx.name_prefix = std::string(sub.name) + ".";
         ctx.is_task     = true;
+        ctx.sym         = &sub;
         const FnScope fn_scope(*this, &ctx);
         ir::Builder             b(module_.pool);
         std::vector<ir::Ref>    param_types;
@@ -19929,6 +19963,7 @@ private:
         const ir::SourceLoc el = to_source_loc(sub.location);
         b.ret_void(el);
 
+        const auto tgt = disable_targets_.find(&sub);
         module_.set_function(id,
                              ir::Function{ .name        = std::string(sub.name),
                                            .return_type = module_.pool.void_type,
@@ -19936,6 +19971,11 @@ private:
                                            .arg_dirs    = std::move(arg_dirs),
                                            .local_types = std::move(ctx.local_types),
                                            .is_task     = true,
+                                           // A `disable` naming this task ends every
+                                           // activation, so each links itself onto the
+                                           // target's list (LRM 9.6.2).
+                                           .disable_target =
+                                             tgt != disable_targets_.end() ? tgt->second : ir::kNoDisableTarget,
                                            .span        = span_of(sub),
                                            .ir          = b.finish() });
     }
