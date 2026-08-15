@@ -133,6 +133,83 @@ TEST_CASE("inside: signed range membership") {
     CHECK(out == "1\n0\n");
 }
 
+TEST_CASE("inside: real values and ranges") {
+    const std::string out = run_capture(R"(
+        module m;
+          real      r;
+          shortreal sr;
+          initial begin
+            r = 1.5;
+            $display("%b %b %b", r inside {1.5, 2.5}, r inside {0.5, 2.5}, r inside {[1.0:2.0]});
+            $display("%b %b", r inside {[2.0:3.0]}, r inside {[1.5:1.5]});
+            r = 2.0;
+            $display("%b", r inside {2, 7});
+            sr = 2.5;
+            $display("%b %b", sr inside {2.5}, sr inside {[2.0:2.4]});
+          end
+        endmodule
+    )");
+    // An integral member converts to real (11.8.1), so `2` matches 2.0; a range
+    // is closed at both ends.
+    CHECK(out == "1 0 1\n0 1\n1\n1 0\n");
+}
+
+TEST_CASE("inside: an array member is traversed elementwise") {
+    const std::string out = run_capture(R"(
+        module m;
+          int q[$];
+          int d[];
+          int fa [0:2];
+          int n  [0:1][0:1];
+          int eq[$];
+          initial begin
+            q = '{3, 4, 5};
+            d = new[2]; d[0] = 8; d[1] = 9;
+            fa = '{11, 12, 13};
+            n[0][0] = 1; n[0][1] = 2; n[1][0] = 3; n[1][1] = 4;
+            $display("%b %b", 4 inside {1, 2, q}, 7 inside {1, 2, q});
+            $display("%b %b", 9 inside {d}, 1 inside {d});
+            $display("%b %b", 12 inside {fa}, 14 inside {fa});
+            $display("%b %b", 3 inside {n}, 9 inside {n});
+            $display("%b", 5 inside {eq});
+            $display("%b", 13 inside {[100:200], fa, q});
+          end
+        endmodule
+    )");
+    // A nested dimension descends; an empty queue contributes nothing; an array
+    // member mixes with ordinary values and ranges in one set.
+    CHECK(out == "1 0\n1 0\n1 0\n1 0\n0\n1\n");
+}
+
+TEST_CASE("inside: x/z in an array member element is a wildcard") {
+    const std::string out = run_capture(R"(
+        module m;
+          logic [3:0] warr [0:1];
+          initial begin
+            warr[0] = 4'b1x01; warr[1] = 4'b0000;
+            $display("%b %b", 4'b1101 inside {warr}, 4'b1110 inside {warr});
+          end
+        endmodule
+    )");
+    CHECK(out == "1 0\n");
+}
+
+// A real set member inside an array works through the same leaf comparison.
+TEST_CASE("inside: a real left operand against a real array member") {
+    const std::string out = run_capture(R"(
+        module m;
+          real rq[$];
+          real r;
+          initial begin
+            rq = '{1.25, 2.5};
+            r = 2.5;
+            $display("%b %b", r inside {rq}, 3.5 inside {rq});
+          end
+        endmodule
+    )");
+    CHECK(out == "1 0\n");
+}
+
 // Unsupported forms fail loudly (never silently accept).
 TEST_CASE("inside: unsupported forms are rejected") {
     check_rejected(R"(
@@ -143,19 +220,23 @@ TEST_CASE("inside: unsupported forms are rejected") {
     )",
                    "string operands");
 
+    // An associative array has no index walk to share with the ordered
+    // containers; its traversal is the first/next key pair (LRM 7.9.4).
     check_rejected(R"(
         module m;
-          int a; int mem [0:3];
-          initial begin a = 2; $display("%b", a inside {mem}); end
+          int a; int amap [string];
+          initial begin a = 2; amap["k"] = 2; $display("%b", a inside {amap}); end
         endmodule
     )",
-                   "unpacked-array set member");
+                   "associative-array set member");
 
+    // Descending into a non-singular element of a VARIABLE-size member needs the
+    // walk nested inside itself; the fixed-size member recurses instead.
     check_rejected(R"(
         module m;
-          real a;
-          initial begin a = 2.0; $display("%b", a inside {[1.0:3.0]}); end
+          int a; int qq [$][0:1];
+          initial begin a = 2; $display("%b", a inside {qq}); end
         endmodule
     )",
-                   "real operands");
+                   "not singular");
 }

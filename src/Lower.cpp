@@ -19300,35 +19300,158 @@ private:
         }
     }
 
+    // One comparison of the `inside` left operand against a singular member value
+    // (LRM 11.4.13): "the inside operator uses the equality (==) operator on
+    // nonintegral expressions ... Integral expressions use the wildcard equality
+    // (==?) operator so that an x or z bit in a VALUE IN THE SET is treated as a
+    // do-not-care". WildEq's wildcards are its right operand's, which is exactly
+    // that asymmetry; a real has no x/z, so it compares with plain FEq.
+    ir::Index inside_leaf_eq(ir::Index               sel,
+                             ir::Index               val,
+                             const slang::ast::Type& vt,
+                             ir::Ref                 ty,
+                             bool                    real,
+                             ir::Builder&            b,
+                             ir::SourceLoc           l) {
+        if (real) {
+            return b.binary(ir::Inst::Tag::FEq, sel, coerce(val, vt, ty, b, l), l);
+        }
+        return b.binary(ir::Inst::Tag::WildEq, sel, b.resize(val, ty, l), l);
+    }
+
+    // A FIXED-SIZE unpacked-array member of an `inside` set, as an OR over its
+    // elements. 11.4.13 traverses "by descending into the array until reaching a
+    // singular value", so an element that is itself an array dimension recurses.
+    // The element count is static here and the elements are ordinary addressable
+    // storage, so this unrolls rather than looping.
+    ir::Index inside_fixed_array_pred(ir::Index               base,
+                                      const slang::ast::Type& arr,
+                                      ir::Index               sel,
+                                      ir::Ref                 ty,
+                                      bool                    real,
+                                      ir::Builder&            b,
+                                      ir::SourceLoc           l) {
+        using T                      = ir::Inst::Tag;
+        const ir::Ref           aty  = lower_type(arr);
+        const ir::Type          at   = std::get<ir::Type>(module_.pool.get(aty));
+        const slang::ast::Type& et   = *arr.getArrayElementType();
+        const bool              nest = et.getCanonicalType().isUnpackedArray();
+        const uint32_t          n    = (at.left >= at.right ? at.left - at.right : at.right - at.left) + 1;
+        const ir::Ref           i32  = make_int_type(32, false, true);
+        ir::Index               acc{};
+        for (uint32_t k = 0; k < n; ++k) {
+            // Element k in DECLARED index coordinates, as every other fixed-array
+            // element walk builds them (store_pattern).
+            const int32_t coord =
+              at.left <= at.right ? static_cast<int32_t>(at.left + k) : static_cast<int32_t>(at.left - k);
+            const ir::Index idx =
+              b.constant(module_.pool.put_int(i32, static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
+            const ir::Index elv = b.elem_select(base, idx, aty, l);
+            const ir::Index one = nest ? inside_fixed_array_pred(elv, et, sel, ty, real, b, l)
+                                       : inside_leaf_eq(sel, b.unary(T::Load, elv, l), et, ty, real, b, l);
+            acc                 = k == 0 ? one : b.binary(T::Lor, acc, one, l);
+        }
+        return acc;
+    }
+
+    // A QUEUE or DYNAMIC-ARRAY member of an `inside` set: the same OR, but its
+    // element count is a runtime value, so it walks (`q.size()` snapshotted like a
+    // foreach bound) and folds into a cell. LRM 11.4.13's own example is a queue
+    // member: `ex inside {1, 2, array}` with `int array[$] = '{3,4,5}`.
+    ir::Index inside_container_pred(const Expression& m,
+                                    ir::Index         sel,
+                                    ir::Ref           ty,
+                                    bool              real,
+                                    ir::Builder&      b,
+                                    ir::SourceLoc     l) {
+        using T                    = ir::Inst::Tag;
+        const slang::ast::Type& et = *m.type->getArrayElementType();
+        if (et.getCanonicalType().isUnpackedArray() || is_agg_abi_type(et.getCanonicalType())) {
+            // TODO: descend into a non-singular element of a variable-size member
+            // (11.4.13 traverses until it reaches a singular value). The fixed-size
+            // member above recurses; doing it here needs the walk nested inside
+            // itself, one loop per dimension.
+            fail("inside operator with a queue or dynamic-array member whose elements are "
+                 "not singular is not supported");
+        }
+        const ir::Ref   aty   = lower_type(*m.type);
+        const ir::Index arr   = lower_lvalue(m, b);
+        const ir::Ref   i32   = make_int_type(32, false, true);
+        const ir::Ref   log1  = make_int_type(1, true, false);
+        const TempCell  hit   = make_temp_cell(log1, "inside_hit");
+        const TempCell  idx   = make_temp_cell(i32, "inside_idx");
+        const TempCell  bound = make_temp_cell(i32, "inside_n");
+        const ir::Index size  = is_queue(m) ? b.queue_size(arr, aty, l) : b.dyn_array_size(arr, aty, l);
+        b.binary(T::Store, hit.lv(b, l), b.constant(module_.pool.put_int(log1, 0), l), l);
+        b.binary(T::Store, bound.lv(b, l), b.resize(size, i32, l), l);
+        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+
+        b.open_region();
+        const ir::Index pred =
+          b.binary(T::Lt, b.unary(T::Load, idx.lv(b, l), l), b.unary(T::Load, bound.lv(b, l), l), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        // No early exit on a match: the comparisons are side-effect-free, and
+        // 11.4.13 makes the set's order of evaluation nondeterministic anyway, so
+        // the full OR reduction is the cheaper shape (no branch per element) and
+        // gives the same answer, x propagation included.
+        b.open_region();
+        const ir::Index elem = b.unary(T::Load, b.elem_select(arr, b.unary(T::Load, idx.lv(b, l), l), aty, l), l);
+        b.binary(T::Store,
+                 hit.lv(b, l),
+                 b.binary(T::Lor, b.unary(T::Load, hit.lv(b, l), l), inside_leaf_eq(sel, elem, et, ty, real, b, l), l),
+                 l);
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        b.binary(T::Store,
+                 idx.lv(b, l),
+                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
+                 l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test=*/false, l);
+        return b.unary(T::Load, hit.lv(b, l), l);
+    }
+
     // The `inside` set-membership operator (LRM 11.4.13): `sel inside { m0, m1, … }`
     // is 1'b1 if any member matches, 1'bx if some comparison is x with no definite
     // match, else 1'b0 — exactly a logical-OR reduction of the per-member
     // predicates. slang has already widened the left operand and every member (and
     // range bound) to a common comparison type (bindMembershipExpressions ->
     // contextDetermined), so the compares are width-matched.
+    //
+    // Integral members and ranges ride one InsideSet instruction. A member that
+    // needs its own control flow -- an unpacked array, whose elements are
+    // traversed -- and every member of a REAL set, whose compares are the float
+    // ops rather than InsideSet's integral ones, build their own predicate and
+    // fold in with Lor. That reorders those members ahead of the instruction's,
+    // which 11.4.13 allows outright ("the order of evaluation of the expressions
+    // and ranges is nondeterministic").
     ir::Index lower_inside(const InsideExpression& e, ir::Builder& b) {
+        using T               = ir::Inst::Tag;
         const ir::SourceLoc l = loc(e);
         if (is_string_expr(e.left())) {
             // TODO: string-typed `inside` — members would need string comparison,
             // not the integral WildEq / relational ops used here.
             fail("inside operator over string operands is not supported");
         }
-        if (e.left().type->isFloating()) {
-            // TODO: real `inside` — members need the float compare ops (FEq / FGe /
-            // FLe), not the integral WildEq / Ge / Le used here (LRM 11.4.13; reals
-            // carry no x/z, so it reduces to == / >= && <=).
-            fail("inside operator over real operands is not supported");
-        }
-        // One InsideSet node carries the whole set; member operands are still
-        // evaluated in source order. A `[lo:hi]` range tests
-        // `sel >= lo && sel <= hi`; a singular member uses ==? wildcard
-        // equality, where only the member's own x/z bits are wildcards
-        // (LRM 11.4.13), which is exactly WildEq's right-operand-wildcards
-        // semantics.
-        const ir::Ref          ty  = lower_type(*e.left().type);
-        const ir::Index        sel = lower_expr(e.left(), b);
+        // A real set compares at `real`: a shortreal widens exactly (LRM 6.12.2),
+        // and 11.4.13's relational range test is defined for reals (Table 11-1).
+        const bool      real = e.left().type->isFloating();
+        const ir::Ref   ty   = real ? module_.pool.real_type : lower_type(*e.left().type);
+        const ir::Index sel =
+          real ? coerce(lower_expr(e.left(), b), *e.left().type, ty, b, l) : lower_expr(e.left(), b);
+
         std::vector<ir::Index> values;
         std::vector<ir::Index> ranges;
+        ir::Index              acc{};
+        bool                   have_acc = false;
+        const auto             fold     = [&](ir::Index p) {
+            acc      = have_acc ? b.binary(T::Lor, acc, p, l) : p;
+            have_acc = true;
+        };
+
         for (const Expression* m : e.rangeList()) {
             if (m->kind == ExpressionKind::ValueRange) {
                 const auto& vr = m->as<ValueRangeExpression>();
@@ -19340,18 +19463,45 @@ private:
                     // TODO: unbounded `$` range bounds (`[lo:$]` / `[$:hi]`).
                     fail("inside operator unbounded ($) range bounds are not supported");
                 }
+                if (real) {
+                    // `sel >= lo && sel <= hi`, inclusive both ends; an inverted
+                    // range is empty and matches nothing, which falls out of the
+                    // conjunction (11.4.13).
+                    const ir::Index lo = coerce(lower_expr(vr.left(), b), *vr.left().type, ty, b, loc(vr.left()));
+                    const ir::Index hi = coerce(lower_expr(vr.right(), b), *vr.right().type, ty, b, loc(vr.right()));
+                    fold(b.binary(T::Land, b.binary(T::FGe, sel, lo, l), b.binary(T::FLe, sel, hi, l), l));
+                    continue;
+                }
                 ranges.push_back(b.resize(lower_expr(vr.left(), b), ty, loc(vr.left())));
                 ranges.push_back(b.resize(lower_expr(vr.right(), b), ty, loc(vr.right())));
                 continue;
             }
             if (m->type->getCanonicalType().isUnpackedArray()) {
-                // TODO: an unpacked-array set member (`sel inside {arr}`) matches any
-                // element (LRM 11.4.13 array unwrap); needs runtime element iteration.
-                fail("inside operator with an unpacked-array set member is not supported");
+                if (is_assoc(*m)) {
+                    // TODO: an associative-array set member (LRM 11.4.13). Its
+                    // traversal is the first/next key walk (7.9.4), not the index
+                    // loop the ordered containers share.
+                    fail("inside operator with an associative-array set member is not supported");
+                }
+                fold(is_unpacked_array(*m) ? inside_fixed_array_pred(lower_lvalue(*m, b), *m->type, sel, ty, real, b, l)
+                                           : inside_container_pred(*m, sel, ty, real, b, l));
+                continue;
+            }
+            if (real) {
+                fold(inside_leaf_eq(sel, lower_expr(*m, b), *m->type, ty, real, b, l));
+                continue;
             }
             values.push_back(b.resize(lower_expr(*m, b), ty, loc(*m)));
         }
-        return b.inside_set(sel, values, ranges, l);
+        if (!values.empty() || !ranges.empty()) {
+            fold(b.inside_set(sel, values, ranges, l));
+        }
+        if (!have_acc) {
+            // A range_list has at least one value_range (A.8.3), and every shape of
+            // one either lands in the instruction or folds its own predicate.
+            fail("internal: an inside set with no members");
+        }
+        return acc;
     }
 
     // Build the lvalue for a part-select over an already-lowered base lvalue: a
