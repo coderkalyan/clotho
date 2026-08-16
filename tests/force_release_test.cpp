@@ -75,6 +75,10 @@ TEST_CASE("force: RHS is continuously tracked") {
     CHECK(run_capture_finish(src) == "a=20\na=50\na=200\n");
 }
 
+// Re-force is last-wins (LRM 10.6.2): a second force to the same variable
+// supersedes the first, breaking its continuous relationship. iverilog 13
+// diverges here (it keeps the first force's RHS link live, so a later change to
+// that RHS leaks through) —
 TEST_CASE("force: re-force is last-wins, old RHS link broken") {
     constexpr std::string_view src = R"(
         module m;
@@ -146,6 +150,10 @@ TEST_CASE("release: never-forced variable is a no-op") {
     CHECK(run_capture_finish(src) == "a=5\n");
 }
 
+// LRM 10.6: the full procedural continuous-assignment priority ladder on a
+// variable — procedural, then `assign` (overrides procedural), then `force`
+// (overrides assign), `release` (reverts to the active assign), `deassign`
+// (holds), procedural resumes. Byte-identical to iverilog 13.
 TEST_CASE("assign/force/release/deassign: full priority ladder") {
     constexpr std::string_view src = R"(
         module m;
@@ -193,6 +201,11 @@ TEST_CASE("assign: continuous tracking and last-wins") {
     CHECK(run_capture_finish(src) == "a=10\na=11\na=50\na=50\na=55\n");
 }
 
+// LRM 10.6.2: a force on a net overrides all its drivers (here a gate) and the
+// RHS is a continuous relationship; on release the net immediately reverts to
+// the driver-resolved value. This is the standard's own `and`-gate-patched-to-`or`
+// example. iverilog agrees on values but evaluates the net-force RHS only
+// once — its own documented limitation.
 TEST_CASE("force: net override of a gate driver, continuous, revert on release") {
     constexpr std::string_view src = R"(
         module m;
@@ -212,6 +225,8 @@ TEST_CASE("force: net override of a gate driver, continuous, revert on release")
     CHECK(run_capture_finish(src) == "e=0\ne=1\ne=0\n");
 }
 
+// A forced net tracks its RHS; on release a single continuous driver takes over
+// immediately.
 TEST_CASE("force: net tracks RHS, reverts to assign driver on release") {
     constexpr std::string_view src = R"(
         module m;
@@ -230,6 +245,7 @@ TEST_CASE("force: net tracks RHS, reverts to assign driver on release") {
     CHECK(run_capture_finish(src) == "y=50\ny=77\ny=1\n");
 }
 
+// An undriven net floats z; a force overrides it and release reverts to z.
 TEST_CASE("force: undriven net reverts to z on release") {
     constexpr std::string_view src = R"(
         module m;
@@ -246,6 +262,8 @@ TEST_CASE("force: undriven net reverts to z on release") {
     CHECK(run_capture_finish(src) == "u=zzzz\nu=5\nu=zzzz\n");
 }
 
+// A force on a multiply-driven (resolved) net overrides the resolution; on
+// release the net reverts to the resolved value (x on a 0/1 conflict).
 TEST_CASE("force: resolved net override reverts to resolution on release") {
     constexpr std::string_view src = R"(
         module m;
@@ -549,6 +567,9 @@ TEST_CASE("force of a variable bit-select or array word is rejected") {
     CHECK(lower_error(arr_word).find("unsupported statement") != std::string::npos);
 }
 
+// LRM 10.6.2: releasing a variable driven by a continuous assignment
+// reestablishes that assignment (the variable reverts to the driver's current
+// value, not held). Byte-identical to iverilog 13.
 TEST_CASE("release: reestablishes a continuous assignment on the variable") {
     constexpr std::string_view src = R"(
         module m;

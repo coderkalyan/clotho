@@ -12,6 +12,9 @@ using namespace clotho;
 
 namespace {
 
+// JIT-run a module and capture stdout (mirrors event_test.cpp). The interface /
+// modport behavior exercised below is defined by LRM 25; iverilog 13 has no
+// SystemVerilog interface support (it rejects an interface port at parse time).
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
@@ -51,6 +54,10 @@ std::string reject(std::string_view source) {
 
 } // namespace
 
+// A modport port shares the interface instance's storage with the enclosing
+// interface: the producer drives it, the consumer reads it, both across module
+// boundaries with no copy process. The consumer lags the producer by one
+// posedge (the producer's NBA to data/valid commits after both blocks sample).
 TEST_CASE("modport port shares storage across modules") {
     const std::string out = run_capture(R"(
         interface simple_bus;
@@ -86,6 +93,9 @@ TEST_CASE("modport port shares storage across modules") {
     CHECK(out == "got=1\ngot=2\ngot=3\ngot=4\n");
 }
 
+// An interface subroutine reached through a modport `import`, an array of
+// interfaces (per-element storage), and modport input/output directions.
+// Each worker resolves w.sum() to its own interface instance's function.
 TEST_CASE("interface subroutine, array, and directions") {
     const std::string out = run_capture(R"(
         interface ibus;
@@ -165,6 +175,9 @@ TEST_CASE("multiple continuous drivers on an interface net fail loudly") {
     CHECK(diag.find("multiple drivers") != std::string::npos);
 }
 
+// A modport expression port that renames a whole interface signal
+// (`.clean(raw)`, LRM 25.5.3) shares that signal's storage: writing p.clean
+// writes raw.
 TEST_CASE("modport rename expression port") {
     const std::string out = run_capture(R"(
         interface ibus;

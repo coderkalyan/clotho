@@ -12,6 +12,11 @@ using namespace clotho;
 
 namespace {
 
+// JIT-run a module and capture stdout (mirrors queue_test.cpp / dynamic_array_test.cpp).
+// Associative-array behaviour below follows LRM 7.8/7.9. iverilog 13 cannot parse
+// an associative-array declaration at all, and verilator violates LRM 7.8 by
+// CREATING an entry on a read of an absent key (its num()/foreach then include
+// the phantom key).
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
@@ -44,6 +49,9 @@ std::string run_capture(std::string_view source) {
 
 } // namespace
 
+// a[k] write creates the entry; read returns the value; num() counts entries;
+// a read of an absent key returns the element default and does NOT create it
+// (LRM 7.8 — verilator wrongly creates it, so num stays 2 here for clotho).
 TEST_CASE("assoc integral put/get/num, absent-read no create") {
     constexpr std::string_view src = R"(
         module m;
@@ -173,6 +181,15 @@ TEST_CASE("assoc wildcard cross-width equality") {
     CHECK(run_capture(src) == "num=2 w5=99 w300=7 ex5=1 ex6=0\nafterdel num=1 ex5=0\n");
 }
 
+// ---------------------------------------------------------------------------
+// Unpacked-struct keys (LRM 7.8.5 "other user-defined types") and class-handle
+// keys (LRM 7.8.3). Both fold into the same normalized byte span the integral
+// and string keys use: a struct serializes leaf by leaf (never a memcpy of its
+// padded storage image), a handle serializes its 64-bit identity word.
+// ---------------------------------------------------------------------------
+
+// A struct key orders lexicographically by member in declaration order, with each
+// member compared in its own signedness -- the ordering LRM 7.8.5 leaves free.
 TEST_CASE("assoc unpacked-struct keys: distinct entries and member-order traversal") {
     constexpr std::string_view src = R"(
         module m;
@@ -321,6 +338,10 @@ TEST_CASE("assoc class-handle keys: identity, null, derived index, traversal") {
                               "del num=3 exnull=0 b1=uno\n");
 }
 
+// LRM 7.8.4 / 7.8.5: an index that is or contains an x/z bit is INVALID, and
+// 7.8.6 makes a read of an invalid index return the element default (creating
+// nothing) and a write no-op. Clotho used to normalize the must plane, so `a['x]`
+// silently aliased `a[0]`.
 TEST_CASE("assoc invalid (x/z) key: read defaults, write drops, exists is 0") {
     constexpr std::string_view src = R"(
         module m;
@@ -676,6 +697,9 @@ TEST_CASE("assoc unpacked-struct deep-copy independence") {
 
 // -- Associative array literals (LRM 7.9.11) --------------------------------
 
+// The LRM 7.9.11 examples verbatim, and the sv-tests chapter-7 literals case: a
+// `'{default: v}` initializer makes every absent key read back `v` (and no
+// warning), keyed entries are created, and the default does not count as one.
 TEST_CASE("assoc literal with a default (LRM 7.9.11)") {
     constexpr std::string_view src = R"(
         module m;
@@ -716,6 +740,10 @@ TEST_CASE("assoc literal without a default") {
                               "b=2\n");
 }
 
+// The default is per-array state, not an entry: a.delete() keeps it (LRM 7.9.11
+// makes it independent of the array's contents), and a created entry starts from
+// the ELEMENT default rather than the pattern default, so a partial write into an
+// absent key yields x-bits, not the default.
 TEST_CASE("assoc literal default survives delete and does not seed entries") {
     constexpr std::string_view src = R"(
         module m;
@@ -734,6 +762,8 @@ TEST_CASE("assoc literal default survives delete and does not seed entries") {
                               "d5=xX num=1\n");
 }
 
+// The default is part of the value, so a whole-array copy carries it and a copy
+// from an array without one clears the target's.
 TEST_CASE("assoc literal default follows a whole-array copy") {
     constexpr std::string_view src = R"(
         module m;

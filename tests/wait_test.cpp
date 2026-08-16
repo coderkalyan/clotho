@@ -31,6 +31,9 @@ std::string lower_error(std::string_view source) {
 
 } // namespace
 
+// IEEE 1800-2023 9.4.3: a `wait` whose condition is already true does not
+// suspend — it falls through in the same time step. Verified against iverilog 13
+// (which prints the second line at t=0).
 TEST_CASE("wait on an already-true condition does not suspend") {
     constexpr std::string_view src = R"(
         module m;
@@ -63,6 +66,10 @@ TEST_CASE("wait suspends until the condition rises") {
     CHECK(run_capture_finish(src) == "woke 25\n");
 }
 
+// LRM 9.4.3 truth is the `if` truth (12.4): X is false. A wait on an X value
+// must keep blocking until a definite 1 — it must NOT fall through on X. This is
+// the case a naive `while (!cond)` lowering gets wrong (RedOr of a 4-state cond
+// is X, not a must-plane 0). iverilog resumes only at the 1.
 TEST_CASE("wait treats X as false and blocks until a definite 1") {
     constexpr std::string_view src = R"(
         module m;
@@ -125,6 +132,9 @@ TEST_CASE("wait re-arms across loop iterations (handshake)") {
     CHECK(run_capture_finish(src) == "got 0 10\ngot 1 30\ngot 2 50\n");
 }
 
+// LRM 9.4.3 with a constant-false condition: the process blocks permanently
+// (iverilog warns "will block permanently"). Simulation continues — other
+// processes run and $finish still fires. The unreachable body must never print.
 TEST_CASE("wait on a constant-false condition parks the process forever") {
     constexpr std::string_view src = R"(
         module m;

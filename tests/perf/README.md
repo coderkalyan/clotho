@@ -1,8 +1,8 @@
 # Performance benchmarks
 
 Tracks clotho compile time and simulation time per benchmark case, gates
-regressions against a checked-in baseline, and keeps static reference numbers
-for iverilog and Verilator. Requires `hyperfine` and Python 3.11+.
+regressions against a checked-in baseline, and records iverilog and Verilator
+numbers on the same cases for context. Requires `hyperfine` and Python 3.11+.
 
 ## Usage
 
@@ -47,6 +47,21 @@ Sign-off = run `perf.py baseline` and commit the `baseline.json` diff with
 justification in the same change. `compare` exits 1 on any regression, so a
 future CI job is: `perf.py run && perf.py compare` on a pinned runner, with
 the baseline update reviewable in the PR diff.
+
+## Oracles
+
+`perf.py oracles` measures iverilog and Verilator compile and sim time per
+case, writing `oracles.json` (checked in, with tool versions/host/date). It is
+run manually when convenient — never in CI — and `compare` only prints the
+numbers as context, never gates on them. Tools missing from PATH are skipped,
+keeping existing numbers. Per-case, per-tool applicability lives in the case's
+`case.toml` (`[oracles.<tool>] enabled = false` + `note`), e.g. a feature
+iverilog does not support, or a harness that is not workload-comparable.
+
+A tool installed outside the system PATH is located via `tools.local.json`
+(gitignored; copy `tools.local.json.example`), a `{tool: bindir}` map prepended
+to PATH for that tool's commands. A tool the shell already resolves needs no
+entry.
 
 ## Cases
 

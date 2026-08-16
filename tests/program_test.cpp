@@ -10,6 +10,20 @@
 
 using namespace clotho;
 
+// `program` blocks per LRM §24. A program elaborates exactly like a module --
+// same scope, same variables, same subroutines -- and differs in one thing: its
+// `initial` procedures run in the Reactive region (§24.3) rather than the
+// Active one, so everything they print lands after the Active-region work of
+// the same time slot. When the last one completes the simulation ends on its
+// own (§24.6, the implicit $finish).
+//
+// The region is observable only as print ordering, so that is what these check.
+//
+// Before this existed, `program` was accepted and silently lowered as a plain
+// module, which put its initials in the Active region -- a wrong-scheduling bug
+// that happened to print plausibly. Every shape not verified here is refused
+// loudly rather than given module semantics again.
+
 namespace {
 
 // JIT-run a design and capture stdout (mirrors display_test.cpp / final_test.cpp).
@@ -87,6 +101,11 @@ void check_backend_rejected(std::string_view source, std::string_view needle) {
 
 // -- Scheduling: the Reactive region ----------------------------------------
 
+// The observable that proves the region. `cascade` is woken by a write the
+// first always block makes, so it joins the Active region AFTER the program was
+// already waiting on the same posedge. An Active-region program initial would
+// print between the two; a Reactive one prints after both, because Reactive
+// runs only once the whole Active/Inactive/NBA set has settled.
 TEST_CASE("program initial runs in the Reactive region, after all Active work") {
     CHECK(run_capture(R"(
         module t;
@@ -211,6 +230,9 @@ TEST_CASE("multiple program instances each get their own initial") {
 
 // -- LRM 24.6: the implicit finish -------------------------------------------
 
+// When the last program initial completes, simulation ends by itself -- the
+// module's own $finish at 25 is never reached, and the third clock edge never
+// prints.
 TEST_CASE("simulation ends when the last program initial completes") {
     CHECK(run_capture(R"(
         module t;
@@ -261,6 +283,12 @@ TEST_CASE("implicit finish waits for every program initial") {
     )") == "early done\nlate done\n");
 }
 
+// The LRM does not settle what happens when the last program initial's final
+// act is a blocking store that wakes an always block: whether
+// that block runs before the implicit $finish. Clotho does not run it, because
+// that is what clotho's explicit $finish already does (lower_finish empties the
+// rings) and a second, contradictory convention for the same LRM sentence would
+// be worse than either answer. Pinned so the choice stays deliberate.
 TEST_CASE("implicit finish does not drain work the last program initial woke") {
     CHECK(run_capture(R"(
         module t;
@@ -354,6 +382,18 @@ TEST_CASE("$exit is rejected") {
     )", "$exit");
 }
 
+// A #0 in a program initial parks in Re-Inactive, not Inactive (LRM 4.4.2.7),
+// and the batch promotes back into the Reactive ring of the SAME instant. The
+// observable is where the resumed print sorts relative to OTHER reactive work
+// of that instant: `a` suspends first but must resume after `b` has run,
+// because Re-Inactive promotes only once the reactive ring has drained.
+//
+// The LRM names the region (4.4.2.7 "an explicit #0 ... shall be scheduled in
+// the Re-Inactive region") but says nothing about how two program initials of
+// one instant interleave around it. What is pinned here is that the #0 resumes
+// in Reactive at the same time as it suspended, and lands behind reactive work
+// already queued -- the Re-Inactive signature. The a/b interleave is clotho's
+// choice, not something the LRM fixes.
 TEST_CASE("a #0 in a program initial resumes in Reactive at the same instant") {
     CHECK(run_capture(R"(
         module t;

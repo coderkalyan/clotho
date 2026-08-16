@@ -491,8 +491,8 @@ TEST_CASE("a vector condition with a definite 1 bit is definitely true") {
     //
     // Note the published rule disagrees: Sutherland 2005 and Standard Gotchas
     // 2006 6.10 both require that no bit be x/z for the condition to be true,
-    // 6.10 using 4'b010z as its worked example. That is not the LRM's rule;
-    // iverilog agrees with the expectation below on every line.
+    // 6.10 using 4'b010z as its worked example. iverilog agrees with the
+    // expectation below on every line.
     constexpr std::string_view src = R"(
         module m;
             logic [3:0] v;
@@ -723,6 +723,8 @@ TEST_CASE("priority casez: no matching pattern reports a violation") {
     CHECK(run_capture_stderr(src).find("no condition is true") != std::string::npos);
 }
 
+// -- unique / unique0 (LRM 12.5.3) --
+
 // unique reports a no-match like priority (default-less, no item matched).
 TEST_CASE("unique case: no match, no default reports a no-match violation") {
     constexpr std::string_view src = R"(
@@ -856,6 +858,10 @@ TEST_CASE("unique case: non-constant labels overlap at runtime") {
     CHECK(run_capture(src) == "a\n");
 }
 
+// -- priority if (LRM 12.4.2) --
+// Execution is ordered first-match (identical to a plain if); only the no-match
+// report is added. unique/unique0 if overlap is still TODO.
+
 // A default-less priority-if chain with no true condition reports a no-match.
 TEST_CASE("priority if: no true condition, no else reports a violation") {
     constexpr std::string_view src = R"(
@@ -937,6 +943,10 @@ TEST_CASE("plain if: no match, no else is silent") {
     )";
     CHECK(run_capture_stderr(src).empty());
 }
+
+// -- unique / unique0 if (LRM 12.4.2) --
+// Overlap detection is eager (all conditions evaluated); execution runs the
+// first true arm.
 
 // More than one condition true is a uniqueness violation; the first true arm
 // still runs.
@@ -1379,6 +1389,8 @@ TEST_CASE("case statement over type() with no match and no default is a no-op") 
     CHECK(run_capture(src) == "done\n");
 }
 
+// LRM 12.6.1: a pattern-matching case can carry unique/priority qualifiers,
+// which report the same violations as a plain case (LRM 12.5.3).
 TEST_CASE("priority pattern case: no match, no default reports a violation") {
     constexpr std::string_view src = R"(
         module m;
@@ -1417,6 +1429,13 @@ TEST_CASE("unique pattern case: two matching items report an overlap") {
     CHECK(run_capture(src) == "a 5\n");
 }
 
+// -- real selectors and labels (LRM 12.5) --
+// 12.5 words matching as a bit-for-bit `===` and Table 11-1 bars `===` on a
+// real, so the standard defines the comparison only for integral operands. A
+// real carries no x/z -- the entire content of the 4-state rule -- so clotho
+// matches with IEEE-754 equality, the same degeneration it already applies to a
+// string (6.16.9). iverilog 13 agrees on every case below.
+
 // An integral label against a real selector converts to real (11.8.1), so `2`
 // matches 2.0; -0.0 and 0.0 are the same IEEE-754 value; a multi-label item ORs
 // its labels.
@@ -1439,6 +1458,15 @@ TEST_CASE("case with a real selector compares by value") {
     CHECK(out == "int-label\nnegzero\nmulti\ndflt\n");
 }
 
+// casez / casex over a real never reaches lowering: 12.5.1's do-not-care
+// positions are BIT positions, and slang's binder refuses a non-integral
+// selector for either keyword ("invalid type 'real' for casez expression").
+// iverilog 13 accepts it and treats it as a plain case; clotho follows slang's
+// stricter reading, and the rejection is pinned in tests/real_test.cpp.
+
+// 12.5's linear search stops at the first match, so a later label is never
+// evaluated -- the real path chains lazily rather than computing every
+// predicate up front. iverilog also reports zero calls to bump().
 TEST_CASE("a real case stops the search at the first match") {
     const std::string out = run_capture(R"(
         module m;
@@ -1459,6 +1487,12 @@ TEST_CASE("a real case stops the search at the first match") {
     CHECK(out == "first\nbump calls=0\n");
 }
 
+// `case ... inside` over reals: 11.4.13 membership is the pair of relational
+// comparisons, and Table 11-1 DOES define those for reals, so this arm needs no
+// interpretation. iverilog 13 does not parse a ranged `case ... inside` at all,
+// so the expectations are the LRM's: closed bounds, and a singular member
+// compares by value. (A case_inside_item is a bare range_list, A.6.7: no braces,
+// unlike the `inside` operator's open_range_list.)
 TEST_CASE("case inside with real ranges and members") {
     const std::string out = run_capture(R"(
         module m;

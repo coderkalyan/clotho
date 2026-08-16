@@ -51,4 +51,3 @@ note = "Runs (the testbench is plain Verilog + the SV core parses), but CoreMark
 [oracles.verilator]
 enabled = true
 note = "2-state cycle-accurate reference; build with -Isrc, --binary --timing runs tb_hazard3 directly. Validated (MCYCLES match)."
-

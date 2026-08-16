@@ -1,3 +1,19 @@
+// Inferred clocking (LRM 16.14.6). No property here carries a clocking event, so
+// each takes the one from the procedure it sits in.
+//
+//   ap_pos  posedge procedure
+//   ap_neg  negedge procedure -- same clock, so the two reports separate in time
+//           only if the inferred EDGE is honoured and not just the signal
+//   ap_rst  the ordinary reset-flop procedure: two events in the list, and
+//           16.14.6 picks `posedge clk` because the body reads `rst_n` and so
+//           disqualifies it. Its report must coincide with ap_pos's
+//
+// `clk` appears in each asserting procedure only as an event control, which is
+// the condition 16.14.6 puts on a candidate clock; the counter and the trace
+// driver are separate procedures and do not disturb that.
+//
+// The trace is driven with nonblocking assignments so every sampled value is
+// unambiguous, and $display marks each edge so a report can be attributed.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

@@ -163,6 +163,9 @@ TEST_CASE("xhier: reference into a generate-loop block") {
     CHECK(out == "g0=2 g2=2\n");
 }
 
+// inout / ref ports (LRM 23.3.3): the child port's internal net/variable shares
+// storage with the parent connection (build_inout_aliases) — no copy process, so
+// a value driven on either side is seen on the other.
 TEST_CASE("inout port: child drives, parent (and a sibling) read") {
     const std::string out = run_capture(R"(
         module io4(inout wire [3:0] b);

@@ -190,6 +190,8 @@ TEST_CASE("enum methods are rejected") {
                    "non-constant step");
 }
 
+// $cast (LRM 6.24.2 / 8.16), Tier 1: numeric + enum destinations. Returns 1 and
+// assigns on success, else 0 with dest unchanged.
 TEST_CASE("$cast: numeric and enum destinations") {
     const std::string out = run_capture(R"(
         module m;

@@ -496,6 +496,11 @@ TEST_CASE("unpacked arrays of string init empty and assign per element") {
     CHECK(run_capture(src) == "[zero] [one] [] [zero-one]\n8 0\n[zero+one]\n");
 }
 
+// LRM 5.9: "A string literal can be assigned to an unpacked array of bytes.
+// If the size differs, it is left justified." Left-justified: character 0
+// lands at the array's declared left bound; a shorter string zero-pads the
+// remaining elements, a longer string's tail is dropped. iverilog does not
+// implement the construct at all.
 TEST_CASE("string literal assigns element-wise into an unpacked byte array") {
     constexpr std::string_view src = R"(
         module m;
@@ -558,6 +563,12 @@ TEST_CASE("string comparisons drive control flow") {
     )";
     CHECK(run_capture(src) == "yes\n[gogogo]\n");
 }
+
+// -- String truthiness in conditions --
+//
+// The LRM leaves the truth of a string undefined (§12.4 tests a "numeric
+// value"), so clotho defines it: non-empty = true, empty = false, which is what
+// slang's const-eval also does. iverilog crashes on every one of these forms.
 
 TEST_CASE("if on a string tests emptiness") {
     constexpr std::string_view src = R"(

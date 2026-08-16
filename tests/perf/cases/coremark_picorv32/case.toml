@@ -24,4 +24,3 @@ note = "iverilog 13 runs the plain-Verilog core + TB directly (verified: MCYCLES
 [oracles.verilator]
 enabled = false
 note = "Not comparable: the picorv32 testbench module is under `ifndef VERILATOR`, so verilator needs its C++ harness (testbench.cc) which drives the clock differently and ends at a different cycle count (same reason as the picorv32 case)."
-

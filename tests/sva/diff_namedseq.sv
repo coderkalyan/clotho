@@ -1,3 +1,11 @@
+// A named sequence with formal arguments is instantiated as the antecedent of an
+// implication, and a named property wraps a second implication, so both layers
+// of AssertionInstanceExpression::body are exercised -- a sequence instance
+// lowers at the sequence layer, a property instance at the property layer.
+// Both formals of `ab` are substituted differently by the two uses.
+//
+// Each assertion passes once and fails once, so a monitor that never fires is
+// distinguishable from one that fires correctly.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

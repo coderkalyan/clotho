@@ -13,4 +13,3 @@ enabled = true
 
 [oracles.verilator]
 enabled = true
-

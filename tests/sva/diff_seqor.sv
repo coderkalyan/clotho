@@ -1,3 +1,6 @@
+// Sequence disjunction, with both branches live at once.
+// The trace is driven with nonblocking assignments so every sampled value is
+// unambiguous, and $display marks each cycle so a report can be attributed.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;
@@ -28,7 +31,7 @@ module t;
   // The coverage moved: tests/sva_test.cpp asserts the refusal by name and
   // asserts that the same operator still lowers in a CONSEQUENT on the counted
   // discipline. Restoring this line needs the trigger determinised, tracked in
-  // docs/TODO.md; re-score the file when it lands.
+  // docs/TODO.md.
 
   initial begin
     @(posedge clk);

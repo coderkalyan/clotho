@@ -137,7 +137,8 @@ TEST_CASE("signed decimal automatic sizing") {
     )") == ":  -1:\n: 100:\n:  7:\n");
 }
 
-// `-` left-justifies with trailing spaces (an extension the LRM does not define).
+// `-` left-justifies with trailing spaces (an extension beyond the LRM's
+// format list).
 TEST_CASE("left justification") {
     CHECK(run_capture(R"(
         module m;
@@ -201,6 +202,12 @@ TEST_CASE("%m reports the invoking scope") {
     )") == "blk m.blk\ntask m.t\nsub m2.u1\n");
 }
 
+// %l splices "library.cell" (LRM §21.2.1.3): the current module instance's
+// library binding and cell (module definition) name. Clotho has no
+// library/config system (Clause 33), so there is no library map to consult and
+// every instance is unconditionally in "work". Static per lowering site, same
+// as %m: the cell is the module's DEFINITION name, not the instance name
+// (`s1`'s cell is still "sub").
 TEST_CASE("%l reports the invoking instance's library.cell") {
     CHECK(run_capture(R"(
         module sub;
@@ -423,6 +430,9 @@ TEST_CASE("display operands wider than 64 bits (LRM 21.2)") {
 }
 
 TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)") {
+    // `'{...}` with struct member names and decimal leaves: the clause prints a
+    // singular element "as [it] would unformatted", which 21.2.1.1 makes decimal.
+    // Verilator instead tags leaves `'h`.
     SUBCASE("fixed unpacked array") {
         CHECK(run_capture(R"(
             module m;
@@ -449,6 +459,10 @@ TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"
         )") == "x=7 v='{'{a:1, b:1}, '{a:2, b:2}} y=9\n");
     }
     SUBCASE("real, string, and string-literal leaves") {
+        // The clause's remaining per-element rules: a string "enclosed in quotes",
+        // a real as it would print unformatted. A bare string literal is an
+        // integral packed value (LRM 5.9), so it needs the literal's own text, not
+        // its decimal value.
         CHECK(run_capture(R"(
             module m;
                 typedef struct { real r; string s; int n; } s_t;

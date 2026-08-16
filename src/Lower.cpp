@@ -2552,6 +2552,14 @@ private:
         emit_agg_store(lhs_base, sty, rhs, tag, b, l);
     }
 
+    // True if a (possibly struct-nested) unpacked struct type has any field
+    // carrying its own declared initializer (LRM 7.2's struct_union_member
+    // list_of_variable_decl_assignments) -- applied as that field's default
+    // value when a variable of the type is declared with no initializer of
+    // its own, the same way a class property default applies at construction
+    // (LRM 8.8 / emit_class_property_inits). An unset field still keeps its
+    // own domain default (X / 0), so this only needs to detect whether ANY
+    // field needs a store at all.
     static bool struct_has_field_defaults(const slang::ast::Type& t) {
         const slang::ast::Type& ct = t.getCanonicalType();
         if (!ct.isUnpackedStruct()) {
@@ -2738,6 +2746,16 @@ private:
                 return;
             }
             if (t.kind == ir::Type::Kind::UnpackedArray) {
+                // Position k of the (expanded) pattern stores into the array
+                // coordinate slang assigned it. A keyed (structured) pattern binds
+                // element k to the numeric index `min(left,right) + k` (the array
+                // index is the key); a positional / replicated pattern (or a bare
+                // concatenation literal, always positional) binds it left-to-right,
+                // so k is the k-th element from the `left` bound. slang's
+                // `elements()` is already fully ordered and default-filled, but a
+                // replicated pattern (`'{N{...}}`) stores only one copy in
+                // `elements()` — the count multiplies the position span. Verified
+                // against Verilator on ascending and descending ranges.
                 const bool     keyed = pat != nullptr && rhs.kind == ExpressionKind::StructuredAssignmentPattern;
                 const uint32_t n     = static_cast<uint32_t>(elems.size());
                 const uint32_t lo    = std::min(t.left, t.right);
@@ -3161,6 +3179,21 @@ private:
         }
     }
 
+    // Lower a packed (integral) assignment pattern `'{...}` — a packed struct,
+    // vector, or multi-dim packed array — to its flat value. slang resolves all
+    // three kinds (positional / keyed-structured / replicated) into an ordered
+    // `elements()` list; its own const-eval feeds that list to SVInt::concat with
+    // element 0 at the MSB, and Clotho's `concat` matches that order, so the value
+    // is the concatenation of the lowered elements.
+    //
+    // NOTE: slang orders a *structured* (keyed) packed-array pattern by numeric
+    // index ascending regardless of the declared range direction, then places the
+    // lowest index at the MSB — wrong for a descending array (`[3:0]`), where
+    // index 0 is the LSB. `'{0:x,3:y}` of `logic[3:0][7:0]` is y..x (index 3 at
+    // MSB), matching Verilator; slang mis-folds it to x..y. Clotho reverses the
+    // element order for a descending packed array so the concat is LRM-correct.
+    // Positional/replicated are source-ordered (first = leftmost = MSB) and
+    // already correct.
     ir::Index lower_packed_pattern(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc    l   = loc(expr);
         const auto*            pat = as_assignment_pattern(expr);
@@ -7423,6 +7456,16 @@ private:
         b.fork(ids, args, kind, l);
     }
 
+    // Reduce a condition expression to its 1-bit truth value for `if`/`?:`.
+    // LRM §12.4: the condition is true if any bit is 1, false if all bits are 0,
+    // and ambiguous (X) otherwise. That is exactly reduction-OR: must = any bit
+    // definitely 1, may = any bit could be 1 (Z bits read as X via `may`). This
+    // also normalizes a multi-bit predicate to the 1-bit value `b.cond`/`b.select`
+    // require; without it the backend emits a mismatched-width icmp.
+    // A string condition is true iff non-empty (the
+    // LRM is silent, and slang's const-eval takes it as len != 0).
+    // RedOr of the non-negative 2-state length is exactly len != 0, definite
+    // 0/1, so it also satisfies the backend's definite-1 loop rule.
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
         const ir::SourceLoc l = loc(cond);
         if (is_string_expr(cond)) {
@@ -8771,6 +8814,10 @@ private:
         // Not round-tripped through libsva, which has one cover kind: the tally
         // is clotho's own choice and this is where the choice is recorded.
         monitor.cover_matches = cover_matches;
+        // TODO: carry the statement's label (`ap: assert property ...`) so a
+        // report can name the assertion. slang models it as the name of the
+        // enclosing statement-block symbol rather than a field on the
+        // statement, and nothing reads it until the report path lands.
 
         if (kind == ir::AssertionKind::Expect) {
             expect_shape_check(monitor, disable);
@@ -8816,7 +8863,8 @@ private:
             // would wait forever on the verdict that was abandoned.
             // TODO: `disable iff` on an `expect`. Needs a disposition for an
             // abandoned attempt that has a process blocked on it -- resume it with
-            // neither action, or leave it blocked -- which LRM 16.17 does not settle.
+            // neither action, or leave it blocked -- which LRM 16.17 does not
+            // settle.
             fail("a `disable iff` on an `expect` is not supported: an abandoned "
                  "attempt produces no verdict, and the process would never unblock");
         }
@@ -9831,6 +9879,32 @@ private:
                name == "$changed";
     }
 
+    // entries[n - 1] of the ring `live` keeps for `gate`: the value its shadow held
+    // n advances of that ring ago. A null `gate` names the ungated ring, which is
+    // what every $past without a third argument -- and every value change function,
+    // none of which takes one -- reads.
+    //
+    // Keyed by the PAIR and not by the variable alone. LRM 16.9.3 reads
+    // $past(v, n, g) at "the kth strictly prior time step in which the event ev iff
+    // g occurred", so a gated ring advances on a subset of the ticks and is a
+    // second history of the same variable. Keyed by pointer, so two textually
+    // identical gates at two call sites get two rings: state spent, never an answer
+    // changed, because both shift on the same condition.
+    //
+    // An entry carries the variable's OWN type, full width and full 4-state, for
+    // the same reason the shadow does -- a collapsed bit could answer neither
+    // $past(bus, 2) nor a whole-value $stable. Like the shadow it is a variable
+    // and not a net, so nothing drives it but the shift and the seed below.
+    //
+    // Every entry is SEEDED with the variable's time-zero value, so a $past
+    // deeper than the number of ticks that have elapsed reports the value the
+    // variable started the simulation with, not its type default. The difference
+    // is observable: for `logic [3:0] v = 4'd7`, $past(v, 2) is 7 at the second
+    // tick, not 4'bxxxx. An uninitialised ring happens to agree only when the
+    // variable is itself uninitialised, because then the type default and the
+    // time-zero value are both X. A gated ring seeds identically: a tick the
+    // gate held back is a tick that never happened for it, so its shallow
+    // entries stay at time zero for longer.
     ir::Signal sva_history_slot(ir::Signal live, const Expression* gate, uint32_t n, ir::Builder& b) {
         SvaHistory& hist = *sva_history_;
 
@@ -10372,6 +10446,14 @@ private:
         }
         const ir::Index active = b.binary(ir::Inst::Tag::Band, bit_not(disabled, b, l), edge, l);
 
+        // Each abort's condition for this cycle. A `sync_` one is just its root:
+        // the Preponed sample, read at the edge like every other guard. An
+        // asynchronous one is read live and LRM 16.12.7 examines it at every
+        // simulation time step, so it also counts if it was seen at any slot
+        // since the last edge -- see MonitorState::abort_seen. The latch defers
+        // an asynchronous report to the next tick: the edge is where this monitor
+        // produces its verdicts, and the LRM does not fix which time step an
+        // asynchronous abort reports in.
         std::vector<ir::Index> abort_cond(mon.aborts.size());
         for (uint32_t i = 0; i < mon.aborts.size(); ++i) {
             const ir::Index now = roots[mon.aborts[i].root];
@@ -10856,6 +10938,19 @@ private:
                                     l);
             }
 
+            // One FAIL report per ATTEMPT that is owed one, which is not the same
+            // as one per slot. Attempts whose antecedent matches end in the SAME
+            // cycle share a single obligation -- the obligation they impose really
+            // is one and the same -- but they do not share the verdict it produces,
+            // and LRM 16.14.1 owes each attempt its own. Three attempts started
+            // at 45, 55 and 65 whose shared obligation fails at 75 therefore
+            // report `FAIL 75` each, not one failure for the slot they share.
+            //
+            // `failed_ids` is already exactly the set of attempts a failing
+            // obligation resolves this cycle, so a report is one bit of it per id.
+            // Being a SET it also collapses an attempt two of whose obligations
+            // fail in this one cycle, which is what the per-slot walk needed a
+            // claim chain to do by hand.
             report_fail.assign(ring, none);
             for (uint32_t i = 0; i < ring; ++i) {
                 report_fail[i] = mask_bit(failed_ids, i, ring, b, l);
@@ -12926,6 +13021,23 @@ private:
         b.loop(cond, pred, body, step, /*bottom_test*/ true, loc(d));
     }
 
+    // Level-sensitive wait (LRM 9.4.3): suspend until `cond` is true, then run
+    // the body. Lowered as `forever begin if (cond) break; @(any-change on cond's
+    // reads); end` followed by the body. An already-true cond breaks on the first
+    // iteration and falls straight through in zero time (LRM: no suspend); a
+    // false cond parks on an any-change wait of every signal cond reads and
+    // re-tests on wake. The break uses `if`'s truth (definite 1 iff any bit is
+    // definitely 1), so an X cond takes the else path and keeps waiting until a
+    // definite 1 — matching iverilog. (A top-tested `while (!cond)` is
+    // wrong here: RedOr of a 4-state cond yields X, not a must-plane 0, so the
+    // negated loop predicate is non-definite and the loop exits on X.)
+    //
+    // A constant-false or read-less cond (`wait(0)`) yields an empty wait event
+    // list: a suspend with no waker, so the process parks permanently while the
+    // rest of the simulation proceeds. iverilog does the same (and additionally
+    // warns at elaboration). Verified against iverilog 13: zero-time
+    // passthrough, false->true resume, X-blocks, and const-false permanent park
+    // all match.
     void lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
         const ir::SourceLoc l = loc(w);
 
@@ -13706,6 +13818,22 @@ private:
         return false;
     }
 
+    // One case_item label against a real selector, both already at `real`.
+    //
+    // LRM 12.5 words case matching as a bit-for-bit `===` over a common width,
+    // and Table 11-1 bars `===` on a real operand -- so the standard defines the
+    // comparison only for integral operands. A real carries no x or z, which is
+    // the whole content of the 4-state matching rule, so `===` degenerates to
+    // `==` exactly as it does for a string (6.16.9, the same call clotho's string
+    // comparison lowering already makes). Clotho therefore matches with IEEE-754
+    // equality: `-0.0` matches `0.0`, and a NaN selector matches nothing and
+    // falls to `default`. iverilog 13 agrees. casez / casex
+    // are the same comparison: their do-not-care bits are a property of a
+    // 4-state vector, and iverilog treats a real casez / casex exactly as a
+    // plain case.
+    //
+    // An integral operand on either side converts to real first (`coerce`, i.e.
+    // ItoF), the ordinary mixed-operand rule of 11.8.1.
     ir::Index real_case_label_pred(const Expression& label, ir::Index sel, ir::Ref rty, ir::Builder& b) {
         if (label.kind == ExpressionKind::ValueRange) {
             // `case ... inside` range member (12.5.4 / 11.4.13): membership is the
@@ -15267,6 +15395,16 @@ private:
         fail("internal: unhandled enum method '" + std::string(name) + "'");
     }
 
+    // Format a type as its LRM 20.6.1 $typename string, for the type kinds
+    // Clotho lowers. The LRM's own examples are self-contradictory on the space
+    // before a packed dimension (`node[2:0]` -> "bit [2:0]" but the very next
+    // example, `typedef bit [9:1] word`, -> "A::bit[9:1]"); slang resolves it as
+    // no-space, which also matches the second LRM example, so Clotho emits
+    // `logic[7:0]`. Rule (b): the default signing is dropped, so only a
+    // non-default sign (`int unsigned`, `logic signed`) is spelled out.
+    // Unsupported type kinds (enum / struct / union / class / interface /
+    // dynamic) fail loudly — Clotho does not lower them, so it must not
+    // fabricate a name for them.
     std::string format_typename(const slang::ast::Type& type) {
         const slang::ast::Type& t = type.getCanonicalType();
 
@@ -16165,6 +16303,16 @@ private:
         return path;
     }
 
+    // "library.cell" of the instance invoking the statement currently being
+    // lowered (LRM §21.2.1.3 %l): the library from which the current module
+    // instance was extracted, and its cell (module definition) name. Clotho
+    // has no library/config system (LRM Clause 33 is unimplemented -- every
+    // definition compiles from one source set with no binding choice to make),
+    // so every instance is unconditionally in "work", the conventional default
+    // library name when no library map is in play. Static per lowering site,
+    // same as hier_name (%m): the current instance's InstanceScope is the top
+    // of scope_stack_ for the whole dynamic extent of lowering that instance's
+    // processes.
     std::string lib_cell_name() const {
         return "work." + scope_stack_.back()->def_name;
     }
@@ -16332,6 +16480,11 @@ private:
             return;
         }
         if (e.kind == ir::Type::Kind::Class) {
+            // A class handle is a 64-bit word, so it would otherwise fall into the
+            // scalar arm below and print as a heap address.
+            // TODO: %p of a queue / dynamic array of class handles (it would need
+            // a per-object id, which the flat container descriptor cannot reach).
+            // The same refusal already covers a bare handle -- see display_test.
             fail("%p of a queue / dynamic array of class handles is not supported");
         }
         if (value_cat(elem) == ValueCat::scalar) {
@@ -16378,6 +16531,13 @@ private:
                          ir::SourceLoc           l) {
         const slang::ast::Type& ct = sty.getCanonicalType();
         if (ct.isTaggedUnion()) {
+            // "In the case of a tagged union, it shall print "tag:value" along with
+            // the currently valid element." Which member that is only the run-time
+            // tag knows, so this is the one %p shape that renders in the runtime
+            // rather than expanding to literal text here. The `'{...}` around it is
+            // literal: the clause requires the whole output to be "a legal
+            // interpretation of the assignment pattern syntax", which a bare
+            // `tag:value` pair is not.
             std::vector<ir::Builder::TaggedFmtRow> rows;
             for (const auto& f : union_scope(ct).membersOfType<FieldSymbol>()) {
                 const slang::ast::Type& mt = f.getType();
@@ -16458,6 +16618,8 @@ private:
         if (module_.pool.is_float(lty)) {
             frag += "%g";
         } else if (value_cat(lty) == ValueCat::string) {
+            // The clause says a string operand prints "enclosed in quotes", and
+            // that is also how a queue's string elements already print.
             frag += "\"%s\"";
         } else if (!sty.isIntegral()) {
             // TODO: %p of a class / chandle / event / virtual-interface handle. The
@@ -17120,6 +17282,9 @@ private:
                 fail_keyed_pattern_lvalue();
             }
             if (a.isCompound()) {
+                // LRM 10.8's assignment-like contexts do not include
+                // operator_assignment, so an assignment pattern cannot appear
+                // on the left of one.
                 fail("compound assignment to an assignment-pattern lvalue is not "
                      "legal SystemVerilog");
             }
@@ -17877,6 +18042,9 @@ private:
         if (!is_red) {
             return res;
         }
+        // An empty array reduces to 0, not to the fold's identity -- LRM 7.12.3 does
+        // not say, and Verilator answers 0 for all five, including `product` and
+        // `and`.
         const ir::Index n     = b.unary(T::Load, bound.lv(b, l), l);
         const ir::Index empty = b.binary(T::Eq, n, b.constant(module_.pool.put_int(i32, 0), l), l);
         return b.select(empty, b.constant(module_.pool.put_int(rty, 0), l), b.unary(T::Load, acc.lv(b, l), l), l);
@@ -18364,6 +18532,13 @@ private:
              "(LRM 10.9 requires positional notation)");
     }
 
+    // Entry point for an assignment-pattern lvalue, `'{a, b, c} = rhs` / typed
+    // `U'{a, b, c} = rhs` (LRM 10.9): a positional, non-compound assignment
+    // whose right-hand side is a fixed-size array, an unpacked struct, or a
+    // packed (bit-stream) value. A queue / dynamic-array / associative-array
+    // right-hand side is rejected outright — the pattern's positional
+    // correspondence needs a statically-known element count, which those types
+    // do not have.
     ir::Index lower_pattern_assign(const slang::ast::AssignmentPatternExpressionBase& pat,
                                    const Expression&                                  rhs_expr,
                                    ir::Inst::Tag                                      tag,
@@ -18435,6 +18610,12 @@ private:
         }
     }
 
+    // One pattern member: a nested pattern/concat recurses; a plain lvalue
+    // whose element type is itself an aggregate is a whole-object copy; a
+    // scalar leaf is an ordinary truncating/extending assignment. (LRM 10.9
+    // requires a member to have "the same number of bits" as its RHS element;
+    // Clotho does not enforce that here, and lets a mismatch truncate or extend
+    // exactly like the plain scalar assignment this is sugar for.)
     void store_pattern_elem(const Expression& member,
                             ir::Index         rhs_elem_addr,
                             ir::Ref           elem_ty,
@@ -18937,6 +19118,12 @@ private:
                 return b.unary(T::Bnot, op, l);
             case U::LogicalNot:
                 if (is_string_expr(u.operand())) {
+                    // Illegal: LRM Table 11-1 restricts logical operators to
+                    // integral/real/shortreal, and Table 6-9 defines no logical
+                    // operators on strings.
+                    // TODO: fix upstream in slang — Type::isBooleanConvertible
+                    // whitelists StringType, so UnaryLogicalNot binds with no
+                    // diagnostic and reaches us.
                     fail("logical negation of a string is not legal (LRM Table 11-1)");
                 }
                 return b.unary(T::Lnot, op, l);
@@ -22596,6 +22783,20 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     }
 }
 
+// Why a signal's type has no VCD representation, or nullptr when it has one.
+//
+// VCD's $var forms carry a scalar, a vector, a `real` and an `event` (LRM 21.7.2)
+// -- everything with a fixed-width value image. A string, a heap container
+// (queue / dynamic array / associative array), an unpacked struct/union and a
+// class handle have none: `layout()` reports width 0 for all but the handle (64,
+// the pointer), so a $var written from the layout alone declares a 1-bit signal
+// aliased to the container's ring pointer, dumps a heap address, or -- for an
+// aggregate, whose storage is a recursive mirror with no leaf slot type -- reads a
+// null slot pointer and crashes. All three were silent before this check.
+//
+// TODO: an unpacked struct / array of structs could dump as one $var per leaf.
+// A container has no fixed-width form at all: its size changes during the run,
+// which VCD cannot express.
 const char* vcd_unrepresentable(const ir::InternPool& pool, ir::Ref type) {
     ir::Ref leaf = type;
     while (std::get<ir::Type>(pool.get(leaf)).kind == ir::Type::Kind::UnpackedArray) {

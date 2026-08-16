@@ -247,6 +247,9 @@ TEST_CASE("event handle / event-controlled trigger forms are rejected") {
             "event") != std::string::npos);
 }
 
+// LRM 9.4.2.3: `@(edge sig iff cond)` triggers only when the edge fires and the
+// guard holds at event time. Clotho gates the body with `if (cond)` (observably
+// identical, the block re-subscribes each pass).
 TEST_CASE("iff qualifier gates a top-level sensitivity list") {
     const std::string out = run_capture(R"(
         module m;
@@ -264,6 +267,8 @@ TEST_CASE("iff qualifier gates a top-level sensitivity list") {
     CHECK(out == "count=2\n");
 }
 
+// Intra-body `@(edge iff cond)` re-waits until the edge fires with the guard
+// true: forever { @(ev); if (cond) break; }.
 TEST_CASE("iff qualifier gates an intra-body event wait") {
     const std::string out = run_capture(R"(
         module m;

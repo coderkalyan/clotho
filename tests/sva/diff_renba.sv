@@ -1,3 +1,17 @@
+// An action block that performs a nonblocking assignment. LRM 4.4.2.8 commits it
+// in the Re-NBA region -- the reactive region set's dual of the NBA region --
+// which runs once Reactive and Re-Inactive have settled but still inside the
+// failing edge's own time slot, before Postponed. Print ordering is the whole
+// observable, as it is in diff_action_delay.sv:
+//
+//   * the action block's own $display, placed immediately after `flag <= 1`,
+//     must still read the OLD flag: Re-NBA has not committed yet.
+//   * `always @(flag)` is woken by that commit and must run at the SAME time,
+//     because LRM 4.4.2's outer loop returns to the Active region set when the
+//     reactive one has put work back into it.
+//
+// Staging the store into the ordinary NBA region instead would commit it a full
+// time step late and move both of those lines to the next edge.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

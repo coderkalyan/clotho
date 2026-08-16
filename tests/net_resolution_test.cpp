@@ -388,6 +388,13 @@ TEST_CASE("a cmos switch shares a resolved net with another driver") {
     CHECK(out == "z\n0\nx\n1\n1\n");
 }
 
+// -- Drive strengths (LRM 6.6.1, 28.11) --
+//
+// A net with any non-default drive strength resolves through the strength fold
+// (StrengthRes) instead of WireRes: per bit the strongest side wins, equal top
+// strength on both sides is X, no driver is Z. At all-Strong it degenerates to
+// WireRes. (iverilog does not model strengths.)
+
 TEST_CASE("strong beats weak, either polarity") {
     const std::string out = run_capture(R"(
         module top;
@@ -459,6 +466,9 @@ TEST_CASE("per-bit strength resolution over a vector") {
     CHECK(out == "1100\n");
 }
 
+// Open-drain (drive 0 strong, float 1) and open-source (float 0, drive 1 strong)
+// use an asymmetric (highz on one side) strength with definite values — the
+// common asymmetric use.
 TEST_CASE("open-drain and open-source asymmetric strengths") {
     const std::string out = run_capture(R"(
         module top;
@@ -504,6 +514,9 @@ TEST_CASE("tri0/tri1 pull competes on strength with explicit drivers") {
     CHECK(out == "0111\n0010\n0011\n");
 }
 
+// pullup / pulldown (LRM 28.5): a lone permanent Pull-strength driver of 1 / 0.
+// A stronger (strong/supply) driver wins; when every driver is off (z) the net
+// holds the pull value.
 TEST_CASE("pullup and pulldown compete on strength") {
     const std::string out = run_capture(R"(
         module top;
@@ -524,6 +537,8 @@ TEST_CASE("pullup and pulldown compete on strength") {
     CHECK(out == "10\n00\n11\n");
 }
 
+// supply0 / supply1 nets (LRM 6.6.5): a permanent Supply-strength (level 4)
+// driver of 0 / 1 that beats even a Strong driver.
 TEST_CASE("supply0/supply1 nets hold their value and beat strong drivers") {
     const std::string out = run_capture(R"(
         module top;

@@ -1173,6 +1173,11 @@ TEST_CASE("$finish with a diagnostic-level argument passes the level through") {
     CHECK(ir.find(", i32 2)") != std::string::npos);
 }
 
+// LRM §20.2 / Table 20-1: the default $finish (level 1) prints "simulation time
+// and location" — verified vs iverilog, which prints a banner with the time and
+// file:line. Clotho routes it to stderr (a diagnostic), so the design's stdout
+// stays clean. The lower_text buffer is named "source"; the design has no
+// timescale, so time 0 renders in the default 1 s precision.
 TEST_CASE("$finish (default level) prints a time+location banner to stderr") {
     constexpr std::string_view src = R"(
         module m;
@@ -1519,6 +1524,12 @@ TEST_CASE("single-element concat and replication produce correct bits") {
     CHECK(out == "10 10 10101010 1111\n");
 }
 
+// $random's global stream is the IEEE 1800-2023 Annex N reference PRNG from an
+// unseeded start (seed 0), so the sequence is fully determined. This is the only
+// test in the suite that draws from it, so it observes the stream from its first
+// value. These exact numbers are produced bit-for-bit by iverilog as well
+// (verified), which is the point of using the reference PRNG; negatives prove
+// the signed return type and the distinct values prove variation.
 TEST_CASE("$random yields the deterministic signed-32 stream") {
     const std::string out = run_capture(R"(
         module top;
@@ -2777,6 +2788,9 @@ TEST_CASE("$fgets reads a line right-justified") {
     std::remove(path);
 }
 
+// $fgets into a `string` destination (LRM §21.3.4): no fixed width to
+// right-justify into, so the destination is assigned exactly the bytes read
+// (through the newline).
 TEST_CASE("$fgets into a string variable") {
     const char* path = "clotho_fgets_str_test.txt";
     write_file(path, "hello\nworld\n");
@@ -2928,6 +2942,8 @@ TEST_CASE("$ferror on a clear stream returns 0") {
     std::remove(path);
 }
 
+// $ferror into a `string` destination reports a clear stream as code 0 with
+// an empty message, mirroring the packed-vector destination's behavior.
 TEST_CASE("$ferror into a string variable on a clear stream returns 0") {
     const char* path = "clotho_ferror_str_test.txt";
     const std::string src = std::string(R"(

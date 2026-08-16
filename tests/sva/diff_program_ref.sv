@@ -1,3 +1,6 @@
+// A program block whose `initial` samples a module signal by hierarchical
+// reference. Both processes wake on the same edge, and each print is stamped, so
+// the program's lines must follow the module's within every time step.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

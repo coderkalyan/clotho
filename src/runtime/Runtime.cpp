@@ -257,7 +257,7 @@ uint32_t dec_digits(uint64_t v) {
 // largest possible value (decimal space-padded, other radices zero-padded, %t
 // to $timeformat's min width); width 0 is the minimal form; an explicit width
 // pads on the left (spaces for d/s/c/t, zeros for h/o/b) and never truncates.
-// `-` left-justifies with trailing spaces (an extension the LRM does not define).
+// `-` left-justifies with trailing spaces (an extension).
 void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spec) {
     const uint32_t w     = a.width ? a.width : 1;
     const uint32_t words = plane_words(w);
@@ -1522,7 +1522,8 @@ void intra_ready_push(rt_intra_rec* rec) {
 //   - push_back puts the new element at logical len, so what gets dropped is the
 //     element just pushed, and the push has no visible effect.
 // Both fall out of "keep the first bound + 1"; neither direction is special-
-// cased below. LRM 7.10.4 does not pin the choice.
+// cased below. LRM 7.10.4 does not pin the
+// choice.
 static void q_apply_bound_ops(rt_queue* h, const rt_elem_ops* ops, uint64_t bound) {
     if (bound == 0 || h->len <= bound + 1) {
         return;
@@ -2382,6 +2383,10 @@ extern "C" void rt_assoc_assign(rt_assoc* dst, const rt_assoc* src, const rt_ele
         return;
     }
     const AssocSiteScope scope(site);
+    // The pattern default is part of the value, so the copy replaces dst's
+    // default with src's -- reset, do not delete_all, so that assigning an
+    // array with no default clears the target's. That reset is also where dst's
+    // single epoch bump for this assignment comes from.
     rt_assoc_reset(dst, ops);
     AssocMap* sm = assoc_impl(const_cast<rt_assoc*>(src));
     if (sm == nullptr || (sm->entries.empty() && !sm->has_default)) {
@@ -3315,6 +3320,23 @@ namespace {
 // Everything a $finish does before control leaves: the Observed drain, the
 // banner, and closing the dump.
 void finish_report(const char* banner, uint64_t now, int32_t arg) {
+    // $finish / $stop: print the exit banner (LRM Table 20-1), then end the
+    // simulation. arg 0 prints nothing; 1 prints time + location; 2 adds a
+    // resource-usage line. The banner is a simulator diagnostic (not design
+    // output), so it goes to stderr, keeping it out of the design's stdout data
+    // stream. LRM Table 20-1 fixes the content (time + location) but not the
+    // stream; iverilog puts it on stdout, but strict equivalence
+    // on LRM-unspecified behavior is not required, and stderr keeps captured
+    // $display output clean. Flush stdout first so any buffered $display text
+    // is committed before the banner.
+    //
+    // $finish ends the current time step, so drain any Observed-region case
+    // violations queued this instant before we stop — the sim loop's own
+    // Observed flush at the settled point is never reached on this path.
+    // Deferred immediate assertion reports (LRM 16.4) are deliberately NOT
+    // flushed here: they mature only IN the Observed / Postponed region, so a
+    // $finish that preempts that region discards the un-matured reports, which
+    // is what the LRM 16.4.1 maturation model implies.
     rt_observed_flush();
     if (arg >= 1) {
         std::fflush(stdout);
@@ -3437,6 +3459,11 @@ extern "C" void rt_observed_flush() {
     if (g_observed_case.empty()) {
         return;
     }
+    // A simulator diagnostic (not design output), so it goes to stderr, like
+    // rt_finish's banner. The message content is not LRM-mandated; the two forms
+    // below name the two violations a unique / priority if or case can produce.
+    // Flush stdout first so buffered $display text is committed before the
+    // warning interleaves.
     std::fflush(stdout);
     for (const ObservedCaseViol& r : g_observed_case) {
         std::string line = r.banner;
@@ -4585,6 +4612,9 @@ extern "C" int32_t rt_fread(int32_t fd, uint8_t* mm_base, uint8_t* z_base, uint3
 // they must not be reassociated (no fast-math).
 namespace {
 
+// The unseeded global $random stream. Starts at 0, which the algorithm remaps
+// to 259341593 on the first draw, so an unseeded run draws the same
+// deterministic stream every time.
 uint32_t g_random_seed = 0;
 
 // One draw of the Annex N `uniform(seed, INT32_MIN, INT32_MAX)`: a real in
@@ -5977,6 +6007,10 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
     if (v.nwords > g_vcd.max_nwords) {
         g_vcd.max_nwords = v.nwords;
     }
+    // A real declares var type `real`; its size field is meaningless to a reader
+    // (the value is a decimal, not a bit string), so it is always 64 -- what
+    // Verilator writes, and what a shortreal's widened double matches.
+    // An event declares `event`, size 1: it has occurrences, not a value.
     const char* vtype = v.is_real                          ? "real"
                         : v.is_event                       ? "event"
                         : (flags & RT_VCD_FLAG_NET) != 0   ? "wire"

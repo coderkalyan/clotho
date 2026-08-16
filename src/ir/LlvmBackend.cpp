@@ -2009,6 +2009,7 @@ private:
         // partially-driven packed net powers its undriven bits z per this mask.
         const std::vector<bool>& undriven = facts_.undriven;
 
+
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
             const Type&  ty  = std::get<Type>(mod_.pool.get(sigs[i].type));
@@ -5800,6 +5801,7 @@ private:
         return false;
     }
 
+
     // Comb-fusion eligibility (analysis only — grouping lands with the comb
     // fusion phase). A member of a union-sensitivity fused group can be run
     // when its own trigger did NOT fire. Such a spurious run is unobservable —
@@ -5810,6 +5812,7 @@ private:
     // downstream can tell the run happened. The verdict enumerates exactly the
     // conditions that argument needs; purity is a whitelist, so a new IR tag
     // defaults to ineligible.
+
 
     // Comb-fusion coverage probe: verdict histogram over Always processes plus
     // the count V1 fusion left in singleton groups (the comb-fusion
@@ -7510,9 +7513,9 @@ private:
     // behind the current batch, so combinational cascades settle breadth-first —
     // each process runs at most once per wave and the worst case is bounded by
     // net depth, where LIFO's depth-first re-entry is exponential on dense
-    // fan-in. It also runs same-instant processes in declaration order.
-    // Created once, lazily, so the timer callback (built while
-    // lowering a process) and emit_active_run share it.
+    // fan-in. It also runs same-instant processes in declaration order. Created
+    // once, lazily, so the timer callback (built while lowering a process) and
+    // emit_active_run share it.
     // Number of fork-child bodies in the design = Σ fork widths (each fork child
     // is one Function). Says whether the design forks at all; the ring bound needs
     // the per-body activation counts below, not this raw total.
@@ -13504,6 +13507,17 @@ private:
         return { scratch, b_.getInt32(nbytes) };
     }
 
+    // Serialize an aggregate key's leaves into `scratch`, in declaration order
+    // (depth first), returning the next free byte offset and OR-ing each leaf's
+    // unknown-ness into `any_x`.
+    //
+    // The raw storage image is deliberately NOT used: agg_storage_ty builds a
+    // non-packed LLVM struct, so it has ABI padding holes, and a frame aggregate is
+    // a bare alloca whose padding is never written (emit_agg_init touches leaves
+    // only) -- two structs with equal members could differ byte for byte, which
+    // would break both the hash and the ordering. Per-leaf normalization also gets
+    // the per-leaf signedness right, and gives the ordering LRM 7.8.5 leaves free:
+    // lexicographic by member in declaration order.
     uint32_t emit_agg_key_bytes(Ref              type,
                                 const LValue&    lv,
                                 llvm::Value*     scratch,
@@ -14120,6 +14134,7 @@ private:
             block_register(lv.sig, site_const_mask(lv, s), /*dynamic=*/false);
         }
     }
+
 
     // Deferred-buffer index for an aggregate NBA signal: the aggregate buffers
     // follow the array buffers in the shared runtime index space (rt_nba_arr_*).
@@ -21021,6 +21036,7 @@ private:
     void lower_disable_remote(Index i) {
         lower_disable_list(ir_->payload(i).label);
     }
+
 
     // `disable <task>` (LRM 9.6.2): end EVERY activation, "whether the processes
     // were forked by the calling thread or not". Walk the target's activation list,

@@ -556,6 +556,8 @@ TEST_CASE("the same module instantiated twice gets distinct signal storage") {
     CHECK(names.contains("u1.y"));
 }
 
+// An inout port lowers via the shared-storage collapse (LRM 23.3.3); behavior is
+// exercised in xhier_test.cpp.
 TEST_CASE("an inout port connection lowers (shared storage)") {
     const LowerResult r = lower_text(R"(
         module pass(inout a);
@@ -1396,6 +1398,8 @@ TEST_CASE("a net with one continuous driver read procedurally is accepted") {
     CHECK_MESSAGE(r.ok, r.diagnostic_text());
 }
 
+// Drive strengths (LRM 6.6.1, 28.11) lower and resolve; the multi-driver
+// resolution semantics are exercised in net_resolution_test.cpp.
 TEST_CASE("drive strengths lower on continuous assigns and net declarations") {
     const LowerResult ra = lower_text(R"(
         module m(input a);

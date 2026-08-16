@@ -22,4 +22,3 @@ enabled = true
 [oracles.verilator]
 enabled = false
 note = "Not comparable: verilator harness drives the clock from C++ with no AXI delay randomization and ends at firmware completion, a different cycle count."
-

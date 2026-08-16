@@ -1,3 +1,10 @@
+// Double commit in one instant: nonblocking updates staged from BOTH the active region
+// and reactive code at the same instant, through both the block-commit path
+// (scalars) and the shared array-record buffer (runtime index).
+//
+// If the Re-NBA commit re-applied what the NBA commit already committed, actcnt
+// or mem[0] would advance by 2 on the failing edge. If it lost the reactive
+// update, rcnt or mem[1] would never move.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

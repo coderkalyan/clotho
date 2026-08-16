@@ -246,6 +246,8 @@ TEST_CASE("deferred #0 assertion: default failure report matures and fires") {
     CHECK(contains(c.err, "assertion failed"));
 }
 
+// An explicit else action ($error with a message) defers, and its arguments are
+// sampled at the point the assertion executes (LRM 16.4.1).
 TEST_CASE("deferred #0 assertion: else action with sampled arguments") {
     const Captured c = run_capture("module m;\n"
                                    "  logic clk = 0; logic [7:0] x = 42;\n"
@@ -256,6 +258,8 @@ TEST_CASE("deferred #0 assertion: else action with sampled arguments") {
     CHECK(contains(c.err, "bad x=42"));
 }
 
+// A $finish in the same instant preempts the Observed region, so the un-matured
+// deferred report is discarded (LRM 16.4.1 maturation).
 TEST_CASE("deferred #0 assertion: a same-instant $finish discards the pending report") {
     const Captured c = run_capture("module m;\n"
                                    "  logic clk = 0; logic [7:0] x = 5;\n"

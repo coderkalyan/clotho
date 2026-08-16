@@ -3,8 +3,7 @@
 // These check the tables clotho hands the backend, because that is the contract
 // between the two halves and it is the part libsva's own tests cannot see. The
 // temporal semantics themselves are already verified inside libsva by differential
-// and mutation testing, and the automaton step's codegen has its own oracle; see
-// docs/design/concurrent-assertions.md §11.
+// and mutation testing; see docs/design/concurrent-assertions.md §11.
 
 #include <doctest/doctest.h>
 
@@ -2231,6 +2230,24 @@ TEST_CASE("a universal position still needs a single-cycle operand") {
     CHECK_MESSAGE(rhs.ok, rhs.diagnostic_text());
 }
 
+// -- Sampled value functions (LRM 16.9.3) -----------------------------------
+//
+// $past is the primitive: a per-monitor history ring, one entry per tick of
+// depth, shifted at the END of the monitor body so that every root above it read
+// the previous tick's contents. $sampled is the shadow itself, and the four value
+// change functions are that ring's first entry plus a comparison.
+//
+// The load-bearing property is that history advances per CLOCK TICK and not per
+// time step (LRM 16.9.3: "the most recent strictly prior time step in which the
+// clocking event occurred"), while the shadow underneath it is rewritten every
+// time step. The behavioural cases below are built around that difference: each
+// puts extra time steps between clock edges, so a ring shifted in the sampling
+// process rather than in the monitor reports a visibly different set of cycles.
+//
+// tests/sva/diff_past.sv and tests/sva/diff_valuechange.sv are the differential
+// half; the expectations in each were hand-derived from the LRM. The ring seed
+// pinned below came out of that derivation.
+
 namespace {
 
 // JIT-run a design and capture stdout AND stderr into one stream, in the order
@@ -2281,6 +2298,18 @@ std::string sva_run_capture(std::string_view source) {
     return out;
 }
 
+// The times at which the design reported, space separated. Each fixture below
+// prints `[<time>]` once per clock tick, so a default assertion report is
+// attributed to the tick whose marker precedes it.
+//
+// The report SET is the observable of an assertion, so it is what these compare:
+// it changes under every mutation of the ring that matters, and under nothing
+// else.
+//
+// `marker` is the line a report leaves behind. It defaults to the failure one,
+// which is what every case below the assertion-control ones wants; those pass
+// their own, because what they have to show is a PASS or cover action running
+// or not running while the failures are unchanged.
 std::string report_times(std::string_view source, std::string_view marker = "assertion failed") {
     const std::string out = sva_run_capture(source);
     std::string       times;
@@ -2941,6 +2970,16 @@ endmodule
 }
 
 TEST_CASE("a ring entry is seeded with the variable's time-zero value") {
+    // NOT the type default, which is what an uninitialised ring would give. A
+    // tick with no predecessor at that depth reads the variable's time-zero
+    // value, and the two differ whenever the variable has a declaration
+    // initializer: v below is 4'd7 at time zero and 4'd3 by the first clock
+    // edge, so the type default (x) and the seed (7) are told apart.
+    //
+    // $past(v, 2) is therefore 7 at the first two ticks, then the t=5 sample of 3,
+    // then the t=15 sample of 1 -- so asserting it equals 7 reports at t=25 and
+    // t=35. Seed with the type default instead and the first two ticks compare
+    // x against 7, which is unknown and so false, adding reports at 5 and 15.
     CHECK(report_times(R"(
 module t;
   bit clk = 0;
@@ -4208,8 +4247,8 @@ TEST_CASE("many attempts resolving in one cycle are reported once each") {
     //
     // `a` samples 1 at t=5..35 and 0 at t=45, so five attempts of `always a` -- the
     // ones opened at 5, 15, 25, 35 and 45 -- are alive and all fail in that single
-    // cycle. Reports are per attempt, so the answer is
-    // five reports at t=45 and not one.
+    // cycle. Reporting is per attempt, so the answer is five
+    // reports at t=45 and not one.
     //
     // This is exactly what one merged state vector cannot do: it preserves the
     // cycle set and reads "45", because a vector carries at most one verdict per
@@ -4312,6 +4351,13 @@ TEST_CASE("a branch of an if or case property that is an implication is refused"
                           "case (sel) 2'd0: (a |=> b); default: a; endcase"),
             "branch of an `if` or `case`");
 }
+
+// -- The abort operators (LRM 16.12.7) ---------------------------------------
+//
+// tests/sva/diff_abort.sv is the differential half, covering nine reports. These
+// pin the pieces that fixture cannot isolate: which table each spelling
+// produces, and each of the three behaviours separately, on traces where a
+// dropped or mis-timed abort changes the report set rather than leaving it alone.
 
 TEST_CASE("all four abort operators lower, carrying effect and sampling") {
     struct Case {
@@ -4458,6 +4504,16 @@ endmodule
 }
 
 TEST_CASE("an abort covering a trigger resolves the attempt in its own start cycle") {
+    // diff_abort.sv's t=75 in miniature, and the case that needs the abort ABOVE the
+    // implication. The antecedent matches at tick 1 and the condition is high at
+    // tick 1, so the attempt is resolved THERE -- one cycle before its obligation
+    // would have been seeded, and before `b` (high throughout) could discharge it.
+    // The report therefore belongs to the start cycle.
+    //
+    // Two mutations this separates. Drop the operator and the attempt seeds at tick
+    // 2, passes on `b`, and the set is empty. Read the condition at seed time
+    // instead of match time and tick 2 samples `c` low, so the set is empty again.
+    // Only resolving at match time gives `15`.
     CHECK(report_times(R"(
 module t;
   bit clk = 0;
@@ -4627,6 +4683,13 @@ endmodule
     CHECK(reports("#22 x = 1; y = 1;") == "");
 }
 
+// -- One verdict per attempt -------------------------------
+//
+// LRM 16.12.1 starts an attempt at every tick, and a ranged antecedent can match
+// more than once within ONE of them, each match seeding its own obligation.
+// Clotho used to give each obligation its own verdict; it now gives the ATTEMPT
+// one, and the fixtures below pin that.
+
 TEST_CASE("a twice-matching attempt reports only its first failing obligation") {
     // The repro for the per-attempt rule, in miniature. `a ##[1:2] b` matches at tick 2 and
     // again at tick 3 from the single `a` at tick 1, seeding obligations that
@@ -4784,8 +4847,9 @@ endmodule
 }
 
 TEST_CASE("a cover of an implication counts a twice-matching attempt once") {
-    // A cover counts attempts, not obligations (LRM 16.12.6), so an antecedent matching twice with both consequents
-    // holding is ONE hit -- in the cycle the attempt settles.
+    // A cover counts attempts, not obligations (LRM 16.12.6), so an antecedent
+    // matching twice with both consequents holding is ONE hit -- in the cycle the
+    // attempt settles.
     //
     // Counting per obligation hits twice, at 35 and 45.
     const std::string out = sva_run_capture(R"(
@@ -4969,6 +5033,19 @@ module t;
 endmodule
 )") == "35 45");
 }
+
+// -- Attempts whose antecedent matches end in the SAME cycle ------------------
+//
+// The other half of one-verdict-per-attempt, and the half that reads the rule in
+// the opposite direction. Folding an attempt's several obligations into one
+// verdict is right; folding several ATTEMPTS' verdicts into one because they
+// happen to share an obligation is not. Attempts started at different ticks whose
+// antecedent matches all end in the same cycle impose the same obligation -- one
+// obligation, genuinely -- and are still owed a verdict each, per LRM 16.14.1.
+//
+// tests/sva/diff_strongprop.sv is the differential half, reporting each of the
+// attempts started at 45, 55 and 65 rather than once for the obligation the
+// three of them share.
 
 TEST_CASE("three attempts whose antecedent matches share an end cycle each report") {
     // `a` is high at ticks 0, 1 and 2, so three attempts start. `b` is high at tick
@@ -5758,6 +5835,14 @@ endmodule
     CHECK(refusal("    tk();").find("task") != std::string::npos);
 }
 
+// A `case` property (LRM 16.12.16) selecting on a REAL. 16.12.16 defers to
+// 12.5's matching rules, which are written bit-for-bit and which Table 11-1
+// leaves undefined for a real operand -- so clotho matches with IEEE-754
+// equality, the same call lower_case_real makes for the case STATEMENT.
+// iverilog does not implement the case property form at all (see
+// tests/sva/diff_propcase.sv), so the expectation here is the LRM's own: the
+// selected item's property is evaluated, and an unmatched selector with a
+// default takes the default.
 TEST_CASE("a case property selects on a real by value") {
     // Sampled r is 1.5 only at t=5, where the selected property `a` is 0 and the
     // assertion fails. At t=15 the sampled r is 2.5, so the default (true) runs;

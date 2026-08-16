@@ -1,3 +1,10 @@
+// An action block containing `#0`. LRM 4.4.2.7 parks that suspension in the
+// Re-Inactive region and promotes it back into Reactive at the same instant, so
+// the delayed print must land at the SAME time as the edge that failed the
+// assertion -- after the Active-region $display of that edge, and after the
+// undelayed report of the same action block. Ordering within the time step is
+// the whole observable here: if `#0` were routed to the ordinary inactive queue
+// instead, the print would come back in the Active region and sort before them.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

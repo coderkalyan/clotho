@@ -118,6 +118,12 @@ void dpi_oa_inc_logic(const svOpenArrayHandle h) {
 
 namespace {
 
+// JIT-run a module and capture stdout (mirrors string_test.cpp). The DPI imports
+// resolve against libc / libm, which are dynamic symbols in the test process, so
+// run_jit's process-symbol generator finds them with no --dpi-lib needed. The
+// scalar marshaling (int / longint / real) is exercised end to end; the
+// byte/shortint/bit/logic and svLogic x/z paths, and the --dpi-lib .so path, are
+// exercised at the CLI instead (see docs/design/dpi-c.md).
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
@@ -236,6 +242,16 @@ TEST_CASE("DPI import: pure function runs correctly") {
     CHECK(run_capture(src) == "4\n");
 }
 
+// An `output` scalar (Phase 2): the C writes through a pointer; the backend
+// copies the C scratch back into the caller temp, which the CopyOutArg path
+// stores to the actual. libm `frexp(x, int* e)` returns the mantissa and writes
+// the exponent through its output pointer. 8.0 = 0.5 * 2^4.
+//
+// The paths libc cannot reach are exercised at the CLI instead: scalar `inout`;
+// scalar `logic` output/return incl. svLogic X/Z (exercises the z-elision fix in
+// Analysis.cpp); and Phase 3 packed vectors — `bit[N]` in/out/inout (svBitVecVal),
+// `logic[N]` carrying 0/1/x/z (svLogicVecVal, the aval/bval marshal), across
+// multi-chunk and non-32-aligned widths.
 TEST_CASE("DPI import: output argument") {
     constexpr std::string_view src = R"(
         module m;
@@ -270,6 +286,11 @@ TEST_CASE("DPI import: chandle round-trips an opaque pointer") {
     CHECK(run_capture(src) == "1\n1\n");
 }
 
+// An `input string` passes the handle's bytes as a NUL-terminated `const char*`
+// (zero-copy — the rt_string NUL invariant makes rt_string_data a valid C string).
+// libc strlen is the no-.so probe. The return-string path (C returns char* ->
+// rt_dpi_str_out) is covered at the CLI instead; libc has no deterministic
+// char*-returning function.
 TEST_CASE("DPI import: input string passes a NUL-terminated char*") {
     constexpr std::string_view src = R"(
         module m;
@@ -414,6 +435,11 @@ TEST_CASE("DPI import: inout 100-bit element (unaligned wide write-back)") {
     CHECK(run_capture(src) == "300000000000000000000000f\n");
 }
 
+// A dynamic-array actual (LRM 7.5) passed to an open-array formal: the runtime
+// { data, len } handle drives the descriptor — nelem is the runtime size, and a
+// named-scalar (int) element is zero-copy (the descriptor points at the heap
+// buffer, read and output-written in place). Same C fns as the fixed-array tests;
+// only the actual's storage kind differs.
 TEST_CASE("DPI import: dynamic-array actual is zero-copy (runtime size)") {
     constexpr std::string_view src = R"(
         module m;
@@ -431,6 +457,9 @@ TEST_CASE("DPI import: dynamic-array actual is zero-copy (runtime size)") {
     CHECK(run_capture(src) == "150\n0 1 4 9 16\n");
 }
 
+// An unallocated / empty dynamic array (size 0, LRM 7.5): the descriptor carries
+// nelem 0, and svLow/svHigh return an empty span so a `svLow..svHigh` C loop reads
+// nothing (no null-buffer deref).
 TEST_CASE("DPI import: empty dynamic-array actual reads as size 0") {
     constexpr std::string_view src = R"(
         module m;

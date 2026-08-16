@@ -1,3 +1,6 @@
+// `first_match` in an antecedent, where suppressing a later match is visible.
+// The trace is driven with nonblocking assignments so every sampled value is
+// unambiguous, and $display marks each cycle so a report can be attributed.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

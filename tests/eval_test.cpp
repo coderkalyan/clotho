@@ -130,6 +130,9 @@ TEST_CASE("reset qualified by an enable stays unknown") {
     CHECK(pinned_truth(d, "rst", 0) == ir::Tri::False);
 }
 
+// R04. Nesting is irrelevant to folding: the inner predicate is the reset test
+// wherever it sits, which is why the condition-based rule handles the shape yosys
+// rejects.
 TEST_CASE("nesting does not affect the fold") {
     const Design d = body("always @(posedge clk or posedge rst)\n"
                           "    if (en) begin if (rst) q<=0; else q<=dat; end else if (rst) q<=0;");

@@ -10,6 +10,16 @@
 
 using namespace clotho;
 
+// Assignment patterns `'{...}` (LRM 10.9): positional (Simple), keyed
+// (Structured: member / index / default), and replicated. Packed operands
+// lower to a concatenation of the ordered elements (`lower_packed_pattern`);
+// unpacked structs/arrays decompose to per-leaf stores (`emit_agg_store`).
+//
+// Expected values are pinned against verilator; it diverges from slang only on a
+// keyed pattern over a *descending* packed array, where slang mis-folds the
+// element order (see lower_packed_pattern NOTE) — Clotho reverses to
+// correct that, exercised by the descending cases below.
+
 namespace {
 
 // JIT-run a module and capture stdout (mirrors struct_test.cpp).
@@ -79,6 +89,7 @@ TEST_CASE("packed array pattern: positional direction-independent") {
 }
 
 TEST_CASE("packed array pattern: keyed, descending reverses (slang-bug workaround)") {
+    // verilator: '{0:x,3:y} of logic[3:0] places index 0 at the LSB.
     CHECK(run_capture(R"(
         module m;
             logic [3:0][7:0] d; logic [0:3][7:0] a;
@@ -248,6 +259,8 @@ TEST_CASE("nonblocking '{...} pattern to an unpacked array") {
 }
 
 TEST_CASE("whole unpacked-array equality is per-element, X-propagating") {
+    // Equal -> 1, one definite mismatch -> 0, an ambiguous (x) member with all
+    // others equal -> x (LRM 11.4.5).
     CHECK(run_capture(R"(
         module m;
             logic [7:0] a [0:3];
@@ -312,7 +325,20 @@ TEST_CASE("nonblocking unpacked-array slice copy commits deferred") {
     )") == "0 a1 a2 3\n");
 }
 
+// ---------------------------------------------------------------------------
+// Indexed part-select slice of an unpacked array, `a[i +: n]` / `a[i -: n]`
+// (LRM 7.4.5: "The size of the part-select or slice shall be constant, but the
+// position can be variable"). Expanded position-wise at lower time, so every
+// position is an ordinary element access and carries the clause's out-of-range
+// rule on its own. iverilog rejects unpacked-array slices outright; the two
+// deliberate choices Clotho makes here are judging each position on its own and
+// treating an x/z base as invalid.
+// ---------------------------------------------------------------------------
+
 TEST_CASE("indexed unpacked-array slice: direction, endianness, and element order") {
+    // Positions run in the BASE array's declaration order, so `+:` and `-:` only
+    // choose which contiguous index window is selected -- exactly like a packed
+    // indexed part-select.
     CHECK(run_capture(R"(
         module m;
             logic [7:0] q [0:7];   // ascending
@@ -366,6 +392,11 @@ TEST_CASE("indexed unpacked-array slice writes, including `-:` and a descending 
 }
 
 TEST_CASE("an overlapping slice copy reads the source's pre-assignment values") {
+    // LRM 10.4.1 evaluates the right-hand side and then assigns, so a shifted copy
+    // must not read a position it has already written. Both slice forms stage the
+    // source in a temp when the two sides are rooted at the same array. (The
+    // constant-bounds form used to propagate its own writes: `q[1:3] = q[0:2]` gave
+    // `10 10 10 10`.)
     CHECK(run_capture(R"(
         module m;
             logic [7:0] q [0:7];
@@ -384,6 +415,10 @@ TEST_CASE("an overlapping slice copy reads the source's pre-assignment values") 
 }
 
 TEST_CASE("an out-of-range indexed slice reads the element default per position") {
+    // LRM 7.4.5: an invalid index reads Table 7-1's value (x for 4-state, 0 for
+    // 2-state) and writes nothing. Each POSITION is judged on its own, so a
+    // partially out-of-range slice keeps its in-range positions where they are --
+    // the same rule 11.5.1 states for a packed part-select.
     CHECK(run_capture(R"(
         module m;
             logic [7:0] q [0:7];
@@ -412,6 +447,9 @@ TEST_CASE("an out-of-range indexed slice reads the element default per position"
 }
 
 TEST_CASE("an x/z indexed slice base is an invalid index (LRM 7.4.5)") {
+    // "If an index expression is out of bounds or if any bit in the index
+    // expression is x or z, then the index shall be invalid." Every position of
+    // the slice inherits the unknown, so the read is all-x and the write a no-op.
     CHECK(run_capture(R"(
         module m;
             logic [7:0] q [0:7];
@@ -432,6 +470,10 @@ TEST_CASE("an x/z indexed slice base is an invalid index (LRM 7.4.5)") {
 }
 
 TEST_CASE("indexed unpacked-array slice in every supported context") {
+    // Equality operand, nonblocking source and target, by-value / output / inout
+    // subroutine argument, a slice of a struct's array member, a slice of a
+    // multidimensional array's outer dimension, and a base expression evaluated
+    // exactly once (LRM 11.5.1's self-determined context).
     CHECK(run_capture(R"(
         module m;
             typedef struct { logic [7:0] arr [0:5]; int tag; } s_t;
@@ -488,6 +530,16 @@ TEST_CASE("indexed unpacked-array slice in every supported context") {
            "md_wr    77 78 79 80\n"
            "once     12 13 calls=1\n");
 }
+
+// ---------------------------------------------------------------------------
+// Assignment-pattern lvalue destructuring, `'{a, b, c} = rhs` / typed
+// `U'{a, b, c} = rhs` (LRM 10.9). Positional only ("the positional notation
+// shall be required" when a pattern is used as an lvalue). iverilog and
+// verilator both reject the syntax outright. Clotho destructures *structurally*
+// (element-for-element against the right-hand type), not as a flat bit-slice —
+// the truncation test below pins that, since a flat-bit-concat reading would not
+// reproduce the plain per-element truncated values.
+// ---------------------------------------------------------------------------
 
 TEST_CASE("assignment-pattern lvalue: bare positional destructure of a fixed array") {
     CHECK(run_capture(R"(
@@ -550,6 +602,10 @@ TEST_CASE("assignment-pattern lvalue: nested pattern over a struct-of-struct") {
 }
 
 TEST_CASE("assignment-pattern lvalue: per-element width truncates like an ordinary assignment") {
+    // A flat bit-concat reading of `'{a,b,c,d} = B` would take the top 32 bits
+    // of a 128-bit concatenation of B's four 32-bit elements (~0), not each
+    // element's low byte; Clotho destructures element for element, so each
+    // target truncates its own element.
     CHECK(run_capture(R"(
         module m;
             byte a, b, c, d;
@@ -608,6 +664,9 @@ TEST_CASE("assignment-pattern lvalue: compound assignment is rejected") {
 }
 
 TEST_CASE("assignment-pattern lvalue: queue right-hand side is rejected") {
+    // slang rejects this at binding time ("lvalue assignment patterns cannot
+    // be assigned from dynamic arrays"), ahead of Lower.cpp's own guard (kept
+    // as defense in depth).
     CHECK_FALSE(reject(R"(
         module m;
             int a, b, c;

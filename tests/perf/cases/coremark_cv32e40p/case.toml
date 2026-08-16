@@ -62,4 +62,3 @@ note = "iverilog 13 cannot parse cv32e40p (import pkg::* in the ANSI module head
 [oracles.verilator]
 enabled = true
 note = "2-state cycle-accurate reference. Build with packages first; --binary --timing runs tb_top directly."
-

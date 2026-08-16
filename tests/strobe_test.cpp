@@ -232,6 +232,8 @@ TEST_CASE("$strobe of an automatic local is rejected") {
                    "cannot be traced");
 }
 
+// $monitor (LRM 21.2.2): a single persistent monitor that reprints at the end of
+// each time step only when an argument changes.
 TEST_CASE("$monitor prints once per change") {
     CHECK(run_capture(R"(
         module m;

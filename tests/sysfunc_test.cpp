@@ -194,6 +194,11 @@ TEST_CASE("$isunbounded folds in a constant context") {
 
 // -- $typename --------------------------------------------------------------
 
+// Clotho's own LRM 20.6.1 formatter (format_typename) over the supported type
+// kinds. The declared `logic` keyword is kept rather than canonicalized to the
+// legacy `reg`, matching slang and the LRM's modern keyword, and the
+// non-default `int unsigned` signing is preserved, as LRM 20.6.1(b) keeps it.
+// Both an expression and a data-type argument name the same type.
 TEST_CASE("$typename formats the supported type kinds") {
     const std::string out = run_capture(prog(
       "typedef bit node; bit b; logic l; reg r; int i; integer ig; byte by;"

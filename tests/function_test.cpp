@@ -304,6 +304,11 @@ TEST_CASE("static function local is per module instance") {
     CHECK(run_capture(src) == "1 2\n1 2\n");
 }
 
+// A static local with an initializer needs once-at-time-zero initialization,
+// which is not modeled; reject it rather than re-init on every call.
+// A static local's initializer runs once before time zero (LRM 13.4.2), not per
+// call: the counter persists and increments across calls; an automatic local
+// re-inits each call.
 TEST_CASE("static local initializer runs once at time zero") {
     constexpr std::string_view src = R"(
         module m;
@@ -326,6 +331,10 @@ TEST_CASE("static local initializer runs once at time zero") {
     CHECK(run_capture(src) == "101 102 103\n6 6\n");
 }
 
+// Output / inout formals copy back to the caller's actual at return (LRM 13.5):
+// the callee writes its frame copy, which the backend copies out through a caller
+// pointer at every return point. iverilog rejects a non-input function port
+// ("Function arguments must be input ports").
 TEST_CASE("function output and inout arguments copy back") {
     constexpr std::string_view src = R"(
         module m;
@@ -424,6 +433,12 @@ TEST_CASE("&& and || evaluate the right operand on an x/z left") {
     CHECK(run_capture(src) == "f\nr=0\nf\nr=x\nf\nr=1\nf\nr=x\n");
 }
 
+// `->` is short-circuit like `&&`/`||` (LRM 11.3.5's list is &&, ||, ->, ?:):
+// a definite-false left makes the implication definitely true without
+// evaluating the right operand. `<->` is deliberately absent from that list
+// -- LRM 11.4.7 requires each operand "evaluated exactly once" -- so it always
+// calls the side-effecting right operand. iverilog does not implement ->'s
+// short-circuit (evaluates the right operand unconditionally).
 TEST_CASE("-> short-circuits but <-> always evaluates its right operand") {
     constexpr std::string_view src = R"(
         module m;
@@ -570,6 +585,10 @@ TEST_CASE("unpacked array as a function frame local") {
 }
 
 TEST_CASE("unpacked array and struct as output / inout function arguments") {
+    // The other two by-value directions over the same storage-pointer ABI: an
+    // output formal starts at its frame default and is copied back at return, an
+    // inout is seeded from the actual first (LRM 13.5.1). A flat array actual goes
+    // through the caller's canonical temp, a struct through its own storage.
     CHECK(run_capture(R"(
         module m;
             typedef struct { int a; logic [7:0] b; } s_t;

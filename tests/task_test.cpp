@@ -275,6 +275,9 @@ TEST_CASE("static task locals persist between calls") {
     CHECK(run_capture(src) == "1 2 3\n");
 }
 
+// A ref formal aliases the actual's live storage (LRM 13.5.2): a function writes
+// the caller's variable directly, with no copy-out snapshot. (iverilog rejects
+// ref ports: "Reference ports not supported yet".)
 TEST_CASE("function ref mutates the caller variable") {
     constexpr std::string_view src = R"(
         module m;
@@ -353,6 +356,9 @@ TEST_CASE("task ref observed live across a #delay") {
     CHECK(run_capture(src) == "mid=1\nafter=11\n");
 }
 
+// A blocking write through a ref formal is a write to the actual, so it must
+// service the actual signal's wait queue — an `always @(sig)` woken solely by a
+// ref write fires. Serviced at the call site (a function is atomic).
 TEST_CASE("ref write wakes a process sensitive to the actual") {
     constexpr std::string_view src = R"(
         module m;
@@ -375,6 +381,9 @@ TEST_CASE("ref write wakes a process sensitive to the actual") {
     CHECK(run_capture(src) == "mon=11 hits=1\nmon=22 hits=2\n");
 }
 
+// An unpacked-array element is a whole `{i(2W),iW}` slot, so it is a legal ref
+// actual (LRM 13.5.2): the callee aliases that element's storage. Const and
+// dynamic index, nested dimensions, and a task ref across a #delay.
 TEST_CASE("ref to an unpacked-array element") {
     constexpr std::string_view src = R"(
         module m;
@@ -403,6 +412,10 @@ TEST_CASE("ref to an unpacked-array element") {
           "a1=201\na=101 202 1 401\npa2=9\nm2=6\nmid=51\na2=61\n");
 }
 
+// `ref` binds every storage class through the same fat pointer
+// (docs/design/data-model.md §3), so a non-integral formal aliases its actual
+// exactly as a scalar one does: an unpacked array by its canonical image, a
+// string and a container by their handles; iverilog rejects ref ports outright.
 TEST_CASE("ref of an unpacked array aliases the actual") {
     constexpr std::string_view src = R"(
         module m;
@@ -638,6 +651,13 @@ TEST_CASE("nonblocking assignment to a module signal in a task defers") {
     CHECK(run_capture(src) == "a q=10 seen=10\nb q=99\n");
 }
 
+// A nonblocking assignment to a module signal from inside a function is legal
+// (LRM 13.4.4: "nonblocking assignments ... shall be allowed inside a function")
+// and stages into the signal's shadow exactly like a task: the function returns
+// immediately with the old value still live, the new value commits one delta
+// later. iverilog rejects function NBA — a stale Verilog-2001 constraint the
+// LRM lifted. Old q=0 mem[1]=0 right after the call; committed q=5 mem[1]=6
+// after #1.
 TEST_CASE("nonblocking assignment to a module signal in a function defers") {
     constexpr std::string_view src = R"(
         module m;
@@ -657,6 +677,9 @@ TEST_CASE("nonblocking assignment to a module signal in a function defers") {
     CHECK(run_capture(src) == "t0 q=0 mem1=0\nt1 q=5 mem1=6\n");
 }
 
+// The same signal NBA'd from a function in two instances stages into each
+// instance's own shadow (per-instance ctx / def-relative block id): both counters
+// advance independently.
 TEST_CASE("nonblocking assignment from a function is per-instance") {
     constexpr std::string_view src = R"(
         module sub(input logic clk);

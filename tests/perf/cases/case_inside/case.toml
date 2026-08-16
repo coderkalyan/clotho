@@ -18,4 +18,3 @@ note = "iverilog does not implement case ... inside (syntax error on the constru
 
 [oracles.verilator]
 enabled = true
-

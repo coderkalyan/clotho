@@ -1,4 +1,5 @@
 name = "str_append"
+description = "60k iterations of s = {s, \"abcdefgh\"} (480kB final string), the log/report-building idiom. Clotho's rt_string concat reallocates and copies the destination every iteration -- O(n^2) total (halving the count quarters sim time). iverilog is quadratic here too. Fix: capacity doubling + in-place append when the destination is the concat's own first operand."
 top = "top"
 
 [clotho]
@@ -12,4 +13,3 @@ enabled = true
 
 [oracles.verilator]
 enabled = true
-

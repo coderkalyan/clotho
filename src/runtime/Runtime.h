@@ -139,6 +139,7 @@ void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind);
 // no-op when nothing is queued.
 void rt_observed_flush(void);
 
+
 // Report a severity system task ($info / $warning / $error / $fatal, LRM 20.10)
 // or an immediate-assertion default failure (LRM 16.3). Renders the $display-
 // style message (`fmt` + `argc` `argv`, empty for a bare `$error;`) and writes
@@ -356,12 +357,12 @@ void rt_ref_names(const rt_container_name* table, uint64_t count);
 // that element, and may point outside the buffer entirely, so LRM 13.5.2's
 // "the formal refers to the actual" no longer holds.
 //
-// The LRM does not define this case; an unchecked implementation would dereference the
-// stale pointer. Clotho reports it instead: prints a located diagnostic naming
-// the formal, the container and both epochs, and ends the simulation with a
-// nonzero status. `--loose-stale-ref` downgrades it to a once-per-site warning
-// and returns, which is the escape hatch for a design that relies on the
-// stale-pointer behaviour.
+// The LRM does not define this case. Rather than dereference the stale pointer,
+// Clotho reports it: prints a located diagnostic naming the formal, the
+// container and both epochs, and ends the simulation with a nonzero status.
+// `--loose-stale-ref` downgrades it to a once-per-site warning and returns,
+// which is the escape hatch for a design that relies on the stale-pointer
+// behaviour.
 //
 // `epoch` is the pointer the guard was watching; the report resolves it to the
 // container's declared name through the rt_ref_names table. Passing it costs
@@ -766,6 +767,14 @@ void rt_vcd_limit(uint64_t bytes);
 // Called on normal simulation end and when a $finish stops the drain.
 void rt_vcd_close(void);
 
+// -- $random --
+//
+// $random (LRM 1800-2023 §20.15.1): return the next value of the simulator's
+// global random stream as a signed 32-bit integer. Clotho implements the
+// IEEE Std 1800-2023 Annex N generator (rtl_dist_uniform over the full int32 span)
+// from an unseeded global stream starting at seed 0, so the stream is
+// deterministic and identical from run to run. The generator is process-global,
+// matching the single-simulator-per-process model.
 int32_t rt_random(void);
 
 // -- Probabilistic distribution functions (LRM §20.15.2) and $random(seed) --
@@ -1146,6 +1155,11 @@ typedef struct rt_assoc {
 // element default). The pointer is valid until the next mutation of `h`.
 void* rt_assoc_get_ptr(rt_assoc* h, const uint8_t* kptr, uint32_t klen);
 
+// a[key] write: pointer to the element slot for `key`, creating (and proto-
+// initializing) the entry if absent (LRM 7.8). Valid until the next mutation.
+// `site` locates the write for an allocation-failure report. A created entry
+// starts from the element default, NOT from the pattern default (see
+// docs/design/dynamic-arrays.md §8).
 void* rt_assoc_put_ptr(rt_assoc* h, const rt_elem_ops* ops, const uint8_t* kptr, uint32_t klen,
                        const rt_alloc_site* site);
 

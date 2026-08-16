@@ -1,3 +1,6 @@
+// An antecedent that matches twice within one attempt.
+// The trace is driven with nonblocking assignments so every sampled value is
+// unambiguous, and $display marks each cycle so a report can be attributed.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;
@@ -15,8 +18,8 @@ module t;
   // An attempt (LRM 16.12.1, one per tick) whose antecedent matches twice owes
   // ONE verdict, not one per obligation: it fails at the FIRST obligation to
   // fail and never reports again, and it passes only once every one of them has
-  // passed. Reporting per obligation would print the
-  // cyc26 window below twice. Six windows, one `a` pulse each:
+  // passed. Clotho used to report per obligation, so the cyc26 window below
+  // printed twice. Six windows, one `a` pulse each:
   //
   //   cyc1  both matches; the early obligation passes, the late one fails
   //   cyc7  only the early match exists, and it fails

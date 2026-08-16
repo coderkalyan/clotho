@@ -36,6 +36,7 @@ import argparse
 import random
 import sys
 
+
 def gen_regs(n: int, cycles: int, fused: bool, seed: int | None) -> str:
     out = []
     out.append("module top;")
@@ -70,6 +71,7 @@ def gen_regs(n: int, cycles: int, fused: bool, seed: int | None) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+
 def gen_wideff(n: int, cycles: int) -> str:
     # One clocked process whose single straight-line block holds N whole-signal
     # scalar NBAs to independent flops. Isolates NBA *enqueue* overhead: per-signal
@@ -97,6 +99,7 @@ def gen_wideff(n: int, cycles: int) -> str:
     out.append("  end")
     out.append("endmodule")
     return "\n".join(out) + "\n"
+
 
 def gen_nbablocks(blocks: int, sig_per_block: int, cycles: int) -> str:
     # `blocks` independent clocked processes, each staging `sig_per_block` whole-
@@ -127,6 +130,7 @@ def gen_nbablocks(blocks: int, sig_per_block: int, cycles: int) -> str:
     out.append("  end")
     out.append("endmodule")
     return "\n".join(out) + "\n"
+
 
 def gen_nbamem(n: int, width: int, cycles: int, select: str) -> str:
     # N nonblocking writes to distinct elements of one unpacked-array (memory) per
@@ -164,6 +168,7 @@ def gen_nbamem(n: int, width: int, cycles: int, select: str) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+
 def gen_partblocks(blocks: int, sig_per_block: int, cycles: int, select: str) -> str:
     # Like nbablocks, but every NBA is a *partial* (bit/part-select) target, to
     # exercise the masked commit path. select="static": a constant [15:0] half-word
@@ -196,6 +201,7 @@ def gen_partblocks(blocks: int, sig_per_block: int, cycles: int, select: str) ->
     out.append("  end")
     out.append("endmodule")
     return "\n".join(out) + "\n"
+
 
 def gen_thunk(n: int, cycles: int, shape: str) -> str:
     out = []
@@ -245,6 +251,7 @@ def gen_thunk(n: int, cycles: int, shape: str) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+
 def gen_wheel(cycles: int) -> str:
     """Timestep-bound clock microbench: one #delay clock generator and one
     trivial clocked process, so ~2 wheel ticks per cycle dominate over the
@@ -266,6 +273,7 @@ def gen_wheel(cycles: int) -> str:
         "  end\n"
         "endmodule\n"
     )
+
 
 def gen_tri(k: int, cycles: int, fused: bool, order: str) -> str:
     out = []
@@ -316,6 +324,7 @@ def gen_tri(k: int, cycles: int, fused: bool, order: str) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+
 def gen_chain(k: int, cycles: int, fused: bool, order: str) -> str:
     """Sparse counterpart of tri: proc i reads only s and a_{i-1}. Waste from
     bad order is bounded (~2x), the realistic envelope for RTL-like nets."""
@@ -361,13 +370,14 @@ def gen_chain(k: int, cycles: int, fused: bool, order: str) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+
 def gen_combchain(depth: int, cycles: int) -> str:
     """Deep combinational module chain: DEPTH pass-through cell modules, each
     one continuous assign, wired input->output through ports. Every clock edge
     ripples one wave of DEPTH single-assign activations down the chain, so the
     bench is dominated by per-wave wake/subscription/port-copy cost -- the
     target of comb-process fusion.
-    2026-07); per-activation cost measured ~4x the thunk_comb figure."""
+    Per-activation cost measured ~4x the thunk_comb figure."""
     out = []
     out.append("module stage(input wire [31:0] in, output wire [31:0] out);")
     out.append("  assign out = in + 32'h1;")
@@ -396,6 +406,7 @@ def gen_combchain(depth: int, cycles: int) -> str:
     out.append("  end")
     out.append("endmodule")
     return "\n".join(out) + "\n"
+
 
 def gen_star(n: int, cycles: int) -> str:
     """Adversarial comb-fusion fan-out: one candidate-produced signal s feeds
@@ -431,6 +442,7 @@ def gen_star(n: int, cycles: int) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+
 def _primes(count: int, start: int = 3):
     """First COUNT odd primes from START."""
     primes = []
@@ -440,6 +452,7 @@ def _primes(count: int, start: int = 3):
             primes.append(cand)
         cand += 2
     return primes
+
 
 def gen_timers(n: int, horizon: int) -> str:
     """N free-running `always #p` toggles with distinct prime periods: keeps N
@@ -471,6 +484,7 @@ def gen_timers(n: int, horizon: int) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+
 def gen_bigcase(n: int, cycles: int) -> str:
     """One clocked process holding an N-entry case statement over a hashed
     selector. Tracks two costs on the same design: LLVM compile time of a
@@ -500,6 +514,7 @@ def gen_bigcase(n: int, cycles: int) -> str:
     out.append("  end")
     out.append("endmodule")
     return "\n".join(out) + "\n"
+
 
 def gen_case_inside(n: int, cycles: int, gap: int) -> str:
     """One clocked process holding an N-item `case ... inside` (LRM 12.5.4)
@@ -544,6 +559,7 @@ def gen_case_inside(n: int, cycles: int, gap: int) -> str:
     out.append("endmodule")
     return "\n".join(out) + "\n"
 
+
 def gen_onehot(n: int, cycles: int, order: str) -> str:
     """One clocked process holding the reverse-case one-hot priority-encoder
     idiom: `case (1'b1)` over N single-bit selects `sel[i]` of a packed vector.
@@ -581,6 +597,7 @@ def gen_onehot(n: int, cycles: int, order: str) -> str:
     out.append("  end")
     out.append("endmodule")
     return "\n".join(out) + "\n"
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

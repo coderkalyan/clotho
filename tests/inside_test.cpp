@@ -133,6 +133,11 @@ TEST_CASE("inside: signed range membership") {
     CHECK(out == "1\n0\n");
 }
 
+// -- real operands (LRM 11.4.13) --
+// 11.4.13 uses `==` (not `==?`) on a nonintegral expression, and Table 11-1
+// defines `>=` / `<=` for reals, so a real set is IEEE-754 equality plus the
+// inclusive relational range. iverilog 13 cannot compile `inside` at all
+// ("sorry: inside expressions not supported yet").
 TEST_CASE("inside: real values and ranges") {
     const std::string out = run_capture(R"(
         module m;
@@ -154,6 +159,11 @@ TEST_CASE("inside: real values and ranges") {
     CHECK(out == "1 0 1\n0 1\n1\n1 0\n");
 }
 
+// -- unpacked-array set members (LRM 11.4.13) --
+// "If an expression in the list is an unpacked array, its elements are traversed
+// by descending into the array until reaching a singular value." A fixed-size
+// member unrolls, a queue / dynamic array walks at runtime; 11.4.13's own
+// example is the queue one.
 TEST_CASE("inside: an array member is traversed elementwise") {
     const std::string out = run_capture(R"(
         module m;
@@ -181,6 +191,8 @@ TEST_CASE("inside: an array member is traversed elementwise") {
     CHECK(out == "1 0\n1 0\n1 0\n1 0\n0\n1\n");
 }
 
+// An element of a 4-state array member keeps the ==? asymmetry: the MEMBER's x/z
+// bits are do-not-cares, the left operand's are not (11.4.13).
 TEST_CASE("inside: x/z in an array member element is a wildcard") {
     const std::string out = run_capture(R"(
         module m;

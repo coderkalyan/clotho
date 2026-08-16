@@ -1,3 +1,6 @@
+// Length-matching intersection of two sequences.
+// The trace is driven with nonblocking assignments so every sampled value is
+// unambiguous, and $display marks each cycle so a report can be attributed.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;
@@ -26,14 +29,13 @@ module t;
   // cycle needs per-attempt identity whose window is the antecedent's longest
   // match. libsva refuses it with SVA_ERROR_UNBOUNDED_ANTECEDENT rather than
   // under-report, which is a capability traded for a correct number -- the old
-  // lowering was right whenever no two matches ended together, which is why
-  // this directive used to give the right count.
+  // lowering was right whenever no two matches ended together.
   //
   // The coverage moved rather than vanished: tests/sva_test.cpp asserts the
   // refusal by name, and asserts the same operator still lowers in a
   // CONSEQUENT, which is where the counted discipline takes it. The fix that
   // would bring this line back is determinising the trigger, tracked in
-  // docs/TODO.md; when it lands, restore this directive and re-score the file.
+  // docs/TODO.md; when it lands, restore this directive.
 
   initial begin
     @(posedge clk);

@@ -51,4 +51,3 @@ enabled = true
 [oracles.verilator]
 enabled = false
 note = "Candidate fast oracle (the testbench is plain Verilog), but verilator is 2-state/cycle-accurate and not yet cross-checked on this case."
-

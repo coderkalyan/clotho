@@ -235,6 +235,10 @@ TEST_CASE("packed union x-propagates through overlaid members") {
 }
 
 TEST_CASE("packed tagged union: setter, member read, whole value (LRM 7.3.2)") {
+    // A `tagged Member(value)` setter builds the flat {tag, payload}: tag
+    // (member index) in the high bit(s), payload in the low bits. Member read is
+    // the low payload; the whole value is the raw 33-bit vector. %b prints the
+    // raw bits rather than rendering the tag symbolically.
     CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void Invalid; int Valid; } opt_t;
@@ -272,6 +276,12 @@ TEST_CASE("packed tagged union: narrow member gap is x for 4-state, run==param")
 }
 
 TEST_CASE("tagged union: a member write does not retag; it checks the tag (LRM 11.9)") {
+    // LRM 11.9: "the value read or assigned shall be consistent with the current
+    // tag ... An attempt to read or assign a value whose type is inconsistent with
+    // the tag results in a run-time error", and its own example calls
+    // `i1.Add = '{19, 4, 3};` legal "only if the instruction variable i1 currently
+    // has tag Add". So a member write never moves the tag — only a whole-value
+    // `tagged` expression does (LRM 7.3.2).
     const std::string src = "module m;\n"
                             "    typedef union tagged packed { void Invalid; int Valid; } opt_t;\n"
                             "    opt_t a;\n"
@@ -391,6 +401,9 @@ TEST_CASE("unpacked tagged union: LSB overlay under the synthesized tag (LRM 7.3
 }
 
 TEST_CASE("tagged union pattern case: tag match, .var binding, filter (LRM 12.6)") {
+    // `case (u) matches`: first-match over tagged patterns; `.n` binds the
+    // payload, `&&& (n > 10)` filters. iverilog / verilator have no tagged-union
+    // support.
     CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void Invalid; int Valid; } opt_t;
@@ -425,6 +438,9 @@ TEST_CASE("tagged union: if/else matches with pattern-var binding (LRM 12.6.2)")
 }
 
 TEST_CASE("tagged union: ?: matches binds and single-evaluates the chosen arm") {
+    // `expr matches pattern ? a : b` (LRM 12.6.2). `.n` binds the payload; when
+    // an arm has an observable effect (a call), only the chosen arm evaluates
+    // (11.4.11 single-evaluation).
     CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void Invalid; int Valid; } opt_t;
@@ -441,6 +457,8 @@ TEST_CASE("tagged union: ?: matches binds and single-evaluates the chosen arm") 
 }
 
 TEST_CASE("pattern case: default, unpacked-union tag, and structure pattern (LRM 12.6)") {
+    // A structure pattern binds and constant-matches per field; `.*` is a
+    // field wildcard.
     CHECK(run_capture(R"(
         module m;
             typedef union tagged { void none; byte b; int w; } u_t;
@@ -464,6 +482,10 @@ TEST_CASE("pattern case: default, unpacked-union tag, and structure pattern (LRM
 }
 
 TEST_CASE("casez/casex pattern case wildcards the label bits (LRM 12.6.1)") {
+    // LRM 12.6.1: casez/casex `matches` wildcard the z (casez) or x/z (casex)
+    // bits of the pattern's labels, over tag and member bits alike. Clotho is
+    // LRM-compliant here; iverilog/verilator have no tagged unions, so the
+    // expected values are hand-derived from the normative text.
     CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void none; logic [7:0] data; } u_t;
@@ -563,6 +585,13 @@ TEST_CASE("tagged union with a non-integral member is rejected loudly (Phase 3 g
 }
 
 TEST_CASE("%p of a tagged union prints '{tag:value} (LRM 21.2.1.6)") {
+    // LRM 21.2.1.6: "For unions, only the first declared elements shall be printed.
+    // In the case of a tagged union, it shall print "tag:value" along with the
+    // currently valid element." Which member that is only the run-time tag knows,
+    // so this is the one %p shape rendered in the runtime. A `void` member has no
+    // element, so its tag prints alone. The payload renders at the MEMBER's own
+    // width, not the union's payload region, so the gap bits never leak in, and at
+    // the member's own signedness (`byte b` of 8'hAB is -85).
     CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void Invalid; int Valid; } opt_t;
@@ -599,6 +628,10 @@ TEST_CASE("%p of a tagged union whose tag is x falls back to the flat value") {
 }
 
 TEST_CASE("%p of a tagged union is a legal assignment pattern (sv-tests 7.3.2)") {
+    // The whole `%p` output "shall be a legal interpretation of the assignment
+    // pattern syntax" (LRM 21.2.1.6), so the `tag:value` pair is bracketed. This is
+    // the shape sv-tests chapter-7/unions/tagged/basic.sv asserts.
+    // The assert text embeds `)"`, so the raw string needs its own delimiter.
     CHECK(run_capture(R"SV(
         module m;
             union tagged { void invalid; bit [3:0] valid; } un;
@@ -640,6 +673,14 @@ TEST_CASE("%p of a nested tagged union / packed struct / enum (LRM 21.2.1.6)") {
 }
 
 TEST_CASE("%p of a packed struct, a plain union, and an enum (LRM 21.2.1.6)") {
+    // Three more `shall` clauses that the aggregate-ABI dispatch used to miss, all
+    // rendering as a bare decimal before: "A packed structure data type shall print
+    // its value as an assignment pattern with named elements", "For unions, only the
+    // first declared elements shall be printed", and "An enumerated data type shall
+    // print its value as an enumeration name if the value is valid for that type.
+    // Otherwise the value shall print according to the base type" — so a value
+    // matching no member of a `byte`-based enum prints as a signed decimal (the
+    // clause names the base type, and `byte` is signed).
     CHECK(run_capture(R"(
         module m;
             typedef struct packed { byte a; byte b; } ps_t;
@@ -726,6 +767,11 @@ TEST_CASE("%p of a queue of tagged unions names the tag") {
     )") == "'{'{Valid:1}, '{Invalid}}\n");
 }
 
+// --- Unpacked structs (aggregate llvm::StructType backing, Stage 1) ---
+// An unpacked struct has no flat bit-vector value (LRM 7.2): each member owns
+// its own storage, addressed by a struct GEP (MemberSelect), not a bit offset.
+// (iverilog 13 does not support unpacked structs.)
+
 TEST_CASE("blocking read and write of unpacked struct members") {
     CHECK(run_capture(R"(
         module m;
@@ -754,6 +800,12 @@ TEST_CASE("unpacked struct member power-on: 4-state X, 2-state 0") {
         endmodule
     )") == "a=xx b=0\n");
 }
+
+// -- Struct member default initializers (LRM 7.2's struct_union_member
+// list_of_variable_decl_assignments, mirroring a class property default,
+// LRM 8.8): a field's own `= expr` applies when a variable of the struct
+// type is declared with no initializer of its own. iverilog has no unpacked
+// struct support.
 
 TEST_CASE("struct field default applies when the variable has no initializer") {
     CHECK(run_capture(R"(
@@ -800,6 +852,12 @@ TEST_CASE("a nested struct field's own default applies") {
     )") == "7 3\n");
 }
 
+// A static function-local with a struct field default is guarded loudly
+// (same "runs once, not per call" hazard as an explicit static-local
+// initializer): applying it per call would clobber a previous call's
+// mutations.
+// A static local struct's field-level defaults apply once before time zero
+// (LRM 13.4.2 / 7.2), then the object persists across calls.
 TEST_CASE("static local struct field default applies once") {
     const std::string out = run_capture(R"(
         module m;
@@ -870,6 +928,8 @@ TEST_CASE("unpacked struct declaration initializer") {
 }
 
 TEST_CASE("unpacked struct equality is field-wise; X makes it ambiguous (LRM 11.4.5)") {
+    // == / != reduce over members; an unknown member makes the relation
+    // ambiguous, so the result is X.
     CHECK(run_capture(R"(
         module m;
             typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
@@ -934,6 +994,10 @@ TEST_CASE("nested packed struct member inside an unpacked struct") {
         endmodule
     )") == "p=a5 q=cd\n");
 }
+
+// --- Unpacked struct nonblocking assignment (per-member aggregate shadow) ---
+// A struct member commits from its own shadow slot; a whole-struct `<=`
+// decomposes to per-member NBA.
 
 TEST_CASE("nonblocking write to unpacked struct members, one cycle latency") {
     // Two clock edges: member NBA reads the pre-edge value and commits after, so
@@ -1044,6 +1108,9 @@ TEST_CASE("partial NBA through a runtime array index into a struct member") {
         endmodule
     )") == "a3 aa\n");
 }
+
+// --- Recursive aggregates: arbitrary nesting (array-of-struct, nested struct,
+// struct-with-array-member). Reads + blocking writes. ---
 
 TEST_CASE("array of unpacked struct: runtime-indexed member access") {
     CHECK(run_capture(R"(
@@ -1175,6 +1242,9 @@ TEST_CASE("nested unpacked struct equality (x-propagating)") {
     )") == "1\n0\n");
 }
 
+// --- Deferred nonblocking assignment through a runtime array index into an
+// aggregate (arr[i].f <= v, arr[i] <= s, x.mem[i] <= v). ---
+
 TEST_CASE("runtime-indexed register file of structs (deferred NBA)") {
     CHECK(run_capture(R"(
         module m;
@@ -1301,6 +1371,9 @@ TEST_CASE("nonblocking whole-object copy over an array member commits deferred")
     )") == "10 11 12 13 1\n");
 }
 
+// A whole blocking copy of a plain (string-free) unpacked array shares the
+// AggCopy / memcpy path with aggregates.
+
 TEST_CASE("whole plain unpacked array copy is an independent memcpy") {
     CHECK(run_capture(R"(
         module m;
@@ -1386,6 +1459,8 @@ TEST_CASE("nested unpacked struct passed and returned by value") {
 }
 
 TEST_CASE("array of unpacked struct passed by value (recursive copy-in)") {
+    // The whole array-of-struct actual passes by pointer; the callee's frame copy
+    // is mutated without touching the caller.
     CHECK(run_capture(R"(
         module m;
             typedef struct { int a; logic [7:0] b; } pair_t;
@@ -1425,6 +1500,11 @@ TEST_CASE("unpacked struct with an array member returned by value") {
 }
 
 TEST_CASE("unpacked aggregate task arguments pass by value (LRM 13.5.1)") {
+    // A task takes the same one-storage-pointer ABI a function does: the caller
+    // passes the actual's storage (a canonical temp for a flat array), the task
+    // prologue copies it into its frame Local, and the completion epilogue copies an
+    // output / inout Local back. So an input mutation stays local, and an output /
+    // inout lands in the caller.
     CHECK(run_capture(R"(
         module m;
             typedef struct { int a; logic [7:0] b; } s_t;
@@ -1462,6 +1542,10 @@ TEST_CASE("unpacked aggregate task arguments pass by value (LRM 13.5.1)") {
 }
 
 TEST_CASE("an aggregate task argument copies out when the task returns, not earlier") {
+    // A task may consume time, and 13.5.1 copies output / inout arguments back on
+    // return. The copy-out rides the coroutine's completion epilogue, so the caller
+    // observes the write only after the task's last delay — and the caller's temp /
+    // storage stays live across the suspend. `@0` before, `@5` after.
     CHECK(run_capture(R"(
         module m;
             typedef struct { int a; } s_t;
@@ -1486,6 +1570,8 @@ TEST_CASE("an aggregate task argument copies out when the task returns, not earl
 }
 
 TEST_CASE("aggregate task arguments nest, recurse, and run concurrently") {
+    // One frame per call: a task handing its own inout formal to another task, a
+    // recursive call, and two concurrent fork branches each keep their own copies.
     CHECK(run_capture(R"(
         module m;
             typedef struct { int x; } s_t;
@@ -1516,6 +1602,8 @@ TEST_CASE("aggregate task arguments nest, recurse, and run concurrently") {
 }
 
 TEST_CASE("aggregate task argument shapes: struct-with-array, array-of-struct, 2-D, slice") {
+    // Every unpacked shape rides the same recursive storage copy, and a slice actual
+    // is a legal whole-array actual (its element count matches the formal).
     CHECK(run_capture(R"(
         module m;
             typedef struct { int a; logic [3:0] f [0:1]; } witharr_t;
@@ -1570,6 +1658,13 @@ TEST_CASE("a class method task takes an inout unpacked struct") {
 }
 
 TEST_CASE("an aggregate output argument's copy-out wakes the actual's waiters") {
+    // The copy-out has to reach the actual through the ordinary store path, or the
+    // signal's wait queue goes unserviced and `always @(s.a)` never runs. So an
+    // output / inout aggregate actual always goes through a caller temp: the callee
+    // memcpies the temp, and emit_call_copyouts copies the temp into the actual.
+    // (Before this, a struct-bearing formal handed the callee the actual's own
+    // storage and the wake was silently lost — for functions as well as tasks.)
+    // Each shape wakes its waiter once per call.
     CHECK(run_capture(R"(
         module m;
             typedef struct { int a; } s_t;
@@ -1657,6 +1752,7 @@ TEST_CASE("chained continuous copy of a struct wakes downstream readers") {
 }
 
 TEST_CASE("unpacked struct passed through module ports") {
+    // Input and output struct ports lower to whole-object continuous copies.
     CHECK(run_capture(R"(
         typedef struct { int a; logic [7:0] b; } p_t;
         module passthru(input p_t i, output p_t o);
@@ -1745,6 +1841,12 @@ TEST_CASE("nested member select of a constant struct folds") {
         endmodule
     )") == "11 22 3\n");
 }
+
+// -- Narrow-slot (2-state / real) aggregate leaves --
+//
+// A 2-state or real member takes the genuine single-iW leaf slot inside an
+// aggregate; every consumer (load/store, NBA shadow + commit, deferred array
+// records, copies) must dispatch on the narrow shape. Values hand-checkable.
 
 TEST_CASE("2-state and real members compute and copy through narrow leaf slots") {
     constexpr std::string_view src = R"(

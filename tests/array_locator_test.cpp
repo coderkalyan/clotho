@@ -12,6 +12,9 @@ using namespace clotho;
 
 namespace {
 
+// JIT-run a module and capture stdout (mirrors array_ordering_test.cpp).
+// The LRM 7.12.1 locator and 7.12.3 reduction results below are matched against
+// verilator 5.050 unless noted; iverilog 13.0 implements none of LRM 7.12.
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
@@ -89,6 +92,11 @@ TEST_CASE("array locator find family (LRM 7.12.1)") {
                               "nomatch=0\n");
 }
 
+// min/max/unique/unique_index (LRM 7.12.1) with the `with` clause omitted, which
+// compares the element itself. min/max return a one-element queue, and a tie
+// keeps the earlier element ("only one element is returned"). The order of the
+// unique* results is LRM-unspecified; Clotho keeps first-occurrence order, which
+// this pins.
 TEST_CASE("array locator min/max/unique (LRM 7.12.1)") {
     constexpr std::string_view src = R"(
         module m;
@@ -142,6 +150,9 @@ TEST_CASE("array reduction methods (LRM 7.12.3)") {
                               "wrap=44 widened=300\n");
 }
 
+// An empty array reduces to 0 for every method, including `product` and `and`
+// whose fold identities are 1 and all-ones. LRM 7.12.3 does not say; verilator
+// also answers 0.
 TEST_CASE("array reduction of an empty array is zero") {
     constexpr std::string_view src = R"(
         module m;
@@ -158,6 +169,9 @@ TEST_CASE("array reduction of an empty array is zero") {
                               "00 00 00\n");
 }
 
+// A 4-state element folds with the ordinary operator semantics, so x propagates
+// per LRM 11.4.x rather than being dropped: the sum is fully unknown while the
+// bitwise AND keeps the bits every element pins to 0.
 TEST_CASE("array reduction propagates x") {
     constexpr std::string_view src = R"(
         module m;
@@ -173,6 +187,9 @@ TEST_CASE("array reduction propagates x") {
     CHECK(run_capture(src) == "xx 0X\n");
 }
 
+// min/max over 4-state elements: an unknown-bearing compare is not a definite 1,
+// so an unknown element never wins. LRM 7.12.1 does not define the placement of
+// unknowns, so this pins Clotho's rule.
 TEST_CASE("array min/max over 4-state elements skips unknowns") {
     constexpr std::string_view src = R"(
         module m;
@@ -193,6 +210,10 @@ TEST_CASE("array min/max over 4-state elements skips unknowns") {
                               "max: 05\n");
 }
 
+// `item.index` inside a `with` clause (LRM 7.12.4), including under a
+// user-chosen iterator name, and the dedup scan of unique() leaving the outer
+// index intact. 7.12.1 leaves the order of unique's result open; Clotho returns
+// first-occurrence order.
 TEST_CASE("iterator index method (LRM 7.12.4)") {
     constexpr std::string_view src = R"(
         module m;
@@ -239,6 +260,9 @@ TEST_CASE("locator and reduction methods on a queue") {
                               "sum=24 uniq=3\n");
 }
 
+// The methods are element-type agnostic because the clause and the comparison go
+// through the ordinary expression path: string, real and packed-struct elements
+// all work (verilator mis-prints the struct member select).
 TEST_CASE("locator methods over string, real and struct elements") {
     constexpr std::string_view src = R"(
         typedef struct packed { byte red, green, blue; } rgb_t;

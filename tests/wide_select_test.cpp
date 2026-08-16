@@ -1,3 +1,28 @@
+// Runtime-offset bit / part-selects of a vector too wide to shift inline
+// (LRM 11.5.1 / 11.5.2). Above `wide_dyn_select_bits` (4096) the backend stops
+// asking LLVM for a variable shift on an i(2W) value -- which legalizes into
+// O(W/64) selects per word, so JIT time grew as O(W^2): 21 s for a 12 Kbit vector
+// and over half an hour for ivtest pr722's 65537-bit one -- and calls
+// rt_wide_sel / rt_wide_ins, which index the containing 64-bit word instead.
+//
+// These cases pin the *semantics* of that path, since it reimplements in C++ what
+// the inline form gets from the shift: the in-range read / write, LRM 11.5.1's
+// per-bit out-of-range rule in both directions, an x/z index, 4-state payloads
+// through a selection wider than one word, non-zero-based and descending
+// containers, and the nonblocking form (which stages into the shadow and its dirty
+// mask the same way). The crossover to the inline path is a pure codegen choice
+// with no observable difference, so the narrow twin of each case is the same
+// text.
+//
+// Timing is not asserted here (a machine-speed assertion in a unit test is a
+// flake); tests/perf carries the JIT-time guard.
+//
+// If the nonblocking case fails in an **ASan build** with an empty capture and a
+// `Delta32 fixup ... out of range` JIT session error on stderr, that is the
+// pre-existing code/data distance hazard, not this path: a multi-kilobit signal
+// with a nonblocking write hits it at any width (4095 bits included, on main too),
+// about one run in five, because ASan's shadow reservations fragment the address
+// space.
 
 #include <doctest/doctest.h>
 

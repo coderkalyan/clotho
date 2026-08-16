@@ -1,3 +1,10 @@
+// 200k-iteration zero-time loop exercising the string numeric-conversion
+// methods (LRM 6.16.9/6.16.11: atoi/atohex/atoreal, itoa/hextoa/realtoa).
+// Operands are kept non-negative and the real value always exact in <=6
+// significant digits, so the output does not depend on the choices made for
+// sign-magnitude toa and full-precision realtoa, neither of which applies to
+// this operand range --
+// verified vs iverilog and verilator, same checksum on both.
 module top;
   string s;
   integer r, acc;

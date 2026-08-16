@@ -33,6 +33,8 @@ BUILD_DIR = REPO / "build-perf"
 RESULTS_PATH = HERE / "results.json"
 BASELINE_PATH = HERE / "baseline.json"
 ORACLES_PATH = HERE / "oracles.json"
+# Machine-local map {tool: bindir} prepended to PATH for that tool's commands.
+# Gitignored: an oracle installed outside the system PATH is machine-specific.
 TOOLS_LOCAL_PATH = HERE / "tools.local.json"
 DEFAULT_RUNS = 5
 SANITY_TIMEOUT_S = 900
@@ -65,9 +67,11 @@ ORACLE_VERSION_CMD = {
     "verilator": ["verilator", "--version"],
 }
 
+
 def fail(msg):
     print(f"perf.py: {msg}", file=sys.stderr)
     sys.exit(2)
+
 
 def load_cases(names):
     cases = []
@@ -89,6 +93,7 @@ def load_cases(names):
         fail("no cases found under cases/")
     return cases
 
+
 def ensure_sources(case):
     fetch = case.get("fetch")
     if not fetch:
@@ -97,6 +102,7 @@ def ensure_sources(case):
         return
     print(f"[{case['name']}] fetching sources ({fetch['script']})")
     subprocess.run(["sh", fetch["script"]], cwd=case["_dir"], check=True)
+
 
 def ensure_build(no_build):
     clotho = BUILD_DIR / "clotho"
@@ -114,6 +120,7 @@ def ensure_build(no_build):
     subprocess.run(["ninja", "-C", str(BUILD_DIR), "clotho"], check=True)
     return clotho
 
+
 def hyperfine(cmd, cwd, runs, warmup, env=None):
     """Run one shell command under hyperfine; return per-run wall times in ms."""
     export = cwd / "hyperfine.json"
@@ -125,8 +132,10 @@ def hyperfine(cmd, cwd, runs, warmup, env=None):
         times_s = json.load(f)["results"][0]["times"]
     return [t * 1000.0 for t in times_s]
 
+
 def metric(samples):
     return {"samples": [round(s, 3) for s in samples], "min": round(min(samples), 3)}
+
 
 def sanity_run(cmd, cwd, regex, label, env=None):
     """One untimed correctness run; refuse to benchmark a broken sim."""
@@ -136,6 +145,7 @@ def sanity_run(cmd, cwd, regex, label, env=None):
         fail(f"[{label}] sanity run failed (rc={r.returncode}):\n{r.stdout}\n{r.stderr}")
     if regex and not re.search(regex, r.stdout):
         fail(f"[{label}] sanity run stdout does not match /{regex}/:\n{r.stdout}")
+
 
 def measure_clotho(case, clotho, runs):
     name = case["name"]
@@ -172,6 +182,7 @@ def measure_clotho(case, clotho, runs):
     metrics["compile_ms"] = metric(compile_samples)
     return metrics
 
+
 def run_meta(runs):
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO,
                             capture_output=True, text=True).stdout.strip()
@@ -185,6 +196,7 @@ def run_meta(runs):
         pass
     return {"date": datetime.date.today().isoformat(), "commit": commit,
             "host": platform.node(), "cpu": cpu, "runs": runs}
+
 
 def cmd_run(args, out_path):
     cases = load_cases(args.cases)
@@ -206,6 +218,7 @@ def cmd_run(args, out_path):
         print(f"  {name}: sim {m['sim_ms']['min']} ms | compile {m['compile_ms']['min']} ms"
               f" | wall {m['wall_ms']['min']} ms")
 
+
 def rel_spread(m):
     """Noise of the min estimator: how far the median sits above the min.
 
@@ -213,6 +226,7 @@ def rel_spread(m):
     order of magnitude but leaves median - min untouched).
     """
     return statistics.median(m["samples"]) / m["min"] - 1.0 if m["samples"] else 0.0
+
 
 def cmd_compare(args):
     for p in (args.results, args.baseline):
@@ -268,6 +282,7 @@ def cmd_compare(args):
         sys.exit(1)
     print("\nOK: no significant regressions")
 
+
 def oracle_cmds(tool, files, top, incdirs=()):
     """Return (compile_cmd, sim_cmd) shell strings, run from the case dir.
 
@@ -289,16 +304,19 @@ def oracle_cmds(tool, files, top, incdirs=()):
                 f"obj_dir/V{top}")
     fail(f"unknown oracle tool '{tool}'")
 
+
 def tool_version(tool, env):
     r = subprocess.run(ORACLE_VERSION_CMD[tool], capture_output=True, text=True, env=env)
     lines = (r.stdout or r.stderr).strip().splitlines()
     return lines[0].strip() if lines else "unknown"
+
 
 def load_tools_local():
     if not TOOLS_LOCAL_PATH.is_file():
         return {}
     with open(TOOLS_LOCAL_PATH) as f:
         return json.load(f)
+
 
 def tool_env(tool, tools_local):
     """Environment for a tool's commands, with its local bindir prepended to PATH."""
@@ -309,9 +327,11 @@ def tool_env(tool, tools_local):
     env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
     return env
 
+
 def on_path(bins, env):
     path = env["PATH"] if env else None
     return all(shutil.which(b, path=path) is not None for b in bins)
+
 
 def cmd_oracles(args):
     cases = load_cases(args.cases)
@@ -359,6 +379,7 @@ def cmd_oracles(args):
         f.write("\n")
     print(f"wrote {ORACLES_PATH}")
 
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -390,6 +411,7 @@ def main():
         cmd_compare(args)
     elif args.cmd == "oracles":
         cmd_oracles(args)
+
 
 if __name__ == "__main__":
     main()

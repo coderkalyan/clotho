@@ -240,6 +240,10 @@ TEST_CASE("queue built in a loop") {
     CHECK(run_capture(src) == "size=100 first=0 last=198 sum=9900\n");
 }
 
+// Queue subroutine ABI (LRM 13.5, 7.10): input copy-in (value semantics),
+// output/inout copy-out, and function return. iverilog cannot pass queue
+// arguments. The value-semantics rationale is shared with
+// dynamic arrays.
 TEST_CASE("queue input argument is copy-in (value semantics)") {
     constexpr std::string_view src = R"(
         module m;
@@ -331,6 +335,13 @@ TEST_CASE("queue $size") {
     )";
     CHECK(run_capture(src) == "3\n");
 }
+
+// -- Composition: heap-handle leaves inside aggregates (recursive lifecycle) --
+//
+// Queue / dynamic-array members of unpacked structs and class bodies, and
+// fixed arrays of queues, ride the recursive aggregate storage model: real
+// handle slots, power-on empty, per-leaf deep copy, teardown walks. iverilog
+// has no struct/queue composition support at all.
 
 TEST_CASE("queue struct member: push/size/index and whole-struct deep copy") {
     constexpr std::string_view src = R"(
@@ -468,6 +479,12 @@ TEST_CASE("foreach over a struct-member queue") {
     )";
     CHECK(run_capture(src) == "acc=6\n");
 }
+
+// -- String elements (rt_elem_ops managed lifecycle) --
+//
+// `string q[$]` / `string d[]`: elements are rt_string handles constructed,
+// deep-copied, and destroyed through the per-element descriptor. iverilog has no
+// string-element container support.
 
 TEST_CASE("string queue: push/pop/index/element methods/OOB default") {
     constexpr std::string_view src = R"(
@@ -631,6 +648,10 @@ TEST_CASE("queue slice/concat into a bounded queue drops the tail") {
     CHECK(run_capture(src) == "s=4 1 2 3 4\n");
 }
 
+// %p (LRM 21.2.1.6) renders '{e0, e1, ...} over the runtime element count:
+// integral leaves as minimal decimal (the clause's "as [it] would unformatted",
+// with 21.2.1.3's x/z collapse), reals as %g, strings quoted, empty as '{}.
+// Nested-in-struct reuses the same runtime path.
 TEST_CASE("%p of a queue") {
     constexpr std::string_view src = R"(
         module m;
@@ -883,6 +904,7 @@ TEST_CASE("dynamic array of class handles") {
 }
 
 TEST_CASE("%p of a container of class handles is rejected loudly") {
+    // A handle has no printable value the flat container descriptor can reach.
     expect_fail(R"(
         class Item;
             int v;
@@ -906,6 +928,13 @@ TEST_CASE("an event element is still refused") {
     )",
                 "queue element type is not supported");
 }
+
+// -- Aggregate elements (LRM 7.10 with 7.2) ------------------------------------
+//
+// The element slot holds the recursive storage image, so `q[i]` is a heap-anchored
+// aggregate lvalue: member and element selects descend it with the ordinary
+// aggregate machinery, and a whole element crosses the rt_queue_* ABI by pointer.
+// (iverilog cannot parse a queue of structs.)
 
 TEST_CASE("queue of unpacked structs: element, member, and whole-element access") {
     constexpr std::string_view src = R"(

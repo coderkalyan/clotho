@@ -1,3 +1,6 @@
+// Custom action blocks: an `else $error` on an assertion and a `$display` pass
+// statement on a cover, so the directives report through their own statements
+// rather than through the default report.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

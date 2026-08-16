@@ -13,6 +13,10 @@ using namespace clotho;
 
 namespace {
 
+// JIT-run a module and capture stdout (mirrors string_test.cpp). Expectations
+// below are cross-checked against iverilog where its class support suffices;
+// iverilog 13 rejects handle comparison, nested member paths, and
+// self-references (see docs/design/classes.md §10).
 std::string run_capture(std::string_view source) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
@@ -72,6 +76,10 @@ TEST_CASE("class new, constructor, field read/write") {
     CHECK(run_capture(src) == "5 7\n");
 }
 
+// Reference semantics (LRM 8.6): `h2 = h1` copies the handle, not the object, so a
+// write through one handle is visible through the other. The single most important
+// test distinguishing a class handle from the deep-copy handle types. iverilog
+// cannot compare handles in the same test.
 TEST_CASE("handle assignment shares the object") {
     constexpr std::string_view src = R"(
         module m;
@@ -88,6 +96,7 @@ TEST_CASE("handle assignment shares the object") {
     CHECK(run_capture(src) == "5\n");
 }
 
+// null literal, identity `==` / `!=` (LRM 8.4).
 TEST_CASE("null and handle identity") {
     constexpr std::string_view src = R"(
         module m;
@@ -103,6 +112,9 @@ TEST_CASE("null and handle identity") {
     CHECK(run_capture(src) == "1 1 1 0\n");
 }
 
+// Self-referential property (a handle to the enclosing class) + nested member path
+// (LRM 8.4). Reference semantics make the cycle trivial (a property is a pointer).
+// iverilog rejects both the self-reference and `a.next.val`.
 TEST_CASE("self-referential class and nested member path") {
     constexpr std::string_view src = R"(
         module m;
@@ -120,6 +132,9 @@ TEST_CASE("self-referential class and nested member path") {
     CHECK(run_capture(src) == "99 99 0\n");
 }
 
+// Non-static property default initializers run at construction, in declaration
+// order, before the constructor body (LRM 8.8) — for scalars and strings, and with
+// or without an explicit constructor.
 TEST_CASE("property default initializers") {
     constexpr std::string_view src = R"(
         module m;
@@ -144,6 +159,12 @@ TEST_CASE("property default initializers") {
     CHECK(run_capture(src) == "100 ctr 200\n7 9\n");
 }
 
+// A property declaration initializer may CALL a method of the same class: LRM 8.7
+// runs those initializers as part of construction ("each property defined in the
+// class shall be initialized to its explicit default value"), so `this` is in scope
+// and a bare `f()` is an ordinary method call on the object being constructed.
+// `y = g()` also pins the ordering: g reads `x`, which the preceding initializer
+// already stored, so 3 + 4 rather than 0 + 4.
 TEST_CASE("property initializer calling a method of the same class") {
     constexpr std::string_view src = R"(
         module m;
@@ -280,6 +301,8 @@ TEST_CASE("task method and handle as a function argument") {
     CHECK(run_capture(src) == "42\n");
 }
 
+// A 4-state property powers on X (LRM 8.8 default init); a 2-state property powers
+// on 0.
 TEST_CASE("property power-on defaults by domain") {
     constexpr std::string_view src = R"(
         module m;
@@ -296,6 +319,13 @@ TEST_CASE("property power-on defaults by domain") {
     )";
     CHECK(run_capture(src) == "xx 0\n");
 }
+
+// -- Single inheritance (LRM 8.13), Phase 2 --
+// Prefix layout: base properties are laid first, so an inherited property keeps
+// its base-relative field index and an upcast is the same pointer. Non-virtual
+// methods bind statically. super.new / super.method run against the same object.
+// iverilog's class support cannot resolve inherited methods from a derived
+// method body.
 
 // Inherited field + own field, an inherited method run on a derived object, and
 // a non-virtual override selected by the STATIC handle type (the reference test
@@ -361,6 +391,10 @@ TEST_CASE("class inheritance: multi-level chain, implicit ctor, chained defaults
     CHECK(run_capture(src) == "12 22 99 133 12\n");
 }
 
+// `extends Base(args)` clause form (LRM 8.15): the base constructor is invoked
+// from the extends clause (class scope, so a constant / param, not a ctor
+// formal), both when the derived class has its own constructor and when it does
+// not.
 TEST_CASE("class inheritance: extends-args base constructor") {
     constexpr std::string_view src = R"(
         module m;
@@ -405,6 +439,10 @@ TEST_CASE("class inheritance: upcast shares the object") {
     CHECK(run_capture(src) == "10 10\n");
 }
 
+// -- Static members (LRM 8.9), Phase 2 --
+// A static property is one slot shared across all instances (and inherited by
+// derived classes), initialized once at time zero, reachable as `obj.p`, `C::p`,
+// or a bare `p` in a static method.
 TEST_CASE("class static property: shared slot, inherited, all access forms") {
     constexpr std::string_view src = R"(
         module m;
@@ -451,6 +489,12 @@ TEST_CASE("class static property: no instance, const, local") {
     CHECK(run_capture(src) == "43 99 7\n");
 }
 
+// A static property's initializer runs once in PreInit (LRM 8.9: "fileID shall be
+// created and initialized once") whatever its type: an unpacked struct and an
+// unpacked array take the same element-wise aggregate store a module-level
+// declaration initializer does, a queue / dynamic array build their handles, and a
+// string assigns whole. Reading the elements back proves each handle was allocated
+// to the right length, not bit-blasted.
 TEST_CASE("class static property: aggregate and container initializers") {
     constexpr std::string_view src = R"(
         module m;
@@ -474,6 +518,13 @@ TEST_CASE("class static property: aggregate and container initializers") {
     CHECK(run_capture(src) == "1 2 3 4 hi\n11 22 5 6 7 8 9\n");
 }
 
+// -- Virtual methods / dynamic dispatch (LRM 8.20), Phase 3 --
+// A virtual method called through a base handle dispatches on the object's
+// concrete type, not the handle's static type. An override reuses its base
+// method's vtable slot; a non-overriding derived class inherits the base body.
+// A non-virtual method (describe) that internally calls a virtual one dispatches
+// dynamically too. `super.method()` binds STATICALLY to the base version.
+// iverilog cannot resolve these.
 TEST_CASE("class virtual dispatch: override, inherit, internal call, super") {
     constexpr std::string_view src = R"(
         module m;
@@ -531,6 +582,9 @@ TEST_CASE("class virtual dispatch: derived-introduced virtual, multi-slot") {
     CHECK(run_capture(src) == "2 20\n");
 }
 
+// A virtual method returning a non-scalar (string / unpacked struct / container)
+// dispatches like any virtual call; the call-temp scanners (build_str_temps,
+// build_dynarr_temps, agg-return) recognize CallVirtual.
 TEST_CASE("class virtual dispatch: string return") {
     constexpr std::string_view src = R"(
         module m;
@@ -571,6 +625,9 @@ TEST_CASE("class virtual dispatch: unpacked struct return") {
     CHECK(run_capture(src) == "0 0\n10 20\n");
 }
 
+// A virtual TASK (LRM 8.20) dispatches on the concrete type through a base handle
+// over the task (coroutine) ABI — including a time-consuming task (#delay) and a
+// non-virtual task that calls a virtual one internally.
 TEST_CASE("class virtual task: dynamic dispatch, time-consuming") {
     constexpr std::string_view src = R"(
         module m;
@@ -595,6 +652,11 @@ TEST_CASE("class virtual task: dynamic dispatch, time-consuming") {
     CHECK(run_capture(src) == "base run\nbase step 5\nder run\nder step 15\n");
 }
 
+// A pure virtual TASK (LRM 8.21 + 13.3) dispatches on the concrete type over the
+// task (coroutine) ABI: the abstract-class slot's never-called stub carries the
+// `is_task` flag, so the TaskCallVirtual signature is the one every override was
+// built with. Covers an argument, a time-consuming override, and a concrete base
+// task that enables the pure one internally.
 TEST_CASE("pure virtual task: dynamic dispatch, time-consuming") {
     constexpr std::string_view src = R"(
         module m;
@@ -622,6 +684,10 @@ TEST_CASE("pure virtual task: dynamic dispatch, time-consuming") {
     CHECK(run_capture(src) == "der t 4 4\ntwice t 4 12\nder t 3 15\ngo 15\n");
 }
 
+// -- Abstract classes (`virtual class`, LRM 8.21) --
+// An abstract class cannot be instantiated but is a valid handle type and base;
+// its concrete virtual methods dispatch dynamically on the derived object. A
+// derived class that omits an override inherits the abstract base's body.
 TEST_CASE("abstract class: concrete virtual dispatch through the base") {
     constexpr std::string_view src = R"(
         module m;
@@ -654,6 +720,12 @@ TEST_CASE("abstract class: concrete virtual dispatch through the base") {
     CHECK(run_capture(src) == "25 1 26\n12 0 12\n");
 }
 
+// A pure virtual method (LRM 8.21) — a MethodPrototypeSymbol with no body, whose
+// concrete overrides slang does not link via getOverride() — dispatches on the
+// object's concrete type through an abstract base handle, both with and without
+// arguments, and via a non-virtual method that calls it internally. The
+// name-keyed vtable slot and a prototype-built signature stub (never executed)
+// make this work.
 TEST_CASE("pure virtual: dispatch through the abstract base, no args") {
     constexpr std::string_view src = R"(
         module m;
@@ -708,6 +780,9 @@ TEST_CASE("pure virtual: dispatch with arguments") {
     CHECK(run_capture(src) == "7 10\n12 25\n");
 }
 
+// A pure virtual carried through two abstract levels, overridden in the concrete
+// leaf WITHOUT the `virtual` keyword (an implicit override slang does not link) —
+// the name-keyed slot still matches it.
 TEST_CASE("pure virtual: multi-level abstract, implicit override") {
     constexpr std::string_view src = R"(
         module m;
@@ -726,6 +801,11 @@ TEST_CASE("pure virtual: multi-level abstract, implicit override") {
     CHECK(run_capture(src) == "7\n7 100\n");
 }
 
+// A pure virtual returning a non-scalar: the never-called stub reuses
+// build_function's return shape, so its signature is the one the override was built
+// with. A string handle returns as a loaded value (and feeds a concrete base method
+// that concatenates it); an unpacked struct returns through the trailing out-param
+// the caller owns.
 TEST_CASE("pure virtual: string return") {
     constexpr std::string_view src = R"(
         module m;
@@ -773,6 +853,10 @@ TEST_CASE("pure virtual: unpacked struct return") {
     CHECK(run_capture(src) == "0 0\n10 20\n");
 }
 
+// A container result (queue / dynamic array / assoc) takes the third return shape:
+// the stub Rets its frame handle lvalue, like build_function, so the backend
+// deep-copies it out through the trailing out-param. Dispatched directly and from a
+// concrete base method that consumes the pure result.
 TEST_CASE("pure virtual: queue return") {
     constexpr std::string_view src = R"(
         module m;
@@ -818,6 +902,11 @@ TEST_CASE("pure virtual returning a string-containing aggregate fails loudly") {
     CHECK(d.find("by-value return of a string-containing aggregate is not supported") != std::string::npos);
 }
 
+// -- Parameterized classes (LRM 8.25) --
+// slang monomorphizes each `C#(args)` into a distinct, fully-substituted
+// ClassType, so each specialization lowers as an independent nominal class. Type
+// and value parameters, param-sized members, and methods over the type parameter
+// all fall out.
 TEST_CASE("parameterized class: type + value params, param-sized array") {
     constexpr std::string_view src = R"(
         module m;
@@ -891,6 +980,15 @@ TEST_CASE("parameterized class: value parameter access") {
     )";
     CHECK(run_capture(src) == "34 16\n");
 }
+
+// -- Forward typedef classes (`typedef class C;`, LRM 6.18 / 8.27) --
+// Class resolution itself needed no work: lower_class_type's intern-first
+// cache keys on the ClassType symbol pointer, which slang resolves a forward
+// declaration and its later full definition to identically, so mutual
+// cross-class handle references fall out for free. lower_members did need a
+// fix -- it loud-failed on the ForwardingTypedef symbol (the declaration
+// itself) wherever it appears outside the top compilation-unit scope; see
+// docs/TODO.md.
 
 // Two classes forward-referencing each other's handle type: A's field type B
 // is declared before B exists, and B's method takes an A argument before A's
@@ -1146,6 +1244,10 @@ TEST_CASE("built-in std classes are refused in the frontend") {
 
 // -- shallow copy, `dst = new src` (LRM 8.12) ---------------------------------
 
+// LRM 8.12's own worked example, values included: `b2.i = 10` changes only the
+// copy, `b2.a.j = 50` changes the object BOTH handles point at ("objects, however,
+// are not copied, only their handles"). iverilog 13 rejects the nested member
+// path `b1.a.j`.
 TEST_CASE("class shallow copy: values are independent, handles are shared") {
     constexpr std::string_view src = R"(
         module m;
@@ -1167,6 +1269,10 @@ TEST_CASE("class shallow copy: values are independent, handles are shared") {
     CHECK(run_capture(src) == "1 50 10 1\n");
 }
 
+// LRM 8.12 step 1: the allocation "shall not call the object's constructor or
+// execute any variable declaration initialization assignments". So the source's
+// current value survives into the copy instead of being reset to the initializer,
+// and the constructor runs once for the whole test.
 TEST_CASE("class shallow copy: no constructor, no declaration initializers") {
     constexpr std::string_view src = R"(
         module m;
@@ -1186,6 +1292,10 @@ TEST_CASE("class shallow copy: no constructor, no declaration initializers") {
     CHECK(run_capture(src) == "ctor\n99\n");
 }
 
+// A property that is a value type owning a heap buffer copies by VALUE (LRM 8.12
+// "all of the variables are copied"), so writing through the copy cannot reach the
+// source's buffer. Covers all four: string, queue, dynamic array, associative
+// array.
 TEST_CASE("class shallow copy: string, queue, dynamic and associative members copy by value") {
     constexpr std::string_view src = R"(
         module m;
@@ -1216,6 +1326,12 @@ TEST_CASE("class shallow copy: string, queue, dynamic and associative members co
     CHECK(run_capture(src) == "abc 1 3 4\nxyz 2 30 40\n");
 }
 
+// The object allocated is of the SOURCE's class, not of the expression's static
+// type: copying a Derived through a Base-typed handle must yield a Derived, which
+// is observable through a virtual call on the copy. Clotho dispatches the copy
+// itself through the source's vtable to that class's synthesized copy thunk
+// (compute_vtable's kCopySlot), which is what makes the allocation the right size.
+// iverilog 13 ASSERTS on this case (vvp_cobject.cc:83 `defn_ == that->defn_`).
 TEST_CASE("class shallow copy: through a base handle copies the derived object") {
     constexpr std::string_view src = R"(
         module m;
@@ -1244,6 +1360,9 @@ TEST_CASE("class shallow copy: through a base handle copies the derived object")
     CHECK(run_capture(src) == "Derived 11\n11 111\n");
 }
 
+// The static type may be an abstract class (LRM 8.21): nothing instantiates it, the
+// dispatch still lands on the concrete class two levels down, and inherited
+// properties come across.
 TEST_CASE("class shallow copy: through an abstract handle reaches the concrete class") {
     constexpr std::string_view src = R"(
         module m;
@@ -1273,6 +1392,9 @@ TEST_CASE("class shallow copy: through an abstract handle reaches the concrete c
     CHECK(run_capture(src) == "30 11\n");
 }
 
+// Copying `this` from inside a method, an unpacked struct and a fixed unpacked
+// array property copying element-wise, and a self-referential handle property
+// staying a handle.
 TEST_CASE("class shallow copy: `new this` in a method, aggregate members, self-reference") {
     constexpr std::string_view src = R"(
         module m;
@@ -1302,6 +1424,13 @@ TEST_CASE("class shallow copy: `new this` in a method, aggregate members, self-r
     CHECK(run_capture(src) == "1 2 5 6\n100 2 500 1\n");
 }
 
+// The declaration-initializer spelling of the same expression (the LRM's own
+// `B b2 = new b1;`), which reaches lower_expr through lower_var_decl rather than
+// through an assignment. Declared `automatic` deliberately: a block-scope
+// declaration in a module defaults to STATIC lifetime, whose initializer runs
+// before time 0 (LRM 6.21) -- so the un-annotated spelling copies a still-null
+// handle, which is a separate question from this feature. With `automatic` the
+// copy happens where it is written, which is what the line below pins.
 TEST_CASE("class shallow copy: as a declaration initializer") {
     constexpr std::string_view src = R"(
         module m;
@@ -1321,6 +1450,11 @@ TEST_CASE("class shallow copy: as a declaration initializer") {
     CHECK(run_capture(src) == "4 5\n");
 }
 
+// `new null_handle` has no object to copy. Both lowerings reach the same guard:
+// the non-polymorphic one dereferences the source to read its properties, the
+// polymorphic one dereferences it to load the vtable it dispatches through. Out of
+// process because the fatal exits. (iverilog 13 dies here without a diagnostic
+// naming the source line.)
 TEST_CASE("class shallow copy: a null source is a located fatal") {
     constexpr std::string_view plain = "module m;\n"
                                        "    class C;\n"

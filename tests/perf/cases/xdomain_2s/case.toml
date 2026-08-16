@@ -19,4 +19,3 @@ note = "clotho-internal ceiling reference; cross-simulator comparison lives on t
 [oracles.verilator]
 enabled = false
 note = "clotho-internal ceiling reference; cross-simulator comparison lives on the 4-state xdomain case"
-

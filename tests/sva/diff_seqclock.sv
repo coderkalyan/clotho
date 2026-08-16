@@ -1,3 +1,59 @@
+// The clocking event is declared INSIDE the named sequence or property rather
+// than on the assertion (LRM 16.13.1, clock flow), so nothing at the top of
+// `assert property (...)` says what clocks it. Three shapes:
+//
+//   ap  a named sequence carrying its own clock, used bare
+//   bp  the same sequence as the antecedent of an implication. A clock does NOT
+//       flow from an antecedent into a consequent -- 16.13.1 hands the
+//       consequent the clock from OUTSIDE the operator, and there is none here
+//       -- so the consequent spells the same event again. Two clocking events,
+//       written twice, one clock: they are compared for equivalence and not for
+//       identity, because slang expands each use into its own bound tree.
+//   cp  a named property carrying its own clock, wrapped around an implication,
+//       so the event is stepped over at the property layer, not the sequence one
+//
+// The clock is deliberately a NEGEDGE, and $display runs on BOTH edges. A
+// resolver that found the declaration's event but dropped its edge would report
+// half a period away, and with only one $display per period those reports would
+// be attributed to the same cycle as the correct ones and read as agreement.
+// Marking both edges makes a wrong edge land on its own timestamp.
+//
+// Sampled values, one row per negedge (cycle N is at t = 10 + 10N):
+//
+//   cyc   t   a b c d
+//    0   10   0 0 0 0
+//    1   20   1 0 0 0
+//    2   30   0 1 0 0
+//    3   40   0 0 1 0
+//    4   50   1 0 0 1
+//    5   60   0 1 0 0
+//    6   70   0 0 0 0
+//    7   80   0 0 1 0
+//    8   90   0 0 0 0
+//    9  100   1 1 0 0
+//   10  110   1 1 0 0   $finish
+//
+// Derived from that:
+//
+//   ap  an attempt starts every cycle. It fails in cycle N when a is low there,
+//       and in cycle N+1 when a was high and b is low. a is low in cycles
+//       0,2,3,5,6,7,8 -> reports at 10, 30, 40, 60, 70, 80, 90. The attempts
+//       from cycles 1, 4 and 9 all find their b and pass. The attempt from
+//       cycle 10 is still open when the trace ends and the property is weak, so
+//       it does not report.
+//   bp  the antecedent matches at cycles 2, 5 and 10. c holds at cycle 3 (pass),
+//       is low at cycle 6 (report at 70), and cycle 11 never happens (weak, no
+//       report).
+//   cp  c holds at cycles 3 and 7. d holds at cycle 4 (pass) and is low at
+//       cycle 8 (report at 90).
+//
+//   expected: FAIL 10 30 40 60 70(ap) 70(bp) 80 90(ap) 90(cp) -- nine reports,
+//   ap before bp before cp within a time step, which is source order.
+//
+// Every assertion passes at least once and reports at least once, so a monitor
+// that never fires and one that always fires are both distinguishable from a
+// correct one. The trace is driven with nonblocking assignments so every
+// sampled value is unambiguous.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

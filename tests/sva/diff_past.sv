@@ -1,3 +1,18 @@
+// $past and $sampled (LRM 16.9.3). The trace drives `v` and `w` with nonblocking
+// assignments so every sampled value is unambiguous, and $display marks each
+// cycle so a report can be attributed to one.
+//
+// `noise` is as much the point of this fixture as `v` is. It toggles on a period
+// coprime with the clock, so most time steps carry no clocking edge at all. LRM
+// 16.9.3 advances history per CLOCK TICK -- "the most recent strictly prior time
+// step in which the clocking event occurred" -- so those extra steps must leave
+// $past alone. A history ring shifted by the per-time-step sampling process
+// rather than by the monitor would skew several ticks per cycle here and move
+// every report below.
+//
+// `v` is 4-state and `w` is 2-state so that both halves of LRM 16.5.1's default
+// sampled value are exercised: before the first tick $past(v) is X, which makes
+// `!=` unknown and therefore false, while $past(w) is 0.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;

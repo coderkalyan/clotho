@@ -1,3 +1,17 @@
+// `and` and `intersect` over one pair of operands, side by side.
+// The trace is driven with nonblocking assignments so every sampled value is
+// unambiguous, and $display marks each cycle so a report can be attributed.
+//
+// Why this fixture exists: `and` needed a tag of its own precisely because it
+// is NOT an intersection. Both operators start their operands together, but an
+// intersection also makes them END together, while `and` waits for the later
+// end. This runs ONE pair of operands, whose lengths agree on one attempt and
+// not on the other, under both operators at once.
+//
+// The operands are `a ##[1:2] b` and `c ##1 d`, so the left one spans two or
+// three cycles depending on when `b` lands and the right one always spans two.
+// A statically impossible intersection would not do: slang folds one away with
+// -Wseq-no-match before clotho ever sees it.
 module t;
   bit clk = 0;
   always #5 clk = ~clk;
