@@ -1,0 +1,74 @@
+# clotho
+
+A SystemVerilog simulator that JIT-compiles the design to native code.
+
+clotho reads SystemVerilog, elaborates it with [slang](https://sv-lang.com/),
+lowers it through its own IR to LLVM IR, compiles that with the LLVM ORC JIT,
+and runs the result against an event-driven scheduler. There is no interpreter
+and no generated C++ to build: `clotho run design.sv` goes from source to a
+running simulation in one process.
+
+Targeting IEEE 1800-2023 (the LRM) in full. Not there yet — `docs/TODO.md`
+tracks coverage item by item, organised by milestone. Anything clotho does not
+implement fails loudly; it never silently accepts a construct it cannot
+correctly simulate.
+
+## Status
+
+Working today: Verilog-2005 RTL, the SystemVerilog data model (packed and
+unpacked aggregates, dynamic arrays, queues, associative arrays, strings,
+classes), processes and fine-grained timing control, interfaces, packages,
+generate, gates and net resolution, immediate and concurrent assertions,
+DPI-C import and export, VCD output, and language-server and debug-adapter
+front ends. See `docs/TODO.md` for the precise state of each construct and
+`docs/design/` for how the interesting parts work.
+
+## Building
+
+Requirements: a C++23 compiler (clang is what we test), CMake 3.20+, Ninja,
+LLVM 22 development libraries, and Python 3 (slang's build needs an
+interpreter). slang, doctest, unordered\_dense and glaze are fetched by CMake
+at configure time.
+
+```sh
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target clotho_cli
+./build/clotho run examples/initial.v
+```
+
+The default build type is Debug, which builds the frontend unoptimized with
+every assertion live; use `RelWithDebInfo` or `Release` for anything you intend
+to measure. CI covers Linux x64/arm64, macOS arm64/x64 and Windows x64 under
+MSYS2 CLANG64; Windows arm64 is advisory.
+
+## Using it
+
+```
+clotho build   compile the design and write the generated code, without running it
+clotho run     compile the design and simulate it
+clotho lint    check the design and report problems, without compiling or running
+clotho lsp     language server over stdio
+clotho dap     debug adapter over stdio
+```
+
+## Testing
+
+```sh
+cmake --build build --target clotho_test
+./build/clotho_test --duration=true --order-by=file
+```
+
+The suite is doctest-based and lives in `tests/`. `tests/perf/` is a benchmark
+harness (`perf.py`) that measures compile and simulation time per case, gates
+regressions against a checked-in baseline, and can measure the same cases under
+iverilog and Verilator for context.
+
+## Contributing
+
+Issues and pull requests are welcome. Two things worth knowing before you
+start: the LRM is the source of truth for every semantic question, and
+TigerStyle describes the style the codebase holds itself to.
+
+## License
+
+GPL-3.0-only. See `LICENSE.txt`.
