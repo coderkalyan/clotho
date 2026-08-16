@@ -36,6 +36,12 @@ cmake --build build --target clotho_cli
 ./build/clotho run examples/initial.v
 ```
 
+Concurrent assertions are compiled by [libsva](https://github.com/coderkalyan/libsva),
+a separate Zig library, so a full build also needs Zig 0.16+ and a libsva
+checkout beside this one (or `-DCLOTHO_LIBSVA_DIR=<path>`). Build without it
+with `-DCLOTHO_SVA=OFF`; everything except `assert property` and its relatives
+still works.
+
 The default build type is Debug, which builds the frontend unoptimized with
 every assertion live; use `RelWithDebInfo` or `Release` for anything you intend
 to measure. CI covers Linux x64/arm64, macOS arm64/x64 and Windows x64 under
