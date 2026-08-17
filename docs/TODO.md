@@ -1311,6 +1311,16 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   never materialized). Covered: a pure virtual task with an argument,
   time-consuming and internally enabled; string, unpacked-struct and queue
   returns.
+  An **`extern virtual`** method (LRM 8.24) dispatches too: the class member is the
+  prototype and the body sits outside the class, so it is not a member
+  `SubroutineSymbol` and a table filled only from members left the slot empty —
+  reported as an internal error, since the un-overridden slot then found no pure
+  prototype to stub. `compute_vtable` now also walks each class's
+  `MethodPrototypeSymbol`s and fills the slot from `getSubroutine()`, the
+  out-of-block implementation; a prototype with none is pure and still gets the
+  stub. Covered: an abstract root whose extern body is the slot's implementation, a
+  derived class overriding one extern with another and inheriting the other, a leaf
+  overriding an inherited extern with an inline body, functions and tasks.
   **Deferred, guarded loud:** a pure virtual returning a by-value aggregate that owns
   heap (a string member) — the same per-leaf-deep-copy gap `build_function` guards for
   a concrete body, which is why this bullet stays `[~]`.
@@ -1327,8 +1337,10 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   specialization identity inherits the existing per-Lowerer class-cache limitation
   below.)
 - [ ] **Interface classes** — `interface class`, `implements`, multiple.
-- [ ] **Class scope & nesting** — nested classes, out-of-block method bodies, `::`
-  on parameterized specializations.
+- [~] **Class scope & nesting** — out-of-block method bodies (`function C::f();`,
+  LRM 8.24) work, in a module or a package scope, for functions, tasks, `static`
+  methods, `new`, and `virtual` (see Polymorphism above). Remaining: nested classes
+  and `::` on parameterized specializations.
 - [~] **`$cast`** (LRM 6.24.2 / 8.16) — Tier 1 (numeric + enum destinations) done:
   a numeric `$cast` converts and always succeeds (returns 1); an enum `$cast`
   succeeds (assigns + returns 1) only if the source is a legal member value

@@ -1494,3 +1494,47 @@ TEST_CASE("class shallow copy: a null source is a located fatal") {
     CHECK(test::design_exit_code(vrun) != 0);
     CHECK(vrun.err.find("fatal: dereference of a null class handle") != std::string::npos);
 }
+
+// An `extern virtual` method (LRM 8.24) declares the prototype in the class and
+// the body outside it, so the body is not a member subroutine of the class and a
+// vtable built only from members leaves the slot empty. Every level here is
+// covered: a root abstract class whose extern body IS the slot's implementation, a
+// derived class overriding one extern with another extern while inheriting the
+// other, and a leaf overriding an inherited extern with an inline body. Tasks as
+// well as functions, since the two take different ABIs.
+TEST_CASE("virtual dispatch reaches an out-of-block `extern virtual` body") {
+    constexpr std::string_view src = R"(
+        module m;
+            virtual class Abs;
+                extern virtual function int tag();
+                extern virtual task show();
+                pure virtual function int pv();
+            endclass
+            function int Abs::tag(); return 1; endfunction
+            task Abs::show(); #1 $display("abs show"); endtask
+
+            class Mid extends Abs;
+                extern virtual function int tag();
+                virtual function int pv(); return 7; endfunction
+            endclass
+            function int Mid::tag(); return 2; endfunction
+
+            class Leaf extends Mid;
+                virtual task show(); #1 $display("leaf show"); endtask
+            endclass
+
+            initial begin
+                Abs  a;
+                Mid  mid = new;
+                Leaf lf  = new;
+                a = mid;
+                $display("%0d %0d", a.tag(), a.pv());
+                a.show();
+                a = lf;
+                $display("%0d %0d", a.tag(), a.pv());
+                a.show();
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 7\nabs show\n2 7\nleaf show\n");
+}

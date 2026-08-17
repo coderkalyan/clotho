@@ -2317,6 +2317,24 @@ private:
                 table[it->second]  = function_id(m);
                 filled[it->second] = true;
             }
+            // An `extern virtual` method (LRM 8.24): the class member is the prototype
+            // and the body is declared outside the class, so it is not a member
+            // SubroutineSymbol and the loop above never sees it. The out-of-block
+            // implementation is the body of that slot; a prototype with none is pure
+            // and gets a stub below. A class cannot declare both an inline body and a
+            // prototype for one name, so this never contends with the loop above.
+            for (const auto& p : k->membersOfType<slang::ast::MethodPrototypeSymbol>()) {
+                const auto it = slots.find(p.name);
+                if (it == slots.end() || filled[it->second]) {
+                    continue;
+                }
+                const slang::ast::SubroutineSymbol* impl = p.getSubroutine();
+                if (impl == nullptr) {
+                    continue;
+                }
+                table[it->second]  = function_id(*impl);
+                filled[it->second] = true;
+            }
         }
         const uint32_t copy_slot = slots.at(kCopySlot);
         table[copy_slot]         = copy_thunk_id(clt, class_ref);
