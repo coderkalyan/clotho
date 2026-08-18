@@ -440,34 +440,86 @@ TEST_CASE("virtual interface: a null handle dereference is a located fatal") {
     CHECK(run.err.find("source:9:9") != std::string::npos);
 }
 
-// An event control through a handle needs the waiter to park on the instance the
-// handle names, which the per-signal wait buckets cannot express. Refused loudly
-// rather than synthesized into a continuous net, which would both dereference the
-// handle before it is assigned and freeze onto one instance.
-TEST_CASE("virtual interface: an event control through a handle is refused") {
-    const std::string diag = reject(R"(
-        interface ibus; logic clk; endinterface
+// An event control through a handle parks a frame-resident node on the member's
+// waiter list in the instance the handle names -- the intrusive list the event
+// objects use, so there is no capacity to size and no bucket to pick. Retargeting
+// the handle between waits moves which instance is watched.
+TEST_CASE("virtual interface: an event control through a handle") {
+    const std::string out = run_capture(R"(
+        interface ibus;
+            logic clk;
+            logic [7:0] d;
+        endinterface
         module top;
-            ibus bus();
+            ibus a(), b();
             virtual ibus vif;
-            initial begin vif = bus; @(posedge vif.clk); end
+            initial begin
+                a.clk = 0; b.clk = 0;
+                forever #1 begin a.clk = ~a.clk; b.clk = ~b.clk; end
+            end
+            initial begin
+                vif = a;
+                @(posedge vif.clk) $display("pos %0t", $time);
+                vif = b;
+                @(negedge vif.clk) $display("neg %0t", $time);
+                @(vif.d)           $display("d %h %0t", vif.d, $time);
+                $finish;
+            end
+            initial #6 b.d = 8'h09;
         endmodule
     )");
-    CHECK(diag.find("event control through a virtual interface") != std::string::npos);
+    CHECK(out == "pos 1\nneg 2\nd 09 6\n");
 }
 
-// Same gap, level form: the reads collector would otherwise record the HANDLE
-// variable as the sensitivity and the wait would never wake.
-TEST_CASE("virtual interface: a level wait on a member is refused") {
-    const std::string diag = reject(R"(
+// The level form: the reads collector sees only the HANDLE variable, so the
+// members are gathered separately and each parks on its own instance.
+TEST_CASE("virtual interface: a level wait on a member") {
+    const std::string out = run_capture(R"(
         interface ibus; logic [7:0] d; endinterface
         module top;
             ibus bus();
             virtual ibus vif;
-            initial begin vif = bus; wait(vif.d == 8'h5); end
+            initial begin
+                vif = bus;
+                wait(vif.d == 8'h5);
+                $display("woken %0t", $time);
+            end
+            initial #3 bus.d = 8'h5;
         endmodule
     )");
-    CHECK(diag.find("`wait` on a virtual interface member") != std::string::npos);
+    CHECK(out == "woken 3\n");
+}
+
+// A wait on an EXPRESSION over members still has no answer: the synthesized net
+// the general path builds is driven by a continuous process, which would read the
+// handle before it is assigned and then freeze onto one instance.
+TEST_CASE("virtual interface: an event control on a member expression is refused") {
+    const std::string diag = reject(R"(
+        interface ibus; logic a, b; endinterface
+        module top;
+            ibus bus();
+            virtual ibus vif;
+            initial begin vif = bus; @(vif.a & vif.b); end
+        endmodule
+    )");
+    CHECK(diag.find("event control on an expression through a virtual interface") != std::string::npos);
+}
+
+// An interface subroutine is lowered once per instance body, against that
+// instance's own signals, so a handle has no single callee to dispatch to.
+TEST_CASE("virtual interface: a subroutine call through a handle is refused") {
+    const std::string diag = reject(R"(
+        interface ibus;
+            logic [7:0] d;
+            function automatic int getd(); return d; endfunction
+        endinterface
+        module top;
+            ibus bus();
+            virtual ibus vif;
+            initial begin vif = bus; $display("%0d", vif.getd()); end
+        endmodule
+    )");
+    CHECK(diag.find("subroutine call through a virtual interface") != std::string::npos);
 }
 
 // A clockvar read resolves, but a synchronous drive is performed by the block's

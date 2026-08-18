@@ -979,6 +979,11 @@ struct WaitEdge {
     // site (which uses designated initializers naming only signal and edge) keeps
     // meaning "no handle" instead of silently naming instruction 0.
     Index handle = static_cast<Index>(~uint32_t{ 0 });
+    // For a wait on a member reached through a VIRTUAL INTERFACE (LRM 25.9): the
+    // SSA value of the handle. `signal` is then a representative of the member and
+    // this names the instance whose waiter list the park goes onto. Same sentinel
+    // and same defaulting rule as `handle`, with which it is mutually exclusive.
+    Index inst = static_cast<Index>(~uint32_t{ 0 });
 };
 
 // `WaitEdge::handle` is absent: this wait names its signal directly.

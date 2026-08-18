@@ -6958,6 +6958,26 @@ private:
                 if (ev.iffCondition != nullptr) {
                     iff = ev.iffCondition;
                 }
+                if (wait_builder_ != nullptr && ev.expr.kind == ExpressionKind::MemberAccess &&
+                    ev.expr.as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface()) {
+                    // `@(edge vif.sig)` (LRM 25.9): park on the member of whichever
+                    // instance the handle names right now. The handle is evaluated
+                    // here, immediately before the wait, for the same reason an
+                    // event array element's is.
+                    const auto&      ma  = ev.expr.as<MemberAccessExpression>();
+                    const ir::Signal rep = vif_member_signal(ma.member, "'" + std::string(ma.member.name) + "'");
+                    const ir::Index  inst = lower_expr(ma.value(), *wait_builder_);
+                    if (ev.edge == slang::ast::EdgeKind::BothEdges) {
+                        out.push_back(
+                          ir::WaitEvent{ .signal = rep, .edge = ir::Edge::Positive, .inst = inst });
+                        out.push_back(
+                          ir::WaitEvent{ .signal = rep, .edge = ir::Edge::Negative, .inst = inst });
+                    } else {
+                        out.push_back(
+                          ir::WaitEvent{ .signal = rep, .edge = to_edge(ev.edge), .inst = inst });
+                    }
+                    break;
+                }
                 if (wait_builder_ != nullptr && event_wait_needs_handle(ev.expr)) {
                     // An event with no signal of its own: park on the handle the
                     // expression evaluates to, right here, so `@(ev[i])` uses the
@@ -7096,14 +7116,39 @@ private:
         return scan.found;
     }
 
+    // Every `vif.member` read in an expression, in source order and deduplicated by
+    // member symbol: one wait entry per distinct member is enough, and a repeated
+    // read of the same one would otherwise park twice on the same list.
+    static std::vector<const MemberAccessExpression*> vif_member_reads(const Expression& e) {
+        struct Scan : slang::ast::ASTVisitor<Scan, slang::ast::VisitFlags::AllGood> {
+            std::vector<const MemberAccessExpression*> hits;
+            void handle(const MemberAccessExpression& ma) {
+                if (ma.value().type->getCanonicalType().isVirtualInterface() &&
+                    std::ranges::none_of(hits, [&](const MemberAccessExpression* h) {
+                        return &h->member == &ma.member;
+                    })) {
+                    hits.push_back(&ma);
+                }
+                visitDefault(ma);
+            }
+        };
+        Scan scan;
+        e.visit(scan);
+        return std::move(scan.hits);
+    }
+
     ir::Signal event_signal(const Expression& e) {
         if (reads_vif(e)) {
-            // TODO: `@(edge vif.sig)` / `@(vif.cb)` (LRM 25.9) — the waiter has to
-            // park on the instance the handle names, which the per-signal wait
-            // buckets cannot express. Refused rather than synthesized into a
-            // continuous net, which would both dereference the handle before it is
-            // assigned and track whichever instance was bound at time zero.
-            fail("an event control through a virtual interface is not supported");
+            // A direct `@(edge vif.sig)` never reaches here: collect_wait_events
+            // parks it on the member's waiter list in the instance the handle
+            // names. What is left is a COMPOSITE expression over one (`@(vif.a &
+            // vif.b)`), which the temp-net path would answer by dereferencing the
+            // handle from a continuous process -- before it is assigned, and then
+            // frozen onto whichever instance was bound at time zero.
+            //
+            // TODO: an event control on an expression over virtual interface
+            // members (LRM 25.9) — needs the synthesized net to re-read the handle.
+            fail("an event control on an expression through a virtual interface is not supported");
         }
         if (is_string_expr(e)) {
             // TODO: waiting on a string change (needs string-aware wait-queue
@@ -7212,7 +7257,7 @@ private:
         edges.reserve(events.size());
         for (const ir::WaitEvent& e : events) {
             edges.push_back(
-              ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge), e.handle });
+              ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge), e.handle, e.inst });
         }
         if (iff != nullptr) {
             emit_guarded_wait(edges, *iff, b, l);
@@ -13533,24 +13578,17 @@ private:
     // all match.
     void lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
         const ir::SourceLoc l = loc(w);
-        if (reads_vif(w.cond)) {
-            // TODO: `wait(vif.x)` (LRM 25.9) — same gap as an event control through
-            // a handle. collect_expr_reads would otherwise record the HANDLE
-            // variable as the sensitivity (the member access reads it) and the wait
-            // would never be woken by a change to the member itself.
-            fail("a `wait` on a virtual interface member is not supported");
-        }
-
         // The wait sensitivity: every signal the condition reads, each as an
         // any-change (level) event. Fails loudly on a string operand (wait
         // queues are not string-aware — see collect_expr_reads).
         std::vector<ir::WaitEvent> reads;
         collect_expr_reads(w.cond, reads);
-        std::vector<ir::WaitEdge> edges;
-        edges.reserve(reads.size());
-        for (const ir::WaitEvent& e : reads) {
-            edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
-        }
+        // A member read through a virtual interface is not one of those signals:
+        // the collector sees the handle variable, not the member. Gather the member
+        // accesses separately and park on each one's instance (LRM 25.9). The
+        // handles are evaluated inside the loop body, so a retargeted handle is
+        // re-read on every pass, and so that the values dominate the wait.
+        const std::vector<const MemberAccessExpression*> vif_reads = vif_member_reads(w.cond);
 
         // forever { if (cond) break; @(reads); }
         b.open_region();
@@ -13566,6 +13604,19 @@ private:
             b.open_region();
             const ir::ExtraSlice else_r = b.close_region(); // empty
             b.cond(c, then_r, else_r, l);
+            std::vector<ir::WaitEdge> edges;
+            edges.reserve(reads.size() + vif_reads.size());
+            for (const ir::WaitEvent& e : reads) {
+                edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
+            }
+            for (const MemberAccessExpression* ma : vif_reads) {
+                edges.push_back(ir::WaitEdge{
+                  vif_member_signal(ma->member, "'" + std::string(ma->member.name) + "'"),
+                  static_cast<uint32_t>(ir::Edge::Any), ir::kNoWaitHandle,
+                  lower_expr(ma->value(), b) });
+            }
+            // An empty list is legal and meaningful: `wait(0)` reads nothing and
+            // parks the process for the rest of the run.
             b.wait(edges, l);
         }
         const ir::ExtraSlice body = b.close_region();
@@ -22584,6 +22635,15 @@ private:
                                                  const SubroutineSymbol& sub,
                                                  ir::Builder&            b) {
         if (call.thisClass() != nullptr) {
+            if (call.thisClass()->type->getCanonicalType().isVirtualInterface()) {
+                // TODO: `vif.task()` / `vif.func()` (LRM 25.7 through 25.9) — an
+                // interface subroutine is lowered once per INSTANCE body, against
+                // that instance's own signals, so there is no single callee a
+                // handle can dispatch to. It needs a body parameterized on the
+                // instance context, the transform clone_with_ctx_param already
+                // performs for a shared process body.
+                fail("a subroutine call through a virtual interface is not supported");
+            }
             return lower_expr(*call.thisClass(), b);
         }
         // A bare in-method call to an instance method uses the enclosing `this`. A

@@ -195,6 +195,12 @@ struct WaitEvent {
     // sensitivity list that would need a handle is left in the body instead, where
     // it lowers as an ordinary intra-body wait (build_process).
     Index handle = kNoWaitHandle;
+    // Intra-body waits only: the SSA value of a virtual interface handle, when the
+    // wait names a member reached through one (`@(posedge vif.clk)`, LRM 25.9).
+    // `signal` is then a REPRESENTATIVE of that member -- some instance's copy,
+    // naming which member -- and this says which instance is actually waited on.
+    // kNoWaitHandle otherwise. Mutually exclusive with `handle`.
+    Index inst = kNoWaitHandle;
 };
 
 // One lowered process plus the metadata the IR body itself does not carry: how

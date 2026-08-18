@@ -612,6 +612,9 @@ struct Anchor {
     llvm::StructType*     shadow_ty      = nullptr;
     llvm::GlobalVariable* shadow_gv      = nullptr;
     llvm::GlobalVariable* shadow_base_gv = nullptr;
+    // First state-struct field of the definition's virtual-interface waiter-list
+    // heads (see scope_type); equal to the scope's own signal count.
+    uint32_t vif_head_base = 0;
     // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
@@ -2040,6 +2043,23 @@ private:
             slots_[si].anchor = aid;
             fields.push_back(slots_[si].storage_ty);
         }
+        // Waiter-list heads for members some `@(edge vif.sig)` parks on (LRM 25.9).
+        // They live in the definition's own state struct, so a waiter reaches the
+        // head exactly the way it reaches the member: the instance base the handle
+        // gave plus a def-local field index. One head per (member, edge) actually
+        // waited on, shaped like an event object so the intrusive list primitives
+        // serve both without a second engine.
+        anchors_[aid].vif_head_base = static_cast<uint32_t>(fields.size());
+        for (uint32_t k = 0; k < scope.signals.size(); ++k) {
+            const auto si = static_cast<uint32_t>(scope.signals[k]);
+            for (uint32_t e = 0; e < 3; ++e) {
+                if (vif_wait_[si][e]) {
+                    vif_head_ord_[si][e] = static_cast<uint32_t>(fields.size()) -
+                                           anchors_[aid].vif_head_base;
+                    fields.push_back(event_obj_ty());
+                }
+            }
+        }
         for (const InstanceScope& child : scope.children) {
             scope_type(child, claimed, hier + "." + child.name);
         }
@@ -2116,6 +2136,79 @@ private:
         }
     }
 
+    // Which (member, edge) pairs a `@(edge vif.sig)` parks on. The wait names one
+    // representative instance's signal; every instance of that definition needs the
+    // head, because the handle may name any of them, so the mark is spread by
+    // definition exactly as vif_sig_ is.
+    void collect_vif_waits() {
+        const auto n = mod_.signals().size();
+        vif_wait_.assign(n, { false, false, false });
+        vif_head_ord_.assign(n, { ~0u, ~0u, ~0u });
+        const auto scan = [&](const Ir& ir) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (ir.tag(idx) != Inst::Tag::Wait) {
+                    continue;
+                }
+                for (const WaitEdge& we : ir.wait_edges(ir.payload(idx).extra)) {
+                    if (we.inst != kNoWaitHandle) {
+                        vif_wait_[static_cast<uint32_t>(we.signal)][we.edge] = true;
+                    }
+                }
+            }
+        };
+        for (const Process& pr : mod_.processes()) {
+            scan(pr.ir);
+        }
+        for (size_t f = 0; f < mod_.function_count(); ++f) {
+            scan(mod_.function(static_cast<FunctionId>(f)).ir);
+        }
+        // Spread each mark across the definition: a representative's def-local
+        // position is shared by its twins, and the layout must be too.
+        std::array<bool, 3> any{ false, false, false };
+        for (uint32_t i = 0; i < n; ++i) {
+            for (uint32_t e = 0; e < 3; ++e) {
+                any[e] = any[e] || vif_wait_[i][e];
+            }
+        }
+        if (!any[0] && !any[1] && !any[2]) {
+            return;
+        }
+        // Index within its own scope -> the edges wanted, per definition name.
+        ankerl::unordered_dense::map<std::string, std::vector<std::array<bool, 3>>> want;
+        const auto note = [&](auto&& self, const InstanceScope& sc) -> void {
+            auto& w = want[sc.def_name];
+            w.resize(std::max(w.size(), sc.signals.size()), { false, false, false });
+            for (uint32_t k = 0; k < sc.signals.size(); ++k) {
+                const auto si = static_cast<uint32_t>(sc.signals[k]);
+                for (uint32_t e = 0; e < 3; ++e) {
+                    w[k][e] = w[k][e] || vif_wait_[si][e];
+                }
+            }
+            for (const InstanceScope& c : sc.children) {
+                self(self, c);
+            }
+        };
+        const auto apply = [&](auto&& self, const InstanceScope& sc) -> void {
+            const auto& w = want[sc.def_name];
+            for (uint32_t k = 0; k < sc.signals.size() && k < w.size(); ++k) {
+                const auto si = static_cast<uint32_t>(sc.signals[k]);
+                for (uint32_t e = 0; e < 3; ++e) {
+                    vif_wait_[si][e] = vif_wait_[si][e] || w[k][e];
+                }
+            }
+            for (const InstanceScope& c : sc.children) {
+                self(self, c);
+            }
+        };
+        for (const InstanceScope& top : mod_.tops()) {
+            note(note, top);
+        }
+        for (const InstanceScope& top : mod_.tops()) {
+            apply(apply, top);
+        }
+    }
+
     // Build the design's state types: per-signal slot / storage types, one
     // struct per module definition (own signals only — every instance scope
     // owns a separate state global, children own theirs), and the root
@@ -2146,6 +2239,7 @@ private:
         // partially-driven packed net powers its undriven bits z per this mask.
         const std::vector<bool>& undriven = facts_.undriven;
         compute_vif_reachable();
+        collect_vif_waits();
 
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
@@ -2696,6 +2790,25 @@ private:
             idx.push_back(b_.getInt32(f));
         }
         return b_.CreateInBoundsGEP(a.ty, base, idx);
+    }
+
+    // Address of the waiter-list head for one (member, edge) of the instance the
+    // current access names: the same base a member access uses, plus the head's
+    // def-local field index (see scope_type). Shaped like an event object, so the
+    // intrusive list primitives apply unchanged.
+    llvm::Value* vif_head_ptr(Signal sig, uint32_t edge) {
+        const SignalSlot& s   = slot_of(sig);
+        const auto        si  = static_cast<uint32_t>(sig);
+        const uint32_t    ord = vif_head_ord_[si][edge];
+        if (s.anchor == SignalSlot::no_anchor || ord == ~0u) {
+            throw BackendError{ "internal: no virtual-interface waiter head for this member" };
+        }
+        Anchor&      a    = anchors_[s.anchor];
+        llvm::Value* base = ctx_override_ != nullptr
+                              ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
+                              : static_cast<llvm::Value*>(sym(a.state_gv));
+        return b_.CreateInBoundsGEP(a.ty, base,
+                                    { b_.getInt32(0), b_.getInt32(a.vif_head_base + ord) });
     }
 
     // Pointer to one field of the root NBA shadow struct, addressed through a base
@@ -4813,7 +4926,15 @@ private:
         // suspend.
         uint32_t ev_k = 0;
         for (const WaitEdge& e : events) {
-            if (e.handle != kNoWaitHandle) {
+            if (e.inst != kNoWaitHandle) {
+                // `@(edge vif.sig)`: park on the member's waiter list in the
+                // instance the handle names. Frame-resident, so there is no
+                // capacity to size -- the bucket path could not express this at all.
+                llvm::Value* ctx = b_.CreateIntToPtr(must_of(value_of(e.inst)), raw_ptr_ty());
+                CtxOverride  ov(*this, ctx);
+                emit_event_link(vif_head_ptr(e.signal, e.edge), event_wait_node(ev_k++),
+                                parked_handle(b_, hdl_), sched_ptr_);
+            } else if (e.handle != kNoWaitHandle) {
                 // An event with no signal of its own -- an array element, a class
                 // property, a formal. The frontend lowered its handle just before
                 // this wait, so park on whatever object it names now.
@@ -4843,7 +4964,11 @@ private:
         const bool remove_sigs = events.size() > 1 || design_uses_disable_;
         ev_k                   = 0;
         for (const WaitEdge& e : events) {
-            if (e.handle != kNoWaitHandle) {
+            if (e.inst != kNoWaitHandle) {
+                // The head is read back from the node, like an event's: the handle
+                // may have been retargeted while we were parked.
+                emit_event_unlink(event_wait_node(ev_k++));
+            } else if (e.handle != kNoWaitHandle) {
                 // The object is read back from the node: the expression that named
                 // it may not even be evaluable here (a loop index may have moved).
                 emit_event_unlink(event_wait_node(ev_k++));
@@ -7848,7 +7973,7 @@ private:
             // A `<= @e` trigger has no coroutine waiter but its edge must still be
             // watched so a store/commit fires its deferred records.
             if (wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr ||
-                trigger_id(sig, e) >= 0) {
+                vif_wait_[i][e] || trigger_id(sig, e) >= 0) {
                 return true;
             }
         }
@@ -8008,7 +8133,7 @@ private:
         const auto has_bucket = [&](Edge e) {
             const auto k = static_cast<uint32_t>(e);
             return wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr ||
-                   trigger_id(sig, k) >= 0;
+                   vif_wait_[i][k] || trigger_id(sig, k) >= 0;
         };
         const SignalSlot& slot = slot_of(sig);
         const EdgeFacts   f =
@@ -8038,6 +8163,12 @@ private:
             }
             if (wait_dyn_gv_[i][e] != nullptr) {
                 service_dynamic_queue(sig, e);
+            }
+            if (vif_wait_[i][e]) {
+                // Waiters that reached this member through a virtual interface: an
+                // intrusive list on the instance the write is landing in, walked
+                // exactly like an event object's (each waiter unlinks itself).
+                emit_event_wake_list(vif_head_ptr(sig, e));
             }
             fire_event_trigger(sig, e);
             b_.CreateBr(cont);
@@ -22596,6 +22727,12 @@ private:
     // every signal of every instance of an interface definition some `virtual`
     // handle names. They keep the canonical type-derived shape.
     std::vector<bool> vif_sig_;
+    // Per (signal, edge): does some `@(edge vif.sig)` park on this member? Set by
+    // collect_vif_waits over the representative each such wait names, then spread
+    // to every instance of the definition so the state layout stays def-uniform.
+    // vif_head_ord_ is the head's def-local ordinal past Anchor::vif_head_base.
+    std::vector<std::array<bool, 3>>     vif_wait_;
+    std::vector<std::array<uint32_t, 3>> vif_head_ord_;
     // Instance context to resolve def-relative bases against, while emitting an
     // access through a virtual interface handle (see CtxOverride). Null outside
     // one, when the owning instance is the one whose body is being emitted.
