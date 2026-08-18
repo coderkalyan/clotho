@@ -458,10 +458,10 @@ TEST_CASE("extra_operand_tail classifies exactly the tags whose operands overflo
     }
 }
 
-// Exactly six tags, named. The count is the claim the header comment makes, so
-// pin it: a seventh appearing means someone widened a record without extending
+// Exactly seven tags, named. The count is the claim the header comment makes, so
+// pin it: an eighth appearing means someone widened a record without extending
 // the walk, and one disappearing means the walk got a capability nobody noticed.
-TEST_CASE("exactly six tags hold operands back from the span") {
+TEST_CASE("exactly seven tags hold operands back from the span") {
     std::set<ir::Inst::Tag> tailed;
     for (unsigned v = 0; v <= 0xFF; ++v) {
         const auto tag = static_cast<ir::Inst::Tag>(v);
@@ -472,7 +472,12 @@ TEST_CASE("exactly six tags hold operands back from the span") {
 
     const std::set<ir::Inst::Tag> expected = { ir::Inst::Tag::FDisplay, ir::Inst::Tag::MonitorEmit,
                                                ir::Inst::Tag::Fscanf,   ir::Inst::Tag::Sscanf,
-                                               ir::Inst::Tag::Sformat,  ir::Inst::Tag::InsideSet };
+                                               ir::Inst::Tag::Sformat,  ir::Inst::Tag::InsideSet,
+                                               // Wait: an event edge may park on a
+                                               // handle VALUE, strided inside the
+                                               // packed WaitEdge run rather than a
+                                               // slice, so it cannot be a span.
+                                               ir::Inst::Tag::Wait };
     CHECK(tailed == expected);
 }
 

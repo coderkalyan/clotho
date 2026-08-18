@@ -559,15 +559,8 @@ TEST_CASE("an event passes as a subroutine argument") {
 TEST_CASE("event forms that are still rejected") {
     CHECK(reject("module top; logic clk; event e; initial ->> @(posedge clk) e; endmodule").find(
             "event-controlled nonblocking trigger") != std::string::npos);
-    // Waiting on an event held in a call frame: a WaitEdge names a signal, and a
-    // formal or automatic local has none. Triggering one works.
-    CHECK(reject("module top; event e; task automatic w(event x); @(x); endtask "
-                 "initial w(e); endmodule")
-            .find("waiting on an event held in a subroutine argument") != std::string::npos);
-    // An event array / per-instance class property needs one object per element or
-    // per class object, which the compile-time slot array cannot size.
-    CHECK(reject("module top; event ev[4]; initial -> ev[0]; endmodule")
-            .find("unpacked array of events") != std::string::npos);
+    CHECK(reject("module top; event a, b; initial wait_order(a, b); endmodule").find(
+            "wait_order is not supported") != std::string::npos);
 }
 
 // An event declared in a procedural scope gets signal-like storage through
@@ -617,18 +610,35 @@ TEST_CASE("a block-local named event wakes a waiter") {
     CHECK(out == "woke t=5\ndone\n");
 }
 
-// An AUTOMATIC-lifetime event local in a subroutine is the one procedural form
-// still unsupported: per-call lifetime means a fresh sync object per activation,
-// which one static timestamp cannot represent. It lands in the per-call frame,
-// where every event op resolved through signal_of and reported the generic
-// "reference to unknown signal". Name the construct instead.
-TEST_CASE("an automatic-lifetime event local in a subroutine is rejected") {
-    CHECK(reject("module top; task automatic t(); event e; -> e; endtask "
-                 "initial t(); endmodule")
-            .find("an automatic-lifetime event local in a subroutine") != std::string::npos);
-    CHECK(reject("module top; function int f(); automatic event e; -> e; return 1; "
-                 "endfunction initial $display(\"%0d\", f()); endmodule")
-            .find("an automatic-lifetime event local in a subroutine") != std::string::npos);
+// An automatic-lifetime event local is bound to a FRESH object on every entry
+// (LRM Table 6-7's "New event"), so two activations never share one.
+TEST_CASE("an automatic-lifetime event local is a new event per activation") {
+    SUBCASE("each call gets its own") {
+        CHECK(run_capture("module top; int n = 0;\n"
+                          "  task automatic t(); event e; -> e; if (e.triggered) n++; endtask\n"
+                          "  initial begin t(); t(); t(); $display(\"n=%0d\", n); end\n"
+                          "endmodule") == "n=3\n");
+    }
+    SUBCASE("activations do not share the object") {
+        // `pre` reads .triggered BEFORE this activation triggers. Both calls run
+        // in the same time step, so a SHARED object would still carry the first
+        // call's stamp and the second would read 1. One object per activation makes
+        // both read 0.
+        CHECK(run_capture(R"(
+            module top;
+              task automatic t(output bit pre);
+                event e;
+                pre = e.triggered;
+                -> e;
+              endtask
+              bit b1, b2;
+              initial begin
+                t(b1); t(b2);
+                $display("%0b%0b", b1, b2);
+              end
+            endmodule
+        )") == "00\n");
+    }
 }
 
 // Every event op stamps or compares the current tick via rt_wheel_now(wheel), and
@@ -681,17 +691,24 @@ TEST_CASE("a hierarchical named event can be triggered, not just waited on") {
     }
 }
 
-// A per-instance event class property is still unsupported: it would need one
-// event object per class object, which the compile-time slot array cannot size.
-// lower_class_type's guard runs only for a class something instantiates, so the
-// reference-site guard in signal_of is what names it in the other cases.
-TEST_CASE("a per-instance event class property is rejected") {
-    CHECK(reject("module top; class C; event e; endclass "
-                 "initial begin C c = new(); -> c.e; end endmodule")
-            .find("a per-instance event class property is not supported") != std::string::npos);
-    // A `static` property is NOT in the object body -- it is persistent
-    // module-signal storage -- so once an event is a handle word it needs nothing
-    // per-object and works. Only the per-instance form is still missing.
+// A per-instance event class property is one event PER OBJECT: the body's leaf is
+// bound by emit_class_body_init at `new` time, from the runtime object pool.
+TEST_CASE("a per-instance event class property is one event per object") {
+    const std::string out = run_capture(R"(
+        module top;
+          class C; event e; endclass
+          int n1 = 0, n2 = 0;
+          C c1, c2;
+          initial begin
+            c1 = new(); c2 = new();
+            fork forever begin @(c1.e); n1++; end join_none
+            fork forever begin @(c2.e); n2++; end join_none
+            #1 -> c1.e; #1 -> c1.e; #1 -> c2.e;
+            #1 $display("n1=%0d n2=%0d", n1, n2);
+          end
+        endmodule
+    )");
+    CHECK(out == "n1=2 n2=1\n");
 }
 
 // `wait_order` (LRM 15.5.6) fell through lower_stmt's `default:` to the bare

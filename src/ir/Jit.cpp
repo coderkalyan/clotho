@@ -270,6 +270,9 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_vcd_close", &rt_vcd_close);
     expose("rt_alloc", &rt_alloc);
     expose("rt_free", &rt_free);
+    expose("rt_event_pool_init", &rt_event_pool_init);
+    expose("rt_event_new", &rt_event_new);
+    expose("rt_event_ptr", &rt_event_ptr);
     expose("rt_nba_arr_slot", &rt_nba_arr_slot);
     expose("rt_nba_arr_base", &rt_nba_arr_base);
     expose("rt_nba_arr_count", &rt_nba_arr_count);

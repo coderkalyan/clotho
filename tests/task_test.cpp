@@ -527,15 +527,18 @@ TEST_CASE("an event passes as a subroutine argument in every direction") {
     }
 }
 
-// The one event-argument form still missing: a WaitEdge names a signal, and an
-// event held in a call frame has none. Triggering through a formal works.
-TEST_CASE("waiting on an event held in a subroutine argument is rejected") {
-    CHECK(reject("module m;\n"
-                 "    event e;\n"
-                 "    task automatic w(event x); @(x); endtask\n"
-                 "    initial w(e);\n"
-                 "endmodule\n")
-            .find("waiting on an event held in a subroutine argument") != std::string::npos);
+// Waiting on an event held in a call frame works too: the frontend lowers the
+// formal's handle immediately before the Wait and the waiter parks on whatever
+// object it names, so the caller's event wakes the callee.
+TEST_CASE("a subroutine can wait on an event passed to it") {
+    CHECK(run_capture(R"(
+        module m;
+            event e;
+            task automatic w(event x); @(x); $display("woke t=%0t", $time); endtask
+            initial w(e);
+            initial #2 -> e;
+        endmodule
+    )") == "woke t=2\n");
 }
 
 // A packed bit/part-select is not a whole slot, so it is not a legal ref actual —

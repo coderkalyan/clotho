@@ -1045,12 +1045,33 @@ extern "C" void rt_nba_arr_reset(void) {
 namespace {
 
 void rt_elem_init(const rt_elem_ops* o, void* p) {
+    if (o->kind == rt_elem_event) {
+        // LRM Table 6-7: an event's default value is a NEW event, so every element
+        // slot gets its own object. This is the one kind whose power-on image is
+        // not a constant, which is why init cannot be a blind copy of `proto`.
+        auto h = rt_event_new();
+        std::memcpy(p, &h, sizeof h);
+        return;
+    }
     std::memcpy(p, o->proto, static_cast<size_t>(o->stride));
+    if (o->kind == rt_elem_aggregate) {
+        // The proto image covers every leaf whose power-on value is a constant; an
+        // event leaf is the one that is not, so construct the leaves afterwards.
+        // Re-initialising a string / container leaf here is a no-op copy of the same
+        // bytes the proto already supplied.
+        for (uint32_t i = 0; i < o->nleaves; ++i) {
+            rt_elem_init(o->leaves[i].ops, static_cast<uint8_t*>(p) + o->leaves[i].offset);
+        }
+    }
 }
 
 void rt_elem_deinit(const rt_elem_ops* o, void* p) {
     switch (o->kind) {
         case rt_elem_pod:
+            return;
+        case rt_elem_event:
+            // Nothing to release: event objects are never freed (LRM 15.5.5.2's
+            // reclamation is GC, which Clotho does not have).
             return;
         case rt_elem_string:
             rt_string_deinit(static_cast<rt_string*>(p));
@@ -1078,6 +1099,11 @@ void rt_elem_deinit(const rt_elem_ops* o, void* p) {
 void rt_elem_copy(const rt_elem_ops* o, void* dst, const void* src, const rt_alloc_site* site) {
     switch (o->kind) {
         case rt_elem_pod:
+            std::memcpy(dst, src, static_cast<size_t>(o->stride));
+            return;
+        case rt_elem_event:
+            // Copying an event copies the HANDLE, so both elements name one sync
+            // object -- the merge LRM 15.5.5 specifies for `a = b`.
             std::memcpy(dst, src, static_cast<size_t>(o->stride));
             return;
         case rt_elem_string:
@@ -1165,14 +1191,16 @@ extern "C" void rt_dynarr_new(rt_dynarr* h, const rt_elem_ops* ops, int64_t n,
     const uint64_t stride = ops->stride;
     // Scanning the prototype costs `stride` bytes against a fill of
     // `count * stride`, so it is worth it for every array but a singleton.
-    if (count > 1 && proto_is_zero(ops)) {
+    if (!elem_managed(ops) && count > 1 && proto_is_zero(ops)) {
         h->data = rt_zalloc_elems_checked(count, stride, site, rt_diag_now());
         h->len  = count;
         return;
     }
     auto* buf = static_cast<uint8_t*>(rt_alloc_elems_checked(count, stride, site, rt_diag_now()));
     for (uint64_t i = 0; i < count; ++i) {
-        std::memcpy(buf + i * stride, ops->proto, static_cast<size_t>(stride));
+        // rt_elem_init, not a memcpy of the prototype: a managed element may need
+        // per-slot construction (an event element binds its own object).
+        rt_elem_init(ops, buf + i * stride);
     }
     h->data = buf;
     h->len  = count;
@@ -5345,6 +5373,58 @@ extern "C" void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t w
 // ABI with no unwind tables, so a thrown bad_alloc could not propagate.
 namespace {
 constexpr std::align_val_t frame_align{64};
+}
+
+// -- Named event objects (LRM 15.5) --
+//
+// One slot space over two tiers: the backend's static block is chunk 0 (its slots
+// are the scalar declared events, so their addresses fold to constants at compile
+// time), and every other event storage location -- an array element, a struct
+// member, a class property, an automatic local, a container element -- draws from
+// the chunks after it. Chunks are never resized or moved, so an object address
+// stays valid across growth even while a process is parked on its waiter list.
+namespace {
+
+constexpr uint32_t kEventChunk = 256;
+
+// chunk 0 is the backend's static block, of g_event_static objects; every later
+// chunk holds kEventChunk pool objects.
+std::vector<rt_event*> g_event_chunks;
+uint32_t               g_event_static = 0;
+uint32_t               g_event_pooled = 0; // pool objects handed out so far
+
+} // namespace
+
+extern "C" void rt_event_pool_init(void* static_block, uint32_t count) {
+    g_event_chunks.clear();
+    g_event_chunks.push_back(static_cast<rt_event*>(static_block));
+    g_event_static = count;
+    g_event_pooled = 0;
+}
+
+extern "C" void* rt_event_ptr(uint32_t slot) {
+    if (slot < g_event_static) {
+        return g_event_chunks[0] + slot;
+    }
+    const uint32_t i = slot - g_event_static;
+    return g_event_chunks[1 + (i / kEventChunk)] + (i % kEventChunk);
+}
+
+extern "C" uint64_t rt_event_new(void) {
+    const uint32_t i = g_event_pooled++;
+    if (i % kEventChunk == 0) {
+        // A fresh chunk, zeroed: waiters / pending / next_pend all start clear.
+        g_event_chunks.push_back(
+            static_cast<rt_event*>(::operator new(sizeof(rt_event) * kEventChunk, frame_align)));
+        std::memset(g_event_chunks.back(), 0, sizeof(rt_event) * kEventChunk);
+    }
+    rt_event* e  = g_event_chunks[1 + (i / kEventChunk)] + (i % kEventChunk);
+    e->last_trig = ~uint64_t{ 0 }; // never triggered; `.triggered` reads 0
+    e->vcd       = -1;             // an object reached through a handle is not dumped
+    // The slot is past the static block, and gen is 0 for the run: nothing is ever
+    // freed (LRM 15.5.5.2 reclamation is GC), so a slot is never reused and its
+    // generation never advances.
+    return static_cast<uint64_t>(g_event_static + i);
 }
 
 extern "C" void* rt_alloc(uint64_t size) {

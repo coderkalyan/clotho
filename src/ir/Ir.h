@@ -952,7 +952,21 @@ struct WaitEdge {
     Signal signal;
     // Edge to wait for (ir::Edge value).
     uint32_t edge;
+    // For an EVENT wait only: the SSA value of the event handle to park on, which
+    // may name any object (an array element, a class property, a formal), not just
+    // the one `signal` declares. kNoWaitHandle when the wait names a signal
+    // directly -- including a plain `@(e)` on a declared event, which resolves
+    // through `signal` so the common case stays a folded constant address.
+    //
+    // Index{0} is a real instruction, so the sentinel is the max value, like
+    // kNoDisableTarget -- and it is the DEFAULT, so every existing construction
+    // site (which uses designated initializers naming only signal and edge) keeps
+    // meaning "no handle" instead of silently naming instruction 0.
+    Index handle = static_cast<Index>(~uint32_t{ 0 });
 };
+
+// `WaitEdge::handle` is absent: this wait names its signal directly.
+inline constexpr Index kNoWaitHandle = static_cast<Index>(~uint32_t{ 0 });
 
 // Extra payload for `wait`: the list of events the process suspends on. The
 // process wakes when ANY listed (signal, edge) fires. `events` is a run of
@@ -1525,6 +1539,13 @@ struct Inst {
         // registering the process on each event's wait queue plus a coroutine
         // suspend; a matching blocking assignment to one of the signals wakes it.
         Wait,
+        // Bind a NEW event object and yield its handle (payload: none). LRM Table
+        // 6-7 makes "New event" the default value of an event variable, so this is
+        // emitted wherever event storage comes into existence and no constant handle
+        // can be baked in: an automatic-lifetime local. Static storage gets its
+        // handle from the state initializer, and aggregate / container element leaves
+        // are constructed by their own init walks.
+        EventNew,
         // Blocking trigger of a named event `-> e` (payload: unary -> the event
         // HANDLE value, a 64-bit { slot, gen }). Resolves the handle to its event
         // object, records the trigger time (for `.triggered`) and wakes every
@@ -2043,6 +2064,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
             return K::Ref;
         case T::Signal:
             return K::Signal;
+        case T::EventNew:
+            return K::None;
         case T::Arg:
             return K::Arg;
         case T::Local:
@@ -2424,6 +2447,10 @@ enum class ExtraOperandTail : uint8_t {
     // range operands, two slices, neither of which is the span (which holds
     // only the selector, payload.op_extra.op).
     InsideSetMembers,
+    // + WaitInfo::events[k].handle for each event edge that carries one. The
+    // handles are strided three words apart inside the packed WaitEdge run, so
+    // they are not a slice and cannot be a span.
+    WaitHandles,
 };
 
 // Constexpr for the same reason as extra_operand_shape(): operand walks inline
@@ -2443,6 +2470,8 @@ constexpr ExtraOperandTail extra_operand_tail(Inst::Tag tag) {
             return E::ScanfSource;
         case T::InsideSet:
             return E::InsideSetMembers;
+        case T::Wait:
+            return E::WaitHandles;
         default:
             return E::None;
     }
@@ -2640,6 +2669,13 @@ public:
                 }
                 return;
             }
+            case ExtraOperandTail::WaitHandles:
+                for (const WaitEdge& e : wait_edges(p.extra)) {
+                    if (e.handle != kNoWaitHandle) {
+                        fn(e.handle);
+                    }
+                }
+                return;
         }
     }
 

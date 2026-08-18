@@ -893,6 +893,7 @@ enum {
     rt_elem_queue     = 3, // one rt_queue handle; `inner` describes ITS element
     rt_elem_aggregate = 4, // fixed byte image with `nleaves` heap leaves
     rt_elem_assoc     = 5, // one rt_assoc handle; `inner` describes ITS value element
+    rt_elem_event     = 6, // one event handle; init binds a NEW object (Table 6-7)
 };
 
 struct rt_elem_ops {
@@ -1369,6 +1370,45 @@ void rt_string_realtoa(rt_string* dst, double r, const rt_alloc_site* site);
 // entirely for processes whose frame can live on the caller's stack.
 void* rt_alloc(uint64_t size);
 void  rt_free(void* p);
+
+// -- Named event objects (LRM 15.5) --
+//
+// An event variable holds a 64-bit handle `{ u32 slot, u32 gen }` naming an event
+// OBJECT. LRM Table 6-7 gives an event's default initial value as "New event", so
+// EVERY event-typed storage location is bound to a fresh object when that storage
+// comes into existence -- a declared variable, an unpacked-array element, a struct
+// member, a class property, an automatic local, a container element.
+//
+// The objects a scalar declared event needs are laid out by the backend in one
+// static array, so the common case folds to a constant address. Everything else is
+// allocated here, from a CHUNKED pool: chunks never move, so an object pointer
+// stays valid across growth even while a process is parked on its waiter list.
+// The backend registers its static block as the pool's first chunk at startup, so
+// one slot space covers both tiers and rt_event_ptr resolves any handle.
+//
+// Objects are never freed. LRM 15.5.5.2 reclaims a synchronization object once no
+// variable references it, which is garbage collection; Clotho has none, and class
+// object bodies leak by the same direction (docs/design/classes.md §7).
+
+// Mirror of the backend's `%clotho.event`. Field order and types must match it
+// exactly, like rt_null_site -- the two change together.
+typedef struct rt_event {
+    uint64_t last_trig; // tick of the last fire; UINT64_MAX == never triggered
+    void*    waiters;   // intrusive waiter-list head
+    uint8_t  pending;   // a `->> e` awaiting the NBA region
+    int32_t  vcd;       // dump-var index, or -1
+    void*    next_pend; // next object on the NBA pending chain
+} rt_event;
+
+// Register the backend's static object block as the pool's first chunk. `count`
+// includes the reserved null object at slot 0.
+void rt_event_pool_init(void* static_block, uint32_t count);
+
+// Allocate a fresh event object; returns its handle `{ slot, gen }`.
+uint64_t rt_event_new(void);
+
+// The object a handle's slot names, in either tier.
+void* rt_event_ptr(uint32_t slot);
 
 // -- Timing wheel --
 //

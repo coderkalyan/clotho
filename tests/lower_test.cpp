@@ -766,39 +766,41 @@ TEST_CASE("queue member assignment from a pattern builds the queue element-wise"
     CHECK(r.ok);
 }
 
-TEST_CASE("an event struct member fails loudly") {
+// An event in an aggregate is one event PER LEAF, bound when the storage comes
+// into existence (LRM Table 6-7's "New event"): a fixed unpacked array binds each
+// element in init_state's array loop, a struct member and a class property in the
+// aggregate init walk that module signals, frame locals and object bodies share.
+TEST_CASE("an event struct member declares and lowers") {
     const LowerResult r = lower_text(R"(
         module top;
             typedef struct { event e; int x; } t;
             t a;
-            initial a.x = 1;
+            initial begin a.x = 1; -> a.e; end
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("event struct member") != std::string::npos);
+    CHECK(r.ok);
+    CHECK(r.diagnostic_text().find("event struct member") == std::string::npos);
 }
 
-TEST_CASE("an unpacked array of events fails loudly") {
+TEST_CASE("an unpacked array of events declares and lowers") {
     const LowerResult r = lower_text(R"(
         module top;
             event ev [4];
             initial ->ev[0];
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("unpacked array of events") != std::string::npos);
+    CHECK(r.ok);
 }
 
-TEST_CASE("an event class property fails loudly") {
+TEST_CASE("an event class property declares and lowers") {
     const LowerResult r = lower_text(R"(
         module top;
             class C; event e; endclass
             C c;
-            initial c = new;
+            initial begin c = new; -> c.e; end
         endmodule
     )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("event class property") != std::string::npos);
+    CHECK(r.ok);
 }
 
 TEST_CASE("a packed struct declares and carries its field table") {
@@ -1023,18 +1025,17 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
 TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
     // Binding a type parameter to a not-yet-lowered type must hit the same loud
     // guard as a direct declaration, not silently accept it. (`event`,
-    // `chandle`, `class`, and an associative array with a class-handle value were
-    // all prior examples here; every one of them lowers now.) An associative array
-    // of EVENT stands in: an event carries no value, so there is no per-entry
-    // storage to give it (docs/design/data-model.md §7).
+    // `chandle`, `class`, an associative array with a class-handle value and one
+    // with an EVENT value were all prior examples here; every one of them lowers
+    // now.) A virtual interface stands in as the still-unsupported type.
     const LowerResult r = lower_text(R"(
-        typedef event AA[int];
-        module m #(parameter type T = AA);
+        interface I; logic x; endinterface
+        module m #(parameter type T = virtual I);
             T v;
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostic_text().find("has no value to store") != std::string::npos);
+    CHECK(r.diagnostic_text().find("virtual interface") != std::string::npos);
 }
 
 TEST_CASE("a class type parameter lowers as a handle") {

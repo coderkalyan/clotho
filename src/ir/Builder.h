@@ -39,6 +39,7 @@ public:
 
     // -- Named events (LRM 15.5) --
     // `-> e`: blocking trigger of the event whose synthetic signal is `sig`.
+    Index event_new(SourceLoc loc);
     Index event_trigger(Index handle, SourceLoc loc);
     // `e.triggered`: 1-bit "triggered this time step" property of event `sig`.
     Index event_triggered(Index handle, SourceLoc loc);

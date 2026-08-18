@@ -84,6 +84,10 @@ Index Builder::local(uint32_t index, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::Local, Inst::Payload{ .local = { index, type } } }, loc);
 }
 
+Index Builder::event_new(SourceLoc loc) {
+    return emit({ Inst::Tag::EventNew, Inst::Payload{} }, loc);
+}
+
 Index Builder::event_trigger(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::EventTrigger, pay(&Inst::Payload::unary, handle) }, loc);
 }

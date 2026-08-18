@@ -409,6 +409,9 @@ struct LValue {
     llvm::Value*    assoc_key_ptr = nullptr;
     llvm::Value*    assoc_key_len = nullptr;
     llvm::Constant* assoc_ops     = nullptr;
+    // The assoc's VALUE element type, so the resolver can ask type-level questions
+    // about it (an event element's Table 7-1 default is not a constant image).
+    Ref             assoc_elem_type = Ref::Invalid;
     // Value element kind for a managed (string / nested-container) assoc value.
     // Set on the deferred lvalue; assoc_elem_lvalue lifts them onto the resolved
     // element lvalue (is_string / is_handle) so the Load/Store dispatch routes a
@@ -1415,7 +1418,7 @@ private:
             return;
         }
         if (t.kind != Type::Kind::String && t.kind != Type::Kind::DynArray && t.kind != Type::Kind::Queue &&
-            t.kind != Type::Kind::Assoc) {
+            t.kind != Type::Kind::Assoc && t.kind != Type::Kind::Event) {
             return;
         }
         out.push_back(llvm::ConstantStruct::get(elem_leaf_ty(), { b_.getInt64(base), elem_ops_for(type) }));
@@ -1437,7 +1440,13 @@ private:
         llvm::Constant* inner = llvm::Constant::getNullValue(raw_ptr_ty());
         llvm::Constant* leaves  = llvm::Constant::getNullValue(raw_ptr_ty());
         uint32_t        nleaves = 0;
-        if (e.is_string) {
+        if (std::get<Type>(mod_.pool.get(elem_type)).kind == Type::Kind::Event) {
+            // An event element is a 64-bit handle word like a class handle, but
+            // unlike one it needs per-slot CONSTRUCTION: LRM Table 6-7 binds every
+            // new event storage location to a new object, which a shared prototype
+            // image cannot express. Hence its own kind rather than POD.
+            kind = 6;
+        } else if (e.is_string) {
             kind = 1;
         } else if (e.is_handle) {
             // A nested container element: the slot holds ITS handle, and the
@@ -1459,7 +1468,7 @@ private:
                     break;
             }
             inner = elem_ops_for(et.element);
-        } else if (e.is_agg && has_heap_leaf(elem_type)) {
+        } else if (e.is_agg && (has_heap_leaf(elem_type) || types::has_ctor_leaf(mod_.pool, elem_type))) {
             std::vector<llvm::Constant*> table;
             collect_elem_leaves(elem_type, 0, e.agg_ty, table);
             auto* arr_ty = llvm::ArrayType::get(elem_leaf_ty(), table.size());
@@ -4683,7 +4692,13 @@ private:
         // suspend.
         uint32_t ev_k = 0;
         for (const WaitEdge& e : events) {
-            if (mod_.signal(e.signal).is_event) {
+            if (e.handle != kNoWaitHandle) {
+                // An event with no signal of its own -- an array element, a class
+                // property, a formal. The frontend lowered its handle just before
+                // this wait, so park on whatever object it names now.
+                emit_event_link(event_obj_of(must_of(value_of(e.handle))), event_wait_node(ev_k++),
+                                parked_handle(b_, hdl_), sched_ptr_);
+            } else if (mod_.signal(e.signal).is_event) {
                 // Resolve the variable's CURRENT handle: after `a = b`, `@(a)` must
                 // park on b's object (LRM 15.5.5). The declared object is only the
                 // power-on binding.
@@ -4707,7 +4722,11 @@ private:
         const bool remove_sigs = events.size() > 1 || design_uses_disable_;
         ev_k                   = 0;
         for (const WaitEdge& e : events) {
-            if (mod_.signal(e.signal).is_event) {
+            if (e.handle != kNoWaitHandle) {
+                // The object is read back from the node: the expression that named
+                // it may not even be evaluable here (a loop index may have moved).
+                emit_event_unlink(event_wait_node(ev_k++));
+            } else if (mod_.signal(e.signal).is_event) {
                 emit_event_unlink(event_wait_node(ev_k++),
                                   event_is_mono(e.signal) ? event_obj(e.signal) : nullptr);
             } else if (remove_sigs) {
@@ -5239,6 +5258,11 @@ private:
         for (const auto& [aid, field, first_id] : ctx_blk_fills_) {
             b_.CreateStore(b_.getInt32(first_id), ctx_ptr(anchors_[aid], field));
         }
+        // Hand the static event block to the pool before anything can allocate an
+        // event object or resolve a handle: init_state binds aggregate event leaves.
+        if (events_gv_ != nullptr) {
+            b_.CreateCall(event_pool_init_fn(), { sym(events_gv_), b_.getInt32(event_slot_count_) });
+        }
         init_state();
         // Shadow bases fill only when some shadow access loaded them (lazy):
         // the root base covers unscoped targets, the per-instance bases each
@@ -5327,6 +5351,13 @@ private:
         std::vector<std::array<uint32_t, 3>> dyn;
     };
 
+    // A handle-carrying wait edge names no signal (it parks on an object the body
+    // computes), so it must never be counted into a signal's bucket -- signal 0's,
+    // in particular, which its zero placeholder would otherwise inflate.
+    static bool edge_is_handle(const WaitEdge& e) {
+        return e.handle != kNoWaitHandle;
+    }
+
     WaitCounts wait_counts() const {
         const auto n = mod_.signals().size();
         WaitCounts c{ std::vector<std::array<uint32_t, 3>>(n, { 0, 0, 0 }),
@@ -5352,6 +5383,9 @@ private:
                     continue;
                 }
                 for (const WaitEdge& we : p.ir.wait_edges(p.ir.payload(idx).extra)) {
+                    if (edge_is_handle(we)) {
+                        continue; // parks on an object, not a signal bucket
+                    }
                     const std::pair<Signal, uint32_t> key{ we.signal, we.edge };
                     if (!std::ranges::contains(seen, key)) {
                         seen.push_back(key);
@@ -5381,6 +5415,9 @@ private:
                         continue;
                     }
                     for (const WaitEdge& we : f.ir.wait_edges(f.ir.payload(idx).extra)) {
+                        if (edge_is_handle(we)) {
+                            continue; // parks on an object, not a signal bucket
+                        }
                         task_waits[static_cast<uint32_t>(we.signal)][we.edge] = true;
                     }
                 }
@@ -5427,6 +5464,9 @@ private:
                         continue;
                     }
                     for (const WaitEdge& we : f.ir.wait_edges(f.ir.payload(idx).extra)) {
+                        if (edge_is_handle(we)) {
+                            continue; // parks on an object, not a signal bucket
+                        }
                         const std::pair<Signal, uint32_t> key{ we.signal, we.edge };
                         if (std::ranges::contains(seen, key)) {
                             continue;
@@ -5551,12 +5591,15 @@ private:
     // objects this is unreachable, and it costs one `and` against a constant.
     llvm::Value* event_obj_of(llvm::Value* handle) {
         llvm::Value* slot = b_.CreateTrunc(handle, b_.getInt32Ty());
-        if (const uint32_t n = event_slot_count_; (n & (n - 1)) == 0 && n > 1) {
-            slot = b_.CreateAnd(slot, b_.getInt32(n - 1));
-        } else {
-            slot = b_.CreateURem(slot, b_.getInt32(event_slot_count_));
+        // A compile-time slot in the static block folds to a constant address --
+        // the whole point of giving scalar declared events their own tier.
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(slot);
+            c != nullptr && c->getZExtValue() < event_slot_count_) {
+            return b_.CreateInBoundsGEP(events_arr_ty_, sym(events_gv_), { b_.getInt32(0), slot });
         }
-        return b_.CreateInBoundsGEP(events_arr_ty_, sym(events_gv_), { b_.getInt32(0), slot });
+        // Otherwise the slot may name either tier, so let the pool resolve it: it
+        // owns the static block as its first chunk, so one call covers both.
+        return b_.CreateCall(event_ptr_fn(), { slot });
     }
 
     // The 64-bit handle currently stored in an event variable's own signal slot.
@@ -10325,6 +10368,15 @@ private:
         return rt_fn("rt_ring_overflow", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
     }
 
+    llvm::FunctionCallee event_new_fn() {
+        return rt_fn("rt_event_new", b_.getInt64Ty(), {});
+    }
+    llvm::FunctionCallee event_ptr_fn() {
+        return rt_fn("rt_event_ptr", raw_ptr_ty(), { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee event_pool_init_fn() {
+        return rt_fn("rt_event_pool_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
     llvm::FunctionCallee wheel_now_fn() {
         return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
     }
@@ -10463,6 +10515,16 @@ private:
         idx.push_back(b_.getInt32(0));
         for (llvm::Value* s : path) {
             idx.push_back(s);
+        }
+        if (t.kind == Type::Kind::Event) {
+            // LRM Table 6-7: an event's default value is a NEW event, so every event
+            // leaf of an aggregate -- an array element, a struct member, a class
+            // property -- binds its own object. This one arm serves all three,
+            // because module signals (init_state), frame locals (init_frame) and
+            // class object bodies (emit_class_body_init) all reach this walk.
+            b_.CreateStore(b_.CreateCall(event_new_fn()),
+                           b_.CreateInBoundsGEP(root_ty, base, idx));
+            return;
         }
         if (t.kind == Type::Kind::String) {
             b_.CreateCall(str_init_fn(), { b_.CreateInBoundsGEP(root_ty, base, idx) });
@@ -10695,8 +10757,25 @@ private:
             // A null handle is all-zero, i.e. slot 0, which is why real slots start
             // at 1: an uninitialized or explicitly nulled event resolves to the
             // reserved null object and its trigger is the no-op LRM 15.5.5 asks for.
-            return llvm::ConstantStruct::get(
-              s.slot_ty, { llvm::ConstantInt::get(int_ty(64), event_slot_[sidx]) });
+            // Build to the slot's ACTUAL shape: a narrow slot is one iW word, a
+            // wide one packs must | may << W (a handle is definite, so both planes
+            // carry it), and a slot forced to keep a z plane needs that field too.
+            // Assuming the narrow shape here produced a struct initializer with the
+            // wrong field count for a class-property event, whose slot is widened.
+            const uint64_t                h = event_slot_[sidx];
+            std::vector<llvm::Constant*>  fields;
+            if (s.narrow) {
+                fields.push_back(llvm::ConstantInt::get(int_ty(s.width), h));
+            } else {
+                llvm::APInt mm(2 * s.width, 0);
+                mm |= llvm::APInt(2 * s.width, h);
+                mm |= llvm::APInt(2 * s.width, h) << s.width;
+                fields.push_back(llvm::ConstantInt::get(int_ty(2 * s.width), mm));
+            }
+            if (s.has_z) {
+                fields.push_back(llvm::ConstantInt::get(int_ty(s.width), 0));
+            }
+            return llvm::ConstantStruct::get(s.slot_ty, fields);
         }
         if (s.is_array || s.is_agg) {
             // Zeroinitialized; the runtime fill (init_state -> emit_array_init /
@@ -10768,6 +10847,12 @@ private:
     void emit_array_init(const SignalSlot& s) {
         const uint32_t w   = s.width;
         auto*          i32 = b_.getInt32Ty();
+        // An event array takes the flat storage model (its element is a plain
+        // 64-bit word), but its power-on value is not a constant: LRM Table 6-7
+        // binds each element to its OWN new object, so the loop stores a fresh
+        // handle per element instead of one shared image.
+        const bool     evt = std::get<Type>(mod_.pool.get(s.ir_type)).kind == Type::Kind::Event ||
+                         types::has_ctor_leaf(mod_.pool, s.ir_type);
         llvm::Value*   mm  = s.narrow ? zero(w) : (s.four_state ? x_mm(w) : zero(2 * w));
         auto*        arr_ty = llvm::cast<llvm::ArrayType>(s.storage_ty);
         llvm::Value* base   = storage_ptr(s);
@@ -10785,7 +10870,8 @@ private:
         b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(s.elem_count)), body, done);
 
         b_.SetInsertPoint(body);
-        b_.CreateStore(mm, b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(0) }));
+        b_.CreateStore(evt ? b_.CreateCall(event_new_fn()) : mm,
+                       b_.CreateInBoundsGEP(arr_ty, base, { b_.getInt32(0), idx, b_.getInt32(0) }));
         if (s.has_z) {
             // An undriven net array's elements default to z like any net.
             b_.CreateStore(s.init_z ? ones(w) : zero(w),
@@ -11204,6 +11290,9 @@ private:
             case Inst::Tag::Load:
                 return type_of(p.unary);
             case Inst::Tag::SimTime:
+                return { 64, false, false };
+            case Inst::Tag::EventNew:
+                // An event handle: a 2-state 64-bit word.
                 return { 64, false, false };
             case Inst::Tag::EventTriggered:
                 // `e.triggered` (LRM 15.5.3): a definite 2-state 1-bit `bit`.
@@ -12101,6 +12190,7 @@ private:
                 // dropped without creating an entry (7.8.6).
                 el.dyn_inrange       = kvalid;
                 el.assoc_ops         = elem_ops_global(aa.assoc_type);
+                el.assoc_elem_type   = std::get<Type>(mod_.pool.get(aa.assoc_type)).element;
                 el.assoc_val_string  = e.is_string;
                 el.assoc_val_handle  = e.is_handle;
                 if (e.is_agg) {
@@ -12144,6 +12234,7 @@ private:
                 el.epoch_ptr        = b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
                                                         handle_epoch_field(pt.type));
                 el.assoc_ops        = elem_ops_global(pt.type);
+                el.assoc_elem_type  = std::get<Type>(mod_.pool.get(pt.type)).element;
                 el.assoc_val_string = e.is_string;
                 el.assoc_val_handle = e.is_handle;
                 if (e.is_agg) {
@@ -13133,6 +13224,13 @@ private:
             case Inst::Tag::Wait:
                 ++cur_seg_epoch_;
                 lower_wait(p.extra);
+                return;
+
+            case Inst::Tag::EventNew:
+                // LRM Table 6-7's "New event": bind a fresh object and yield its
+                // handle. Only storage whose power-on handle cannot be a compile-time
+                // constant reaches here.
+                set_value(i, two_val(b_.CreateCall(event_new_fn())));
                 return;
 
             case Inst::Tag::EventTrigger:
@@ -14543,6 +14641,41 @@ private:
                 auto* phi = b_.CreatePHI(raw_ptr_ty(), 2);
                 phi->addIncoming(llvm::Constant::getNullValue(raw_ptr_ty()), from);
                 phi->addIncoming(p, putend);
+                return phi;
+            }
+            if (lv.assoc_elem_type != Ref::Invalid &&
+                types::has_ctor_leaf(mod_.pool, lv.assoc_elem_type)) {
+                // The element's Table 7-1 default is a NEW event, which is not a
+                // constant image the load path can materialize -- and returning a
+                // null handle instead would be wrong twice over: `aa[absent] == null`
+                // must read 0 (LRM 15.5.5.3), and `@(aa[absent])` must block rather
+                // than be undefined.
+                //
+                // So an absent key resolves to the array's default slot, which
+                // rt_elem_init binds to one event when it is first asked for. That
+                // event is reachable only through absent-key reads of this array, so
+                // triggering it wakes exactly the processes that waited the same way.
+                // LRM 7.9.11 does not say whether two distinct absent keys yield the
+                // same event or different ones; one per array is chosen because a
+                // fresh object per READ would allocate without bound.
+                auto* fn    = b_.GetInsertBlock()->getParent();
+                auto* miss  = llvm::BasicBlock::Create(ctx_, "assoc.absent", fn);
+                auto* cont  = llvm::BasicBlock::Create(ctx_, "assoc.found", fn);
+                llvm::Value* got = b_.CreateCall(assoc_get_ptr_fn(),
+                                                 { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
+                auto* from = b_.GetInsertBlock();
+                b_.CreateCondBr(b_.CreateICmpEQ(got, llvm::Constant::getNullValue(raw_ptr_ty())),
+                                miss, cont);
+                b_.SetInsertPoint(miss);
+                llvm::Value* def = b_.CreateCall(assoc_default_ptr_fn(),
+                                                 { lv.assoc_handle, lv.assoc_ops,
+                                                   alloc_site_global(at, "associative array") });
+                auto* missend = b_.GetInsertBlock();
+                b_.CreateBr(cont);
+                b_.SetInsertPoint(cont);
+                auto* phi = b_.CreatePHI(raw_ptr_ty(), 2);
+                phi->addIncoming(got, from);
+                phi->addIncoming(def, missend);
                 return phi;
             }
             return b_.CreateCall(assoc_get_ptr_fn(),
