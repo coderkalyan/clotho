@@ -40,23 +40,23 @@ object happened to be mid-lowering when first access triggered registration.
 
 **Virtual functions / dynamic dispatch** (LRM 8.20) now work (Phase 3, part 1). A
 class is *polymorphic* iff it or a base declares a virtual method; virtual
-propagates down, so polymorphism is uniform across a hierarchy and the vtable
-pointer always sits at object-body field 0 (consistent under upcast). Design:
+propagates down, so polymorphism is uniform across a hierarchy. Design:
 
-- **Body header, polymorphic-only.** `class_body_ty` prepends a `ptr` (the vtable
-  pointer) for a polymorphic class; a property's GEP index is then its 0-based
-  declaration index + `class_header_words` (1 for polymorphic, else 0), applied in
-  the single member-GEP chokepoint (`agg_member`) and `emit_class_body_init`.
-  Non-polymorphic classes are byte-identical to Phase 1/2.
+- **Body header.** `class_body_ty` prepends a `ptr` (the class descriptor, whose
+  slots are the vtable); a property's GEP index is then its 0-based declaration
+  index + `class_header_words`, applied in the single member-GEP chokepoint
+  (`agg_member`) and `emit_class_body_init`. Every class carries the word — see
+  Runtime type identity below for why it cannot be conditioned on polymorphism.
 - **Slots.** `compute_vtable` (Lower.cpp) keys slots by method **name** per
   hierarchy (`class_vslot_`): base virtuals take 0..k-1, an override — implicit, or
   of a pure prototype — reuses the base slot of the same name, a new virtual
   appends. Name-keying (rather than an override-chain / `getOverride()` identity) is
   what lets a pure virtual — a `MethodPrototypeSymbol`, which slang does *not* link
   to its concrete overrides — share a slot with them. The concrete table maps each
-  slot to the most-derived body of that name, registered via `Module::set_vtable`.
-  The backend emits one constant vtable global per class (`vtable_global`) and
-  stores its address into the header at `ClassNew`.
+  slot to the most-derived body of that name, registered via
+  `Module::set_class_desc`. The backend emits one constant descriptor global per
+  class (`class_desc_global`) and stores the address of its slot 0 into the header
+  at `ClassNew`.
 - **Dispatch.** A virtual call through a handle lowers to the new `CallVirtual` IR
   op carrying `{resolved-method (for signature/return type), slot, receiver class,
   args}`. The backend (`lower_virtual_call_inst`) loads the callee from the
@@ -147,8 +147,79 @@ out-param, while a string handle and a class handle `Ret` a loaded value. The st
 stays never-executed either way, yielding what an override that never assigns its
 return variable would.
 
-Still deferred (Phase 3 remainder), each guarded loud: `$cast`, randomize. The
-built-in virtual `randomize` is excluded from dispatch via `MethodFlags::BuiltIn`.
+**Runtime type identity and `$cast`** (LRM 6.24.2 / 8.16) work. Every class — not
+only a polymorphic one — carries a pointer to its **class descriptor** at object
+body field 0, and the descriptor carries the type identity a dynamic down-cast
+tests:
+
+```
+%clotho.classdesc = {
+  [16 x i32] display,   ; ancestor id by depth, 0 past this class's own depth
+  [N x ptr]  slots      ; <- the object header points HERE, at slot 0
+}
+```
+
+- **Cohen's display, not an interval numbering.** `display[d]` is the type id of
+  this class's ancestor at depth `d`, ending with the class's own id. So
+  `$cast` to a class at depth `d` with id `i` is `display[d] == i`: one load off
+  the object's descriptor and one compare, both operands constant at the cast
+  site. The classic alternative — DFS pre-order numbering of the whole
+  inheritance forest, testing `(tid - lo) <u extent` — is one ALU op *cheaper* but
+  makes an id a position in a global order: it needs the whole forest before it
+  can emit the first descriptor, and inserting one class renumbers everything
+  after it. A display entry needs nothing but the class's own ancestor chain, so
+  ids are unique and nothing more (`ClassIds` in Lower.cpp, minted on demand) and
+  a future granular/incremental compilation has no whole-design barrier to clear.
+  Id 0 is reserved for "no class": it is the display padding past a class's own
+  depth, and what a zeroed word reads as, so both fail closed.
+- **Fixed display width** (`ir::kMaxClassDepth`, 16). The destination's depth is
+  the load's index, so the offset must not depend on the *object's* class — which
+  means the display cannot be variable length. A deeper chain is refused loudly.
+- **The header points at slot 0, not at the descriptor base**, so virtual dispatch
+  is unchanged (a load plus a constant-index GEP) and the display sits at constant
+  *negative* offsets — the shape the Itanium C++ ABI gives `typeinfo` at
+  `vptr[-1]`.
+- **Ids are design-wide, keyed on the slang `ClassType`.** Two tops intern one
+  class as two nominal Refs and emit two descriptors (see the cache limitation
+  under Parameterized classes); comparing ids rather than descriptor addresses is
+  what keeps that sound.
+- **Only case 2 of LRM 8.16 reaches run time.** A destination that is the source's
+  own class or an ancestor of it, and a literal `null` source, always succeed and
+  lower to a plain assignment; two unrelated class types always fail and lower to
+  a constant 0 (single inheritance is what makes that conclusive). The emitted
+  test is branch-free: a null handle selects a static all-zero stand-in object
+  rather than faulting, and answers 1 separately.
+- **A source that is null at run time succeeds** (assigns null, answers 1). LRM
+  8.16 is ambiguous — case 2 wants "an object that is assignment compatible", and
+  null is not an object, but the closing sentence forces failure on a null source
+  only "when the source and destination types are not cast compatible", a
+  qualification that would be redundant if every run-time null failed. iverilog
+  does not implement `$cast` at all, so it is no oracle here; Verilator answers 1.
+  Recorded at `lower_cast` in Lower.cpp.
+- **The task form of a failed cast is a run-time error** (LRM 6.24.2), reported
+  through the same `severity` + `finish` pair `$fatal` uses. This closes the same
+  gap for an enum destination.
+
+The header is uniform across a hierarchy because it has to be: prefix layout puts
+the base's properties first so an upcast is the same pointer at the same offsets,
+and whether some *derived* class introduces a virtual method is not a property of
+the base being laid out. Conditioning the header on polymorphism gave a plain base
+of a polymorphic derived class no header while the derived class had one, so every
+inherited property read through the base handle was off by a word (a base
+constructor writing its own first property overwrote the vtable pointer). One
+consequence of making it uniform: every class now has a descriptor, so every class
+has the reserved `$copy` slot, and the shallow copy of a non-virtual hierarchy no
+longer slices the source.
+
+Still deferred (Phase 3 remainder), guarded loud: randomize. The built-in virtual
+`randomize` is excluded from dispatch via `MethodFlags::BuiltIn`. **Interface
+classes** (LRM 8.26) are a separate gap, and a DAG rather than a tree: a display
+cannot answer "does this class implement interface I". The descriptor grows a
+sorted, transitively closed set of implemented interface ids (plus a bloom word
+for a one-load reject) beside the display, which is still computable from the
+class's own declaration and its ancestors. A `$cast` *from* an interface-class
+handle needs nothing new — the object behind it is always a real class, so its
+display answers as usual.
 
 **Null-handle dereference** (LRM 8.4) is a located fatal, not a fault. LRM 8.4
 calls an access to a non-static member through a null handle illegal, leaves the
@@ -179,11 +250,11 @@ staying LRM-correct:
   scalar-arg path. Only two backend ops are new: `ClassNew` (alloc + power-on the
   body + `ptrtoint`) and `HandleDeref` (`inttoptr` → an `is_agg` lvalue rooted at
   the object body, off which the existing `MemberSelect` addresses a property).
-- **No reserved type-id / vtable header word in V1.** The object body is exactly
-  the property aggregate (`class_body_ty` in `LlvmBackend.cpp`), so property `k`
-  is LLVM field `k` and `MemberSelect` needs no offset. Phase 3 re-lays-out the
-  body to prepend the vtable header — a trivial backend-only change since the
-  body type is entirely derived from the class Ref.
+- **~~No reserved type-id / vtable header word in V1.~~** Superseded: every class
+  now carries a descriptor pointer at object-body field 0 (see Runtime type
+  identity above). Phase 1 shipped without it, and property `k` was LLVM field
+  `k`; `class_header_words` is now 1 for every class and the `struct_fields` table
+  and logical field path stay 0-based.
 
 The type layer, storage model, and lowering below describe the interned
 `Kind::Class` (nominal identity via a never-deduped `fields_id`; recursion via
@@ -433,16 +504,17 @@ number after it — and fills it with that class's thunk. `new src` then becomes
 right class with the right vtable. The thunk's LLVM signature is `(i64) -> i64` in
 every class, so the dispatch is type-safe by construction.
 
-The slot is reserved only for classes that already have a vtable. Giving one to a
-non-polymorphic class would add a header word to every object in the language. A
-non-polymorphic hierarchy therefore copies the static type inline, which slices a
-derived source — unobservable, because reaching the sliced-off part needs `$cast`
-and there is no dispatch to get wrong.
+Every class has a descriptor and so a `$copy` slot (see Runtime type identity
+above), so this covers a non-virtual hierarchy too. It did not originally: the
+slot was reserved only for a class that already had a vtable, and a non-virtual
+hierarchy copied the static type inline, slicing a derived source. That was argued
+unobservable because reaching the sliced-off part needs `$cast` — which is exactly
+what `$cast` then made observable.
 
-Costs: one small thunk per instantiated polymorphic class, emitted whether or not
-the design copies anything (the vtable slot has to be filled when the vtable is
-built, and whether a copy exists is not known then), and one more pointer per
-vtable. A copy also leaks like any other `new` (§7).
+Costs: one small thunk per instantiated class, emitted whether or not the design
+copies anything (the slot has to be filled when the descriptor is built, and
+whether a copy exists is not known then), and one more pointer per descriptor. A
+copy also leaks like any other `new` (§7).
 
 ## 8. Deferred, each loud-guarded
 
