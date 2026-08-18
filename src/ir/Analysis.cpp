@@ -198,6 +198,8 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::ClassNew:
         case Inst::Tag::HandleDeref:
         case Inst::Tag::ClassIsA:
+        case Inst::Tag::IfaceRef:
+        case Inst::Tag::IfaceSignal:
         case Inst::Tag::DynArrayNew:
         case Inst::Tag::DynArrayNewInit:
         case Inst::Tag::DynArraySize:
@@ -1009,6 +1011,17 @@ struct ValueSweep {
                     // constant table through the object's descriptor.
                     val_z[raw] = 0;
                     val_x[raw] = 0;
+                    break;
+                case Inst::Tag::IfaceRef:
+                    // The instance address is a 2-state 64-bit word; never x/z.
+                    val_z[raw] = 0;
+                    val_x[raw] = 0;
+                    break;
+                case Inst::Tag::IfaceSignal:
+                    // An lvalue on the named member, whose own 4-state planes the
+                    // reads and writes off it carry; report conservatively.
+                    val_z[raw] = 1;
+                    val_x[raw] = 1;
                     break;
                 case Inst::Tag::HandleDeref:
                     // An aggregate lvalue rooted at the heap object body, whose

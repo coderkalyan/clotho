@@ -47,6 +47,9 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
         case Type::Kind::Event:
             os << "event";
             break;
+        case Type::Kind::VirtualIface:
+            os << "virtual interface";
+            break;
         case Type::Kind::Struct: {
             const auto fields = pool.struct_fields(t.fields_id);
             os << (t.is_packed ? "struct packed{" : "struct{");
@@ -119,6 +122,10 @@ const char* tag_name(Inst::Tag tag) {
             return "arr_slice";
         case T::MemberSelect:
             return "member_select";
+        case T::IfaceRef:
+            return "iface_ref";
+        case T::IfaceSignal:
+            return "iface_signal";
         case T::ClassNew:
             return "class_new";
         case T::HandleDeref:
@@ -777,6 +784,10 @@ private:
                     os_ << "mon" << info.monitor;
                     break;
                 }
+                if (tag == Inst::Tag::IfaceRef) {
+                    os_ << "scope" << ir_.extra_data<IfaceInst>(p.extra).scope;
+                    break;
+                }
                 // concat: variadic operands.
                 const auto parts = ir_.region(ir_.extra_data<ExtraSlice>(p.extra));
                 for (size_t k = 0; k < parts.size(); ++k) {
@@ -892,6 +903,12 @@ private:
                 os_ << "[";
                 ref(es.index);
                 os_ << "])\n";
+                break;
+            }
+            case Inst::Tag::IfaceSignal: {
+                const IfaceMember m = ir_.extra_data<IfaceMember>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << "->s" << static_cast<uint32_t>(m.signal) << ")\n";
                 break;
             }
             case Inst::Tag::MemberSelect: {

@@ -1025,17 +1025,18 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
 TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
     // Binding a type parameter to a not-yet-lowered type must hit the same loud
     // guard as a direct declaration, not silently accept it. (`event`,
-    // `chandle`, `class`, an associative array with a class-handle value and one
-    // with an EVENT value were all prior examples here; every one of them lowers
-    // now.) A virtual interface stands in as the still-unsupported type.
+    // `chandle`, `class`, a virtual interface, an associative array with a
+    // class-handle value and one with an EVENT value were all prior examples here;
+    // every one of them lowers now.) A `chandle` associative-array KEY stands in as
+    // the still-unsupported type: it is a legal index type slang accepts, and
+    // clotho refuses it because a handle word has no equality-defined byte form.
     const LowerResult r = lower_text(R"(
-        interface I; logic x; endinterface
-        module m #(parameter type T = virtual I);
-            T v;
+        module m #(parameter type T = int);
+            T v[chandle];
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostic_text().find("virtual interface") != std::string::npos);
+    CHECK(r.diagnostic_text().find("associative array key type") != std::string::npos);
 }
 
 TEST_CASE("a class type parameter lowers as a handle") {

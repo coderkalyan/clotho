@@ -117,6 +117,13 @@ public:
     // object body. `handle` is the loaded handle value; `class_type` the Kind::Class
     // giving the body layout. A following member_select addresses a property.
     Index handle_deref(Index handle, Ref class_type, SourceLoc loc);
+    // Virtual interface handle naming the elaborated interface instance whose
+    // InstanceScope id is `scope` (LRM 25.9).
+    Index iface_ref(uint32_t scope, SourceLoc loc);
+    // Member of the interface instance `handle` names, as an lvalue. `rep` is any
+    // real instance's copy of that member: it supplies the def-local field index,
+    // the handle supplies the instance base.
+    Index iface_signal(Index handle, Signal rep, SourceLoc loc);
     // `$cast` dynamic type test (LRM 8.16): 1 when the object `handle` refers to
     // is of `class_type` or of a class derived from it, else 0. A null handle
     // answers 1; the frontend emits this only for a cast-compatible pair.

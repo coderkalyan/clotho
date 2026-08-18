@@ -635,6 +635,12 @@ public:
     // Femtoseconds per wheel tick (the design's finest time unit). Used by %t to
     // convert a tick-valued time argument to real time. 1 when unitless.
     uint64_t tick_fs = 1;
+    // InstanceScope ids of the interface instances a virtual interface handle can
+    // name (LRM 25.9). Every instance of the same definition must then present one
+    // runtime context record and one canonical signal shape, because an access
+    // through a handle is emitted once for the definition. Empty when the design
+    // declares no virtual interface.
+    std::vector<uint32_t> vif_scopes;
     // Default %t time-unit exponent (10^n seconds): the smallest time precision
     // across all design timescales (LRM Table 20-3). Seeds the runtime's
     // $timeformat default at startup.
