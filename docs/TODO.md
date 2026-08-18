@@ -98,9 +98,10 @@ professional parity; M5 makes it complete.
   covered too: the frame is per call, so `init_frame` alone was not enough.
   lower_var_decl still clears fn_ctx_ around the PreInit lowering, so a static
   initializer that reaches for a frame local fails loud rather than mis-resolving.
-  An `event` local is skipped — its trigger state is separate static state and its
-  placeholder slot is never read (Table 6-7's "new event" would need that stamp
-  reset).
+  An `event` local is skipped: its power-on value is its own handle, baked into the
+  state initializer, and re-running a default init would unbind it. An
+  automatic-lifetime event local is refused instead (Table 6-7's "new event" per
+  activation would need a fresh object).
   * Perf follow-up: the aggregate default is unrolled per leaf, and tier-0 does not
     fold it (measured: 279 stores for `automatic byte mem[256]`). A bulk reset needs
     an op that memcpys the type's proto image, valid only for a trivially-copyable
@@ -113,7 +114,8 @@ professional parity; M5 makes it complete.
   module signal / `static` local / array element (LRM 13.4.4 — same shadow-staging
   path as a task; frame-local NBA guarded).
 - [x] **ref / const ref args** (13.5.2) — a pointer to the actual's storage,
-  uniform for every storage class, so the formal may be any type but `event` and
+  uniform for every storage class, so the formal may be any type at all (an
+  `event` formal aliases its 64-bit handle word like a class handle) and
   the actual any whole place: a container element, an assoc element, a struct
   member, a class property, nested to any depth. A ref into a container's heap
   storage additionally carries that container's relocation epoch and is re-checked
@@ -269,11 +271,31 @@ professional parity; M5 makes it complete.
   Single-event only, lowered as a body/`@`-loop guard (`if (cond)`). Per-event
   `iff` in a multi-event list (`@(posedge a iff x or ...)`) still rejected loud —
   needs waking-source identification the shared-wake engine lacks.
-- [ ] **Event assignment / merge** (`e2 = e1`) and `null` event handles.
-- [ ] **Event-controlled trigger** (`->> @(x) e`, `->> repeat(n) @(x) e`).
-- [ ] **Event ports / task-function event args**.
-- [ ] **Events inside arrays / structs / queues**.
-- [ ] **`wait_order`**.
+- [x] **Event handles** (LRM 15.5.5) — `event` is a reference type: a 2-state
+  64-bit handle `{ u32 slot, u32 gen }` naming an entry in the backend's
+  `clotho.events` object array, laid out and passed exactly like a class handle.
+  `a = b` merges onto one sync object, `a = null` unbinds (`-> null` is a no-op and
+  `null.triggered` is 0), `a == b` is object identity, and a declared event powers
+  on holding its own handle straight from the state initializer. `@(a)` resolves
+  the handle when the wait executes, so a waiter already parked stays on the object
+  it parked on. An **event argument** works in every direction (LRM 15.5.5's own
+  "task triggers the caller's event" example, plus `ref` retargeting), an **event
+  port** is an aliasing port on both sides, and a **`static` event class property**
+  is one shared event. A monomorphism analysis keeps an event that is never
+  assigned folded to a constant object address, so a design that does not use
+  handles pays nothing. Design: docs/design/event-handles.md.
+
+  Still guarded loud, each needing an event OBJECT that a compile-time slot array
+  cannot size: events inside **arrays / structs / queues / dynamic arrays /
+  associative arrays**, a **per-instance** event class property, and an
+  **automatic-lifetime** event local in a subroutine (a fresh object per
+  activation). Also `@(<event held in a call frame>)`, because a `WaitEdge` names a
+  signal; triggering one works. And every event op **inside a function**, which is
+  the same missing-wheel restriction `$time` states.
+- [ ] **Event-controlled trigger** (`->> @(x) e`, `->> repeat(n) @(x) e`) — needs a
+  detached one-shot subscription on `x`; see docs/design/event-handles.md §7.4.
+- [ ] **`wait_order`** (LRM 15.5.6) — an ordered multi-event park with a failure
+  branch; the reactive-region walk rejects it ahead of lowering too.
 - [x] **`join_any` / `join_none`** (LRM 9.3.2, V2) — the join kinds differ at run
   time in one join-record field (`wake_at`: 0 for `join`, W-1 for `join_any`, never
   reached for `join_none`) and in when a child starts. `join` keeps resuming children
@@ -325,7 +347,12 @@ professional parity; M5 makes it complete.
 - [x] **`wait (expr)` statement** (LRM 9.4.3) — level-sensitive suspend; subsumes
   `wait(e.triggered)`.
 - [x] **Named events** (LRM 15.5) — `event e;`, `-> e`, `->> e`, `->> #d e`,
-  `@(e)` / `always @(e)`, `wait(e.triggered)`. Design: docs/design/named-events.md.
+  `@(e)` / `always @(e)`, `wait(e.triggered)`, at module, package, generate,
+  procedural-block and `static`-local scope. An event is an OBJECT (trigger tick +
+  intrusive waiter list + `->>` pending state) in the `clotho.events` array; its
+  waiters are a doubly-linked list of frame- or array-resident nodes, so the number
+  of simultaneous waiters is unbounded. Design: docs/design/named-events.md, and
+  docs/design/event-handles.md for the handle layer.
 - [x] **`fork` / `join`** (LRM 9.3.2, V1) — each child a coroutine; the parent
   joins all. Also inside a **task** body (and an assertion action block, which is
   lowered as one): a child takes the enclosing frame's packed integral /
@@ -843,8 +870,9 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
     included) was accessed misaligned — UB that UBSan reported 13 times on a
     two-member struct. The mirror now leads with an i64.
   An associative-array element works too, through the `rt_elem_assoc` (kind 5)
-  descriptor. Still guarded loud: an event element, which would need per-element
-  trigger state (LRM 15.5) — a scheduler change, not a data-model one.
+  descriptor. Still guarded loud: an event element, which needs one event OBJECT per
+  element; the object slot array is sized at compile time from the declared events
+  (docs/design/event-handles.md §9).
 - [x] **NBA to a dynamic array** — and to an associative array. `HandleCopyNb`
   stages a deep copy in the Active region and MOVES it into the live handle in the
   NBA region, generalizing the queue's path to all three container kinds. A

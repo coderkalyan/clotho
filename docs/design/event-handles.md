@@ -6,11 +6,31 @@ identity `a == b` / `a == null`, events as subroutine arguments (`in`, `out`,
 aggregate (fixed unpacked array, unpacked struct, queue, dynamic array,
 associative array value *and* key).
 
-Status: **designed, not built.** Supersedes the "Deferred: event handles" section
-of `docs/design/named-events.md`, whose Options A/B are both withdrawn — see
-[§2](#2-the-two-recorded-blockers-dissolve). Tier 1/2 (`event e;`, `-> e`,
-`->> e`, `->> #d e`, `@(e)`, `always @(e)`, `e.triggered`, `wait(...)`) is landed
-and this design subsumes it under one mechanism rather than adding a second.
+Status: **largely landed.** Supersedes the "Deferred: event handles" section of
+`docs/design/named-events.md`, whose Options A/B are both withdrawn — see
+[§2](#2-the-two-recorded-blockers-dissolve).
+
+Built: the event object and its intrusive waiter list (§3, §6), the 64-bit handle
+word (§3.1), merge / `null` / identity, event arguments in every direction, event
+ports, `static` event class properties, the `->>` pending chain (§7.2), the single
+`->> #d` thunk (§7.3), and the monomorphic fast path (§5).
+
+Not built, each loud-failing with a TODO: events inside aggregates and containers,
+per-instance event class properties, automatic-lifetime event locals — all of which
+need an event object per element / per activation, which the compile-time slot array
+cannot size (§9 names the runtime pool that would fix them together) — plus
+`@(<event held in a call frame>)` (§6 note), `->> @(x) e` (§7.4) and `wait_order`
+(§8).
+
+Two deviations from the design as first written, both measured:
+
+- The object array is **codegen-owned** (`clotho.events`), not a runtime slot table.
+  Every object is statically bound today, so the table bought nothing and cost an
+  indirection; §9's runtime pool is what the deferred aggregate cases need, and it
+  can be added underneath the same handle word without changing anything above it.
+  The `gen` half of the handle is therefore reserved, not yet consulted.
+- Refcounting is **not** implemented, because nothing is freed yet: every object is
+  immortal. It becomes necessary exactly when the runtime pool lands.
 
 ---
 
@@ -605,7 +625,7 @@ Two constraints follow, both acceptable:
 Each phase is independently landable and independently testable. Phases 0-2 are
 prerequisites; 3-5 are parallel.
 
-**Phase 0 — close the current holes (do first, independent of everything).**
+**Phase 0 — close the current holes.** (landed)
 Three real defects exist today, all in the "`is_event` set at only 2 of 18
 signal-creating sites" family:
 
@@ -626,29 +646,29 @@ Also give `wait_order` a named message instead of the generic
 `-> i.e` work and removes the wait/trigger asymmetry, with no handle machinery at
 all.
 
-**Phase 1 — the word.** `Type::Kind::Event`, 64-bit plane layout, the runtime slot
+**Phase 1 — the word.** (landed, together with Phase 2) `Type::Kind::Event`, 64-bit plane layout, the runtime slot
 table, `rt_event_bind_static`, monomorphic analysis, the constant-folded static
 deref. Retarget the existing `EventTrigger`/`EventTriggered` lowering onto the
 object while keeping the *bucket* waiter representation. Nothing user-visible
 changes; the whole existing `tests/event_test.cpp` must pass unaltered. This is
 the risky-but-invisible step and it must land alone.
 
-**Phase 2 — the list.** Replace the per-event bucket with the intrusive node
+**Phase 2 — the list.** (landed) Replace the per-event bucket with the intrusive node
 list, static nodes in a contiguous module-state array, dynamic nodes in frames.
 Delete the event arm of `wait_counts()`. Add `design_uses_event_handles_` to
 `ring_guard_wanted()`. Again no user-visible change; the test suite is the
 oracle.
 
-**Phase 3 — handles.** Delete the value/assignment gates, add the shared
+**Phase 3 — handles.** (landed, except the aggregate cases) Delete the value/assignment gates, add the shared
 `resolve_event` resolver, add refcounting and `rt_elem_event`. This is where
 `a = b`, `a = null`, `a == b`, arrays, queues, dynamic and associative arrays,
 struct members, class properties, and all four argument directions light up — as
 gate deletions, per §4.
 
-**Phase 4 — ports.** Extend `build_inout_aliases` to `In`/`Out` event ports;
+**Phase 4 — ports.** (landed) Extend `build_inout_aliases` to `In`/`Out` event ports;
 delete `Lower.cpp:3974-3978`.
 
-**Phase 5 — the two remaining LRM forms.** `->> @(x) e` / `->> repeat(n) @(x) e`
+**Phase 5 — the two remaining LRM forms.** (not started) `->> @(x) e` / `->> repeat(n) @(x) e`
 via `rt_event_detach_*` (§7.4), and `wait_order` (§8) including the
 reactive-region walk at `Lower.cpp:883-891`.
 
