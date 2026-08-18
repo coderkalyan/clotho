@@ -1145,7 +1145,7 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   nets (a net continuously driven from both sides fails loud, shared with `inout`;
   single-driver works), modport `export` methods, and structural modport
   expression ports (`.name(sig[hi:lo])` / concat; the whole-signal rename form
-  `.name(sig)` works). Virtual interfaces (LRM 25.9) tracked under M4.
+  `.name(sig)` works). Virtual interfaces (LRM 25.9) are under M4, below.
 - [x] **Interfaces & modports** (LRM 25) — interface instantiation, plain and
   modport-restricted interface ports, generic interface ports (`interface p`),
   modport views/directions, whole-signal modport expression (rename) ports,
@@ -1740,7 +1740,32 @@ project with its own algorithm, not tail cleanup on the property layer:
 
 ### UVM enablers
 
-- [ ] **Virtual interfaces** — full, including arrays and modport-typed.
+- [~] **Virtual interfaces** (LRM 25.9) — a handle is the 64-bit address of one
+  elaborated interface instance's runtime context record (the per-instance
+  descriptor module dedup already builds: state base, NBA shadow base, sched base,
+  dump-var base, wait-bucket bases). A member reached through it is the ordinary
+  signal lvalue with that base substituted — the representative's def-local field
+  index, the handle's instance — which is what a reused definition's own body
+  already emits for itself. slang resolves `vif.sig` against a cached placeholder
+  instance body, so the member symbol is matched to a real instance by
+  `InstanceBodySymbol::hasSameType` (`VifDefs`), and that representative supplies
+  every def-local constant. Working: declaration, `null`, `==` / `!=`, assignment
+  from an instance / another handle / `null`, modport-qualified and parameterized
+  handles, handles as class properties, constructor and task arguments and array
+  elements, member reads and blocking / nonblocking writes with correct wake, VCD
+  and NBA staging on the bound instance, interface events triggered through a
+  handle, and `@(edge vif.sig)` / `wait(vif.x)` — which park a frame-resident node
+  on an intrusive waiter list in the definition's state, the event-object list
+  reused, so there is no bucket identity or capacity to know at compile time.
+  Signals of an interface a handle can name keep the canonical type-derived shape,
+  the `ref`-actual rule. Deferred, guarded loud: a **clocking block** through a
+  handle (25.9.1 / 25.9.2 — a clockvar read would resolve but the synchronous
+  drive is performed by that block's Re-NBA process, bound to one instance), an
+  **interface subroutine** through a handle (lowered once per instance body, so it
+  needs a ctx-parameterized body — the `clone_with_ctx_param` transform — and an
+  ABI change to the call path), an event control on an **expression** over members,
+  and a member of an interface the design never instantiates. Design:
+  docs/design/interfaces.md.
 - [~] **String formatting** — `%p` (LRM 21.2.1.6). The four structural `shall`
   cases the clause names beyond unpacked arrays/structs now print correctly
   instead of falling through to a bare decimal: a tagged union as `'{tag:value}`
