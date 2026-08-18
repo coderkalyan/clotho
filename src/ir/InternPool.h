@@ -133,6 +133,17 @@ struct Type {
         // identical classes, even two empty ones, never unify. `element` holds the
         // base-class Ref for inheritance (Invalid in V1). See docs/design/classes.md.
         Class,
+        // Named event (LRM §15.5): a reference type, like Class. The value is a
+        // 64-bit handle `{ u32 slot, u32 gen }` naming an entry in the backend's
+        // design-wide event object array; the object carries the trigger timestamp,
+        // the intrusive waiter list head and the `->>` pending state. Handle
+        // semantics per LRM 15.5.5: assignment aliases the same sync object
+        // (`a = b` merges), `==` is identity, and `null` is the all-zero handle,
+        // which resolves to the reserved null object at slot 0 -- so it is also the
+        // power-on default Table 7-1 asks for. Plane-sized so every storage class,
+        // container and call-ABI path carries it with no special case, exactly as a
+        // class handle is. See docs/design/event-handles.md.
+        Event,
     };
 
     // Discriminant for this type.
@@ -298,6 +309,8 @@ public:
     Ref bit_type;
     // Dynamic string.
     Ref string_type;
+    // Named event: the 64-bit handle to a sync object (LRM 15.5.5).
+    Ref event_type;
     // IEEE-754 double / float (SV real, realtime / shortreal).
     Ref real_type;
     Ref shortreal_type;

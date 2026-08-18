@@ -964,11 +964,6 @@ struct WaitInfo {
 
 // Extra payload for `event_trigger_nb_delayed` (`->> #d e`): the target event
 // signal. The delay (in wheel ticks) is the instruction's `op` operand.
-struct EventDelayInfo {
-    // Event whose synthetic signal owns the wait queue to service on expiry.
-    Signal event;
-};
-
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
@@ -1530,28 +1525,31 @@ struct Inst {
         // registering the process on each event's wait queue plus a coroutine
         // suspend; a matching blocking assignment to one of the signals wakes it.
         Wait,
-        // Blocking trigger of a named event `-> e` (payload: signal, the event's
-        // synthetic signal). Records the trigger time (for `.triggered`) and
-        // unconditionally services the event signal's Any-edge wait queues,
-        // waking every `@(e)` / `always @(e)` waiter in the current instant
-        // (LRM 15.5.2). An event has no value, so there is no edge computation.
+        // Blocking trigger of a named event `-> e` (payload: unary -> the event
+        // HANDLE value, a 64-bit { slot, gen }). Resolves the handle to its event
+        // object, records the trigger time (for `.triggered`) and wakes every
+        // waiter on the object's list in the current instant (LRM 15.5.2). An event
+        // has no value, so there is no edge computation. A null handle resolves to
+        // the reserved null object, whose waiter list is always empty -- the no-op
+        // LRM 15.5.5 requires of `-> null`.
         EventTrigger,
-        // The `e.triggered` event property (payload: signal), -> a definite 1-bit
-        // value: 1 iff the event was triggered in the current time step, else 0
-        // (LRM 15.5.3). Lowers to a compare of the recorded trigger time against
-        // the current sim time.
+        // The `e.triggered` event property (payload: unary -> the event handle),
+        // -> a definite 1-bit value: 1 iff the event was triggered in the current
+        // time step, else 0 (LRM 15.5.3). Lowers to a compare of the object's
+        // recorded trigger time against the current sim time; a null handle reads
+        // the null object's never-triggered sentinel and answers 0.
         EventTriggered,
-        // Nonblocking trigger of a named event `->> e` (payload: signal). Unlike
-        // EventTrigger, the wake is deferred to the NBA region of the current time
-        // step (LRM 15.5.4): it marks the event pending; the NBA region then
-        // stamps the trigger time and services the waiters. The triggering process
-        // does not block.
+        // Nonblocking trigger of a named event `->> e` (payload: unary -> the event
+        // handle). Unlike EventTrigger, the wake is deferred to the NBA region of
+        // the current time step (LRM 15.5.4): it links the object onto the pending
+        // chain; the NBA region then stamps the trigger time and wakes the waiters.
+        // The triggering process does not block.
         EventTriggerNb,
-        // Delayed nonblocking trigger `->> #d e` (payload: op_extra -> op is the
-        // delay in wheel ticks, extra -> EventDelayInfo names the event). Schedules
-        // a detached wheel timer that, on expiry, stamps the trigger time and
-        // services the event's waiters (LRM 15.5.4). The triggering process does
-        // not block. The event-controlled form (`->> @(x) e`) is not lowered here.
+        // Delayed nonblocking trigger `->> #d e` (payload: binary -> l is the delay
+        // in wheel ticks, r is the event HANDLE value). Schedules a detached wheel
+        // timer carrying the handle that, on expiry, stamps the trigger time and
+        // wakes the event's waiters (LRM 15.5.4). The triggering process does not
+        // block. The event-controlled form (`->> @(x) e`) is not lowered here.
         EventTriggerNbDelayed,
         // Fork block `fork … join` (payload: extra -> ForkInfo). A statement that
         // spawns each child body as its own coroutine (a fork-child task, whose
@@ -2044,15 +2042,15 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Constant:
             return K::Ref;
         case T::Signal:
-        case T::EventTrigger:
-        case T::EventTriggered:
-        case T::EventTriggerNb:
             return K::Signal;
         case T::Arg:
             return K::Arg;
         case T::Local:
             return K::Local;
 
+        case T::EventTrigger:
+        case T::EventTriggered:
+        case T::EventTriggerNb:
         case T::Load:
         case T::Bnot:
         case T::RedAnd:
@@ -2151,6 +2149,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FopenFd:
         // $ungetc: l is the character, r the descriptor.
         case T::Ungetc:
+        // `->> #d e`: l is the delay in ticks, r is the event handle.
+        case T::EventTriggerNbDelayed:
             return K::Binary;
 
         case T::Resize:
@@ -2314,7 +2314,6 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::TaggedFmtP:
         case T::CountBits:
         case T::ValuePlusArgs:
-        case T::EventTriggerNbDelayed:
             return K::OpExtra;
     }
 

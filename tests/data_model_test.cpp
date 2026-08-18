@@ -236,11 +236,13 @@ const Elem elems[] = {
       "$$[\"a\"] = 11;", "$display(\"%0d\", $$[\"a\"]);", "11\n", t_managed },
     { "class handle", "class EC;\n    int v;\nendclass", "typedef EC ET;",
       "$$ = new;\n$$.v = 13;", "$display(\"%0d\", $$.v);", "13\n", t_handle },
-    // The one deliberate exclusion (§7). An event has no value, so it has no
-    // literal to assign and nothing to render; `expect` is never consulted
-    // because every event cell must be refused.
+    // An event is a 64-bit handle with reference semantics, exactly like a class
+    // handle (docs/design/event-handles.md): a bare event variable assigns, holds
+    // null and reads `.triggered`. `$$ = null` then `.triggered` is 0 -- the null
+    // object never triggers. The shapes that still refuse (events in aggregates,
+    // across ports, as subroutine arguments) stay on the allowlist below.
     { "event", "", "typedef event ET;",
-      "$$ = null;", "$display(\"%0d\", $$.triggered);", "", t_event },
+      "$$ = null;", "$display(\"%0d\", $$.triggered);", "0\n", t_event },
 };
 // clang-format on
 
@@ -587,8 +589,8 @@ const Allow allowlist[] = {
       "event struct member is not supported",
       "§7: an event in an aggregate has no per-member trigger state (LRM 15.5)." },
     { [](const Cell& k) { return is_event(k) && k.c->kind == C::cprop; },
-      "event class property is not supported",
-      "§7: an event in an aggregate has no per-property trigger state (LRM 15.5)." },
+      "a per-instance event class property is not supported",
+      "an event object per class object needs a runtime slot pool (LRM 15.5.5)." },
     { [](const Cell& k) { return is_event(k) &&
                                  (k.c->kind == C::dynarr || k.c->kind == C::queue); },
       "element type is not supported",

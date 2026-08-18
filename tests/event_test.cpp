@@ -345,11 +345,145 @@ TEST_CASE("package-scoped named event triggers and wakes a waiter") {
     CHECK(out.find("woke t=5") != std::string::npos);
 }
 
-TEST_CASE("event handle / event-controlled trigger forms are rejected") {
-    CHECK(reject("module top; event e, f; initial e = f; endmodule").find(
-            "event assignment") != std::string::npos);
-    CHECK(reject("module top; event e; initial e = null; endmodule").find(
-            "event assignment") != std::string::npos);
+// -- Event handles (LRM 15.5.5): docs/design/event-handles.md --
+
+// An event variable is a handle to a sync object, so `a = b` makes both names
+// refer to ONE object: a trigger through either wakes every waiter parked on it.
+TEST_CASE("event assignment merges the two handles onto one object") {
+    const std::string out = run_capture(R"(
+        module top;
+          event a, b; int na = 0, nb = 0;
+          initial begin
+            a = b;
+            fork forever begin @(a); na++; end join_none
+            fork forever begin @(b); nb++; end join_none
+            #1 -> a;
+            #1 $display("na=%0d nb=%0d", na, nb);
+          end
+        endmodule
+    )");
+    CHECK(out == "na=1 nb=1\n");
+}
+
+// A wait captures the object the variable names WHEN IT EXECUTES. Re-pointing the
+// variable afterwards must not move an already-parked waiter.
+TEST_CASE("a parked event waiter stays on the object it parked on") {
+    const std::string out = run_capture(R"(
+        module top;
+          event a, b; int na = 0, nb = 0;
+          initial forever begin @(a); na++; end
+          initial forever begin @(b); nb++; end
+          initial begin
+            #1 a = b;
+            #1 -> a;
+            #1 $display("na=%0d nb=%0d", na, nb);
+          end
+        endmodule
+    )");
+    // The @(a) waiter parked on a's original object at t=0; `-> a` at t=2 fires b's
+    // object, so only the @(b) waiter wakes.
+    CHECK(out == "na=0 nb=1\n");
+}
+
+// `null` is the all-zero handle and the power-on default (LRM Table 7-1 / 15.5.5):
+// `-> null` is a no-op, `null.triggered` is 0, and `@(null)` blocks forever.
+TEST_CASE("a null event handle triggers nothing and never wakes") {
+    SUBCASE("no-op trigger, triggered stays 0") {
+        CHECK(run_capture("module top; event a; initial begin a = null; -> a; "
+                          "$display(\"t=%0b\", a.triggered); end endmodule") == "t=0\n");
+    }
+    SUBCASE("power-on default is null") {
+        CHECK(run_capture("module top; event a; initial $display(\"n=%0b\", a == null); "
+                          "endmodule") == "n=0\n");
+    }
+    SUBCASE("@(null) blocks forever") {
+        CHECK(run_capture("module top; event a; initial begin a = null; @(a); $display(\"BAD\"); end "
+                          "initial #5 $display(\"blocked\"); endmodule") == "blocked\n");
+    }
+    SUBCASE("re-pointing away from null restores triggering") {
+        CHECK(run_capture(R"(
+            module top;
+              event a, keep; int n = 0;
+              initial forever begin @(keep); n++; end
+              initial begin
+                a = keep; -> a; #1;
+                a = null; -> a; #1;
+                a = keep; -> a; #1;
+                $display("n=%0d", n);
+              end
+            endmodule
+        )") == "n=2\n");
+    }
+}
+
+// `==` on two event handles is an identity compare of the objects they name, not a
+// value compare (there is no value): distinct declarations never compare equal, and
+// a merged handle compares equal to its source.
+TEST_CASE("event handle equality is object identity") {
+    const std::string out = run_capture(R"(
+        module top;
+          event a, b, c;
+          initial begin
+            $display("%0b%0b", a == a, a == b);
+            c = a;
+            $display("%0b%0b", c == a, c == b);
+          end
+        endmodule
+    )");
+    CHECK(out == "10\n10\n");
+}
+
+// Both nonblocking forms follow the handle, not the declaration: after `a = b`,
+// `->> a` and `->> #d a` must fire b's object.
+TEST_CASE("nonblocking triggers follow a merged handle") {
+    SUBCASE("->> in the NBA region") {
+        const std::string out = run_capture(R"(
+            module top;
+              event a, b; logic [7:0] q = 0;
+              initial begin a = b; #5; q <= 8'hAA; ->> a; end
+              initial begin @(b); $display("q=%02h", q); end
+              initial #10 $finish;
+            endmodule
+        )");
+        CHECK(out.find("q=aa") != std::string::npos);
+    }
+    SUBCASE("->> #d detached timer") {
+        const std::string out = run_capture(R"(
+            module top;
+              event a, b;
+              initial begin a = b; ->> #4 a; end
+              initial begin @(b); $display("t=%0t", $time); end
+              initial #10 $finish;
+            endmodule
+        )");
+        CHECK(out.find("t=4") != std::string::npos);
+    }
+}
+
+// A `static` class property of event type is ordinary persistent module-signal
+// storage holding a handle, so it needs no per-object machinery and works: ONE
+// event shared by every instance of the class (LRM 8.9).
+TEST_CASE("a static event class property is one shared event") {
+    const std::string out = run_capture(R"(
+        module top;
+          class C;
+            static event e;
+            task fire(); -> e; endtask
+          endclass
+          int n = 0;
+          initial forever begin @(C::e); n++; end
+          initial begin
+            C c1 = new(); C c2 = new();
+            #1 c1.fire();
+            #1 c2.fire();
+            #1 $display("n=%0d", n);
+          end
+        endmodule
+    )");
+    CHECK(out == "n=2\n");
+}
+
+TEST_CASE("event forms that are still rejected") {
     CHECK(reject("module top; logic clk; event e; initial ->> @(posedge clk) e; endmodule").find(
             "event-controlled nonblocking trigger") != std::string::npos);
     CHECK(reject("module top; event e; input e; endmodule").find(
@@ -467,18 +601,17 @@ TEST_CASE("a hierarchical named event can be triggered, not just waited on") {
     }
 }
 
-// An event class property is unsupported in BOTH lifetimes. lower_class_type's
-// guard only runs for a class something instantiates, and it sat after the
-// static-property `continue`, so `-> C::e` on a never-instantiated class reported
-// the generic "reference to unknown signal" instead of naming the construct.
-TEST_CASE("an event class property is rejected in either lifetime") {
+// A per-instance event class property is still unsupported: it would need one
+// event object per class object, which the compile-time slot array cannot size.
+// lower_class_type's guard runs only for a class something instantiates, so the
+// reference-site guard in signal_of is what names it in the other cases.
+TEST_CASE("a per-instance event class property is rejected") {
     CHECK(reject("module top; class C; event e; endclass "
                  "initial begin C c = new(); -> c.e; end endmodule")
-            .find("event class property is not supported") != std::string::npos);
-    CHECK(reject("module top; class C; static event e; endclass initial -> C::e; endmodule")
-            .find("event class property is not supported") != std::string::npos);
-    CHECK(reject("module top; class C; static event e; endclass initial @(C::e); endmodule")
-            .find("event class property is not supported") != std::string::npos);
+            .find("a per-instance event class property is not supported") != std::string::npos);
+    // A `static` property is NOT in the object body -- it is persistent
+    // module-signal storage -- so once an event is a handle word it needs nothing
+    // per-object and works. Only the per-instance form is still missing.
 }
 
 // `wait_order` (LRM 15.5.6) fell through lower_stmt's `default:` to the bare

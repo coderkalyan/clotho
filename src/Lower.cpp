@@ -2114,11 +2114,14 @@ private:
             return ref;
         }
         if (ct.isEvent()) {
-            // Named event (LRM 15.5): no data value. Modeled as a 1-bit logic
-            // placeholder signal whose only role is to own wait queues; the
-            // trigger state lives in a separate per-event timestamp. See
-            // docs/design/named-events.md.
-            return module_.pool.logic_type;
+            // Named event (LRM 15.5): a reference type. The variable holds a 64-bit
+            // handle `{ u32 slot, u32 gen }` naming an entry in the backend's event
+            // object array (which carries the trigger timestamp, the waiter list and
+            // the `->>` pending state). Handle semantics come out of the ordinary
+            // scalar machinery -- assignment aliases, `==` is identity, `null` is the
+            // all-zero power-on default -- exactly as for a class handle.
+            // See docs/design/event-handles.md.
+            return module_.pool.event_type;
         }
         if (ct.isCHandle()) {
             // chandle (LRM 6.14): an opaque pointer-width handle. Lowered as a
@@ -2224,17 +2227,6 @@ private:
             }
         }
         for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
-            // Ahead of the static skip below: a `static event` property took the
-            // `continue` and never reached this guard, so it reported the generic
-            // `reference to unknown signal` from signal_of instead of naming the
-            // construct. Both lifetimes are equally unimplemented -- an instance
-            // property would be an inert placeholder in the object body, a static one
-            // an inert module signal -- so the gate belongs before the split.
-            // TODO: event class properties (LRM 15.5.5) need the event handle word;
-            // see docs/design/event-handles.md.
-            if (prop.getType().getCanonicalType().isEvent()) {
-                fail("event class property is not supported");
-            }
             if (prop.lifetime == slang::ast::VariableLifetime::Static) {
                 // A static property (LRM 8.9) is ONE slot shared across all
                 // instances, not part of the per-object body — it gets persistent
@@ -2245,6 +2237,17 @@ private:
             if (prop.randMode != slang::ast::RandMode::None) {
                 // TODO: rand / randc properties and randomize() (Phase 3).
                 fail("rand / randc class properties are not supported");
+            }
+            if (prop.getType().getCanonicalType().isEvent()) {
+                // A PER-INSTANCE event property would need one event object per class
+                // object, and the object slot array is sized at compile time -- a
+                // class can be `new`'d unboundedly. A `static` event property is
+                // fine and took the `continue` above: it is one shared handle in
+                // ordinary module-signal storage.
+                // TODO: per-object event objects (a runtime slot pool); see
+                // docs/design/event-handles.md §9.
+                fail("a per-instance event class property is not supported "
+                     "(a `static` one is)");
             }
             class_prop_index_.emplace(&prop, idx);
             fields.push_back({ prop.name, lower_type(prop.getType()), idx });
@@ -4056,22 +4059,21 @@ private:
             fail("modport expression port with a non-trivial connection "
                  "expression is not supported");
         }
-        if (csym.kind == SymbolKind::ClassProperty && csym.getType().getCanonicalType().isEvent()) {
-            // lower_class_type's event-property guard only runs for a class that is
-            // actually elaborated (something calls `new`). `-> C::e` on a class that
-            // is never instantiated reaches here instead, with the property never
-            // registered, and reported the generic "unknown signal". Name the
-            // construct wherever the reference appears.
-            // TODO: event class properties (LRM 15.5.5) — see
-            // docs/design/event-handles.md.
-            fail("event class property is not supported");
-        }
         const auto it = sigmap_.find(&csym);
-        if (it == sigmap_.end()) {
-            fail("reference to unknown signal '" + std::string(csym.name) + "'");
+        if (it != sigmap_.end()) {
+            return it->second;
         }
-
-        return it->second;
+        if (csym.kind == SymbolKind::ClassProperty &&
+            csym.as<slang::ast::ClassPropertySymbol>().lifetime == slang::ast::VariableLifetime::Static) {
+            // A static class property gets persistent module-signal storage
+            // registered LAZILY on first access (declare_static_prop), and the value
+            // paths do that themselves. A reference that arrives here instead --
+            // `@(C::e)` on a static event property, which resolves through
+            // event_signal -- must trigger the same registration rather than report
+            // the property as unknown.
+            return declare_static_prop(csym.as<slang::ast::ClassPropertySymbol>());
+        }
+        fail("reference to unknown signal '" + std::string(csym.name) + "'");
     }
 
     // Register a procedural local variable (a for-loop control variable or a
@@ -7137,28 +7139,45 @@ private:
         }
     }
 
+    // Resolve any event expression to its 64-bit handle value. Because an event is
+    // now an ordinary plane-typed value, this is just the generic rvalue path -- a
+    // declared event reads its signal, an array element reads its element, a class
+    // property reads its field, a formal reads its frame slot -- so no event-shaped
+    // resolver is needed and every target form works the same way.
+    ir::Index event_handle(const Expression& e, ir::Builder& b) {
+        if (!e.type->isEvent()) {
+            // Defensive: slang types a trigger target and a `.triggered` receiver as
+            // an event already.
+            fail("expected an event expression");
+        }
+        return lower_expr(e, b);
+    }
+
     // Lower `-> e` / `->> e` / `->> #d e` (LRM 15.5.2, 15.5.4).
     void lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
         require_wheel_for_event(ev.isNonBlocking ? "'->> e'" : "'-> e'");
-        const ir::Signal sig = trigger_target(ev.target);
         if (ev.timing != nullptr) {
             // Only `->>` carries a timing control (grammar), so a delayed trigger
             // is always nonblocking. A fixed delay `->> #d e` schedules a detached
             // wheel timer; the event-controlled form is not yet lowered.
             if (ev.timing->kind == slang::ast::TimingControlKind::Delay) {
                 const Expression& amount = ev.timing->as<slang::ast::DelayControl>().expr;
-                b.event_trigger_nb_delayed(sig, scaled_delay(amount, b), loc(ev));
+                // Evaluate the delay first, then the target: the LRM leaves the order
+                // unspecified, and this keeps the handle load adjacent to its use.
+                const ir::Index ticks = scaled_delay(amount, b);
+                b.event_trigger_nb_delayed(event_handle(ev.target, b), ticks, loc(ev));
                 return;
             }
             // TODO: event-controlled nonblocking trigger (`->> @(x) e`,
             // `->> repeat(n) @(x) e`) — needs a detached one-shot event
-            // subscription (docs/design/named-events.md, Tier 2 Form 2).
+            // subscription (docs/design/event-handles.md §7.4).
             fail("event-controlled nonblocking trigger ('->> @(...) e') is not supported");
         }
+        const ir::Index h = event_handle(ev.target, b);
         if (ev.isNonBlocking) {
-            b.event_trigger_nb(sig, loc(ev)); // `->> e`: wake in the NBA region
+            b.event_trigger_nb(h, loc(ev)); // `->> e`: wake in the NBA region
         } else {
-            b.event_trigger(sig, loc(ev)); // `-> e`: wake now
+            b.event_trigger(h, loc(ev)); // `-> e`: wake now
         }
     }
 
@@ -15812,7 +15831,7 @@ private:
         // `e.triggered` (LRM 15.5.3): 1-bit "triggered this time step" property.
         if (const Expression* ev = triggered_event(call)) {
             require_wheel_for_event("'e.triggered'");
-            return b.event_triggered(event_signal(*ev), l);
+            return b.event_triggered(event_handle(*ev, b), l);
         }
 
         // `<sequence>.triggered` (see sequence_method): the same spelling on a
@@ -17428,12 +17447,6 @@ private:
                 return gated_store(a, *fi, b);
             }
         }
-        if (a.left().type->isEvent()) {
-            // `e2 = e1` (merge) / `e = null` (LRM 15.5.5): event variables are
-            // handles; assignment aliases the underlying sync object. Tier 2 —
-            // needs event reference semantics (docs/design/named-events.md).
-            fail("event assignment is not supported");
-        }
         if (a.isNonBlocking() && a.left().kind == ExpressionKind::MemberAccess &&
             a.left().as<MemberAccessExpression>().member.kind == SymbolKind::ClassProperty) {
             // TODO: nonblocking assignment to a class property. The aggregate NBA
@@ -18976,15 +18989,10 @@ private:
                 // signals are collected (the two-pass lowering below) it flows
                 // through the ordinary signal_of path.
                 const ValueSymbol& sym = expr.as<ValueExpressionBase>().symbol;
-                if (expr.type->isEvent()) {
-                    // A named event has no data value; the legal forms (`@(e)`,
-                    // `-> e`, `e.triggered`) resolve the event symbol directly and
-                    // never reach this value path. This catches the Tier-2 handle
-                    // forms — `e2 = e1` merge, `e == null` — which need event
-                    // reference semantics (docs/design/named-events.md).
-                    fail("event used as a value is not supported (event assignment / "
-                         "comparison / null)");
-                }
+                // An event is a plane-typed handle value (LRM 15.5.5), so it needs
+                // no special case here: `e2 = e1` merges by copying the handle,
+                // `e == null` is an identity compare, and passing one is a scalar
+                // copy. See docs/design/event-handles.md.
                 if (sym.kind == SymbolKind::Parameter) {
                     const ParameterSymbol& p = sym.as<ParameterSymbol>();
                     return b.constant(lower_constant(p.getValue(), p.getType()), l);

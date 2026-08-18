@@ -739,7 +739,8 @@ public:
         // undriven / ptr-arg bits while laying out signal slots.
         facts_ = analyze(mod_);
         build_state_types();
-        emit_state_global(); // before any body: storage_ptr resolves through the anchors
+        assign_event_slots(); // before emit_state_global: an event's power-on value IS its handle
+        emit_state_global();  // before any body: storage_ptr resolves through the anchors
         build_rng_global();  // before any body: every call site passes an RNG pointer
         if (stat_on(config_.stats, Stat::Dedup)) {
             report_dedup_stat();
@@ -781,7 +782,6 @@ public:
         build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
         build_wait_queues();
         build_instance_ctx_layout(); // after build_wait_queues: ctx sizes need wait slots
-        build_delay_event_thunks(); // after build_wait_queues: thunks read the event globals
         build_sched_flags();
         build_nba_state();
 
@@ -2461,22 +2461,11 @@ private:
                 continue;
             }
             if (ir.tag(idx) == Inst::Tag::EventTriggerNb) {
-                // `->> e` defers its wake to the NBA region; record the event so
-                // the region scans it. (Distinct events dedup; the list is tiny.)
-                const Signal sig = ir.payload(idx).signal;
-                if (std::find(nb_event_sigs_.begin(), nb_event_sigs_.end(), sig) == nb_event_sigs_.end()) {
-                    nb_event_sigs_.push_back(sig);
-                }
-                continue;
-            }
-            if (ir.tag(idx) == Inst::Tag::EventTriggerNbDelayed) {
-                // `->> #d e` schedules a detached wheel timer; record the event so
-                // a per-event on-expiry thunk is generated.
-                const Signal sig = ir.extra_data<EventDelayInfo>(ir.payload(idx).op_extra.extra).event;
-                if (std::find(nb_delay_event_sigs_.begin(), nb_delay_event_sigs_.end(), sig) ==
-                    nb_delay_event_sigs_.end()) {
-                    nb_delay_event_sigs_.push_back(sig);
-                }
+                // `->> e` defers its wake to the NBA region. The target is a handle,
+                // so there is no compile-time event to record: the region drains a
+                // runtime pending chain instead, and only needs to know the design
+                // contains at least one such trigger.
+                design_uses_nb_events_ = true;
                 continue;
             }
             // A whole-container nonblocking assignment (`q <= rhs`, `d <= rhs`,
@@ -4618,7 +4607,9 @@ private:
             // array onto the event object's waiter list. Edge is meaningless for an
             // event (a trigger is not a transition), so it is ignored here -- every
             // event subscription is recorded once, on the one list.
-            emit_event_link(event_obj(sig), next_static_event_node(), handle, flag_ptr);
+            // A persistent subscription is never unlinked, so it needs no owner.
+            emit_event_link(event_obj_for(sig), next_static_event_node(), handle, flag_ptr,
+                            /*record_owner=*/false);
             return;
         }
         const uint32_t slot = sta_next_[i][edge]++;
@@ -4693,8 +4684,12 @@ private:
         uint32_t ev_k = 0;
         for (const WaitEdge& e : events) {
             if (mod_.signal(e.signal).is_event) {
-                emit_event_link(event_obj(e.signal), event_wait_node(ev_k++),
-                                parked_handle(b_, hdl_), sched_ptr_);
+                // Resolve the variable's CURRENT handle: after `a = b`, `@(a)` must
+                // park on b's object (LRM 15.5.5). The declared object is only the
+                // power-on binding.
+                emit_event_link(event_obj_for(e.signal), event_wait_node(ev_k++),
+                                parked_handle(b_, hdl_), sched_ptr_,
+                                /*record_owner=*/!event_is_mono(e.signal));
             } else {
                 emit_dynamic_register(e.signal, e.edge);
             }
@@ -4713,7 +4708,8 @@ private:
         ev_k                   = 0;
         for (const WaitEdge& e : events) {
             if (mod_.signal(e.signal).is_event) {
-                emit_event_unlink(event_obj(e.signal), event_wait_node(ev_k++));
+                emit_event_unlink(event_wait_node(ev_k++),
+                                  event_is_mono(e.signal) ? event_obj(e.signal) : nullptr);
             } else if (remove_sigs) {
                 emit_dynamic_remove(e.signal, e.edge);
             }
@@ -5482,7 +5478,7 @@ private:
     // enumerated at compile time. See docs/design/event-handles.md.
     llvm::StructType* event_obj_ty() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llvm::StructType::get(ctx_, { b_.getInt64Ty(), ptr, b_.getInt8Ty() });
+        return llvm::StructType::get(ctx_, { b_.getInt64Ty(), ptr, b_.getInt8Ty(), b_.getInt32Ty(), ptr });
     }
 
     // One waiter on an event: an intrusive doubly-linked node.
@@ -5502,17 +5498,28 @@ private:
     // `disable` activation list already uses (disable_node_ty).
     llvm::StructType* event_node_ty() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, ptr });
+        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, ptr, ptr });
     }
 
     static constexpr uint32_t kEventTrig    = 0;
     static constexpr uint32_t kEventWaiters = 1;
     static constexpr uint32_t kEventPending = 2;
+    // The event's runtime dump-var index, or -1 when it is not dumped. Carried in
+    // the object because a fire reached through a handle does not know which
+    // declared event it landed on, and the VCD dirty set is index-based.
+    static constexpr uint32_t kEventVcd     = 3;
+    // Next object on the NBA pending chain, or null when this one is not on it.
+    static constexpr uint32_t kEventNextPend = 4;
 
     static constexpr uint32_t kNodeNext   = 0;
     static constexpr uint32_t kNodePrev   = 1;
     static constexpr uint32_t kNodeHandle = 2;
     static constexpr uint32_t kNodeFlag   = 3;
+    // The object this node is linked onto. Recorded at link time so unlinking is
+    // correct even when the event VARIABLE is reassigned while we are parked --
+    // `@(a)` captures the object a named when the wait executed (LRM 15.5.5), and
+    // the node must come off that object, not off whatever `a` names on resume.
+    static constexpr uint32_t kNodeOwner  = 4;
 
     // The object of a statically-declared event, as a folded constant GEP into
     // clotho.events. Slot 0 is the reserved null object, so a real event's slot is
@@ -5529,6 +5536,37 @@ private:
                                     { b_.getInt32(0), b_.getInt32(slot) });
     }
 
+    // The object a runtime event HANDLE names. The handle is { u32 slot, u32 gen }
+    // packed into an i64, so the slot is the low half; `gen` is carried for the
+    // dynamic-lifetime work and is not consulted while every object is statically
+    // bound and immortal.
+    //
+    // A null handle is all-zero, so it indexes slot 0 -- the reserved null object.
+    // Its waiter list is permanently empty and its trigger tick is the
+    // never-triggered sentinel, which is exactly LRM 15.5.5's `-> null` no-op and
+    // `null.triggered == 0`, with no branch on the hot path.
+    //
+    // The index is masked to the array bound so a corrupted or stale handle reads
+    // some object rather than off the end of the global; with only statically bound
+    // objects this is unreachable, and it costs one `and` against a constant.
+    llvm::Value* event_obj_of(llvm::Value* handle) {
+        llvm::Value* slot = b_.CreateTrunc(handle, b_.getInt32Ty());
+        if (const uint32_t n = event_slot_count_; (n & (n - 1)) == 0 && n > 1) {
+            slot = b_.CreateAnd(slot, b_.getInt32(n - 1));
+        } else {
+            slot = b_.CreateURem(slot, b_.getInt32(event_slot_count_));
+        }
+        return b_.CreateInBoundsGEP(events_arr_ty_, sym(events_gv_), { b_.getInt32(0), slot });
+    }
+
+    // The 64-bit handle currently stored in an event variable's own signal slot.
+    // An event signal is a narrow 2-state 64-bit plane, so this is a single load of
+    // field 0 of its slot.
+    llvm::Value* load_event_handle(Signal sig) {
+        return b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(slot_of(sig).slot_ty,
+                                                                 storage_ptr(slot_of(sig)), 0));
+    }
+
     llvm::Value* event_field(llvm::Value* obj, uint32_t field) {
         return b_.CreateStructGEP(event_obj_ty(), obj, field);
     }
@@ -5541,6 +5579,94 @@ private:
             case Edge::Any: return "any";
         }
         return "any";
+    }
+    // Number one event object slot per declared event, reserving slot 0 for the null
+    // object. Split out of build_wait_queues because slot_const needs the numbering
+    // to bake each event's own handle into the state initializer, and that happens
+    // much earlier in the pipeline (emit_state_global).
+    //
+    // The walk is in signal order, so numbering is deterministic -- which is what
+    // lets `-> e` on a statically-bound event resolve to a constant object address
+    // with no indirection at all.
+    void assign_event_slots() {
+        const auto sigs = mod_.signals();
+        event_slot_.assign(sigs.size(), 0);
+        event_slot_count_ = 1;
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            if (sigs[i].is_event) {
+                event_slot_[i] = event_slot_count_++;
+            }
+        }
+        analyze_event_monomorphism();
+    }
+
+    // Which event variables provably name ONE object for the whole run.
+    //
+    // An event's handle only ever changes by being assigned (LRM 15.5.5's merge and
+    // `= null`; event subroutine arguments and ports are refused today, and an
+    // aggregate element has no signal of its own). So an event signal that is never
+    // the target of a store keeps its power-on binding forever, and every reference
+    // to it can use the CONSTANT object address instead of loading the handle and
+    // indexing the array.
+    //
+    // That is the difference between paying for handles everywhere and paying for
+    // them only where they are used: an ordinary design, which never merges, gets
+    // exactly the code it got before handles existed.
+    //
+    // Conservative by construction: anything that stores to an event signal, or any
+    // store whose lvalue root cannot be resolved to a signal at all, clears the bit
+    // (the latter clears every event's, since the target is unknown).
+    void analyze_event_monomorphism() {
+        event_mono_.assign(mod_.signals().size(), true);
+        const auto visit = [&](const Ir& ir) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                // Every store form reaches its target through an lvalue in the same
+                // operand position: Store/StoreNb are binary (l is the lvalue), the
+                // delayed / intra forms are op_extra with `op` as the lvalue.
+                Index lv{};
+                switch (ir.tag(idx)) {
+                    case Inst::Tag::Store:
+                    case Inst::Tag::StoreNb:
+                        lv = ir.payload(idx).binary.l;
+                        break;
+                    case Inst::Tag::StoreNbDelay:
+                    case Inst::Tag::StoreInertialDelay:
+                    case Inst::Tag::StoreNbEvent:
+                        lv = ir.payload(idx).op_extra.op;
+                        break;
+                    default:
+                        continue;
+                }
+                const LvalueRoot r = lvalue_root(ir, lv);
+                if (ir.tag(r.root) != Inst::Tag::Signal) {
+                    continue; // a frame local or a formal: never an event today
+                }
+                const auto s = static_cast<uint32_t>(ir.payload(r.root).signal);
+                if (s < event_slot_.size() && event_slot_[s] != 0) {
+                    event_mono_[s] = false;
+                }
+            }
+        };
+        for (const Process& p : mod_.processes()) {
+            visit(p.ir);
+        }
+        for (uint32_t i = 0; i < mod_.function_count(); ++i) {
+            visit(mod_.function(static_cast<FunctionId>(i)).ir);
+        }
+    }
+
+    // True when `sig` is an event whose object is fixed at compile time.
+    bool event_is_mono(Signal sig) const {
+        const auto i = static_cast<uint32_t>(sig);
+        return i < event_mono_.size() && event_mono_[i];
+    }
+
+    // The object an event VARIABLE currently names: the folded constant when the
+    // variable is monomorphic, else a load of its handle and an index into the
+    // array.
+    llvm::Value* event_obj_for(Signal sig) {
+        return event_is_mono(sig) ? event_obj(sig) : event_obj_of(load_event_handle(sig));
     }
 
     // Per-signal wait queues, split into up to three per-edge sub-queues, each
@@ -5635,38 +5761,54 @@ private:
         wait_dyn_len_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
         sta_next_.assign(sigs.size(), { 0, 0, 0 });
 
-        // Event objects. Every declared event gets a slot in one design-wide
-        // `clotho.events` array; slot 0 is the reserved null object, which a null
-        // handle resolves to so that `-> null` stamps a tick nothing reads and
-        // walks an always-empty waiter list (LRM 15.5.5's no-op) without a branch.
-        //
-        // Persistent waiters get their nodes from `clotho.event_nodes`, sized by the
-        // same static-subscription count that would have sized the .sta bucket. The
-        // nodes are contiguous so an event's permanent waiter prefix stays
-        // sequential in memory even though the walk is a pointer chase; one-shot
-        // waiters are frame-resident and need no capacity at all.
-        event_slot_.assign(sigs.size(), 0);
-        uint32_t nslots = 1;
-        uint32_t nnodes = 0;
+        // Event objects. Slots were numbered by assign_event_slots (it has to run
+        // before emit_state_global, because a declared event's power-on value IS its
+        // own handle). Here the array and the persistent-node pool are created, the
+        // latter sized by the same static-subscription count that would have sized
+        // the .sta bucket. The nodes are contiguous so an event's permanent waiter
+        // prefix stays sequential in memory even though the walk is a pointer chase;
+        // one-shot waiters are frame-resident and need no capacity at all.
+        const uint32_t nslots = event_slot_count_;
+        uint32_t       nnodes = 0;
         for (uint32_t i = 0; i < sigs.size(); ++i) {
-            if (!sigs[i].is_event) {
-                continue;
+            if (sigs[i].is_event) {
+                nnodes += c.sta[i][static_cast<uint32_t>(Edge::Any)];
             }
-            event_slot_[i] = nslots++;
-            nnodes += c.sta[i][static_cast<uint32_t>(Edge::Any)];
         }
         auto* obj_ty   = event_obj_ty();
         events_arr_ty_ = llvm::ArrayType::get(obj_ty, nslots);
-        events_gv_     = new llvm::GlobalVariable(
+        // Per-slot initializer: never-triggered sentinel, empty waiter list, not
+        // pending, and the slot's dump-var index (-1 when it is not dumped, which is
+        // every slot in a design without $dumpvars and the null object always).
+        std::vector<llvm::Constant*> slot_init(
+          nslots, llvm::ConstantStruct::get(
+                    obj_ty, { llvm::ConstantInt::get(b_.getInt64Ty(), ~uint64_t{ 0 }),
+                              llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
+                              llvm::ConstantInt::get(b_.getInt8Ty(), 0),
+                              llvm::ConstantInt::get(b_.getInt32Ty(), ~uint32_t{ 0 }),
+                              llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)) }));
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            const uint32_t slot = event_slot_[i];
+            if (slot == 0 || !design_uses_vcd_ || vcd_index_[i] < 0) {
+                continue;
+            }
+            slot_init[slot] = llvm::ConstantStruct::get(
+              obj_ty, { llvm::ConstantInt::get(b_.getInt64Ty(), ~uint64_t{ 0 }),
+                        llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
+                        llvm::ConstantInt::get(b_.getInt8Ty(), 0),
+                        llvm::ConstantInt::get(b_.getInt32Ty(),
+                                               static_cast<uint64_t>(vcd_index_[i])),
+                        llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)) });
+        }
+        events_gv_ = new llvm::GlobalVariable(
           env_->llmod, events_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
-          llvm::ConstantArray::get(
-            events_arr_ty_,
-            std::vector<llvm::Constant*>(
-              nslots, llvm::ConstantStruct::get(
-                        obj_ty, { llvm::ConstantInt::get(b_.getInt64Ty(), ~uint64_t{ 0 }),
-                                  llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
-                                  llvm::ConstantInt::get(b_.getInt8Ty(), 0) }))),
-          "clotho.events");
+          llvm::ConstantArray::get(events_arr_ty_, slot_init), "clotho.events");
+        // Head of the NBA pending chain (`->> e`). A runtime list rather than a
+        // compile-time set of target events, because the target is a handle.
+        event_pend_head_gv_ = new llvm::GlobalVariable(
+          env_->llmod, llvm::PointerType::getUnqual(ctx_), false, llvm::GlobalValue::InternalLinkage,
+          llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
+          "clotho.event_pend_head");
         event_nodes_arr_ty_ = llvm::ArrayType::get(event_node_ty(), nnodes);
         event_nodes_gv_ =
           nnodes == 0 ? nullptr
@@ -7767,48 +7909,154 @@ private:
                              wait_base(wait_slot_len_[i][edge], wait_dyn_len_gv_[i][edge], i));
     }
 
-    // Lower `-> e` (LRM 15.5.2): stamp the current sim tick into the event's
-    // trigger timestamp (so `.triggered` reads 1 for the rest of the step) and
-    // wake every waiter now. A named event has no value, so — unlike a signal
-    // store — there is no edge computation: it services the Any-edge static and
-    // dynamic queues unconditionally. `@(e)` and `always @(e)` both subscribe the
-    // Any bucket (edge None -> Any), so this reaches every waiter.
-    void lower_event_trigger(Signal sig) {
-        emit_event_fire(sig, wheel_);
+    // The detached timer node a `->> #d e` schedules: an rt_timer ({next,
+    // on_expire}) followed by the event handle to fire. Carrying the handle is what
+    // lets ONE thunk serve every delayed trigger in the design -- the target of
+    // `->> #d e` can be any event expression, so there is no declared event to
+    // specialise on.
+    llvm::StructType* event_timer_ty() {
+        auto* ptr = raw_ptr_ty();
+        return llvm::StructType::get(ctx_, { ptr, ptr, b_.getInt64Ty() });
     }
 
-    // Generate a detached on-expiry thunk per `->> #d e` target event. The wheel
-    // calls it as on_expire(rt_timer* t, void* ctx) with ctx == the wheel (see the
-    // drain's rt_wheel_advance ctx); it stamps the event's trigger time and
-    // services its waiters, then frees the timer node the schedule site allocated.
-    void build_delay_event_thunks() {
-        event_delay_thunk_.assign(mod_.signals().size(), nullptr);
-        if (nb_delay_event_sigs_.empty()) {
+    // The design's one detached on-expiry thunk. The wheel calls it as
+    // on_expire(rt_timer* t, void* ctx) with ctx == the wheel (see the drain's
+    // rt_wheel_advance ctx); it reads the handle out of the node, fires that event,
+    // then frees the node the schedule site allocated.
+    llvm::Function* event_delay_thunk() {
+        if (event_delay_thunk_ != nullptr) {
+            return event_delay_thunk_;
+        }
+        auto*             ptr  = raw_ptr_ty();
+        auto*             fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
+        llvm::IRBuilder<> save(ctx_);
+        auto*             saved_bb = b_.GetInsertBlock();
+        auto              saved_pt = b_.GetInsertPoint();
+        event_delay_thunk_ =
+          llvm::Function::Create(fnty, llvm::Function::InternalLinkage, "clotho.ev_delay", env_->llmod);
+        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", event_delay_thunk_));
+        auto* nty = event_timer_ty();
+        llvm::Value* handle =
+          b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(nty, event_delay_thunk_->getArg(0), 2));
+        emit_event_fire_guarded(handle, event_delay_thunk_->getArg(1)); // ctx is the wheel
+        b_.CreateCall(free_fn(), { event_delay_thunk_->getArg(0) });
+        b_.CreateRetVoid();
+        if (saved_bb != nullptr) {
+            b_.SetInsertPoint(saved_bb, saved_pt);
+        }
+        return event_delay_thunk_;
+    }
+
+    // Link an event object onto the NBA pending chain (LRM 15.5.4), unless it is
+    // already on it. The chain replaces the old compile-time list of `->>` target
+    // signals, which a handle-reached event could not join; it also means the NBA
+    // region visits exactly the events that fired rather than every `->>` target in
+    // the design.
+    //
+    // `next_pend` doubles as the on-chain marker: a linked object stores the next
+    // object pointer (or the chain terminator, itself, for the last one), and an
+    // unlinked object stores null. `pending` stays as the boolean the "anything
+    // staged" test reads.
+    void emit_event_pend_guarded(llvm::Value* handle) {
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(handle); c != nullptr && !c->isZero()) {
+            emit_event_pend(event_obj_of(handle));
             return;
         }
-        auto* ptr  = raw_ptr_ty();
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr }, false);
-        for (const Signal sig : nb_delay_event_sigs_) {
-            const auto i  = static_cast<uint32_t>(sig);
-            auto*      fn = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
-                                                   "clotho.ev_delay." + mod_.signal(sig).name, env_->llmod);
-            event_delay_thunk_[i] = fn;
-            b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
-            emit_event_fire(sig, fn->getArg(1));         // ctx (arg 1) is the wheel
-            b_.CreateCall(free_fn(), { fn->getArg(0) }); // free the detached timer node
-            b_.CreateRetVoid();
-        }
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* pend = llvm::BasicBlock::Create(ctx_, "evpend.live", fn);
+        auto* skip = llvm::BasicBlock::Create(ctx_, "evpend.null", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(handle, b_.getInt64(0)), pend, skip);
+        b_.SetInsertPoint(pend);
+        emit_event_pend(event_obj_of(handle));
+        b_.CreateBr(skip);
+        b_.SetInsertPoint(skip);
+    }
+
+    void emit_event_pend(llvm::Value* obj) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* link = llvm::BasicBlock::Create(ctx_, "evpend.link", fn);
+        auto* done = llvm::BasicBlock::Create(ctx_, "evpend.done", fn);
+
+        llvm::Value* pendp = event_field(obj, kEventPending);
+        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(b_.getInt8Ty(), pendp), b_.getInt8(0)), link, done);
+
+        b_.SetInsertPoint(link);
+        b_.CreateStore(b_.getInt8(1), pendp);
+        llvm::Value* headp = sym(event_pend_head_gv_);
+        b_.CreateStore(b_.CreateLoad(ptr, headp), event_field(obj, kEventNextPend));
+        b_.CreateStore(obj, headp);
+        b_.CreateBr(done);
+        b_.SetInsertPoint(done);
+        (void)null;
+    }
+
+    // Drain the NBA pending chain: fire every `->> e` staged this instant, clearing
+    // each object's pending mark as it goes. Reads `next` before firing, because a
+    // waiter woken by the fire may itself `->>` another event -- that link goes onto
+    // the (now empty) head and is drained by the NBA region's next pass, which is
+    // the deferral LRM 15.5.4 asks for.
+    void emit_event_pend_drain(llvm::Value* wheel) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* head = llvm::BasicBlock::Create(ctx_, "evpend.walk", fn);
+        auto* body = llvm::BasicBlock::Create(ctx_, "evpend.fire", fn);
+        auto* done = llvm::BasicBlock::Create(ctx_, "evpend.drained", fn);
+
+        llvm::Value* headp = sym(event_pend_head_gv_);
+        llvm::Value* first = b_.CreateLoad(ptr, headp);
+        b_.CreateStore(null, headp);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(head);
+        llvm::PHINode* n = b_.CreatePHI(ptr, 2);
+        n->addIncoming(first, entry);
+        b_.CreateCondBr(b_.CreateICmpNE(n, null), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* next = b_.CreateLoad(ptr, event_field(n, kEventNextPend));
+        b_.CreateStore(null, event_field(n, kEventNextPend));
+        b_.CreateStore(b_.getInt8(0), event_field(n, kEventPending));
+        emit_event_fire(n, wheel);
+        n->addIncoming(next, b_.GetInsertBlock());
+        b_.CreateBr(head);
+
+        b_.SetInsertPoint(done);
     }
 
     // Stamp event `sig`'s trigger time (from `wheel`) and wake every waiter on its
     // object's list. Shared by `-> e` in a process body (wheel_), the NBA-region
     // `->> e` service (the drain's local wheel — wheel_ is stale there, so it must
     // be passed in) and the `->> #d e` expiry thunk (ctx == the wheel).
-    void emit_event_fire(Signal sig, llvm::Value* wheel) {
-        llvm::Value* obj = event_obj(sig);
+    void emit_event_fire(llvm::Value* obj, llvm::Value* wheel) {
         b_.CreateStore(b_.CreateCall(wheel_now_fn(), { wheel }), event_field(obj, kEventTrig));
-        vcd_touch_event(sig);
+        vcd_touch_event_obj(obj);
         emit_event_wake_list(obj);
+    }
+
+    // `-> null` / `->> null` is a no-op (LRM 15.5.5): a null handle names nothing to
+    // trigger. Skipping the whole fire -- rather than letting it land on the
+    // reserved null object -- is what keeps `null.triggered` reading 0 afterwards,
+    // since a stamp on slot 0 would otherwise be observable through any null handle.
+    //
+    // Emitted only where the handle is not a compile-time non-null constant, so a
+    // plain `-> e` on a declared event pays nothing.
+    void emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel) {
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(handle); c != nullptr && !c->isZero()) {
+            emit_event_fire(event_obj_of(handle), wheel);
+            return;
+        }
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* fire = llvm::BasicBlock::Create(ctx_, "ev.fire", fn);
+        auto* skip = llvm::BasicBlock::Create(ctx_, "ev.null", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(handle, b_.getInt64(0)), fire, skip);
+        b_.SetInsertPoint(fire);
+        emit_event_fire(event_obj_of(handle), wheel);
+        b_.CreateBr(skip);
+        b_.SetInsertPoint(skip);
     }
 
     // Wake every waiter on an event object's list.
@@ -7874,8 +8122,11 @@ private:
     // handle and scheduled-flag pointer. Push-front keeps this O(1) with no tail
     // pointer; wake order within one instant is unspecified by the LRM (LRM 4.7
     // leaves the order of processes woken by one event arbitrary).
+    // `record_owner` is false when the caller can name the same object again at
+    // unlink time (a monomorphic event), which is the common case: the owner field
+    // then costs nothing at all.
     void emit_event_link(llvm::Value* obj, llvm::Value* node, llvm::Value* handle,
-                         llvm::Value* flag) {
+                         llvm::Value* flag, bool record_owner = true) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* nty  = event_node_ty();
         auto* null = llvm::ConstantPointerNull::get(ptr);
@@ -7883,6 +8134,9 @@ private:
 
         b_.CreateStore(handle, b_.CreateStructGEP(nty, node, kNodeHandle));
         b_.CreateStore(flag, b_.CreateStructGEP(nty, node, kNodeFlag));
+        if (record_owner) {
+            b_.CreateStore(obj, b_.CreateStructGEP(nty, node, kNodeOwner));
+        }
         llvm::Value* headp = event_field(obj, kEventWaiters);
         llvm::Value* old   = b_.CreateLoad(ptr, headp);
         b_.CreateStore(null, b_.CreateStructGEP(nty, node, kNodePrev));
@@ -7902,9 +8156,15 @@ private:
     // node only if it was cleared on unlink, which this does: both links are nulled
     // so a second unlink is a no-op head-relink of a node that is no longer the
     // head. Callers unlink exactly once, on resume.
-    void emit_event_unlink(llvm::Value* obj, llvm::Value* node) {
+    // `obj` null means "read it back from the node", which a polymorphic event
+    // needs: the variable may have been reassigned while we were parked, and the
+    // node must come off the object it actually went onto.
+    void emit_event_unlink(llvm::Value* node, llvm::Value* obj = nullptr) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* nty  = event_node_ty();
+        if (obj == nullptr) {
+            obj = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, kNodeOwner));
+        }
         auto* null = llvm::ConstantPointerNull::get(ptr);
         auto* fn   = b_.GetInsertBlock()->getParent();
 
@@ -7948,8 +8208,8 @@ private:
     // Lower `e.triggered` (LRM 15.5.3) to a definite 2-state 1-bit: 1 iff the last
     // trigger tick equals the current tick (true across all delta cycles of the
     // step, false once time advances — no per-step reset needed).
-    Plane lower_event_triggered(Signal sig) {
-        llvm::Value* stamp = b_.CreateLoad(b_.getInt64Ty(), event_field(event_obj(sig), kEventTrig));
+    Plane lower_event_triggered(llvm::Value* obj) {
+        llvm::Value* stamp = b_.CreateLoad(b_.getInt64Ty(), event_field(obj, kEventTrig));
         llvm::Value* now   = b_.CreateCall(wheel_now_fn(), { wheel_ });
         return { b_.CreateICmpEQ(stamp, now), nullptr, true };
     }
@@ -8844,11 +9104,11 @@ private:
         if (!intra_nba_sigs_.empty()) {
             any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(intra_any_fn(), {}), b_.getInt32(0)));
         }
-        for (const Signal sig : nb_event_sigs_) {
-            // A pending `->> e` this instant.
-            llvm::Value* pend =
-              b_.CreateLoad(b_.getInt8Ty(), event_field(event_obj(sig), kEventPending));
-            any = b_.CreateOr(any, b_.CreateICmpNE(pend, b_.getInt8(0)));
+        if (design_uses_nb_events_) {
+            // Any `->> e` staged this instant: the pending chain is non-empty.
+            llvm::Value* head = b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), sym(event_pend_head_gv_));
+            any = b_.CreateOr(
+              any, b_.CreateICmpNE(head, llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_))));
         }
         return any;
     }
@@ -8929,19 +9189,8 @@ private:
         // clear the flag. Done in the NBA region so the wake lands after this
         // instant's nonblocking updates; the caller's loop-back then drains the
         // woken waiters.
-        for (const Signal sig : nb_event_sigs_) {
-            const auto   i    = static_cast<uint32_t>(sig);
-            auto*        cfn  = b_.GetInsertBlock()->getParent();
-            auto*        fire = llvm::BasicBlock::Create(ctx_, "nbev.fire", cfn);
-            auto*        skip = llvm::BasicBlock::Create(ctx_, "nbev.skip", cfn);
-            llvm::Value* pendp = event_field(event_obj(sig), kEventPending);
-            llvm::Value* pend  = b_.CreateLoad(b_.getInt8Ty(), pendp);
-            b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt8(0)), fire, skip);
-            b_.SetInsertPoint(fire);
-            b_.CreateStore(b_.getInt8(0), pendp);
-            emit_event_fire(sig, wheel); // stamp now + service Any static/dynamic queues
-            b_.CreateBr(skip);
-            b_.SetInsertPoint(skip);
+        if (design_uses_nb_events_) {
+            emit_event_pend_drain(wheel);
         }
     }
 
@@ -9120,7 +9369,7 @@ private:
         // to the wheel. So active and NBA iterate until both settle before time moves.
         const bool has_nba = !array_nba_sigs_.empty() || !agg_nba_sigs_.empty() ||
                              !handle_nba_sigs_.empty() || !block_commits_.empty() ||
-                             !nb_event_sigs_.empty() || !intra_nba_sigs_.empty();
+                             design_uses_nb_events_ || !intra_nba_sigs_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
         // Inactive region: only when the design has a #0. When the active queue
@@ -9543,7 +9792,7 @@ private:
         // crossing per timestep, no separate occupancy scan — and returns non-zero
         // iff it fired something (an idle wheel ends the sim). The tick ctx is the
         // wheel: coroutine-timer trampolines ignore it, but a detached `->> #d e`
-        // on-expiry thunk reads the current time from it (build_delay_event_thunks).
+        // on-expiry thunk reads the current time from it (event_delay_thunk).
         llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
         // Time advanced: a new instant begins, so reset the oscillation counter.
         b_.CreateStore(b_.getInt64(0), sym(osc_count_gv_));
@@ -10434,6 +10683,20 @@ private:
         const Ref const_data = mod_.signals()[static_cast<size_t>(&s - slots_.data())].const_data;
         if (const_data != Ref::Invalid) {
             return const_data_init(s, const_data);
+        }
+        const auto sidx = static_cast<uint32_t>(&s - slots_.data());
+        if (!event_slot_.empty() && event_slot_[sidx] != 0) {
+            // A declared event powers on holding the handle of its OWN object:
+            // `{ u32 slot, u32 gen }` with gen 0, the generation a statically-bound
+            // object keeps forever. Baked into the state initializer rather than
+            // stored at startup, so binding an event costs nothing at run time --
+            // and `-> e` in a PreInit process already sees a valid handle.
+            //
+            // A null handle is all-zero, i.e. slot 0, which is why real slots start
+            // at 1: an uninitialized or explicitly nulled event resolves to the
+            // reserved null object and its trigger is the no-op LRM 15.5.5 asks for.
+            return llvm::ConstantStruct::get(
+              s.slot_ty, { llvm::ConstantInt::get(int_ty(64), event_slot_[sidx]) });
         }
         if (s.is_array || s.is_agg) {
             // Zeroinitialized; the runtime fill (init_state -> emit_array_init /
@@ -12873,29 +13136,31 @@ private:
                 return;
 
             case Inst::Tag::EventTrigger:
-                // `-> e` (LRM 15.5.2): stamp the trigger time and wake every
-                // waiter now. Zero-time — the current process does not suspend, so
-                // it does not end the NBA segment.
-                lower_event_trigger(p.signal);
+                // `-> e` (LRM 15.5.2): resolve the handle, stamp the trigger time and
+                // wake every waiter now. Zero-time — the current process does not
+                // suspend, so it does not end the NBA segment.
+                emit_event_fire_guarded(must_of(value_of(p.unary)), wheel_);
                 return;
 
             case Inst::Tag::EventTriggerNb:
-                // `->> e` (LRM 15.5.4): mark the event pending; the NBA region
-                // stamps + wakes. The triggering process does not block.
-                b_.CreateStore(b_.getInt8(1), event_field(event_obj(p.signal), kEventPending));
+                // `->> e` (LRM 15.5.4): link the object onto the pending chain; the
+                // NBA region stamps + wakes. The triggering process does not block.
+                emit_event_pend_guarded(must_of(value_of(p.unary)));
                 return;
 
             case Inst::Tag::EventTriggerNbDelayed: {
-                // `->> #d e` (LRM 15.5.4): schedule a detached wheel timer that
-                // fires the event's on-expiry thunk `d` ticks from now. The process
-                // does not block. The timer node (a bare rt_timer = {next, on_expire}
-                // = 2 pointers) is heap-allocated here and freed by the thunk.
-                const Signal ev       = ir_->extra_data<EventDelayInfo>(p.op_extra.extra).event;
-                llvm::Value* ticks    = cast(must_of(value_of(p.op_extra.op)), 64, false);
+                // `->> #d e` (LRM 15.5.4): schedule a detached wheel timer that fires
+                // the event `d` ticks from now. The process does not block. The timer
+                // node carries the handle, so ONE thunk serves the whole design (the
+                // target may be any event expression, not a fixed declared one).
+                llvm::Value* handle   = must_of(value_of(p.binary.r));
+                llvm::Value* ticks    = cast(must_of(value_of(p.binary.l)), 64, false);
                 llvm::Value* deadline = b_.CreateAdd(b_.CreateCall(wheel_now_fn(), { wheel_ }), ticks);
-                llvm::Value* node     = b_.CreateCall(alloc_fn(), { b_.getInt64(16) });
-                b_.CreateCall(wheel_schedule_fn(),
-                              { wheel_, node, deadline, sym(event_delay_thunk_[static_cast<uint32_t>(ev)]) });
+                auto*        nty      = event_timer_ty();
+                llvm::Value* node     = b_.CreateCall(
+                  alloc_fn(), { b_.getInt64(env_->llmod.getDataLayout().getTypeAllocSize(nty)) });
+                b_.CreateStore(handle, b_.CreateStructGEP(nty, node, 2));
+                b_.CreateCall(wheel_schedule_fn(), { wheel_, node, deadline, event_delay_thunk() });
                 return;
             }
 
@@ -13083,7 +13348,7 @@ private:
             }
 
             case Inst::Tag::EventTriggered:
-                set_value(i, lower_event_triggered(p.signal));
+                set_value(i, lower_event_triggered(event_obj_of(must_of(value_of(p.unary)))));
                 return;
 
             case Inst::Tag::Random: {
@@ -17684,13 +17949,20 @@ private:
     // `make_args` runs inside the taken branch, so index loads (the NBA vcd
     // table, a reused instance's vcd base) stay off the inactive hot path —
     // the point of the gate.
+    // `extra` narrows the guard beyond "dumping is active" -- an event carries its
+    // dump index in its object, so whether it is dumped at all is a runtime test.
     void emit_guarded_vcd_touch(llvm::FunctionCallee                                  fn,
-                                llvm::function_ref<llvm::SmallVector<llvm::Value*, 2>()> make_args) {
+                                llvm::function_ref<llvm::SmallVector<llvm::Value*, 2>()> make_args,
+                                llvm::Value* extra = nullptr) {
         llvm::Function*   f      = b_.GetInsertBlock()->getParent();
         llvm::Value*      active = b_.CreateLoad(b_.getInt8Ty(), vcd_active_gv());
+        llvm::Value*      pred   = b_.CreateICmpNE(active, b_.getInt8(0));
+        if (extra != nullptr) {
+            pred = b_.CreateAnd(pred, extra);
+        }
         llvm::BasicBlock* touch  = llvm::BasicBlock::Create(ctx_, "vcd.touch", f);
         llvm::BasicBlock* cont   = llvm::BasicBlock::Create(ctx_, "vcd.cont", f);
-        b_.CreateCondBr(b_.CreateICmpNE(active, b_.getInt8(0)), touch, cont);
+        b_.CreateCondBr(pred, touch, cont);
         b_.SetInsertPoint(touch);
         b_.CreateCall(fn, make_args());
         b_.CreateBr(cont);
@@ -17943,7 +18215,17 @@ private:
     // the one place every trigger form converges (`-> e` in a process body, the
     // NBA-region service of `->> e`, and the `->> #d e` expiry thunk), so the dump
     // sees an occurrence however it was produced.
-    void vcd_touch_event(Signal sig) {
+    void vcd_touch_event_obj(llvm::Value* obj) {
+        if (!design_uses_vcd_) {
+            return;
+        }
+        llvm::Value* idx = b_.CreateLoad(b_.getInt32Ty(), event_field(obj, kEventVcd));
+        emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+            return llvm::SmallVector<llvm::Value*, 2>{ idx };
+        }, b_.CreateICmpSGE(idx, b_.getInt32(0)));
+    }
+
+    void vcd_touch_event_unused(Signal sig) {
         if (!design_uses_vcd_) {
             return;
         }
@@ -22225,23 +22507,27 @@ private:
     llvm::ArrayType*                                   events_arr_ty_ = nullptr;
     // Slot of each signal's event object, or 0 for a non-event signal.
     std::vector<uint32_t>                              event_slot_;
+    // Per signal: true when an event variable is never assigned, so it names one
+    // object for the whole run and every reference folds to a constant address.
+    std::vector<bool>                                  event_mono_;
+    // Number of event object slots, including the reserved null object at 0.
+    uint32_t                                           event_slot_count_ = 1;
     // Contiguous nodes for persistent (`always @(e)`) event waiters
     // (clotho.event_nodes), one per static subscription, plus the next free index.
     // Null when the design has no persistent event waiter.
     llvm::GlobalVariable*                              event_nodes_gv_ = nullptr;
     llvm::ArrayType*                                   event_nodes_arr_ty_ = nullptr;
     uint32_t                                           event_node_next_ = 0;
-    // Event signals that are targets of a `->> e` somewhere in the design; the NBA
-    // region scans exactly these for a pending nonblocking trigger. Collected in
-    // nba_classify_ir.
-    std::vector<Signal>                                nb_event_sigs_;
-    // Event signals that are targets of a delayed `->> #d e`; each gets a detached
-    // on-expiry thunk (event_delay_thunk_). Collected in nba_classify_ir.
-    std::vector<Signal>                                nb_delay_event_sigs_;
-    // Per delayed-trigger event: the wheel-timer on_expire thunk that stamps the
-    // trigger time and services the event's waiters. Indexed by signal handle;
-    // null for a non-target. Built in build_delay_event_thunks.
-    std::vector<llvm::Function*>                       event_delay_thunk_;
+    // True when the design contains any `->> e`, so the NBA region emits the
+    // pending-chain test and drain. The chain itself is a runtime list threaded
+    // through the event objects (clotho.event_pend_head), because a handle-reached
+    // event cannot be enumerated at compile time.
+    bool                                               design_uses_nb_events_ = false;
+    // Head of the NBA pending chain (clotho.event_pend_head).
+    llvm::GlobalVariable*                              event_pend_head_gv_ = nullptr;
+    // The design's single detached `->> #d e` on-expiry thunk (clotho.ev_delay).
+    // One rather than one-per-event: the timer node carries the handle.
+    llvm::Function*                                    event_delay_thunk_ = nullptr;
     // Per-process scheduled-flag placement (build_sched_flags): owning anchor
     // (~0 = root array) and dense def-local ordinal within that owner's array.
     std::vector<uint32_t>               proc_sched_anchor_;

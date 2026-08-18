@@ -84,21 +84,20 @@ Index Builder::local(uint32_t index, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::Local, Inst::Payload{ .local = { index, type } } }, loc);
 }
 
-Index Builder::event_trigger(Signal sig, SourceLoc loc) {
-    return emit({ Inst::Tag::EventTrigger, pay(&Inst::Payload::signal, sig) }, loc);
+Index Builder::event_trigger(Index handle, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTrigger, pay(&Inst::Payload::unary, handle) }, loc);
 }
 
-Index Builder::event_triggered(Signal sig, SourceLoc loc) {
-    return emit({ Inst::Tag::EventTriggered, pay(&Inst::Payload::signal, sig) }, loc);
+Index Builder::event_triggered(Index handle, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTriggered, pay(&Inst::Payload::unary, handle) }, loc);
 }
 
-Index Builder::event_trigger_nb(Signal sig, SourceLoc loc) {
-    return emit({ Inst::Tag::EventTriggerNb, pay(&Inst::Payload::signal, sig) }, loc);
+Index Builder::event_trigger_nb(Index handle, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTriggerNb, pay(&Inst::Payload::unary, handle) }, loc);
 }
 
-Index Builder::event_trigger_nb_delayed(Signal sig, Index delay, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(EventDelayInfo{ sig });
-    return emit({ Inst::Tag::EventTriggerNbDelayed, Inst::Payload{ .op_extra = { delay, extra } } }, loc);
+Index Builder::event_trigger_nb_delayed(Index handle, Index delay, SourceLoc loc) {
+    return emit({ Inst::Tag::EventTriggerNbDelayed, Inst::Payload{ .binary = { delay, handle } } }, loc);
 }
 
 Index Builder::unary(Inst::Tag tag, Index op, SourceLoc loc) {
