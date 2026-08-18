@@ -271,31 +271,47 @@ professional parity; M5 makes it complete.
   Single-event only, lowered as a body/`@`-loop guard (`if (cond)`). Per-event
   `iff` in a multi-event list (`@(posedge a iff x or ...)`) still rejected loud —
   needs waking-source identification the shared-wake engine lacks.
-- [x] **Event handles** (LRM 15.5.5) — `event` is a reference type: a 2-state
-  64-bit handle `{ u32 slot, u32 gen }` naming an entry in the backend's
-  `clotho.events` object array, laid out and passed exactly like a class handle.
-  `a = b` merges onto one sync object, `a = null` unbinds (`-> null` is a no-op and
-  `null.triggered` is 0), `a == b` is object identity, and a declared event powers
-  on holding its own handle straight from the state initializer. `@(a)` resolves
-  the handle when the wait executes, so a waiter already parked stays on the object
-  it parked on. An **event argument** works in every direction (LRM 15.5.5's own
-  "task triggers the caller's event" example, plus `ref` retargeting), an **event
-  port** is an aliasing port on both sides, and a **`static` event class property**
-  is one shared event. A monomorphism analysis keeps an event that is never
-  assigned folded to a constant object address, so a design that does not use
-  handles pays nothing. Design: docs/design/event-handles.md.
+- [x] **Event handles and every event storage class** (LRM 15.5) — `event` is a
+  reference type: a 2-state 64-bit handle `{ u32 slot, u32 gen }` naming an event
+  OBJECT, laid out and passed exactly like a class handle. `a = b` merges onto one
+  sync object, `a = null` unbinds (`-> null` is a no-op, `null.triggered` is 0,
+  `@(null)` blocks -- 15.5.5.2 leaves it undefined), `==`/`!=`/`===`/`!==` are
+  identity and `if (e)` is the Boolean test (15.5.5.3).
 
-  Still guarded loud, each needing an event OBJECT that a compile-time slot array
-  cannot size: events inside **arrays / structs / queues / dynamic arrays /
-  associative arrays**, a **per-instance** event class property, and an
-  **automatic-lifetime** event local in a subroutine (a fresh object per
-  activation). Also `@(<event held in a call frame>)`, because a `WaitEdge` names a
-  signal; triggering one works. And every event op **inside a function**, which is
-  the same missing-wheel restriction `$time` states.
-- [ ] **Event-controlled trigger** (`->> @(x) e`, `->> repeat(n) @(x) e`) — needs a
-  detached one-shot subscription on `x`; see docs/design/event-handles.md §7.4.
-- [ ] **`wait_order`** (LRM 15.5.6) — an ordered multi-event park with a failure
-  branch; the reactive-region walk rejects it ahead of lowering too.
+  LRM Table 6-7 makes an event's default initial value a **New event**, so every
+  event-typed storage location binds its own object when that storage comes into
+  existence: a declared variable, an **unpacked-array element** (any dimension), an
+  **unpacked-struct member**, a **class property** (per instance and `static`), an
+  **automatic-lifetime local** (a fresh object per activation), and a **queue /
+  dynamic-array / associative-array element**. A scalar declared event takes a
+  compile-time slot in a static block; everything else draws from a chunked runtime
+  pool whose chunks never move, so an object address survives growth while a
+  process is parked on its waiter list.
+
+  Waiters are an intrusive doubly-linked list on the object -- persistent nodes in a
+  contiguous array, one-shot nodes frame-resident -- so the number of simultaneous
+  waiters is unbounded. `@(<any event expression>)` works: a `WaitEdge` carries an
+  optional handle operand, and a sensitivity list that would need one is left in the
+  body, where it re-reads the handle each pass (a static subscription is issued from
+  the seed loop and cannot re-resolve). Events pass as **subroutine arguments** in
+  every direction and across **module ports** (aliasing, not copying, in both
+  directions -- `inout event` is illegal SV).
+
+  `->> e` defers to the NBA region through a runtime pending chain; `->> #d e`
+  schedules one detached wheel timer carrying the handle; **`->> @(x) e` /
+  `->> repeat(n) @(x) e`** register a detached one-shot subscription on the edge,
+  growable because a loop makes one per pass. **`wait_order`** (15.5.4) desugars to
+  one park per stage, each waiting on the events still ahead of it, with the
+  else-arm on an out-of-order trigger and a run-time error when it is absent.
+
+  Event operations work **inside a function**: the timing wheel is a module global,
+  so a body with no wheel parameter still reads the clock. A monomorphism analysis
+  keeps an event that is never assigned folded to a constant object address, so a
+  design that does not merge pays nothing.
+
+  Objects are never freed: LRM 15.5.5.2's reclamation is garbage collection, which
+  Clotho does not have (class bodies leak by the same direction).
+  Design: docs/design/event-handles.md, docs/design/named-events.md.
 - [x] **`join_any` / `join_none`** (LRM 9.3.2, V2) — the join kinds differ at run
   time in one join-record field (`wake_at`: 0 for `join`, W-1 for `join_any`, never
   reached for `join_none`) and in when a child starts. `join` keeps resuming children

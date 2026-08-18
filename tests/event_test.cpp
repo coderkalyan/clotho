@@ -556,11 +556,163 @@ TEST_CASE("an event passes as a subroutine argument") {
     }
 }
 
-TEST_CASE("event forms that are still rejected") {
-    CHECK(reject("module top; logic clk; event e; initial ->> @(posedge clk) e; endmodule").find(
-            "event-controlled nonblocking trigger") != std::string::npos);
-    CHECK(reject("module top; event a, b; initial wait_order(a, b); endmodule").find(
-            "wait_order is not supported") != std::string::npos);
+// LRM Table 6-7 gives an event's default initial value as "New event", so every
+// event-typed storage location is bound to its OWN object when that storage comes
+// into existence. Distinctness is the property worth pinning: a waiter on one leaf
+// must not be woken by a trigger of another.
+TEST_CASE("an event in an aggregate is one event per leaf") {
+    SUBCASE("fixed unpacked array") {
+        CHECK(run_capture(R"(
+            module top;
+              event ev[4]; int n0 = 0, n2 = 0;
+              initial forever begin @(ev[0]); n0++; end
+              initial forever begin @(ev[2]); n2++; end
+              initial begin
+                #1 -> ev[0]; #1 -> ev[0]; #1 -> ev[2];
+                #1 $display("n0=%0d n2=%0d", n0, n2);
+              end
+            endmodule
+        )") == "n0=2 n2=1\n");
+    }
+    SUBCASE("multidimensional array") {
+        CHECK(run_capture(R"(
+            module top;
+              event ev[2][3]; int n = 0;
+              initial forever begin @(ev[1][2]); n++; end
+              initial begin #1 -> ev[1][2]; #1 -> ev[0][0]; #1 $display("n=%0d", n); end
+            endmodule
+        )") == "n=1\n");
+    }
+    SUBCASE("struct member, one per struct variable") {
+        CHECK(run_capture(R"(
+            module top;
+              typedef struct { event e; } s_t;
+              s_t a, b; int na = 0, nb = 0;
+              initial forever begin @(a.e); na++; end
+              initial forever begin @(b.e); nb++; end
+              initial begin #1 -> a.e; #1 -> a.e; #1 -> b.e;
+                            #1 $display("na=%0d nb=%0d", na, nb); end
+            endmodule
+        )") == "na=2 nb=1\n");
+    }
+}
+
+// A container element is bound by rt_elem_init, which for an event constructs a new
+// object per slot instead of copying the prototype image. Copying an element copies
+// the HANDLE, so both slots then name one object (LRM 15.5.5's merge).
+TEST_CASE("an event in a container is one event per element") {
+    SUBCASE("dynamic array") {
+        CHECK(run_capture(R"(
+            module top;
+              event d[]; int n = 0;
+              initial begin
+                d = new[3];
+                fork forever begin @(d[1]); n++; end join_none
+                #1 -> d[1]; #1 -> d[1]; #1 -> d[0];
+                #1 $display("n=%0d", n);
+              end
+            endmodule
+        )") == "n=2\n");
+    }
+    SUBCASE("queue, and a pushed handle is shared") {
+        CHECK(run_capture(R"(
+            module top;
+              event q[$]; event a; int n = 0;
+              initial begin
+                q.push_back(a); q.push_back(a);
+                fork forever begin @(q[0]); n++; end join_none
+                #1 -> a;
+                #1 $display("n=%0d same=%0b", n, q[0] == q[1]);
+              end
+            endmodule
+        )") == "n=1 same=1\n");
+    }
+    SUBCASE("associative array") {
+        CHECK(run_capture(R"(
+            module top;
+              event aa[string]; int n = 0;
+              initial begin
+                fork forever begin @(aa["k"]); n++; end join_none
+                #1 -> aa["k"]; #1 -> aa["k"];
+                #1 $display("n=%0d", n);
+              end
+            endmodule
+        )") == "n=2\n");
+    }
+    SUBCASE("an absent key reads a non-null event, not null") {
+        // LRM 7.9.11 gives the element default, which for an event is a new event
+        // (Table 6-7) -- so `== null` must read 0.
+        CHECK(run_capture("module top; event aa[string]; "
+                          "initial $display(\"%0b\", aa[\"absent\"] != null); endmodule") == "1\n");
+    }
+}
+
+// LRM 15.5.5.3: an event compares against another event or null with ==, !=, ===
+// and !==, and tests as a Boolean that is 0 iff it is null.
+TEST_CASE("an event tests as a Boolean and compares with every allowed operator") {
+    CHECK(run_capture(R"(
+        module top;
+          event a, b;
+          initial begin
+            $display("%0b%0b%0b%0b", a == b, a != b, a === b, a !== b);
+            if (a) $display("bound");
+            a = null;
+            if (!a) $display("null");
+          end
+        endmodule
+    )") == "0101\nbound\nnull\n");
+}
+
+// `->> @(x) e` / `->> repeat(n) @(x) e` (LRM 15.5.1): a DETACHED one-shot
+// subscription on the edge. The process does not block, and when the edge matures
+// the subscription the event is triggered in the NBA region. Registrations are
+// runtime-owned and growable, which is what a static wait bucket could not bound.
+TEST_CASE("an event-controlled nonblocking trigger fires from a detached subscription") {
+    SUBCASE("does not block, fires on the edge") {
+        const std::string out = run_capture(R"(
+            module top;
+              logic clk = 0; event e;
+              initial begin @(e); $display("woke t=%0t", $time); end
+              initial begin ->> @(posedge clk) e; #1 $display("free t=%0t", $time); end
+              initial begin #5 clk = 1; #5 $finish; end
+            endmodule
+        )");
+        CHECK(out.find("free t=1") != std::string::npos);
+        CHECK(out.find("woke t=5") != std::string::npos);
+    }
+    SUBCASE("repeat(n) waits for the nth occurrence") {
+        CHECK(run_capture(R"(
+            module top;
+              logic clk = 0; event e;
+              initial begin @(e); $display("woke t=%0t", $time); end
+              initial ->> repeat(2) @(posedge clk) e;
+              initial begin #2 clk=1; #2 clk=0; #2 clk=1; #4 $finish; end
+            endmodule
+        )").find("woke t=6") != std::string::npos);
+    }
+    SUBCASE("the wake lands in the NBA region") {
+        CHECK(run_capture(R"(
+            module top;
+              logic clk = 0; event e; logic [7:0] q = 0;
+              initial begin @(e); $display("q=%02h", q); end
+              initial ->> @(posedge clk) e;
+              initial begin #5 q <= 8'hAA; clk = 1; #5 $finish; end
+            endmodule
+        )").find("q=aa") != std::string::npos);
+    }
+    SUBCASE("registrations are unbounded") {
+        CHECK(run_capture(R"(
+            module top;
+              logic clk = 0; event e; int n = 0;
+              initial forever begin @(e); n++; end
+              initial begin
+                for (int i = 0; i < 300; i++) ->> @(posedge clk) e;
+                #1 clk = 1;
+                #2 $display("n=%0d", n);
+              end
+            endmodule
+        )") == "n=1\n");
+    }
 }
 
 // An event declared in a procedural scope gets signal-like storage through
@@ -641,25 +793,25 @@ TEST_CASE("an automatic-lifetime event local is a new event per activation") {
     }
 }
 
-// Every event op stamps or compares the current tick via rt_wheel_now(wheel), and
-// a function carries no wheel in its ABI (the same restriction $time, $strobe and
-// $monitor already state). The call was emitted with a null operand, so the LLVM
-// verifier rejected the module ("Operand is null") with no located diagnostic.
-// A task is a coroutine and does carry the wheel, so it must keep working.
-TEST_CASE("an event operation inside a function is rejected") {
-    CHECK(reject("module top; event a; function int f(); -> a; return 1; endfunction "
-                 "initial $display(\"%0d\", f()); endmodule")
-            .find("'-> e' inside a function is not supported") != std::string::npos);
-    CHECK(reject("module top; event a; function int f(); ->> a; return 1; endfunction "
-                 "initial $display(\"%0d\", f()); endmodule")
-            .find("'->> e' inside a function is not supported") != std::string::npos);
-    CHECK(reject("module top; event a; function int f(); return a.triggered; endfunction "
-                 "initial $display(\"%0d\", f()); endmodule")
-            .find("'e.triggered' inside a function is not supported") != std::string::npos);
-    // The same statement in a task is fine.
-    CHECK(run_capture("module top; event a; task t(); -> a; endtask "
-                      "initial begin t(); $display(\"t=%0b\", a.triggered); end endmodule") ==
-          "t=1\n");
+// Every event op stamps or compares the current tick. A function carries no wheel
+// parameter, so the wheel is a module global (clotho.wheel) and a function reads
+// the clock exactly as a task does -- rather than the op being refused.
+TEST_CASE("event operations work inside a function") {
+    SUBCASE("trigger from a function wakes a waiter") {
+        CHECK(run_capture("module top;\n"
+                          "  event e; int n = 0;\n"
+                          "  always @(e) n++;\n"
+                          "  function int f(); -> e; return 1; endfunction\n"
+                          "  initial begin #1 if (f()) ; #1 $display(\"n=%0d\", n); end\n"
+                          "endmodule") == "n=1\n");
+    }
+    SUBCASE(".triggered read from a function") {
+        CHECK(run_capture("module top;\n"
+                          "  event e;\n"
+                          "  function int f(); return e.triggered; endfunction\n"
+                          "  initial begin -> e; $display(\"t=%0d\", f()); end\n"
+                          "endmodule") == "t=1\n");
+    }
 }
 
 // `@(u.e)` has always accepted a hierarchical event (event_signal admits
@@ -711,14 +863,49 @@ TEST_CASE("a per-instance event class property is one event per object") {
     CHECK(out == "n1=2 n2=1\n");
 }
 
-// `wait_order` (LRM 15.5.6) fell through lower_stmt's `default:` to the bare
-// "unsupported statement", naming nothing.
-TEST_CASE("wait_order is rejected by name") {
-    CHECK(reject("module top; event a, b; initial wait_order(a, b); endmodule")
-            .find("wait_order is not supported") != std::string::npos);
-    CHECK(reject("module top; event a, b; initial wait_order(a, b) $display(\"x\"); "
-                 "else $display(\"y\"); endmodule")
-            .find("wait_order is not supported") != std::string::npos);
+// wait_order (LRM 15.5.4) suspends until every listed event triggers left to
+// right, failing the moment a not-yet-reached event triggers out of turn. It
+// desugars to one park per stage, each waiting on the events still ahead of it.
+TEST_CASE("wait_order sequences events") {
+    const auto seq = [](std::string_view order) {
+        return run_capture(std::string("module top;\n"
+                                       "  event a, b, c;\n"
+                                       "  initial wait_order(a, b, c) $display(\"PASS\"); "
+                                       "else $display(\"FAIL\");\n"
+                                       "  initial begin ") +
+                           std::string(order) + " #2 $display(\"end\"); end\nendmodule\n");
+    };
+    SUBCASE("in order passes") {
+        CHECK(seq("#1 -> a; #1 -> b; #1 -> c;") == "PASS\nend\n");
+    }
+    SUBCASE("out of order fails") {
+        CHECK(seq("#1 -> a; #1 -> c; #1 -> b;") == "FAIL\nend\n");
+    }
+    SUBCASE("a preceding event may retrigger") {
+        // LRM: "once an event occurs in the prescribed order, it can be triggered
+        // again without causing the construct to fail".
+        CHECK(seq("#1 -> a; #1 -> a; #1 -> b; #1 -> a; #1 -> c;") == "PASS\nend\n");
+    }
+    SUBCASE("only the first event may use the persistent triggered state") {
+        CHECK(run_capture(R"(
+            module top;
+              event a, b;
+              initial -> a;
+              initial wait_order(a, b) $display("PASS"); else $display("FAIL");
+              initial begin #1 -> b; #1 $display("end"); end
+            endmodule
+        )") == "PASS\nend\n");
+    }
+    SUBCASE("the status-variable form") {
+        CHECK(run_capture(R"(
+            module top;
+              event a, b; bit success;
+              initial begin wait_order(a, b) success = 1; else success = 0;
+                            $display("s=%0b", success); end
+              initial #1 -> b;
+            endmodule
+        )") == "s=0\n");
+    }
 }
 
 // LRM 9.4.2.3: `@(edge sig iff cond)` triggers only when the edge fires and the

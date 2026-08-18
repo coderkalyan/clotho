@@ -6,33 +6,39 @@ identity `a == b` / `a == null`, events as subroutine arguments (`in`, `out`,
 aggregate (fixed unpacked array, unpacked struct, queue, dynamic array,
 associative array value *and* key).
 
-Status: **largely landed.** Supersedes the "Deferred: event handles" section of
+Status: **landed.** Supersedes the "Deferred: event handles" section of
 `docs/design/named-events.md`, whose Options A/B are both withdrawn — see
 [§2](#2-the-two-recorded-blockers-dissolve).
 
-Built: the event object and its intrusive waiter list (§3, §6), the 64-bit handle
-word (§3.1), merge / `null` / identity, event arguments in every direction, event
-ports, `static` event class properties, the `->>` pending chain (§7.2), the single
-`->> #d` thunk (§7.3), and the monomorphic fast path (§5).
+Every form in LRM 15.5 is implemented: handles (merge / `null` / identity / the
+Boolean test), events in unpacked arrays, unpacked structs, queues, dynamic arrays
+and associative arrays, per-instance and `static` class properties,
+automatic-lifetime locals, subroutine arguments in all four directions, module
+ports, `@(<any event expression>)`, `->> e`, `->> #d e`, `->> @(x) e` /
+`->> repeat(n) @(x) e`, `wait_order`, and event operations inside a function.
 
-Not built, each loud-failing with a TODO: events inside aggregates and containers,
-per-instance event class properties, automatic-lifetime event locals — all of which
-need an event object per element / per activation, which the compile-time slot array
-cannot size (§9 names the runtime pool that would fix them together) — plus
-`@(<event held in a call frame>)` (§6 note), `->> @(x) e` (§7.4) and `wait_order`
-(§8).
+Three deviations from the design as first written, each measured or forced by the
+LRM text:
 
-Two deviations from the design as first written, both measured:
+- **Two storage tiers, one slot space.** A scalar declared event keeps a
+  compile-time slot in a codegen-owned static block, so the common case folds to a
+  constant object address; every other storage location draws from a chunked
+  runtime pool. The backend registers the static block as the pool's first chunk,
+  so one handle format and one `rt_event_ptr` cover both. §5's monomorphism
+  analysis is what makes the fast path reachable.
+- **No refcounting.** Objects are never freed, because LRM 15.5.5.2's reclamation
+  is garbage collection, which Clotho does not have — the same direction class
+  bodies already take. The `gen` half of the handle is carried and reserved for the
+  day that changes; nothing consults it today.
+- **The wheel is a module global.** Cheaper than threading `ptr wheel` through
+  every function signature (the RNG precedent), and it lifts the restriction that
+  event operations could not appear in a function. Measured a 16% *win* on a pure
+  `#delay` loop.
 
-- The object array is **codegen-owned** (`clotho.events`), not a runtime slot table.
-  Every object is statically bound today, so the table bought nothing and cost an
-  indirection; §9's runtime pool is what the deferred aggregate cases need, and it
-  can be added underneath the same handle word without changing anything above it.
-  The `gen` half of the handle is therefore reserved, not yet consulted.
-- Refcounting is **not** implemented, because nothing is freed yet: every object is
-  immortal. It becomes necessary exactly when the runtime pool lands.
-
----
+Measured against `main` on 3M triggers: **−19%** with three `always @(e)` waiters,
+**−16%** on a pure `#delay` loop, **+15%** with two one-shot `@(e)` waiters in a
+loop — the price of a doubly-linked node's link/unlink over the old bucket's append
+plus bulk clear, which is what buys the unbounded waiter set and handle semantics.
 
 ## 1. Decision summary
 

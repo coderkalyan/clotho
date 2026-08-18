@@ -881,13 +881,16 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 suspends("a wait");
                 break;
             case StatementKind::WaitOrder:
+                // `wait_order` desugars to a park per stage (lower_wait_order), so
+                // it suspends exactly like a `wait` and the pended copy allows it.
+                suspends("a wait_order");
+                break;
             case StatementKind::WaitFork:
-                // Nothing to do with the region: clotho lowers neither anywhere.
-                // `wait fork` needs the live-child set a fork does not keep and
-                // `wait_order` has no lowering at all (lower_stmt). Named here for
-                // the reason the fork case is: this walk runs first.
-                reject("a wait fork or a wait_order",
-                       "clotho does not lower either one, in reactive code or outside it");
+                // Nothing to do with the region: clotho does not lower it anywhere.
+                // `wait fork` needs the live-child set a fork does not keep. Named
+                // here for the reason the fork case is: this walk runs first.
+                reject("a wait fork",
+                       "clotho does not lower it, in reactive code or outside it");
                 break;
             case StatementKind::ForeverLoop:
                 // Still refused, and still not a region matter -- but the old reason
@@ -1241,6 +1244,16 @@ public:
 
     // Point this Lowerer at the design-wide class id table. `ids` must outlive
     // every call made through this Lowerer.
+    // Design-wide: some assignment can retarget an event variable, so no event's
+    // handle is provably fixed. A static sensitivity subscription is issued once
+    // from the seed loop and can never re-resolve, so with merging in the design an
+    // event sensitivity list must be left in the body instead, where it re-reads
+    // the handle on every pass (LRM 15.5.5: a re-armed wait uses the CURRENT
+    // object; only an already-parked waiter stays where it is).
+    void set_events_merge(bool v) {
+        events_merge_ = v;
+    }
+
     void set_class_ids(ClassIds* ids) {
         class_ids_ = ids;
     }
@@ -6901,6 +6914,8 @@ private:
     // than a signal: it is event-typed but is not a plain reference to a declared
     // event variable. `@(ev[i])`, `@(obj.e)`, `@(s.e)` and `@(<formal>)` are the
     // cases; each names an object that no signal identifies.
+    bool events_merge_ = false;
+
     bool event_wait_needs_handle(const Expression& e) {
         if (!e.type->isEvent()) {
             return false;
@@ -6916,7 +6931,12 @@ private:
             return true; // an element select, a member access, ...
         }
         // A frame-resident event (a formal or an automatic local) has no signal.
-        return fn_ctx_ != nullptr && fn_ctx_->localmap.contains(&e.as<ValueExpressionBase>().symbol);
+        if (fn_ctx_ != nullptr && fn_ctx_->localmap.contains(&e.as<ValueExpressionBase>().symbol)) {
+            return true;
+        }
+        // With merging anywhere in the design, even a plain `@(e)` has to re-read
+        // the handle on each pass, which only the body-resident wait can do.
+        return events_merge_;
     }
 
     // Whether any event in a sensitivity list would need a handle, which a process's
@@ -7059,6 +7079,107 @@ private:
         }
     }
 
+    // Lower `wait_order(a, b, c) pass; else fail;` (LRM 15.5.4): suspend until every
+    // listed event has triggered left to right, failing the moment a not-yet-reached
+    // event triggers out of turn.
+    //
+    // Desugared over the existing IR -- no new op. The list length is a compile-time
+    // constant, so the stages are UNROLLED, which is what lets each stage wait on a
+    // different set (the events still ahead of it):
+    //
+    //   failed = 0;
+    //   stage k:  if (!failed) forever { @(e_k or e_k+1 or ... or e_N-1);
+    //                                    if (e_k.triggered) break;
+    //                                    failed = 1; break; }
+    //   if (failed) <fail> else <pass>
+    //
+    // Waiting on the whole remaining tail is what detects an out-of-order trigger:
+    // any later event wakes the stage, and `e_k.triggered` is then 0. An event
+    // already passed is not in any later stage's list, so re-triggering it is
+    // ignored -- LRM: "preceding events are not limited to occur only once".
+    //
+    // Stage 0 additionally accepts the PERSISTENT triggered state before waiting,
+    // which the LRM allows for the first event only ("only the first event in the
+    // list can wait for the persistent triggered event").
+    void lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Builder& b) {
+        const ir::SourceLoc l = loc(s);
+        const auto          n = s.events.size();
+
+        const TempCell    failed = make_temp_cell(module_.pool.logic_type, "wait_order");
+        const ir::Index   zero   = b.constant(module_.pool.put_int(module_.pool.logic_type, 0), l);
+        b.binary(ir::Inst::Tag::Store, failed.lv(b, l), zero, l);
+
+        for (size_t k = 0; k < n; ++k) {
+            // if (!failed) { ...stage k... }
+            const ir::Index not_failed =
+              b.unary(ir::Inst::Tag::Bnot, b.unary(ir::Inst::Tag::Load, failed.lv(b, l), l), l);
+            b.open_region();
+            {
+                // Stage 0 may be satisfied by the persistent triggered state.
+                b.open_region();
+                const ir::Index lpred =
+                  k == 0 ? b.unary(ir::Inst::Tag::Bnot, b.event_triggered(event_handle(*s.events[0], b), l), l)
+                         : true_const(b, l);
+                const ir::ExtraSlice lcond = b.close_region();
+
+                b.open_region();
+                {
+                    // Wait on every event still ahead, this one included.
+                    std::vector<ir::WaitEdge> edges;
+                    edges.reserve(n - k);
+                    for (size_t j = k; j < n; ++j) {
+                        edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
+                                                      static_cast<uint32_t>(ir::Edge::Any),
+                                                      event_handle(*s.events[j], b) });
+                    }
+                    b.wait(edges, l);
+
+                    const ir::Index hit = b.event_triggered(event_handle(*s.events[k], b), l);
+                    b.open_region();
+                    b.break_(l);
+                    const ir::ExtraSlice then_r = b.close_region();
+                    b.open_region();
+                    {
+                        b.binary(ir::Inst::Tag::Store, failed.lv(b, l), true_const(b, l), l);
+                        b.break_(l);
+                    }
+                    const ir::ExtraSlice else_r = b.close_region();
+                    b.cond(hit, then_r, else_r, l);
+                }
+                const ir::ExtraSlice body = b.close_region();
+                b.open_region();
+                const ir::ExtraSlice step = b.close_region();
+                b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
+            }
+            const ir::ExtraSlice stage = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice skip = b.close_region();
+            b.cond(not_failed, stage, skip, l);
+        }
+
+        // The action block. With no `else`, LRM 15.5.4 makes a failure a run-time
+        // error rather than a silent skip.
+        const ir::Index fail_now = b.unary(ir::Inst::Tag::Load, failed.lv(b, l), l);
+        b.open_region();
+        if (s.ifFalse != nullptr) {
+            lower_stmt(*s.ifFalse, b);
+        } else {
+            // LRM 15.5.4: "If the fail statement is not specified, a failure
+            // generates a run-time error." $error is the located, non-fatal
+            // severity the LRM's wording matches.
+            b.severity(static_cast<uint32_t>(ir::Severity::Error),
+                       banner_at(s.sourceRange.start()),
+                       "wait_order: events triggered out of order", {}, l);
+        }
+        const ir::ExtraSlice on_fail = b.close_region();
+        b.open_region();
+        if (s.ifTrue != nullptr) {
+            lower_stmt(*s.ifTrue, b);
+        }
+        const ir::ExtraSlice on_pass = b.close_region();
+        b.cond(fail_now, on_fail, on_pass, l);
+    }
+
     // Lower `if (guard) body` as an entire process body: the `iff` qualifier on a
     // top-level sensitivity list (LRM 9.4.2.3). The guard predicate is evaluated
     // in the body's own scope, so it sees the event-time values.
@@ -7184,21 +7305,7 @@ private:
         return signal_of(target.as<ValueExpressionBase>().symbol);
     }
 
-    // Every event operation stamps or compares the current sim tick, which the
-    // backend reads with rt_wheel_now(wheel). A function is a plain callable with
-    // no wheel pointer in its ABI, so the call was emitted with a null operand and
-    // failed the LLVM verifier ("Operand is null") instead of reporting anything.
-    // Refuse in the front end, exactly as $time / $realtime / $strobe / $monitor
-    // already do for the same missing parameter (lower_sysfunc, lower_strobe).
-    // A task is a coroutine and does carry the wheel, so tasks are unaffected.
-    // TODO: thread the wheel (or a runtime `now` global) into the function ABI;
-    // that lifts this restriction and the $time one together.
-    void require_wheel_for_event(const char* what) {
-        if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
-            fail(std::string(what) + " inside a function is not supported (no wheel "
-                                     "in the ABI, like $time)");
-        }
-    }
+
 
     // Resolve any event expression to its 64-bit handle value. Because an event is
     // now an ordinary plane-typed value, this is just the generic rvalue path -- a
@@ -7214,9 +7321,30 @@ private:
         return lower_expr(e, b);
     }
 
+    // The `repeat (n)` count of a detached trigger, as a compile-time constant.
+    // A runtime count would need the registration to carry a value, which the
+    // record could hold -- but LRM 15.5.1's form is a fixed repetition in every
+    // real use, and a constant keeps the record a plain integer.
+    uint32_t repeat_count_const(const Expression& e) {
+        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    ectx(actx);
+        const slang::ConstantValue cv = e.eval(ectx);
+        if (!cv.isInteger()) {
+            // TODO: a runtime repeat count on `->> repeat(n) @(x) e`.
+            fail("a non-constant repeat count on an event-controlled nonblocking "
+                 "trigger is not supported");
+        }
+        const auto n = cv.integer().as<int64_t>();
+        if (!n.has_value() || *n <= 0) {
+            // LRM 11.4.13-style: a non-positive repetition means the trigger is
+            // immediate; treat it as one occurrence rather than never maturing.
+            return 1;
+        }
+        return static_cast<uint32_t>(*n);
+    }
+
     // Lower `-> e` / `->> e` / `->> #d e` (LRM 15.5.2, 15.5.4).
     void lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
-        require_wheel_for_event(ev.isNonBlocking ? "'->> e'" : "'-> e'");
         if (ev.timing != nullptr) {
             // Only `->>` carries a timing control (grammar), so a delayed trigger
             // is always nonblocking. A fixed delay `->> #d e` schedules a detached
@@ -7229,10 +7357,37 @@ private:
                 b.event_trigger_nb_delayed(event_handle(ev.target, b), ticks, loc(ev));
                 return;
             }
-            // TODO: event-controlled nonblocking trigger (`->> @(x) e`,
-            // `->> repeat(n) @(x) e`) — needs a detached one-shot event
-            // subscription (docs/design/event-handles.md §7.4).
-            fail("event-controlled nonblocking trigger ('->> @(...) e') is not supported");
+            // `->> @(x) e` / `->> repeat(n) @(x) e` (LRM 15.5.1): register a
+            // DETACHED one-shot subscription on the edge and fall through. No
+            // coroutine hosts the wait, so the process does not block; when the
+            // edge matures the subscription, the event is triggered in the NBA
+            // region, which is what `->>` means.
+            const TimingControl* inner = &*ev.timing;
+            uint32_t             count = 1;
+            if (inner->kind == slang::ast::TimingControlKind::RepeatedEvent) {
+                const auto& rec = inner->as<slang::ast::RepeatedEventControl>();
+                count           = repeat_count_const(rec.expr);
+                inner           = &rec.event;
+            }
+            if (!is_event_control(*inner)) {
+                fail("event-controlled nonblocking trigger requires an event control");
+            }
+            std::vector<ir::WaitEvent> evs;
+            if (collect_wait_events(*inner, evs) != nullptr) {
+                // TODO: `iff` on the controlling edge of a detached trigger.
+                fail("an iff qualifier on an event-controlled nonblocking trigger is "
+                     "not supported");
+            }
+            if (evs.size() != 1) {
+                // TODO: a multi-edge control (`->> @(a or b) e`) needs one
+                // registration per edge plus a shared one-shot claim, so the first
+                // edge to mature cancels the others.
+                fail("an event-controlled nonblocking trigger on a multi-event "
+                     "control is not supported");
+            }
+            b.event_trigger_nb_event(event_handle(ev.target, b), evs[0].signal,
+                                     static_cast<uint32_t>(evs[0].edge), count, loc(ev));
+            return;
         }
         const ir::Index h = event_handle(ev.target, b);
         if (ev.isNonBlocking) {
@@ -7445,12 +7600,8 @@ private:
                 // join-all count cannot express.
                 fail("wait fork is not supported");
             case StatementKind::WaitOrder:
-                // TODO: wait_order (LRM 15.5.6) blocks until every listed event
-                // triggers in the given order, taking the else-arm on the first
-                // out-of-order trigger. Needs an ordered multi-event park with a
-                // failure branch, which the WaitEdge list cannot express, and the
-                // reactive-region walk rejects it ahead of here too.
-                fail("wait_order is not supported");
+                lower_wait_order(stmt.as<slang::ast::WaitOrderStatement>(), b);
+                break;
             default:
                 fail("unsupported statement");
         }
@@ -15897,7 +16048,6 @@ private:
 
         // `e.triggered` (LRM 15.5.3): 1-bit "triggered this time step" property.
         if (const Expression* ev = triggered_event(call)) {
-            require_wheel_for_event("'e.triggered'");
             return b.event_triggered(event_handle(*ev, b), l);
         }
 
@@ -23272,8 +23422,30 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     }
     bool poisoned  = false;
     bool dumps_vcd = false;
+    // Design-wide: can any event variable be retargeted (LRM 15.5.5)? If not, every
+    // event names one object for the run and a sensitivity list may be hoisted to a
+    // static subscription, which is the fast path. If so, event sensitivity has to
+    // stay in the body so each pass re-reads the handle -- a static subscription is
+    // issued once from the seed loop and can never move. A `ref` / `output` event
+    // formal counts: the callee can retarget the caller's variable.
+    struct EventMergeScan : slang::ast::ASTVisitor<EventMergeScan, slang::ast::VisitFlags::AllGood> {
+        bool found = false;
+        void handle(const slang::ast::AssignmentExpression& a) {
+            found = found || a.left().type->isEvent();
+            visitDefault(a);
+        }
+        void handle(const slang::ast::FormalArgumentSymbol& fa) {
+            found = found || (fa.direction != slang::ast::ArgumentDirection::In &&
+                              fa.getType().getCanonicalType().isEvent());
+            visitDefault(fa);
+        }
+    };
+    EventMergeScan merge_scan;
+    root.visit(merge_scan);
+    const bool events_merge = merge_scan.found;
     try {
         Lowerer globals(*module, tick_fs, allow_system);
+        globals.set_events_merge(events_merge);
         globals.set_class_ids(&class_ids);
         globals.lower_globals(comp, root);
 
@@ -23283,6 +23455,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.set_class_ids(&class_ids);
+            lw.set_events_merge(events_merge);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
             // Exported functions resolve in the scope that owns them: this top's

@@ -745,6 +745,7 @@ public:
         assign_event_slots(); // before emit_state_global: an event's power-on value IS its handle
         emit_state_global();  // before any body: storage_ptr resolves through the anchors
         build_rng_global();  // before any body: every call site passes an RNG pointer
+        build_wheel_global(); // before any body: a function reads the clock from it
         if (stat_on(config_.stats, Stat::Dedup)) {
             report_dedup_stat();
         }
@@ -2469,6 +2470,19 @@ private:
                 }
                 continue;
             }
+            if (ir.tag(idx) == Inst::Tag::EventTriggerNbEvent) {
+                // `->> @(x) e` needs a dense trigger id on the watched (signal,
+                // edge) -- the same id space the intra-assignment event mechanism
+                // uses -- so the wake can find its registrations.
+                const auto info = ir.extra_data<EventDetachInfo>(ir.payload(idx).op_extra.extra);
+                int32_t&   tid  = trigger_id_[static_cast<uint32_t>(info.signal)][info.edge];
+                if (tid < 0) {
+                    tid = static_cast<int32_t>(n_triggers_++);
+                }
+                design_uses_detached_events_ = true;
+                design_uses_nb_events_       = true; // it pends into the NBA region
+                continue;
+            }
             if (ir.tag(idx) == Inst::Tag::EventTriggerNb) {
                 // `->> e` defers its wake to the NBA region. The target is a handle,
                 // so there is no compile-time event to record: the region drains a
@@ -3908,6 +3922,9 @@ private:
         // cannot outlive the call: a function is atomic.
         rng_slot_ = fn_->getArg(1);
         rng_slot_->setName("rng");
+        // A function takes no wheel parameter, but the clock is a global, so event
+        // ops and any other time read resolve here exactly as they do in a task.
+        wheel_ = wheel_gv_ != nullptr ? sym(wheel_gv_) : nullptr;
 
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         // Ref formals bind FIRST: they emit no code, but build_str_temps resolves
@@ -5305,9 +5322,13 @@ private:
 
         // Timing wheel: the event scheduler. Processes schedule timers on it at
         // #delay and the drain loop ticks it to advance time and resume them.
-        auto* wheel_ty = llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_wheel));
-        auto* wheel    = b_.CreateAlloca(wheel_ty, nullptr, "wheel");
-        wheel->setAlignment(llvm::Align(alignof(rt_wheel)));
+        //
+        // A GLOBAL rather than main's alloca, so a body with no wheel parameter can
+        // still read the clock. A plain function is the case that needs it: every
+        // event op stamps or compares the current tick, and a function's ABI carries
+        // state and rng but no wheel. One global costs nothing (the wheel is a
+        // singleton either way) and avoids widening every function signature.
+        llvm::Value* wheel = sym(wheel_gv_);
         b_.CreateCall(wheel_init_fn(), { wheel });
 
         // Seed the %t formatter with the design tick size (fs) and the default
@@ -7911,9 +7932,34 @@ private:
     // Called from both wake paths inside a block already guarded by the edge fact.
     void fire_event_trigger(Signal sig, uint32_t edge) {
         const int32_t tid = trigger_id(sig, edge);
-        if (tid >= 0) {
-            b_.CreateCall(intra_event_fire_fn(), { trigger_id_value(sig, edge) });
+        if (tid < 0) {
+            return;
         }
+        b_.CreateCall(intra_event_fire_fn(), { trigger_id_value(sig, edge) });
+        // Detached `->> @(x) e` subscriptions on the same (signal, edge): count them
+        // down and pend every event whose countdown reached zero. The wake is
+        // NONBLOCKING (LRM 15.5.1: the update event triggers the referenced event in
+        // the NBA region), so this pends rather than fires.
+        if (!design_uses_detached_events_) {
+            return;
+        }
+        auto* i32  = b_.getInt32Ty();
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* head = llvm::BasicBlock::Create(ctx_, "evdet.head", fn);
+        auto* body = llvm::BasicBlock::Create(ctx_, "evdet.body", fn);
+        auto* done = llvm::BasicBlock::Create(ctx_, "evdet.done", fn);
+        llvm::Value* n = b_.CreateCall(event_detach_fire_fn(), { trigger_id_value(sig, edge) });
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+        b_.SetInsertPoint(head);
+        auto* idx = b_.CreatePHI(i32, 2);
+        idx->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(idx, n), body, done);
+        b_.SetInsertPoint(body);
+        emit_event_pend_guarded(b_.CreateCall(event_detach_ready_fn(), { idx }));
+        idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+        b_.SetInsertPoint(done);
     }
 
     // Static sub-queue scan (one edge bucket): a fixed-trip loop over the
@@ -10368,6 +10414,30 @@ private:
         return rt_fn("rt_ring_overflow", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
     }
 
+    // The timing wheel's storage, as a module global rather than main's alloca.
+    // Created before any body is lowered, because a function body binds `wheel_` to
+    // it: a function's ABI carries state and rng but no wheel, and every event op
+    // needs the current tick. main initialises it (rt_wheel_init) before the drain.
+    void build_wheel_global() {
+        auto* wheel_ty = llvm::ArrayType::get(b_.getInt8Ty(), sizeof(rt_wheel));
+        wheel_gv_      = new llvm::GlobalVariable(env_->llmod, wheel_ty, false,
+                                                  llvm::GlobalValue::InternalLinkage,
+                                                  llvm::ConstantAggregateZero::get(wheel_ty),
+                                                  "clotho.wheel");
+        wheel_gv_->setAlignment(llvm::Align(alignof(rt_wheel)));
+    }
+
+    llvm::FunctionCallee event_detach_register_fn() {
+        return rt_fn("rt_event_detach_register", b_.getVoidTy(),
+                     { b_.getInt32Ty(), b_.getInt64Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee event_detach_fire_fn() {
+        return rt_fn("rt_event_detach_fire", b_.getInt32Ty(), { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee event_detach_ready_fn() {
+        return rt_fn("rt_event_detach_ready", b_.getInt64Ty(), { b_.getInt32Ty() });
+    }
+
     llvm::FunctionCallee event_new_fn() {
         return rt_fn("rt_event_new", b_.getInt64Ty(), {});
     }
@@ -11624,6 +11694,7 @@ private:
             case Inst::Tag::EventTrigger:
             case Inst::Tag::EventTriggerNb:
             case Inst::Tag::EventTriggerNbDelayed:
+            case Inst::Tag::EventTriggerNbEvent:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -13245,6 +13316,17 @@ private:
                 // NBA region stamps + wakes. The triggering process does not block.
                 emit_event_pend_guarded(must_of(value_of(p.unary)));
                 return;
+
+            case Inst::Tag::EventTriggerNbEvent: {
+                // `->> @(x) e`: register a detached one-shot subscription on the
+                // edge and carry on. The wake comes from fire_event_trigger on that
+                // (signal, edge), which pends the event for the NBA region.
+                const auto info = ir_->extra_data<EventDetachInfo>(p.op_extra.extra);
+                b_.CreateCall(event_detach_register_fn(),
+                              { trigger_id_value(info.signal, info.edge),
+                                must_of(value_of(p.op_extra.op)), b_.getInt32(info.count) });
+                return;
+            }
 
             case Inst::Tag::EventTriggerNbDelayed: {
                 // `->> #d e` (LRM 15.5.4): schedule a detached wheel timer that fires
@@ -17389,7 +17471,9 @@ private:
     // Whether wheel_ points at a live timing wheel: true in a process or task
     // body, false in a pure function (no wheel parameter).
     bool has_wheel() const {
-        return cur_fn_ == nullptr || cur_is_task_;
+        // The wheel is a module global (clotho.wheel), so every body can read the
+        // clock -- including a plain function, which carries no wheel parameter.
+        return true;
     }
 
     // void rt_sim_run(ptr state, ptr wheel, ptr drain, ptr finals) — wraps the
@@ -22314,6 +22398,9 @@ private:
     // emit_state_global; also the vestigial `state` argument main threads
     // through the process/drain ABI.
     llvm::GlobalVariable*   state_global_ = nullptr;
+    // The timing wheel's storage (clotho.wheel). A global so a function body, which
+    // has no wheel parameter, can still read the clock.
+    llvm::GlobalVariable*   wheel_gv_     = nullptr;
     // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
     std::vector<std::tuple<uint32_t, bool, bool, bool, llvm::StructType*>> slot_types_;
     // Per-definition state-struct memo: (definition name, field types, type).
@@ -22656,6 +22743,9 @@ private:
     // through the event objects (clotho.event_pend_head), because a handle-reached
     // event cannot be enumerated at compile time.
     bool                                               design_uses_nb_events_ = false;
+    // True when the design contains any `->> @(x) e`, so a signal wake also drains
+    // the detached-subscription list for its (signal, edge).
+    bool                                               design_uses_detached_events_ = false;
     // Head of the NBA pending chain (clotho.event_pend_head).
     llvm::GlobalVariable*                              event_pend_head_gv_ = nullptr;
     // The design's single detached `->> #d e` on-expiry thunk (clotho.ev_delay).

@@ -978,6 +978,17 @@ struct WaitInfo {
 
 // Extra payload for `event_trigger_nb_delayed` (`->> #d e`): the target event
 // signal. The delay (in wheel ticks) is the instruction's `op` operand.
+// Extra payload for `event_trigger_nb_event` (`->> @(x) e`): the edge to watch and
+// the `repeat (n)` countdown. The event handle is the instruction's `op` operand.
+struct EventDetachInfo {
+    // Signal whose edge matures the subscription.
+    Signal signal;
+    // Edge to watch (ir::Edge value).
+    uint32_t edge;
+    // Number of occurrences before the trigger fires (1 for the bare form).
+    uint32_t count;
+};
+
 static_assert(ExtraPayload<ExtraSlice>);
 static_assert(ExtraPayload<CallInfo>);
 static_assert(ExtraPayload<TaskCallInfo>);
@@ -1566,6 +1577,13 @@ struct Inst {
         // chain; the NBA region then stamps the trigger time and wakes the waiters.
         // The triggering process does not block.
         EventTriggerNb,
+        // Event-controlled nonblocking trigger `->> @(x) e` / `->> repeat(n) @(x) e`
+        // (payload: op_extra -> op is the event HANDLE value, extra ->
+        // EventDetachInfo names the (signal, edge) to watch and the repeat count).
+        // Registers a detached one-shot subscription on that edge; when it matures
+        // the referenced event is triggered in the NBA region (LRM 15.5.1). The
+        // triggering process does not block, and no coroutine hosts the wait.
+        EventTriggerNbEvent,
         // Delayed nonblocking trigger `->> #d e` (payload: binary -> l is the delay
         // in wheel ticks, r is the event HANDLE value). Schedules a detached wheel
         // timer carrying the handle that, on expiry, stamps the trigger time and
@@ -2337,6 +2355,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::TaggedFmtP:
         case T::CountBits:
         case T::ValuePlusArgs:
+        case T::EventTriggerNbEvent:
             return K::OpExtra;
     }
 

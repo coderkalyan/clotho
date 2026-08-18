@@ -335,6 +335,8 @@ const char* tag_name(Inst::Tag tag) {
             return "event_triggered";
         case T::EventTriggerNb:
             return "event_trigger_nb";
+        case T::EventTriggerNbEvent:
+            return "event_trigger_nb_event";
         case T::EventTriggerNbDelayed:
             return "event_trigger_nb_delayed";
         case T::StrLen:

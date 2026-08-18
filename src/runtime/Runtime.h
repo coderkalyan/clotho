@@ -1404,6 +1404,16 @@ typedef struct rt_event {
 // includes the reserved null object at slot 0.
 void rt_event_pool_init(void* static_block, uint32_t count);
 
+// Detached one-shot event subscriptions (`->> @(x) e`, LRM 15.5.1), keyed by the
+// dense (signal, edge) trigger id. Growable: a `->> @(x) e` in a loop makes one
+// registration per pass, which no static wait bucket can bound. `count` is the
+// `repeat (n)` countdown; the edge decrements and only a record reaching zero
+// fires. rt_event_detach_fire moves the matured handles to a ready list the caller
+// reads back with rt_event_detach_ready.
+void     rt_event_detach_register(uint32_t trig_id, uint64_t handle, uint32_t count);
+uint32_t rt_event_detach_fire(uint32_t trig_id);
+uint64_t rt_event_detach_ready(uint32_t i);
+
 // Allocate a fresh event object; returns its handle `{ slot, gen }`.
 uint64_t rt_event_new(void);
 

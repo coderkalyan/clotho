@@ -47,6 +47,8 @@ public:
     Index event_trigger_nb(Index handle, SourceLoc loc);
     // `->> #d e`: delayed nonblocking trigger; `delay` is the tick count.
     Index event_trigger_nb_delayed(Index handle, Index delay, SourceLoc loc);
+    Index event_trigger_nb_event(Index handle, Signal sig, uint32_t edge, uint32_t count,
+                                 SourceLoc loc);
 
     // -- Generic ops sharing a payload shape --
     // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).

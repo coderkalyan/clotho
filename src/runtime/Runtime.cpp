@@ -2519,6 +2519,58 @@ extern "C" void rt_inertial_cb(rt_timer* timer, void* /*ctx*/) {
     intra_sites[rec->idx].freelist.push_back(rec);
 }
 
+// -- Detached event subscriptions: `->> @(x) e` (LRM 15.5.1) --
+//
+// A one-shot registration keyed by the same dense (signal, edge) trigger id the
+// intra-assignment event mechanism uses. Growable, because the number of live
+// registrations is what a static wait bucket cannot bound -- a `->> @(x) e` in a
+// loop makes one per pass, all waiting on the same edge.
+//
+// Each record is a handle plus a countdown, so `->> repeat(n) @(x) e` is the same
+// thing with n > 1: the edge decrements, and only the record reaching zero fires.
+namespace {
+
+struct EventDetach {
+    uint64_t handle;
+    uint32_t count;
+};
+
+std::vector<std::vector<EventDetach>> event_detach_pending;
+std::vector<uint64_t>                 event_detach_ready;
+
+} // namespace
+
+extern "C" void rt_event_detach_register(uint32_t trig_id, uint64_t handle, uint32_t count) {
+    if (trig_id >= event_detach_pending.size()) {
+        event_detach_pending.resize(trig_id + 1);
+    }
+    event_detach_pending[trig_id].push_back(EventDetach{ handle, count == 0 ? 1u : count });
+}
+
+// The edge fired: decrement every record on this id, move the matured ones to the
+// ready list and compact the rest. Returns how many matured.
+extern "C" uint32_t rt_event_detach_fire(uint32_t trig_id) {
+    event_detach_ready.clear();
+    if (trig_id >= event_detach_pending.size()) {
+        return 0;
+    }
+    auto&  list = event_detach_pending[trig_id];
+    size_t w    = 0;
+    for (size_t i = 0; i < list.size(); ++i) {
+        if (--list[i].count == 0) {
+            event_detach_ready.push_back(list[i].handle);
+        } else {
+            list[w++] = list[i];
+        }
+    }
+    list.resize(w);
+    return static_cast<uint32_t>(event_detach_ready.size());
+}
+
+extern "C" uint64_t rt_event_detach_ready(uint32_t i) {
+    return i < event_detach_ready.size() ? event_detach_ready[i] : 0;
+}
+
 extern "C" void rt_intra_event_register(uint32_t trig_id, void* rec) {
     if (trig_id >= intra_event_pending.size()) {
         intra_event_pending.resize(trig_id + 1);

@@ -818,20 +818,15 @@ TEST_CASE("the action-block whitelist keeps refusing what no region can help wit
     // know what would have to be built, and a reason that quietly stops being true
     // is worse than no reason at all.
 
-    // `wait fork` and `wait_order` have no lowering anywhere, reactive or not.
+    // `wait fork` has no lowering anywhere, reactive or not. (`wait_order` used to
+    // be refused alongside it; it desugars to a park per stage now, so it suspends
+    // like any other wait and the pended copy allows it.)
     refuses(R"(
 module t;
   bit clk, a, b;
   ap: assert property (@(posedge clk) a |=> b) else wait fork;
 endmodule
-)", "a wait fork or a wait_order in an assertion action block");
-    refuses(R"(
-module t;
-  bit clk, a, b;
-  event e1, e2;
-  ap: assert property (@(posedge clk) a |=> b) else wait_order(e1, e2);
-endmodule
-)", "a wait fork or a wait_order in an assertion action block");
+)", "a wait fork in an assertion action block");
 
     // A `forever` loop. The old reason -- a reactive body is resumed once -- is
     // gone: a body may now be resumed as often as it suspends. What is left is

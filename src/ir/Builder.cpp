@@ -100,6 +100,12 @@ Index Builder::event_trigger_nb(Index handle, SourceLoc loc) {
     return emit({ Inst::Tag::EventTriggerNb, pay(&Inst::Payload::unary, handle) }, loc);
 }
 
+Index Builder::event_trigger_nb_event(Index handle, Signal sig, uint32_t edge, uint32_t count,
+                                      SourceLoc loc) {
+    const ExtraIndex extra = add_extra(EventDetachInfo{ sig, edge, count });
+    return emit({ Inst::Tag::EventTriggerNbEvent, Inst::Payload{ .op_extra = { handle, extra } } }, loc);
+}
+
 Index Builder::event_trigger_nb_delayed(Index handle, Index delay, SourceLoc loc) {
     return emit({ Inst::Tag::EventTriggerNbDelayed, Inst::Payload{ .binary = { delay, handle } } }, loc);
 }
