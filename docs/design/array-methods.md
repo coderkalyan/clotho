@@ -32,10 +32,11 @@ ring's logical order).
   `rsort` sorts ascending then reverses (ties are unobservable — a scalar
   element equals its own key). Restricted to a **2-state integral (width ≤ 64)
   or real** element.
-- **shuffle** is Fisher-Yates driven by the process frame RNG (xoshiro256++,
+- **shuffle** is Fisher-Yates driven by the calling thread's RNG (xoshiro256++,
   LRM 18.13). The runtime replicates the backend's inlined `emit_xoshiro_next`
   byte-for-byte, so a shuffle leaves the `$urandom` stream consistent. A
-  shuffling process is forced to a coroutine (needs the frame RNG).
+  shuffling process is forced to a coroutine (the state lives in its frame); a
+  shuffle in a subroutine uses the caller's, threaded through the call ABI.
 
 Oracle: iverilog implements none of these ("sorry: not currently supported").
 verilator matches Clotho byte-for-byte on the value cases. shuffle's permutation

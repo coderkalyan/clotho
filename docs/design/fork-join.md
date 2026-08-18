@@ -333,6 +333,13 @@ is the hard half of that work, not the ring.
 - `Inst::Tag::Fork` stays in `blocks_thunk` for `join_none` too: it spawns coroutines
   and mutates scheduler state, so the process still cannot be a thunk and must not
   fuse.
+- **Random stability** (LRM 18.14.1): a child owns its xoshiro256++ state rather
+  than sharing the parent's pointer, seeded in its ramp from one draw of the
+  parent's stream. Sharing was not an option even ignoring 18.14.1 — the state is
+  an alloca in the parent's coroutine frame, and under `join_any` / `join_none` a
+  child can outlive it. The state is materialized only for a child that can reach
+  a draw, so an ordinary fork costs nothing and does not perturb the parent's
+  stream (`build_rng_fns`).
 
 Still open, and unchanged by V2: `Structural::walk` has no `Fork` case, so children
 are absent from `BodyFacts::calls`; and `scan_finish` omits `Fork`, so a `$finish` in

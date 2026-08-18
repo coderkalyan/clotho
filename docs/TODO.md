@@ -854,9 +854,9 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `shuffle` on a dynamic array or queue (`rt_dynarr_*` / `rt_queue_*` helpers).
   `reverse` / `shuffle` are element-agnostic; `sort` / `rsort` are value-keyed,
   restricted to a 2-state integral (width <= 64) or real element. `shuffle` draws
-  from the process frame RNG (forces a coroutine). Guarded loud: `sort` / `rsort`
-  `with` iterator clause; wide (> 64-bit) elements; `shuffle` inside a
-  function/task (no frame RNG in the call ABI); and 4-state `sort` ordering —
+  from the calling thread's RNG (which forces its process to a coroutine, and
+  reaches a subroutine body through the call ABI). Guarded loud: `sort` / `rsort`
+  `with` iterator clause; wide (> 64-bit) elements; and 4-state `sort` ordering —
   deferred deliberately because the LRM (7.12.2) leaves x/z placement
   unspecified: a 4-state `<` yields x rather than a total order, so any ordering
   would be an invented one, and guarding loud beats silently picking.
@@ -1301,7 +1301,7 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   (coroutine) ABI too: slang types a task prototype's return as `void`, so the stub's
   existing void body is already right and the only task-specific part is the `is_task`
   flag on its `Function` record, which is what selects the
-  `(state, wheel, <formals>, record)` signature a `TaskCallVirtual` drives the
+  `(state, rng, wheel, <formals>, record)` signature a `TaskCallVirtual` drives the
   override's ramp through. A **pure virtual with a non-scalar return** reuses
   `build_function`'s fall-through return shape, so the stub's signature is the one
   every override was built with: an unpacked struct / fixed array and a container
@@ -1363,20 +1363,26 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 - [x] **`$urandom` / `$urandom_range`** (LRM 18.13) — per-process xoshiro256++
   RNG in the coroutine frame (thread-stable by process index), inlined draw +
   Lemire range map. Stream intentionally not iverilog-identical (LRM
-  §18.13 leaves the algorithm unspecified).
+  §18.13 leaves the algorithm unspecified). Legal anywhere: a function or task
+  runs in its caller's thread, so the state pointer is an implicit parameter of
+  the call ABI (`declare_function`) and a draw inside a subroutine continues the
+  calling process's stream.
 - [x] **`randcase`** (LRM 18.16) — weighted random branch selection: each weight
   evaluated once, summed as unsigned at the widest weight's precision, one
   `$urandom_range` draw picking the first branch whose cumulative weight passes
   it. A zero-weight branch never runs and an all-zero sum runs none (the LRM's
   warning is optional). The fixed-precision sum wraps per the literal LRM
   reading, where verilator widens instead. Guarded loud: a
-  weight wider than 32 bits (needs the LRM's several-draw stitching), and
-  `randcase` in a function/task (no frame RNG, same as `$urandom`).
-- [ ] **Random stability & seeding, remaining** — fork-time child seeding from
-  the parent RNG (per-process state is ready; needs the fork hook),
-  per-object RNG for class `randomize`, `srandom` / `get_randstate` /
-  `set_randstate`, and `$urandom` inside a function/task (needs the caller RNG
-  threaded through the call ABI — currently a loud frontend guard).
+  weight wider than 32 bits (needs the LRM's several-draw stitching).
+- [x] **Random stability across threads** (LRM 18.14.1) — a body that can outlive
+  the site that ramped it owns its generator instead of sharing the pointer: a
+  fork child, and the deferred `$strobe` / `$monitor` / action bodies. Each is
+  seeded at its ramp from one draw of the ramping thread's state, so a child's
+  stream is reproducible and independent of its siblings'. A DPI export thunk and
+  the `$monitor` ramp in `main` have no calling thread at all and use a
+  module-wide state seeded at startup.
+- [ ] **Random stability & seeding, remaining** — per-object RNG for class
+  `randomize`, and `srandom` / `get_randstate` / `set_randstate`.
 
 ### Concurrency & synchronization
 

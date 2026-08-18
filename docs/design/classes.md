@@ -138,7 +138,7 @@ two nominal Refs) — not new to parameterization.
 task** gets the coroutine-shaped stub: slang types a task prototype's return as
 `void`, so the existing void body (a bare `ret_void`) is already right, and the only
 task-specific part is the `is_task` flag on the `Function` record — which is what
-selects the `(state, wheel, <formals>, record)` task ABI in `declare_task`, the
+selects the `(state, rng, wheel, <formals>, record)` task ABI in `declare_task`, the
 signature a `TaskCallVirtual` on an abstract handle drives the override's ramp
 through. A **non-scalar return** reuses `build_function`'s fall-through return shape:
 an unpacked struct / fixed array and a container (dynamic array, queue, assoc) `Ret`

@@ -409,8 +409,11 @@ emission below.
   flat design-state global — signal addressing is absolute from the root, so there
   is **no** "which instance" problem for one instance), marshal each C arg → plane
   (**reuse `dpi_c_to_plane` / `dpi_vec_copyout`**), `call @<mod>.fn.<name>(state,
-  planes...)` (a plain SV function needs only `(state, args)` — no wheel/coroutine),
-  extract the `{mm,z}` return, marshal plane → C (**reuse `dpi_arg_to_c` /
+  rng, planes...)` (a plain SV function needs only `(state, rng, args)` — no
+  wheel/coroutine). `rng` is `@clotho.rng`, the module-wide xoshiro256++ state
+  `main` seeds at startup: C drove this call, so there is no calling process whose
+  stream a `$urandom` inside the exported function could continue (LRM 18.13).
+  Then extract the `{mm,z}` return, marshal plane → C (**reuse `dpi_arg_to_c` /
   `dpi_vec_copyin`**). The scalar/vec/chandle marshal helpers reverse directly.
 - Incremental pieces: `output`/`inout` formals (thunk allocas caller temps, passes
   their `(mm_ptr,z_ptr)`, copies back to the C pointers post-call) and string
