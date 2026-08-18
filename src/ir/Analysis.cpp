@@ -121,9 +121,11 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Wait:
         case Inst::Tag::TaskCall:
         case Inst::Tag::TaskCallVirtual:
+        case Inst::Tag::EventNew:
         case Inst::Tag::EventTrigger:
         case Inst::Tag::EventTriggerNb:
         case Inst::Tag::EventTriggerNbDelayed:
+        case Inst::Tag::EventTriggerNbEvent:
         case Inst::Tag::EventTriggered:
         case Inst::Tag::Fork:
         // Frame-resident RNG: the per-process stream lives in the coroutine frame
@@ -912,6 +914,12 @@ struct ValueSweep {
                 case Inst::Tag::Signal:
                     val_z[raw] = sig_z[static_cast<uint32_t>(p.signal)];
                     val_x[raw] = sig_x[static_cast<uint32_t>(p.signal)];
+                    break;
+                case Inst::Tag::EventNew:
+                    // A fresh event handle is a definite 2-state 64-bit word.
+                    break;
+                case Inst::Tag::EventTriggerNbEvent:
+                    // A statement: no value.
                     break;
                 case Inst::Tag::Arg:
                     // An Arg outside a function cannot occur; stay conservative.

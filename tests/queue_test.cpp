@@ -917,16 +917,26 @@ TEST_CASE("%p of a container of class handles is rejected loudly") {
                 "%p of a queue / dynamic array of class handles is not supported");
 }
 
-TEST_CASE("an event element is still refused") {
-    // Not a lifecycle question: an event's trigger state is per-signal static, so
-    // an element has nowhere to keep it (LRM 15.5).
-    expect_fail(R"(
+TEST_CASE("an event element is a distinct event per slot") {
+    // An event element is a 64-bit handle like a class handle, with one difference
+    // the descriptor carries: rt_elem_event CONSTRUCTS a new object per slot
+    // (LRM Table 6-7's "New event"), where every other kind copies a constant
+    // prototype. Copying an element copies the handle, so both slots then name one
+    // object -- LRM 15.5.5's merge.
+    CHECK(run_capture(R"(
         module m;
-            event e[$];
-            initial $display("%0d", e.size());
+            event q[$];
+            event a;
+            int n = 0;
+            initial begin
+                q.push_back(a);
+                q.push_back(a);
+                fork forever begin @(q[0]); n++; end join_none
+                #1 -> a;
+                #1 $display("n=%0d same=%0b size=%0d", n, q[0] == q[1], q.size());
+            end
         endmodule
-    )",
-                "queue element type is not supported");
+    )") == "n=1 same=1 size=2\n");
 }
 
 // -- Aggregate elements (LRM 7.10 with 7.2) ------------------------------------

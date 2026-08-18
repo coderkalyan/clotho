@@ -236,11 +236,13 @@ const Elem elems[] = {
       "$$[\"a\"] = 11;", "$display(\"%0d\", $$[\"a\"]);", "11\n", t_managed },
     { "class handle", "class EC;\n    int v;\nendclass", "typedef EC ET;",
       "$$ = new;\n$$.v = 13;", "$display(\"%0d\", $$.v);", "13\n", t_handle },
-    // The one deliberate exclusion (§7). An event has no value, so it has no
-    // literal to assign and nothing to render; `expect` is never consulted
-    // because every event cell must be refused.
+    // An event is a 64-bit handle with reference semantics, exactly like a class
+    // handle (docs/design/event-handles.md): a bare event variable assigns, holds
+    // null and reads `.triggered`. `$$ = null` then `.triggered` is 0 -- the null
+    // object never triggers. The shapes that still refuse (events in aggregates,
+    // across ports, as subroutine arguments) stay on the allowlist below.
     { "event", "", "typedef event ET;",
-      "$$ = null;", "$display(\"%0d\", $$.triggered);", "", t_event },
+      "$$ = null;", "$display(\"%0d\", $$.triggered);", "0\n", t_event },
 };
 // clang-format on
 
@@ -580,33 +582,47 @@ bool is_port(const Cell& k) {
 
 // clang-format off
 const Allow allowlist[] = {
-    { [](const Cell& k) { return is_event(k) && k.c->kind == C::farray; },
+    // An event ARRAY needs one object per element, and the object slot array is
+    // sized at compile time from the declared events -- there is no per-element
+    // binding yet. `foreach read` builds an array of the element even in the `none`
+    // column, so it lands here too.
+    { [](const Cell& k) { return is_event(k) &&
+                                 (k.c->kind == C::farray || k.m->kind == P::foreach_read); },
       "unpacked array of events is not supported",
-      "§7: per-element event trigger state is a scheduler change (LRM 15.5)." },
+      "an event array needs one object per element (LRM 15.5.5)." },
     { [](const Cell& k) { return is_event(k) && k.c->kind == C::ustruct; },
       "event struct member is not supported",
       "§7: an event in an aggregate has no per-member trigger state (LRM 15.5)." },
     { [](const Cell& k) { return is_event(k) && k.c->kind == C::cprop; },
-      "event class property is not supported",
-      "§7: an event in an aggregate has no per-property trigger state (LRM 15.5)." },
+      "a per-instance event class property is not supported",
+      "an event object per class object needs a runtime slot pool (LRM 15.5.5)." },
     { [](const Cell& k) { return is_event(k) &&
                                  (k.c->kind == C::dynarr || k.c->kind == C::queue); },
       "element type is not supported",
       "§7: an event element needs per-element trigger state (LRM 15.5)." },
+    // An event passes and triggers like any other 64-bit handle, so the remaining
+    // exclusions are narrow and each has its own reason.
+    //
+    // Inside a FUNCTION every event op is refused for the same missing parameter
+    // $time is: a function carries no wheel, and an event op needs the current tick
+    // to stamp or compare. Not event-specific -- lifting it is an ABI change that
+    // lifts the $time restriction too.
+    { [](const Cell& k) { return is_event(k) &&
+                                 (k.m->kind == P::func_in || k.m->kind == P::func_out ||
+                                  k.m->kind == P::func_inout || k.m->kind == P::func_ref ||
+                                  k.m->kind == P::func_cref); },
+      "inside a function is not supported",
+      "an event op needs the current tick; a function has no wheel in its ABI." },
+    // A function return needs a local to hold the result, and an automatic-lifetime
+    // event local would need a FRESH object per activation.
+    { [](const Cell& k) { return is_event(k) && k.m->kind == P::func_return; },
+      "an automatic-lifetime event local in a subroutine is not supported",
+      "a per-call event needs an object per activation (LRM 15.5.5)." },
     { [](const Cell& k) { return is_event(k) && (k.c->kind == C::assoc_int ||
                                                  k.c->kind == C::assoc_str); },
       "associative array value element type is not supported",
       "§7: an event value element needs per-element trigger state (LRM 15.5)." },
-    { [](const Cell& k) { return is_event(k) && is_port(k); },
-      "event ports are not supported",
-      "§7: an event has no value to copy across a port boundary (LRM 15.5)." },
-    // The catch-all for every remaining event shape. Deliberately broad: an
-    // event has no value, so the guard that fires moves with the shape (the
-    // assignment, the formal, the return, the render) while the reason does not.
-    { [](const Cell& k) { return is_event(k); },
-      "event",
-      "§7: an event has no value, so no passing mode can copy, return or "
-      "render one (LRM 15.5)." },
+
     // An inout port aliases whole storage, and a sub-object of an aggregate or
     // a container has no independent net identity to resolve drivers on.
     { [](const Cell& k) { return k.m->kind == P::port_inout && k.c->kind != C::none; },

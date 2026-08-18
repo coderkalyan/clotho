@@ -881,13 +881,16 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 suspends("a wait");
                 break;
             case StatementKind::WaitOrder:
+                // `wait_order` desugars to a park per stage (lower_wait_order), so
+                // it suspends exactly like a `wait` and the pended copy allows it.
+                suspends("a wait_order");
+                break;
             case StatementKind::WaitFork:
-                // Nothing to do with the region: clotho lowers neither anywhere.
-                // `wait fork` needs the live-child set a fork does not keep and
-                // `wait_order` has no lowering at all (lower_stmt). Named here for
-                // the reason the fork case is: this walk runs first.
-                reject("a wait fork or a wait_order",
-                       "clotho does not lower either one, in reactive code or outside it");
+                // Nothing to do with the region: clotho does not lower it anywhere.
+                // `wait fork` needs the live-child set a fork does not keep. Named
+                // here for the reason the fork case is: this walk runs first.
+                reject("a wait fork",
+                       "clotho does not lower it, in reactive code or outside it");
                 break;
             case StatementKind::ForeverLoop:
                 // Still refused, and still not a region matter -- but the old reason
@@ -1241,6 +1244,16 @@ public:
 
     // Point this Lowerer at the design-wide class id table. `ids` must outlive
     // every call made through this Lowerer.
+    // Design-wide: some assignment can retarget an event variable, so no event's
+    // handle is provably fixed. A static sensitivity subscription is issued once
+    // from the seed loop and can never re-resolve, so with merging in the design an
+    // event sensitivity list must be left in the body instead, where it re-reads
+    // the handle on every pass (LRM 15.5.5: a re-armed wait uses the CURRENT
+    // object; only an already-parked waiter stays where it is).
+    void set_events_merge(bool v) {
+        events_merge_ = v;
+    }
+
     void set_class_ids(ClassIds* ids) {
         class_ids_ = ids;
     }
@@ -1820,12 +1833,15 @@ private:
             e.kind == ir::Type::Kind::Assoc) {
             return;
         }
-        // An event has no value and its trigger state is a separate static
-        // timestamp, so there is no per-element storage to give it
-        // (docs/design/data-model.md §7). Every other kind is admitted above.
-        // TODO: event elements would need per-element trigger state (LRM 15.5),
-        // which is a scheduler change rather than a data-model one.
-        fail(std::string(what) + " element type is not supported (an event has no value to store)");
+        // An event element is a 64-bit handle word, like a class handle, with one
+        // extra requirement its descriptor carries: rt_elem_event CONSTRUCTS a new
+        // object per slot (LRM Table 6-7's "New event"), where every other kind
+        // copies a constant prototype image. Copying an element copies the handle,
+        // so both slots then name one object -- LRM 15.5.5's merge.
+        if (e.kind == ir::Type::Kind::Event) {
+            return;
+        }
+        fail(std::string(what) + " element type is not supported");
     }
 
     ir::Ref lower_type(const slang::ast::Type& type) {
@@ -1843,14 +1859,6 @@ private:
                 // stores bounds as uint32; supporting them needs signed normalization
                 // in the backend element-select. Rare in RTL memories.
                 fail("unpacked array with negative index bounds is not supported");
-            }
-            if (arr->elementType.getCanonicalType().isEvent()) {
-                // An event lowers to a 1-bit placeholder whose trigger state is a
-                // separate static per-event timestamp, so an event under an array
-                // dimension would declare fine but have no trigger/wait machinery
-                // (every use already fails; the declaration must too).
-                // TODO: event arrays (need per-element trigger state, LRM 15.5).
-                fail("unpacked array of events is not supported");
             }
             ir::Type t;
             t.kind    = ir::Type::Kind::UnpackedArray;
@@ -1969,12 +1977,6 @@ private:
                                                : static_cast<const Scope&>(ct.as<slang::ast::UnpackedStructType>());
             std::vector<ir::FieldRow> fields;
             for (const auto& f : body.membersOfType<slang::ast::FieldSymbol>()) {
-                if (!is_packed && f.getType().getCanonicalType().isEvent()) {
-                    // Same as the array-of-event guard above: the member would
-                    // declare as an inert 1-bit placeholder with no trigger state.
-                    // TODO: event struct members (LRM 15.5).
-                    fail("event struct member is not supported");
-                }
                 // Packed member: `bitOffset` is the field's bit position. Unpacked
                 // member: addressed by declaration index (`fieldIndex`), no flat
                 // offset — store the index so the field table is self-describing.
@@ -2114,11 +2116,14 @@ private:
             return ref;
         }
         if (ct.isEvent()) {
-            // Named event (LRM 15.5): no data value. Modeled as a 1-bit logic
-            // placeholder signal whose only role is to own wait queues; the
-            // trigger state lives in a separate per-event timestamp. See
-            // docs/design/named-events.md.
-            return module_.pool.logic_type;
+            // Named event (LRM 15.5): a reference type. The variable holds a 64-bit
+            // handle `{ u32 slot, u32 gen }` naming an entry in the backend's event
+            // object array (which carries the trigger timestamp, the waiter list and
+            // the `->>` pending state). Handle semantics come out of the ordinary
+            // scalar machinery -- assignment aliases, `==` is identity, `null` is the
+            // all-zero power-on default -- exactly as for a class handle.
+            // See docs/design/event-handles.md.
+            return module_.pool.event_type;
         }
         if (ct.isCHandle()) {
             // chandle (LRM 6.14): an opaque pointer-width handle. Lowered as a
@@ -2234,11 +2239,6 @@ private:
             if (prop.randMode != slang::ast::RandMode::None) {
                 // TODO: rand / randc properties and randomize() (Phase 3).
                 fail("rand / randc class properties are not supported");
-            }
-            if (prop.getType().getCanonicalType().isEvent()) {
-                // TODO: event class properties (LRM 15.5) — the property would
-                // declare as an inert placeholder with no trigger state.
-                fail("event class property is not supported");
             }
             class_prop_index_.emplace(&prop, idx);
             fields.push_back({ prop.name, lower_type(prop.getType()), idx });
@@ -3860,7 +3860,16 @@ private:
                 continue;
             }
             const PortSymbol& p = pc->port.as<PortSymbol>();
-            if (p.direction != slang::ast::ArgumentDirection::InOut &&
+            // An event port is an ALIASING port in every direction (LRM 15.5.5): a
+            // port-connected event names the same sync object on both sides, so the
+            // two symbols collapse onto one signal exactly as an inout does. Copying
+            // the handle instead would be wrong -- a later merge on one side would
+            // not be seen on the other -- and there is nothing to propagate, since
+            // an event carries occurrences rather than a value.
+            const bool event_port =
+              p.internalSymbol != nullptr && p.internalSymbol->kind == SymbolKind::Variable &&
+              p.internalSymbol->as<VariableSymbol>().getType().isEvent();
+            if (!event_port && p.direction != slang::ast::ArgumentDirection::InOut &&
                 p.direction != slang::ast::ArgumentDirection::Ref) {
                 continue;
             }
@@ -3971,11 +3980,6 @@ private:
                             info.dir = found->second;
                         }
                     }
-                    if (info.dir != ir::SignalInfo::Direction::Internal && info.is_event) {
-                        // TODO: event ports (LRM 15.5) — needs cross-boundary
-                        // event aliasing (Tier 2, docs/design/named-events.md).
-                        fail("event ports are not supported");
-                    }
                     if (info.dir != ir::SignalInfo::Direction::Internal &&
                         ir::types::contains_string(module_.pool, info.type)) {
                         // TODO: string module ports (needs string-aware port copies
@@ -4051,11 +4055,20 @@ private:
                  "expression is not supported");
         }
         const auto it = sigmap_.find(&csym);
-        if (it == sigmap_.end()) {
-            fail("reference to unknown signal '" + std::string(csym.name) + "'");
+        if (it != sigmap_.end()) {
+            return it->second;
         }
-
-        return it->second;
+        if (csym.kind == SymbolKind::ClassProperty &&
+            csym.as<slang::ast::ClassPropertySymbol>().lifetime == slang::ast::VariableLifetime::Static) {
+            // A static class property gets persistent module-signal storage
+            // registered LAZILY on first access (declare_static_prop), and the value
+            // paths do that themselves. A reference that arrives here instead --
+            // `@(C::e)` on a static event property, which resolves through
+            // event_signal -- must trigger the same registration rather than report
+            // the property as unknown.
+            return declare_static_prop(csym.as<slang::ast::ClassPropertySymbol>());
+        }
+        fail("reference to unknown signal '" + std::string(csym.name) + "'");
     }
 
     // Register a procedural local variable (a for-loop control variable or a
@@ -4076,7 +4089,14 @@ private:
         info.name = prefix_ + std::string(vs.name);
         info.loc  = to_source_loc(vs.location);
         info.type = lower_type(vs.getType());
-        info.dir  = ir::SignalInfo::Direction::Internal;
+        // Every site that registers a *declared variable* must derive is_event from
+        // the type: the backend allocates an event's trigger-timestamp global only
+        // for a signal carrying the flag, so a cleared flag on an event makes
+        // `-> e` / `e.triggered` store through a null global. A block-local
+        // `event e;` reaches exactly here (declare_storage routes fn_ctx_ == null
+        // here), so omitting it crashed the backend rather than failing loudly.
+        info.is_event = vs.getType().isEvent();
+        info.dir      = ir::SignalInfo::Direction::Internal;
 
         const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&vs]         = sig;
@@ -6688,11 +6708,17 @@ private:
             if (timed.timing.kind == TimingControlKind::ImplicitEvent) {
                 infer = true;
                 body  = &timed.stmt;
-            } else if (is_event_control(timed.timing)) {
+            } else if (is_event_control(timed.timing) && !sensitivity_needs_handle(timed.timing)) {
                 iff_guard    = collect_wait_events(timed.timing, wait_events);
                 body         = &timed.stmt;
                 proc_timing_ = &timed.timing;
             }
+            // Otherwise the list names an event with no signal of its own
+            // (`always @(ev[i])`). A static subscription cannot carry a runtime
+            // handle, so the control is LEFT IN THE BODY: `looping` below wraps the
+            // block in a forever loop and the `@(...)` lowers as an ordinary
+            // intra-body wait, which re-evaluates the handle on every pass. That is
+            // also the more correct reading of a re-triggering sensitivity list.
         }
 
         // An `always` is semantically a forever loop around its body (LRM 9.2.2).
@@ -6814,6 +6840,16 @@ private:
                 if (ev.iffCondition != nullptr) {
                     iff = ev.iffCondition;
                 }
+                if (wait_builder_ != nullptr && event_wait_needs_handle(ev.expr)) {
+                    // An event with no signal of its own: park on the handle the
+                    // expression evaluates to, right here, so `@(ev[i])` uses the
+                    // index's value at the moment the wait executes (LRM 15.5.5's
+                    // "the assignment only affects subsequent event control").
+                    out.push_back(ir::WaitEvent{ .signal = ir::Signal{ 0 },
+                                                 .edge   = ir::Edge::Any,
+                                                 .handle = lower_expr(ev.expr, *wait_builder_) });
+                    break;
+                }
                 const ir::Signal sig = event_signal(ev.expr);
                 if (ev.edge == slang::ast::EdgeKind::BothEdges) {
                     // `edge` means posedge-or-negedge (LRM 9.4.2), not any change:
@@ -6874,6 +6910,58 @@ private:
         }
     }
 
+    // True when a `@(...)` on this expression needs a runtime event HANDLE rather
+    // than a signal: it is event-typed but is not a plain reference to a declared
+    // event variable. `@(ev[i])`, `@(obj.e)`, `@(s.e)` and `@(<formal>)` are the
+    // cases; each names an object that no signal identifies.
+    bool events_merge_ = false;
+
+    bool event_wait_needs_handle(const Expression& e) {
+        if (!e.type->isEvent()) {
+            return false;
+        }
+        // Forms event_signal resolves to a synthetic signal of their own rather
+        // than to an event object: a clocking block's hidden toggle (`@(cb)`) and
+        // the global clocking event (`@($global_clock)`). Both are event-typed but
+        // neither is an event VARIABLE, and neither has a handle to evaluate.
+        if (e.kind == ExpressionKind::ArbitrarySymbol || global_clock_call(e) != nullptr) {
+            return false;
+        }
+        if (e.kind != ExpressionKind::NamedValue && e.kind != ExpressionKind::HierarchicalValue) {
+            return true; // an element select, a member access, ...
+        }
+        // A frame-resident event (a formal or an automatic local) has no signal.
+        if (fn_ctx_ != nullptr && fn_ctx_->localmap.contains(&e.as<ValueExpressionBase>().symbol)) {
+            return true;
+        }
+        // With merging anywhere in the design, even a plain `@(e)` has to re-read
+        // the handle on each pass, which only the body-resident wait can do.
+        return events_merge_;
+    }
+
+    // Whether any event in a sensitivity list would need a handle, which a process's
+    // static subscription cannot carry. build_process leaves such a list in the body.
+    bool sensitivity_needs_handle(const TimingControl& tc) {
+        switch (tc.kind) {
+            case TimingControlKind::SignalEvent:
+                return event_wait_needs_handle(tc.as<SignalEventControl>().expr);
+            case TimingControlKind::EventList:
+                for (const TimingControl* e : tc.as<EventListControl>().events) {
+                    if (sensitivity_needs_handle(*e)) {
+                        return true;
+                    }
+                }
+                return false;
+            default:
+                return false;
+        }
+    }
+
+    // Set while an INTRA-BODY wait is being collected: the builder its handle
+    // expressions lower into. Null while a process's static sensitivity is
+    // collected, which is what makes event_signal refuse a frame-held event there.
+    ir::Builder* wait_builder_ = nullptr;
+
     ir::Signal event_signal(const Expression& e) {
         if (is_string_expr(e)) {
             // TODO: waiting on a string change (needs string-aware wait-queue
@@ -6903,7 +6991,19 @@ private:
             // (`@(posedge cb.sig)`, LRM 14.15) resolves the same way and lands on
             // its sampled storage, so the edge seen is the edge of the sampled
             // value stream, which is what 14.15 specifies.
-            return signal_of(e.as<ValueExpressionBase>().symbol);
+            const ValueSymbol& vs = e.as<ValueExpressionBase>().symbol;
+            if (e.type->isEvent() && fn_ctx_ != nullptr && fn_ctx_->localmap.contains(&vs) &&
+                wait_builder_ == nullptr) {
+                // An event whose handle lives in a call frame -- a formal, or an
+                // automatic local -- has no signal for the wait list to name. The
+                // trigger forms take the handle as a value and work; the wait does
+                // not, because a WaitEdge names a signal.
+                // TODO: carry the handle value on a WaitEdge so `@(<any event
+                // expression>)` works; see docs/design/event-handles.md §6.
+                fail("waiting on an event held in a subroutine argument or an "
+                     "automatic local is not supported (triggering one is)");
+            }
+            return signal_of(vs);
         }
         // A non-simple event expression (struct/union member, array element,
         // bit/part-select, arithmetic): the wait engine subscribes by whole-signal
@@ -6957,20 +7057,127 @@ private:
     // (signal, edge) queue at once; it wakes when any of them fires.
     void lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
         std::vector<ir::WaitEvent> events;
-        const Expression*          iff = collect_wait_events(tc, events);
+        // Handle expressions in this list lower into `b`, immediately before the
+        // Wait, so an `@(ev[i])` parks on the object `ev[i]` names right now.
+        ir::Builder* const saved = wait_builder_;
+        wait_builder_            = &b;
+        const Expression* iff    = collect_wait_events(tc, events);
+        wait_builder_            = saved;
         if (events.empty()) {
             fail("intra-body event wait has no signal events");
         }
         std::vector<ir::WaitEdge> edges;
         edges.reserve(events.size());
         for (const ir::WaitEvent& e : events) {
-            edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
+            edges.push_back(
+              ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge), e.handle });
         }
         if (iff != nullptr) {
             emit_guarded_wait(edges, *iff, b, l);
         } else {
             b.wait(edges, l);
         }
+    }
+
+    // Lower `wait_order(a, b, c) pass; else fail;` (LRM 15.5.4): suspend until every
+    // listed event has triggered left to right, failing the moment a not-yet-reached
+    // event triggers out of turn.
+    //
+    // Desugared over the existing IR -- no new op. The list length is a compile-time
+    // constant, so the stages are UNROLLED, which is what lets each stage wait on a
+    // different set (the events still ahead of it):
+    //
+    //   failed = 0;
+    //   stage k:  if (!failed) forever { @(e_k or e_k+1 or ... or e_N-1);
+    //                                    if (e_k.triggered) break;
+    //                                    failed = 1; break; }
+    //   if (failed) <fail> else <pass>
+    //
+    // Waiting on the whole remaining tail is what detects an out-of-order trigger:
+    // any later event wakes the stage, and `e_k.triggered` is then 0. An event
+    // already passed is not in any later stage's list, so re-triggering it is
+    // ignored -- LRM: "preceding events are not limited to occur only once".
+    //
+    // Stage 0 additionally accepts the PERSISTENT triggered state before waiting,
+    // which the LRM allows for the first event only ("only the first event in the
+    // list can wait for the persistent triggered event").
+    void lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Builder& b) {
+        const ir::SourceLoc l = loc(s);
+        const auto          n = s.events.size();
+
+        const TempCell    failed = make_temp_cell(module_.pool.logic_type, "wait_order");
+        const ir::Index   zero   = b.constant(module_.pool.put_int(module_.pool.logic_type, 0), l);
+        b.binary(ir::Inst::Tag::Store, failed.lv(b, l), zero, l);
+
+        for (size_t k = 0; k < n; ++k) {
+            // if (!failed) { ...stage k... }
+            const ir::Index not_failed =
+              b.unary(ir::Inst::Tag::Bnot, b.unary(ir::Inst::Tag::Load, failed.lv(b, l), l), l);
+            b.open_region();
+            {
+                // Stage 0 may be satisfied by the persistent triggered state.
+                b.open_region();
+                const ir::Index lpred =
+                  k == 0 ? b.unary(ir::Inst::Tag::Bnot, b.event_triggered(event_handle(*s.events[0], b), l), l)
+                         : true_const(b, l);
+                const ir::ExtraSlice lcond = b.close_region();
+
+                b.open_region();
+                {
+                    // Wait on every event still ahead, this one included.
+                    std::vector<ir::WaitEdge> edges;
+                    edges.reserve(n - k);
+                    for (size_t j = k; j < n; ++j) {
+                        edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
+                                                      static_cast<uint32_t>(ir::Edge::Any),
+                                                      event_handle(*s.events[j], b) });
+                    }
+                    b.wait(edges, l);
+
+                    const ir::Index hit = b.event_triggered(event_handle(*s.events[k], b), l);
+                    b.open_region();
+                    b.break_(l);
+                    const ir::ExtraSlice then_r = b.close_region();
+                    b.open_region();
+                    {
+                        b.binary(ir::Inst::Tag::Store, failed.lv(b, l), true_const(b, l), l);
+                        b.break_(l);
+                    }
+                    const ir::ExtraSlice else_r = b.close_region();
+                    b.cond(hit, then_r, else_r, l);
+                }
+                const ir::ExtraSlice body = b.close_region();
+                b.open_region();
+                const ir::ExtraSlice step = b.close_region();
+                b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
+            }
+            const ir::ExtraSlice stage = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice skip = b.close_region();
+            b.cond(not_failed, stage, skip, l);
+        }
+
+        // The action block. With no `else`, LRM 15.5.4 makes a failure a run-time
+        // error rather than a silent skip.
+        const ir::Index fail_now = b.unary(ir::Inst::Tag::Load, failed.lv(b, l), l);
+        b.open_region();
+        if (s.ifFalse != nullptr) {
+            lower_stmt(*s.ifFalse, b);
+        } else {
+            // LRM 15.5.4: "If the fail statement is not specified, a failure
+            // generates a run-time error." $error is the located, non-fatal
+            // severity the LRM's wording matches.
+            b.severity(static_cast<uint32_t>(ir::Severity::Error),
+                       banner_at(s.sourceRange.start()),
+                       "wait_order: events triggered out of order", {}, l);
+        }
+        const ir::ExtraSlice on_fail = b.close_region();
+        b.open_region();
+        if (s.ifTrue != nullptr) {
+            lower_stmt(*s.ifTrue, b);
+        }
+        const ir::ExtraSlice on_pass = b.close_region();
+        b.cond(fail_now, on_fail, on_pass, l);
     }
 
     // Lower `if (guard) body` as an entire process body: the `iff` qualifier on a
@@ -7078,36 +7285,115 @@ private:
 
     // Resolve the target of `-> e` to the event's synthetic signal, verifying it
     // is an event (defensive — slang types the target as an event already).
+    //
+    // A hierarchical target (`-> u.e`, `-> i.e` through an interface port or a
+    // modport) resolves like any other cross-instance reference: slang binds the
+    // name to the SAME ValueSymbol a local `e` would, so signal_of lands on the
+    // one shared signal and the trigger reaches the instance that owns it. This
+    // matches event_signal, which has always accepted HierarchicalValue for
+    // `@(u.e)` / `u.e.triggered` — the two paths bottom out in the same
+    // signal_of, and only accepting the narrower kind here is what made a
+    // submodule's event waitable but not triggerable.
     ir::Signal trigger_target(const Expression& target) {
-        if (target.kind != ExpressionKind::NamedValue || !target.type->isEvent()) {
+        const bool named = target.kind == ExpressionKind::NamedValue ||
+                           target.kind == ExpressionKind::HierarchicalValue;
+        if (!named || !target.type->isEvent()) {
             // TODO: triggering an event element of an array / struct member, or an
-            // event through a hierarchical / handle expression (Tier 2).
+            // event through a handle expression (docs/design/event-handles.md).
             fail("unsupported event trigger target");
         }
-        return signal_of(target.as<NamedValueExpression>().symbol);
+        return signal_of(target.as<ValueExpressionBase>().symbol);
+    }
+
+
+
+    // Resolve any event expression to its 64-bit handle value. Because an event is
+    // now an ordinary plane-typed value, this is just the generic rvalue path -- a
+    // declared event reads its signal, an array element reads its element, a class
+    // property reads its field, a formal reads its frame slot -- so no event-shaped
+    // resolver is needed and every target form works the same way.
+    ir::Index event_handle(const Expression& e, ir::Builder& b) {
+        if (!e.type->isEvent()) {
+            // Defensive: slang types a trigger target and a `.triggered` receiver as
+            // an event already.
+            fail("expected an event expression");
+        }
+        return lower_expr(e, b);
+    }
+
+    // The `repeat (n)` count of a detached trigger, as a compile-time constant.
+    // A runtime count would need the registration to carry a value, which the
+    // record could hold -- but LRM 15.5.1's form is a fixed repetition in every
+    // real use, and a constant keeps the record a plain integer.
+    uint32_t repeat_count_const(const Expression& e) {
+        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    ectx(actx);
+        const slang::ConstantValue cv = e.eval(ectx);
+        if (!cv.isInteger()) {
+            // TODO: a runtime repeat count on `->> repeat(n) @(x) e`.
+            fail("a non-constant repeat count on an event-controlled nonblocking "
+                 "trigger is not supported");
+        }
+        const auto n = cv.integer().as<int64_t>();
+        if (!n.has_value() || *n <= 0) {
+            // LRM 11.4.13-style: a non-positive repetition means the trigger is
+            // immediate; treat it as one occurrence rather than never maturing.
+            return 1;
+        }
+        return static_cast<uint32_t>(*n);
     }
 
     // Lower `-> e` / `->> e` / `->> #d e` (LRM 15.5.2, 15.5.4).
     void lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
-        const ir::Signal sig = trigger_target(ev.target);
         if (ev.timing != nullptr) {
             // Only `->>` carries a timing control (grammar), so a delayed trigger
             // is always nonblocking. A fixed delay `->> #d e` schedules a detached
             // wheel timer; the event-controlled form is not yet lowered.
             if (ev.timing->kind == slang::ast::TimingControlKind::Delay) {
                 const Expression& amount = ev.timing->as<slang::ast::DelayControl>().expr;
-                b.event_trigger_nb_delayed(sig, scaled_delay(amount, b), loc(ev));
+                // Evaluate the delay first, then the target: the LRM leaves the order
+                // unspecified, and this keeps the handle load adjacent to its use.
+                const ir::Index ticks = scaled_delay(amount, b);
+                b.event_trigger_nb_delayed(event_handle(ev.target, b), ticks, loc(ev));
                 return;
             }
-            // TODO: event-controlled nonblocking trigger (`->> @(x) e`,
-            // `->> repeat(n) @(x) e`) — needs a detached one-shot event
-            // subscription (docs/design/named-events.md, Tier 2 Form 2).
-            fail("event-controlled nonblocking trigger ('->> @(...) e') is not supported");
+            // `->> @(x) e` / `->> repeat(n) @(x) e` (LRM 15.5.1): register a
+            // DETACHED one-shot subscription on the edge and fall through. No
+            // coroutine hosts the wait, so the process does not block; when the
+            // edge matures the subscription, the event is triggered in the NBA
+            // region, which is what `->>` means.
+            const TimingControl* inner = &*ev.timing;
+            uint32_t             count = 1;
+            if (inner->kind == slang::ast::TimingControlKind::RepeatedEvent) {
+                const auto& rec = inner->as<slang::ast::RepeatedEventControl>();
+                count           = repeat_count_const(rec.expr);
+                inner           = &rec.event;
+            }
+            if (!is_event_control(*inner)) {
+                fail("event-controlled nonblocking trigger requires an event control");
+            }
+            std::vector<ir::WaitEvent> evs;
+            if (collect_wait_events(*inner, evs) != nullptr) {
+                // TODO: `iff` on the controlling edge of a detached trigger.
+                fail("an iff qualifier on an event-controlled nonblocking trigger is "
+                     "not supported");
+            }
+            if (evs.size() != 1) {
+                // TODO: a multi-edge control (`->> @(a or b) e`) needs one
+                // registration per edge plus a shared one-shot claim, so the first
+                // edge to mature cancels the others.
+                fail("an event-controlled nonblocking trigger on a multi-event "
+                     "control is not supported");
+            }
+            b.event_trigger_nb_event(event_handle(ev.target, b), evs[0].signal,
+                                     static_cast<uint32_t>(evs[0].edge), count, loc(ev));
+            return;
         }
+        const ir::Index h = event_handle(ev.target, b);
         if (ev.isNonBlocking) {
-            b.event_trigger_nb(sig, loc(ev)); // `->> e`: wake in the NBA region
+            b.event_trigger_nb(h, loc(ev)); // `->> e`: wake in the NBA region
         } else {
-            b.event_trigger(sig, loc(ev)); // `-> e`: wake now
+            b.event_trigger(h, loc(ev)); // `-> e`: wake now
         }
     }
 
@@ -7313,6 +7599,9 @@ private:
                 // process must block until every descendant has finished, which the
                 // join-all count cannot express.
                 fail("wait fork is not supported");
+            case StatementKind::WaitOrder:
+                lower_wait_order(stmt.as<slang::ast::WaitOrderStatement>(), b);
+                break;
             default:
                 fail("unsupported statement");
         }
@@ -12152,9 +12441,7 @@ private:
         // An event is not a value: its trigger state is separate static per-event
         // state, and its 1-bit placeholder slot is never read (docs/design/
         // named-events.md), so there is nothing to reset.
-        // TODO: LRM Table 6-7 wants a NEW event per entry, which needs the trigger
-        // stamp reset too.
-        if (automatic && !vs.getType().isEvent()) {
+        if (automatic) {
             emit_default_init(value_lvalue(vs, b, l), lower_type(vs.getType()), b, l);
         }
         if (aggregate_has_field_defaults(vs.getType())) {
@@ -12181,6 +12468,14 @@ private:
                 return;
             case ir::Type::Kind::Assoc:
                 b.assoc_delete(lv, lv, /*has_key=*/false, ty, l);
+                return;
+            case ir::Type::Kind::Event:
+                // LRM Table 6-7: "New event". Every entry to the declaration binds a
+                // FRESH synchronization object, so two concurrent activations of the
+                // same task do not share one -- which is the whole reason an
+                // automatic event cannot take a baked constant handle the way a
+                // static one does.
+                b.binary(ir::Inst::Tag::Store, lv, b.event_new(l), l);
                 return;
             case ir::Type::Kind::String:
                 b.binary(ir::Inst::Tag::Store, lv, b.constant(string_value_ref(""), l), l);
@@ -15753,7 +16048,7 @@ private:
 
         // `e.triggered` (LRM 15.5.3): 1-bit "triggered this time step" property.
         if (const Expression* ev = triggered_event(call)) {
-            return b.event_triggered(event_signal(*ev), l);
+            return b.event_triggered(event_handle(*ev, b), l);
         }
 
         // `<sequence>.triggered` (see sequence_method): the same spelling on a
@@ -17369,12 +17664,6 @@ private:
                 return gated_store(a, *fi, b);
             }
         }
-        if (a.left().type->isEvent()) {
-            // `e2 = e1` (merge) / `e = null` (LRM 15.5.5): event variables are
-            // handles; assignment aliases the underlying sync object. Tier 2 —
-            // needs event reference semantics (docs/design/named-events.md).
-            fail("event assignment is not supported");
-        }
         if (a.isNonBlocking() && a.left().kind == ExpressionKind::MemberAccess &&
             a.left().as<MemberAccessExpression>().member.kind == SymbolKind::ClassProperty) {
             // TODO: nonblocking assignment to a class property. The aggregate NBA
@@ -18917,15 +19206,10 @@ private:
                 // signals are collected (the two-pass lowering below) it flows
                 // through the ordinary signal_of path.
                 const ValueSymbol& sym = expr.as<ValueExpressionBase>().symbol;
-                if (expr.type->isEvent()) {
-                    // A named event has no data value; the legal forms (`@(e)`,
-                    // `-> e`, `e.triggered`) resolve the event symbol directly and
-                    // never reach this value path. This catches the Tier-2 handle
-                    // forms — `e2 = e1` merge, `e == null` — which need event
-                    // reference semantics (docs/design/named-events.md).
-                    fail("event used as a value is not supported (event assignment / "
-                         "comparison / null)");
-                }
+                // An event is a plane-typed handle value (LRM 15.5.5), so it needs
+                // no special case here: `e2 = e1` merges by copying the handle,
+                // `e == null` is an identity compare, and passing one is a scalar
+                // copy. See docs/design/event-handles.md.
                 if (sym.kind == SymbolKind::Parameter) {
                     const ParameterSymbol& p = sym.as<ParameterSymbol>();
                     return b.constant(lower_constant(p.getValue(), p.getType()), l);
@@ -20783,6 +21067,7 @@ private:
         info.name            = prefix_ + fn_ctx_->name_prefix + std::string(vs.name);
         info.loc             = to_source_loc(vs.location);
         info.type            = lower_type(vs.getType());
+        info.is_event        = vs.getType().isEvent(); // see declare_local
         info.dir             = ir::SignalInfo::Direction::Internal;
         const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&vs]         = sig;
@@ -20811,6 +21096,7 @@ private:
         info.name            = prefix_ + cls + std::string(prop.name);
         info.loc             = to_source_loc(prop.location);
         info.type            = pty;
+        info.is_event        = prop.getType().isEvent(); // see declare_local
         info.dir             = ir::SignalInfo::Direction::Internal;
         const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&prop]       = sig;
@@ -21382,15 +21668,6 @@ private:
                 // report site (docs/design/data-model.md §3). Every storage class
                 // passes the same way — a plane slot, a managed handle, an aggregate
                 // image — so there is no per-type restriction here.
-                //
-                // An `event` formal is the one exclusion: an event has no value and
-                // its trigger state is a separate static timestamp, so there is
-                // nothing for a pointer to alias.
-                if (fa->getType().getCanonicalType().isEvent()) {
-                    // TODO: ref of an event (LRM 15.5) needs event reference
-                    // semantics, which is a scheduler change, not a data-model one.
-                    fail("ref argument of an event type is not supported");
-                }
                 continue;
             }
             if (dir != slang::ast::ArgumentDirection::In && fa->getType().getCanonicalType().isString()) {
@@ -23145,8 +23422,30 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     }
     bool poisoned  = false;
     bool dumps_vcd = false;
+    // Design-wide: can any event variable be retargeted (LRM 15.5.5)? If not, every
+    // event names one object for the run and a sensitivity list may be hoisted to a
+    // static subscription, which is the fast path. If so, event sensitivity has to
+    // stay in the body so each pass re-reads the handle -- a static subscription is
+    // issued once from the seed loop and can never move. A `ref` / `output` event
+    // formal counts: the callee can retarget the caller's variable.
+    struct EventMergeScan : slang::ast::ASTVisitor<EventMergeScan, slang::ast::VisitFlags::AllGood> {
+        bool found = false;
+        void handle(const slang::ast::AssignmentExpression& a) {
+            found = found || a.left().type->isEvent();
+            visitDefault(a);
+        }
+        void handle(const slang::ast::FormalArgumentSymbol& fa) {
+            found = found || (fa.direction != slang::ast::ArgumentDirection::In &&
+                              fa.getType().getCanonicalType().isEvent());
+            visitDefault(fa);
+        }
+    };
+    EventMergeScan merge_scan;
+    root.visit(merge_scan);
+    const bool events_merge = merge_scan.found;
     try {
         Lowerer globals(*module, tick_fs, allow_system);
+        globals.set_events_merge(events_merge);
         globals.set_class_ids(&class_ids);
         globals.lower_globals(comp, root);
 
@@ -23156,6 +23455,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.set_class_ids(&class_ids);
+            lw.set_events_merge(events_merge);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
             // Exported functions resolve in the scope that owns them: this top's

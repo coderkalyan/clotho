@@ -952,7 +952,21 @@ struct WaitEdge {
     Signal signal;
     // Edge to wait for (ir::Edge value).
     uint32_t edge;
+    // For an EVENT wait only: the SSA value of the event handle to park on, which
+    // may name any object (an array element, a class property, a formal), not just
+    // the one `signal` declares. kNoWaitHandle when the wait names a signal
+    // directly -- including a plain `@(e)` on a declared event, which resolves
+    // through `signal` so the common case stays a folded constant address.
+    //
+    // Index{0} is a real instruction, so the sentinel is the max value, like
+    // kNoDisableTarget -- and it is the DEFAULT, so every existing construction
+    // site (which uses designated initializers naming only signal and edge) keeps
+    // meaning "no handle" instead of silently naming instruction 0.
+    Index handle = static_cast<Index>(~uint32_t{ 0 });
 };
+
+// `WaitEdge::handle` is absent: this wait names its signal directly.
+inline constexpr Index kNoWaitHandle = static_cast<Index>(~uint32_t{ 0 });
 
 // Extra payload for `wait`: the list of events the process suspends on. The
 // process wakes when ANY listed (signal, edge) fires. `events` is a run of
@@ -964,9 +978,15 @@ struct WaitInfo {
 
 // Extra payload for `event_trigger_nb_delayed` (`->> #d e`): the target event
 // signal. The delay (in wheel ticks) is the instruction's `op` operand.
-struct EventDelayInfo {
-    // Event whose synthetic signal owns the wait queue to service on expiry.
-    Signal event;
+// Extra payload for `event_trigger_nb_event` (`->> @(x) e`): the edge to watch and
+// the `repeat (n)` countdown. The event handle is the instruction's `op` operand.
+struct EventDetachInfo {
+    // Signal whose edge matures the subscription.
+    Signal signal;
+    // Edge to watch (ir::Edge value).
+    uint32_t edge;
+    // Number of occurrences before the trigger fires (1 for the bare form).
+    uint32_t count;
 };
 
 static_assert(ExtraPayload<ExtraSlice>);
@@ -1530,28 +1550,45 @@ struct Inst {
         // registering the process on each event's wait queue plus a coroutine
         // suspend; a matching blocking assignment to one of the signals wakes it.
         Wait,
-        // Blocking trigger of a named event `-> e` (payload: signal, the event's
-        // synthetic signal). Records the trigger time (for `.triggered`) and
-        // unconditionally services the event signal's Any-edge wait queues,
-        // waking every `@(e)` / `always @(e)` waiter in the current instant
-        // (LRM 15.5.2). An event has no value, so there is no edge computation.
+        // Bind a NEW event object and yield its handle (payload: none). LRM Table
+        // 6-7 makes "New event" the default value of an event variable, so this is
+        // emitted wherever event storage comes into existence and no constant handle
+        // can be baked in: an automatic-lifetime local. Static storage gets its
+        // handle from the state initializer, and aggregate / container element leaves
+        // are constructed by their own init walks.
+        EventNew,
+        // Blocking trigger of a named event `-> e` (payload: unary -> the event
+        // HANDLE value, a 64-bit { slot, gen }). Resolves the handle to its event
+        // object, records the trigger time (for `.triggered`) and wakes every
+        // waiter on the object's list in the current instant (LRM 15.5.2). An event
+        // has no value, so there is no edge computation. A null handle resolves to
+        // the reserved null object, whose waiter list is always empty -- the no-op
+        // LRM 15.5.5 requires of `-> null`.
         EventTrigger,
-        // The `e.triggered` event property (payload: signal), -> a definite 1-bit
-        // value: 1 iff the event was triggered in the current time step, else 0
-        // (LRM 15.5.3). Lowers to a compare of the recorded trigger time against
-        // the current sim time.
+        // The `e.triggered` event property (payload: unary -> the event handle),
+        // -> a definite 1-bit value: 1 iff the event was triggered in the current
+        // time step, else 0 (LRM 15.5.3). Lowers to a compare of the object's
+        // recorded trigger time against the current sim time; a null handle reads
+        // the null object's never-triggered sentinel and answers 0.
         EventTriggered,
-        // Nonblocking trigger of a named event `->> e` (payload: signal). Unlike
-        // EventTrigger, the wake is deferred to the NBA region of the current time
-        // step (LRM 15.5.4): it marks the event pending; the NBA region then
-        // stamps the trigger time and services the waiters. The triggering process
-        // does not block.
+        // Nonblocking trigger of a named event `->> e` (payload: unary -> the event
+        // handle). Unlike EventTrigger, the wake is deferred to the NBA region of
+        // the current time step (LRM 15.5.4): it links the object onto the pending
+        // chain; the NBA region then stamps the trigger time and wakes the waiters.
+        // The triggering process does not block.
         EventTriggerNb,
-        // Delayed nonblocking trigger `->> #d e` (payload: op_extra -> op is the
-        // delay in wheel ticks, extra -> EventDelayInfo names the event). Schedules
-        // a detached wheel timer that, on expiry, stamps the trigger time and
-        // services the event's waiters (LRM 15.5.4). The triggering process does
-        // not block. The event-controlled form (`->> @(x) e`) is not lowered here.
+        // Event-controlled nonblocking trigger `->> @(x) e` / `->> repeat(n) @(x) e`
+        // (payload: op_extra -> op is the event HANDLE value, extra ->
+        // EventDetachInfo names the (signal, edge) to watch and the repeat count).
+        // Registers a detached one-shot subscription on that edge; when it matures
+        // the referenced event is triggered in the NBA region (LRM 15.5.1). The
+        // triggering process does not block, and no coroutine hosts the wait.
+        EventTriggerNbEvent,
+        // Delayed nonblocking trigger `->> #d e` (payload: binary -> l is the delay
+        // in wheel ticks, r is the event HANDLE value). Schedules a detached wheel
+        // timer carrying the handle that, on expiry, stamps the trigger time and
+        // wakes the event's waiters (LRM 15.5.4). The triggering process does not
+        // block. The event-controlled form (`->> @(x) e`) is not lowered here.
         EventTriggerNbDelayed,
         // Fork block `fork … join` (payload: extra -> ForkInfo). A statement that
         // spawns each child body as its own coroutine (a fork-child task, whose
@@ -2044,15 +2081,17 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Constant:
             return K::Ref;
         case T::Signal:
-        case T::EventTrigger:
-        case T::EventTriggered:
-        case T::EventTriggerNb:
             return K::Signal;
+        case T::EventNew:
+            return K::None;
         case T::Arg:
             return K::Arg;
         case T::Local:
             return K::Local;
 
+        case T::EventTrigger:
+        case T::EventTriggered:
+        case T::EventTriggerNb:
         case T::Load:
         case T::Bnot:
         case T::RedAnd:
@@ -2151,6 +2190,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FopenFd:
         // $ungetc: l is the character, r the descriptor.
         case T::Ungetc:
+        // `->> #d e`: l is the delay in ticks, r is the event handle.
+        case T::EventTriggerNbDelayed:
             return K::Binary;
 
         case T::Resize:
@@ -2314,7 +2355,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::TaggedFmtP:
         case T::CountBits:
         case T::ValuePlusArgs:
-        case T::EventTriggerNbDelayed:
+        case T::EventTriggerNbEvent:
             return K::OpExtra;
     }
 
@@ -2425,6 +2466,10 @@ enum class ExtraOperandTail : uint8_t {
     // range operands, two slices, neither of which is the span (which holds
     // only the selector, payload.op_extra.op).
     InsideSetMembers,
+    // + WaitInfo::events[k].handle for each event edge that carries one. The
+    // handles are strided three words apart inside the packed WaitEdge run, so
+    // they are not a slice and cannot be a span.
+    WaitHandles,
 };
 
 // Constexpr for the same reason as extra_operand_shape(): operand walks inline
@@ -2444,6 +2489,8 @@ constexpr ExtraOperandTail extra_operand_tail(Inst::Tag tag) {
             return E::ScanfSource;
         case T::InsideSet:
             return E::InsideSetMembers;
+        case T::Wait:
+            return E::WaitHandles;
         default:
             return E::None;
     }
@@ -2641,6 +2688,13 @@ public:
                 }
                 return;
             }
+            case ExtraOperandTail::WaitHandles:
+                for (const WaitEdge& e : wait_edges(p.extra)) {
+                    if (e.handle != kNoWaitHandle) {
+                        fn(e.handle);
+                    }
+                }
+                return;
         }
     }
 

@@ -6,10 +6,15 @@ loud-fail today.
 
 Status: **Landed** — Tier 1 (`event e;`, `-> e`, `@(e)`, `always @(e)`,
 `wait(e.triggered)`, `e.triggered`) plus the Tier-2 slice `->>` (NBA-region),
-`->> #d e` (detached timer), and general `wait(<level-expr>)`. The **event
-handle** semantics (assignment / merge / `null` / `==` / arrays / event args)
-and the **event-controlled trigger** `->> @(x) e` are deferred with their
-designs captured below.
+`->> #d e` (detached timer), and general `wait(<level-expr>)`.
+
+The **event handle** semantics (assignment / merge / `null` / `==` / aggregates /
+arguments / class properties / ports) and the **event-controlled trigger**
+`->> @(x) e` are designed in **`docs/design/event-handles.md`**, which supersedes
+the deferral sections at the end of this file. That design reworks the model
+below — an event becomes a 64-bit handle into a runtime slot table with an
+intrusive waiter list — so treat everything from "Event `Signal` identity"
+onward as a description of the *current* implementation, not the target.
 
 ## The enabling insight
 
@@ -205,85 +210,25 @@ block, the event fires `d` ticks later, runtime (non-constant) delays work, and
 1000 concurrent detached timers run and free cleanly. iverilog implements no
 `->>`, so pinned to the LRM.
 
-## Deferred: event handles (LRM 15.5.5) — captured design
+## Superseded: event handles, `->> @(x) e`, `wait_order`, ports
 
-This is the largest remaining piece and is really an **M3/M4 (OOP/UVM)
-enabler** — common RTL/testbench event use is fully covered above. Deferred
-until a class/UVM workload needs it. Loud-fails today
-(`event assignment is not supported`, `event used as a value is not supported`).
+These were deferred here with a captured design (Options A/B) built on the
+premise that handles require exposing the active-queue push to the C runtime and
+growable wait queues — a scheduler-core change. **That premise is wrong and both
+options are withdrawn.** See `docs/design/event-handles.md`:
 
-### The semantics
+- Generated code is already reachable *from* the runtime through the wheel's
+  `rt_timer_fn` callback, and `clotho.ev_delay.<e>` already performs a
+  runtime-initiated event wake that touches `clotho.active`. The active queue
+  stays codegen-private.
+- Statically sized wait buckets are replaced for events by an intrusive
+  doubly-linked list of frame-resident nodes — the mechanism remote `disable`
+  already uses (`disable_node_ty`, `emit_disable_link`/`_unlink`) — which is
+  unbounded by construction.
 
-A named event is a **handle** to a synchronization object, not a value (like a
-class handle):
+`wait fork` remains genuinely deferred: it needs the live-child set a `fork` does
+not retain, which is unrelated to events.
 
-- `event a, b;` — two variables, each bound to its own fresh sync object.
-- `a = b;` — **merge**: `a` now references `b`'s object. `-> a`/`-> b` become
-  the same trigger; `@(a)`/`@(b)` wake on either. Aliases.
-- `a = null;` — `a` references nothing. `-> a` is a no-op; `@(a)` blocks forever.
-- `a == b` / `a == null` — **identity** compare (same object / null).
-- `event evq[4];`, `-> evq[i];` — arrays of handles, runtime-indexed target.
-- `task fire(event e); -> e; endtask` — pass a handle; the task triggers the
-  caller's event.
-
-iverilog does not support event arrays ("sorry: event arrays are not supported")
-or the full handle set, so the semantics above come straight from LRM 15.5.5.
-
-### Why the current model can't do it
-
-Tier 1/2 bake each `event e` to a fixed compile-time `Signal` with statically
-sized wait-queue globals and a timestamp global, and inline the trigger/wait
-against those. Handles need a **runtime identity** for events, so:
-
-- merge/null/`==` have no runtime object to point at / compare;
-- an `evq[i]` / class-member / task-arg target is unknown until runtime, so the
-  trigger/wait cannot be inlined against a specific global.
-
-The event has to become a **sync object** — `{ dynamic waiter list, u64
-timestamp }` — reached through a runtime handle, and the ops become runtime
-calls (`rt_event_trigger` / `rt_event_wait` / `rt_event_triggered` /
-`rt_event_cmp`). **The hard coupling:** waking a waiter pushes its coroutine
-handle onto the active queue, which today is a *codegen-owned* structure
-(`clotho.active`, drained by generated code). A runtime `rt_event_trigger`
-can't reach it — so handles force exposing the active-queue push to runtime (or
-moving the active queue into runtime ownership), a change to the scheduler core.
-The Tier 1/2 static-queue event path would then be re-plumbed onto the sync
-object (same semantics, runtime mechanism) — costing the simple-event case the
-inlined-codegen speed, or keeping two parallel event engines.
-
-### Options
-
-- **Option A — full runtime sync objects.** New `rt_event` subsystem; event
-  storage is a handle; declaration binds a fresh object, `null` is the null
-  handle; active-queue push exposed to runtime; all event ops re-plumbed.
-  General and correct. ~a week+, touches the scheduler core.
-- **Option B — bounded static pool + runtime index.** One sync slot per
-  *statically-declared* event/array-element (enumerable, since non-class events
-  aren't dynamically `new`'d); the variable holds a runtime index; `a = b`
-  copies the index, `null` is a sentinel, `==` compares indices. Covers
-  merge/null/compare/arrays/args for non-class events; **not** class-member
-  events (per-object storage → M4). Still needs dynamic waiter lists + the
-  active-queue-from-runtime hook, so the scheduler coupling is the same as A.
-
-Recommendation: Option A is the right target if built; Option B does most of the
-hard work for only a subset, so it is worth it only as an explicit stepping
-stone. Either way, gate on a concrete class/UVM need — the scheduler-core change
-is the real cost, not the event surface.
-
-## Deferred: event-controlled trigger `->> @(x) e`
-
-`->> @(x) e` / `->> repeat(n) @(x) e` needs a **detached one-shot event
-subscription**: register on `x`'s edge such that the wake fires the event
-trigger with no hosting coroutine. It can reuse the active-queue thunk-tagging
-(push a tagged event-trigger thunk instead of a coroutine handle), but the
-dynamic wait-queue **capacities are computed statically**, so an unbounded
-number of live detached registrations (a `->> @(x) e` in a loop) would overflow.
-Needs growable wait queues or a separate detached-subscription structure.
-Loud-fails today.
-
-## Deferred: misc
-
-Events through ports; `wait_order`; `wait fork`.
 
 ## Oracle
 

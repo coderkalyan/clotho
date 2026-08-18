@@ -44,6 +44,9 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
         case Type::Kind::String:
             os << "string";
             break;
+        case Type::Kind::Event:
+            os << "event";
+            break;
         case Type::Kind::Struct: {
             const auto fields = pool.struct_fields(t.fields_id);
             os << (t.is_packed ? "struct packed{" : "struct{");
@@ -324,12 +327,16 @@ const char* tag_name(Inst::Tag tag) {
             return "delay";
         case T::Wait:
             return "wait";
+        case T::EventNew:
+            return "event_new";
         case T::EventTrigger:
             return "event_trigger";
         case T::EventTriggered:
             return "event_triggered";
         case T::EventTriggerNb:
             return "event_trigger_nb";
+        case T::EventTriggerNbEvent:
+            return "event_trigger_nb_event";
         case T::EventTriggerNbDelayed:
             return "event_trigger_nb_delayed";
         case T::StrLen:

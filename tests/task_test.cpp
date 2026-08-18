@@ -490,17 +490,55 @@ TEST_CASE("ref of an unpacked struct aliases the actual") {
 
 // -- Guarded gaps: must fail loudly, not silently miscompile. --
 
-// An event has no value and its trigger state is a separate static timestamp, so
-// there is nothing for a pointer to alias (docs/design/data-model.md §7).
-TEST_CASE("ref of an event is rejected") {
-    constexpr std::string_view src = R"(
+// An event is a 64-bit handle (docs/design/event-handles.md), so it passes like any
+// other scalar in every direction. LRM 15.5.5's own example is a task that triggers
+// the caller's event through an `input` formal; `ref` retargets the caller's
+// variable, as it does for a class handle.
+TEST_CASE("an event passes as a subroutine argument in every direction") {
+    SUBCASE("input: the callee triggers the caller's event") {
+        CHECK(run_capture(R"(
+            module m;
+              event e; int n = 0;
+              task automatic fire(event x); -> x; endtask
+              initial forever begin @(e); n++; end
+              initial begin #1 fire(e); #1 fire(e); #1 $display("n=%0d", n); end
+            endmodule
+        )") == "n=2\n");
+    }
+    SUBCASE("ref: the callee retargets the caller's variable") {
+        CHECK(run_capture(R"(
+            module m;
+              event a, b; int nb = 0;
+              task automatic point_at_b(ref event x); x = b; endtask
+              initial forever begin @(b); nb++; end
+              initial begin point_at_b(a); #1 -> a; #1 $display("nb=%0d", nb); end
+            endmodule
+        )") == "nb=1\n");
+    }
+    SUBCASE("output: the callee hands back a binding") {
+        CHECK(run_capture(R"(
+            module m;
+              event src, got; int n = 0;
+              task automatic give(output event x); x = src; endtask
+              initial forever begin @(src); n++; end
+              initial begin give(got); #1 -> got; #1 $display("n=%0d", n); end
+            endmodule
+        )") == "n=1\n");
+    }
+}
+
+// Waiting on an event held in a call frame works too: the frontend lowers the
+// formal's handle immediately before the Wait and the waiter parks on whatever
+// object it names, so the caller's event wakes the callee.
+TEST_CASE("a subroutine can wait on an event passed to it") {
+    CHECK(run_capture(R"(
         module m;
-            function automatic void f(ref event e); endfunction
-            event ev;
-            initial f(ev);
+            event e;
+            task automatic w(event x); @(x); $display("woke t=%0t", $time); endtask
+            initial w(e);
+            initial #2 -> e;
         endmodule
-    )";
-    CHECK(reject(src).find("ref argument of an event type is not supported") != std::string::npos);
+    )") == "woke t=2\n");
 }
 
 // A packed bit/part-select is not a whole slot, so it is not a legal ref actual —

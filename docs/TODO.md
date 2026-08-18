@@ -98,9 +98,10 @@ professional parity; M5 makes it complete.
   covered too: the frame is per call, so `init_frame` alone was not enough.
   lower_var_decl still clears fn_ctx_ around the PreInit lowering, so a static
   initializer that reaches for a frame local fails loud rather than mis-resolving.
-  An `event` local is skipped — its trigger state is separate static state and its
-  placeholder slot is never read (Table 6-7's "new event" would need that stamp
-  reset).
+  An `event` local is skipped: its power-on value is its own handle, baked into the
+  state initializer, and re-running a default init would unbind it. An
+  automatic-lifetime event local is refused instead (Table 6-7's "new event" per
+  activation would need a fresh object).
   * Perf follow-up: the aggregate default is unrolled per leaf, and tier-0 does not
     fold it (measured: 279 stores for `automatic byte mem[256]`). A bulk reset needs
     an op that memcpys the type's proto image, valid only for a trivially-copyable
@@ -113,7 +114,8 @@ professional parity; M5 makes it complete.
   module signal / `static` local / array element (LRM 13.4.4 — same shadow-staging
   path as a task; frame-local NBA guarded).
 - [x] **ref / const ref args** (13.5.2) — a pointer to the actual's storage,
-  uniform for every storage class, so the formal may be any type but `event` and
+  uniform for every storage class, so the formal may be any type at all (an
+  `event` formal aliases its 64-bit handle word like a class handle) and
   the actual any whole place: a container element, an assoc element, a struct
   member, a class property, nested to any depth. A ref into a container's heap
   storage additionally carries that container's relocation epoch and is re-checked
@@ -269,11 +271,47 @@ professional parity; M5 makes it complete.
   Single-event only, lowered as a body/`@`-loop guard (`if (cond)`). Per-event
   `iff` in a multi-event list (`@(posedge a iff x or ...)`) still rejected loud —
   needs waking-source identification the shared-wake engine lacks.
-- [ ] **Event assignment / merge** (`e2 = e1`) and `null` event handles.
-- [ ] **Event-controlled trigger** (`->> @(x) e`, `->> repeat(n) @(x) e`).
-- [ ] **Event ports / task-function event args**.
-- [ ] **Events inside arrays / structs / queues**.
-- [ ] **`wait_order`**.
+- [x] **Event handles and every event storage class** (LRM 15.5) — `event` is a
+  reference type: a 2-state 64-bit handle `{ u32 slot, u32 gen }` naming an event
+  OBJECT, laid out and passed exactly like a class handle. `a = b` merges onto one
+  sync object, `a = null` unbinds (`-> null` is a no-op, `null.triggered` is 0,
+  `@(null)` blocks -- 15.5.5.2 leaves it undefined), `==`/`!=`/`===`/`!==` are
+  identity and `if (e)` is the Boolean test (15.5.5.3).
+
+  LRM Table 6-7 makes an event's default initial value a **New event**, so every
+  event-typed storage location binds its own object when that storage comes into
+  existence: a declared variable, an **unpacked-array element** (any dimension), an
+  **unpacked-struct member**, a **class property** (per instance and `static`), an
+  **automatic-lifetime local** (a fresh object per activation), and a **queue /
+  dynamic-array / associative-array element**. A scalar declared event takes a
+  compile-time slot in a static block; everything else draws from a chunked runtime
+  pool whose chunks never move, so an object address survives growth while a
+  process is parked on its waiter list.
+
+  Waiters are an intrusive doubly-linked list on the object -- persistent nodes in a
+  contiguous array, one-shot nodes frame-resident -- so the number of simultaneous
+  waiters is unbounded. `@(<any event expression>)` works: a `WaitEdge` carries an
+  optional handle operand, and a sensitivity list that would need one is left in the
+  body, where it re-reads the handle each pass (a static subscription is issued from
+  the seed loop and cannot re-resolve). Events pass as **subroutine arguments** in
+  every direction and across **module ports** (aliasing, not copying, in both
+  directions -- `inout event` is illegal SV).
+
+  `->> e` defers to the NBA region through a runtime pending chain; `->> #d e`
+  schedules one detached wheel timer carrying the handle; **`->> @(x) e` /
+  `->> repeat(n) @(x) e`** register a detached one-shot subscription on the edge,
+  growable because a loop makes one per pass. **`wait_order`** (15.5.4) desugars to
+  one park per stage, each waiting on the events still ahead of it, with the
+  else-arm on an out-of-order trigger and a run-time error when it is absent.
+
+  Event operations work **inside a function**: the timing wheel is a module global,
+  so a body with no wheel parameter still reads the clock. A monomorphism analysis
+  keeps an event that is never assigned folded to a constant object address, so a
+  design that does not merge pays nothing.
+
+  Objects are never freed: LRM 15.5.5.2's reclamation is garbage collection, which
+  Clotho does not have (class bodies leak by the same direction).
+  Design: docs/design/event-handles.md, docs/design/named-events.md.
 - [x] **`join_any` / `join_none`** (LRM 9.3.2, V2) — the join kinds differ at run
   time in one join-record field (`wake_at`: 0 for `join`, W-1 for `join_any`, never
   reached for `join_none`) and in when a child starts. `join` keeps resuming children
@@ -325,7 +363,12 @@ professional parity; M5 makes it complete.
 - [x] **`wait (expr)` statement** (LRM 9.4.3) — level-sensitive suspend; subsumes
   `wait(e.triggered)`.
 - [x] **Named events** (LRM 15.5) — `event e;`, `-> e`, `->> e`, `->> #d e`,
-  `@(e)` / `always @(e)`, `wait(e.triggered)`. Design: docs/design/named-events.md.
+  `@(e)` / `always @(e)`, `wait(e.triggered)`, at module, package, generate,
+  procedural-block and `static`-local scope. An event is an OBJECT (trigger tick +
+  intrusive waiter list + `->>` pending state) in the `clotho.events` array; its
+  waiters are a doubly-linked list of frame- or array-resident nodes, so the number
+  of simultaneous waiters is unbounded. Design: docs/design/named-events.md, and
+  docs/design/event-handles.md for the handle layer.
 - [x] **`fork` / `join`** (LRM 9.3.2, V1) — each child a coroutine; the parent
   joins all. Also inside a **task** body (and an assertion action block, which is
   lowered as one): a child takes the enclosing frame's packed integral /
@@ -843,8 +886,9 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
     included) was accessed misaligned — UB that UBSan reported 13 times on a
     two-member struct. The mirror now leads with an i64.
   An associative-array element works too, through the `rt_elem_assoc` (kind 5)
-  descriptor. Still guarded loud: an event element, which would need per-element
-  trigger state (LRM 15.5) — a scheduler change, not a data-model one.
+  descriptor. Still guarded loud: an event element, which needs one event OBJECT per
+  element; the object slot array is sized at compile time from the declared events
+  (docs/design/event-handles.md §9).
 - [x] **NBA to a dynamic array** — and to an associative array. `HandleCopyNb`
   stages a deep copy in the Active region and MOVES it into the live handle in the
   NBA region, generalizing the queue's path to all three container kinds. A

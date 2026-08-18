@@ -21,6 +21,7 @@ InternPool::InternPool()
     logic_type     = put(Type{ .kind = Type::Kind::Logic });
     bit_type       = put(Type{ .kind = Type::Kind::Bit });
     string_type    = put(Type{ .kind = Type::Kind::String });
+    event_type     = put(Type{ .kind = Type::Kind::Event });
     real_type      = put(Type{ .kind = Type::Kind::Real });
     shortreal_type = put(Type{ .kind = Type::Kind::ShortReal });
 }
@@ -177,6 +178,12 @@ Layout InternPool::compute_layout(Ref type) const {
             // stored as a 2-state 64-bit value (identical storage/assign/compare
             // to chandle). The object body layout is backend-owned (built from the
             // property table `fields_id`), reached by dereferencing the handle.
+            return { Domain::Two, 64, plane_bytes(64) };
+        case Type::Kind::Event:
+            // A named event variable holds a handle: { u32 slot, u32 gen } naming an
+            // entry in the backend's event object array, stored as one 2-state
+            // 64-bit value. Identical storage / assign / compare to a class handle,
+            // which is what makes every container and ABI path work unchanged.
             return { Domain::Two, 64, plane_bytes(64) };
         case Type::Kind::UnpackedArray: {
             // Report the leaf element's domain / width (recursion drills through

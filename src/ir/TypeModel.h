@@ -202,6 +202,36 @@ inline bool has_heap_leaf(const InternPool& pool, Ref ref) {
     }
 }
 
+// Whether a type has a leaf that must be CONSTRUCTED per storage location rather
+// than copied from a constant power-on image: an event leaf binds a NEW event
+// object (LRM Table 6-7), which no fixed byte pattern can express.
+//
+// Deliberately separate from has_heap_leaf: an event leaf owns no heap, needs no
+// deinit, and IS trivially copyable -- copying the handle merges the two locations
+// onto one object, which is exactly LRM 15.5.5's `a = b`. Only construction differs.
+inline bool has_ctor_leaf(const InternPool& pool, Ref ref) {
+    const Type& t = type_of(pool, ref);
+    switch (t.kind) {
+        case Type::Kind::Event:
+            return true;
+        case Type::Kind::UnpackedArray:
+            return has_ctor_leaf(pool, t.element);
+        case Type::Kind::Struct: {
+            if (t.is_packed) {
+                return false;
+            }
+            for (const Field& f : pool.struct_fields(t.fields_id)) {
+                if (has_ctor_leaf(pool, f.type)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        default:
+            return false;
+    }
+}
+
 // Whether a whole-object copy may be a single memcpy of the storage image: no
 // leaf owns heap, so duplicating the bytes duplicates the value. A class-handle
 // leaf IS trivially copyable — the pointer copy is the reference semantics.

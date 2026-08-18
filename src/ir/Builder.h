@@ -39,13 +39,16 @@ public:
 
     // -- Named events (LRM 15.5) --
     // `-> e`: blocking trigger of the event whose synthetic signal is `sig`.
-    Index event_trigger(Signal sig, SourceLoc loc);
+    Index event_new(SourceLoc loc);
+    Index event_trigger(Index handle, SourceLoc loc);
     // `e.triggered`: 1-bit "triggered this time step" property of event `sig`.
-    Index event_triggered(Signal sig, SourceLoc loc);
+    Index event_triggered(Index handle, SourceLoc loc);
     // `->> e`: nonblocking trigger of event `sig` (deferred to the NBA region).
-    Index event_trigger_nb(Signal sig, SourceLoc loc);
+    Index event_trigger_nb(Index handle, SourceLoc loc);
     // `->> #d e`: delayed nonblocking trigger; `delay` is the tick count.
-    Index event_trigger_nb_delayed(Signal sig, Index delay, SourceLoc loc);
+    Index event_trigger_nb_delayed(Index handle, Index delay, SourceLoc loc);
+    Index event_trigger_nb_event(Index handle, Signal sig, uint32_t edge, uint32_t count,
+                                 SourceLoc loc);
 
     // -- Generic ops sharing a payload shape --
     // tag must be a unary-payload op (load, bnot, lnot, red_*, ret).

@@ -185,6 +185,16 @@ enum class Edge : uint8_t {
 struct WaitEvent {
     Signal signal = Signal{ 0 };
     Edge   edge   = Edge::Any;
+    // Intra-body waits only: the SSA value of the event handle to park on, when the
+    // wait names an event that has no signal of its own -- an array element, a class
+    // property, a subroutine formal. kNoWaitHandle otherwise, including for a plain
+    // `@(e)` on a declared event, which resolves through `signal`.
+    //
+    // A process's STATIC sensitivity can never carry one: it is subscribed from the
+    // seed loop, a different function with no access to the body's values. A
+    // sensitivity list that would need a handle is left in the body instead, where
+    // it lowers as an ordinary intra-body wait (build_process).
+    Index handle = kNoWaitHandle;
 };
 
 // One lowered process plus the metadata the IR body itself does not carry: how
