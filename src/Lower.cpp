@@ -14654,12 +14654,6 @@ private:
     // warning for that case optional; Clotho does not emit one).
     void lower_randcase(const slang::ast::RandCaseStatement& rc, ir::Builder& b) {
         const ir::SourceLoc l = loc(rc);
-        if (fn_ctx_ != nullptr) {
-            // TODO: randcase inside a function/task/fork child/action block needs
-            // the caller's RNG threaded through the call ABI (the $urandom gap).
-            fail("randcase inside a function/task is not supported yet (no per-process RNG "
-                 "in the call frame); use it directly in a process");
-        }
         if (rc.items.empty()) {
             return;
         }
@@ -15717,25 +15711,17 @@ private:
             return seed_writeback(*argv[0], b.dist_call(d.op, args, l));
         }
 
-        // $urandom / $urandom_range (LRM §18.13): the per-process RNG lives in
-        // the process's coroutine frame, so these are only legal in a process
-        // context. A function/task body has no frame RNG (threading the caller's
-        // RNG through the call ABI is future work — tracked in docs/TODO.md).
+        // $urandom / $urandom_range (LRM §18.13). The RNG is per THREAD, not per
+        // body: a function or task runs in its caller's thread, so a draw inside
+        // one continues the calling process's stream. The backend threads that
+        // state through the call ABI (declare_function's `rng` parameter).
         if (name == "$urandom") {
-            if (fn_ctx_ != nullptr) {
-                fail("$urandom inside a function/task is not supported yet (no per-process "
-                     "RNG in the call frame); call it directly from a process");
-            }
             if (call.arguments().empty()) {
                 return b.urandom(l);
             }
             return b.urandom_seeded(lower_expr(*call.arguments()[0], b), l);
         }
         if (name == "$urandom_range") {
-            if (fn_ctx_ != nullptr) {
-                fail("$urandom_range inside a function/task is not supported yet (no per-process "
-                     "RNG in the call frame); call it directly from a process");
-            }
             const auto argv = call.arguments();
             if (argv.empty() || argv.size() > 2) {
                 fail("$urandom_range requires one or two arguments (maxval [, minval])");
@@ -17695,7 +17681,6 @@ private:
             return b.dyn_array_sort(arr, name == "rsort", aty, l);
         }
         if (name == "shuffle") {
-            guard_shuffle();
             return b.dyn_array_shuffle(arr, aty, l);
         }
         if (is_locator_method(name) || is_reduction_method(name)) {
@@ -17704,17 +17689,6 @@ private:
         // TODO: `map` (LRM 7.12.5), the sort/rsort `with` clause (7.12.2), and
         // 4-state / wide sort.
         fail("dynamic array method '" + std::string(name) + "' is not supported");
-    }
-
-    // Loud guard for shuffle() (LRM 7.12.2): the per-process RNG lives in the
-    // process coroutine frame (LRM 18.13), so it is only legal directly in a
-    // process — a function/task body has no frame RNG (same restriction as
-    // $urandom; threading the caller RNG through the call ABI is future work).
-    void guard_shuffle() {
-        if (fn_ctx_ != nullptr) {
-            fail("shuffle inside a function/task is not supported yet (no per-process RNG "
-                 "in the call frame); call it directly from a process");
-        }
     }
 
     // Loud guard for the array ordering methods sort()/rsort() (LRM 7.12.2): the
@@ -18391,7 +18365,6 @@ private:
             return b.queue_sort(q, name == "rsort", qty, l);
         }
         if (name == "shuffle") {
-            guard_shuffle();
             return b.queue_shuffle(q, qty, l);
         }
         if (is_locator_method(name) || is_reduction_method(name)) {

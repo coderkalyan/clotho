@@ -488,10 +488,11 @@ public:
     // the count selects the DistUnary / DistBinary tag). Yields an i64 with the
     // updated seed packed in [32,64) and the signed draw in [0,32).
     Index dist_call(DistOp op, std::span<const Index> args, SourceLoc loc);
-    // $urandom (LRM §18.13.1): a 32-bit unsigned per-process xoshiro256++ draw.
-    // No operands; reads/advances the process frame RNG.
+    // $urandom (LRM §18.13.1): a 32-bit unsigned per-thread xoshiro256++ draw.
+    // No operands; reads/advances the calling thread's RNG, which the backend
+    // supplies (a process's frame state, or a subroutine's caller's).
     Index urandom(SourceLoc loc);
-    // $urandom(seed) (LRM §18.13.1): reseed the process RNG from `seed`, then draw.
+    // $urandom(seed) (LRM §18.13.1): reseed that RNG from `seed`, then draw.
     Index urandom_seeded(Index seed, SourceLoc loc);
     // $urandom_range(maxval, minval) (LRM §18.13.2): one draw mapped into
     // [min, max] (the backend swaps when min > max).

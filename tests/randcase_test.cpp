@@ -209,12 +209,30 @@ TEST_CASE("randcase in an always block draws per activation") {
     CHECK(run_capture(src) == "n=100 mixed=1\n");
 }
 
-// The per-process RNG lives in the coroutine frame, so randcase is refused in a
-// function/task body — the same guard $urandom carries.
-TEST_CASE("randcase in a function fails loudly") {
-    CHECK(lower_error("module m; function int f(); randcase 1 : return 1; endcase endfunction\n"
-                      " initial $display(\"%0d\", f()); endmodule")
-            .find("randcase") != std::string::npos);
+// randcase draws through $urandom_range, so it works wherever that does -- the
+// caller's RNG reaches a subroutine body through the call ABI. The weights here
+// leave one branch reachable, so the outcome is determined by the weights and not
+// by the draw.
+TEST_CASE("randcase in a function and in a task") {
+    const std::string src = R"(
+        module m;
+            function automatic int f();
+                randcase
+                    0 : return 1;
+                    3 : return 2;
+                endcase
+            endfunction
+            task automatic t(output int o);
+                randcase
+                    2 : o = 7;
+                    0 : o = 8;
+                endcase
+            endtask
+            int x;
+            initial begin t(x); $display("%0d %0d", f(), x); end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 7\n");
 }
 
 // A sum wider than 32 bits would need several stitched $urandom_range draws

@@ -802,11 +802,13 @@ uint64_t rt_dist_erlang(int32_t seed, int32_t k, int32_t mean);
 //
 // Unlike $random/$dist_* the LRM leaves the $urandom algorithm unspecified,
 // requiring only that it be deterministic and per-process ("thread") stable. Its
-// RNG is a per-process xoshiro256++ generator whose 256-bit state lives in the
-// process's coroutine frame; the draw and the $urandom_range mapping are inlined
-// into the JIT (no runtime call per draw). The only runtime entry is the
-// one-per-process seeding of that state from a 64-bit selector (splitmix64
-// expansion): the process index at startup, or the user seed for $urandom(seed).
+// RNG is a per-thread xoshiro256++ generator whose 256-bit state lives in the
+// coroutine frame of the process (or spawned child) that owns the thread; a
+// function or task draws from its caller's, reached through the call ABI. The
+// draw and the $urandom_range mapping are inlined into the JIT (no runtime call
+// per draw). The only runtime entry is seeding a state from a 64-bit selector
+// (splitmix64 expansion): the process index at startup, one draw of the parent's
+// stream for a spawned child, or the user seed for $urandom(seed).
 // A modern integer PRNG (not the $random LCG) is chosen for quality and speed
 // per the project's "unspecified -> pick performance and simplicity"; the stream is
 // therefore intentionally not iverilog-identical.

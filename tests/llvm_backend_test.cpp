@@ -4033,7 +4033,7 @@ TEST_CASE("a ref to a place that cannot move is one pointer, with no epoch check
             initial begin v = 5; f(v); $display("%0d", v); end
         endmodule
     )");
-    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.inst.m.state)") == 1);
+    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 1);
     CHECK(count_substr(ir, "rt_ref_stale") == 0);
     CHECK(run_capture(R"(
         module m;
@@ -4055,7 +4055,7 @@ TEST_CASE("a ref to a whole container handle is one pointer") {
             initial begin q.push_back(5); f(q); $display("%0d", q.size()); end
         endmodule
     )");
-    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.inst.m.state)") == 1);
+    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 1);
 }
 
 TEST_CASE("a ref to a container element keeps the epoch words") {
@@ -4095,7 +4095,7 @@ TEST_CASE("one ref formal reached by both actual shapes stays fat at every call"
     // The sentinel appears as a call OPERAND (the global's own definition line
     // matches the bare name too, hence the surrounding argument text).
     CHECK(count_substr(ir, ", ptr @clotho.ref.noepoch, i64 0)") == 1);
-    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.inst.m.state)") == 0);
+    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 0);
     CHECK(run_capture(src) == "2 6\n");
 }
 
@@ -4128,7 +4128,7 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     const std::vector<std::string> sigs = define_params(ir, "fn.g");
     REQUIRE(sigs.size() == 2);
     CHECK(sigs[0] == sigs[1]);
-    CHECK(sigs[0] == "(ptr noalias %state, i128 %0, i64 %1, ptr %2, ptr %3, i64 %4)");
+    CHECK(sigs[0] == "(ptr noalias %state, ptr %rng, i128 %0, i64 %1, ptr %2, ptr %3, i64 %4)");
     CHECK(run_capture(src) == "2 7\n");
 
     // And with no heap-rooted actual at either site, the whole slot narrows.
@@ -4148,5 +4148,5 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     const std::vector<std::string> nsigs = define_params(narrow, "fn.g");
     REQUIRE(nsigs.size() == 2);
     CHECK(nsigs[0] == nsigs[1]);
-    CHECK(nsigs[0] == "(ptr noalias %state, i128 %0, i64 %1, ptr %2)");
+    CHECK(nsigs[0] == "(ptr noalias %state, ptr %rng, i128 %0, i64 %1, ptr %2)");
 }

@@ -1190,8 +1190,9 @@ struct Inst {
         // the handle lvalue + interned type (payload: op_type, like
         // DynArrayDelete). Reverse / Shuffle are element-agnostic; Sort / Rsort
         // are value-keyed (2-state integral width<=64 or real, guarded in the
-        // frontend). Shuffle draws from the process frame RNG (forces a
-        // coroutine); the backend threads the frame RNG slot at lowering.
+        // frontend). Shuffle draws from the calling thread's RNG (forcing a
+        // process that does to a coroutine); the backend supplies the state
+        // pointer at lowering.
         DynArrayReverse,
         DynArraySort,
         DynArrayRsort,
@@ -1820,9 +1821,10 @@ struct Inst {
         DistBinary,
         // $urandom (LRM §18.13.1): a per-process xoshiro256++ draw, -> a 32-bit
         // unsigned two-state `int`. No operand (payload: none); reads and
-        // advances the process's coroutine-frame RNG state, inlined by the
-        // backend. A process containing this tag is forced to a coroutine (it
-        // needs the frame) — see is_simple_always.
+        // advances the calling thread's xoshiro256++ state, inlined by the
+        // backend. A process containing this tag is forced to a coroutine (the
+        // state lives in its frame) — see is_simple_always; in a function or task
+        // it is the caller's state, an implicit parameter of the call ABI.
         Urandom,
         // $urandom(seed) (LRM §18.13.1): reseed the process RNG from `seed`
         // (payload: unary) then draw, -> a 32-bit unsigned `int`.

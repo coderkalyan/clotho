@@ -314,8 +314,90 @@ TEST_CASE("two processes each get an independent $urandom stream") {
     CHECK(out == "indep 1\n");
 }
 
-TEST_CASE("$urandom in a function fails loudly (no per-process RNG in frame)") {
-    CHECK(lower_error("module m; function int f(); return $urandom; endfunction\n"
-                      " initial $display(\"%0d\", f()); endmodule")
-            .find("$urandom") != std::string::npos);
+// The RNG is per THREAD, not per body (LRM 18.14.1): a function or task runs in
+// its caller's process, so the backend threads the caller's state through the
+// call ABI and a draw inside one continues the calling process's stream. Pinned
+// against a reseed rather than against literal draws, so these test the sharing
+// and not the (deliberately unspecified) stream.
+TEST_CASE("$urandom inside a function draws and advances the caller's stream") {
+    const std::string out = run_capture(
+      "module m;\n"
+      " function automatic int r(); return $urandom; endfunction\n"
+      " int x, y, a, b;\n"
+      " initial begin\n"
+      "  x = $urandom(7); y = $urandom;\n"   // the pair the stream gives after seed 7
+      "  a = $urandom(7); b = r();\n"        // the same pair, second draw via a call
+      "  $display(\"share %0d\", x == a && y == b);\n"
+      "  $finish;\n"
+      " end\n"
+      "endmodule\n");
+    CHECK(out == "share 1\n");
+}
+
+TEST_CASE("$urandom inside a task draws and advances the caller's stream") {
+    const std::string out = run_capture(
+      "module m;\n"
+      " task automatic t(output int o); o = $urandom; endtask\n"
+      " int x, y, a, b;\n"
+      " initial begin\n"
+      "  x = $urandom(7); y = $urandom;\n"
+      "  a = $urandom(7); t(b);\n"
+      "  $display(\"share %0d\", x == a && y == b);\n"
+      "  $finish;\n"
+      " end\n"
+      "endmodule\n");
+    CHECK(out == "share 1\n");
+}
+
+TEST_CASE("two processes calling one $urandom function keep independent streams") {
+    // The state is the caller's, so one shared function body still yields two
+    // streams -- the property 18.14.1 requires and a body-local state would break.
+    const std::string out = run_capture(
+      "module m;\n"
+      " function automatic int r(); return $urandom; endfunction\n"
+      " int va, vb;\n"
+      " initial va = r();\n"
+      " initial vb = r();\n"
+      " initial #1 begin $display(\"indep %0d\", va != vb); $finish; end\n"
+      "endmodule\n");
+    CHECK(out == "indep 1\n");
+}
+
+TEST_CASE("a process reaching $urandom only through a call keeps its state across activations") {
+    // Such a process cannot be coroutine-elided: a thunk has no frame to hold the
+    // xoshiro state in, so its stream would restart on every activation and both
+    // draws below would be equal (compute_fusion_groups excludes it for that).
+    const std::string out = run_capture(
+      "module m;\n"
+      " function automatic int r(); return $urandom; endfunction\n"
+      " reg clk; int a, b, n;\n"
+      " always @(posedge clk) begin n = n + 1; if (n == 1) a = r(); else b = r(); end\n"
+      " initial begin\n"
+      "  clk = 0; n = 0;\n"
+      "  #1 clk = 1; #1 clk = 0; #1 clk = 1;\n"
+      "  #1 $display(\"adv %0d\", a != b); $finish;\n"
+      " end\n"
+      "endmodule\n");
+    CHECK(out == "adv 1\n");
+}
+
+TEST_CASE("each fork child gets its own stream, seeded from the parent's") {
+    // LRM 18.14.1 gives a spawned process its own generator, seeded from its
+    // parent's -- so the two children differ from each other and from the parent's
+    // next draw. A child sharing the parent's state pointer would also be a
+    // dangling one under join_none, which is why it owns a state at all.
+    const std::string out = run_capture(
+      "module m;\n"
+      " int a, b, c;\n"
+      " initial begin\n"
+      "  fork\n"
+      "   a = $urandom;\n"
+      "   b = $urandom;\n"
+      "  join\n"
+      "  c = $urandom;\n"
+      "  $display(\"kids %0d\", a != b && a != c && b != c);\n"
+      "  $finish;\n"
+      " end\n"
+      "endmodule\n");
+    CHECK(out == "kids 1\n");
 }

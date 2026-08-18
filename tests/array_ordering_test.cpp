@@ -201,6 +201,25 @@ TEST_CASE("shuffle in an always block keeps a per-process RNG") {
     CHECK(run_capture(src) == "sum=15 a0=5\nsum=15 a0=3\n");
 }
 
+// shuffle() draws from the caller's RNG, which the call ABI threads into a
+// subroutine body -- so a shuffle inside a task is the same permutation the
+// caller would have produced inline (compare against the pinned first
+// permutation above, which the same process index seeds).
+TEST_CASE("shuffle inside a task uses the caller's RNG") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[]; int i;
+            task automatic mix(ref int v[]); v.shuffle(); endtask
+            initial begin
+                a = new[6]; foreach (a[i]) a[i] = i;
+                mix(a);
+                $write("sh:"); foreach (a[i]) $write(" %0d", a[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "sh: 2 3 1 4 0 5\n");
+}
+
 // Ordering an empty or single-element container is a no-op (no crash).
 TEST_CASE("array ordering on empty / single element is a no-op") {
     constexpr std::string_view src = R"(

@@ -132,8 +132,11 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Urandom:
         case Inst::Tag::UrandomSeeded:
         case Inst::Tag::UrandomRange:
-        // Shuffle draws from the frame RNG for the same reason; the other
-        // container-ordering methods stay eligible.
+        // Shuffle draws from the same state for the same reason; the other
+        // container-ordering methods stay eligible. NOTE: this covers a body that
+        // draws ITSELF. A process that reaches a draw only through a call is
+        // excluded by the backend (compute_fusion_groups), which is where the
+        // call graph is.
         case Inst::Tag::DynArrayShuffle:
         case Inst::Tag::QueueShuffle:
         // Deferred stores need a record slot anchored on the coroutine.

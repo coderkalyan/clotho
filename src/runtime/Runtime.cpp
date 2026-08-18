@@ -1291,9 +1291,9 @@ namespace {
 // Sort-key kind for the ordering comparator; mirrors the backend descriptor.
 enum : uint32_t { sort_unsigned = 0, sort_signed = 1, sort_real = 2 };
 
-// One xoshiro256++ step against a process frame RNG state. Byte-for-byte the
+// One xoshiro256++ step against a thread's RNG state. Byte-for-byte the
 // same recurrence the backend inlines at each $urandom site
-// (`emit_xoshiro_next` in LlvmBackend.cpp), so a shuffle drawing from the frame
+// (`emit_xoshiro_next` in LlvmBackend.cpp), so a shuffle drawing from that
 // state leaves the stream consistent for subsequent inlined $urandom draws.
 uint64_t xoshiro_next(uint64_t* s) {
     const auto rotl = [](uint64_t x, unsigned k) { return (x << k) | (x >> (64 - k)); };

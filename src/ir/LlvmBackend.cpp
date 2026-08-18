@@ -740,9 +740,11 @@ public:
         facts_ = analyze(mod_);
         build_state_types();
         emit_state_global(); // before any body: storage_ptr resolves through the anchors
+        build_rng_global();  // before any body: every call site passes an RNG pointer
         if (stat_on(config_.stats, Stat::Dedup)) {
             report_dedup_stat();
         }
+        build_rng_fns();         // before compute_fusion_groups: gates thunk eligibility
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
         if (stat_on(config_.stats, Stat::CombFuse)) {
@@ -2959,6 +2961,7 @@ private:
                 wheel_->setName("wheel");
                 fn_->addParamAttr(0, llvm::Attribute::NoAlias);
                 b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+                rng_slot_ = sym(rng_global_);
                 // Member bodies never touch the sched flag (the dispatcher
                 // owns the timeline) and address absolutely (no ctx), but
                 // their NBA block ids need a member-scoped def-stable idval
@@ -2989,6 +2992,7 @@ private:
             wheel_->setName("wheel");
             fn_->addParamAttr(0, llvm::Attribute::NoAlias);
             b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
+            rng_slot_ = sym(rng_global_);
             for (llvm::Function* mf : member_fns) {
                 b_.CreateCall(fnty, sym(mf), { state_, wheel_ });
             }
@@ -3017,6 +3021,10 @@ private:
             hdl_              = nullptr;
             auto* entry_bb = llvm::BasicBlock::Create(ctx_, "entry", fn_);
             b_.SetInsertPoint(entry_bb);
+            // A thunk group cannot reach a draw (compute_fusion_groups excludes one
+            // that can), so this pointer only ever travels as a callee's ABI
+            // argument and is never dereferenced.
+            rng_slot_ = sym(rng_global_);
             materialize_group_ctx();
             // Run each member body per activation, freeing its string temporaries
             // afterward — a thunk has no frame to persist them in (a per-call cost
@@ -3174,12 +3182,15 @@ private:
         // body loop, so it persists across activations (the loop back-edge is
         // below this point) and CoroSplit frames it. The seed selector is the
         // process index — an independent, run-stable stream per process,
-        // schedule-independent; $urandom(seed) reseeds in place. Forked-child
-        // seeding from the parent's stream lands with fork.
-        rng_slot_ = nullptr;
-        if (process_uses_urandom(proc)) {
+        // schedule-independent; $urandom(seed) reseeds in place. A process that
+        // cannot reach a draw (its own or one in a subroutine it calls, a child it
+        // forks or a deferred body it ramps) materializes nothing and passes the
+        // module-wide state along, which by that proof nothing dereferences.
+        if (rng_procs_[proc_index]) {
             rng_slot_ = b_.CreateAlloca(llvm::ArrayType::get(b_.getInt64Ty(), 4), nullptr, "urng");
             b_.CreateCall(urandom_seed_fn(), { rng_slot_, b_.getInt64(proc_index) });
+        } else {
+            rng_slot_ = sym(rng_global_);
         }
         const bool always_loop = proc.activation == Activation::Always && !proc.wait_events.empty();
         if (always_loop) {
@@ -3394,6 +3405,13 @@ private:
         auto*                    ptr = llvm::PointerType::getUnqual(ctx_);
         std::vector<llvm::Type*> params;
         params.push_back(ptr); // state
+        // The caller's xoshiro256++ state (LRM 18.13). Unconditional rather than
+        // gated on whether the callee draws: every entry of a vtable slot and every
+        // $monitor body is called through ONE FunctionType, which no per-callee bit
+        // can vary -- the monitor ramp pointer even round-trips through the C
+        // runtime as a void*. One pointer register on a call that does not need it
+        // is the price of that uniformity.
+        params.push_back(ptr); // rng
         // TODO: pass a 2-state formal as a single iW param (and a 2-state result as
         // a bare iW) instead of the packed (mm, z) pair. The wire is packed today —
         // a 2-state arg lifts to must==may with a constant-0 z, which LLVM folds —
@@ -3453,7 +3471,7 @@ private:
     }
 
     // A task is a switched-resume coroutine. Its signature is:
-    //   ptr @<mod>.task.<name>(ptr noalias state, ptr wheel,
+    //   ptr @<mod>.task.<name>(ptr noalias state, ptr rng, ptr wheel,
     //                          <per formal>, ptr record)
     // where each input formal contributes (i(2W) mm, iW z) value planes, each
     // output / inout formal contributes (ptr mm_ptr, ptr z_ptr) into a caller temp,
@@ -3467,6 +3485,7 @@ private:
         auto*                    ptr = llvm::PointerType::getUnqual(ctx_);
         std::vector<llvm::Type*> params;
         params.push_back(ptr); // state
+        params.push_back(ptr); // rng
         params.push_back(ptr); // wheel
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             if (f.arg_dirs[k] == ArgDir::Ref) {
@@ -3507,10 +3526,6 @@ private:
         return fn;
     }
 
-    // LLVM arg index of each formal's first parameter for `f`'s signature shape:
-    // functions start after `state`, tasks after `state, wheel`. The record slot
-    // follows all formals.
-
     // How many LLVM parameters formal k occupies:
     //   4 — a `ref` fat pointer { &storage, &epoch, expect, site }
     //   1 — an aggregate storage pointer, a container handle pointer, or a string
@@ -3546,9 +3561,12 @@ private:
         return str_one ? 1u : 2u;
     }
 
+    // LLVM arg index of each formal's first parameter for `f`'s signature shape:
+    // functions start after `state, rng`, tasks after `state, rng, wheel`. The
+    // record slot follows all formals.
     std::vector<uint32_t> param_indices(const Function& f) const {
         std::vector<uint32_t> idx(f.param_types.size());
-        uint32_t              cur = f.is_task ? 2 : 1;
+        uint32_t              cur = f.is_task ? 3 : 2;
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             idx[k] = cur;
             cur += formal_param_count(f, k);
@@ -3560,7 +3578,7 @@ private:
     uint32_t task_record_param(const Function& f) const {
         const auto idx = param_indices(f);
         if (idx.empty()) {
-            return 2;
+            return 3;
         }
         return idx.back() + formal_param_count(f, f.param_types.size() - 1);
     }
@@ -3816,6 +3834,11 @@ private:
         b_.SetInsertPoint(entry);
         state_ = fn_->getArg(0);
         state_->setName("state");
+        // A function body runs inside the caller's thread, so its $urandom draws
+        // come from the caller's state (LRM 18.13). Unlike a task's, this pointer
+        // cannot outlive the call: a function is atomic.
+        rng_slot_ = fn_->getArg(1);
+        rng_slot_->setName("rng");
 
         frame_ = b_.CreateAlloca(frame_ty_, nullptr, "frame");
         // Ref formals bind FIRST: they emit no code, but build_str_temps resolves
@@ -3910,7 +3933,7 @@ private:
         auto* ptr_ty = llvm::PointerType::getUnqual(ctx_);
         state_       = fn_->getArg(0);
         state_->setName("state");
-        wheel_ = fn_->getArg(1);
+        wheel_ = fn_->getArg(2);
         wheel_->setName("wheel");
         awaiter_ = nullptr;
         record_  = nullptr;
@@ -3960,6 +3983,21 @@ private:
         // placement and for the same reason: a `disable` reads it while we are parked.
         disable_node_ = f.disable_target != kNoDisableTarget
           ? b_.CreateAlloca(disable_node_ty(), nullptr, "disable_node") : nullptr;
+        // The RNG (LRM 18.13). A plain task runs in its caller's thread, so it
+        // draws straight from the caller's state; a body that can outlive the ramp
+        // site -- a fork child, a deferred $strobe / $monitor / action body -- takes
+        // one draw from it and seeds a state of its own here instead, both because
+        // the pointer would dangle and because LRM 18.14.1 gives a spawned thread
+        // its own generator seeded from its parent's. Placed with the frame allocas
+        // so CoroSplit spills it, and in the RAMP so the seeding draw happens while
+        // the ramping context is still on the stack.
+        rng_slot_ = fn_->getArg(1);
+        rng_slot_->setName("rng");
+        if (rng_own_[static_cast<uint32_t>(id)] && rng_fns_[static_cast<uint32_t>(id)]) {
+            llvm::Value* seed = emit_xoshiro_next(rng_slot_);
+            rng_slot_ = b_.CreateAlloca(llvm::ArrayType::get(b_.getInt64Ty(), 4), nullptr, "urng");
+            b_.CreateCall(urandom_seed_fn(), { rng_slot_, seed });
+        }
 
         auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
         auto* free_bb    = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
@@ -5053,6 +5091,10 @@ private:
 
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
+        // The fallback RNG (LRM 18.13), seeded before anything can draw from it.
+        // Its selector is deliberately outside the process-index space every
+        // per-process stream is seeded from, so the two never coincide.
+        b_.CreateCall(urandom_seed_fn(), { sym(rng_global_), b_.getInt64(~0ull) });
 
         // The design state struct holds every signal, including large memories.
         // It is a single internal global whose initializer is the whole power-on
@@ -5765,40 +5807,175 @@ private:
                          [&](uint32_t a, uint32_t b) { return level[dense(a)] < level[dense(b)]; });
     }
 
-    // True when a process is a suspension-free always-with-sensitivity: an
-    // Always with a static sensitivity list whose body has no suspension point
-    // (#delay, intra-body @/wait, task call) and no blocking write to a signal
-    // in its own sensitivity set. Such a process re-runs its whole body on each
-    // trigger with no state carried across activations, so it can lower to a
-    // plain per-activation thunk instead of a coroutine (see the thunk path in
-    // lower_group) and can be fused with peers sharing its sensitivity. Shared
-    // by compute_fusion_groups and the thunk decision.
     // True when instruction `i` in `ir` is an array shuffle (DynArrayShuffle /
-    // QueueShuffle), which draws from the process frame RNG like $urandom.
+    // QueueShuffle), which draws from the thread's RNG like $urandom.
     static bool is_shuffle(const Ir& ir, Index i) {
         const Inst::Tag tag = ir.tag(i);
         return tag == Inst::Tag::DynArrayShuffle || tag == Inst::Tag::QueueShuffle;
     }
 
-    // True when a process body contains any node that draws from the per-process
-    // frame RNG ($urandom family or an array shuffle), so lower_group must
-    // materialize and seed the frame RNG.
-    static bool process_uses_urandom(const Process& p) {
-        for (size_t k = 0; k < p.ir.inst_count(); ++k) {
+    // True when a body draws from an RNG state directly: the $urandom family, or
+    // an array shuffle (which advances the same state, through the runtime rather
+    // than inline -- see rt_dynarr_shuffle). The seed set of build_rng_fns.
+    static bool ir_draws_rng(const Ir& ir) {
+        for (size_t k = 0; k < ir.inst_count(); ++k) {
             const auto idx = static_cast<Index>(k);
-            switch (p.ir.tag(idx)) {
+            switch (ir.tag(idx)) {
                 case Inst::Tag::Urandom:
                 case Inst::Tag::UrandomSeeded:
                 case Inst::Tag::UrandomRange:
                     return true;
                 default:
-                    if (is_shuffle(p.ir, idx)) {
+                    if (is_shuffle(ir, idx)) {
                         return true;
                     }
                     break;
             }
         }
         return false;
+    }
+
+    // Which bodies can reach an RNG draw, and which own their state.
+    //
+    // The `ptr rng` ABI parameter itself is unconditional (declare_function), so
+    // this decides only where a state is MATERIALIZED: a process allocates and
+    // seeds one in its coroutine frame iff it can reach a draw, and everything
+    // else hands callees the module-wide fallback. Must run before
+    // compute_fusion_groups, which reads rng_procs_ to keep a reaching process
+    // off the thunk path.
+    void build_rng_fns() {
+        const size_t nfn   = mod_.function_count();
+        const auto   procs = mod_.processes();
+        rng_fns_.assign(nfn, false);
+        rng_own_.assign(nfn, false);
+        rng_procs_.assign(procs.size(), false);
+
+        // Virtual dispatch picks the body out of a vtable SLOT at run time, so a
+        // virtual call reaches every function that can occupy that slot -- the same
+        // union the ref ABI takes (Analysis.cpp). Following the statically named
+        // target alone, as collect_callees does, would miss an override's draw and
+        // silently leave its caller without a state to hand it.
+        std::vector<std::vector<FunctionId>> slot_fns;
+        for (const Vtable& vt : mod_.vtables()) {
+            if (slot_fns.size() < vt.slots.size()) {
+                slot_fns.resize(vt.slots.size());
+            }
+            for (size_t s = 0; s < vt.slots.size(); ++s) {
+                slot_fns[s].push_back(vt.slots[s]);
+            }
+        }
+
+        // Every body whose draws are charged to `ir`'s own state: its callees, the
+        // fork children it spawns and the deferred bodies it ramps (both seed
+        // themselves from this state at the ramp, so this body needs one).
+        // Deliberately NOT MonitorSet: that only registers the body, which the
+        // Postponed drain ramps from main against the module-wide state.
+        const auto callees = [&](const Ir& ir, std::vector<FunctionId>& out) {
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                const auto           i = static_cast<Index>(k);
+                const Inst::Payload& p = ir.payload(i);
+                switch (ir.tag(i)) {
+                    case Inst::Tag::Call:
+                        out.push_back(ir.extra_data<CallInfo>(p.extra).func);
+                        break;
+                    case Inst::Tag::TaskCall:
+                        out.push_back(ir.extra_data<TaskCallInfo>(p.extra).func);
+                        break;
+                    case Inst::Tag::CallVirtual:
+                    case Inst::Tag::TaskCallVirtual: {
+                        const uint32_t slot = ir.extra_data<VirtualCallInfo>(p.extra).slot;
+                        if (slot < slot_fns.size()) {
+                            out.insert(out.end(), slot_fns[slot].begin(), slot_fns[slot].end());
+                        }
+                        break;
+                    }
+                    case Inst::Tag::Fork:
+                        for (const Index kid : ir.region(ir.extra_data<ForkInfo>(p.extra).children)) {
+                            out.push_back(static_cast<FunctionId>(kid));
+                        }
+                        break;
+                    case Inst::Tag::StrobePend:
+                    case Inst::Tag::ReactivePend:
+                        out.push_back(ir.extra_data<StrobePendInfo>(p.extra).func);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        };
+
+        // A body that can outlive the pointer it was handed owns its state instead
+        // of sharing it: a fork child (its parent's frame goes away under join_none
+        // / join_any) and a deferred $strobe / $monitor / action body (ramped now,
+        // resumed in a later region, possibly from main).
+        const auto note_detached = [&](const Ir& ir) {
+            for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+                const auto i = static_cast<Index>(k);
+                switch (ir.tag(i)) {
+                    case Inst::Tag::StrobePend:
+                    case Inst::Tag::ReactivePend:
+                    case Inst::Tag::MonitorSet:
+                        rng_own_[static_cast<uint32_t>(
+                          ir.extra_data<StrobePendInfo>(ir.payload(i).extra).func)] = true;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        };
+
+        // Reverse edges, then a worklist from every direct drawer: `rng_fns_[f]`
+        // ends up true iff f can reach a draw.
+        std::vector<std::vector<uint32_t>> callers(nfn);
+        std::vector<FunctionId>            tmp;
+        std::vector<uint32_t>              work;
+        for (uint32_t f = 0; f < nfn; ++f) {
+            const Function& fu = mod_.function(static_cast<FunctionId>(f));
+            rng_own_[f]        = rng_own_[f] || fu.is_fork_child;
+            if (ir_draws_rng(fu.ir)) {
+                rng_fns_[f] = true;
+                work.push_back(f);
+            }
+            note_detached(fu.ir);
+            tmp.clear();
+            callees(fu.ir, tmp);
+            for (const FunctionId c : tmp) {
+                callers[static_cast<uint32_t>(c)].push_back(f);
+            }
+        }
+        while (!work.empty()) {
+            const uint32_t f = work.back();
+            work.pop_back();
+            for (const uint32_t c : callers[f]) {
+                if (!rng_fns_[c]) {
+                    rng_fns_[c] = true;
+                    work.push_back(c);
+                }
+            }
+        }
+        for (size_t k = 0; k < procs.size(); ++k) {
+            note_detached(procs[k].ir);
+            if (ir_draws_rng(procs[k].ir)) {
+                rng_procs_[k] = true;
+                continue;
+            }
+            tmp.clear();
+            callees(procs[k].ir, tmp);
+            rng_procs_[k] = std::any_of(tmp.begin(), tmp.end(), [&](FunctionId c) {
+                return rng_fns_[static_cast<uint32_t>(c)];
+            });
+        }
+    }
+
+    // The module-wide fallback xoshiro256++ state. Created once in run() so main
+    // can seed it before anything runs; 32 bytes and one splitmix64 call, paid
+    // unconditionally so that every context without a process of its own -- a DPI
+    // export thunk, the $monitor ramp -- has a defined stream.
+    void build_rng_global() {
+        auto* arrty = llvm::ArrayType::get(llvm::Type::getInt64Ty(ctx_), 4);
+        rng_global_ = new llvm::GlobalVariable(env_->llmod, arrty, false,
+                                               llvm::GlobalValue::InternalLinkage,
+                                               llvm::ConstantAggregateZero::get(arrty), "clotho.rng");
     }
 
 
@@ -6744,10 +6921,19 @@ private:
         // always-with-sensitivity: fused members all passed is_simple_always, so
         // the front's verdict holds for the group. Computed here so lower_group
         // and the seed/drain read one table. Empty is fine when --no-thunk.
+        //
+        // A member that can reach a $urandom draw is excluded whatever its shape:
+        // a thunk has no frame to keep the xoshiro state in, so its stream would
+        // restart on every activation. is_simple_always already rejects a body
+        // holding a draw ITSELF (tag_info().blocks_thunk); this covers the ones
+        // that reach one through a call.
         thunk_group_.assign(groups_.size(), false);
         if (config_.thunk) {
             for (uint32_t g = 0; g < groups_.size(); ++g) {
-                thunk_group_[g] = facts_.processes[groups_[g].front()].simple_always;
+                thunk_group_[g] =
+                  facts_.processes[groups_[g].front()].simple_always &&
+                  std::none_of(groups_[g].begin(), groups_[g].end(),
+                               [&](uint32_t m) { return rng_procs_[m]; });
             }
         }
     }
@@ -9009,7 +9195,8 @@ private:
         // suspends (timing controls in the arg list are rejected), so one resume
         // runs it to completion. Ramping is indirect: rt_monitor_active_ramp yields
         // the registered body's ramp function pointer (or null), which we call with
-        // the task ABI (state, wheel, record).
+        // the task ABI (state, rng, wheel, record). There is no calling process
+        // here, so the body seeds its own state from the module-wide one.
         if (design_uses_monitor_) {
             auto* fn      = b_.GetInsertBlock()->getParent();
             auto* run_bb  = llvm::BasicBlock::Create(ctx_, "monitor.run", fn);
@@ -9021,8 +9208,8 @@ private:
             b_.SetInsertPoint(run_bb);
             llvm::Value* record = b_.CreateAlloca(ptr_ty, nullptr, "monitor.record");
             b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), record);
-            auto* rampty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty, ptr_ty }, false);
-            llvm::Value* hdl = b_.CreateCall(rampty, ramp, { state, wheel, record });
+            auto* rampty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty, ptr_ty, ptr_ty }, false);
+            llvm::Value* hdl = b_.CreateCall(rampty, ramp, { state, sym(rng_global_), wheel, record });
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
             b_.CreateBr(cont_bb);
@@ -12606,7 +12793,7 @@ private:
                   b_.CreateAdd(b_.CreateZExt(b_.CreateSub(hi, lo), b_.getInt64Ty()), b_.getInt64(1));
                 // draw32 = high 32 bits of the 64-bit result (already zero-extended
                 // into the low half by the shift).
-                llvm::Value* draw32 = b_.CreateLShr(emit_xoshiro_next(), 32);
+                llvm::Value* draw32 = b_.CreateLShr(emit_xoshiro_next(rng_slot_), 32);
                 llvm::Value* off =
                   b_.CreateTrunc(b_.CreateLShr(b_.CreateMul(draw32, range), 32), b_.getInt32Ty());
                 set_value(i, two_val(b_.CreateAdd(lo, off)));
@@ -13076,7 +13263,7 @@ private:
     // Array ordering methods (LRM 7.12.2). Each carries only the handle lvalue +
     // interned type (op_type payload). Reverse is element-agnostic; Sort/Rsort
     // pass the value comparator descriptor derived from the element type;
-    // Shuffle threads the process frame RNG slot.
+    // Shuffle threads the calling thread's RNG state pointer.
     //
     // All three resolve the handle through lv_handle_ptr, so a struct-member,
     // class-property or container-element dynamic array orders in place rather
@@ -13098,9 +13285,9 @@ private:
 
     void lower_dyn_array_shuffle(Index i) {
         const auto& p = ir_->payload(i).op_type;
-        // rng_slot_ is non-null: process_uses_urandom flags a shuffling process,
-        // so lower_group allocates and seeds the frame RNG.
-        assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
+        // rng_slot_ is non-null in every body: a drawing process owns a frame
+        // state, a subroutine takes its caller's, and the rest carry the fallback.
+        assert(rng_slot_ != nullptr && "shuffle needs an RNG");
         b_.CreateCall(dynarr_shuffle_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(p.type), rng_slot_ });
     }
@@ -13386,7 +13573,7 @@ private:
 
     void lower_queue_shuffle(Index i) {
         const auto& p = ir_->payload(i).op_type;
-        assert(rng_slot_ != nullptr && "shuffle needs the frame RNG");
+        assert(rng_slot_ != nullptr && "shuffle needs an RNG");
         b_.CreateCall(queue_shuffle_fn(),
                       { lv_handle_ptr(lvalue_of(p.op)), elem_ops_global(p.type), rng_slot_ });
     }
@@ -15425,7 +15612,7 @@ private:
 
         llvm::Value* record = record_slot();
         b_.CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)), record);
-        llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, { state_, wheel_, record });
+        llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, { state_, rng_slot_, wheel_, record });
         b_.CreateCall(strobe_pend_fn(), { hdl });
     }
 
@@ -15444,7 +15631,8 @@ private:
         const auto      info = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra);
         llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
 
-        llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, { state_, wheel_, reactive_record_slot() });
+        llvm::Value* hdl =
+          b_.CreateCall(cf->getFunctionType(), cf, { state_, rng_slot_, wheel_, reactive_record_slot() });
         emit_reactive_push(b_, hdl);
     }
 
@@ -17723,14 +17911,17 @@ private:
     }
 
     // Shared marshaling + result handling for a direct or a virtual method call
-    // (they differ only in how the callee is obtained). Passes the state pointer
-    // plus each argument as its (must|may, z) plane pair (the frontend has resized
-    // each to its parameter width), calls `callee` with `fnty`, and unpacks the
-    // returned struct into a Plane. A void callee yields no value.
+    // (they differ only in how the callee is obtained). Passes the state and RNG
+    // pointers plus each argument as its (must|may, z) plane pair (the frontend has
+    // resized each to its parameter width), calls `callee` with `fnty`, and unpacks
+    // the returned struct into a Plane. A void callee yields no value.
     void lower_call_common(Index i, const Function& f, llvm::FunctionType* fnty,
                            llvm::Value* callee, ExtraSlice arg_slice) {
         std::vector<llvm::Value*> argv;
         argv.push_back(state_);
+        // A function body runs in the caller's thread, so $urandom inside one
+        // continues the caller's stream (LRM 18.13, 18.14.1).
+        argv.push_back(rng_slot_);
         // A ref actual that is a signal with waiters: the callee writes it live, so
         // its wait queue must be serviced with the call's net old -> new transition.
         // Snapshot each before the (atomic, zero-time) function call; service after.
@@ -18407,6 +18598,9 @@ private:
 
         std::vector<llvm::Value*> argv;
         argv.push_back(sym(state_global_));
+        // No calling process exists on this path -- native C drove the call -- so
+        // the exported subroutine draws from the module-wide state.
+        argv.push_back(sym(rng_global_));
         for (size_t k = 0; k < ex.arg_ctypes.size(); ++k) {
             const DpiCType ct     = ex.arg_ctypes[k];
             const ArgDir   dir    = ex.arg_dirs[k];
@@ -18683,8 +18877,12 @@ private:
         // captures at all — the ref ABI needs this frame to outlive the children.
         const std::span<const Index> caps = ir_->region(fi.args);
         std::vector<llvm::Value*>    argv;
-        argv.reserve(caps.size() + 3);
+        argv.reserve(caps.size() + 4);
         argv.push_back(state_);
+        // The child seeds its OWN state from this one at its ramp (lower_task): a
+        // join_none / join_any child can outlive this frame, so it must not hold a
+        // pointer into it.
+        argv.push_back(rng_slot_);
         argv.push_back(wheel_);
         if (!caps.empty()) {
             // Every child took the same formal list, so one child's declared types
@@ -18808,10 +19006,13 @@ private:
         llvm::Value* record = record_slot();
         b_.CreateStore(null, record);
 
-        // Ramp arguments: state, wheel, per-formal planes / pointers, record.
+        // Ramp arguments: state, rng, wheel, per-formal planes / pointers, record.
+        // A task runs in the calling process's thread (LRM 13.3), so it draws from
+        // the caller's RNG rather than one of its own.
         const std::span<const Index> args = ir_->region(argslice);
         std::vector<llvm::Value*>    argv;
         argv.push_back(state_);
+        argv.push_back(rng_slot_);
         argv.push_back(wheel_);
         // Snapshot each ref-actual signal with waiters before the call; the wait
         // queue is serviced at the continuation with the net old -> new transition.
@@ -19412,16 +19613,18 @@ private:
         return b_.CreateOr(b_.CreateShl(x, k), b_.CreateLShr(x, 64 - k));
     }
 
-    // One xoshiro256++ step against the process frame RNG (rng_slot_): load the
-    // four state words, produce the 64-bit result, advance and store the state.
-    // Inlined at each $urandom site (no per-draw runtime call).
-    llvm::Value* emit_xoshiro_next() {
+    // One xoshiro256++ step against the state at `rng`: load the four state
+    // words, produce the 64-bit result, advance and store the state. Inlined at
+    // each $urandom site (no per-draw runtime call). `rng` is the body's own
+    // rng_slot_ everywhere except the seeding draw a detached body takes from the
+    // ramping context's state (lower_task).
+    llvm::Value* emit_xoshiro_next(llvm::Value* rng) {
         auto* i64ty = b_.getInt64Ty();
         auto* arrty = llvm::ArrayType::get(i64ty, 4);
         llvm::Value* s[4];
         for (int k = 0; k < 4; ++k) {
             auto* ptr =
-              b_.CreateInBoundsGEP(arrty, rng_slot_, { b_.getInt32(0), b_.getInt32(k) });
+              b_.CreateInBoundsGEP(arrty, rng, { b_.getInt32(0), b_.getInt32(k) });
             s[k] = b_.CreateLoad(i64ty, ptr);
         }
         // result = rotl(s0 + s3, 23) + s0.
@@ -19437,7 +19640,7 @@ private:
         llvm::Value* ns[4] = { n0, n1, n2, n3 };
         for (int k = 0; k < 4; ++k) {
             auto* ptr =
-              b_.CreateInBoundsGEP(arrty, rng_slot_, { b_.getInt32(0), b_.getInt32(k) });
+              b_.CreateInBoundsGEP(arrty, rng, { b_.getInt32(0), b_.getInt32(k) });
             b_.CreateStore(ns[k], ptr);
         }
         return result;
@@ -19445,7 +19648,7 @@ private:
 
     // $urandom (LRM §18.13.1): the high 32 bits of one xoshiro256++ draw.
     Plane lower_urandom() {
-        llvm::Value* hi = b_.CreateTrunc(b_.CreateLShr(emit_xoshiro_next(), 32), b_.getInt32Ty());
+        llvm::Value* hi = b_.CreateTrunc(b_.CreateLShr(emit_xoshiro_next(rng_slot_), 32), b_.getInt32Ty());
         return two_val(hi);
     }
 
@@ -21486,11 +21689,30 @@ private:
     llvm::Value*        hdl_        = nullptr;
     llvm::Instruction*  coro_begin_ = nullptr;
     llvm::AllocaInst*   awaiter_    = nullptr;
-    // The current process's $urandom RNG state: a [4 x i64] xoshiro256++ alloca
-    // in the coroutine frame, seeded once in the ramp. Null for a process that
-    // never calls $urandom (no state materialized) or a thunk (which the
-    // $urandom-forces-coroutine rule keeps $urandom out of).
+    // The RNG the body being lowered draws from (LRM 18.13): a pointer to a
+    // [4 x i64] xoshiro256++ state. Never null while a body lowers -- a process
+    // that needs one owns a coroutine-frame alloca, a function or task takes the
+    // caller's pointer as ABI parameter 1, and everything else (a thunk group, a
+    // process the closure proved cannot reach a draw) gets the module-wide
+    // fallback state, which no draw can reach.
     llvm::Value*        rng_slot_   = nullptr;
+    // The module-wide fallback xoshiro256++ state, seeded once in main. It backs
+    // the two entries that have no calling process at all -- a DPI export thunk
+    // called from C, and the $monitor body the Postponed drain ramps -- and is
+    // what a process with no draw of its own hands to a callee.
+    llvm::GlobalVariable* rng_global_ = nullptr;
+    // Per function: this body, or something it can reach, draws from the RNG.
+    // Decides which processes materialize a frame state and which bodies own one;
+    // the ABI parameter itself is unconditional (see declare_function).
+    std::vector<bool>   rng_fns_;
+    // Per function: this body owns its RNG rather than sharing its caller's,
+    // because it can outlive the ramp site whose pointer it was handed -- a fork
+    // child (LRM 9.3.2) and the deferred $strobe / $monitor / action-block bodies.
+    // Seeded at the ramp from one draw of the ramping context's state, which is
+    // the per-thread seeding LRM 18.14.1 requires of a spawned process.
+    std::vector<bool>   rng_own_;
+    // Per process (indexed as Module::processes()): reaches a draw.
+    std::vector<bool>   rng_procs_;
     // Reused scratch for staging array-NBA value/mask bytes before a push call
     // (one per process, hoisted to coro.begin so a loop of element NBAs does not
     // grow the stack). Layout: [16]mm_val [16]mm_mask [8]z_val [8]z_mask.

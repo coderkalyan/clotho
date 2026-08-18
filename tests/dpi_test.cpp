@@ -542,6 +542,22 @@ TEST_CASE("DPI export: a design with export directives lowers and runs") {
     CHECK(run_capture(src) == "42 3\n");
 }
 
+// An exported function may draw from the RNG (LRM 18.13) even though the C entry
+// that calls it has no calling process: the thunk passes the module-wide state,
+// which main seeds at startup. Emitting the thunk is what this covers -- the
+// C-calls-into-SV half is the verilator CLI cross-check -- plus the SV-side use,
+// where the draws come from the calling process instead.
+TEST_CASE("DPI export: an exported function may draw from the RNG") {
+    constexpr std::string_view src = R"(
+        module m;
+          export "DPI-C" function rnd;
+          function int rnd(); return $urandom; endfunction
+          int a, b;
+          initial begin a = rnd(); b = rnd(); $display("%0d", a != b); end
+        endmodule)";
+    CHECK(run_capture(src) == "1\n");
+}
+
 // Export out-of-scope forms loud-fail (collect_dpi_exports guards).
 TEST_CASE("DPI export: unsupported forms are rejected") {
     SUBCASE("exported task") {
