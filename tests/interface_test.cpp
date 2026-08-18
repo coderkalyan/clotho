@@ -241,7 +241,7 @@ TEST_CASE("virtual interface: bind, write and read a member") {
                 vif.d = 8'hA5;
                 #1;
                 $display("%h %h", bus.d, vif.d);
-                vif.req <= 1'b1;
+                vif.req = 1'b1;
                 #1;
                 $display("%b", bus.req);
             end
@@ -266,7 +266,7 @@ TEST_CASE("virtual interface: a write through a handle wakes the instance's wait
                 bus.clk = 0;
                 vif = bus;
                 #1 vif.clk = 1;
-                #1 vif.d <= 8'h3c;
+                #1 vif.d = 8'h3c;
                 #2 $finish;
             end
             always @(posedge bus.clk) $display("posedge %0t", $time);
@@ -522,19 +522,34 @@ TEST_CASE("virtual interface: a subroutine call through a handle is refused") {
     CHECK(diag.find("subroutine call through a virtual interface") != std::string::npos);
 }
 
+// The block-shadow staging path is keyed on the target signal, and a handle only
+// supplies a representative of the member: two handles naming twin instances
+// would stage into one shadow and commit into one instance.
+TEST_CASE("virtual interface: a nonblocking write through a handle is refused") {
+    const std::string diag = reject(R"(
+        interface ibus; logic [7:0] d; endinterface
+        module top;
+            ibus bus();
+            virtual ibus vif;
+            initial begin vif = bus; vif.d <= 8'h1; end
+        endmodule
+    )");
+    CHECK(diag.find("nonblocking assignment through a virtual interface") != std::string::npos);
+}
+
 // A clockvar read resolves, but a synchronous drive is performed by the block's
 // own Re-NBA process, which is bound to one instance. Refused whole.
 TEST_CASE("virtual interface: a clocking block through a handle is refused") {
     const std::string diag = reject(R"(
         interface ibus(input bit clk);
             logic [7:0] d;
-            clocking cb @(posedge clk); output d; endclocking
+            clocking cb @(posedge clk); input d; endclocking
         endinterface
         module top;
             bit clk = 0;
             ibus bus(clk);
             virtual ibus vif;
-            initial begin vif = bus; vif.cb.d <= 8'h1; end
+            initial begin vif = bus; $display("%h", vif.cb.d); end
         endmodule
     )");
     CHECK(diag.find("clocking block reached through a virtual interface") != std::string::npos);

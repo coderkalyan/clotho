@@ -173,6 +173,15 @@ through a clocking block or an in-interface driver, per the clause.
 
 **Deferred, each guarded loud:**
 
+- **A nonblocking write through a handle** (`vif.d <= x`). The block-shadow
+  staging path is keyed on the target *signal*, and a handle supplies only a
+  representative of the member: two handles naming twin instances would stage into
+  one shadow and commit into one instance. The deferred-record path
+  (`emit_array_nba`) is the shape that fits — its record already carries the
+  destination pointer resolved at statement-execution time — and it needs the
+  instance context beside it so the replay wakes the bound instance's waiters too.
+  Blocking assignment through a handle is unaffected and correct. This is the one
+  gap that blocks the LRM 25.9 example verbatim (`bus.req <= 1'b1`).
 - **A clocking block through a handle** (`vif.cb.sig`, `@(vif.cb)`, LRM 25.9.1 /
   25.9.2). A clockvar read would resolve, but a synchronous drive is performed by
   that block's own Re-NBA process, which is bound to one instance; half of it

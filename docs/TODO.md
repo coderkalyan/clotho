@@ -1752,13 +1752,17 @@ project with its own algorithm, not tail cleanup on the property layer:
   every def-local constant. Working: declaration, `null`, `==` / `!=`, assignment
   from an instance / another handle / `null`, modport-qualified and parameterized
   handles, handles as class properties, constructor and task arguments and array
-  elements, member reads and blocking / nonblocking writes with correct wake, VCD
-  and NBA staging on the bound instance, interface events triggered through a
-  handle, and `@(edge vif.sig)` / `wait(vif.x)` — which park a frame-resident node
+  elements, member reads and blocking writes with correct wake and VCD on the
+  bound instance, interface events triggered through a handle, and `@(edge vif.sig)` / `wait(vif.x)` — which park a frame-resident node
   on an intrusive waiter list in the definition's state, the event-object list
   reused, so there is no bucket identity or capacity to know at compile time.
   Signals of an interface a handle can name keep the canonical type-derived shape,
-  the `ref`-actual rule. Deferred, guarded loud: a **clocking block** through a
+  the `ref`-actual rule. Deferred, guarded loud: a **nonblocking write** through a
+  handle (the block shadow is keyed on the target signal, so two handles naming
+  twin instances would stage into one; the deferred-record path, whose record
+  already carries the destination pointer resolved at statement-execution time, is
+  where it belongs — this is the one gap that blocks the LRM 25.9 example
+  verbatim, and blocking writes are unaffected), a **clocking block** through a
   handle (25.9.1 / 25.9.2 — a clockvar read would resolve but the synchronous
   drive is performed by that block's Re-NBA process, bound to one instance), an
   **interface subroutine** through a handle (lowered once per instance body, so it
@@ -1783,7 +1787,6 @@ project with its own algorithm, not tail cleanup on the property layer:
   inside the literal and left the real specifier for the runtime formatter to abort
   on), and a `%p` operand was lowered twice (a call operand ran twice). Remaining:
   - [ ] `%p` of a class / chandle / event / virtual-interface handle — rejected
-    loud (21.2.1.6 wants an implementation-defined form, `null` for a null handle).
   - [ ] `%0p` — a field width / flags on the whole pattern is rejected loud.
   - [ ] `%p` of a queue / dynamic array of tagged unions — rejected loud.
   - [ ] `%p` of an associative-array leaf inside an aggregate — rejected loud.

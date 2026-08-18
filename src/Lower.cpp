@@ -17864,6 +17864,18 @@ private:
                 return gated_store(a, *fi, b);
             }
         }
+        if (a.isNonBlocking() && reads_vif(a.left())) {
+            // TODO: nonblocking assignment through a virtual interface (LRM 25.9).
+            // The block-shadow staging path is keyed on the target SIGNAL, and a
+            // handle only supplies a representative of the member -- two handles
+            // naming twin instances would stage into one shadow and commit into one
+            // instance. The deferred-record path (emit_array_nba) is the shape that
+            // fits: its record already carries the destination pointer resolved at
+            // statement-execution time, and it would need the instance context
+            // beside it so the replay wakes the bound instance's waiters too.
+            // Blocking assignment through a handle is unaffected and works.
+            fail("nonblocking assignment through a virtual interface is not supported");
+        }
         if (a.isNonBlocking() && a.left().kind == ExpressionKind::MemberAccess &&
             a.left().as<MemberAccessExpression>().member.kind == SymbolKind::ClassProperty) {
             // TODO: nonblocking assignment to a class property. The aggregate NBA

@@ -2804,7 +2804,9 @@ private:
             throw BackendError{ "internal: no virtual-interface waiter head for this member" };
         }
         Anchor&      a    = anchors_[s.anchor];
-        llvm::Value* base = ctx_override_ != nullptr
+        // Exactly storage_ptr's base rule: a shared body of a reused definition
+        // must load its instance base rather than bake one instance's symbol.
+        llvm::Value* base = (a.indirect || ctx_override_ != nullptr) && def_relative_for(s)
                               ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
                               : static_cast<llvm::Value*>(sym(a.state_gv));
         return b_.CreateInBoundsGEP(a.ty, base,
@@ -9389,6 +9391,14 @@ private:
             auto* i32 = b_.getInt32Ty();
             emit_static_scan_rt(meta_at(meta, 0, e, ptr), meta_at(meta, 1, e, i32));
             emit_dynamic_scan_rt(meta_at(meta, 2, e, ptr), meta_at(meta, 3, e, ptr));
+            if (vif_wait_[static_cast<uint32_t>(sig)][e]) {
+                // Waiters that reached this member through a virtual interface. The
+                // meta table carries only the bucket bases, so the list is addressed
+                // directly -- `sig` is compile-time here, and the commit runs in the
+                // owning instance's own code (a handle-written target commits
+                // through the same block as any other write to it).
+                emit_event_wake_list(vif_head_ptr(sig, e));
+            }
             // An NBA commit to a `<= @e` trigger fires its records too (the other
             // wake path is a blocking store, in service_wait_queue).
             fire_event_trigger(sig, e);
