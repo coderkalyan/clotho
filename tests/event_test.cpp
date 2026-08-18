@@ -115,6 +115,115 @@ TEST_CASE("mixed @(e or f) wakes on either event") {
     CHECK(out.find("mixed woke t=7") != std::string::npos);
 }
 
+// An event's waiters are an intrusive list on its object rather than a
+// fixed-capacity bucket (docs/design/event-handles.md), so the number of
+// simultaneous waiters is bounded by nothing the compiler has to predict. 200
+// fork children parked on one event must all wake from one trigger.
+TEST_CASE("an event wakes an unbounded number of simultaneous waiters") {
+    const std::string out = run_capture(R"(
+        module top;
+          event e;
+          int woke = 0;
+          initial begin
+            for (int i = 0; i < 200; i++) fork begin @(e); woke++; end join_none
+            #1 -> e;
+            #1 $display("woke=%0d", woke);
+          end
+        endmodule
+    )");
+    CHECK(out == "woke=200\n");
+}
+
+// Persistent (`always @(e)`) and one-shot (`@(e)` in a body) waiters share one
+// list per event, with nodes from different storage: the contiguous
+// clotho.event_nodes array and the coroutine frame respectively. A trigger must
+// reach both kinds, and each `always` block must be woken independently.
+TEST_CASE("persistent and one-shot event waiters share one list") {
+    SUBCASE("mixed kinds") {
+        const std::string out = run_capture(R"(
+            module top;
+              event e; int a = 0, b = 0;
+              always @(e) a++;
+              initial forever begin @(e); b++; end
+              initial begin #1 -> e; #1 -> e; #1 $display("a=%0d b=%0d", a, b); end
+            endmodule
+        )");
+        CHECK(out == "a=2 b=2\n");
+    }
+    SUBCASE("three persistent waiters on one event") {
+        const std::string out = run_capture(R"(
+            module top;
+              event e; int x = 0, y = 0, z = 0;
+              always @(e) x++;
+              always @(e) y++;
+              always @(e) z++;
+              initial begin #1 -> e; #1 -> e; #1 $display("%0d %0d %0d", x, y, z); end
+            endmodule
+        )");
+        CHECK(out == "2 2 2\n");
+    }
+}
+
+// A one-shot waiter owns its node and unlinks it on resume. Firing does NOT clear
+// the list (unlike a dynamic bucket, which resets its whole length), so a node
+// left linked would be woken again by the next trigger and, in a forever loop,
+// re-linked on top of itself. Re-arming thousands of times must stay exact.
+TEST_CASE("a one-shot event waiter unlinks itself on resume") {
+    SUBCASE("repeated re-arm") {
+        const std::string out = run_capture(R"(
+            module top;
+              event e; int n = 0;
+              initial forever begin @(e); n++; end
+              initial begin
+                for (int i = 0; i < 500; i++) begin #1 -> e; end
+                #1 $display("n=%0d", n);
+              end
+            endmodule
+        )");
+        CHECK(out == "n=500\n");
+    }
+    SUBCASE("multi-event wait unlinks from every event it linked") {
+        const std::string out = run_capture(R"(
+            module top;
+              event a, b, c; int n = 0;
+              initial forever begin @(a or b or c); n++; end
+              initial begin #1 -> a; #1 -> b; #1 -> c; #1 -> a; #1 $display("n=%0d", n); end
+            endmodule
+        )");
+        CHECK(out == "n=4\n");
+    }
+    SUBCASE("event and signal in one wait") {
+        const std::string out = run_capture(R"(
+            module top;
+              event e; logic clk = 0; int n = 0;
+              initial forever begin @(e or posedge clk); n++; end
+              initial begin #1 -> e; #1 clk=1; #1 clk=0; #1 -> e; #1 $display("n=%0d", n); end
+            endmodule
+        )");
+        CHECK(out == "n=3\n");
+    }
+}
+
+// Each instance of a module that declares an event owns its own event object.
+// This is why a compile-time object slot is sound: an event signal is an
+// instance-specific hint, so module dedup never body-shares such a definition.
+TEST_CASE("each instance of a module owns its own event") {
+    const std::string out = run_capture(R"(
+        module sub;
+          event e; int hits = 0;
+          initial forever begin @(e); hits++; end
+        endmodule
+        module top;
+          sub u0(); sub u1();
+          initial begin
+            #1 -> u0.e; #1 -> u0.e; #1 -> u1.e;
+            #1 $display("u0=%0d u1=%0d", u0.hits, u1.hits);
+          end
+        endmodule
+    )");
+    CHECK(out == "u0=2 u1=1\n");
+}
+
 // `.triggered` is true for the whole triggering step and false afterwards
 // (LRM 15.5.3): same-step read after `-> e` is 1, a later step reads 0.
 TEST_CASE("e.triggered persists within the triggering step only") {
