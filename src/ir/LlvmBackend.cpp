@@ -1719,13 +1719,19 @@ private:
     // body pointer's GEP source type (`HandleDeref` root_ty) and the MemberSelect
     // field GEPs share one identity. Distinct from `agg_storage_ty(classRef)`,
     // which yields the *handle* leaf slot (a class value is a handle, not a body).
-    // Number of leading LLVM fields reserved before a class's properties: 1 for a
-    // polymorphic class (a vtable pointer at field 0, LRM 8.20), else 0. A
-    // property's GEP index into the object body is its 0-based declaration index
-    // plus this offset; the struct_fields table and logical field path stay 0-based.
+    // Number of leading LLVM fields reserved before a class's properties: one, the
+    // descriptor pointer at field 0 (LRM 8.16 / 8.20). A property's GEP index into
+    // the object body is its 0-based declaration index plus this offset; the
+    // struct_fields table and logical field path stay 0-based.
+    //
+    // Every class carries the word, not only a polymorphic one. The header has to
+    // be present or absent uniformly across a whole hierarchy -- prefix layout puts
+    // the base's properties first precisely so an upcast is the same pointer at the
+    // same offsets -- and whether some *derived* class introduces a virtual method
+    // or is `$cast` to is not a property of the class being laid out.
     uint32_t class_header_words(Ref class_ref) const {
         const Type& t = std::get<Type>(mod_.pool.get(class_ref));
-        return (t.kind == Type::Kind::Class && mod_.vtable_for(class_ref) != nullptr) ? 1u : 0u;
+        return t.kind == Type::Kind::Class ? 1u : 0u;
     }
 
     llvm::StructType* class_body_ty(Ref class_ref) {
@@ -1735,11 +1741,9 @@ private:
         }
         const Type&              t = std::get<Type>(mod_.pool.get(class_ref));
         std::vector<llvm::Type*> fields;
-        // A polymorphic class carries a vtable pointer at field 0 (prefix-consistent
-        // across the whole hierarchy, so an upcast reads it at the same offset).
-        if (class_header_words(class_ref) != 0) {
-            fields.push_back(raw_ptr_ty());
-        }
+        // Every class carries a descriptor pointer at field 0, at the same offset
+        // in every class of a hierarchy so an upcast reads it unchanged.
+        fields.push_back(raw_ptr_ty());
         for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
             fields.push_back(agg_storage_ty(f.type));
         }
@@ -1748,25 +1752,92 @@ private:
         return st;
     }
 
-    // The vtable global for a polymorphic class: a constant array of function
-    // pointers, slot k = the override occupying slot k for this concrete class.
-    // One per class per module (deduped by name); referenced by ClassNew's header
-    // store and loaded at each virtual dispatch.
-    llvm::GlobalVariable* vtable_global(Ref class_ref) {
-        const std::string nm = "clotho.vtable." + std::to_string(static_cast<uint32_t>(class_ref));
+    // A class's runtime descriptor: its ancestor display followed by its vtable
+    // slots. One per class per module (deduped by name).
+    //
+    // The object header points at slot 0, not at the descriptor base, so a virtual
+    // dispatch is one load plus a constant-index GEP and the display sits at
+    // constant NEGATIVE offsets -- the same shape the Itanium C++ ABI gives
+    // `typeinfo` at vptr[-1]. `display[d]` is the type id of the ancestor at depth
+    // d, padded with 0 ("no class") past this class's own depth, so a `$cast` to a
+    // class at depth d is one load of display[d] and one compare against that
+    // class's id, with no dependence on the object's own depth.
+    llvm::StructType* class_desc_ty(size_t slots) {
+        return llvm::StructType::get(
+          ctx_, { llvm::ArrayType::get(b_.getInt32Ty(), kMaxClassDepth), llvm::ArrayType::get(raw_ptr_ty(), slots) });
+    }
+
+    llvm::GlobalVariable* class_desc_global(Ref class_ref) {
+        const std::string nm = "clotho.classdesc." + std::to_string(static_cast<uint32_t>(class_ref));
         if (auto* g = env_->llmod.getNamedGlobal(nm)) {
             return g;
         }
-        const Vtable* vt = mod_.vtable_for(class_ref);
+        const ClassDesc* cd = mod_.class_desc(class_ref);
+        if (cd == nullptr) {
+            throw BackendError{ "internal: class without a descriptor" };
+        }
         std::vector<llvm::Constant*> entries;
-        entries.reserve(vt->slots.size());
-        for (const FunctionId fid : vt->slots) {
+        entries.reserve(cd->slots.size());
+        for (const FunctionId fid : cd->slots) {
             entries.push_back(sym(fn_decls_[static_cast<uint32_t>(fid)]));
         }
-        auto* arrty = llvm::ArrayType::get(raw_ptr_ty(), entries.size());
-        auto* init  = llvm::ConstantArray::get(arrty, entries);
-        return new llvm::GlobalVariable(env_->llmod, arrty, /*isConstant=*/true,
-                                        llvm::GlobalValue::PrivateLinkage, init, nm);
+        std::vector<llvm::Constant*> disp(kMaxClassDepth, b_.getInt32(0));
+        // Walk to the root filling the display back to front: `element` is the base
+        // class Ref, so the chain length is the class's depth.
+        uint32_t depth = class_depth(class_ref);
+        for (Ref k = class_ref; k != Ref::Invalid; k = std::get<Type>(mod_.pool.get(k)).element) {
+            const ClassDesc* anc = mod_.class_desc(k);
+            if (anc == nullptr) {
+                throw BackendError{ "internal: class without a descriptor" };
+            }
+            disp[depth--] = b_.getInt32(anc->type_id);
+        }
+        auto* ty   = class_desc_ty(entries.size());
+        auto* init = llvm::ConstantStruct::get(
+          ty,
+          { llvm::ConstantArray::get(llvm::ArrayType::get(b_.getInt32Ty(), kMaxClassDepth), disp),
+            llvm::ConstantArray::get(llvm::ArrayType::get(raw_ptr_ty(), entries.size()), entries) });
+        return new llvm::GlobalVariable(
+          env_->llmod, ty, /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, init, nm);
+    }
+
+    // Depth of a class in its hierarchy: 0 for a root, +1 per base.
+    uint32_t class_depth(Ref class_ref) const {
+        uint32_t d = 0;
+        for (Ref k = std::get<Type>(mod_.pool.get(class_ref)).element; k != Ref::Invalid;
+             k     = std::get<Type>(mod_.pool.get(k)).element) {
+            ++d;
+        }
+        return d;
+    }
+
+    // The value an object body's header holds: the address of its class's vtable
+    // slot 0, i.e. the descriptor global past its display.
+    llvm::Constant* class_vptr(Ref class_ref) {
+        llvm::GlobalVariable* g = class_desc_global(class_ref);
+        return llvm::ConstantExpr::getGetElementPtr(
+          g->getValueType(), g, std::array<llvm::Constant*, 3>{ b_.getInt32(0), b_.getInt32(1), b_.getInt32(0) });
+    }
+
+    // A stand-in object body for a null handle in a `$cast` type test: one word
+    // pointing just past an all-zero display, so reading any display entry off it
+    // yields 0 ("no class") instead of faulting. Lets the test stay branch-free;
+    // the null answer itself comes from the separate compare against 0.
+    llvm::Constant* null_object_global() {
+        if (auto* g = env_->llmod.getNamedGlobal("clotho.nullobj")) {
+            return g;
+        }
+        auto* disp_ty = llvm::ArrayType::get(b_.getInt32Ty(), kMaxClassDepth);
+        auto* disp    = new llvm::GlobalVariable(env_->llmod,
+                                                 disp_ty,
+                                                 /*isConstant=*/true,
+                                                 llvm::GlobalValue::PrivateLinkage,
+                                                 llvm::ConstantAggregateZero::get(disp_ty),
+                                                 "clotho.nulldisplay");
+        auto* past    = llvm::ConstantExpr::getGetElementPtr(
+          disp_ty, disp, std::array<llvm::Constant*, 2>{ b_.getInt32(0), b_.getInt32(kMaxClassDepth) });
+        return new llvm::GlobalVariable(
+          env_->llmod, raw_ptr_ty(), /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, past, "clotho.nullobj");
     }
 
     // Power-on the properties of a freshly-allocated class object body (LRM 8.8):
@@ -5856,7 +5927,7 @@ private:
         // target alone, as collect_callees does, would miss an override's draw and
         // silently leave its caller without a state to hand it.
         std::vector<std::vector<FunctionId>> slot_fns;
-        for (const Vtable& vt : mod_.vtables()) {
+        for (const ClassDesc& vt : mod_.class_descs()) {
             if (slot_fns.size() < vt.slots.size()) {
                 slot_fns.resize(vt.slots.size());
             }
@@ -10831,6 +10902,10 @@ private:
             case Inst::Tag::Lequiv:
                 return { 1, true, false };
 
+            case Inst::Tag::ClassIsA:
+                // A definite bit: the display entry either matches or it does not.
+                return { 1, false, false };
+
             case Inst::Tag::Concat: {
                 std::array<Index, 4> scratch;
                 uint32_t             width = 0;
@@ -11613,13 +11688,10 @@ private:
                 llvm::Value*   body      = b_.CreateCall(alloc_fn(), { b_.getInt64(size) });
                 b_.CreateMemSet(body, b_.getInt8(0), b_.getInt64(size), llvm::MaybeAlign(64));
                 emit_class_body_init(class_ref, body);
-                // Install the vtable pointer at the object header (field 0) for a
-                // polymorphic class, so a later virtual dispatch resolves against the
-                // concrete type (LRM 8.20).
-                if (mod_.vtable_for(class_ref) != nullptr) {
-                    b_.CreateStore(vtable_global(class_ref),
-                                   b_.CreateStructGEP(class_body_ty(class_ref), body, 0));
-                }
+                // Install the descriptor pointer at the object header (field 0), so
+                // a later virtual dispatch (LRM 8.20) and a later `$cast` (LRM 8.16)
+                // both resolve against the concrete type.
+                b_.CreateStore(class_vptr(class_ref), b_.CreateStructGEP(class_body_ty(class_ref), body, 0));
                 set_value(i, two_val(b_.CreatePtrToInt(body, b_.getInt64Ty())));
                 return;
             }
@@ -11642,6 +11714,32 @@ private:
                 lv.is_agg    = true;
                 lv.is_signal = false;
                 set_lvalue(i, lv);
+                return;
+            }
+            case Inst::Tag::ClassIsA: {
+                // `$cast` type test (LRM 8.16). Read the destination's depth entry
+                // out of the object's ancestor display and compare it against the
+                // destination's id: equal exactly when the object's class is the
+                // destination or descends from it, since display[d] is the ancestor
+                // at depth d and is 0 past the object's own depth.
+                //
+                // Branch-free. A null handle reads the all-zero display of a static
+                // sentinel object rather than faulting, and answers 1 separately:
+                // assigning null to a cast-compatible destination is legal.
+                const Ref        dest = p.op_type.type;
+                const ClassDesc* cd   = mod_.class_desc(dest);
+                if (cd == nullptr) {
+                    throw BackendError{ "internal: class without a descriptor" };
+                }
+                llvm::Value* handle = must_of(value_of(p.op_type.op));
+                llvm::Value* isnull = b_.CreateICmpEQ(handle, b_.getInt64(0));
+                llvm::Value* obj =
+                  b_.CreateSelect(isnull, null_object_global(), b_.CreateIntToPtr(handle, raw_ptr_ty()));
+                llvm::Value*  vptr = b_.CreateLoad(raw_ptr_ty(), obj);
+                const int64_t off  = static_cast<int64_t>(4 * class_depth(dest)) - 4 * kMaxClassDepth;
+                llvm::Value* ent = b_.CreateLoad(b_.getInt32Ty(), b_.CreateGEP(b_.getInt8Ty(), vptr, b_.getInt64(off)));
+                llvm::Value* ok  = b_.CreateICmpEQ(ent, b_.getInt32(cd->type_id));
+                set_value(i, two_val(b_.CreateOr(ok, isnull)));
                 return;
             }
 

@@ -1076,6 +1076,13 @@ struct Inst {
         // reference handle into a body lvalue (contrast a value struct, addressed
         // inline).
         HandleDeref,
+        // Dynamic type test behind `$cast` (LRM 8.16): is the object a handle
+        // refers to of the payload class, or of a class derived from it? (payload:
+        // op_type -> op is the handle value, type is the destination Kind::Class).
+        // Yields a 1-bit 2-state value. A null handle answers 1 -- assigning null
+        // to a cast-compatible destination is legal, and the frontend only emits
+        // this op once the two types are known to be cast compatible.
+        ClassIsA,
 
         // -- State access --
         // Read the current value of an lvalue (payload: unary).
@@ -2154,6 +2161,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FBitcast:
         case T::FResize:
         case T::HandleDeref:
+        case T::ClassIsA:
         // Handle-lvalue queue / dynamic-array ops with no extra operand: op is
         // the handle, type the interned Queue / DynArray type.
         case T::QueueSize:
