@@ -3869,7 +3869,16 @@ private:
                 continue;
             }
             const PortSymbol& p = pc->port.as<PortSymbol>();
-            if (p.direction != slang::ast::ArgumentDirection::InOut &&
+            // An event port is an ALIASING port in every direction (LRM 15.5.5): a
+            // port-connected event names the same sync object on both sides, so the
+            // two symbols collapse onto one signal exactly as an inout does. Copying
+            // the handle instead would be wrong -- a later merge on one side would
+            // not be seen on the other -- and there is nothing to propagate, since
+            // an event carries occurrences rather than a value.
+            const bool event_port =
+              p.internalSymbol != nullptr && p.internalSymbol->kind == SymbolKind::Variable &&
+              p.internalSymbol->as<VariableSymbol>().getType().isEvent();
+            if (!event_port && p.direction != slang::ast::ArgumentDirection::InOut &&
                 p.direction != slang::ast::ArgumentDirection::Ref) {
                 continue;
             }
@@ -3979,11 +3988,6 @@ private:
                         if (found != port_dir->end()) {
                             info.dir = found->second;
                         }
-                    }
-                    if (info.dir != ir::SignalInfo::Direction::Internal && info.is_event) {
-                        // TODO: event ports (LRM 15.5) — needs cross-boundary
-                        // event aliasing (Tier 2, docs/design/named-events.md).
-                        fail("event ports are not supported");
                     }
                     if (info.dir != ir::SignalInfo::Direction::Internal &&
                         ir::types::contains_string(module_.pool, info.type)) {
@@ -6928,7 +6932,18 @@ private:
             // (`@(posedge cb.sig)`, LRM 14.15) resolves the same way and lands on
             // its sampled storage, so the edge seen is the edge of the sampled
             // value stream, which is what 14.15 specifies.
-            return signal_of(e.as<ValueExpressionBase>().symbol);
+            const ValueSymbol& vs = e.as<ValueExpressionBase>().symbol;
+            if (e.type->isEvent() && fn_ctx_ != nullptr && fn_ctx_->localmap.contains(&vs)) {
+                // An event whose handle lives in a call frame -- a formal, or an
+                // automatic local -- has no signal for the wait list to name. The
+                // trigger forms take the handle as a value and work; the wait does
+                // not, because a WaitEdge names a signal.
+                // TODO: carry the handle value on a WaitEdge so `@(<any event
+                // expression>)` works; see docs/design/event-handles.md §6.
+                fail("waiting on an event held in a subroutine argument or an "
+                     "automatic local is not supported (triggering one is)");
+            }
+            return signal_of(vs);
         }
         // A non-simple event expression (struct/union member, array element,
         // bit/part-select, arithmetic): the wait engine subscribes by whole-signal
@@ -21458,18 +21473,6 @@ private:
         const bool is_task = sub.subroutineKind == SubroutineKind::Task;
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             const auto dir = fa->direction;
-            // An `event` formal of ANY direction is unsupported: an event lowers to
-            // a valueless 1-bit placeholder, so `in` copies a meaningless bit, `ref`
-            // has nothing to alias, and `output`/`inout` used to copy the
-            // placeholder plane back and forth and SILENTLY SUCCEED -- the caller's
-            // event kept working only because its planes are never read. One gate
-            // for all four directions, ahead of the per-direction checks below, so
-            // no direction can slip through again.
-            // TODO: event arguments (LRM 15.5.5) need the event handle word; see
-            // docs/design/event-handles.md.
-            if (fa->getType().getCanonicalType().isEvent()) {
-                fail("an event subroutine argument is not supported");
-            }
             if (dir == slang::ast::ArgumentDirection::Ref) {
                 // ref / const ref (LRM 13.5.2): the formal aliases the actual's live
                 // storage through a fat pointer carrying the storage address, the

@@ -483,11 +483,91 @@ TEST_CASE("a static event class property is one shared event") {
     CHECK(out == "n=2\n");
 }
 
+// An event port is an ALIASING port in every direction (LRM 15.5.5): both sides
+// name the SAME sync object, so a trigger on either side reaches waiters on the
+// other. There is no copy process -- copying the handle would break a later merge,
+// and there is no value to propagate. (`inout event` is illegal SV: slang requires
+// a net, and an event is not one.)
+TEST_CASE("an event port shares one object across the boundary") {
+    SUBCASE("input: parent triggers, child waits") {
+        const std::string out = run_capture(R"(
+            module sub(input event e);
+              initial begin @(e); $display("child t=%0t", $time); end
+            endmodule
+            module top; event e; sub u(e); initial begin #3 -> e; #1 $finish; end endmodule
+        )");
+        CHECK(out.find("child t=3") != std::string::npos);
+    }
+    SUBCASE("output: child triggers, parent waits") {
+        const std::string out = run_capture(R"(
+            module sub(output event e); initial #2 -> e; endmodule
+            module top;
+              event e; sub u(e);
+              initial begin @(e); $display("parent t=%0t", $time); end
+            endmodule
+        )");
+        CHECK(out.find("parent t=2") != std::string::npos);
+    }
+    SUBCASE("two instances keep distinct events") {
+        const std::string out = run_capture(R"(
+            module sub(input event e); int n = 0; initial forever begin @(e); n++; end endmodule
+            module top;
+              event a, b;
+              sub u0(a); sub u1(b);
+              initial begin #1 -> a; #1 -> a; #1 -> b; #1 $display("u0=%0d u1=%0d", u0.n, u1.n); end
+            endmodule
+        )");
+        CHECK(out == "u0=2 u1=1\n");
+    }
+}
+
+// LRM 15.5.5's own example: pass a handle, and the callee triggers the caller's
+// event. Every direction works, because the handle is an ordinary scalar.
+TEST_CASE("an event passes as a subroutine argument") {
+    SUBCASE("input formal, triggered by the callee") {
+        CHECK(run_capture(R"(
+            module top;
+              event e; int n = 0;
+              task automatic fire(event x); -> x; endtask
+              initial forever begin @(e); n++; end
+              initial begin #1 fire(e); #1 fire(e); #1 $display("n=%0d", n); end
+            endmodule
+        )") == "n=2\n");
+    }
+    SUBCASE("nonblocking and delayed triggers through a formal") {
+        CHECK(run_capture(R"(
+            module top;
+              event e;
+              task automatic fire(event x); ->> #2 x; endtask
+              initial begin @(e); $display("t=%0t", $time); end
+              initial begin #1 fire(e); #5 $finish; end
+            endmodule
+        )").find("t=3") != std::string::npos);
+    }
+    SUBCASE("a class method taking an event") {
+        CHECK(run_capture(R"(
+            module top;
+              event e; int n = 0;
+              class C; task fire(event x); -> x; endtask endclass
+              initial forever begin @(e); n++; end
+              initial begin C c = new(); #1 c.fire(e); #1 $display("n=%0d", n); end
+            endmodule
+        )") == "n=1\n");
+    }
+}
+
 TEST_CASE("event forms that are still rejected") {
     CHECK(reject("module top; logic clk; event e; initial ->> @(posedge clk) e; endmodule").find(
             "event-controlled nonblocking trigger") != std::string::npos);
-    CHECK(reject("module top; event e; input e; endmodule").find(
-            "event") != std::string::npos);
+    // Waiting on an event held in a call frame: a WaitEdge names a signal, and a
+    // formal or automatic local has none. Triggering one works.
+    CHECK(reject("module top; event e; task automatic w(event x); @(x); endtask "
+                 "initial w(e); endmodule")
+            .find("waiting on an event held in a subroutine argument") != std::string::npos);
+    // An event array / per-instance class property needs one object per element or
+    // per class object, which the compile-time slot array cannot size.
+    CHECK(reject("module top; event ev[4]; initial -> ev[0]; endmodule")
+            .find("unpacked array of events") != std::string::npos);
 }
 
 // An event declared in a procedural scope gets signal-like storage through

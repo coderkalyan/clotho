@@ -490,25 +490,52 @@ TEST_CASE("ref of an unpacked struct aliases the actual") {
 
 // -- Guarded gaps: must fail loudly, not silently miscompile. --
 
-// An event has no value and its trigger state is a separate static timestamp, so
-// there is nothing for a pointer to alias, nothing meaningful for an `input` to
-// copy, and nothing for `output`/`inout` to copy back. One gate covers all four
-// directions: `output event` used to be accepted silently and run, because the
-// copy-out moved the valueless placeholder plane that nothing ever reads.
-TEST_CASE("an event subroutine argument is rejected in every direction") {
-    const auto with_dir = [](std::string_view dir) {
-        return std::string("module m;\n"
-                           "    task automatic t(") +
-               std::string(dir) +
-               "event e); endtask\n"
-               "    event ev;\n"
-               "    initial t(ev);\n"
-               "endmodule\n";
-    };
-    for (const std::string_view dir : { "", "input ", "output ", "inout ", "ref " }) {
-        CHECK(reject(with_dir(dir)).find("an event subroutine argument is not supported") !=
-              std::string::npos);
+// An event is a 64-bit handle (docs/design/event-handles.md), so it passes like any
+// other scalar in every direction. LRM 15.5.5's own example is a task that triggers
+// the caller's event through an `input` formal; `ref` retargets the caller's
+// variable, as it does for a class handle.
+TEST_CASE("an event passes as a subroutine argument in every direction") {
+    SUBCASE("input: the callee triggers the caller's event") {
+        CHECK(run_capture(R"(
+            module m;
+              event e; int n = 0;
+              task automatic fire(event x); -> x; endtask
+              initial forever begin @(e); n++; end
+              initial begin #1 fire(e); #1 fire(e); #1 $display("n=%0d", n); end
+            endmodule
+        )") == "n=2\n");
     }
+    SUBCASE("ref: the callee retargets the caller's variable") {
+        CHECK(run_capture(R"(
+            module m;
+              event a, b; int nb = 0;
+              task automatic point_at_b(ref event x); x = b; endtask
+              initial forever begin @(b); nb++; end
+              initial begin point_at_b(a); #1 -> a; #1 $display("nb=%0d", nb); end
+            endmodule
+        )") == "nb=1\n");
+    }
+    SUBCASE("output: the callee hands back a binding") {
+        CHECK(run_capture(R"(
+            module m;
+              event src, got; int n = 0;
+              task automatic give(output event x); x = src; endtask
+              initial forever begin @(src); n++; end
+              initial begin give(got); #1 -> got; #1 $display("n=%0d", n); end
+            endmodule
+        )") == "n=1\n");
+    }
+}
+
+// The one event-argument form still missing: a WaitEdge names a signal, and an
+// event held in a call frame has none. Triggering through a formal works.
+TEST_CASE("waiting on an event held in a subroutine argument is rejected") {
+    CHECK(reject("module m;\n"
+                 "    event e;\n"
+                 "    task automatic w(event x); @(x); endtask\n"
+                 "    initial w(e);\n"
+                 "endmodule\n")
+            .find("waiting on an event held in a subroutine argument") != std::string::npos);
 }
 
 // A packed bit/part-select is not a whole slot, so it is not a legal ref actual —
