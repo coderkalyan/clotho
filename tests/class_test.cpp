@@ -1538,3 +1538,314 @@ TEST_CASE("virtual dispatch reaches an out-of-block `extern virtual` body") {
     )";
     CHECK(run_capture(src) == "2 7\nabs show\n2 7\nleaf show\n");
 }
+
+// -- Runtime type identity and `$cast` (LRM 6.24.2 / 8.16) --
+
+// The object body carries a class-descriptor pointer at field 0 in EVERY class,
+// not only a polymorphic one. It has to be uniform across a hierarchy: prefix
+// layout puts the base's properties first so an upcast is the same pointer at the
+// same offsets, and a base laid out without the header while its derived class
+// has one shifts every inherited property by a word. Whether some derived class
+// introduces a virtual method is not a property of the base being laid out, so
+// the header cannot be conditioned on it. Reading `a.x` here through the base
+// handle used to return the low half of the vtable pointer.
+TEST_CASE("a plain base of a polymorphic class keeps its property offsets") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A;
+                int x;
+                function new(); x = 7; endfunction
+            endclass
+            class B extends A;
+                virtual function int f(); return 42; endfunction
+            endclass
+            initial begin
+                B b = new;
+                A a = b;
+                $display("%0d %0d %0d", b.x, a.x, b.f());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "7 7 42\n");
+}
+
+// LRM 8.16 case 2, the only case that needs a run-time test: the destination
+// descends from the source's static type, so the object's own class decides. A
+// hit assigns and answers 1; a miss leaves the destination alone and answers 0.
+TEST_CASE("$cast: down-cast succeeds on the object's own class") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A; int x; endclass
+            class B extends A; int y; endclass
+            class C extends A; int z; endclass
+            initial begin
+                A a; B b; C c; int r;
+                b = new; b.x = 1; b.y = 2;
+                a = b;
+                r = $cast(b, a);
+                $display("%0d %0d %0d", r, b.x, b.y);
+                c = new; c.z = 9;
+                r = $cast(c, a);
+                $display("%0d %0d", r, c.z);
+            end
+        endmodule
+    )";
+    // The sibling cast fails and leaves `c` pointing at its own object.
+    CHECK(run_capture(src) == "1 1 2\n0 9\n");
+}
+
+// The test is an ancestor test, not an equality test: a grandchild satisfies a
+// cast to the middle class, and the exact class satisfies its own.
+TEST_CASE("$cast: a down-cast accepts any descendant of the destination") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A; endclass
+            class B extends A; int y; endclass
+            class D extends B; int w; endclass
+            initial begin
+                A a; B b; D d; int r;
+                d = new; d.w = 5; d.y = 3;
+                a = d;
+                r = $cast(b, a);
+                $display("%0d %0d", r, b.y);
+                r = $cast(d, a);
+                $display("%0d %0d", r, d.w);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 3\n1 5\n");
+}
+
+// LRM 8.16 case 1 (the destination is the source's class or an ancestor of it)
+// and case 3 (the literal `null`) cannot fail, so they lower to a plain
+// assignment and a constant 1 with no run-time test at all.
+TEST_CASE("$cast: an up-cast, a same-type cast and a literal null always succeed") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A; int x; endclass
+            class B extends A; endclass
+            initial begin
+                A a; B b; B b2; int r;
+                b = new; b.x = 4;
+                r = $cast(a, b);
+                $display("%0d %0d", r, a.x);
+                r = $cast(b2, b);
+                $display("%0d %0d", r, b2.x);
+                r = $cast(b2, null);
+                $display("%0d %0d", r, b2 == null);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 4\n1 4\n1 1\n");
+}
+
+// A source that is null at run time, in a cast-compatible pair, succeeds and
+// assigns null. LRM 8.16 is ambiguous here -- case 2 wants "an object that is
+// assignment compatible", which null is not, but the closing sentence forces
+// failure on a null source only "when the source and destination types are not
+// cast compatible", a qualification that would be redundant if every run-time
+// null failed. iverilog does not implement $cast at all so it is no oracle;
+// Verilator answers 1 and assigns null, which is what this pins.
+TEST_CASE("$cast: a run-time null source assigns null and succeeds") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A; endclass
+            class B extends A; endclass
+            initial begin
+                A a; B b; int r;
+                b = new;
+                a = null;
+                r = $cast(b, a);
+                $display("%0d %0d", r, b == null);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 1\n");
+}
+
+// Two classes in unrelated hierarchies: no object can satisfy the cast, so it is
+// a compile-time constant 0 that leaves the destination untouched. Single
+// inheritance is what makes that conclusive.
+TEST_CASE("$cast: unrelated class types always fail") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A; endclass
+            class Z; int q; endclass
+            initial begin
+                A a; Z z; int r;
+                a = new;
+                z = new; z.q = 6;
+                r = $cast(z, a);
+                $display("%0d %0d", r, z.q);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 6\n");
+}
+
+// The cast yields a handle to the same object, so a virtual call through it
+// still dispatches on the concrete class, and the properties are the ones the
+// object already had.
+TEST_CASE("$cast: the cast handle shares the object") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A;
+                int x;
+                virtual function int who(); return 1; endfunction
+            endclass
+            class B extends A;
+                virtual function int who(); return 2; endfunction
+            endclass
+            initial begin
+                A a; B b;
+                b = new; b.x = 8;
+                a = b;
+                b = null;
+                if (!$cast(b, a)) $display("cast failed");
+                b.x = 9;
+                $display("%0d %0d %0d", b.who(), a.x, a == b);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 9 1\n");
+}
+
+// A hierarchy with no virtual method at all still carries type identity, so the
+// down-cast works there too -- and the shallow copy of such a hierarchy no longer
+// slices, which `$cast` is what makes observable (LRM 8.12 copies the source's
+// own class, not the static type of the expression).
+TEST_CASE("$cast: a hierarchy with no virtual method") {
+    constexpr std::string_view src = R"(
+        module m;
+            class P; int x; endclass
+            class Q extends P; int y; endclass
+            initial begin
+                P p; Q q; int r;
+                q = new; q.x = 3; q.y = 4;
+                p = q;
+                r = $cast(q, p);
+                $display("%0d %0d %0d", r, q.x, q.y);
+                p = new q;
+                r = $cast(q, p);
+                $display("%0d %0d %0d", r, q.x, q.y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 3 4\n1 3 4\n");
+}
+
+// Two specializations of one generic class are distinct types (LRM 8.25), and
+// each gets its own id: neither casts into the other.
+TEST_CASE("$cast: parameterized specializations are distinct types") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Base; endclass
+            class C #(int N = 0) extends Base; int n = N; endclass
+            initial begin
+                Base b; C#(1) c1; C#(2) c2; int r;
+                c1 = new;
+                b  = c1;
+                r  = $cast(c2, b);
+                $display("%0d", r);
+                r = $cast(c1, b);
+                $display("%0d %0d", r, c1.n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0\n1 1\n");
+}
+
+// LRM 6.24.2: called as a task, an invalid assignment is a run-time error and
+// the destination is left unchanged. Out of process because the report ends the
+// run. The function form of the same cast reports nothing and answers 0.
+TEST_CASE("$cast: the task form of a failed cast is a run-time error") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    class A; endclass\n"
+                                     "    class B extends A; endclass\n"
+                                     "    initial begin\n"
+                                     "        A a; B b;\n"
+                                     "        a = new;\n"
+                                     "        $display(\"before\");\n"
+                                     "        $cast(b, a);\n"
+                                     "        $display(\"after\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(run.out.find("before\n") != std::string::npos);
+    CHECK(run.out.find("after") == std::string::npos);
+    CHECK(run.err.find("$cast: the source is not assignment compatible with the destination") != std::string::npos);
+    CHECK(run.err.find("source:8") != std::string::npos);
+}
+
+// A task-form cast that succeeds reports nothing and runs on.
+TEST_CASE("$cast: the task form of a successful cast is silent") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A; endclass
+            class B extends A; int y; endclass
+            initial begin
+                A a; B b;
+                b = new; b.y = 5;
+                a = b;
+                b = null;
+                $cast(b, a);
+                $display("%0d", b.y);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "5\n");
+}
+
+// A class id is design-wide, keyed on the slang ClassType, not on the lowered
+// Ref. It has to be: a package-scope class is lowered once per Lowerer -- the
+// shared `globals` one that owns the package function's body, and each top that
+// names the class -- so one class is several nominal Refs with several
+// descriptors. Comparing ids rather than descriptor addresses is what lets an
+// object the package function allocated cast correctly inside either top.
+TEST_CASE("$cast: a package class crosses tops and Lowerers") {
+    constexpr std::string_view src = R"(
+        package p;
+            class A; int x; endclass
+            class B extends A; int y; endclass
+            function automatic A make();
+                B b = new;
+                b.x = 1;
+                b.y = 2;
+                return b;
+            endfunction
+        endpackage
+        module t1;
+            import p::*;
+            initial begin
+                A a; B b;
+                a = make();
+                $display("t1 %0d %0d", $cast(b, a), b.y);
+            end
+        endmodule
+        module t2;
+            import p::*;
+            initial begin
+                A a; B b;
+                #1;
+                a = make();
+                $display("t2 %0d %0d", $cast(b, a), b.x);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "t1 1 2\nt2 1 1\n");
+}
+
+// The ancestor display a cast reads is one fixed width for every class, so a
+// chain deeper than it has nowhere to record its ancestors. Refused loudly
+// rather than silently answering the wrong thing.
+TEST_CASE("an inheritance chain deeper than the display is refused") {
+    std::string src = "module m;\n    class C0; endclass\n";
+    for (int k = 1; k <= 16; ++k) {
+        src += "    class C" + std::to_string(k) + " extends C" + std::to_string(k - 1) + "; endclass\n";
+    }
+    src += "    initial begin C16 d; d = new; end\nendmodule\n";
+
+    CHECK(fails(src).find("deeper than 16 levels") != std::string::npos);
+}

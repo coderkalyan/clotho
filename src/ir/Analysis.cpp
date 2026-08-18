@@ -195,6 +195,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::DeferFlush:
         case Inst::Tag::ClassNew:
         case Inst::Tag::HandleDeref:
+        case Inst::Tag::ClassIsA:
         case Inst::Tag::DynArrayNew:
         case Inst::Tag::DynArrayNewInit:
         case Inst::Tag::DynArraySize:
@@ -995,6 +996,12 @@ struct ValueSweep {
                     val_z[raw] = 0;
                     val_x[raw] = 0;
                     break;
+                case Inst::Tag::ClassIsA:
+                    // A definite 1-bit answer: the test reads a compile-time
+                    // constant table through the object's descriptor.
+                    val_z[raw] = 0;
+                    val_x[raw] = 0;
+                    break;
                 case Inst::Tag::HandleDeref:
                     // An aggregate lvalue rooted at the heap object body, whose
                     // 4-state property leaves keep their own planes; report
@@ -1656,7 +1663,7 @@ DesignFacts analyze(const Module& m) {
             }
             slot_needs[slot][k] = slot_needs[slot][k] || v;
         };
-        for (const Vtable& vt : m.vtables()) {
+        for (const ClassDesc& vt : m.class_descs()) {
             for (size_t slot = 0; slot < vt.slots.size(); ++slot) {
                 const auto      fid = static_cast<uint32_t>(vt.slots[slot]);
                 const Function& f   = m.function(vt.slots[slot]);
@@ -1665,7 +1672,7 @@ DesignFacts analyze(const Module& m) {
                 }
             }
         }
-        for (const Vtable& vt : m.vtables()) {
+        for (const ClassDesc& vt : m.class_descs()) {
             for (size_t slot = 0; slot < vt.slots.size(); ++slot) {
                 const auto      fid = static_cast<uint32_t>(vt.slots[slot]);
                 const Function& f   = m.function(vt.slots[slot]);

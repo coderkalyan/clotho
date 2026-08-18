@@ -1153,13 +1153,11 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   / queue / dynamic array / associative array property deep-copies, a class-handle
   property copies as a handle, so the copy and the source share what they point at
   (8.12: "objects, however, are not copied, only their handles"). The object
-  allocated is of the SOURCE's class, not the expression's static type: a
-  polymorphic class carries a synthesized copy thunk in a reserved vtable slot
+  allocated is of the SOURCE's class, not the expression's static type: every
+  class carries a synthesized copy thunk in a reserved descriptor slot
   (`kCopySlot`), so `new base_handle` dispatches to the concrete class and allocates
   its size (iverilog 13 asserts on the polymorphic case, so it cannot cover
-  this). A null source is the usual located fatal. Non-polymorphic hierarchies
-  copy the static type inline and therefore slice a derived source —
-  unobservable without `$cast`. Randomization state (8.12 step 2)
+  this). A null source is the usual located fatal. Randomization state (8.12 step 2)
   is moot: `rand`/`randc` properties and covergroups are refused upstream.
 - [x] **Null-handle dereference is a located fatal** (LRM 8.4) — accessing a
   non-static property, or dispatching a virtual method, through a handle that
@@ -1269,10 +1267,9 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 ### Full object orientation
 
 - [~] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
-  landed. A polymorphic class (one with a virtual method in its hierarchy) carries
-  a vtable pointer at object-body field 0 (`class_body_ty`; non-polymorphic classes
-  keep the headerless body); each class registers a per-concrete-type dispatch
-  table (`Module::set_vtable`) whose slots are keyed by method NAME per hierarchy
+  landed. Every class carries a descriptor pointer at object-body field 0
+  (`class_body_ty`); each class registers a per-concrete-type dispatch
+  table (`Module::set_class_desc`) whose slots are keyed by method NAME per hierarchy
   (base virtuals 0..k-1, an override — implicit or of a pure prototype — reuses the
   base slot of the same name, a new virtual appends, `compute_vtable` in Lower.cpp).
   A virtual call through a handle lowers to the new `CallVirtual` IR op (loads the
@@ -1341,16 +1338,23 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   LRM 8.24) work, in a module or a package scope, for functions, tasks, `static`
   methods, `new`, and `virtual` (see Polymorphism above). Remaining: nested classes
   and `::` on parameterized specializations.
-- [~] **`$cast`** (LRM 6.24.2 / 8.16) — Tier 1 (numeric + enum destinations) done:
-  a numeric `$cast` converts and always succeeds (returns 1); an enum `$cast`
-  succeeds (assigns + returns 1) only if the source is a legal member value
-  (runtime `===` membership over `enum_members`), else returns 0 and leaves the
-  destination unchanged. Function form returns the 1/0; the bare task form shares
-  the same conditional-assign logic (result discarded). Both dispatch in
-  `lower_sysfunc`. Deferred (guarded loud): **class-handle dynamic down-cast**
-  (Tier 2 — needs a runtime per-object type identity; the vtable pointer is
-  half of it) and the **task-form runtime fatal** on a failed cast (only a
-  bare-statement enum/class `$cast` that actually fails observes it).
+- [x] **`$cast`** (LRM 6.24.2 / 8.16) — all destinations. A numeric `$cast`
+  converts and always succeeds (returns 1); an enum `$cast` succeeds only if the
+  source is a legal member value (runtime `===` membership over `enum_members`);
+  a class-handle `$cast` is the dynamic down-cast. Every class carries a
+  descriptor pointer at object-body field 0 whose **ancestor display** (Cohen's
+  display, `display[depth] == id`, one load and one compare, ids unique but
+  unordered so nothing needs a whole-design numbering pass) answers the test. Only
+  LRM 8.16 case 2 reaches run time: a cast to the source's own class or an
+  ancestor of it, and a literal `null` source, always succeed; two unrelated class
+  types always fail. A source that is null at run time succeeds and assigns null
+  (8.16 is ambiguous; the reading is recorded at `lower_cast` and in
+  docs/design/classes.md). The function form returns the 1/0; the task form
+  reports a run-time error on failure, for an enum destination as well. All of it
+  dispatches through `lower_cast`. Deferred: a `chandle` destination (guarded
+  loud — a chandle carries no type identity), and a destination or source that is
+  an **interface class** (`implements` is itself unimplemented; the descriptor
+  needs an implemented-interface set beside the display).
 
 ### Constrained randomization
 

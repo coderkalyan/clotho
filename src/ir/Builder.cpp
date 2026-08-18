@@ -215,6 +215,10 @@ Index Builder::handle_deref(Index handle, Ref class_type, SourceLoc loc) {
     return emit({ Inst::Tag::HandleDeref, Inst::Payload{ .op_type = { handle, class_type } } }, loc);
 }
 
+Index Builder::class_is_a(Index handle, Ref class_type, SourceLoc loc) {
+    return emit({ Inst::Tag::ClassIsA, Inst::Payload{ .op_type = { handle, class_type } } }, loc);
+}
+
 Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
     const ExtraIndex extra = add_extra(AggCopyInfo{ src, type });
 

@@ -114,6 +114,10 @@ public:
     // object body. `handle` is the loaded handle value; `class_type` the Kind::Class
     // giving the body layout. A following member_select addresses a property.
     Index handle_deref(Index handle, Ref class_type, SourceLoc loc);
+    // `$cast` dynamic type test (LRM 8.16): 1 when the object `handle` refers to
+    // is of `class_type` or of a class derived from it, else 0. A null handle
+    // answers 1; the frontend emits this only for a cast-compatible pair.
+    Index class_is_a(Index handle, Ref class_type, SourceLoc loc);
     // Whole-object blocking copy `dst = src` of two aggregate lvalues of `type`
     // (lowered to llvm.memcpy of the storage; caller ensures no string leaf).
     Index agg_copy(Index dst, Index src, Ref type, SourceLoc loc);

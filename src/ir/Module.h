@@ -584,11 +584,25 @@ struct DpiExport {
     DpiCType              ret_ctype;
 };
 
-// A polymorphic class's virtual-dispatch table (LRM 8.20): slots[k] is the
-// FunctionId of the override occupying vtable slot k for this concrete class.
-struct Vtable {
-    Ref                     class_ref;
+// Deepest inheritance chain a class may have (LRM 8.13 puts no limit on it).
+// Every class descriptor carries a fixed-width ancestor display, so the depth of
+// the destination class is a constant offset at a `$cast` site; the width has to
+// be one design-wide constant for that offset to be independent of the object's
+// own class. Exceeding it is a loud frontend failure.
+inline constexpr uint32_t kMaxClassDepth = 16;
+
+// A class's runtime descriptor: its virtual-dispatch table (LRM 8.20) plus the
+// type identity a dynamic `$cast` tests (LRM 8.16). Every class has one, so an
+// object body always carries a descriptor pointer at field 0.
+struct ClassDesc {
+    Ref class_ref;
+    // slots[k] is the FunctionId of the override occupying vtable slot k for this
+    // concrete class.
     std::vector<FunctionId> slots;
+    // Design-wide unique id of this class, never 0. Ids are unique and nothing
+    // more -- no order, no density -- so minting one needs no knowledge of any
+    // class but this one. See docs/design/classes.md.
+    uint32_t type_id;
 };
 
 class Module {
@@ -696,28 +710,29 @@ public:
         return tops_;
     }
 
-    // Register the virtual-dispatch table of a polymorphic class (LRM 8.20):
-    // slots[k] is the FunctionId of the override occupying vtable slot k for this
-    // concrete class. Only polymorphic classes (those with a virtual method) get an
-    // entry; a class with no entry carries no vtable pointer in its object body.
-    void set_vtable(Ref class_ref, std::vector<FunctionId> slots) {
-        vtables_.push_back({ class_ref, std::move(slots) });
+    // Register a class's runtime descriptor. Every class has one: the slots drive
+    // virtual dispatch (LRM 8.20) and `type_id` plus the base chain give the
+    // ancestor display a dynamic `$cast` tests (LRM 8.16).
+    void set_class_desc(Ref class_ref, std::vector<FunctionId> slots, uint32_t type_id) {
+        class_descs_.push_back({ class_ref, std::move(slots), type_id });
     }
 
-    // The vtable for a class type, or null if the class is non-polymorphic.
-    const Vtable* vtable_for(Ref class_ref) const {
-        for (const Vtable& vt : vtables_) {
-            if (vt.class_ref == class_ref) {
-                return &vt;
+    // The descriptor of a class type, or null when the type has not been lowered
+    // as a class (every lowered class registers one).
+    const ClassDesc* class_desc(Ref class_ref) const {
+        for (const ClassDesc& cd : class_descs_) {
+            if (cd.class_ref == class_ref) {
+                return &cd;
             }
         }
         return nullptr;
     }
 
-    // Every registered vtable. Whole-design analyses need the slot layout to reason
-    // about virtual dispatch, which can reach any function occupying a slot.
-    [[nodiscard]] std::span<const Vtable> vtables() const {
-        return vtables_;
+    // Every registered class descriptor. Whole-design analyses need the slot
+    // layout to reason about virtual dispatch, which can reach any function
+    // occupying a slot.
+    [[nodiscard]] std::span<const ClassDesc> class_descs() const {
+        return class_descs_;
     }
 
 private:
@@ -731,8 +746,8 @@ private:
     std::deque<Function> functions_;
     // Instance hierarchy, one scope tree per top-level module.
     std::vector<InstanceScope> tops_;
-    // Virtual-dispatch tables, one per polymorphic class (LRM 8.20).
-    std::vector<Vtable> vtables_;
+    // Class descriptors, one per lowered class.
+    std::vector<ClassDesc> class_descs_;
     // Next InstanceScope::id (see alloc_scope_id).
     uint32_t next_scope_id_ = 0;
 };

@@ -1019,6 +1019,19 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
 using InferredClockMap =
   ankerl::unordered_dense::map<const slang::syntax::SyntaxNode*, const slang::syntax::SyntaxNode*>;
 
+// Design-wide class type ids (LRM 8.16). One id per slang ClassType, minted on
+// demand: a `$cast` compares ids, so the same class reached through two Lowerers
+// -- which intern it as two nominal Refs (see class_type_cache_) -- must still
+// answer with one id. Nothing orders or packs the ids, so minting one needs no
+// view of the design beyond the class itself.
+struct ClassIds {
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, uint32_t> ids;
+    // 0 is reserved: it is the display padding past a class's own depth and the
+    // reading a null handle's stand-in object gives, both of which must match no
+    // class at all.
+    uint32_t next = 1;
+};
+
 // Walks the elaborated AST of one top module into an ir::Module.
 class Lowerer {
 public:
@@ -1224,6 +1237,12 @@ public:
     // `clocks` must outlive every call made through this Lowerer.
     void set_inferred_clocks(const InferredClockMap* clocks) {
         inferred_clocks_ = clocks;
+    }
+
+    // Point this Lowerer at the design-wide class id table. `ids` must outlive
+    // every call made through this Lowerer.
+    void set_class_ids(ClassIds* ids) {
+        class_ids_ = ids;
     }
 
     // Diagnostics for members this Lowerer recovered past, and whether it did so
@@ -2227,9 +2246,8 @@ private:
         }
         module_.pool.set_struct_fields(fid, std::move(fields));
 
-        // Virtual dispatch (LRM 8.20): assign vtable slots and build the concrete
-        // dispatch table for a polymorphic class (one with a virtual method in its
-        // hierarchy). Non-polymorphic classes get no vtable (no object-body header).
+        // Build the class's runtime descriptor: its dispatch table (LRM 8.20) and
+        // its type identity (LRM 8.16). Every class gets one.
         compute_vtable(clt, ref);
 
         return ref;
@@ -2247,6 +2265,31 @@ private:
                                              : nullptr;
     }
 
+    // Design-wide id of a class, minted on first sight. Ids are unique and nothing
+    // more, so this needs to know about no other class -- see docs/design/classes.md
+    // on why the alternative, a dense pre-order numbering of the whole inheritance
+    // forest, was rejected. The map is shared by every Lowerer: one ClassType has one
+    // id even when two tops intern it into two nominal Refs.
+    uint32_t class_type_id(const slang::ast::ClassType& clt) {
+        const auto it = class_ids_->ids.find(&clt);
+        if (it != class_ids_->ids.end()) {
+            return it->second;
+        }
+        // The display a $cast reads is indexed by the destination's depth and is one
+        // fixed width for every class, so a chain deeper than that width has nowhere
+        // to record its ancestors.
+        uint32_t depth = 0;
+        for (const slang::ast::ClassType* k = base_class_of(clt); k != nullptr; k = base_class_of(*k)) {
+            ++depth;
+        }
+        if (depth >= ir::kMaxClassDepth) {
+            fail("class inheritance deeper than " + std::to_string(ir::kMaxClassDepth) + " levels is not supported");
+        }
+        const uint32_t id = class_ids_->next++;
+        class_ids_->ids.emplace(&clt, id);
+        return id;
+    }
+
     // The pure-virtual prototype named `name` reachable in `clt`'s hierarchy (LRM
     // 8.21), or null. Used to build a stub for an abstract class's un-overridden
     // slot.
@@ -2262,7 +2305,7 @@ private:
         return nullptr;
     }
 
-    // Assign vtable slots and register the dispatch table of a class (LRM 8.20/8.21).
+    // Assign vtable slots and register the descriptor of a class (LRM 8.16/8.20/8.21).
     // Slots are keyed by method NAME per hierarchy (a base's virtuals take slots
     // 0..k-1; an override — including an implicit one, or the override of a pure
     // prototype whose `getOverride()` slang leaves null — reuses the base slot of the
@@ -2290,20 +2333,15 @@ private:
                 slots.emplace(p.name, size++);
             }
         }
-        // A polymorphic class also carries a shallow-copy thunk (LRM 8.12), so
-        // `new src` through a base-typed handle allocates the source's own class.
-        // The slot lives in the same name-keyed map under a name no method can have,
-        // so it inherits down the hierarchy like any other slot and a derived class's
-        // own virtuals number after it. Reserved only when the class already has a
-        // vtable: giving one to a non-polymorphic class would add an object-body
-        // header word to every class in the language.
-        if (size != 0 && !slots.contains(kCopySlot)) {
+        // Every class also carries a shallow-copy thunk (LRM 8.12), so `new src`
+        // through a base-typed handle allocates the source's own class. The slot
+        // lives in the same name-keyed map under a name no method can have, so it
+        // inherits down the hierarchy like any other slot and a derived class's own
+        // virtuals number after it.
+        if (!slots.contains(kCopySlot)) {
             slots.emplace(kCopySlot, size++);
         }
         class_vslot_[&clt] = slots;
-        if (size == 0) {
-            return; // non-polymorphic: no vtable, no object-body header
-        }
         // Fill each slot with the most-derived body of that name (an override is an
         // override regardless of its own `virtual` keyword — match by name).
         std::vector<ir::FunctionId> table(size);
@@ -2354,7 +2392,7 @@ private:
             }
             table[s] = pure_stub_id(*proto);
         }
-        module_.set_vtable(class_ref, std::move(table));
+        module_.set_class_desc(class_ref, std::move(table), class_type_id(clt));
     }
 
     // The FunctionId of the never-executed stub for a pure virtual prototype (its
@@ -14945,10 +14983,9 @@ private:
             return;
         }
         if (name == "$cast") {
-            // Task form (LRM 6.24.2): performs the conditional assignment; the
-            // success result is discarded (the failed-cast runtime fatal is a
-            // documented follow-up — see lower_sysfunc). Shares the function logic.
-            (void)lower_sysfunc(call, b);
+            // Task form (LRM 6.24.2): the same conditional assignment, but a failed
+            // cast is a run-time error rather than a 0 the caller reads.
+            (void)lower_cast(call, b, /*task_form=*/true);
             return;
         }
         if (is_assert_control_task(name)) {
@@ -15556,6 +15593,118 @@ private:
         return b.resize(b.count_bits(val, mask, l), lower_type(*call.type), l);
     }
 
+    // A failed $cast called as a task is a run-time error (LRM 6.24.2), reported
+    // and terminated through the same severity + finish pair `$fatal` uses. The
+    // function form never reports: it answers 0.
+    void emit_cast_fatal(const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+        const std::string banner = banner_at(call.sourceRange.start());
+        b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
+                   banner,
+                   "$cast: the source is not assignment compatible with the destination",
+                   {},
+                   l);
+        b.finish(banner + "$cast", 1, l);
+    }
+
+    // The same report, taken only when the run-time test said the cast failed.
+    void emit_cast_fatal_unless(ir::Index valid, const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Index failed = b.unary(ir::Inst::Tag::Lnot, valid, l);
+        b.open_region();
+        emit_cast_fatal(call, b, l);
+        const ir::ExtraSlice then_region = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_region = b.close_region();
+        b.cond(failed, then_region, else_region, l, /*unlikely=*/true);
+    }
+
+    // $cast(dest, source) (LRM 6.24.2 / 8.16): a dynamic, run-time-checked cast.
+    // Assigns and answers 1 on success; on failure the destination keeps its value
+    // and the function form answers 0 while the task form (`task_form`) reports a
+    // run-time error.
+    //
+    // The destination's type picks the test. A numeric destination always succeeds.
+    // An enum destination succeeds only for a legal member value. A class
+    // destination is the dynamic down-cast, whose three success cases LRM 8.16
+    // spells out; two of them are decided here, at compile time.
+    ir::Index lower_cast(const CallExpression& call, ir::Builder& b, bool task_form) {
+        const ir::SourceLoc l = loc(call);
+        if (call.arguments().size() != 2) {
+            fail("$cast expects exactly two arguments");
+        }
+        const Expression&       dest_expr = *call.arguments()[0];
+        const Expression&       src_expr  = *call.arguments()[1];
+        const slang::ast::Type& dt        = dest_expr.type->getCanonicalType();
+        const slang::ast::Type& st        = src_expr.type->getCanonicalType();
+        if (dt.isCHandle()) {
+            // TODO: $cast to a chandle (LRM 6.14). A chandle carries no type
+            // identity at all -- it is an opaque pointer from foreign code -- so
+            // there is nothing to check it against.
+            fail("$cast of a chandle is not supported");
+        }
+        const ir::Ref   int_ty  = lower_type(*call.type);
+        const ir::Index int1    = b.constant(svint_to_ref(slang::SVInt(32, 1, true), int_ty), l);
+        const ir::Index int0    = b.constant(svint_to_ref(slang::SVInt(32, 0, true), int_ty), l);
+        const ir::Ref   dest_ty = lower_type(*dest_expr.type);
+        const ir::Index dst     = lower_lvalue(dest_expr, b);
+        if (dt.isClass()) {
+            // The source is evaluated whatever the verdict: it is an expression and
+            // may have side effects.
+            const ir::Index src = lower_expr(src_expr, b);
+            // Case 1 (the destination is the source's own class or an ancestor of
+            // it) and case 3 (the source is the literal `null`) are static: the cast
+            // cannot fail, so it is a plain assignment. isAssignmentCompatible
+            // answers both -- slang types the null literal as `null`, which is
+            // assignment compatible with every class handle.
+            if (dt.isAssignmentCompatible(st)) {
+                b.binary(ir::Inst::Tag::Store, dst, coerce(src, st, dest_ty, b, l), l);
+                return int1;
+            }
+            // Neither direction relates the two types, so no object can satisfy the
+            // cast: it always fails, and slang has already warned (DynamicCastConst).
+            // Single inheritance is what makes this conclusive -- with two bases a
+            // common descendant could satisfy both.
+            if (!st.isClass() || !st.isAssignmentCompatible(dt)) {
+                if (task_form) {
+                    emit_cast_fatal(call, b, l);
+                }
+                return int0;
+            }
+            // Case 2: the destination descends from the source's static type, so
+            // only the object's own class decides. Assign on success, keep the
+            // current value on failure.
+            const ir::Index valid = b.class_is_a(src, dest_ty, l);
+            const ir::Index cur   = b.unary(ir::Inst::Tag::Load, dst, l);
+            b.binary(ir::Inst::Tag::Store, dst, b.select(valid, src, cur, l), l);
+            if (task_form) {
+                emit_cast_fatal_unless(valid, call, b, l);
+            }
+            return b.select(valid, int1, int0, l);
+        }
+        const ir::Index conv = coerce(lower_expr(src_expr, b), *src_expr.type, dest_ty, b, l);
+        const ir::Ref   bit1 = make_int_type(1, false, false);
+        if (const auto* et = dt.as_if<slang::ast::EnumType>()) {
+            // Enum destination (LRM 6.19.3): succeed only if the value is a legal
+            // member. valid = OR over members of (conv === member).
+            ir::Index       valid = b.constant(module_.pool.put_int(bit1, 0), l);
+            const ir::Index one   = b.constant(module_.pool.put_int(bit1, 1), l);
+            for (const EnumMember& m : enum_members(*et)) {
+                const ir::Index mc = b.constant(svint_to_ref(m.value, dest_ty), l);
+                const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, conv, mc, l);
+                valid              = b.select(eq, one, valid, l);
+            }
+            // Assign the value on success; keep the current dest on failure.
+            const ir::Index cur = b.unary(ir::Inst::Tag::Load, dst, l);
+            b.binary(ir::Inst::Tag::Store, dst, b.select(valid, conv, cur, l), l);
+            if (task_form) {
+                emit_cast_fatal_unless(valid, call, b, l);
+            }
+            return b.select(valid, int1, int0, l);
+        }
+        // Numeric destination: a value cast always succeeds (LRM 6.24.2).
+        b.binary(ir::Inst::Tag::Store, dst, conv, l);
+        return int1;
+    }
+
     // Lower a system function call used as an rvalue (e.g. `$time`). User function
     // calls are not yet supported.
     ir::Index lower_sysfunc(const CallExpression& call, ir::Builder& b) {
@@ -15858,50 +16007,8 @@ private:
             return b.constant(string_value_ref(format_typename(*call.arguments()[0]->type)), l);
         }
 
-        // $cast(dest, source) (LRM 6.24.2 / 8.16): a dynamic, run-time-checked cast.
-        // Returns 1 and assigns on success, else returns 0 and leaves dest unchanged.
-        // Tier 1: numeric and enum destinations (a class-handle down-cast needs a
-        // runtime type identity — Tier 2, guarded below). The task-form runtime
-        // fatal on a failed cast is a documented follow-up (only a bare-statement
-        // enum/class $cast that actually fails would observe it; the sv-tests and
-        // the common `if(!$cast(...))` function form do not).
         if (name == "$cast") {
-            if (call.arguments().size() != 2) {
-                fail("$cast expects exactly two arguments");
-            }
-            const Expression&       dest_expr = *call.arguments()[0];
-            const Expression&       src_expr  = *call.arguments()[1];
-            const slang::ast::Type& dt        = dest_expr.type->getCanonicalType();
-            if (dt.isClass() || dt.isCHandle()) {
-                // TODO: $cast of a class handle (dynamic down-cast) — needs a runtime
-                // per-object type identity (Tier 2).
-                fail("$cast of a class handle is not supported");
-            }
-            const ir::Ref   dest_ty = lower_type(*dest_expr.type);
-            const ir::Index dst     = lower_lvalue(dest_expr, b);
-            const ir::Index conv    = coerce(lower_expr(src_expr, b), *src_expr.type, dest_ty, b, l);
-            const ir::Ref   bit1    = make_int_type(1, false, false);
-            if (const auto* et = dt.as_if<slang::ast::EnumType>()) {
-                // Enum destination (LRM 6.19.3): succeed only if the value is a legal
-                // member. valid = OR over members of (conv === member).
-                ir::Index       valid = b.constant(module_.pool.put_int(bit1, 0), l);
-                const ir::Index one   = b.constant(module_.pool.put_int(bit1, 1), l);
-                for (const EnumMember& m : enum_members(*et)) {
-                    const ir::Index mc = b.constant(svint_to_ref(m.value, dest_ty), l);
-                    const ir::Index eq = b.binary(ir::Inst::Tag::CaseEq, conv, mc, l);
-                    valid              = b.select(eq, one, valid, l);
-                }
-                // Assign the value on success; keep the current dest on failure.
-                const ir::Index cur = b.unary(ir::Inst::Tag::Load, dst, l);
-                b.binary(ir::Inst::Tag::Store, dst, b.select(valid, conv, cur, l), l);
-                const ir::Ref   int_ty = lower_type(*call.type);
-                const ir::Index int1   = b.constant(svint_to_ref(slang::SVInt(32, 1, true), int_ty), l);
-                const ir::Index int0   = b.constant(svint_to_ref(slang::SVInt(32, 0, true), int_ty), l);
-                return b.select(valid, int1, int0, l);
-            }
-            // Numeric destination: a value cast always succeeds (LRM 6.24.2).
-            b.binary(ir::Inst::Tag::Store, dst, conv, l);
-            return b.constant(svint_to_ref(slang::SVInt(32, 1, true), lower_type(*call.type)), l);
+            return lower_cast(call, b, /*task_form=*/false);
         }
 
         // $fopen (LRM §21.3): one argument opens a multichannel descriptor (MCD)
@@ -21715,25 +21822,18 @@ private:
     //
     // The object allocated must be of the SOURCE's dynamic type, not of the
     // expression's static type: `new b` where `b` is a base-typed handle holding a
-    // derived object copies the derived object. For a polymorphic class that is
-    // observable through a virtual call on the copy, so the copy dispatches through
-    // the source's own vtable to its class's synthesized copy thunk. A
-    // non-polymorphic hierarchy has no dispatch to get wrong and no way to reach the
-    // sliced-off part (a derived handle needs $cast), so it copies the
-    // static type inline.
+    // derived object copies the derived object, which is observable through a
+    // virtual call on the copy and through a later `$cast` of it. So the copy
+    // dispatches through the source's own descriptor to its class's synthesized
+    // copy thunk, which allocates exactly its own class.
     ir::Index lower_copy_class(const slang::ast::CopyClassExpression& cc, ir::Builder& b) {
-        const ir::SourceLoc l         = loc(cc);
-        const auto&         clt       = cc.type->getCanonicalType().as<slang::ast::ClassType>();
-        const ir::Ref       class_ref = lower_type(*cc.type);
-        const ir::Index     src       = lower_expr(cc.sourceExpr(), b);
-        if (module_.vtable_for(class_ref) != nullptr) {
-            const ir::FunctionId sig  = copy_thunk_id(clt, class_ref);
-            const uint32_t       slot = class_vslot_.at(&clt).at(kCopySlot);
-            return b.call_virtual(sig, slot, class_ref, std::array<ir::Index, 1>{ src }, l);
-        }
-        const ir::Index dst = b.class_new(class_ref, l);
-        emit_class_body_copy(dst, src, class_ref, b, l);
-        return dst;
+        const ir::SourceLoc  l         = loc(cc);
+        const auto&          clt       = cc.type->getCanonicalType().as<slang::ast::ClassType>();
+        const ir::Ref        class_ref = lower_type(*cc.type);
+        const ir::Index      src       = lower_expr(cc.sourceExpr(), b);
+        const ir::FunctionId sig       = copy_thunk_id(clt, class_ref);
+        const uint32_t       slot      = class_vslot_.at(&clt).at(kCopySlot);
+        return b.call_virtual(sig, slot, class_ref, std::array<ir::Index, 1>{ src }, l);
     }
 
     // Copy every property of object `src` into object `dst`, both of class
@@ -22524,8 +22624,8 @@ private:
     // Class property symbol -> its declaration-order field index in the owning
     // class's property table (used to lower a member access to a MemberSelect).
     ankerl::unordered_dense::map<const slang::ast::Symbol*, uint32_t> class_prop_index_;
-    // Virtual dispatch (LRM 8.20/8.21). class_vslot_: a polymorphic class -> its
-    // method NAME -> vtable slot map (inheriting the base's numbering, extended with
+    // Virtual dispatch (LRM 8.20/8.21). class_vslot_: a class -> its method NAME ->
+    // vtable slot map (inheriting the base's numbering, extended with
     // the class's own virtuals). Name-keyed so a pure virtual (a
     // MethodPrototypeSymbol) shares a slot with its concrete overrides. pure_stub_:
     // a pure prototype -> the FunctionId of its never-executed signature stub. Both
@@ -22538,6 +22638,10 @@ private:
     static constexpr std::string_view kCopySlot = "$copy";
     // Polymorphic class -> the FunctionId of its shallow-copy thunk (copy_thunk_id).
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> copy_thunk_;
+    // Design-wide class type ids (LRM 8.16). Owned here so a standalone Lowerer
+    // works; lower_compilation points every Lowerer at one shared table instead.
+    ClassIds  own_class_ids_;
+    ClassIds* class_ids_ = &own_class_ids_;
     // The shared Lowerer that owns package/$unit-scope subroutine bodies (see
     // set_globals / function_id). Null on the shared Lowerer itself and on any
     // Lowerer built without one (e.g. tests that lower a single module with no
@@ -22869,6 +22973,9 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     // SyntaxTree owns, so nothing in it outlives the manager's arena and the
     // analysis results are still freed as soon as their diagnostics are harvested.
     InferredClockMap inferred_clocks;
+    // One id per class for the whole design, shared by every Lowerer below (see
+    // ClassIds).
+    ClassIds class_ids;
     if (sm != nullptr) {
         slang::DiagnosticEngine engine(*sm);
         auto                    client = std::make_shared<slang::TextDiagnosticClient>();
@@ -23040,6 +23147,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     bool dumps_vcd = false;
     try {
         Lowerer globals(*module, tick_fs, allow_system);
+        globals.set_class_ids(&class_ids);
         globals.lower_globals(comp, root);
 
         for (const InstanceSymbol* top : root.topInstances) {
@@ -23047,6 +23155,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             Lowerer           lw(*module, tick_fs, allow_system);
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
+            lw.set_class_ids(&class_ids);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
             // Exported functions resolve in the scope that owns them: this top's

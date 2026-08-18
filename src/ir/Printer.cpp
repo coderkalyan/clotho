@@ -120,6 +120,8 @@ const char* tag_name(Inst::Tag tag) {
             return "class_new";
         case T::HandleDeref:
             return "handle_deref";
+        case T::ClassIsA:
+            return "class_is_a";
         case T::AggCopy:
             return "agg_copy";
         case T::AggEq:

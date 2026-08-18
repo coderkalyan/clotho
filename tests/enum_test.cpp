@@ -190,8 +190,9 @@ TEST_CASE("enum methods are rejected") {
                    "non-constant step");
 }
 
-// $cast (LRM 6.24.2 / 8.16), Tier 1: numeric + enum destinations. Returns 1 and
-// assigns on success, else 0 with dest unchanged.
+// $cast (LRM 6.24.2 / 8.16): numeric + enum destinations. Returns 1 and assigns
+// on success, else 0 with dest unchanged. The class-handle down-cast lives in
+// tests/class_test.cpp.
 TEST_CASE("$cast: numeric and enum destinations") {
     const std::string out = run_capture(R"(
         module m;
@@ -222,15 +223,15 @@ TEST_CASE("$cast: task form assigns") {
     CHECK(out == "8\n");  // 2.1*3.7 = 7.77 -> rounds to 8
 }
 
-// A class-handle $cast (dynamic down-cast, Tier 2) needs a runtime type identity;
-// it must fail loudly, not silently mis-lower.
-TEST_CASE("$cast: class handle rejected") {
+// A `chandle` carries no type identity -- it is an opaque pointer from foreign
+// code -- so there is nothing to check a cast to one against. Loud, not silently
+// mis-lowered.
+TEST_CASE("$cast: chandle destination rejected") {
     check_rejected(R"(
         module m;
-          class Base; endclass
-          class Der extends Base; endclass
-          initial begin Base b; Der d; b = new(); if ($cast(d, b)) ; end
+          chandle c;
+          initial begin int i; i = $cast(c, 0); end
         endmodule
     )",
-                   "class handle is not supported");
+                   "chandle is not supported");
 }
