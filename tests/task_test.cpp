@@ -491,16 +491,24 @@ TEST_CASE("ref of an unpacked struct aliases the actual") {
 // -- Guarded gaps: must fail loudly, not silently miscompile. --
 
 // An event has no value and its trigger state is a separate static timestamp, so
-// there is nothing for a pointer to alias (docs/design/data-model.md §7).
-TEST_CASE("ref of an event is rejected") {
-    constexpr std::string_view src = R"(
-        module m;
-            function automatic void f(ref event e); endfunction
-            event ev;
-            initial f(ev);
-        endmodule
-    )";
-    CHECK(reject(src).find("ref argument of an event type is not supported") != std::string::npos);
+// there is nothing for a pointer to alias, nothing meaningful for an `input` to
+// copy, and nothing for `output`/`inout` to copy back. One gate covers all four
+// directions: `output event` used to be accepted silently and run, because the
+// copy-out moved the valueless placeholder plane that nothing ever reads.
+TEST_CASE("an event subroutine argument is rejected in every direction") {
+    const auto with_dir = [](std::string_view dir) {
+        return std::string("module m;\n"
+                           "    task automatic t(") +
+               std::string(dir) +
+               "event e); endtask\n"
+               "    event ev;\n"
+               "    initial t(ev);\n"
+               "endmodule\n";
+    };
+    for (const std::string_view dir : { "", "input ", "output ", "inout ", "ref " }) {
+        CHECK(reject(with_dir(dir)).find("an event subroutine argument is not supported") !=
+              std::string::npos);
+    }
 }
 
 // A packed bit/part-select is not a whole slot, so it is not a legal ref actual —

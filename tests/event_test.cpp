@@ -247,6 +247,141 @@ TEST_CASE("event handle / event-controlled trigger forms are rejected") {
             "event") != std::string::npos);
 }
 
+// An event declared in a procedural scope gets signal-like storage through
+// declare_local / declare_static_local. Those two paths never set
+// SignalInfo::is_event, so the backend allocated no trigger-timestamp global and
+// emit_event_fire stored through a null pointer: `clotho build` died with SIGSEGV
+// on any of these, with no diagnostic. Same failure mode as the package-scope
+// regression above, in the other two registration paths.
+TEST_CASE("a procedural-scope named event triggers and reads .triggered") {
+    SUBCASE("initial block-local") {
+        CHECK(run_capture("module top; initial begin event e; -> e; "
+                          "$display(\"t=%0b\", e.triggered); end endmodule") == "t=1\n");
+    }
+    SUBCASE("named block-local") {
+        CHECK(run_capture("module top; initial begin : blk event e; -> e; "
+                          "$display(\"t=%0b\", e.triggered); end endmodule") == "t=1\n");
+    }
+    SUBCASE("static local in a process") {
+        CHECK(run_capture("module top; initial begin static event e; -> e; "
+                          "$display(\"t=%0b\", e.triggered); end endmodule") == "t=1\n");
+    }
+    SUBCASE("static local in a task") {
+        CHECK(run_capture("module top; task t(); static event e; -> e; "
+                          "$display(\"t=%0b\", e.triggered); endtask "
+                          "initial t(); endmodule") == "t=1\n");
+    }
+    SUBCASE("loop-body declaration, re-entered") {
+        CHECK(run_capture("module top; initial for (int i=0;i<2;i++) begin "
+                          "event e; -> e; $display(\"i%0d=%0b\", i, e.triggered); "
+                          "end endmodule") == "i0=1\ni1=1\n");
+    }
+}
+
+// A block-local event owns real wait queues, not just a timestamp: a waiter
+// parked on it must actually be woken by the trigger.
+TEST_CASE("a block-local named event wakes a waiter") {
+    const std::string out = run_capture(R"(
+        module top;
+          initial begin
+            event e;
+            fork begin @(e); $display("woke t=%0t", $time); end join_none
+            #5 -> e;
+            #1 $display("done");
+          end
+        endmodule
+    )");
+    CHECK(out == "woke t=5\ndone\n");
+}
+
+// An AUTOMATIC-lifetime event local in a subroutine is the one procedural form
+// still unsupported: per-call lifetime means a fresh sync object per activation,
+// which one static timestamp cannot represent. It lands in the per-call frame,
+// where every event op resolved through signal_of and reported the generic
+// "reference to unknown signal". Name the construct instead.
+TEST_CASE("an automatic-lifetime event local in a subroutine is rejected") {
+    CHECK(reject("module top; task automatic t(); event e; -> e; endtask "
+                 "initial t(); endmodule")
+            .find("an automatic-lifetime event local in a subroutine") != std::string::npos);
+    CHECK(reject("module top; function int f(); automatic event e; -> e; return 1; "
+                 "endfunction initial $display(\"%0d\", f()); endmodule")
+            .find("an automatic-lifetime event local in a subroutine") != std::string::npos);
+}
+
+// Every event op stamps or compares the current tick via rt_wheel_now(wheel), and
+// a function carries no wheel in its ABI (the same restriction $time, $strobe and
+// $monitor already state). The call was emitted with a null operand, so the LLVM
+// verifier rejected the module ("Operand is null") with no located diagnostic.
+// A task is a coroutine and does carry the wheel, so it must keep working.
+TEST_CASE("an event operation inside a function is rejected") {
+    CHECK(reject("module top; event a; function int f(); -> a; return 1; endfunction "
+                 "initial $display(\"%0d\", f()); endmodule")
+            .find("'-> e' inside a function is not supported") != std::string::npos);
+    CHECK(reject("module top; event a; function int f(); ->> a; return 1; endfunction "
+                 "initial $display(\"%0d\", f()); endmodule")
+            .find("'->> e' inside a function is not supported") != std::string::npos);
+    CHECK(reject("module top; event a; function int f(); return a.triggered; endfunction "
+                 "initial $display(\"%0d\", f()); endmodule")
+            .find("'e.triggered' inside a function is not supported") != std::string::npos);
+    // The same statement in a task is fine.
+    CHECK(run_capture("module top; event a; task t(); -> a; endtask "
+                      "initial begin t(); $display(\"t=%0b\", a.triggered); end endmodule") ==
+          "t=1\n");
+}
+
+// `@(u.e)` has always accepted a hierarchical event (event_signal admits
+// HierarchicalValue), but trigger_target demanded a bare NamedValue -- so a
+// submodule's event was waitable from outside and not triggerable. Both paths end
+// in the same signal_of, so the asymmetry was purely the expression-kind test.
+TEST_CASE("a hierarchical named event can be triggered, not just waited on") {
+    SUBCASE("through an instance name") {
+        const std::string out = run_capture(R"(
+            module sub; event e; initial begin @(e); $display("sub woke t=%0t", $time); end endmodule
+            module top; sub u(); initial begin #3 -> u.e; #1 $display("done"); end endmodule
+        )");
+        CHECK(out == "sub woke t=3\ndone\n");
+    }
+    SUBCASE("through an interface port") {
+        const std::string out = run_capture(R"(
+            interface I; event e; endinterface
+            module child(I p); initial begin @(p.e); $display("child woke t=%0t", $time); end endmodule
+            module top; I i(); child c(i); initial begin #4 -> i.e; #1 $display("done"); end endmodule
+        )");
+        CHECK(out == "child woke t=4\ndone\n");
+    }
+    SUBCASE("nonblocking trigger of a hierarchical event") {
+        const std::string out = run_capture(R"(
+            module sub; event e; initial begin @(e); $display("sub woke t=%0t", $time); end endmodule
+            module top; sub u(); initial begin #1 ->> u.e; #2 $display("done"); end endmodule
+        )");
+        CHECK(out == "sub woke t=1\ndone\n");
+    }
+}
+
+// An event class property is unsupported in BOTH lifetimes. lower_class_type's
+// guard only runs for a class something instantiates, and it sat after the
+// static-property `continue`, so `-> C::e` on a never-instantiated class reported
+// the generic "reference to unknown signal" instead of naming the construct.
+TEST_CASE("an event class property is rejected in either lifetime") {
+    CHECK(reject("module top; class C; event e; endclass "
+                 "initial begin C c = new(); -> c.e; end endmodule")
+            .find("event class property is not supported") != std::string::npos);
+    CHECK(reject("module top; class C; static event e; endclass initial -> C::e; endmodule")
+            .find("event class property is not supported") != std::string::npos);
+    CHECK(reject("module top; class C; static event e; endclass initial @(C::e); endmodule")
+            .find("event class property is not supported") != std::string::npos);
+}
+
+// `wait_order` (LRM 15.5.6) fell through lower_stmt's `default:` to the bare
+// "unsupported statement", naming nothing.
+TEST_CASE("wait_order is rejected by name") {
+    CHECK(reject("module top; event a, b; initial wait_order(a, b); endmodule")
+            .find("wait_order is not supported") != std::string::npos);
+    CHECK(reject("module top; event a, b; initial wait_order(a, b) $display(\"x\"); "
+                 "else $display(\"y\"); endmodule")
+            .find("wait_order is not supported") != std::string::npos);
+}
+
 // LRM 9.4.2.3: `@(edge sig iff cond)` triggers only when the edge fires and the
 // guard holds at event time. Clotho gates the body with `if (cond)` (observably
 // identical, the block re-subscribes each pass).

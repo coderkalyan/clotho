@@ -2224,6 +2224,17 @@ private:
             }
         }
         for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
+            // Ahead of the static skip below: a `static event` property took the
+            // `continue` and never reached this guard, so it reported the generic
+            // `reference to unknown signal` from signal_of instead of naming the
+            // construct. Both lifetimes are equally unimplemented -- an instance
+            // property would be an inert placeholder in the object body, a static one
+            // an inert module signal -- so the gate belongs before the split.
+            // TODO: event class properties (LRM 15.5.5) need the event handle word;
+            // see docs/design/event-handles.md.
+            if (prop.getType().getCanonicalType().isEvent()) {
+                fail("event class property is not supported");
+            }
             if (prop.lifetime == slang::ast::VariableLifetime::Static) {
                 // A static property (LRM 8.9) is ONE slot shared across all
                 // instances, not part of the per-object body — it gets persistent
@@ -2234,11 +2245,6 @@ private:
             if (prop.randMode != slang::ast::RandMode::None) {
                 // TODO: rand / randc properties and randomize() (Phase 3).
                 fail("rand / randc class properties are not supported");
-            }
-            if (prop.getType().getCanonicalType().isEvent()) {
-                // TODO: event class properties (LRM 15.5) — the property would
-                // declare as an inert placeholder with no trigger state.
-                fail("event class property is not supported");
             }
             class_prop_index_.emplace(&prop, idx);
             fields.push_back({ prop.name, lower_type(prop.getType()), idx });
@@ -4050,6 +4056,16 @@ private:
             fail("modport expression port with a non-trivial connection "
                  "expression is not supported");
         }
+        if (csym.kind == SymbolKind::ClassProperty && csym.getType().getCanonicalType().isEvent()) {
+            // lower_class_type's event-property guard only runs for a class that is
+            // actually elaborated (something calls `new`). `-> C::e` on a class that
+            // is never instantiated reaches here instead, with the property never
+            // registered, and reported the generic "unknown signal". Name the
+            // construct wherever the reference appears.
+            // TODO: event class properties (LRM 15.5.5) — see
+            // docs/design/event-handles.md.
+            fail("event class property is not supported");
+        }
         const auto it = sigmap_.find(&csym);
         if (it == sigmap_.end()) {
             fail("reference to unknown signal '" + std::string(csym.name) + "'");
@@ -4076,7 +4092,14 @@ private:
         info.name = prefix_ + std::string(vs.name);
         info.loc  = to_source_loc(vs.location);
         info.type = lower_type(vs.getType());
-        info.dir  = ir::SignalInfo::Direction::Internal;
+        // Every site that registers a *declared variable* must derive is_event from
+        // the type: the backend allocates an event's trigger-timestamp global only
+        // for a signal carrying the flag, so a cleared flag on an event makes
+        // `-> e` / `e.triggered` store through a null global. A block-local
+        // `event e;` reaches exactly here (declare_storage routes fn_ctx_ == null
+        // here), so omitting it crashed the backend rather than failing loudly.
+        info.is_event = vs.getType().isEvent();
+        info.dir      = ir::SignalInfo::Direction::Internal;
 
         const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&vs]         = sig;
@@ -7078,17 +7101,45 @@ private:
 
     // Resolve the target of `-> e` to the event's synthetic signal, verifying it
     // is an event (defensive — slang types the target as an event already).
+    //
+    // A hierarchical target (`-> u.e`, `-> i.e` through an interface port or a
+    // modport) resolves like any other cross-instance reference: slang binds the
+    // name to the SAME ValueSymbol a local `e` would, so signal_of lands on the
+    // one shared signal and the trigger reaches the instance that owns it. This
+    // matches event_signal, which has always accepted HierarchicalValue for
+    // `@(u.e)` / `u.e.triggered` — the two paths bottom out in the same
+    // signal_of, and only accepting the narrower kind here is what made a
+    // submodule's event waitable but not triggerable.
     ir::Signal trigger_target(const Expression& target) {
-        if (target.kind != ExpressionKind::NamedValue || !target.type->isEvent()) {
+        const bool named = target.kind == ExpressionKind::NamedValue ||
+                           target.kind == ExpressionKind::HierarchicalValue;
+        if (!named || !target.type->isEvent()) {
             // TODO: triggering an event element of an array / struct member, or an
-            // event through a hierarchical / handle expression (Tier 2).
+            // event through a handle expression (docs/design/event-handles.md).
             fail("unsupported event trigger target");
         }
-        return signal_of(target.as<NamedValueExpression>().symbol);
+        return signal_of(target.as<ValueExpressionBase>().symbol);
+    }
+
+    // Every event operation stamps or compares the current sim tick, which the
+    // backend reads with rt_wheel_now(wheel). A function is a plain callable with
+    // no wheel pointer in its ABI, so the call was emitted with a null operand and
+    // failed the LLVM verifier ("Operand is null") instead of reporting anything.
+    // Refuse in the front end, exactly as $time / $realtime / $strobe / $monitor
+    // already do for the same missing parameter (lower_sysfunc, lower_strobe).
+    // A task is a coroutine and does carry the wheel, so tasks are unaffected.
+    // TODO: thread the wheel (or a runtime `now` global) into the function ABI;
+    // that lifts this restriction and the $time one together.
+    void require_wheel_for_event(const char* what) {
+        if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
+            fail(std::string(what) + " inside a function is not supported (no wheel "
+                                     "in the ABI, like $time)");
+        }
     }
 
     // Lower `-> e` / `->> e` / `->> #d e` (LRM 15.5.2, 15.5.4).
     void lower_event_trigger(const EventTriggerStatement& ev, ir::Builder& b) {
+        require_wheel_for_event(ev.isNonBlocking ? "'->> e'" : "'-> e'");
         const ir::Signal sig = trigger_target(ev.target);
         if (ev.timing != nullptr) {
             // Only `->>` carries a timing control (grammar), so a delayed trigger
@@ -7313,6 +7364,13 @@ private:
                 // process must block until every descendant has finished, which the
                 // join-all count cannot express.
                 fail("wait fork is not supported");
+            case StatementKind::WaitOrder:
+                // TODO: wait_order (LRM 15.5.6) blocks until every listed event
+                // triggers in the given order, taking the else-arm on the first
+                // out-of-order trigger. Needs an ordered multi-event park with a
+                // failure branch, which the WaitEdge list cannot express, and the
+                // reactive-region walk rejects it ahead of here too.
+                fail("wait_order is not supported");
             default:
                 fail("unsupported statement");
         }
@@ -15753,6 +15811,7 @@ private:
 
         // `e.triggered` (LRM 15.5.3): 1-bit "triggered this time step" property.
         if (const Expression* ev = triggered_event(call)) {
+            require_wheel_for_event("'e.triggered'");
             return b.event_triggered(event_signal(*ev), l);
         }
 
@@ -20783,6 +20842,7 @@ private:
         info.name            = prefix_ + fn_ctx_->name_prefix + std::string(vs.name);
         info.loc             = to_source_loc(vs.location);
         info.type            = lower_type(vs.getType());
+        info.is_event        = vs.getType().isEvent(); // see declare_local
         info.dir             = ir::SignalInfo::Direction::Internal;
         const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&vs]         = sig;
@@ -20811,6 +20871,7 @@ private:
         info.name            = prefix_ + cls + std::string(prop.name);
         info.loc             = to_source_loc(prop.location);
         info.type            = pty;
+        info.is_event        = prop.getType().isEvent(); // see declare_local
         info.dir             = ir::SignalInfo::Direction::Internal;
         const ir::Signal sig = register_signal(std::move(info));
         sigmap_[&prop]       = sig;
@@ -20893,6 +20954,20 @@ private:
         } else if (is_static_local(vs, force_frame)) {
             declare_static_local(vs);
         } else {
+            // An automatic-lifetime event local would land in the per-call frame,
+            // which has no trigger timestamp and no wait queues -- the frame slot is
+            // a plain value, and every event op resolves through signal_of, which
+            // would report the generic "reference to unknown signal". Name the
+            // construct instead. A `static` event local works (persistent signal
+            // storage above); only the per-call form is missing, and it is missing
+            // because per-call means a FRESH sync object per activation, which one
+            // static timestamp cannot represent.
+            // TODO: automatic-lifetime event locals (LRM 15.5) need a per-activation
+            // event object; see docs/design/event-handles.md.
+            if (vs.getType().getCanonicalType().isEvent()) {
+                fail("an automatic-lifetime event local in a subroutine is not "
+                     "supported (declare it `static`)");
+            }
             fn_local(vs);
         }
     }
@@ -21375,6 +21450,18 @@ private:
         const bool is_task = sub.subroutineKind == SubroutineKind::Task;
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             const auto dir = fa->direction;
+            // An `event` formal of ANY direction is unsupported: an event lowers to
+            // a valueless 1-bit placeholder, so `in` copies a meaningless bit, `ref`
+            // has nothing to alias, and `output`/`inout` used to copy the
+            // placeholder plane back and forth and SILENTLY SUCCEED -- the caller's
+            // event kept working only because its planes are never read. One gate
+            // for all four directions, ahead of the per-direction checks below, so
+            // no direction can slip through again.
+            // TODO: event arguments (LRM 15.5.5) need the event handle word; see
+            // docs/design/event-handles.md.
+            if (fa->getType().getCanonicalType().isEvent()) {
+                fail("an event subroutine argument is not supported");
+            }
             if (dir == slang::ast::ArgumentDirection::Ref) {
                 // ref / const ref (LRM 13.5.2): the formal aliases the actual's live
                 // storage through a fat pointer carrying the storage address, the
@@ -21382,15 +21469,6 @@ private:
                 // report site (docs/design/data-model.md §3). Every storage class
                 // passes the same way — a plane slot, a managed handle, an aggregate
                 // image — so there is no per-type restriction here.
-                //
-                // An `event` formal is the one exclusion: an event has no value and
-                // its trigger state is a separate static timestamp, so there is
-                // nothing for a pointer to alias.
-                if (fa->getType().getCanonicalType().isEvent()) {
-                    // TODO: ref of an event (LRM 15.5) needs event reference
-                    // semantics, which is a scheduler change, not a data-model one.
-                    fail("ref argument of an event type is not supported");
-                }
                 continue;
             }
             if (dir != slang::ast::ArgumentDirection::In && fa->getType().getCanonicalType().isString()) {
