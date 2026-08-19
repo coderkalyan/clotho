@@ -724,32 +724,35 @@ Ranked by how much damage a naive implementation does.
   stale: it also answers "is anything executing the target?" — LRM 9.6.2's own
   precondition — and it is what lets each activation carry its own park to claim.
 
-- **V3 — `disable fork`.** Walk the calling process's live-child set and apply
-  V2's abort per descendant. **The gate stated here before was wrong**, in a way
-  that matters for planning: fork V2 as scoped (`docs/design/fork-join.md`
-  §V2.3) keeps a per-fork-site heap join record whose count acts as a refcount —
-  still a COUNT, not an enumerable set. Today the entire fork state is one
-  `{ i32 count, ptr parent }` alloca and every child handle is dropped as a dead
-  SSA value at the spawn site (`LlvmBackend.cpp:17357-17369`), so a child cannot
-  be named after it is spawned, and `is_fork_child` is a compile-time flag on the
-  `Function`, not a runtime relation. So `disable fork` needs a child collection
-  that **no phase of either document currently commits to building**, and landing
-  fork V2 in full would not by itself produce it. `wait fork` needs the same
-  collection, which is why both refuse together. V3 must either add an
-  enumerable live-descendant structure to fork V2's scope explicitly, or own it
-  itself — and it must also revisit the capture ABI (Hazard 10), because a child
-  outliving its join dangles ref formals into the parent frame.
-- **V4 — `process` class (LRM 9.7).** `kill()` is V2's abort applied to a
-  dynamic handle, `await()` a join barrier, `suspend()`/`resume()` a
-  desensitise pair; `status()` needs the `KILLED` state the abort already
-  implies. Two structural facts the plan previously omitted: the refusal is
-  **type-level**, shared with `semaphore` / `mailbox` / `weak_reference` (`the
-  built-in 'process' class is not supported`, `src/Lower.cpp:2120-2122`), so a
-  bare `process p;` declaration already fails and V4 cannot land one method at a
-  time without narrowing that guard by class name first; and a `process` handle
-  needs a first-class runtime representation that does not exist — a coroutine
-  handle is never a value anywhere, only a payload stored into scheduler-owned
-  slots. Out of scope until someone wants it; nothing in `disable` blocks it now.
+- **V3 — `disable fork`. LANDED with the `process` class**
+  (`docs/design/process-class.md` §8). The walk applies V2's abort per descendant, over
+  the control-block tree — which is the enumerable live-descendant structure this
+  document correctly said neither it nor `fork-join.md` committed to building. Fork V2's
+  record is still a count; the tree is elsewhere, and `disable fork` reads it.
+- **V4 — `process` class (LRM 9.7). LANDED; see `docs/design/process-class.md`.**
+  Three sentences of this document's sketch were wrong and are worth keeping corrected,
+  because each named a real difficulty it had mis-sized:
+
+  `kill()` is not "the abort applied to a dynamic handle". A thread is a CHAIN of
+  coroutine frames plus a SUBTREE of descendants: each frame aborts at its own poll and
+  wakes its caller on the way out, and the subtree is marked before any of them is
+  woken. What V2's abort did supply, and unchanged, is the protocol —
+  `emit_node_force_wake` is now SHARED by `lower_disable_list` and by `kill`, since both
+  publish the same `disable_node_ty` and both need "force-wake exactly once": claim the
+  per-arm `#delay` record, else the scheduled-flag token.
+
+  `suspend()`/`resume()` are not "a desensitise pair". Nothing can be desensitised —
+  the wheel cannot cancel and a static bucket cannot compact — so a suspended thread
+  stays parked, records the wake it receives, and `resume` replays it.
+
+  The type-level refusal was at `src/Lower.cpp`'s `lower_class_type`, and is now keyed
+  by class name: `semaphore` / `mailbox` / `weak_reference` keep it.
+
+  Two things this document owes now. The per-target activation node here and the
+  per-thread activation stack there are two ways to find a thread's park, and they
+  should converge. And the `hard_park` refusals above are liftable: `kill` demonstrably
+  unwinds a thread parked behind a time-consuming task call or a fork, through that
+  stack, which is exactly what those refusals said could not be claimed.
 
 ## Verification
 

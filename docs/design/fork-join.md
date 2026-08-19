@@ -456,23 +456,30 @@ record/awaiter pattern); `$finish` mid-fork leaks suspended child frames
   heap record; the activation bound saturates for an unbounded spawn edge so the
   rings, `#0` batches and wait buckets all size from one answer; and two V1
   corruptions were fixed first.
-- **V3 — `wait fork` / `disable fork`.** `wait fork` = join barrier over the
-  whole live-child set. `disable fork` needs the general `disable`-unwind
-  machinery (unregister wheel / wait-queue entries and free frames of
-  suspended children) — the largest scheduler surgery, gated on `disable`
-  support landing first.
+- **V3 — `wait fork` / `disable fork`. LANDED, AND NOT HERE:
+  `docs/design/process-class.md` §8.** `wait fork` = a barrier over the whole live
+  descendant set; `disable fork` = an abort per descendant.
 
-  **Neither is unblocked by V2 as scoped, and the dependency is worth stating
-  precisely because both documents previously stated it wrongly.** V2's
-  per-fork-site heap join record is still a COUNT used as a refcount; a
-  "live-child set" that can be enumerated does not exist in it. Today the fork
-  state is `{ i32 count, ptr parent }` and every child handle is dropped as a dead
-  SSA value at the spawn site, so a child cannot be named after it is spawned, and
-  `is_fork_child` is a compile-time `Function` flag, not a runtime relation. V3
-  therefore owns building an enumerable live-descendant structure — either added
-  to V2's scope explicitly, or built here — and must revisit the `ArgDir::Ref`
-  capture ABI at the same time, since a child outliving its join dangles formals
-  into the parent's frame. `docs/design/disable.md` V3 states the same conclusion.
+  **Neither was unblocked by V2 as scoped, and the dependency is worth keeping
+  because both documents once stated it wrongly.** V2's per-fork-site heap join record
+  is a COUNT used as a refcount; a "live-child set" that can be enumerated does not
+  exist in it, every child handle is dropped as a dead SSA value at the spawn site, and
+  `is_fork_child` is a compile-time `Function` flag rather than a runtime relation. So
+  V3 owed an enumerable live-descendant structure — and that structure turned out to be
+  the LRM 9.7 `process` control block's tree, so both statements shipped with the
+  `process` class instead of here. Two consequences for this document:
+
+  - **Every fork in a design with process control now takes the HEAP refcounted
+    record**, including `join` (`design_uses_process_` in `lower_fork_inst` and in the
+    child epilogue). A `join` record is a frame slot, which is sound only while the
+    parent outlives its children; `kill` breaks exactly that, and an aborting parent
+    additionally nulls the record's `parent` before releasing its reference so a
+    surviving child wakes nobody. §V2.2's byte-identical `join` codegen therefore holds
+    only while process control is unused — which is the gate, and is verified.
+  - **The `ArgDir::Ref` capture refusal for the detaching kinds must STAY until V4**,
+    now for two reasons rather than one: a `join_none` parent can return, and a killed
+    parent's frame goes away under live children.
+
 - **V4 — true per-spawn automatic lifetime.** Give fork-captured automatics
   real per-spawn copies (frame locals), fixing `for … fork … i … join_none`.
   Cross-cutting with the broader automatic-lifetime gap (`declare_local`).

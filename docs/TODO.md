@@ -333,15 +333,16 @@ professional parity; M5 makes it complete.
   they lift when `ref` arguments cover those types (docs/design/ref-args.md). Under
   `join_any` / `join_none` NO capture is carried, whatever its type: the ABI hands
   out a pointer into the enclosing frame and only `join` keeps that frame alive.
-- [ ] **`wait fork` / `disable fork`** and per-spawn automatic-variable lifetime.
-  Both name themselves in the refusal rather than reporting "unsupported statement".
-  Both need a per-process live-child SET, which V2's count-and-`wake_at` record does
-  not carry. That is now the ONLY thing missing for `disable fork`: the abort
-  primitive it used to wait on has landed with `disable` (an activation list per
-  target, a claim on the park, a poll after each park — docs/design/disable.md), so
-  `disable fork` is a walk of the child set applying that abort per descendant.
-  Per-spawn lifetime is what the classic `for (int i…) fork … i … join_none` needs
-  (fork-join.md V4).
+- [x] **`wait fork` / `disable fork`** — landed, but not here: the live-descendant SET
+  V2's count-and-`wake_at` record could not carry is the `process` control-block tree
+  (LRM 9.7), so both statements came with it. `disable fork` is `kill` over the
+  caller's subtree; `wait fork` is `first_child == null`, exact because a completing
+  thread re-parents its live children. Design: docs/design/process-class.md §8.
+- [ ] **Per-spawn automatic-variable lifetime** — what the classic
+  `for (int i…) fork … i … join_none` needs (fork-join.md V4). Refused by name rather
+  than reading a shared final `i`. Note the capture refusal for the detaching kinds is
+  now load-bearing for a second reason: a killed parent's frame goes away under its
+  live children, so V4's per-spawn copies are what would make a capture safe there.
 - [ ] **1024 concurrent detached children** is the ceiling: an unbounded spawn edge
   saturates the activation bound, and past it the scheduler-buffer guards report a
   located FATAL. Lifting it means a spill on the already-emitted overflow edge; the
@@ -1429,13 +1430,27 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   stream is reproducible and independent of its siblings'. A DPI export thunk and
   the `$monitor` ramp in `main` have no calling thread at all and use a
   module-wide state seeded at startup.
+- [x] **`srandom` / `get_randstate` / `set_randstate`** (LRM 9.7, 18.14) — the
+  `process` methods: the thread's generator state rides its control block, so all three
+  reach a thread through a handle. `srandom` is `$urandom(seed)`'s splitmix64
+  expansion; the state renders as 64 hex digits and round-trips. A design that uses any
+  of the three gives every thread its OWN generator (the target of `p.srandom()` is not
+  statically known), gated so a `$urandom`-only design keeps the ownership
+  `build_rng_fns` computes. A foreign string is a located fatal, LRM 18.14.4 leaving it
+  undefined.
 - [ ] **Random stability & seeding, remaining** — per-object RNG for class
-  `randomize`, and `srandom` / `get_randstate` / `set_randstate`.
+  `randomize`.
 
 ### Concurrency & synchronization
 
-- [ ] **`wait fork`, `disable fork`** — `fork … join_any` / `join_none` are done
-  (LRM 9.3.2, V2); these two still need a per-process live-child set.
+- [x] **`wait fork`, `disable fork`** (LRM 9.6.1 / 9.6.3) — both landed with the
+  `process` control blocks, which is where the live-descendant set they needed came
+  from: `disable fork` is `kill` over the caller's subtree with the caller spared, and
+  `wait fork` is the one-pointer test `first_child == null`, exact because a completing
+  thread re-parents its live children (so a grandchild of a finished child still
+  counts, as 9.6.3 requires). Both stay refused inside an assertion action block,
+  which runs on the MONITOR's thread rather than one of its own.
+  Design: docs/design/process-class.md §8.
 - [ ] **`std::mailbox` / `std::semaphore`** (parameterized, bounded/unbounded).
   Slang synthesizes both into the `std` package with signatures but no bodies,
   so a real runtime is needed: a key count plus a wait queue for `semaphore`, a
@@ -1443,9 +1458,27 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `lower_class_type` (any class whose parent scope is the `std` package) — a
   `semaphore` used to abort on an out-of-range formal index and a `mailbox` to
   report only "unsupported non-integral type".
-- [ ] **`process` class** — `self`, `status`, `kill`, `await`, `suspend`,
-  `resume`. Same `std`-package guard as above; so is `std::weak_reference`
-  (LRM 8.30).
+- [x] **`process` class** (LRM 9.7) — all nine methods: `self`, `status`, `kill`,
+  `await`, `suspend`, `resume`, `srandom`, `get_randstate`, `set_randstate`. A
+  thread's control block is native, untraced storage in two tiers -- a static slot per
+  process (no allocation, a constant address, the starting state in the initializer)
+  and a pooled record per fork child, the only unbounded tier -- and a `process`
+  handle is an ordinary class handle onto it, created lazily at the first `self()` and
+  memoized so identity is a pointer compare. Identity travels the call ABI beside
+  `rng`, because a task or function is not a thread.
+
+  `kill` is the landed `disable` abort per thread rather than per static target: mark
+  the subtree, force-wake each exactly once through the shared claim-or-flag protocol,
+  and let every activation leave through its ordinary exit -- so a thread parked behind
+  a time-consuming task call unwinds its whole frame chain, which is the case remote
+  `disable` still refuses. `suspend`/`resume` desensitise nothing (the wheel cannot
+  cancel, a static bucket cannot compact): a suspended thread replays the wake it
+  already received, which is what makes `resume` continue it in the current time step.
+
+  Everything is behind `DesignUses::process`, verified byte-identical `--emit llvm` on
+  every design that does not name it. `std::weak_reference` keeps the std-package
+  guard, now keyed by class name. 27 cases in `tests/process_test.cpp`, clean under
+  ASan/UBSan/LSan. Design: docs/design/process-class.md.
 - [~] **Clocking blocks** (LRM 14) — `clocking`/`endclocking` elaborates in a
   module, an interface (so a modport-scoped block comes free) or a program, and
   each block becomes one `ir::Activation::Observed` process that samples every

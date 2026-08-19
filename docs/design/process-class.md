@@ -2,32 +2,34 @@
 
 Target: the built-in `process` class — `self`, `status`, `kill`, `await`, `suspend`,
 `resume`, `srandom`, `get_randstate`, `set_randstate` — plus the two statements that
-need the same runtime structure and are refused today for exactly that reason,
-`disable fork` and `wait fork` (LRM 9.6.2/9.6.3, fork V3).
+need the same runtime structure and were refused for exactly that reason,
+`disable fork` and `wait fork` (LRM 9.6.1/9.6.3, fork V3).
 
-Status: **scoping. Nothing is implemented.** The whole surface is refused
-type-level, by class name, at one site (`src/Lower.cpp:2178-2181`), so today a bare
-`process p;` declaration fails before any method is reached.
+Status: **landed, all nine methods plus both fork statements.** Phases P0-P4 below
+are done in four commits; §13 records what each cost against what it predicted. The
+`std`-package refusal is now keyed by class name, so `semaphore` / `mailbox` /
+`weak_reference` keep theirs (`src/Lower.cpp`, `lower_class_type`).
 
 This is an M4 feature, not a nice-to-have: a UVM testbench stores a `process`
 handle in a class property, calls `process::self()` inside a forked thread and
 `kill()` on it later, and `uvm_objection`-style code awaits completion. Nothing in
-the tree is close — `docs/design/disable.md:189-196` states it plainly: *"No process
-identity, no process table, and no handle array. A process is the raw `ptr` from
-`llvm.coro.begin`."*
+the tree was close — `docs/design/disable.md:189-196` still states the starting
+point: *"No process identity, no process table, and no handle array. A process is
+the raw `ptr` from `llvm.coro.begin`."*
 
-Two documents defer to this one and both understate it:
+Two documents deferred to this one and both understated it:
 
-- `docs/design/disable.md` V4 (`:745-768`, now corrected there) said `kill()` is "V2's abort applied to a
-  dynamic handle, `await()` a join barrier, `suspend()`/`resume()` a desensitise
-  pair". The first is true only for a *single* activation of a process body; a
-  thread is a chain of coroutine frames and a subtree of descendants, and neither
-  is reachable from anything that exists.
-- `docs/design/fork-join.md` V3 (`:459-484`) says `wait fork` / `disable fork` need
+- `docs/design/disable.md` V4 (`:745-768`, corrected there) said `kill()` is "V2's
+  abort applied to a dynamic handle, `await()` a join barrier, `suspend()`/`resume()`
+  a desensitise pair". The first is true only for a *single* activation of a process
+  body; a thread is a chain of coroutine frames and a subtree of descendants. The
+  third is wrong outright: nothing can be desensitised, because the wheel cannot
+  cancel and a static wait bucket cannot be compacted (§7.3).
+- `docs/design/fork-join.md` V3 (`:459-484`) said `wait fork` / `disable fork` need
   "an enumerable live-descendant structure" that **no phase of either document
-  commits to building**. This design builds it, once, and all three features fall
-  out of it. That is the single most important architectural claim here: the
-  process control block below is fork V3's missing structure, not a parallel one.
+  commits to building**. This design built it once, and all three features fell out
+  of it. That is the load-bearing architectural claim here, and it held: the control
+  block tree IS fork V3's missing structure, not a parallel one.
 
 ---
 
@@ -224,19 +226,30 @@ needs its size — the `disable_node_ty` / `rt_event` convention of keeping the 
 declarations in lockstep.
 
 ```
-%clotho.pcb = type {
-  i32  ctl,          ; state in bits 0-2 (the enum's own 0..4); flags above:
-                     ; ABORT (3), WAKE_PENDING (4), SELF_PARKED (5), WAIT_FORK (6)
+%clotho.pcb = type {                    ; == rt_proc (Runtime.h), field for field
+  i32  ctl,          ; state in bits 0-2 (the enum's own 0..4); flags in the high
+                     ; bits: STATIC (8), ABORT (9), WAKE_PENDING (10),
+                     ; SELF_PARKED (11), WAIT_FORK (12)
   i32  refs,         ; 0..2: one for a live thread, one for an existing object
   ptr  acts,         ; activation-node stack, innermost first (frame-resident nodes)
-  ptr  waiters,      ; await waiter list head (frame-resident nodes)
+  ptr  waiters,      ; await / wait-fork waiter list head (frame-resident nodes)
   ptr  rng,          ; this thread's xoshiro state, or the module-wide state
-  ptr  join_rec,     ; the heap fork record this thread is a child of, or null
+  ptr  join_rec,     ; reserved: the heap fork record a killed child decrements
   ptr  obj,          ; WEAK memo: the process object naming this block, or null
   ptr  parent,       ; always a live thread or a static block (§5.3)
-  ptr  first_child, ptr next_sib, ptr prev_sib
+  ptr  first_child, ptr next_sib, ptr prev_sib,
+  ptr  next_marked   ; scratch chain of the blocks one `kill` marked (§7.1)
 }
 ```
+
+Two changes from the design as first written. `STATIC` moved into the flag bits
+because the static tier needed to be recognisable at run time (a reference count
+reaching zero on a static block is not a free), and `next_marked` was added so the
+subtree WALK can live in the runtime -- plain memory work -- while the force-wake it
+feeds stays in generated code, which is what touches the scheduler rings. The
+`join_rec` slot is still reserved: the abandon path (§11 hazard 2) turned out to need
+the record in a FRAME slot rather than on the block, because the thread that abandons
+a join is the one whose frame holds it.
 
 State and flags share one word so the poll of §6 is one load and one masked
 compare. Nothing here is a class handle, so **the collector never sees the tree,
@@ -354,8 +367,9 @@ Consequences that must be handled rather than discovered:
 
 ### 5.1 `self()`
 
-`ptr proc` becomes argument 2 of `declare_function` / `declare_task`, immediately
-after `ptr rng`, present only when `DesignUses::process` is set. Every call site
+`ptr proc` is argument 2 of a function and argument 3 of a task -- right after the
+fixed prefix in each, so `state` / `rng` / `wheel` keep their indices and only
+`param_indices`' formal base moves -- present only when `DesignUses::process` is set. Every call site
 that already pushes `rng_slot_` pushes `pcb_` beside it (function call `:19399`,
 task call `:20490`, fork spawn `:20360`, `$strobe` pend `:17071`, reactive pend
 `:17091`). `self()` in a process body can also fold to a constant load from
@@ -782,12 +796,14 @@ Ranked by how much damage a naive implementation does.
 
 ---
 
-## 13. Phased plan
+## 13. Phased plan — as built
 
-Each phase is independently landable and independently testable, and every phase
-keeps the ungated IR byte-identical.
+Each phase was independently landable and independently testable, and every one kept
+the ungated IR byte-identical (verified per commit on
+`examples/{nba,alu,wait,gates_bench}`). P0 and P1 landed together, because a
+structure with no reachable method could not be smoke-tested; P5 is still open.
 
-- **P0 — the structure, no user-visible feature.** Narrow the std-package guard by
+- **P0 — the structure, no user-visible feature. LANDED with P1.** Narrow the std-package guard by
   class name; register the synthetic `process` class body and its trace map;
   `DesignUses::process` + the ABI argument + `@clotho.proc_pcb` root table; PCB
   creation in both ramps; the activation-node stack; the status word transitions;
@@ -796,20 +812,37 @@ keeps the ungated IR byte-identical.
   records). `process p;` and `p == null` work; every method still refuses by name.
   Acceptance: byte-identical `--emit llvm` on picorv32, every `examples/` design
   and `tests/perf`, with the feature unused.
-- **P1 — `self()`, `status()`, `await()`.** Adds the waiter list and the shared
-  `emit_wake_list`. No termination, so no abort paths yet. This is the phase a
-  UVM-shaped smoke test can first exercise.
-- **P2 — `kill()` and `disable fork`.** The subtree walk, the abort exits, the
-  join-record ownership change, the killed-thread wake discipline, self-kill.
-  The largest phase and the one carrying hazards 1-6.
-- **P3 — `suspend()` / `resume()` and `wait fork`.** `WAKE_PENDING`, the
-  `first_child == null` barrier.
-- **P4 — the randstate trio.** RNG ownership forcing, the string codec, two runtime
-  entry points.
-- **P5 — optional cleanups, once P2 is proven.** Lift `disable`'s `hard_park`
-  refusals through the activation stack; converge `disable`'s per-target node and
-  the PCB stack; narrow §4.3's PCB set with a reachability closure if profiling
-  says the allocation matters.
+- **P1 — `self()`, `status()`, `await()`. LANDED.** The waiter list is the event
+  object's node type (`event_node_ty`) rather than a new one, and the wake walk was
+  written fresh rather than factored out of `emit_event_wake_list`: the third user
+  (`wait fork`) arrived one phase later and shares the process one, so the two lists
+  still have two walks. Factoring them is a follow-up, not a debt with a bug in it.
+- **P2 — `kill()` and `disable fork`. LANDED**, and it did carry hazards 1-6. Two
+  things the plan did not say: the force-wake protocol was FACTORED out of
+  `lower_disable_list` into `emit_node_force_wake` rather than duplicated (both sides
+  publish the same `disable_node_ty`, so the claim-or-flag chain is now written once);
+  and KILLED has to be published where `kill` RUNS, not where the killed thread
+  notices, or a caller that kills a thread and reads its status sees WAITING.
+- **P3 — `suspend()` / `resume()` and `wait fork`. LANDED.** The one thing the plan
+  missed cost two bugs before it was found: the RUNNING <-> WAITING pair maintained at
+  every park has to be a CONDITIONAL transition. An unconditional store at a park
+  erased a SUSPENDED another thread had just set -- its `resume` then found nothing
+  suspended and the thread never came back -- and would equally erase a KILLED. It is
+  now one load, one compare, one select, one store (`emit_proc_state(from, to)`).
+- **P4 — the randstate trio. LANDED.** RNG ownership forcing behaves as designed
+  (`DesignUses::process_randstate` -> every thread owns its state). The string codec is
+  64 lowercase hex digits, and `set_randstate` rejects both a malformed string and the
+  all-zero state -- xoshiro's fixed point, which `get_randstate` can never produce.
+- **P5 — still open, and now unblocked.** Lift `disable`'s `hard_park` refusals
+  through the activation stack (a thread parked behind a task call or a fork is
+  reachable now -- `kill` proves it); converge `disable`'s per-target node with the
+  activation stack; factor the three waiter-list walks; narrow §4.3's control-block set
+  with a reachability closure if profiling ever says the pooled allocation matters.
+
+Two deliberate refusals survive their own implementation, both for the same identity
+reason: `disable fork` and `wait fork` inside an ASSERTION ACTION BLOCK. An action
+block is pended as a task body and runs on the monitor process's control block, so the
+descendants it would end or wait for are the monitor's, not the assertion's.
 
 `process` in a queue / dynamic array / associative array is **not** a phase here:
 it is `garbage-collection.md` §3.3's container trace work, and it gates
@@ -819,8 +852,8 @@ it is `garbage-collection.md` §3.3's container trace work, and it gates
 
 ## 14. Verification
 
-**There is no oracle, and this needs a decision before P1 lands.** Probed on
-this workstation:
+**There is no oracle.** Probed on this workstation, and this is what the test
+file's per-case oracle notes record:
 
 - **iverilog 13.0 cannot parse the class at all** — `process p;` is a syntax
   error (`Invalid module instantiation`), as is `process::self()`. So the
@@ -852,21 +885,56 @@ encodes — the approach `fork-join.md:508-511` already takes for the three case
 A Verilator-scored case must state which of the two it is in the test comment, so a
 later Verilator release changing behaviour cannot silently reclassify a pinned case.
 
-Regardless of oracle, the suite owes:
+**Landed:** `tests/process_test.cpp` (in the explicit TU list), 27 cases over the
+whole surface -- identity within and across threads, all five statuses including a
+killed and a finished thread read *after* completion, `.name()` on the status enum,
+`await` before / after completion / from inside a task / with two awaiters / on a
+killed target, `kill` of a parked thread, of a subtree, of a thread parked inside a
+time-consuming task call, of a parent parked at a `join` with a live child, of self
+and of an already-dead thread, `disable fork`, suspend-with-transpired-delay,
+self-suspend-and-resume, both no-op shapes, `wait fork` over a grandchild and with
+nothing forked, the randstate round-trip, cross-thread `srandom`, two threads seeded
+alike, a handle in a class property, and the two surviving refusals.
 
-- **Ordering and value cases per method**, in a new `tests/process_test.cpp` added
-  to the explicit TU list (`CMakeLists.txt:515-584`): identity, all five statuses
-  including a killed and a finished thread read *after* completion, `await` before
-  and after completion, `await`-on-self as a fatal, kill of a parked / queued /
-  suspended / already-dead thread, kill of a subtree two levels deep with the
-  middle thread already finished, self-kill, `kill` inside a task called by the
-  target thread, suspend-then-resume across a transpired delay and across an
-  untriggered event, `disable fork` / `wait fork` shapes lifted from
-  `fork-join.md`'s owed list (LRM 9.6.2 example 6 among them).
-- **The three GC modes.** `tests/gc_test.cpp`'s `check_all_gc_modes` harness
-  (`:80-84`) is the right vehicle: a PCB is a class object with tree links, so
-  Off/On/Stress must all pass, and a stress run is what catches a PCB collected
-  under a live thread.
+Each case names its oracle in a comment: Verilator-scored ones say so, LRM-pinned ones
+name the sentence they encode.
+
+**ASan + UBSan + LeakSanitizer (RelWithDebInfo, `-DCLOTHO_SANITIZE=ON`), on the
+process and fork suites: no errors.** That is the check that actually covers the fork
+record's ownership change, the abort exits, the subtree walk and three intrusive
+lists -- a missed release leaks, a double release is a double free, and a stale wake
+is a use-after-free, none of which a value check would show.
+
+The leaks LeakSanitizer does report are accounted for exactly, which is the point of
+citing them rather than the summary line:
+
+- 27 process cases leak **6064 bytes in 28 allocations** = one 5632-byte control-block
+  pool chunk (64 blocks, allocated once, never returned -- the event pool's discipline)
+  plus one 16-byte `process` object per design. Class bodies leak on this branch by
+  direction (`LlvmBackend.cpp`, `ClassNew`: "with --gc off the lifetime is leaked,
+  which LRM 8.4 makes observably correct"), and a `process` object is a class body.
+  For comparison, the class suite leaks 10 648 bytes in 104 allocations for the same
+  reason.
+- **The freelist demonstrably works.** 2000 spawn / `disable fork` cycles whose
+  children never call `self()` leak *16 bytes in 1 allocation* -- one chunk's worth of
+  blocks, recycled 2000 times. The same 2000 cycles where each child DOES call
+  `self()` leak one block per child, because the object that names it leaks and a
+  named block cannot be recycled. That is the `--gc off` cost of §4.2 stated as a
+  measurement rather than a claim, and it is what the collector removes.
+
+**Still owed:**
+
+- **The three GC modes.** `tests/gc_test.cpp`'s `check_all_gc_modes` harness is the
+  right vehicle once the collector is in the tree -- it is not on this branch. A
+  `process` object is an ordinary class body, so Off/On/Stress must all pass, and a
+  stress run is what would catch one collected while its thread is live. The control
+  block itself is native and untraced, so the collector cannot reach the tree at all
+  (§4.1), which is what makes this a check rather than a risk. The object's finalizer
+  clearing `pcb->obj` (§4.2) is the one piece of the design that only exists on paper
+  until then -- with no collector, the memo is never cleared, which is why the leak
+  above is per named thread rather than per live one.
+- **A UVM-shaped integration case**, once `process q[$]` is expressible (it inherits
+  the container class-handle refusal, §11 hazard 9).
 - **ASan + UBSan + LeakSanitizer**, which is what actually covers the fork-record
   ownership change: a missed release leaks and a double release is a double free,
   and neither shows up in a value check (`fork-join.md:504-506`).
@@ -896,3 +964,16 @@ Regardless of oracle, the suite owes:
   than getting one of its own (§4.3).
 - `KILLED` is shared by `kill` and by `disable`, per 9.7's own definition of the
   state.
+- **KILLED is published where `kill` runs**, not where the killed thread notices. 9.7
+  defines the state as "process was forcibly killed", and a caller that kills a thread
+  and then reads its status must not see WAITING. The unwind is driven separately, by
+  the abort flag.
+- **`await` treats KILLED as a completion**, so an awaiting thread is released by a
+  kill rather than hanging on a thread that will never finish. 9.7 says await waits for
+  "the completion of another process" and gives KILLED as a terminal state.
+- **A suspended thread that is killed is KILLED**, not resumed: the poll tests the
+  abort flag before the suspension state.
+- **`set_randstate` rejects the all-zero state** as well as a malformed string. It is
+  xoshiro256++'s fixed point, so accepting it would make every later draw zero;
+  `get_randstate` cannot produce it, so it can only come from a foreign string, which
+  18.14.4 leaves undefined anyway.
