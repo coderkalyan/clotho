@@ -341,6 +341,13 @@ struct LValue {
     // is meaningful only then.
     bool   is_signal = false;
     Signal sig{ 0 };
+    // Reached through a virtual interface handle (LRM 25.9): the runtime address
+    // of the owning instance's context record. `sig` is then a REPRESENTATIVE of
+    // the member -- some instance's copy, naming which member and supplying every
+    // def-local constant -- and this pointer says which instance actually owns the
+    // storage, the wait buckets, the NBA shadow and the dump-var base. Null for an
+    // ordinary signal, whose owner is fixed at compile time.
+    llvm::Value* vif_ctx = nullptr;
     // A string target: `base` (indexed by elem_idx for an array) is the
     // rt_string handle; widths / bit_off / has_z are meaningless.
     bool is_string = false;
@@ -564,6 +571,14 @@ struct SignalSlot {
     // which is addressed directly off @clotho.state.
     static constexpr uint32_t no_anchor = ~0u;
     uint32_t anchor = no_anchor;
+    // A nonblocking target some virtual interface writes (LRM 25.9). Its writes
+    // defer a record carrying the destination pointer AND the instance context,
+    // instead of the per-signal block shadow: a handle supplies only a
+    // representative of the member, so two handles naming twin instances would
+    // stage into one shadow and commit into one instance. Every writer of such a
+    // member takes the record path, or the two would commit out of execution
+    // order (LRM 10.4.2) -- block commits run before records.
+    bool vif_rec = false;
 };
 
 // One instance-scope occurrence: the addressing anchor for every signal the
@@ -605,6 +620,9 @@ struct Anchor {
     llvm::StructType*     shadow_ty      = nullptr;
     llvm::GlobalVariable* shadow_gv      = nullptr;
     llvm::GlobalVariable* shadow_base_gv = nullptr;
+    // First state-struct field of the definition's virtual-interface waiter-list
+    // heads (see scope_type); equal to the scope's own signal count.
+    uint32_t vif_head_base = 0;
     // Lowest VCD dump-var index of the scope's own dumped signals (-1: none).
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
@@ -832,6 +850,15 @@ public:
         }
         if (config_.dedup && config_.thunk) {
             share_twin_groups(group_fns);
+        }
+        // Every interface instance a virtual interface can name needs its context
+        // record to exist before main fills it, whether or not any body happened
+        // to address that instance def-relatively: the handle IS the context
+        // address (LRM 25.9).
+        for (const uint32_t sc : mod_.vif_scopes) {
+            if (sc < anchor_of_scope_.size() && anchor_of_scope_[sc] != SignalSlot::no_anchor) {
+                ensure_ctx(anchors_[anchor_of_scope_[sc]]);
+            }
         }
         // Blocks are discovered during the lowering above; size the block-commit
         // globals and emit the commit / enqueue functions now, before emit_main
@@ -2024,6 +2051,23 @@ private:
             slots_[si].anchor = aid;
             fields.push_back(slots_[si].storage_ty);
         }
+        // Waiter-list heads for members some `@(edge vif.sig)` parks on (LRM 25.9).
+        // They live in the definition's own state struct, so a waiter reaches the
+        // head exactly the way it reaches the member: the instance base the handle
+        // gave plus a def-local field index. One head per (member, edge) actually
+        // waited on, shaped like an event object so the intrusive list primitives
+        // serve both without a second engine.
+        anchors_[aid].vif_head_base = static_cast<uint32_t>(fields.size());
+        for (uint32_t k = 0; k < scope.signals.size(); ++k) {
+            const auto si = static_cast<uint32_t>(scope.signals[k]);
+            for (uint32_t e = 0; e < 3; ++e) {
+                if (vif_wait_[si][e]) {
+                    vif_head_ord_[si][e] = static_cast<uint32_t>(fields.size()) -
+                                           anchors_[aid].vif_head_base;
+                    fields.push_back(event_obj_ty());
+                }
+            }
+        }
         for (const InstanceScope& child : scope.children) {
             scope_type(child, claimed, hier + "." + child.name);
         }
@@ -2062,6 +2106,196 @@ private:
         return false;
     }
 
+    // Mark every signal a virtual interface can reach. The frontend records which
+    // instance scopes a `virtual` handle may name (Module::vif_scopes); an access
+    // through such a handle is emitted once against a base chosen at run time, so
+    // EVERY instance of the same interface definition must present the same
+    // layout and the same shape. Keyed on the definition name, which is what the
+    // state-type dedup keys on too.
+    void compute_vif_reachable() {
+        vif_sig_.assign(mod_.signals().size(), false);
+        if (mod_.vif_scopes.empty()) {
+            return;
+        }
+        ankerl::unordered_dense::set<std::string> defs;
+        const auto                                collect_defs = [&](auto&& self, const InstanceScope& s) -> void {
+            if (std::ranges::contains(mod_.vif_scopes, s.id)) {
+                defs.insert(s.def_name);
+            }
+            for (const InstanceScope& c : s.children) {
+                self(self, c);
+            }
+        };
+        const auto mark = [&](auto&& self, const InstanceScope& s) -> void {
+            if (defs.contains(s.def_name)) {
+                for (const Signal sg : s.signals) {
+                    vif_sig_[static_cast<uint32_t>(sg)] = true;
+                }
+            }
+            for (const InstanceScope& c : s.children) {
+                self(self, c);
+            }
+        };
+        for (const InstanceScope& top : mod_.tops()) {
+            collect_defs(collect_defs, top);
+        }
+        for (const InstanceScope& top : mod_.tops()) {
+            mark(mark, top);
+        }
+    }
+
+    // Which members a nonblocking write through a handle targets. The write names
+    // one representative instance's signal; the mark is spread across the
+    // definition, because the handle may name any instance and every writer of the
+    // member has to agree on the path.
+    void collect_vif_nba() {
+        const auto n = mod_.signals().size();
+        vif_nba_.assign(n, false);
+        bool any = false;
+        // A write whose lvalue reaches through a handle names it syntactically.
+        const auto scan = [&](const Ir& ir, bool whole_body_is_vif) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (ir.tag(idx) != Inst::Tag::StoreNb) {
+                    continue;
+                }
+                const LvalueRoot r = lvalue_root(ir, ir.payload(idx).binary.l);
+                if (ir.tag(r.root) == Inst::Tag::IfaceSignal) {
+                    vif_nba_[static_cast<uint32_t>(
+                      ir.extra_data<IfaceMember>(ir.payload(r.root).op_extra.extra).signal)] = true;
+                    any = true;
+                    continue;
+                }
+                // Inside a subroutine reached through a handle, a bare member
+                // reference IS a write through a handle -- the instance is the one
+                // formal 0 named, not the one the body was lowered against. Its
+                // lvalue is an ordinary Signal, so nothing about the statement says
+                // so; the body does. Without this the write stages into the
+                // representative's block shadow and commits into the wrong instance.
+                if (whole_body_is_vif && ir.tag(r.root) == Inst::Tag::Signal) {
+                    vif_nba_[static_cast<uint32_t>(ir.payload(r.root).signal)] = true;
+                    any = true;
+                }
+            }
+        };
+        for (const Process& pr : mod_.processes()) {
+            scan(pr.ir, /*whole_body_is_vif=*/false);
+        }
+        for (size_t f = 0; f < mod_.function_count(); ++f) {
+            const Function& fn = mod_.function(static_cast<FunctionId>(f));
+            scan(fn.ir, fn.takes_iface_ctx);
+        }
+        if (any) {
+            spread_by_definition(vif_nba_);
+        }
+    }
+
+    // Spread a per-signal mark across every instance of each definition, by
+    // (definition name, index within its own scope) -- the pair that identifies a
+    // member independently of which instance it belongs to.
+    void spread_by_definition(std::vector<bool>& mark) {
+        ankerl::unordered_dense::map<std::string, std::vector<bool>> want;
+        const auto note = [&](auto&& self, const InstanceScope& sc) -> void {
+            auto& w = want[sc.def_name];
+            w.resize(std::max(w.size(), sc.signals.size()), false);
+            for (uint32_t k = 0; k < sc.signals.size(); ++k) {
+                w[k] = w[k] || mark[static_cast<uint32_t>(sc.signals[k])];
+            }
+            for (const InstanceScope& c : sc.children) {
+                self(self, c);
+            }
+        };
+        const auto apply = [&](auto&& self, const InstanceScope& sc) -> void {
+            const auto& w = want[sc.def_name];
+            for (uint32_t k = 0; k < sc.signals.size() && k < w.size(); ++k) {
+                mark[static_cast<uint32_t>(sc.signals[k])] =
+                  mark[static_cast<uint32_t>(sc.signals[k])] || w[k];
+            }
+            for (const InstanceScope& c : sc.children) {
+                self(self, c);
+            }
+        };
+        for (const InstanceScope& top : mod_.tops()) {
+            note(note, top);
+        }
+        for (const InstanceScope& top : mod_.tops()) {
+            apply(apply, top);
+        }
+    }
+
+    // Which (member, edge) pairs a `@(edge vif.sig)` parks on. The wait names one
+    // representative instance's signal; every instance of that definition needs the
+    // head, because the handle may name any of them, so the mark is spread by
+    // definition exactly as vif_sig_ is.
+    void collect_vif_waits() {
+        const auto n = mod_.signals().size();
+        vif_wait_.assign(n, { false, false, false });
+        vif_head_ord_.assign(n, { ~0u, ~0u, ~0u });
+        const auto scan = [&](const Ir& ir) {
+            for (size_t k = 0; k < ir.inst_count(); ++k) {
+                const auto idx = static_cast<Index>(k);
+                if (ir.tag(idx) != Inst::Tag::Wait) {
+                    continue;
+                }
+                for (const WaitEdge& we : ir.wait_edges(ir.payload(idx).extra)) {
+                    if (we.inst != kNoWaitHandle) {
+                        vif_wait_[static_cast<uint32_t>(we.signal)][we.edge] = true;
+                    }
+                }
+            }
+        };
+        for (const Process& pr : mod_.processes()) {
+            scan(pr.ir);
+        }
+        for (size_t f = 0; f < mod_.function_count(); ++f) {
+            scan(mod_.function(static_cast<FunctionId>(f)).ir);
+        }
+        // Spread each mark across the definition: a representative's def-local
+        // position is shared by its twins, and the layout must be too.
+        std::array<bool, 3> any{ false, false, false };
+        for (uint32_t i = 0; i < n; ++i) {
+            for (uint32_t e = 0; e < 3; ++e) {
+                any[e] = any[e] || vif_wait_[i][e];
+            }
+        }
+        if (!any[0] && !any[1] && !any[2]) {
+            return;
+        }
+        // Index within its own scope -> the edges wanted, per definition name.
+        ankerl::unordered_dense::map<std::string, std::vector<std::array<bool, 3>>> want;
+        const auto note = [&](auto&& self, const InstanceScope& sc) -> void {
+            auto& w = want[sc.def_name];
+            w.resize(std::max(w.size(), sc.signals.size()), { false, false, false });
+            for (uint32_t k = 0; k < sc.signals.size(); ++k) {
+                const auto si = static_cast<uint32_t>(sc.signals[k]);
+                for (uint32_t e = 0; e < 3; ++e) {
+                    w[k][e] = w[k][e] || vif_wait_[si][e];
+                }
+            }
+            for (const InstanceScope& c : sc.children) {
+                self(self, c);
+            }
+        };
+        const auto apply = [&](auto&& self, const InstanceScope& sc) -> void {
+            const auto& w = want[sc.def_name];
+            for (uint32_t k = 0; k < sc.signals.size() && k < w.size(); ++k) {
+                const auto si = static_cast<uint32_t>(sc.signals[k]);
+                for (uint32_t e = 0; e < 3; ++e) {
+                    vif_wait_[si][e] = vif_wait_[si][e] || w[k][e];
+                }
+            }
+            for (const InstanceScope& c : sc.children) {
+                self(self, c);
+            }
+        };
+        for (const InstanceScope& top : mod_.tops()) {
+            note(note, top);
+        }
+        for (const InstanceScope& top : mod_.tops()) {
+            apply(apply, top);
+        }
+    }
+
     // Build the design's state types: per-signal slot / storage types, one
     // struct per module definition (own signals only — every instance scope
     // owns a separate state global, children own theirs), and the root
@@ -2074,6 +2308,12 @@ private:
     void build_state_types() {
         const auto sigs = mod_.signals();
         slots_.resize(sigs.size());
+        // Before classification: which members a handle nonblocking-writes decides
+        // their staging path, and every writer of such a member must agree on it.
+        collect_vif_nba();
+        for (uint32_t i = 0; i < sigs.size(); ++i) {
+            slots_[i].vif_rec = vif_nba_[i];
+        }
         // Classify NBA targets up front so the slot loop can keep an NBA-target
         // 2-state signal on the packed word (its shadow / commit still expect it).
         nba_classify();
@@ -2091,7 +2331,8 @@ private:
         // An undriven 4-state net powers up z (LRM 6.6); everything else x / 0. A
         // partially-driven packed net powers its undriven bits z per this mask.
         const std::vector<bool>& undriven = facts_.undriven;
-
+        compute_vif_reachable();
+        collect_vif_waits();
 
         for (uint32_t i = 0; i < sigs.size(); ++i) {
             const Layout lay = mod_.pool.layout(sigs[i].type);
@@ -2201,6 +2442,15 @@ private:
             // passed as a compiler-materialized temp, never the variable itself
             // (Lower.cpp's make_arg_temp), and a temp is never a ref actual.
             if (facts_.ref_arg[i]) {
+                slot.has_z  = slot.four_state;
+                slot.narrow = !slot.four_state;
+            }
+            // A member reachable through a virtual interface takes the same
+            // canonical, type-derived shape a `ref` actual does, and for the same
+            // reason: the access is emitted once per definition against a base
+            // chosen at run time, so it cannot depend on what the may-z analysis
+            // proved about one particular instance's writers (LRM 25.9).
+            if (vif_sig_[i]) {
                 slot.has_z  = slot.four_state;
                 slot.narrow = !slot.four_state;
             }
@@ -2329,6 +2579,13 @@ private:
     };
     NbaTarget nba_target(const Ir& ir, Index lv) const {
         const LvalueRoot r = lvalue_root(ir, lv);
+        // A member reached through a virtual interface stages through the
+        // REPRESENTATIVE's def-local shadow fields and block ordinal; which
+        // instance's shadow those name is resolved at run time from the handle
+        // (LValue::vif_ctx), exactly as a reused definition's own body does.
+        if (ir.tag(r.root) == Inst::Tag::IfaceSignal) {
+            return { ir.extra_data<IfaceMember>(ir.payload(r.root).op_extra.extra).signal, r.whole };
+        }
         if (ir.tag(r.root) != Inst::Tag::Signal) {
             throw BackendError{ "unsupported nonblocking-assignment lvalue" };
         }
@@ -2540,6 +2797,21 @@ private:
                 }
                 continue;
             }
+            // A member some handle nonblocking-writes takes the same deferred
+            // queue, for the same reason an array element does: the destination is
+            // not a compile-time address. Every writer routes here, including the
+            // interface's own and a module port's, so the instant's writes commit
+            // in execution order rather than split across two phases.
+            if (slots_[static_cast<uint32_t>(t.sig)].vif_rec) {
+                if (std::find(array_nba_sigs_.begin(), array_nba_sigs_.end(), t.sig) ==
+                    array_nba_sigs_.end()) {
+                    array_nba_sigs_.push_back(t.sig);
+                }
+                if (lvalue_has_subselect(ir, lv_idx)) {
+                    slots_[static_cast<uint32_t>(t.sig)].arr_masked = true;
+                }
+                continue;
+            }
             // An unpacked-array element NBA uses the runtime deferred queue, not
             // the per-signal shadow; record the array signal for wake servicing.
             // (slot.is_array is not set until the placement loop below, so test
@@ -2619,13 +2891,34 @@ private:
             return b_.CreateInBoundsGEP(state_ty_, sym(state_global_), idx);
         }
         Anchor&      a    = anchors_[s.anchor];
-        llvm::Value* base = a.indirect && def_relative_for(s)
+        llvm::Value* base = (a.indirect || ctx_override_for(s)) && def_relative_for(s)
                               ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
                               : static_cast<llvm::Value*>(sym(a.state_gv));
         for (const uint32_t f : s.path) {
             idx.push_back(b_.getInt32(f));
         }
         return b_.CreateInBoundsGEP(a.ty, base, idx);
+    }
+
+    // Address of the waiter-list head for one (member, edge) of the instance the
+    // current access names: the same base a member access uses, plus the head's
+    // def-local field index (see scope_type). Shaped like an event object, so the
+    // intrusive list primitives apply unchanged.
+    llvm::Value* vif_head_ptr(Signal sig, uint32_t edge) {
+        const SignalSlot& s   = slot_of(sig);
+        const auto        si  = static_cast<uint32_t>(sig);
+        const uint32_t    ord = vif_head_ord_[si][edge];
+        if (s.anchor == SignalSlot::no_anchor || ord == ~0u) {
+            throw BackendError{ "internal: no virtual-interface waiter head for this member" };
+        }
+        Anchor&      a    = anchors_[s.anchor];
+        // Exactly storage_ptr's base rule: a shared body of a reused definition
+        // must load its instance base rather than bake one instance's symbol.
+        llvm::Value* base = (a.indirect || ctx_override_for(s)) && def_relative_for(s)
+                              ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
+                              : static_cast<llvm::Value*>(sym(a.state_gv));
+        return b_.CreateInBoundsGEP(a.ty, base,
+                                    { b_.getInt32(0), b_.getInt32(a.vif_head_base + ord) });
     }
 
     // Pointer to one field of the root NBA shadow struct, addressed through a base
@@ -2652,7 +2945,10 @@ private:
     // unconditional indirection (32 per-instance base loads GVN cannot merge).
     // Either form addresses the same storage; this is codegen policy only.
     bool def_relative_for(const SignalSlot& owner) const {
-        return sched_anchor_ != SignalSlot::no_anchor && owner.anchor == sched_anchor_;
+        // A virtual interface access is def-relative by construction: the instance
+        // is not known until run time, so there is no absolute form to fold to.
+        return ctx_override_for(owner) ||
+               (sched_anchor_ != SignalSlot::no_anchor && owner.anchor == sched_anchor_);
     }
 
     // `owner` is the signal whose (def-local, for an anchored signal) shadow
@@ -2667,7 +2963,7 @@ private:
             // An NBA target's anchor always carries a shadow struct (the
             // fields were assigned per anchor in build_state_types).
             Anchor&      a    = anchors_[owner.anchor];
-            llvm::Value* base = a.indirect && def_relative_for(owner)
+            llvm::Value* base = (a.indirect || ctx_override_for(owner)) && def_relative_for(owner)
                                   ? ctx_field(a, 1, ptr)
                                   : b_.CreateLoad(ptr, anchor_shadow_base(a));
             return b_.CreateInBoundsGEP(a.shadow_ty, base, { b_.getInt32(0), b_.getInt32(field) });
@@ -2757,11 +3053,66 @@ private:
         return sym(a.ctx_gv);
     }
 
-    // A def-relative load of one instance-context field.
+    // A def-relative load of one instance-context field. `ctx_override_` redirects
+    // it to an instance chosen at run time -- a virtual interface access, whose
+    // whole point is that the def-local field constants stay while the record they
+    // are read from is whichever instance the handle names (LRM 25.9).
     llvm::Value* ctx_field(Anchor& a, uint32_t field, llvm::Type* ty) {
+        if (ctx_override_ != nullptr) {
+            return b_.CreateLoad(ty, b_.CreateInBoundsGEP(a.ctx_ty, ctx_override_,
+                                                          { b_.getInt32(0), b_.getInt32(field) }));
+        }
         auto* gep = llvm::ConstantExpr::getInBoundsGetElementPtr(
           a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(field) });
         return b_.CreateLoad(ty, gep);
+    }
+
+    // Install a runtime instance context for the duration of one access (see
+    // LValue::vif_ctx). Every def-relative base -- storage, NBA shadow, wait
+    // buckets, dump-var index -- then resolves against that instance instead of
+    // the one whose body is being emitted.
+    //
+    // The ANCHOR is half the override: a record only describes the definition it
+    // was laid out for, so it may serve only signals of that anchor. A body-wide
+    // install (a ctx-parameterized subroutine) can otherwise reach a signal of
+    // some other scope -- a hierarchical reference out of the interface -- whose
+    // ctx_ty is a different layout, and GEP a plausible offset off the wrong
+    // record. ctx_override_for is the gate every base consults.
+    class CtxOverride {
+    public:
+        CtxOverride(Backend& be, llvm::Value* ctx, uint32_t anchor)
+          : be_(be)
+          , saved_(be.ctx_override_)
+          , saved_anchor_(be.ctx_override_anchor_) {
+            if (ctx != nullptr && anchor != SignalSlot::no_anchor) {
+                be_.ctx_override_        = ctx;
+                be_.ctx_override_anchor_ = anchor;
+            }
+        }
+        ~CtxOverride() {
+            be_.ctx_override_        = saved_;
+            be_.ctx_override_anchor_ = saved_anchor_;
+        }
+        CtxOverride(const CtxOverride&)            = delete;
+        CtxOverride& operator=(const CtxOverride&) = delete;
+
+    private:
+        Backend&     be_;
+        llvm::Value* saved_;
+        uint32_t     saved_anchor_;
+    };
+
+    // The anchor a vif-rooted lvalue's context record describes: its representative
+    // signal's own scope. no_anchor when the lvalue is not vif-rooted, which makes
+    // the CtxOverride a no-op.
+    uint32_t lvalue_ctx_anchor(const LValue& lv) const {
+        return lv.vif_ctx != nullptr && lv.is_signal ? slot_of(lv.sig).anchor : SignalSlot::no_anchor;
+    }
+
+    // Whether the installed instance context (if any) describes `owner`'s scope,
+    // and may therefore supply its bases.
+    bool ctx_override_for(const SignalSlot& owner) const {
+        return ctx_override_ != nullptr && owner.anchor == ctx_override_anchor_;
     }
 
     // Materialize the group's deferred def-relative context at the current
@@ -3890,6 +4241,11 @@ private:
     void lower_function(FunctionId id) {
         sched_anchor_ = SignalSlot::no_anchor; // functions are not a shareable group
         const Function& f = mod_.function(id);
+        // A subroutine reached through a virtual interface handle addresses its
+        // interface's signals through the instance formal 0 names, for the whole
+        // body (LRM 25.9). Scoped to this lowering, and to that interface's anchor:
+        // any other signal the body touches keeps the absolute form.
+        const BodyCtx body_ctx(*this, f);
         if (f.is_dpi) {
             // A DPI import is only an external declaration (declare_dpi_import);
             // its body is native C, so there is nothing to lower.
@@ -3937,6 +4293,7 @@ private:
         build_dynarr_temps();
         build_agg_elem_temps();
         emit_copyin(f);
+        arm_body_ctx();
 
         lower_region(ir_->root());
         // The frontend appends a trailing Ret, so the entry path always terminates;
@@ -3996,8 +4353,50 @@ private:
     // lower_task_call_inst. The body may suspend on #delay / @event, in which case
     // the caller suspends too; on completion the task copies output / inout formals
     // back through their pointers and resumes the caller (the record's parent).
+    // Installs the instance context of a ctx-parameterized subroutine (see
+    // Function::takes_iface_ctx) for its whole body. Held by value in the body
+    // lowerer so it unwinds with the frame; the override itself is materialized
+    // once the entry block exists, by arm().
+    class BodyCtx {
+    public:
+        BodyCtx(Backend& be, const Function& f)
+          : be_(be)
+          , saved_(be.body_ctx_fn_) {
+            be_.body_ctx_fn_ = f.takes_iface_ctx ? &f : nullptr;
+        }
+        ~BodyCtx() {
+            be_.body_ctx_fn_ = saved_;
+            be_.ctx_override_        = nullptr;
+            be_.ctx_override_anchor_ = SignalSlot::no_anchor;
+        }
+        BodyCtx(const BodyCtx&)            = delete;
+        BodyCtx& operator=(const BodyCtx&) = delete;
+
+    private:
+        Backend&        be_;
+        const Function* saved_;
+    };
+
+    // Materialize the body-wide instance context at the current insert point (the
+    // entry block, so it dominates every use). No-op unless the body takes one.
+    void arm_body_ctx() {
+        if (body_ctx_fn_ == nullptr) {
+            return;
+        }
+        const SignalSlot& s = slot_of(body_ctx_fn_->ctx_member);
+        // Formal 0 is the handle. Read it from its frame Local rather than the raw
+        // argument: the parameter travels in the packed scalar ABI, and the copy-in
+        // has already narrowed it to the 64-bit value the frame slot holds.
+        llvm::Value* handle =
+          b_.CreateLoad(int_ty(64), b_.CreateStructGEP(frame_ty_, frame_, 0), "vif.ctx");
+        emit_null_handle_check(handle, Index{ 0 }, NullKind::Iface);
+        ctx_override_        = b_.CreateIntToPtr(handle, raw_ptr_ty());
+        ctx_override_anchor_ = s.anchor;
+    }
+
     void lower_task(FunctionId id) {
         const Function& f = mod_.function(id);
+        const BodyCtx   body_ctx(*this, f);
         ir_               = &f.ir;
         cur_fn_           = &f;
         in_reactive_body_ = is_reactive_fn(id);
@@ -4131,6 +4530,7 @@ private:
         build_dynarr_temps();
         build_agg_elem_temps();
         emit_copyin(f);
+        arm_body_ctx();
         // On the target's activation list before the body can park, off it again in
         // the epilogue: a `disable` must see every activation that is live, and none
         // that is not (LRM 9.6.2).
@@ -4709,7 +5109,15 @@ private:
         // suspend.
         uint32_t ev_k = 0;
         for (const WaitEdge& e : events) {
-            if (e.handle != kNoWaitHandle) {
+            if (e.inst != kNoWaitHandle) {
+                // `@(edge vif.sig)`: park on the member's waiter list in the
+                // instance the handle names. Frame-resident, so there is no
+                // capacity to size -- the bucket path could not express this at all.
+                llvm::Value* ctx = b_.CreateIntToPtr(must_of(value_of(e.inst)), raw_ptr_ty());
+                CtxOverride  ov(*this, ctx, slot_of(e.signal).anchor);
+                emit_event_link(vif_head_ptr(e.signal, e.edge), event_wait_node(ev_k++),
+                                parked_handle(b_, hdl_), sched_ptr_);
+            } else if (e.handle != kNoWaitHandle) {
                 // An event with no signal of its own -- an array element, a class
                 // property, a formal. The frontend lowered its handle just before
                 // this wait, so park on whatever object it names now.
@@ -4739,7 +5147,11 @@ private:
         const bool remove_sigs = events.size() > 1 || design_uses_disable_;
         ev_k                   = 0;
         for (const WaitEdge& e : events) {
-            if (e.handle != kNoWaitHandle) {
+            if (e.inst != kNoWaitHandle) {
+                // The head is read back from the node, like an event's: the handle
+                // may have been retargeted while we were parked.
+                emit_event_unlink(event_wait_node(ev_k++));
+            } else if (e.handle != kNoWaitHandle) {
                 // The object is read back from the node: the expression that named
                 // it may not even be evaluable here (a loop index may have moved).
                 emit_event_unlink(event_wait_node(ev_k++));
@@ -5924,7 +6336,14 @@ private:
         wait_slot_dyn_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
         wait_slot_len_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
         for (uint32_t a = 0; a < anchors_.size(); ++a) {
-            if (!anchors_[a].indirect) {
+            // A virtual interface reaches an instance chosen at run time, so its
+            // buckets have to be addressable through the context record even when
+            // the definition is instantiated once and its own body bakes symbols.
+            const bool vif_anchor =
+              std::ranges::any_of(by_anchor[a], [&](Signal sj) {
+                  return sj != Signal{ ~0u } && vif_sig_[static_cast<uint32_t>(sj)];
+              });
+            if (!anchors_[a].indirect && !vif_anchor) {
                 continue;
             }
             uint32_t next = 0;
@@ -5993,7 +6412,14 @@ private:
         auto* i32 = b_.getInt32Ty();
         ankerl::unordered_dense::map<llvm::StructType*, llvm::StructType*> def_ctx;
         for (Anchor& a : anchors_) {
-            if (!a.indirect) {
+            // A virtual interface addresses its target instance through this
+            // record whatever the definition's instance count, so an interface a
+            // handle can name needs the layout even when it is unique.
+            const bool vif_anchor =
+              std::ranges::any_of(anchor_signals_[&a - anchors_.data()], [&](Signal sj) {
+                  return sj != Signal{ ~0u } && vif_sig_[static_cast<uint32_t>(sj)];
+              });
+            if (!a.indirect && !vif_anchor) {
                 continue;
             }
             a.n_groups     = def_groups[a.ty];
@@ -7730,7 +8156,7 @@ private:
             // A `<= @e` trigger has no coroutine waiter but its edge must still be
             // watched so a store/commit fires its deferred records.
             if (wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr ||
-                trigger_id(sig, e) >= 0) {
+                vif_wait_[i][e] || trigger_id(sig, e) >= 0) {
                 return true;
             }
         }
@@ -7890,7 +8316,7 @@ private:
         const auto has_bucket = [&](Edge e) {
             const auto k = static_cast<uint32_t>(e);
             return wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr ||
-                   trigger_id(sig, k) >= 0;
+                   vif_wait_[i][k] || trigger_id(sig, k) >= 0;
         };
         const SignalSlot& slot = slot_of(sig);
         const EdgeFacts   f =
@@ -7920,6 +8346,12 @@ private:
             }
             if (wait_dyn_gv_[i][e] != nullptr) {
                 service_dynamic_queue(sig, e);
+            }
+            if (vif_wait_[i][e]) {
+                // Waiters that reached this member through a virtual interface: an
+                // intrusive list on the instance the write is landing in, walked
+                // exactly like an event object's (each waiter unlinks itself).
+                emit_event_wake_list(vif_head_ptr(sig, e));
             }
             fire_event_trigger(sig, e);
             b_.CreateBr(cont);
@@ -9140,6 +9572,14 @@ private:
             auto* i32 = b_.getInt32Ty();
             emit_static_scan_rt(meta_at(meta, 0, e, ptr), meta_at(meta, 1, e, i32));
             emit_dynamic_scan_rt(meta_at(meta, 2, e, ptr), meta_at(meta, 3, e, ptr));
+            if (vif_wait_[static_cast<uint32_t>(sig)][e]) {
+                // Waiters that reached this member through a virtual interface. The
+                // meta table carries only the bucket bases, so the list is addressed
+                // directly -- `sig` is compile-time here, and the commit runs in the
+                // owning instance's own code (a handle-written target commits
+                // through the same block as any other write to it).
+                emit_event_wake_list(vif_head_ptr(sig, e));
+            }
             // An NBA commit to a `<= @e` trigger fires its records too (the other
             // wake path is a blocking store, in service_wait_queue).
             fire_event_trigger(sig, e);
@@ -9247,8 +9687,8 @@ private:
             // whole element range; the flush diff still emits only what changed.
             if (uses_vcd) {
                 for (const Signal sig : array_nba_sigs_) {
-                    if (vcd_index_[static_cast<uint32_t>(sig)] < 0) {
-                        continue;
+                    if (vcd_index_[static_cast<uint32_t>(sig)] < 0 || slot_of(sig).vif_rec) {
+                        continue; // a vif member touched its own index per record
                     }
                     auto* fn     = b_.GetInsertBlock()->getParent();
                     auto* svc    = llvm::BasicBlock::Create(ctx_, "vcd.arr.svc", fn);
@@ -10089,12 +10529,20 @@ private:
         if (s.arr_masked) {
             f.push_back(int_ty(s.width));
         }
+        if (s.vif_rec) {
+            // The instance the write landed in, so the replay can wake ITS waiters
+            // rather than the representative's.
+            f.push_back(ptr);
+        }
         return llvm::StructType::get(ctx_, f);
     }
     // Field indices within the record (mm_ptr=0, mm_val=1 are fixed).
     uint32_t arr_rec_z_ptr(const SignalSlot&) const { return 2; }
     uint32_t arr_rec_z_val(const SignalSlot&) const { return 3; }
     uint32_t arr_rec_mask(const SignalSlot& s) const { return s.has_z ? 4 : 2; }
+    uint32_t arr_rec_ctx(const SignalSlot& s) const {
+        return (s.has_z ? 4u : 2u) + (s.arr_masked ? 1u : 0u);
+    }
 
     // String runtime (rt_string_*); every ptr is an rt_string handle except
     // where noted.
@@ -11357,6 +11805,17 @@ private:
             case Inst::Tag::ClassNew:
                 // The object handle (a 2-state 64-bit value, per layout(Class)).
                 return from_ref(p.ref);
+            case Inst::Tag::IfaceRef:
+                // The instance-context address, as a 2-state 64-bit handle.
+                return { 64, false, false };
+            case Inst::Tag::IfaceSignal: {
+                // An lvalue producer (the named member of the handle's instance);
+                // its shape is the representative signal's, which every instance of
+                // the definition shares.
+                const SignalSlot& s = slot_of(ir_->extra_data<IfaceMember>(p.op_extra.extra).signal);
+                return { s.width, s.four_state, s.is_signed, s.is_string && !s.is_array,
+                         s.is_real && !s.is_array };
+            }
             case Inst::Tag::Load:
                 return type_of(p.unary);
             case Inst::Tag::SimTime:
@@ -12353,6 +12812,34 @@ private:
                 set_lvalue(i, lv);
                 return;
             }
+            case Inst::Tag::IfaceRef: {
+                // The handle a `vif = bus;` stores: the address of that instance's
+                // context record, as an i64 (LRM 25.9). A link-time constant.
+                const auto info = ir_->extra_data<IfaceInst>(p.extra);
+                if (info.scope >= anchor_of_scope_.size() ||
+                    anchor_of_scope_[info.scope] == SignalSlot::no_anchor) {
+                    throw BackendError{ "internal: virtual interface names an unanchored scope" };
+                }
+                Anchor& a = anchors_[anchor_of_scope_[info.scope]];
+                set_value(i, two_val(b_.CreatePtrToInt(ensure_ctx(a), b_.getInt64Ty())));
+                return;
+            }
+            case Inst::Tag::IfaceSignal: {
+                // A member of the instance the handle names. The representative
+                // supplies every def-local constant -- field path, slot shape, wait
+                // slots, shadow fields, dump-var offset -- and `vif_ctx` supplies
+                // the instance those constants are resolved against, so this is the
+                // ordinary signal lvalue with one substituted base.
+                const auto   rep    = ir_->extra_data<IfaceMember>(p.op_extra.extra).signal;
+                llvm::Value* handle = must_of(value_of(p.op_extra.op));
+                emit_null_handle_check(handle, i, NullKind::Iface);
+                llvm::Value* ctx = b_.CreateIntToPtr(handle, raw_ptr_ty());
+                CtxOverride  ov(*this, ctx, slot_of(rep).anchor);
+                LValue       lv = signal_lvalue(rep);
+                lv.vif_ctx      = ctx;
+                set_lvalue(i, lv);
+                return;
+            }
             case Inst::Tag::ClassNew: {
                 // Allocate the object body, zero it (2-state / handle leaves power
                 // on 0 / null), X-init 4-state leaves and init string leaves, and
@@ -12422,6 +12909,9 @@ private:
 
             case Inst::Tag::Load: {
                 const LValue& raw = lvalue_of(p.unary);
+                // A place reached through a virtual interface resolves every
+                // def-relative base against the instance the handle named.
+                CtxOverride ov(*this, raw.vif_ctx, lvalue_ctx_anchor(raw));
                 emit_bounds_reports(raw, /*is_write=*/false);
                 // An assoc element resolves its base FIRST (get_ptr for a read: an
                 // absent key yields no slot and no entry is created, LRM 7.8.6), and
@@ -12462,6 +12952,7 @@ private:
                 // is woken. Snapshot the old value first so the transition can be
                 // detected from old -> new.
                 const LValue& raw = lvalue_of(p.binary.l);
+                CtxOverride   ov(*this, raw.vif_ctx, lvalue_ctx_anchor(raw));
                 emit_bounds_reports(raw, /*is_write=*/true);
                 // As in Load, an assoc element resolves its base before anything
                 // dispatches on the place's storage class -- put_ptr here, which
@@ -12519,6 +13010,7 @@ private:
             // live and services wait queues only after every active process has run.
             case Inst::Tag::StoreNb: {
                 const LValue& lv  = lvalue_of(p.binary.l);
+                CtxOverride   ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
                 emit_bounds_reports(lv, /*is_write=*/true);
                 Plane         rhs = value_of(p.binary.r);
                 if (type_of(p.binary.r).is_real) {
@@ -12530,7 +13022,7 @@ private:
                 // scalar select, or aggregate static leaf) uses the block shadow.
                 const bool agg_partial =
                   lv.is_agg && lv.agg_leaf && (lv.width != lv.store_width || !is_zero_const(lv.bit_off));
-                if (lv.is_signal && slot_of(lv.sig).is_array) {
+                if (lv.is_signal && (slot_of(lv.sig).is_array || slot_of(lv.sig).vif_rec)) {
                     emit_array_nba(lv, rhs);
                 } else if (lv.is_agg && (!lv.agg_static || agg_partial)) {
                     emit_agg_nba(lv, rhs);
@@ -15545,6 +16037,20 @@ private:
         if (s.arr_masked) {
             b_.CreateAlignedStore(mask_w, b_.CreateStructGEP(rt, rec, arr_rec_mask(s)), a1);
         }
+        if (s.vif_rec) {
+            // Through a handle, the instance it named; inside a subroutine reached
+            // through one, the instance formal 0 named (the body-wide override);
+            // from the member's own instance, that instance's own record. Either
+            // way the replay wakes the instance the value actually landed in.
+            llvm::Value* ctx = lv.vif_ctx;
+            if (ctx == nullptr && ctx_override_for(s)) {
+                ctx = ctx_override_;
+            }
+            if (ctx == nullptr) {
+                ctx = ensure_ctx(anchors_[s.anchor]);
+            }
+            b_.CreateAlignedStore(ctx, b_.CreateStructGEP(rt, rec, arr_rec_ctx(s)), a1);
+        }
     }
 
     // Replay array `sig`'s deferred records in push order (later write to an element
@@ -16134,6 +16640,12 @@ private:
         llvm::Value* recp   = b_.CreateInBoundsGEP(i8, base, b_.CreateMul(idx, b_.getInt32(stride)));
         llvm::Value* mm_ptr = b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, 0));
         llvm::Value* mm_val = b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 1), a1);
+        // A member written through a virtual interface wakes per record, not once
+        // for the whole pass: each record may have landed in a different instance,
+        // and a scalar member has real edge semantics (an array element does not).
+        // Snapshot before the store so the transition can be classified after it.
+        llvm::Value* old_mm = s.vif_rec ? b_.CreateAlignedLoad(mmty, mm_ptr, mm_al) : nullptr;
+        llvm::Value* old_z  = nullptr;
         llvm::Value* mask   = nullptr;
         if (s.arr_masked) {
             mask = b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, arr_rec_mask(s)), a1);
@@ -16147,9 +16659,13 @@ private:
         } else {
             b_.CreateAlignedStore(mm_val, mm_ptr, mm_al);
         }
+        llvm::Value* new_z = nullptr;
         if (s.has_z) {
             llvm::Value* z_ptr = b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, arr_rec_z_ptr(s)));
             llvm::Value* z_val = b_.CreateAlignedLoad(zty, b_.CreateStructGEP(rt, recp, arr_rec_z_val(s)), a1);
+            if (s.vif_rec) {
+                old_z = b_.CreateAlignedLoad(zty, z_ptr, z_al);
+            }
             if (s.arr_masked) {
                 llvm::Value* old = b_.CreateAlignedLoad(zty, z_ptr, z_al);
                 b_.CreateAlignedStore(
@@ -16158,12 +16674,27 @@ private:
                 b_.CreateAlignedStore(z_val, z_ptr, z_al);
             }
         }
+        if (s.vif_rec) {
+            // Re-read through the recorded pointer: the store above may have been a
+            // masked merge, so the committed word is not the staged one.
+            llvm::Value* new_mm = b_.CreateAlignedLoad(mmty, mm_ptr, mm_al);
+            if (s.has_z) {
+                llvm::Value* z_ptr =
+                  b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, arr_rec_z_ptr(s)));
+                new_z = b_.CreateAlignedLoad(zty, z_ptr, z_al);
+            }
+            llvm::Value* rec_ctx = b_.CreateLoad(ptr, b_.CreateStructGEP(rt, recp, arr_rec_ctx(s)));
+            CtxOverride  ov(*this, rec_ctx, s.anchor);
+            service_wait_queue(sig, old_mm, new_mm, old_z, new_z);
+            vcd_touch_signal(sig);
+        }
         idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
         b_.CreateBr(head);
 
         b_.SetInsertPoint(done);
-        // Wake the array's level readers if it took any write this pass.
-        if (signal_has_waiters(sig)) {
+        // Wake the array's level readers if it took any write this pass. A vif
+        // member woke per record above, with its own edge facts.
+        if (!s.vif_rec && signal_has_waiters(sig)) {
             auto* svc  = llvm::BasicBlock::Create(ctx_, "arr.svc", fn);
             auto* cont = llvm::BasicBlock::Create(ctx_, "arr.svc.cont", fn);
             b_.CreateCondBr(b_.CreateICmpNE(n, b_.getInt32(0)), svc, cont);
@@ -17041,21 +17572,26 @@ private:
     // The rt_null_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
     // i32 column, i32 end_column }. Field order and types mirror the C struct
     // exactly, so the two change together.
+    // Which handle kind a null guard is protecting, so the report names it (LRM 8.4
+    // for a class, 25.9 for a virtual interface). Mirrors rt_null_kind.
+    enum class NullKind : int32_t { Class = 0, Iface = 1 };
+
     llvm::StructType* null_site_ty() {
         auto* i32 = b_.getInt32Ty();
-        return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32 });
+        return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, i32 });
     }
 
     // One constant rt_null_site per guarded dereference. Everything the fatal
     // knows is compile-time, so only the simulation time travels as an argument.
-    llvm::Constant* null_site_global(const SourceText& at) {
+    llvm::Constant* null_site_global(const SourceText& at, NullKind kind) {
         auto* const i32  = b_.getInt32Ty();
         auto* const rec  = null_site_ty();
         auto*       init = llvm::ConstantStruct::get(
           rec, { b_.CreateGlobalString(at.where, "null.at"),
                  b_.CreateGlobalString(at.line, "null.src"),
                  llvm::ConstantInt::get(i32, at.line_no), llvm::ConstantInt::get(i32, at.column),
-                 llvm::ConstantInt::get(i32, at.end_column) });
+                 llvm::ConstantInt::get(i32, at.end_column),
+                 llvm::ConstantInt::get(i32, static_cast<int32_t>(kind)) });
         return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
                                         llvm::GlobalValue::PrivateLinkage, init,
                                         "clotho.null.site");
@@ -17075,7 +17611,7 @@ private:
     // same handle value reaches two derefs unchanged, CSE folds the second
     // compare away. The wheel fallback mirrors lower_case_viol: a dereference
     // inside a pure function has no wheel and reports time 0.
-    void emit_null_handle_check(llvm::Value* handle, Index at) {
+    void emit_null_handle_check(llvm::Value* handle, Index at, NullKind kind = NullKind::Class) {
         auto* fn   = b_.GetInsertBlock()->getParent();
         auto* bad  = llvm::BasicBlock::Create(ctx_, "null.deref", fn);
         auto* cont = llvm::BasicBlock::Create(ctx_, "deref.ok", fn);
@@ -17087,7 +17623,8 @@ private:
         llvm::Value* now  = has_wheel()
                               ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                               : static_cast<llvm::Value*>(b_.getInt64(0));
-        auto*        call = b_.CreateCall(null_handle_fn(), { null_site_global(loc_text(at)), now });
+        auto*        call =
+          b_.CreateCall(null_handle_fn(), { null_site_global(loc_text(at), kind), now });
         call->addFnAttr(llvm::Attribute::NoReturn);
         call->addFnAttr(llvm::Attribute::Cold);
         b_.CreateUnreachable();
@@ -18365,7 +18902,7 @@ private:
         const SignalSlot& s = slot_of(sig);
         if (s.anchor != SignalSlot::no_anchor && def_relative_for(s)) {
             Anchor& a = anchors_[s.anchor];
-            if (a.indirect && a.first_vcd >= 0) {
+            if ((a.indirect || ctx_override_for(s)) && a.first_vcd >= 0) {
                 llvm::Value* b0 = ctx_field(a, 3, b_.getInt32Ty());
                 return b_.CreateAdd(b0, b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));
             }
@@ -18410,6 +18947,21 @@ private:
         emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
             return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(lv.sig, base) };
         });
+    }
+
+    // Emit an rt_vcd_touch for one dumped scalar signal. Used by the deferred-record
+    // replay of a member written through a virtual interface, where the index is
+    // the bound instance's (an installed CtxOverride supplies its base).
+    void vcd_touch_signal(Signal sig) {
+        if (!design_uses_vcd_) {
+            return;
+        }
+        const int32_t base = vcd_index_[static_cast<uint32_t>(sig)];
+        if (base >= 0) {
+            emit_guarded_vcd_touch(vcd_touch_fn(), [&] {
+                return llvm::SmallVector<llvm::Value*, 2>{ vcd_index_value(sig, base) };
+            });
+        }
     }
 
     // Emit an rt_vcd_touch_range for a dumped array signal (whole element range).
@@ -22430,6 +22982,25 @@ private:
     // Def-local signal table per anchor (slot.path's last element), kept from
     // build_wait_queues for the ctx layout and block-signal translation.
     std::vector<std::vector<Signal>> anchor_signals_;
+    // The ctx-parameterized subroutine currently being lowered, or null (BodyCtx).
+    const Function* body_ctx_fn_ = nullptr;
+    // Signals reachable through a virtual interface handle (compute_vif_reachable):
+    // every signal of every instance of an interface definition some `virtual`
+    // handle names. They keep the canonical type-derived shape.
+    std::vector<bool> vif_sig_;
+    // Per (signal, edge): does some `@(edge vif.sig)` park on this member? Set by
+    // collect_vif_waits over the representative each such wait names, then spread
+    // to every instance of the definition so the state layout stays def-uniform.
+    // vif_head_ord_ is the head's def-local ordinal past Anchor::vif_head_base.
+    std::vector<std::array<bool, 3>>     vif_wait_;
+    std::vector<std::array<uint32_t, 3>> vif_head_ord_;
+    // Members some handle nonblocking-writes (see SignalSlot::vif_rec).
+    std::vector<bool> vif_nba_;
+    // Instance context to resolve def-relative bases against, while emitting an
+    // access through a virtual interface handle (see CtxOverride). Null outside
+    // one, when the owning instance is the one whose body is being emitted.
+    llvm::Value* ctx_override_        = nullptr;
+    uint32_t     ctx_override_anchor_ = SignalSlot::no_anchor;
 
     // VCD dirty set (meaningful iff design_uses_vcd_). vcd_index_[sig] is the
     // runtime dump-var index of a dumped scalar signal, or -1 when the signal is

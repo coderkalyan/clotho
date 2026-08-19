@@ -195,6 +195,12 @@ struct WaitEvent {
     // sensitivity list that would need a handle is left in the body instead, where
     // it lowers as an ordinary intra-body wait (build_process).
     Index handle = kNoWaitHandle;
+    // Intra-body waits only: the SSA value of a virtual interface handle, when the
+    // wait names a member reached through one (`@(posedge vif.clk)`, LRM 25.9).
+    // `signal` is then a REPRESENTATIVE of that member -- some instance's copy,
+    // naming which member -- and this says which instance is actually waited on.
+    // kNoWaitHandle otherwise. Mutually exclusive with `handle`.
+    Index inst = kNoWaitHandle;
 };
 
 // One lowered process plus the metadata the IR body itself does not carry: how
@@ -532,6 +538,13 @@ struct Function {
     // Storage type of every frame local, indexed by the Local handle's index:
     // the parameter copies, the return variable, and body-local declarations.
     std::vector<Ref> local_types;
+    // Set for a subroutine reached through a VIRTUAL INTERFACE handle (LRM 25.9):
+    // formal 0 is the handle, and the whole body addresses signals through the
+    // instance it names rather than the one the body was lowered against.
+    // `ctx_member` is any signal of that interface -- it names the definition whose
+    // layout the instance record must describe for the substitution to be sound.
+    bool   takes_iface_ctx = false;
+    Signal ctx_member{ 0 };
     // True for a task: lowered as a coroutine that may suspend on timing controls.
     bool is_task = false;
     // True for a synthetic fork-child body (LRM 9.3.2): a coroutine spawned at a
@@ -635,6 +648,12 @@ public:
     // Femtoseconds per wheel tick (the design's finest time unit). Used by %t to
     // convert a tick-valued time argument to real time. 1 when unitless.
     uint64_t tick_fs = 1;
+    // InstanceScope ids of the interface instances a virtual interface handle can
+    // name (LRM 25.9). Every instance of the same definition must then present one
+    // runtime context record and one canonical signal shape, because an access
+    // through a handle is emitted once for the definition. Empty when the design
+    // declares no virtual interface.
+    std::vector<uint32_t> vif_scopes;
     // Default %t time-unit exponent (10^n seconds): the smallest time precision
     // across all design timescales (LRM Table 20-3). Seeds the runtime's
     // $timeformat default at startup.

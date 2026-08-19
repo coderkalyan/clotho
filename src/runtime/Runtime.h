@@ -284,9 +284,17 @@ void rt_wide_ins(void* mm, void* z, uint32_t width, int64_t base, uint32_t cwidt
 
 // The site of one guarded class-handle use — a property dereference or a virtual
 // dispatch — emitted by the backend as a constant global beside the guard.
+// What kind of handle was null, which decides the wording: a class handle is
+// constructed with `new`, a virtual interface is bound to an elaborated instance,
+// so the same report would misdirect for the other.
+typedef enum rt_null_kind {
+    RT_NULL_CLASS = 0,
+    RT_NULL_IFACE = 1,
+} rt_null_kind;
+
 // Nothing about a null handle is dynamic except the simulation time, so the whole
 // record is compile-time. Field order and types mirror the LLVM struct the
-// backend builds: { ptr, ptr, i32 x3 }.
+// backend builds: { ptr, ptr, i32 x4 }.
 typedef struct rt_null_site {
     // "<file>:<line>:<col>" of the handle expression, or "<unknown>" when the
     // location cannot be resolved.
@@ -301,6 +309,8 @@ typedef struct rt_null_site {
     // 1-based column one past its last character, so the caret spans
     // [column, end_column). Equals `column` when no extent was recorded.
     int32_t end_column;
+    // An rt_null_kind.
+    int32_t kind;
 } rt_null_site;
 
 // Reaching a non-static property, or dispatching a virtual method, through a

@@ -216,6 +216,18 @@ Index Builder::member_select(Index base, uint32_t field_index, Ref struct_type, 
     return emit({ Inst::Tag::MemberSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
+Index Builder::iface_ref(uint32_t scope, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(IfaceInst{ scope });
+
+    return emit({ Inst::Tag::IfaceRef, Inst::Payload{ .extra = extra } }, loc);
+}
+
+Index Builder::iface_signal(Index handle, Signal rep, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(IfaceMember{ rep });
+
+    return emit({ Inst::Tag::IfaceSignal, Inst::Payload{ .op_extra = { handle, extra } } }, loc);
+}
+
 Index Builder::class_new(Ref class_type, SourceLoc loc) {
     return emit({ Inst::Tag::ClassNew, Inst::Payload{ .ref = class_type } }, loc);
 }

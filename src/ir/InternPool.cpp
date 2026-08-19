@@ -22,6 +22,7 @@ InternPool::InternPool()
     bit_type       = put(Type{ .kind = Type::Kind::Bit });
     string_type    = put(Type{ .kind = Type::Kind::String });
     event_type     = put(Type{ .kind = Type::Kind::Event });
+    viface_type    = put(Type{ .kind = Type::Kind::VirtualIface });
     real_type      = put(Type{ .kind = Type::Kind::Real });
     shortreal_type = put(Type{ .kind = Type::Kind::ShortReal });
 }
@@ -184,6 +185,11 @@ Layout InternPool::compute_layout(Ref type) const {
             // entry in the backend's event object array, stored as one 2-state
             // 64-bit value. Identical storage / assign / compare to a class handle,
             // which is what makes every container and ABI path work unchanged.
+            return { Domain::Two, 64, plane_bytes(64) };
+        case Type::Kind::VirtualIface:
+            // A virtual interface variable holds a handle to one interface
+            // instance's runtime context record, stored as one 2-state 64-bit
+            // value -- the class / event handle shape, for the same reason.
             return { Domain::Two, 64, plane_bytes(64) };
         case Type::Kind::UnpackedArray: {
             // Report the leaf element's domain / width (recursion drills through

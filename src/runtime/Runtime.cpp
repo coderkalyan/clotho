@@ -3811,8 +3811,13 @@ extern "C" void rt_null_handle(const rt_null_site* site, uint64_t now) {
     // Each styled run stops short of the newline: fmt closes a style after
     // everything it formatted, and a reset that lands past the line break leaves
     // the style live across it.
+    const bool iface = site->kind == RT_NULL_IFACE;
     fmt::print(stderr, label, "fatal:");
-    fmt::print(stderr, head, " dereference of a null class handle");
+    if (iface) {
+        fmt::print(stderr, head, " use of a null virtual interface");
+    } else {
+        fmt::print(stderr, head, " dereference of a null class handle");
+    }
     fmt::print(stderr, "\n");
     fmt::print(stderr, loc, "{}", site->where);
     fmt::print(stderr, "\n");
@@ -3824,13 +3829,26 @@ extern "C" void rt_null_handle(const rt_null_site* site, uint64_t now) {
                       loc, caret);
     }
     fmt::print(stderr, tag, "  note:");
-    fmt::print(stderr, body, " the handle holds no object at {} -- it was never assigned one, or "
-                             "was assigned null",
-               when);
+    if (iface) {
+        fmt::print(stderr, body,
+                   " the handle names no interface instance at {} -- it was never assigned one, "
+                   "or was assigned null",
+                   when);
+    } else {
+        fmt::print(stderr, body,
+                   " the handle holds no object at {} -- it was never assigned one, or was "
+                   "assigned null",
+                   when);
+    }
     fmt::print(stderr, "\n");
     fmt::print(stderr, tag, "  note:");
-    fmt::print(stderr, body, " construct the object with `new` before reaching a member "
-                             "through it (LRM 8.4)");
+    if (iface) {
+        fmt::print(stderr, body, " assign an elaborated interface instance to the handle before "
+                                 "reaching a member through it (LRM 25.9)");
+    } else {
+        fmt::print(stderr, body, " construct the object with `new` before reaching a member "
+                                 "through it (LRM 8.4)");
+    }
     fmt::print(stderr, "\n");
     std::fflush(stderr);
 

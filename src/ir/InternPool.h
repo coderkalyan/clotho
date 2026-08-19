@@ -144,6 +144,20 @@ struct Type {
         // container and call-ABI path carries it with no special case, exactly as a
         // class handle is. See docs/design/event-handles.md.
         Event,
+        // Virtual interface (LRM §25.9): a reference type, like Class and Event.
+        // The value is a 64-bit handle to one elaborated interface instance -- the
+        // address of that instance's runtime context record, whose field 0 is the
+        // instance's state base. Every instance of one interface definition lays
+        // its signals out identically, so a member reached through the handle is
+        // that one runtime base plus a compile-time def-local field index.
+        //
+        // Only assignment, `==`/`!=` and `null` apply to the variable itself (LRM
+        // 25.9), all of which the plane machinery already gives. The IR carries no
+        // per-interface type identity: slang polices which instance may be assigned
+        // to which variable (parameters and modport are part of the type), so one
+        // interned kind serves every virtual interface in the design, exactly as
+        // one Event kind serves every event. See docs/design/interfaces.md.
+        VirtualIface,
     };
 
     // Discriminant for this type.
@@ -311,6 +325,8 @@ public:
     Ref string_type;
     // Named event: the 64-bit handle to a sync object (LRM 15.5.5).
     Ref event_type;
+    // Virtual interface: the 64-bit handle to an interface instance (LRM 25.9).
+    Ref viface_type;
     // IEEE-754 double / float (SV real, realtime / shortreal).
     Ref real_type;
     Ref shortreal_type;

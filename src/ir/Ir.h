@@ -307,6 +307,22 @@ struct MemberSelect {
     Ref struct_type;
 };
 
+// Extra payload for `iface_ref`: which elaborated interface instance a virtual
+// interface handle names, as its InstanceScope id. The backend maps the id to
+// that instance's runtime context record and yields its address.
+struct IfaceInst {
+    uint32_t scope;
+};
+
+// Extra payload for `iface_signal`: which member of the interface definition is
+// being reached through the handle, named by a REPRESENTATIVE signal -- any real
+// instance's copy of that member. Every instance of one definition lays its
+// members out identically, so the representative supplies the def-local field
+// index while the handle supplies the base. See docs/design/interfaces.md.
+struct IfaceMember {
+    Signal signal;
+};
+
 // Extra payload for `dyn_array_new` / `dyn_array_copy`: the tag's single
 // non-handle operand (element count for New, source handle for Copy) plus the
 // interned DynArray type (element stride / slot), independent of the target
@@ -963,6 +979,11 @@ struct WaitEdge {
     // site (which uses designated initializers naming only signal and edge) keeps
     // meaning "no handle" instead of silently naming instruction 0.
     Index handle = static_cast<Index>(~uint32_t{ 0 });
+    // For a wait on a member reached through a VIRTUAL INTERFACE (LRM 25.9): the
+    // SSA value of the handle. `signal` is then a representative of the member and
+    // this names the instance whose waiter list the park goes onto. Same sentinel
+    // and same defaulting rule as `handle`, with which it is mutually exclusive.
+    Index inst = static_cast<Index>(~uint32_t{ 0 });
 };
 
 // `WaitEdge::handle` is absent: this wait names its signal directly.
@@ -1083,6 +1104,16 @@ struct Inst {
         // addressed by declaration-order field index into the backing StructType,
         // not a bit offset (a packed struct member is a PartSelect instead).
         MemberSelect,
+        // Address of one elaborated interface instance, as a virtual interface
+        // handle (payload: extra -> IfaceInst). A 2-state 64-bit value; the
+        // constant an `vif = bus;` assignment stores. LRM 25.9.
+        IfaceRef,
+        // Reach a member of the interface instance a virtual interface handle
+        // names (payload: op_extra -> op is the handle value, extra ->
+        // IfaceMember). Yields the member's lvalue: the representative signal's
+        // own lvalue with its state base taken from the handle instead of from
+        // the owning instance's symbol. A null handle is a located fatal.
+        IfaceSignal,
         // Class object `new` (LRM 8.7): allocate the heap object body, power-on
         // init its properties, and yield the object handle as a 2-state 64-bit
         // value (payload: ref -> the Kind::Class type). The constructor call is
@@ -2234,6 +2265,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Repl:
             return K::Repl;
         case T::Concat:
+        case T::IfaceRef:
         case T::StrengthRes:
         case T::Loop:
         case T::NamedBlock:
@@ -2318,6 +2350,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ElemSelect:
         case T::ArrSlice:
         case T::MemberSelect:
+        case T::IfaceSignal:
         case T::AggCopy:
         case T::AggEq:
         case T::DynArrayNew:
@@ -2413,6 +2446,8 @@ constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
         case T::MonitorSet:
         // expect_wait: a monitor index only.
         case T::ExpectWait:
+        // iface_ref: a scope id only.
+        case T::IfaceRef:
         // finish / case_viol / test_plusargs: banner / query bytes only.
         case T::Finish:
         case T::CaseViol:
