@@ -10932,6 +10932,13 @@ private:
     llvm::FunctionCallee urandom_seed_fn() {
         return rt_fn("rt_urandom_seed", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
     }
+    // i32 rt_randc_next(i64* seen, i32 nvals, i64* rng): one cyclic draw for a
+    // randc property (LRM §18.6), against that property's remaining-value bitmap
+    // and the object's own RNG state. Both are passed as raw pointers to class
+    // properties, so the runtime needs no knowledge of the class layout.
+    llvm::FunctionCallee randc_next_fn() {
+        return rt_fn("rt_randc_next", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
+    }
     llvm::FunctionCallee wheel_pending_fn() {
         return rt_fn("rt_wheel_pending", b_.getInt32Ty(), { raw_ptr_ty() });
     }
@@ -12007,10 +12014,14 @@ private:
             case Inst::Tag::DistUnary:
             case Inst::Tag::DistBinary:
                 return { 64, false, false };
-            // $urandom / $urandom_range: a 32-bit unsigned `int` (2-state).
+            // $urandom / $urandom_range: a 32-bit unsigned `int` (2-state). An
+            // object's own draw (LRM §18.14.2) and a randc draw (LRM §18.6) have
+            // the same result type; only the state they advance differs.
             case Inst::Tag::Urandom:
             case Inst::Tag::UrandomSeeded:
             case Inst::Tag::UrandomRange:
+            case Inst::Tag::ObjRandom:
+            case Inst::Tag::RandcNext:
                 return { 32, false, false };
 
             case Inst::Tag::RedAnd:
@@ -12154,6 +12165,9 @@ private:
             case Inst::Tag::EventTriggerNb:
             case Inst::Tag::EventTriggerNbDelayed:
             case Inst::Tag::EventTriggerNbEvent:
+                // Reseeding an object's RNG state yields nothing, like the
+                // per-process $urandom(seed) reseed that precedes a draw.
+            case Inst::Tag::ObjRandSeed:
                 return { 0, false, false };
         }
         return { 0, false, false };
@@ -14084,6 +14098,48 @@ private:
                 llvm::Value* off =
                   b_.CreateTrunc(b_.CreateLShr(b_.CreateMul(draw32, range), 32), b_.getInt32Ty());
                 set_value(i, two_val(b_.CreateAdd(lo, off)));
+                return;
+            }
+
+            case Inst::Tag::ObjRandom: {
+                // An object's own draw (LRM §18.14.2): the $urandom high-32
+                // extraction, but advancing the 4x64 state the operand lvalue
+                // names rather than the body's frame state.
+                //
+                // There is deliberately no ir_draws_rng / blocks_thunk arm for
+                // this tag. That machinery exists to give a coroutine FRAME its
+                // own RNG state; this state is an ordinary unpacked-array class
+                // property, heap-resident in the object. The single draw of the
+                // creating thread that seeds it is a real Urandom the frontend
+                // emits beside the ClassNew, so the frame machinery already
+                // accounts for every draw that touches a process stream.
+                llvm::Value* rng = agg_slot_ptr(lvalue_of(ir_->payload(i).unary));
+                set_value(i, lower_urandom(rng));
+                return;
+            }
+
+            case Inst::Tag::ObjRandSeed: {
+                // obj.srandom(seed) (LRM §18.14.2): splitmix64-expand `seed` over
+                // the object's own state. The same runtime entry as the
+                // per-process reseed -- only the state pointer differs.
+                const auto&  p    = ir_->payload(i).binary;
+                llvm::Value* rng  = agg_slot_ptr(lvalue_of(p.l));
+                llvm::Value* seed = cast(must_of(value_of(p.r)), 64, false);
+                b_.CreateCall(urandom_seed_fn(), { rng, seed });
+                return;
+            }
+
+            case Inst::Tag::RandcNext: {
+                // One cyclic draw for a randc property (LRM §18.6). The 256-bit
+                // remaining-value bitmap and the object's RNG are both class
+                // properties, so both reach the runtime as plain pointers and the
+                // bit selection stays out of the JIT.
+                const auto&  p    = ir_->payload(i).op_extra;
+                const auto   info = ir_->extra_data<RandcInfo>(p.extra);
+                llvm::Value* seen = agg_slot_ptr(lvalue_of(p.op));
+                llvm::Value* rng  = agg_slot_ptr(lvalue_of(info.rng));
+                set_value(i, two_val(b_.CreateCall(randc_next_fn(),
+                                                   { seen, b_.getInt32(info.nvals), rng })));
                 return;
             }
 
@@ -21047,9 +21103,13 @@ private:
         return result;
     }
 
-    // $urandom (LRM §18.13.1): the high 32 bits of one xoshiro256++ draw.
-    Plane lower_urandom() {
-        llvm::Value* hi = b_.CreateTrunc(b_.CreateLShr(emit_xoshiro_next(rng_slot_), 32), b_.getInt32Ty());
+    // $urandom (LRM §18.13.1): the high 32 bits of one xoshiro256++ draw. `rng`
+    // selects the state to advance and defaults to the body's own; ObjRandom
+    // passes an object's state instead (LRM §18.14.2). A null default rather than
+    // `rng_slot_` because a non-static member cannot be a default argument.
+    Plane lower_urandom(llvm::Value* rng = nullptr) {
+        llvm::Value* draw = emit_xoshiro_next(rng != nullptr ? rng : rng_slot_);
+        llvm::Value* hi   = b_.CreateTrunc(b_.CreateLShr(draw, 32), b_.getInt32Ty());
         return two_val(hi);
     }
 

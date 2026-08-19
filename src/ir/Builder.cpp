@@ -929,6 +929,19 @@ Index Builder::urandom_range(Index maxval, Index minval, SourceLoc loc) {
     return emit({ Inst::Tag::UrandomRange, Inst::Payload{ .binary = { maxval, minval } } }, loc);
 }
 
+Index Builder::obj_random(Index rng_lv, SourceLoc loc) {
+    return emit({ Inst::Tag::ObjRandom, pay(&Inst::Payload::unary, rng_lv) }, loc);
+}
+
+Index Builder::obj_rand_seed(Index rng_lv, Index seed, SourceLoc loc) {
+    return emit({ Inst::Tag::ObjRandSeed, Inst::Payload{ .binary = { rng_lv, seed } } }, loc);
+}
+
+Index Builder::randc_next(Index seen_lv, Index rng_lv, uint32_t nvals, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(RandcInfo{ rng_lv, nvals });
+    return emit({ Inst::Tag::RandcNext, Inst::Payload{ .op_extra = { seen_lv, extra } } }, loc);
+}
+
 Index Builder::test_plusargs(std::string_view str, SourceLoc loc) {
     const ExtraIndex str_at = add_bytes(str);
     const ExtraIndex extra  = add_extra(TestPlusArgsInfo{ str_at, static_cast<uint32_t>(str.size()) });

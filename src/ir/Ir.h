@@ -669,6 +669,21 @@ struct ExpectInfo {
     uint32_t monitor = 0;
 };
 
+// Extra payload for `randc_next`: the state of one `randc` property's cycle (LRM
+// 18.6). The 256-bit "already used this cycle" bitmap is the instruction's `op`
+// operand, so this record carries only what does not fit there.
+//
+// The RNG lvalue lives here rather than in a second payload slot because op_extra
+// holds exactly one operand plus one extra handle, and both lvalues are genuine
+// operands: Ir::operands() reports this one too, so a def-use walk sees the stream
+// the pick advances instead of just the bitmap it marks.
+struct RandcInfo {
+    // The object's xoshiro256++ state lvalue (4 x `bit [63:0]`, LRM 18.14.2).
+    Index rng;
+    // Values in one cycle: `1 << width`, with width <= 8 (wider randc is refused).
+    uint32_t nvals;
+};
+
 // Severity level of a `severity` instruction. Selects the diagnostic label the
 // runtime prints (LRM 20.10); Fatal is `$fatal` (the frontend follows the report
 // with a Finish carrying the finish number, so the report itself never
@@ -1040,6 +1055,7 @@ static_assert(ExtraPayload<FinishInfo>);
 static_assert(ExtraPayload<CaseViolInfo>);
 static_assert(ExtraPayload<StrobePendInfo>);
 static_assert(ExtraPayload<ExpectInfo>);
+static_assert(ExtraPayload<RandcInfo>);
 static_assert(ExtraPayload<SeverityInfo>);
 static_assert(ExtraPayload<FseekInfo>);
 static_assert(ExtraPayload<RealMathBinaryInfo>);
@@ -1985,6 +2001,40 @@ struct Inst {
         // the refusal in lower_concurrent_assertion), so the queue is always exactly
         // the cohort of the next attempt to resolve.
         ExpectWake,
+        // -- Constrained randomization (LRM 18). All three reach their state through
+        // an LVALUE operand rather than an object handle plus a layout rule: the
+        // rand block is ordinary struct fields, so the frontend selects the field and
+        // the backend needs no knowledge of where the block sits. --
+        // One xoshiro256++ step of an OBJECT's RNG (payload: unary -- the operand is
+        // the state lvalue, a 4-element unpacked array of `bit [63:0]`, LRM 18.14.2),
+        // -> the high 32 bits as a definite 2-state unsigned value. Exactly what
+        // Urandom computes, on a caller-supplied stream instead of the thread's.
+        //
+        // Deliberately NOT in ir_draws_rng and NOT blocks_thunk, unlike Urandom. That
+        // stream is frame-resident, so an elided coroutine has nowhere to keep it;
+        // this one is heap-resident in the object, so a thunk-lowered body restarts
+        // no stream and owns none. Grouping this with $urandom would be a regression,
+        // not a fix.
+        ObjRandom,
+        // Reseed an object's RNG from one 64-bit selector (payload: binary -- l is
+        // the state lvalue, r the seed value). Produces NO value. The splitmix64
+        // expansion rt_urandom_seed already performs for a process, which is what
+        // `obj.srandom(seed)` and the seeding of a fresh object (LRM 18.14.2) need.
+        //
+        // Heap-resident state, so the same two exclusions as ObjRandom apply.
+        ObjRandSeed,
+        // One cyclic-randomization pick for a `randc` property (LRM 18.6) (payload:
+        // op_extra -> RandcInfo; op is that property's 256-bit used-this-cycle bitmap
+        // lvalue, RandcInfo::rng the object's RNG state lvalue), -> a definite 2-state
+        // unsigned 32-bit value in [0, nvals).
+        //
+        // Picks uniformly among the values whose bit is still CLEAR, then sets that
+        // bit; when no bit is clear the bitmap is cleared first and a new cycle
+        // starts. That is what makes each cycle a permutation of [0, nvals) with no
+        // permutation array to store. Lowers to an rt_randc_next call.
+        //
+        // Heap-resident state, so the same two exclusions as ObjRandom apply.
+        RandcNext,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2157,6 +2207,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::OneHot0:
         case T::IsUnknown:
         case T::UrandomSeeded:
+        case T::ObjRandom:
             return K::Unary;
 
         case T::BitSelect:
@@ -2223,6 +2274,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Ungetc:
         // `->> #d e`: l is the delay in ticks, r is the event handle.
         case T::EventTriggerNbDelayed:
+        // obj_rand_seed: l is the object's RNG state lvalue, r the 64-bit seed.
+        case T::ObjRandSeed:
             return K::Binary;
 
         case T::Resize:
@@ -2389,6 +2442,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::CountBits:
         case T::ValuePlusArgs:
         case T::EventTriggerNbEvent:
+        case T::RandcNext:
             return K::OpExtra;
     }
 

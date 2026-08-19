@@ -506,6 +506,12 @@ const char* tag_name(Inst::Tag tag) {
             return "urandom_seeded";
         case T::UrandomRange:
             return "urandom_range";
+        case T::ObjRandom:
+            return "obj_random";
+        case T::ObjRandSeed:
+            return "obj_rand_seed";
+        case T::RandcNext:
+            return "randc_next";
         case T::Clog2:
             return "clog2";
         case T::CountBits:
@@ -1010,6 +1016,14 @@ private:
                 ref(p.op_extra.op);
                 os_ << ", \"" << ir_.extra_bytes(info.prefix, info.prefix_len) << "%"
                     << static_cast<char>(info.conv) << "\")\n";
+                break;
+            }
+            case Inst::Tag::RandcNext: {
+                const auto info = ir_.extra_data<RandcInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ", ";
+                ref(info.rng);
+                os_ << ", " << info.nvals << ")\n";
                 break;
             }
             default:

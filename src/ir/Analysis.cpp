@@ -300,6 +300,13 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::Random:
         case Inst::Tag::DistUnary:
         case Inst::Tag::DistBinary:
+        // The object RNG (LRM 18.14.2) and a `randc` property's cycle state (LRM
+        // 18.6) live in the object, on the heap, and are reached through an lvalue
+        // operand. So unlike the Urandom family above these do NOT block thunk
+        // elision: a thunk-lowered body owns no stream here and restarts none.
+        case Inst::Tag::ObjRandom:
+        case Inst::Tag::ObjRandSeed:
+        case Inst::Tag::RandcNext:
         case Inst::Tag::TestPlusArgs:
         case Inst::Tag::ValuePlusArgs:
             return none;
@@ -1444,6 +1451,9 @@ struct ValueSweep {
                 case Inst::Tag::Urandom:
                 case Inst::Tag::UrandomSeeded:
                 case Inst::Tag::UrandomRange:
+                case Inst::Tag::ObjRandom:
+                case Inst::Tag::ObjRandSeed:
+                case Inst::Tag::RandcNext:
                 case Inst::Tag::EventTrigger:
                 case Inst::Tag::EventTriggerNb:
                 case Inst::Tag::EventTriggerNbDelayed:

@@ -824,6 +824,25 @@ uint64_t rt_dist_erlang(int32_t seed, int32_t k, int32_t mean);
 // therefore intentionally not iverilog-identical.
 void rt_urandom_seed(uint64_t* state, uint64_t seed);
 
+// -- randc cyclic randomization (LRM §18.6) --
+//
+// One cyclic draw for a `randc` property. `seen` is that property's 256-bit
+// "already used this cycle" bitmap (4 words, word 0 holding values 0-63) and
+// `nvals` is its value count 1 << width, a power of two in [2, 256] (the
+// frontend refuses a randc wider than 8 bits). Picks uniformly among the values
+// in [0, nvals) whose bit is still clear, sets that bit and returns the value;
+// when no bit is clear the permutation has been exhausted, so the bitmap is
+// cleared first and a fresh cycle begins -- LRM §18.6's guarantee that no value
+// repeats until every one has been drawn.
+//
+// Draws exactly once, from `rng`: the object's own xoshiro256++ state (LRM
+// §18.14.2), not the randomizing process's stream, which is what keeps an
+// object's randc sequence stable regardless of which thread randomizes it.
+// Unlike the inlined $urandom draw this is a real call -- selecting the i-th
+// clear bit is a popcount-and-scan over four words, too much to inline at every
+// randc site.
+uint32_t rt_randc_next(uint64_t* seen, uint32_t nvals, uint64_t* rng);
+
 // -- Plusargs (LRM §21.6) --
 //
 // Command-line arguments prefixed with `+` (everything after the leading `+`

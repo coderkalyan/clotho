@@ -331,6 +331,15 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 scratch[1]    = aa.arg;
                 return { scratch.data(), 2 };
             }
+            // randc_next exposes both lvalues it advances: the property's
+            // used-this-cycle bitmap and the object's RNG state. `nvals` is a
+            // compile-time bound, not an operand.
+            if (tag == Inst::Tag::RandcNext) {
+                const auto rc = extra_data<RandcInfo>(p.op_extra.extra);
+                scratch[0]    = p.op_extra.op;
+                scratch[1]    = rc.rng;
+                return { scratch.data(), 2 };
+            }
             scratch[0] = p.op_extra.op;
             return { scratch.data(), 1 };
     }

@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <cerrno>
 #include <charconv>
 #include <cinttypes>
@@ -4951,6 +4952,80 @@ extern "C" void rt_urandom_seed(uint64_t* state, uint64_t seed) {
         z          = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
         state[i]   = z ^ (z >> 31);
     }
+}
+
+// -- randc cyclic randomization (LRM §18.6) -----------------------------------
+//
+// One cyclic draw against a randc property's 256-bit remaining-value bitmap. The
+// bitmap is fixed at four words because the frontend caps a randc at 8 bits, so
+// `nvals` never needs a fifth; the cap is what keeps the exact cyclic semantics
+// affordable as a bitmap instead of a shuffled permutation array.
+extern "C" uint32_t rt_randc_next(uint64_t* seen, uint32_t nvals, uint64_t* rng) {
+    assert(seen != nullptr && "randc needs a seen bitmap");
+    assert(rng != nullptr && "randc needs an object RNG");
+    assert(nvals >= 2 && "randc has at least two values");
+    assert(nvals <= 256 && "randc is capped at 8 bits");
+    assert(std::has_single_bit(nvals) && "randc value count is a power of two");
+
+    // The bits each word actually owns: full below `nvals`, empty above it. A
+    // power-of-two `nvals` is either a multiple of 64 or smaller than one word,
+    // so the shift below is never the UB `1 << 64`.
+    uint64_t live[4];
+    for (uint32_t w = 0; w < 4; ++w) {
+        const uint32_t lo = 64 * w;
+        live[w] = nvals <= lo ? 0ull : (nvals - lo >= 64 ? ~0ull : (1ull << (nvals - lo)) - 1);
+    }
+
+    uint32_t remaining = 0;
+    for (uint32_t w = 0; w < 4; ++w) {
+        remaining += static_cast<uint32_t>(std::popcount(~seen[w] & live[w]));
+    }
+    if (remaining == 0) {
+        // Every value has been handed out, so this draw opens a fresh permutation
+        // (LRM §18.6). Clearing here rather than after the last draw of a cycle
+        // keeps the bitmap a pure record of what this cycle consumed.
+        for (uint32_t w = 0; w < 4; ++w) {
+            seen[w] = 0;
+        }
+        remaining = nvals;
+    }
+    assert(remaining >= 1 && "randc has a candidate after the cycle check");
+    assert(remaining <= nvals && "randc candidate count cannot exceed the value count");
+
+    // Lemire multiply-shift of the draw's high 32 bits onto [0, remaining) --
+    // the same mapping the JIT inlines for $urandom_range (the UrandomRange arm
+    // of LlvmBackend.cpp's lower_inst), so a bounded index is produced one way
+    // across all of clotho. Exactly one draw per call, whether or not the cycle
+    // restarted above.
+    const uint64_t draw32 = xoshiro_next(rng) >> 32;
+    auto           pick   = static_cast<uint32_t>((draw32 * remaining) >> 32);
+    assert(pick < remaining && "randc pick is within the candidate count");
+
+    // `pick` counts clear bits, so walk the words spending it on each word's
+    // clear count, then take the pick-th clear bit of the word it lands in.
+    for (uint32_t w = 0; w < 4; ++w) {
+        const uint64_t free_bits = ~seen[w] & live[w];
+        const auto     count     = static_cast<uint32_t>(std::popcount(free_bits));
+        if (pick >= count) {
+            pick -= count;
+            continue;
+        }
+        // Drop the `pick` lowest clear bits; the lowest one left is the choice.
+        // Bounded by 63 iterations of one ANDN, which a per-randomize draw can
+        // afford far more cheaply than maintaining a permutation array.
+        uint64_t rest = free_bits;
+        for (uint32_t k = 0; k < pick; ++k) {
+            rest &= rest - 1;
+        }
+        assert(rest != 0 && "randc word had the pick-th clear bit");
+        const auto bit = static_cast<uint32_t>(std::countr_zero(rest));
+        seen[w] |= 1ull << bit;
+        return 64 * w + bit;
+    }
+
+    // Unreachable: `remaining` counted the clear bits the loop just spent.
+    assert(false && "randc found no clear bit");
+    return 0;
 }
 
 namespace {

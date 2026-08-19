@@ -511,6 +511,25 @@ public:
     // $urandom_range(maxval, minval) (LRM §18.13.2): one draw mapped into
     // [min, max] (the backend swaps when min > max).
     Index urandom_range(Index maxval, Index minval, SourceLoc loc);
+    // The object RNG of LRM §18.14.2. Its state is four 64-bit words held IN the
+    // object rather than in the calling thread's frame, so `rng_lv` is an lvalue of
+    // a 4-element unpacked array of `bit [63:0]`: the caller selects the field and
+    // neither of the next two ops needs to know the class layout.
+    //
+    // One xoshiro256++ step of that state, yielding its high 32 bits as a 32-bit
+    // unsigned value -- $urandom's draw, on the object's own stream.
+    Index obj_random(Index rng_lv, SourceLoc loc);
+    // Reseed that state from the 64-bit value `seed`, splitmix64-expanded exactly as
+    // a process's own reseed is. Yields no value; `obj.srandom(seed)` and the seeding
+    // of a freshly constructed object both lower to this.
+    Index obj_rand_seed(Index rng_lv, Index seed, SourceLoc loc);
+    // One cyclic-randomization pick for a `randc` property (LRM §18.6): draw
+    // uniformly among the values of [0, nvals) whose bit is still clear in `seen_lv`
+    // -- an lvalue of a 4-element unpacked array of `bit [63:0]`, that property's
+    // 256-bit used-this-cycle bitmap -- set that bit, and yield the value. An
+    // exhausted bitmap is cleared first, starting the next cycle, so every cycle is a
+    // permutation. `nvals` is `1 << width` with width <= 8.
+    Index randc_next(Index seen_lv, Index rng_lv, uint32_t nvals, SourceLoc loc);
     // $test$plusargs(str): nonzero iff a command-line plusarg's prefix matches
     // `str`. No SSA operands.
     Index test_plusargs(std::string_view str, SourceLoc loc);
