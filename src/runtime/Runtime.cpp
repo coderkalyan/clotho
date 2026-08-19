@@ -3860,6 +3860,49 @@ extern "C" void rt_null_handle(const rt_null_site* site, uint64_t now) {
     std::exit(1);
 }
 
+// LRM 9.7: "it shall be an error to call this task on the current process, i.e., a
+// process cannot wait for its own completion." Dynamic, because the target is a
+// handle value -- so this is the report, laid out like rt_null_handle.
+extern "C" void rt_proc_await_self(const rt_null_site* site, uint64_t now) {
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+
+    std::string when;
+    append_finish_time(when, now);
+
+    fmt::print(stderr, label, "fatal:");
+    fmt::print(stderr, head, " process::await() on the current process");
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        const std::string text = snippet_text(site->line);
+        print_snippet(text, site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column), '^' } },
+                      loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " the handle names the thread that is awaiting at {}, which can never "
+                             "complete while it waits",
+               when);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " LRM 9.7 makes awaiting the current process an error");
+    fmt::print(stderr, "\n");
+    std::fflush(stderr);
+
+    rt_vcd_close();
+    rt_finishing = 1;
+    std::exit(1);
+}
+
 // ---- Stale `ref` through a restructured container (LRM 13.5.2) ----
 
 namespace {
@@ -5495,6 +5538,127 @@ extern "C" uint64_t rt_event_new(void) {
     // freed (LRM 15.5.5.2 reclamation is GC), so a slot is never reused and its
     // generation never advances.
     return static_cast<uint64_t>(g_event_static + i);
+}
+
+// -- Process control blocks (the `process` class, LRM 9.7) --
+//
+// A chunked pool with a freelist, for the one tier that is dynamic: fork children.
+// A statically created process's block lives in the backend's `clotho.proc_pcb`
+// array and never comes from here (RT_PROC_STATIC marks it, so a reference count
+// reaching zero on one is not a free). Chunks are never resized or moved, so a
+// block address stays valid across growth while a thread is parked on it or an
+// object names it. See docs/design/process-class.md §4.1.
+namespace {
+
+constexpr uint32_t kProcChunk = 64;
+
+std::vector<rt_proc*> g_proc_chunks;
+uint32_t              g_proc_used = 0;        // blocks handed out of the last chunk
+rt_proc*              g_proc_free = nullptr;  // freelist, threaded through next_sib
+
+rt_proc* proc_take() {
+    if (g_proc_free != nullptr) {
+        rt_proc* p  = g_proc_free;
+        g_proc_free = p->next_sib;
+        std::memset(p, 0, sizeof(rt_proc));
+        return p;
+    }
+    if (g_proc_chunks.empty() || g_proc_used == kProcChunk) {
+        g_proc_chunks.push_back(
+            static_cast<rt_proc*>(::operator new(sizeof(rt_proc) * kProcChunk, frame_align)));
+        std::memset(g_proc_chunks.back(), 0, sizeof(rt_proc) * kProcChunk);
+        g_proc_used = 0;
+    }
+    return g_proc_chunks.back() + g_proc_used++;
+}
+
+// Unlink `p` from its parent's child list. Leaves `p`'s own links dangling; every
+// caller either frees `p` or re-links it immediately.
+void proc_unlink(rt_proc* p) {
+    if (p->prev_sib != nullptr) {
+        p->prev_sib->next_sib = p->next_sib;
+    } else if (p->parent != nullptr) {
+        p->parent->first_child = p->next_sib;
+    }
+    if (p->next_sib != nullptr) {
+        p->next_sib->prev_sib = p->prev_sib;
+    }
+}
+
+void proc_link_child(rt_proc* parent, rt_proc* child) {
+    child->parent   = parent;
+    child->prev_sib = nullptr;
+    child->next_sib = parent != nullptr ? parent->first_child : nullptr;
+    if (child->next_sib != nullptr) {
+        child->next_sib->prev_sib = child;
+    }
+    if (parent != nullptr) {
+        parent->first_child = child;
+    }
+}
+
+void proc_maybe_free(rt_proc* p) {
+    if (p->refs != 0 || (p->ctl & RT_PROC_STATIC) != 0) {
+        return;
+    }
+    // Back on the freelist, threaded through next_sib. The block is memset on
+    // reuse, so no field needs clearing here.
+    p->next_sib = g_proc_free;
+    g_proc_free = p;
+}
+
+} // namespace
+
+extern "C" void* rt_proc_alloc(void* parent) {
+    rt_proc* p = proc_take();
+    p->ctl     = RT_PROC_RUNNING;
+    p->refs    = 1; // the live thread
+    proc_link_child(static_cast<rt_proc*>(parent), p);
+    return p;
+}
+
+extern "C" void* rt_proc_complete(void* pcb, uint32_t killed) {
+    auto* p = static_cast<rt_proc*>(pcb);
+    p->ctl  = (p->ctl & ~static_cast<uint32_t>(RT_PROC_STATE_MASK)) |
+             (killed != 0 ? RT_PROC_KILLED : RT_PROC_FINISHED);
+    // Re-parent live children onto this thread's own parent, so a later
+    // `disable fork` / `kill` still reaches them (LRM 9.6.3: descendants include
+    // those of children that already terminated), and so "no live descendants" stays
+    // exactly `first_child == nullptr`.
+    rt_proc* child = p->first_child;
+    while (child != nullptr) {
+        rt_proc* next = child->next_sib;
+        proc_link_child(p->parent, child);
+        child = next;
+    }
+    p->first_child = nullptr;
+    proc_unlink(p);
+    p->parent   = nullptr;
+    p->next_sib = nullptr;
+    p->prev_sib = nullptr;
+    void* w     = p->waiters;
+    p->waiters  = nullptr;
+    return w;
+}
+
+extern "C" void rt_proc_thread_done(void* pcb) {
+    auto* p = static_cast<rt_proc*>(pcb);
+    if (p->refs != 0) {
+        p->refs -= 1;
+    }
+    proc_maybe_free(p);
+}
+
+extern "C" void rt_proc_obj_retain(void* pcb) {
+    static_cast<rt_proc*>(pcb)->refs += 1;
+}
+
+extern "C" void rt_proc_obj_release(void* pcb) {
+    auto* p = static_cast<rt_proc*>(pcb);
+    if (p->refs != 0) {
+        p->refs -= 1;
+    }
+    proc_maybe_free(p);
 }
 
 extern "C" void* rt_alloc(uint64_t size) {

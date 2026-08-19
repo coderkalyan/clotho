@@ -366,6 +366,20 @@ public:
                ForkKind                   kind,
                SourceLoc                  loc);
 
+    // -- Process control (the `process` class, LRM 9.7) --
+    // `args` is the operand run ProcCtlInfo carries: the receiver handle first
+    // (absent for `self`, `disable fork` and `wait fork`, which name the calling
+    // thread), then the value argument of `srandom` / `set_randstate`.
+    //
+    // A value-producing query (`self`, `status`, `get_randstate`); `type` is its
+    // result type.
+    Index proc_query(ProcOp op, std::span<const Index> args, Ref type, SourceLoc loc);
+    // A zero-time control statement (`kill`, `suspend`, `resume`, `srandom`,
+    // `set_randstate`, `disable fork`).
+    Index proc_ctl(ProcOp op, std::span<const Index> args, SourceLoc loc);
+    // A parking statement (`await`, `wait fork`).
+    Index proc_wait(ProcOp op, std::span<const Index> args, SourceLoc loc);
+
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for
     // $display), and the already-lowered value args its specifiers consume. The

@@ -697,6 +697,21 @@ Index Builder::fork(std::span<const FunctionId> children,
     return emit({ Inst::Tag::Fork, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
+Index Builder::proc_query(ProcOp op, std::span<const Index> args, Ref type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(ProcCtlInfo{ add_slice(args), type, op });
+    return emit({ Inst::Tag::ProcQuery, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
+Index Builder::proc_ctl(ProcOp op, std::span<const Index> args, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(ProcCtlInfo{ add_slice(args), Ref::Invalid, op });
+    return emit({ Inst::Tag::ProcCtl, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
+Index Builder::proc_wait(ProcOp op, std::span<const Index> args, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(ProcCtlInfo{ add_slice(args), Ref::Invalid, op });
+    return emit({ Inst::Tag::ProcWait, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // $display / $write: no descriptor operand; the backend targets standard output.
     return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, display_info(fmt, newline, args)) }, loc);

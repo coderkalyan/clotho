@@ -78,6 +78,12 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                     const auto info = extra_data<ForkInfo>(p.extra);
                     return index_slice(info.args);
                 }
+                case ExtraOperandShape::ProcArgs: {
+                    // process control (LRM 9.7): the receiver handle plus any value
+                    // argument; the op selector and the result type are not operands.
+                    const auto info = extra_data<ProcCtlInfo>(p.extra);
+                    return index_slice(info.args);
+                }
                 case ExtraOperandShape::NotExtra:
                     break;
             }

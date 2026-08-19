@@ -273,6 +273,12 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_event_pool_init", &rt_event_pool_init);
     expose("rt_event_new", &rt_event_new);
     expose("rt_event_ptr", &rt_event_ptr);
+    expose("rt_proc_alloc", &rt_proc_alloc);
+    expose("rt_proc_complete", &rt_proc_complete);
+    expose("rt_proc_thread_done", &rt_proc_thread_done);
+    expose("rt_proc_obj_retain", &rt_proc_obj_retain);
+    expose("rt_proc_obj_release", &rt_proc_obj_release);
+    expose("rt_proc_await_self", &rt_proc_await_self);
     expose("rt_event_detach_register", &rt_event_detach_register);
     expose("rt_event_detach_fire", &rt_event_detach_fire);
     expose("rt_event_detach_ready", &rt_event_detach_ready);

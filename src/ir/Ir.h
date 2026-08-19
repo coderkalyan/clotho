@@ -485,6 +485,42 @@ struct ForkInfo {
     ForkKind   kind;
 };
 
+// Which built-in `process` method (LRM 9.7) a ProcQuery / ProcCtl / ProcWait
+// instruction performs. Split across three tags rather than one, so value-ness and
+// suspension are properties of the TAG (which every analysis keys on) rather than of
+// the payload: ProcQuery yields a value, ProcCtl does not, ProcWait parks.
+// See docs/design/process-class.md §10.
+// u32-wide (not u8) so ProcCtlInfo has no padding: the ExtraPayload concept
+// requires a unique object representation.
+enum class ProcOp : uint32_t {
+    // ProcQuery.
+    Self,         // process::self() -> a handle on the calling thread
+    Status,       // p.status() -> the `state` enum value
+    RandstateGet, // p.get_randstate() -> string
+    // ProcCtl.
+    Kill,         // p.kill(): end p and every descendant
+    Suspend,      // p.suspend()
+    Resume,       // p.resume()
+    Srandom,      // p.srandom(seed)
+    RandstateSet, // p.set_randstate(s)
+    DisableFork,  // `disable fork` (LRM 9.6.3): kill every descendant of self
+    // ProcWait.
+    Await,        // p.await(): park until p completes
+    WaitFork,     // `wait fork`: park until every descendant completes
+};
+
+// Extra payload for the three `process` tags.
+struct ProcCtlInfo {
+    // SSA operands, in order: the receiver handle (absent for `self`, `disable fork`
+    // and `wait fork`, which name the calling thread), then the value argument of
+    // `srandom` / `set_randstate`.
+    ExtraSlice args;
+    // Result type, for ProcQuery only: the `process` class Ref for Self, the 32-bit
+    // enum for Status, the string type for RandstateGet. Invalid elsewhere.
+    Ref    type = Ref::Invalid;
+    ProcOp op   = ProcOp::Self;
+};
+
 // Extra payload for `cond`: the then / else regions (the condition is the op).
 struct Regions {
     // Instructions executed when the condition is true.
@@ -1985,6 +2021,23 @@ struct Inst {
         // the refusal in lower_concurrent_assertion), so the queue is always exactly
         // the cohort of the next attempt to resolve.
         ExpectWake,
+
+        // -- Process control (the `process` class, LRM 9.7) --
+        // Every one carries `extra -> ProcCtlInfo`, whose `op` selects the method.
+        // A thread's control block is native, untraced storage (a static slot per
+        // process, a pooled record per fork child) and a `process` handle is an
+        // ordinary class handle onto it; see docs/design/process-class.md.
+        //
+        // Value-producing: `process::self()`, `p.status()`, `p.get_randstate()`.
+        ProcQuery,
+        // Statement, zero-time: `p.kill()`, `p.suspend()`, `p.resume()`,
+        // `p.srandom(seed)`, `p.set_randstate(s)`, and `disable fork` (LRM 9.6.3),
+        // which is `kill` over the calling thread's descendants.
+        ProcCtl,
+        // Statement that PARKS the calling thread: `p.await()` and `wait fork`. Like
+        // ExpectWait, a body holding one is forced to a coroutine (is_simple_always)
+        // and the tag blocks the thunk path.
+        ProcWait,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2325,6 +2378,12 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         // parked handle. No operands -- the request store is a separate Store.
         case T::ExpectWait:
             return K::Extra;
+        // process control: extra -> ProcCtlInfo, whose `args` run is the operands
+        // (receiver handle, then a value argument).
+        case T::ProcQuery:
+        case T::ProcCtl:
+        case T::ProcWait:
+            return K::Extra;
         case T::MonitorEmit:
             return K::FDisplay; // op = descriptor, extra = DisplayInfo
         case T::MonitorOn:
@@ -2419,6 +2478,9 @@ enum class ExtraOperandShape : uint8_t {
     // `extra` is a ForkInfo whose `args` slice is the operand run (the captured
     // frame lvalues each child aliases); `children` are FunctionIds, not operands.
     ForkArgs,
+    // `extra` is a ProcCtlInfo whose `args` slice is the operand run (the receiver
+    // handle and, for srandom / set_randstate, the value argument).
+    ProcArgs,
 };
 
 // Constexpr for the same reason as payload_kind(): operand walks inline it.
@@ -2434,6 +2496,12 @@ constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
         // child aliases through its ref formals ARE operands (ForkInfo::args).
         case T::Fork:
             return S::ForkArgs;
+        // process control: the receiver handle and any value argument are operands;
+        // the op selector and result type are not.
+        case T::ProcQuery:
+        case T::ProcCtl:
+        case T::ProcWait:
+            return S::ProcArgs;
         // loop: the predicate and regions are not top-level operands (the
         // predicate is defined inside the cond region, walked via region()).
         case T::Loop:

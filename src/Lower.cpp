@@ -2537,20 +2537,28 @@ private:
         if (const auto cached = class_type_cache_.find(&clt); cached != class_type_cache_.end()) {
             return cached->second;
         }
-        // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4), `process` (LRM 9.7)
-        // and `std::weak_reference` (LRM 8.30) are built-in classes slang
-        // synthesizes into the `std` package. Slang builds their *signatures* only
-        // -- every method is a bodyless prototype whose semantics the simulator is
+        // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4) and
+        // `std::weak_reference` (LRM 8.30) are built-in classes slang synthesizes
+        // into the `std` package. Slang builds their *signatures* only -- every
+        // method is a bodyless SubroutineSymbol whose semantics the simulator is
         // expected to supply -- so lowering one walks into a method with no
         // statements and no formals to bind, and used to die on an out-of-range
         // formal index instead of saying anything. Each needs a real runtime: a key
         // count plus a wait queue for a semaphore, a bounded FIFO with blocking
-        // put/get/peek for a mailbox, per-process control for `process`.
+        // put/get/peek for a mailbox.
         //
-        // TODO: built-in std classes (semaphore / mailbox / process /
-        // weak_reference) -- need the runtime support described above.
+        // `process` (LRM 9.7) is the one that is implemented: it has its own body
+        // shape and its own method lowering, because a `process` object is not a
+        // user class but a handle onto a thread's control block. See
+        // docs/design/process-class.md.
+        //
+        // TODO: built-in std classes (semaphore / mailbox / weak_reference) -- need
+        // the runtime support described above.
         if (const slang::ast::Scope* parent = clt.getParentScope();
             parent != nullptr && parent->asSymbol().kind == SymbolKind::Package && parent->asSymbol().name == "std") {
+            if (clt.name == "process") {
+                return lower_process_class(clt);
+            }
             fail("the built-in '" + std::string(clt.name) + "' class is not supported");
         }
         // Phase 3 features (docs/design/classes.md §2): guarded loud.
@@ -2647,6 +2655,48 @@ private:
         compute_vtable(clt, ref);
 
         return ref;
+    }
+
+    // Lower the built-in `process` class (LRM 9.7). Unlike a user class, its body is
+    // not a property table: slang synthesizes only method signatures, so the object
+    // carries ONE hidden `chandle` naming the thread's control block (a native,
+    // untraced record — see docs/design/process-class.md §4). Everything else about
+    // the handle is an ordinary class handle: a 64-bit 2-state word, `null` == 0,
+    // `==` an identity compare, storable in a variable or a class property.
+    //
+    // The class is `final` and `abstract` in slang, so there is no derivation and no
+    // user `new` (slang rejects it), and every method is `MethodFlags::BuiltIn`, so
+    // compute_vtable mints no dispatch slot for one — only the shallow-copy thunk
+    // every class gets, which is unreachable here for the same reason `new` is.
+    ir::Ref lower_process_class(const slang::ast::ClassType& clt) {
+        const uint32_t fid = module_.pool.reserve_struct_fields();
+        ir::Type       t;
+        t.kind      = ir::Type::Kind::Class;
+        t.fields_id = fid;
+        t.element   = ir::Ref::Invalid;
+        const ir::Ref ref = module_.pool.put(ir::Item{ t });
+        class_type_cache_.emplace(&clt, ref);
+        std::vector<ir::FieldRow> fields;
+        fields.push_back({ kProcessCtlField, make_int_type(64, false, false), 0 });
+        module_.pool.set_struct_fields(fid, std::move(fields));
+        compute_vtable(clt, ref);
+        return ref;
+    }
+
+    // Whether `sub` is one of `process`'s nine built-in methods (LRM 9.7). Keyed on
+    // the owning ClassType's name and package rather than on a remembered Ref: a
+    // method call can be lowered before any `process` variable has been declared.
+    static bool is_process_method(const slang::ast::SubroutineSymbol& sub) {
+        if (!sub.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+            return false;
+        }
+        const slang::ast::Scope* owner = sub.getParentScope();
+        if (owner == nullptr || owner->asSymbol().kind != SymbolKind::ClassType ||
+            owner->asSymbol().name != "process") {
+            return false;
+        }
+        const slang::ast::Scope* pkg = owner->asSymbol().getParentScope();
+        return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
     }
 
     // True if `m` is a user-declared virtual method (LRM 8.20) — excludes slang's
@@ -23070,6 +23120,44 @@ private:
         }
     }
 
+    // Lower one of the nine built-in `process` methods (LRM 9.7). `self` is static
+    // (no receiver); every other method takes the receiver's control block. Each
+    // lowers to a ProcQuery / ProcCtl / ProcWait instruction, never to a call: slang
+    // gives these methods no body.
+    std::optional<ir::Index> lower_process_method(const CallExpression&    call,
+                                                 const SubroutineSymbol&  sub,
+                                                 ir::Builder&             b) {
+        const ir::SourceLoc l = loc(call);
+        // The receiver handle, for every method except the static `self`.
+        const auto recv = [&]() -> ir::Index {
+            if (call.thisClass() == nullptr) {
+                fail("process::" + std::string(sub.name) + " needs an explicit process handle");
+            }
+            return lower_expr(*call.thisClass(), b);
+        };
+        if (sub.name == "self") {
+            // `process::self()` is static: its return type IS the process class, so
+            // lowering that type is also what interns the class body (and is a no-op
+            // once some `process` variable has been declared).
+            return b.proc_query(ir::ProcOp::Self, {}, lower_type(sub.getReturnType()), l);
+        }
+        if (sub.name == "status") {
+            // The `state` typedef over an int enum, so an ordinary 32-bit result.
+            const std::array<ir::Index, 1> args{ recv() };
+            return b.proc_query(ir::ProcOp::Status, args, lower_type(sub.getReturnType()), l);
+        }
+        if (sub.name == "await") {
+            // A task: it parks the calling thread until the target completes, so it
+            // is a statement with no value (LRM 9.7).
+            const std::array<ir::Index, 1> args{ recv() };
+            b.proc_wait(ir::ProcOp::Await, args, l);
+            return std::nullopt;
+        }
+        // TODO: kill / suspend / resume / srandom / get_randstate / set_randstate
+        // (docs/design/process-class.md, phases P2-P4).
+        fail("process::" + std::string(sub.name) + "() is not supported yet");
+    }
+
     // Lower a user function call: the actuals (resized to the parameter types)
     // become a `call`. Returns the result value, or nullopt for a void function.
     std::optional<ir::Index> lower_user_call(const CallExpression& call, ir::Builder& b) {
@@ -23077,6 +23165,14 @@ private:
             fail("system call used where a user subroutine was expected");
         }
         const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+        if (is_process_method(sub)) {
+            // The nine `process` methods (LRM 9.7) have no lowerable body -- slang
+            // synthesizes signatures only -- so they never reach the call path
+            // below. Their receiver is resolved here rather than through
+            // resolve_method_this, because `self()` is static and the rest take the
+            // control block out of the receiver's object.
+            return lower_process_method(call, sub, b);
+        }
         // A class method (LRM 8.11): resolve the `this` object handle, spliced as
         // arg 0 (the callee splices it as formal 0). An explicit receiver
         // (`obj.method()`) is call.thisClass(); a bare in-method call uses `this`.
@@ -23707,6 +23803,10 @@ private:
     static constexpr std::string_view kCopySlot = "$copy";
     // Polymorphic class -> the FunctionId of its shallow-copy thunk (copy_thunk_id).
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> copy_thunk_;
+    // The built-in `process` class (LRM 9.7): the name of the hidden body field
+    // holding the thread control-block pointer. Not a legal SV identifier, so it
+    // cannot collide with a property name.
+    static constexpr std::string_view kProcessCtlField = "$pcb";
     // Design-wide class type ids (LRM 8.16). Owned here so a standalone Lowerer
     // works; lower_compilation points every Lowerer at one shared table instead.
     // A subroutine reached through a virtual interface handle -> its

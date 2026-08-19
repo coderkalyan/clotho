@@ -1430,6 +1430,90 @@ uint64_t rt_event_new(void);
 // The object a handle's slot names, in either tier.
 void* rt_event_ptr(uint32_t slot);
 
+// -- Process control blocks (the `process` class, LRM 9.7) --
+//
+// One block per THREAD -- a process body or a fork child, never a task activation
+// (a task runs in its caller's thread, so `process::self()` inside one names the
+// caller). It carries the status word LRM 9.7's `status()` reports, the `await`
+// waiter list, and the descendant tree `kill` / `disable fork` / `wait fork` walk.
+//
+// Two storage tiers, because only one of them is dynamic: a statically created
+// process gets a slot in the backend's `clotho.proc_pcb` array (there are exactly
+// `nproc` of them, known at compile time), while a fork child -- unbounded, since a
+// `join_none` in a loop spawns one per pass -- takes a block from the chunked pool
+// here. Chunks never move, so a block pointer stays valid across pool growth while
+// a thread is parked on it, exactly as the event pool guarantees.
+//
+// A block outlives its thread while a `process` object still names it, because
+// LRM 9.7 lets a program read `FINISHED` / `KILLED` after the fact. That is the
+// whole reason the block is not simply frame-resident.
+// See docs/design/process-class.md §4.
+
+// Mirror of the backend's `%clotho.pcb`. Field order and types must match it
+// exactly, like rt_event -- the two change together.
+typedef struct rt_proc {
+    // LRM 9.7 `state` in bits 0-2, flags above (RT_PROC_* below).
+    uint32_t ctl;
+    // 1 while the thread is live, plus 1 while a `process` object names this block.
+    // A pooled block returns to the freelist when it reaches 0.
+    uint32_t refs;
+    // Reserved: the activation-node stack whose head is the frame this thread is
+    // parked in, which is what `kill` claims. Null until that phase lands.
+    void* acts;
+    // `await` waiter list head: frame-resident nodes in the awaiting threads.
+    void* waiters;
+    // Reserved: this thread's xoshiro256++ state (srandom / get_randstate).
+    void* rng;
+    // Reserved: the fork record this thread decrements when killed.
+    void* join_rec;
+    // Weak memo: the `process` object naming this block, or null. Weak so a handle
+    // the program has dropped can be collected; the object's finalizer clears it.
+    void* obj;
+    // Descendant tree. `parent` always names a live thread or a static block: a
+    // completing thread re-parents its live children before unlinking itself.
+    struct rt_proc* parent;
+    struct rt_proc* first_child;
+    struct rt_proc* next_sib;
+    struct rt_proc* prev_sib;
+} rt_proc;
+
+// LRM 9.7 `process::state`, the values slang's synthesized enum assigns.
+enum {
+    RT_PROC_FINISHED  = 0,
+    RT_PROC_RUNNING   = 1,
+    RT_PROC_WAITING   = 2,
+    RT_PROC_SUSPENDED = 3,
+    RT_PROC_KILLED    = 4,
+    // Mask of the state field within `ctl`.
+    RT_PROC_STATE_MASK = 7,
+    // Set on a block that lives in the backend's static array, so it is never
+    // returned to the pool freelist however its reference count moves.
+    RT_PROC_STATIC = 1u << 8,
+};
+
+// A pooled block for a fork child, linked in as a child of `parent` (which may be
+// null for a thread with no parent). Starts RUNNING with one reference.
+void* rt_proc_alloc(void* parent);
+
+// End `pcb`'s thread: set FINISHED (or KILLED when `killed`), re-parent its live
+// children onto its own parent -- LRM 9.6.3 counts descendants of children that
+// already terminated -- and unlink it from the tree. Returns the `await` waiter
+// list head, which generated code walks (the wake pushes onto a codegen-owned
+// ring, so the runtime cannot do it), and clears it.
+void* rt_proc_complete(void* pcb, uint32_t killed);
+
+// Drop the reference the live thread held. Frees a pooled block whose last
+// reference this was.
+void rt_proc_thread_done(void* pcb);
+
+// Take / drop the reference a `process` object holds on the block it names.
+void rt_proc_obj_retain(void* pcb);
+void rt_proc_obj_release(void* pcb);
+
+// LRM 9.7 makes `p.await()` on the current process an error; the check is dynamic
+// (the target is a handle value), so this is its located fatal.
+[[noreturn]] void rt_proc_await_self(const rt_null_site* site, uint64_t now);
+
 // -- Timing wheel --
 //
 // The wheel (src/Wheel.h) is the design's event scheduler, surfaced here behind

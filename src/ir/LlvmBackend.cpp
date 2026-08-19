@@ -785,6 +785,8 @@ public:
         // after each suspend inside a targeted region -- and widens the
         // ring-overflow guard, which was fork-only until force-wake existed.
         design_uses_disable_  = facts_.uses.disable;
+        // Gates every process-control site (docs/design/process-class.md §9).
+        design_uses_process_  = facts_.uses.process;
         // The reactive region set (LRM 4.4.2.5 - 4.4.2.7): wanted when there is
         // pass/fail code to schedule, a process in Observed that could schedule
         // some, or a program block, whose `initial` procedures run in Reactive
@@ -3626,6 +3628,10 @@ private:
         } else {
             rng_slot_ = sym(rng_global_);
         }
+        // This thread's control block (LRM 9.7): a statically created process has a
+        // constant slot in clotho.proc_pcb, whose initializer already holds the
+        // starting state, so this costs one GEP and no stores.
+        pcb_ = design_uses_process_ ? proc_pcb_slot(proc_index) : nullptr;
         const bool always_loop = proc.activation == Activation::Always && !proc.wait_events.empty();
         if (always_loop) {
             // An always block with a sensitivity list. It is subscribed to its
@@ -3710,6 +3716,10 @@ private:
         // reaches here only by finishing — otherwise its temps persist, bounded
         // and capacity-reused.)
         deinit_body_strings();
+        // ... and stops being a thread (LRM 9.7): FINISHED, children re-parented,
+        // `await`ers woken. An `always` body reaches this only through $finish, which
+        // is also the end of its thread, so the hook is right for both shapes.
+        emit_proc_complete(/*killed=*/false);
         auto* res = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { none, b_.getTrue() });
         auto* sw  = b_.CreateSwitch(res, coro_ret_bb_, 2);
         sw->addCase(b_.getInt8(0), trap_bb);
@@ -3846,6 +3856,14 @@ private:
         // runtime as a void*. One pointer register on a call that does not need it
         // is the price of that uniformity.
         params.push_back(ptr); // rng
+        // The calling THREAD's process control block (LRM 9.7), so
+        // `process::self()` inside a subroutine names the caller rather than the
+        // callee -- a task or function is not a thread. Present only in a design
+        // that names `process`, and uniform across the design for the same reason
+        // `rng` is unconditional: one FunctionType per vtable slot.
+        if (design_uses_process_) {
+            params.push_back(ptr); // proc
+        }
         // TODO: pass a 2-state formal as a single iW param (and a 2-state result as
         // a bare iW) instead of the packed (mm, z) pair. The wire is packed today —
         // a 2-state arg lifts to must==may with a constant-0 z, which LLVM folds —
@@ -3921,6 +3939,9 @@ private:
         params.push_back(ptr); // state
         params.push_back(ptr); // rng
         params.push_back(ptr); // wheel
+        if (design_uses_process_) {
+            params.push_back(ptr); // proc — the calling thread's control block
+        }
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             if (f.arg_dirs[k] == ArgDir::Ref) {
                 // The same shape declare_function builds, narrow or fat.
@@ -4000,7 +4021,8 @@ private:
     // record slot follows all formals.
     std::vector<uint32_t> param_indices(const Function& f) const {
         std::vector<uint32_t> idx(f.param_types.size());
-        uint32_t              cur = f.is_task ? 3 : 2;
+        // ... plus the gated `proc` parameter, which sits right after them.
+        uint32_t              cur = (f.is_task ? 3u : 2u) + (design_uses_process_ ? 1u : 0u);
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             idx[k] = cur;
             cur += formal_param_count(f, k);
@@ -4012,7 +4034,7 @@ private:
     uint32_t task_record_param(const Function& f) const {
         const auto idx = param_indices(f);
         if (idx.empty()) {
-            return 3;
+            return (design_uses_process_ ? 4u : 3u);
         }
         return idx.back() + formal_param_count(f, f.param_types.size() - 1);
     }
@@ -4278,6 +4300,13 @@ private:
         // cannot outlive the call: a function is atomic.
         rng_slot_ = fn_->getArg(1);
         rng_slot_->setName("rng");
+        // A function is not a thread either: `process::self()` inside one names the
+        // caller, so the block travels as a parameter (LRM 9.7).
+        pcb_ = nullptr;
+        if (design_uses_process_) {
+            pcb_ = fn_->getArg(2);
+            pcb_->setName("proc");
+        }
         // A function takes no wheel parameter, but the clock is a global, so event
         // ops and any other time read resolve here exactly as they do in a task.
         wheel_ = wheel_gv_ != nullptr ? sym(wheel_gv_) : nullptr;
@@ -4484,6 +4513,17 @@ private:
             rng_slot_ = b_.CreateAlloca(llvm::ArrayType::get(b_.getInt64Ty(), 4), nullptr, "urng");
             b_.CreateCall(urandom_seed_fn(), { rng_slot_, seed });
         }
+        // Process control (LRM 9.7). A fork child IS a thread, so it takes a pooled
+        // control block and links itself in as a child of the spawning thread -- that
+        // link is the descendant relation `kill` / `disable fork` / `wait fork` walk.
+        // A plain task activation is NOT a thread: it runs in its caller's, so it
+        // carries the caller's block through unchanged (LRM 13.3).
+        pcb_ = nullptr;
+        if (design_uses_process_) {
+            llvm::Value* caller = fn_->getArg(3);
+            caller->setName("proc");
+            pcb_ = f.is_fork_child ? b_.CreateCall(proc_alloc_fn(), { caller }) : caller;
+        }
 
         auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
         auto* free_bb    = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
@@ -4567,6 +4607,14 @@ private:
             emit_copyout(f);
         }
         deinit_body_strings(); // string locals + temps die with the call
+        if (f.is_fork_child) {
+            // A fork child is a THREAD, so this is where it stops existing (LRM 9.7):
+            // publish FINISHED, hand its live children to its own parent, wake
+            // everything in `p.await()` on it, and drop the thread's reference to the
+            // block. Before the join bookkeeping below, so an awaiting thread and the
+            // joining parent are queued in that order.
+            emit_proc_complete(/*killed=*/false);
+        }
         llvm::Value* rec    = fn_->getArg(task_record_param(f));
         auto*        has_bb = llvm::BasicBlock::Create(ctx_, "task.wake", fn_);
         if (f.is_fork_child) {
@@ -4882,6 +4930,11 @@ private:
     // case 1 is a destroy while suspended. Shared by every suspend site (#delay,
     // #0, event wait).
     void emit_suspend_raw(const char* label) {
+        // LRM 9.7's WAITING is "waiting in a blocking statement", which is exactly
+        // this: every park goes through here, so the status word is maintained in one
+        // place rather than at each parking construct. Two stores, in a design that
+        // names `process` and nowhere else.
+        emit_proc_state(kProcWaiting);
         auto* save   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_save), { hdl_ });
         auto* susp   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { save, b_.getFalse() });
         auto* resume = llvm::BasicBlock::Create(ctx_, label, fn_);
@@ -4889,6 +4942,7 @@ private:
         sw->addCase(b_.getInt8(0), resume);
         sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
         b_.SetInsertPoint(resume);
+        emit_proc_state(kProcRunning);
     }
 
     // Suspend. Coming back in the right region is the parked handle's business,
@@ -10310,7 +10364,12 @@ private:
             llvm::Value* record = b_.CreateAlloca(ptr_ty, nullptr, "monitor.record");
             b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), record);
             auto* rampty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty, ptr_ty, ptr_ty }, false);
-            llvm::Value* hdl = b_.CreateCall(rampty, ramp, { state, sym(rng_global_), wheel, record });
+            std::vector<llvm::Value*> margv{ state, sym(rng_global_), wheel };
+            if (design_uses_process_) {
+                margv.push_back(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+            }
+            margv.push_back(record);
+            llvm::Value* hdl = b_.CreateCall(rampty, ramp, margv);
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
             b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
             b_.CreateBr(cont_bb);
@@ -11823,6 +11882,14 @@ private:
             case Inst::Tag::EventNew:
                 // An event handle: a 2-state 64-bit word.
                 return { 64, false, false };
+            case Inst::Tag::ProcQuery:
+                // `self` is a class handle, `status` the 32-bit state enum,
+                // `get_randstate` a string -- the frontend recorded which on the op.
+                return from_ref(ir_->extra_data<ProcCtlInfo>(p.extra).type);
+            case Inst::Tag::ProcCtl:
+            case Inst::Tag::ProcWait:
+                // Statements, never values.
+                return { 1, false, false };
             case Inst::Tag::EventTriggered:
                 // `e.triggered` (LRM 15.5.3): a definite 2-state 1-bit `bit`.
                 return { 1, false, false };
@@ -13855,6 +13922,14 @@ private:
                 return;
             case Inst::Tag::ExpectWake:
                 lower_expect_wake(i);
+                return;
+            case Inst::Tag::ProcQuery:
+                lower_proc_query(i);
+                return;
+            case Inst::Tag::ProcCtl:
+                throw BackendError{ "internal: a process control statement reached the backend" };
+            case Inst::Tag::ProcWait:
+                lower_proc_wait(i);
                 return;
             case Inst::Tag::MonitorSet:
                 b_.CreateCall(monitor_set_fn(),
@@ -16973,7 +17048,12 @@ private:
 
         llvm::Value* record = record_slot();
         b_.CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)), record);
-        llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, { state_, rng_slot_, wheel_, record });
+        std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
+        if (design_uses_process_) {
+            argv.push_back(proc_arg());
+        }
+        argv.push_back(record);
+        llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
         b_.CreateCall(strobe_pend_fn(), { hdl });
     }
 
@@ -16992,8 +17072,12 @@ private:
         const auto      info = ir_->extra_data<StrobePendInfo>(ir_->payload(i).extra);
         llvm::Function* cf   = sym(fn_decls_[static_cast<uint32_t>(info.func)]);
 
-        llvm::Value* hdl =
-          b_.CreateCall(cf->getFunctionType(), cf, { state_, rng_slot_, wheel_, reactive_record_slot() });
+        std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
+        if (design_uses_process_) {
+            argv.push_back(proc_arg());
+        }
+        argv.push_back(reactive_record_slot());
+        llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
         emit_reactive_push(b_, hdl);
     }
 
@@ -19323,6 +19407,11 @@ private:
         // A function body runs in the caller's thread, so $urandom inside one
         // continues the caller's stream (LRM 18.13, 18.14.1).
         argv.push_back(rng_slot_);
+        // A function runs in its caller's thread, so `process::self()` inside one
+        // names the caller (LRM 9.7).
+        if (design_uses_process_) {
+            argv.push_back(proc_arg());
+        }
         // A ref actual that is a signal with waiters: the callee writes it live, so
         // its wait queue must be serviced with the call's net old -> new transition.
         // Snapshot each before the (atomic, zero-time) function call; service after.
@@ -20002,6 +20091,11 @@ private:
         // No calling process exists on this path -- native C drove the call -- so
         // the exported subroutine draws from the module-wide state.
         argv.push_back(sym(rng_global_));
+        // Nor a calling thread: `process::self()` in an exported subroutine has no
+        // answer, and reports a located fatal rather than inventing one.
+        if (design_uses_process_) {
+            argv.push_back(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+        }
         for (size_t k = 0; k < ex.arg_ctypes.size(); ++k) {
             const DpiCType ct     = ex.arg_ctypes[k];
             const ArgDir   dir    = ex.arg_dirs[k];
@@ -20285,6 +20379,12 @@ private:
         // pointer into it.
         argv.push_back(rng_slot_);
         argv.push_back(wheel_);
+        // The spawning thread's block: the child's ramp takes a pooled block of its
+        // own and links itself in as a child of this one (LRM 9.6.3's descendant
+        // relation).
+        if (design_uses_process_) {
+            argv.push_back(proc_arg());
+        }
         if (!caps.empty()) {
             // Every child took the same formal list, so one child's declared types
             // decide the ABI for all of them.
@@ -20415,6 +20515,10 @@ private:
         argv.push_back(state_);
         argv.push_back(rng_slot_);
         argv.push_back(wheel_);
+        // A task runs in its caller's thread too, so it carries the caller's block.
+        if (design_uses_process_) {
+            argv.push_back(proc_arg());
+        }
         // Snapshot each ref-actual signal with waiters before the call; the wait
         // queue is serviced at the continuation with the net old -> new transition.
         // NOTE: a task that writes the same ref signal across a #delay (multiple time
@@ -22795,6 +22899,388 @@ private:
         }
     }
 
+    // -- Process control (the `process` class, LRM 9.7) --
+    //
+    // A thread's control block, mirroring `rt_proc` (Runtime.h) field for field --
+    // the two change together, the rt_event convention. Native, untraced storage:
+    // nothing here is a class handle, so the tree and the park state are invisible
+    // to any collector and every walk below is plain GEPs.
+    //
+    //   { i32 ctl, i32 refs, ptr acts, ptr waiters, ptr rng, ptr join_rec,
+    //     ptr obj, ptr parent, ptr first_child, ptr next_sib, ptr prev_sib }
+    //
+    // See docs/design/process-class.md §4.
+    llvm::StructType* pcb_ty() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        auto* i32 = b_.getInt32Ty();
+        return llvm::StructType::get(ctx_, { i32, i32, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr });
+    }
+
+    static constexpr uint32_t kPcbCtl        = 0;
+    static constexpr uint32_t kPcbRefs       = 1;
+    static constexpr uint32_t kPcbActs       = 2;
+    static constexpr uint32_t kPcbWaiters    = 3;
+    static constexpr uint32_t kPcbRng        = 4;
+    static constexpr uint32_t kPcbJoinRec    = 5;
+    static constexpr uint32_t kPcbObj        = 6;
+    static constexpr uint32_t kPcbParent     = 7;
+    static constexpr uint32_t kPcbFirstChild = 8;
+    static constexpr uint32_t kPcbNextSib    = 9;
+    static constexpr uint32_t kPcbPrevSib    = 10;
+
+    // LRM 9.7 `process::state`, the values slang's synthesized enum assigns, plus
+    // the flags that share the word (RT_PROC_* in Runtime.h).
+    static constexpr uint32_t kProcFinished  = 0;
+    static constexpr uint32_t kProcRunning   = 1;
+    static constexpr uint32_t kProcWaiting   = 2;
+    static constexpr uint32_t kProcSuspended = 3;
+    static constexpr uint32_t kProcKilled    = 4;
+    static constexpr uint32_t kProcStateMask = 7;
+    static constexpr uint32_t kProcStatic    = 1u << 8;
+
+    // The value a call passes as the callee's `proc` parameter: this thread's block,
+    // or null where there is no thread (a DPI export thunk, the $monitor ramp, a
+    // fused thunk group).
+    llvm::Value* proc_arg() {
+        return pcb_ != nullptr ? pcb_
+                               : static_cast<llvm::Value*>(
+                                   llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+    }
+
+    llvm::Value* pcb_field(llvm::Value* pcb, uint32_t field) {
+        return b_.CreateStructGEP(pcb_ty(), pcb, field);
+    }
+
+    // The static control blocks: one per process, at a constant address, because
+    // `mod_.processes()` is a compile-time set. The INITIALIZER carries the starting
+    // state, so a design pays no startup code for them at all -- and every process's
+    // block is valid from time zero, before its own ramp has run.
+    llvm::GlobalVariable* proc_pcb_table() {
+        if (proc_pcb_gv_ == nullptr) {
+            const auto n  = std::max<size_t>(mod_.processes().size(), 1);
+            auto*      ty = llvm::ArrayType::get(pcb_ty(), n);
+            auto*      i32 = b_.getInt32Ty();
+            auto*      ptr = llvm::PointerType::getUnqual(ctx_);
+            auto*      null = llvm::ConstantPointerNull::get(ptr);
+            std::vector<llvm::Constant*> fields{ llvm::ConstantInt::get(i32, kProcRunning | kProcStatic),
+                                                 llvm::ConstantInt::get(i32, 1) };
+            for (uint32_t k = 2; k <= kPcbPrevSib; ++k) {
+                fields.push_back(null);
+            }
+            auto* one = llvm::ConstantStruct::get(pcb_ty(), fields);
+            proc_pcb_arr_ty_ = ty;
+            proc_pcb_gv_ =
+              new llvm::GlobalVariable(root_env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
+                                       llvm::ConstantArray::get(ty, std::vector<llvm::Constant*>(n, one)),
+                                       "clotho.proc_pcb");
+        }
+        return proc_pcb_gv_;
+    }
+
+    llvm::Value* proc_pcb_slot(uint32_t proc_index) {
+        auto* gv = proc_pcb_table();
+        return b_.CreateInBoundsGEP(proc_pcb_arr_ty_, sym(gv),
+                                    { b_.getInt32(0), b_.getInt32(proc_index) });
+    }
+
+    llvm::FunctionCallee proc_alloc_fn() {
+        return rt_fn("rt_proc_alloc", raw_ptr_ty(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee proc_complete_fn() {
+        return rt_fn("rt_proc_complete", raw_ptr_ty(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee proc_thread_done_fn() {
+        return rt_fn("rt_proc_thread_done", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee proc_obj_retain_fn() {
+        return rt_fn("rt_proc_obj_retain", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+
+    // Set this thread's LRM 9.7 state, preserving the flag bits that share the
+    // word. A no-op in a body with no control block: either the design never names
+    // `process`, or this is a function, which is not a thread.
+    void emit_proc_state(uint32_t state) {
+        if (pcb_ == nullptr) {
+            return;
+        }
+        auto*        i32 = b_.getInt32Ty();
+        llvm::Value* p   = pcb_field(pcb_, kPcbCtl);
+        llvm::Value* cur = b_.CreateLoad(i32, p);
+        llvm::Value* next =
+          b_.CreateOr(b_.CreateAnd(cur, b_.getInt32(~kProcStateMask)), b_.getInt32(state));
+        b_.CreateStore(next, p);
+    }
+
+    // The `process` object naming `pcb`, created on first demand and memoized in the
+    // block. One object per thread is what makes handle identity a pointer compare:
+    // `process::self() == process::self()` has to hold, and clotho compares class
+    // handles with a bare icmp (docs/design/process-class.md §5.1).
+    llvm::Value* emit_proc_object(llvm::Value* pcb, Ref class_ref) {
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* ptr   = llvm::PointerType::getUnqual(ctx_);
+        auto* null  = llvm::ConstantPointerNull::get(ptr);
+        auto* slot  = pcb_field(pcb, kPcbObj);
+        auto* have  = b_.CreateLoad(ptr, slot);
+        auto* make  = llvm::BasicBlock::Create(ctx_, "proc.obj.new", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "proc.obj", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateCondBr(b_.CreateICmpEQ(have, null), make, done);
+
+        b_.SetInsertPoint(make);
+        llvm::Type*    body_ty = class_body_ty(class_ref);
+        const uint64_t size    = env_->llmod.getDataLayout().getTypeAllocSize(body_ty);
+        llvm::Value*   obj     = b_.CreateCall(alloc_fn(), { b_.getInt64(size) });
+        b_.CreateMemSet(obj, b_.getInt8(0), b_.getInt64(size), llvm::MaybeAlign(64));
+        b_.CreateStore(class_vptr(class_ref), b_.CreateStructGEP(body_ty, obj, 0));
+        // The one body field: the block this handle names (a chandle-shaped word, so
+        // no collector ever follows it).
+        b_.CreateStore(b_.CreatePtrToInt(pcb, b_.getInt64Ty()), b_.CreateStructGEP(body_ty, obj, 1));
+        b_.CreateStore(obj, slot);
+        b_.CreateCall(proc_obj_retain_fn(), { pcb });
+        b_.CreateBr(done);
+
+        b_.SetInsertPoint(done);
+        llvm::PHINode* result = b_.CreatePHI(ptr, 2);
+        result->addIncoming(have, entry);
+        result->addIncoming(obj, make);
+        return b_.CreatePtrToInt(result, b_.getInt64Ty());
+    }
+
+    // The control block a `process` handle names, with the null-handle guard every
+    // class-handle dereference gets (LRM 8.4).
+    llvm::Value* proc_pcb_of(llvm::Value* handle, Index at) {
+        emit_null_handle_check(handle, at);
+        llvm::Value* obj = b_.CreateIntToPtr(handle, raw_ptr_ty());
+        // Field 1 of the object body is the block pointer; field 0 is the vptr.
+        llvm::Value* w = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(proc_obj_body_ty(), obj, 1));
+        return b_.CreateIntToPtr(w, raw_ptr_ty());
+    }
+
+    // The object body shape of the `process` class: { ptr vptr, i64 pcb }. Built
+    // here rather than through class_body_ty so a use site does not need the class
+    // Ref (the frontend puts it on the instruction that needs it).
+    llvm::StructType* proc_obj_body_ty() {
+        return llvm::StructType::get(ctx_, { llvm::PointerType::getUnqual(ctx_), b_.getInt64Ty() });
+    }
+
+    // Wake every thread parked in `p.await()` on this block. The list is the event
+    // waiter list shape (event_node_ty: next / prev / handle / flag / owner), and the
+    // walk is the same one emit_event_wake_list runs, for the same reasons: read
+    // `next` before the wake, because the woken thread unlinks its own node, and gate
+    // on the scheduled flag, the design's one-wake-per-thread token.
+    void emit_proc_wake_waiters(llvm::Value* head) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* nty  = event_node_ty();
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+
+        auto* walk = llvm::BasicBlock::Create(ctx_, "await.walk", fn);
+        auto* body = llvm::BasicBlock::Create(ctx_, "await.node", fn);
+        auto* wake = llvm::BasicBlock::Create(ctx_, "await.wake", fn);
+        auto* step = llvm::BasicBlock::Create(ctx_, "await.next", fn);
+        auto* done = llvm::BasicBlock::Create(ctx_, "await.done", fn);
+
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(walk);
+
+        b_.SetInsertPoint(walk);
+        llvm::PHINode* n = b_.CreatePHI(ptr, 2);
+        n->addIncoming(head, entry);
+        b_.CreateCondBr(b_.CreateICmpNE(n, null), body, done);
+
+        b_.SetInsertPoint(body);
+        llvm::Value* next = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kNodeNext));
+        llvm::Value* hdl  = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kNodeHandle));
+        llvm::Value* flag = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kNodeFlag));
+        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(i32, flag), b_.getInt32(0)), wake, step);
+
+        b_.SetInsertPoint(wake);
+        emit_wake_push(b_, hdl);
+        b_.CreateStore(b_.getInt32(1), flag);
+        b_.CreateBr(step);
+
+        b_.SetInsertPoint(step);
+        b_.CreateBr(walk);
+        n->addIncoming(next, step);
+
+        b_.SetInsertPoint(done);
+    }
+
+    // End the calling thread: publish its final state, hand its live children to its
+    // own parent, wake everything awaiting it, and drop the reference the thread
+    // held. Emitted at a process body's natural end and in a fork child's epilogue --
+    // the two places a thread stops existing. An `always` body never reaches one,
+    // which is correct: only `kill`, `disable` or `$finish` end it.
+    void emit_proc_complete(bool killed) {
+        if (pcb_ == nullptr) {
+            return;
+        }
+        llvm::Value* waiters =
+          b_.CreateCall(proc_complete_fn(), { pcb_, b_.getInt32(killed ? 1 : 0) });
+        emit_proc_wake_waiters(waiters);
+        b_.CreateCall(proc_thread_done_fn(), { pcb_ });
+    }
+
+    // A frame-resident `await` waiter node, hoisted with the other frame allocas so
+    // CoroSplit spills it: one per await site, reused across iterations of the retry
+    // loop below (only one park is live at a time).
+    llvm::Value* proc_wait_node() {
+        llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+        return ab.CreateAlloca(event_node_ty(), nullptr, "await_node");
+    }
+
+    llvm::FunctionCallee proc_await_self_fn() {
+        return rt_fn("rt_proc_await_self", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
+    }
+
+    // `process::self()`, `p.status()`, `p.get_randstate()` (LRM 9.7).
+    void lower_proc_query(Index i) {
+        const auto  info = ir_->extra_data<ProcCtlInfo>(ir_->payload(i).extra);
+        const auto  args = ir_->region(info.args);
+        auto*       i32  = b_.getInt32Ty();
+        switch (info.op) {
+            case ProcOp::Self: {
+                if (pcb_ == nullptr) {
+                    // No calling thread: a DPI export thunk or the $monitor ramp. The
+                    // gate is on (this op set it), so the only way here is one of
+                    // those, and there is no honest answer to give.
+                    throw BackendError{ "internal: process::self() with no calling thread" };
+                }
+                set_value(i, two_val(emit_proc_object(pcb_, info.type)));
+                return;
+            }
+            case ProcOp::Status: {
+                llvm::Value* pcb = proc_pcb_of(must_of(value_of(args[0])), i);
+                llvm::Value* ctl = b_.CreateLoad(i32, pcb_field(pcb, kPcbCtl));
+                set_value(i, two_val(b_.CreateAnd(ctl, b_.getInt32(kProcStateMask))));
+                return;
+            }
+            case ProcOp::RandstateGet:
+                throw BackendError{ "internal: process::get_randstate() reached the backend" };
+            default:
+                throw BackendError{ "internal: non-query op on a proc_query" };
+        }
+    }
+
+    // `p.await()` (LRM 9.7): park until the target thread completes. A loop, not a
+    // single park, so a spurious wake (this thread is on other queues too) re-tests
+    // rather than falling through -- and so a target that is already FINISHED costs
+    // no suspend at all.
+    void lower_proc_wait(Index i) {
+        const auto info = ir_->extra_data<ProcCtlInfo>(ir_->payload(i).extra);
+        const auto args = ir_->region(info.args);
+        if (info.op != ProcOp::Await) {
+            throw BackendError{ "internal: `wait fork` reached the backend" };
+        }
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* nty  = event_node_ty();
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+
+        llvm::Value* pcb = proc_pcb_of(must_of(value_of(args[0])), i);
+        // LRM 9.7: "it shall be an error to call this task on the current process".
+        // Dynamic, because the handle is a value -- `process::self().await()` and a
+        // handle that happens to name this thread are the same case.
+        if (pcb_ != nullptr) {
+            auto* bad  = llvm::BasicBlock::Create(ctx_, "await.self", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "await.other", fn);
+            b_.CreateCondBr(b_.CreateICmpEQ(pcb, pcb_), bad, cont);
+            b_.SetInsertPoint(bad);
+            llvm::Value* now = has_wheel()
+                                 ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                                 : static_cast<llvm::Value*>(b_.getInt64(0));
+            auto* call = b_.CreateCall(proc_await_self_fn(),
+                                       { null_site_global(loc_text(i), NullKind::Class), now });
+            call->addFnAttr(llvm::Attribute::NoReturn);
+            call->addFnAttr(llvm::Attribute::Cold);
+            b_.CreateUnreachable();
+            b_.SetInsertPoint(cont);
+        }
+
+        llvm::Value* node = proc_wait_node();
+        auto*        test = llvm::BasicBlock::Create(ctx_, "await.test", fn);
+        auto*        park = llvm::BasicBlock::Create(ctx_, "await.park", fn);
+        auto*        done = llvm::BasicBlock::Create(ctx_, "await.over", fn);
+        b_.CreateBr(test);
+
+        b_.SetInsertPoint(test);
+        llvm::Value* state = b_.CreateAnd(b_.CreateLoad(i32, pcb_field(pcb, kPcbCtl)),
+                                          b_.getInt32(kProcStateMask));
+        // FINISHED (0) or KILLED (4) both mean "completed" for await's purposes.
+        llvm::Value* over = b_.CreateOr(b_.CreateICmpEQ(state, b_.getInt32(kProcFinished)),
+                                        b_.CreateICmpEQ(state, b_.getInt32(kProcKilled)));
+        b_.CreateCondBr(over, done, park);
+
+        b_.SetInsertPoint(park);
+        // Push-front onto the target's waiter list, recording the region-tagged
+        // handle and this thread's scheduled flag -- the same two words a wait bucket
+        // entry holds, read back by emit_proc_wake_waiters.
+        llvm::Value* headp = pcb_field(pcb, kPcbWaiters);
+        llvm::Value* old   = b_.CreateLoad(ptr, headp);
+        b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(nty, node, kNodeHandle));
+        b_.CreateStore(sched_ptr_, b_.CreateStructGEP(nty, node, kNodeFlag));
+        b_.CreateStore(null, b_.CreateStructGEP(nty, node, kNodePrev));
+        b_.CreateStore(old, b_.CreateStructGEP(nty, node, kNodeNext));
+        b_.CreateStore(pcb, b_.CreateStructGEP(nty, node, kNodeOwner));
+        auto* fixup = llvm::BasicBlock::Create(ctx_, "await.link.fix", fn);
+        auto* armed = llvm::BasicBlock::Create(ctx_, "await.armed", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(old, null), fixup, armed);
+        b_.SetInsertPoint(fixup);
+        b_.CreateStore(node, b_.CreateStructGEP(nty, old, kNodePrev));
+        b_.CreateBr(armed);
+        b_.SetInsertPoint(armed);
+        b_.CreateStore(node, headp);
+        // Armed for the reason `wait` and `expect` arm: parked here this thread sits
+        // in no other queue, so the flag has to read "not scheduled" or the wake is
+        // dropped as a duplicate.
+        b_.CreateStore(b_.getInt32(0), sched_ptr_);
+        emit_suspend_raw("await.resume");
+        // Unlink on resume, whoever woke us: the waker only walks and pushes, it does
+        // not unlink, which is what keeps a multi-waiter list correct without a
+        // compaction pass.
+        emit_proc_unlink_node(node);
+        b_.CreateBr(test);
+
+        b_.SetInsertPoint(done);
+    }
+
+    // Take `node` off whatever waiter list it went onto (its recorded owner), and
+    // clear its links so a second unlink is a no-op.
+    void emit_proc_unlink_node(llvm::Value* node) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* nty  = event_node_ty();
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+
+        llvm::Value* owner = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, kNodeOwner));
+        llvm::Value* prev  = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, kNodePrev));
+        llvm::Value* next  = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, kNodeNext));
+
+        auto* has_prev = llvm::BasicBlock::Create(ctx_, "await.unlink.prev", fn);
+        auto* no_prev  = llvm::BasicBlock::Create(ctx_, "await.unlink.head", fn);
+        auto* mid      = llvm::BasicBlock::Create(ctx_, "await.unlink.mid", fn);
+        auto* has_next = llvm::BasicBlock::Create(ctx_, "await.unlink.next", fn);
+        auto* tail     = llvm::BasicBlock::Create(ctx_, "await.unlink.done", fn);
+
+        b_.CreateCondBr(b_.CreateICmpNE(prev, null), has_prev, no_prev);
+        b_.SetInsertPoint(has_prev);
+        b_.CreateStore(next, b_.CreateStructGEP(nty, prev, kNodeNext));
+        b_.CreateBr(mid);
+        b_.SetInsertPoint(no_prev);
+        b_.CreateStore(next, pcb_field(owner, kPcbWaiters));
+        b_.CreateBr(mid);
+        b_.SetInsertPoint(mid);
+        b_.CreateCondBr(b_.CreateICmpNE(next, null), has_next, tail);
+        b_.SetInsertPoint(has_next);
+        b_.CreateStore(prev, b_.CreateStructGEP(nty, next, kNodePrev));
+        b_.CreateBr(tail);
+        b_.SetInsertPoint(tail);
+        b_.CreateStore(null, b_.CreateStructGEP(nty, node, kNodePrev));
+        b_.CreateStore(null, b_.CreateStructGEP(nty, node, kNodeNext));
+    }
+
     // The per-target tables the remote form needs, sized by the frontend's target
     // count and emitted only for a design that has a remote `disable`. Flat arrays,
     // not the per-instance anchored shape proc_sched uses: an id is allocated per
@@ -22933,6 +23419,11 @@ private:
     // created in the root unit and indexed by target id: the head of the list of
     // activations currently inside that block, or running that task.
     llvm::GlobalVariable*   disable_head_gv_  = nullptr;
+    // The static per-process control blocks (LRM 9.7): one array element per
+    // process, at a constant address, with the starting state carried by the
+    // initializer. A fork child's block comes from the runtime pool instead.
+    llvm::GlobalVariable*   proc_pcb_gv_      = nullptr;
+    llvm::ArrayType*        proc_pcb_arr_ty_  = nullptr;
     ankerl::unordered_dense::map<llvm::StructType*, ModuleEnv*>   unit_env_of_;
     // Root-defined integer-id value globals (abs_id_const): name -> global.
     ankerl::unordered_dense::map<std::string, llvm::GlobalVariable*> idval_gvs_;
@@ -23023,6 +23514,10 @@ private:
     // force-wake, the post-suspend poll, and the ring-overflow guard's second
     // reason to exist.
     bool design_uses_disable_  = false;
+    // Any `process` class op (LRM 9.7). Gates the control-block machinery: the ABI
+    // argument carrying the calling thread's block, the pooled block a fork child
+    // takes, the status stores at every park, and the completion hook.
+    bool design_uses_process_  = false;
     // Any ReactivePend, or any process that runs in Observed. Gates the entire
     // reactive region set: both queues, the drain blocks, and the Observed run.
     // A design with neither emits none of it.
@@ -23145,6 +23640,11 @@ private:
     // process the closure proved cannot reach a draw) gets the module-wide
     // fallback state, which no draw can reach.
     llvm::Value*        rng_slot_   = nullptr;
+    // The control block of the thread whose body is being lowered (LRM 9.7): a
+    // constant slot for a process, the pooled block for a fork child, the caller's
+    // for a task. Null in a function (not a thread) and in any design that never
+    // names `process`.
+    llvm::Value*        pcb_        = nullptr;
     // The module-wide fallback xoshiro256++ state, seeded once in main. It backs
     // the two entries that have no calling process at all -- a DPI export thunk
     // called from C, and the $monitor body the Postponed drain ramps -- and is
