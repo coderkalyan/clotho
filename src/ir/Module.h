@@ -538,6 +538,13 @@ struct Function {
     // Storage type of every frame local, indexed by the Local handle's index:
     // the parameter copies, the return variable, and body-local declarations.
     std::vector<Ref> local_types;
+    // Set for a subroutine reached through a VIRTUAL INTERFACE handle (LRM 25.9):
+    // formal 0 is the handle, and the whole body addresses signals through the
+    // instance it names rather than the one the body was lowered against.
+    // `ctx_member` is any signal of that interface -- it names the definition whose
+    // layout the instance record must describe for the substitution to be sound.
+    bool   takes_iface_ctx = false;
+    Signal ctx_member{ 0 };
     // True for a task: lowered as a coroutine that may suspend on timing controls.
     bool is_task = false;
     // True for a synthetic fork-child body (LRM 9.3.2): a coroutine spawned at a

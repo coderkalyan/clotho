@@ -490,80 +490,143 @@ TEST_CASE("virtual interface: a level wait on a member") {
     CHECK(out == "woken 3\n");
 }
 
-// A wait on an EXPRESSION over members still has no answer: the synthesized net
-// the general path builds is driven by a continuous process, which would read the
-// handle before it is assigned and then freeze onto one instance.
-TEST_CASE("virtual interface: an event control on a member expression is refused") {
-    const std::string diag = reject(R"(
+// An event control over an EXPRESSION of members (LRM 9.4.2) cannot become a
+// continuous net: that net's process would read the handle before it was assigned
+// and freeze onto one instance. Desugared instead into the shape a `wait` already
+// uses -- sample, park on each member, re-evaluate -- so it retargets with the
+// handle.
+TEST_CASE("virtual interface: an event control on a member expression") {
+    const std::string out = run_capture(R"(
         interface ibus; logic a, b; endinterface
         module top;
             ibus bus();
             virtual ibus vif;
-            initial begin vif = bus; @(vif.a & vif.b); end
+            initial begin
+                vif = bus;
+                @(vif.a & vif.b);
+                $display("changed %0t", $time);
+            end
+            initial begin #1 bus.a = 1; #1 bus.b = 1; end
         endmodule
     )");
-    CHECK(diag.find("event control on an expression through a virtual interface") != std::string::npos);
+    CHECK(out == "changed 2\n");
 }
 
-// An interface subroutine is lowered once per instance body, against that
-// instance's own signals, so a handle has no single callee to dispatch to.
-TEST_CASE("virtual interface: a subroutine call through a handle is refused") {
-    const std::string diag = reject(R"(
+// An interface subroutine reached through a handle (LRM 25.7) is lowered ONCE for
+// the definition, with the handle as formal 0, and addresses its signals through
+// the instance that names. Two handles on twin instances must therefore drive
+// their own instances, and a blocking task must suspend on its own instance's
+// signals.
+TEST_CASE("virtual interface: a subroutine call through a handle") {
+    const std::string out = run_capture(R"(
         interface ibus;
             logic [7:0] d;
+            task automatic drive(input logic [7:0] v); d = v; #1 d = d + 1; endtask
             function automatic int getd(); return d; endfunction
         endinterface
         module top;
-            ibus bus();
-            virtual ibus vif;
-            initial begin vif = bus; $display("%0d", vif.getd()); end
+            ibus a(), b();
+            virtual ibus v1, v2;
+            initial begin
+                v1 = a; v2 = b;
+                v1.drive(8'h10);
+                v2.drive(8'h20);
+                $display("a=%h b=%h peek=%0d/%0d", a.d, b.d, v1.getd(), v2.getd());
+            end
         endmodule
     )");
-    CHECK(diag.find("subroutine call through a virtual interface") != std::string::npos);
+    CHECK(out == "a=11 b=21 peek=17/33\n");
 }
 
-// The block-shadow staging path is keyed on the target signal, and a handle only
-// supplies a representative of the member: two handles naming twin instances
-// would stage into one shadow and commit into one instance.
-TEST_CASE("virtual interface: a nonblocking write through a handle is refused") {
-    const std::string diag = reject(R"(
+// A bare call to a sibling subroutine of the same interface, from inside such a
+// body, is a call on the SAME instance: the context travels on as arg 0.
+TEST_CASE("virtual interface: a sibling call keeps the instance") {
+    const std::string out = run_capture(R"(
+        interface ibus;
+            logic [7:0] d;
+            function automatic void poke(input logic [7:0] v); d = v; endfunction
+            task automatic seq(); poke(8'hAA); #1 poke(8'hBB); endtask
+        endinterface
+        module top;
+            ibus a(), b();
+            virtual ibus v2;
+            initial begin v2 = b; v2.seq(); $display("a=%h b=%h", a.d, b.d); end
+        endmodule
+    )");
+    CHECK(out == "a=xx b=bb\n");
+}
+
+// A member some handle nonblocking-writes leaves the per-signal block shadow (one
+// slot per signal, which two handles naming twin instances would collide in) for
+// the deferred-record path, whose record carries the destination resolved at
+// statement-execution time. Execution order still decides the winner.
+TEST_CASE("virtual interface: a nonblocking write through a handle") {
+    const std::string out = run_capture(R"(
         interface ibus; logic [7:0] d; endinterface
         module top;
-            ibus bus();
-            virtual ibus vif;
-            initial begin vif = bus; vif.d <= 8'h1; end
+            ibus a(), b();
+            virtual ibus v1, v2;
+            initial begin
+                v1 = a; v2 = b;
+                v1.d <= 8'h11;
+                v2.d <= 8'h22;
+                a.d  <= 8'h33;
+                #1 $display("a=%h b=%h", a.d, b.d);
+            end
         endmodule
     )");
-    CHECK(diag.find("nonblocking assignment through a virtual interface") != std::string::npos);
+    CHECK(out == "a=33 b=22\n");
 }
 
-// A clockvar read resolves, but a synchronous drive is performed by the block's
-// own Re-NBA process, which is bound to one instance. Refused whole.
-TEST_CASE("virtual interface: a clocking block through a handle is refused") {
-    const std::string diag = reject(R"(
+// A clocking block reached through a handle (LRM 25.9.1 / 25.9.2): the clockvar
+// read resolves against the sampled storage of the instance the handle names, and
+// a synchronous drive lands in that instance's Re-NBA region.
+TEST_CASE("virtual interface: a clocking block through a handle") {
+    const std::string out = run_capture(R"(
         interface ibus(input bit clk);
-            logic [7:0] d;
-            clocking cb @(posedge clk); input d; endclocking
+            logic [7:0] d, q;
+            clocking cb @(posedge clk); input q; output d; endclocking
         endinterface
         module top;
             bit clk = 0;
-            ibus bus(clk);
-            virtual ibus vif;
-            initial begin vif = bus; $display("%h", vif.cb.d); end
+            ibus a(clk), b(clk);
+            virtual ibus v1, v2;
+            always #1 clk = ~clk;
+            initial begin
+                v1 = a; v2 = b;
+                @(posedge clk);
+                v1.cb.d <= 8'h1;
+                v2.cb.d <= 8'h2;
+                @(posedge clk);
+                // A clockvar read returns the value sampled at the last clocking
+                // event, so each handle must reach its own instance's sample.
+                $display("q=%h/%h", v1.cb.q, v2.cb.q);
+                @(posedge clk);
+                $display("a=%h b=%h", a.d, b.d);
+                $finish;
+            end
+            initial begin a.q = 8'h55; b.q = 8'h66; end
         endmodule
     )");
-    CHECK(diag.find("clocking block reached through a virtual interface") != std::string::npos);
+    CHECK(out == "q=55/66\na=01 b=02\n");
 }
 
-// With no instance of the interface anywhere, there is no layout to resolve a
-// member against -- and no assignment could ever make the handle non-null.
-TEST_CASE("virtual interface: a member of an uninstantiated interface is refused") {
-    const std::string diag = reject(R"(
+// With no instance of the interface anywhere, the handle is null for the whole run
+// and every access through it is a run-time fatal. A design that never executes the
+// access is still legal, so this is a warning at compile time, not a refusal.
+TEST_CASE("virtual interface: a member of an uninstantiated interface is a fatal") {
+    const test::DesignRun run = test::run_design_captured(R"(
         interface ibus; logic [7:0] d; endinterface
         module top;
             virtual ibus vif;
-            initial vif.d = 8'h1;
+            initial begin
+                $display("before");
+                vif.d = 8'h1;
+                $display("after");
+            end
         endmodule
     )");
-    CHECK(diag.find("no elaborated instance") != std::string::npos);
+    CHECK(run.err.find("use of a null virtual interface") != std::string::npos);
+    // The write never happens, and nothing after it runs.
+    CHECK(run.out == "before\n");
 }

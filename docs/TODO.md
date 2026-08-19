@@ -1740,7 +1740,7 @@ project with its own algorithm, not tail cleanup on the property layer:
 
 ### UVM enablers
 
-- [~] **Virtual interfaces** (LRM 25.9) — a handle is the 64-bit address of one
+- [x] **Virtual interfaces** (LRM 25.9) — a handle is the 64-bit address of one
   elaborated interface instance's runtime context record (the per-instance
   descriptor module dedup already builds: state base, NBA shadow base, sched base,
   dump-var base, wait-bucket bases). A member reached through it is the ordinary
@@ -1749,27 +1749,35 @@ project with its own algorithm, not tail cleanup on the property layer:
   already emits for itself. slang resolves `vif.sig` against a cached placeholder
   instance body, so the member symbol is matched to a real instance by
   `InstanceBodySymbol::hasSameType` (`VifDefs`), and that representative supplies
-  every def-local constant. Working: declaration, `null`, `==` / `!=`, assignment
-  from an instance / another handle / `null`, modport-qualified and parameterized
-  handles, handles as class properties, constructor and task arguments and array
-  elements, member reads and blocking writes with correct wake and VCD on the
-  bound instance, interface events triggered through a handle, and `@(edge vif.sig)` / `wait(vif.x)` — which park a frame-resident node
-  on an intrusive waiter list in the definition's state, the event-object list
-  reused, so there is no bucket identity or capacity to know at compile time.
-  Signals of an interface a handle can name keep the canonical type-derived shape,
-  the `ref`-actual rule. Deferred, guarded loud: a **nonblocking write** through a
-  handle (the block shadow is keyed on the target signal, so two handles naming
-  twin instances would stage into one; the deferred-record path, whose record
-  already carries the destination pointer resolved at statement-execution time, is
-  where it belongs — this is the one gap that blocks the LRM 25.9 example
-  verbatim, and blocking writes are unaffected), a **clocking block** through a
-  handle (25.9.1 / 25.9.2 — a clockvar read would resolve but the synchronous
-  drive is performed by that block's Re-NBA process, bound to one instance), an
-  **interface subroutine** through a handle (lowered once per instance body, so it
-  needs a ctx-parameterized body — the `clone_with_ctx_param` transform — and an
-  ABI change to the call path), an event control on an **expression** over members,
-  and a member of an interface the design never instantiates. Design:
-  docs/design/interfaces.md.
+  every def-local constant. Declaration, `null`, `==` / `!=`, assignment from an
+  instance / another handle / `null`, modport-qualified and parameterized handles,
+  handles as class properties, constructor and task arguments and array elements,
+  member reads and blocking writes with correct wake and VCD on the bound instance,
+  interface events triggered through a handle, and `@(edge vif.sig)` /
+  `wait(vif.x)` — which park a frame-resident node on an intrusive waiter list in
+  the definition's state, the event-object list reused, so there is no bucket
+  identity or capacity to know at compile time. Signals of an interface a handle
+  can name keep the canonical type-derived shape, the `ref`-actual rule.
+  **Nonblocking writes** (`vif.d <= x`) move the *member* — every writer of it,
+  handle or direct — off the per-signal block shadow, which two handles naming twin
+  instances would collide in, onto the deferred-record path, whose record carries
+  the destination pointer resolved at statement-execution time plus the instance
+  context the replay wakes against. A **clocking block** through a handle (25.9.1 /
+  25.9.2) reads that instance's sampled storage and drives that instance's
+  `drive_pend` pair, so its own Re-NBA process performs the drive and 14.16.2's
+  last-write-wins falls out per instance. An **interface subroutine** through a
+  handle is lowered once for the definition with the handle as formal 0
+  (`Function::takes_iface_ctx`), installed body-wide by the backend, so one body
+  serves every instance; a bare sibling call passes the context on. That body-wide
+  install is why `CtxOverride` now carries an anchor and `def_relative_for` gates on
+  it — a hierarchical reference out of the interface has a different `ctx_ty`. An
+  event control on an **expression** over members is desugared into the sample /
+  park / re-evaluate shape `wait` uses, never a continuous net (which would freeze
+  onto whichever instance was bound at time zero); an `edge` / `iff` qualifier on
+  such an expression stays guarded loud. A member of an interface the design never
+  instantiates is an unconditional run-time fatal with a
+  `virtual-interface-never-bound` warning up front, not a refusal. The LRM 25.9
+  `SBusTransactor` example runs verbatim. Design: docs/design/interfaces.md.
 - [~] **String formatting** — `%p` (LRM 21.2.1.6). The four structural `shall`
   cases the clause names beyond unpacked arrays/structs now print correctly
   instead of falling through to a bare decimal: a tagged union as `'{tag:value}`

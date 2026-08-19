@@ -171,33 +171,61 @@ no static subscription to build, and slang enforces all of it (`DynamicNotProced
 `VirtualInterfaceIfaceMember`, `VirtualInterfaceUnionMember`). Nets are driven
 through a clocking block or an in-interface driver, per the clause.
 
-**Deferred, each guarded loud:**
+**Nonblocking writes.** A member that any handle nonblocking-writes leaves the
+per-signal block shadow for the **deferred-record** path (`emit_array_nba` /
+`emit_array_commit`, generalized from arrays to scalars). A shadow is one slot per
+signal and a handle supplies only a representative, so two handles naming twin
+instances would stage into one slot and one write would silently never land.
+A record is per *write*: it already carries the destination pointer resolved at
+statement-execution time, and it gains a `ptr ctx` field so the replay wakes the
+bound instance's waiters. The decision is a property of the **member**, not of the
+statement — `vif_passes` runs before `nba_classify`, so *every* writer of such a
+member, handle or direct, routes to records and execution order still decides the
+winner. The cost is confined to members of vif-bound interfaces that anyone
+nonblocking-writes; every other signal's layout is untouched.
 
-- **A nonblocking write through a handle** (`vif.d <= x`). The block-shadow
-  staging path is keyed on the target *signal*, and a handle supplies only a
-  representative of the member: two handles naming twin instances would stage into
-  one shadow and commit into one instance. The deferred-record path
-  (`emit_array_nba`) is the shape that fits — its record already carries the
-  destination pointer resolved at statement-execution time — and it needs the
-  instance context beside it so the replay wakes the bound instance's waiters too.
-  Blocking assignment through a handle is unaffected and correct. This is the one
-  gap that blocks the LRM 25.9 example verbatim (`bus.req <= 1'b1`).
-- **A clocking block through a handle** (`vif.cb.sig`, `@(vif.cb)`, LRM 25.9.1 /
-  25.9.2). A clockvar read would resolve, but a synchronous drive is performed by
-  that block's own Re-NBA process, which is bound to one instance; half of it
-  working is worse than none.
-- **An interface subroutine through a handle** (`vif.task()`). A subroutine
-  declared in an interface is lowered once per instance body, against that
-  instance's own signals, so there is no single callee to dispatch to. It needs a
-  body parameterized on the instance context — the transform
-  `clone_with_ctx_param` already performs for a shared process body — and that is
-  an ABI change to the call path, so it is its own piece of work.
-- **An event control on an EXPRESSION over members** (`@(vif.a & vif.b)`). The
-  general path synthesizes a net driven by a continuous process, which would read
-  the handle before it is assigned and then freeze onto whichever instance was
-  bound at time zero.
-- **A member of an interface the design never instantiates.** There is no layout
-  to resolve the member against, and no assignment could make the handle non-null.
+**Clocking blocks.** `vif.cb.sig` reads the sampled storage of the instance the
+handle names: the clockvar's sampled temp lives in that instance's own scope, so it
+is one more def-relative base. A synchronous drive (`vif.cb.d <= x`) writes the
+block's `drive_pend` / `drive_val` pair in that instance, and that instance's own
+Re-NBA process performs the drive — the LRM 14.16.2 last-write-wins rule falls out
+because the two handles' drives land in different instances' slots. The vif
+registry carries the clockvars by name (`VifClockVar`), because a placeholder's
+`ClockingBlockSymbol` members are not in `sigmap_` for the same reason its signals
+are not.
+
+**Interface subroutines.** `vif.task()` is lowered **once for the definition**,
+with the handle spliced as formal 0 exactly as a class method takes `this`
+(`splice_iface_ctx`, `Function::takes_iface_ctx`). The backend reads it out of the
+frame Local at entry and installs it as a **body-wide** instance context, so every
+signal the body touches — reads, writes, waits, NBA records — resolves against the
+caller's instance. `vif_function_id` builds that body from the representative's
+`SubroutineSymbol` and caches it on the placeholder's, so the ordinary per-instance
+lowering (`fnmap_`) is untouched and still serves direct calls. A bare call to a
+sibling subroutine of the same interface passes the context straight on
+(`vif_ctx_arg`), because it is a call on the same instance.
+
+The body-wide install is what forced `CtxOverride` to carry an **anchor**: a
+hierarchical reference out of the interface (`top.u1.sig`) has a different anchor
+and a different `ctx_ty`, and would otherwise GEP the wrong layout off the record.
+`def_relative_for` now gates on `owner.anchor == ctx_override_anchor_`, which turns
+the hazard into a compile-time invariant.
+
+**An event control on an EXPRESSION over members** (`@(vif.a & vif.b)`) is
+desugared rather than synthesized into a net: sample the expression, park on each
+member the way `wait` already does, re-evaluate, loop until it changes. A
+continuous net would read the handle before it was assigned and freeze onto
+whichever instance was bound at time zero.
+
+An `edge` or an `iff` qualifier on such an expression (`@(posedge (vif.a &
+vif.b))`, LRM 9.4.2 takes the edge of the LSB) stays guarded loud: the change form
+is the one that occurs, and the qualifier would need the sample compared bit-wise
+rather than for inequality.
+
+**A member of an interface the design never instantiates.** The handle can only
+ever be null, so the access is an unconditional run-time fatal, and the compiler
+says so up front with a `virtual-interface-never-bound` warning. A design that
+never executes the access is still legal, so this is not a refusal.
 
 ## Deferred (loud-fail, tracked)
 

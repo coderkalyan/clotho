@@ -1049,10 +1049,31 @@ struct ClassIds {
 // Design-wide, and shared by every Lowerer, because the interface is elaborated
 // under one top while the class method that dereferences the handle may be
 // lowered by another (a package-scope class body lowers on the shared Lowerer).
+// One clockvar of an interface's clocking block, as reachable through a handle:
+// the sampled storage a read yields and the two slots a synchronous drive writes
+// (LRM 14.16). All three are ordinary per-instance signals in the interface's
+// scope, so the handle addresses them like any other member.
+struct VifClockVar {
+    ir::Signal sampled{ 0 };
+    ir::Signal drive_val{ 0 };
+    ir::Signal drive_pend{ 0 };
+    bool       drives = false;
+};
+
 struct VifInstance {
-    const slang::ast::InstanceBodySymbol*                      body = nullptr;
-    uint32_t                                                   scope = 0;
-    ankerl::unordered_dense::map<std::string_view, ir::Signal> members;
+    const slang::ast::InstanceBodySymbol* body  = nullptr;
+    uint32_t                              scope = 0;
+    // Body-level signals by name, plus each clocking block's event under the
+    // block's own name. Keys are OWNED strings because a clockvar's key is
+    // qualified ("cb.d"): an unqualified one would collide with a body-level `d`
+    // and silently hand back the live signal instead of the sampled one.
+    ankerl::unordered_dense::map<std::string, ir::Signal>  members;
+    ankerl::unordered_dense::map<std::string, VifClockVar> clockvars;
+    // The same body-level members by SYMBOL. A subroutine of this interface lowered
+    // for handle dispatch resolves its signal references through sigmap_, which
+    // belongs to whichever Lowerer does the lowering -- possibly not the one that
+    // elaborated this instance. Seeding from here is what makes that work.
+    ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, ir::Signal> syms;
 };
 
 struct VifDefs {
@@ -1207,10 +1228,74 @@ public:
         rec.scope = scope;
         for (const auto& vs : body.membersOfType<slang::ast::ValueSymbol>()) {
             if (const auto it = sigmap_.find(&vs); it != sigmap_.end()) {
-                rec.members.emplace(vs.name, it->second);
+                rec.members.emplace(std::string(vs.name), it->second);
+                rec.syms.emplace(&vs, it->second);
+            }
+        }
+        // A clocking block's storage is not a body member: its event and its
+        // clockvars live in the block's own scope. collect_clocking_block has
+        // already created all of it (the Collect walk above), and every piece is a
+        // signal of THIS instance's scope, so a handle reaches them like any other
+        // member -- see docs/design/interfaces.md.
+        for (const auto& cb : body.membersOfType<slang::ast::ClockingBlockSymbol>()) {
+            const auto st = clocking_.find(&cb);
+            if (st == clocking_.end()) {
+                continue; // refused during collection; the reader fails on its own
+            }
+            rec.members.emplace(std::string(cb.name), st->second.event);
+            for (const ClockVarState& cv : st->second.vars) {
+                rec.clockvars.emplace(std::string(cb.name) + "." + std::string(cv.sym->name),
+                                      VifClockVar{ .sampled    = cv.sampled,
+                                                   .drive_val  = cv.drive_val,
+                                                   .drive_pend = cv.drive_pend,
+                                                   .drives     = cv.drives });
             }
         }
         vif_defs_->insts.push_back(std::move(rec));
+    }
+
+    // The representative's record for a clockvar reached through a handle, or
+    // nullopt when no instance of the interface exists (the caller then emits the
+    // null-handle fatal, as for any other member).
+    std::optional<VifClockVar> vif_clockvar(const slang::ast::ClockVarSymbol& cv, std::string_view what) {
+        const auto& cb = cv.getParentScope()->asSymbol().as<slang::ast::ClockingBlockSymbol>();
+        const auto& placeholder =
+          cb.getParentScope()->asSymbol().as<slang::ast::InstanceBodySymbol>();
+        const std::string key = std::string(cb.name) + "." + std::string(cv.name);
+        for (const VifInstance& inst : vif_defs_->insts) {
+            if (!inst.body->hasSameType(placeholder)) {
+                continue;
+            }
+            if (const auto it = inst.clockvars.find(key); it != inst.clockvars.end()) {
+                return it->second;
+            }
+            fail(std::string(what) + " through a virtual interface is not supported: clocking block '" +
+                 std::string(cb.name) + "' of interface '" + std::string(placeholder.getDefinition().name) +
+                 "' provides no clockvar '" + std::string(cv.name) + "'");
+        }
+        report(Severity::Warning,
+               "virtual-interface-never-bound",
+               "no instance of interface '" + std::string(placeholder.getDefinition().name) +
+                 "' exists in the design, so this virtual interface is null for the whole run and " +
+                 std::string(what) + " through it is a run-time fatal",
+               to_source_span(cur_range_));
+        return std::nullopt;
+    }
+
+    // The place a member access resolves to when the handle is provably null for
+    // the whole run (no instance of its interface exists). LRM 25.9 makes using a
+    // null virtual interface a fatal run-time error, so that is what this emits;
+    // the throwaway storage exists only to give the surrounding read or write a
+    // well-formed target on the unreachable path after it.
+    ir::Index vif_null_place(const slang::ast::Type& type, ir::Builder& b, ir::SourceLoc l) {
+        const std::string banner = banner_at(cur_range_.start());
+        b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
+                   banner,
+                   "use of a null virtual interface",
+                   {},
+                   l);
+        b.finish(banner + "virtual interface", 1, l);
+        return b.signal(declare_temp(lower_type(type), "vif_null"), l);
     }
 
     // The InstanceScope id of an elaborated interface instance, for a handle that
@@ -1230,7 +1315,7 @@ public:
     // some real instance's copy of it. Every instance of one definition lays its
     // members out identically, so which one is picked does not matter -- it only
     // has to be a member of a definition the handle's type admits.
-    ir::Signal vif_member_signal(const slang::ast::Symbol& member, std::string_view what) {
+    std::optional<ir::Signal> vif_member_signal(const slang::ast::Symbol& member, std::string_view what) {
         const slang::ast::Symbol* m = &member;
         if (const auto* mp = m->as_if<slang::ast::ModportPortSymbol>()) {
             // A modport-qualified handle resolves to the modport's port symbol;
@@ -1240,14 +1325,23 @@ public:
             }
             m = mp->internalSymbol;
         }
-        const slang::ast::Scope* owner = m->getParentScope();
-        if (owner != nullptr && owner->asSymbol().kind == SymbolKind::ClockingBlock) {
-            // TODO: `vif.cb.sig` (LRM 25.9.1) — a clockvar read resolves to the
-            // block's sampled storage, but a synchronous drive is performed by that
-            // block's own Re-NBA process, which is bound to one instance. Refused
-            // whole rather than half-working.
-            fail("a clocking block reached through a virtual interface is not supported");
+        if (const auto* cv = m->as_if<slang::ast::ClockVarSymbol>()) {
+            // `vif.cb.d` (LRM 25.9.1): the block's sampled storage for that
+            // clockvar, which is an ordinary per-instance signal in the interface's
+            // scope. An output-only clockvar has none -- slang rejects reading one
+            // (ClockVarOutputRead), so reaching here with a zero signal would be a
+            // write, which routes through the drive path instead.
+            const std::optional<VifClockVar> rec = vif_clockvar(*cv, what);
+            if (!rec) {
+                return std::nullopt;
+            }
+            if (rec->sampled == ir::Signal{ 0 }) {
+                fail(std::string(what) + " through a virtual interface is not readable: it is an "
+                     "output-only clockvar");
+            }
+            return rec->sampled;
         }
+        const slang::ast::Scope* owner = m->getParentScope();
         while (owner != nullptr && owner->asSymbol().kind != SymbolKind::InstanceBody) {
             owner = owner->asSymbol().getParentScope();
         }
@@ -1259,17 +1353,38 @@ public:
             if (!inst.body->hasSameType(placeholder)) {
                 continue;
             }
-            if (const auto it = inst.members.find(m->name); it != inst.members.end()) {
+            if (const auto it = inst.members.find(std::string(m->name)); it != inst.members.end()) {
                 return it->second;
             }
         }
-        // Either the design instantiates no interface of this type -- the handle
-        // can then only ever be null, so every use of it is a fatal anyway and
-        // there is no layout to resolve against -- or the member has no storage of
-        // its own (a parameter, a subroutine), which has no lowering here yet.
-        fail(std::string(what) + " through a virtual interface is not supported: no elaborated instance of "
-             "interface '" + std::string(placeholder.getDefinition().name) + "' provides a signal '" +
-             std::string(m->name) + "'");
+        // No elaborated instance of this interface exists anywhere in the design.
+        // Nothing can ever be assigned to the handle, so it is null for the whole
+        // run and every access through it is the LRM 25.9 run-time fatal. There is
+        // also no layout to resolve the member against, so the caller emits that
+        // fatal directly rather than an access.
+        //
+        // Warned rather than refused: the design is legal and simulates, and this
+        // is a fact clotho proved about it (DiagnosticOrigin::Analysis).
+        //
+        // TODO: suppression. Clotho's own diagnostic codes have no `-Wno-<code>`
+        // path yet (apply_severity_policy re-ranks slang's engine only), so a
+        // deliberate forward declaration cannot silence this.
+        for (const VifInstance& inst : vif_defs_->insts) {
+            if (inst.body->hasSameType(placeholder)) {
+                // An instance DOES exist; the member itself is what has no storage
+                // (a parameter, or a shape with no lowering here yet).
+                fail(std::string(what) + " through a virtual interface is not supported: interface '" +
+                     std::string(placeholder.getDefinition().name) + "' provides no signal '" +
+                     std::string(m->name) + "'");
+            }
+        }
+        report(Severity::Warning,
+               "virtual-interface-never-bound",
+               "no instance of interface '" + std::string(placeholder.getDefinition().name) +
+                 "' exists in the design, so this virtual interface is null for the whole run and " +
+                 std::string(what) + " through it is a run-time fatal",
+               to_source_span(cur_range_));
+        return std::nullopt;
     }
 
     // Lower one top instance and its whole hierarchy, then emit the accumulated
@@ -6964,17 +7079,23 @@ private:
                     // instance the handle names right now. The handle is evaluated
                     // here, immediately before the wait, for the same reason an
                     // event array element's is.
-                    const auto&      ma  = ev.expr.as<MemberAccessExpression>();
-                    const ir::Signal rep = vif_member_signal(ma.member, "'" + std::string(ma.member.name) + "'");
-                    const ir::Index  inst = lower_expr(ma.value(), *wait_builder_);
+                    const auto&                     ma = ev.expr.as<MemberAccessExpression>();
+                    const std::optional<ir::Signal> rep =
+                      vif_member_signal(ma.member, "'" + std::string(ma.member.name) + "'");
+                    const ir::Index inst = lower_expr(ma.value(), *wait_builder_);
+                    if (!rep) {
+                        // Null for the whole run: waiting on it blocks forever, which
+                        // an empty event list is. The warning is already reported.
+                        break;
+                    }
                     if (ev.edge == slang::ast::EdgeKind::BothEdges) {
                         out.push_back(
-                          ir::WaitEvent{ .signal = rep, .edge = ir::Edge::Positive, .inst = inst });
+                          ir::WaitEvent{ .signal = *rep, .edge = ir::Edge::Positive, .inst = inst });
                         out.push_back(
-                          ir::WaitEvent{ .signal = rep, .edge = ir::Edge::Negative, .inst = inst });
+                          ir::WaitEvent{ .signal = *rep, .edge = ir::Edge::Negative, .inst = inst });
                     } else {
                         out.push_back(
-                          ir::WaitEvent{ .signal = rep, .edge = to_edge(ev.edge), .inst = inst });
+                          ir::WaitEvent{ .signal = *rep, .edge = to_edge(ev.edge), .inst = inst });
                     }
                     break;
                 }
@@ -7239,10 +7360,132 @@ private:
         return tmp;
     }
 
+    // A frame Local with no symbol behind it, for a compiler-synthesized value that
+    // must be per-activation rather than per-design.
+    uint32_t anon_local(ir::Ref type) {
+        const auto idx = static_cast<uint32_t>(fn_ctx_->local_types.size());
+        fn_ctx_->local_types.push_back(type);
+        return idx;
+    }
+
+    // `@(<expression over virtual interface members>)` (LRM 9.4.2 + 25.9). The
+    // general path synthesizes a net driven by a continuous process, which cannot
+    // work through a handle: it would read the handle before it is assigned, and
+    // then track whichever instance was bound at time zero. So this desugars to
+    // exactly what the clause asks for -- wait until the expression's value
+    // changes -- over the per-member waits that do work:
+    //
+    //   sample = expr;
+    //   forever begin @(each member read) if (expr !== sample) break; sample = expr; end
+    //
+    // The sample lives in the call frame inside a subroutine (so two activations of
+    // one task do not share it) and in module storage in a process body, which is a
+    // single coroutine and cannot re-enter its own wait.
+    void lower_vif_expr_wait(const SignalEventControl& ev, ir::Builder& b, ir::SourceLoc l) {
+        if (ev.edge != slang::ast::EdgeKind::None) {
+            // TODO: an edge qualifier on an expression over virtual interface
+            // members (LRM 9.4.2 takes the edge of the expression's LSB). The
+            // change form below is the one that occurs in practice.
+            fail("an edge qualifier on an expression through a virtual interface is not supported");
+        }
+        if (ev.iffCondition != nullptr) {
+            fail("an `iff` qualifier on an expression through a virtual interface is not supported");
+        }
+        const ir::Ref ty = lower_type(*ev.expr.type);
+        // The sample's storage, as a maker so each use re-forms the lvalue.
+        const bool       in_frame = fn_ctx_ != nullptr;
+        const uint32_t   slot     = in_frame ? anon_local(ty) : 0;
+        const ir::Signal tmp      = in_frame ? ir::Signal{ 0 } : declare_temp(ty, "vif_event");
+        const auto       place    = [&](ir::Builder& bb) {
+            return in_frame ? bb.local(slot, ty, l) : bb.signal(tmp, l);
+        };
+        b.binary(ir::Inst::Tag::Store, place(b), b.resize(lower_expr(ev.expr, b), ty, l), l);
+
+        b.open_region();
+        const ir::Index      lpred = true_const(b, l);
+        const ir::ExtraSlice lcond = b.close_region();
+
+        b.open_region();
+        {
+            std::vector<ir::WaitEdge> edges;
+            for (const MemberAccessExpression* ma : vif_member_reads(ev.expr)) {
+                const std::optional<ir::Signal> rep =
+                  vif_member_signal(ma->member, "'" + std::string(ma->member.name) + "'");
+                const ir::Index inst = lower_expr(ma->value(), b);
+                if (rep) {
+                    edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
+                                                  ir::kNoWaitHandle, inst });
+                }
+            }
+            std::vector<ir::WaitEvent> reads;
+            collect_expr_reads(ev.expr, reads);
+            for (const ir::WaitEvent& e : reads) {
+                edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
+            }
+            b.wait(edges, l);
+            const ir::Index cur     = b.resize(lower_expr(ev.expr, b), ty, l);
+            const ir::Index sampled = b.unary(ir::Inst::Tag::Load, place(b), l);
+            const ir::Index same    = b.binary(ir::Inst::Tag::CaseEq, cur, sampled, l);
+            b.open_region();
+            b.break_(l);
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region();
+            b.cond(b.unary(ir::Inst::Tag::Lnot, same, l), then_r, else_r, l);
+            b.binary(ir::Inst::Tag::Store, place(b), cur, l);
+        }
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(lcond, lpred, body, step, /*bottom_test*/ false, l);
+    }
+
+    // `vif.cb.d <= expr` (LRM 14.16 reached through LRM 25.9). Identical to the
+    // ordinary synchronous drive -- two stores into the block's per-clockvar
+    // pending state, applied by that block's Re-NBA process at the clocking event
+    // -- except that the handle picks which INSTANCE's pending slot is written.
+    // There is no aliasing hazard the way there is for an NBA: the slot is
+    // selected at run time, and two drives landing in one slot in a cycle
+    // overwriting each other is exactly LRM 14.16.2.
+    void lower_vif_clocking_drive(const MemberAccessExpression& ma, const AssignmentExpression& a,
+                                  ir::Builder& b) {
+        const auto& cv = ma.member.as<slang::ast::ClockVarSymbol>();
+        if (!a.isNonBlocking()) {
+            fail("a clocking block drive must use `<=` (LRM 14.16)");
+        }
+        if (a.timingControl != nullptr) {
+            fail("a cycle delay on a synchronous drive is not supported");
+        }
+        const std::optional<VifClockVar> rec =
+          vif_clockvar(cv, "'" + std::string(cv.name) + "'");
+        const ir::SourceLoc l = loc(a);
+        if (!rec) {
+            (void)vif_null_place(*ma.type, b, l);
+            return;
+        }
+        if (!rec->drives) {
+            fail("a drive of a clocking block input is not legal SystemVerilog");
+        }
+        const ir::Index handle = lower_expr(ma.value(), b);
+        const ir::Index val    = b.iface_signal(handle, rec->drive_val, l);
+        b.binary(ir::Inst::Tag::Store, val,
+                 b.resize(lower_expr(a.right(), b), module_.signal(rec->drive_val).type, l), l);
+        b.binary(ir::Inst::Tag::Store, b.iface_signal(handle, rec->drive_pend, l), true_const(b, l), l);
+    }
+
     // Lower an intra-body event control `@(...)` to a Wait instruction. A
     // multi-signal list (@(a or posedge b)) registers the process on every listed
     // (signal, edge) queue at once; it wakes when any of them fires.
     void lower_event_wait(const TimingControl& tc, ir::Builder& b, ir::SourceLoc l) {
+        if (tc.kind == TimingControlKind::SignalEvent) {
+            const auto& ev = tc.as<SignalEventControl>();
+            if (reads_vif(ev.expr) && ev.expr.kind != ExpressionKind::MemberAccess) {
+                lower_vif_expr_wait(ev, b, l);
+                return;
+            }
+        }
         std::vector<ir::WaitEvent> events;
         // Handle expressions in this list lower into `b`, immediately before the
         // Wait, so an `@(ev[i])` parks on the object `ev[i]` names right now.
@@ -13610,10 +13853,13 @@ private:
                 edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
             }
             for (const MemberAccessExpression* ma : vif_reads) {
-                edges.push_back(ir::WaitEdge{
-                  vif_member_signal(ma->member, "'" + std::string(ma->member.name) + "'"),
-                  static_cast<uint32_t>(ir::Edge::Any), ir::kNoWaitHandle,
-                  lower_expr(ma->value(), b) });
+                const std::optional<ir::Signal> rep =
+                  vif_member_signal(ma->member, "'" + std::string(ma->member.name) + "'");
+                const ir::Index inst = lower_expr(ma->value(), b);
+                if (rep) {
+                    edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
+                                                  ir::kNoWaitHandle, inst });
+                }
             }
             // An empty list is legal and meaningful: `wait(0)` reads nothing and
             // parks the process for the rest of the run.
@@ -17864,17 +18110,16 @@ private:
                 return gated_store(a, *fi, b);
             }
         }
-        if (a.isNonBlocking() && reads_vif(a.left())) {
-            // TODO: nonblocking assignment through a virtual interface (LRM 25.9).
-            // The block-shadow staging path is keyed on the target SIGNAL, and a
-            // handle only supplies a representative of the member -- two handles
-            // naming twin instances would stage into one shadow and commit into one
-            // instance. The deferred-record path (emit_array_nba) is the shape that
-            // fits: its record already carries the destination pointer resolved at
-            // statement-execution time, and it would need the instance context
-            // beside it so the replay wakes the bound instance's waiters too.
-            // Blocking assignment through a handle is unaffected and works.
-            fail("nonblocking assignment through a virtual interface is not supported");
+        if (a.left().kind == ExpressionKind::MemberAccess &&
+            a.left().as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface() &&
+            a.left().as<MemberAccessExpression>().member.kind == SymbolKind::ClockVar) {
+            // `vif.cb.d <= x` (LRM 14.16 through 25.9.1): a synchronous drive, not a
+            // nonblocking assignment -- it stages nothing in the NBA shadow. Must be
+            // tested before the NBA guard below, which would otherwise claim it:
+            // lvalue_root of a handle access is the HANDLE variable, so the ordinary
+            // ClockVar dispatch above never sees it.
+            lower_vif_clocking_drive(a.left().as<MemberAccessExpression>(), a, b);
+            return ir::Index{};
         }
         if (a.isNonBlocking() && a.left().kind == ExpressionKind::MemberAccess &&
             a.left().as<MemberAccessExpression>().member.kind == SymbolKind::ClassProperty) {
@@ -20988,9 +21233,13 @@ private:
             // names. slang resolved `ma.member` against a cached placeholder body,
             // so it names WHICH member; the representative names where in a
             // definition's state that member sits.
-            const ir::Index handle = lower_expr(ma.value(), b);
-            return b.iface_signal(handle, vif_member_signal(ma.member, "'" + std::string(ma.member.name) + "'"),
-                                  l);
+            const ir::Index                 handle = lower_expr(ma.value(), b);
+            const std::optional<ir::Signal> rep =
+              vif_member_signal(ma.member, "'" + std::string(ma.member.name) + "'");
+            if (!rep) {
+                return vif_null_place(*ma.type, b, l);
+            }
+            return b.iface_signal(handle, *rep, l);
         }
         if (const auto* prop = ma.member.as_if<slang::ast::ClassPropertySymbol>()) {
             if (prop->lifetime == slang::ast::VariableLifetime::Static) {
@@ -21875,6 +22124,52 @@ private:
         prec_over_tick_ = ts ? tsv_to_fs(ts->precision) / tick_fs_ : 1;
     }
 
+    // The FunctionId of a subroutine reached through a virtual interface handle:
+    // the REPRESENTATIVE instance's body, lowered a second time with the handle as
+    // formal 0 (LRM 25.7 through 25.9). One body serves every instance, which is
+    // what the instance-context indirection is for; the ordinary per-instance
+    // lowering (fnmap_) is untouched and still serves direct calls.
+    ir::FunctionId vif_function_id(const SubroutineSymbol& ph_sub) {
+        if (const auto it = vif_fnmap_.find(&ph_sub); it != vif_fnmap_.end()) {
+            return it->second;
+        }
+        const auto& placeholder =
+          ph_sub.getParentScope()->asSymbol().as<slang::ast::InstanceBodySymbol>();
+        for (const VifInstance& inst : vif_defs_->insts) {
+            if (!inst.body->hasSameType(placeholder)) {
+                continue;
+            }
+            if (inst.syms.empty()) {
+                fail("a subroutine call through a virtual interface is not supported for an "
+                     "interface with no signals: there is no instance layout to address");
+            }
+            const slang::ast::Symbol* rep_sym = inst.body->find(ph_sub.name);
+            if (rep_sym == nullptr || rep_sym->kind != SymbolKind::Subroutine) {
+                fail("internal: virtual interface subroutine missing from the representative");
+            }
+            // The representative's signals may have been registered by a different
+            // Lowerer (another top, or the shared globals one). Seed them so the
+            // body's own references resolve; a symbol maps to one signal for the
+            // whole design, so this can only add.
+            for (const auto& [sym, sig] : inst.syms) {
+                sigmap_.emplace(sym, sig);
+            }
+            const ir::FunctionId id = module_.reserve_function();
+            vif_fnmap_[&ph_sub]     = id;
+            const Restore<std::optional<ir::Signal>> ctx(vif_build_ctx_, inst.syms.begin()->second);
+            const Restore<const Scope*> scope(scope_, inst.body);
+            const auto&                 rep = rep_sym->as<SubroutineSymbol>();
+            if (rep.subroutineKind == SubroutineKind::Task) {
+                build_task(rep, id);
+            } else {
+                build_function(rep, id);
+            }
+            return id;
+        }
+        fail("a subroutine call through a virtual interface is not supported: no elaborated "
+             "instance of interface '" + std::string(placeholder.getDefinition().name) + "' exists");
+    }
+
     ir::FunctionId function_id(const SubroutineSymbol& sub) {
         if (globals_ != nullptr && this != globals_ && is_global_subroutine(sub)) {
             const Restore<const Scope*> scope(globals_->scope_, sub.getParentScope());
@@ -21936,6 +22231,13 @@ private:
         return id;
     }
 
+    // Whether a call's receiver is a virtual interface handle, so the callee is the
+    // ctx-parameterized body rather than one instance's.
+    static bool is_vif_call(const CallExpression& call) {
+        return call.thisClass() != nullptr &&
+               call.thisClass()->type->getCanonicalType().isVirtualInterface();
+    }
+
     // Map a slang argument direction to the IR direction.
     static ir::ArgDir to_arg_dir(slang::ast::ArgumentDirection dir) {
         switch (dir) {
@@ -21950,6 +22252,49 @@ private:
             default:
                 return ir::ArgDir::In;
         }
+    }
+
+    // Splice the virtual interface handle of a subroutine lowered for handle
+    // dispatch (LRM 25.9) as frame Local 0, exactly as splice_this does for a class
+    // method. The body never names it: the backend reads it at entry and makes it
+    // the instance every signal access resolves against. Returns the interface
+    // member that identifies the definition, or Signal{0} outside such a lowering.
+    std::optional<ir::Signal> splice_iface_ctx(std::vector<ir::Ref>&    param_types,
+                                               std::vector<ir::ArgDir>& arg_dirs) {
+        if (!vif_build_ctx_) {
+            return std::nullopt;
+        }
+        param_types.push_back(module_.pool.viface_type);
+        arg_dirs.push_back(ir::ArgDir::In);
+        fn_ctx_->local_types.push_back(module_.pool.viface_type);
+        // Consumed: a body this one lowers on the way (an ordinary package function,
+        // say) is not itself ctx-parameterized. `in_vif_body_` is what stays set.
+        const ir::Signal member = *vif_build_ctx_;
+        vif_build_ctx_.reset();
+        return member;
+    }
+
+    // Whether `sub` is declared directly in an interface body, so a BARE call to it
+    // from inside a ctx-parameterized body is a call on the same instance and must
+    // carry the same context (LRM 25.7).
+    static bool is_iface_body_subroutine(const SubroutineSymbol& sub) {
+        const Scope* owner = sub.getParentScope();
+        return owner != nullptr && owner->asSymbol().kind == SymbolKind::InstanceBody &&
+               owner->asSymbol().as<slang::ast::InstanceBodySymbol>().getDefinition().definitionKind ==
+                 slang::ast::DefinitionKind::Interface;
+    }
+
+    // The instance-context argument for a call made from inside a ctx-parameterized
+    // body: frame Local 0, the handle this activation was entered with.
+    bool vif_ctx_arg_wanted(const SubroutineSymbol& sub) const {
+        return in_vif_body_ && is_iface_body_subroutine(sub);
+    }
+
+    std::optional<ir::Index> vif_ctx_arg(const SubroutineSymbol& sub, ir::Builder& b, ir::SourceLoc l) {
+        if (!vif_ctx_arg_wanted(sub)) {
+            return std::nullopt;
+        }
+        return b.unary(ir::Inst::Tag::Load, b.local(0, module_.pool.viface_type, l), l);
     }
 
     // Splice the implicit `this` handle of a class method (LRM 8.11) as frame Local
@@ -22022,6 +22367,11 @@ private:
         // before the real formals, so they (and the return var) keep formal k ==
         // Local k with `this` at Local 0.
         splice_this(sub, param_types, arg_dirs);
+        // A subroutine reached through a virtual interface handle (LRM 25.9): the
+        // handle is formal 0 instead, and the backend installs it as the instance
+        // context for the whole body.
+        const std::optional<ir::Signal> ctx_member = splice_iface_ctx(param_types, arg_dirs);
+        const Restore<bool>             in_vif(in_vif_body_, ctx_member.has_value());
 
         // Allocate the formals' frame Locals first so formal k maps to Local k (the
         // backend's prologue / epilogue rely on this). No Arg copy is emitted: the
@@ -22040,12 +22390,14 @@ private:
 
         const auto tgt = disable_targets_.find(&sub);
         module_.set_function(id,
-                             ir::Function{ .name        = std::string(sub.name),
-                                           .return_type = module_.pool.void_type,
-                                           .param_types = std::move(param_types),
-                                           .arg_dirs    = std::move(arg_dirs),
-                                           .local_types = std::move(ctx.local_types),
-                                           .is_task     = true,
+                             ir::Function{ .name            = std::string(sub.name),
+                                           .return_type     = module_.pool.void_type,
+                                           .param_types     = std::move(param_types),
+                                           .arg_dirs        = std::move(arg_dirs),
+                                           .local_types     = std::move(ctx.local_types),
+                                           .takes_iface_ctx = ctx_member.has_value(),
+                                           .ctx_member      = ctx_member.value_or(ir::Signal{ 0 }),
+                                           .is_task         = true,
                                            // A `disable` naming this task ends every
                                            // activation, so each links itself onto the
                                            // target's list (LRM 9.6.2).
@@ -22198,6 +22550,11 @@ private:
 
         // A class method (LRM 8.11): splice the implicit `this` handle as formal 0.
         splice_this(sub, param_types, arg_dirs);
+        // A subroutine reached through a virtual interface handle (LRM 25.9): the
+        // handle is formal 0 instead, and the backend installs it as the instance
+        // context for the whole body.
+        const std::optional<ir::Signal> ctx_member = splice_iface_ctx(param_types, arg_dirs);
+        const Restore<bool>             in_vif(in_vif_body_, ctx_member.has_value());
 
         // Allocate a frame Local per formal (formal k == Local k), like build_task.
         // The backend copies parameters into these Locals at entry (emit_copyin) and
@@ -22276,13 +22633,15 @@ private:
         }
 
         module_.set_function(id,
-                             ir::Function{ .name        = std::string(sub.name),
-                                           .return_type = return_type,
-                                           .param_types = std::move(param_types),
-                                           .arg_dirs    = std::move(arg_dirs),
-                                           .local_types = std::move(ctx.local_types),
-                                           .span        = span_of(sub),
-                                           .ir          = b.finish() });
+                             ir::Function{ .name            = std::string(sub.name),
+                                           .return_type     = return_type,
+                                           .param_types     = std::move(param_types),
+                                           .arg_dirs        = std::move(arg_dirs),
+                                           .local_types     = std::move(ctx.local_types),
+                                           .takes_iface_ctx = ctx_member.has_value(),
+                                           .ctx_member      = ctx_member.value_or(ir::Signal{ 0 }),
+                                           .span            = span_of(sub),
+                                           .ir              = b.finish() });
     }
 
     // Lower a class `new` expression (LRM 8.7): allocate + power-on the object body
@@ -22536,7 +22895,13 @@ private:
         // A class method (LRM 8.11): resolve the `this` object handle, spliced as
         // arg 0 (the callee splices it as formal 0). An explicit receiver
         // (`obj.method()`) is call.thisClass(); a bare in-method call uses `this`.
-        const std::optional<ir::Index> this_val = resolve_method_this(call, sub, b);
+        std::optional<ir::Index> this_val = resolve_method_this(call, sub, b);
+        // A bare call to a sibling subroutine of the same interface, from inside a
+        // ctx-parameterized body: the context travels as arg 0, like a receiver.
+        const bool bare_vif = !this_val.has_value() && vif_ctx_arg_wanted(sub);
+        if (bare_vif) {
+            this_val = vif_ctx_arg(sub, b, loc(call));
+        }
         if (sub.subroutineKind == SubroutineKind::Task) {
             // A task is a statement, never a value; it blocks the caller until done.
             lower_task_call(call, sub, b, this_val);
@@ -22547,7 +22912,9 @@ private:
         // formal-side guards (e.g. ref-arg restrictions) before arg marshaling. A
         // virtual call instead sources its callee from the vtable below, never
         // function_id(sub), which would lower slang's degenerate pure subroutine.
-        const ir::FunctionId direct_id = is_virtual ? ir::FunctionId{} : function_id(sub);
+        const ir::FunctionId direct_id =
+          is_virtual ? ir::FunctionId{}
+                     : ((is_vif_call(call) || bare_vif) ? vif_function_id(sub) : function_id(sub));
 
         const auto formals = sub.getArguments();
         const auto actuals = call.arguments();
@@ -22599,8 +22966,12 @@ private:
         // virtual task's callee is slang's degenerate associated subroutine, which has
         // no body to lower — its prototype stub supplies the signature instead
         // (virtual_sig_id).
-        const bool           is_virtual = this_val && is_user_virtual(sub) && !is_super_call(call);
-        const ir::FunctionId id         = is_virtual ? ir::FunctionId{} : function_id(sub);
+        const bool is_virtual = this_val && is_user_virtual(sub) && !is_super_call(call);
+        // A receiver that is a virtual interface handle, or a bare sibling call from
+        // inside a ctx-parameterized body, both dispatch to the one shared body.
+        const bool           through_vif = is_vif_call(call) || vif_ctx_arg_wanted(sub);
+        const ir::FunctionId id =
+          is_virtual ? ir::FunctionId{} : (through_vif ? vif_function_id(sub) : function_id(sub));
         const auto           formals    = sub.getArguments();
         const auto           actuals    = call.arguments();
         if (formals.size() != actuals.size()) {
@@ -22647,15 +23018,9 @@ private:
                                                  const SubroutineSymbol& sub,
                                                  ir::Builder&            b) {
         if (call.thisClass() != nullptr) {
-            if (call.thisClass()->type->getCanonicalType().isVirtualInterface()) {
-                // TODO: `vif.task()` / `vif.func()` (LRM 25.7 through 25.9) — an
-                // interface subroutine is lowered once per INSTANCE body, against
-                // that instance's own signals, so there is no single callee a
-                // handle can dispatch to. It needs a body parameterized on the
-                // instance context, the transform clone_with_ctx_param already
-                // performs for a shared process body.
-                fail("a subroutine call through a virtual interface is not supported");
-            }
+            // For a virtual interface receiver this is the handle, which the
+            // ctx-parameterized body takes as formal 0 (vif_function_id) exactly as
+            // a class method takes `this`.
             return lower_expr(*call.thisClass(), b);
         }
         // A bare in-method call to an instance method uses the enclosing `this`. A
@@ -23159,6 +23524,16 @@ private:
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> copy_thunk_;
     // Design-wide class type ids (LRM 8.16). Owned here so a standalone Lowerer
     // works; lower_compilation points every Lowerer at one shared table instead.
+    // A subroutine reached through a virtual interface handle -> its
+    // ctx-parameterized body (vif_function_id). Keyed on the PLACEHOLDER symbol, so
+    // it never collides with fnmap_'s per-instance entries.
+    ankerl::unordered_dense::map<const SubroutineSymbol*, ir::FunctionId> vif_fnmap_;
+    // Set while such a body is being built: the interface member whose definition
+    // the body is compiled against (see splice_iface_ctx).
+    std::optional<ir::Signal> vif_build_ctx_;
+    // Set while lowering such a body: a bare call to a sibling subroutine of the
+    // same interface passes the context on (vif_ctx_arg).
+    bool in_vif_body_ = false;
     ClassIds  own_class_ids_;
     ClassIds* class_ids_ = &own_class_ids_;
     // Design-wide virtual interface registry (see VifDefs). Owned here so a
