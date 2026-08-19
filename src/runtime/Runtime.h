@@ -1496,6 +1496,17 @@ enum {
     // `kill` (or `disable fork`) has been requested on this thread: it aborts at its
     // next poll point, which is right after whatever park it is sitting in.
     RT_PROC_ABORT = 1u << 9,
+    // The thread was woken while SUSPENDED, so the wake it was waiting for has
+    // already happened: `resume` must schedule it rather than leave it parked (LRM
+    // 9.7 -- "if the wait condition is now true or the original delay has transpired,
+    // the process is scheduled ... in the current time step").
+    RT_PROC_WAKE_PENDING = 1u << 10,
+    // The thread suspended ITSELF, so there is no source that could wake it at all
+    // and only `resume` can.
+    RT_PROC_SELF_PARKED = 1u << 11,
+    // The thread is parked in `wait fork`: it is woken when its last live descendant
+    // completes.
+    RT_PROC_WAIT_FORK = 1u << 12,
 };
 
 // A pooled block for a fork child, linked in as a child of `parent` (which may be
@@ -1514,7 +1525,12 @@ void* rt_proc_mark_kill(void* pcb, uint32_t with_self);
 // already terminated -- and unlink it from the tree. Returns the `await` waiter
 // list head, which generated code walks (the wake pushes onto a codegen-owned
 // ring, so the runtime cannot do it), and clears it.
-void* rt_proc_complete(void* pcb);
+//
+// `fork_waiters_out` receives a SECOND list to wake: the parent's, when the parent
+// is parked in `wait fork` and this completion emptied its subtree. The barrier is
+// exactly `first_child == NULL` thanks to the re-parenting above, and it has to be
+// tested here -- after the unlink, while the parent is still reachable.
+void* rt_proc_complete(void* pcb, void** fork_waiters_out);
 
 // Drop the reference the live thread held. Frees a pooled block whose last
 // reference this was.

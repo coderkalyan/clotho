@@ -229,10 +229,6 @@ TEST_CASE("process: await and self inside a task name the calling thread") {
 // Each unimplemented method refuses by its own name rather than falling into a
 // generic message.
 TEST_CASE("process: the unimplemented methods refuse by name") {
-    check_rejected("module m; initial begin process p; p = process::self(); p.suspend(); end endmodule",
-                   "process::suspend() is not supported yet");
-    check_rejected("module m; initial begin process p; p = process::self(); p.resume(); end endmodule",
-                   "process::resume() is not supported yet");
     check_rejected("module m; initial begin process p; p = process::self(); p.srandom(1); end endmodule",
                    "process::srandom() is not supported yet");
     check_rejected("module m; string s; initial begin process p; p = process::self();"
@@ -421,4 +417,116 @@ TEST_CASE("process: await returns when the target is killed") {
         endmodule
     )");
     CHECK(out == "await returned at 20 status=4\n");
+}
+
+// -- process::suspend() / resume() (LRM 9.7) -----------------------------------
+
+// LRM-pinned: Verilator 5.050 refuses `suspend()` outright ($error), so it is no
+// oracle for any of these. The rule being encoded is 9.7's own sentence about
+// resume: "Calling resume on a process that was suspended while blocked on another
+// condition shall re-sensitize the process ... If the wait condition is now true or
+// the original delay has transpired, the process is scheduled onto the Active or
+// Reactive region, so as to continue its execution in the current time step."
+//
+// So: a thread suspended while parked on a #20 does NOT run at 20, and the resume
+// at 45 continues it AT 45.
+TEST_CASE("process: a suspended thread does not run, and resume continues it now") {
+    const std::string out = run_capture(R"(
+        module t;
+          process w;
+          int n = 0;
+          initial begin
+            fork
+              begin w = process::self(); #20 n = 1; $display("worker at %0t", $time); end
+            join_none
+            #5  w.suspend();
+            #40 $display("t=%0t n=%0d status=%0d", $time, n, w.status());
+            w.resume();
+            #1  $display("t=%0t n=%0d status=%0d", $time, n, w.status());
+          end
+        endmodule
+    )");
+    CHECK(out == "t=45 n=0 status=3\nworker at 45\nt=46 n=1 status=0\n");
+}
+
+// A self-suspend "takes place immediately" and the thread resumes at the statement
+// after the call, which is what makes `suspend` a function rather than a task here.
+TEST_CASE("process: a thread can suspend itself and be resumed by another") {
+    const std::string out = run_capture(R"(
+        module t;
+          initial begin
+            process me = null;
+            me = process::self();
+            fork
+              begin #10 me.resume(); end
+            join_none
+            $display("before t=%0t", $time);
+            me.suspend();
+            $display("after t=%0t status=%0d", $time, me.status());
+          end
+        endmodule
+    )");
+    CHECK(out == "before t=0\nafter t=10 status=1\n");
+}
+
+// Suspending a completed thread has nothing to suspend, and resuming a thread that
+// is not suspended is a no-op (LRM 9.7 says nothing about either, so the conservative
+// reading is that neither changes a terminal or running state).
+TEST_CASE("process: suspend and resume are no-ops on a completed thread") {
+    const std::string out = run_capture(R"(
+        module t;
+          process child;
+          initial begin
+            fork
+              begin child = process::self(); #5; end
+            join
+            child.suspend();
+            child.resume();
+            $display("status=%0d t=%0t", child.status(), $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "status=0 t=5\n");
+}
+
+// -- `wait fork` (LRM 9.6.1) ---------------------------------------------------
+
+// LRM-pinned. The barrier covers the whole subtree, not just immediate children: the
+// grandchild here finishes last (150) and that is when `wait fork` returns.
+TEST_CASE("process: wait fork blocks on the whole descendant set") {
+    const std::string out = run_capture(R"(
+        module t;
+          initial begin
+            fork
+              begin #30 $display("child at %0t", $time); end
+              begin #10 fork begin #40 $display("grandchild at %0t", $time); end join_none end
+            join_none
+            wait fork;
+            $display("wait fork returned at %0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "child at 30\ngrandchild at 50\nwait fork returned at 50\n");
+}
+
+// With no live descendants the barrier is one pointer test and costs no suspend.
+TEST_CASE("process: wait fork with nothing forked returns at once") {
+    const std::string out = run_capture(R"(
+        module t;
+          initial begin
+            #7 wait fork;
+            $display("t=%0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "t=7\n");
+}
+
+// `wait fork` stays refused inside an assertion action block, and for an identity
+// reason rather than a region one: the block runs on the monitor process's thread.
+TEST_CASE("process: wait fork is refused in an assertion action block") {
+    check_rejected("module t; bit clk, a, b;"
+                   " ap: assert property (@(posedge clk) a |=> b) else wait fork;"
+                   " endmodule",
+                   "the descendants it would wait for are the monitor process's");
 }

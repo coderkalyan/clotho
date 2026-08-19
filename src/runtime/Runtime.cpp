@@ -5652,7 +5652,7 @@ extern "C" void* rt_proc_mark_kill(void* pcb, uint32_t with_self) {
     return chain;
 }
 
-extern "C" void* rt_proc_complete(void* pcb) {
+extern "C" void* rt_proc_complete(void* pcb, void** fork_waiters_out) {
     auto*          p       = static_cast<rt_proc*>(pcb);
     const uint32_t killed  = p->ctl & RT_PROC_ABORT;
     p->ctl  = (p->ctl & ~static_cast<uint32_t>(RT_PROC_STATE_MASK | RT_PROC_ABORT)) |
@@ -5668,12 +5668,24 @@ extern "C" void* rt_proc_complete(void* pcb) {
         child = next;
     }
     p->first_child = nullptr;
+    rt_proc* parent = p->parent;
     proc_unlink(p);
     p->parent   = nullptr;
     p->next_sib = nullptr;
     p->prev_sib = nullptr;
-    void* w     = p->waiters;
-    p->waiters  = nullptr;
+    if (fork_waiters_out != nullptr) {
+        *fork_waiters_out = nullptr;
+        // `wait fork`: the caller is due when its subtree is empty, which after
+        // re-parenting is exactly first_child == NULL.
+        if (parent != nullptr && (parent->ctl & RT_PROC_WAIT_FORK) != 0 &&
+            parent->first_child == nullptr) {
+            parent->ctl &= ~static_cast<uint32_t>(RT_PROC_WAIT_FORK);
+            *fork_waiters_out = parent->waiters;
+            parent->waiters   = nullptr;
+        }
+    }
+    void* w    = p->waiters;
+    p->waiters = nullptr;
     return w;
 }
 

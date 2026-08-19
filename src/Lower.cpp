@@ -887,11 +887,13 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 suspends("a wait_order");
                 break;
             case StatementKind::WaitFork:
-                // Nothing to do with the region: clotho does not lower it anywhere.
-                // `wait fork` needs the live-child set a fork does not keep. Named
-                // here for the reason the fork case is: this walk runs first.
+                // Lowerable everywhere else (LRM 9.6.1), but not here, and for the
+                // identity reason `disable fork` is refused below: an action block is
+                // pended as a task body and runs on the MONITOR process's control
+                // block, so the descendants it would wait for are the monitor's.
                 reject("a wait fork",
-                       "clotho does not lower it, in reactive code or outside it");
+                       "the descendants it would wait for are the monitor process's, not the "
+                       "assertion's: an action block runs on the monitor's thread");
                 break;
             case StatementKind::ForeverLoop:
                 // Still refused, and still not a region matter -- but the old reason
@@ -8258,10 +8260,11 @@ private:
                 b.proc_ctl(ir::ProcOp::DisableFork, {}, loc(stmt));
                 break;
             case StatementKind::WaitFork:
-                // TODO: wait fork (LRM 9.6.1) needs the same live-child set: a
-                // process must block until every descendant has finished, which the
-                // join-all count cannot express.
-                fail("wait fork is not supported");
+                // LRM 9.6.1: block until every descendant has completed. One pointer
+                // test on the control-block tree, because a completing thread
+                // re-parents its live children (docs/design/process-class.md §8).
+                b.proc_wait(ir::ProcOp::WaitFork, {}, loc(stmt));
+                break;
             case StatementKind::WaitOrder:
                 lower_wait_order(stmt.as<slang::ast::WaitOrderStatement>(), b);
                 break;
@@ -23162,6 +23165,15 @@ private:
             b.proc_ctl(ir::ProcOp::Kill, args, l);
             return std::nullopt;
         }
+        if (sub.name == "suspend" || sub.name == "resume") {
+            // LRM 9.7: suspend this thread or another one; resume restarts a suspended
+            // thread. Both are functions, not tasks -- even though suspending the
+            // CALLER parks it, which is the suspension itself rather than a wait for a
+            // value, and is why `suspend` needs no ProcWait.
+            const std::array<ir::Index, 1> args{ recv() };
+            b.proc_ctl(sub.name == "suspend" ? ir::ProcOp::Suspend : ir::ProcOp::Resume, args, l);
+            return std::nullopt;
+        }
         if (sub.name == "await") {
             // A task: it parks the calling thread until the target completes, so it
             // is a statement with no value (LRM 9.7).
@@ -23169,8 +23181,8 @@ private:
             b.proc_wait(ir::ProcOp::Await, args, l);
             return std::nullopt;
         }
-        // TODO: suspend / resume / srandom / get_randstate / set_randstate
-        // (docs/design/process-class.md, phases P3-P4).
+        // TODO: srandom / get_randstate / set_randstate (LRM 9.7, 18.14) --
+        // docs/design/process-class.md §7.4, phase P4.
         fail("process::" + std::string(sub.name) + "() is not supported yet");
     }
 

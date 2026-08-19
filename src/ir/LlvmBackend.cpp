@@ -4946,7 +4946,7 @@ private:
         // this: every park goes through here, so the status word is maintained in one
         // place rather than at each parking construct. Two stores, in a design that
         // names `process` and nowhere else.
-        emit_proc_state(kProcWaiting);
+        emit_proc_state(kProcRunning, kProcWaiting);
         auto* save   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_save), { hdl_ });
         auto* susp   = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_suspend), { save, b_.getFalse() });
         auto* resume = llvm::BasicBlock::Create(ctx_, label, fn_);
@@ -4954,7 +4954,7 @@ private:
         sw->addCase(b_.getInt8(0), resume);
         sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
         b_.SetInsertPoint(resume);
-        emit_proc_state(kProcRunning);
+        emit_proc_state(kProcWaiting, kProcRunning);
     }
 
     // Suspend. Coming back in the right region is the parked handle's business,
@@ -23048,6 +23048,12 @@ private:
     static constexpr uint32_t kProcStatic    = 1u << 8;
     // `kill` requested: the thread aborts at its next poll point.
     static constexpr uint32_t kProcAbort     = 1u << 9;
+    // Woken while SUSPENDED, so `resume` owes it a push rather than a re-park.
+    static constexpr uint32_t kProcWakePend  = 1u << 10;
+    // Suspended itself: no source can wake it, only `resume`.
+    static constexpr uint32_t kProcSelfPark  = 1u << 11;
+    // Parked in `wait fork`, woken when the last live descendant completes.
+    static constexpr uint32_t kProcWaitFork  = 1u << 12;
 
     // The value a call passes as the callee's `proc` parameter: this thread's block,
     // or null where there is no thread (a DPI export thunk, the $monitor ramp, a
@@ -23098,7 +23104,7 @@ private:
         return rt_fn("rt_proc_alloc", raw_ptr_ty(), { raw_ptr_ty() });
     }
     llvm::FunctionCallee proc_complete_fn() {
-        return rt_fn("rt_proc_complete", raw_ptr_ty(), { raw_ptr_ty() });
+        return rt_fn("rt_proc_complete", raw_ptr_ty(), { raw_ptr_ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee proc_mark_kill_fn() {
         return rt_fn("rt_proc_mark_kill", raw_ptr_ty(), { raw_ptr_ty(), b_.getInt32Ty() });
@@ -23110,19 +23116,28 @@ private:
         return rt_fn("rt_proc_obj_retain", b_.getVoidTy(), { raw_ptr_ty() });
     }
 
-    // Set this thread's LRM 9.7 state, preserving the flag bits that share the
-    // word. A no-op in a body with no control block: either the design never names
+    // Move this thread's LRM 9.7 state from `from` to `to`, preserving the flag bits
+    // that share the word and leaving any OTHER state alone. Conditional, and that is
+    // load-bearing rather than defensive: the park/resume pair below maintains
+    // RUNNING <-> WAITING at every suspension, and an unconditional store there would
+    // erase a SUSPENDED set by another thread (its `resume` would then find no
+    // suspended thread to restart) or a KILLED set by `kill`. Branch-free: one load,
+    // one compare, one select, one store.
+    //
+    // A no-op in a body with no control block: either the design never names
     // `process`, or this is a function, which is not a thread.
-    void emit_proc_state(uint32_t state) {
+    void emit_proc_state(uint32_t from, uint32_t to) {
         if (pcb_ == nullptr) {
             return;
         }
         auto*        i32 = b_.getInt32Ty();
         llvm::Value* p   = pcb_field(pcb_, kPcbCtl);
         llvm::Value* cur = b_.CreateLoad(i32, p);
-        llvm::Value* next =
-          b_.CreateOr(b_.CreateAnd(cur, b_.getInt32(~kProcStateMask)), b_.getInt32(state));
-        b_.CreateStore(next, p);
+        llvm::Value* is  = b_.CreateICmpEQ(b_.CreateAnd(cur, b_.getInt32(kProcStateMask)),
+                                          b_.getInt32(from));
+        llvm::Value* moved =
+          b_.CreateOr(b_.CreateAnd(cur, b_.getInt32(~kProcStateMask)), b_.getInt32(to));
+        b_.CreateStore(b_.CreateSelect(is, moved, cur), p);
     }
 
     // The `process` object naming `pcb`, created on first demand and memoized in the
@@ -23233,8 +23248,14 @@ private:
         // FINISHED or KILLED is decided by the abort mark the runtime reads off the
         // block, not by the emitting site: one hook serves the normal exit and the
         // aborted one, which arrive at the same place.
-        llvm::Value* waiters = b_.CreateCall(proc_complete_fn(), { pcb_ });
+        // Two waiter lists come back: this thread's own `await`ers, and -- when this
+        // completion emptied the parent's subtree -- whatever is parked in the
+        // parent's `wait fork`.
+        llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+        llvm::Value*      forkw = ab.CreateAlloca(llvm::PointerType::getUnqual(ctx_), nullptr, "fork_waiters");
+        llvm::Value* waiters    = b_.CreateCall(proc_complete_fn(), { pcb_, forkw });
         emit_proc_wake_waiters(waiters);
+        emit_proc_wake_waiters(b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), forkw));
         b_.CreateCall(proc_thread_done_fn(), { pcb_ });
     }
 
@@ -23337,6 +23358,9 @@ private:
         auto*        cont = llvm::BasicBlock::Create(ctx_, "proc.alive", fn);
         b_.CreateCondBr(b_.CreateICmpNE(kill, b_.getInt32(0)), exit, cont);
         b_.SetInsertPoint(cont);
+        // Suspended while we were parked (LRM 9.7): park again, remembering that the
+        // wake already arrived, until `resume`.
+        emit_proc_park_while_suspended();
     }
 
     // `p.kill()` (LRM 9.7) and `disable fork` (LRM 9.6.3). Mark the subtree, then
@@ -23434,6 +23458,177 @@ private:
         }
     }
 
+    // Park while this thread is SUSPENDED (LRM 9.7). Two callers: the poll after every
+    // park -- a thread suspended while it was blocked notices here -- and a
+    // self-suspend, which parks immediately.
+    //
+    // Nothing is desensitised: the wheel cannot cancel and a static wait bucket cannot
+    // be compacted, so the source the thread was parked on stays armed. When it fires
+    // the thread is woken, lands here, records WAKE_PENDING and parks again with no
+    // source of its own; `resume` then pushes it and it continues in the current time
+    // step, which is exactly what LRM 9.7 asks for ("if the wait condition is now true
+    // or the original delay has transpired ... scheduled onto the Active or Reactive
+    // region"). If the source has NOT fired, the registration is untouched and the
+    // re-sensitisation the same sentence asks for is free.
+    void emit_proc_park_while_suspended() {
+        if (pcb_ == nullptr || hdl_ == nullptr) {
+            return;
+        }
+        auto* i32  = b_.getInt32Ty();
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* test  = llvm::BasicBlock::Create(ctx_, "susp.test", fn);
+        auto* park  = llvm::BasicBlock::Create(ctx_, "susp.park", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "susp.done", fn);
+        b_.CreateBr(test);
+
+        b_.SetInsertPoint(test);
+        llvm::Value* ctlp = pcb_field(pcb_, kPcbCtl);
+        llvm::Value* ctl  = b_.CreateLoad(i32, ctlp);
+        llvm::Value* susp = b_.CreateICmpEQ(b_.CreateAnd(ctl, b_.getInt32(kProcStateMask)),
+                                            b_.getInt32(kProcSuspended));
+        b_.CreateCondBr(susp, park, done);
+
+        b_.SetInsertPoint(park);
+        // Record that the wake we were parked for has already been delivered, so
+        // `resume` schedules instead of waiting for a source that will not fire twice.
+        b_.CreateStore(b_.CreateOr(b_.CreateLoad(i32, ctlp), b_.getInt32(kProcWakePend)), ctlp);
+        emit_suspend_raw("susp.resume");
+        b_.CreateBr(test);
+
+        b_.SetInsertPoint(done);
+    }
+
+    // `p.suspend()` (LRM 9.7). On another thread this is one store: it stays parked
+    // where it is, and its poll turns the next wake into a re-park. On THIS thread the
+    // suspension "takes place immediately", so the park happens here.
+    void emit_proc_suspend(llvm::Value* pcb) {
+        auto* i32  = b_.getInt32Ty();
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* set  = llvm::BasicBlock::Create(ctx_, "susp.set", fn);
+        auto* skip = llvm::BasicBlock::Create(ctx_, "susp.skip", fn);
+
+        llvm::Value* ctlp  = pcb_field(pcb, kPcbCtl);
+        llvm::Value* ctl   = b_.CreateLoad(i32, ctlp);
+        llvm::Value* state = b_.CreateAnd(ctl, b_.getInt32(kProcStateMask));
+        // A completed thread cannot be suspended: LRM 9.7 has no transition out of
+        // FINISHED or KILLED.
+        llvm::Value* over = b_.CreateOr(b_.CreateICmpEQ(state, b_.getInt32(kProcFinished)),
+                                        b_.CreateICmpEQ(state, b_.getInt32(kProcKilled)));
+        b_.CreateCondBr(over, skip, set);
+
+        b_.SetInsertPoint(set);
+        llvm::Value* self = pcb_ != nullptr ? b_.CreateICmpEQ(pcb, pcb_) : b_.getFalse();
+        llvm::Value* mask = b_.CreateOr(b_.CreateAnd(ctl, b_.getInt32(~kProcStateMask)),
+                                        b_.getInt32(kProcSuspended));
+        // A self-suspend also records that no source can wake it.
+        b_.CreateStore(b_.CreateOr(mask, b_.CreateSelect(self, b_.getInt32(kProcSelfPark),
+                                                         b_.getInt32(0))),
+                       ctlp);
+        if (pcb_ != nullptr && hdl_ != nullptr) {
+            auto* mine = llvm::BasicBlock::Create(ctx_, "susp.self", fn);
+            b_.CreateCondBr(self, mine, skip);
+            b_.SetInsertPoint(mine);
+            emit_proc_park_while_suspended();
+            b_.CreateBr(skip);
+        } else {
+            b_.CreateBr(skip);
+        }
+        b_.SetInsertPoint(skip);
+    }
+
+    // `p.resume()` (LRM 9.7). A no-op unless the thread is SUSPENDED; otherwise clear
+    // the state and, if the wake it was parked for already arrived (or it suspended
+    // itself, so no wake ever will), push it now. The push is unconditional rather
+    // than scheduled-flag-gated: a thread parked in the suspension loop is in no ring,
+    // and the flag is typically already set by whatever scan woke it into that loop.
+    void emit_proc_resume(llvm::Value* pcb) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* nty  = disable_node_ty();
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+
+        auto* go   = llvm::BasicBlock::Create(ctx_, "resume.go", fn);
+        auto* push = llvm::BasicBlock::Create(ctx_, "resume.push", fn);
+        auto* skip = llvm::BasicBlock::Create(ctx_, "resume.skip", fn);
+
+        llvm::Value* ctlp = pcb_field(pcb, kPcbCtl);
+        llvm::Value* ctl  = b_.CreateLoad(i32, ctlp);
+        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateAnd(ctl, b_.getInt32(kProcStateMask)),
+                                        b_.getInt32(kProcSuspended)),
+                        go, skip);
+
+        b_.SetInsertPoint(go);
+        llvm::Value* pend = b_.CreateAnd(ctl, b_.getInt32(kProcWakePend | kProcSelfPark));
+        b_.CreateStore(b_.CreateOr(b_.CreateAnd(ctl, b_.getInt32(~(kProcStateMask | kProcWakePend |
+                                                                  kProcSelfPark))),
+                                   b_.getInt32(kProcRunning)),
+                       ctlp);
+        llvm::Value* acts = b_.CreateLoad(ptr, pcb_field(pcb, kPcbActs));
+        b_.CreateCondBr(b_.CreateAnd(b_.CreateICmpNE(pend, b_.getInt32(0)),
+                                     b_.CreateICmpNE(acts, null)),
+                        push, skip);
+
+        b_.SetInsertPoint(push);
+        llvm::Value* hdl = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, acts, 2));
+        emit_wake_push(b_, hdl);
+        b_.CreateStore(b_.getInt32(1), b_.CreateLoad(ptr, b_.CreateStructGEP(nty, acts, 4)));
+        b_.CreateBr(skip);
+
+        b_.SetInsertPoint(skip);
+    }
+
+    // `wait fork` (LRM 9.6.1): park until every descendant of this thread has
+    // completed. The barrier is one pointer test -- a completing thread re-parents its
+    // live children, so an empty child list means the whole subtree is done -- and the
+    // wake comes from the last descendant's completion, which takes this thread's
+    // waiter list when it sees the WAIT_FORK flag.
+    void lower_wait_fork(Index i) {
+        if (pcb_ == nullptr || hdl_ == nullptr) {
+            throw BackendError{ "internal: `wait fork` with no calling thread" };
+        }
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* i32  = b_.getInt32Ty();
+        auto* nty  = event_node_ty();
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+
+        llvm::Value* node = proc_wait_node();
+        auto*        test = llvm::BasicBlock::Create(ctx_, "waitfork.test", fn);
+        auto*        park = llvm::BasicBlock::Create(ctx_, "waitfork.park", fn);
+        auto*        done = llvm::BasicBlock::Create(ctx_, "waitfork.done", fn);
+        b_.CreateBr(test);
+
+        b_.SetInsertPoint(test);
+        llvm::Value* kid = b_.CreateLoad(ptr, pcb_field(pcb_, kPcbFirstChild));
+        b_.CreateCondBr(b_.CreateICmpEQ(kid, null), done, park);
+
+        b_.SetInsertPoint(park);
+        llvm::Value* ctlp = pcb_field(pcb_, kPcbCtl);
+        b_.CreateStore(b_.CreateOr(b_.CreateLoad(i32, ctlp), b_.getInt32(kProcWaitFork)), ctlp);
+        llvm::Value* headp = pcb_field(pcb_, kPcbWaiters);
+        llvm::Value* old   = b_.CreateLoad(ptr, headp);
+        b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(nty, node, kNodeHandle));
+        b_.CreateStore(sched_ptr_, b_.CreateStructGEP(nty, node, kNodeFlag));
+        b_.CreateStore(null, b_.CreateStructGEP(nty, node, kNodePrev));
+        b_.CreateStore(old, b_.CreateStructGEP(nty, node, kNodeNext));
+        b_.CreateStore(pcb_, b_.CreateStructGEP(nty, node, kNodeOwner));
+        auto* fix   = llvm::BasicBlock::Create(ctx_, "waitfork.link.fix", fn);
+        auto* armed = llvm::BasicBlock::Create(ctx_, "waitfork.armed", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(old, null), fix, armed);
+        b_.SetInsertPoint(fix);
+        b_.CreateStore(node, b_.CreateStructGEP(nty, old, kNodePrev));
+        b_.CreateBr(armed);
+        b_.SetInsertPoint(armed);
+        b_.CreateStore(node, headp);
+        b_.CreateStore(b_.getInt32(0), sched_ptr_);
+        emit_suspend_raw("waitfork.resume");
+        emit_proc_unlink_node(node);
+        b_.CreateBr(test);
+
+        b_.SetInsertPoint(done);
+    }
+
     // `p.kill()`, `disable fork` (LRM 9.7, 9.6.3). The other control ops are still
     // refused in the frontend.
     void lower_proc_ctl(Index i) {
@@ -23450,6 +23645,12 @@ private:
                 // Descendants only: 9.6.3 kills what the caller forked, not the caller.
                 lower_proc_kill(pcb_, /*with_self=*/false);
                 return;
+            case ProcOp::Suspend:
+                emit_proc_suspend(proc_pcb_of(must_of(value_of(args[0])), i));
+                return;
+            case ProcOp::Resume:
+                emit_proc_resume(proc_pcb_of(must_of(value_of(args[0])), i));
+                return;
             default:
                 throw BackendError{ "internal: unimplemented process control op" };
         }
@@ -23462,8 +23663,12 @@ private:
     void lower_proc_wait(Index i) {
         const auto info = ir_->extra_data<ProcCtlInfo>(ir_->payload(i).extra);
         const auto args = ir_->region(info.args);
+        if (info.op == ProcOp::WaitFork) {
+            lower_wait_fork(i);
+            return;
+        }
         if (info.op != ProcOp::Await) {
-            throw BackendError{ "internal: `wait fork` reached the backend" };
+            throw BackendError{ "internal: unimplemented process wait op" };
         }
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();

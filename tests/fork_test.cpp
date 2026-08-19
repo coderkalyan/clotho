@@ -344,21 +344,11 @@ TEST_CASE("fork: a child reading an uncapturable task local is rejected by name"
                    "reads a class property of the enclosing method is not supported");
 }
 
-// `wait fork` (LRM 9.6.1) still needs the barrier over the live descendant set;
-// `disable fork` (9.6.3) has landed with the `process` control blocks that carry
-// that set (tests/process_test.cpp, docs/design/process-class.md §8). Refused with
-// its own name, not the generic "unsupported statement".
-TEST_CASE("fork: wait fork rejected") {
-    check_rejected(R"(
-        module t;
-          initial begin
-            fork #1 $display("x"); join
-            wait fork;
-          end
-        endmodule
-    )",
-                   "wait fork is not supported");
-}
+// `disable fork` (LRM 9.6.3) and `wait fork` (LRM 9.6.1) both land with the
+// `process` control blocks that carry the descendant set they need -- the behaviour
+// is pinned in tests/process_test.cpp, and docs/design/process-class.md §8 records
+// why fork V3 turned out to be a corollary of LRM 9.7 rather than a phase of its own.
+// What fork keeps here is the ring-bound reasoning the detaching kinds rest on.
 
 // `disable` reaching INTO a detached child (LRM 9.6.2 × 9.3.2). A `join_none` child
 // can outlive its parent, so its blocks are the case a single occupant slot could
