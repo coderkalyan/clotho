@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <utility>
@@ -2201,11 +2202,11 @@ private:
         ir::Type       t;
         t.kind      = ir::Type::Kind::Class;
         t.fields_id = fid;
-        // Single inheritance (LRM 8.13): the object body lays the base's
-        // properties FIRST (prefix layout), so an upcast is the same pointer and an
-        // inherited property keeps its base-relative field index in every derived
-        // class. `element` records the base-class Ref (Invalid for a root class);
-        // the base is lowered first so its (already flattened) field table exists.
+        // Single inheritance (LRM 8.13): the object body lays the base chain's
+        // properties FIRST (prefix layout, deepest base first), so an upcast is the
+        // same pointer and an inherited property keeps one field index in every class
+        // that inherits it. `element` records the base-class Ref (Invalid for a root
+        // class).
         ir::Ref base_ref = ir::Ref::Invalid;
         if (const slang::ast::Type* base = clt.getBaseClass()) {
             base_ref = lower_class_type(base->getCanonicalType().as<slang::ast::ClassType>());
@@ -2214,35 +2215,56 @@ private:
         const ir::Ref ref = module_.pool.put(ir::Item{ t });
         class_type_cache_.emplace(&clt, ref);
 
+        // The chain, deepest base first — the field order of the object body.
+        std::vector<const slang::ast::ClassType*> chain;
+        for (const slang::ast::ClassType* k = &clt; k != nullptr; k = base_class_of(*k)) {
+            chain.push_back(k);
+        }
+        std::ranges::reverse(chain);
+
+        // Two passes, both over the whole chain.
+        //
+        // Over the CHAIN and not the base's own already-flattened field table, because
+        // a property's type lowers without bound: a class-handle property lowers its
+        // pointee class, whose compute_vtable lowers method bodies, any of which can
+        // reach back to a class still laying itself out below on this stack. Copying
+        // the base's table then reads an empty table and silently gives this class's
+        // own properties the base's indices. Rebuilding from the property symbols
+        // costs a cached lower_type per inherited property and depends on no other
+        // class's layout state. (`uvm_component extends uvm_report_object`, and
+        // uvm_report_object's `uvm_report_handler m_rh` reaches uvm_component.)
+        //
+        // TWO passes, because every index must be assigned before the first
+        // lower_type: a body reached from that recursion can read any property of any
+        // class in this chain, and assigning one at a time left every property
+        // declared after the recursing one unindexed (`uvm_report_object`'s
+        // `local bit m_rh_set`, declared after `m_rh`).
         std::vector<ir::FieldRow> fields;
         uint32_t                  idx = 0;
-        // Copy the base's flattened property table as the prefix. The base's own
-        // base chain is already flattened into its table by this same recursion,
-        // so one level of copy suffices for arbitrary depth. Inherited props keep
-        // their base-relative index (already in class_prop_index_ from lowering the
-        // base), which prefix layout makes valid in this derived body too.
-        if (base_ref != ir::Ref::Invalid) {
-            const auto& bt = std::get<ir::Type>(module_.pool.get(base_ref));
-            for (const ir::Field& bf : module_.pool.struct_fields(bt.fields_id)) {
-                fields.push_back({ module_.pool.field_name(bf), bf.type, idx });
+        for (const slang::ast::ClassType* k : chain) {
+            for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
+                if (prop.lifetime == slang::ast::VariableLifetime::Static) {
+                    // A static property (LRM 8.9) is ONE slot shared across all
+                    // instances, not part of the per-object body — it gets persistent
+                    // module-signal storage (declare_static_prop), registered lazily on
+                    // first access. Skip it here.
+                    continue;
+                }
+                if (prop.randMode != slang::ast::RandMode::None) {
+                    // TODO: rand / randc properties and randomize() (Phase 3).
+                    fail("rand / randc class properties are not supported");
+                }
+                class_prop_index_.emplace(&prop, idx);
                 ++idx;
             }
         }
-        for (const auto& prop : clt.membersOfType<slang::ast::ClassPropertySymbol>()) {
-            if (prop.lifetime == slang::ast::VariableLifetime::Static) {
-                // A static property (LRM 8.9) is ONE slot shared across all
-                // instances, not part of the per-object body — it gets persistent
-                // module-signal storage (declare_static_prop), registered lazily on
-                // first access. Skip it here.
-                continue;
+        for (const slang::ast::ClassType* k : chain) {
+            for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
+                if (prop.lifetime == slang::ast::VariableLifetime::Static) {
+                    continue;
+                }
+                fields.push_back({ prop.name, lower_type(prop.getType()), class_prop_index_.at(&prop) });
             }
-            if (prop.randMode != slang::ast::RandMode::None) {
-                // TODO: rand / randc properties and randomize() (Phase 3).
-                fail("rand / randc class properties are not supported");
-            }
-            class_prop_index_.emplace(&prop, idx);
-            fields.push_back({ prop.name, lower_type(prop.getType()), idx });
-            ++idx;
         }
         module_.pool.set_struct_fields(fid, std::move(fields));
 
@@ -21760,7 +21782,17 @@ private:
         if (handle_span.end != ir::SourceLoc{ 0 }) {
             b.set_end(body, handle_span.end);
         }
-        return b.member_select(body, class_prop_index_.at(&prop), class_ref, l);
+        // Every non-static property of a lowered class is indexed by lower_class_type,
+        // so a miss is a lowering bug, not an unsupported construct. Reported instead
+        // of `at()`-throwing so it arrives as a located diagnostic naming the property
+        // rather than an uncaught std::out_of_range with no source at all.
+        const auto it = class_prop_index_.find(&prop);
+        if (it == class_prop_index_.end()) {
+            const slang::ast::Scope* sc = prop.getParentScope();
+            fail("internal: class property '" + std::string(prop.name) + "' of '" +
+                 std::string(sc != nullptr ? sc->asSymbol().name : "?") + "' has no field index");
+        }
+        return b.member_select(body, it->second, class_ref, l);
     }
 
     // Lower one task body into the reserved slot. Like build_function, but the task

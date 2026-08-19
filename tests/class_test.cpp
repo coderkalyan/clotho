@@ -1849,3 +1849,69 @@ TEST_CASE("an inheritance chain deeper than the display is refused") {
 
     CHECK(fails(src).find("deeper than 16 levels") != std::string::npos);
 }
+
+// Lowering a property's TYPE recurses without bound: a class-handle property lowers
+// its pointee class, whose vtable construction lowers that class's method bodies,
+// and those bodies can read a property of the class still being laid out below on
+// the stack. Here B's first property is a handle to A, A's virtual method reads B's
+// SECOND property, and B is lowered first — so `flag` is read while B's own layout
+// is mid-flight. Every index has to be assigned before the first property type is
+// lowered; assigning them one at a time left `flag` unindexed.
+TEST_CASE("class layout: a property type that reaches back into the same class") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef class A;
+            class B;
+                A        ha;
+                local bit flag;
+                function int f(); return flag ? 1 : 2; endfunction
+            endclass
+            class A;
+                virtual function int g();
+                    B b = new;
+                    return b.f();
+                endfunction
+            endclass
+            initial begin
+                static B b = new;
+                static A a = new;
+                $display("%0d %0d", b.f(), a.g());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 2\n");
+}
+
+// The same cycle across inheritance, which is what decides field INDICES rather
+// than just their presence. Base holds a handle to its own derived class, so
+// lowering Base's properties lays out D, whose prefix is Base's own property table
+// — still empty at that moment. Copying it there gave D's `d0` the index of
+// Base's `b0`, silently aliasing an inherited property with an own one. The prefix
+// is rebuilt from the base chain's property symbols instead, which needs no other
+// class's layout to be finished. `dd.sum()` reads the inherited pair through the
+// derived body; the values separate a correct layout from an aliased one.
+TEST_CASE("class layout: a base property holding a handle to its own derived class") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef class D;
+            class Base;
+                int b0;
+                D   hd;
+                int b1;
+                function int sum(); return b0 + b1; endfunction
+            endclass
+            class D extends Base;
+                int d0 = 7;
+                virtual function int all(); return sum() + d0; endfunction
+            endclass
+            initial begin
+                static Base bb = new;
+                static D    dd = new;
+                bb.b0 = 1;  bb.b1 = 2;
+                dd.b0 = 10; dd.b1 = 20;
+                $display("%0d %0d %0d %0d", bb.sum(), dd.sum(), dd.all(), dd.d0);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 30 37 7\n");
+}
