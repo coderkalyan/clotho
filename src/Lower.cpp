@@ -2525,6 +2525,30 @@ private:
         return make_int_type(ct.getBitWidth(), ct.isFourState(), ct.isSigned());
     }
 
+    // One `rand` / `randc` property of a class, as the generated body sees it.
+    struct RandProp {
+        const slang::ast::ClassPropertySymbol* sym = nullptr;
+        // The property's own field index in the object body.
+        uint32_t field = 0;
+        // Its bit in the object's rand_mode mask (LRM 18.8).
+        uint32_t ordinal = 0;
+        // `randc` (LRM 18.6): cyclic, and `randc_field` is the body field index of
+        // its 256-bit already-used bitmap.
+        bool     cyclic      = false;
+        uint32_t randc_field = 0;
+        uint32_t randc_vals  = 0;
+    };
+    // A class's rand block: the appended body fields plus the flattened rand-property
+    // table of its whole inheritance chain. `present` is false for a class that
+    // declares no rand property anywhere in its chain -- such a class carries no
+    // block at all and its synthesized bodies are the trivial ones.
+    struct ClassRand {
+        bool                  present    = false;
+        uint32_t              rng_field  = 0;
+        uint32_t              mode_field = 0;
+        std::vector<RandProp> props;
+    };
+
     // Lower a class type (LRM 8) to a Kind::Class reference type. A class variable
     // holds a handle (a pointer, stored as a 2-state 64-bit value); the object body
     // layout is the property table, reused from the struct Field machinery but
@@ -2537,6 +2561,10 @@ private:
         if (const auto cached = class_type_cache_.find(&clt); cached != class_type_cache_.end()) {
             return cached->second;
         }
+        // The synthesized randomization bodies (compute_vtable reserves their ids)
+        // are built by the OUTERMOST frame of this recursion, once every class it
+        // reached has its vtable numbering. See rand_pending_.
+        const Restore<uint32_t> depth(class_depth_, class_depth_ + 1);
         // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4), `process` (LRM 9.7)
         // and `std::weak_reference` (LRM 8.30) are built-in classes slang
         // synthesizes into the `std` package. Slang builds their *signatures* only
@@ -2615,7 +2643,9 @@ private:
         // `local bit m_rh_set`, declared after `m_rh`).
         std::vector<ir::FieldRow> fields;
         uint32_t                  idx = 0;
+        ClassRand                 rand;
         for (const slang::ast::ClassType* k : chain) {
+            guard_constraint_blocks(*k);
             for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
                 if (prop.lifetime == slang::ast::VariableLifetime::Static) {
                     // A static property (LRM 8.9) is ONE slot shared across all
@@ -2625,13 +2655,42 @@ private:
                     continue;
                 }
                 if (prop.randMode != slang::ast::RandMode::None) {
-                    // TODO: rand / randc properties and randomize() (Phase 3).
-                    fail("rand / randc class properties are not supported");
+                    rand.props.push_back(admit_rand_prop(prop, idx, static_cast<uint32_t>(rand.props.size())));
                 }
                 class_prop_index_.emplace(&prop, idx);
                 ++idx;
             }
         }
+        // The rand block (docs/design/constrained-randomization.md §5): the object's
+        // own RNG (LRM 18.14.2), its rand_mode mask (LRM 18.8) and one cyclic-history
+        // bitmap per `randc` property, appended AFTER every declared property so no
+        // property index moves and the base's layout stays a prefix of this one.
+        // Carrying them as ordinary fields is what keeps the backend out of this: a
+        // member_select reaches them like any other property, and because none of
+        // them is a class handle the GC's trace map is unchanged.
+        //
+        // The block sits after the properties, so its offset differs between a base
+        // and a class derived from it. That is sound only because it is never
+        // addressed from a statically unknown type: every access is inside a body
+        // synthesized for this exact class and reached through the vtable.
+        //
+        // Its indices are decided, and PUBLISHED, before the second pass for the same
+        // reason the property indices are: lowering a property's type can reach a
+        // method body that constructs an object of this very class, and the seeding
+        // at that `new` needs the block it is about to get.
+        uint32_t block = idx;
+        if (!rand.props.empty()) {
+            rand.present    = true;
+            rand.rng_field  = block++;
+            rand.mode_field = block++;
+            for (RandProp& p : rand.props) {
+                if (p.cyclic) {
+                    p.randc_field = block++;
+                }
+            }
+        }
+        class_rand_.emplace(&clt, rand);
+
         for (const slang::ast::ClassType* k : chain) {
             for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
                 if (prop.lifetime == slang::ast::VariableLifetime::Static) {
@@ -2640,13 +2699,111 @@ private:
                 fields.push_back({ prop.name, lower_type(prop.getType()), class_prop_index_.at(&prop) });
             }
         }
+        if (rand.present) {
+            const ir::Ref state_ty = rng_state_type();
+            fields.push_back({ "$rand.rng", state_ty, rand.rng_field });
+            fields.push_back({ "$rand.mode", make_int_type(64, false, false), rand.mode_field });
+            for (const RandProp& p : rand.props) {
+                if (p.cyclic) {
+                    fields.push_back({ "$rand.randc", state_ty, p.randc_field });
+                }
+            }
+        }
         module_.pool.set_struct_fields(fid, std::move(fields));
 
         // Build the class's runtime descriptor: its dispatch table (LRM 8.20) and
         // its type identity (LRM 8.16). Every class gets one.
         compute_vtable(clt, ref);
 
+        if (class_depth_ == 1) {
+            drain_rand_bodies();
+        }
         return ref;
+    }
+
+    // Admit one `rand` / `randc` property (LRM 18.3) and describe it for the
+    // generated body. `field` is its body field index, `ordinal` its bit in the mask.
+    // slang has already rejected the types that are illegal for its mode
+    // (Type::isValidForRand); what is refused here is the legal-but-unimplemented
+    // remainder, each loud.
+    RandProp admit_rand_prop(const slang::ast::ClassPropertySymbol& prop, uint32_t field, uint32_t ordinal) {
+        RandProp                p{ .sym = &prop, .field = field, .ordinal = ordinal };
+        const slang::ast::Type& ty = prop.getType().getCanonicalType();
+        if (ordinal >= 64) {
+            // TODO: more than 64 rand properties in one chain — the rand_mode mask is
+            // one word (LRM 18.8 puts no bound on the count).
+            fail("more than 64 rand / randc properties in one class is not supported");
+        }
+        rand_ordinal_[&prop] = ordinal;
+        if (prop.randMode == slang::ast::RandMode::RandC) {
+            if (!ty.isIntegral()) {
+                fail("randc is supported on an integral property only");
+            }
+            const uint32_t w = ty.getBitWidth();
+            if (w > 8) {
+                // LRM 18.6 lets an implementation cap randc and requires only 8 bits;
+                // the cycle history is a 256-bit bitmap in the object.
+                fail("randc wider than 8 bits is not supported");
+            }
+            p.cyclic     = true;
+            p.randc_vals = 1u << w;
+            return p;
+        }
+        guard_rand_type(ty);
+        return p;
+    }
+
+    // Refuse a `rand` property type step 1 cannot draw a value for. Every one of
+    // these is legal SystemVerilog and every one is a TODO, not a limitation.
+    void guard_rand_type(const slang::ast::Type& ty) {
+        const slang::ast::Type& ct = ty.getCanonicalType();
+        if (ct.isIntegral() || ct.isClass()) {
+            return;
+        }
+        if (ct.isFloating()) {
+            // TODO: `rand real` (LRM 1800-2023 18.3) — an unconstrained real has no
+            // uniform distribution over its range to draw from.
+            fail("rand real properties are not supported");
+        }
+        if (const auto* arr = ct.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            guard_rand_type(arr->elementType);
+            return;
+        }
+        // TODO: rand dynamic arrays, queues, associative arrays and unpacked structs
+        // (LRM 18.4). Each needs an element walk the fixed-array case above does
+        // statically; a dynamic one needs a runtime loop in the generated body.
+        fail("rand properties of this type are not supported");
+    }
+
+    // The type of one 256-bit RNG / cyclic-history slot: four 64-bit words, laid out
+    // as an unpacked array so the storage is addressable as a `uint64_t[4]` — the
+    // shape rt_urandom_seed and the inlined xoshiro256++ step already take.
+    ir::Ref rng_state_type() {
+        ir::Type t;
+        t.kind    = ir::Type::Kind::UnpackedArray;
+        t.element = make_int_type(64, false, false);
+        t.left    = 3;
+        t.right   = 0;
+        return module_.pool.put(ir::Item{ t });
+    }
+
+    // A `constraint` block is declarative and step 1 solves nothing, so a class
+    // carrying one is refused rather than silently randomized as if unconstrained.
+    // Enumerating them needs slang's own walk: an inherited member is wrapped in a
+    // TransparentMemberSymbol and membersOfType does not unwrap, so the chain is
+    // walked by the caller and only this class's own members are examined here.
+    //
+    // TODO: constraint blocks (LRM 18.5) — step 2, the solver.
+    void guard_constraint_blocks(const slang::ast::ClassType& clt) {
+        for (const slang::ast::Symbol& member : clt.members()) {
+            const slang::ast::Symbol* sym = &member;
+            while (sym->kind == SymbolKind::TransparentMember) {
+                sym = &sym->as<slang::ast::TransparentMemberSymbol>().wrapped;
+            }
+            if (sym->kind == SymbolKind::ConstraintBlock) {
+                fail("constraint blocks are not supported");
+            }
+        }
     }
 
     // True if `m` is a user-declared virtual method (LRM 8.20) — excludes slang's
@@ -2737,6 +2894,16 @@ private:
         if (!slots.contains(kCopySlot)) {
             slots.emplace(kCopySlot, size++);
         }
+        // And the two randomization entry points (LRM 18.4/18.8/18.14.2), reserved
+        // the same way and for the same reason: `randomize()` is virtual, and both
+        // bodies address a rand block whose offset only their own class knows, so a
+        // base-typed handle has to arrive at the most-derived body.
+        if (!slots.contains(kRandomizeSlot)) {
+            slots.emplace(kRandomizeSlot, size++);
+        }
+        if (!slots.contains(kRandOpsSlot)) {
+            slots.emplace(kRandOpsSlot, size++);
+        }
         class_vslot_[&clt] = slots;
         // Fill each slot with the most-derived body of that name (an override is an
         // override regardless of its own `virtual` keyword — match by name).
@@ -2773,6 +2940,15 @@ private:
         const uint32_t copy_slot = slots.at(kCopySlot);
         table[copy_slot]         = copy_thunk_id(clt, class_ref);
         filled[copy_slot]        = true;
+        // The ids only; the bodies are built by drain_rand_bodies once every class in
+        // this lowering has its vtable numbering (a `rand` handle can point back at a
+        // class still laying itself out below this frame).
+        const uint32_t randomize_slot = slots.at(kRandomizeSlot);
+        const uint32_t randops_slot   = slots.at(kRandOpsSlot);
+        table[randomize_slot]         = rand_body_id(clt, class_ref, randomize_fn_);
+        filled[randomize_slot]        = true;
+        table[randops_slot]           = rand_body_id(clt, class_ref, randops_fn_);
+        filled[randops_slot]          = true;
         // Un-overridden slots: a pure virtual in an abstract class. Fill with a
         // prototype-built stub (the slot's signature source).
         for (const auto& [name, s] : slots) {
@@ -15743,6 +15919,12 @@ private:
         if (lower_container_method(call, b, loc(call))) {
             return;
         }
+        // A randomization system call as a statement: `obj.randomize();` with the
+        // result discarded, and the task forms of rand_mode / constraint_mode.
+        if (name == "randomize" || name == "rand_mode" || name == "constraint_mode") {
+            lower_sysfunc(call, b);
+            return;
+        }
         if (const char rx = display_radix(name, "$display")) {
             lower_display(call, /*newline=*/true, b, rx);
             return;
@@ -16634,6 +16816,20 @@ private:
         // as an ordinary expression: each reads a shadow or a history ring.
         if (is_sampled_value_fn(name)) {
             return lower_sampled_value(name, call, b, l);
+        }
+
+        // Randomization (LRM 18). slang rewrites `obj.randomize()`,
+        // `std::randomize(...)` and the per-property `rand_mode` / `constraint_mode`
+        // into system calls, so all of them arrive here, receiver first.
+        if (name == "randomize") {
+            return lower_randomize_call(call, b, l);
+        }
+        if (name == "rand_mode") {
+            return lower_rand_mode_call(call, b, l);
+        }
+        if (name == "constraint_mode") {
+            // TODO: constraint_mode (LRM 18.9) — step 2, the solver.
+            fail("constraint_mode is not supported");
         }
 
         // String built-in methods (s.len(), s.substr(i,j), ...) arrive as system
@@ -22846,6 +23042,7 @@ private:
         }
         const ir::Ref   class_ref = lower_type(*nc.type);
         const ir::Index handle    = b.class_new(class_ref, l);
+        emit_object_rng_seed(clt, handle, class_ref, b, l);
         // Non-static property default initializers run at construction, in
         // declaration order, BEFORE any constructor body (LRM 8.8). slang attaches
         // them to the property (not the constructor body); apply the whole
@@ -22861,6 +23058,35 @@ private:
         }
         emit_ctor_call(clt, ctor, actuals, handle, b, l);
         return handle;
+    }
+
+    // Object stability (LRM 18.14.2): an object's RNG is seeded, when the object is
+    // created, from the next random value of the thread that creates it. The draw is
+    // the ordinary `$urandom` one, so no analysis changes: a process that constructs
+    // a randomizable object is already, by that instruction, a process that draws —
+    // it materializes its own frame state and leaves the comb-thunk path.
+    //
+    // Unconditional for a rand-bearing class, whether or not the object is ever
+    // randomized: a draw that appeared only on first use would shift every later
+    // seed in the creating thread the moment a randomize() call was added, which is
+    // the instability LRM 18.14 exists to prevent.
+    void emit_object_rng_seed(const slang::ast::ClassType& clt,
+                              ir::Index                    handle,
+                              ir::Ref                      class_ref,
+                              ir::Builder&                 b,
+                              ir::SourceLoc                l) {
+        const ClassRand& rd = class_rand_.at(&clt);
+        if (!rd.present) {
+            return;
+        }
+        const ir::Ref   u64  = make_int_type(64, false, false);
+        const ir::Index body = b.handle_deref(handle, class_ref, l);
+        b.obj_rand_seed(b.member_select(body, rd.rng_field, class_ref, l), b.resize(b.urandom(l), u64, l), l);
+        // Every rand property starts enabled (LRM 18.8).
+        b.binary(ir::Inst::Tag::Store,
+                 b.member_select(body, rd.mode_field, class_ref, l),
+                 b.constant(module_.pool.put_int(u64, ~0ull), l),
+                 l);
     }
 
     // Lower a class shallow copy (LRM 8.12): `dst = new src`. Allocates a second
@@ -22953,6 +23179,325 @@ private:
                                            .param_types = std::move(param_types),
                                            .arg_dirs    = std::move(arg_dirs),
                                            .local_types = std::move(local_types),
+                                           .span        = span_of(clt),
+                                           .ir          = b.finish() });
+    }
+
+    // -- Constrained randomization, step 1 (docs/design/constrained-randomization.md) --
+
+    // Reserve the FunctionId of one of class `clt`'s two synthesized randomization
+    // bodies, recording the class for drain_rand_bodies. The id has to exist now
+    // (compute_vtable is filling the slot with it) and the body cannot be built now
+    // (see rand_pending_).
+    ir::FunctionId rand_body_id(const slang::ast::ClassType&                                              clt,
+                                ir::Ref                                                                   class_ref,
+                                ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId>& map) {
+        const auto it = map.find(&clt);
+        if (it != map.end()) {
+            return it->second;
+        }
+        const ir::FunctionId id = module_.reserve_function();
+        map[&clt]               = id;
+        if (randomize_fn_.contains(&clt) && randops_fn_.contains(&clt)) {
+            rand_pending_.emplace_back(&clt, class_ref);
+        }
+        return id;
+    }
+
+    // Build every deferred randomization body. Runs from the outermost
+    // lower_class_type frame, where every class this lowering reached has its vtable
+    // numbering; a body built here can reach a further class, whose own bodies join
+    // the list and are drained by the same loop.
+    void drain_rand_bodies() {
+        while (!rand_pending_.empty()) {
+            const auto [clt, class_ref] = rand_pending_.back();
+            rand_pending_.pop_back();
+            build_randomize_body(*clt, class_ref, randomize_fn_.at(clt));
+            build_randops_body(*clt, class_ref, randops_fn_.at(clt));
+        }
+    }
+
+    // The most-derived USER declaration of `pre_randomize` / `post_randomize` in
+    // `clt`'s chain, or null when no class in it declares one (LRM 18.6.2). slang
+    // synthesizes an empty built-in on every class, which is what BuiltIn filters
+    // out. Only this one is called: an override is responsible for reaching its
+    // base's with an explicit `super.pre_randomize()`, and where a class declares no
+    // override the walk finds the nearest base's declaration, which is exactly what
+    // the LRM's default (chaining) implementation would have run.
+    const SubroutineSymbol* find_rand_hook(const slang::ast::ClassType& clt, std::string_view name) {
+        for (const slang::ast::ClassType* k = &clt; k != nullptr; k = base_class_of(*k)) {
+            for (const auto& m : k->membersOfType<SubroutineSymbol>()) {
+                if (m.name == name && !m.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+                    return &m;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    void emit_rand_hook(const slang::ast::ClassType& clt,
+                        std::string_view             name,
+                        ir::Index                    self,
+                        ir::Builder&                 b,
+                        ir::SourceLoc                l) {
+        if (const SubroutineSymbol* hook = find_rand_hook(clt, name)) {
+            b.call(function_id(*hook), std::array<ir::Index, 1>{ self }, l);
+        }
+    }
+
+    // Build `clt`'s `$randomize(this, mask) -> int` (LRM 18.4). `mask` is a FILTER
+    // over rand ordinals, not the active set itself: the body intersects it with the
+    // object's own rand_mode mask, so a caller that does not know the callee's
+    // dynamic type (the recursion into a `rand` handle, and every plain
+    // `obj.randomize()`) passes all-ones and still honours modes the callee owns.
+    // `randomize(x, y)` passes the subset, `randomize(null)` passes zero.
+    //
+    // Step 1 solves nothing, so the middle is a straight-line draw per active
+    // property and the result is always 1. A constraint solver replaces exactly that
+    // middle: the hook calls, the mask intersection and the recursion are
+    // constraint-independent.
+    void build_randomize_body(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
+        const ir::SourceLoc l   = to_source_loc(clt.location);
+        const ir::Ref       u64 = make_int_type(64, false, false);
+        const ir::Ref       i32 = make_int_type(32, false, true);
+        ir::Builder         b(module_.pool);
+        const ClassRand&    rd   = class_rand_.at(&clt);
+        const ir::Index     self = b.unary(ir::Inst::Tag::Load, b.local(0, class_ref, l), l);
+        emit_rand_hook(clt, "pre_randomize", self, b, l);
+        if (rd.present) {
+            const ir::Index body = b.handle_deref(self, class_ref, l);
+            const ir::Index eff =
+              b.binary(ir::Inst::Tag::Band,
+                       b.unary(ir::Inst::Tag::Load, b.local(1, u64, l), l),
+                       b.unary(ir::Inst::Tag::Load, b.member_select(body, rd.mode_field, class_ref, l), l),
+                       l);
+            for (const RandProp& p : rd.props) {
+                b.open_region();
+                emit_rand_assign(p, rd, body, class_ref, b, l);
+                const ir::ExtraSlice then_region = b.close_region();
+                b.open_region();
+                const ir::ExtraSlice else_region = b.close_region();
+                const ir::Index      bit =
+                  b.binary(ir::Inst::Tag::Band,
+                                b.binary(ir::Inst::Tag::Srl, eff, b.constant(module_.pool.put_int(u64, p.ordinal), l), l),
+                                b.constant(module_.pool.put_int(u64, 1), l),
+                                l);
+                b.cond(b.binary(ir::Inst::Tag::Ne, bit, b.constant(module_.pool.put_int(u64, 0), l), l),
+                       then_region,
+                       else_region,
+                       l);
+            }
+        }
+        emit_rand_hook(clt, "post_randomize", self, b, l);
+        b.unary(ir::Inst::Tag::Ret, b.constant(module_.pool.put_int(i32, 1), l), l);
+        module_.set_function(id,
+                             ir::Function{ .name        = std::string(clt.name) + ".randomize",
+                                           .return_type = i32,
+                                           .param_types = std::vector<ir::Ref>{ class_ref, u64 },
+                                           .arg_dirs = std::vector<ir::ArgDir>{ ir::ArgDir::In, ir::ArgDir::In },
+                                           .local_types = std::vector<ir::Ref>{ class_ref, u64 },
+                                           .span        = span_of(clt),
+                                           .ir          = b.finish() });
+    }
+
+    // A source of one 32-bit draw. The object's own RNG inside a generated
+    // `$randomize` (LRM 18.14.2), the calling thread's for `std::randomize`.
+    using RandDraw = std::function<ir::Index()>;
+
+    // One active rand property's assignment (LRM 18.4, unconstrained).
+    void emit_rand_assign(const RandProp&  p,
+                          const ClassRand& rd,
+                          ir::Index        body,
+                          ir::Ref          class_ref,
+                          ir::Builder&     b,
+                          ir::SourceLoc    l) {
+        const ir::Index         lv = b.member_select(body, p.field, class_ref, l);
+        const slang::ast::Type& ty = p.sym->getType().getCanonicalType();
+        if (p.cyclic) {
+            // randc (LRM 18.6): the next value of a random permutation of the type's
+            // range, tracked by this property's own 256-bit history in the object.
+            const ir::Index v = b.randc_next(b.member_select(body, p.randc_field, class_ref, l),
+                                             b.member_select(body, rd.rng_field, class_ref, l),
+                                             p.randc_vals,
+                                             l);
+            b.binary(ir::Inst::Tag::Store, lv, b.resize(v, lower_type(p.sym->getType()), l), l);
+            return;
+        }
+        const RandDraw draw = [&] { return b.obj_random(b.member_select(body, rd.rng_field, class_ref, l), l); };
+        emit_rand_value(lv, ty, draw, b, l);
+    }
+
+    // Draw into the lvalue `lv` of type `ty`, recursing structurally.
+    void emit_rand_value(ir::Index               lv,
+                         const slang::ast::Type& ty,
+                         const RandDraw&         draw,
+                         ir::Builder&            b,
+                         ir::SourceLoc           l) {
+        if (ty.isClass()) {
+            // A `rand` class handle is not assigned: the object it refers to is
+            // randomized instead, and a null handle is skipped (LRM 18.4). The call
+            // is virtual, so a base-typed handle randomizes the derived object it
+            // actually holds.
+            emit_rand_recurse(lv, ty.as<slang::ast::ClassType>(), b, l);
+            return;
+        }
+        if (const auto* arr = ty.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            const ir::Ref                aty = lower_type(ty);
+            const slang::ConstantRange   r   = arr->range;
+            const slang::ast::Type&      et  = arr->elementType.getCanonicalType();
+            for (int32_t c = r.lower(); c <= r.upper(); ++c) {
+                const ir::Index idx = b.constant(
+                  module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(c))),
+                  l);
+                emit_rand_value(b.elem_select(lv, idx, aty, l), et, draw, b, l);
+            }
+            return;
+        }
+        const ir::Ref target = lower_type(ty);
+        b.binary(ir::Inst::Tag::Store, lv, emit_rand_scalar(ty, target, draw, b, l), l);
+    }
+
+    // `if (h != null) h.$randomize(all)`.
+    void emit_rand_recurse(ir::Index lv, const slang::ast::ClassType& pointee, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Ref   u64    = make_int_type(64, false, false);
+        const ir::Ref   ref    = lower_class_type(pointee);
+        const ir::Index handle = b.unary(ir::Inst::Tag::Load, lv, l);
+        b.open_region();
+        const std::array<ir::Index, 2> args{ handle, b.constant(module_.pool.put_int(u64, ~0ull), l) };
+        b.call_virtual(randomize_fn_.at(&pointee), class_vslot_.at(&pointee).at(kRandomizeSlot), ref, args, l);
+        const ir::ExtraSlice then_region = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice else_region = b.close_region();
+        b.cond(b.binary(ir::Inst::Tag::Ne, handle, b.constant(module_.pool.put_int(u64, 0), l), l),
+               then_region,
+               else_region,
+               l);
+    }
+
+    // One scalar draw of type `ty` from the object's own RNG (LRM 18.14.2). An
+    // integral value is uniform over its full range and always 2-state — LRM 18.4
+    // gives an unconstrained rand variable a value, never x or z. An enum draws
+    // uniformly over its DISTINCT declared values, not over the base type's range.
+    ir::Index emit_rand_scalar(const slang::ast::Type& ty,
+                               ir::Ref                 target,
+                               const RandDraw&         draw,
+                               ir::Builder&            b,
+                               ir::SourceLoc           l) {
+        if (const auto* et = ty.as_if<slang::ast::EnumType>()) {
+            return emit_rand_enum(*et, target, draw(), b, l);
+        }
+        const uint32_t width = ty.getBitWidth();
+        if (width <= 32) {
+            return b.resize(draw(), target, l);
+        }
+        // Wider than one draw: one 32-bit draw per chunk, filling from the LSB up.
+        // The chunk order is part of the reproducible stream, so it is fixed here
+        // rather than left to concat's operand order (which is MSB-first).
+        const ir::Ref          u32   = make_int_type(32, false, false);
+        const uint32_t         n     = (width + 31) / 32;
+        std::vector<ir::Index> parts(n);
+        for (uint32_t k = 0; k < n; ++k) {
+            const uint32_t chunk_w = (k + 1 == n) ? width - 32 * (n - 1) : 32;
+            parts[n - 1 - k]       = chunk_w == 32 ? draw() : b.resize(draw(), make_int_type(chunk_w, false, false), l);
+        }
+        (void)u32;
+        return b.resize(b.concat(parts, l), target, l);
+    }
+
+    // Uniform over the enum's distinct values: one draw, mapped onto [0, n) by the
+    // same multiply-shift $urandom_range uses, then a select chain. A chain rather
+    // than a constant table because an enum's member count is small and a table
+    // would be a second mechanism to keep alive.
+    ir::Index emit_rand_enum(const slang::ast::EnumType& et,
+                             ir::Ref                     target,
+                             ir::Index                   draw,
+                             ir::Builder&                b,
+                             ir::SourceLoc               l) {
+        std::vector<slang::SVInt> values;
+        for (const EnumMember& m : enum_members(et)) {
+            if (std::ranges::none_of(values, [&](const slang::SVInt& v) { return (bool)(v == m.value); })) {
+                values.push_back(m.value);
+            }
+        }
+        if (values.empty()) {
+            fail("internal: rand enum with no members");
+        }
+        const ir::Ref   u64 = make_int_type(64, false, false);
+        const ir::Index idx = b.binary(ir::Inst::Tag::Srl,
+                                       b.binary(ir::Inst::Tag::Mul,
+                                                b.resize(draw, u64, l),
+                                                b.constant(module_.pool.put_int(u64, values.size()), l),
+                                                l),
+                                       b.constant(module_.pool.put_int(u64, 32), l),
+                                       l);
+        ir::Index       acc = b.constant(svint_to_ref(values.back(), target), l);
+        for (size_t k = values.size() - 1; k-- > 0;) {
+            const ir::Index eq =
+              b.binary(ir::Inst::Tag::Eq, idx, b.constant(module_.pool.put_int(u64, k), l), l);
+            acc = b.select(eq, b.constant(svint_to_ref(values[k], target), l), acc, l);
+        }
+        return acc;
+    }
+
+    // Build `clt`'s `$randops(this, op, arg) -> longint`: the per-object built-ins
+    // whose target layout is only known to the object's own class — `srandom`
+    // (LRM 18.13.3) and both `rand_mode` forms (LRM 18.8). One slot with an opcode
+    // rather than four slots: these are rare calls, and the vtable is per class.
+    void build_randops_body(const slang::ast::ClassType& clt, ir::Ref class_ref, ir::FunctionId id) {
+        const ir::SourceLoc l   = to_source_loc(clt.location);
+        const ir::Ref       u64 = make_int_type(64, false, false);
+        ir::Builder         b(module_.pool);
+        const ClassRand&    rd = class_rand_.at(&clt);
+        if (rd.present) {
+            const ir::Index self = b.unary(ir::Inst::Tag::Load, b.local(0, class_ref, l), l);
+            const ir::Index body = b.handle_deref(self, class_ref, l);
+            const ir::Index op   = b.unary(ir::Inst::Tag::Load, b.local(1, u64, l), l);
+            const ir::Index arg  = b.unary(ir::Inst::Tag::Load, b.local(2, u64, l), l);
+            const ir::Index zero = b.constant(module_.pool.put_int(u64, 0), l);
+            const ir::Index one  = b.constant(module_.pool.put_int(u64, 1), l);
+            const auto      mode_lv = [&] { return b.member_select(body, rd.mode_field, class_ref, l); };
+            const auto      is_op   = [&](uint64_t which) {
+                return b.binary(ir::Inst::Tag::Eq, op, b.constant(module_.pool.put_int(u64, which), l), l);
+            };
+            const auto arm = [&](uint64_t which, auto&& emit) {
+                b.open_region();
+                emit();
+                const ir::ExtraSlice then_region = b.close_region();
+                b.open_region();
+                const ir::ExtraSlice else_region = b.close_region();
+                b.cond(is_op(which), then_region, else_region, l);
+            };
+            arm(kRandOpSrandom, [&] { b.obj_rand_seed(b.member_select(body, rd.rng_field, class_ref, l), arg, l); });
+            arm(kRandOpModeAll, [&] {
+                const ir::Index all = b.constant(module_.pool.put_int(u64, ~0ull), l);
+                const ir::Index on  = b.binary(ir::Inst::Tag::Ne, arg, zero, l);
+                b.binary(ir::Inst::Tag::Store, mode_lv(), b.select(on, all, zero, l), l);
+            });
+            arm(kRandOpModeOne, [&] {
+                const ir::Index ord  = b.binary(ir::Inst::Tag::Srl, arg, one, l);
+                const ir::Index bit  = b.binary(ir::Inst::Tag::Sll, one, ord, l);
+                const ir::Index cur  = b.unary(ir::Inst::Tag::Load, mode_lv(), l);
+                const ir::Index on   = b.binary(ir::Inst::Tag::Ne, b.binary(ir::Inst::Tag::Band, arg, one, l), zero, l);
+                const ir::Index set  = b.binary(ir::Inst::Tag::Bor, cur, bit, l);
+                const ir::Index clr  = b.binary(ir::Inst::Tag::Band, cur, b.unary(ir::Inst::Tag::Bnot, bit, l), l);
+                b.binary(ir::Inst::Tag::Store, mode_lv(), b.select(on, set, clr, l), l);
+            });
+            arm(kRandOpModeQuery, [&] {
+                const ir::Index cur = b.unary(ir::Inst::Tag::Load, mode_lv(), l);
+                b.unary(ir::Inst::Tag::Ret,
+                        b.binary(ir::Inst::Tag::Band, b.binary(ir::Inst::Tag::Srl, cur, arg, l), one, l),
+                        l);
+            });
+        }
+        b.unary(ir::Inst::Tag::Ret, b.constant(module_.pool.put_int(u64, 0), l), l);
+        module_.set_function(id,
+                             ir::Function{ .name        = std::string(clt.name) + ".randops",
+                                           .return_type = u64,
+                                           .param_types = std::vector<ir::Ref>{ class_ref, u64, u64 },
+                                           .arg_dirs    = std::vector<ir::ArgDir>{ ir::ArgDir::In,
+                                                                                   ir::ArgDir::In,
+                                                                                   ir::ArgDir::In },
+                                           .local_types = std::vector<ir::Ref>{ class_ref, u64, u64 },
                                            .span        = span_of(clt),
                                            .ir          = b.finish() });
     }
@@ -23077,6 +23622,13 @@ private:
             fail("system call used where a user subroutine was expected");
         }
         const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+        // A class built-in slang synthesizes with an empty body (srandom, rand_mode,
+        // the randstate pair, the default randomization hooks). Intercepted before
+        // anything else: lowering slang's degenerate body is silently wrong.
+        if (sub.flags.has(slang::ast::MethodFlags::BuiltIn) && sub.getParentScope() != nullptr
+            && sub.getParentScope()->asSymbol().kind == SymbolKind::ClassType) {
+            return lower_builtin_class_method(call, sub, b);
+        }
         // A class method (LRM 8.11): resolve the `this` object handle, spliced as
         // arg 0 (the callee splices it as formal 0). An explicit receiver
         // (`obj.method()`) is call.thisClass(); a bare in-method call uses `this`.
@@ -23229,6 +23781,243 @@ private:
         }
         const ir::SourceLoc l = loc(call);
         return b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
+    }
+
+    // The enclosing `this` handle and its class, for a built-in randomization call
+    // written without a receiver (`randomize()`, `x.rand_mode(0)` inside a method).
+    std::pair<ir::Index, const slang::ast::ClassType*> implicit_this(ir::Builder& b, ir::SourceLoc l) {
+        if (ctor_this_) {
+            return { ctor_this_->handle, class_of_ref(ctor_this_->cls) };
+        }
+        if (fn_ctx_ == nullptr || !fn_ctx_->has_this) {
+            fail("a randomization method call outside a class method needs an object handle");
+        }
+        return { b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l),
+                 class_of_ref(fn_ctx_->this_class) };
+    }
+
+    // The ClassType a lowered Kind::Class Ref came from (class_type_cache_ inverted).
+    const slang::ast::ClassType* class_of_ref(ir::Ref ref) {
+        for (const auto& [clt, r] : class_type_cache_) {
+            if (r == ref) {
+                return clt;
+            }
+        }
+        fail("internal: class ref without a symbol");
+    }
+
+    // `obj.randomize()`, a bare `randomize()` in a class method, and
+    // `std::randomize(...)` (LRM 18.4 / 18.12). slang rewrites all of them into one
+    // system call named "randomize" (CallExpression::fromLookup), so they are
+    // separated here: a scope randomize's arguments are lvalue-bound, which slang
+    // wraps in an AssignmentExpression.
+    ir::Index lower_randomize_call(const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+        const auto& sci = std::get<1>(call.subroutine);
+        if (const auto* rc = std::get_if<slang::ast::CallExpression::RandomizeCallInfo>(&sci.extraInfo);
+            rc != nullptr && rc->inlineConstraints != nullptr) {
+            // TODO: inline constraints (LRM 18.7) — step 2, the solver.
+            fail("inline constraints on randomize() are not supported");
+        }
+        const auto args = call.arguments();
+        if (!args.empty() && args[0]->kind == ExpressionKind::Assignment) {
+            return lower_scope_randomize(call, b, l);
+        }
+        ir::Index                    self{};
+        const slang::ast::ClassType* clt = nullptr;
+        size_t                       k   = 0;
+        if (!args.empty() && args[0]->type->isClass()) {
+            self = lower_expr(*args[0], b);
+            clt  = &args[0]->type->getCanonicalType().as<slang::ast::ClassType>();
+            k    = 1;
+        } else {
+            std::tie(self, clt) = implicit_this(b, l);
+        }
+        // The active-set filter (LRM 18.11): every rand property by default, the
+        // named subset when arguments are given, and none for `randomize(null)`.
+        // The callee intersects it with the object's own rand_mode mask.
+        uint64_t mask = ~0ull;
+        if (k < args.size()) {
+            mask = 0;
+            for (; k < args.size(); ++k) {
+                if (args[k]->type->isNull()) {
+                    continue;
+                }
+                const slang::ast::Symbol* sym = args[k]->getSymbolReference();
+                const auto                it  = sym != nullptr ? rand_ordinal_.find(sym) : rand_ordinal_.end();
+                if (it == rand_ordinal_.end()) {
+                    // TODO: LRM 18.11 lets randomize(x) name a non-rand property,
+                    // making it random for that call only; the mask has no bit for one.
+                    fail("randomize() argument naming a non-rand property is not supported");
+                }
+                mask |= 1ull << it->second;
+            }
+        }
+        return emit_randomize_dispatch(*clt, self, mask, b, l);
+    }
+
+    // `std::randomize(a, b, ...)` (LRM 18.12). The targets are ordinary variables, so
+    // there is no object and the draws come from the CALLING THREAD's RNG — which is
+    // also why this needs no new machinery: `$urandom`'s existing analysis already
+    // gives the process its own stream.
+    ir::Index lower_scope_randomize(const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+        const auto  draw = [&] { return b.urandom(l); };
+        std::function<ir::Index()> drawer = draw;
+        for (const Expression* arg : call.arguments()) {
+            const Expression& target = arg->kind == ExpressionKind::Assignment
+                                         ? arg->as<slang::ast::AssignmentExpression>().left()
+                                         : *arg;
+            const slang::ast::Type& ty = target.type->getCanonicalType();
+            guard_rand_type(ty);
+            if (ty.isClass()) {
+                // TODO: std::randomize of a class handle (LRM 18.12) — the recursion
+                // needs the handle's own randomize, which is a virtual dispatch here.
+                fail("std::randomize of a class handle is not supported");
+            }
+            emit_rand_value(lower_lvalue(target, b), ty, drawer, b, loc(target));
+        }
+        return b.constant(module_.pool.put_int(lower_type(*call.type), 1), l);
+    }
+
+    // `x.rand_mode()` / `x.rand_mode(on)` on one rand property (LRM 18.8). slang
+    // models this as a system method whose receiver is arguments()[0]; the property's
+    // ordinal is static, only the address of the mask it lives in is not, so the work
+    // is done by the object's own `$randops`.
+    ir::Index lower_rand_mode_call(const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
+        const auto args = call.arguments();
+        if (args.empty()) {
+            fail("rand_mode requires a property receiver");
+        }
+        const Expression&         target = *args[0];
+        const slang::ast::Symbol* sym    = target.getSymbolReference();
+        const auto                it     = sym != nullptr ? rand_ordinal_.find(sym) : rand_ordinal_.end();
+        if (it == rand_ordinal_.end()) {
+            // TODO: rand_mode on a SUBELEMENT of a rand property (LRM 18.8) — it
+            // needs a per-element enable, not one bit per property.
+            fail("rand_mode is supported on a whole rand property only");
+        }
+        const uint32_t               ordinal = it->second;
+        ir::Index                    self{};
+        const slang::ast::ClassType* clt = nullptr;
+        if (target.kind == ExpressionKind::MemberAccess) {
+            const Expression& recv = target.as<slang::ast::MemberAccessExpression>().value();
+            if (!recv.type->isClass()) {
+                fail("rand_mode on a non-class receiver is not supported");
+            }
+            self = lower_expr(recv, b);
+            clt  = &recv.type->getCanonicalType().as<slang::ast::ClassType>();
+        } else {
+            std::tie(self, clt) = implicit_this(b, l);
+        }
+        const ir::Ref u64 = make_int_type(64, false, false);
+        ir::Index     op  = b.constant(module_.pool.put_int(u64, kRandOpModeQuery), l);
+        ir::Index     arg = b.constant(module_.pool.put_int(u64, ordinal), l);
+        if (args.size() > 1) {
+            // The task form: `ordinal << 1 | (on != 0)`.
+            const ir::Index on = b.binary(ir::Inst::Tag::Ne,
+                                          b.resize(lower_expr(*args[1], b), u64, l),
+                                          b.constant(module_.pool.put_int(u64, 0), l),
+                                          l);
+            op                 = b.constant(module_.pool.put_int(u64, kRandOpModeOne), l);
+            arg                = b.binary(ir::Inst::Tag::Bor,
+                            b.constant(module_.pool.put_int(u64, uint64_t{ ordinal } << 1), l),
+                            b.resize(on, u64, l),
+                            l);
+        }
+        return b.resize(emit_randops_dispatch(*clt, self, op, arg, b, l), lower_type(*call.type), l);
+    }
+
+    // The vtable slot of one of `clt`'s randomization entry points, and the
+    // FunctionId that supplies the slot's signature. Both are set by compute_vtable,
+    // which a class still laying itself out has not reached — reachable only through
+    // a property-type cycle whose method body randomizes the very class it is a
+    // property of.
+    //
+    // TODO: randomize() of a class whose layout is still in progress. It needs the
+    // call itself deferred, the way the generated bodies already are.
+    uint32_t rand_slot_of(const slang::ast::ClassType& clt, std::string_view slot) {
+        const auto it = class_vslot_.find(&clt);
+        if (it == class_vslot_.end()) {
+            fail("randomization of a class that is still being laid out is not supported");
+        }
+        return it->second.at(slot);
+    }
+
+    ir::FunctionId rand_slot_sig(const slang::ast::ClassType&                                                     clt,
+                                 const ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId>& map) {
+        const auto it = map.find(&clt);
+        if (it == map.end()) {
+            fail("randomization of a class that is still being laid out is not supported");
+        }
+        return it->second;
+    }
+
+    ir::Index emit_randops_dispatch(const slang::ast::ClassType& clt,
+                                    ir::Index                    self,
+                                    ir::Index                    op,
+                                    ir::Index                    arg,
+                                    ir::Builder&                 b,
+                                    ir::SourceLoc                l) {
+        const ir::Ref                  ref = lower_class_type(clt);
+        const std::array<ir::Index, 3> args{ self, op, arg };
+        return b.call_virtual(rand_slot_sig(clt, randops_fn_), rand_slot_of(clt, kRandOpsSlot), ref, args, l);
+    }
+
+    ir::Index emit_randomize_dispatch(const slang::ast::ClassType& clt,
+                                      ir::Index                    self,
+                                      uint64_t                     mask,
+                                      ir::Builder&                 b,
+                                      ir::SourceLoc                l) {
+        const ir::Ref                  ref = lower_class_type(clt);
+        const ir::Ref                  u64 = make_int_type(64, false, false);
+        const std::array<ir::Index, 2> args{ self, b.constant(module_.pool.put_int(u64, mask), l) };
+        return b.call_virtual(rand_slot_sig(clt, randomize_fn_), rand_slot_of(clt, kRandomizeSlot), ref, args, l);
+    }
+
+    // The class built-ins slang synthesizes on EVERY class with an empty body
+    // (ClassSymbols.cpp's populate): `srandom`, `get_randstate`, `set_randstate`, the
+    // object-level `rand_mode` / `constraint_mode`, and the default
+    // `pre_randomize` / `post_randomize`. They are ordinary SubroutineSymbols, so
+    // without this intercept they lower as a call into slang's degenerate empty body
+    // — which is both silently wrong and, because the formal list does not match the
+    // spliced receiver, a crash in the argument walk. Whitelisted, so a future slang
+    // adding a built-in fails loud instead of no-oping.
+    std::optional<ir::Index> lower_builtin_class_method(const CallExpression&   call,
+                                                        const SubroutineSymbol& sub,
+                                                        ir::Builder&            b) {
+        const ir::SourceLoc l    = loc(call);
+        const ir::Ref       u64  = make_int_type(64, false, false);
+        const auto          args = call.arguments();
+        if (sub.name == "pre_randomize" || sub.name == "post_randomize") {
+            // The synthesized default is empty (a user override is not BuiltIn and
+            // never reaches here), so an explicit call — typically
+            // `super.pre_randomize()` — has nothing to run.
+            return std::nullopt;
+        }
+        if (sub.name == "srandom" || sub.name == "rand_mode") {
+            const auto [self, clt] = call.thisClass() != nullptr
+                                       ? std::pair<ir::Index, const slang::ast::ClassType*>{
+                                           lower_expr(*call.thisClass(), b),
+                                           &call.thisClass()->type->getCanonicalType().as<slang::ast::ClassType>() }
+                                       : implicit_this(b, l);
+            if (args.size() != 1) {
+                fail("built-in class method '" + std::string(sub.name) + "' takes one argument");
+            }
+            const uint64_t  which = sub.name == "srandom" ? kRandOpSrandom : kRandOpModeAll;
+            const ir::Index op    = b.constant(module_.pool.put_int(u64, which), l);
+            emit_randops_dispatch(*clt, self, op, b.resize(lower_expr(*args[0], b), u64, l), b, l);
+            return std::nullopt;
+        }
+        if (sub.name == "constraint_mode") {
+            // TODO: constraint_mode (LRM 18.9) — nothing to enable until constraints
+            // are solved at all.
+            fail("constraint_mode is not supported");
+        }
+        if (sub.name == "get_randstate" || sub.name == "set_randstate") {
+            // TODO: the object randstate codec (LRM 18.13.4/18.13.5) — two runtime
+            // helpers formatting the four state words as a string.
+            fail("get_randstate / set_randstate are not supported");
+        }
+        fail("unsupported built-in class method '" + std::string(sub.name) + "'");
     }
 
     // One output / inout argument's copy-back record: the caller temp holding the
@@ -23707,6 +24496,34 @@ private:
     static constexpr std::string_view kCopySlot = "$copy";
     // Polymorphic class -> the FunctionId of its shallow-copy thunk (copy_thunk_id).
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> copy_thunk_;
+    // Constrained randomization, step 1 (docs/design/constrained-randomization.md).
+    // The reserved vtable slots of a class's synthesized randomization entry points.
+    // Neither is a legal method name, so neither can collide with a virtual method.
+    // Both are reserved for EVERY class, so the slot number of each is one constant
+    // per hierarchy exactly as kCopySlot's is.
+    static constexpr std::string_view kRandomizeSlot = "$randomize";
+    static constexpr std::string_view kRandOpsSlot   = "$randops";
+    // `$randops` opcodes. `arg` is the seed for Srandom, the on/off bit for ModeAll,
+    // `ordinal << 1 | on` for ModeOne and the ordinal for ModeQuery.
+    static constexpr uint64_t kRandOpSrandom   = 0;
+    static constexpr uint64_t kRandOpModeAll   = 1;
+    static constexpr uint64_t kRandOpModeOne   = 2;
+    static constexpr uint64_t kRandOpModeQuery = 3;
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, ClassRand> class_rand_;
+    // A rand property -> its rand ordinal. Design-wide like class_prop_index_ and
+    // stable for the same reason: prefix layout gives an inherited property the same
+    // ordinal in the base and in every class derived from it.
+    ankerl::unordered_dense::map<const slang::ast::Symbol*, uint32_t> rand_ordinal_;
+    // Class -> the FunctionIds of its two synthesized bodies. The ids are reserved by
+    // compute_vtable and the bodies are built later, by drain_rand_bodies: a body
+    // dispatches into the classes its `rand` handles point at, and with a cycle
+    // (`rand A next`, or a mutual pair) one of those has no vtable numbering yet at
+    // the point its holder is being laid out.
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> randomize_fn_;
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> randops_fn_;
+    std::vector<std::pair<const slang::ast::ClassType*, ir::Ref>>              rand_pending_;
+    // Depth of the lower_class_type recursion; the outermost frame drains the list.
+    uint32_t class_depth_ = 0;
     // Design-wide class type ids (LRM 8.16). Owned here so a standalone Lowerer
     // works; lower_compilation points every Lowerer at one shared table instead.
     // A subroutine reached through a virtual interface handle -> its
