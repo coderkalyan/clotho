@@ -710,6 +710,11 @@ struct Structural {
                     // A design that never mentions `process` emits none of it
                     // (docs/design/process-class.md §9).
                     uses.process = true;
+                    if (const ProcOp op = ir.extra_data<ProcCtlInfo>(p.extra).op;
+                        op == ProcOp::Srandom || op == ProcOp::RandstateGet ||
+                        op == ProcOp::RandstateSet) {
+                        uses.process_randstate = true;
+                    }
                     break;
                 case Inst::Tag::Severity:
                     // Deferred assertions are processes-only: the frontend rejects

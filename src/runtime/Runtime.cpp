@@ -3903,6 +3903,112 @@ extern "C" void rt_proc_await_self(const rt_null_site* site, uint64_t now) {
     std::exit(1);
 }
 
+// LRM 18.14.4 leaves `set_randstate` with a foreign string undefined. Clotho reports
+// it: silently seeding an arbitrary state would make a run irreproducible in a way
+// nothing else in the design could explain.
+extern "C" void rt_proc_randstate_bad(const rt_null_site* site, uint64_t now) {
+    io_ensure_init();
+    std::fflush(stdout);
+
+    const fmt::text_style label = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+    const fmt::text_style head  = styled(fmt::emphasis::bold);
+    const fmt::text_style loc   = styled(fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style tag   = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan));
+    const fmt::text_style body  = styled(fmt::emphasis::faint);
+    const fmt::text_style caret = styled(fmt::emphasis::bold | fmt::fg(fmt::terminal_color::red));
+
+    std::string when;
+    append_finish_time(when, now);
+
+    fmt::print(stderr, label, "fatal:");
+    fmt::print(stderr, head, " process::set_randstate() with a string it did not produce");
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, loc, "{}", site->where);
+    fmt::print(stderr, "\n");
+    if (site->line != nullptr && site->line[0] != '\0') {
+        const std::string text = snippet_text(site->line);
+        print_snippet(text, site->line_no,
+                      { SnippetMark{ site->column, mark_width(site->column, site->end_column), '^' } },
+                      loc, caret);
+    }
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " at {} the string was not 64 hex digits naming a generator state",
+               when);
+    fmt::print(stderr, "\n");
+    fmt::print(stderr, tag, "  note:");
+    fmt::print(stderr, body, " LRM 18.14.4 only defines a string obtained from get_randstate on "
+                             "this implementation");
+    fmt::print(stderr, "\n");
+    std::fflush(stderr);
+
+    rt_vcd_close();
+    rt_finishing = 1;
+    std::exit(1);
+}
+
+// ---- Random state of a thread (LRM 9.7, 18.14) ----
+
+namespace {
+
+constexpr char kHexDigits[] = "0123456789abcdef";
+
+int hex_value(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (c - 'a');
+    }
+    if (c >= 'A' && c <= 'F') {
+        return 10 + (c - 'A');
+    }
+    return -1;
+}
+
+} // namespace
+
+extern "C" void rt_proc_randstate_get(rt_string* dst, const void* rng, const rt_alloc_site* site) {
+    const auto* w = static_cast<const uint64_t*>(rng);
+    char        buf[64];
+    for (int k = 0; k < 4; ++k) {
+        const uint64_t v = w[k];
+        for (int d = 0; d < 16; ++d) {
+            buf[(k * 16) + d] = kHexDigits[(v >> ((15 - d) * 4)) & 0xF];
+        }
+    }
+    str_assign(dst, buf, sizeof(buf), site);
+}
+
+extern "C" void rt_proc_randstate_set(void* rng, const rt_string* s, const rt_null_site* site,
+                                      uint64_t now) {
+    const char*    p = str_data(const_cast<rt_string*>(s));
+    const uint64_t n = str_len(const_cast<rt_string*>(s));
+    uint64_t       w[4]{};
+    bool           ok = n == 64;
+    for (uint64_t k = 0; ok && k < 64; ++k) {
+        const int v = hex_value(p[k]);
+        if (v < 0) {
+            ok = false;
+            break;
+        }
+        w[k / 16] = (w[k / 16] << 4) | static_cast<uint64_t>(v);
+    }
+    // All-zero is not a legal xoshiro256++ state: it is the generator's fixed point,
+    // so every subsequent draw would be zero. get_randstate never produces it (the
+    // seeding expansion cannot yield four zero words), so it can only come from a
+    // string that was not one of ours.
+    if (ok && (w[0] | w[1] | w[2] | w[3]) == 0) {
+        ok = false;
+    }
+    if (!ok) {
+        rt_proc_randstate_bad(site, now);
+    }
+    auto* dst = static_cast<uint64_t*>(rng);
+    for (int k = 0; k < 4; ++k) {
+        dst[k] = w[k];
+    }
+}
+
 // ---- Stale `ref` through a restructured container (LRM 13.5.2) ----
 
 namespace {

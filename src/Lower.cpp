@@ -23165,6 +23165,21 @@ private:
             b.proc_ctl(ir::ProcOp::Kill, args, l);
             return std::nullopt;
         }
+        if (sub.name == "srandom") {
+            // LRM 18.14: reseed that thread's generator.
+            const std::array<ir::Index, 2> args{ recv(), lower_expr(*call.arguments()[0], b) };
+            b.proc_ctl(ir::ProcOp::Srandom, args, l);
+            return std::nullopt;
+        }
+        if (sub.name == "get_randstate") {
+            const std::array<ir::Index, 1> args{ recv() };
+            return b.proc_query(ir::ProcOp::RandstateGet, args, module_.pool.string_type, l);
+        }
+        if (sub.name == "set_randstate") {
+            const std::array<ir::Index, 2> args{ recv(), lower_expr(*call.arguments()[0], b) };
+            b.proc_ctl(ir::ProcOp::RandstateSet, args, l);
+            return std::nullopt;
+        }
         if (sub.name == "suspend" || sub.name == "resume") {
             // LRM 9.7: suspend this thread or another one; resume restarts a suspended
             // thread. Both are functions, not tasks -- even though suspending the
@@ -23181,9 +23196,9 @@ private:
             b.proc_wait(ir::ProcOp::Await, args, l);
             return std::nullopt;
         }
-        // TODO: srandom / get_randstate / set_randstate (LRM 9.7, 18.14) --
-        // docs/design/process-class.md §7.4, phase P4.
-        fail("process::" + std::string(sub.name) + "() is not supported yet");
+        // Every method of LRM 9.7 is handled above; a new one would arrive with a new
+        // slang release rather than from a design.
+        fail("process::" + std::string(sub.name) + "() is not supported");
     }
 
     // Lower a user function call: the actuals (resized to the parameter types)

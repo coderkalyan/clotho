@@ -280,6 +280,9 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_proc_obj_retain", &rt_proc_obj_retain);
     expose("rt_proc_obj_release", &rt_proc_obj_release);
     expose("rt_proc_await_self", &rt_proc_await_self);
+    expose("rt_proc_randstate_get", &rt_proc_randstate_get);
+    expose("rt_proc_randstate_set", &rt_proc_randstate_set);
+    expose("rt_proc_randstate_bad", &rt_proc_randstate_bad);
     expose("rt_event_detach_register", &rt_event_detach_register);
     expose("rt_event_detach_fire", &rt_event_detach_fire);
     expose("rt_event_detach_ready", &rt_event_detach_ready);

@@ -226,14 +226,25 @@ TEST_CASE("process: await and self inside a task name the calling thread") {
 
 // -- Refusals (the phases not yet implemented) --------------------------------
 
-// Each unimplemented method refuses by its own name rather than falling into a
-// generic message.
-TEST_CASE("process: the unimplemented methods refuse by name") {
-    check_rejected("module m; initial begin process p; p = process::self(); p.srandom(1); end endmodule",
-                   "process::srandom() is not supported yet");
-    check_rejected("module m; string s; initial begin process p; p = process::self();"
-                   " s = p.get_randstate(); end endmodule",
-                   "process::get_randstate() is not supported yet");
+// Every method of LRM 9.7 is implemented, so what is pinned here is the shape of the
+// surface rather than a gap: a `process` handle behaves like any other class handle,
+// and the still-unimplemented std classes keep their own refusal
+// (tests/class_test.cpp).
+TEST_CASE("process: a handle is an ordinary class handle") {
+    const std::string out = run_capture(R"(
+        module t;
+          class Holder;
+            process p;
+          endclass
+          initial begin
+            Holder h = new;
+            $display("null=%0d", h.p == null);
+            h.p = process::self();
+            $display("set=%0d same=%0d", h.p != null, h.p == process::self());
+          end
+        endmodule
+    )");
+    CHECK(out == "null=1\nset=1 same=1\n");
 }
 
 // `process` is abstract in slang, so a user `new` is rejected before clotho sees it
@@ -529,4 +540,74 @@ TEST_CASE("process: wait fork is refused in an assertion action block") {
                    " ap: assert property (@(posedge clk) a |=> b) else wait fork;"
                    " endmodule",
                    "the descendants it would wait for are the monitor process's");
+}
+
+// -- srandom / get_randstate / set_randstate (LRM 9.7, 18.14) -------------------
+
+// Verilator-scored for the shape (it implements all three), though the state STRING
+// is implementation-defined and so is not compared with Verilator's: what is pinned
+// is the contract -- a state captured and restored replays the same draws, and the
+// same seed reproduces the same stream.
+TEST_CASE("process: randstate round-trips and srandom is reproducible") {
+    const std::string out = run_capture(R"(
+        module t;
+          process p;
+          string st;
+          int a, b, c;
+          initial begin
+            p = process::self();
+            p.srandom(7);
+            a  = $urandom();
+            st = p.get_randstate();
+            b  = $urandom();
+            p.set_randstate(st);
+            c  = $urandom();
+            p.srandom(7);
+            $display("len=%0d replay=%0d reseed=%0d", st.len(), b == c, $urandom() == a);
+          end
+        endmodule
+    )");
+    CHECK(out == "len=64 replay=1 reseed=1\n");
+}
+
+// LRM 18.14: the generator is PER PROCESS, so seeding through a handle reaches that
+// thread's stream and not the caller's. Reseeding mid-flight changes what the target
+// draws next, which is the whole point of the method.
+TEST_CASE("process: srandom through a handle reseeds that thread") {
+    const std::string out = run_capture(R"(
+        module t;
+          process w;
+          int x1 = 0, x2 = 0;
+          initial begin
+            fork
+              begin
+                w = process::self();
+                #1  x1 = $urandom();
+                #10 x2 = $urandom();
+              end
+            join_none
+            #5  w.srandom(99);
+            #20 $display("changed=%0d", x1 != x2);
+          end
+        endmodule
+    )");
+    CHECK(out == "changed=1\n");
+}
+
+// Two threads seeded identically draw identical streams -- random stability per
+// thread (LRM 18.14.1), reached here through the handle rather than at the fork.
+TEST_CASE("process: two threads seeded alike draw alike") {
+    const std::string out = run_capture(R"(
+        module t;
+          int u = 0, v = 0;
+          initial begin
+            fork
+              begin process s = null; s = process::self(); s.srandom(1234); u = $urandom(); end
+              begin process s = null; s = process::self(); s.srandom(1234); v = $urandom(); end
+            join
+            $display("equal=%0d", u == v);
+          end
+        endmodule
+    )");
+    CHECK(out == "equal=1\n");
 }

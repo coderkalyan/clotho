@@ -1544,6 +1544,17 @@ void rt_proc_obj_release(void* pcb);
 // (the target is a handle value), so this is its located fatal.
 [[noreturn]] void rt_proc_await_self(const rt_null_site* site, uint64_t now);
 
+// Random stability (LRM 9.7, 18.14): a thread's generator state as a string, and back.
+// The format is implementation-defined and only has to round-trip through
+// set_randstate on the same implementation -- 64 lowercase hex digits, the four
+// xoshiro256++ words most-significant word first.
+void rt_proc_randstate_get(rt_string* dst, const void* rng, const rt_alloc_site* site);
+// LRM 18.14.4 leaves a string that did not come from get_randstate undefined; clotho
+// reports it rather than silently seeding something arbitrary.
+void rt_proc_randstate_set(void* rng, const rt_string* s, const rt_null_site* site, uint64_t now);
+// The report for such a string.
+[[noreturn]] void rt_proc_randstate_bad(const rt_null_site* site, uint64_t now);
+
 // -- Timing wheel --
 //
 // The wheel (src/Wheel.h) is the design's event scheduler, surfaced here behind

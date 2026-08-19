@@ -3634,6 +3634,7 @@ private:
         // constant slot in clotho.proc_pcb, whose initializer already holds the
         // starting state, so this costs one GEP and no stores.
         pcb_       = design_uses_process_ ? proc_pcb_slot(proc_index) : nullptr;
+        emit_proc_publish_rng();
         acts_node_ = nullptr;
         emit_pcb_acts_link();
         const bool always_loop = proc.activation == Activation::Always && !proc.wait_events.empty();
@@ -4528,6 +4529,12 @@ private:
             llvm::Value* caller = fn_->getArg(3);
             caller->setName("proc");
             pcb_ = f.is_fork_child ? b_.CreateCall(proc_alloc_fn(), { caller }) : caller;
+            // A fork child owns its state (it was reseeded above), so it publishes its
+            // own; a plain task activation publishes nothing -- the thread's block
+            // already names the caller's state.
+            if (f.is_fork_child) {
+                emit_proc_publish_rng();
+            }
         }
         acts_node_ = nullptr;
         fork_live_ = nullptr;
@@ -6857,6 +6864,20 @@ private:
             rng_procs_[k] = std::any_of(tmp.begin(), tmp.end(), [&](FunctionId c) {
                 return rng_fns_[static_cast<uint32_t>(c)];
             });
+        }
+        // `p.srandom(seed)` / `p.set_randstate(s)` name their target through a HANDLE,
+        // so which thread gets reseeded is not statically known (LRM 9.7, 18.14). A
+        // design that uses any of the three therefore gives every thread its own
+        // generator state instead of letting one share the module-wide fallback --
+        // reseeding that would perturb every other sharer's stream.
+        if (facts_.uses.process_randstate) {
+            std::fill(rng_procs_.begin(), rng_procs_.end(), true);
+            for (uint32_t f = 0; f < nfn; ++f) {
+                if (mod_.function(static_cast<FunctionId>(f)).is_fork_child) {
+                    rng_own_[f] = true;
+                    rng_fns_[f] = true;
+                }
+            }
         }
     }
 
@@ -12348,6 +12369,10 @@ private:
             case Inst::Tag::ContainerFmtP:
             case Inst::Tag::TaggedFmtP:
                 return true;
+            // `p.get_randstate()` renders a fresh string (LRM 9.7); every other
+            // process query yields a word.
+            case Inst::Tag::ProcQuery:
+                return type_of(i).is_string;
             case Inst::Tag::Constant:
             case Inst::Tag::Concat:
             case Inst::Tag::Repl:
@@ -23451,8 +23476,12 @@ private:
                 set_value(i, two_val(b_.CreateAnd(ctl, b_.getInt32(kProcStateMask))));
                 return;
             }
-            case ProcOp::RandstateGet:
-                throw BackendError{ "internal: process::get_randstate() reached the backend" };
+            case ProcOp::RandstateGet: {
+                llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(value_of(args[0])), i));
+                b_.CreateCall(proc_randstate_get_fn(),
+                              { str_of(i), rng, alloc_site_global(loc_text(i), "string") });
+                return;
+            }
             default:
                 throw BackendError{ "internal: non-query op on a proc_query" };
         }
@@ -23629,6 +23658,30 @@ private:
         b_.SetInsertPoint(done);
     }
 
+    // Record this thread's generator state on its control block, so `p.srandom()` and
+    // the randstate pair can reach it through a handle (LRM 9.7, 18.14).
+    void emit_proc_publish_rng() {
+        if (pcb_ == nullptr || rng_slot_ == nullptr) {
+            return;
+        }
+        b_.CreateStore(rng_slot_, pcb_field(pcb_, kPcbRng));
+    }
+
+    llvm::FunctionCallee proc_randstate_get_fn() {
+        return rt_fn("rt_proc_randstate_get", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+    llvm::FunctionCallee proc_randstate_set_fn() {
+        return rt_fn("rt_proc_randstate_set", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+
+    // The generator state of the thread `pcb` names. Non-null in a design that uses
+    // the randstate ops at all, because build_rng_fns then gives every thread its own.
+    llvm::Value* proc_rng_of(llvm::Value* pcb) {
+        return b_.CreateLoad(llvm::PointerType::getUnqual(ctx_), pcb_field(pcb, kPcbRng));
+    }
+
     // `p.kill()`, `disable fork` (LRM 9.7, 9.6.3). The other control ops are still
     // refused in the frontend.
     void lower_proc_ctl(Index i) {
@@ -23651,6 +23704,25 @@ private:
             case ProcOp::Resume:
                 emit_proc_resume(proc_pcb_of(must_of(value_of(args[0])), i));
                 return;
+            case ProcOp::Srandom: {
+                // LRM 18.14: seed that thread's generator. Same splitmix64 expansion
+                // `$urandom(seed)` uses, so a seed means the same thing either way.
+                llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(value_of(args[0])), i));
+                b_.CreateCall(urandom_seed_fn(),
+                              { rng, b_.CreateZExt(cast(must_of(value_of(args[1])), 32, false),
+                                                   b_.getInt64Ty()) });
+                return;
+            }
+            case ProcOp::RandstateSet: {
+                llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(value_of(args[0])), i));
+                llvm::Value* now = has_wheel()
+                                     ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
+                                     : static_cast<llvm::Value*>(b_.getInt64(0));
+                b_.CreateCall(proc_randstate_set_fn(),
+                              { rng, str_of(args[1]),
+                                null_site_global(loc_text(i), NullKind::Class), now });
+                return;
+            }
             default:
                 throw BackendError{ "internal: unimplemented process control op" };
         }
