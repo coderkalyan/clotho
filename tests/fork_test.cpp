@@ -344,20 +344,11 @@ TEST_CASE("fork: a child reading an uncapturable task local is rejected by name"
                    "reads a class property of the enclosing method is not supported");
 }
 
-// The two dynamic process-control statements (LRM 9.6.1 / 9.6.3) both need the
-// live-child set fork V2 owes — `disable fork` kills every descendant, `wait
-// fork` blocks on them — and the join-all count cannot express either. Refused
-// with their own names, not the generic "unsupported statement".
-TEST_CASE("fork: disable fork / wait fork rejected") {
-    check_rejected(R"(
-        module t;
-          initial begin
-            fork #1 $display("x"); join
-            disable fork;
-          end
-        endmodule
-    )",
-                   "disable fork is not supported");
+// `wait fork` (LRM 9.6.1) still needs the barrier over the live descendant set;
+// `disable fork` (9.6.3) has landed with the `process` control blocks that carry
+// that set (tests/process_test.cpp, docs/design/process-class.md §8). Refused with
+// its own name, not the generic "unsupported statement".
+TEST_CASE("fork: wait fork rejected") {
     check_rejected(R"(
         module t;
           initial begin

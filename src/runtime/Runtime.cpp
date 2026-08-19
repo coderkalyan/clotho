@@ -5617,9 +5617,45 @@ extern "C" void* rt_proc_alloc(void* parent) {
     return p;
 }
 
-extern "C" void* rt_proc_complete(void* pcb, uint32_t killed) {
-    auto* p = static_cast<rt_proc*>(pcb);
-    p->ctl  = (p->ctl & ~static_cast<uint32_t>(RT_PROC_STATE_MASK)) |
+extern "C" void* rt_proc_mark_kill(void* pcb, uint32_t with_self) {
+    auto*    root  = static_cast<rt_proc*>(pcb);
+    rt_proc* chain = nullptr;
+    // Depth-first over the subtree, using `parent` to backtrack rather than a stack:
+    // the tree is arbitrarily deep (a UVM phase forks per component) and this runs
+    // inside a simulation step.
+    rt_proc* p = with_self != 0 ? root : root->first_child;
+    while (p != nullptr) {
+        const uint32_t state = p->ctl & RT_PROC_STATE_MASK;
+        if (state != RT_PROC_FINISHED && state != RT_PROC_KILLED && (p->ctl & RT_PROC_ABORT) == 0) {
+            // KILLED at the instant `kill` runs, not when the thread gets round to
+            // unwinding: LRM 9.7 defines the state as "process was forcibly killed",
+            // and a caller that kills a thread and then reads its status must not see
+            // WAITING. The thread still has to reach its own poll point to release its
+            // frames, which is what the ABORT flag drives.
+            p->ctl = (p->ctl & ~static_cast<uint32_t>(RT_PROC_STATE_MASK)) | RT_PROC_KILLED |
+                     RT_PROC_ABORT;
+            p->next_marked = chain;
+            chain          = p;
+        }
+        if (p->first_child != nullptr) {
+            p = p->first_child;
+            continue;
+        }
+        while (p != root && p->next_sib == nullptr) {
+            p = p->parent;
+        }
+        if (p == root) {
+            break;
+        }
+        p = p->next_sib;
+    }
+    return chain;
+}
+
+extern "C" void* rt_proc_complete(void* pcb) {
+    auto*          p       = static_cast<rt_proc*>(pcb);
+    const uint32_t killed  = p->ctl & RT_PROC_ABORT;
+    p->ctl  = (p->ctl & ~static_cast<uint32_t>(RT_PROC_STATE_MASK | RT_PROC_ABORT)) |
              (killed != 0 ? RT_PROC_KILLED : RT_PROC_FINISHED);
     // Re-parent live children onto this thread's own parent, so a later
     // `disable fork` / `kill` still reaches them (LRM 9.6.3: descendants include

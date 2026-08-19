@@ -229,8 +229,6 @@ TEST_CASE("process: await and self inside a task name the calling thread") {
 // Each unimplemented method refuses by its own name rather than falling into a
 // generic message.
 TEST_CASE("process: the unimplemented methods refuse by name") {
-    check_rejected("module m; initial begin process p; p = process::self(); p.kill(); end endmodule",
-                   "process::kill() is not supported yet");
     check_rejected("module m; initial begin process p; p = process::self(); p.suspend(); end endmodule",
                    "process::suspend() is not supported yet");
     check_rejected("module m; initial begin process p; p = process::self(); p.resume(); end endmodule",
@@ -247,4 +245,180 @@ TEST_CASE("process: the unimplemented methods refuse by name") {
 TEST_CASE("process: cannot be constructed with new") {
     check_rejected("module m; initial begin process p; p = new; end endmodule",
                    "cannot create instance of virtual class 'process'");
+}
+
+// -- process::kill() (LRM 9.7) and `disable fork` (LRM 9.6.3) ------------------
+
+// Verilator-scored (5.050 prints `status=4 ticks=3` / `after ticks=3` for this
+// exact source): a killed thread stops at once and reads KILLED immediately, before
+// it has unwound -- the state is set where `kill` runs, not where the thread notices.
+TEST_CASE("process: kill stops a thread and reports KILLED at once") {
+    const std::string out = run_capture(R"(
+        module t;
+          process child;
+          int ticks = 0;
+          initial begin
+            fork
+              begin child = process::self(); forever begin #10; ticks++; end end
+            join_none
+            #35 child.kill();
+            $display("status=%0d ticks=%0d", child.status(), ticks);
+            #100 $display("after ticks=%0d", ticks);
+          end
+        endmodule
+    )");
+    CHECK(out == "status=4 ticks=3\nafter ticks=3\n");
+}
+
+// LRM-pinned: 9.7 kills "the given process and all its sub-processes", and 9.6.3
+// spells out that descendants include those of children that already terminated.
+// Verilator cannot score this -- its control block detaches a finished thread's
+// children instead of re-parenting them -- so the expectation is the LRM text.
+TEST_CASE("process: kill reaches a whole subtree") {
+    const std::string out = run_capture(R"(
+        module t;
+          process child;
+          initial begin
+            fork
+              begin
+                child = process::self();
+                fork
+                  begin #200 $display("grandchild ran"); end
+                join_none
+                #400 $display("child ran");
+              end
+            join_none
+            #35 child.kill();
+            #500 $display("end t=%0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "end t=535\n");
+}
+
+// A thread parked inside a time-consuming task call is parked in an INNER frame, and
+// the whole chain has to unwind: the innermost activation aborts at its poll, wakes
+// its caller, and the caller aborts at its own. This is the case remote `disable`
+// still refuses (`hard_park`), and it is why the control block carries an activation
+// stack rather than one occupant slot.
+TEST_CASE("process: kill unwinds a thread parked inside a task call") {
+    const std::string out = run_capture(R"(
+        module t;
+          process deep;
+          task automatic slow();
+            #50 $display("task returned");
+          endtask
+          initial begin
+            fork
+              begin deep = process::self(); slow(); $display("body after task"); end
+            join_none
+            #5 deep.kill();
+            #100 $display("end t=%0t status=%0d", $time, deep.status());
+          end
+        endmodule
+    )");
+    CHECK(out == "end t=105 status=4\n");
+}
+
+// Killing a parent that is parked at a `join` with a live child: the join record
+// outlives the parent's frame (it is heap and reference-counted once a design has
+// process control), so the child's epilogue cannot write through a freed frame.
+// Under ASan this is the case that catches the ownership change being wrong.
+TEST_CASE("process: kill a parent parked at a join") {
+    const std::string out = run_capture(R"(
+        module t;
+          process parent;
+          initial begin
+            fork
+              begin
+                parent = process::self();
+                fork
+                  begin #500 $display("join child ran"); end
+                join
+                $display("parent past join");
+              end
+            join_none
+            #10 parent.kill();
+            #600 $display("end t=%0t", $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "end t=610\n");
+}
+
+// Killing the calling thread ends it where the call is: nothing else would ever
+// resume it to notice the mark, so the abort is taken directly.
+TEST_CASE("process: kill of self ends the caller") {
+    const std::string out = run_capture(R"(
+        module t;
+          initial begin
+            process me = null;
+            me = process::self();
+            $display("before");
+            me.kill();
+            $display("after - unreachable");
+          end
+          initial #10 $display("other thread still runs");
+        endmodule
+    )");
+    CHECK(out == "before\nother thread still runs\n");
+}
+
+// A kill of a thread that has already completed has no effect (the state is already
+// terminal), and a second kill of a killed thread is likewise a no-op.
+TEST_CASE("process: kill of a completed thread is a no-op") {
+    const std::string out = run_capture(R"(
+        module t;
+          process child;
+          initial begin
+            fork
+              begin child = process::self(); #5; end
+            join
+            child.kill();
+            child.kill();
+            $display("status=%0d t=%0t", child.status(), $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "status=0 t=5\n");
+}
+
+// `disable fork` (LRM 9.6.3) ends every descendant of the calling thread and leaves
+// the caller running -- the same walk as `kill`, with the root spared. LRM-pinned.
+TEST_CASE("process: disable fork ends the descendants only") {
+    const std::string out = run_capture(R"(
+        module t;
+          int n = 0, m = 0;
+          initial begin
+            fork
+              begin forever begin #10 n++; end end
+              begin forever begin #10 m++; end end
+            join_none
+            #35 disable fork;
+            $display("at kill n=%0d m=%0d", n, m);
+            #50 $display("later n=%0d m=%0d caller alive", n, m);
+          end
+        endmodule
+    )");
+    CHECK(out == "at kill n=3 m=3\nlater n=3 m=3 caller alive\n");
+}
+
+// `await` on a killed thread returns: KILLED is a completion as far as 9.7's await
+// is concerned, which is also what keeps an awaiting thread from hanging forever.
+TEST_CASE("process: await returns when the target is killed") {
+    const std::string out = run_capture(R"(
+        module t;
+          process child;
+          initial begin
+            fork
+              begin child = process::self(); #1000; end
+            join_none
+            fork
+              begin #20 child.kill(); end
+              begin #1 child.await(); $display("await returned at %0t status=%0d", $time, child.status()); end
+            join
+          end
+        endmodule
+    )");
+    CHECK(out == "await returned at 20 status=4\n");
 }

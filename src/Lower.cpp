@@ -924,9 +924,15 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 // it refuses everywhere else.
                 break;
             case StatementKind::DisableFork:
-                // `disable fork` needs the live-child set, like `wait fork` above.
+                // Lowerable everywhere else (LRM 9.6.3, docs/design/process-class.md
+                // §8), but not here, and the reason is identity rather than region: an
+                // action block is not a thread of its own -- it is pended as a task
+                // body and runs on the monitor process's control block -- so the
+                // descendants it would end are the monitor's, which is not what the
+                // statement means.
                 reject("a disable fork",
-                       "clotho does not lower it: it needs the live-child set fork owes");
+                       "the descendants it would end are the monitor process's, not the "
+                       "assertion's: an action block runs on the monitor's thread");
                 break;
             default:
                 // The whitelist's floor, and what it now asks. Suspending is no
@@ -8243,10 +8249,14 @@ private:
                 lower_disable(stmt.as<slang::ast::DisableStatement>(), b);
                 break;
             case StatementKind::DisableFork:
-                // TODO: disable fork (V3) kills every descendant of the calling
-                // process (LRM 9.6.3), so it needs the live-child set fork V2 owes
-                // plus the general abort primitive (docs/design/disable.md).
-                fail("disable fork is not supported");
+                // LRM 9.6.3: end every descendant of the calling process, "not just
+                // immediate children", including descendants of children that have
+                // already terminated -- which the control-block tree gives by
+                // re-parenting a completing thread's live children
+                // (docs/design/process-class.md §5.3, §8). Exactly `kill` over the
+                // subtree, with the caller itself spared.
+                b.proc_ctl(ir::ProcOp::DisableFork, {}, loc(stmt));
+                break;
             case StatementKind::WaitFork:
                 // TODO: wait fork (LRM 9.6.1) needs the same live-child set: a
                 // process must block until every descendant has finished, which the
@@ -23146,6 +23156,12 @@ private:
             const std::array<ir::Index, 1> args{ recv() };
             return b.proc_query(ir::ProcOp::Status, args, lower_type(sub.getReturnType()), l);
         }
+        if (sub.name == "kill") {
+            // LRM 9.7: end the process and every descendant it forked.
+            const std::array<ir::Index, 1> args{ recv() };
+            b.proc_ctl(ir::ProcOp::Kill, args, l);
+            return std::nullopt;
+        }
         if (sub.name == "await") {
             // A task: it parks the calling thread until the target completes, so it
             // is a statement with no value (LRM 9.7).
@@ -23153,8 +23169,8 @@ private:
             b.proc_wait(ir::ProcOp::Await, args, l);
             return std::nullopt;
         }
-        // TODO: kill / suspend / resume / srandom / get_randstate / set_randstate
-        // (docs/design/process-class.md, phases P2-P4).
+        // TODO: suspend / resume / srandom / get_randstate / set_randstate
+        // (docs/design/process-class.md, phases P3-P4).
         fail("process::" + std::string(sub.name) + "() is not supported yet");
     }
 

@@ -1475,6 +1475,10 @@ typedef struct rt_proc {
     struct rt_proc* first_child;
     struct rt_proc* next_sib;
     struct rt_proc* prev_sib;
+    // Scratch chain of the blocks one `kill` marked, so the walk that marks a
+    // subtree (here, plain memory work) and the force-wake that follows it
+    // (generated code, because it touches the scheduler rings) can be separate.
+    struct rt_proc* next_marked;
 } rt_proc;
 
 // LRM 9.7 `process::state`, the values slang's synthesized enum assigns.
@@ -1489,18 +1493,28 @@ enum {
     // Set on a block that lives in the backend's static array, so it is never
     // returned to the pool freelist however its reference count moves.
     RT_PROC_STATIC = 1u << 8,
+    // `kill` (or `disable fork`) has been requested on this thread: it aborts at its
+    // next poll point, which is right after whatever park it is sitting in.
+    RT_PROC_ABORT = 1u << 9,
 };
 
 // A pooled block for a fork child, linked in as a child of `parent` (which may be
 // null for a thread with no parent). Starts RUNNING with one reference.
 void* rt_proc_alloc(void* parent);
 
-// End `pcb`'s thread: set FINISHED (or KILLED when `killed`), re-parent its live
+// Mark `pcb`'s whole live subtree for abort (LRM 9.7 `kill` ends the process "and
+// all its descendants", 9.6.3 says the same for `disable fork`) and return them as a
+// chain through `next_marked`. `with_self` is 0 for `disable fork`, which kills the
+// descendants but not the caller. A thread that has already completed is skipped.
+// Generated code then force-wakes each one exactly once.
+void* rt_proc_mark_kill(void* pcb, uint32_t with_self);
+
+// End `pcb`'s thread: set FINISHED (or KILLED when an abort was marked), re-parent its live
 // children onto its own parent -- LRM 9.6.3 counts descendants of children that
 // already terminated -- and unlink it from the tree. Returns the `await` waiter
 // list head, which generated code walks (the wake pushes onto a codegen-owned
 // ring, so the runtime cannot do it), and clears it.
-void* rt_proc_complete(void* pcb, uint32_t killed);
+void* rt_proc_complete(void* pcb);
 
 // Drop the reference the live thread held. Frees a pooled block whose last
 // reference this was.

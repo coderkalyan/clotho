@@ -843,14 +843,18 @@ endmodule
     // is involved, and the remote form does not care where it runs -- it marks the
     // activations on a target's list and pushes their handles. Both copies of an
     // action block are ordinary bodies to it. Pinned as behaviour in
-    // tests/loop_test.cpp; what stays refused is `disable fork`, for the reason
-    // `wait fork` is.
+    // tests/loop_test.cpp.
+    //
+    // `disable fork` stays refused, and for a reason that survived its
+    // implementation: an action block is not a thread of its own -- it runs on the
+    // monitor process's control block -- so the descendants it would kill are the
+    // MONITOR's, not the assertion's.
     refuses(R"(
 module t;
   bit clk, a, b;
   ap: assert property (@(posedge clk) a |=> b) else disable fork;
 endmodule
-)", "it needs the live-child set fork owes");
+)", "the descendants it would end are the monitor process's");
 
     // A deferred immediate assertion matures in Observed, and reactive code is
     // downstream of Observed in every time slot -- a region order no wake can

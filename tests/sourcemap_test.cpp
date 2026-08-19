@@ -96,7 +96,7 @@ module m;
   logic a;
   initial begin : blk
     a = 1;
-    disable fork;
+    wait fork;
   end
 endmodule
 )");
@@ -117,7 +117,7 @@ endmodule
     CHECK(d.origin == DiagnosticOrigin::Unsupported);
     CHECK(d.code == "unsupported-construct");
     // The message is the bare complaint: no location baked into the text.
-    CHECK(d.message.find("disable") != std::string::npos);
+    CHECK(d.message.find("wait fork") != std::string::npos);
     CHECK(d.message.find(".sv") == std::string::npos);
     CHECK(d.message.find(":6:") == std::string::npos);
     // The location lives in the span instead, and points at the `disable`.
