@@ -555,6 +555,7 @@ add_executable(clotho_test
   tests/enum_test.cpp
   tests/sysfunc_test.cpp
   tests/randcase_test.cpp
+  tests/randomize_test.cpp
   tests/streaming_test.cpp
   tests/uwire_test.cpp
   tests/struct_test.cpp

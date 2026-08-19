@@ -211,8 +211,11 @@ consequence of making it uniform: every class now has a descriptor, so every cla
 has the reserved `$copy` slot, and the shallow copy of a non-virtual hierarchy no
 longer slices the source.
 
-Still deferred (Phase 3 remainder), guarded loud: randomize. The built-in virtual
-`randomize` is excluded from dispatch via `MethodFlags::BuiltIn`. **Interface
+Randomization has since landed alongside `$copy`, and by the same mechanism: two
+more reserved slots, `$randomize` and `$randops`, hold per-class synthesized bodies
+(docs/design/constrained-randomization.md). slang's built-in virtual `randomize` is
+still excluded from ordinary dispatch via `MethodFlags::BuiltIn`; the slot is
+reserved by name instead. **Interface
 classes** (LRM 8.26) are a separate gap, and a DAG rather than a tree: a display
 cannot answer "does this class implement interface I". The descriptor grows a
 sorted, transitively closed set of implemented interface ids (plus a bloom word

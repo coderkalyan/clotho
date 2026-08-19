@@ -1402,12 +1402,35 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 
 ### Constrained randomization
 
-- [ ] **`rand` / `randc`** members and `randomize()`.
 - [ ] **Constraint blocks** — relational, `inside`, implication `->`, `if/else`,
-  `foreach`, `solve … before`, `dist`, `soft`, uniqueness `unique{}`.
-- [ ] **Inline / external constraints**, `constraint_mode`, `rand_mode`.
-- [ ] **Randomization hooks** — `pre_randomize`/`post_randomize`,
-  `std::randomize` with inline constraints.
+  `foreach`, `solve … before`, `dist`, `soft`, uniqueness `unique{}`. Guarded loud,
+  each by its own message: a `constraint` block in a class, an inline `with { … }`
+  on either `randomize` form, and `constraint_mode`. The generated `$randomize` body
+  is shaped around the seam a solver drops into
+  (docs/design/constrained-randomization.md §7).
+- [x] **`rand` / `randc` and `randomize()`, unconstrained** (LRM 18.3/18.4/18.6/18.8/
+  18.11/18.12/18.14.2) — a class carrying a `rand` property grows a rand block of
+  ordinary fields (its own xoshiro256++ state, a 64-bit rand_mode mask, a 256-bit
+  cycle bitmap per `randc`), and two reserved vtable slots alongside `kCopySlot` hold
+  per-class synthesized bodies: `$randomize(this, mask)` and
+  `$randops(this, op, arg)`. The mask is a filter the body intersects with the
+  object's own mode word, so one body serves `randomize()`, `randomize(x, y)`,
+  `randomize(null)` and the recursion into a `rand` handle. Draws come from the
+  OBJECT's generator, seeded at `new` from one `$urandom` draw of the creating thread
+  (LRM 18.14.2) — which is also why no analysis pass changed: the seeding draw is an
+  ordinary `Urandom` instruction, so a process that constructs a randomizable object
+  already owns its frame state and leaves the thunk path. An unconstrained field is
+  uniform over its full range, an enum over its distinct labels, a 4-state field
+  never x or z; a `rand` handle is recursed into, never replaced, and a null one is
+  skipped. `pre_randomize` / `post_randomize`, per-property and object-level
+  `rand_mode`, `srandom`, `std::randomize` (which draws from the calling thread — no
+  object) and `randc` all land with it. Three IR tags — `ObjRandom`, `ObjRandSeed`,
+  `RandcNext` — all taking lvalue operands so the backend needs no layout knowledge,
+  plus one runtime helper, `rt_randc_next`. Guarded loud: `randc` wider than 8 bits
+  (LRM 18.6 allows the cap), `rand real`, `rand` dynamic arrays / queues /
+  associative arrays / unpacked structs, more than 64 rand properties in one chain,
+  `randomize(x)` naming a non-rand property, and `rand_mode` on a subelement. Design:
+  docs/design/constrained-randomization.md.
 - [x] **`$urandom` / `$urandom_range`** (LRM 18.13) — per-process xoshiro256++
   RNG in the coroutine frame (thread-stable by process index), inlined draw +
   Lemire range map. Stream intentionally not iverilog-identical (LRM
@@ -1429,8 +1452,11 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   stream is reproducible and independent of its siblings'. A DPI export thunk and
   the `$monitor` ramp in `main` have no calling thread at all and use a
   module-wide state seeded at startup.
-- [ ] **Random stability & seeding, remaining** — per-object RNG for class
-  `randomize`, and `srandom` / `get_randstate` / `set_randstate`.
+- [ ] **Random stability & seeding, remaining** — `srandom` / `get_randstate` /
+  `set_randstate`. The per-object RNG for class `randomize` has landed (above);
+  `srandom` on an object with it. What remains is the `process`-side trio, designed
+  with it (docs/design/process-class.md §7.4), and the object-side randstate codec,
+  which shares those two `clotho.str` helpers and is guarded loud until they exist.
 
 ### Concurrency & synchronization
 
