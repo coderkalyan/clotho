@@ -1740,7 +1740,7 @@ project with its own algorithm, not tail cleanup on the property layer:
 
 ### UVM enablers
 
-- [x] **Virtual interfaces** (LRM 25.9) — a handle is the 64-bit address of one
+- [~] **Virtual interfaces** (LRM 25.9) — a handle is the 64-bit address of one
   elaborated interface instance's runtime context record (the per-instance
   descriptor module dedup already builds: state base, NBA shadow base, sched base,
   dump-var base, wait-bucket bases). A member reached through it is the ordinary
@@ -1776,8 +1776,21 @@ project with its own algorithm, not tail cleanup on the property layer:
   onto whichever instance was bound at time zero); an `edge` / `iff` qualifier on
   such an expression stays guarded loud. A member of an interface the design never
   instantiates is an unconditional run-time fatal with a
-  `virtual-interface-never-bound` warning up front, not a refusal. The LRM 25.9
-  `SBusTransactor` example runs verbatim. Design: docs/design/interfaces.md.
+  `virtual-interface-never-bound` warning up front, not a refusal. A member in a
+  **generate block** of the interface resolves too — a generate block is not a
+  separate instance, and the representative is found by ordinal path rather than by
+  name. An `event` member is waited on through its own object, the mechanism its
+  trigger fires. An NBA inside a subroutine reached through a handle takes the
+  record path like any other handle write. The LRM 25.9 `SBusTransactor` example
+  runs verbatim. Remaining, guarded loud:
+  - [ ] A member of an interface **instantiated inside** the interface a handle
+    names (`vif.i.d`) — a separate instance with a separate context record; needs
+    the record to carry its children's. A handle taken directly to the inner
+    instance works.
+  - [ ] `virtual` handles in a **queue / dynamic / associative array** — the
+    generic container-of-handles gap below, shared with class handles.
+
+  Design: docs/design/interfaces.md.
 - [~] **String formatting** — `%p` (LRM 21.2.1.6). The four structural `shall`
   cases the clause names beyond unpacked arrays/structs now print correctly
   instead of falling through to a bare decimal: a tagged union as `'{tag:value}`

@@ -227,6 +227,39 @@ ever be null, so the access is an unconditional run-time fatal, and the compiler
 says so up front with a `virtual-interface-never-bound` warning. A design that
 never executes the access is still legal, so this is not a refusal.
 
+**Which scope a member may live in.** A **generate block** of the interface is not
+a separate instance: its signals are fields of the instance's own state struct, on
+the same anchor, so `vif.g[0].e` is an ordinary member access. It cannot be found
+by name in the body's member list, so the representative is located by its
+**ordinal path** — the chain of member positions from the body down. Two instances
+of one definition with equal parameters elaborate identically (that is what
+`hasSameType` asserts), so the same chain reaches the corresponding member of any
+of them, and no path name has to be rendered or parsed.
+
+An interface **instantiated inside** the interface (`vif.i.d`) is the opposite
+case and is refused loud: `i` is a separate instance with a separate state struct
+and a separate context record, and the handle's record says nothing about it.
+Resolving the member against the registry by type alone finds the nested
+instance's own signal and then reads it off the *outer* instance's record — the
+wrong layout off the wrong base. `vif_member_signal` therefore requires the
+member's body to be the body the handle's TYPE names, which is what makes the
+difference between these two cases decidable. Supporting it needs the context
+record to carry its children's records so a nested base can be reached from the
+outer one; a handle taken directly to the inner instance (`virtual inner v = o.i;`)
+works today and is the way to express it.
+
+**Writes inside a ctx-parameterized body.** A nonblocking write in an interface
+subroutine reached through a handle names a bare member, but the instance is the
+one formal 0 named, so it is a write through a handle and must take the
+deferred-record path like any other. `collect_vif_nba` marks NBA targets inside a
+`takes_iface_ctx` body for exactly this reason; without it the write stages into
+the representative's block shadow and commits into the wrong instance.
+
+**Events are woken through the object, not the member.** `@(vif.e)` parks on the
+event object in the instance the handle names — the same intrusive list `@(ev[i])`
+uses — not on the member's signal waiter list, because `-> vif.e` fires the
+object. Routing it to the waiter list instead never wakes at all.
+
 ## Deferred (loud-fail, tracked)
 
 - **Multi-driver interface nets** — a true bidirectional bus net driven

@@ -2152,26 +2152,38 @@ private:
         const auto n = mod_.signals().size();
         vif_nba_.assign(n, false);
         bool any = false;
-        const auto scan = [&](const Ir& ir) {
+        // A write whose lvalue reaches through a handle names it syntactically.
+        const auto scan = [&](const Ir& ir, bool whole_body_is_vif) {
             for (size_t k = 0; k < ir.inst_count(); ++k) {
                 const auto idx = static_cast<Index>(k);
                 if (ir.tag(idx) != Inst::Tag::StoreNb) {
                     continue;
                 }
                 const LvalueRoot r = lvalue_root(ir, ir.payload(idx).binary.l);
-                if (ir.tag(r.root) != Inst::Tag::IfaceSignal) {
+                if (ir.tag(r.root) == Inst::Tag::IfaceSignal) {
+                    vif_nba_[static_cast<uint32_t>(
+                      ir.extra_data<IfaceMember>(ir.payload(r.root).op_extra.extra).signal)] = true;
+                    any = true;
                     continue;
                 }
-                vif_nba_[static_cast<uint32_t>(
-                  ir.extra_data<IfaceMember>(ir.payload(r.root).op_extra.extra).signal)] = true;
-                any = true;
+                // Inside a subroutine reached through a handle, a bare member
+                // reference IS a write through a handle -- the instance is the one
+                // formal 0 named, not the one the body was lowered against. Its
+                // lvalue is an ordinary Signal, so nothing about the statement says
+                // so; the body does. Without this the write stages into the
+                // representative's block shadow and commits into the wrong instance.
+                if (whole_body_is_vif && ir.tag(r.root) == Inst::Tag::Signal) {
+                    vif_nba_[static_cast<uint32_t>(ir.payload(r.root).signal)] = true;
+                    any = true;
+                }
             }
         };
         for (const Process& pr : mod_.processes()) {
-            scan(pr.ir);
+            scan(pr.ir, /*whole_body_is_vif=*/false);
         }
         for (size_t f = 0; f < mod_.function_count(); ++f) {
-            scan(mod_.function(static_cast<FunctionId>(f)).ir);
+            const Function& fn = mod_.function(static_cast<FunctionId>(f));
+            scan(fn.ir, fn.takes_iface_ctx);
         }
         if (any) {
             spread_by_definition(vif_nba_);
@@ -4377,7 +4389,7 @@ private:
         // has already narrowed it to the 64-bit value the frame slot holds.
         llvm::Value* handle =
           b_.CreateLoad(int_ty(64), b_.CreateStructGEP(frame_ty_, frame_, 0), "vif.ctx");
-        emit_null_handle_check(handle, Index{ 0 });
+        emit_null_handle_check(handle, Index{ 0 }, NullKind::Iface);
         ctx_override_        = b_.CreateIntToPtr(handle, raw_ptr_ty());
         ctx_override_anchor_ = s.anchor;
     }
@@ -12820,7 +12832,7 @@ private:
                 // ordinary signal lvalue with one substituted base.
                 const auto   rep    = ir_->extra_data<IfaceMember>(p.op_extra.extra).signal;
                 llvm::Value* handle = must_of(value_of(p.op_extra.op));
-                emit_null_handle_check(handle, i);
+                emit_null_handle_check(handle, i, NullKind::Iface);
                 llvm::Value* ctx = b_.CreateIntToPtr(handle, raw_ptr_ty());
                 CtxOverride  ov(*this, ctx, slot_of(rep).anchor);
                 LValue       lv = signal_lvalue(rep);
@@ -16026,12 +16038,17 @@ private:
             b_.CreateAlignedStore(mask_w, b_.CreateStructGEP(rt, rec, arr_rec_mask(s)), a1);
         }
         if (s.vif_rec) {
-            // Through a handle, the instance it named; from the member's own
-            // instance, that instance's own record. Either way the replay wakes the
-            // instance the value actually landed in.
-            llvm::Value* ctx = lv.vif_ctx != nullptr
-                                 ? lv.vif_ctx
-                                 : static_cast<llvm::Value*>(ensure_ctx(anchors_[s.anchor]));
+            // Through a handle, the instance it named; inside a subroutine reached
+            // through one, the instance formal 0 named (the body-wide override);
+            // from the member's own instance, that instance's own record. Either
+            // way the replay wakes the instance the value actually landed in.
+            llvm::Value* ctx = lv.vif_ctx;
+            if (ctx == nullptr && ctx_override_for(s)) {
+                ctx = ctx_override_;
+            }
+            if (ctx == nullptr) {
+                ctx = ensure_ctx(anchors_[s.anchor]);
+            }
             b_.CreateAlignedStore(ctx, b_.CreateStructGEP(rt, rec, arr_rec_ctx(s)), a1);
         }
     }
@@ -17555,21 +17572,26 @@ private:
     // The rt_null_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
     // i32 column, i32 end_column }. Field order and types mirror the C struct
     // exactly, so the two change together.
+    // Which handle kind a null guard is protecting, so the report names it (LRM 8.4
+    // for a class, 25.9 for a virtual interface). Mirrors rt_null_kind.
+    enum class NullKind : int32_t { Class = 0, Iface = 1 };
+
     llvm::StructType* null_site_ty() {
         auto* i32 = b_.getInt32Ty();
-        return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32 });
+        return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, i32 });
     }
 
     // One constant rt_null_site per guarded dereference. Everything the fatal
     // knows is compile-time, so only the simulation time travels as an argument.
-    llvm::Constant* null_site_global(const SourceText& at) {
+    llvm::Constant* null_site_global(const SourceText& at, NullKind kind) {
         auto* const i32  = b_.getInt32Ty();
         auto* const rec  = null_site_ty();
         auto*       init = llvm::ConstantStruct::get(
           rec, { b_.CreateGlobalString(at.where, "null.at"),
                  b_.CreateGlobalString(at.line, "null.src"),
                  llvm::ConstantInt::get(i32, at.line_no), llvm::ConstantInt::get(i32, at.column),
-                 llvm::ConstantInt::get(i32, at.end_column) });
+                 llvm::ConstantInt::get(i32, at.end_column),
+                 llvm::ConstantInt::get(i32, static_cast<int32_t>(kind)) });
         return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
                                         llvm::GlobalValue::PrivateLinkage, init,
                                         "clotho.null.site");
@@ -17589,7 +17611,7 @@ private:
     // same handle value reaches two derefs unchanged, CSE folds the second
     // compare away. The wheel fallback mirrors lower_case_viol: a dereference
     // inside a pure function has no wheel and reports time 0.
-    void emit_null_handle_check(llvm::Value* handle, Index at) {
+    void emit_null_handle_check(llvm::Value* handle, Index at, NullKind kind = NullKind::Class) {
         auto* fn   = b_.GetInsertBlock()->getParent();
         auto* bad  = llvm::BasicBlock::Create(ctx_, "null.deref", fn);
         auto* cont = llvm::BasicBlock::Create(ctx_, "deref.ok", fn);
@@ -17601,7 +17623,8 @@ private:
         llvm::Value* now  = has_wheel()
                               ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
                               : static_cast<llvm::Value*>(b_.getInt64(0));
-        auto*        call = b_.CreateCall(null_handle_fn(), { null_site_global(loc_text(at)), now });
+        auto*        call =
+          b_.CreateCall(null_handle_fn(), { null_site_global(loc_text(at), kind), now });
         call->addFnAttr(llvm::Attribute::NoReturn);
         call->addFnAttr(llvm::Attribute::Cold);
         b_.CreateUnreachable();

@@ -436,7 +436,7 @@ TEST_CASE("virtual interface: a null handle dereference is a located fatal") {
 
     CHECK(run.out == "before\n");
     CHECK(test::design_exit_code(run) != 0);
-    CHECK(run.err.find("fatal: dereference of a null class handle") != std::string::npos);
+    CHECK(run.err.find("fatal: use of a null virtual interface") != std::string::npos);
     CHECK(run.err.find("source:9:9") != std::string::npos);
 }
 
@@ -628,5 +628,115 @@ TEST_CASE("virtual interface: a member of an uninstantiated interface is a fatal
     )");
     CHECK(run.err.find("use of a null virtual interface") != std::string::npos);
     // The write never happens, and nothing after it runs.
+    CHECK(run.out == "before\n");
+}
+
+// A signal declared inside a GENERATE block of the interface is still a field of
+// the instance's own state struct -- a generate block is not a separate instance --
+// so a handle reaches it like any other member. It cannot be found by name in the
+// body's member list, though, so the representative is located by its position,
+// which is identical across instances of one definition.
+TEST_CASE("virtual interface: a generate-block member through a handle") {
+    const std::string out = run_capture(R"(
+        interface ibus;
+            logic [7:0] d;
+            for (genvar i = 0; i < 2; i++) begin : g logic [7:0] e; end
+        endinterface
+        module top;
+            ibus a(), b();
+            virtual ibus v1, v2;
+            initial begin
+                v1 = a; v2 = b;
+                v1.g[0].e = 8'h11;
+                v2.g[1].e = 8'h22;
+                $display("%h/%h %h/%h", a.g[0].e, a.g[1].e, b.g[0].e, b.g[1].e);
+            end
+        endmodule
+    )");
+    CHECK(out == "11/xx xx/22\n");
+}
+
+// An interface instantiated INSIDE the interface a handle names is a separate
+// instance: a separate state struct and a separate context record, which the
+// handle's record says nothing about. Resolving the member by type alone would
+// find the nested instance's own signal and then read it off the outer instance's
+// record -- the wrong layout off the wrong base, which used to be a segfault.
+TEST_CASE("virtual interface: a member of a nested interface instance is refused") {
+    const std::string diag = reject(R"(
+        interface inner; logic [7:0] d; endinterface
+        interface outer; inner i(); logic [7:0] e; endinterface
+        module top;
+            outer o();
+            virtual outer vif;
+            initial begin vif = o; vif.i.d = 8'h3; end
+        endmodule
+    )");
+    CHECK(diag.find("a separate instance the handle does not name") != std::string::npos);
+}
+
+// A nonblocking write inside an interface subroutine reached through a handle is a
+// write through a handle, even though the statement names a bare member: the
+// instance is the one formal 0 named. It has to take the deferred-record path like
+// any other handle write, or it stages into the representative's block shadow and
+// commits into the wrong instance.
+TEST_CASE("virtual interface: a nonblocking write inside a subroutine through a handle") {
+    const std::string out = run_capture(R"(
+        interface ibus;
+            logic [7:0] d;
+            task automatic put(input logic [7:0] x); d <= x; endtask
+        endinterface
+        module top;
+            ibus a(), b();
+            virtual ibus v1, v2;
+            initial begin
+                v1 = a; v2 = b;
+                v1.put(8'h11);
+                v2.put(8'h22);
+                #1 $display("a=%h b=%h", a.d, b.d);
+            end
+        endmodule
+    )");
+    CHECK(out == "a=11 b=22\n");
+}
+
+// An event member is woken through its own object's intrusive list, not through
+// the member's signal wait buckets, and the object lives in the instance the handle
+// names. Waiting on it has to park on that object -- parking on the vif waiter list
+// instead never woke at all, because `-> vif.e` fires the object.
+TEST_CASE("virtual interface: waiting on an event member through a handle") {
+    const std::string out = run_capture(R"(
+        interface ibus; event e; endinterface
+        module top;
+            ibus a(), b();
+            virtual ibus v1, v2;
+            initial begin
+                v1 = a; v2 = b;
+                fork begin @(v2.e); $display("b at %0t", $time); end join_none
+                #1 -> v1.e;
+                #1 -> v2.e;
+                #1 $display("done");
+            end
+        endmodule
+    )");
+    // Only b's event wakes it, at 2 -- not a's at 1.
+    CHECK(out == "b at 2\ndone\n");
+}
+
+// The run-time null report names what was actually null. A virtual interface is
+// bound to an elaborated instance, not constructed with `new`, so the class-handle
+// wording would misdirect.
+TEST_CASE("virtual interface: a null handle reports as an interface, not a class") {
+    const test::DesignRun run = test::run_design_captured(R"(
+        interface ibus; logic [7:0] d; endinterface
+        module top;
+            ibus a();
+            virtual ibus v;
+            initial begin v = a; v = null; $display("before"); v.d = 8'h1; end
+        endmodule
+    )");
+    CHECK(run.err.find("use of a null virtual interface") != std::string::npos);
+    CHECK(run.err.find("names no interface instance") != std::string::npos);
+    CHECK(run.err.find("(LRM 25.9)") != std::string::npos);
+    CHECK(run.err.find("class handle") == std::string::npos);
     CHECK(run.out == "before\n");
 }

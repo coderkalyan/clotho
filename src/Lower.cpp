@@ -1217,6 +1217,96 @@ public:
         scope_stack_.pop_back();
     }
 
+    // Every signal of one interface instance that a handle can reach, including
+    // those declared inside a generate block of the interface body. A generate
+    // block is not a separate instance -- its signals are fields of this
+    // instance's own state struct, on this instance's anchor -- so a handle
+    // reaches them exactly like a top-level member. A nested interface INSTANCE is
+    // not walked: it owns a separate state struct and a separate context record,
+    // which this handle's record says nothing about (see vif_member_signal).
+    void collect_iface_members(const slang::ast::Scope& scope, VifInstance& rec, bool top_level) {
+        for (const slang::ast::Symbol& s : scope.members()) {
+            if (const auto* vs = s.as_if<slang::ast::ValueSymbol>()) {
+                if (const auto it = sigmap_.find(vs); it != sigmap_.end()) {
+                    rec.syms.emplace(vs, it->second);
+                    if (top_level) {
+                        rec.members.emplace(std::string(vs->name), it->second);
+                    }
+                }
+                continue;
+            }
+            if (s.kind == SymbolKind::InstanceBody || s.kind == SymbolKind::Instance) {
+                continue;
+            }
+            if (const auto* child = s.as_if<slang::ast::Scope>()) {
+                collect_iface_members(*child, rec, /*top_level=*/false);
+            }
+        }
+    }
+
+    // The position of `m` inside its interface body, as the chain of member
+    // ordinals from the body down. Two instances of one definition with equal
+    // parameter values elaborate identically -- that is exactly what
+    // `InstanceBodySymbol::hasSameType` asserts -- so the same chain reaches the
+    // corresponding member of any of them. Used instead of a rendered path name
+    // because a generate block's naming is clotho's own, not slang's.
+    static std::vector<uint32_t> member_ordinal_path(const slang::ast::Symbol& m,
+                                                     const slang::ast::Scope&  body) {
+        std::vector<uint32_t>     rev;
+        const slang::ast::Symbol* cur = &m;
+        while (true) {
+            const slang::ast::Scope* parent = cur->getParentScope();
+            if (parent == nullptr) {
+                return {};
+            }
+            uint32_t ord   = 0;
+            bool     found = false;
+            for (const slang::ast::Symbol& s : parent->members()) {
+                if (&s == cur) {
+                    found = true;
+                    break;
+                }
+                ++ord;
+            }
+            if (!found) {
+                return {};
+            }
+            rev.push_back(ord);
+            if (parent == &body) {
+                std::reverse(rev.begin(), rev.end());
+                return rev;
+            }
+            cur = &parent->asSymbol();
+        }
+    }
+
+    // Walk an ordinal path from `body` to the symbol it names, or null.
+    static const slang::ast::Symbol* symbol_at_path(const slang::ast::Scope&     body,
+                                                    const std::vector<uint32_t>& path) {
+        const slang::ast::Scope* scope = &body;
+        for (size_t k = 0; k < path.size(); ++k) {
+            uint32_t                  ord = 0;
+            const slang::ast::Symbol* hit = nullptr;
+            for (const slang::ast::Symbol& s : scope->members()) {
+                if (ord++ == path[k]) {
+                    hit = &s;
+                    break;
+                }
+            }
+            if (hit == nullptr) {
+                return nullptr;
+            }
+            if (k + 1 == path.size()) {
+                return hit;
+            }
+            scope = hit->as_if<slang::ast::Scope>();
+            if (scope == nullptr) {
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
+
     // Record an elaborated interface instance so a virtual interface handle can
     // name it (see VifDefs). Its members are captured by name from this Lowerer's
     // sigmap_, which the Collect walk above has just filled -- a later Lowerer
@@ -1226,12 +1316,7 @@ public:
         VifInstance rec;
         rec.body  = &body;
         rec.scope = scope;
-        for (const auto& vs : body.membersOfType<slang::ast::ValueSymbol>()) {
-            if (const auto it = sigmap_.find(&vs); it != sigmap_.end()) {
-                rec.members.emplace(std::string(vs.name), it->second);
-                rec.syms.emplace(&vs, it->second);
-            }
-        }
+        collect_iface_members(body, rec, /*top_level=*/true);
         // A clocking block's storage is not a body member: its event and its
         // clockvars live in the block's own scope. collect_clocking_block has
         // already created all of it (the Collect walk above), and every piece is a
@@ -1257,10 +1342,21 @@ public:
     // The representative's record for a clockvar reached through a handle, or
     // nullopt when no instance of the interface exists (the caller then emits the
     // null-handle fatal, as for any other member).
-    std::optional<VifClockVar> vif_clockvar(const slang::ast::ClockVarSymbol& cv, std::string_view what) {
+    std::optional<VifClockVar> vif_clockvar(const slang::ast::ClockVarSymbol&     cv,
+                                            const slang::ast::InstanceBodySymbol* named,
+                                            std::string_view                      what) {
         const auto& cb = cv.getParentScope()->asSymbol().as<slang::ast::ClockingBlockSymbol>();
         const auto& placeholder =
           cb.getParentScope()->asSymbol().as<slang::ast::InstanceBodySymbol>();
+        // Same rule as an ordinary member: the block must belong to the body the
+        // handle's type names, not to an interface instantiated inside it.
+        if (named != nullptr && !named->hasSameType(placeholder)) {
+            fail(std::string(what) + " through a virtual interface is not supported: clocking block '" +
+                 std::string(cb.name) + "' belongs to interface '" +
+                 std::string(placeholder.getDefinition().name) + "' instantiated inside '" +
+                 std::string(named->getDefinition().name) +
+                 "', a separate instance the handle does not name");
+        }
         const std::string key = std::string(cb.name) + "." + std::string(cv.name);
         for (const VifInstance& inst : vif_defs_->insts) {
             if (!inst.body->hasSameType(placeholder)) {
@@ -1311,11 +1407,24 @@ public:
              "' is not supported: it is not an elaborated interface instance");
     }
 
+    // The interface body a virtual interface handle's TYPE names (LRM 25.9): the
+    // placeholder instance slang caches per (definition, parameter values). Null
+    // when the expression is not a handle, which no caller here allows.
+    static const slang::ast::InstanceBodySymbol* vif_named_body(const Expression& handle) {
+        const slang::ast::Type& t = handle.type->getCanonicalType();
+        if (!t.isVirtualInterface()) {
+            return nullptr;
+        }
+        return &t.as<slang::ast::VirtualInterfaceType>().iface.body;
+    }
+
     // The representative signal for a member reached through a virtual interface:
     // some real instance's copy of it. Every instance of one definition lays its
     // members out identically, so which one is picked does not matter -- it only
-    // has to be a member of a definition the handle's type admits.
-    std::optional<ir::Signal> vif_member_signal(const slang::ast::Symbol& member, std::string_view what) {
+    // has to be a member of the body the handle's type names, which `named` is.
+    std::optional<ir::Signal> vif_member_signal(const slang::ast::Symbol&             member,
+                                                const slang::ast::InstanceBodySymbol* named,
+                                                std::string_view                      what) {
         const slang::ast::Symbol* m = &member;
         if (const auto* mp = m->as_if<slang::ast::ModportPortSymbol>()) {
             // A modport-qualified handle resolves to the modport's port symbol;
@@ -1331,7 +1440,7 @@ public:
             // scope. An output-only clockvar has none -- slang rejects reading one
             // (ClockVarOutputRead), so reaching here with a zero signal would be a
             // write, which routes through the drive path instead.
-            const std::optional<VifClockVar> rec = vif_clockvar(*cv, what);
+            const std::optional<VifClockVar> rec = vif_clockvar(*cv, named, what);
             if (!rec) {
                 return std::nullopt;
             }
@@ -1349,13 +1458,45 @@ public:
             fail("internal: virtual interface member outside an interface body");
         }
         const auto& placeholder = owner->asSymbol().as<slang::ast::InstanceBodySymbol>();
+        // The body the member lives in must be the body the HANDLE'S TYPE names.
+        // `vif.i.d`, where `i` is an interface instantiated inside the interface,
+        // reaches a nested instance: a separate state struct with a separate
+        // context record, which this handle's record does not describe. Matching it
+        // against the registry by type alone would resolve the nested instance's
+        // own signal and then read it off the outer instance's record -- the wrong
+        // layout off the wrong base.
+        //
+        // TODO: a member of an interface instantiated INSIDE the interface a handle
+        // names (LRM 25.9) -- needs the context record to carry its children's
+        // records, so the nested instance's base can be reached from the outer's.
+        if (named != nullptr && !named->hasSameType(placeholder)) {
+            fail(std::string(what) + " through a virtual interface is not supported: it is a member "
+                 "of interface '" + std::string(placeholder.getDefinition().name) +
+                 "' instantiated inside '" + std::string(named->getDefinition().name) +
+                 "', a separate instance the handle does not name");
+        }
+        const std::vector<uint32_t> path = member_ordinal_path(*m, placeholder);
         for (const VifInstance& inst : vif_defs_->insts) {
             if (!inst.body->hasSameType(placeholder)) {
                 continue;
             }
-            if (const auto it = inst.members.find(std::string(m->name)); it != inst.members.end()) {
-                return it->second;
+            // Top-level members resolve by name; anything deeper (a generate block's
+            // signal) by its position, which is identical across instances of one
+            // definition and needs no path rendering.
+            if (path.size() == 1) {
+                if (const auto it = inst.members.find(std::string(m->name)); it != inst.members.end()) {
+                    return it->second;
+                }
+            } else if (!path.empty()) {
+                if (const slang::ast::Symbol* rep = symbol_at_path(*inst.body, path)) {
+                    if (const auto* vs = rep->as_if<slang::ast::ValueSymbol>()) {
+                        if (const auto it = inst.syms.find(vs); it != inst.syms.end()) {
+                            return it->second;
+                        }
+                    }
+                }
             }
+            break;
         }
         // No elaborated instance of this interface exists anywhere in the design.
         // Nothing can ever be assigned to the handle, so it is null for the whole
@@ -7073,7 +7214,15 @@ private:
                 if (ev.iffCondition != nullptr) {
                     iff = ev.iffCondition;
                 }
+                // An EVENT member reached through a handle is excluded here on
+                // purpose: an event is woken through its own object's intrusive
+                // list, not through the member's signal wait buckets, and the
+                // object lives in the instance the handle names. Falling through to
+                // the handle path below parks on exactly that object -- the same
+                // mechanism `@(ev[i])` uses. Parking it on the vif waiter list
+                // instead would never wake: `-> vif.e` fires the object.
                 if (wait_builder_ != nullptr && ev.expr.kind == ExpressionKind::MemberAccess &&
+                    !ev.expr.type->isEvent() &&
                     ev.expr.as<MemberAccessExpression>().value().type->getCanonicalType().isVirtualInterface()) {
                     // `@(edge vif.sig)` (LRM 25.9): park on the member of whichever
                     // instance the handle names right now. The handle is evaluated
@@ -7081,7 +7230,8 @@ private:
                     // event array element's is.
                     const auto&                     ma = ev.expr.as<MemberAccessExpression>();
                     const std::optional<ir::Signal> rep =
-                      vif_member_signal(ma.member, "'" + std::string(ma.member.name) + "'");
+                      vif_member_signal(ma.member, vif_named_body(ma.value()),
+                                        "'" + std::string(ma.member.name) + "'");
                     const ir::Index inst = lower_expr(ma.value(), *wait_builder_);
                     if (!rep) {
                         // Null for the whole run: waiting on it blocks forever, which
@@ -7410,7 +7560,8 @@ private:
             std::vector<ir::WaitEdge> edges;
             for (const MemberAccessExpression* ma : vif_member_reads(ev.expr)) {
                 const std::optional<ir::Signal> rep =
-                  vif_member_signal(ma->member, "'" + std::string(ma->member.name) + "'");
+                  vif_member_signal(ma->member, vif_named_body(ma->value()),
+                                    "'" + std::string(ma->member.name) + "'");
                 const ir::Index inst = lower_expr(ma->value(), b);
                 if (rep) {
                     edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
@@ -7459,7 +7610,7 @@ private:
             fail("a cycle delay on a synchronous drive is not supported");
         }
         const std::optional<VifClockVar> rec =
-          vif_clockvar(cv, "'" + std::string(cv.name) + "'");
+          vif_clockvar(cv, vif_named_body(ma.value()), "'" + std::string(cv.name) + "'");
         const ir::SourceLoc l = loc(a);
         if (!rec) {
             (void)vif_null_place(*ma.type, b, l);
@@ -13854,7 +14005,8 @@ private:
             }
             for (const MemberAccessExpression* ma : vif_reads) {
                 const std::optional<ir::Signal> rep =
-                  vif_member_signal(ma->member, "'" + std::string(ma->member.name) + "'");
+                  vif_member_signal(ma->member, vif_named_body(ma->value()),
+                                    "'" + std::string(ma->member.name) + "'");
                 const ir::Index inst = lower_expr(ma->value(), b);
                 if (rep) {
                     edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
@@ -21235,7 +21387,8 @@ private:
             // definition's state that member sits.
             const ir::Index                 handle = lower_expr(ma.value(), b);
             const std::optional<ir::Signal> rep =
-              vif_member_signal(ma.member, "'" + std::string(ma.member.name) + "'");
+              vif_member_signal(ma.member, vif_named_body(ma.value()),
+                                "'" + std::string(ma.member.name) + "'");
             if (!rep) {
                 return vif_null_place(*ma.type, b, l);
             }
