@@ -4,9 +4,12 @@ Target: the two built-in synchronization classes slang synthesizes into the `std
 package — `semaphore` (`new`, `put`, `get`, `try_get`) and `mailbox #(T)` (`new`,
 `num`, `put`, `try_put`, `get`, `try_get`, `peek`, `try_peek`).
 
-Status: **scoping. Nothing is implemented.** Both are refused type-level, by class
-name, at one site (`src/Lower.cpp:2565-2571`), so a bare `semaphore s;` declaration
-fails before any method is reached (`tests/class_test.cpp:1229`).
+Status: **landed, in the shape scoped below.** `semaphore` and `mailbox #(T)` are
+implemented end to end (P0-P3 of §13), with 20 cases in `tests/sync_test.cpp`; the
+typeless mailbox (§8, P4) is the one piece still refused, by its own message. The
+two claims this document got wrong before it was implemented are marked **measured
+correction** where they appear (§6.2, and the `require_head` split in §6.2's third
+bullet); everything else was built as written.
 
 This document is written after `process` (LRM 9.7) landed, and it deliberately
 copies that document's shape. The conclusion, however, is the opposite one: where
@@ -466,17 +469,25 @@ peek(d):           if (size > 0) goto copy                        ; NO queue tes
 Three details that are decisions, not mechanics:
 
 - **The destination is an ordinary assignment target, not a `ref` formal.** The
-  message is materialized into the canonical element-shaped temp the existing pop
-  path already uses (a pop *relocates* the element, so for an aggregate or nested
-  container the temp is body-lifetime, `queue-nba-and-nonpod.md:134-137`), and the
-  frontend then emits the ordinary store to the actual's lvalue. This sidesteps the
-  ref ABI entirely — including its one refusal, `"ref argument actual must be a
-  whole variable, element, member or class property, not a bit or part select"` — so
-  `m.get(v[3:0])` works, which LRM 15.4.5's "valid left-hand expression" wants.
+  message crosses as the element-shaped value the existing pop path produces (a pop
+  *relocates* the element, so for an aggregate or nested container that storage is
+  body-lifetime, `queue-nba-and-nonpod.md:134-137`), and the frontend then emits
+  the copy verb the element type calls for — a plane or string stores, a nested
+  container deep-copies through its own runtime verb, an aggregate goes leaf-wise.
+  This sidesteps the ref ABI entirely. **Measured correction to an earlier draft of
+  this section:** it does NOT buy a bit-select destination, because slang rejects a
+  bit or part select as a `ref` actual itself ("invalid expression for pass by
+  reference"), before lowering ever sees it. LRM 15.4.5's "valid left-hand
+  expression" is therefore narrower in practice than it reads.
 - **`try_get` / `try_peek` assign only on success**, so the store is emitted on the
-  success edge; the status is the value of the expression.
-- **`peek` unlinks but wakes nobody**: it changed no state. The `WakeAll(peek_head)`
-  on the put side is what discharges 15.4.7's broad-unblock sentence.
+  success edge and the status is the value of the expression.
+- **`peek` unlinks but wakes nobody**: it changed no state. A `put` wakes the peek
+  queue **before** the receive queue's head, so a peeker observes the message the
+  receiver is about to consume — the only order under which 15.4.7's "as long as a
+  message remains ... any process blocked in either a `peek()` or `get()` operation
+  shall become unblocked" is observable at all. A peek waiter is also exempt from
+  the head-of-line test its `get` counterpart takes (`require_head`), since it
+  consumes nothing and so can starve nobody.
 
 ### 6.3 What `SyncWait` does, precisely
 

@@ -1213,31 +1213,18 @@ TEST_CASE("virtual dispatch through a null handle is a located fatal") {
     CHECK(run.err.find("10 |         $display(\"%0d\", b.tag());\n") != std::string::npos);
 }
 
-// `mailbox` (LRM 15.4) and `std::weak_reference` (LRM 8.30) are classes slang
-// synthesizes into the `std` package with signatures but no bodies -- the
-// simulator is expected to supply the semantics. Clotho has no runtime for either,
-// so each is refused in the frontend. Before this guard, `mailbox`
-// reached lower_type's catch-all and said only "unsupported non-integral type".
-//
-// `process` (LRM 9.7) and `semaphore` (LRM 15.3) used to be refused by the same
-// guard and no longer are: each has its own body shape and its own method lowering
-// (tests/process_test.cpp, tests/sync_test.cpp), so the guard is keyed by class
-// name.
+// The `std` package's built-in classes are synthesized by slang with signatures but
+// no bodies -- the simulator supplies the semantics -- so the guard in
+// lower_class_type is keyed by class name and each name is either implemented or
+// refused. `process` (LRM 9.7), `semaphore` (LRM 15.3) and `mailbox #(T)` (LRM
+// 15.4) are implemented (tests/process_test.cpp, tests/sync_test.cpp). What is left
+// is `std::weak_reference` (LRM 8.30), which still has no runtime, and the TYPELESS
+// mailbox (15.4.9), which is refused by its own message because it needs run-time
+// type identity -- covered in tests/sync_test.cpp.
 TEST_CASE("built-in std classes are refused in the frontend") {
     // A declaration is enough: the type lowers before any method is reached.
-    CHECK(fails("module m; mailbox b; initial b = new(); endmodule")
-            .find("the built-in 'mailbox' class is not supported") != std::string::npos);
-    // A specialization and an explicit `std::` qualification are the same type.
-    CHECK(fails("module m; mailbox #(int) b; initial b = new(2); endmodule")
-            .find("the built-in 'mailbox' class is not supported") != std::string::npos);
-    CHECK(fails("module m; std::mailbox b; initial b = new(); endmodule")
-            .find("the built-in 'mailbox' class is not supported") != std::string::npos);
-    // Reached indirectly: as a property of a user class, and as a formal.
-    CHECK(fails("module m; class H; mailbox q; endclass H h; initial h = new; endmodule")
-            .find("the built-in 'mailbox' class is not supported") != std::string::npos);
-    CHECK(fails("module m; task automatic t(mailbox b); endtask"
-                " mailbox g; initial begin g = new(); t(g); end endmodule")
-            .find("the built-in 'mailbox' class is not supported") != std::string::npos);
+    CHECK(fails("module m; std::weak_reference #(int) w; initial w = null; endmodule")
+            .find("not supported") != std::string::npos);
 }
 
 // -- shallow copy, `dst = new src` (LRM 8.12) ---------------------------------
