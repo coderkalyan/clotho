@@ -2928,6 +2928,11 @@ private:
         return nullptr;
     }
 
+    // A class's method NAME -> vtable slot map (LRM 8.20). Declared here, ahead of
+    // compute_vtable and ensure_vtable, because it names ensure_vtable's return type
+    // and a member alias is not visible in a signature above its own declaration.
+    using VtableSlots = ankerl::unordered_dense::map<std::string_view, uint32_t>;
+
     // Assign vtable slots and register the descriptor of a class (LRM 8.16/8.20/8.21).
     // Slots are keyed by method NAME per hierarchy (a base's virtuals take slots
     // 0..k-1; an override — including an implicit one, or the override of a pure
@@ -2940,9 +2945,20 @@ private:
     // signature but is never executed (an abstract class is never `new`'d, so its
     // vtable is never materialized). Called after the base is lowered.
     void compute_vtable(const slang::ast::ClassType& clt, ir::Ref class_ref) {
-        const slang::ast::ClassType* base  = base_class_of(clt);
-        VtableSlots                  slots = base != nullptr ? class_vslot_[base] : VtableSlots{};
-        uint32_t                     size  = static_cast<uint32_t>(slots.size());
+        if (class_vslot_.contains(&clt)) {
+            // Already numbered, by ensure_vtable reaching this class from a virtual
+            // call site before the class's own lower_class_type frame got here. The
+            // numbering is the part that has to happen once; the table below is keyed
+            // off it and was filled by that same earlier call.
+            return;
+        }
+        const slang::ast::ClassType* base = base_class_of(clt);
+        // The base's numbering, which the derived class extends. `ensure_vtable` and
+        // not `class_vslot_[base]`: operator[] INSERTS an empty map for a base that
+        // has not been numbered yet, and the derived class then numbers its own
+        // virtuals from 0, silently aliasing every inherited slot.
+        VtableSlots slots = base != nullptr ? ensure_vtable(*base) : VtableSlots{};
+        uint32_t    size  = static_cast<uint32_t>(slots.size());
         for (const auto& m : clt.membersOfType<slang::ast::SubroutineSymbol>()) {
             if (is_user_virtual(m) && !slots.contains(m.name)) {
                 slots.emplace(m.name, size++);
@@ -3119,12 +3135,44 @@ private:
                                            .ir          = b.finish() });
     }
 
+    // The slot map of `clt`, numbering the class first if nothing has yet.
+    //
+    // A function body is lowered on demand, at its first call, and such a body can
+    // reach a virtual call whose DECLARING class has not been through compute_vtable
+    // yet. A small design never does: every class it mentions is lowered before any
+    // body is. UVM's call graph is deep and mutually referential enough that the
+    // deferred path (`lower_user_call` -> `function_id` -> `build_function` ->
+    // `lower_user_call` -> ...) arrives at a virtual dispatch ahead of the target
+    // class, and the lookup found nothing -- an uncaught std::out_of_range with no
+    // source location, on `uvm_object::get_full_name` in a bare `uvm_pkg` elaboration.
+    //
+    // Numbering on demand mirrors how function_id lowers a callee on demand, and only
+    // the numbering is needed here: the call site wants a slot index, not a filled
+    // table.
+    const VtableSlots& ensure_vtable(const slang::ast::ClassType& clt) {
+        const auto it = class_vslot_.find(&clt);
+        if (it != class_vslot_.end()) {
+            return it->second;
+        }
+        const auto cached = class_type_cache_.find(&clt);
+        if (cached != class_type_cache_.end()) {
+            // Interned but not yet numbered: its own lower_class_type frame is below
+            // us on the stack, still walking properties (lowering a property's type
+            // recurses into bodies). Number it here; compute_vtable is idempotent, so
+            // that frame's own call becomes a no-op.
+            compute_vtable(clt, cached->second);
+        } else {
+            lower_class_type(clt);
+        }
+        return class_vslot_.at(&clt);
+    }
+
     // The vtable slot of virtual method `sub` (LRM 8.20), looked up by name in the
     // slot map of its declaring class (walk out to the enclosing ClassType — a pure
     // method's degenerate subroutine nests under its prototype scope). The slot is
     // identical across the hierarchy, so any class containing the name works.
     uint32_t virtual_slot_of(const slang::ast::SubroutineSymbol& sub) {
-        return class_vslot_.at(&declaring_class(sub)).at(sub.name);
+        return ensure_vtable(declaring_class(sub)).at(sub.name);
     }
 
     // The class scope that declares method `sub` (walk out past a pure method's
@@ -23202,7 +23250,7 @@ private:
         const ir::Ref        class_ref = lower_type(*cc.type);
         const ir::Index      src       = lower_expr(cc.sourceExpr(), b);
         const ir::FunctionId sig       = copy_thunk_id(clt, class_ref);
-        const uint32_t       slot      = class_vslot_.at(&clt).at(kCopySlot);
+        const uint32_t       slot      = ensure_vtable(clt).at(kCopySlot);
         return b.call_virtual(sig, slot, class_ref, std::array<ir::Index, 1>{ src }, l);
     }
 
@@ -23454,7 +23502,7 @@ private:
         const ir::Index handle = b.unary(ir::Inst::Tag::Load, lv, l);
         b.open_region();
         const std::array<ir::Index, 2> args{ handle, b.constant(module_.pool.put_int(u64, ~0ull), l) };
-        b.call_virtual(randomize_fn_.at(&pointee), class_vslot_.at(&pointee).at(kRandomizeSlot), ref, args, l);
+        b.call_virtual(randomize_fn_.at(&pointee), ensure_vtable(pointee).at(kRandomizeSlot), ref, args, l);
         const ir::ExtraSlice then_region = b.close_region();
         b.open_region();
         const ir::ExtraSlice else_region = b.close_region();
@@ -24654,7 +24702,6 @@ private:
     // MethodPrototypeSymbol) shares a slot with its concrete overrides. pure_stub_:
     // a pure prototype -> the FunctionId of its never-executed signature stub. Both
     // filled by compute_vtable / pure_stub_id.
-    using VtableSlots = ankerl::unordered_dense::map<std::string_view, uint32_t>;
     ankerl::unordered_dense::map<const slang::ast::ClassType*, VtableSlots>                class_vslot_;
     ankerl::unordered_dense::map<const slang::ast::MethodPrototypeSymbol*, ir::FunctionId> pure_stub_;
     // The reserved vtable slot name of a class's shallow-copy thunk (LRM 8.12). Not

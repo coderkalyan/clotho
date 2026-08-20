@@ -1916,3 +1916,40 @@ TEST_CASE("class layout: a base property holding a handle to its own derived cla
     )";
     CHECK(run_capture(src) == "3 30 37 7\n");
 }
+
+// A function body is lowered on demand, at its first call, and such a body can reach
+// a virtual call whose DECLARING class has not been numbered yet. Here Base's first
+// property is a handle to Helper, so lowering it runs Helper's compute_vtable, which
+// builds `poke` -- and `poke` virtual-calls `tag` on Base, which is still mid-layout
+// below on the stack and has no slot map at all. The lookup was an unguarded `.at()`
+// and threw std::out_of_range with no source location; a bare `uvm_pkg` elaboration
+// aborted this way on `uvm_object::get_full_name`. The slot numbering is now done on
+// demand, like function_id lowers a callee on demand.
+//
+// `d.tag()` and `hp.poke(d)` both have to reach the derived override: the numbering
+// this produces has to agree with the one Base's own frame would have produced, not
+// merely exist.
+TEST_CASE("class vtable: a virtual call reached before its class is numbered") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef class Helper;
+            class Base;
+                Helper h;
+                virtual function int tag(); return 1; endfunction
+            endclass
+            class Helper;
+                virtual function int poke(Base b); return b.tag(); endfunction
+            endclass
+            class Derived extends Base;
+                virtual function int tag(); return 2; endfunction
+            endclass
+            initial begin
+                static Base    b  = new;
+                static Derived d  = new;
+                static Helper  hp = new;
+                $display("%0d %0d %0d", b.tag(), d.tag(), hp.poke(d));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 2\n");
+}
