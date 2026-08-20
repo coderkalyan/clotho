@@ -23025,10 +23025,66 @@ private:
             case Inst::Tag::TaskCallVirtual:
             case Inst::Tag::Fork:
             case Inst::Tag::ExpectWait:
+            case Inst::Tag::ProcWait:
                 return true;
             default:
                 return false;
         }
+    }
+
+    // Whether an abort has landed on this activation while it was parked: a
+    // `kill` / `disable fork` on its thread, or a remote `disable` of a block or
+    // task activation it is inside. Null when the design uses neither feature, so
+    // the caller emits no test at all.
+    //
+    // The polls this duplicates (emit_proc_abort_poll, emit_disable_poll,
+    // emit_task_abort_poll) are emitted by lower_region AFTER the whole
+    // instruction, which is enough for a park that is one instruction. It is not
+    // enough for an op whose own lowering is a RETRY LOOP -- `await`, `wait fork`
+    // -- because the loop re-parks without ever reaching the end of the
+    // instruction: the force-wake would be answered by a fresh park and the thread
+    // would never abort. Such a loop tests this on resume and leaves the loop, and
+    // the poll then takes the real exit.
+    llvm::Value* emit_abort_pending() {
+        llvm::Value* any = nullptr;
+        const auto   fold = [&](llvm::Value* bit) {
+            any = any == nullptr ? bit : b_.CreateOr(any, bit);
+        };
+        if (design_uses_process_ && pcb_ != nullptr) {
+            llvm::Value* ctl = b_.CreateLoad(b_.getInt32Ty(), pcb_field(pcb_, kPcbCtl));
+            fold(b_.CreateICmpNE(b_.CreateAnd(ctl, b_.getInt32(kProcAbort)), b_.getInt32(0)));
+        }
+        if (design_uses_disable_) {
+            const auto node_abort = [&](llvm::Value* node) {
+                llvm::Value* mark = b_.CreateLoad(
+                  b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), node, 5));
+                fold(b_.CreateICmpNE(mark, b_.getInt32(0)));
+            };
+            if (disable_node_ != nullptr) {
+                node_abort(disable_node_);
+            }
+            for (const OpenNamedBlock& blk : block_targets_) {
+                if (blk.remote != kNoDisableTarget) {
+                    node_abort(blk.node);
+                }
+            }
+        }
+        return any;
+    }
+
+    // On resume inside a retry-loop park: if an abort has landed, branch to `leave`
+    // -- the loop's own exit block -- so the instruction ends and lower_region's
+    // poll can take the activation's real abort exit. Emits nothing in a design
+    // with neither `kill` nor a remote `disable`.
+    void emit_wait_abort_exit(llvm::BasicBlock* leave) {
+        llvm::Value* pend = emit_abort_pending();
+        if (pend == nullptr) {
+            return;
+        }
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* cont = llvm::BasicBlock::Create(ctx_, "proc.wait.alive", fn);
+        b_.CreateCondBr(pend, leave, cont);
+        b_.SetInsertPoint(cont);
     }
 
     // -- Process control (the `process` class, LRM 9.7) --
@@ -23653,6 +23709,10 @@ private:
         b_.CreateStore(b_.getInt32(0), sched_ptr_);
         emit_suspend_raw("waitfork.resume");
         emit_proc_unlink_node(node);
+        // Killed while parked (LRM 9.7): leave the barrier now. Re-testing instead
+        // would re-park on a still-live child list and the force-wake would be lost;
+        // lower_region's poll, right after this instruction, takes the real exit.
+        emit_wait_abort_exit(done);
         b_.CreateBr(test);
 
         b_.SetInsertPoint(done);
@@ -23810,6 +23870,9 @@ private:
         // not unlink, which is what keeps a multi-waiter list correct without a
         // compaction pass.
         emit_proc_unlink_node(node);
+        // Killed while awaiting: same reasoning as `wait fork` -- the target has not
+        // completed, so a re-test would re-park and the abort would never be seen.
+        emit_wait_abort_exit(done);
         b_.CreateBr(test);
 
         b_.SetInsertPoint(done);

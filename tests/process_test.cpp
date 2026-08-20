@@ -430,6 +430,38 @@ TEST_CASE("process: await returns when the target is killed") {
     CHECK(out == "await returned at 20 status=4\n");
 }
 
+// LRM-pinned (9.7: a killed process "shall be terminated"; Verilator cannot score
+// kill-an-awaiter -- its await is a plain join barrier). The regression this
+// guards: `await` is a RETRY LOOP inside one instruction, so the abort poll
+// lower_region emits after the instruction is never reached while the loop is
+// parked. The killed awaiter was force-woken, unlinked, re-tested, re-parked -- and
+// then ran its continuation when the target finished, minutes of simulated time
+// after it was killed. It must never run again.
+TEST_CASE("process: killing a thread parked in await terminates it") {
+    const std::string out = run_capture(R"(
+        module t;
+          process aw, tg;
+          int n = 0;
+          initial begin
+            fork
+              begin tg = process::self(); #50; end
+            join_none
+            fork
+              begin
+                aw = process::self();
+                tg.await();
+                n  = 1;
+                $display("killed awaiter ran at %0t", $time);
+              end
+            join_none
+            #10 aw.kill();
+            #60 $display("t=%0t n=%0d aw=%0d tg=%0d", $time, n, aw.status(), tg.status());
+          end
+        endmodule
+    )");
+    CHECK(out == "t=70 n=0 aw=4 tg=0\n");
+}
+
 // -- process::suspend() / resume() (LRM 9.7) -----------------------------------
 
 // LRM-pinned: Verilator 5.050 refuses `suspend()` outright ($error), so it is no
@@ -531,6 +563,34 @@ TEST_CASE("process: wait fork with nothing forked returns at once") {
         endmodule
     )");
     CHECK(out == "t=7\n");
+}
+
+// The same retry-loop hazard as the killed awaiter, on the other loop: `wait fork`
+// re-tests `first_child == null` after every wake. Killing the waiter also kills its
+// descendant, so the child list DOES go empty -- which is exactly what made this
+// silent: the barrier was satisfied, the loop exited, and the killed thread ran its
+// continuation. LRM 9.7 says it is terminated. LRM-pinned.
+TEST_CASE("process: killing a thread parked in wait fork terminates it") {
+    const std::string out = run_capture(R"(
+        module t;
+          process w;
+          int n = 0;
+          initial begin
+            fork
+              begin
+                w = process::self();
+                fork begin #50; end join_none
+                wait fork;
+                n = 1;
+                $display("killed waiter ran at %0t", $time);
+              end
+            join_none
+            #10 w.kill();
+            #60 $display("t=%0t n=%0d w=%0d", $time, n, w.status());
+          end
+        endmodule
+    )");
+    CHECK(out == "t=70 n=0 w=4\n");
 }
 
 // `wait fork` stays refused inside an assertion action block, and for an identity
