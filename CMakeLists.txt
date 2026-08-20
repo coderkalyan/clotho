@@ -283,6 +283,7 @@ endif()
 # timing wheel is part of this surface: the runtime exposes it behind a C ABI.
 add_library(clotho_runtime STATIC
   src/runtime/Runtime.cpp
+  src/runtime/Gc.cpp
   src/runtime/Svdpi.cpp
   src/Wheel.cpp
 )
@@ -577,6 +578,7 @@ add_executable(clotho_test
   tests/array_ordering_test.cpp
   tests/array_locator_test.cpp
   tests/class_test.cpp
+  tests/gc_test.cpp
   tests/unbased_test.cpp
   tests/preprocess_test.cpp
   tests/interface_test.cpp

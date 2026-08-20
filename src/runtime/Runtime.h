@@ -925,6 +925,25 @@ enum {
     rt_elem_event     = 6, // one event handle; init binds a NEW object (Table 6-7)
 };
 
+// The four trailing fields are the GC's (docs/design/garbage-collection.md §3.3).
+// They are APPENDED, so every existing field keeps its offset and the backend's
+// mirror (`elem_ops_ty`, LlvmBackend.cpp) changes in lockstep by growing.
+//
+// `nhandles` / `handles` describe the class-handle words inside ONE element image,
+// by byte offset: a bare class-handle element is `nhandles == 1` at offset 0, an
+// aggregate element lists the handles reachable without leaving its image, and a
+// nested container element lists none (its handles are found by recursing through
+// `inner`).
+//
+// `nkeyhandles` / `keyhandles` do the same for an associative array's normalized
+// KEY bytes, and exist because a key is a strong reference the collector has to
+// decode: `m[obj] = 1` keeps `obj` alive and `m.first(k)` hands the handle back, so
+// the key bytes are the only copy of it. An offset LIST rather than a flag, because
+// an aggregate key is serialized leaf by leaf with no padding (assoc-keys.md §2), so
+// a handle can sit at any offset and a struct can carry several. A bare class-handle
+// key is the one-entry case, `nkeyhandles == 1` at offset 0. Each listed offset
+// names 8 big-endian bytes -- a handle is unsigned, so there is no sign flip to
+// undo (emit_key_bytes).
 struct rt_elem_ops {
     uint32_t            kind;
     uint32_t            nleaves; // rt_elem_aggregate only
@@ -932,7 +951,20 @@ struct rt_elem_ops {
     const void*         proto;   // power-on byte image, `stride` bytes
     const rt_elem_ops*  inner;   // rt_elem_dynarr / rt_elem_queue / rt_elem_assoc only
     const rt_elem_leaf* leaves;  // rt_elem_aggregate only
+    uint32_t            nhandles;
+    uint32_t            nkeyhandles; // rt_elem_assoc only
+    const uint32_t*     handles;
+    const uint32_t*     keyhandles;  // rt_elem_assoc only
 };
+
+// Visit every live element image of an associative array, in unspecified order,
+// passing the normalized key bytes alongside. Exported for exactly one caller --
+// the collector's precise walk -- because the map itself (an unordered_dense of
+// per-entry SlotVec blocks, Runtime.cpp:2093-2110) is internal to Runtime.cpp and
+// its payloads relocate on rehash, so no external code can iterate it by address.
+void rt_assoc_visit(const struct rt_assoc* h,
+                    void (*visit)(void* elem, const uint8_t* key, uint32_t klen, void* ctx),
+                    void* ctx);
 
 // -- The relocation epoch --
 //

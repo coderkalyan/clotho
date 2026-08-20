@@ -2353,6 +2353,47 @@ extern "C" uint64_t rt_assoc_num(rt_assoc* h) {
     return m == nullptr ? 0 : static_cast<uint64_t>(m->entries.size());
 }
 
+// The collector's precise walk over an associative array (Runtime.h:934-941). The
+// only export of the map's interior, and deliberately the narrowest one that works:
+// the entries live in an unordered_dense whose per-entry SlotVec payloads relocate
+// on rehash, so an address handed out now is not an address later and no external
+// code can iterate the map by address.
+//
+// Read-only by contract. The visitor marks; it must not insert, erase or resize,
+// which would invalidate the iterator this loop holds -- so the entry count is
+// captured before the walk and asserted unchanged after it.
+extern "C" void rt_assoc_visit(const rt_assoc* h,
+                               void (*visit)(void* elem, const uint8_t* key, uint32_t klen,
+                                             void* ctx),
+                               void* ctx) {
+    assert(h != nullptr && "a visit needs an initialized associative-array handle");
+    assert(visit != nullptr && "a visit needs a visitor");
+    AssocMap* m = assoc_impl(const_cast<rt_assoc*>(h));
+    if (m == nullptr) {
+        // A null impl IS the empty array -- no map is allocated until the first
+        // entry-creating put or default_ptr, and every reader spells that out the
+        // same way (rt_assoc_num, :2351-2354; rt_assoc_get_ptr, :2228-2232).
+        return;
+    }
+    [[maybe_unused]] const size_t entries_before = m->entries.size();
+    for (auto& kv : m->entries) {
+        assert(kv.second.data() != nullptr && "a live entry owns its element slot");
+        visit(kv.second.data(), reinterpret_cast<const uint8_t*>(kv.first.data()),
+              static_cast<uint32_t>(kv.first.size()), ctx);
+    }
+    // The pattern default (LRM 7.9.11) is a live element image with no key: a read of
+    // ANY absent index yields it, so a class handle inside it is a strong reference
+    // just as an entry's is (docs/design/garbage-collection.md §9). A null `key` is
+    // the unambiguous marker for it -- std::string::data() never returns null, not
+    // even for the empty string a[""] legitimately produces, so no real entry can
+    // present one.
+    if (m->has_default) {
+        assert(m->default_slot.data() != nullptr && "a present default owns its slot");
+        visit(m->default_slot.data(), nullptr, 0, ctx);
+    }
+    assert(m->entries.size() == entries_before && "a visitor mutated the map");
+}
+
 extern "C" int rt_assoc_first(rt_assoc* h, const uint8_t** out_ptr, uint32_t* out_len) {
     AssocMap* m = assoc_impl(h);
     if (m == nullptr || m->entries.empty()) {

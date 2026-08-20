@@ -475,6 +475,13 @@ V1 leaks. Correct-but-unbounded. The two real options later:
 
 Neither is needed for a base; both are gated behind a note here and in TODO.md.
 
+**Scoped out (2026-08).** `docs/design/garbage-collection.md` picks the tracing
+option and rejects ref-counting on the cycle argument above: an Immix mark-region
+heap, generational in place, precisely traced through the class descriptor, with
+conservative pinned coroutine-frame roots, collecting at the scheduler's region
+boundaries. Evacuation and multiple mutators are policy and phasing questions
+there, not architecture. Read it before touching anything in this section.
+
 ## 7a. Shallow copy (LRM 8.12)
 
 `dst = new src` allocates a second object and copies `src`'s properties into it.

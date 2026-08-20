@@ -324,9 +324,24 @@ professional parity; M5 makes it complete.
   A capture of an enclosing task frame is refused for the detaching kinds (the ref
   ABI needs the frame to outlive the child) — lifts with V4.
   Design: docs/design/fork-join.md §"V2 scope".
-- [ ] **`fork` inside a function** — slang rejects a timing control in a function
-  outright, so only `fork … join_none` can reach `lower_fork` there; it is refused by
-  name on the non-task context.
+- [ ] **`fork … join_none` inside a function** (LRM 13.4.4) — **SCOPED, NOT
+  IMPLEMENTED: docs/design/fork-join.md §"V5 scope".** LRM 13.4.4 requires it
+  ("fork-join_none constructs shall be allowed inside a function", and the children
+  may hold anything a task may); `join` / `join_any` there are illegal SV and slang
+  rejects them itself, so only `join_none` reaches `lower_fork`, where the non-task
+  `fn_ctx_` check refuses it by name. The spawn path needs nothing a function lacks
+  — `state` and `rng` are parameters, the wheel is the `clotho.wheel` global, the
+  record is heap and refcounted, the target region is a compile-time bit, and a
+  detaching kind carries no captures. The work is 13.4.4's second paragraph: the
+  caller must be a thread of an `initial` / `always` procedure, so a static-variable
+  initializer, a continuous assignment, a `final` block, a Preponed / Observed /
+  Re-NBA process, a `$strobe` / `$monitor` body and a DPI export must all report —
+  one reverse-reachability set plus a `Process::procedural` bit, since
+  `Activation::Always` covers `always` and `assign` alike. Plus one exclusion:
+  thunk elision is syntactic on the process body and `Call` is not a barrier, so an
+  `always_comb` calling a forking function must lose its thunk (not be refused).
+  A child still cannot read the function's own formals or locals, which is what the
+  LRM's own `watch_for_zero` example does — that lifts with V4's per-spawn copies.
 - [ ] **`fork`-child capture of a local the ref ABI cannot carry** — an unpacked
   array / struct / string / real / queue / class-handle local, or a class property
   reached through the enclosing method's implicit `this`. Each is refused by name;
@@ -1175,11 +1190,15 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   field read/write, handle assignment (reference semantics), `null`, `==`/`!=`
   identity, pass-by-value through the subroutine ABI. A class handle is a 2-state
   64-bit value (like `chandle`); the object body reuses the unpacked-aggregate
-  storage. Lifetime leaks in V1 (LRM 8.4 objects are GC'd — unobservable). See
-  docs/design/classes.md; verified vs iverilog in tests/class_test.cpp.
+  storage. Lifetime: leaked by default (LRM 8.4 objects are GC'd — unobservable);
+  collected under `--gc`, see docs/design/garbage-collection.md and the M4 item
+  below. See docs/design/classes.md; verified vs iverilog in tests/class_test.cpp.
   Deferred within Phase 1, each guarded loud: nonblocking assignment to a class
-  property; class handles as queue / dynamic-array / assoc-array elements;
-  `$display("%p")` of a handle. A property initializer may now CALL a method of its
+  property; `$display("%p")` of a handle. (Class handles as queue /
+  dynamic-array / assoc-array elements were listed here as guarded and are not:
+  all three work. They are refused only under `--gc`, which cannot yet trace
+  through a container — garbage-collection.md §3.3.) A property initializer may
+  now CALL a method of its
   own class (LRM 8.7 runs initializers as part of construction, so `this` is in
   scope; `ctor_this_` carries the object under construction from the `new` site and
   is consulted ahead of the enclosing frame's `this`, which the old code handed to
@@ -1309,6 +1328,30 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 ## M4 — Industrial SystemVerilog + UVM
 
 ### Full object orientation
+
+- [~] **Garbage collection** (LRM 8.4) — objects are collected under `--gc`
+  (default off, so the leak is still the default). Design and phasing:
+  docs/design/garbage-collection.md. Landed: an Immix-shaped mark-region heap
+  (32 KiB blocks / 128 B lines, `src/runtime/Gc.cpp`), a GC word below the
+  descriptor pointer at handle[-1], a per-class trace map and finalizer emitted
+  beside each class descriptor, precise `clotho.gcroots` tables over design state
+  and statics, conservative pinned coroutine-frame roots through an intrusive
+  registry node CoroSplit hoists into the frame, and stop-the-world collection at
+  the drain loop's quiescent edge. Non-moving; the header reserves the forwarding
+  and pin encodings so evacuation stays a policy change. 15 cases in
+  tests/gc_test.cpp (43 cases). P2 landed: the bump-allocation fast path and the
+  frame registry are emitted inline, and allocation is 2x faster than the leaking
+  path. P3 landed: generational in place, sticky mark bits, an inlined write
+  barrier over object remembering, per-line age records, young/full kinds and
+  `--gc-full-every`; 3.3-5.9x over forcing every collection full. P4 landed: class
+  handles inside dynamic arrays, queues, assoc arrays and aggregates are described
+  and rooted, so a UVM-shaped component tree runs collected. Remaining: event
+  handles / `std::mailbox` / `semaphore` / `process` / `std::weak_reference` as
+  those features land; then evacuation and multi-mutator as independent,
+  measurement-gated tracks. Nothing is refused under `--gc` that `--gc=off`
+  accepts: the assoc key-handle table (Runtime.h `nkeyhandles`) closed the last
+  gap, so a key containing a class handle traces too. `--gc` stays off by
+  default.
 
 - [~] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
   landed. Every class carries a descriptor pointer at object-body field 0
@@ -1453,15 +1496,19 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   the `$monitor` ramp in `main` have no calling thread at all and use a
   module-wide state seeded at startup.
 - [ ] **Random stability & seeding, remaining** — `srandom` / `get_randstate` /
-  `set_randstate`. The per-object RNG for class `randomize` has landed (above);
+  `set_randstate`. The per-object RNG for class `randomize` has landed (above), and
   `srandom` on an object with it. What remains is the `process`-side trio, designed
-  with it (docs/design/process-class.md §7.4), and the object-side randstate codec,
-  which shares those two `clotho.str` helpers and is guarded loud until they exist.
+  with it (docs/design/process-class.md §7.4): they need per-thread RNG ownership
+  forced for every PCB-bearing body, since the target of `p.srandom()` is not
+  statically known. The object-side randstate codec shares those two `clotho.str`
+  helpers and is guarded loud until they exist.
 
 ### Concurrency & synchronization
 
 - [ ] **`wait fork`, `disable fork`** — `fork … join_any` / `join_none` are done
-  (LRM 9.3.2, V2); these two still need a per-process live-child set.
+  (LRM 9.3.2, V2); these two still need a per-process live-child set, which
+  docs/design/process-class.md owns (the PCB tree, §5.3 and §8): both fall out of
+  the same structure as `process::kill`, so they land with it rather than before it.
 - [ ] **`std::mailbox` / `std::semaphore`** (parameterized, bounded/unbounded).
   Slang synthesizes both into the `std` package with signatures but no bodies,
   so a real runtime is needed: a key count plus a wait queue for `semaphore`, a
@@ -1469,9 +1516,16 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `lower_class_type` (any class whose parent scope is the `std` package) — a
   `semaphore` used to abort on an out-of-range formal index and a `mailbox` to
   report only "unsupported non-integral type".
-- [ ] **`process` class** — `self`, `status`, `kill`, `await`, `suspend`,
-  `resume`. Same `std`-package guard as above; so is `std::weak_reference`
-  (LRM 8.30).
+- [ ] **`process` class** (LRM 9.7) — `self`, `status`, `kill`, `await`, `suspend`,
+  `resume`, `srandom`, `get_randstate`, `set_randstate`. **Designed in full:
+  docs/design/process-class.md** — one GC-allocated process control block per
+  thread carrying the status word, the activation stack (a claimable park even
+  behind a task call), the `await` waiter list and the descendant tree; `kill` is
+  the landed `disable` abort applied per thread; `suspend`/`resume` are a status
+  word plus a pending-wake bit. Same `std`-package guard as above, narrowed by
+  class name in P0; `std::weak_reference` (LRM 8.30) keeps it. No oracle —
+  iverilog cannot parse the class and Verilator implements no `suspend`, so the
+  verification strategy needs a decision (§14).
 - [~] **Clocking blocks** (LRM 14) — `clocking`/`endclocking` elaborates in a
   module, an interface (so a modport-scoped block comes free) or a program, and
   each block becomes one `ir::Activation::Observed` process that samples every

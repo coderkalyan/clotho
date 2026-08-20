@@ -33,6 +33,7 @@
 
 #include "LlvmBackend.h"
 #include "runtime/Runtime.h"
+#include "runtime/Gc.h"
 #include "runtime/svdpi.h"
 
 #if defined(__MINGW32__)
@@ -271,6 +272,33 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_vcd_close", &rt_vcd_close);
     expose("rt_alloc", &rt_alloc);
     expose("rt_free", &rt_free);
+    // Garbage collection (LRM 8.4; docs/design/garbage-collection.md). Emitted
+    // only under --gc, but exposed unconditionally: the allow-list is a property
+    // of the runtime, not of one design's config.
+    expose("rt_gc_init", &rt_gc_init);
+    expose("rt_gc_shutdown", &rt_gc_shutdown);
+    expose("rt_gc_mutator_current", &rt_gc_mutator_current);
+    expose("rt_gc_alloc", &rt_gc_alloc);
+    // The out-of-line half of the inlined bump-allocation fast path (§4.3).
+    expose("rt_gc_alloc_slow", &rt_gc_alloc_slow);
+    // The write barrier's out-of-line half (§7): generated code tests the owner's
+    // OLD/LOGGED bits inline and names this on the taken edge only.
+    expose("rt_gc_remember", &rt_gc_remember);
+    expose("rt_gc_roots_add", &rt_gc_roots_add);
+    expose("rt_gc_frame_link", &rt_gc_frame_link);
+    expose("rt_gc_frame_unlink", &rt_gc_frame_unlink);
+    // The safepoint's SLOW half only. Generated code polls rt_gc_mutator::request
+    // inline and names this on the taken edge alone (LlvmBackend.cpp
+    // emit_gc_safepoint), so rt_gc_safepoint itself is no longer reachable from a
+    // JIT'd module -- it stays in the ABI for the runtime's own call sites and the
+    // tests, which link against it directly (Gc.h:242-245).
+    expose("rt_gc_safepoint_slow", &rt_gc_safepoint_slow);
+    // Handle-bearing containers (§3.3): a container's payload is malloc'd, so
+    // neither root path finds the handles inside it and the container itself has
+    // to be a root when its storage is one.
+    expose("rt_gc_containers_add", &rt_gc_containers_add);
+    expose("rt_gc_container_add", &rt_gc_container_add);
+    expose("rt_gc_container_remove", &rt_gc_container_remove);
     expose("rt_event_pool_init", &rt_event_pool_init);
     expose("rt_event_new", &rt_event_new);
     expose("rt_event_ptr", &rt_event_ptr);
