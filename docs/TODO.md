@@ -324,9 +324,31 @@ professional parity; M5 makes it complete.
   A capture of an enclosing task frame is refused for the detaching kinds (the ref
   ABI needs the frame to outlive the child) — lifts with V4.
   Design: docs/design/fork-join.md §"V2 scope".
-- [ ] **`fork` inside a function** — slang rejects a timing control in a function
-  outright, so only `fork … join_none` can reach `lower_fork` there; it is refused by
-  name on the non-task context.
+- [x] **`fork … join_none` inside a function** (LRM 13.4.4) — the only kind the LRM
+  allows there ("fork-join_none constructs shall be allowed inside a function", with
+  children holding anything a task may); `join` / `join_any` in a function are
+  illegal SV and slang rejects them itself, so `lower_fork`'s non-task check is now
+  kind-specific. The spawn path needed almost nothing a function lacks — `state`,
+  `rng` and (with process control) the caller's `proc` block are parameters, the
+  wheel is the `clotho.wheel` global, the record is heap and refcounted, the region
+  is a compile-time bit, and a detaching kind carries no captures. One line did need
+  gating: V3 published the heap record into the `coro_begin_`-anchored
+  `fork_live_slot`, which `join_none` never needs (it cannot park, so no abort can
+  intervene) — now `!none`, which also removes two stores from every detached fork
+  in a process-control design. The real work was 13.4.4's second paragraph: the
+  calling thread must belong to an `initial` / `always` procedure, so
+  `check_spawn_roots` (a spawn-reachability fixpoint over the call graph) plus
+  `Process::spawn_root` report a static-variable initializer, a continuous
+  assignment, a `final` block, a Preponed / Observed / Re-NBA process, a `$strobe` /
+  `$monitor` body and a DPI export, each with the fork site and a "called from here"
+  note. All five accepted the spawn silently before, and the `final` one leaked the
+  record and the child frame. `reject_resume_once` now closes over calls as the
+  backend backstop. Children spawned in a function belong to the CALLING thread, so
+  `wait fork` / `disable fork` in the caller reach them (LRM 9.6.3). A child still
+  cannot read the function's own formals or locals — exactly what the LRM's own
+  `watch_for_zero` example does — which lifts with V4's per-spawn copies, and
+  `$time` in a function stays refused for a timescale reason (LRM 20.3.1), not an
+  ABI one. Design: docs/design/fork-join.md §"V5 scope".
 - [ ] **`fork`-child capture of a local the ref ABI cannot carry** — an unpacked
   array / struct / string / real / queue / class-handle local, or a class property
   reached through the enclosing method's implicit `this`. Each is refused by name;
