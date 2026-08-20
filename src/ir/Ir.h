@@ -1676,8 +1676,11 @@ struct Inst {
         // Fork block `fork … join` (payload: extra -> ForkInfo). A statement that
         // spawns each child body as its own coroutine (a fork-child task, whose
         // only formals are the ref captures in ForkInfo::args), then — for `join` —
-        // suspends the parent until all children complete. Only legal inside a
-        // coroutine (process or task). LRM 9.3.2.
+        // suspends the parent until all children complete. `ForkKind::Join` and
+        // `JoinAny` park the parent and are legal only inside a coroutine (a process
+        // or a task); `JoinNone` parks nobody and is legal in a plain FUNCTION body
+        // too, which is what LRM 13.4.4 requires (docs/design/fork-join.md §V5).
+        // LRM 9.3.2.
         Fork,
 
         // -- String ops (operands are string values unless noted) --

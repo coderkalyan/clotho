@@ -3913,6 +3913,11 @@ private:
             params.push_back(int_ty(2 * w)); // must|may
             params.push_back(int_ty(w));     // z
         }
+        if (f.return_type == Ref::Invalid) {
+            std::fprintf(stderr, "DEBUG unbuilt fn id=%u name='%s' nparams=%zu\n",
+                         static_cast<uint32_t>(id), std::string(f.name).c_str(),
+                         f.param_types.size());
+        }
         // A string, aggregate, dynamic-array, or queue result returns through a
         // trailing out-param the caller owns (its call-site temp) — no plane form.
         llvm::Type* rty = fn_return_ty(f.return_type);
@@ -5636,17 +5641,60 @@ private:
         }
     }
 
+    // Whether `ir` holds a `Fork`, or calls something that does. A `Fork` used to
+    // be possible only in a coroutine body, so a syntactic scan of the process was
+    // enough; LRM 13.4.4 allows `fork … join_none` in a plain FUNCTION, so the scan
+    // has to close over calls or a fork reached one call deep goes unseen. The
+    // frontend refuses this with a source location (check_spawn_roots); this is the
+    // independent backstop, so the two are kept in agreement deliberately.
+    bool reaches_fork(const Ir& ir) {
+        const auto holds_fork = [](const Ir& body) {
+            for (uint32_t k = 0; k < body.inst_count(); ++k) {
+                if (body.tag(static_cast<Index>(k)) == Inst::Tag::Fork) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (holds_fork(ir)) {
+            return true;
+        }
+        std::vector<uint8_t>    seen(mod_.function_count(), 0);
+        std::vector<FunctionId> work;
+        collect_callees(ir, work);
+        while (!work.empty()) {
+            const auto f = static_cast<uint32_t>(work.back());
+            work.pop_back();
+            if (f >= seen.size() || seen[f] != 0) {
+                continue;
+            }
+            seen[f]          = 1;
+            const Ir& body   = mod_.function(static_cast<FunctionId>(f)).ir;
+            if (holds_fork(body)) {
+                return true;
+            }
+            collect_callees(body, work);
+        }
+        return false;
+    }
+
     // What a resume-once region process may not contain -- an Observed body
     // (emit_observed_run) or a Re-NBA one (emit_renba_run). Both are run to
     // completion by a single resume at a point where the NBA region has already
     // committed, so neither may suspend, and neither is in the reactive region set
     // that LRM 4.4.2.8 scopes the update region to.
     void reject_resume_once(const Ir& ir, std::string_view region, std::string_view what) {
+        if (reaches_fork(ir)) {
+            // Same reason as the Delay / Wait case below, one call deep: a spawned
+            // child would be pushed onto a ring this region's straight-line run never
+            // drains. LRM 13.4.4 refuses the source shape too (check_spawn_roots).
+            throw BackendError{ "a fork in a " + std::string(region) + "-region process (" +
+                                std::string(what) + ") is not supported" };
+        }
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             switch (ir.tag(static_cast<Index>(k))) {
                 case Inst::Tag::Delay:
                 case Inst::Tag::Wait:
-                case Inst::Tag::Fork:
                     // TODO: a body that suspends needs its region to be a queue that
                     // can be re-entered, not a straight-line run. Resuming it once
                     // would silently truncate the body.
@@ -20512,8 +20560,13 @@ private:
             b_.CreateStore(b_.getInt32(width + 1), b_.CreateStructGEP(rty, rec, 3));
             // Published in a frame slot for the duration of the join, so an abort
             // leaving this body can find the record and stop the children from waking
-            // a handle that no longer exists (emit_fork_record_abandon).
-            if (design_uses_process_) {
+            // a handle that no longer exists (emit_fork_record_abandon). Only for a
+            // kind that PARKS: `join_none` runs straight through, so there is no
+            // suspend between the alloc and the release for an abort to land in, and
+            // it never stores a parent for a surviving child to wake. That also keeps
+            // the slot -- an alloca hoisted to coro.begin -- off the one path a plain
+            // FUNCTION can reach (LRM 13.4.4, docs/design/fork-join.md §V5).
+            if (design_uses_process_ && !none) {
                 b_.CreateStore(rec, fork_live_slot());
             }
         } else {
@@ -20634,7 +20687,7 @@ private:
         // drop our reference — but only for a heap record. A `join` record is a frame
         // slot with no refcount at all, and its children are all done by now.
         if (heap) {
-            if (design_uses_process_) {
+            if (design_uses_process_ && !none) {
                 b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), fork_live_slot());
             }
             emit_fork_record_release(b_, rec);
