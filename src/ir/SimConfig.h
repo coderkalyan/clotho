@@ -92,31 +92,12 @@ enum class Sanitizer : uint32_t {
     return (sanitizers & static_cast<uint32_t>(s)) != 0;
 }
 
-// Garbage collection for class objects (`--gc=off|on|stress`). A class object's
-// lifetime is exactly its reachability: LRM 8.4 gives an object no destructor and
-// no `delete`, so "no handle designates it any more" is the only end of life the
-// language defines, and today's runtime never acts on it -- every `new` leaks
-// until the process exits. See docs/design/garbage-collection.md.
-//
-// This is a mode, not an optimization gate: it changes the emitted code
-// (allocation routed through rt_gc_alloc, root registration, safepoints at the
-// drain-loop quiescent edges), so a `build` artifact and the `run` that executes
-// it must have been given the same mode. The values are stable -- the backend
-// bakes the selected policy into the rt_gc_config it emits for rt_gc_init
-// (src/runtime/Gc.h:158).
-enum class GcMode : uint8_t {
-    // Default: byte-identical to today. No collector code is emitted, class
-    // bodies are allocated and never reclaimed.
-    Off = 0,
-    // Stop-the-world, non-moving mark-region collection, run at a quiescent
-    // scheduler edge once the nursery budget is spent
-    // (garbage-collection.md §6.1).
-    On = 1,
-    // Collect at every safepoint. Not a performance mode: it turns a latent
-    // missing root into a deterministic failure on the first collection instead
-    // of a rare corruption much later (garbage-collection.md §13).
-    Stress = 2,
-};
+// Garbage collection for class objects. A class object's lifetime is exactly its
+// reachability: LRM 8.4 gives an object no destructor and no `delete`, so "no
+// handle designates it any more" is the only end of life the language defines.
+// Reclamation is therefore unobservable, which is why the collector is
+// unconditional and only its cadence is on the CLI. See
+// docs/design/garbage-collection.md.
 
 struct SimulationConfig {
     // Run the coroutine-lowering pipeline (CoroSplit et al.), required to
@@ -227,15 +208,15 @@ struct SimulationConfig {
     // `Sanitizer` bits, tested with sanitizer_on. Zero instruments nothing,
     // which is the default — a sanitizer costs code size and simulation time.
     uint32_t sanitizers = 0;
-    // Collect class objects instead of leaking them (`--gc=off|on|stress`), a
-    // `GcMode`. Off by default: a collector that changed observable behaviour
-    // would be a bug by definition, so it stays opt-in until the whole suite is
-    // byte-identical under all three modes (garbage-collection.md §13).
-    GcMode gc = GcMode::Off;
+    // Collect at every safepoint (`--gc-stress`). Not a performance mode: it
+    // turns a latent missing root into a deterministic failure on the first
+    // collection instead of a rare corruption much later, and it is the
+    // differential partner for the ordinary cadence now that there is no
+    // uncollected mode to compare against (garbage-collection.md §13).
+    bool gc_stress = false;
     // Print a collection summary when the design exits (`--gc-stats`): counts,
     // bytes, and what the soft ceiling did. rt_gc_config::stats
-    // (src/runtime/Gc.h:153). Nothing is printed with `gc == GcMode::Off`,
-    // because nothing collected.
+    // (src/runtime/Gc.h:153).
     bool gc_stats = false;
     // Bytes allocated between collections (`--gc-nursery=<bytes>`): the budget
     // whose exhaustion is what makes a collection due at the next quiescent edge

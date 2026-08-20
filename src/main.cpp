@@ -59,7 +59,6 @@
 
 namespace {
 
-using clotho::ir::GcMode;
 using clotho::ir::Sanitizer;
 using clotho::ir::SimulationConfig;
 using clotho::ir::Stat;
@@ -85,7 +84,7 @@ struct Options {
     std::optional<bool>        o3;
     std::vector<std::string>   stats;
     std::vector<std::string>   sanitizers;
-    std::optional<std::string> gc;
+    std::optional<bool>        gc_stress;
     std::optional<bool>        gc_stats;
     std::optional<uint64_t>    gc_nursery_bytes;
     std::optional<uint64_t>    gc_heap_bytes_max;
@@ -114,23 +113,6 @@ constexpr std::string_view kSanitizeList =
   "bounds";
 #endif
 
-// The `--gc=<mode>` spellings, in one place because two callers must agree on
-// them: the config assembly below, and the bare-`--gc` rewrite in main, which has
-// to recognize a mode word that arrived after a space so it can say the value
-// needs an '=' instead of quietly meaning something else.
-std::optional<GcMode> gc_mode_from_name(std::string_view name) {
-    if (name == "off") {
-        return GcMode::Off;
-    }
-    if (name == "on") {
-        return GcMode::On;
-    }
-    if (name == "stress") {
-        return GcMode::Stress;
-    }
-    return std::nullopt;
-}
-
 // Wording rule for everything a user reads: say what the option does for the
 // design being simulated, not how Clotho implements it. An option that exists
 // only for working on Clotho itself says so ("for working on clotho"), which is
@@ -138,8 +120,8 @@ std::optional<GcMode> gc_mode_from_name(std::string_view name) {
 //
 // Registered before Driver::addStandardArgs so these head the --help listing.
 // A `[build]` / `[run]` tag in a description marks a command-specific option, and
-// `[build|run]` one that two commands share (--gc, whose mode the artifact is
-// built with and then run with); check_scope enforces it after parsing.
+// `[build|run]` one that two commands share (the --gc-* group, whose settings the
+// artifact is built with and then run with); check_scope enforces it after parsing.
 void register_options(slang::CommandLine& cl, Options& o) {
     cl.add("-h,--help", o.help, "Show this help and exit");
     cl.add("--version", o.version, "Show version information and exit");
@@ -171,31 +153,28 @@ void register_options(slang::CommandLine& cl, Options& o) {
            ". Costs simulation time (repeatable, comma-separated)",
            "<check>",
            slang::CommandLineFlags::CommaList);
-    cl.add("--gc",
-           o.gc,
-           "[build|run] Reclaim class objects the design can no longer reach, which it does not "
-           "do by default: 'on' reclaims them while the design runs, 'off' keeps every object "
-           "the design ever created until it exits, 'stress' reclaims at every opportunity -- "
-           "slow, but it turns a missed object into an immediate failure, so it is for working "
-           "on clotho. Written --gc=<mode>; --gc on its own means on. Changes the generated "
-           "code, so a build and the run of what it built must be given the same mode",
-           "<mode>");
+    cl.add("--gc-stress",
+           o.gc_stress,
+           "[build|run] Reclaim unused class objects at every opportunity instead of when the "
+           "design has created enough of them. Slow by design: it turns an object Clotho failed "
+           "to keep into an immediate wrong answer rather than a rare one, so it is for working "
+           "on clotho itself. Changes the generated code, so a build and the run of what it "
+           "built must be given the same setting");
     cl.add("--gc-stats",
            o.gc_stats,
            "[build|run] Print what reclaiming class objects did when the design exits: how many "
-           "times it ran, how much it reclaimed, and how long the design was paused for it. Needs "
-           "--gc");
+           "times it ran, how much it reclaimed, and how long the design was paused for it");
     cl.add("--gc-nursery",
            o.gc_nursery_bytes,
            "[build|run] How many bytes of class objects the design may create between one reclaim "
-           "and the next (default 8388608). A plain number of bytes. Needs --gc",
+           "and the next (default 8388608). A plain number of bytes",
            "<bytes>");
     cl.add("--gc-heap-max",
            o.gc_heap_bytes_max,
            "[build|run] Size in bytes the design's class objects should stay under: reaching it "
            "asks for a reclaim at the next opportunity, and passing it anyway is reported rather "
            "than refused, since a design is free to create objects without ever pausing. 0, the "
-           "default, sets no limit. Needs --gc",
+           "default, sets no limit",
            "<bytes>");
     cl.add("--gc-full-every",
            o.gc_full_every,
@@ -203,7 +182,6 @@ void register_options(slang::CommandLine& cl, Options& o) {
            "created since the last one. Only a whole-heap pass frees objects that have already "
            "survived a reclaim, so this trades cheap frequent passes against how long those "
            "linger. 0, the default, lets the runtime decide from how fast the heap is growing. "
-           "Needs --gc",
            "<n>");
     cl.add("--allow-system",
            o.allow_system,
@@ -336,10 +314,10 @@ std::string_view command_name(Command command) {
 // silently ignored no-op (never silently accept).
 bool check_scope(const Options& o, Command command, int& status) {
     // `-o` names the artifact, and two commands produce one, so ownership is a set
-    // rather than a single command. The --gc group is a set for a different
-    // reason: the mode is compiled in (the backend bakes an rt_gc_config into the
-    // emitted module and calls rt_gc_init from its main), so `build` is told it
-    // exactly as `run` is, and `lint`, which emits no code, refuses it.
+    // rather than a single command. The --gc-* group is a set for a different
+    // reason: its settings are compiled in (the backend bakes an rt_gc_config into
+    // the emitted module and calls rt_gc_init from its main), so `build` is told
+    // them exactly as `run` is, and `lint`, which emits no code, refuses them.
     struct Check {
         bool             given;
         std::string_view name;
@@ -349,7 +327,7 @@ bool check_scope(const Options& o, Command command, int& status) {
     const Check checks[] = {
         { o.emit.has_value(), "--emit", Command::Build },
         { o.out.has_value(), "-o", Command::Build, Command::Synth },
-        { o.gc.has_value(), "--gc", Command::Build, Command::Run },
+        { o.gc_stress.has_value(), "--gc-stress", Command::Build, Command::Run },
         { o.gc_stats.has_value(), "--gc-stats", Command::Build, Command::Run },
         { o.gc_nursery_bytes.has_value(), "--gc-nursery", Command::Build, Command::Run },
         { o.gc_heap_bytes_max.has_value(), "--gc-heap-max", Command::Build, Command::Run },
@@ -524,9 +502,8 @@ int main(int argc, char** argv) {
         clotho::lsp::serve(CLOTHO_GIT_HASH);
     }
 
-    // Peel runtime plusargs, spell out a bare `--gc`, and hand everything else to
-    // the Driver verbatim. argv entries are already null-terminated, so they can
-    // be handed over directly.
+    // Peel runtime plusargs and hand everything else to the Driver verbatim. argv
+    // entries are already null-terminated, so they can be handed over directly.
     std::vector<const char*>      driver_argv{ "clotho" };
     std::vector<std::string_view> plusargs;
     bool                          verbatim = false;
@@ -541,26 +518,6 @@ int main(int argc, char** argv) {
                 return usage_error(std::format("plusarg '{}' applies to 'run', not '{}'", arg, command_name(command)));
             }
             plusargs.emplace_back(arg.substr(1));
-            continue;
-        }
-        // `--gc` with no mode means `--gc=on`. slang's CommandLine has no
-        // optional-value option -- "all options (besides boolean flags) require a
-        // value" (slang/util/CommandLine.h), and a boolean one would reject
-        // `stress` -- so the bare form is written out here, into the same
-        // registered option, rather than by adding a second parser or a second
-        // help (docs/design/cli.md, "One parser"). Measured: without this, `--gc
-        // design.sv` parses design.sv as the mode and leaves no source file.
-        if (!verbatim && arg == "--gc") {
-            // `--gc on` cannot be made to work, and must not look as though it
-            // had: an optional value takes '=' (GNU longopts, which is what slang
-            // implements), so a following word stays a source file -- and a
-            // design file named `off` would then have chosen the mode. Say which
-            // spelling works instead of guessing at one of the two readings.
-            if (i + 1 < argc && gc_mode_from_name(argv[i + 1]).has_value()) {
-                return usage_error(
-                  std::format("--gc takes its mode after '=': write '--gc={}'", argv[i + 1]));
-            }
-            driver_argv.push_back("--gc=on");
             continue;
         }
         driver_argv.push_back(argv[i]);
@@ -646,46 +603,18 @@ int main(int argc, char** argv) {
               std::format("unknown --sanitize check '{}'; expected {}", name, kSanitizeList));
         }
     }
-    // Class objects are collected only on request (docs/design/garbage-collection.md
-    // §12): the mode is compiled into the artifact, so `build` and the `run` of what
-    // it built must be given the same one, and the default off reproduces today's
-    // generated code exactly.
-    if (options.gc.has_value()) {
-        const std::string&          mode   = *options.gc;
-        const std::optional<GcMode> parsed = gc_mode_from_name(mode);
-        if (!parsed.has_value()) {
-            return usage_error(
-              std::format("unknown --gc mode '{}'; write --gc=off, --gc=on or --gc=stress", mode));
-        }
-        config.gc = *parsed;
-    }
-    if (config.gc == GcMode::Off) {
-        // The rest of the group tunes a collector that would not be running: with
-        // the mode off nothing reads them, and a knob that quietly does nothing is
-        // the silent acceptance the project forbids. Reported one at a time, since
-        // the reader needs one fix (add --gc), not an inventory.
-        std::string_view idle;
-        if (options.gc_stats.has_value()) {
-            idle = "--gc-stats";
-        } else if (options.gc_nursery_bytes.has_value()) {
-            idle = "--gc-nursery";
-        } else if (options.gc_heap_bytes_max.has_value()) {
-            idle = "--gc-heap-max";
-        } else if (options.gc_full_every.has_value()) {
-            idle = "--gc-full-every";
-        }
-        if (!idle.empty()) {
-            const std::string_view why = options.gc.has_value() ? "under --gc=off" : "by default";
-            return usage_error(
-              std::format("{} needs --gc: class objects are not collected {}", idle, why));
-        }
-    }
+    // Class objects are always collected (LRM 8.4 makes reclamation unobservable,
+    // and docs/design/garbage-collection.md §12 records the measurements that made
+    // an uncollected mode not worth keeping). What is left on the CLI only tunes
+    // the collector, and every one of these is compiled into the artifact, so a
+    // `build` and the `run` of what it built must be given the same values.
+    config.gc_stress = options.gc_stress == true;
     config.gc_stats = options.gc_stats == true;
     // A zero nursery would make a collection due at every safepoint, which is
-    // --gc=stress spelled obscurely; and 0 means "no limit" for --gc-heap-max, so
+    // --gc-stress spelled obscurely; and 0 means "no limit" for --gc-heap-max, so
     // two adjacent byte options would read the same value opposite ways.
     if (options.gc_nursery_bytes.has_value() && *options.gc_nursery_bytes == 0) {
-        return usage_error("--gc-nursery=0 would collect at every opportunity; write --gc=stress");
+        return usage_error("--gc-nursery=0 would collect at every opportunity; write --gc-stress");
     }
     config.gc_nursery_bytes  = options.gc_nursery_bytes.value_or(config.gc_nursery_bytes);
     config.gc_heap_bytes_max = options.gc_heap_bytes_max.value_or(config.gc_heap_bytes_max);

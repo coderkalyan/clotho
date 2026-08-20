@@ -1348,10 +1348,12 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   and rooted, so a UVM-shaped component tree runs collected. Remaining: event
   handles / `std::mailbox` / `semaphore` / `process` / `std::weak_reference` as
   those features land; then evacuation and multi-mutator as independent,
-  measurement-gated tracks. Nothing is refused under `--gc` that `--gc=off`
-  accepts: the assoc key-handle table (Runtime.h `nkeyhandles`) closed the last
-  gap, so a key containing a class handle traces too. `--gc` stays off by
-  default.
+  measurement-gated tracks. Nothing is refused that was accepted before the
+  collector existed: the assoc key-handle table (Runtime.h `nkeyhandles`) closed
+  the last gap, so a key containing a class handle traces too. The collector is
+  unconditional -- `--gc` is gone and only its cadence and budgets are on the CLI
+  (`--gc-stress`, `--gc-stats`, `--gc-nursery`, `--gc-heap-max`,
+  `--gc-full-every`); docs/design/garbage-collection.md 12a records why.
 
 - [~] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
   landed. Every class carries a descriptor pointer at object-body field 0

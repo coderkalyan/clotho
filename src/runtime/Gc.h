@@ -279,10 +279,6 @@ void rt_gc_init(const rt_gc_config* cfg);
 // meaningful for class objects, which is the acceptance evidence for this work.
 void rt_gc_shutdown(void);
 
-// Whether rt_gc_init ran. Generated code never asks; the runtime's own staging
-// paths do.
-int32_t rt_gc_enabled(void);
-
 // The constant negative offset from a vptr to the rt_gc_map pointer that sits
 // immediately below the ancestor display.
 int32_t rt_gc_map_vptr_offset(void);

@@ -3034,11 +3034,6 @@ extern "C" void rt_gc_shutdown(void) {
     assert(g.large.empty() && "shutdown released every large cell");
 }
 
-extern "C" int32_t rt_gc_enabled(void) {
-    assert(g.initialized == 0 || g.initialized == 1);
-    return g.initialized;
-}
-
 // -- Allocation ---------------------------------------------------------------
 
 extern "C" rt_gc_mutator* rt_gc_mutator_current(void) {

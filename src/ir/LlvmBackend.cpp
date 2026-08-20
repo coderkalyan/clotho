@@ -1366,15 +1366,14 @@ private:
         return cf;
     }
 
-    // The rt_elem_ops mirror type (Runtime.h:920-930):
+    // The rt_elem_ops mirror type (Runtime.h:947-958):
     // { i32 kind, i32 nleaves, i64 stride, ptr proto, ptr inner, ptr leaves,
-    //   i32 nhandles, i32 flags, ptr handles }.
+    //   i32 nhandles, i32 nkeyhandles, ptr handles, ptr keyhandles }.
     // Must match the runtime struct exactly.
     //
     // The last four fields are the collector's (docs/design/garbage-collection.md
     // §3.3) and are APPENDED, so every field that predates them keeps its offset and
-    // this mirror grows in lockstep by growing (Runtime.h:909-911). They are 0 / 0 /
-    // null / null with the collector off, where nothing ever reads them.
+    // this mirror grows in lockstep by growing (Runtime.h:909-911).
     llvm::StructType* elem_ops_ty() {
         if (elem_ops_ty_ == nullptr) {
             elem_ops_ty_ = llvm::StructType::create(
@@ -1396,32 +1395,19 @@ private:
     // polls, are cross-checked at run time by rt_gc_init against
     // gc_map_vptr_offset() and gc_mutator_request_offset() below (Gc.h:167-173).
     //
-    // Every GC emission in this file is gated on gc_on(). With the collector off
-    // the module is byte-identical to one built before the collector existed:
-    // no type changes shape, no global and no call is emitted, and not even a
-    // declaration is inserted (an unused declaration still lands in the module).
-    // Whether this module emits the collector at all: exactly `--gc`, and nothing
-    // else about the design.
-    //
-    // An earlier draft also required a non-empty class table, so that a class-free
-    // design paid nothing: examples/wait_bench.v measured +10.3% simulate time under
-    // --gc=on with no class anywhere in it, all of it rt_gc_frame_link /
-    // rt_gc_frame_unlink per process activation plus one out-of-line rt_gc_safepoint
-    // per wheel advance. The perf gate (tests/perf/README.md) makes that a bug even
-    // behind a non-default flag, because P3 flips the default.
-    //
-    // Both costs are now gone by construction rather than switched off, so the
-    // shortcut buys nothing: the safepoint is an inlined load-test-branch
-    // (emit_gc_safepoint) and a coroutine frame is registered only when it can hold
-    // a reference (frame_may_hold_gc_ref), which no frame of a class-free design
-    // can. What the shortcut did buy was a discontinuity -- declaring one class
-    // turned the full per-activation and per-tick price back on for the whole
-    // design -- and a design with two long-lived objects and no churn should pay a
-    // not-taken branch per wheel advance and nothing per activation
-    // (docs/design/garbage-collection.md §5.2).
-    bool gc_on() const {
-        return config_.gc != GcMode::Off;
-    }
+    // A design that declares no class pays essentially nothing for the collector, and
+    // that is by construction rather than by a shortcut. An earlier draft emitted the
+    // collector only for a design with a non-empty class table, because
+    // examples/wait_bench.v measured +10.3% simulate time with no class anywhere in
+    // it, all of it rt_gc_frame_link / rt_gc_frame_unlink per process activation plus
+    // one out-of-line rt_gc_safepoint per wheel advance. Both costs are gone now: the
+    // safepoint is an inlined load-test-branch (emit_gc_safepoint) and a coroutine
+    // frame is registered only when it can hold a reference (frame_may_hold_gc_ref),
+    // which no frame of a class-free design can. What the shortcut bought was a
+    // discontinuity -- declaring one class turned the full per-activation and
+    // per-tick price back on for the whole design -- whereas a design with two
+    // long-lived objects and no churn should pay a not-taken branch per wheel advance
+    // and nothing per activation (docs/design/garbage-collection.md §5.2).
 
     // rt_gc_map (Gc.h:85-92):
     // { i64 size, i32 nhandles, i32 nleaves, ptr handles, ptr leaves, ptr finalize }.
@@ -1495,7 +1481,6 @@ private:
     // literal. Used both to address `next` off a possibly-null `prev` and to assert
     // the `prev`-at-offset-0 identity the two emitters rely on.
     uint32_t gc_frame_off(unsigned field) {
-        assert(gc_on() && "the frame registry exists only under the collector");
         assert(field < gc_frame_ty()->getNumElements() && "a frame field index is in range");
         const auto* sl = env_->llmod.getDataLayout().getStructLayout(gc_frame_ty());
         return static_cast<uint32_t>(sl->getElementOffset(field));
@@ -1555,7 +1540,6 @@ private:
     // gc_mut_off() hands the allocator is suspect and the run must fail at startup
     // rather than at the first bump.
     int32_t gc_mutator_bytes() {
-        assert(gc_on() && "no mutator field is addressed with the collector off");
         const uint64_t sz = env_->llmod.getDataLayout().getTypeAllocSize(gc_mutator_ty());
         assert(sz >= sizeof(void*) && "the mutator holds at least one field");
         assert(sz % sizeof(void*) == 0 && "a pointer-bearing LP64 struct is word-sized");
@@ -1566,7 +1550,6 @@ private:
     // a literal. Every field access generated code emits routes through here, so the
     // mirror above is the single place a layout change has to be made.
     uint32_t gc_mut_off(GcMutField f) {
-        assert(gc_on() && "no mutator field is addressed with the collector off");
         const auto     idx = static_cast<unsigned>(f);
         const auto&    dl  = env_->llmod.getDataLayout();
         const uint64_t off = dl.getStructLayout(gc_mutator_ty())->getElementOffset(idx);
@@ -1603,7 +1586,6 @@ private:
     // rt_gc_init instead of leaving every safepoint polling a byte that is not the
     // request flag (Gc.h:193-195).
     int32_t gc_mutator_request_offset() {
-        assert(gc_on() && "no safepoint poll is emitted with the collector off");
         const uint32_t off = gc_mut_off(GcMutField::Request);
         assert(off % sizeof(uint32_t) == 0 && "the request flag is a naturally aligned i32");
         return static_cast<int32_t>(off);
@@ -1823,9 +1805,6 @@ private:
         assert(std::get<Type>(mod_.pool.get(assoc_type)).kind == Type::Kind::Assoc &&
                "only an associative array has a key");
         std::vector<uint32_t> out;
-        if (!gc_on()) {
-            return out;
-        }
         const AssocKeyInfo info = assoc_key_info(assoc_type);
         if (info.wildcard || info.is_string) {
             return out;
@@ -1851,15 +1830,14 @@ private:
     // arrays have handle keys. `nkeyhandles != 0` is the single source of truth; there
     // is deliberately no flag bit saying the same thing a second time.
     bool assoc_key_is_class_handle(Ref assoc_type) {
-        assert(gc_on() && "the key table is read only by the collector");
         assert(std::get<Type>(mod_.pool.get(assoc_type)).kind == Type::Kind::Assoc &&
                "only an associative array has a key");
         return !assoc_key_handle_offsets(assoc_type).empty();
     }
 
     // rt_elem_ops::handles for one element type: the byte offsets of the class-handle
-    // words inside ONE element image, ascending. Empty with the collector off, and
-    // empty for a container element -- whose handles are reached through `inner`.
+    // words inside ONE element image, ascending. Empty for a container element --
+    // whose handles are reached through `inner`.
     //
     // collect_class_handles is the same walk clotho.gcroots and the class trace map
     // use, and it answers this with no second walker: its Class arm reports `base`, so
@@ -1872,9 +1850,6 @@ private:
     // offset here indexes the bytes the runtime actually memcpys.
     std::vector<uint32_t> elem_handle_offsets(Ref elem_type, const DynElem& e) {
         std::vector<uint32_t> out;
-        if (!gc_on()) {
-            return out; // the three appended fields are 0 / 0 / null without a collector
-        }
         collect_class_handles(elem_type, 0, e.is_agg ? e.agg_ty : e.slot_ty, out);
         assert((out.empty() || !e.is_handle) &&
                "a container element lists no inline handle; it is reached through inner");
@@ -1891,9 +1866,8 @@ private:
     // a string / container leaf, which the leaf table then makes the runtime
     // deep-copy and free.
     //
-    // Under the collector this descriptor is also how a class handle inside a
-    // container is TRACED (docs/design/garbage-collection.md §3.3), through the three
-    // appended fields:
+    // This descriptor is also how a class handle inside a container is TRACED
+    // (docs/design/garbage-collection.md §3.3), through the four appended fields:
     //
     //   bare class handle  -> nhandles 1, handles { 0 }
     //   aggregate          -> every handle reachable without leaving the element
@@ -2245,23 +2219,20 @@ private:
     // class at depth d is one load of display[d] and one compare against that
     // class's id, with no dependence on the object's own depth.
     //
-    // With the collector on the trace map pointer is PREPENDED, so it sits
-    // immediately below the display -- one load from any handle, at a design-wide
-    // constant negative offset from the vptr (Gc.h:68-84). Prepending is what keeps
-    // the offset independent of the vtable slot count; reaching the map from the
-    // descriptor base instead would make it depend on it.
+    // The trace map pointer is PREPENDED, so it sits immediately below the display --
+    // one load from any handle, at a design-wide constant negative offset from the
+    // vptr (Gc.h:68-84). Prepending is what keeps the offset independent of the
+    // vtable slot count; reaching the map from the descriptor base instead would make
+    // it depend on it.
     //
-    // `$cast`'s display arithmetic is UNAFFECTED, and the reason is structural: the
-    // display still ends exactly where slot 0 begins, so display[d] remains at
-    // `vptr - 4*kMaxClassDepth + 4*d` -- literally the offset ClassIsA computes
-    // below (`4 * class_depth(dest) - 4 * kMaxClassDepth`). The new field lands
-    // BELOW the display, i.e. further negative, and no existing offset moves.
+    // `$cast`'s display arithmetic does not have to know about the map, and the reason
+    // is structural: the display still ends exactly where slot 0 begins, so display[d]
+    // is at `vptr - 4*kMaxClassDepth + 4*d` -- literally the offset ClassIsA computes
+    // below (`4 * class_depth(dest) - 4 * kMaxClassDepth`). The map pointer lands
+    // BELOW the display, i.e. further negative, so no display offset depends on it.
     llvm::StructType* class_desc_ty(size_t slots) {
         auto* display = llvm::ArrayType::get(b_.getInt32Ty(), kMaxClassDepth);
         auto* vtable  = llvm::ArrayType::get(raw_ptr_ty(), slots);
-        if (!gc_on()) {
-            return llvm::StructType::get(ctx_, { display, vtable });
-        }
         return llvm::StructType::get(ctx_, { raw_ptr_ty(), display, vtable });
     }
 
@@ -2272,7 +2243,6 @@ private:
     // (Gc.h:167-170). The slot count cannot affect it: the map and the display
     // both precede the vtable.
     int32_t gc_map_vptr_offset() {
-        assert(gc_on() && "no map pointer in the descriptor with the collector off");
         auto*       ty = class_desc_ty(/*slots=*/1);
         const auto* sl = env_->llmod.getDataLayout().getStructLayout(ty);
         const auto  off = static_cast<int64_t>(sl->getElementOffset(0)) -
@@ -2308,9 +2278,7 @@ private:
         }
         auto*                        ty = class_desc_ty(entries.size());
         std::vector<llvm::Constant*> init_fields;
-        if (gc_on()) {
-            init_fields.push_back(class_gc_map_global(class_ref));
-        }
+        init_fields.push_back(class_gc_map_global(class_ref));
         init_fields.push_back(
           llvm::ConstantArray::get(llvm::ArrayType::get(b_.getInt32Ty(), kMaxClassDepth), disp));
         init_fields.push_back(
@@ -2331,14 +2299,13 @@ private:
     }
 
     // The value an object body's header holds: the address of its class's vtable
-    // slot 0, i.e. the descriptor global past its display (and past the trace map
-    // pointer that precedes the display when the collector is on).
+    // slot 0, i.e. the descriptor global past the trace map pointer and the display
+    // that precede it -- field 2, element 0.
     llvm::Constant* class_vptr(Ref class_ref) {
-        llvm::GlobalVariable* g    = class_desc_global(class_ref);
-        const uint32_t        vtbl = gc_on() ? 2u : 1u;
+        llvm::GlobalVariable* g = class_desc_global(class_ref);
         return llvm::ConstantExpr::getGetElementPtr(
           g->getValueType(), g,
-          std::array<llvm::Constant*, 3>{ b_.getInt32(0), b_.getInt32(vtbl), b_.getInt32(0) });
+          std::array<llvm::Constant*, 3>{ b_.getInt32(0), b_.getInt32(2), b_.getInt32(0) });
     }
 
     // A stand-in object body for a null handle in a `$cast` type test: one word
@@ -2665,7 +2632,6 @@ private:
     // held in a class body is traced through it. It doubles as the finalization table
     // Gc.h:81-85 anticipated -- same offsets, same descriptors.
     llvm::Constant* class_gc_map_global(Ref class_ref) {
-        assert(gc_on() && "no trace map is emitted with the collector off");
         const std::string nm = "clotho.classgc." + std::to_string(static_cast<uint32_t>(class_ref));
         if (auto* g = env_->llmod.getNamedGlobal(nm)) {
             return g;
@@ -2770,7 +2736,6 @@ private:
     // arrays of handles.
     void collect_gc_containers(Ref type, uint64_t base, llvm::Type* storage,
                                std::vector<GcContainer>& out) {
-        assert(gc_on() && "container roots exist only under the collector");
         assert(storage != nullptr && "a storage mirror is required to read offsets");
         // Every step pops one node of a finite storage tree; the cap turns a malformed
         // type graph into a loud crash rather than a hang (TigerStyle).
@@ -2851,7 +2816,6 @@ private:
     enum class GcRootOp : uint8_t { Add, Remove };
     void emit_gc_container_roots(GcRootOp op, Ref type, llvm::Value* base,
                                  llvm::Type* storage) {
-        assert(gc_on() && "container roots exist only under the collector");
         assert(base != nullptr && "a container root needs its storage address");
         std::vector<GcContainer> found;
         collect_gc_containers(type, 0, storage, found);
@@ -4543,8 +4507,8 @@ private:
         // entry block, because the frame registry below needs the byte count in
         // coro.begin -- including on the elided path, where coro.alloc never runs.
         // Both intrinsics are pure and CoroSplit folds each to a constant, so the
-        // hoist costs nothing; it is gated only so that a ramp which registers
-        // nothing keeps the instruction order it has always had.
+        // hoist costs nothing; it is gated only to keep the unregistered ramp's
+        // instruction order free of a hoist that would serve nothing there.
         llvm::Value* size  = nullptr;
         llvm::Value* align = nullptr;
         const auto   frame_bytes = [&] {
@@ -4554,7 +4518,7 @@ private:
         // Register this frame only when it can hold a reference into the collected
         // heap. A fused group's members share one coroutine, so any member that can
         // decides for the whole frame.
-        const bool gc_frame = gc_on() && std::ranges::any_of(members, [&](uint32_t m) {
+        const bool gc_frame = std::ranges::any_of(members, [&](uint32_t m) {
                                   return frame_may_hold_gc_ref(all[m]);
                               });
         if (gc_frame) {
@@ -5199,12 +5163,10 @@ private:
                 // input formal's slot is then overwritten by copy-in.
                 std::vector<llvm::Value*> path;
                 emit_agg_init(s.ir_type, slot, path, s.storage_ty);
-                if (gc_on()) {
-                    // Any handle-bearing container leaf is now an empty container at a
-                    // stable frame address: a root for this activation. Paired with the
-                    // Remove in deinit_body_strings' matching arm.
-                    emit_gc_container_roots(GcRootOp::Add, s.ir_type, slot, s.storage_ty);
-                }
+                // Any handle-bearing container leaf is now an empty container at a
+                // stable frame address: a root for this activation. Paired with the
+                // Remove in deinit_body_strings' matching arm.
+                emit_gc_container_roots(GcRootOp::Add, s.ir_type, slot, s.storage_ty);
                 continue;
             }
             if (s.is_string) {
@@ -5215,13 +5177,11 @@ private:
                 // Empty handle ({0}): the frame alloca is not zeroed, so store the
                 // empty handle (null buffer pointer, zero length).
                 b_.CreateStore(llvm::Constant::getNullValue(s.slot_ty), slot);
-                if (gc_on()) {
-                    // A container local whose elements can reach a class handle is a
-                    // root while this activation lives; nothing else names the
-                    // malloc'd payload (Gc.h:228-232). Paired with the Remove in
-                    // deinit_body_strings' matching arm.
-                    emit_gc_container_roots(GcRootOp::Add, s.ir_type, slot, s.slot_ty);
-                }
+                // A container local whose elements can reach a class handle is a
+                // root while this activation lives; nothing else names the
+                // malloc'd payload (Gc.h:228-232). Paired with the Remove in
+                // deinit_body_strings' matching arm.
+                emit_gc_container_roots(GcRootOp::Add, s.ir_type, slot, s.slot_ty);
                 continue;
             }
             // A narrow 2-state local is a single iW field (comes up 0); a 4-state
@@ -5256,20 +5216,16 @@ private:
                 // BEFORE the free, or the collector holds an entry naming a released
                 // ring -- the Add is in init_frame's matching arm.
                 llvm::Value* slot = b_.CreateStructGEP(frame_ty_, frame_, i);
-                if (gc_on()) {
-                    emit_gc_container_roots(GcRootOp::Remove, frame_slots_[i].ir_type, slot,
-                                            frame_slots_[i].slot_ty);
-                }
+                emit_gc_container_roots(GcRootOp::Remove, frame_slots_[i].ir_type, slot,
+                                        frame_slots_[i].slot_ty);
                 emit_handle_delete(slot, frame_slots_[i].handle_type);
             } else if (frame_slots_[i].is_agg && has_heap_leaf(frame_slots_[i].ir_type)) {
                 // An aggregate local with string / handle leaves owns their heap
                 // buffers at any nesting depth: recursive teardown. Same ordering rule
                 // -- unregister every container leaf before emit_agg_deinit frees it.
                 llvm::Value* slot = b_.CreateStructGEP(frame_ty_, frame_, i);
-                if (gc_on()) {
-                    emit_gc_container_roots(GcRootOp::Remove, frame_slots_[i].ir_type, slot,
-                                            frame_slots_[i].storage_ty);
-                }
+                emit_gc_container_roots(GcRootOp::Remove, frame_slots_[i].ir_type, slot,
+                                        frame_slots_[i].storage_ty);
                 std::vector<llvm::Value*> path;
                 emit_agg_deinit(frame_slots_[i].ir_type, slot, path, frame_slots_[i].storage_ty);
             }
@@ -5278,9 +5234,7 @@ private:
             b_.CreateCall(str_deinit_fn(), { temp });
         }
         for (const auto& [temp, type] : dynarr_temp_list_) {
-            if (gc_on()) {
-                emit_gc_container_roots(GcRootOp::Remove, type, temp, handle_slot_ty(type));
-            }
+            emit_gc_container_roots(GcRootOp::Remove, type, temp, handle_slot_ty(type));
             emit_handle_delete(temp, type);
         }
         for (const auto& [temp, type] : agg_elem_temp_list_) {
@@ -5288,9 +5242,7 @@ private:
             // storage it carries is ours to free: a nested container's buffer, or an
             // aggregate's string / container leaves (a POD-leaf element owns nothing).
             if (is_handle_type(type)) {
-                if (gc_on()) {
-                    emit_gc_container_roots(GcRootOp::Remove, type, temp, handle_slot_ty(type));
-                }
+                emit_gc_container_roots(GcRootOp::Remove, type, temp, handle_slot_ty(type));
                 emit_handle_delete(temp, type);
                 continue;
             }
@@ -5299,9 +5251,7 @@ private:
             }
             // The aggregate case: agg_storage_ty is the same mirror build_agg_elem_temps
             // allocated the buffer as, so the container-leaf offsets match the Add's.
-            if (gc_on()) {
-                emit_gc_container_roots(GcRootOp::Remove, type, temp, agg_storage_ty(type));
-            }
+            emit_gc_container_roots(GcRootOp::Remove, type, temp, agg_storage_ty(type));
             std::vector<llvm::Value*> path;
             emit_agg_deinit(type, temp, path, agg_storage_ty(type));
         }
@@ -5524,9 +5474,9 @@ private:
             align = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_align, { b_.getInt64Ty() }), {});
         };
         // Register this frame only when it can hold a reference into the collected
-        // heap (frame_may_hold_gc_ref); a task whose frame cannot keeps the ramp it
-        // has with the collector off.
-        const bool gc_frame = gc_on() && frame_may_hold_gc_ref(f);
+        // heap (frame_may_hold_gc_ref); a task whose frame cannot holds nothing the
+        // collector needs to find, so it pays neither the link nor the unlink.
+        const bool gc_frame = frame_may_hold_gc_ref(f);
         if (gc_frame) {
             frame_bytes();
         }
@@ -6729,17 +6679,15 @@ private:
 
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
-        if (gc_on()) {
-            // Before anything can allocate: rt_gc_init cross-checks our own
-            // DataLayout computations -- the vptr-to-map offset against its
-            // rt_gc_map_vptr_offset(), the request-flag offset against its
-            // rt_gc_mutator_request_offset() -- so a descriptor or mutator layout
-            // change fails loudly here instead of reading garbage at the first
-            // trace or polling the wrong byte at the first safepoint
-            // (Gc.h:167-173).
-            b_.CreateCall(gc_init_fn(), { gc_config_global() });
-            emit_gc_root_tables();
-        }
+        // Before anything can allocate: rt_gc_init cross-checks our own
+        // DataLayout computations -- the vptr-to-map offset against its
+        // rt_gc_map_vptr_offset(), the request-flag offset against its
+        // rt_gc_mutator_request_offset() -- so a descriptor or mutator layout
+        // change fails loudly here instead of reading garbage at the first
+        // trace or polling the wrong byte at the first safepoint
+        // (Gc.h:167-173).
+        b_.CreateCall(gc_init_fn(), { gc_config_global() });
+        emit_gc_root_tables();
         // The fallback RNG (LRM 18.13), seeded before anything can draw from it.
         // Its selector is deliberately outside the process-index space every
         // per-process stream is seeded from, so the two never coincide.
@@ -6874,18 +6822,16 @@ private:
                 emit_agg_deinit(s.ir_type, storage_ptr(s), path, s.storage_ty);
             }
         }
-        if (gc_on()) {
-            // Runs every remaining finalizer and releases the heap, on exactly the
-            // same "every exit path" the signal teardown above relies on -- natural
-            // drain, $finish in a process, and $finish inside a final block all
-            // return through sim_run above. Not needed for correctness (the process
-            // is exiting) but it is what makes LeakSanitizer meaningful for class
-            // objects, which is the acceptance evidence for the collector
-            // (Gc.h:169-172). After the signal teardown, so a finalizer and a signal
-            // deinit can never both reach one managed buffer: a class body's managed
-            // properties are reachable only from the body.
-            b_.CreateCall(gc_shutdown_fn(), {});
-        }
+        // Runs every remaining finalizer and releases the heap, on exactly the
+        // same "every exit path" the signal teardown above relies on -- natural
+        // drain, $finish in a process, and $finish inside a final block all
+        // return through sim_run above. Not needed for correctness (the process
+        // is exiting) but it is what makes LeakSanitizer meaningful for class
+        // objects, which is the acceptance evidence for the collector
+        // (Gc.h:169-172). After the signal teardown, so a finalizer and a signal
+        // deinit can never both reach one managed buffer: a class body's managed
+        // properties are reachable only from the body.
+        b_.CreateCall(gc_shutdown_fn(), {});
 
         b_.CreateCall(wheel_deinit_fn(), { wheel });
         b_.CreateRet(llvm::ConstantInt::get(i32, 0));
@@ -6915,7 +6861,6 @@ private:
     // (docs/design/garbage-collection.md §3.3). Static class properties are ordinary
     // SignalSlots, as above, so `static Cell q[$]` is covered here too.
     void emit_gc_root_tables() {
-        assert(gc_on() && "no root table is emitted with the collector off");
         const llvm::DataLayout& dl = env_->llmod.getDataLayout();
         // Anchor index -> offsets, with the root state buffer in the last bucket:
         // a slot names its region by SignalSlot::anchor, no_anchor meaning the root.
@@ -6996,7 +6941,6 @@ private:
     // The container-root counterpart of signal_handle_offsets, and the STATE half of
     // the distinction in the container-roots section above.
     void signal_gc_containers(const SignalSlot& s, uint64_t base, std::vector<GcContainer>& out) {
-        assert(gc_on() && "container roots exist only under the collector");
         assert(s.ir_type != Ref::Invalid && "every slot carries its interned IR type");
         if (s.is_agg) {
             // An aggregate slot's storage_ty IS the recursive agg_storage_ty mirror,
@@ -7036,7 +6980,6 @@ private:
     llvm::Constant* gc_containers_global(llvm::Constant* base,
                                          const std::vector<GcContainer>& entries,
                                          uint32_t                        index) {
-        assert(gc_on() && "container roots exist only under the collector");
         assert(!entries.empty() && "an empty container table would register nothing");
         const std::string            nm = "clotho.gccontainers." + std::to_string(index);
         std::vector<llvm::Constant*> rows;
@@ -7061,16 +7004,16 @@ private:
 
     // `clotho.gc.config`: the rt_gc_config rt_gc_init reads. Every field is an
     // emit-time constant, so the collector's knobs are baked into the module rather
-    // than armed at run start -- one lowered module belongs to exactly one gc mode.
+    // than armed at run start -- one lowered module belongs to exactly one collector
+    // configuration.
     llvm::Constant* gc_config_global() {
-        assert(gc_on() && "no config is emitted with the collector off");
         if (auto* g = env_->llmod.getNamedGlobal("clotho.gc.config")) {
             return g;
         }
         auto* init = llvm::ConstantStruct::get(
           gc_config_ty(),
           { b_.getInt64(config_.gc_nursery_bytes), b_.getInt64(config_.gc_heap_bytes_max),
-            b_.getInt32(config_.gc == GcMode::Stress ? 1u : 0u),
+            b_.getInt32(config_.gc_stress ? 1u : 0u),
             b_.getInt32(config_.gc_stats ? 1u : 0u), b_.getInt32(gc_map_vptr_offset()),
             b_.getInt32(gc_mutator_request_offset()),
             b_.getInt32(static_cast<uint32_t>(gc_mutator_bytes())),
@@ -11635,28 +11578,26 @@ private:
         // wheel: coroutine-timer trampolines ignore it, but a detached `->> #d e`
         // on-expiry thunk reads the current time from it (event_delay_thunk).
         llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
-        if (gc_on()) {
-            // THE safepoint (docs/design/garbage-collection.md §2, F1). This is the
-            // drain loop's quiescent edge: the active ring, the inactive queue, the
-            // NBA region and the reactive ring have all drained to reach here, so
-            // every process in the design is parked at a suspend inside its own
-            // coroutine frame and the native stack is exactly
-            // main -> rt_sim_run -> sim_drain. No JIT frame can be live: every
-            // emitted body is reached only by a coro.resume from one of the drains
-            // above, and each of those returned before this point -- a resume that
-            // has not returned is, by construction, not this edge.
-            //
-            // Immediately AFTER rt_wheel_advance rather than before it, so the
-            // timers this tick fired have already enqueued their handles onto the
-            // active ring, where the root scan reaches them, instead of being live
-            // only inside the wheel mid-tick.
-            //
-            // The poll itself is inlined: a load of rt_gc_mutator::request, a test
-            // and a cold not-taken branch, because the out-of-line call this
-            // replaced cost real simulate time on designs that never allocate
-            // (Gc.h:144-149).
-            emit_gc_safepoint();
-        }
+        // THE safepoint (docs/design/garbage-collection.md §2, F1). This is the
+        // drain loop's quiescent edge: the active ring, the inactive queue, the
+        // NBA region and the reactive ring have all drained to reach here, so
+        // every process in the design is parked at a suspend inside its own
+        // coroutine frame and the native stack is exactly
+        // main -> rt_sim_run -> sim_drain. No JIT frame can be live: every
+        // emitted body is reached only by a coro.resume from one of the drains
+        // above, and each of those returned before this point -- a resume that
+        // has not returned is, by construction, not this edge.
+        //
+        // Immediately AFTER rt_wheel_advance rather than before it, so the
+        // timers this tick fired have already enqueued their handles onto the
+        // active ring, where the root scan reaches them, instead of being live
+        // only inside the wheel mid-tick.
+        //
+        // The poll itself is inlined: a load of rt_gc_mutator::request, a test
+        // and a cold not-taken branch, because the out-of-line call this
+        // replaced cost real simulate time on designs that never allocate
+        // (Gc.h:144-149).
+        emit_gc_safepoint();
         // Time advanced: a new instant begins, so reset the oscillation counter.
         b_.CreateStore(b_.getInt64(0), sym(osc_count_gv_));
         const bool preponed = has_preponed();
@@ -11728,10 +11669,10 @@ private:
     }
 
     // -- Garbage collection entry points (src/runtime/Gc.h) ----------------------
-    // Every one of these is reached only from a gc_on() guarded site: rt_fn inserts
-    // a declaration into the module, and a declaration is module text, so calling
-    // one with the collector off would already break the "--gc off emits today's
-    // module" property.
+    // rt_fn declares on demand, so each of these lands in the module only if some
+    // emitter actually calls it: a design that never allocates carries no
+    // rt_gc_alloc declaration, and one whose every frame is unregistered carries no
+    // rt_gc_frame_link.
     llvm::FunctionCallee gc_init_fn() {
         return rt_fn("rt_gc_init", b_.getVoidTy(), { raw_ptr_ty() });
     }
@@ -11832,7 +11773,6 @@ private:
     // walk (holds_class_handle) that answered false for `Cell q[$]` -- which was
     // sound only while the shape was refused.
     bool frame_may_hold_gc_ref(const Function& f) {
-        assert(gc_on() && "the frame registry exists only under the collector");
         assert((f.arg_dirs.empty() || f.arg_dirs.size() == f.param_types.size()) &&
                "arg_dirs is absent or parallel to param_types (Module.h:534-537)");
         if (std::ranges::find(f.arg_dirs, ArgDir::Ref) != f.arg_dirs.end()) {
@@ -11856,7 +11796,6 @@ private:
     // for one (:3677) and why the precise global root tables already cover that
     // storage -- so the only door left open is door 4, the spilled temporary.
     bool frame_may_hold_gc_ref(const Process& p) {
-        assert(gc_on() && "the frame registry exists only under the collector");
         return ir_may_hold_gc_ref(p.ir);
     }
 
@@ -11880,7 +11819,6 @@ private:
     // A flat scan of the instruction column, like ir_has_expect_wait (:9942): the
     // region tree is irrelevant here, only whether a tag occurs at all.
     bool ir_may_hold_gc_ref(const Ir& ir) {
-        assert(gc_on() && "the frame registry exists only under the collector");
         const size_t n = ir.inst_count();
         for (size_t k = 0; k < n; ++k) {
             const auto           i = static_cast<Index>(k);
@@ -11955,11 +11893,10 @@ private:
     // head, and when the registry is empty the "fix the old head's prev" store can be
     // aimed at &mutator->frames_head instead -- where it writes exactly the value the
     // following head store writes anyway, making the pair idempotent rather than
-    // conditional. That keeps the ramp's CFG byte-for-byte what it is today:
-    // splitting the block that holds coro.begin to host a null test would be a change
-    // to coroutine machinery, and this needs none.
+    // conditional. That keeps the ramp's CFG free of an extra block: splitting the
+    // block that holds coro.begin to host a null test would be a change to coroutine
+    // machinery, and this needs none.
     void emit_gc_frame_link(llvm::Value* frame_bytes) {
-        assert(gc_on() && "the frame registry exists only under the collector");
         assert(frame_bytes != nullptr && "the frame byte count must reach coro.begin");
         // The redirect below is silently wrong if `prev` ever stops being field 0, so
         // the identity is asserted from the DataLayout and not merely trusted.
@@ -12006,7 +11943,6 @@ private:
     // released immediately after, with no safepoint in between at which the collector
     // could walk the registry and observe them.
     void emit_gc_frame_unlink() {
-        assert(gc_on() && "the frame registry exists only under the collector");
         assert(gc_frame_node_ != nullptr && "every linked frame must unlink exactly once");
         assert(gc_frame_off(kGcFramePrev) == 0 &&
                "rt_gc_frame::prev is field 0, so a node's address is its prev slot");
@@ -12044,7 +11980,6 @@ private:
     // of precisely threshold size is block-resident on both paths rather than on
     // whichever one happened to round differently.
     bool gc_alloc_is_inline(Ref class_ref) {
-        assert(gc_on() && "the allocation shape is a question only under the collector");
         const uint64_t size = gc_object_bytes(class_ref);
         assert(size > RT_GC_HEADER_BYTES && "an object is a header plus a body");
         assert(size % RT_GC_ALIGN == 0 && "an object size is grain-aligned");
@@ -12057,7 +11992,6 @@ private:
     // exactly one of them, so assigning would clear up to seven neighbours' bits. The
     // runtime asserts against an OR for the same reason (Gc.cpp:544).
     void emit_gc_bitmap_set(GcMutField f, llvm::Value* byi, llvm::Value* bit, const char* nm) {
-        assert(gc_on() && "the heap bitmaps exist only under the collector");
         assert(byi != nullptr && bit != nullptr && "a bitmap set needs both a byte and a bit");
         assert((f == GcMutField::StartBitmap || f == GcMutField::FinBitmap) &&
                "only the start and finalizable bitmaps are set inline");
@@ -12088,7 +12022,6 @@ private:
     //       compile-time predicate that decides the gcword's FINALIZE bit, so the two
     //       cannot disagree.
     void emit_gc_start_bits(llvm::Value* start, bool fin) {
-        assert(gc_on() && "the heap bitmaps exist only under the collector");
         assert(start != nullptr && "an object start is needed to index the bitmaps");
         constexpr unsigned kGrainShift = 4;  // log2(RT_GC_ALIGN)
         constexpr unsigned kByteShift  = 3;  // log2(bits per bitmap byte)
@@ -12125,7 +12058,6 @@ private:
     // sequence free of budget arithmetic while leaving the accounting exact in bytes
     // made available.
     llvm::Value* emit_gc_alloc_fast(Ref class_ref) {
-        assert(gc_on() && "the inlined allocator exists only under the collector");
         assert(gc_alloc_is_inline(class_ref) && "a large object keeps the out-of-line call");
         const uint64_t  size = gc_object_bytes(class_ref);
         llvm::Constant* map  = class_gc_map_global(class_ref);
@@ -12226,7 +12158,6 @@ private:
     // because an SSA value may not cross a function boundary and a forgotten reset
     // would be a verifier failure in whichever body allocated next.
     llvm::Value* gc_mutator_cur() {
-        assert(gc_on() && "the mutator context is reached only under the collector");
         llvm::Function* fn = b_.GetInsertBlock()->getParent();
         assert(fn != nullptr && "a mutator access is emitted into some function");
         if (gc_mutator_cur_ != nullptr &&
@@ -12259,7 +12190,6 @@ private:
     // collection re-arms it, so this same poll fires at every safepoint
     // (Gc.h:144-149).
     void emit_gc_safepoint() {
-        assert(gc_on() && "safepoints exist only under the collector");
         llvm::Function* fn = b_.GetInsertBlock()->getParent();
         // Every poll site is scheduler-level (emit_active_run, lowered into
         // sim_drain), never inside a body. gc_mutator_cur() serves coroutines too now
@@ -12303,7 +12233,6 @@ private:
     // a GEP, a load, an and/compare pair folded by the backend, and a not-taken
     // branch -- on the path a young object or an already-logged object takes.
     void emit_gc_barrier(llvm::Value* owner) {
-        assert(gc_on() && "the write barrier exists only under the collector");
         assert(owner != nullptr && "a barrier needs the object acquiring the reference");
         llvm::Function* fn = b_.GetInsertBlock()->getParent();
         assert(fn != nullptr && "a barrier is emitted into some function");
@@ -12311,9 +12240,10 @@ private:
         // (HandleDeref's own inttoptr, reused rather than repeated). A caller holding
         // only the i64 handle bits converts once at its own site.
         assert(owner->getType()->isPointerTy() && "an owner is a class body pointer");
-        // The GC word sits BELOW the handle, so the header is at handle[-8]: that
-        // placement is the whole reason property GEPs and the $cast display arithmetic
-        // were untouched by the collector (Gc.h:54-59).
+        // The GC word sits BELOW the handle, so the header is at handle[-8]. That
+        // placement is what keeps every property GEP and the $cast display arithmetic
+        // a plain offset off the handle a program holds, with the header out of their
+        // way (Gc.h:54-59).
         const int64_t hdr_off = -static_cast<int64_t>(RT_GC_HEADER_BYTES);
         llvm::Value* hdr = b_.CreateGEP(b_.getInt8Ty(), owner, b_.getInt64(hdr_off), "gc.hdr");
         llvm::Value*  w   = b_.CreateLoad(b_.getInt64Ty(), hdr, "gc.word");
@@ -12334,11 +12264,12 @@ private:
     }
 
     // The barrier for a store through `lv`, or nothing when `lv` does not name a place
-    // inside a class object. THE call site for every instrumented store: keeping the
-    // gc_on() test and the owner test in one place is what makes "--gc off emits no GC
-    // artifact" hold for the barrier without eleven guarded call sites.
+    // inside a class object. THE call site for every instrumented store: the owner
+    // test lives here, once, rather than repeated at each of the eleven store sites,
+    // so a new store site is instrumented by routing through this function and cannot
+    // forget it.
     void emit_gc_barrier_for(const LValue& lv) {
-        if (!gc_on() || lv.gc_owner == nullptr) {
+        if (lv.gc_owner == nullptr) {
             return;
         }
         // Both halves of the propagation invariant, asserted where it is consumed: a
@@ -12369,7 +12300,7 @@ private:
                                 Ref container_type) {
         assert(handle != nullptr && "a container root needs its handle address");
         assert(container_type != Ref::Invalid && "a container root names its type");
-        if (!gc_on() || lv.gc_owner == nullptr) {
+        if (lv.gc_owner == nullptr) {
             return;
         }
         lv.gc_container_root = parent.gc_container_root;
@@ -12403,7 +12334,7 @@ private:
     // loop's quiescent edge (:11542), so no collection can occur inside a function call
     // and the call-site barrier alone covers it.
     llvm::Value* emit_gc_ref_container_add(const LValue& lv) {
-        if (!gc_on() || lv.gc_container_root == nullptr) {
+        if (lv.gc_container_root == nullptr) {
             return nullptr;
         }
         assert(lv.gc_owner != nullptr && "a container root is recorded only inside an object");
@@ -14397,14 +14328,12 @@ private:
             auto* temp = b_.CreateAlloca(slot, nullptr, "handle.ret");
             temp->setAlignment(llvm::Align(8));
             b_.CreateStore(llvm::Constant::getNullValue(slot), temp); // empty handle
-            if (gc_on()) {
-                // The temp OWNS the returned container for the body's lifetime, and
-                // its payload is malloc'd, so it is a root exactly like a container
-                // local. Registered while empty and never re-registered: the address
-                // is fixed, so the entry keeps describing whatever container the slot
-                // holds. Paired with the Remove in deinit_body_strings' temp loop.
-                emit_gc_container_roots(GcRootOp::Add, rty, temp, slot);
-            }
+            // The temp OWNS the returned container for the body's lifetime, and
+            // its payload is malloc'd, so it is a root exactly like a container
+            // local. Registered while empty and never re-registered: the address
+            // is fixed, so the entry keeps describing whatever container the slot
+            // holds. Paired with the Remove in deinit_body_strings' temp loop.
+            emit_gc_container_roots(GcRootOp::Add, rty, temp, slot);
             dynarr_ret_[k] = temp;
             dynarr_temp_list_.push_back({ temp, rty });
         }
@@ -14430,14 +14359,12 @@ private:
             if (e.is_agg) {
                 auto* temp = b_.CreateAlloca(e.agg_ty, nullptr, "q.pop.agg");
                 emit_agg_proto_fill(temp, e);
-                if (gc_on()) {
-                    // The proto image leaves every container leaf empty, so this
-                    // registers empty containers at fixed addresses. It is deliberately
-                    // NOT repeated at the pop site: that site deinits the previous
-                    // contents and re-fills the proto at the SAME address, so the entry
-                    // stays valid across every pop and only the body exit removes it.
-                    emit_gc_container_roots(GcRootOp::Add, e.elem_type, temp, e.agg_ty);
-                }
+                // The proto image leaves every container leaf empty, so this
+                // registers empty containers at fixed addresses. It is deliberately
+                // NOT repeated at the pop site: that site deinits the previous
+                // contents and re-fills the proto at the SAME address, so the entry
+                // stays valid across every pop and only the body exit removes it.
+                emit_gc_container_roots(GcRootOp::Add, e.elem_type, temp, e.agg_ty);
                 agg_elem_ret_[k] = temp;
                 agg_elem_temp_list_.push_back({ temp, e.elem_type });
                 continue;
@@ -14448,9 +14375,7 @@ private:
                 // exactly as an aggregate buffer owns its leaves.
                 auto* temp = b_.CreateAlloca(e.slot_ty, nullptr, "q.pop.handle");
                 b_.CreateStore(llvm::Constant::getNullValue(e.slot_ty), temp);
-                if (gc_on()) {
-                    emit_gc_container_roots(GcRootOp::Add, e.elem_type, temp, e.slot_ty);
-                }
+                emit_gc_container_roots(GcRootOp::Add, e.elem_type, temp, e.slot_ty);
                 agg_elem_ret_[k] = temp;
                 agg_elem_temp_list_.push_back({ temp, e.elem_type });
             }
@@ -14791,7 +14716,7 @@ private:
                 // further member selection is party to it -- so it cannot ride the
                 // value path's owner. assoc_elem_lvalue emits the barrier beside the
                 // put_ptr that writes the key.
-                el.assoc_key_handle  = gc_on() && el.gc_owner != nullptr &&
+                el.assoc_key_handle  = el.gc_owner != nullptr &&
                                        assoc_key_is_class_handle(aa.assoc_type);
                 if (e.is_agg) {
                     // Aggregate value: a deferred is_agg lvalue. A following
@@ -14916,44 +14841,34 @@ private:
                 return;
             }
             case Inst::Tag::ClassNew: {
-                // Allocate the object body, zero it (2-state / handle leaves power
-                // on 0 / null), X-init 4-state leaves and init string leaves, and
-                // yield the handle as an i64 (reference semantics: the pointer is
-                // the value).
+                // Allocate the object body from the collected heap, X-init its
+                // 4-state leaves, init its string leaves, and yield the handle as an
+                // i64 (reference semantics: the pointer is the value).
                 //
-                // With --gc off the lifetime is leaked, which LRM 8.4 makes
-                // observably correct (there is no `delete` for a class handle and a
-                // program cannot observe a free) — see docs/design/classes.md §7.
+                // The allocator returns the HANDLE -- the body base, one word above
+                // the GC header -- with the body already zeroed (2-state and handle
+                // leaves power on 0 / null) and the GC word already written, so no
+                // memset is emitted here. The header sits BELOW the handle precisely
+                // so that every property offset and the vptr store are plain
+                // non-negative offsets off the value a program holds (Gc.h:41-46).
+                //
+                // The common case emits NO call at all: the bump sequence is inlined
+                // (emit_gc_alloc_fast, design §4.3) and reaches rt_gc_alloc_slow only
+                // when the mutator's current hole cannot satisfy the request. A class
+                // at or above the large-object threshold has no hole to bump and keeps
+                // the out-of-line rt_gc_alloc. Either way the mutator pointer costs
+                // one call per emitted function rather than one per `new`
+                // (gc_mutator_cur), and it stays a LOADED pointer rather than a
+                // link-time constant address so that multi-threaded simulation stays
+                // possible.
                 const Ref    class_ref = p.ref;
                 llvm::Value* body      = nullptr;
-                if (gc_on()) {
-                    // The allocator returns the HANDLE (the body base, one word above
-                    // the GC header), zeroes the body and writes the GC word, so the
-                    // memset goes away and everything below is unchanged: the header
-                    // sits BELOW the handle precisely so every property offset and
-                    // the vptr store stay exactly where they were (Gc.h:41-46).
-                    //
-                    // Since P2 the common case emits NO call at all: the bump sequence
-                    // is inlined (emit_gc_alloc_fast, design §4.3) and reaches
-                    // rt_gc_alloc_slow only when the mutator's current hole cannot
-                    // satisfy the request. A class at or above the large-object
-                    // threshold has no hole to bump and keeps the out-of-line
-                    // rt_gc_alloc. Either way the mutator pointer costs one call per
-                    // emitted function rather than one per `new` (gc_mutator_cur), and
-                    // it stays a LOADED pointer rather than a link-time constant
-                    // address so that multi-threaded simulation stays possible.
-                    if (gc_alloc_is_inline(class_ref)) {
-                        body = emit_gc_alloc_fast(class_ref);
-                    } else {
-                        body = b_.CreateCall(gc_alloc_fn(),
-                                             { gc_mutator_cur(), b_.getInt64(gc_object_bytes(class_ref)),
-                                               class_gc_map_global(class_ref) });
-                    }
+                if (gc_alloc_is_inline(class_ref)) {
+                    body = emit_gc_alloc_fast(class_ref);
                 } else {
-                    llvm::Type*    body_ty = class_body_ty(class_ref);
-                    const uint64_t size    = env_->llmod.getDataLayout().getTypeAllocSize(body_ty);
-                    body                   = b_.CreateCall(alloc_fn(), { b_.getInt64(size) });
-                    b_.CreateMemSet(body, b_.getInt8(0), b_.getInt64(size), llvm::MaybeAlign(64));
+                    body = b_.CreateCall(gc_alloc_fn(),
+                                         { gc_mutator_cur(), b_.getInt64(gc_object_bytes(class_ref)),
+                                           class_gc_map_global(class_ref) });
                 }
                 emit_class_body_init(class_ref, body);
                 // Install the descriptor pointer at the object header (field 0), so
@@ -14969,10 +14884,10 @@ private:
                 // object (reference semantics), unlike a value struct addressed
                 // inline. A following MemberSelect addresses a property.
                 llvm::Value* handle = must_of(value_of(p.op_type.op));
-                // A handle straight out of ClassNew is the address rt_alloc just
-                // returned, so the property default-initializer stores every
-                // `new` emits need no guard -- and rt_alloc carries no nonnull
-                // attribute for the optimizer to fold one away with.
+                // A handle straight out of ClassNew is the address the allocator just
+                // returned, so the property default-initializer stores every `new`
+                // emits need no guard -- and no runtime declaration carries a nonnull
+                // attribute (rt_fn adds none) for the optimizer to fold one away with.
                 const bool fresh = ir_->tag(p.op_type.op) == Inst::Tag::ClassNew;
                 if (!fresh) {
                     emit_null_handle_check(handle, i);
@@ -14995,7 +14910,7 @@ private:
                 // loop's quiescent edge (:11542) -- so the barrier's test provably
                 // cannot fire and the store needs none. This is exactly the "a `new` in
                 // the same statement" case, decided rather than assumed.
-                if (gc_on() && !fresh) {
+                if (!fresh) {
                     lv.gc_owner = lv.base;
                 }
                 set_lvalue(i, lv);
@@ -25516,9 +25431,8 @@ private:
     llvm::AllocaInst*   awaiter_    = nullptr;
     // This coroutine's rt_gc_frame registry node: an alloca placed just after
     // coro.begin, so CoroSplit hoists it into the heap frame (see
-    // emit_gc_frame_link). Null when this frame is not registered -- the collector is
-    // off, or frame_may_hold_gc_ref said the frame can hold no reference -- and reset
-    // per ramp.
+    // emit_gc_frame_link). Null when frame_may_hold_gc_ref said this frame can hold
+    // no reference, so it was never registered -- and reset per ramp.
     llvm::Value*        gc_frame_node_ = nullptr;
     // The hoisted rt_gc_mutator_current() result for the function being emitted: one
     // call feeding every inlined safepoint poll in it (gc_mutator_cur). Not reset per
@@ -25853,7 +25767,7 @@ private:
     // Memoized `%clotho.assoc` handle slot type ({ ptr impl }).
     llvm::StructType* assoc_slot_ty_ = nullptr;
     llvm::StructType* elem_ops_ty_ = nullptr;
-    // Memoized rt_gc_* ABI mirrors (src/runtime/Gc.h); null until --gc asks.
+    // Memoized rt_gc_* ABI mirrors (src/runtime/Gc.h); null until first asked for.
     llvm::StructType* gc_map_ty_     = nullptr;
     llvm::StructType* gc_roots_ty_   = nullptr;
     llvm::StructType* gc_frame_ty_   = nullptr;

@@ -1,20 +1,22 @@
 # Garbage collection (LRM 8.4)
 
-Status: **P0-P4 landed behind a non-default `--gc`. Both tracks (evacuation,
-multi-mutator) remain the proposal (§12).** What runs today: the Immix-shaped heap
+Status: **P0-P4 landed, and the collector is unconditional. Both tracks
+(evacuation, multi-mutator) remain the proposal (§12).** What runs today: the Immix-shaped heap
 with an inlined bump-allocation fast path, the object model, precise global roots,
 precise container roots, conservative pinned coroutine-frame roots, per-class trace
 maps and finalizers, generational collection in place with an inlined write
 barrier, and stop-the-world young or full mark-region collection at the scheduler's
-region boundary. `--gc=off` is the default and emits no collector at all.
+region boundary. There is no way to run a design uncollected; §12a records why the
+flag went and what that cost.
 
 Landed evidence, all [in-tree]:
 
 - 2029/2029 of the suite passes, including 43 cases in `tests/gc_test.cpp` (723
   assertions), which also pass under ASan+UBSan with no memory error.
 - **Allocation is 2.0× faster than the leak-everything path**: 4M short-lived
-  objects, `--gc=off` 196 ms of simulate time against `--gc=on` **96 ms**. `--gc=off`
-  calls `rt_alloc` (64-byte-aligned `operator new`) per object; `--gc=on` bumps a
+  objects, 196 ms of simulate time uncollected against **96 ms** collected. The
+  uncollected path called `rt_alloc` (64-byte-aligned `operator new`) per object;
+  the collector bumps a
   cursor inline. Inlining that path (P2) was itself worth 1.5× over the out-of-line
   pool allocator.
 - **Generational collection does what it exists for**: a 20,000-node stable
@@ -25,11 +27,13 @@ Landed evidence, all [in-tree]:
   collection count triples (22 → 50 young collections cost 3.35 → 3.68 ms) while
   all-full time scales with it. `live at last collection: 1 object` on a heap
   holding 20,000 live nodes is the same fact from the other side.
-- `--gc=off` emits zero GC artifacts: the class descriptor keeps its original
-  `{ [16 x i32], [N x ptr] }` shape and no `rt_gc_*` symbol appears in the module,
-  so the `sim_ms` gate is met by construction rather than by measurement.
+- The collector costs a design that does not allocate essentially nothing, measured
+  rather than argued: median **0.0%** simulate delta over the 12 runnable cases of
+  `tests/perf/cases` (min of 9, interleaved), corpus total −1.7%. That is what made
+  the flag removable (§12a); while it existed, `--gc=off` emitted no GC artifact at
+  all, so the same claim held by construction.
 - Byte-identical stdout across `off` / `on` / `stress` on every case.
-- A 10,201-object churn design under `--gc=stress`: 201 collections, live set
+- A 10,201-object churn design under `--gc-stress`: 201 collections, live set
   settles at 202 objects / 12,928 bytes, 9,999 objects finalized during the run
   (their `string` buffers freed — the second-order leak in §0), heap 128 blocks
   with 127 free at exit.
@@ -39,14 +43,14 @@ Landed evidence, all [in-tree]:
   10,000-object filler, with 29 conservative pins recorded. `tests/gc_test.cpp`
   asserts `conservative_pins > 0` on that case so it cannot silently decay into a
   precise-root test (see §5.4 for why that trap is easy to fall into).
-- LeakSanitizer, the house method for lifetime work, on the churn design: `--gc=off`
-  reports **571,256 bytes leaked in 10,201 allocations** — the class objects and
-  their `string` buffers, exactly §0's two leaks. `--gc=on` reports **no leak at
-  all**. On a design that also calls `$finish`, `--gc=off` leaks 10,024
-  allocations and `--gc=stress` leaks **4**: the collector removes 10,020 of them
+- LeakSanitizer, the house method for lifetime work, on the churn design:
+  uncollected it reported **571,256 bytes leaked in 10,201 allocations** — the class
+  objects and their `string` buffers, exactly §0's two leaks. Collected it reports
+  **no leak at all**. On a design that also calls `$finish`, uncollected leaks 10,024
+  allocations and `--gc-stress` leaks **4**: the collector removes 10,020 of them
   and the residue is the pre-existing `$finish`-abandons-live-frames leak
   (`cooperative-finish.md:24-28`), not a collector bug.
-- ASan and UBSan report no memory error on any case under `--gc=stress`
+- ASan and UBSan report no memory error on any case under `--gc-stress`
   — no use-after-free, no overflow. That is the signal that matters most, because
   a missed root shows up as exactly that.
 - **Idle overhead is proportional to what a design actually uses, with no cliff.**
@@ -65,7 +69,7 @@ Landed evidence, all [in-tree]:
   emitted code — its hot `always` blocks contain no GC instruction at all, and the
   only per-event addition is the inlined poll in `sim_drain`, which the class-free
   design gets identically and does not pay for. A control run isolates part of it:
-  adding the unused class field alone, with `--gc=off` on both sides, moves the
+  adding the unused class field alone, uncollected on both sides, moves the
   same benchmark **−2.4%**, so this family swings ±2-3% on layout. Honest summary:
   **within a few percent, at the edge of what this harness can resolve, with no
   per-event GC code in the hot path.** Settling it properly needs `perf.py` plus
@@ -388,7 +392,7 @@ alternative is silently freeing an object whose only reference is a container el
 and that has to be a located failure rather than a quiet
 fallback. Worth recording why the refusal existed at all: an earlier draft of this
 document asserted the shape was already loud-guarded in the frontend, citing `TODO.md`.
-It was not — `C q[$]; q.push_back(a);` compiles and runs under `--gc=off` [in-tree],
+It was not — `C q[$]; q.push_back(a);` compiled and ran uncollected [in-tree],
 so the collector was one guard away from freeing live objects in a shape users
 already write.
 
@@ -628,7 +632,7 @@ in its comment.
 
 Collection runs at the drain-loop quiescent edges (F1) when the allocation budget
 is exceeded — a nursery budget in bytes plus a heap-size threshold, both
-benchmarked (§11), with `--gc=off` reproducing today's behaviour and `--gc=stress`
+benchmarked (§11), with `--gc-stress`
 collecting at every safepoint. No polls are emitted in generated code.
 
 **The unsuspended-allocation hole.** A process may allocate without bound between
@@ -992,8 +996,8 @@ metadata, object-start bitmap; GC word at −8 with forwarding, pin and lazy-id
 encodings defined; trace map and per-class finalizer emitted but unused; `chandle`
 distinction threaded into layout metadata; `clotho.gcroots` emitted; frame registry
 node linked and unlinked; allocation state addressed through a mutator context
-pointer. Default `--gc=off` behaves exactly as today.
-*Acceptance, met:* byte-identical stdout on the whole suite (1980/1980); `--gc=off`
+pointer. The collector was still opt-in at this point (§12a).
+*Acceptance, met:* byte-identical stdout on the whole suite (1980/1980); the off mode
 emits no GC artifact at all, so `sim_ms` is flat by construction rather than by
 measurement; registry invariants assert clean. Not yet measured: the peak-RSS fall
 from 64→16-byte object alignment, because `perf.py` has no memory metric (§11).
@@ -1005,14 +1009,14 @@ finalizers at sweep; lazy line sweep; teardown sweep at `$finish`. Requires
 cooperative `$finish` (§6.3).
 *Acceptance, met:* a churn design reaches a steady live set (202 objects held out
 of 10,201 allocated) instead of growing linearly; the class suite passes under
-`--gc=on` and `--gc=stress`; both frame-root shapes retain against a filler.
+both cadences; both frame-root shapes retain against a filler.
 *Not met, deliberately deferred:* cooperative `$finish` has not landed, so a
 `$finish` out of live frames still abandons them — with the collector that is
 retention, not corruption, because an abandoned frame is never freed and so is
 never a dangling registry entry. The `detect_leaks=0` overrides in
 `tests/data_model_test.cpp` and `tests/dynamic_array_test.cpp` therefore stay until
 `$finish` is cooperative; the class-object half of their justification is now
-obsolete under `--gc=on`.
+obsolete once objects are collected.
 
 **P2 — inlined bump allocation. (landed)** The fast path is emitted inline against
 the mutator context: bump, object-start bit, GC word, zeroed body, with a cold call
@@ -1021,14 +1025,14 @@ pointer surgery too, since `frames_head` moved into the mutator. The finalizable
 became a per-block bitmap, because the allocation-time `std::vector` push was the one
 thing an inlined path could not do — and restricting inlining to classes without
 finalizers would have excluded almost every UVM object.
-*Acceptance, met:* 4M objects at **96 ms against `--gc=off`'s 196 ms**, and 1.5×
+*Acceptance, met:* 4M objects at **96 ms against the uncollected path's 196 ms**, and 1.5×
 over the out-of-line pool allocator it replaced.
 
 **P3 — generational (StickyImmix). (landed)** Sticky mark bits, an inlined write
 barrier over object remembering (§7), a remembered set, per-line age records, and
 young-or-full collection kinds with `--gc-full-every=N` over a heap-growth default.
-The default stays `--gc=off`: flipping it is a user-facing decision that should
-follow a real UVM run, not precede it.
+The default was left off here; §12a records what happened instead, which is that
+the flag was removed outright once the measurements were in.
 *Acceptance, met:* young-collection cost is independent of stable-set size — 20,000
 live nodes, and the last young collection reports **1 live object**; 3.3× to 5.9×
 against forcing every collection full, and nearly flat as the collection count
@@ -1066,6 +1070,39 @@ bounded-latency stopping (§6.2). The P0 commitments — indirect allocation sta
 byte metadata, unconditional card store — are the parts that would be expensive to
 retrofit, which is why they are in P0 and not here.
 
+
+## 12a. Why there is no uncollected mode
+
+Every phase above shipped behind `--gc[=off|on|stress]`, default off, and the
+backend carried a complete second code path for the off case: `rt_alloc` instead of
+the bump allocator, a class descriptor with no trace-map pointer, a zeroed
+`rt_elem_ops` GC tail, and emit-nothing gates on the root tables, the safepoint, the
+frame registry and `rt_gc_init`. That flag is gone. The collector always runs; only
+its cadence and its budgets are on the CLI (`--gc-stress`, `--gc-stats`,
+`--gc-nursery`, `--gc-heap-max`, `--gc-full-every`).
+
+**The evidence that made it removable**, all measured on this branch: median **0.0%**
+simulate delta across the 12 runnable cases of `tests/perf/cases` (min of 9,
+interleaved; corpus total −1.7%, worst case +2.3%); allocation-heavy designs roughly
+**2× faster** collected, because the fast path replaces `operator new`; a UVM-shaped
+run **28% faster** at **44% lower peak RSS**; and, since P4 and §3.3a, nothing
+refused that was previously accepted. There was no workload left that the flag
+protected.
+
+**What it cost.** Two things, and neither should be discovered by surprise later:
+
+- **The strongest test oracle.** "Byte-identical with the collector off" compared
+  against a reference in which nothing can be freed early. §13.1 states what
+  replaced it and what that no longer covers.
+- **The escape hatch.** A collector bug can no longer be worked around from the
+  command line. That is a deliberate trade for one code path instead of two — a
+  dual path that is exercised by every test is a real maintenance asset, and one
+  that is exercised only by the flag's own test is a liability, which is what this
+  one had become.
+
+Removing it also deleted `rt_gc_enabled()` from the runtime ABI: its only caller was
+the test that proved the off mode collected nothing.
+
 ---
 
 ## 13. Verification
@@ -1074,10 +1111,28 @@ retrofit, which is why they are in P0 and not here.
 iverilog cannot check it — the substitute strategy is stated, and
 it is four things:
 
-1. **Stdout identity.** Every existing test byte-identical under `--gc=off`,
-   `--gc=on`, `--gc=stress`, and later `--gc-defrag=opportunistic`. A collector
-   that changes observable behaviour is a bug by definition; a *moving* collector
-   that changes observable behaviour is the bug this catches.
+1. **Cadence identity, and it is weaker than it was.** Every existing test is
+   byte-identical under the ordinary cadence and under `--gc-stress` (and later
+   under `--gc-defrag=opportunistic`). A collector that changes observable
+   behaviour is a bug by definition, and for a *moving* collector this is the bug
+   this catches.
+
+   What it no longer catches: **a bug that affects both cadences equally.** Until
+   §12a the strongest leg of this oracle was "byte-identical with the collector
+   *off*", and an uncollected run is a perfect reference because nothing in it can
+   be freed early. That leg went with the flag. Stress is a far more aggressive
+   cadence than the default, so it still catches anything sensitive to *when*
+   collection happens — which is what a missing root is — but it cannot catch a
+   wrong answer that both cadences produce identically.
+
+   What covers the gap, and why the reachability cases are built the way they are:
+   each runs a filler process that recycles and poisons freed lines, so a
+   wrongly-collected object reads back as `0x5A5A5A5A` instead of its own
+   stale-but-intact bytes — a value check needing no reference run. Several also
+   give the object under test a `string` property, so the same mistake becomes a
+   heap-use-after-free under ASan rather than a text diff. Both devices measure
+   against an absolute expectation rather than a differential one, which is
+   precisely why they were built that way while the off mode still existed.
 2. **LeakSanitizer with the overrides removed.** The house method for lifetime
    work (`fork-join.md:495-497`: "a missed release leaks and a double release is a
    double free, and neither shows up in a value check"). Concrete criterion:
@@ -1088,7 +1143,7 @@ it is four things:
 
 **Four debug modes carry most of the correctness load:**
 
-- `--gc=stress` — collect at every region boundary, and at every allocation under
+- `--gc-stress` — collect at every region boundary, and at every allocation under
   `-DCLOTHO_SANITIZE=ON`. Turns a latent missing root into a deterministic
   failure. Under evacuation, also *move every movable object at every collection*,
   which is the standard way to shake out stale-pointer bugs.
@@ -1116,7 +1171,7 @@ validate-on-trace as the canonical pair.
 
 ## 14. Deferred, each loud-guarded
 
-- **Nothing is refused under `--gc` that `--gc=off` accepts.** Every guard this work
+- **Nothing is refused that was accepted before the collector existed.** Every guard this work
   introduced has since been lifted: class handles as container elements and aggregate
   leaves (P4, §3.3), and an associative-array key containing a class handle (§3.3a).
 - Event handles, event arrays, events as class properties — already guarded

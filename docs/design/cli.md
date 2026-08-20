@@ -58,10 +58,10 @@ There is no second help and nothing to forward — see "One parser" below.
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
 | `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel` |
 | `--sanitize <list>` | both | dynamic bug checks instrumented into the emitted code, reported to stderr and non-fatal: `bounds` (an index outside what it indexes — array element, packed bit/part select, string character, queue method index, pop from an empty queue; x/z index included), `xprov` (xsan, x provenance — not yet implemented, so **Debug builds only**, `CLOTHO_XSAN`; a shipped build rejects the name). Off by default |
-| `--gc[=<mode>]` | both | collect class objects instead of leaking them: `off` (default), `on`, `stress` (collect at every opportunity, so a missed root fails immediately; for working on clotho). Bare `--gc` means `on`; the mode attaches with `=` only (`--gc on` is a usage error, see the conventions below). **Changes the generated code** (garbage-collection.md), so a `build` and the `run` of what it built must be given the same mode |
-| `--gc-stats` | both | collection summary when the design exits: how many collections, how much was reclaimed, how long the design was paused. Needs `--gc` |
-| `--gc-nursery <bytes>` | both | bytes of class objects the design may allocate between collections (default `8388608`). A plain integer — no `k`/`m`/`g` suffix, because no option on this surface has one. `0` is refused: it means `--gc=stress`, and `0` already means "no ceiling" for `--gc-heap-max`. Needs `--gc` |
-| `--gc-heap-max <bytes>` | both | soft ceiling in bytes: reaching it asks for a collection at the next opportunity, and passing it anyway is reported rather than refused, since a process may allocate without ever suspending (garbage-collection.md §6.1). `0`, the default, sets no ceiling. Needs `--gc` |
+| `--gc-stress` | both | collect class objects at every opportunity instead of when the design has created enough of them. Slow by design: it turns an object clotho failed to keep into an immediate wrong answer rather than a rare one, so it is for working on clotho itself. **Changes the generated code** (garbage-collection.md), so a `build` and the `run` of what it built must be given the same setting |
+| `--gc-stats` | both | collection summary when the design exits: how many collections, how much was reclaimed, how long the design was paused |
+| `--gc-nursery <bytes>` | both | bytes of class objects the design may allocate between collections (default `8388608`). A plain integer — no `k`/`m`/`g` suffix, because no option on this surface has one. `0` is refused: it means `--gc-stress`, and `0` already means "no ceiling" for `--gc-heap-max` |
+| `--gc-heap-max <bytes>` | both | soft ceiling in bytes: reaching it asks for a collection at the next opportunity, and passing it anyway is reported rather than refused, since a process may allocate without ever suspending (garbage-collection.md §6.1). `0`, the default, sets no ceiling |
 | `--allow-system <const\|full>` | both | permit `$system` (LRM 20.17.1); refused by default |
 | `--loose-timescale` | both | accept a design that mixes elements declaring a time scale with elements that do not (slang's `MissingTimeScale`, LRM 3.14.2.2); the un-annotated ones take `--timescale`'s value, or `1ns/1ns`. Refused by default |
 | `-j, --threads <n>` | both | slang's own option; sizes its parser **and** the LLVM compile pool |
@@ -71,14 +71,12 @@ There is no second help and nothing to forward — see "One parser" below.
 | `-h, --help` / `--version` | any | help; versions (clotho git hash, LLVM, slang) |
 | `+<text>` | run | plusarg (LRM 21.6), `+` stripped, in order |
 
-Valued options take `--name value` or `--name=value`, with one exception:
-`--gc`, whose value may be omitted, takes it only as `--gc=<mode>`, and `--gc on`
-is a usage error rather than either of its two readings (see the conventions
-below). Clotho's options sit in the same namespace as slang's `-D`, `-I`, `-y`,
+Valued options take `--name value` or `--name=value`. Clotho's options sit in the
+same namespace as slang's `-D`, `-I`, `-y`,
 `-v`, `-f`, `--top`, `-G`, `--timescale`, `--std`, `-W`, `--error-limit` and
 `-j`, which are options this tool has rather than options it forwards.
 
-"both" in the table means `build` and `run`. The `--gc` group is the only such
+"both" in the table means `build` and `run`. The `--gc-*` group is the only such
 set that is *refused* elsewhere, because it is the only one that means something
 specific to compiling and running rather than nothing at all: `--help` tags it
 `[build|run]`, and `lint`, which compiles nothing, rejects it.
@@ -105,12 +103,9 @@ the help), and the Driver parses the whole line. Consequences:
   replaces the CLI's use of `lower_sources`, which now only builds a Driver for
   callers that have plain argument lists (tests).
 
-Three things still reach argv before slang: the command word; runtime plusargs,
-which slang would reject as unknown `+` options; and a bare `--gc`, rewritten to
-`--gc=on` because slang's `CommandLine` has no optional-value option (every
-non-boolean one demands a value, and a boolean one would reject `stress`). The
-rewrite feeds the same registered option, so there is still one parser and one
-help. A `+arg` that is not one of the three `+` forms slang registers
+Two things still reach argv before slang: the command word, and runtime plusargs,
+which slang would reject as unknown `+` options. A `+arg` that is not one of the
+three `+` forms slang registers
 (`+define+`, `+incdir+`, `+libext+`) is a plusarg; `--` ends plusarg
 interpretation and passes everything after it to slang as given — the escape for
 a `+` command slang gained through `--cmd-rename`.
@@ -123,10 +118,10 @@ surface accepted `--dpi-lib`, `--perf-jitdump`, `--jobs` and plusargs on every
 emit path and ignored them, which contradicts the project's never-silently-accept
 rule.
 
-A knob that would do nothing is the same error. `--gc-stats`, `--gc-nursery` and
-`--gc-heap-max` without `--gc` (or with `--gc=off`) are refused rather than
-accepted and dropped, and `--gc on` is refused rather than read as either
-`--gc=on` plus a source file named `on` or as a value the parser cannot take.
+A knob that would do nothing is the same error. The `--gc-*` group used to be
+refused without `--gc`, back when class objects were collected only on request;
+the collector is unconditional now (garbage-collection.md §12a), so every one of
+them always means something and none of them needs a companion flag.
 
 ### Exit status
 
@@ -205,13 +200,9 @@ behaviour change; docs quoting the old spellings were migrated with this commit.
 - Anything that only makes sense during simulation belongs to `run`, and using
   it under `build` must be an error.
 - A mode that is *compiled into* the artifact belongs to `build` **and** `run`,
-  tagged `[build|run]`, and the two must be given the same one: `--gc` changes
-  the generated code, so `run` cannot add it to what a `build` emitted without
-  it. `lint`, which compiles nothing, still refuses it.
-- An option whose value may be omitted takes that value with `=` only (`--gc`,
-  `--gc=stress`). slang's `CommandLine` has no optional-value option, so the
-  bare form is rewritten to the valued one before the Driver parses; the space
-  form is a usage error, since it would otherwise swallow the next source file.
+  tagged `[build|run]`, and the two must be given the same one: the `--gc-*` group
+  changes the generated code, so `run` cannot add one to what a `build` emitted
+  without it. `lint`, which compiles nothing, still refuses them.
 - A size is a plain integer number of bytes (`--gc-nursery`, `--gc-heap-max`).
   No `k`/`m`/`g` suffix exists on this surface, and the first option that needs
   one adds it to every size option at once rather than to itself.
