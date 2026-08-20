@@ -710,13 +710,18 @@ placement failure likelier. Collapsing the trivial bodies (§14) would take most
 that back, and giving the JIT a small-code-model memory manager would remove the
 failure class entirely; neither is this branch's job.
 
+**GC: measured, not yet a test.** Run against a merged tree that also carried the
+in-progress collector, a design randomizing a `rand` class that holds a `rand` class
+handle and a `randc` property, churning 200 garbage objects against a 64 KiB nursery
+so the collector runs many cycles, prints byte-identical output under `--gc=off`,
+`--gc=on` and `--gc=stress`. That is the claim the appended fields rest on: they hold
+no class handles, so `class_handle_offsets` yields the same list and only
+`rt_gc_map::size` and `gc_object_bytes` grow. It belongs in `tests/gc_test.cpp` as a
+`check_all_gc_modes` case, because that is the only TU with a config-taking
+`run_capture` — so it lands with the collector, whose own work is still unlanded.
+
 Still owed, and not yet written:
 
-- **GC:** `check_all_gc_modes` (`tests/gc_test.cpp:80-84`) over a randomizing design.
-  Objects grew, so `gc_object_bytes` and `rt_gc_map::size` changed; the appended
-  fields hold no handles, so the trace map should be unaffected, but that is reasoned
-  rather than measured. `--gc` is a non-default mode and the GC work itself is
-  unlanded on main, so this belongs with whichever lands second.
 - **Thunk polarity:** an assertion in the shape of `tests/analysis_test.cpp:53-79`
   that a randomizing `always` block leaves the comb-thunk path (it does, through the
   `Urandom` at the `new` site, §9.2) while a body that only calls `randomize()` on an
