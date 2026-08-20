@@ -380,6 +380,17 @@ public:
     // A parking statement (`await`, `wait fork`).
     Index proc_wait(ProcOp op, std::span<const Index> args, SourceLoc loc);
 
+    // -- Wait queue of a built-in synchronization object (LRM 15.3, 15.4) --
+    // `args` is the operand run SyncInfo carries: the queue's head-word lvalue,
+    // then its tail-word lvalue. `site` identifies the wait, and a `Leave` MUST
+    // carry the same site as the `Park` it discharges -- that is how the two share
+    // one frame-resident waiter node.
+    //
+    // Park on the queue -> 1 when this thread resumed as the queue's head.
+    Index sync_wait(uint32_t site, std::span<const Index> args, SourceLoc loc);
+    // Leave the queue (handing off to the new head), or wake it.
+    Index sync_ctl(SyncOp op, uint32_t site, std::span<const Index> args, SourceLoc loc);
+
     // -- System tasks --
     // $display / $write: a literal format string, a newline flag (true for
     // $display), and the already-lowered value args its specifiers consume. The

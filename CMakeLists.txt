@@ -568,6 +568,7 @@ add_executable(clotho_test
   tests/xhier_test.cpp
   tests/fork_test.cpp
   tests/process_test.cpp
+  tests/sync_test.cpp
   tests/severity_test.cpp
   tests/event_test.cpp
   tests/data_model_test.cpp

@@ -712,6 +712,16 @@ Index Builder::proc_wait(ProcOp op, std::span<const Index> args, SourceLoc loc) 
     return emit({ Inst::Tag::ProcWait, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
+Index Builder::sync_wait(uint32_t site, std::span<const Index> args, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(SyncInfo{ add_slice(args), site, SyncOp::Park });
+    return emit({ Inst::Tag::SyncWait, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
+Index Builder::sync_ctl(SyncOp op, uint32_t site, std::span<const Index> args, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(SyncInfo{ add_slice(args), site, op });
+    return emit({ Inst::Tag::SyncCtl, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
 Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
     // $display / $write: no descriptor operand; the backend targets standard output.
     return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, display_info(fmt, newline, args)) }, loc);

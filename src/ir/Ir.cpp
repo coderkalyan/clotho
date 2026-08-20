@@ -84,6 +84,12 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                     const auto info = extra_data<ProcCtlInfo>(p.extra);
                     return index_slice(info.args);
                 }
+                case ExtraOperandShape::SyncArgs: {
+                    // wait queue (LRM 15.3 / 15.4): the queue's head-word and
+                    // tail-word lvalues; the site id and op selector are not.
+                    const auto info = extra_data<SyncInfo>(p.extra);
+                    return index_slice(info.args);
+                }
                 case ExtraOperandShape::NotExtra:
                     break;
             }

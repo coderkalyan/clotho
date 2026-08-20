@@ -163,6 +163,12 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::ProcQuery:
         case Inst::Tag::ProcCtl:
         case Inst::Tag::ProcWait:
+        // The wait queue of a built-in `semaphore` / `mailbox` (LRM 15.3, 15.4).
+        // SyncWait parks, and both need the frame the waiter node lives in, so
+        // neither can appear in a thunk-elided group either
+        // (docs/design/mailbox-and-semaphore.md §5.1).
+        case Inst::Tag::SyncWait:
+        case Inst::Tag::SyncCtl:
             return blocks;
 
         // -- Synthesizable but not pure: the assignments, and the aggregate
@@ -1465,6 +1471,8 @@ struct ValueSweep {
                 case Inst::Tag::ProcQuery:
                 case Inst::Tag::ProcCtl:
                 case Inst::Tag::ProcWait:
+                case Inst::Tag::SyncWait:
+                case Inst::Tag::SyncCtl:
                 case Inst::Tag::MonitorSet:
                 case Inst::Tag::MonitorEmit:
                 case Inst::Tag::MonitorOn:

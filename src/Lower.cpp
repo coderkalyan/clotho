@@ -2595,6 +2595,9 @@ private:
             if (clt.name == "process") {
                 return lower_process_class(clt);
             }
+            if (clt.name == "semaphore") {
+                return lower_semaphore_class(clt);
+            }
             fail("the built-in '" + std::string(clt.name) + "' class is not supported");
         }
         // Phase 3 features (docs/design/classes.md §2): guarded loud.
@@ -2858,6 +2861,68 @@ private:
             drain_rand_bodies();
         }
         return ref;
+    }
+
+    // Lower the built-in `semaphore` class (LRM 15.3). Like `process` its body is
+    // not a property table -- slang synthesizes signatures only -- so it is
+    // synthesized here: the key count, plus the two words of its FIFO wait queue.
+    // Everything else is an ordinary class: the handle is a 64-bit 2-state word,
+    // `null` is 0, `==` is identity, and it is storable in a variable, a class
+    // property or a container. See docs/design/mailbox-and-semaphore.md §4.1.
+    //
+    // The key count is SIGNED 64-bit, not `int`: LRM 15.3.1 says the count "can
+    // increase beyond keyCount when more keys are put into the semaphore than are
+    // removed", so a 32-bit accumulator would wrap in a long run of unbalanced
+    // `put`s. The two queue words are chandle-shaped (2-state, 64-bit), so no
+    // collector ever sees the coroutine-frame pointers they hold.
+    ir::Ref lower_semaphore_class(const slang::ast::ClassType& clt) {
+        const uint32_t fid = module_.pool.reserve_struct_fields();
+        ir::Type       t;
+        t.kind      = ir::Type::Kind::Class;
+        t.fields_id = fid;
+        t.element   = ir::Ref::Invalid;
+        const ir::Ref ref = module_.pool.put(ir::Item{ t });
+        class_type_cache_.emplace(&clt, ref);
+        std::vector<ir::FieldRow> fields;
+        fields.push_back({ kSemKeysField, make_int_type(64, true, false), kSemKeys });
+        fields.push_back({ kSemHeadField, make_int_type(64, false, false), kSemQHead });
+        fields.push_back({ kSemTailField, make_int_type(64, false, false), kSemQTail });
+        module_.pool.set_struct_fields(fid, std::move(fields));
+        // Same two obligations lower_process_class has: the reserved randomization
+        // slots need an (empty) rand block for the generated bodies to read, and the
+        // outermost frame drains the ids compute_vtable reserved.
+        class_rand_.emplace(&clt, ClassRand{});
+        compute_vtable(clt, ref);
+        if (class_depth_ == 1) {
+            drain_rand_bodies();
+        }
+        return ref;
+    }
+
+    // Whether `sub` is one of the built-in synchronization classes' methods (LRM
+    // 15.3, 15.4). Keyed on the owning ClassType's name and package for the reason
+    // is_process_method is: a method call can be lowered before any variable of the
+    // type has been declared.
+    static bool is_sync_method(const slang::ast::SubroutineSymbol& sub) {
+        if (!sub.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+            return false;
+        }
+        const slang::ast::Scope* owner = sub.getParentScope();
+        if (owner == nullptr || owner->asSymbol().kind != SymbolKind::ClassType ||
+            owner->asSymbol().name != "semaphore") {
+            return false;
+        }
+        const slang::ast::Scope* pkg = owner->asSymbol().getParentScope();
+        return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
+    }
+
+    // Whether `clt` is a built-in synchronization class of the `std` package.
+    static bool is_sync_class(const slang::ast::ClassType& clt) {
+        if (clt.name != "semaphore") {
+            return false;
+        }
+        const slang::ast::Scope* pkg = clt.getParentScope();
+        return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
     }
 
     // Whether `sub` is one of `process`'s nine built-in methods (LRM 9.7). Keyed on
@@ -23180,6 +23245,23 @@ private:
         }
         const ir::Ref   class_ref = lower_type(*nc.type);
         const ir::Index handle    = b.class_new(class_ref, l);
+        if (is_sync_class(clt)) {
+            // `semaphore::new(int keyCount = 0)` is a BODYLESS built-in constructor
+            // (LRM 15.3.1): emit_ctor_call would lower slang's empty prototype and
+            // die on an out-of-range formal index, so the argument is stored into the
+            // synthetic body here instead. The rest of the body powers on all-zero,
+            // which is exactly an empty wait queue.
+            ir::Index keys = b.constant(module_.pool.put_int(make_int_type(64, true, false), 0), l);
+            if (const Expression* cc = nc.constructorCall()) {
+                const CallExpression& call = cc->as<CallExpression>();
+                if (call.arguments().size() == 1) {
+                    keys = b.resize(lower_expr(*call.arguments()[0], b), make_int_type(64, true, false), l);
+                }
+            }
+            b.binary(ir::Inst::Tag::Store,
+                     b.member_select(b.handle_deref(handle, class_ref, l), kSemKeys, class_ref, l), keys, l);
+            return handle;
+        }
         emit_object_rng_seed(clt, handle, class_ref, b, l);
         // Non-static property default initializers run at construction, in
         // declaration order, BEFORE any constructor body (LRM 8.8). slang attaches
@@ -23821,6 +23903,108 @@ private:
         fail("process::" + std::string(sub.name) + "() is not supported");
     }
 
+    // Lower a call to a built-in `semaphore` method (LRM 15.3). Each expands HERE,
+    // into ordinary IR over the synthetic body plus the two wait-queue primitives:
+    // the resource test is a frontend compare, the park / wake discipline is the
+    // backend's. See docs/design/mailbox-and-semaphore.md §6.1.
+    std::optional<ir::Index> lower_sync_method(const CallExpression&   call,
+                                               const SubroutineSymbol& sub,
+                                               ir::Builder&            b) {
+        const ir::SourceLoc l = loc(call);
+        if (call.thisClass() == nullptr) {
+            fail("semaphore::" + std::string(sub.name) + " needs an explicit semaphore handle");
+        }
+        const ir::Ref   ref    = lower_type(*call.thisClass()->type);
+        const ir::Index handle = lower_expr(*call.thisClass(), b);
+        const ir::Ref   i64    = make_int_type(64, true, false);
+        const ir::Ref   int_ty = make_int_type(32, true, true);
+        // The body lvalue is re-derived per access rather than held across the park:
+        // a suspend may have run in between, and an lvalue is a place, not a copy.
+        const auto field = [&](uint32_t idx) {
+            return b.member_select(b.handle_deref(handle, ref, l), idx, ref, l);
+        };
+        const auto keys     = [&] { return b.unary(ir::Inst::Tag::Load, field(kSemKeys), l); };
+        const auto qwords   = [&] {
+            return std::array<ir::Index, 2>{ field(kSemQHead), field(kSemQTail) };
+        };
+        // `keyCount` defaults to 1 (`put`/`get`/`try_get`); slang materialises the
+        // default actual, so an absent one is an internal error rather than a case.
+        const auto count = [&]() -> ir::Index {
+            if (call.arguments().size() != 1) {
+                fail("semaphore::" + std::string(sub.name) + " expects one argument");
+            }
+            return b.resize(lower_expr(*call.arguments()[0], b), i64, l);
+        };
+
+        if (sub.name == "put") {
+            // LRM 15.3.2: return the keys, then "if a process has been suspended
+            // waiting for a key, that process shall execute if enough keys have been
+            // returned" -- the woken head re-tests and takes them.
+            const ir::Index n = count();
+            b.binary(ir::Inst::Tag::Store, field(kSemKeys), b.binary(ir::Inst::Tag::Add, keys(), n, l), l);
+            b.sync_ctl(ir::SyncOp::WakeHead, sync_site_seq_++, qwords(), l);
+            return std::nullopt;
+        }
+        if (sub.name == "try_get") {
+            // LRM 15.3.4 defines this on availability alone: it never joins the
+            // waiting queue, so 15.3.3's FIFO rule -- which is about that queue --
+            // does not constrain it, and a queued waiter does not block it. Recorded
+            // in the design doc §15; Verilator agrees.
+            const ir::Index n  = count();
+            const ir::Index ok = b.binary(ir::Inst::Tag::Ge, keys(), n, l);
+            b.binary(ir::Inst::Tag::Store, field(kSemKeys),
+                     b.select(ok, b.binary(ir::Inst::Tag::Sub, keys(), n, l), keys(), l), l);
+            return b.select(ok, b.constant(module_.pool.put_int(int_ty, 1), l),
+                            b.constant(module_.pool.put_int(int_ty, 0), l), l);
+        }
+        if (sub.name == "get") {
+            const uint32_t  site = sync_site_seq_++;
+            const ir::Index n    = count();
+            // Fast path, taken only when NOBODY is queued: LRM 15.3.3's FIFO rule
+            // (and Accellera's Interpretation #1 of it) makes a blocked head block
+            // later arrivals even when the keys would satisfy them.
+            const ir::Index empty =
+              b.binary(ir::Inst::Tag::Eq, b.unary(ir::Inst::Tag::Load, field(kSemQHead), l),
+                       b.constant(module_.pool.put_int(make_int_type(64, false, false), 0), l), l);
+            const ir::Index ready = b.binary(ir::Inst::Tag::Land, empty, b.binary(ir::Inst::Tag::Ge, keys(), n, l), l);
+            b.open_region();
+            {
+                // Slow path: park on the queue, re-test on every wake, and leave the
+                // queue only once satisfied -- the node keeps its arrival position
+                // across an unsatisfied retest, which is what preserves FIFO order.
+                b.open_region();
+                const ir::Index pred = true_const(b, l);
+                const ir::ExtraSlice lcond = b.close_region();
+                b.open_region();
+                {
+                    const ir::Index head = b.sync_wait(site, qwords(), l);
+                    const ir::Index mine =
+                      b.binary(ir::Inst::Tag::Land, head, b.binary(ir::Inst::Tag::Ge, keys(), n, l), l);
+                    b.open_region();
+                    b.break_(l);
+                    const ir::ExtraSlice then_r = b.close_region();
+                    b.open_region();
+                    const ir::ExtraSlice else_r = b.close_region();
+                    b.cond(mine, then_r, else_r, l);
+                }
+                const ir::ExtraSlice body = b.close_region();
+                b.open_region();
+                const ir::ExtraSlice step = b.close_region();
+                b.loop(lcond, pred, body, step, /*bottom_test=*/false, l);
+                b.sync_ctl(ir::SyncOp::Leave, site, qwords(), l);
+            }
+            const ir::ExtraSlice slow = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice fast = b.close_region();
+            b.cond(ready, fast, slow, l);
+            b.binary(ir::Inst::Tag::Store, field(kSemKeys), b.binary(ir::Inst::Tag::Sub, keys(), n, l), l);
+            return std::nullopt;
+        }
+        // Every method of LRM 15.3 is handled above; a new one would arrive with a
+        // new slang release rather than from a design.
+        fail("semaphore::" + std::string(sub.name) + "() is not supported");
+    }
+
     // Lower a user function call: the actuals (resized to the parameter types)
     // become a `call`. Returns the result value, or nullopt for a void function.
     std::optional<ir::Index> lower_user_call(const CallExpression& call, ir::Builder& b) {
@@ -23835,6 +24019,12 @@ private:
             // resolve_method_this, because `self()` is static and the rest take the
             // control block out of the receiver's object.
             return lower_process_method(call, sub, b);
+        }
+        if (is_sync_method(sub)) {
+            // The `semaphore` methods (LRM 15.3) are the same shape of bodyless
+            // built-in: each expands into ordinary IR over the object's synthetic
+            // body, so none of the call path below applies.
+            return lower_sync_method(call, sub, b);
         }
         // A class built-in slang synthesizes with an empty body (srandom, rand_mode,
         // the randstate pair, the default randomization hooks). Intercepted before
@@ -24741,6 +24931,19 @@ private:
     // holding the thread control-block pointer. Not a legal SV identifier, so it
     // cannot collide with a property name.
     static constexpr std::string_view kProcessCtlField = "$pcb";
+    // The built-in `semaphore` class (LRM 15.3): the synthetic body's fields --
+    // the key count and the two words of its FIFO wait queue. None is a legal SV
+    // identifier, so none can collide with a property name.
+    static constexpr std::string_view kSemKeysField = "$keys";
+    static constexpr std::string_view kSemHeadField = "$getq.head";
+    static constexpr std::string_view kSemTailField = "$getq.tail";
+    static constexpr uint32_t         kSemKeys      = 0;
+    static constexpr uint32_t         kSemQHead     = 1;
+    static constexpr uint32_t         kSemQTail     = 2;
+    // Wait-site ids for the SyncWait / SyncCtl pairs this Lowerer emits. Unique
+    // design-wide, which is stricter than the backend needs (it keys one node per
+    // site per body) and costs nothing.
+    uint32_t sync_site_seq_ = 0;
     // Design-wide class type ids (LRM 8.16). Owned here so a standalone Lowerer
     // works; lower_compilation points every Lowerer at one shared table instead.
     // A subroutine reached through a virtual interface handle -> its
