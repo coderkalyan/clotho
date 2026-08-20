@@ -406,6 +406,12 @@ const char* tag_name(Inst::Tag tag) {
             return "expect_wait";
         case T::ExpectWake:
             return "expect_wake";
+        case T::ProcQuery:
+            return "proc_query";
+        case T::ProcCtl:
+            return "proc_ctl";
+        case T::ProcWait:
+            return "proc_wait";
         case T::MonitorSet:
             return "monitor_set";
         case T::MonitorEmit:

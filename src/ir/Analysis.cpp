@@ -154,6 +154,15 @@ TagInfo tag_info(Inst::Tag tag) {
         // function of the signals a thunk reads.
         case Inst::Tag::ExpectWait:
         case Inst::Tag::ExpectWake:
+        // Process control (LRM 9.7). Every one of these needs the calling thread's
+        // control block, which a thunk-elided group does not have (no frame, no
+        // handle -- docs/design/process-class.md §4.3), and ProcWait is a suspension
+        // point besides. So the whole family forces a real coroutine rather than
+        // testing the payload: a body that mentions `process` at all is testbench
+        // code, never the sensitivity-driven RTL shape thunk elision targets.
+        case Inst::Tag::ProcQuery:
+        case Inst::Tag::ProcCtl:
+        case Inst::Tag::ProcWait:
             return blocks;
 
         // -- Synthesizable but not pure: the assignments, and the aggregate
@@ -697,6 +706,22 @@ struct Structural {
                     // branch, so it deliberately does NOT set the fact -- a design
                     // using only V1's form keeps paying nothing.
                     uses.disable = true;
+                    break;
+                case Inst::Tag::ProcQuery:
+                case Inst::Tag::ProcCtl:
+                case Inst::Tag::ProcWait:
+                    // Any use of the `process` class (LRM 9.7) turns on the whole
+                    // per-thread control-block machinery: the static block array, the
+                    // pooled blocks fork children take, the ABI argument that carries
+                    // the calling thread's block, and the status stores at every park.
+                    // A design that never mentions `process` emits none of it
+                    // (docs/design/process-class.md §9).
+                    uses.process = true;
+                    if (const ProcOp op = ir.extra_data<ProcCtlInfo>(p.extra).op;
+                        op == ProcOp::Srandom || op == ProcOp::RandstateGet ||
+                        op == ProcOp::RandstateSet) {
+                        uses.process_randstate = true;
+                    }
                     break;
                 case Inst::Tag::Severity:
                     // Deferred assertions are processes-only: the frontend rejects
@@ -1434,6 +1459,12 @@ struct ValueSweep {
                 case Inst::Tag::ReactivePend:
                 case Inst::Tag::ExpectWait:
                 case Inst::Tag::ExpectWake:
+                // Process control (LRM 9.7): a status word, a handle, or a
+                // statement -- all definite 2-state, none derived from an operand's
+                // planes.
+                case Inst::Tag::ProcQuery:
+                case Inst::Tag::ProcCtl:
+                case Inst::Tag::ProcWait:
                 case Inst::Tag::MonitorSet:
                 case Inst::Tag::MonitorEmit:
                 case Inst::Tag::MonitorOn:

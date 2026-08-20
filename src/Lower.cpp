@@ -887,11 +887,13 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 suspends("a wait_order");
                 break;
             case StatementKind::WaitFork:
-                // Nothing to do with the region: clotho does not lower it anywhere.
-                // `wait fork` needs the live-child set a fork does not keep. Named
-                // here for the reason the fork case is: this walk runs first.
+                // Lowerable everywhere else (LRM 9.6.1), but not here, and for the
+                // identity reason `disable fork` is refused below: an action block is
+                // pended as a task body and runs on the MONITOR process's control
+                // block, so the descendants it would wait for are the monitor's.
                 reject("a wait fork",
-                       "clotho does not lower it, in reactive code or outside it");
+                       "the descendants it would wait for are the monitor process's, not the "
+                       "assertion's: an action block runs on the monitor's thread");
                 break;
             case StatementKind::ForeverLoop:
                 // Still refused, and still not a region matter -- but the old reason
@@ -924,9 +926,15 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 // it refuses everywhere else.
                 break;
             case StatementKind::DisableFork:
-                // `disable fork` needs the live-child set, like `wait fork` above.
+                // Lowerable everywhere else (LRM 9.6.3, docs/design/process-class.md
+                // §8), but not here, and the reason is identity rather than region: an
+                // action block is not a thread of its own -- it is pended as a task
+                // body and runs on the monitor process's control block -- so the
+                // descendants it would end are the monitor's, which is not what the
+                // statement means.
                 reject("a disable fork",
-                       "clotho does not lower it: it needs the live-child set fork owes");
+                       "the descendants it would end are the monitor process's, not the "
+                       "assertion's: an action block runs on the monitor's thread");
                 break;
             default:
                 // The whitelist's floor, and what it now asks. Suspending is no
@@ -2565,20 +2573,28 @@ private:
         // are built by the OUTERMOST frame of this recursion, once every class it
         // reached has its vtable numbering. See rand_pending_.
         const Restore<uint32_t> depth(class_depth_, class_depth_ + 1);
-        // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4), `process` (LRM 9.7)
-        // and `std::weak_reference` (LRM 8.30) are built-in classes slang
-        // synthesizes into the `std` package. Slang builds their *signatures* only
-        // -- every method is a bodyless prototype whose semantics the simulator is
+        // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4) and
+        // `std::weak_reference` (LRM 8.30) are built-in classes slang synthesizes
+        // into the `std` package. Slang builds their *signatures* only -- every
+        // method is a bodyless SubroutineSymbol whose semantics the simulator is
         // expected to supply -- so lowering one walks into a method with no
         // statements and no formals to bind, and used to die on an out-of-range
         // formal index instead of saying anything. Each needs a real runtime: a key
         // count plus a wait queue for a semaphore, a bounded FIFO with blocking
-        // put/get/peek for a mailbox, per-process control for `process`.
+        // put/get/peek for a mailbox.
         //
-        // TODO: built-in std classes (semaphore / mailbox / process /
-        // weak_reference) -- need the runtime support described above.
+        // `process` (LRM 9.7) is the one that is implemented: it has its own body
+        // shape and its own method lowering, because a `process` object is not a
+        // user class but a handle onto a thread's control block. See
+        // docs/design/process-class.md.
+        //
+        // TODO: built-in std classes (semaphore / mailbox / weak_reference) -- need
+        // the runtime support described above.
         if (const slang::ast::Scope* parent = clt.getParentScope();
             parent != nullptr && parent->asSymbol().kind == SymbolKind::Package && parent->asSymbol().name == "std") {
+            if (clt.name == "process") {
+                return lower_process_class(clt);
+            }
             fail("the built-in '" + std::string(clt.name) + "' class is not supported");
         }
         // Phase 3 features (docs/design/classes.md §2): guarded loud.
@@ -2804,6 +2820,60 @@ private:
                 fail("constraint blocks are not supported");
             }
         }
+    }
+
+    // Lower the built-in `process` class (LRM 9.7). Unlike a user class, its body is
+    // not a property table: slang synthesizes only method signatures, so the object
+    // carries ONE hidden `chandle` naming the thread's control block (a native,
+    // untraced record — see docs/design/process-class.md §4). Everything else about
+    // the handle is an ordinary class handle: a 64-bit 2-state word, `null` == 0,
+    // `==` an identity compare, storable in a variable or a class property.
+    //
+    // The class is `final` and `abstract` in slang, so there is no derivation and no
+    // user `new` (slang rejects it), and every method is `MethodFlags::BuiltIn`, so
+    // compute_vtable mints no dispatch slot for one — only the shallow-copy thunk
+    // every class gets, which is unreachable here for the same reason `new` is.
+    //
+    // It does get the two RESERVED randomization slots, because compute_vtable
+    // reserves them for every class (LRM 18 makes `randomize` a member of every
+    // class, `process` included). So this path owes what the user-class path owes:
+    // an empty `ClassRand` for the generated bodies to read, and the same
+    // outermost-frame drain that builds them -- without both, the two FunctionIds
+    // compute_vtable reserved stay unbuilt and the backend declares a function with
+    // no return type.
+    ir::Ref lower_process_class(const slang::ast::ClassType& clt) {
+        const uint32_t fid = module_.pool.reserve_struct_fields();
+        ir::Type       t;
+        t.kind      = ir::Type::Kind::Class;
+        t.fields_id = fid;
+        t.element   = ir::Ref::Invalid;
+        const ir::Ref ref = module_.pool.put(ir::Item{ t });
+        class_type_cache_.emplace(&clt, ref);
+        std::vector<ir::FieldRow> fields;
+        fields.push_back({ kProcessCtlField, make_int_type(64, false, false), 0 });
+        module_.pool.set_struct_fields(fid, std::move(fields));
+        class_rand_.emplace(&clt, ClassRand{});
+        compute_vtable(clt, ref);
+        if (class_depth_ == 1) {
+            drain_rand_bodies();
+        }
+        return ref;
+    }
+
+    // Whether `sub` is one of `process`'s nine built-in methods (LRM 9.7). Keyed on
+    // the owning ClassType's name and package rather than on a remembered Ref: a
+    // method call can be lowered before any `process` variable has been declared.
+    static bool is_process_method(const slang::ast::SubroutineSymbol& sub) {
+        if (!sub.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+            return false;
+        }
+        const slang::ast::Scope* owner = sub.getParentScope();
+        if (owner == nullptr || owner->asSymbol().kind != SymbolKind::ClassType ||
+            owner->asSymbol().name != "process") {
+            return false;
+        }
+        const slang::ast::Scope* pkg = owner->asSymbol().getParentScope();
+        return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
     }
 
     // True if `m` is a user-declared virtual method (LRM 8.20) — excludes slang's
@@ -8369,15 +8439,20 @@ private:
                 lower_disable(stmt.as<slang::ast::DisableStatement>(), b);
                 break;
             case StatementKind::DisableFork:
-                // TODO: disable fork (V3) kills every descendant of the calling
-                // process (LRM 9.6.3), so it needs the live-child set fork V2 owes
-                // plus the general abort primitive (docs/design/disable.md).
-                fail("disable fork is not supported");
+                // LRM 9.6.3: end every descendant of the calling process, "not just
+                // immediate children", including descendants of children that have
+                // already terminated -- which the control-block tree gives by
+                // re-parenting a completing thread's live children
+                // (docs/design/process-class.md §5.3, §8). Exactly `kill` over the
+                // subtree, with the caller itself spared.
+                b.proc_ctl(ir::ProcOp::DisableFork, {}, loc(stmt));
+                break;
             case StatementKind::WaitFork:
-                // TODO: wait fork (LRM 9.6.1) needs the same live-child set: a
-                // process must block until every descendant has finished, which the
-                // join-all count cannot express.
-                fail("wait fork is not supported");
+                // LRM 9.6.1: block until every descendant has completed. One pointer
+                // test on the control-block tree, because a completing thread
+                // re-parents its live children (docs/design/process-class.md §8).
+                b.proc_wait(ir::ProcOp::WaitFork, {}, loc(stmt));
+                break;
             case StatementKind::WaitOrder:
                 lower_wait_order(stmt.as<slang::ast::WaitOrderStatement>(), b);
                 break;
@@ -23615,6 +23690,74 @@ private:
         }
     }
 
+    // Lower one of the nine built-in `process` methods (LRM 9.7). `self` is static
+    // (no receiver); every other method takes the receiver's control block. Each
+    // lowers to a ProcQuery / ProcCtl / ProcWait instruction, never to a call: slang
+    // gives these methods no body.
+    std::optional<ir::Index> lower_process_method(const CallExpression&    call,
+                                                 const SubroutineSymbol&  sub,
+                                                 ir::Builder&             b) {
+        const ir::SourceLoc l = loc(call);
+        // The receiver handle, for every method except the static `self`.
+        const auto recv = [&]() -> ir::Index {
+            if (call.thisClass() == nullptr) {
+                fail("process::" + std::string(sub.name) + " needs an explicit process handle");
+            }
+            return lower_expr(*call.thisClass(), b);
+        };
+        if (sub.name == "self") {
+            // `process::self()` is static: its return type IS the process class, so
+            // lowering that type is also what interns the class body (and is a no-op
+            // once some `process` variable has been declared).
+            return b.proc_query(ir::ProcOp::Self, {}, lower_type(sub.getReturnType()), l);
+        }
+        if (sub.name == "status") {
+            // The `state` typedef over an int enum, so an ordinary 32-bit result.
+            const std::array<ir::Index, 1> args{ recv() };
+            return b.proc_query(ir::ProcOp::Status, args, lower_type(sub.getReturnType()), l);
+        }
+        if (sub.name == "kill") {
+            // LRM 9.7: end the process and every descendant it forked.
+            const std::array<ir::Index, 1> args{ recv() };
+            b.proc_ctl(ir::ProcOp::Kill, args, l);
+            return std::nullopt;
+        }
+        if (sub.name == "srandom") {
+            // LRM 18.14: reseed that thread's generator.
+            const std::array<ir::Index, 2> args{ recv(), lower_expr(*call.arguments()[0], b) };
+            b.proc_ctl(ir::ProcOp::Srandom, args, l);
+            return std::nullopt;
+        }
+        if (sub.name == "get_randstate") {
+            const std::array<ir::Index, 1> args{ recv() };
+            return b.proc_query(ir::ProcOp::RandstateGet, args, module_.pool.string_type, l);
+        }
+        if (sub.name == "set_randstate") {
+            const std::array<ir::Index, 2> args{ recv(), lower_expr(*call.arguments()[0], b) };
+            b.proc_ctl(ir::ProcOp::RandstateSet, args, l);
+            return std::nullopt;
+        }
+        if (sub.name == "suspend" || sub.name == "resume") {
+            // LRM 9.7: suspend this thread or another one; resume restarts a suspended
+            // thread. Both are functions, not tasks -- even though suspending the
+            // CALLER parks it, which is the suspension itself rather than a wait for a
+            // value, and is why `suspend` needs no ProcWait.
+            const std::array<ir::Index, 1> args{ recv() };
+            b.proc_ctl(sub.name == "suspend" ? ir::ProcOp::Suspend : ir::ProcOp::Resume, args, l);
+            return std::nullopt;
+        }
+        if (sub.name == "await") {
+            // A task: it parks the calling thread until the target completes, so it
+            // is a statement with no value (LRM 9.7).
+            const std::array<ir::Index, 1> args{ recv() };
+            b.proc_wait(ir::ProcOp::Await, args, l);
+            return std::nullopt;
+        }
+        // Every method of LRM 9.7 is handled above; a new one would arrive with a new
+        // slang release rather than from a design.
+        fail("process::" + std::string(sub.name) + "() is not supported");
+    }
+
     // Lower a user function call: the actuals (resized to the parameter types)
     // become a `call`. Returns the result value, or nullopt for a void function.
     std::optional<ir::Index> lower_user_call(const CallExpression& call, ir::Builder& b) {
@@ -23622,6 +23765,14 @@ private:
             fail("system call used where a user subroutine was expected");
         }
         const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+        if (is_process_method(sub)) {
+            // The nine `process` methods (LRM 9.7) have no lowerable body -- slang
+            // synthesizes signatures only -- so they never reach the call path
+            // below. Their receiver is resolved here rather than through
+            // resolve_method_this, because `self()` is static and the rest take the
+            // control block out of the receiver's object.
+            return lower_process_method(call, sub, b);
+        }
         // A class built-in slang synthesizes with an empty body (srandom, rand_mode,
         // the randstate pair, the default randomization hooks). Intercepted before
         // anything else: lowering slang's degenerate body is silently wrong.
@@ -24524,6 +24675,10 @@ private:
     std::vector<std::pair<const slang::ast::ClassType*, ir::Ref>>              rand_pending_;
     // Depth of the lower_class_type recursion; the outermost frame drains the list.
     uint32_t class_depth_ = 0;
+    // The built-in `process` class (LRM 9.7): the name of the hidden body field
+    // holding the thread control-block pointer. Not a legal SV identifier, so it
+    // cannot collide with a property name.
+    static constexpr std::string_view kProcessCtlField = "$pcb";
     // Design-wide class type ids (LRM 8.16). Owned here so a standalone Lowerer
     // works; lower_compilation points every Lowerer at one shared table instead.
     // A subroutine reached through a virtual interface handle -> its
