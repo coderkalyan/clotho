@@ -671,3 +671,208 @@ TEST_CASE("fork: join_none in an assertion action block queues into Reactive") {
     )");
     CHECK(out == "action@15 n=0\ndone n=1\n");
 }
+
+// fork … join_none inside a FUNCTION (LRM 13.4.4: "fork-join_none constructs shall
+// be allowed inside a function", and within one the children may hold anything a
+// task may). `join` / `join_any` there are illegal SV and slang rejects them.
+//
+// Ordering is pinned from the LRM (9.3.2 Table 9-1: the children start when the
+// calling THREAD next blocks or ends, not when the function returns) rather than
+// from iverilog, which rejects a delay in such a child outright and runs delay-free
+// ones at the fork. Verilator 5.050 --timing agrees with the values below.
+TEST_CASE("fork: join_none in a function schedules children without blocking") {
+    const std::string out = run_capture(R"(
+        module t;
+          int n = 0;
+          function void spawn;
+            fork
+              n = n + 1;
+              #5 n = n + 10;
+            join_none
+            $display("fn done n=%0d", n);
+          endfunction
+          initial begin
+            spawn;
+            $display("after call n=%0d@%0t", n, $time);
+            #1 $display("mid n=%0d@%0t", n, $time);
+            #10 $display("end n=%0d@%0t", n, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "fn done n=0\nafter call n=0@0\nmid n=1@1\nend n=11@11\n");
+}
+
+TEST_CASE("fork: join_none in a function called from a task") {
+    const std::string out = run_capture(R"(
+        module t;
+          int n = 0;
+          function void spawn;
+            fork
+              #2 n = n + 1;
+            join_none
+          endfunction
+          task automatic go;
+            spawn;
+            #1 $display("task n=%0d@%0t", n, $time);
+          endtask
+          initial begin
+            go;
+            #5 $display("end n=%0d@%0t", n, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "task n=0@1\nend n=1@6\n");
+}
+
+// An `always_comb` IS an always procedure, so 13.4.4 allows it to reach a spawning
+// function, and it spawns once per evaluation. The process stays on the thunk path
+// (is_simple_always is syntactic on the process body and a Call is not a barrier),
+// which is fine: a thunk has the state and wheel it needs and the rings are globals.
+TEST_CASE("fork: join_none in a function called from always_comb") {
+    const std::string out = run_capture(R"(
+        module t;
+          int a = 0;
+          int n = 0;
+          int y;
+          function int bump(int x);
+            fork
+              #1 n = n + 1;
+            join_none
+            return x + 1;
+          endfunction
+          always_comb y = bump(a);
+          initial begin
+            #2 a = 1;
+            #5 $display("y=%0d n=%0d@%0t", y, n, $time);
+          end
+        endmodule
+    )");
+    CHECK(out == "y=2 n=2@7\n");
+}
+
+TEST_CASE("fork: a loop of calls accumulates one live child per call") {
+    const std::string out = run_capture(R"(
+        module t;
+          int n = 0;
+          function void spawn;
+            fork
+              #3 n = n + 1;
+            join_none
+          endfunction
+          initial begin
+            for (int i = 0; i < 8; i++) begin
+              spawn;
+            end
+            #1 $display("mid n=%0d", n);
+            #10 $display("end n=%0d", n);
+          end
+        endmodule
+    )");
+    CHECK(out == "mid n=0\nend n=8\n");
+}
+
+// A child spawned inside a function belongs to the CALLING thread (its control
+// block is the caller's, LRM 9.6.3's descendant relation), so the caller's
+// `wait fork` and `disable fork` reach it with no extra plumbing.
+TEST_CASE("fork: wait fork and disable fork reach a child spawned in a function") {
+    const std::string waited = run_capture(R"(
+        module t;
+          int n = 0;
+          function void spawn;
+            fork
+              #1 n = n + 1;
+              #3 n = n + 1;
+            join_none
+          endfunction
+          initial begin
+            spawn;
+            wait fork;
+            $display("waited n=%0d@%0t", n, $time);
+          end
+        endmodule
+    )");
+    CHECK(waited == "waited n=2@3\n");
+
+    const std::string killed = run_capture(R"(
+        module t;
+          int n = 0;
+          function void spawn;
+            fork
+              #1 n = n + 1;
+              #3 n = n + 1;
+            join_none
+          endfunction
+          initial begin
+            spawn;
+            #2 disable fork;
+            #5 $display("killed n=%0d@%0t", n, $time);
+          end
+        endmodule
+    )");
+    CHECK(killed == "killed n=1@7\n");
+}
+
+// The refusal names the enclosing FUNCTION, whose formals are exactly what LRM
+// 13.4.4's own `watch_for_zero` example captures. Lifts with V4.
+TEST_CASE("fork: a join_none child capturing a function local is rejected") {
+    check_rejected(R"(
+        module t;
+          function void spawn(int k);
+            fork
+              #1 $display("%0d", k);
+            join_none
+          endfunction
+          initial spawn(3);
+        endmodule
+    )",
+                   "fork..join_none child that reads the enclosing function's 'k' is not supported");
+}
+
+// LRM 13.4.4 second paragraph: the calling thread must be created by an initial or
+// always procedure, and an implementation "shall issue an error either at compile
+// time or run time" otherwise. Each of these accepted the spawn silently before the
+// check landed; the `final` one also leaked the record and the child frame.
+TEST_CASE("fork: a spawning function called from a non-procedural context is rejected") {
+    const auto spawner = R"(
+          int n = 0;
+          function int spawn;
+            fork
+              #1 n = n + 1;
+            join_none
+            return 1;
+          endfunction
+    )";
+
+    check_rejected(std::string("module t;") + spawner + R"(
+          int y = spawn();
+        endmodule
+    )",
+                   "called from a static variable initializer");
+
+    check_rejected(std::string("module t;") + spawner + R"(
+          logic [31:0] z;
+          assign z = spawn();
+        endmodule
+    )",
+                   "called from a continuous assignment");
+
+    check_rejected(std::string("module t;") + spawner + R"(
+          final begin
+            void'(spawn());
+          end
+        endmodule
+    )",
+                   "called from a `final` block");
+
+    check_rejected(std::string("module t;") + spawner + R"(
+          initial $strobe("y=%0d", spawn());
+        endmodule
+    )",
+                   "called from a $strobe / $monitor body");
+
+    check_rejected(std::string("module t;") + spawner + R"(
+          export "DPI-C" function spawn;
+        endmodule
+    )",
+                   "called from a DPI export");
+}
