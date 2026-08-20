@@ -1499,13 +1499,29 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   counts, as 9.6.3 requires). Both stay refused inside an assertion action block,
   which runs on the MONITOR's thread rather than one of its own.
   Design: docs/design/process-class.md §8.
-- [ ] **`std::mailbox` / `std::semaphore`** (parameterized, bounded/unbounded).
-  Slang synthesizes both into the `std` package with signatures but no bodies,
-  so a real runtime is needed: a key count plus a wait queue for `semaphore`, a
-  bounded FIFO with blocking `put`/`get`/`peek` for `mailbox`. Guarded loud in
-  `lower_class_type` (any class whose parent scope is the `std` package) — a
-  `semaphore` used to abort on an out-of-range formal index and a `mailbox` to
-  report only "unsupported non-integral type".
+- [ ] **`std::mailbox` / `std::semaphore`** (LRM 15.4 / 15.3). **Designed in full:
+  docs/design/mailbox-and-semaphore.md** — both become ordinary GC class objects with
+  a synthetic body, because most of what they need is already landed: a specialization
+  of a parameterized class is already its own nominal class, so `mailbox #(T)` needs
+  no type machinery; the message FIFO is an UNBOUNDED queue property (a bounded queue
+  TYPE silently drops the opposite end instead of blocking), so strings, handles,
+  aggregates, nested containers and their GC tracing come free through the element
+  descriptor and the class trace map; and the wait queue is the named-event intrusive
+  list with two changes — enqueue at the tail, and the node stays linked across a
+  spurious wake — because LRM 15.3.3 / 15.4.5 require arrival order to be preserved
+  where LRM 4.7 leaves event wake order arbitrary. Head-of-line admission per 15.3.3
+  and Accellera's Interpretation #1 (a blocked head blocks later arrivals even when
+  the keys would satisfy them), with `peek` exempt since it consumes nothing. New
+  surface: one frame-resident node shape, three emitters, two IR tags (`SyncWait`
+  suspending, `SyncCtl` not) and the frontend expansion of ten bodyless built-ins —
+  no runtime symbol, no pool, no ABI change, no `DesignUses` gate. `SyncWait` MUST
+  join `tag_suspends`, or a thread blocked in `get()` is unkillable. The typeless
+  mailbox (15.4.9, `mailbox m;` — legal SV, and slang type-checks it) keeps its own
+  refusal: it needs a dynamically typed element plus a run-time type identity, a
+  separate phase. Same std-package guard as `process`, narrowed by class name;
+  `std::weak_reference` keeps it. No oracle for the FIFO cases — iverilog
+  cannot parse either class, and Verilator deliberately lets a later smaller request
+  bypass a blocked head, so those are pinned from the LRM text.
 - [x] **`process` class** (LRM 9.7) — all nine methods: `self`, `status`, `kill`,
   `await`, `suspend`, `resume`, `srandom`, `get_randstate`, `set_randstate`. A
   thread's control block is native, untraced storage in two tiers -- a static slot per
