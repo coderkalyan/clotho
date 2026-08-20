@@ -20678,6 +20678,22 @@ private:
 
             b_.SetInsertPoint(susp);
             b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(rty, rec, 1));
+            // Say that this park is already scheduled, for the same reason
+            // emit_zero_delay_push does: the wake we are waiting for is guaranteed to
+            // arrive -- the due child delivers it from its epilogue, on the abort path
+            // as much as the normal one (a killed child still decrements and still
+            // wakes us, §7.1 point 1). A `kill` or `disable` landing on us meanwhile
+            // must therefore stand down rather than push a second copy of this handle:
+            // two copies resumed the activation twice, and the second resume jumped
+            // through the frame the first one had already destroyed -- a call through
+            // a null function pointer out of the drain.
+            //
+            // The child's wake is an unconditional push and does not consult the flag,
+            // so it still lands. Every later park re-arms the flag before suspending,
+            // so leaving it set here strands nothing.
+            if (park_claim_wanted() && sched_ptr_ != nullptr) {
+                b_.CreateStore(b_.getInt32(1), sched_ptr_);
+            }
             emit_suspend("fork.join.resume");
             b_.CreateBr(cont);
 
