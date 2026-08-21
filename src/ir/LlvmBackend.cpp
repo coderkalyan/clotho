@@ -768,7 +768,10 @@ struct ModuleEnv {
     // and the write-only string sink. Memoized per env so each unit creates
     // its own copies.
     ankerl::unordered_dense::map<uint32_t, llvm::Constant*> elem_ops;
-    llvm::GlobalVariable* str_sink = nullptr;
+    llvm::GlobalVariable* str_sink  = nullptr;
+    // The read-only empty-string image an ambiguous string ternary yields
+    // (str_empty_global).
+    llvm::GlobalVariable* str_empty = nullptr;
     // Write-only sink handles for out-of-range nested-container elements, keyed by
     // element type Ref (handle_sink_global).
     ankerl::unordered_dense::map<uint32_t, llvm::GlobalVariable*> handle_sinks;
@@ -14373,6 +14376,19 @@ private:
         return env_->str_sink;
     }
 
+    // A read-only owned-empty rt_string handle. Every string consumer borrows its
+    // operand pointer and deep-copies what it keeps (Runtime.h: handles never
+    // share storage), so a value nobody may write can be shared by every reader.
+    // Only lower_string_mux uses it, for the string type's default value.
+    llvm::Value* str_empty_global() {
+        if (env_->str_empty == nullptr) {
+            env_->str_empty = new llvm::GlobalVariable(env_->llmod, str_slot_ty(), /*isConstant=*/true,
+                                                       llvm::GlobalValue::InternalLinkage, str_empty_const(),
+                                                       "clotho.str.empty");
+        }
+        return env_->str_empty;
+    }
+
     // Whether an instruction produces a fresh string value that needs its own
     // 32-byte handle (as opposed to yielding a pointer at existing storage).
     bool produces_string_temp(Index i) {
@@ -15708,9 +15724,8 @@ private:
             case Inst::Tag::Select: {
                 const auto select = ir_->extra_data<Select>(p.op_extra.extra);
                 if (type_of(select.a).is_string) {
-                    throw BackendError{ "internal: string value in select" };
-                }
-                if (type_of(select.a).is_real) {
+                    set_str(i, lower_string_mux(value_of(p.op_extra.op), select.a, select.b));
+                } else if (type_of(select.a).is_real) {
                     set_value(i, lower_real_mux(value_of(p.op_extra.op), value_of(select.a), value_of(select.b)));
                 } else {
                     set_value(i, lower_select(value_of(p.op_extra.op), value_of(select.a), value_of(select.b)));
@@ -23540,6 +23555,31 @@ private:
         return real_plane(b_.CreateSelect(known, sel, amb));
     }
 
+    // Mux with string alternatives, the exact shape of lower_real_mux one level
+    // up: a string value is a borrowed rt_string handle pointer, so a definite
+    // condition selects a pointer and there is nothing to blend. An ambiguous
+    // (x/z) condition compares the alternatives and yields the common value,
+    // else "" — the string type's default (LRM Table 7-1). LRM 11.4.11 defines
+    // its bitwise merge for integral results only; slang's own constant
+    // evaluator falls back to type->getDefaultValue() the same way
+    // (ConditionalExpression::evalImpl), and that is what real does with 0.0.
+    // Note verilator instead takes the false arm here, and iverilog rejects a
+    // string ternary outright, so neither is an oracle for this case.
+    llvm::Value* lower_string_mux(Plane cond, Index a, Index b) {
+        llvm::Value* x   = str_of(a);
+        llvm::Value* y   = str_of(b);
+        llvm::Value* sel = b_.CreateSelect(b_.CreateICmpNE(must_of(cond), zero(1)), x, y);
+        // A 2-state condition can never be ambiguous, so it costs one select and
+        // no rt_string_cmp call -- the common case (a comparison, a bit, a flag).
+        if (cond.two) {
+            return sel;
+        }
+        llvm::Value* known = b_.CreateICmpEQ(must_of(cond), may_of(cond));
+        llvm::Value* eq    = b_.CreateICmpEQ(b_.CreateCall(str_cmp_fn(), { x, y }), b_.getInt32(0));
+        llvm::Value* amb   = b_.CreateSelect(eq, x, str_empty_global());
+        return b_.CreateSelect(known, sel, amb);
+    }
+
     // A double-typed libm routine, resolved from the host process by the JIT
     // (DynamicLibrarySearchGenerator in run_jit).
     llvm::Value* libm_call(const char* name, llvm::Value* x, llvm::Value* y = nullptr) {
@@ -25038,6 +25078,13 @@ private:
         auto* cont_bb = llvm::BasicBlock::Create(ctx_, "sel.end", fn_);
         b_.CreateCondBr(take, then_bb, else_bb);
 
+        // A string arm carries a borrowed rt_string handle pointer rather than a
+        // Plane, so its merge is one pointer PHI. That is sound because
+        // build_str_temps walks the flat instruction array and allocas + inits
+        // every string temp in the prologue: the not-taken arm's handle exists and
+        // holds "" even though its producer never ran, and the PHI only forwards
+        // the pointer from the block that did execute.
+        const bool is_str = type_of(i).is_string;
         // The two arms may disagree in Plane domain (a 2-state constant against a
         // 4-state Land/Lor result), so each is normalized to the instruction's own
         // domain inside its block — the PHIs need identical value types.
@@ -25046,17 +25093,26 @@ private:
 
         b_.SetInsertPoint(then_bb);
         lower_region(ir_->region(sel.then_));
-        const Plane       tv       = norm(sel.then_val);
+        const Plane       tv       = is_str ? Plane{} : norm(sel.then_val);
+        llvm::Value*      ts       = is_str ? str_of(sel.then_val) : nullptr;
         llvm::BasicBlock* then_end = b_.GetInsertBlock();
         branch_to(cont_bb);
 
         b_.SetInsertPoint(else_bb);
         lower_region(ir_->region(sel.else_));
-        const Plane       ev       = norm(sel.else_val);
+        const Plane       ev       = is_str ? Plane{} : norm(sel.else_val);
+        llvm::Value*      es       = is_str ? str_of(sel.else_val) : nullptr;
         llvm::BasicBlock* else_end = b_.GetInsertBlock();
         branch_to(cont_bb);
 
         b_.SetInsertPoint(cont_bb);
+        if (is_str) {
+            llvm::PHINode* h = b_.CreatePHI(ts->getType(), 2);
+            h->addIncoming(ts, then_end);
+            h->addIncoming(es, else_end);
+            set_str(i, h);
+            return;
+        }
         llvm::PHINode* mm = b_.CreatePHI(tv.mm->getType(), 2);
         mm->addIncoming(tv.mm, then_end);
         mm->addIncoming(ev.mm, else_end);

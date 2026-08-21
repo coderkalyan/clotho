@@ -20362,11 +20362,6 @@ private:
                 return lower_tagged_union_set(expr.as<slang::ast::TaggedUnionExpression>(), b);
             case ExpressionKind::ConditionalOp: {
                 const ConditionalExpression& c = expr.as<ConditionalExpression>();
-                if (is_string_expr(expr)) {
-                    // TODO: ?: over strings (needs a string-aware select; lower to a
-                    // Cond with a string temp).
-                    fail("conditional operator (?:) over strings is not supported");
-                }
                 // Condition (pattern-aware, incl. `&&&` filters) lowered once up
                 // front — LRM 11.4.11 single-evaluation — and shared by both
                 // dispatch paths. `x matches pat ? a : b` binds the pattern's

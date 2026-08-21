@@ -637,6 +637,133 @@ TEST_CASE("ternary with a string condition selects by emptiness") {
     CHECK(run_capture(src) == "2\n1\n");
 }
 
+// `?:` yielding a string (LRM 11.4.11). The arms are rt_string handles, so the
+// select merges pointers; the consumer (assignment, concat, argument, compare)
+// copies what it keeps. Oracle: hand-derived from the LRM plus slang's own
+// constant evaluator. iverilog crashes on a string ternary and verilator
+// disagrees on an ambiguous condition (it takes the false arm), so neither is an
+// oracle for the X case below.
+TEST_CASE("ternary over strings selects an arm") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a = "yes", b = "no", r;
+            reg c;
+            initial begin
+                c = 1'b1;
+                r = c ? a : b;
+                $display("[%s]", r);
+                c = 1'b0;
+                r = c ? a : b;
+                $display("[%s]", r);
+                r = c ? a : "lit";
+                $display("[%s]", r);
+                r = (a == "yes") ? {a, "!"} : b;
+                $display("[%s]", r);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[yes]\n[no]\n[lit]\n[yes!]\n");
+}
+
+// The target appearing as an arm: rt_string_assign treats dst == src as a no-op,
+// so the self-referential form neither frees nor truncates the live string.
+TEST_CASE("ternary over strings assigns through its own target") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s = "keep", t = "other";
+            reg c;
+            initial begin
+                c = 1'b1;
+                s = c ? s : t;
+                $display("[%s]", s);
+                c = 1'b0;
+                s = c ? s : t;
+                $display("[%s]", s);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[keep]\n[other]\n");
+}
+
+// An arm with an observable effect takes the lazy path (a branch per arm, not a
+// branchless select), so the unchosen call never runs. $sformatf and substr both
+// produce a fresh temp handle inside their arm's region.
+TEST_CASE("ternary over strings evaluates only the chosen call") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s = "abcd", t = "tail", r;
+            integer n, calls;
+            function string bump(string v);
+                calls = calls + 1;
+                return {v, "*"};
+            endfunction
+            initial begin
+                n = 7;
+                r = (n > 5) ? $sformatf("big %0d", n) : "small";
+                $display("[%s]", r);
+                r = (n < 5) ? $sformatf("big %0d", n) : "small";
+                $display("[%s]", r);
+                r = (n > 5) ? s.substr(0, 1) : t;
+                $display("[%s]", r);
+                calls = 0;
+                r = (n > 5) ? bump(s) : bump(t);
+                $display("[%s] %0d", r, calls);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[big 7]\n[small]\n[ab]\n[abcd*] 1\n");
+}
+
+// An ambiguous condition cannot blend two handles the way it blends bits, so it
+// yields the common value when the arms are equal and the string default ""
+// otherwise -- the same rule real uses with 0.0 (LRM 11.4.11 defines its
+// bitwise merge for integral results only, and slang's constant evaluator falls
+// back to the type's default value).
+TEST_CASE("ternary over strings with an ambiguous condition") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a = "aa", b = "bb", e1 = "same", e2 = "same", r;
+            reg c;
+            initial begin
+                c = 1'bx;
+                r = c ? a : b;
+                $display("[%s] %0d", r, r.len());
+                r = c ? e1 : e2;
+                $display("[%s]", r);
+                c = 1'bz;
+                r = c ? a : b;
+                $display("[%s]", r);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[] 0\n[same]\n[]\n");
+}
+
+// A string ternary in a consumer that is not an assignment: the selected handle
+// is borrowed, exactly like a Load or a passed argument.
+TEST_CASE("ternary over strings feeds concat, compare, argument and display") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a = "aa", b = "bb", r;
+            reg c;
+            function integer plen(string v);
+                return v.len();
+            endfunction
+            initial begin
+                c = 1'b1;
+                $display("[%s]", c ? a : b);
+                r = {(c ? a : b), "-tail"};
+                $display("[%s]", r);
+                $display("%0d", (c ? a : b) == "aa");
+                $display("%0d", plen(c ? a : "xyz"));
+                c = 1'b0;
+                $display("%0d", plen(c ? a : "xyz"));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[aa]\n[aa-tail]\n1\n2\n3\n");
+}
+
 // A constant string condition (a string'() cast of a literal folds to a pooled
 // string constant at lowering) takes the same truthiness. A bare string literal
 // in a condition is NOT a string: slang types it as a packed byte vector (LRM
@@ -708,15 +835,6 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
                 initial @(s) $display("x");
             endmodule
         )", "string in an event control");
-    }
-    SUBCASE("ternary over strings") {
-        check_rejected(R"(
-            module m;
-                string s, t;
-                reg c;
-                initial s = c ? s : t;
-            endmodule
-        )", "conditional operator (?:) over strings");
     }
     SUBCASE("case over strings") {
         check_rejected(R"(

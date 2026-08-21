@@ -798,7 +798,14 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   container element, which the old array-only walk let through to the plane-copy
   path (now guarded).
 - [ ] **String event control / sensitivity**.
-- [ ] **`?:` / `case` over strings**.
+- [ ] **`case` over strings** — needs its own comparison chain over the existing
+  string `Eq` (the shape `lower_case_real` uses), not a value merge.
+- [x] **`?:` over strings** — the arms are borrowed `rt_string` handles, so the
+  eager path selects a pointer (`lower_string_mux`) and the lazy path merges the
+  two arms with a pointer PHI; no string temp and no deep copy. An ambiguous
+  condition yields the common value when the arms are equal and `""` otherwise,
+  matching what `real` does with 0.0 (LRM 11.4.11 defines the bitwise merge for
+  integral results only). See docs/design/x-semantics.md §1.4.
 - [x] **Strings inside structs / queues / dynamic arrays** — recursive aggregate
   string leaves (init/deinit/copy walks) and rt_elem_ops string elements. A
   string as an associative-array VALUE element is now supported (a[k] routes the
