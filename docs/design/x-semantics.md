@@ -144,6 +144,17 @@ agree pass through, and bits on which they differ go to X.
 So `merge` needs no new combination rule. **It is the LRM's own §11.4.11 rule applied
 uniformly to control flow.** We already implement the merge function, in `lower_select`.
 
+**The merge is defined for integral results only.** A `real` or `string` arm has no
+bits to disagree on, so §11.4.11's table cannot apply. Both fall back to the arms'
+common value when they compare equal, and to the type's default (`0.0`, `""`) when
+they differ — `lower_real_mux` and `lower_string_mux` in the backend. That is the
+same answer slang's constant evaluator gives (`ConditionalExpression::evalImpl`
+returns `type->getDefaultValue()` for a non-integral, non-array ambiguous ternary),
+and it keeps "agreement passes through, disagreement degrades" as the single rule
+across every value category. iverilog matches on `real` (`x ? 1.0 : 2.0` prints
+`0.000000`) and rejects a string ternary outright; verilator instead takes the false
+arm for a string, which is a plain LRM deviation, not a second reading.
+
 ---
 
 ## 2. Where simulation and synthesis actually differ
