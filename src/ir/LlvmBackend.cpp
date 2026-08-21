@@ -24306,6 +24306,12 @@ private:
             // Off the queue before the poll takes this activation's exit: nothing
             // may be left pointing into a frame that is about to unwind.
             emit_sync_unlink(node);
+            // And hand off, for the reason `Leave` hands off: an aborting thread may
+            // be the HEAD, and the resource it was about to take is still there --
+            // one `put` of several keys satisfies several waiters. Without this the
+            // wake dies with the killed thread and every waiter behind it strands,
+            // which a `put(2)` racing a `kill` of the head reproduces exactly.
+            emit_sync_wake(qhead, /*all=*/false);
             b_.CreateBr(alive);
             b_.SetInsertPoint(alive);
         }

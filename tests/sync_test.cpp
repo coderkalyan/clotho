@@ -671,6 +671,60 @@ TEST_CASE("mailbox: killing a thread blocked in get, put or peek terminates it")
     CHECK(out == "t=10 n=0 g=4 p=4 k=4 num=1\n");
 }
 
+// A kill landing on the queue's HEAD in the same instant as a `put` that would
+// have satisfied it: the aborting thread hands off, so the second key still
+// reaches the next live waiter. Without the hand-off on the abort path the wake
+// died with the killed thread and every waiter behind it stranded -- `put(2)`
+// served exactly one of four. LRM-pinned (15.3.2 + 15.3.3).
+TEST_CASE("semaphore: killing the queue head hands off to the next waiter") {
+    const std::string out = run_capture(R"(
+        module t;
+          semaphore s;
+          process p0, p1, p2, p3;
+          int n = 0;
+          initial begin
+            s = new(0);
+            fork
+              begin p0 = process::self(); s.get(1); n = n + 1; $display("[%0t] w0", $time); end
+              begin p1 = process::self(); s.get(1); n = n + 1; $display("[%0t] w1", $time); end
+              begin p2 = process::self(); s.get(1); n = n + 1; $display("[%0t] w2", $time); end
+              begin p3 = process::self(); s.get(1); n = n + 1; $display("[%0t] w3", $time); end
+            join_none
+            #10;
+            s.put(2);
+            p1.kill();
+            #10 $display("t=%0t n=%0d %0d %0d %0d %0d",
+                         $time, n, p0.status(), p1.status(), p2.status(), p3.status());
+          end
+        endmodule
+    )");
+    // w0 takes the first key; the killed head hands the second to w2; w3 waits.
+    CHECK(out == "[10] w0\n[10] w2\nt=20 n=2 0 4 0 2\n");
+}
+
+// The other order of the same race, on a mailbox: the message a killed receiver
+// was about to take stays in the mailbox rather than vanishing with it.
+TEST_CASE("mailbox: a put racing a kill of the receiver keeps the message") {
+    const std::string out = run_capture(R"(
+        module t;
+          mailbox #(int) m;
+          process w;
+          int n = 0;
+          initial begin
+            m = new();
+            fork
+              begin int v; w = process::self(); #5; m.get(v); n = 1; $display("receiver ran"); end
+            join_none
+            #10;
+            m.put(3);
+            w.kill();
+            #5 $display("t=%0t n=%0d w=%0d num=%0d", $time, n, w.status(), m.num());
+          end
+        endmodule
+    )");
+    CHECK(out == "t=15 n=0 w=4 num=1\n");
+}
+
 // -- what is refused, and why (each loud, each a TODO) --------------------------
 
 // LRM 15.4.1: "The bound shall be positive. Negative bounds are illegal and can

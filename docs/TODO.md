@@ -1532,7 +1532,7 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `mailbox #(event)` (an element's construction mints an event object the copy then
   overwrites, and event objects are never freed); deriving from either built-in
   class; and a **negative bound**, which 15.4.1 calls illegal and which reports at
-  run time since the bound need not be constant. 20 cases in `tests/sync_test.cpp`.
+  run time since the bound need not be constant. 22 cases in `tests/sync_test.cpp`.
   `std::weak_reference` (LRM 8.30) keeps the std-package guard alone.
   Design: docs/design/mailbox-and-semaphore.md.
 - [x] **`process` class** (LRM 9.7) — all nine methods: `self`, `status`, `kill`,

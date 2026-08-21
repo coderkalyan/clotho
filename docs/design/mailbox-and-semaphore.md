@@ -5,7 +5,7 @@ package — `semaphore` (`new`, `put`, `get`, `try_get`) and `mailbox #(T)` (`ne
 `num`, `put`, `try_put`, `get`, `try_get`, `peek`, `try_peek`).
 
 Status: **landed, in the shape scoped below.** `semaphore` and `mailbox #(T)` are
-implemented end to end (P0-P3 of §13), with 20 cases in `tests/sync_test.cpp`; the
+implemented end to end (P0-P3 of §13), with 22 cases in `tests/sync_test.cpp`; the
 typeless mailbox (§8, P4) is the one piece still refused, by its own message. The
 two claims this document got wrong before it was implemented are marked **measured
 correction** where they appear (§6.2, and the `require_head` split in §6.2's third
@@ -526,6 +526,13 @@ That ordering is what buys three separate correctness properties for free:
 `design_uses_process_`) and the open `disable` nodes' abort words (when
 `design_uses_disable_`). With neither feature in the design it folds to `false` and
 the unlink is not emitted.
+
+**The abort path also hands off**, which the first implementation missed: an
+aborting waiter may be the queue's HEAD, and the resource it was about to take is
+still there. Measured — `put(2)` racing a `kill` of the head served exactly one of
+four waiters, and the two behind the killed one stranded forever. So the abort
+branch is `unlink` + `WakeHead`, the same pair `Leave` emits, and it is pinned by
+`semaphore: killing the queue head hands off to the next waiter`.
 
 ---
 
