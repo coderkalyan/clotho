@@ -1213,14 +1213,17 @@ TEST_CASE("virtual dispatch through a null handle is a located fatal") {
     CHECK(run.err.find("10 |         $display(\"%0d\", b.tag());\n") != std::string::npos);
 }
 
-// `semaphore` (LRM 15.3), `mailbox` (LRM 15.4), `process` (LRM 9.7) and
-// `std::weak_reference` (LRM 8.30) are classes slang synthesizes into the `std`
-// package with signatures but no bodies -- the simulator is expected to supply
-// the semantics. Clotho has no runtime for any of them, so each
-// must be refused in the frontend. Before this guard, lowering a `semaphore`
-// bound a bodyless method with no formals and died on an out-of-range formal
-// index; `mailbox` reached lower_type's catch-all and said only "unsupported
-// non-integral type".
+// `semaphore` (LRM 15.3), `mailbox` (LRM 15.4) and `std::weak_reference`
+// (LRM 8.30) are classes slang synthesizes into the `std` package with signatures
+// but no bodies -- the simulator is expected to supply the semantics. Clotho has
+// no runtime for any of them, so each must be refused in the
+// frontend. Before this guard, lowering a `semaphore` bound a bodyless method with
+// no formals and died on an out-of-range formal index; `mailbox` reached
+// lower_type's catch-all and said only "unsupported non-integral type".
+//
+// `process` (LRM 9.7) used to be refused by the same guard and no longer is: it has
+// its own body shape and its own method lowering (tests/process_test.cpp,
+// docs/design/process-class.md), so the guard is keyed by class name.
 TEST_CASE("built-in std classes are refused in the frontend") {
     // A declaration is enough: the type lowers before any method is reached.
     CHECK(fails("module m; semaphore s; initial s = new(1); endmodule")
@@ -1232,8 +1235,6 @@ TEST_CASE("built-in std classes are refused in the frontend") {
             .find("the built-in 'mailbox' class is not supported") != std::string::npos);
     CHECK(fails("module m; std::semaphore s; initial s = new(1); endmodule")
             .find("the built-in 'semaphore' class is not supported") != std::string::npos);
-    CHECK(fails("module m; initial begin process p; p = process::self(); end endmodule")
-            .find("the built-in 'process' class is not supported") != std::string::npos);
     // Reached indirectly: as a property of a user class, and as a formal.
     CHECK(fails("module m; class H; semaphore lock; endclass H h; initial h = new; endmodule")
             .find("the built-in 'semaphore' class is not supported") != std::string::npos);
@@ -1914,4 +1915,41 @@ TEST_CASE("class layout: a base property holding a handle to its own derived cla
         endmodule
     )";
     CHECK(run_capture(src) == "3 30 37 7\n");
+}
+
+// A function body is lowered on demand, at its first call, and such a body can reach
+// a virtual call whose DECLARING class has not been numbered yet. Here Base's first
+// property is a handle to Helper, so lowering it runs Helper's compute_vtable, which
+// builds `poke` -- and `poke` virtual-calls `tag` on Base, which is still mid-layout
+// below on the stack and has no slot map at all. The lookup was an unguarded `.at()`
+// and threw std::out_of_range with no source location; a bare `uvm_pkg` elaboration
+// aborted this way on `uvm_object::get_full_name`. The slot numbering is now done on
+// demand, like function_id lowers a callee on demand.
+//
+// `d.tag()` and `hp.poke(d)` both have to reach the derived override: the numbering
+// this produces has to agree with the one Base's own frame would have produced, not
+// merely exist.
+TEST_CASE("class vtable: a virtual call reached before its class is numbered") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef class Helper;
+            class Base;
+                Helper h;
+                virtual function int tag(); return 1; endfunction
+            endclass
+            class Helper;
+                virtual function int poke(Base b); return b.tag(); endfunction
+            endclass
+            class Derived extends Base;
+                virtual function int tag(); return 2; endfunction
+            endclass
+            initial begin
+                static Base    b  = new;
+                static Derived d  = new;
+                static Helper  hp = new;
+                $display("%0d %0d %0d", b.tag(), d.tag(), hp.poke(d));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 2\n");
 }

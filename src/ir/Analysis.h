@@ -179,6 +179,17 @@ struct DesignUses {
     // after each suspend inside a targeted region -- a design with no remote
     // `disable` emits none of it.
     bool disable = false;
+    // Any `process` class op (LRM 9.7): ProcQuery / ProcCtl / ProcWait, in
+    // processes or functions, like `disable`. Gates the per-thread control blocks,
+    // the ABI argument carrying the calling thread's block, the status stores at
+    // every park and the pooled blocks fork children take -- a design that never
+    // names `process` emits none of it (docs/design/process-class.md §9).
+    bool process = false;
+    // A `process` randstate op (srandom / get_randstate / set_randstate). Forces every
+    // thread to OWN its generator state rather than sharing the module-wide one: the
+    // target of `p.srandom()` is a handle, so which thread gets reseeded is not
+    // statically known (docs/design/process-class.md §7.4).
+    bool process_randstate = false;
 };
 
 // Everything analyze() knows about a Module.

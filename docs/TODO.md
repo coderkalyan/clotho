@@ -324,39 +324,47 @@ professional parity; M5 makes it complete.
   A capture of an enclosing task frame is refused for the detaching kinds (the ref
   ABI needs the frame to outlive the child) — lifts with V4.
   Design: docs/design/fork-join.md §"V2 scope".
-- [ ] **`fork … join_none` inside a function** (LRM 13.4.4) — **SCOPED, NOT
-  IMPLEMENTED: docs/design/fork-join.md §"V5 scope".** LRM 13.4.4 requires it
-  ("fork-join_none constructs shall be allowed inside a function", and the children
-  may hold anything a task may); `join` / `join_any` there are illegal SV and slang
-  rejects them itself, so only `join_none` reaches `lower_fork`, where the non-task
-  `fn_ctx_` check refuses it by name. The spawn path needs nothing a function lacks
-  — `state` and `rng` are parameters, the wheel is the `clotho.wheel` global, the
-  record is heap and refcounted, the target region is a compile-time bit, and a
-  detaching kind carries no captures. The work is 13.4.4's second paragraph: the
-  caller must be a thread of an `initial` / `always` procedure, so a static-variable
-  initializer, a continuous assignment, a `final` block, a Preponed / Observed /
-  Re-NBA process, a `$strobe` / `$monitor` body and a DPI export must all report —
-  one reverse-reachability set plus a `Process::procedural` bit, since
-  `Activation::Always` covers `always` and `assign` alike. Plus one exclusion:
-  thunk elision is syntactic on the process body and `Call` is not a barrier, so an
-  `always_comb` calling a forking function must lose its thunk (not be refused).
-  A child still cannot read the function's own formals or locals, which is what the
-  LRM's own `watch_for_zero` example does — that lifts with V4's per-spawn copies.
+- [x] **`fork … join_none` inside a function** (LRM 13.4.4) — the only kind the LRM
+  allows there ("fork-join_none constructs shall be allowed inside a function", with
+  children holding anything a task may); `join` / `join_any` in a function are
+  illegal SV and slang rejects them itself, so `lower_fork`'s non-task check is now
+  kind-specific. The spawn path needed almost nothing a function lacks — `state`,
+  `rng` and (with process control) the caller's `proc` block are parameters, the
+  wheel is the `clotho.wheel` global, the record is heap and refcounted, the region
+  is a compile-time bit, and a detaching kind carries no captures. One line did need
+  gating: V3 published the heap record into the `coro_begin_`-anchored
+  `fork_live_slot`, which `join_none` never needs (it cannot park, so no abort can
+  intervene) — now `!none`, which also removes two stores from every detached fork
+  in a process-control design. The real work was 13.4.4's second paragraph: the
+  calling thread must belong to an `initial` / `always` procedure, so
+  `check_spawn_roots` (a spawn-reachability fixpoint over the call graph) plus
+  `Process::spawn_root` report a static-variable initializer, a continuous
+  assignment, a `final` block, a Preponed / Observed / Re-NBA process, a `$strobe` /
+  `$monitor` body and a DPI export, each with the fork site and a "called from here"
+  note. All five accepted the spawn silently before, and the `final` one leaked the
+  record and the child frame. `reject_resume_once` now closes over calls as the
+  backend backstop. Children spawned in a function belong to the CALLING thread, so
+  `wait fork` / `disable fork` in the caller reach them (LRM 9.6.3). A child still
+  cannot read the function's own formals or locals — exactly what the LRM's own
+  `watch_for_zero` example does — which lifts with V4's per-spawn copies, and
+  `$time` in a function stays refused for a timescale reason (LRM 20.3.1), not an
+  ABI one. Design: docs/design/fork-join.md §"V5 scope".
 - [ ] **`fork`-child capture of a local the ref ABI cannot carry** — an unpacked
   array / struct / string / real / queue / class-handle local, or a class property
   reached through the enclosing method's implicit `this`. Each is refused by name;
   they lift when `ref` arguments cover those types (docs/design/ref-args.md). Under
   `join_any` / `join_none` NO capture is carried, whatever its type: the ABI hands
   out a pointer into the enclosing frame and only `join` keeps that frame alive.
-- [ ] **`wait fork` / `disable fork`** and per-spawn automatic-variable lifetime.
-  Both name themselves in the refusal rather than reporting "unsupported statement".
-  Both need a per-process live-child SET, which V2's count-and-`wake_at` record does
-  not carry. That is now the ONLY thing missing for `disable fork`: the abort
-  primitive it used to wait on has landed with `disable` (an activation list per
-  target, a claim on the park, a poll after each park — docs/design/disable.md), so
-  `disable fork` is a walk of the child set applying that abort per descendant.
-  Per-spawn lifetime is what the classic `for (int i…) fork … i … join_none` needs
-  (fork-join.md V4).
+- [x] **`wait fork` / `disable fork`** — landed, but not here: the live-descendant SET
+  V2's count-and-`wake_at` record could not carry is the `process` control-block tree
+  (LRM 9.7), so both statements came with it. `disable fork` is `kill` over the
+  caller's subtree; `wait fork` is `first_child == null`, exact because a completing
+  thread re-parents its live children. Design: docs/design/process-class.md §8.
+- [ ] **Per-spawn automatic-variable lifetime** — what the classic
+  `for (int i…) fork … i … join_none` needs (fork-join.md V4). Refused by name rather
+  than reading a shared final `i`. Note the capture refusal for the detaching kinds is
+  now load-bearing for a second reason: a killed parent's frame goes away under its
+  live children, so V4's per-spawn copies are what would make a capture safe there.
 - [ ] **1024 concurrent detached children** is the ceiling: an unbounded spawn edge
   saturates the activation bound, and past it the scheduler-buffer guards report a
   located FATAL. Lifting it means a spill on the already-emitted overflow edge; the
@@ -1329,8 +1337,8 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 
 ### Full object orientation
 
-- [~] **Garbage collection** (LRM 8.4) — objects are collected under `--gc`
-  (default off, so the leak is still the default). Design and phasing:
+- [~] **Garbage collection** (LRM 8.4) — class objects are always collected; no
+  design leaks them any more. Design and phasing:
   docs/design/garbage-collection.md. Landed: an Immix-shaped mark-region heap
   (32 KiB blocks / 128 B lines, `src/runtime/Gc.cpp`), a GC word below the
   descriptor pointer at handle[-1], a per-class trace map and finalizer emitted
@@ -1338,8 +1346,8 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   and statics, conservative pinned coroutine-frame roots through an intrusive
   registry node CoroSplit hoists into the frame, and stop-the-world collection at
   the drain loop's quiescent edge. Non-moving; the header reserves the forwarding
-  and pin encodings so evacuation stays a policy change. 15 cases in
-  tests/gc_test.cpp (43 cases). P2 landed: the bump-allocation fast path and the
+  and pin encodings so evacuation stays a policy change. 48 cases in
+  tests/gc_test.cpp. P2 landed: the bump-allocation fast path and the
   frame registry are emitted inline, and allocation is 2x faster than the leaking
   path. P3 landed: generational in place, sticky mark bits, an inlined write
   barrier over object remembering, per-line age records, young/full kinds and
@@ -1497,20 +1505,30 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   stream is reproducible and independent of its siblings'. A DPI export thunk and
   the `$monitor` ramp in `main` have no calling thread at all and use a
   module-wide state seeded at startup.
-- [ ] **Random stability & seeding, remaining** — `srandom` / `get_randstate` /
-  `set_randstate`. The per-object RNG for class `randomize` has landed (above), and
-  `srandom` on an object with it. What remains is the `process`-side trio, designed
-  with it (docs/design/process-class.md §7.4): they need per-thread RNG ownership
-  forced for every PCB-bearing body, since the target of `p.srandom()` is not
-  statically known. The object-side randstate codec shares those two `clotho.str`
-  helpers and is guarded loud until they exist.
+- [x] **`srandom` / `get_randstate` / `set_randstate`** (LRM 9.7, 18.14) — the
+  `process` methods: the thread's generator state rides its control block, so all three
+  reach a thread through a handle. `srandom` is `$urandom(seed)`'s splitmix64
+  expansion; the state renders as 64 hex digits and round-trips. A design that uses any
+  of the three gives every thread its OWN generator (the target of `p.srandom()` is not
+  statically known), gated so a `$urandom`-only design keeps the ownership
+  `build_rng_fns` computes. A foreign string is a located fatal, LRM 18.14.4 leaving it
+  undefined.
+- [ ] **Random stability & seeding, remaining** — the OBJECT-side randstate pair
+  (`obj.get_randstate()` / `obj.set_randstate()`), which shares the two `clotho.str`
+  helpers the `process` trio above now provides and stays guarded loud until it uses
+  them. The per-object RNG for class `randomize` and `obj.srandom()` landed with
+  randomization; the thread-side trio landed with `process`.
 
 ### Concurrency & synchronization
 
-- [ ] **`wait fork`, `disable fork`** — `fork … join_any` / `join_none` are done
-  (LRM 9.3.2, V2); these two still need a per-process live-child set, which
-  docs/design/process-class.md owns (the PCB tree, §5.3 and §8): both fall out of
-  the same structure as `process::kill`, so they land with it rather than before it.
+- [x] **`wait fork`, `disable fork`** (LRM 9.6.1 / 9.6.3) — both landed with the
+  `process` control blocks, which is where the live-descendant set they needed came
+  from: `disable fork` is `kill` over the caller's subtree with the caller spared, and
+  `wait fork` is the one-pointer test `first_child == null`, exact because a completing
+  thread re-parents its live children (so a grandchild of a finished child still
+  counts, as 9.6.3 requires). Both stay refused inside an assertion action block,
+  which runs on the MONITOR's thread rather than one of its own.
+  Design: docs/design/process-class.md §8.
 - [ ] **`std::mailbox` / `std::semaphore`** (parameterized, bounded/unbounded).
   Slang synthesizes both into the `std` package with signatures but no bodies,
   so a real runtime is needed: a key count plus a wait queue for `semaphore`, a
@@ -1518,16 +1536,27 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `lower_class_type` (any class whose parent scope is the `std` package) — a
   `semaphore` used to abort on an out-of-range formal index and a `mailbox` to
   report only "unsupported non-integral type".
-- [ ] **`process` class** (LRM 9.7) — `self`, `status`, `kill`, `await`, `suspend`,
-  `resume`, `srandom`, `get_randstate`, `set_randstate`. **Designed in full:
-  docs/design/process-class.md** — one GC-allocated process control block per
-  thread carrying the status word, the activation stack (a claimable park even
-  behind a task call), the `await` waiter list and the descendant tree; `kill` is
-  the landed `disable` abort applied per thread; `suspend`/`resume` are a status
-  word plus a pending-wake bit. Same `std`-package guard as above, narrowed by
-  class name in P0; `std::weak_reference` (LRM 8.30) keeps it. No oracle —
-  iverilog cannot parse the class and Verilator implements no `suspend`, so the
-  verification strategy needs a decision (§14).
+- [x] **`process` class** (LRM 9.7) — all nine methods: `self`, `status`, `kill`,
+  `await`, `suspend`, `resume`, `srandom`, `get_randstate`, `set_randstate`. A
+  thread's control block is native, untraced storage in two tiers -- a static slot per
+  process (no allocation, a constant address, the starting state in the initializer)
+  and a pooled record per fork child, the only unbounded tier -- and a `process`
+  handle is an ordinary class handle onto it, created lazily at the first `self()` and
+  memoized so identity is a pointer compare. Identity travels the call ABI beside
+  `rng`, because a task or function is not a thread.
+
+  `kill` is the landed `disable` abort per thread rather than per static target: mark
+  the subtree, force-wake each exactly once through the shared claim-or-flag protocol,
+  and let every activation leave through its ordinary exit -- so a thread parked behind
+  a time-consuming task call unwinds its whole frame chain, which is the case remote
+  `disable` still refuses. `suspend`/`resume` desensitise nothing (the wheel cannot
+  cancel, a static bucket cannot compact): a suspended thread replays the wake it
+  already received, which is what makes `resume` continue it in the current time step.
+
+  Everything is behind `DesignUses::process`, verified byte-identical `--emit llvm` on
+  every design that does not name it. `std::weak_reference` keeps the std-package
+  guard, now keyed by class name. 27 cases in `tests/process_test.cpp`, clean under
+  ASan/UBSan/LSan. Design: docs/design/process-class.md.
 - [~] **Clocking blocks** (LRM 14) — `clocking`/`endclocking` elaborates in a
   module, an interface (so a modport-scoped block comes free) or a program, and
   each block becomes one `ir::Activation::Observed` process that samples every

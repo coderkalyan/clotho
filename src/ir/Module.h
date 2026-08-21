@@ -219,6 +219,17 @@ struct Process {
     // false: it runs only when a wait event fires. Only meaningful with a non-empty
     // wait list (a sensitivity-less process already runs once via the seed loop).
     bool self_start = false;
+    // Whether code this process runs may spawn a background process — a
+    // `fork … join_none` inside a FUNCTION it calls (LRM 13.4.4). The LRM allows
+    // that only when "the thread calling the function is created by an initial
+    // procedure, always procedure, or fork block from one of those procedures",
+    // and requires an error otherwise, so this separates the two populations
+    // `Activation` conflates: a user `always` and a continuous assignment are both
+    // Activation::Always, and only the first is a procedure. False for every
+    // compiler-synthesized process, and for a `final` block, which is neither an
+    // initial nor an always procedure and runs after the drain has ended (a child
+    // pushed there could never be resumed). Read by check_spawn_roots.
+    bool spawn_root = false;
     // Full source extent of the AST construct that produced this process (the
     // continuous assign, always block, ...). A span rather than a point because
     // this is what an editor highlights and what an inferred-hardware hint

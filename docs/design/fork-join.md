@@ -9,7 +9,8 @@ Status: **V1 + V2 landed.** `fork … join` / `join_any` / `join_none`, in a pro
 body and in a task body (children capture the enclosing frame's packed integral /
 dynamic-array locals by reference under `join`; the detaching kinds refuse a capture,
 see §V2.2). Phased: V1 = `fork … join`; V2 = `join_any` / `join_none` (§V2 scope);
-V3 = `wait fork` / `disable fork`; V4 = true per-spawn automatic-variable lifetime.
+V3 = `wait fork` / `disable fork`; V4 = true per-spawn automatic-variable lifetime;
+V5 = `fork … join_none` inside a function (§V5 scope; landed, no captures).
 
 V1 shipped with two statically-sized structures that a fork child reaches sized as
 if it did not exist, and with no overflow guard, so an ordinary `fork … join`
@@ -46,8 +47,10 @@ capture requires each spawn to see its own `i`.
   assertion action block is lowered as one). `disable` / `disable fork` at the
   `Disable` / `DisableFork` cases and `wait fork` are still refused, by name.
   slang itself rejects `join` / `join_any` inside a *function*
-  (`diag::TimingInFuncNotAllowed`) but allows `join_none` there, so `lower_fork`'s
-  own non-task check is what refuses it.
+  (`diag::TimingInFuncNotAllowed`) but allows `join_none` there, clearing
+  `ASTFlags::Function` inside the block so the children may hold anything a task
+  may, so `lower_fork`'s own non-task check used to refuse it. LRM 13.4.4 requires
+  that case to work, and it now lowers: §V5.
 
 ## The process model this builds on
 
@@ -356,6 +359,307 @@ live hazard for the cooperative-finish migration.
   `for (int i…) fork … use i … join_none` still cannot capture, and is refused by
   name rather than reading a shared final `i`.
 - **Truly unbounded** live children — the ceiling in V2.3 is 1024, reported loudly.
+- **A `fork` inside a function** — LANDED for `join_none` (§"V5 scope" below), which
+  is the only kind LRM 13.4.4 allows there. A child still cannot capture the
+  function's own formals, which is V4's job.
+
+## V5 scope: `fork … join_none` inside a function
+
+Status: **LANDED**, without captures. `join` / `join_any` in a function are illegal
+SystemVerilog and stay that way: LRM 13.4.4's "Functions shall execute with no
+delay" is what slang enforces in `BlockStatement::fromSyntax`
+(`diag::TimingInFuncNotAllowed` for `JoinAll` / `JoinAny`, slang
+`source/ast/Statement.cpp:694-698`). So V5 is `join_none` only, and `lower_fork`'s
+guard is kind-specific rather than gone — a non-`JoinNone` fork on a non-task
+`fn_ctx_` is still a defensive fail. A child that reads the function's own formals
+or locals is still refused by name and lifts with V4 (§V5.5).
+
+### V5.0 What the LRM asks for (13.4.4)
+
+> Statements that do not block shall be allowed inside a function; specifically,
+> nonblocking assignments, event triggers, clocking drives, and fork-join_none
+> constructs shall be allowed inside a function. Calling a function that tries to
+> schedule an event that cannot become active until after that function returns
+> shall be allowed provided that the thread calling the function is created by an
+> initial procedure, always procedure, or fork block from one of those procedures
+> and in a context in which a side effect is allowed. Implementations shall issue
+> an error either at compile time or run time when these provisions have not been
+> met. […] Within a function, a fork-join_none construct may contain any statements
+> that are legal within a task.
+
+Three consequences, in increasing order of work:
+
+1. The child body is unrestricted — `#delay`, `@`, `wait`, a task enable. slang
+   implements exactly that by clearing `ASTFlags::Function | ASTFlags::Final`
+   inside a `join_none` block (`Statement.cpp:699-703`, "all statements are allowed
+   in those"), so the children arrive fully formed and the body needs no frontend
+   work at all.
+2. Table 9-1's "the spawned processes do not start executing until the parent
+   thread executes a blocking statement or terminates" is about the THREAD, not the
+   function activation. The function returns at once; the children must run when the
+   CALLING PROCESS next blocks or ends — which is what pushing them onto the
+   caller's own region ring already does.
+3. The CALLER becomes part of the legality question and the LRM demands a
+   diagnostic. Its own example is the illegal case — `bit y = watch_for_zero(stack);`
+   at module scope, i.e. a static-variable initializer, with the same verdict for a
+   continuous assignment. That is V5's real work (§V5.2).
+
+### V5.1 The spawn needed almost nothing a function lacks
+
+The refusal in `lower_fork` was not ABI-driven, and its own comment said so
+("`is_task` is the real discriminator"). The `join_none` path of `lower_fork_inst`
+reads four values out of the enclosing body, and a plain function has all four:
+`state_` (arg 0), `rng_slot_` (arg 1), `wheel_` — a function takes no wheel
+parameter but binds `wheel_` to the `clotho.wheel` global, which `run()` creates
+before any body for exactly this reason — and, in a design with process control,
+`proc_arg()`, which `lower_function` takes as its own `proc` parameter
+(`declare_function` pushes it, `lower_function` binds it). Everything else is a
+global, a compile-time constant, or the heap record `rt_alloc`ed per fork site. The
+target region is the compile-time `reactive_home()` bit `lower_function` already
+computes, folded inside `emit_region_push`; there is no runtime "current region"
+value in Clotho to thread. And `join_none` provably carries no captures:
+`lower_fork`'s `kind != Join` guard runs before the capture-type guard, so
+`ForkInfo::args` is empty on every surviving `JoinNone` path and the child ramp argv
+degenerates to `{ state, rng, wheel, [proc], rec }`.
+
+Every coroutine-dependent line of the join path is on the far side of the `continue`
+the `none` case takes: `fork_record_slot()` (a `coro_begin_`-anchored alloca),
+`parked_handle(b_, hdl_)` and `emit_suspend`. A `join_none` parent never enters the
+record — `parent` stays null, so a child epilogue's `wake` is always false — and the
+record's refcount (`W+1`, released once by the parent and once per child) is what
+already licensed a parent that walks away from live children. A function activation
+that returns is that same lifetime, not a new one.
+
+**The one line that did need changing came from V3.** With process control in the
+design the heap record is also published into `fork_live_slot()`, a
+`coro_begin_`-anchored frame alloca, so that an aborted parent parked at the join can
+detach itself (`emit_fork_record_abandon`). That publish was on the `join_none` path
+and is the only thing that would have null-dereferenced `coro_begin_` in a function.
+It is also dead weight there: between the `rt_alloc` and the parent's release there
+is no park, hence no abort poll, hence no window for an abort to land in, and the
+record's `parent` is never non-null. Both the publish and its matching null-store are
+now gated on `!none`, which unblocks the function case and removes two stores from
+every `join_none` in a process-control design. `fork … join` still publishes — its
+emitted IR is unchanged.
+
+Two consequences of V3 that needed no work, and are the reason V5 is worth having:
+
+- The child's PCB comes from the pool with the SPAWNING body's block as parent
+  (`lower_task`'s `f.is_fork_child ? rt_proc_alloc(caller) : caller`). In a function
+  that block is the CALLING THREAD's, so a child spawned inside a function is a child
+  of the calling process — exactly LRM 9.6.3's descendant relation. `wait fork` and
+  `disable fork` in the caller therefore reach it with no extra plumbing, which is
+  covered by a test, and `process::self()` inside the function is the caller, as LRM
+  13.4 requires.
+- A function activation is not on its thread's activation stack
+  (`emit_pcb_acts_link` needs `hdl_`). Harmless: a function cannot park, so an abort
+  aimed at the thread is noticed at the caller's next poll.
+
+`Ir.h`'s invariant is narrowed accordingly: `Inst::Tag::Fork` is coroutine-only for
+`ForkKind::Join` / `JoinAny`, and legal in a plain function body for `JoinNone`.
+
+### V5.2 The real work: which callers may spawn
+
+13.4.4 makes the legal set "a thread created by an initial procedure, an always
+procedure, or a fork of one, in a context where a side effect is allowed", and
+requires an error otherwise. Clotho's entry contexts, and the verdict for each:
+
+**Legal.** `Activation::Initial`; a user `always` / `always_ff` / `always_comb` /
+`always_latch`; any task or fork child reached from those; `Activation::Reactive` (a
+`program` block's `initial`, LRM 24.3); and a concurrent assertion's action block,
+which already supported a direct `join_none` (§V2.4) and reaches the reactive ring
+through the same `emit_region_push`.
+
+**Refused, each by name.** `Activation::PreInit` — static-variable initializers, the
+LRM's own illegal example. Continuous assignments, gates and port copies — not a
+procedure. `Preponed` / `Observed` / `ReNba` — compiler-synthesized sampling,
+property evaluation and clocking drives; none is a procedure and all are resume-once.
+`Activation::Final` — a `final` block is not an initial/always procedure, slang
+treats it like a function for timing (`ASTFlags::Final`), and the drain has already
+ended, so a child pushed onto the active ring could never run. A `$strobe` /
+`$monitor` deferred body — its arguments are evaluated in Postponed, where LRM
+4.4.2.9 forbids a value change. A DPI export — native C drove the call, so there is
+no thread at all, which the backend already says in so many words at `ProcOp::Self`
+("No calling thread: a DPI export thunk or the $monitor ramp"); a `join_none` there
+would hand `rt_proc_alloc` a null parent.
+
+**All of those were silently accepted before this landed**, which is why the check is
+the deliverable and not a formality. Measured while scoping, with the frontend guard
+relaxed and nothing else changed: `int y = spawn();` ran its child at time 1;
+`assign z = spawn(a);` spawned one child per re-evaluation; and
+`final begin void'(spawn()); end` printed `n=0` with the fork record and the child
+frame leaked (LeakSanitizer, 96 + 24 bytes).
+
+**Mechanism: `check_spawn_roots` in the frontend** (`src/Lower.cpp`, beside
+`check_vcd_scope`), run once after every top has lowered. `build_spawn_graph` marks
+every body that holds a `Fork` and relaxes that over `Call` / `TaskCall` /
+`CallVirtual` / `TaskCallVirtual` edges to a fixpoint — tasks included, because a
+`final` block may enable a task and a `join_none` inside one has the same problem.
+Fork children are deliberately not followed: the forking body is already marked, and
+a child's legality follows its parent's. A design with no fork pays one scan of the
+function table and stops. Roots are then every `Process` the LRM does not allow to
+spawn, plus the two non-process entries: `StrobePend` / `MonitorSet` target bodies
+and `Module::dpi_exports`. `ReactivePend` is deliberately NOT a root — an action
+block is reactive code of the assertion's own thread and may spawn.
+
+**One bit of provenance was missing.** `Activation::Always` covers a user `always`
+AND a continuous assignment — `add_continuous_process` is what `assign`,
+net-declaration assignments, gates and port copies all go through — so the activation
+alone cannot separate the legal case from the illegal one. `Process::spawn_root` now
+carries it, set only where `lower_procedural_block` builds a process and false for
+`Activation::Final` and for every synthesized process. One byte per process, at
+compile time.
+
+The diagnostic is the frontend's because that is the only place a located error is
+possible: `Process::span`, `Function::span` and the `Fork` instruction's own
+`SourceLoc` are all available, while `BackendError` carries a message and no
+location. It points at the fork site and attaches the calling context as a note:
+
+```
+t.sv:5:7: error: a function that spawns a background process (fork..join_none, LRM
+13.4.4) is called from a `final` block, which is not a thread of an initial or
+always procedure: the spawned process could not become active [illegal-construct]
+  t.sv:9:3: note: called from here [illegal-construct]
+```
+
+`DiagnosticOrigin::Rejected` with code `illegal-construct`, not
+`unsupported-construct`: the source is illegal SystemVerilog that slang does not
+catch, rather than something Clotho has not implemented.
+
+### V5.3 What the analyses needed — one closure
+
+Almost everything already covers a `Fork` that lives in a function body, because it
+either walks the whole function table or keys on `Function::is_fork_child` rather
+than on where the `Fork` sits. Verified against code, so it is not re-audited:
+`body_activations` (walks every function's IR, and takes the saturating
+`kUnboundedSource` edge from `ForkInfo::kind` alone, never from the containing body),
+`fork_ring_slots` / `ensure_active_queue`, `wait_counts`'s `from_fork` term (its
+relaxation crosses `Call` edges), `nba_classify` (scans every function body, for the
+NBA-in-a-function case 13.4.4 also allows), `design_forks` / `ring_guard_wanted`
+(per-`Function` flag), `build_rng_fns` (`Call` and `Fork` edges both),
+`collect_callees` — which is what gives a child of a reactive body its own reactive
+classification — and `legalize/Legalize.cpp`, which refuses `is_fork_child` outright
+and maps `Fork` to `Finding::Fork` in its default arm.
+
+The one hole was `reject_resume_once`: it scanned `p.ir` only, so an Observed /
+Re-NBA process reaching a fork through a call would have been resumed once and
+silently truncated. It now closes over calls (`reaches_fork`, a memoized walk over
+`collect_callees`), and its `Inst::Tag::Fork` case is gone as unreachable. Those
+designs are refused by §V5.2's root rule with a source location; this is the backend's
+independent backstop, kept in agreement deliberately, exactly as
+`reject_unsupported_reactive` documents.
+
+**Thunk elision needed nothing, contrary to the obvious worry.** `is_simple_always`
+is syntactic on the process's own IR, `Fork` is `blocks_thunk` but `Call` is not, so
+`always_comb y = bump(a);` where `bump` forks IS thunk-lowered — confirmed in the
+emitted IR (`clotho.inst.top.p0.thunk`) — and it works: children run at the right
+times with the right values, one per evaluation. A thunk has `state` and `wheel`
+parameters and the rings are globals, so the push is mechanically fine, and a
+thunk-lowered process ending is exactly the "parent thread terminates" of Table 9-1.
+The one thing a thunk cannot provide is per-process RNG state, and that is already
+handled: `rng_procs_` follows `Call` and `Fork` edges, so a process whose forked child
+can draw is already off the thunk path. Since `always_comb` calling a spawning
+function is LEGAL per 13.4.4, that is the right answer — no exclusion, no refusal.
+
+### V5.4 Region: already handled, including the shared-body hazard
+
+Region is a compile-time property of the lowered body (`reactive_home()`) plus a tag
+on parked handles, and a function already gets the compile-time answer from
+`build_reactive_fns` / `build_program_fns`. The interesting case — a function reached
+both as reactive code and from ordinary code, which is lowered once and can record
+only one home region — is already refused: `reject_unsupported_reactive` runs over
+every reactive-reachable FUNCTION and its `Fork` arm calls
+`reject_shared_reactive_suspend`. A function is likelier than a task to be shared
+that way, so that guard stops being theoretical with V5; it needs no change.
+
+### V5.5 What V5 alone does not buy: the LRM's own example
+
+```systemverilog
+function automatic bit watch_for_zero( IntClass p );
+  fork forever @p.a begin if ( p.a == 0 ) $display("Unexpected zero"); end join_none
+  return ( p.a == 0 );
+endfunction
+```
+
+The child reads `p`, an automatic FORMAL, so the capture guards fire:
+`fork..join_none child that reads the enclosing function's 'p' is not supported`.
+(The message used to say "the enclosing task's" whatever the body was; it now names
+the kind, because in a function the captures that matter are its own formals.) A
+function's interesting state IS its formals, so V5 admits only children touching
+module signals, static locals and static class properties: a monitor spawned by a
+helper function, not the LRM's idiom.
+
+That is an argument for finishing V4, not for widening the ref ABI. For a detached
+child the right model is **copy-in by value at spawn** (per-spawn automatic lifetime,
+V4): a class handle, an `int` or a string copied into the child's own frame removes
+the lifetime problem `ArgDir::Ref` has, and for a function it is the only model
+available, since the frame is gone the moment the call returns.
+
+Adjacent friction NOT cleared here: `$time` / `$realtime` inside a function is still
+refused, and its stated reason ("no wheel pointer in its ABI") is stale —
+`lower_function` binds `wheel_` to the `clotho.wheel` global and `has_wheel()` is
+unconditionally true. It is left alone because lifting it is a timescale question,
+not an ABI one: LRM 20.3.1 scales `$time` to the time unit of the module that
+invoked the call, and a function body is lowered ONCE with its own definition's
+`time_mul_`, so a package function called from two modules with different
+timescales has no single right answer to bake in. Refusing beats guessing, and it
+is a separate piece of work. Practical consequence for this feature: print `%0t`
+in the CHILD (a task body, where `$time` works) rather than in the spawning
+function. `$strobe` / `$monitor` in a function keep a second, still-real reason (no
+`coro_begin_` to hang the ramp's record slot off).
+
+### V5.6 Cost
+
+Nothing at run time for a design that does not fork inside a function: the spawn
+graph, the root check and `Process::spawn_root` are compile-time, and the `!none`
+gate on the `fork_live_slot` publish removes two stores rather than adding any. No
+new capacity term either — a non-`Join` spawn edge already saturates the activation
+bound (§V2.3), so the rings, `#0` batches and wait buckets size the same whether the
+fork sits in a process, a task or a function. Emitted IR for a `fork … join` design
+is unchanged, including its `fork_live` publish under process control.
+
+### V5.7 Verification
+
+**iverilog is not an oracle for this construct.** Two independent deviations,
+measured on iverilog 13 while scoping this:
+
+- it rejects a `#5` inside a `join_none` child in a function outright
+  (`error: functions cannot have delay statements`), which 13.4.4's "any statements
+  that are legal within a task" allows and slang accepts;
+- for delay-free children it prints both children BEFORE the statement following the
+  fork, i.e. it runs them at the fork, contradicting Table 9-1 — so its function path
+  disagrees with its own process path, which prints the parent first.
+
+It also still asserts (`vthread.cc:3793`, `of_JOIN_DETACH`) on a detaching fork in an
+automatic task, which is what already pins three of the 22 V2 cases.
+
+**Verilator 5.050** (`--binary --timing`) matches the LRM on both shapes.
+Corroboration only; the LRM text is the pin, per the project's rule on Verilator.
+
+In `tests/fork_test.cpp`: parent-first ordering with a `#5` child in a function
+(`fn done n=0 / after call n=0@0 / mid n=1@1 / end n=11@11`); a spawning function
+called from a task; one called from `always_comb`, which spawns per evaluation and
+stays thunked; eight calls in a loop giving eight live children on one delay; `wait
+fork` and `disable fork` in the CALLER reaching a child spawned inside a function;
+the capture refusal naming the function; and all five illegal roots reporting
+(static initializer, continuous assignment, `final`, `$strobe` body, DPI export).
+
+Not covered: a spawning function reached from an Observed / Re-NBA process, which
+needs an SVA build (`-DCLOTHO_SVA=ON`) — the frontend refuses it by the root rule
+and `reject_resume_once`'s new closure is the backstop, both by construction rather
+than by test.
+
+### V5.8 Adjacent gaps this widens but does not own
+
+`BodyFacts::calls` is fed only by `TaskCall` / `TaskCallVirtual` — the `Call` arms
+push nothing and there is no `Fork` arm — so `compute_subscription_order`'s closure
+misses signals a fork child, or any plain function, blocking-writes, and
+`wake_adj_` / `scc_nontrivial_` / `sub_order_` are computed on an incomplete graph
+that `compute_fusion_groups` then reads. Pre-existing (a fork in a task has it too)
+and unchanged in kind by V5, which only widens its reach. Likewise `scan_finish`
+omits `Fork`, so a `$finish` in a child does not mark the parent may-finish —
+harmless while `$finish` is a longjmp, a live hazard for the cooperative-finish
+migration.
 
 ## Hard parts (V1)
 
@@ -422,10 +726,11 @@ from the parent's sensitivity, as called-subroutine bodies are handled.
 
 ### E. Loud guards (never silently accept)
 
-- fork in a **function** or in **`always_comb` / `always_latch`** — slang rejects
-  both itself (`diag::TimingInFuncNotAllowed`, `diag::ForkJoinAlwaysComb`), so a
-  function can only reach `lower_fork` through `join_none`, which is rejected
-  anyway. `lower_fork` keeps a defensive fail on a non-task `fn_ctx_`.
+- fork in a **function** — only `join_none` can reach `lower_fork` there, and its
+  non-task `fn_ctx_` check refuses a non-`JoinNone` kind by name. LRM 13.4.4 permits
+  `join_none` there and it lowers (§V5). `join` / `join_any` in a function, and any
+  fork in **`always_comb` / `always_latch`**, are illegal SV and slang rejects them
+  itself (`diag::TimingInFuncNotAllowed`, `diag::ForkJoinAlwaysComb`).
 - a captured local the ref ABI cannot carry (unpacked array / struct / string /
   real / queue / class handle) — rejected by name, and lifts when the ref ABI
   does.
@@ -456,26 +761,40 @@ record/awaiter pattern); `$finish` mid-fork leaks suspended child frames
   heap record; the activation bound saturates for an unbounded spawn edge so the
   rings, `#0` batches and wait buckets all size from one answer; and two V1
   corruptions were fixed first.
-- **V3 — `wait fork` / `disable fork`.** `wait fork` = join barrier over the
-  whole live-child set. `disable fork` needs the general `disable`-unwind
-  machinery (unregister wheel / wait-queue entries and free frames of
-  suspended children) — the largest scheduler surgery, gated on `disable`
-  support landing first.
+- **V3 — `wait fork` / `disable fork`. LANDED, AND NOT HERE:
+  `docs/design/process-class.md` §8.** `wait fork` = a barrier over the whole live
+  descendant set; `disable fork` = an abort per descendant.
 
-  **Neither is unblocked by V2 as scoped, and the dependency is worth stating
-  precisely because both documents previously stated it wrongly.** V2's
-  per-fork-site heap join record is still a COUNT used as a refcount; a
-  "live-child set" that can be enumerated does not exist in it. Today the fork
-  state is `{ i32 count, ptr parent }` and every child handle is dropped as a dead
-  SSA value at the spawn site, so a child cannot be named after it is spawned, and
-  `is_fork_child` is a compile-time `Function` flag, not a runtime relation. V3
-  therefore owns building an enumerable live-descendant structure — either added
-  to V2's scope explicitly, or built here — and must revisit the `ArgDir::Ref`
-  capture ABI at the same time, since a child outliving its join dangles formals
-  into the parent's frame. `docs/design/disable.md` V3 states the same conclusion.
+  **Neither was unblocked by V2 as scoped, and the dependency is worth keeping
+  because both documents once stated it wrongly.** V2's per-fork-site heap join record
+  is a COUNT used as a refcount; a "live-child set" that can be enumerated does not
+  exist in it, every child handle is dropped as a dead SSA value at the spawn site, and
+  `is_fork_child` is a compile-time `Function` flag rather than a runtime relation. So
+  V3 owed an enumerable live-descendant structure — and that structure turned out to be
+  the LRM 9.7 `process` control block's tree, so both statements shipped with the
+  `process` class instead of here. Two consequences for this document:
+
+  - **Every fork in a design with process control now takes the HEAP refcounted
+    record**, including `join` (`design_uses_process_` in `lower_fork_inst` and in the
+    child epilogue). A `join` record is a frame slot, which is sound only while the
+    parent outlives its children; `kill` breaks exactly that, and an aborting parent
+    additionally nulls the record's `parent` before releasing its reference so a
+    surviving child wakes nobody. §V2.2's byte-identical `join` codegen therefore holds
+    only while process control is unused — which is the gate, and is verified.
+  - **The `ArgDir::Ref` capture refusal for the detaching kinds must STAY until V4**,
+    now for two reasons rather than one: a `join_none` parent can return, and a killed
+    parent's frame goes away under live children.
+
 - **V4 — true per-spawn automatic lifetime.** Give fork-captured automatics
   real per-spawn copies (frame locals), fixing `for … fork … i … join_none`.
   Cross-cutting with the broader automatic-lifetime gap (`declare_local`).
+- **V5 — `fork … join_none` inside a function (LRM 13.4.4). LANDED:** §"V5 scope"
+  above. The spawn path needed almost nothing a function lacks — one `!none` gate on
+  V3's `fork_live_slot` publish, which `join_none` never needed anyway. The work was
+  13.4.4's caller-legality rule (`check_spawn_roots` plus `Process::spawn_root`,
+  since a static initializer, a continuous assignment, a `final` block, a `$strobe`
+  body and a DPI export all accepted a spawn silently before) and closing
+  `reject_resume_once` over calls. Captures stay refused until V4.
 
 ## Verification
 

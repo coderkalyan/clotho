@@ -887,11 +887,13 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 suspends("a wait_order");
                 break;
             case StatementKind::WaitFork:
-                // Nothing to do with the region: clotho does not lower it anywhere.
-                // `wait fork` needs the live-child set a fork does not keep. Named
-                // here for the reason the fork case is: this walk runs first.
+                // Lowerable everywhere else (LRM 9.6.1), but not here, and for the
+                // identity reason `disable fork` is refused below: an action block is
+                // pended as a task body and runs on the MONITOR process's control
+                // block, so the descendants it would wait for are the monitor's.
                 reject("a wait fork",
-                       "clotho does not lower it, in reactive code or outside it");
+                       "the descendants it would wait for are the monitor process's, not the "
+                       "assertion's: an action block runs on the monitor's thread");
                 break;
             case StatementKind::ForeverLoop:
                 // Still refused, and still not a region matter -- but the old reason
@@ -924,9 +926,15 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
                 // it refuses everywhere else.
                 break;
             case StatementKind::DisableFork:
-                // `disable fork` needs the live-child set, like `wait fork` above.
+                // Lowerable everywhere else (LRM 9.6.3, docs/design/process-class.md
+                // §8), but not here, and the reason is identity rather than region: an
+                // action block is not a thread of its own -- it is pended as a task
+                // body and runs on the monitor process's control block -- so the
+                // descendants it would end are the monitor's, which is not what the
+                // statement means.
                 reject("a disable fork",
-                       "clotho does not lower it: it needs the live-child set fork owes");
+                       "the descendants it would end are the monitor process's, not the "
+                       "assertion's: an action block runs on the monitor's thread");
                 break;
             default:
                 // The whitelist's floor, and what it now asks. Suspending is no
@@ -2565,20 +2573,28 @@ private:
         // are built by the OUTERMOST frame of this recursion, once every class it
         // reached has its vtable numbering. See rand_pending_.
         const Restore<uint32_t> depth(class_depth_, class_depth_ + 1);
-        // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4), `process` (LRM 9.7)
-        // and `std::weak_reference` (LRM 8.30) are built-in classes slang
-        // synthesizes into the `std` package. Slang builds their *signatures* only
-        // -- every method is a bodyless prototype whose semantics the simulator is
+        // `semaphore` (LRM 15.3), `mailbox #(T)` (LRM 15.4) and
+        // `std::weak_reference` (LRM 8.30) are built-in classes slang synthesizes
+        // into the `std` package. Slang builds their *signatures* only -- every
+        // method is a bodyless SubroutineSymbol whose semantics the simulator is
         // expected to supply -- so lowering one walks into a method with no
         // statements and no formals to bind, and used to die on an out-of-range
         // formal index instead of saying anything. Each needs a real runtime: a key
         // count plus a wait queue for a semaphore, a bounded FIFO with blocking
-        // put/get/peek for a mailbox, per-process control for `process`.
+        // put/get/peek for a mailbox.
         //
-        // TODO: built-in std classes (semaphore / mailbox / process /
-        // weak_reference) -- need the runtime support described above.
+        // `process` (LRM 9.7) is the one that is implemented: it has its own body
+        // shape and its own method lowering, because a `process` object is not a
+        // user class but a handle onto a thread's control block. See
+        // docs/design/process-class.md.
+        //
+        // TODO: built-in std classes (semaphore / mailbox / weak_reference) -- need
+        // the runtime support described above.
         if (const slang::ast::Scope* parent = clt.getParentScope();
             parent != nullptr && parent->asSymbol().kind == SymbolKind::Package && parent->asSymbol().name == "std") {
+            if (clt.name == "process") {
+                return lower_process_class(clt);
+            }
             fail("the built-in '" + std::string(clt.name) + "' class is not supported");
         }
         // Phase 3 features (docs/design/classes.md §2): guarded loud.
@@ -2806,6 +2822,60 @@ private:
         }
     }
 
+    // Lower the built-in `process` class (LRM 9.7). Unlike a user class, its body is
+    // not a property table: slang synthesizes only method signatures, so the object
+    // carries ONE hidden `chandle` naming the thread's control block (a native,
+    // untraced record — see docs/design/process-class.md §4). Everything else about
+    // the handle is an ordinary class handle: a 64-bit 2-state word, `null` == 0,
+    // `==` an identity compare, storable in a variable or a class property.
+    //
+    // The class is `final` and `abstract` in slang, so there is no derivation and no
+    // user `new` (slang rejects it), and every method is `MethodFlags::BuiltIn`, so
+    // compute_vtable mints no dispatch slot for one — only the shallow-copy thunk
+    // every class gets, which is unreachable here for the same reason `new` is.
+    //
+    // It does get the two RESERVED randomization slots, because compute_vtable
+    // reserves them for every class (LRM 18 makes `randomize` a member of every
+    // class, `process` included). So this path owes what the user-class path owes:
+    // an empty `ClassRand` for the generated bodies to read, and the same
+    // outermost-frame drain that builds them -- without both, the two FunctionIds
+    // compute_vtable reserved stay unbuilt and the backend declares a function with
+    // no return type.
+    ir::Ref lower_process_class(const slang::ast::ClassType& clt) {
+        const uint32_t fid = module_.pool.reserve_struct_fields();
+        ir::Type       t;
+        t.kind      = ir::Type::Kind::Class;
+        t.fields_id = fid;
+        t.element   = ir::Ref::Invalid;
+        const ir::Ref ref = module_.pool.put(ir::Item{ t });
+        class_type_cache_.emplace(&clt, ref);
+        std::vector<ir::FieldRow> fields;
+        fields.push_back({ kProcessCtlField, make_int_type(64, false, false), 0 });
+        module_.pool.set_struct_fields(fid, std::move(fields));
+        class_rand_.emplace(&clt, ClassRand{});
+        compute_vtable(clt, ref);
+        if (class_depth_ == 1) {
+            drain_rand_bodies();
+        }
+        return ref;
+    }
+
+    // Whether `sub` is one of `process`'s nine built-in methods (LRM 9.7). Keyed on
+    // the owning ClassType's name and package rather than on a remembered Ref: a
+    // method call can be lowered before any `process` variable has been declared.
+    static bool is_process_method(const slang::ast::SubroutineSymbol& sub) {
+        if (!sub.flags.has(slang::ast::MethodFlags::BuiltIn)) {
+            return false;
+        }
+        const slang::ast::Scope* owner = sub.getParentScope();
+        if (owner == nullptr || owner->asSymbol().kind != SymbolKind::ClassType ||
+            owner->asSymbol().name != "process") {
+            return false;
+        }
+        const slang::ast::Scope* pkg = owner->asSymbol().getParentScope();
+        return pkg != nullptr && pkg->asSymbol().kind == SymbolKind::Package && pkg->asSymbol().name == "std";
+    }
+
     // True if `m` is a user-declared virtual method (LRM 8.20) — excludes slang's
     // built-in virtual `randomize` (MethodFlags::BuiltIn), not a dispatch target.
     static bool is_user_virtual(const slang::ast::SubroutineSymbol& m) {
@@ -2858,6 +2928,11 @@ private:
         return nullptr;
     }
 
+    // A class's method NAME -> vtable slot map (LRM 8.20). Declared here, ahead of
+    // compute_vtable and ensure_vtable, because it names ensure_vtable's return type
+    // and a member alias is not visible in a signature above its own declaration.
+    using VtableSlots = ankerl::unordered_dense::map<std::string_view, uint32_t>;
+
     // Assign vtable slots and register the descriptor of a class (LRM 8.16/8.20/8.21).
     // Slots are keyed by method NAME per hierarchy (a base's virtuals take slots
     // 0..k-1; an override — including an implicit one, or the override of a pure
@@ -2870,9 +2945,20 @@ private:
     // signature but is never executed (an abstract class is never `new`'d, so its
     // vtable is never materialized). Called after the base is lowered.
     void compute_vtable(const slang::ast::ClassType& clt, ir::Ref class_ref) {
-        const slang::ast::ClassType* base  = base_class_of(clt);
-        VtableSlots                  slots = base != nullptr ? class_vslot_[base] : VtableSlots{};
-        uint32_t                     size  = static_cast<uint32_t>(slots.size());
+        if (class_vslot_.contains(&clt)) {
+            // Already numbered, by ensure_vtable reaching this class from a virtual
+            // call site before the class's own lower_class_type frame got here. The
+            // numbering is the part that has to happen once; the table below is keyed
+            // off it and was filled by that same earlier call.
+            return;
+        }
+        const slang::ast::ClassType* base = base_class_of(clt);
+        // The base's numbering, which the derived class extends. `ensure_vtable` and
+        // not `class_vslot_[base]`: operator[] INSERTS an empty map for a base that
+        // has not been numbered yet, and the derived class then numbers its own
+        // virtuals from 0, silently aliasing every inherited slot.
+        VtableSlots slots = base != nullptr ? ensure_vtable(*base) : VtableSlots{};
+        uint32_t    size  = static_cast<uint32_t>(slots.size());
         for (const auto& m : clt.membersOfType<slang::ast::SubroutineSymbol>()) {
             if (is_user_virtual(m) && !slots.contains(m.name)) {
                 slots.emplace(m.name, size++);
@@ -3049,12 +3135,44 @@ private:
                                            .ir          = b.finish() });
     }
 
+    // The slot map of `clt`, numbering the class first if nothing has yet.
+    //
+    // A function body is lowered on demand, at its first call, and such a body can
+    // reach a virtual call whose DECLARING class has not been through compute_vtable
+    // yet. A small design never does: every class it mentions is lowered before any
+    // body is. UVM's call graph is deep and mutually referential enough that the
+    // deferred path (`lower_user_call` -> `function_id` -> `build_function` ->
+    // `lower_user_call` -> ...) arrives at a virtual dispatch ahead of the target
+    // class, and the lookup found nothing -- an uncaught std::out_of_range with no
+    // source location, on `uvm_object::get_full_name` in a bare `uvm_pkg` elaboration.
+    //
+    // Numbering on demand mirrors how function_id lowers a callee on demand, and only
+    // the numbering is needed here: the call site wants a slot index, not a filled
+    // table.
+    const VtableSlots& ensure_vtable(const slang::ast::ClassType& clt) {
+        const auto it = class_vslot_.find(&clt);
+        if (it != class_vslot_.end()) {
+            return it->second;
+        }
+        const auto cached = class_type_cache_.find(&clt);
+        if (cached != class_type_cache_.end()) {
+            // Interned but not yet numbered: its own lower_class_type frame is below
+            // us on the stack, still walking properties (lowering a property's type
+            // recurses into bodies). Number it here; compute_vtable is idempotent, so
+            // that frame's own call becomes a no-op.
+            compute_vtable(clt, cached->second);
+        } else {
+            lower_class_type(clt);
+        }
+        return class_vslot_.at(&clt);
+    }
+
     // The vtable slot of virtual method `sub` (LRM 8.20), looked up by name in the
     // slot map of its declaring class (walk out to the enclosing ClassType — a pure
     // method's degenerate subroutine nests under its prototype scope). The slot is
     // identical across the hierarchy, so any class containing the name works.
     uint32_t virtual_slot_of(const slang::ast::SubroutineSymbol& sub) {
-        return class_vslot_.at(&declaring_class(sub)).at(sub.name);
+        return ensure_vtable(declaring_class(sub)).at(sub.name);
     }
 
     // The class scope that declares method `sub` (walk out past a pure method's
@@ -7357,6 +7475,11 @@ private:
         module_.add_process(ir::Process{ .activation  = activation,
                                          .wait_events = std::move(wait_events),
                                          .self_start  = self_start,
+                                         // LRM 13.4.4: an `initial` / `always` procedure is a thread
+                                         // whose calls may spawn background processes. A `final`
+                                         // block is not one of the two, and its children could never
+                                         // run anyway (the drain has ended by then).
+                                         .spawn_root  = activation != ir::Activation::Final,
                                          .span        = span_of(sym),
                                          .ir          = std::move(body_ir),
                                          .scope       = cur_scope_id() });
@@ -8369,15 +8492,20 @@ private:
                 lower_disable(stmt.as<slang::ast::DisableStatement>(), b);
                 break;
             case StatementKind::DisableFork:
-                // TODO: disable fork (V3) kills every descendant of the calling
-                // process (LRM 9.6.3), so it needs the live-child set fork V2 owes
-                // plus the general abort primitive (docs/design/disable.md).
-                fail("disable fork is not supported");
+                // LRM 9.6.3: end every descendant of the calling process, "not just
+                // immediate children", including descendants of children that have
+                // already terminated -- which the control-block tree gives by
+                // re-parenting a completing thread's live children
+                // (docs/design/process-class.md §5.3, §8). Exactly `kill` over the
+                // subtree, with the caller itself spared.
+                b.proc_ctl(ir::ProcOp::DisableFork, {}, loc(stmt));
+                break;
             case StatementKind::WaitFork:
-                // TODO: wait fork (LRM 9.6.1) needs the same live-child set: a
-                // process must block until every descendant has finished, which the
-                // join-all count cannot express.
-                fail("wait fork is not supported");
+                // LRM 9.6.1: block until every descendant has completed. One pointer
+                // test on the control-block tree, because a completing thread
+                // re-parents its live children (docs/design/process-class.md §8).
+                b.proc_wait(ir::ProcOp::WaitFork, {}, loc(stmt));
+                break;
             case StatementKind::WaitOrder:
                 lower_wait_order(stmt.as<slang::ast::WaitOrderStatement>(), b);
                 break;
@@ -8520,12 +8648,22 @@ private:
         // it lifts with V4's per-spawn copies (docs/design/fork-join.md).
         std::vector<const ValueSymbol*> captures;
         if (fn_ctx_ != nullptr) {
-            if (!fn_ctx_->is_task) {
-                // Unreachable through slang, which rejects a timing control in a
-                // function outright; `is_task` is the real discriminator, so say so
-                // rather than trusting the front end's reach.
+            // LRM 13.4.4 allows `fork … join_none` in a function -- it schedules
+            // processes and returns, consuming no time -- and slang enforces the rest
+            // (`join` / `join_any` there are rejected as time-consuming, and inside a
+            // join_none block it clears its own function flag so the children may hold
+            // anything a task may). The other two kinds cannot reach here through the
+            // front end; `is_task` is the real discriminator, so the fail stays.
+            //
+            // Which CALLERS may reach a spawning function is a whole-call-graph
+            // question and is checked once, after lowering, by check_spawn_roots.
+            if (!fn_ctx_->is_task && kind != ir::ForkKind::JoinNone) {
                 fail(std::string(kind_name) + " inside a function is not supported");
             }
+            // "the enclosing task's" would be wrong in a function, where the captures
+            // that matter are its own formals -- which is exactly the shape of LRM
+            // 13.4.4's own `watch_for_zero` example.
+            const char* enclosing = fn_ctx_->is_task ? "task" : "function";
             ForkCaptureDetector d;
             d.locals = &fn_ctx_->localmap;
             for (const Statement* c : children) {
@@ -8542,7 +8680,7 @@ private:
             for (const ValueSymbol* sym : d.captured) {
                 const auto& ct = sym->getType().getCanonicalType();
                 if (kind != ir::ForkKind::Join) {
-                    fail(std::string(kind_name) + " child that reads the enclosing task's '" +
+                    fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
                          std::string(sym->name) +
                          "' is not supported (only fork..join can capture an enclosing frame: the "
                          "parent has to outlive every child for the reference to stay valid)");
@@ -8551,7 +8689,7 @@ private:
                     // TODO: capture of an unpacked array / struct / string / real /
                     // queue / class-handle local. Exactly the ref ABI's own gap, so
                     // the two lift together (docs/design/ref-args.md).
-                    fail(std::string(kind_name) + " child that reads the enclosing task's '" +
+                    fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
                          std::string(sym->name) +
                          "' is not supported (only packed integral and dynamic-array "
                          "locals can be captured)");
@@ -23112,7 +23250,7 @@ private:
         const ir::Ref        class_ref = lower_type(*cc.type);
         const ir::Index      src       = lower_expr(cc.sourceExpr(), b);
         const ir::FunctionId sig       = copy_thunk_id(clt, class_ref);
-        const uint32_t       slot      = class_vslot_.at(&clt).at(kCopySlot);
+        const uint32_t       slot      = ensure_vtable(clt).at(kCopySlot);
         return b.call_virtual(sig, slot, class_ref, std::array<ir::Index, 1>{ src }, l);
     }
 
@@ -23364,7 +23502,7 @@ private:
         const ir::Index handle = b.unary(ir::Inst::Tag::Load, lv, l);
         b.open_region();
         const std::array<ir::Index, 2> args{ handle, b.constant(module_.pool.put_int(u64, ~0ull), l) };
-        b.call_virtual(randomize_fn_.at(&pointee), class_vslot_.at(&pointee).at(kRandomizeSlot), ref, args, l);
+        b.call_virtual(randomize_fn_.at(&pointee), ensure_vtable(pointee).at(kRandomizeSlot), ref, args, l);
         const ir::ExtraSlice then_region = b.close_region();
         b.open_region();
         const ir::ExtraSlice else_region = b.close_region();
@@ -23615,6 +23753,74 @@ private:
         }
     }
 
+    // Lower one of the nine built-in `process` methods (LRM 9.7). `self` is static
+    // (no receiver); every other method takes the receiver's control block. Each
+    // lowers to a ProcQuery / ProcCtl / ProcWait instruction, never to a call: slang
+    // gives these methods no body.
+    std::optional<ir::Index> lower_process_method(const CallExpression&    call,
+                                                 const SubroutineSymbol&  sub,
+                                                 ir::Builder&             b) {
+        const ir::SourceLoc l = loc(call);
+        // The receiver handle, for every method except the static `self`.
+        const auto recv = [&]() -> ir::Index {
+            if (call.thisClass() == nullptr) {
+                fail("process::" + std::string(sub.name) + " needs an explicit process handle");
+            }
+            return lower_expr(*call.thisClass(), b);
+        };
+        if (sub.name == "self") {
+            // `process::self()` is static: its return type IS the process class, so
+            // lowering that type is also what interns the class body (and is a no-op
+            // once some `process` variable has been declared).
+            return b.proc_query(ir::ProcOp::Self, {}, lower_type(sub.getReturnType()), l);
+        }
+        if (sub.name == "status") {
+            // The `state` typedef over an int enum, so an ordinary 32-bit result.
+            const std::array<ir::Index, 1> args{ recv() };
+            return b.proc_query(ir::ProcOp::Status, args, lower_type(sub.getReturnType()), l);
+        }
+        if (sub.name == "kill") {
+            // LRM 9.7: end the process and every descendant it forked.
+            const std::array<ir::Index, 1> args{ recv() };
+            b.proc_ctl(ir::ProcOp::Kill, args, l);
+            return std::nullopt;
+        }
+        if (sub.name == "srandom") {
+            // LRM 18.14: reseed that thread's generator.
+            const std::array<ir::Index, 2> args{ recv(), lower_expr(*call.arguments()[0], b) };
+            b.proc_ctl(ir::ProcOp::Srandom, args, l);
+            return std::nullopt;
+        }
+        if (sub.name == "get_randstate") {
+            const std::array<ir::Index, 1> args{ recv() };
+            return b.proc_query(ir::ProcOp::RandstateGet, args, module_.pool.string_type, l);
+        }
+        if (sub.name == "set_randstate") {
+            const std::array<ir::Index, 2> args{ recv(), lower_expr(*call.arguments()[0], b) };
+            b.proc_ctl(ir::ProcOp::RandstateSet, args, l);
+            return std::nullopt;
+        }
+        if (sub.name == "suspend" || sub.name == "resume") {
+            // LRM 9.7: suspend this thread or another one; resume restarts a suspended
+            // thread. Both are functions, not tasks -- even though suspending the
+            // CALLER parks it, which is the suspension itself rather than a wait for a
+            // value, and is why `suspend` needs no ProcWait.
+            const std::array<ir::Index, 1> args{ recv() };
+            b.proc_ctl(sub.name == "suspend" ? ir::ProcOp::Suspend : ir::ProcOp::Resume, args, l);
+            return std::nullopt;
+        }
+        if (sub.name == "await") {
+            // A task: it parks the calling thread until the target completes, so it
+            // is a statement with no value (LRM 9.7).
+            const std::array<ir::Index, 1> args{ recv() };
+            b.proc_wait(ir::ProcOp::Await, args, l);
+            return std::nullopt;
+        }
+        // Every method of LRM 9.7 is handled above; a new one would arrive with a new
+        // slang release rather than from a design.
+        fail("process::" + std::string(sub.name) + "() is not supported");
+    }
+
     // Lower a user function call: the actuals (resized to the parameter types)
     // become a `call`. Returns the result value, or nullopt for a void function.
     std::optional<ir::Index> lower_user_call(const CallExpression& call, ir::Builder& b) {
@@ -23622,6 +23828,14 @@ private:
             fail("system call used where a user subroutine was expected");
         }
         const SubroutineSymbol& sub = *std::get<0>(call.subroutine);
+        if (is_process_method(sub)) {
+            // The nine `process` methods (LRM 9.7) have no lowerable body -- slang
+            // synthesizes signatures only -- so they never reach the call path
+            // below. Their receiver is resolved here rather than through
+            // resolve_method_this, because `self()` is static and the rest take the
+            // control block out of the receiver's object.
+            return lower_process_method(call, sub, b);
+        }
         // A class built-in slang synthesizes with an empty body (srandom, rand_mode,
         // the randstate pair, the default randomization hooks). Intercepted before
         // anything else: lowering slang's degenerate body is silently wrong.
@@ -24488,7 +24702,6 @@ private:
     // MethodPrototypeSymbol) shares a slot with its concrete overrides. pure_stub_:
     // a pure prototype -> the FunctionId of its never-executed signature stub. Both
     // filled by compute_vtable / pure_stub_id.
-    using VtableSlots = ankerl::unordered_dense::map<std::string_view, uint32_t>;
     ankerl::unordered_dense::map<const slang::ast::ClassType*, VtableSlots>                class_vslot_;
     ankerl::unordered_dense::map<const slang::ast::MethodPrototypeSymbol*, ir::FunctionId> pure_stub_;
     // The reserved vtable slot name of a class's shallow-copy thunk (LRM 8.12). Not
@@ -24524,6 +24737,10 @@ private:
     std::vector<std::pair<const slang::ast::ClassType*, ir::Ref>>              rand_pending_;
     // Depth of the lower_class_type recursion; the outermost frame drains the list.
     uint32_t class_depth_ = 0;
+    // The built-in `process` class (LRM 9.7): the name of the hidden body field
+    // holding the thread control-block pointer. Not a legal SV identifier, so it
+    // cannot collide with a property name.
+    static constexpr std::string_view kProcessCtlField = "$pcb";
     // Design-wide class type ids (LRM 8.16). Owned here so a standalone Lowerer
     // works; lower_compilation points every Lowerer at one shared table instead.
     // A subroutine reached through a virtual interface handle -> its
@@ -24847,6 +25064,218 @@ void check_vcd_scope(const ir::Module& m, const ir::InstanceScope& sc, std::vect
     }
 }
 
+// LRM 13.4.4: a `fork … join_none` inside a FUNCTION schedules processes that can
+// only become active after that function has returned, and the LRM allows the call
+// "provided that the thread calling the function is created by an initial
+// procedure, always procedure, or fork block from one of those procedures and in a
+// context in which a side effect is allowed", requiring an error at compile or run
+// time otherwise. Its own example is the illegal shape: a static-variable
+// initializer calling such a function, with the same verdict for a continuous
+// assignment.
+//
+// The offending pair is (spawning body, calling context) and neither half can see
+// the other -- a function is lowered once and knows nothing of its callers -- so it
+// is answered here, once, over the whole lowered call graph. A fork in a PROCESS
+// body needs no check: slang refuses one in `always_comb` / `always_latch` and
+// there is no way to write one in a continuous assignment or in a
+// compiler-synthesized body.
+//
+// "Spawning" covers tasks too, not just functions: a `final` block may enable a
+// task, and a `join_none` inside one has children the drain will never reach.
+struct SpawnGraph {
+    // Whether this body contains a fork or calls something that does.
+    std::vector<uint8_t> spawns;
+    // The fork site the body reaches, for the report.
+    std::vector<ir::SourceLoc> site;
+
+    [[nodiscard]] bool any() const {
+        return std::ranges::any_of(spawns, [](uint8_t s) { return s != 0; });
+    }
+};
+
+// Every function this body calls or enables. Fork children are deliberately NOT
+// followed: the body that forks is already marked by the Fork itself, and a child
+// is a thread of its own whose legality follows its parent's.
+void spawn_callees(const ir::Ir& ir, std::vector<ir::FunctionId>& out) {
+    for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+        const auto                i = static_cast<ir::Index>(k);
+        const ir::Inst::Payload& p = ir.payload(i);
+        switch (ir.tag(i)) {
+            case ir::Inst::Tag::Call:
+                out.push_back(ir.extra_data<ir::CallInfo>(p.extra).func);
+                break;
+            case ir::Inst::Tag::TaskCall:
+                out.push_back(ir.extra_data<ir::TaskCallInfo>(p.extra).func);
+                break;
+            case ir::Inst::Tag::CallVirtual:
+            case ir::Inst::Tag::TaskCallVirtual:
+                // The statically named target only -- the same bound the backend's
+                // own reachability walks document.
+                out.push_back(ir.extra_data<ir::VirtualCallInfo>(p.extra).func);
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+SpawnGraph build_spawn_graph(const ir::Module& m) {
+    const size_t nfn = m.function_count();
+    SpawnGraph   g{ std::vector<uint8_t>(nfn, 0), std::vector<ir::SourceLoc>(nfn, ir::SourceLoc{ 0 }) };
+    for (uint32_t f = 0; f < nfn; ++f) {
+        const ir::Ir& ir = m.function(static_cast<ir::FunctionId>(f)).ir;
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            const auto i = static_cast<ir::Index>(k);
+            if (ir.tag(i) == ir::Inst::Tag::Fork) {
+                g.spawns[f] = 1;
+                g.site[f]   = ir.loc(i);
+                break;
+            }
+        }
+    }
+    if (!g.any()) {
+        return g; // No fork anywhere: the common case pays one scan and stops.
+    }
+    // Relax over the call edges. A DAG converges in at most as many rounds as it
+    // has functions; a cycle (recursion) needs no more, since the flag only ever
+    // goes from 0 to 1.
+    std::vector<ir::FunctionId> callees;
+    bool                        changed = true;
+    while (changed) {
+        changed = false;
+        for (uint32_t f = 0; f < nfn; ++f) {
+            if (g.spawns[f] != 0) {
+                continue;
+            }
+            callees.clear();
+            spawn_callees(m.function(static_cast<ir::FunctionId>(f)).ir, callees);
+            for (const ir::FunctionId c : callees) {
+                const auto ci = static_cast<uint32_t>(c);
+                if (ci < nfn && g.spawns[ci] != 0) {
+                    g.spawns[f] = 1;
+                    g.site[f]   = g.site[ci];
+                    changed     = true;
+                    break;
+                }
+            }
+        }
+    }
+    return g;
+}
+
+// The first fork site `ir` reaches, directly or through a call, or SourceLoc{0}.
+ir::SourceLoc spawn_site_of(const SpawnGraph& g, const ir::Ir& ir) {
+    for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+        const auto i = static_cast<ir::Index>(k);
+        if (ir.tag(i) == ir::Inst::Tag::Fork) {
+            return ir.loc(i);
+        }
+    }
+    std::vector<ir::FunctionId> callees;
+    spawn_callees(ir, callees);
+    for (const ir::FunctionId c : callees) {
+        const auto ci = static_cast<uint32_t>(c);
+        if (ci < g.spawns.size() && g.spawns[ci] != 0) {
+            return g.site[ci];
+        }
+    }
+    return ir::SourceLoc{ 0 };
+}
+
+// Why this process is not a thread LRM 13.4.4 lets spawn, or null when it is one.
+const char* non_spawn_root(const ir::Process& p) {
+    if (p.spawn_root) {
+        return nullptr;
+    }
+    switch (p.activation) {
+        case ir::Activation::PreInit:
+            return "a static variable initializer";
+        case ir::Activation::Preponed:
+            return "an assertion sampling process";
+        case ir::Activation::Observed:
+            return "a property evaluation process";
+        case ir::Activation::ReNba:
+            return "a clocking block drive";
+        case ir::Activation::Final:
+            return "a `final` block";
+        default:
+            // Every remaining shape is a continuous driver: an `assign`, a
+            // net-declaration assignment, a gate, a port copy, a wire resolver.
+            return "a continuous assignment";
+    }
+}
+
+void report_bad_spawn(std::string_view where, ir::SourceLoc site, ir::SourceSpan root,
+                      std::vector<Diagnostic>& out) {
+    Diagnostic d{ .severity = Severity::Error,
+                  .origin   = DiagnosticOrigin::Rejected,
+                  .code     = "illegal-construct",
+                  .message  = "a function that spawns a background process (fork..join_none, LRM "
+                              "13.4.4) is called from " +
+                              std::string(where) +
+                              ", which is not a thread of an initial or always procedure: the "
+                              "spawned process could not become active",
+                  .span     = ir::SourceSpan{ site, site } };
+    if (root.valid()) {
+        d.notes.push_back(Diagnostic{ .severity = Severity::Note,
+                                      .origin   = DiagnosticOrigin::Rejected,
+                                      .code     = "illegal-construct",
+                                      .message  = "called from here",
+                                      .span     = root });
+    }
+    out.push_back(std::move(d));
+}
+
+// Report every call of a spawning body from a context LRM 13.4.4 does not allow.
+void check_spawn_roots(const ir::Module& m, std::vector<Diagnostic>& out) {
+    const SpawnGraph g = build_spawn_graph(m);
+    if (!g.any()) {
+        return;
+    }
+    for (const ir::Process& p : m.processes()) {
+        const char* where = non_spawn_root(p);
+        if (where == nullptr) {
+            continue;
+        }
+        const ir::SourceLoc site = spawn_site_of(g, p.ir);
+        if (site != ir::SourceLoc{ 0 }) {
+            report_bad_spawn(where, site, p.span, out);
+        }
+    }
+    // Bodies that are not processes and have no calling thread at all. A $strobe /
+    // $monitor body runs in Postponed, where LRM 4.4.2.9 forbids a value change; a
+    // DPI export is entered from native C. An action block (ReactivePend) is NOT
+    // here: it is reactive code of the assertion's own thread and may spawn.
+    const auto deferred_bodies = [&](const ir::Ir& ir) {
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            const auto  i   = static_cast<ir::Index>(k);
+            const auto  tag = ir.tag(i);
+            if (tag != ir::Inst::Tag::StrobePend && tag != ir::Inst::Tag::MonitorSet) {
+                continue;
+            }
+            const auto f = static_cast<uint32_t>(
+              ir.extra_data<ir::StrobePendInfo>(ir.payload(i).extra).func);
+            if (f < g.spawns.size() && g.spawns[f] != 0) {
+                report_bad_spawn("a $strobe / $monitor body, which runs in the Postponed region",
+                                 g.site[f], ir::SourceSpan{ ir.loc(i), ir.loc(i) }, out);
+            }
+        }
+    };
+    for (const ir::Process& p : m.processes()) {
+        deferred_bodies(p.ir);
+    }
+    for (uint32_t f = 0; f < m.function_count(); ++f) {
+        deferred_bodies(m.function(static_cast<ir::FunctionId>(f)).ir);
+    }
+    for (const ir::DpiExport& ex : m.dpi_exports) {
+        const auto f = static_cast<uint32_t>(ex.func);
+        if (f < g.spawns.size() && g.spawns[f] != 0) {
+            report_bad_spawn("a DPI export, entered from native C with no calling thread", g.site[f],
+                             m.function(ex.func).span, out);
+        }
+    }
+}
+
 LowerResult lower_compilation(slang::ast::Compilation&       comp,
                               std::shared_ptr<SourceContext> ctx,
                               Timings*                       timings,
@@ -25132,6 +25561,13 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         for (const ir::InstanceScope& top : module->tops()) {
             check_vcd_scope(*module, top, result.diagnostics);
         }
+        poisoned = poisoned || result.diagnostics.size() != before;
+    }
+    // Same reason, one level up: which callers may reach a function that spawns a
+    // background process is a whole-call-graph question (LRM 13.4.4).
+    {
+        const size_t before = result.diagnostics.size();
+        check_spawn_roots(*module, result.diagnostics);
         poisoned = poisoned || result.diagnostics.size() != before;
     }
     if (timings != nullptr) {
