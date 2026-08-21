@@ -19067,6 +19067,10 @@ private:
         // update always lands in the current instant's NBA region.
         const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
         const ir::Index     rhs = lower_expr(a.right(), b);
+        if (a.left().kind == ExpressionKind::Streaming) {
+            store_stream_target(a.left().as<StreamingConcatenationExpression>(), a.right(), rhs, tag, b, loc(a));
+            return rhs;
+        }
         if (a.left().kind == ExpressionKind::Concatenation) {
             store_concat(a.left().as<ConcatenationExpression>(), rhs, tag, b, loc(a));
             return rhs;
@@ -19127,6 +19131,15 @@ private:
             } else {
                 b.dyn_array_new(dst, size, dst, /*has_init*/ false, aty, l);
             }
+            return dst;
+        }
+        if (unwrap_conversion(a.right()).kind == ExpressionKind::Streaming) {
+            // `d = {>>{...}}` (LRM 11.4.14): sized to the stream's element count,
+            // then filled in stream order.
+            std::vector<StreamChunk> chunks;
+            collect_stream_chunks(
+              unwrap_conversion(a.right()).as<StreamingConcatenationExpression>(), chunks, b, l);
+            stream_fill_dynarr(dst, chunks, aty, b, l);
             return dst;
         }
         // arr = other: deep copy the source handle (value semantics).
@@ -19655,6 +19668,14 @@ private:
             }
             const ir::Index src = materialize_queue_rvalue(rs.value(), b);
             b.queue_append_range(dst, src, lower_expr(rs.left(), b), lower_expr(rs.right(), b), qty, l);
+            return;
+        }
+        if (e.kind == ExpressionKind::Streaming) {
+            // `q = {>>{...}}` (LRM 11.4.14): the stream's bits divide into whole
+            // elements, pushed back in stream order.
+            std::vector<StreamChunk> chunks;
+            collect_stream_chunks(e.as<StreamingConcatenationExpression>(), chunks, b, l);
+            stream_fill_queue(dst, chunks, qty, b, l);
             return;
         }
         const auto* pat = as_assignment_pattern(e);
@@ -20251,6 +20272,602 @@ private:
         return b.resize(raw, target_ty, l);
     }
 
+    // -- Streaming concatenation with a dynamically sized operand, or into a
+    // string / queue / dynamic-array destination (LRM 11.4.14) --
+    //
+    // A fixed-size stream is one packed value, so lower_streaming_concat above
+    // builds it (block reversal included) and it arrives below as a single Fixed
+    // chunk. An operand that is a queue, dynamic array or string has no lower-time
+    // width at all -- neither does the stream then -- so those operands stay
+    // separate and the destination consumes them in order: bytes for a string,
+    // elements for a container. Every chunk contributes a whole number of
+    // destination granules; a stream that would split one is refused rather than
+    // silently misaligned.
+    struct StreamChunk {
+        enum class Kind : uint8_t { Fixed, Elems, Str };
+        Kind kind = Kind::Fixed;
+        // Fixed: the packed value. Elems: the container's handle lvalue. Str: the
+        // string value.
+        ir::Index value{};
+        // Elems: the interned queue / dynamic-array type of `value`.
+        ir::Ref ty = ir::Ref::Invalid;
+        // Fixed: the value's bit width. Elems: one element's bit width, 0 when the
+        // element is itself a string.
+        uint32_t width       = 0;
+        bool     is_queue    = false;
+        bool     elem_is_str = false;
+    };
+
+    // One element's bit width in a container the stream reads or fills, and the
+    // guard for an element shape that has no flat width.
+    uint32_t stream_granule_width(const ir::Type& ct) {
+        if (value_cat(ct.element) != ValueCat::scalar || module_.pool.is_float(ct.element)) {
+            // TODO: a real / aggregate / nested-container element (LRM 11.4.14
+            // allows any bit-stream type). Each needs its own per-element
+            // serialization inside the element loop, and a real is not a
+            // bit-stream type at all.
+            fail("streaming a container whose elements are not integral or string is not supported");
+        }
+        return module_.pool.layout(ct.element).width;
+    }
+
+    // Flatten `sc` into destination-order chunks.
+    void collect_stream_chunks(const StreamingConcatenationExpression& sc,
+                               std::vector<StreamChunk>&               out,
+                               ir::Builder&                            b,
+                               ir::SourceLoc                           l) {
+        for (const auto& stream : sc.streams()) {
+            if (stream.withExpr) {
+                fail("streaming concatenation `with` clause is not supported");
+            }
+        }
+        if (sc.isFixedSize()) {
+            bool four = false;
+            for (const auto& stream : sc.streams()) {
+                four = four || stream.operand->type->isFourState();
+            }
+            const auto w = static_cast<uint32_t>(sc.getBitstreamWidth());
+            out.push_back({ .kind  = StreamChunk::Kind::Fixed,
+                            .value = lower_streaming_concat(sc, make_int_type(w, four, false), b, l),
+                            .width = w });
+            return;
+        }
+        if (sc.getSliceSize() > 0) {
+            // TODO: `{<<S{...}}` over a dynamically sized stream. Which block a bit
+            // lands in depends on the total width, so the reversal needs the whole
+            // stream materialized first; the walk below never holds more than one
+            // operand at a time.
+            fail("slice size on a dynamically-sized streaming concatenation is not supported");
+        }
+        for (const auto& stream : sc.streams()) {
+            const Expression& e = *stream.operand;
+            if (e.kind == ExpressionKind::Streaming) {
+                collect_stream_chunks(e.as<StreamingConcatenationExpression>(), out, b, l);
+                continue;
+            }
+            const Expression& u = unwrap_conversion(e);
+            if (is_string_expr(u)) {
+                out.push_back({ .kind = StreamChunk::Kind::Str, .value = lower_expr(u, b) });
+                continue;
+            }
+            if (is_queue(u) || is_dyn_array(u)) {
+                const ir::Ref  cty = lower_type(*u.type);
+                const ir::Type ct  = std::get<ir::Type>(module_.pool.get(cty));
+                StreamChunk    c{ .kind     = StreamChunk::Kind::Elems,
+                                  .value    = lower_lvalue(u, b),
+                                  .ty       = cty,
+                                  .is_queue = ct.kind == ir::Type::Kind::Queue };
+                if (value_cat(ct.element) == ValueCat::string) {
+                    c.elem_is_str = true;
+                } else {
+                    c.width = stream_granule_width(ct);
+                }
+                out.push_back(c);
+                continue;
+            }
+            if (is_agg_bitstream_operand(u)) {
+                // A fixed unpacked aggregate still has one packed serialization.
+                out.push_back({ .kind  = StreamChunk::Kind::Fixed,
+                                .value = serialize_agg_lvalue(lower_lvalue(u, b), lower_type(*u.type), b, l),
+                                .width = static_cast<uint32_t>(u.type->getBitstreamWidth()) });
+                continue;
+            }
+            out.push_back({ .kind  = StreamChunk::Kind::Fixed,
+                            .value = lower_expr(u, b),
+                            .width = static_cast<uint32_t>(u.type->getBitstreamWidth()) });
+        }
+    }
+
+    // Loop over the live elements of an Elems chunk, calling `body(elem_lvalue)`
+    // inside the loop's body region. The bound is snapshotted once, like every
+    // other runtime-length walk here (LRM 12.7.3 leaves a mid-loop resize
+    // undefined), and each region re-emits its own leaves (see TempCell).
+    template<typename Body>
+    void emit_stream_elem_loop(const StreamChunk& c, ir::Builder& b, ir::SourceLoc l, Body body) {
+        using T                  = ir::Inst::Tag;
+        const ir::Ref  i32       = make_int_type(32, false, true);
+        const TempCell idx       = make_temp_cell(i32, "stream_i");
+        const TempCell bound     = make_temp_cell(i32, "stream_n");
+        const ir::Index size     = c.is_queue ? b.queue_size(c.value, c.ty, l) : b.dyn_array_size(c.value, c.ty, l);
+        b.binary(T::Store, bound.lv(b, l), b.resize(size, i32, l), l);
+        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+
+        b.open_region();
+        const ir::Index pred =
+          b.binary(T::Lt, b.unary(T::Load, idx.lv(b, l), l), b.unary(T::Load, bound.lv(b, l), l), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        body(b.elem_select(c.value, b.unary(T::Load, idx.lv(b, l), l), c.ty, l));
+        const ir::ExtraSlice body_r = b.close_region();
+
+        b.open_region();
+        b.binary(T::Store,
+                 idx.lv(b, l),
+                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
+                 l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body_r, step, /*bottom_test*/ false, l);
+    }
+
+    // Loop over the bytes of a string value, calling `body(byte)` with an 8-bit
+    // value inside the body region (LRM 11.4.14: a string contributes 8*len bits,
+    // byte 0 first).
+    template<typename Body>
+    void emit_stream_byte_loop(ir::Index str, ir::Builder& b, ir::SourceLoc l, Body body) {
+        using T                = ir::Inst::Tag;
+        const ir::Ref  i32     = make_int_type(32, false, true);
+        const ir::Ref  byte_ty = make_int_type(8, false, false);
+        const TempCell idx     = make_temp_cell(i32, "stream_bi");
+        const TempCell bound   = make_temp_cell(i32, "stream_bn");
+        b.binary(T::Store, bound.lv(b, l), b.resize(b.unary(T::StrLen, str, l), i32, l), l);
+        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+
+        b.open_region();
+        const ir::Index pred =
+          b.binary(T::Lt, b.unary(T::Load, idx.lv(b, l), l), b.unary(T::Load, bound.lv(b, l), l), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        body(b.resize(b.binary(T::StrGetc, str, b.unary(T::Load, idx.lv(b, l), l), l), byte_ty, l));
+        const ir::ExtraSlice body_r = b.close_region();
+
+        b.open_region();
+        b.binary(T::Store,
+                 idx.lv(b, l),
+                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
+                 l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body_r, step, /*bottom_test*/ false, l);
+    }
+
+    // A string destination takes whole bytes only.
+    void check_stream_byte_multiple(uint32_t w) {
+        if (w % 8 != 0) {
+            // TODO: LRM 11.4.14 rounds a string destination up to whole bytes
+            // (slang: width = ceil(bits / 8)), so the leftover bits need their pad
+            // side pinned down against the LRM text before this can be more than a
+            // guess.
+            fail("streaming a " + std::to_string(w) +
+                 "-bit operand into a string is not supported (not a whole number of bytes)");
+        }
+    }
+
+    // Build the stream into a string value (LRM 11.4.14): a string destination is
+    // byte-granular, so each chunk appends a whole number of bytes, most
+    // significant first. A whole string operand appends in one concat -- which is
+    // what makes `s = {>>{string_q}}` the join it looks like, at one runtime call
+    // per element instead of per byte.
+    ir::Index stream_to_string(std::span<const StreamChunk> chunks, ir::Builder& b, ir::SourceLoc l) {
+        using T            = ir::Inst::Tag;
+        const TempCell out = make_temp_cell(module_.pool.string_type, "stream_str");
+        b.binary(T::Store, out.lv(b, l), b.constant(string_value_ref(""), l), l);
+        const auto append_str = [&](ir::Index sv) {
+            const std::array<ir::Index, 2> parts{ b.unary(T::Load, out.lv(b, l), l), sv };
+            b.binary(T::Store, out.lv(b, l), b.concat(parts, l), l);
+        };
+        const auto append_packed = [&](ir::Index v, uint32_t w) {
+            check_stream_byte_multiple(w);
+            b.binary(T::StrAppendPacked, out.lv(b, l), v, l);
+        };
+        for (const StreamChunk& c : chunks) {
+            switch (c.kind) {
+                case StreamChunk::Kind::Fixed:
+                    append_packed(c.value, c.width);
+                    break;
+                case StreamChunk::Kind::Str:
+                    append_str(c.value);
+                    break;
+                case StreamChunk::Kind::Elems:
+                    // Checked before the loop is emitted, so the diagnostic names
+                    // the element width rather than appearing mid-body.
+                    if (!c.elem_is_str) {
+                        check_stream_byte_multiple(c.width);
+                    }
+                    emit_stream_elem_loop(c, b, l, [&](ir::Index elem) {
+                        const ir::Index v = b.unary(T::Load, elem, l);
+                        if (c.elem_is_str) {
+                            append_str(v);
+                        } else {
+                            append_packed(v, c.width);
+                        }
+                    });
+                    break;
+            }
+        }
+        return b.unary(T::Load, out.lv(b, l), l);
+    }
+
+    // Feed the stream to a destination that takes `g`-bit granules, calling
+    // `emit(value)` with each one in stream order (most significant first within
+    // a chunk).
+    template<typename Emit>
+    void walk_stream_granules(std::span<const StreamChunk> chunks,
+                              uint32_t                     g,
+                              ir::Ref                      gty,
+                              ir::Builder&                 b,
+                              ir::SourceLoc                l,
+                              Emit                         emit) {
+        using T          = ir::Inst::Tag;
+        const auto split = [&](ir::Index v, uint32_t w) {
+            if (w % g != 0) {
+                // TODO: a stream whose operand does not divide into whole
+                // destination elements. Realigning across a granule boundary needs
+                // a bit-level buffer, not this shift-and-resize walk.
+                fail("streaming a " + std::to_string(w) + "-bit operand into " + std::to_string(g) +
+                     "-bit elements is not supported (not a whole number of elements)");
+            }
+            for (uint32_t k = 0; k < w / g; ++k) {
+                const uint32_t lsb  = w - (k + 1) * g;
+                ir::Index      part = v;
+                if (lsb != 0) {
+                    const ir::Index sh =
+                      b.constant(module_.pool.put_int(make_int_type(32, false, false), lsb), l);
+                    part = b.binary(T::Srl, v, sh, l);
+                }
+                emit(b.resize(part, gty, l));
+            }
+        };
+        const auto need_bytes = [&](const char* what) {
+            if (g != 8) {
+                fail(std::string("streaming ") + what + " into " + std::to_string(g) +
+                     "-bit elements is not supported (a string is byte-granular)");
+            }
+        };
+        for (const StreamChunk& c : chunks) {
+            switch (c.kind) {
+                case StreamChunk::Kind::Fixed:
+                    split(c.value, c.width);
+                    break;
+                case StreamChunk::Kind::Str:
+                    need_bytes("a string");
+                    emit_stream_byte_loop(c.value, b, l, [&](ir::Index byte) { emit(b.resize(byte, gty, l)); });
+                    break;
+                case StreamChunk::Kind::Elems:
+                    if (c.elem_is_str) {
+                        need_bytes("a queue of strings");
+                        emit_stream_elem_loop(c, b, l, [&](ir::Index elem) {
+                            emit_stream_byte_loop(b.unary(T::Load, elem, l), b, l,
+                                                  [&](ir::Index byte) { emit(b.resize(byte, gty, l)); });
+                        });
+                    } else {
+                        emit_stream_elem_loop(
+                          c, b, l, [&](ir::Index elem) { split(b.unary(T::Load, elem, l), c.width); });
+                    }
+                    break;
+            }
+        }
+    }
+
+    // How many `g`-bit granules the stream yields, as a runtime value. Only a
+    // dynamic array needs it (it is allocated to size, not pushed onto).
+    ir::Index stream_granule_count(std::span<const StreamChunk> chunks,
+                                   uint32_t                     g,
+                                   ir::Builder&                 b,
+                                   ir::SourceLoc                l) {
+        using T           = ir::Inst::Tag;
+        const ir::Ref i32 = make_int_type(32, false, true);
+        ir::Index     total{};
+        for (const StreamChunk& c : chunks) {
+            ir::Index add{};
+            if (c.kind == StreamChunk::Kind::Str) {
+                add = b.resize(b.unary(T::StrLen, c.value, l), i32, l);
+            } else if (c.kind == StreamChunk::Kind::Fixed) {
+                add = b.constant(module_.pool.put_int(i32, c.width / g), l);
+            } else if (c.elem_is_str) {
+                // A string per element: only the run can add the lengths up.
+                const TempCell acc = make_temp_cell(i32, "stream_cnt");
+                b.binary(T::Store, acc.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+                emit_stream_elem_loop(c, b, l, [&](ir::Index elem) {
+                    const ir::Index len = b.resize(b.unary(T::StrLen, b.unary(T::Load, elem, l), l), i32, l);
+                    b.binary(T::Store,
+                             acc.lv(b, l),
+                             b.binary(T::Add, b.unary(T::Load, acc.lv(b, l), l), len, l),
+                             l);
+                });
+                add = b.unary(T::Load, acc.lv(b, l), l);
+            } else {
+                const ir::Index size =
+                  c.is_queue ? b.queue_size(c.value, c.ty, l) : b.dyn_array_size(c.value, c.ty, l);
+                add = b.binary(T::Mul,
+                               b.resize(size, i32, l),
+                               b.constant(module_.pool.put_int(i32, c.width / g), l),
+                               l);
+            }
+            total = total == ir::Index{} ? add : b.binary(T::Add, total, add, l);
+        }
+        return total == ir::Index{} ? b.constant(module_.pool.put_int(i32, 0), l) : total;
+    }
+
+    // `q = {>>{...}}`: push the stream's granules onto an already-cleared queue
+    // handle (materialize_queue_rvalue owns the clear, as it does for `{q, e}`).
+    void stream_fill_queue(ir::Index                    dst,
+                           std::span<const StreamChunk> chunks,
+                           ir::Ref                      qty,
+                           ir::Builder&                 b,
+                           ir::SourceLoc                l) {
+        const ir::Type qt = std::get<ir::Type>(module_.pool.get(qty));
+        const uint32_t g  = stream_granule_width(qt);
+        walk_stream_granules(chunks, g, qt.element, b, l, [&](ir::Index v) {
+            b.queue_push(dst, v, /*front=*/false, qty, l);
+        });
+    }
+
+    // `d = {>>{...}}`: a dynamic array is sized then filled, so the granules are
+    // counted first and stored by index (no push exists).
+    void stream_fill_dynarr(ir::Index                    dst,
+                            std::span<const StreamChunk> chunks,
+                            ir::Ref                      aty,
+                            ir::Builder&                 b,
+                            ir::SourceLoc                l) {
+        using T           = ir::Inst::Tag;
+        const ir::Type at = std::get<ir::Type>(module_.pool.get(aty));
+        const uint32_t g  = stream_granule_width(at);
+        const ir::Ref  i32 = make_int_type(32, false, true);
+        b.dyn_array_new(dst, stream_granule_count(chunks, g, b, l), dst, /*has_init=*/false, aty, l);
+        const TempCell idx = make_temp_cell(i32, "stream_o");
+        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+        walk_stream_granules(chunks, g, at.element, b, l, [&](ir::Index v) {
+            const ir::Index k = b.unary(T::Load, idx.lv(b, l), l);
+            b.binary(T::Store, b.elem_select(dst, k, aty, l), v, l);
+            b.binary(T::Store,
+                     idx.lv(b, l),
+                     b.binary(T::Add, k, b.constant(module_.pool.put_int(i32, 1), l), l),
+                     l);
+        });
+    }
+
+    // -- Streaming concatenation as an assignment target: unpack (LRM 11.4.14.3) --
+    //
+    // slang leaves the RHS self-determined here (AssignmentExpression::fromComponents
+    // returns before convertAssignment for a streaming target), so the source keeps
+    // its own width: bits are consumed from its LEFT and any low bits the
+    // destinations do not cover are discarded, which is legal precisely because a
+    // streaming RHS is refused below.
+    //
+    // What is unconsumed, as the walk hands bits out: `pos` is one past the highest
+    // bit not yet taken, counting from the trimmed source's LSB, so a destination of
+    // width w takes [pos-1 : pos-w].
+    struct StreamUnpack {
+        ir::Index src{};
+        uint32_t  pos       = 0;
+        // Bits reserved for the FIRST dynamically sized destination; LRM 11.4.14.3
+        // is greedy, so every later one is left empty.
+        uint32_t dyn_bits  = 0;
+        bool     dyn_taken = false;
+    };
+
+    ir::Index take_stream_bits(StreamUnpack& u, uint32_t w, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
+        const uint32_t lsb = u.pos - w;
+        ir::Index      v   = u.src;
+        if (lsb != 0) {
+            const ir::Index sh = b.constant(module_.pool.put_int(make_int_type(32, false, false), lsb), l);
+            v                  = b.binary(ir::Inst::Tag::Srl, u.src, sh, l);
+        }
+        u.pos = lsb;
+        return b.resize(v, ty, l);
+    }
+
+    // The granule of the first dynamically sized destination in stream order, if
+    // there is one: the element width of a queue / dynamic array, 8 for a string.
+    std::optional<uint32_t> first_dynamic_dest_granule(const StreamingConcatenationExpression& sc) {
+        for (const auto& stream : sc.streams()) {
+            const Expression& e = *stream.operand;
+            if (e.kind == ExpressionKind::Streaming) {
+                if (auto g = first_dynamic_dest_granule(e.as<StreamingConcatenationExpression>())) {
+                    return g;
+                }
+                continue;
+            }
+            const Expression& u = unwrap_lvalue_elem(e);
+            if (is_string_expr(u)) {
+                return 8;
+            }
+            if (is_queue(u) || is_dyn_array(u)) {
+                const ir::Type ct = std::get<ir::Type>(module_.pool.get(lower_type(*u.type)));
+                return stream_granule_width(ct);
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Scatter the trimmed source over one destination operand.
+    void unpack_stream_dest(const Expression& dest,
+                            StreamUnpack&     u,
+                            ir::Inst::Tag     tag,
+                            ir::Builder&      b,
+                            ir::SourceLoc     l) {
+        if (dest.kind == ExpressionKind::Streaming) {
+            const auto& inner = dest.as<StreamingConcatenationExpression>();
+            if (inner.getSliceSize() > 0) {
+                // TODO: a nested `{<<S{...}}` destination reverses only its own
+                // slice of the stream, which needs a second trim + reversal.
+                fail("nested slice size in a streaming assignment target is not supported");
+            }
+            for (const auto& stream : inner.streams()) {
+                unpack_stream_dest(*stream.operand, u, tag, b, l);
+            }
+            return;
+        }
+        const Expression& d = unwrap_lvalue_elem(dest);
+        if (is_string_expr(d) || is_queue(d) || is_dyn_array(d)) {
+            const uint32_t bits = u.dyn_taken ? 0 : u.dyn_bits;
+            u.dyn_taken         = true;
+            unpack_stream_dynamic_dest(d, bits, u, b, l);
+            return;
+        }
+        if (is_agg_bitstream_operand(d)) {
+            unpack_stream_agg(lower_lvalue(d, b, /*is_write=*/true), lower_type(*d.type), u, tag, b, l);
+            return;
+        }
+        const ir::Ref   ty  = lower_type(*d.type);
+        const ir::Index val = take_stream_bits(u, module_.pool.layout(ty).width, ty, b, l);
+        // Same per-operand force gating as an lvalue concatenation: a forced
+        // destination keeps its value while its siblings still take their slice.
+        store_or_gate(pca_info_of_lvalue(d), tag, lower_lvalue(d, b, /*is_write=*/true), val, b, l);
+    }
+
+    // A fixed unpacked array / struct destination: the exact inverse of
+    // serialize_agg_lvalue, walking leaves in declared order.
+    void unpack_stream_agg(ir::Index     lv,
+                           ir::Ref       ty,
+                           StreamUnpack& u,
+                           ir::Inst::Tag tag,
+                           ir::Builder&  b,
+                           ir::SourceLoc l) {
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+            for (uint32_t k = 0; k < n; ++k) {
+                const int32_t coord =
+                  t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
+                const ir::Index idx =
+                  b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                                  static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                             l);
+                unpack_stream_agg(b.elem_select(lv, idx, ty, l), t.element, u, tag, b, l);
+            }
+            return;
+        }
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            const auto fields = module_.pool.struct_fields(t.fields_id);
+            for (uint32_t i = 0; i < fields.size(); ++i) {
+                unpack_stream_agg(b.member_select(lv, i, ty, l), fields[i].type, u, tag, b, l);
+            }
+            return;
+        }
+        if (value_cat(ty) != ValueCat::scalar || module_.pool.is_float(ty)) {
+            // TODO: a string / real / handle leaf inside an unpacked destination,
+            // the mirror of serialize_agg_lvalue's own guard.
+            fail("unpacking a stream into a non-integral aggregate leaf is not supported");
+        }
+        b.binary(tag, lv, take_stream_bits(u, module_.pool.layout(ty).width, ty, b, l), l);
+    }
+
+    // The greedy destination: it takes every bit the fixed-size destinations left
+    // over (LRM 11.4.14.3), and a second one takes none.
+    void unpack_stream_dynamic_dest(const Expression& dest,
+                                    uint32_t          bits,
+                                    StreamUnpack&     u,
+                                    ir::Builder&      b,
+                                    ir::SourceLoc     l) {
+        using T = ir::Inst::Tag;
+        if (is_string_expr(dest)) {
+            const ir::Index lv = lower_lvalue(dest, b, /*is_write=*/true);
+            b.binary(T::Store, lv, b.constant(string_value_ref(""), l), l);
+            if (bits == 0) {
+                return;
+            }
+            check_stream_byte_multiple(bits);
+            // One call: the whole run of bytes is contiguous in the source.
+            b.binary(T::StrAppendPacked,
+                     lv,
+                     take_stream_bits(u, bits, make_int_type(bits, false, false), b, l),
+                     l);
+            return;
+        }
+        const ir::Ref   cty = lower_type(*dest.type);
+        const ir::Type  ct  = std::get<ir::Type>(module_.pool.get(cty));
+        const uint32_t  g   = stream_granule_width(ct);
+        const ir::Index dst = lower_lvalue(dest, b, /*is_write=*/true);
+        const uint32_t  n   = bits / g;
+        if (ct.kind == ir::Type::Kind::Queue) {
+            b.queue_delete(dst, dst, /*has_idx=*/false, cty, l);
+            for (uint32_t k = 0; k < n; ++k) {
+                b.queue_push(dst, take_stream_bits(u, g, ct.element, b, l), /*front=*/false, cty, l);
+            }
+            return;
+        }
+        const ir::Ref i32 = make_int_type(32, false, true);
+        b.dyn_array_new(dst, b.constant(module_.pool.put_int(i32, n), l), dst, /*has_init=*/false, cty, l);
+        for (uint32_t k = 0; k < n; ++k) {
+            const ir::Index idx = b.constant(module_.pool.put_int(i32, k), l);
+            b.binary(T::Store,
+                     b.elem_select(dst, idx, cty, l),
+                     take_stream_bits(u, g, ct.element, b, l),
+                     l);
+        }
+    }
+
+    // `{>>{...}} = rhs` / `{<<S{...}} = rhs`.
+    void store_stream_target(const StreamingConcatenationExpression& sc,
+                             const Expression&                       rhs_expr,
+                             ir::Index                               rhs,
+                             ir::Inst::Tag                           tag,
+                             ir::Builder&                            b,
+                             ir::SourceLoc                           l) {
+        for (const auto& stream : sc.streams()) {
+            if (stream.withExpr) {
+                fail("streaming concatenation `with` clause is not supported");
+            }
+        }
+        if (rhs_expr.kind == ExpressionKind::Streaming || !rhs_expr.type->isFixedSize() ||
+            !rhs_expr.type->isBitstreamType()) {
+            // TODO: a dynamically sized source (a queue / string / another stream on
+            // the right). The bit count is then a runtime value, so the destination
+            // widths cannot be resolved at lower time the way they are below.
+            fail("streaming assignment from a dynamically-sized source is not supported");
+        }
+        const auto src_w = static_cast<uint32_t>(rhs_expr.type->getBitstreamWidth());
+        const auto tgt_w = static_cast<uint32_t>(sc.getBitstreamWidth());
+        uint32_t   dyn   = 0;
+        if (const auto g = first_dynamic_dest_granule(sc)) {
+            // Round down: the leftover must divide into whole elements, and the
+            // remainder stays unconsumed (slang does the same, `do not exceed
+            // srcSize`).
+            dyn = src_w > tgt_w ? ((src_w - tgt_w) / *g) * *g : 0;
+        }
+        const uint32_t used = tgt_w + dyn;
+        if (used > src_w) {
+            // slang rejects this when both sides are fixed (diag::BadStreamSize);
+            // reachable only if a destination width and the source disagree here.
+            fail("streaming assignment source is narrower than its target");
+        }
+        // Take the leftmost `used` bits: the low src_w - used are discarded.
+        StreamUnpack u{ .src = rhs, .pos = used, .dyn_bits = dyn };
+        if (src_w > used) {
+            const ir::Index sh =
+              b.constant(module_.pool.put_int(make_int_type(32, false, false), src_w - used), l);
+            u.src = b.binary(ir::Inst::Tag::Srl, rhs, sh, l);
+        }
+        u.src = b.resize(u.src, make_int_type(used, rhs_expr.type->isFourState(), false), l);
+        if (const uint64_t s = sc.getSliceSize(); s > 0) {
+            if (used % s != 0) {
+                // TODO: `{<<S{...}}` where S does not divide the stream. slang's
+                // unpack reorder puts the partial block FIRST (Bitstream::reOrder
+                // with a non-zero unpackWidth), the opposite end from
+                // Tag::StreamReverse's pack-direction slicing.
+                fail("slice size that does not divide a streaming assignment target is not supported");
+            }
+            u.src = b.stream_reverse(u.src, static_cast<uint32_t>(s), l);
+        }
+        for (const auto& stream : sc.streams()) {
+            unpack_stream_dest(*stream.operand, u, tag, b, l);
+        }
+    }
+
     // Lower an expression as an rvalue, returning the SSA value index.
     ir::Index lower_expr(const Expression& expr, ir::Builder& b) {
         cur_range_            = expr.sourceRange;
@@ -20486,6 +21103,19 @@ private:
                 const ConversionExpression& cv       = expr.as<ConversionExpression>();
                 const bool                  to_str   = is_string_expr(expr);
                 const bool                  from_str = is_string_expr(cv.operand());
+                // Tested first: slang wraps a streaming concatenation in a
+                // Conversion to the assignment target, and a Streaming operand has
+                // void type, so the string tests below would see "not integral" and
+                // reject `s = {>>{...}}` before ever reaching the stream path.
+                if (cv.conversionKind == ConversionKind::StreamingConcat) {
+                    const auto& sc = cv.operand().as<StreamingConcatenationExpression>();
+                    if (to_str) {
+                        std::vector<StreamChunk> chunks;
+                        collect_stream_chunks(sc, chunks, b, l);
+                        return stream_to_string(chunks, b, l);
+                    }
+                    return lower_streaming_concat(sc, lower_type(*expr.type), b, l);
+                }
                 if (to_str && from_str) {
                     return lower_expr(cv.operand(), b); // identity
                 }
@@ -20508,10 +21138,6 @@ private:
                         fail("unsupported conversion from string");
                     }
                     return b.str_to_packed(lower_expr(cv.operand(), b), lower_type(*expr.type), l);
-                }
-                if (cv.conversionKind == ConversionKind::StreamingConcat) {
-                    return lower_streaming_concat(
-                      cv.operand().as<StreamingConcatenationExpression>(), lower_type(*expr.type), b, l);
                 }
                 if (is_handle_expr(cv.operand()) && !expr.type->getCanonicalType().isUnpackedArray()) {
                     // TODO: bit-stream cast from a dynamic array / queue to a
