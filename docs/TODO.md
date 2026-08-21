@@ -1481,7 +1481,32 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   member to the specialization constant. (Cross-module
   specialization identity inherits the existing per-Lowerer class-cache limitation
   below.)
-- [ ] **Interface classes** — `interface class`, `implements`, multiple.
+- [x] **Interface classes** (LRM 8.26) — `interface class` as a type and a handle
+  type, `implements` (one or many, on a class or a `virtual class`), `extends`
+  between interface classes including diamonds, dispatch through an interface-class
+  handle (functions and time-consuming tasks), an implementation supplied by a base
+  class (8.26.2), partial implementation in a `virtual class` (8.26.7), parameterized
+  interface classes, `::` typedef / parameter access (8.26.3), `$cast` in every
+  direction that involves one (8.26.5), and `randomize()` through an interface handle
+  (8.26.9). An interface class interns as an ordinary nominal `Kind::Class` Ref with
+  an EMPTY field table — no object, no display id, no vtable, no copy or
+  randomization body. Interface method NAMES get one design-wide index (name keying
+  IS 8.26.6.1's "one implementation satisfies every same-named prototype"), and each
+  implementing class's descriptor grows an interface-method table indexed by it plus a
+  bitmap of the interface ids it implements, both at design-wide constant negative
+  offsets BELOW the trace-map pointer — so dispatch is one vptr load plus one
+  constant-offset load (identical to an ordinary virtual call), the implements test is
+  one load and one AND, and the GC's map offset and its startup cross-check are
+  untouched. Both regions are emitted only in a design that declares an interface
+  class: `--emit llvm` is byte-identical otherwise (measured). The interface closure
+  unions `getImplementedInterfaces()` over the whole base chain, because slang's
+  flattened list stops at the class carrying the `implements` clause — the bug
+  Verilator 5.050 ships on 8.26.2's own example. slang's `DynamicCastConst` warning
+  is dropped for an interface operand: its "always fails" condition is wrong on
+  8.26.5's own legal `$cast(get_ref, put_ref)`. **Refused, loud:** `rand_mode`
+  through an interface handle (8.26.9 makes it illegal, slang accepts it). 19 cases
+  in `tests/class_test.cpp` plus a GC case in `tests/gc_test.cpp`. See
+  docs/design/interface-classes.md.
 - [~] **Class scope & nesting** — out-of-block method bodies (`function C::f();`,
   LRM 8.24) work, in a module or a package scope, for functions, tasks, `static`
   methods, `new`, and `virtual` (see Polymorphism above). Remaining: nested classes
@@ -1495,14 +1520,17 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   unordered so nothing needs a whole-design numbering pass) answers the test. Only
   LRM 8.16 case 2 reaches run time: a cast to the source's own class or an
   ancestor of it, and a literal `null` source, always succeed; two unrelated class
-  types always fail. A source that is null at run time succeeds and assigns null
+  types always fail — a fold that holds only for a pair of ORDINARY classes, since
+  an interface class on either side lets a common implementer relate them
+  (LRM 8.26.5). A source that is null at run time succeeds and assigns null
   (8.16 is ambiguous; the reading is recorded at `lower_cast` and in
-  docs/design/classes.md). The function form returns the 1/0; the task form
-  reports a run-time error on failure, for an enum destination as well. All of it
-  dispatches through `lower_cast`. Deferred: a `chandle` destination (guarded
-  loud — a chandle carries no type identity), and a destination or source that is
-  an **interface class** (`implements` is itself unimplemented; the descriptor
-  needs an implemented-interface set beside the display).
+  docs/design/classes.md). An **interface-class destination** tests the object's
+  implemented-interface bitmap instead of the display (`ClassImplements`); an
+  interface-class SOURCE needs nothing new, since the object behind the handle is
+  always a real class (docs/design/interface-classes.md §6). The function form
+  returns the 1/0; the task form reports a run-time error on failure, for an enum
+  destination as well. All of it dispatches through `lower_cast`. Deferred: a
+  `chandle` destination (guarded loud — a chandle carries no type identity).
 
 ### Constrained randomization
 
