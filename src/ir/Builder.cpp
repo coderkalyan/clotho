@@ -198,8 +198,8 @@ Index Builder::dyn_part_select(Index base, Index offset, uint32_t width, SourceL
     return emit({ Inst::Tag::DynPartSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
-Index Builder::elem_select(Index base, Index index, Ref array_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(ElemSelect{ index, array_type });
+Index Builder::elem_select(Index base, Index index, Ref array_type, SourceLoc loc, bool for_write) {
+    const ExtraIndex extra = add_extra(ElemSelect{ index, array_type, for_write ? 1u : 0u });
 
     return emit({ Inst::Tag::ElemSelect, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
@@ -359,8 +359,8 @@ Index Builder::queue_shuffle(Index q, Ref queue_type, SourceLoc loc) {
     return emit({ Inst::Tag::QueueShuffle, Inst::Payload{ .op_type = { q, queue_type } } }, loc);
 }
 
-Index Builder::assoc_select(Index a, Index key, Ref assoc_type, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(AssocArg{ key, assoc_type });
+Index Builder::assoc_select(Index a, Index key, Ref assoc_type, SourceLoc loc, bool for_write) {
+    const ExtraIndex extra = add_extra(AssocArg{ key, assoc_type, for_write ? 1u : 0u });
 
     return emit({ Inst::Tag::AssocSelect, Inst::Payload{ .op_extra = { a, extra } } }, loc);
 }

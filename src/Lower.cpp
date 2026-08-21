@@ -14645,6 +14645,54 @@ private:
         lower_foreach_dim(f, 0, b);
     }
 
+    // The container dimension `dim` iterates: the array the `foreach` names, with one
+    // dimension peeled per preceding slot. Peeled through the interned IR type, whose
+    // kinds are exact — slang answers isDynamicallySizedArray() for an associative
+    // array too, so peeling by slang predicate measured a map as a dynamic array. A
+    // skipped slot (`a[,j]`) peels as well: it names a dimension without iterating it.
+    ir::Ref foreach_dim_ref(const ForeachLoopStatement& f, size_t dim) {
+        ir::Ref t = lower_type(*f.arrayRef.type);
+        for (size_t k = 0; k < dim; ++k) {
+            const ir::Type& ty = std::get<ir::Type>(module_.pool.get(t));
+            if (ty.element == ir::Ref::Invalid) {
+                return t;
+            }
+            t = ty.element;
+        }
+        return t;
+    }
+
+    // An lvalue for dimension `dim`'s container: the array the `foreach` names, with
+    // one element select per already-iterated dimension, each keyed by that
+    // dimension's live loop variable. `a[k, i]` over an assoc of queues therefore
+    // measures and indexes `a[k]`, not `a`.
+    //
+    // Re-emitted on demand rather than cached, because a loop's cond / body / step are
+    // three separate instruction regions and each needs its own leaf — the same reason
+    // TempCell::lv re-emits. Read-only: measuring a container never creates an entry
+    // (LRM 7.8.6), and the body's own accesses carry their own direction.
+    ir::Index foreach_base_lv(const ForeachLoopStatement& f, size_t dim, ir::Builder& b, ir::SourceLoc l) {
+        ir::Index base = lower_lvalue(f.arrayRef, b);
+        for (size_t k = 0; k < dim; ++k) {
+            const ir::Ref   cref = foreach_dim_ref(f, k);
+            const ir::Type& cty  = std::get<ir::Type>(module_.pool.get(cref));
+            const ForeachLoopStatement::LoopDim& d = f.loopDims[k];
+            if (d.loopVar == nullptr) {
+                // `foreach (a[, i])` where dimension k is runtime-sized: there is no
+                // loop variable, so no entry to descend into and no per-entry bound to
+                // read. A fixed dimension needs no descent (its range is declared),
+                // which is why only the nested runtime case reaches this.
+                // TODO: iterate every entry of a skipped runtime dimension implicitly.
+                fail("foreach over a runtime-sized dimension whose outer dimension is "
+                     "skipped is not supported");
+            }
+            const ir::Index iter = b.unary(ir::Inst::Tag::Load, value_lvalue(*d.loopVar, b, l), l);
+            base = cty.kind == ir::Type::Kind::Assoc ? b.assoc_select(base, iter, cref, l)
+                                                     : b.elem_select(base, iter, cref, l);
+        }
+        return base;
+    }
+
     void lower_foreach_dim(const ForeachLoopStatement& f, size_t dim, ir::Builder& b) {
         if (dim == f.loopDims.size()) {
             lower_stmt(f.body, b);
@@ -14662,26 +14710,36 @@ private:
         const ir::Index iter_lv = value_lvalue(*d.loopVar, b, l);
 
         if (!d.range.has_value()) {
-            // A runtime-sized dimension (string or dynamic array): snapshot the
-            // length once and iterate 0..len-1 (0-based, matching StrGetc and
-            // dynamic-array element addressing).
-            if (is_string_expr(f.arrayRef)) {
-                const ir::Index len = b.unary(ir::Inst::Tag::StrLen, lower_expr(f.arrayRef, b), l);
+            // A runtime-sized dimension: snapshot the length once and iterate
+            // 0..len-1 (0-based, matching StrGetc and element addressing), or walk the
+            // keys for an assoc.
+            //
+            // The container measured is THIS dimension's, not `f.arrayRef`: for a
+            // nested runtime dimension (`foreach (a[k, i])` over an assoc of queues)
+            // the bound is the length of the entry the outer dimension is currently
+            // sitting on. Measuring `f.arrayRef` for every dimension re-walked the
+            // OUTER container with the inner loop variable, which for an assoc of
+            // queues bound the inner index to a key.
+            const ir::Ref cref = foreach_dim_ref(f, dim);
+            if (ir::types::is_string(module_.pool, cref)) {
+                const ir::Index len =
+                  b.unary(ir::Inst::Tag::StrLen,
+                          b.unary(ir::Inst::Tag::Load, foreach_base_lv(f, dim, b, l), l), l);
                 lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
                 return;
             }
-            if (is_dyn_array(f.arrayRef)) {
-                const ir::Index len = b.dyn_array_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
-                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
-                return;
-            }
-            if (is_queue(f.arrayRef)) {
-                const ir::Index len = b.queue_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
-                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
-                return;
-            }
-            if (is_assoc(f.arrayRef)) {
+            if (ir::types::is_assoc(module_.pool, cref)) {
                 lower_foreach_assoc_dim(f, dim, ty, iter_lv, b, l);
+                return;
+            }
+            if (ir::types::is_queue(module_.pool, cref)) {
+                const ir::Index len = b.queue_size(foreach_base_lv(f, dim, b, l), cref, l);
+                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
+                return;
+            }
+            if (ir::types::is_dynarr(module_.pool, cref)) {
+                const ir::Index len = b.dyn_array_size(foreach_base_lv(f, dim, b, l), cref, l);
+                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
                 return;
             }
             fail("foreach over an unsupported runtime-sized dimension");
@@ -14767,12 +14825,12 @@ private:
                                  ir::Builder&  b,
                                  ir::SourceLoc l) {
         const ir::Ref    bit1 = make_int_type(1, false, false);
-        const ir::Ref    aty  = lower_type(*f.arrayRef.type);
+        const ir::Ref    aty  = foreach_dim_ref(f, dim);
         const TempCell   ok   = make_temp_cell(bit1, "foreach_ok");
         using Step            = ir::Builder::AssocStep;
         b.binary(ir::Inst::Tag::Store,
                  ok.lv(b, l),
-                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::First, aty, l), bit1, l),
+                 b.resize(b.assoc_traverse(foreach_base_lv(f, dim, b, l), iter_lv, Step::First, aty, l), bit1, l),
                  l);
 
         b.open_region();
@@ -14786,7 +14844,7 @@ private:
         b.open_region();
         b.binary(ir::Inst::Tag::Store,
                  ok.lv(b, l),
-                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::Next, aty, l), bit1, l),
+                 b.resize(b.assoc_traverse(foreach_base_lv(f, dim, b, l), iter_lv, Step::Next, aty, l), bit1, l),
                  l);
         const ir::ExtraSlice step = b.close_region();
 
@@ -19771,30 +19829,22 @@ private:
     // over the handle lvalue `base`. Handles the queue `$` selector (q[$] is the
     // last element, index size-1; size-1 == -1 selects the OOB default on an
     // empty queue).
-    ir::Index var_elem_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
-        if (is_assoc_element_select(es.value()) && is_handle_expr(es.value())) {
-            // `a[k][i]`: the inner container is an associative-array ENTRY, whose
-            // slot address depends on the access direction (get_ptr must not create
-            // the entry, LRM 7.8.6; put_ptr must), and that direction belongs to the
-            // consumer of this select, not to the select itself.
-            //
-            // TODO: compose the deferral so an ElemSelect over a deferred AssocSelect
-            // stays deferred, carrying the pending index alongside the pending key.
-            // Whole-value assignment (`a[k] = q`, `q = a[k]`) and the container's own
-            // methods (`a[k].push_back(v)`, `a[k].size()`) all work today, each being
-            // unambiguously one direction.
-            fail("an element select through an associative-array element that is "
-                 "itself a queue or dynamic array is not supported (whole-value "
-                 "assignment and its own methods are)");
-        }
+    //
+    // `is_write` marks the direction of the access this select serves. It is only
+    // consulted when `base` is a DEFERRED associative-array element (`a[k][i]`),
+    // where the ring arithmetic below forces the entry's slot to be resolved before
+    // any consumer is in sight: a read resolves with get_ptr and must not create the
+    // entry (LRM 7.8.6), a write with put_ptr and must (LRM 7.8).
+    ir::Index var_elem_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b,
+                              ir::SourceLoc l, bool is_write) {
         const ir::Ref arr_ty = lower_type(*es.value().type);
         if (is_queue(es.value()) && es.selector().type->isUnbounded()) {
             const ir::Ref   i32  = make_int_type(32, false, true);
             const ir::Index size = b.queue_size(base, arr_ty, l);
             const ir::Index idx  = b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
-            return b.elem_select(base, idx, arr_ty, l);
+            return b.elem_select(base, idx, arr_ty, l, is_write);
         }
-        const ir::Index sel = b.elem_select(base, lower_index(es.selector(), b), arr_ty, l);
+        const ir::Index sel = b.elem_select(base, lower_index(es.selector(), b), arr_ty, l, is_write);
         // The select carries the extent of what was indexed, so a bounds report
         // can underline `grid[a]` under the `[b]` of `grid[a][b]` rather than
         // guess the width from the array's name.
@@ -19827,10 +19877,13 @@ private:
 
     // Element address for an associative array (LRM 7.8): `a[key]` over the
     // handle lvalue `base`. The backend normalizes the key into its byte span and
-    // resolves get_ptr (read) / put_ptr (write).
-    ir::Index var_assoc_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
+    // resolves get_ptr (read) / put_ptr (write) at the consumer — except when THIS
+    // select's base is itself a deferred entry (`a[k1][k2]`), where the inner select
+    // must resolve the outer entry eagerly and `is_write` decides how.
+    ir::Index var_assoc_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b,
+                               ir::SourceLoc l, bool is_write) {
         const ir::Ref aty = lower_type(*es.value().type);
-        return b.assoc_select(base, lower_assoc_key(es.selector(), aty, b, l), aty, l);
+        return b.assoc_select(base, lower_assoc_key(es.selector(), aty, b, l), aty, l, is_write);
     }
 
     // Materialize a queue-typed rvalue into a handle lvalue Index. A plain queue
@@ -21236,9 +21289,9 @@ private:
                 }
                 const ir::Index base = select_base_lvalue(es.value(), b, l);
                 const ir::Index sel =
-                  is_assoc(es.value()) ? var_assoc_select(es, base, b, l)
+                  is_assoc(es.value()) ? var_assoc_select(es, base, b, l, /*is_write=*/false)
                   : is_unpacked_array(es.value()) || is_dyn_array(es.value()) || is_queue(es.value())
-                    ? var_elem_select(es, base, b, l)
+                    ? var_elem_select(es, base, b, l, /*is_write=*/false)
                     : lower_packed_element_lvalue(es, base, b, l);
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, sel, l);
                 // See narrow_to_declared / the MemberAccess case below: a
@@ -22772,13 +22825,16 @@ private:
                 // ordinary signal path (selects below recurse to this base).
                 return value_lvalue(expr.as<ValueExpressionBase>().symbol, b, l);
             case ExpressionKind::ElementSelect: {
-                const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
-                const ir::Index                base = lower_lvalue(es.value(), b);
+                const ElementSelectExpression& es = expr.as<ElementSelectExpression>();
+                // The direction travels down the chain: `a[k][i] = v` writes the outer
+                // entry too, since the entry must exist for its element to be
+                // written (LRM 7.8), while a read must leave the map alone (7.8.6).
+                const ir::Index base = lower_lvalue(es.value(), b, is_write);
                 if (is_assoc(es.value())) {
-                    return var_assoc_select(es, base, b, l);
+                    return var_assoc_select(es, base, b, l, is_write);
                 }
                 if (is_unpacked_array(es.value()) || is_dyn_array(es.value()) || is_queue(es.value())) {
-                    return var_elem_select(es, base, b, l);
+                    return var_elem_select(es, base, b, l, is_write);
                 }
                 return lower_packed_element_lvalue(es, base, b, l);
             }

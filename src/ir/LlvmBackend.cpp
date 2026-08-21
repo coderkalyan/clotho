@@ -392,17 +392,23 @@ struct LValue {
     // lowering into rt_bounds_report calls; purely a report channel, the LRM's
     // own out-of-range behaviour stays driven by `dyn_inrange` above.
     std::vector<BoundsCheck> bounds_checks;
-    // Pointer to the relocation epoch of the container this place is rooted
-    // inside, or null when the place is stable (a module signal, a frame local, a
-    // fixed unpacked array element, a class property).
+    // Relocation-epoch witnesses of the containers this place is nested inside,
+    // OUTERMOST FIRST; empty when the place is stable (a module signal, a frame
+    // local, a fixed unpacked array element, a class property).
     //
     // Only `ref` consumes it: forming a ref through a heap-rooted place records
-    // this pointer and the epoch's current value in the fat ref, so the callee
-    // detects a restructuring that happened while the ref was live
-    // (docs/design/data-model.md §3.1). Set at the container element select and
-    // carried unchanged by every subsequent member / element / bit step, since
-    // those only extend `agg_path` and `bit_off`.
-    llvm::Value* epoch_ptr = nullptr;
+    // these pointers and their current values in the fat ref, so the callee detects
+    // a restructuring that happened while the ref was live
+    // (docs/design/data-model.md §3.1). One entry is appended per container element
+    // select / assoc entry; subsequent member / bit steps carry the chain unchanged,
+    // since those only extend `agg_path` and `bit_off`.
+    //
+    // A CHAIN rather than one pointer because level n's witness lives in level n-1's
+    // buffer: `a[k][i]`'s inner queue handle sits in the map's payload, so reading
+    // its epoch is only safe once the map's own epoch has been checked. Appending
+    // (rather than overwriting, which is what a single field forced) is what makes
+    // the nested place checkable at all — see emit_ref_epoch_check.
+    std::vector<llvm::Value*> epoch_chain;
     // An associative-array element target (LRM 7.8/7.9). Unlike dyn/queue the
     // element pointer is not yet resolved: the get_ptr (read) vs put_ptr (write)
     // choice depends on Load/Store context, so it is deferred. `assoc_handle` is
@@ -732,19 +738,21 @@ struct FrameSlot {
 
 // A `ref` formal's fat pointer, as bound from the callee's parameters
 // (docs/design/data-model.md §3). `slot` aliases the actual's storage — a plane
-// slot, a managed handle, or an aggregate image. `epoch` addresses the
-// relocation epoch of the container the actual was rooted in, or the
-// `clotho.ref.noepoch` zero word when the actual was a stable place; `expect` is
-// that epoch's value at the call. Every dereference re-reads `epoch` and reports
-// through `site` if it has moved on.
-// A `ref` formal's binding inside the callee. `slot`/`epoch`/`expect` are the
-// passed words; `formal` is the callee's own name for the binding, used to build
-// the per-dereference site record a staleness report prints (§3.3).
+// slot, a managed handle, or an aggregate image. `epochs` addresses the relocation
+// epoch of each container the actual was nested inside, OUTERMOST FIRST, paired
+// with that epoch's value at the call in `expects`; an unused level (a call site
+// bound shallower than the formal's declared depth) passes the
+// `clotho.ref.noepoch` zero word, which never compares stale. Every dereference
+// re-checks the pairs in order and reports through `site`; the order is what makes
+// a nested witness safe to read, since level n's epoch lives in level n-1's buffer.
+//
+// `formal` is the callee's own name for the binding, used to build the
+// per-dereference site record a staleness report prints (§3.3).
 struct RefBinding {
-    llvm::Value* slot   = nullptr;
-    llvm::Value* epoch  = nullptr;
-    llvm::Value* expect = nullptr;
-    std::string  formal;
+    llvm::Value*              slot = nullptr;
+    std::vector<llvm::Value*> epochs;
+    std::vector<llvm::Value*> expects;
+    std::string               formal;
 };
 
 // Raised on a construct the backend cannot lower; caught at the top level.
@@ -4230,17 +4238,28 @@ private:
         // exactly as a mutating method on `a[k]` does.
         const LValue lv = raw.is_assoc ? assoc_elem_lvalue(raw, /*for_write=*/true) : raw;
         RefBinding   rb;
-        // A stable place has no epoch to watch; pointing at the compile-time zero
-        // word keeps the callee's check uniform.
-        if (lv.epoch_ptr != nullptr) {
-            rb.epoch  = lv.epoch_ptr;
-            rb.expect = b_.CreateLoad(b_.getInt64Ty(), lv.epoch_ptr, "ref.epoch.at.call");
-        } else {
-            rb.epoch  = no_epoch_global();
-            rb.expect = b_.getInt64(0);
+        // One witness per container level, outermost first, each sampled now. A
+        // stable place has none; the caller pads to the formal's declared depth with
+        // the compile-time zero word so the callee's unrolled check is uniform.
+        for (llvm::Value* ep : lv.epoch_chain) {
+            rb.epochs.push_back(ep);
+            rb.expects.push_back(b_.CreateLoad(b_.getInt64Ty(), ep, "ref.epoch.at.call"));
         }
         rb.slot = ref_actual_ptr(lv);
         return rb;
+    }
+
+    // Push a ref binding's witness pairs into a call's argv, padded to the formal's
+    // declared `depth`. A call site may bind SHALLOWER than the formal's deepest
+    // caller (or bind a stable place through a formal some other site nests), and the
+    // signature is fixed, so the unused levels get the compile-time zero word: it
+    // never advances, so it never reports stale.
+    void push_ref_epochs(std::vector<llvm::Value*>& argv, const RefBinding& rb, uint32_t depth) {
+        for (uint32_t lvl = 0; lvl < depth; ++lvl) {
+            const bool have = lvl < rb.epochs.size();
+            argv.push_back(have ? rb.epochs[lvl] : no_epoch_global());
+            argv.push_back(have ? rb.expects[lvl] : b_.getInt64(0));
+        }
     }
 
     // Pointer to a ref actual's storage: the aliased place the callee holds.
@@ -4943,8 +4962,8 @@ private:
                 // the relocation epoch of that container, its value at the call, and
                 // the site record for the staleness report (§3.0).
                 params.push_back(ptr);                 // &actual storage
-                if (ref_needs_epoch(f, k)) {
-                    params.push_back(ptr);             // &epoch
+                for (uint32_t lvl = 0; lvl < ref_epoch_depth(f, k); ++lvl) {
+                    params.push_back(ptr);             // &epoch, outermost first
                     params.push_back(b_.getInt64Ty()); // expected epoch
                 }
                 continue;
@@ -5012,8 +5031,8 @@ private:
             if (f.arg_dirs[k] == ArgDir::Ref) {
                 // The same shape declare_function builds, narrow or fat.
                 params.push_back(ptr);                 // &actual storage
-                if (ref_needs_epoch(f, k)) {
-                    params.push_back(ptr);             // &epoch
+                for (uint32_t lvl = 0; lvl < ref_epoch_depth(f, k); ++lvl) {
+                    params.push_back(ptr);             // &epoch, outermost first
                     params.push_back(b_.getInt64Ty()); // expected epoch
                 }
             } else if (is_handle_type(f.param_types[k])) {
@@ -5054,20 +5073,26 @@ private:
     //       handle (each one pointer in every direction)
     //   2 — everything else: the (must|may, z) plane pair, or the
     //       (&mm, &z) out / inout pointer pair
-    // Whether ref formal k of `f` carries the relocation-epoch words. Only a formal
-    // some call site binds to a place inside a container's heap buffer does; a ref
-    // to a variable, a fixed-array element, a struct member, a class property or a
-    // whole container HANDLE aliases storage that cannot move, so it is one plain
-    // pointer and the callee emits no check (docs/design/data-model.md §3.0).
-    bool ref_needs_epoch(const Function& f, size_t k) const {
+    // How many relocation-epoch witness PAIRS ref formal k of `f` carries: one per
+    // container level some call site nests its actual inside, 0 for a ref to a
+    // variable, a fixed-array element, a struct member, a class property or a whole
+    // container HANDLE — storage that cannot move, so the callee emits no check
+    // (docs/design/data-model.md §3.0).
+    uint32_t ref_epoch_depth(const Function& f, size_t k) const {
         const auto it = fn_ids_.find(&f);
-        // A function the map has not seen cannot be reasoned about; keep the guard.
-        return it == fn_ids_.end() || facts_.ref_needs_epoch(it->second, k);
+        // A function the map has not seen cannot be reasoned about; keep the guard,
+        // and keep it at the one level every heap place has at minimum.
+        return it == fn_ids_.end() ? 1u : facts_.ref_epoch_depth(it->second, k);
+    }
+
+    bool ref_needs_epoch(const Function& f, size_t k) const {
+        return ref_epoch_depth(f, k) != 0;
     }
 
     uint32_t formal_param_count(const Function& f, size_t k) const {
         if (!f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-            return ref_needs_epoch(f, k) ? 3u : 1u;
+            // slot, plus (ptr epoch, i64 expect) per level.
+            return 1u + 2u * ref_epoch_depth(f, k);
         }
         // An aggregate is one storage pointer, in every direction (function or task).
         if (is_agg_abi(f.param_types[k])) {
@@ -5823,9 +5848,9 @@ private:
             }
             const uint32_t p = param_llvm_index_[k];
             ref_ptr_[k].slot = fn_->getArg(p);
-            if (ref_needs_epoch(f, k)) {
-                ref_ptr_[k].epoch  = fn_->getArg(p + 1);
-                ref_ptr_[k].expect = fn_->getArg(p + 2);
+            for (uint32_t lvl = 0; lvl < ref_epoch_depth(f, k); ++lvl) {
+                ref_ptr_[k].epochs.push_back(fn_->getArg(p + 1 + 2 * lvl));
+                ref_ptr_[k].expects.push_back(fn_->getArg(p + 2 + 2 * lvl));
             }
             // `formal` names the binding in a staleness report. It is a property of
             // the CALLEE, so it is held here rather than shipped per call.
@@ -14858,24 +14883,18 @@ private:
                 LValue         lv     = lvalue_of(p.op_extra.op);
                 const auto     es     = ir_->extra_data<ElemSelect>(p.op_extra.extra);
                 const Type&    at     = std::get<Type>(mod_.pool.get(es.array_type));
-                const bool inner_container =
-                  at.kind == Type::Kind::DynArray || at.kind == Type::Kind::Queue;
-                if (lv.is_assoc && inner_container) {
-                    // `a[k][i]` where the assoc value is itself a container. The
-                    // element address needs the entry's slot, but resolving it here
-                    // would have to pick get_ptr or put_ptr WITHOUT knowing whether
-                    // the consumer reads or writes -- and picking put_ptr would
-                    // create an entry on a read, which LRM 7.8.6 forbids.
-                    //
-                    // TODO: compose the deferral. An AssocSelect already defers to
-                    // its Load / Store; an ElemSelect on top of one has to defer
-                    // too, carrying the pending index alongside the pending key, so
-                    // the direction stays the consumer's to choose. Whole-value
-                    // assignment and the container methods on `a[k]` work today
-                    // because each is unambiguously one direction.
-                    throw BackendError{ "element select through an associative-array "
-                                        "element that is itself a container is not "
-                                        "supported" };
+                if (lv.is_assoc) {
+                    // `a[k][i]`: the base is a DEFERRED assoc entry, and the ring /
+                    // bounds arithmetic below needs its slot address now, so the
+                    // entry is resolved here rather than at the consumer. Which way
+                    // is the access's own, threaded from the frontend
+                    // (ir::ElemSelect::for_write): a read resolves get_ptr and
+                    // creates nothing (LRM 7.8.6) -- an absent key then yields the
+                    // empty-container sink, so the element read is the element
+                    // default -- while a write resolves put_ptr and creates the
+                    // entry (LRM 7.8), after which an index past the fresh empty
+                    // container drops its write (7.10).
+                    lv = assoc_elem_lvalue(lv, es.for_write != 0);
                 }
                 if (at.kind == Type::Kind::DynArray) {
                     // Dynamic array (LRM 7.5): the base lvalue addresses the
@@ -14916,21 +14935,24 @@ private:
                         sel.sig           = lv.sig;
                         sel.dyn_inrange   = inrange;
                         sel.bounds_checks = lv.bounds_checks;
-                        sel.epoch_ptr     = epoch;
+                        sel.epoch_chain   = lv.epoch_chain;
+                        sel.epoch_chain.push_back(epoch);
                         add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
                         set_lvalue(i, sel);
                         return;
                     }
                     if (e.is_agg || e.is_handle) {
                         LValue sel      = dyn_agg_elem_lvalue(lv, e, dataptr, idx64, inrange);
-                        sel.epoch_ptr   = epoch;
+                        sel.epoch_chain = lv.epoch_chain;
+                        sel.epoch_chain.push_back(epoch);
                         note_gc_container_root(sel, lv, handle, es.array_type);
                         add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
                         set_lvalue(i, sel);
                         return;
                     }
                     LValue       el;
-                    el.epoch_ptr     = epoch;
+                    el.epoch_chain   = lv.epoch_chain;
+                    el.epoch_chain.push_back(epoch);
                     el.gc_owner      = lv.gc_owner;
                     note_gc_container_root(el, lv, handle, es.array_type);
                     el.base          = dataptr;
@@ -14994,14 +15016,16 @@ private:
                         sel.sig           = lv.sig;
                         sel.dyn_inrange   = inrange;
                         sel.bounds_checks = lv.bounds_checks;
-                        sel.epoch_ptr     = epoch;
+                        sel.epoch_chain   = lv.epoch_chain;
+                        sel.epoch_chain.push_back(epoch);
                         add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
                         set_lvalue(i, sel);
                         return;
                     }
                     if (e.is_agg || e.is_handle) {
                         LValue sel    = dyn_agg_elem_lvalue(lv, e, baseptr, phys, inrange);
-                        sel.epoch_ptr = epoch;
+                        sel.epoch_chain = lv.epoch_chain;
+                        sel.epoch_chain.push_back(epoch);
                         note_gc_container_root(sel, lv, handle, es.array_type);
                         add_elem_bounds_check(sel, i, lv, es.index, inrange, unknown, len);
                         set_lvalue(i, sel);
@@ -15021,7 +15045,8 @@ private:
                     el.sig           = lv.sig;
                     el.dyn_inrange   = inrange;
                     el.bounds_checks = lv.bounds_checks;
-                    el.epoch_ptr     = epoch;
+                    el.epoch_chain   = lv.epoch_chain;
+                    el.epoch_chain.push_back(epoch);
                     el.gc_owner      = lv.gc_owner;
                     note_gc_container_root(el, lv, handle, es.array_type);
                     add_elem_bounds_check(el, i, lv, es.index, inrange, unknown, len);
@@ -15084,16 +15109,24 @@ private:
                 // the value element slot facts.
                 const auto    aa = ir_->extra_data<AssocArg>(p.op_extra.extra);
                 const DynElem e  = dynarr_elem(aa.assoc_type);
-                const LValue     hlv = lvalue_of(p.op_extra.op);
+                // A deferred base means `a[k1][k2]`: the outer entry must be
+                // resolved before its map handle can be read, and the direction is
+                // this access's (AssocArg::for_write) -- resolving a READ with
+                // put_ptr created the outer entry, which LRM 7.8.6 forbids.
+                const LValue raw_hlv = lvalue_of(p.op_extra.op);
+                const LValue hlv =
+                  raw_hlv.is_assoc ? assoc_elem_lvalue(raw_hlv, aa.for_write != 0) : raw_hlv;
                 auto [kptr, klen, kvalid] = normalize_assoc_key_value(aa.arg, aa.assoc_type);
                 LValue el;
                 el.is_assoc          = true;
                 el.assoc_handle      = lv_handle_ptr(hlv);
                 // An entry's slot lives until that entry is erased, so a `ref`
-                // through it records the map's relocation epoch
-                // (docs/design/data-model.md §3.1).
-                el.epoch_ptr         = b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
-                                                          handle_epoch_field(aa.assoc_type));
+                // through it records the map's relocation epoch, appended to whatever
+                // containers the MAP itself sits inside (docs/design/data-model.md
+                // §3.1) — `d[i][k]` watches the dynamic array and then the map.
+                el.epoch_chain       = hlv.epoch_chain;
+                el.epoch_chain.push_back(b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
+                                                            handle_epoch_field(aa.assoc_type)));
                 el.assoc_key_ptr     = kptr;
                 el.assoc_key_len     = klen;
                 // An x/z key is an invalid index (LRM 7.8.4 / 7.8.5): gate the
@@ -15153,8 +15186,9 @@ private:
                 el.assoc_default    = true;
                 const LValue& dlv   = lvalue_of(pt.op);
                 el.assoc_handle     = lv_handle_ptr(dlv);
-                el.epoch_ptr        = b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
-                                                        handle_epoch_field(pt.type));
+                el.epoch_chain      = dlv.epoch_chain;
+                el.epoch_chain.push_back(b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
+                                                            handle_epoch_field(pt.type)));
                 el.assoc_ops        = elem_ops_global(pt.type);
                 el.assoc_elem_type  = std::get<Type>(mod_.pool.get(pt.type)).element;
                 el.assoc_val_string = e.is_string;
@@ -17898,8 +17932,9 @@ private:
         el.base        = slot;
         el.dyn_inrange = gate(nonnull);
         // An entry's slot dies with the entry, so a `ref` formed through it carries
-        // the map's relocation epoch exactly as a queue element does.
-        el.epoch_ptr   = lv.epoch_ptr;
+        // the map's relocation epoch exactly as a queue element does — and whatever
+        // containers the map itself sits inside, ahead of it.
+        el.epoch_chain = lv.epoch_chain;
         // The owner travels with the resolved element: a handle stored into an assoc
         // entry lands in the map's malloc'd payload, which only the OWNING object's
         // trace map reaches (Gc.h:324-326), so the store still needs the barrier (§7).
@@ -20468,45 +20503,58 @@ private:
     // away entirely (no_epoch_global). rt_ref_stale may return (warn mode), so
     // the stale block rejoins rather than trapping.
     void emit_ref_epoch_check(const RefBinding& rb) {
-        if (rb.epoch == nullptr) {
-            // A fork child's captured formals are bound before any actual exists;
-            // nothing to check.
+        if (rb.epochs.empty()) {
+            // A stable place, or a fork child's captured formal — bound before any
+            // actual exists. Nothing to check.
             return;
         }
         llvm::Constant* const site = ref_site_global(loc_text(cur_inst_), rb.formal);
-        auto* fn      = b_.GetInsertBlock()->getParent();
-        auto* bad     = llvm::BasicBlock::Create(ctx_, "ref.moved", fn);
-        auto* regress = llvm::BasicBlock::Create(ctx_, "ref.regress", fn);
-        auto* stale   = llvm::BasicBlock::Create(ctx_, "ref.stale", fn);
-        auto* cont    = llvm::BasicBlock::Create(ctx_, "ref.ok", fn);
-
-        llvm::Value* cur = b_.CreateLoad(b_.getInt64Ty(), rb.epoch, "ref.epoch");
-        auto*        br  = b_.CreateCondBr(b_.CreateICmpNE(cur, rb.expect), bad, cont);
-        br->setMetadata(llvm::LLVMContext::MD_prof,
-                        llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
-
-        // Epochs only ever advance, so a current value BELOW the expected one means
-        // the epoch plumbing itself is wrong, not the design.
-        b_.SetInsertPoint(bad);
-        b_.CreateCondBr(b_.CreateICmpULT(cur, rb.expect), regress, stale);
-
         // The time each report stamps is read in its own cold block: reading it
         // before the branch would put a wheel call on the hot path.
         const auto report_now = [&] { return b_.CreateCall(wheel_now_fn(), { wheel_ }); };
 
-        b_.SetInsertPoint(regress);
-        auto* rcall =
-          b_.CreateCall(ref_epoch_regress_fn(), { site, rb.epoch, rb.expect, cur, report_now() });
-        rcall->addFnAttr(llvm::Attribute::NoReturn);
-        rcall->addFnAttr(llvm::Attribute::Cold);
-        b_.CreateUnreachable();
+        // One check per container level, OUTERMOST FIRST, each guarding the next:
+        // level n's witness lives in level n-1's buffer, so it is only safe to load
+        // once level n-1 has been proven current. A mismatch at any level reports and
+        // (in warn mode) rejoins WITHOUT reading the deeper witnesses, whose storage
+        // the reported restructuring may have released.
+        for (size_t lvl = 0; lvl < rb.epochs.size(); ++lvl) {
+            llvm::Value* const ep  = rb.epochs[lvl];
+            llvm::Value* const exp = rb.expects[lvl];
+            auto* fn      = b_.GetInsertBlock()->getParent();
+            auto* bad     = llvm::BasicBlock::Create(ctx_, "ref.moved", fn);
+            auto* regress = llvm::BasicBlock::Create(ctx_, "ref.regress", fn);
+            auto* stale   = llvm::BasicBlock::Create(ctx_, "ref.stale", fn);
+            auto* cont    = llvm::BasicBlock::Create(ctx_, "ref.ok", fn);
+            auto* done    = llvm::BasicBlock::Create(ctx_, "ref.done", fn);
 
-        b_.SetInsertPoint(stale);
-        b_.CreateCall(ref_stale_fn(), { site, rb.epoch, rb.expect, cur, report_now() })
-          ->addFnAttr(llvm::Attribute::Cold);
-        b_.CreateBr(cont);
+            llvm::Value* cur = b_.CreateLoad(b_.getInt64Ty(), ep, "ref.epoch");
+            auto*        br  = b_.CreateCondBr(b_.CreateICmpNE(cur, exp), bad, cont);
+            br->setMetadata(llvm::LLVMContext::MD_prof,
+                            llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
-        b_.SetInsertPoint(cont);
+            // Epochs only ever advance, so a current value BELOW the expected one
+            // means the epoch plumbing itself is wrong, not the design.
+            b_.SetInsertPoint(bad);
+            b_.CreateCondBr(b_.CreateICmpULT(cur, exp), regress, stale);
+
+            b_.SetInsertPoint(regress);
+            auto* rcall = b_.CreateCall(ref_epoch_regress_fn(), { site, ep, exp, cur, report_now() });
+            rcall->addFnAttr(llvm::Attribute::NoReturn);
+            rcall->addFnAttr(llvm::Attribute::Cold);
+            b_.CreateUnreachable();
+
+            b_.SetInsertPoint(stale);
+            b_.CreateCall(ref_stale_fn(), { site, ep, exp, cur, report_now() })
+              ->addFnAttr(llvm::Attribute::Cold);
+            // Warn mode returns: skip the deeper levels rather than dereference a
+            // witness the reported move may have freed.
+            b_.CreateBr(done);
+
+            b_.SetInsertPoint(cont);
+            b_.CreateBr(done);
+            b_.SetInsertPoint(done);
+        }
     }
 
     // The rt_tagged_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
@@ -22042,10 +22090,7 @@ private:
                 emit_gc_barrier_for(lv);
                 const RefBinding rb = ref_actual_arg(lv);
                 argv.push_back(rb.slot);
-                if (ref_needs_epoch(f, k)) {
-                    argv.push_back(rb.epoch);
-                    argv.push_back(rb.expect);
-                }
+                push_ref_epochs(argv, rb, ref_epoch_depth(f, k));
                 if (!is_handle_type(f.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }
@@ -23100,10 +23145,7 @@ private:
                 assert(clv.gc_owner == nullptr && "a fork capture is a frame local");
                 const RefBinding rb = ref_actual_arg(clv);
                 argv.push_back(rb.slot);
-                if (ref_needs_epoch(child, k)) {
-                    argv.push_back(rb.epoch);
-                    argv.push_back(rb.expect);
-                }
+                push_ref_epochs(argv, rb, ref_epoch_depth(child, k));
             }
         }
         argv.push_back(rec);
@@ -23303,10 +23345,7 @@ private:
                 }
                 const RefBinding rb = ref_actual_arg(lv);
                 argv.push_back(rb.slot);
-                if (ref_needs_epoch(tf, k)) {
-                    argv.push_back(rb.epoch);
-                    argv.push_back(rb.expect);
-                }
+                push_ref_epochs(argv, rb, ref_epoch_depth(tf, k));
                 if (!is_handle_type(tf.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
                 }

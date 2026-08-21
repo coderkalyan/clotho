@@ -243,6 +243,18 @@ struct ElemSelect {
     Index index;
     // The UnpackedArray type being indexed.
     Ref array_type;
+    // Whether the ACCESS this select serves writes the place it designates.
+    //
+    // Only a select whose base is a DEFERRED associative-array element reads it:
+    // resolving that base needs get_ptr (a read must not create the entry, LRM
+    // 7.8.6) or put_ptr (a write must), and unlike a bare `a[k]` — where the
+    // Load / Store consumer picks — a second select must resolve the base eagerly to
+    // do its own ring / bounds arithmetic, before any consumer is in sight. Every
+    // other base resolves the same either way and ignores this.
+    //
+    // A word rather than a bool: an extra payload must have no padding
+    // (ExtraPayload's unique-object-representation requirement).
+    uint32_t for_write = 0;
 };
 
 // Extra payload for `arr_slice`: a constant-bounds slice of a fixed unpacked
@@ -395,6 +407,10 @@ struct AssocArg {
     // The interned Assoc type of the target (element = value, fields_id = key,
     // right = wildcard flag).
     Ref assoc_type;
+    // Whether the access this select serves writes the place it designates; read
+    // only when the BASE is itself a deferred assoc element (`a[k1][k2]`), for the
+    // same reason ElemSelect::for_write exists. A word, not a bool: see ElemSelect.
+    uint32_t for_write = 0;
 };
 
 // Extra payload for `read_mem`: a $readmemh / $readmemb load of a file into an

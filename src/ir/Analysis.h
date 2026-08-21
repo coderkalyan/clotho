@@ -254,9 +254,11 @@ struct DesignFacts {
 
     // `ref` formals whose actual, at some call site, is a place inside a container's
     // HEAP storage — a dynamic-array / queue element, an associative-array entry, or
-    // a member or element reached through one. Keyed `(fid << 32) | formal index`.
+    // a member or element reached through one. Keyed `(fid << 32) | formal index`,
+    // mapping to the NESTING DEPTH: how many relocatable containers the place sits
+    // inside, maxed over every call site.
     //
-    // Only those formals need the relocation-epoch words of the fat ref
+    // Only those formals carry the relocation-epoch words of the fat ref
     // (docs/design/data-model.md §3): the epoch detects that the buffer moved out
     // from under an interior pointer, and it necessarily lives in the handle rather
     // than the buffer, since a stale pointer must not be what reads its own witness.
@@ -264,14 +266,28 @@ struct DesignFacts {
     // class property, or a whole container handle — aliases storage that cannot
     // move, so its formal is one plain pointer and the callee emits no check.
     //
+    // The depth is what makes a NESTED place checkable. `q[i]` sits in one buffer
+    // and needs one witness, which lives in the queue's handle — design state, so
+    // safe to read unconditionally. `a[k][i]` sits in two: the inner queue's handle
+    // lives inside the map's payload, so its witness may itself have been freed, and
+    // reading it is only safe once the OUTER witness has been checked. Hence one
+    // (epoch, expect) pair per level, outermost first, checked in order.
+    //
     // Conservative by construction: a formal is absent only when EVERY call site was
     // seen and none was container-rooted, and the answer is unioned across each
     // virtual-dispatch slot so an override can never disagree with its caller.
-    ankerl::unordered_dense::set<uint64_t> ref_epoch_formals;
+    ankerl::unordered_dense::map<uint64_t, uint32_t> ref_epoch_formals;
 
-    // Whether ref formal `k` of `fid` carries the epoch words.
+    // How many (epoch, expect) pairs ref formal `k` of `fid` carries; 0 = a plain
+    // pointer with no check.
+    [[nodiscard]] uint32_t ref_epoch_depth(uint32_t fid, size_t k) const {
+        const auto it = ref_epoch_formals.find((static_cast<uint64_t>(fid) << 32) | k);
+        return it == ref_epoch_formals.end() ? 0u : it->second;
+    }
+
+    // Whether ref formal `k` of `fid` carries any epoch words.
     [[nodiscard]] bool ref_needs_epoch(uint32_t fid, size_t k) const {
-        return ref_epoch_formals.contains((static_cast<uint64_t>(fid) << 32) | k);
+        return ref_epoch_depth(fid, k) != 0;
     }
 
     // ---- Per-body. ----
