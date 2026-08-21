@@ -1244,6 +1244,21 @@ TEST_CASE("$finish banner reports the current simulation time") {
     CHECK(err == "source:4: $finish called at 12 ns\n");
 }
 
+// The same banner from inside a plain function. A function is not a coroutine and
+// takes no wheel parameter, but the wheel is a module global, so the reported time
+// is the real one rather than a 0 fallback.
+TEST_CASE("$finish inside a function reports the current simulation time") {
+    constexpr std::string_view src = R"(
+        `timescale 1ns/1ps
+        module m;
+            int n = 1;
+            function automatic int die(input int x); if (x != 0) $finish; return x; endfunction
+            initial begin #7; if (die(n) == 0) $display("unreachable"); end
+        endmodule
+    )";
+    CHECK(run_capture_stderr(src) == "source:5: $finish called at 7 ns\n");
+}
+
 TEST_CASE("$time and $stime read the simulation clock") {
     // With no timescale the wheel tick count is the time-unit-scaled value, so
     // $time returns the raw clock and $stime mirrors it (truncated to 32 bits).

@@ -4699,9 +4699,7 @@ private:
             // empty the rings so nothing else queued at this instant runs. The
             // body still leaves through its own final suspend, so its frame is
             // released by the resumer exactly as on a normal completion.
-            llvm::Value* now = has_wheel()
-                                 ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                                 : static_cast<llvm::Value*>(b_.getInt64(0));
+            llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
             b_.CreateCall(finish_coop_fn(),
                           { b_.CreateGlobalString("implicit $finish from program"), now, b_.getInt32(0) });
             if (active_head_gv_ != nullptr) {
@@ -19613,20 +19611,12 @@ private:
     // but stays valid IR — rt_finish is noreturn and the optimizer prunes the
     // unreachable tail.
     //
-    // TODO: a $finish / $stop inside a pure function reports simulation time 0.
-    // Functions take (state) but no wheel argument (only processes and tasks do,
-    // see the function ABI in declare_function / lower_task), so the current
-    // time is unreachable here and the banner falls back to 0 — which reads wrong
-    // if a design actually triggers it (e.g. `if (err) $finish;` in a function).
-    // The location is still exact. $time has the same root cause but is guarded
-    // loudly in the frontend (lower_sysfunc); the clean fix for both is to thread
-    // the wheel into the function ABI, after which this fallback can go.
+    // The time is exact in every body, including a plain function: the wheel is a
+    // module global (clotho.wheel) that every body binds, not a body parameter.
     void lower_finish(Index i) {
         const auto        info   = ir_->extra_data<FinishInfo>(ir_->payload(i).extra);
         const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
-        llvm::Value*      now = has_wheel()
-                                  ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                                  : static_cast<llvm::Value*>(b_.getInt64(0));
+        llvm::Value*      now    = b_.CreateCall(wheel_now_fn(), { wheel_ });
         llvm::Value* args[] = { b_.CreateGlobalString(banner), now, b_.getInt32(info.arg) };
 
         // The runtime reports and returns; control leaves through this body's own
@@ -19677,15 +19667,11 @@ private:
     // prefix, the simulation time of the violation, and the message kind. The
     // runtime queues it (LRM 12.4.2 / 12.5.3 defer reporting to the Observed
     // region) rather than emitting here in the Active region,
-    // so the region continues normally. The wheel fallback mirrors lower_finish:
-    // a case inside a pure function has no wheel and reports time 0 (same TODO
-    // as $finish).
+    // so the region continues normally.
     void lower_case_viol(Index i) {
         const auto        info   = ir_->extra_data<CaseViolInfo>(ir_->payload(i).extra);
         const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
-        llvm::Value*      now = has_wheel()
-                                  ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                                  : static_cast<llvm::Value*>(b_.getInt64(0));
+        llvm::Value*      now    = b_.CreateCall(wheel_now_fn(), { wheel_ });
         b_.CreateCall(observed_case_violation_fn(),
                       { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind) });
     }
@@ -19927,9 +19913,7 @@ private:
     // itself uses, into a cold block that reports and falls through. Emitted
     // BEFORE the access, so the report fires whether or not the LRM then lets
     // the access proceed (an out-of-range read still yields the element
-    // default, an out-of-range write is still dropped). The wheel fallback
-    // mirrors lower_case_viol: an access inside a pure function has no wheel
-    // and reports time 0.
+    // default, an out-of-range write is still dropped).
     void emit_bounds_report(const BoundsCheck& bc, bool is_write) {
         auto* fn   = b_.GetInsertBlock()->getParent();
         auto* bad  = llvm::BasicBlock::Create(ctx_, "bounds.bad", fn);
@@ -19949,9 +19933,7 @@ private:
         }
         // -1 marks "bounded by the declared range in the site record".
         llvm::Value* extent = bc.extent != nullptr ? bc.extent : b_.getInt64(-1);
-        llvm::Value* now    = has_wheel()
-                                ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                                : static_cast<llvm::Value*>(b_.getInt64(0));
+        llvm::Value* now    = b_.CreateCall(wheel_now_fn(), { wheel_ });
         b_.CreateCall(bounds_report_fn(), { bc.site, bc.index, extent, flags, now });
         b_.CreateBr(cont);
 
@@ -20007,8 +19989,7 @@ private:
     // located fatal instead. Cost on the hot path is one compare against zero and
     // a not-taken branch, weighted so the cold block sinks out of line; where the
     // same handle value reaches two derefs unchanged, CSE folds the second
-    // compare away. The wheel fallback mirrors lower_case_viol: a dereference
-    // inside a pure function has no wheel and reports time 0.
+    // compare away.
     void emit_null_handle_check(llvm::Value* handle, Index at, NullKind kind = NullKind::Class) {
         auto* fn   = b_.GetInsertBlock()->getParent();
         auto* bad  = llvm::BasicBlock::Create(ctx_, "null.deref", fn);
@@ -20018,9 +19999,7 @@ private:
                         llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
 
         b_.SetInsertPoint(bad);
-        llvm::Value* now  = has_wheel()
-                              ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                              : static_cast<llvm::Value*>(b_.getInt64(0));
+        llvm::Value* now  = b_.CreateCall(wheel_now_fn(), { wheel_ });
         auto*        call =
           b_.CreateCall(null_handle_fn(), { null_site_global(loc_text(at), kind), now });
         call->addFnAttr(llvm::Attribute::NoReturn);
@@ -20190,10 +20169,7 @@ private:
 
         // The time each report stamps is read in its own cold block: reading it
         // before the branch would put a wheel call on the hot path.
-        const auto report_now = [&]() -> llvm::Value* {
-            return has_wheel() ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                               : static_cast<llvm::Value*>(b_.getInt64(0));
-        };
+        const auto report_now = [&] { return b_.CreateCall(wheel_now_fn(), { wheel_ }); };
 
         b_.SetInsertPoint(regress);
         auto* rcall =
@@ -20232,8 +20208,7 @@ private:
     // constant (plus, for a 4-state union, one must-vs-may compare that rejects an
     // x/z tag) and a not-taken branch, weighted so the cold block sinks out of
     // line; where the same tag value reaches two accesses unchanged, CSE folds the
-    // second compare away. The wheel fallback mirrors lower_case_viol: an access
-    // inside a pure function has no wheel and reports time 0.
+    // second compare away.
     void lower_tagged_check(Index i) {
         const auto& p    = ir_->payload(i);
         const auto  info = ir_->extra_data<TaggedCheckInfo>(p.op_extra.extra);
@@ -20257,9 +20232,7 @@ private:
                         llvm::MDBuilder(ctx_).createBranchWeights(1u << 20, 1));
 
         b_.SetInsertPoint(bad);
-        llvm::Value* now  = has_wheel()
-                              ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                              : static_cast<llvm::Value*>(b_.getInt64(0));
+        llvm::Value* now  = b_.CreateCall(wheel_now_fn(), { wheel_ });
         auto*        call = b_.CreateCall(
           tagged_access_fn(),
           { tagged_site_global(loc_text(i), info),
@@ -20401,14 +20374,6 @@ private:
     }
     llvm::FunctionCallee defer_flush_final_fn() {
         return rt_fn("rt_defer_flush_final", b_.getVoidTy(), {});
-    }
-
-    // Whether wheel_ points at a live timing wheel: true in a process or task
-    // body, false in a pure function (no wheel parameter).
-    bool has_wheel() const {
-        // The wheel is a module global (clotho.wheel), so every body can read the
-        // clock -- including a plain function, which carries no wheel parameter.
-        return true;
     }
 
     // void rt_sim_run(ptr state, ptr wheel, ptr drain, ptr finals) — wraps the
@@ -26146,9 +26111,7 @@ private:
             }
             case ProcOp::RandstateSet: {
                 llvm::Value* rng = proc_rng_of(proc_pcb_of(must_of(value_of(args[0])), i));
-                llvm::Value* now = has_wheel()
-                                     ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                                     : static_cast<llvm::Value*>(b_.getInt64(0));
+                llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
                 b_.CreateCall(proc_randstate_set_fn(),
                               { rng, str_of(args[1]),
                                 null_site_global(loc_text(i), NullKind::Class), now });
@@ -26188,9 +26151,7 @@ private:
             auto* cont = llvm::BasicBlock::Create(ctx_, "await.other", fn);
             b_.CreateCondBr(b_.CreateICmpEQ(pcb, pcb_), bad, cont);
             b_.SetInsertPoint(bad);
-            llvm::Value* now = has_wheel()
-                                 ? static_cast<llvm::Value*>(b_.CreateCall(wheel_now_fn(), { wheel_ }))
-                                 : static_cast<llvm::Value*>(b_.getInt64(0));
+            llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
             auto* call = b_.CreateCall(proc_await_self_fn(),
                                        { null_site_global(loc_text(i), NullKind::Class), now });
             call->addFnAttr(llvm::Attribute::NoReturn);

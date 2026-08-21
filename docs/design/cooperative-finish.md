@@ -111,9 +111,10 @@ Each phase is independently landable and independently revertable.
   them (already dubious for any C++ frame with a destructor). Needs either a
   loud guard or a documented longjmp fallback confined to that boundary. This is
   the one case that may not fully convert.
-- **`$finish` inside a pure function** already misreports time to 0 (an existing
-  `TODO` at the `finish_fn` declaration, since functions take no wheel argument).
-  Phase 2 touches the same code and could fix it in passing, or leave it.
+- **`$finish` inside a plain function** reports the real simulation time: the
+  wheel is a module global (`clotho.wheel`) that every body binds, so there is no
+  0 fallback (the old `TODO` at the `finish_fn` declaration claimed one and was
+  stale; tests/llvm_backend_test.cpp covers it).
 - **`$stop`** shares the path and currently terminates like `$finish`; behavior
   is unchanged here, not corrected.
 - **Perf.** Measured on picorv32 (`--time` sim split, true same-tree
