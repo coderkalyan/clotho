@@ -396,11 +396,11 @@ Deliberately **not** closed, each with a reason rather than a TODO:
 - **assoc key with a `string` or container member.** The order-preserving escaped
   encoding sketched for it (escape `0x00`, terminate `0x00 0x00`) is correct and
   would work; it was cut for scope, and the fixed-width key path is untouched.
-- **whole-`string` NBA.** A string rvalue materializes into a body temp rather
-  than resolving to a handle lvalue, so it does not fit the record-staging shape
-  `HandleCopyNb` uses. Left as its own gap rather than bent into this one. The
-  same reasoning covers a string member of an aggregate under NBA, which used to
-  crash codegen and is now refused.
+- **`s[i] <= c` — a nonblocking write of one string CHARACTER.** Whole-string NBA
+  and a string leaf of an aggregate now stage an owned `rt_string` in their own
+  record range (assign at sample, `rt_string_move` at commit — the Managed analogue
+  of `HandleCopyNb`, see queue-nba-and-nonpod.md §3). A single character is a
+  masked write into an existing value, which that record shape does not express.
 - **`a[k][i]` where the assoc value is a container.** The element select would
   have to choose get_ptr or put_ptr, a direction that belongs to its own consumer;
   choosing put_ptr would create an entry on a read, which LRM 7.8.6 forbids. The

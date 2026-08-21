@@ -739,6 +739,187 @@ TEST_CASE("class method with output and inout string arguments") {
     CHECK(run_capture(src) == "p=[C:P] c=[C0!]\np=[F:C:P] r=1\n");
 }
 
+// -- Whole-string nonblocking assignment (LRM 10.4.2, 4.9.4) --
+//
+// A string is Managed, so its NBA cannot stage into the plane-shaped per-signal
+// shadow: `s <= t` reserves a record holding an OWNED deep copy of the RHS in the
+// Active region and rt_string_move's it into the target in the NBA region (the
+// same assign-at-sample / move-at-commit discipline the whole-container NBA uses;
+// docs/design/queue-nba-and-nonpod.md). No oracle: iverilog 13 aborts on `s <= t`
+// (assertion in eval_vec4.c), so these follow the LRM's region semantics, which
+// the swap below is the canonical witness of.
+TEST_CASE("whole-string nonblocking assignment samples in Active and commits in NBA") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a, b;
+            initial begin
+                a = "A";
+                b = "B";
+                a <= b;
+                b <= a;
+                $display("same instant: a=[%s] b=[%s]", a, b);
+                #1 $display("after NBA: a=[%s] b=[%s]", a, b);
+            end
+        endmodule
+    )";
+    // The swap is what distinguishes sample-then-commit from a blocking store: a
+    // blocking pair would leave both "B".
+    CHECK(run_capture(src) == "same instant: a=[A] b=[B]\nafter NBA: a=[B] b=[A]\n");
+}
+
+// Statement-execution order decides the winner (LRM 10.4.2): records replay in push
+// order, and each move frees what the target held, so the superseded values are
+// released exactly once. The lengths straddle the 30-byte inline/heap boundary in
+// both directions, which is where a mis-staged handle would corrupt or leak.
+TEST_CASE("repeated string NBAs to one target: last write wins across inline and heap") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            initial begin
+                s <= "first";
+                s <= "0123456789012345678901234567890123456789";
+                s <= "third";
+                #1 $display("[%s] %0d", s, s.len());
+                s <= "0123456789012345678901234567890123456789";
+                #1 $display("[%s] %0d", s, s.len());
+                s <= "tiny";
+                #1 $display("[%s] %0d", s, s.len());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[third] 5\n[0123456789012345678901234567890123456789] 40\n[tiny] 4\n");
+}
+
+// The RHS is deep-copied at sample time, so a self-referencing RHS and a source
+// mutated later in the same instant both see the sampled value, not the committed
+// one. A task's NBA to a module string stages into the same per-signal record.
+TEST_CASE("string NBA samples the RHS value, including from a task") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a, b, c;
+            task automatic stage(input string v);
+                c <= v;
+            endtask
+            initial begin
+                a = "x";
+                a <= {a, a, "!"};
+                b = "src";
+                c <= b;
+                b = "mutated-after-sampling";
+                #1 $display("a=[%s] c=[%s]", a, c);
+                stage("from-task");
+                #1 $display("c=[%s]", c);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a=[xx!] c=[src]\nc=[from-task]\n");
+}
+
+// A container element or struct member as the SOURCE of a string NBA is ordinary:
+// the record stages a copy of whatever the RHS reads.
+TEST_CASE("string NBA from a container element or struct member") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { string f; } S;
+            string q[$];
+            string mp[string];
+            S      st;
+            string w;
+            initial begin
+                q.push_back("qv");
+                mp["k"] = "mv";
+                st.f    = "sv";
+                w <= q[0];
+                #1 $display("[%s]", w);
+                w <= mp["k"];
+                #1 $display("[%s]", w);
+                w <= st.f;
+                #1 $display("[%s]", w);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[qv]\n[mv]\n[sv]\n");
+}
+
+// A string LEAF as the target: a struct member and a fixed-array element. The
+// record carries the leaf's own destination pointer, so one record range per root
+// signal serves every leaf of it — and the leaf swap proves each is sampled before
+// any is committed. A whole-struct NBA carrying a string member decomposes into the
+// same per-leaf records.
+TEST_CASE("string NBA to a struct member and a fixed-array element") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { string s; int n; } SS;
+            SS     a, b;
+            string arr[2];
+            string t;
+            initial begin
+                t = "T";
+                a.s = "A";
+                a.n = 1;
+                a.s <= t;
+                arr[0] <= t;
+                arr[1] <= "0123456789012345678901234567890123456789";
+                #1 $display("1: [%s] [%s] [%s] %0d", a.s, arr[0], arr[1], arr[1].len());
+                b.s = "B";
+                b.n = 9;
+                a <= b;
+                #1 $display("2: [%s] %0d", a.s, a.n);
+                arr[0] = "x";
+                arr[1] = "y";
+                arr[0] <= arr[1];
+                arr[1] <= arr[0];
+                #1 $display("3: [%s][%s]", arr[0], arr[1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1: [T] [T] [0123456789012345678901234567890123456789] 40\n"
+                              "2: [B] 9\n3: [y][x]\n");
+}
+
+// One root signal taking BOTH a string-leaf NBA and a byte-image aggregate NBA in
+// the same instant: the two record ranges are independent, and both commit.
+TEST_CASE("string leaf and integral leaf NBA on one aggregate signal") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { string s; int n[2]; } MX;
+            MX     v;
+            string t;
+            int    i;
+            initial begin
+                t = "T";
+                i = 1;
+                v.s    <= t;
+                v.n[i] <= 42;
+                v.n[0] <= 7;
+                #1 $display("[%s] %0d %0d", v.s, v.n[0], v.n[1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[T] 7 42\n");
+}
+
+// 4000 commits alternating heap and inline: the staged record's capacity is retained
+// across instants (rt_string_move re-inits the source), so this must neither grow
+// nor leak. Mirrors the "string reassignment in a loop reuses capacity" smoke test.
+TEST_CASE("string NBA in a loop reuses the record's capacity (leak smoke)") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            initial begin
+                for (int i = 0; i < 2000; i++) begin
+                    s <= "0123456789012345678901234567890123456789012345678901234567890123";
+                    #1;
+                    s <= "s";
+                    #1;
+                end
+                $display("[%s] %0d", s, s.len());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[s] 1\n");
+}
+
 TEST_CASE("unpacked arrays of string init empty and assign per element") {
     constexpr std::string_view src = R"(
         module m;
@@ -808,6 +989,165 @@ TEST_CASE("string reassignment in a loop reuses capacity (leak smoke)") {
         endmodule
     )";
     CHECK(run_capture(src) == "84\n");
+}
+
+// -- Aggregates whose leaves own heap, passed BY VALUE (LRM 13.5.1, 7.4) --
+//
+// An unpacked array of strings (or any aggregate with a string / container leaf)
+// copies per leaf rather than by memcpy: duplicating a handle's bytes would leave
+// two owners of one allocation (docs/design/data-model.md §6, the "Aggregate,
+// managed leaf" row). No oracle: iverilog supports neither unpacked-struct nor
+// unpacked-array subroutine ports, so these follow the LRM.
+
+// The defining property of by-value: the callee's mutation of its own copy is
+// invisible to the caller, and the caller's strings survive the call intact (a
+// memcpy copy-in would have had the callee's frame free them at its return).
+TEST_CASE("string-element array passes by value") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef string SA[2];
+            function automatic int chew(SA x);
+                x[0] = "mutated";
+                x[1] = {x[1], x[1]};
+                return x[1].len();
+            endfunction
+            SA a;
+            int r;
+            initial begin
+                a[0] = "keep0";
+                a[1] = "0123456789012345678901234567890123456789";
+                r = chew(a);
+                $display("%0d [%s] [%s] %0d", r, a[0], a[1], a[1].len());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "80 [keep0] [0123456789012345678901234567890123456789] 40\n");
+}
+
+// output / inout formals of the same shape: the callee fills its frame copy and the
+// epilogue copies it back per leaf, releasing what the actual held.
+TEST_CASE("string-element array as an output and inout formal") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef string SA[2];
+            task automatic fill(output SA o, inout SA io);
+                o[0] = "o0";
+                o[1] = "0123456789012345678901234567890123456789";
+                io[0] = {io[0], "+"};
+                io[1] = "replaced";
+            endtask
+            SA c, b;
+            initial begin
+                b[0] = "b0";
+                b[1] = "b1";
+                fill(c, b);
+                $display("[%s][%s] [%s][%s]", c[0], c[1], b[0], b[1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[o0][0123456789012345678901234567890123456789] [b0+][replaced]\n");
+}
+
+// By-value RETURN: the result lands in a caller-owned, body-lifetime buffer whose
+// leaves the callee assigns into, so the returned strings outlive the callee's
+// frame and are released at the caller's exit rather than leaked.
+TEST_CASE("aggregate return with string leaves, including a nested array") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef string SA[2];
+            typedef struct { string s; SA a; int n; } SN;
+            function automatic SA mk_arr();
+                SA r;
+                r[0] = "arr0";
+                r[1] = "0123456789012345678901234567890123456789";
+                return r;
+            endfunction
+            function automatic SN mk_rec();
+                SN r;
+                r.s    = "rec";
+                r.a    = mk_arr();
+                r.n    = 7;
+                return r;
+            endfunction
+            SA a;
+            SN n;
+            initial begin
+                a = mk_arr();
+                $display("[%s][%s] %0d", a[0], a[1], a[1].len());
+                n = mk_rec();
+                $display("[%s] [%s][%s] %0d", n.s, n.a[0], n.a[1], n.n);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[arr0][0123456789012345678901234567890123456789] 40\n"
+                              "[rec] [arr0][0123456789012345678901234567890123456789] 7\n");
+}
+
+// A whole-array assignment and a slice of a string array are element-wise deep
+// copies: mutating the source afterwards must not touch the destination.
+TEST_CASE("whole-array and slice assignment of a string array deep-copy") {
+    constexpr std::string_view src = R"(
+        module m;
+            string a[4], b[4];
+            initial begin
+                a[0] = "zero";
+                a[1] = "0123456789012345678901234567890123456789";
+                a[2] = "two";
+                a[3] = "three";
+                b = a;
+                a[0] = "clobbered";
+                a[1] = "also-clobbered";
+                $display("[%s][%s][%s][%s]", b[0], b[1], b[2], b[3]);
+                b[0:1] = a[2:3];
+                $display("[%s][%s]", b[0], b[1]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[zero][0123456789012345678901234567890123456789][two][three]\n[two][three]\n");
+}
+
+// A string-element array as a subroutine LOCAL: the frame's aggregate mirror
+// constructs each leaf at activation and releases it at every exit, so recursion
+// and repeated calls neither leak nor alias.
+TEST_CASE("string-element array as a subroutine local, recursively") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int build(int depth);
+                string tmp[2];
+                tmp[0] = "0123456789012345678901234567890123456789";
+                tmp[1] = "b";
+                if (depth == 0) return tmp[0].len();
+                return tmp[1].len() + build(depth - 1);
+            endfunction
+            initial $display("%0d", build(5));
+        endmodule
+    )";
+    CHECK(run_capture(src) == "45\n");
+}
+
+// The by-value copy of a container leaf is a deep copy too, so a queue member of a
+// passed struct is independent in the callee.
+TEST_CASE("aggregate with a queue member passes by value") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int q[$]; string tag; } QS;
+            function automatic int grow(QS x);
+                x.q.push_back(99);
+                x.tag = "callee";
+                return x.q.size();
+            endfunction
+            QS v;
+            int r;
+            initial begin
+                v.q.push_back(1);
+                v.q.push_back(2);
+                v.tag = "caller";
+                r = grow(v);
+                $display("%0d %0d [%s]", r, v.q.size(), v.tag);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "3 2 [caller]\n");
 }
 
 TEST_CASE("string comparisons drive control flow") {
@@ -1070,15 +1410,49 @@ TEST_CASE("logical negation of a string is rejected") {
     )", "logical negation of a string is not legal (LRM Table 11-1)");
 }
 
-TEST_CASE("unsupported string constructs are rejected loudly") {
-    SUBCASE("nonblocking assignment to a string") {
+// Still refused, each for its own reason: a single CHARACTER needs a masked record
+// rather than a whole handle, a class property has no per-object shadow at all
+// (whether or not the reference is qualified), and intra-assignment timing rides a
+// different record pool. A string element of a QUEUE / dynamic / associative array
+// is not on the list: LRM 10.4.2 forbids a nonblocking assignment to an element of
+// a dynamically sized array, so slang rejects it before lowering.
+TEST_CASE("string nonblocking targets that stay refused") {
+    SUBCASE("one character") {
         check_rejected(R"(
             module m;
                 string s;
-                initial s <= "x";
+                initial begin s = "abc"; s[0] <= "z"; end
             endmodule
-        )", "nonblocking assignment to a string");
+        )",
+                       "nonblocking assignment to a string");
     }
+    SUBCASE("unqualified class property inside a method") {
+        check_rejected(R"(
+            module m;
+                class C;
+                    string p;
+                    task automatic set(string v);
+                        p <= v;
+                    endtask
+                endclass
+                C c;
+                initial begin c = new; c.set("x"); end
+            endmodule
+        )",
+                       "nonblocking assignment to a class property");
+    }
+    SUBCASE("intra-assignment delay") {
+        check_rejected(R"(
+            module m;
+                string s, t;
+                initial begin t = "x"; s <= #5 t; end
+            endmodule
+        )",
+                       "intra-assignment timing");
+    }
+}
+
+TEST_CASE("unsupported string constructs are rejected loudly") {
     SUBCASE("string module port") {
         check_rejected(R"(
             module sub(input string name);

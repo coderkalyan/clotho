@@ -2854,16 +2854,21 @@ private:
         }
     }
 
-    // memcpy a whole aggregate from `src` to `dst` (both pointers to its storage).
-    // Valid because the frontend passes an aggregate by value only when it is
-    // trivially copyable (no heap-owning leaf), so its byte image is the value.
+    // Copy a whole aggregate from src to dst (both pointers to its storage). One
+    // memcpy when no leaf owns heap — its byte image is then the value; otherwise a
+    // per-leaf deep copy, since duplicating a string / container leaf's bytes would
+    // duplicate ownership of its allocation (emit_agg_deep_copy).
     void emit_agg_storage_copy(llvm::Value* dst, llvm::Value* src, Ref type) {
+        if (has_heap_leaf(type)) {
+            std::vector<llvm::Value*> path;
+            emit_agg_deep_copy(type, dst, src, path, agg_storage_ty(type));
+            return;
+        }
         llvm::Type* st = agg_storage_ty(type);
         const auto  sz = env_->llmod.getDataLayout().getTypeAllocSize(st);
         const auto  al = env_->llmod.getDataLayout().getABITypeAlign(st);
         b_.CreateMemCpy(dst, al, src, al, sz);
     }
-
     // Fill an LValue's leaf metadata (slot type, width, domain flags) from the
     // scalar / string / handle leaf type a select chain has resolved to.
     // Conservative z for a 4-state leaf, matching agg_leaf_slot_ty.
@@ -3637,6 +3642,45 @@ private:
         }
     }
 
+    // Whether an lvalue chain designates a `string` place: walked down from the
+    // root's own type, since this runs BEFORE lowering (nba_classify_ir) and there
+    // is no LValue yet. True for a whole string signal / local, a string member of
+    // an unpacked struct, and a string element of a fixed unpacked array, composed
+    // to any depth — exactly the places whose NBA record must hold an owned handle
+    // rather than bytes.
+    bool lvalue_is_string_place(const Ir& ir, Index lv) const {
+        const Ref leaf = lvalue_place_type(ir, lv);
+        return leaf != Ref::Invalid && std::get<Type>(mod_.pool.get(leaf)).kind == Type::Kind::String;
+    }
+
+    // The IR type an lvalue chain designates, or Ref::Invalid for a shape whose
+    // type cannot be walked statically (a bit / part select, a container element, a
+    // handle deref — none of which can be a string place).
+    Ref lvalue_place_type(const Ir& ir, Index lv) const {
+        switch (ir.tag(lv)) {
+            case Inst::Tag::Signal:
+                return mod_.signal(ir.payload(lv).signal).type;
+            case Inst::Tag::Local:
+                return ir.payload(lv).local.type;
+            case Inst::Tag::MemberSelect: {
+                const auto  ms = ir.extra_data<MemberSelect>(ir.payload(lv).op_extra.extra);
+                const Type& st = std::get<Type>(mod_.pool.get(ms.struct_type));
+                const auto  fs = mod_.pool.struct_fields(st.fields_id);
+                return ms.field_index < fs.size() ? fs[ms.field_index].type : Ref::Invalid;
+            }
+            case Inst::Tag::ElemSelect: {
+                const Ref base = lvalue_place_type(ir, ir.payload(lv).op_extra.op);
+                if (base == Ref::Invalid) {
+                    return Ref::Invalid;
+                }
+                const Type& t = std::get<Type>(mod_.pool.get(base));
+                return t.kind == Type::Kind::UnpackedArray ? t.element : Ref::Invalid;
+            }
+            default:
+                return Ref::Invalid;
+        }
+    }
+
     // Register a nonblocking intra-assignment (or inertial continuous-assign)
     // target and record how its deferred record must be shaped. The record reuses
     // plain NBA's lvalue encoding, so each target shape mirrors the masking rule
@@ -3749,6 +3793,19 @@ private:
             }
             const Index     lv_idx = ir.payload(idx).binary.l;
             const NbaTarget t      = nba_target(ir, lv_idx);
+            // An NBA to any string PLACE — a whole string signal, a string member of
+            // an unpacked struct, a string element of a fixed array — takes its own
+            // record range: the staged value is an owned rt_string, which neither the
+            // plane shadow nor the byte-image array / aggregate records can hold. The
+            // record carries the leaf's destination pointer, so one range per ROOT
+            // signal serves every leaf of it. Must precede the aggregate and array
+            // branches below, which would otherwise claim the same store.
+            if (lvalue_is_string_place(ir, lv_idx)) {
+                if (std::find(string_nba_sigs_.begin(), string_nba_sigs_.end(), t.sig) == string_nba_sigs_.end()) {
+                    string_nba_sigs_.push_back(t.sig);
+                }
+                continue;
+            }
             // Nonblocking assignment into an aggregate. A STATIC-path leaf (struct
             // fields only) commits through the per-leaf aggregate shadow (block
             // commit). A leaf reached through a runtime array index has no
@@ -11039,9 +11096,10 @@ private:
     llvm::Value* emit_nba_any_staged() {
         auto*        ptr_ty = llvm::PointerType::getUnqual(ctx_);
         llvm::Value* any    = b_.getFalse();
-        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty() ||
+            !string_nba_sigs_.empty()) {
             // rt_nba_arr_any is the total across the shared array + aggregate +
-            // queue buffers.
+            // queue + string buffers.
             any = b_.CreateOr(any, b_.CreateICmpNE(b_.CreateCall(nba_arr_any_fn(), {}), b_.getInt32(0)));
         }
         if (!block_commits_.empty()) {
@@ -11089,7 +11147,8 @@ private:
         // Deferred writes through a runtime array index: replay each array's
         // typed records and each aggregate's memcpy records (both from the
         // shared rt_nba_arr_* buffers), waking Any-edge readers, then reset.
-        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty() ||
+            !string_nba_sigs_.empty()) {
             for (const Signal sig : array_nba_sigs_) {
                 emit_array_commit(sig, state);
             }
@@ -11098,6 +11157,9 @@ private:
             }
             for (const Signal sig : handle_nba_sigs_) {
                 emit_handle_whole_commit(sig);
+            }
+            for (const Signal sig : string_nba_sigs_) {
+                emit_string_whole_commit(sig);
             }
             // VCD: touch each dumped array that took an NBA write this instant,
             // so the flush scans its elements only on write instants (not every
@@ -11178,7 +11240,8 @@ private:
         // The array-NBA record buffers are process-global; clear any state a prior
         // simulation in this process left staged (e.g. a $finish between staging and
         // the NBA commit) so this run starts empty.
-        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty()) {
+        if (!array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty() ||
+            !string_nba_sigs_.empty()) {
             b_.CreateCall(nba_arr_reset_fn(), {});
         }
         // Same for the deferred intra-assignment record pools — reclaim any records
@@ -11314,9 +11377,9 @@ private:
         // the active queue drains; if any update is staged it commits them all and
         // re-drains the active queue at the SAME instant; otherwise it falls through
         // to the wheel. So active and NBA iterate until both settle before time moves.
-        const bool has_nba = !array_nba_sigs_.empty() || !agg_nba_sigs_.empty() ||
-                             !handle_nba_sigs_.empty() || !block_commits_.empty() ||
-                             design_uses_nb_events_ || !intra_nba_sigs_.empty();
+        const bool has_nba = !array_nba_sigs_.empty() || !agg_nba_sigs_.empty() || !handle_nba_sigs_.empty() ||
+                             !string_nba_sigs_.empty() || !block_commits_.empty() || design_uses_nb_events_ ||
+                             !intra_nba_sigs_.empty();
         auto*      ncheck  = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.check", fn) : wcheck;
         auto*      ncommit = has_nba ? llvm::BasicBlock::Create(ctx_, "nba.commit", fn) : nullptr;
         // Inactive region: only when the design has a #0. When the active queue
@@ -13259,6 +13322,90 @@ private:
         }
     }
 
+    // Recursive per-leaf deep copy of one aggregate storage image into another (both
+    // pointers to `root_ty`, addressed by the same GEP path): every string leaf is
+    // rt_string_assign'd and every container leaf deep-copied, so the destination
+    // ends up owning its own heap. A subtree with no heap leaf is one memcpy — there
+    // the byte image IS the value.
+    //
+    // This is what a BY-VALUE copy of a managed-leaf aggregate needs and what
+    // emit_agg_storage_copy cannot do: duplicating the bytes of a string or
+    // container leaf would leave two owners of one allocation, and the second
+    // deinit would free it twice (docs/design/data-model.md §6, the "Aggregate,
+    // managed leaf" row). The sibling of emit_agg_init / emit_agg_deinit, walking
+    // the same array loop and struct recursion.
+    //
+    // Precondition: the destination's managed leaves are already CONSTRUCTED, which
+    // every storage this runs on satisfies — a frame slot (init_frame), a signal
+    // (init_state), a proto-filled call temp. rt_string_assign / the handle assign
+    // release what the destination held, so a repeated copy into the same storage
+    // neither leaks nor double-frees.
+    void emit_agg_deep_copy(Ref                        type,
+                            llvm::Value*               dst,
+                            llvm::Value*               src,
+                            std::vector<llvm::Value*>& path,
+                            llvm::Type*                root_ty) {
+        const auto sub_ptr = [&](llvm::Value* base) {
+            std::vector<llvm::Value*> idx;
+            idx.reserve(path.size() + 1);
+            idx.push_back(b_.getInt32(0));
+            for (llvm::Value* s : path) {
+                idx.push_back(s);
+            }
+            return b_.CreateInBoundsGEP(root_ty, base, idx);
+        };
+        if (!has_heap_leaf(type)) {
+            // Plane-only subtree: one memcpy of its image, whatever its shape. This
+            // is the LLVM-side equivalent of rt_elem_copy's POD-gap walk.
+            llvm::Type* st = agg_storage_ty(type);
+            const auto  sz = env_->llmod.getDataLayout().getTypeAllocSize(st);
+            const auto  al = env_->llmod.getDataLayout().getABITypeAlign(st);
+            b_.CreateMemCpy(sub_ptr(dst), al, sub_ptr(src), al, sz);
+            return;
+        }
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::UnpackedArray) {
+            const uint32_t n     = array_dim(t);
+            auto*          i32   = b_.getInt32Ty();
+            auto*          fn    = b_.GetInsertBlock()->getParent();
+            auto*          head  = llvm::BasicBlock::Create(ctx_, "acopy.head", fn);
+            auto*          body  = llvm::BasicBlock::Create(ctx_, "acopy.body", fn);
+            auto*          done  = llvm::BasicBlock::Create(ctx_, "acopy.done", fn);
+            auto*          entry = b_.GetInsertBlock();
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            auto* idx = b_.CreatePHI(i32, 2);
+            idx->addIncoming(b_.getInt32(0), entry);
+            b_.CreateCondBr(b_.CreateICmpULT(idx, b_.getInt32(n)), body, done);
+            b_.SetInsertPoint(body);
+            path.push_back(idx);
+            emit_agg_deep_copy(t.element, dst, src, path, root_ty);
+            path.pop_back();
+            idx->addIncoming(b_.CreateAdd(idx, b_.getInt32(1)), b_.GetInsertBlock());
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+            return;
+        }
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            uint32_t f = 0;
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                path.push_back(b_.getInt32(f++));
+                emit_agg_deep_copy(fld.type, dst, src, path, root_ty);
+                path.pop_back();
+            }
+            return;
+        }
+        // A heap-owning leaf: has_heap_leaf above proved it is a string or a
+        // container handle, so no plane leaf reaches here.
+        llvm::Value* d = sub_ptr(dst);
+        llvm::Value* s = sub_ptr(src);
+        if (t.kind == Type::Kind::String) {
+            b_.CreateCall(str_assign_fn(), { d, s, alloc_site_global(SourceText{ .where = "<unknown>" }, "string") });
+            return;
+        }
+        emit_handle_assign(d, s, type);
+    }
+
     // Constant power-on initializer for one state global. Every state struct
     // is now flat — field k is signal k's storage (scope-relative path {k}) —
     // so the initializer is a direct per-field loop: each signal gets its
@@ -14592,6 +14739,43 @@ private:
                 agg_elem_temp_list_.push_back({ temp, e.elem_type });
             }
         }
+        // An aggregate-returning CALL whose result owns heap needs the same
+        // treatment, and for the same reason: the callee copies its result out
+        // through the trailing out-param PER LEAF (emit_agg_deep_copy), which
+        // requires constructed leaves to assign over, and whatever heap the result
+        // carries has to be released at the body's exit. A bare per-call alloca (the
+        // plane-only case below in lower_call_common) would give it neither.
+        for (size_t k = 0; k < ir_->inst_count(); ++k) {
+            const auto i = static_cast<Index>(k);
+            if (ir_->tag(i) != Inst::Tag::Call && ir_->tag(i) != Inst::Tag::CallVirtual) {
+                continue;
+            }
+            const Ref ret = call_return_type(i);
+            if (ret == Ref::Invalid || !is_agg_abi(ret) || !has_heap_leaf(ret)) {
+                continue;
+            }
+            llvm::Type*    st   = agg_storage_ty(ret);
+            auto*          temp = b_.CreateAlloca(st, nullptr, "call.agg.ret");
+            const uint64_t size = env_->llmod.getDataLayout().getTypeAllocSize(st);
+            b_.CreateMemCpy(temp, llvm::MaybeAlign(), agg_proto_global(ret), llvm::MaybeAlign(), b_.getInt64(size));
+            emit_gc_container_roots(GcRootOp::Add, ret, temp, st);
+            agg_elem_ret_[k] = temp;
+            agg_elem_temp_list_.push_back({ temp, ret });
+        }
+    }
+
+    // Return type of a Call / CallVirtual instruction, or Ref::Invalid when the
+    // instruction is neither. Used before lowering, when only the IR is available.
+    Ref call_return_type(Index i) const {
+        if (ir_->tag(i) == Inst::Tag::Call) {
+            return mod_.function(ir_->extra_data<CallInfo>(ir_->payload(i).extra).func).return_type;
+        }
+        if (ir_->tag(i) == Inst::Tag::CallVirtual) {
+            // The statically-resolved prototype: every override shares its return
+            // type (LRM 8.20), which is what sizes the result buffer.
+            return mod_.function(ir_->extra_data<VirtualCallInfo>(ir_->payload(i).extra).func).return_type;
+        }
+        return Ref::Invalid;
     }
 
     // Overwrite an element buffer with the element type's power-on image.
@@ -15276,6 +15460,14 @@ private:
                 const LValue& lv  = lvalue_of(p.binary.l);
                 CtxOverride   ov(*this, lv.vif_ctx, lvalue_ctx_anchor(lv));
                 emit_bounds_reports(lv, /*is_write=*/true);
+                if (lv.is_string) {
+                    // A whole-string NBA stages an owned deep copy in its own record
+                    // and moves it into the target in the NBA region. Must precede
+                    // value_of below: a string operand has no plane form. No GC
+                    // barrier — a string can never hold a class handle.
+                    emit_string_whole_nba(lv, p.binary.r);
+                    return;
+                }
                 Plane         rhs = value_of(p.binary.r);
                 if (type_of(p.binary.r).is_real) {
                     rhs = real_to_planes(fp_of(rhs));
@@ -18194,6 +18386,84 @@ private:
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
+    }
+
+    // Position of a signal within string_nba_sigs_.
+    uint32_t str_nba_slot(Signal sig) const {
+        const auto it = std::find(string_nba_sigs_.begin(), string_nba_sigs_.end(), sig);
+        return static_cast<uint32_t>(it - string_nba_sigs_.begin());
+    }
+
+    // Runtime buffer index of a whole-string NBA signal — the fourth range of the
+    // shared rt_nba_arr_* index space, after array, aggregate and container.
+    uint32_t str_buf_idx(Signal sig) const {
+        return static_cast<uint32_t>(array_nba_sigs_.size() + agg_nba_sigs_.size() + handle_nba_sigs_.size()) +
+               str_nba_slot(sig);
+    }
+
+    // Deferred whole-string NBA record: { ptr dest_handle, rt_string staged }. The
+    // staged handle OWNS its value between the Active region (where it is assigned)
+    // and the NBA region (where it is moved into dest), which is what gives the LRM
+    // 4.9.4 sample-now / commit-later semantics for a heap-owning value.
+    llvm::StructType* str_rec_ty() {
+        return llvm::StructType::get(ctx_, { raw_ptr_ty(), str_slot_ty() });
+    }
+
+    // Stage a whole-string nonblocking assignment: reserve a record, capture the
+    // live destination handle pointer (stable — the signal slot never moves, only
+    // its heap buffer does, which the commit's move releases), CONSTRUCT the staged
+    // handle and deep-copy the RHS into it.
+    //
+    // Unlike a container handle, an empty rt_string is NOT all-zero (byte 31 holds
+    // the inline capacity), so the staging handle is built with rt_string_init, not
+    // a memset. Getting that wrong would make rt_string_assign read a bogus
+    // capacity out of the record.
+    void emit_string_whole_nba(const LValue& lv, Index rhs) {
+        auto*        rt   = str_rec_ty();
+        const auto   strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
+        llvm::Value* rec  = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(str_buf_idx(lv.sig)), b_.getInt32(strd) });
+        b_.CreateAlignedStore(lv_string_ptr(lv), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
+        llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
+        b_.CreateCall(str_init_fn(), { staged });
+        b_.CreateCall(str_assign_fn(),
+                      { staged, str_of(rhs), alloc_site_global(SourceText{ .where = "<unknown>" }, "string") });
+    }
+
+    // Replay a string's deferred whole-NBA records: move each staged handle into its
+    // destination (push order, so the last write of the instant wins and every
+    // superseded buffer is freed exactly once — the move releases what the
+    // destination held). rt_string_move re-inits the staged handle, so the record's
+    // retained capacity is left as a valid empty string for the next instant.
+    //
+    // No wake and no VCD touch, unlike the container commit: a string is refused
+    // from sensitivity lists and event controls in the frontend (so no process can
+    // be waiting on one) and has no $var form.
+    void emit_string_whole_commit(Signal sig) {
+        auto*          rt    = str_rec_ty();
+        const auto     strd  = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
+        auto*          i8    = b_.getInt8Ty();
+        const uint32_t idx   = str_buf_idx(sig);
+        llvm::Value*   base  = b_.CreateCall(nba_arr_base_fn(), { b_.getInt32(idx) });
+        llvm::Value*   count = b_.CreateCall(nba_arr_count_fn(), { b_.getInt32(idx) });
+
+        auto* fn    = b_.GetInsertBlock()->getParent();
+        auto* head  = llvm::BasicBlock::Create(ctx_, "snba.head", fn);
+        auto* body  = llvm::BasicBlock::Create(ctx_, "snba.body", fn);
+        auto* done  = llvm::BasicBlock::Create(ctx_, "snba.done", fn);
+        auto* entry = b_.GetInsertBlock();
+        b_.CreateBr(head);
+        b_.SetInsertPoint(head);
+        auto* k = b_.CreatePHI(b_.getInt32Ty(), 2);
+        k->addIncoming(b_.getInt32(0), entry);
+        b_.CreateCondBr(b_.CreateICmpULT(k, count), body, done);
+        b_.SetInsertPoint(body);
+        llvm::Value* rec    = b_.CreateInBoundsGEP(i8, base, { b_.CreateMul(k, b_.getInt32(strd)) });
+        llvm::Value* dest   = b_.CreateAlignedLoad(raw_ptr_ty(), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
+        llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
+        b_.CreateCall(str_move_fn(), { dest, staged });
+        k->addIncoming(b_.CreateAdd(k, b_.getInt32(1)), b_.GetInsertBlock());
+        b_.CreateBr(head);
+        b_.SetInsertPoint(done);
     }
 
     // Largest leaf slot byte size across an aggregate type (sizes the deferred
@@ -21639,7 +21909,7 @@ private:
         // A function copies output / inout formals back through their pointers at
         // each return point (LRM 13.5), before releasing the body and returning.
         emit_copyout(*cur_fn_);
-        if (is_string_type(cur_fn_->return_type)) {
+        if (is_string_type(cur_fn_->return_type) && !is_agg_abi(cur_fn_->return_type)) {
             // Copy the result out through the trailing out-param handle BEFORE
             // releasing the body's strings (the value may be one of them).
             b_.CreateCall(str_assign_fn(), { fn_->getArg(fn_->arg_size() - 1), str_of(value),
@@ -21791,7 +22061,7 @@ private:
                 if (dir == ArgDir::Out || dir == ArgDir::Inout) {
                     emit_gc_barrier_for(lvalue_of(a));
                 }
-            } else if (is_string_type(f.param_types[k])) {
+            } else if (is_string_type(f.param_types[k]) && !is_agg_abi(f.param_types[k])) {
                 // One rt_string handle pointer in every direction (data-model.md §6):
                 // In passes the actual's handle and the callee deep-copies it into
                 // its frame slot; out / inout passes the caller TEMP's handle, which
@@ -21830,11 +22100,20 @@ private:
             ++k;
         }
         if (is_agg_abi(f.return_type)) {
-            // Safe-temp aggregate return: the callee memcpies its result into a
-            // caller stack temp we pass as the trailing out-param; the call result
-            // is that temp lvalue (the frontend copies it into the target).
+            // Safe-temp aggregate return: the callee copies its result into a caller
+            // temp we pass as the trailing out-param; the call result is that temp
+            // lvalue (the frontend copies it into the target). A plane-only result is
+            // a plain stack alloca — its byte image is its value and it owns nothing.
+            // A MANAGED-LEAF result instead uses the body-lifetime buffer
+            // build_agg_elem_temps made for this call: the callee's copy-out is
+            // per-leaf, so it needs constructed leaves to assign over, and the heap
+            // it hands back has to be released at a body exit rather than leaked with
+            // the stack slot.
             auto*        st  = agg_storage_ty(f.return_type);
-            llvm::Value* tmp = b_.CreateAlloca(st, nullptr, "call.agg.ret");
+            llvm::Value* tmp = agg_elem_ret_[static_cast<uint32_t>(i)];
+            if (tmp == nullptr) {
+                tmp = b_.CreateAlloca(st, nullptr, "call.agg.ret");
+            }
             argv.push_back(tmp);
             b_.CreateCall(fnty, callee, argv);
             LValue lv{};
@@ -27232,6 +27511,11 @@ private:
     // Container type of each handle_nba_sigs_ entry, parallel to it. Recorded from
     // the op rather than re-derived from the signal; see the registration comment.
     std::vector<Ref>        handle_nba_types_;
+    // Signals taking a whole-string nonblocking assignment (`s <= t`). Their records
+    // are the fourth range of the shared rt_nba_arr_* index space; a string needs
+    // its own because the staged value is an OWNED 32-byte handle, not a plane word
+    // and not a container handle (the record's move is rt_string_move).
+    std::vector<Signal> string_nba_sigs_;
 
     // Whole-scalar targets of a nonblocking intra-assignment delay (`x <= #d y`,
     // StoreNbDelay). Each gets a dense id; a per-target record (rt_intra_*) holds

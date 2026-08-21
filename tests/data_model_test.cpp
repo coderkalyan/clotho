@@ -619,18 +619,10 @@ const Allow allowlist[] = {
       "inout/ref port with a non-whole-signal connection is not supported",
       "§6: the net mode is Plane-only; a container or aggregate sub-object is "
       "not a whole net (LRM 23.3.3.7)." },
-    // -- The three remaining gaps, each its own separately tracked item. Every one
-    // is a shape whose value is a heap handle that some path cannot stage or copy;
-    // none is an element x container x mode interaction. --
+    // -- The two remaining gaps, each its own separately tracked item. Both are a
+    // shape whose value is a heap handle that some path cannot stage or copy; neither
+    // is an element x container x mode interaction. --
     //
-    // A string's rvalue materializes into a body temp rather than resolving to a
-    // handle lvalue, so it does not fit HandleCopyNb's record staging.
-    { [](const Cell& k) {
-          return (k.m->kind == P::nonblocking || k.m->kind == P::nba_target) &&
-                 k.e->name == std::string("string");
-      },
-      "nonblocking assignment to a string is not supported",
-      "§7: a string rvalue is a body temp, not a stageable handle lvalue." },
     // Every NBA staging buffer -- the scalar shadow slot, the aggregate image and
     // the container-handle record -- is indexed by Signal. An object body is a heap
     // block with no signal, so a class property reaches none of them.

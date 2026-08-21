@@ -151,3 +151,57 @@ an aggregate VALUE element with a managed leaf: the kind-4 table it needs now ex
 but a leaf string / handle access reaches `agg_slot_ptr` with the assoc base still
 deferred, which the backend refuses. Resolving that means choosing get_ptr vs put_ptr
 per leaf access, which is the one thing a queue element never has to do.
+
+## 3. NBA to a `string` — LANDED
+
+A string is Managed like a queue, so it has the same problem and takes the same
+shape: the per-signal NBA shadow is a plane-shaped integer mirror, and an
+`rt_string` is a 32-byte owning handle. Committing it by memcpy out of a byte
+image would leave two owners of one heap buffer and free it twice.
+
+What it does NOT reuse is `HandleCopyNb`. That op's payload is a source handle
+*lvalue* (`QueueArg`), consumed through `lvalue_of` + `lv_handle_ptr`; a string
+rvalue is often a body temp with no LValue at all, so the accessor does not
+resolve. The ordinary `StoreNb` already carries everything needed — a string
+lvalue and a string-valued operand (`str_of` is total over string instructions) —
+so the string path is a branch in `StoreNb`, not a new IR tag.
+
+**The record.** A fourth range of the shared `rt_nba_arr_*` index space (after
+array, aggregate and container), `{ ptr dest, rt_string staged }`:
+
+- **Active region** (`emit_string_whole_nba`): reserve the record, store the
+  destination handle's pointer, **`rt_string_init` the staged handle**, then
+  `rt_string_assign` the RHS into it. The staged handle owns its value from here.
+- **NBA region** (`emit_string_whole_commit`): `rt_string_move(dest, staged)` per
+  record, in push order. The move releases what the destination held, so a target
+  written twice in one instant keeps the last write and frees the superseded buffer
+  exactly once; it also re-inits the staged handle, so the record's retained
+  capacity is a valid empty string for the next instant.
+
+**Two deliberate differences from the container recipe.**
+
+1. **`init`, not `memset`.** Every container handle's empty image is all-zero; an
+   empty `rt_string` is not (byte 31 holds the inline capacity). A memset here
+   would make `rt_string_assign` read a bogus capacity out of the record.
+2. **No wake, no VCD touch.** A string is refused from sensitivity lists and event
+   controls in the frontend, so no process can be waiting on one, and a string has
+   no `$var` form. The container commit's `service_any_waiters` / `rt_vcd_touch`
+   have no counterpart.
+
+**Leaves come free.** The record carries the destination *pointer*, not a signal
+identity, so a string member of an unpacked struct and a string element of a fixed
+unpacked array use the same range keyed on their ROOT signal — which is also what
+closes a whole-aggregate NBA carrying a string member (`emit_agg_copy` decomposes
+it into one per-leaf `StoreNb`). Classification is by lvalue shape
+(`lvalue_is_string_place`), tested ahead of the array and aggregate branches so
+those never claim a string store; a signal may appear in both ranges (a struct with
+a string member and an integral array member takes both, at distinct indices).
+
+### Still guarded
+
+`s[i] <= c` — one character. That is a masked write into an existing value, not the
+replacement of a whole handle, so it needs a record carrying an index and a byte
+rather than a staged string. `s <= #5 t` also stays refused: intra-assignment
+timing rides the separate `rt_intra_*` pool, whose record is a fixed-width packed
+value. An NBA to a string class property is refused for the reason every class
+property is (staging is signal-keyed; an object body has no shadow).

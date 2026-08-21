@@ -884,22 +884,40 @@ TEST_CASE("pure virtual: queue return") {
     CHECK(run_capture(src) == "2 2 3\n3 9 24\n");
 }
 
-// The one pure virtual return shape still deferred: an aggregate that owns heap (a
-// string member) returns by value, which needs a per-leaf deep copy rather than the
-// memcpy the return ABI emits. build_pure_stub guards it exactly as build_function
-// guards a concrete body, so the declaration is rejected whichever is lowered first.
-TEST_CASE("pure virtual returning a string-containing aggregate fails loudly") {
-    const std::string d = fails(R"(
+// An aggregate that owns heap (a string member) now returns by value like any
+// other: the return ABI's copy is per-leaf (emit_agg_deep_copy) instead of a
+// memcpy, so the caller's result temp owns its own strings. Through a virtual
+// dispatch, so the pure stub's signature and the override's agree.
+TEST_CASE("pure virtual: aggregate return with a string member") {
+    constexpr std::string_view src = R"(
         module m;
             typedef struct { string s; int i; } rec;
-            virtual class Base; pure virtual function rec f(); endclass
-            class Der extends Base;
-                virtual function rec f(); rec r; r.s = "x"; r.i = 1; return r; endfunction
+            virtual class Base;
+                pure virtual function rec f();
             endclass
-            initial begin Der d; d = new(); end
+            class Der extends Base;
+                string tag;
+                function new(string t); tag = t; endfunction
+                virtual function rec f();
+                    rec r;
+                    r.s = {"<", tag, ">"};
+                    r.i = tag.len();
+                    return r;
+                endfunction
+            endclass
+            Base b;
+            rec  got;
+            initial begin
+                b   = Der::new("first");
+                got = b.f();
+                $display("[%s] %0d", got.s, got.i);
+                b   = Der::new("0123456789012345678901234567890123456789");
+                got = b.f();
+                $display("[%s] %0d", got.s, got.i);
+            end
         endmodule
-    )");
-    CHECK(d.find("by-value return of a string-containing aggregate is not supported") != std::string::npos);
+    )";
+    CHECK(run_capture(src) == "[<first>] 5\n[<0123456789012345678901234567890123456789>] 40\n");
 }
 
 // -- Parameterized classes (LRM 8.25) --

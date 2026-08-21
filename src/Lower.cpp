@@ -3276,13 +3276,7 @@ private:
         if (is_void) {
             b.ret_void(el);
         } else {
-            const bool agg = is_agg_abi_type(proto.getReturnType());
-            if (agg && !is_trivially_copyable(return_type)) {
-                // TODO: by-value return of a string-containing aggregate / array — the
-                // same gap build_function guards for a concrete body, repeated here so
-                // the prototype is rejected even when no override is ever lowered.
-                fail("by-value return of a string-containing aggregate is not supported");
-            }
+            const bool     agg = is_agg_abi_type(proto.getReturnType());
             const uint32_t rl = static_cast<uint32_t>(local_types.size());
             local_types.push_back(return_type);
             const ir::Index rv = b.local(rl, return_type, el);
@@ -3929,18 +3923,11 @@ private:
             }
             return;
         }
-        if (value_cat(type) == ValueCat::string && tag != ir::Inst::Tag::Store) {
-            // TODO: nonblocking copy of a string member. A string's value is a heap
-            // handle, so it has no plane-shaped shadow to stage into, and the
-            // whole-container record path this pass built stages a CONTAINER handle
-            // (HandleCopyNb), which an rt_string is not.
-            //
-            // Guarded rather than gapped: falling through to the plane StoreNb below
-            // reached the backend with a string lvalue and no string path, which
-            // crashed codegen instead of reporting anything.
-            fail("nonblocking assignment to an aggregate with a string member is not "
-                 "supported");
-        }
+        // A string leaf's nonblocking store needs no guard: StoreNb on a string place
+        // stages an OWNED deep copy of the handle in the string NBA record range and
+        // moves it into the leaf in the NBA region (emit_string_whole_nba), the same
+        // machinery a whole-string `s <= t` uses — the record carries the leaf's
+        // destination pointer, so a member or a fixed-array element works the same.
         b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
     }
 
@@ -4243,6 +4230,34 @@ private:
     // True if an expression is of the dynamic `string` type (LRM 6.16).
     static bool is_string_expr(const slang::ast::Expression& e) {
         return e.type->getCanonicalType().isString();
+    }
+
+    // Whether a string lvalue is a PLACE whose nonblocking assignment the string NBA
+    // record can serve: it needs a destination address that exists when the RHS is
+    // sampled and still exists at the commit. A whole variable qualifies, as does a
+    // member of an unpacked struct or an element of a FIXED unpacked array (both are
+    // fixed offsets inside their root signal's storage), composed to any depth. An
+    // element of a queue / dynamic / associative array does not: its slot can be
+    // created, moved or freed between the two regions.
+    static bool is_string_nba_place(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+            case ExpressionKind::HierarchicalValue:
+                return true;
+            case ExpressionKind::MemberAccess: {
+                const Expression& base = e.as<MemberAccessExpression>().value();
+                // A class property is refused earlier (no per-object shadow); an
+                // unpacked-struct member is a fixed offset in its root's storage.
+                return !base.type->getCanonicalType().isClass() && is_string_nba_place(base);
+            }
+            case ExpressionKind::ElementSelect: {
+                const Expression& base = e.as<ElementSelectExpression>().value();
+                return base.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() != nullptr &&
+                       is_string_nba_place(base);
+            }
+            default:
+                return false;
+        }
     }
 
     // True if an interned IR type is the string type, or an unpacked array whose
@@ -18754,6 +18769,16 @@ private:
                     // TODO: nonblocking assignment to a subroutine local / formal argument.
                     fail("nonblocking assignment to a subroutine-local variable is not supported");
                 }
+                if (vs.kind == SymbolKind::ClassProperty) {
+                    // An UNQUALIFIED property write inside a method (`p <= x`, no
+                    // `this.`): the same gap the explicit `obj.p <= x` form reports in
+                    // lower_assign, which only sees a MemberAccess. Located here
+                    // instead of reaching the backend as an unaddressable NBA root
+                    // (which failed with no source location for every type).
+                    // TODO: shared with the class-property NBA gap — an object body is
+                    // a heap block with no per-object shadow.
+                    fail("nonblocking assignment to a class property is not supported");
+                }
                 return;
             }
             default:
@@ -19008,8 +19033,9 @@ private:
             // nonblocking copy, a `'{...}` pattern, a string-literal assignment,
             // or a slice on either side decomposes per element: each leaf store
             // into an array element rides the backend's deferred array-NBA queue
-            // (nba_classify_ir) for the NBA case. A string array (heap-owning
-            // elements) is still unsupported.
+            // (nba_classify_ir) for the NBA case. An array with heap-owning
+            // elements (string / container) also decomposes per element, each leaf
+            // a deep copy; only its NONBLOCKING form is still refused (emit_agg_copy).
             const ir::Ref       ty        = lower_type(*a.left().type);
             const Expression&   src       = unwrap_conversion(a.right());
             const ir::Inst::Tag tag       = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
@@ -19044,7 +19070,7 @@ private:
                 return true_const(b, loc(a));
             }
             const bool slice_src = src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src);
-            if (is_trivially_copyable(ty) && (is_whole_array_lvalue(src) || slice_src)) {
+            if (is_whole_array_lvalue(src) || slice_src) {
                 // Array-to-array copy where a fast memcpy does not apply: a
                 // nonblocking copy, or a slice on either side (a constant-bounds
                 // ArrSlice lvalue, or an indexed slice materialized into a temp).
@@ -19056,7 +19082,7 @@ private:
                   lower_lvalue(a.left(), b), array_copy_source(a.left(), src, ty, b, loc(a)), ty, tag, b, loc(a));
                 return true_const(b, loc(a));
             }
-            if (src.kind == ExpressionKind::Call && is_trivially_copyable(ty)) {
+            if (src.kind == ExpressionKind::Call) {
                 // `arr = f(...)`: the callee returns its result into a canonical
                 // aggregate temp (the call result lvalue); copy it into the array
                 // target element-wise (a flat / narrowed target is not memcpy-
@@ -19070,10 +19096,12 @@ private:
                 emit_agg_copy(lower_lvalue(a.left(), b), *cv, ty, tag, b, loc(a));
                 return true_const(b, loc(a));
             }
-            // TODO: whole-array copy of a string array (heap-owning elements) —
-            // element-wise deep copy.
+            // A whole-array assignment whose source is none of the shapes above (a
+            // non-lvalue, non-pattern, non-call expression) has no array value to
+            // copy from.
             fail("whole unpacked array assignment is not supported");
         }
+
         // s[i] = c writes one character in place; out-of-range or a zero byte is
         // a no-op (LRM 6.16.2). The LHS element is byte-typed, so detect it via
         // the selected base.
@@ -19091,9 +19119,16 @@ private:
             b.str_putc(str, idx, chr, loc(a));
             return chr;
         }
-        if (is_string_expr(a.left()) && a.isNonBlocking()) {
-            // TODO: nonblocking assignment to strings (needs a string-aware NBA
-            // staging path; the per-signal shadow is plane-shaped).
+        if (is_string_expr(a.left()) && a.isNonBlocking() && !is_string_nba_place(a.left())) {
+            // Every string PLACE — a whole variable, a struct member, a fixed-array
+            // element — falls through to StoreNb, which stages an owned deep copy of
+            // the handle in the string NBA record range and moves it into the place's
+            // own destination in the NBA region. This is the backstop for the rest,
+            // each already reported elsewhere: a string character (`s[i] <= c`) above,
+            // a class property in lower_assign / check_subroutine_nba_target, and an
+            // element of a queue / dynamic / associative array of strings by slang
+            // itself (LRM 10.4.2 forbids a nonblocking assignment to an element of a
+            // dynamically sized array).
             fail("nonblocking assignment to a string is not supported");
         }
         if (a.isNonBlocking() && a.left().kind == ExpressionKind::ElementSelect &&
@@ -21959,10 +21994,6 @@ private:
             // same gap the constant-bounds form has).
             fail("slice of an unpacked array with aggregate elements is not supported");
         }
-        if (!is_trivially_copyable(lower_type(*rs.type))) {
-            // TODO: indexed slice of a string-element array (per-element deep copy).
-            fail("slice of an unpacked array with string elements is not supported");
-        }
     }
 
     // The declared-range coordinate of 0-based position `pos` of an unpacked array
@@ -22074,10 +22105,6 @@ private:
         }
         if (is_whole_array_lvalue(src) || (src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src))) {
             return lower_lvalue(src, b);
-        }
-        if (!is_trivially_copyable(ty)) {
-            // TODO: staging a string-element array rvalue (per-element deep copy).
-            fail("unpacked-array slice assignment from a string-element array is not supported");
         }
         if (as_assignment_pattern(src) != nullptr || src.kind == ExpressionKind::StringLiteral) {
             const ir::Index temp = make_canonical_agg_temp(ty, b, l);
@@ -22952,18 +22979,11 @@ private:
     // Outside a function: a module Signal. Inside a function: a persistent Signal
     // for a static local, else a per-call frame Local.
     void declare_storage(const VariableSymbol& vs, bool force_frame) {
-        if (fn_ctx_ != nullptr && !is_static_local(vs, force_frame) &&
-            vs.getType().getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
-            if (!is_trivially_copyable(lower_type(vs.getType()))) {
-                // TODO: a string / heap-handle-element array frame local (per-element
-                // init/deinit in the frame — the "unpacked arrays of string" gap).
-                fail("string- or handle-element unpacked array as a function local is "
-                     "not supported");
-            }
-            // A trivially copyable fixed array is a per-call frame Local with the
-            // canonical aggregate storage mirror (build_frame_layout). A static-
-            // lifetime array local keeps persistent module-memory storage below.
-        }
+        // A fixed unpacked array frame local is a per-call frame Local with the
+        // canonical aggregate storage mirror (build_frame_layout); its managed leaves
+        // are constructed by init_frame and released by deinit_body_strings, so a
+        // string / container element needs nothing extra here. A static-lifetime
+        // array local keeps persistent module-memory storage below.
         if (fn_ctx_ == nullptr) {
             declare_local(vs);
         } else if (is_static_local(vs, force_frame)) {
@@ -23920,12 +23940,9 @@ private:
                 // the frame Local back through the passed pointer at each return. A
                 // struct-bearing actual passes its own storage pointer directly; a
                 // plain array actual passes a canonical caller temp that
-                // build_call_args copies back into the actual after the call.
-                if (!is_trivially_copyable(lower_type(fa->getType()))) {
-                    // TODO: by-value copy of a string-containing aggregate (needs a
-                    // per-leaf deep copy of the storage, not a memcpy).
-                    fail("by-value pass of a string-containing aggregate is not supported");
-                }
+                // build_call_args copies back into the actual after the call. A
+                // managed leaf (string / container) rides the same pointers — the copy
+                // is per-leaf rather than a memcpy (emit_agg_deep_copy).
             }
             param_types.push_back(lower_type(fa->getType()));
             arg_dirs.push_back(to_arg_dir(fa->direction));
@@ -23933,10 +23950,6 @@ private:
         }
 
         if (!is_void) {
-            if (is_agg_abi_type(sub.returnValVar->getType()) && !is_trivially_copyable(return_type)) {
-                // TODO: by-value return of a string-containing aggregate / array.
-                fail("by-value return of a string-containing aggregate is not supported");
-            }
             ctx.has_ret_local = true;
             ctx.ret_type      = return_type;
             // The implicit return variable is fresh per call even for a static
@@ -25515,11 +25528,7 @@ private:
                 //     ordinary store path (emit_call_copyouts), or the callee's raw
                 //     memcpy through the actual's pointer would leave the signal's
                 //     wait queue unserviced -- `always @(s.a)` would not wake.
-                const bool flat = !contains_struct_ref(pty);
-                if (!is_trivially_copyable(pty)) {
-                    fail(flat ? "by-value pass of a string- or handle-element array is not supported"
-                              : "by-value pass of a string-containing aggregate is not supported");
-                }
+                const bool        flat   = !contains_struct_ref(pty);
                 const Expression* actual = actuals[i];
                 if (actual->kind == ExpressionKind::Assignment) {
                     actual = &actual->as<AssignmentExpression>().left();
