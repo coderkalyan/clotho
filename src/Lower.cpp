@@ -15356,6 +15356,142 @@ private:
         return pred;
     }
 
+    // -- `case` over a string selector --
+    //
+    // LRM AMBIGUITY, decided here. 12.5 words a `case` match as a bit-for-bit `===`
+    // between selector and label, over operands zero-extended to the widest. Neither
+    // half of that is defined for `string`: Table 11-1 bars `===` on a string exactly
+    // as it does on a real, and 6.16 makes `string` a dynamic-length type with no bits
+    // and no width to extend to. 6.16.9 defines `==` / `!=` (and the relational
+    // operators) over string content, and defines no `===`. So a string `case` is not
+    // *sanctioned* by 12.5 -- and it is not prohibited either: 12.5 puts no type
+    // restriction on the case expression, and slang binds it.
+    //
+    // Read as content equality (`==`, 6.16.9). It is the only reading that is both
+    // well defined and degenerates correctly: a string carries no x/z, which is the
+    // whole content of the 4-state rule, so `===` collapses onto `==` -- the same call
+    // the real path already makes (lower_case_real, TODO.md "case on a real
+    // selector"). The zero-extension half is dropped rather than reinterpreted: there
+    // is no width to extend to, and padding one side would contradict 6.16.9's
+    // content comparison. A string literal's NUL bytes are already dropped where the
+    // literal becomes a string (6.16), so `"\000A"` and `"A"` are one value here and
+    // match -- Verilator 5.050 agrees.
+    //
+    // No oracle: iverilog 13 does not compile a string `case` at all (it dies
+    // in `draw_eval_vec4` on an assertion), so this is pinned to the
+    // LRM text above rather than to a simulator. Verilator 5.050 does accept it and
+    // agrees with content equality, which is corroboration and not authority.
+    //
+    // UVM is why this exists: `uvm_string_to_verbosity` and `uvm_string_to_action`
+    // (uvm_globals.svh) dispatch `+UVM_VERBOSITY=` and `+uvm_set_action` this way,
+    // and there are nine such statements in the parts of uvm-core a testbench reaches.
+    ir::Index string_case_label_pred(const Expression& label, ir::Index sel, ir::Builder& b) {
+        if (label.kind == ExpressionKind::ValueRange) {
+            // TODO: `case (s) inside ["a":"z"]` — 11.4.13 membership over a range is
+            // the pair of relational comparisons, which 6.16.9 does define for strings
+            // (lexicographic), so this is implementable; nothing reaches it yet.
+            fail("case ... inside with a string range bound is not supported");
+        }
+        if (!is_string_expr(label)) {
+            // Unreachable from source: slang rejects a mixed string case itself
+            // ("case expression of type 'bit[7:0]' is not comparable to common type
+            // 'string'"), because 12.5 needs one common type across selector and
+            // labels. Kept because the reading below assumes both sides are strings,
+            // and 6.16 does define string/packed conversion, so a future slang could
+            // start admitting it.
+            fail("a non-string label in a case statement over strings is not supported");
+        }
+        return b.binary(ir::Inst::Tag::Eq, sel, lower_expr(label, b), loc(label));
+    }
+
+    // OR of one case_item's label predicates, as every other case path builds it.
+    ir::Index string_case_item_pred(const CaseStatement::ItemGroup& item, ir::Index sel, ir::Builder& b) {
+        ir::Index pred = string_case_label_pred(*item.expressions[0], sel, b);
+        for (size_t j = 1; j < item.expressions.size(); j++) {
+            const Expression* e   = item.expressions[j];
+            const ir::Index   one = string_case_label_pred(*e, sel, b);
+            pred                  = b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e));
+        }
+        return pred;
+    }
+
+    // Lazy first-match chain, the shape lower_case_real_item uses and for the same
+    // reason: item k's predicate is built in the enclosing else region, so a later
+    // label -- and any side effect in it -- is evaluated only if every earlier item
+    // missed (12.5).
+    void lower_case_string_item(const CaseStatement& c, size_t k, ir::Index sel, bool report_viol, ir::Builder& b) {
+        if (k == c.items.size()) {
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            } else if (report_viol) {
+                b.case_violation(case_banner(c), 0, loc(c));
+            }
+            return;
+        }
+        const ir::Index pred = string_case_item_pred(c.items[k], sel, b);
+
+        b.open_region();
+        lower_stmt(*c.items[k].stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        lower_case_string_item(c, k + 1, sel, report_viol, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, loc(*c.items[k].stmt));
+    }
+
+    // `case` with a string selector. The selector is lowered ONCE (12.5: the case
+    // expression is evaluated once, before any label), and every label compares
+    // against that value.
+    //
+    // `(* full_case *)` / `(* parallel_case *)` are skipped for the reason the real
+    // path skips them: both enumerate the selector's integral value space, and a
+    // string does not have one. unique / unique0 / priority keep their 12.5.3 checks.
+    void lower_case_string(const CaseStatement& c, ir::Builder& b) {
+        using Check = slang::ast::UniquePriorityCheck;
+        if (c.condition == CaseStatementCondition::WildcardJustZ ||
+            c.condition == CaseStatementCondition::WildcardXOrZ) {
+            // Unreachable from source: slang rejects it itself ("invalid type 'string'
+            // for casez expression"). Kept because the do-not-care positions of
+            // `casez` / `casex` are bits of a 4-state vector (12.5.1) and a string has
+            // none, so if it ever did arrive there would be nothing for the wildcard
+            // to mean -- and silently demoting it to `case` would be a wrong answer
+            // rather than a refusal.
+            fail("casez / casex over strings is not supported");
+        }
+        const bool no_match_report =
+          (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
+        const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
+
+        const ir::Index sel = lower_expr(c.expr, b);
+        if (!needs_overlap) {
+            lower_case_string_item(c, 0, sel, no_match_report, b);
+            return;
+        }
+        // unique / unique0 evaluate every item's predicate once up front (12.5.3
+        // permits it), share them with the overlap check, and dispatch off the same
+        // temps -- the real path's arrangement, and `allow_switch=false` for the same
+        // reason: there is no integral key to switch on.
+        std::vector<ir::Index> preds;
+        preds.reserve(c.items.size());
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            preds.push_back(string_case_item_pred(item, sel, b));
+        }
+        emit_overlap_check(preds, case_banner(c), loc(c), b);
+        slang::ast::ASTContext astCtx(*scope_, slang::ast::LookupLocation::max);
+        dispatch_preds(c,
+                       0,
+                       sel,
+                       /*width=*/0,
+                       /*key_width=*/0,
+                       astCtx,
+                       preds,
+                       no_match_report,
+                       b,
+                       /*allow_switch=*/false);
+    }
+
     // Lazy first-match chain for a real case, mirroring lower_case_item without
     // its jump-table attempt (a real has no integral key) and without case_dedup
     // (which compares labels as SVInt constants). Item k's predicate is built in
@@ -15822,9 +15958,11 @@ private:
             return;
         }
         if (is_string_expr(c.expr)) {
-            // TODO: case over strings (labels compare with rt_string_cmp; the
-            // common-type/resize machinery below is packed-only).
-            fail("case statement over strings is not supported");
+            // String selector: its own comparison chain, because everything below is
+            // packed-only (a common compare width, an SVInt label dedup, a jump table
+            // keyed on the selector). See lower_case_string for the LRM reading.
+            lower_case_string(c, b);
+            return;
         }
         if (has_real_case_operand(c)) {
             // Real selector or real label, `inside` included: its own comparison
