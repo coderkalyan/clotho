@@ -41,8 +41,22 @@ professional parity; M5 makes it complete.
 
 ### Subroutines
 
-- [ ] **Output / inout string formals** (function and task) — the copy-out path
-  passes plane pointers, not `rt_string` handles.
+- [x] **Output / inout string formals** (function and task, LRM 13.5) — a string is
+  Managed, so it now takes the Managed ABI of data-model.md §6 like a queue or a
+  dynamic array: ONE `rt_string*` per formal in every direction (the caller temp),
+  `rt_string_assign` copy-in for `inout`, and `rt_string_move` out of the frame slot
+  in the callee's epilogue — free, since copy-out is always immediately followed by
+  `deinit_body_strings`. The frontend's post-call copy re-resolves the actual, so
+  any place a string store can name is a legal actual (queue / dynarr / assoc
+  element, struct member, fixed-array element, class property, hierarchical ref),
+  and a task's copy-out rides its completion epilogue (visible when the caller
+  resumes, not when the body writes). A `disable`d activation skips copy-out, so the
+  actual keeps the temp's content — the same policy as a scalar out/inout arg (LRM
+  9.6.2 leaves it undefined; iverilog copies the pre-abort value instead). Fixed in
+  passing: `formal_param_count` and `declare_function` disagreed on a function's
+  out/inout string formal (1 param vs 2), which would have mis-indexed every later
+  formal. Still refused: a mixed string / packed actual (slang rejects it first —
+  neither direction is assignment compatible), and a string-element ARRAY by value.
 - [x] **DPI-C import function** (LRM 35) — `import "DPI-C" [pure] function` over
   the scalar-mapped types (byte/shortint/int/longint/real/shortreal/bit/logic;
   by-value, direct native `call`, ~1.8ns/call), packed vectors (bit[N]→

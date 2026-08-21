@@ -619,20 +619,10 @@ const Allow allowlist[] = {
       "inout/ref port with a non-whole-signal connection is not supported",
       "§6: the net mode is Plane-only; a container or aggregate sub-object is "
       "not a whole net (LRM 23.3.3.7)." },
-    // -- The four remaining gaps, each its own separately tracked item. Every one
+    // -- The three remaining gaps, each its own separately tracked item. Every one
     // is a shape whose value is a heap handle that some path cannot stage or copy;
     // none is an element x container x mode interaction. --
     //
-    // A string output / inout formal would have to copy an rt_string handle back
-    // through the (&mm, &z) plane-pointer pair the out/inout ABI passes.
-    { [](const Cell& k) {
-          const bool str = (k.e->traits & t_managed) != 0 && k.e->name == std::string("string");
-          return str && (k.m->kind == P::func_out || k.m->kind == P::func_inout ||
-                         k.m->kind == P::task_out || k.m->kind == P::task_inout);
-      },
-      "output/inout string arguments are not supported",
-      "§7: a string is Managed; the out/inout ABI passes plane pointers, not a "
-      "handle. Tracked under M3 Data types, not part of this pass." },
     // A string's rvalue materializes into a body temp rather than resolving to a
     // handle lvalue, so it does not fit HandleCopyNb's record staging.
     { [](const Cell& k) {
