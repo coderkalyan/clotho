@@ -2082,7 +2082,29 @@ project with its own algorithm, not tail cleanup on the property layer:
   corrupted the output (the splice did not skip `%%` escapes, so it substituted
   inside the literal and left the real specifier for the runtime formatter to abort
   on), and a `%p` operand was lowered twice (a call operand ran twice). Remaining:
-  - [ ] `%p` of a class / chandle / event / virtual-interface handle — rejected
+  - [x] **`%p` of a class handle** (LRM 21.2.1.6) — **another implementation-defined
+    form decided deliberately.** The clause describes `%p` over aggregate VALUES and
+    a handle is not one; it says nothing about what a handle prints beyond `null` for
+    a null one. Decision: a null handle prints `null`, any other prints its CLASS
+    NAME, at **every depth** — a direct operand, a struct member, a container
+    element. The uniformity is the point: it is cycle-safe by construction, and UVM's
+    object graphs are cyclic (`uvm_component` holds `m_parent` and `m_children`), so
+    expanding properties would not terminate without a depth cap the LRM does not
+    define. Verilator 5.050 is itself inconsistent — it expands a direct operand
+    (`'{x:'h5, i:t::Inner}`) but prints the type name for a handle inside a container
+    (`'{t::C}`) — so there is no reference behaviour to match, only a choice to
+    record. iverilog is no oracle either: it cannot compile a queue of class handles
+    at all. The name is unqualified (a specialization carries its own arguments,
+    `uvm_queue#(uvm_callback)`); Verilator writes `pkg::C`. Rendered by
+    `class_p_render` as a select over two string constants, so nothing dereferences
+    the handle. A class-handle container ELEMENT routes the container through the
+    loop render (`build_container_p_string`) rather than the flat runtime descriptor,
+    which would have printed the pointer word. Needed by uvm_queue's
+    `convert2string`, which is `%p` over a queue of handles.
+    Follow-up: expand the properties of a DIRECT operand, the one depth where a
+    cycle cannot be reached in one step, leaving nested handles as names.
+  - [ ] `%p` of a chandle / event / virtual-interface handle — rejected loud; unlike
+    a class handle, none of these has a name to print in place of the object.
   - [ ] `%0p` — a field width / flags on the whole pattern is rejected loud.
   - [ ] `%p` of a queue / dynamic array of tagged unions — rejected loud.
   - [ ] `%p` of an associative-array leaf inside an aggregate — rejected loud.

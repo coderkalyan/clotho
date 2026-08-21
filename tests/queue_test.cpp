@@ -903,18 +903,34 @@ TEST_CASE("dynamic array of class handles") {
                               "n=2 v=6\n");
 }
 
-TEST_CASE("%p of a container of class handles is rejected loudly") {
-    // A handle has no printable value the flat container descriptor can reach.
-    expect_fail(R"(
+// `%p` over a container of class handles. Each element renders as `null` or its class
+// name -- the same rule a handle follows at any other depth, which is what keeps it
+// cycle-safe. The element cannot go through the flat runtime descriptor (a handle is
+// a 64-bit word, so it would print the pointer), so a class element routes the
+// container through the loop render instead, like every other element the descriptor
+// cannot describe. Verilator 5.050 prints `'{t::Item}` here, the same shape.
+TEST_CASE("%p of a container of class handles prints the class name per element") {
+    CHECK(run_capture(R"(
         class Item;
             int v;
         endclass
         module m;
             Item q[$];
-            initial $display("%p", q);
+            Item d[];
+            Item a[2];
+            initial begin
+                Item it = new;
+                q.push_back(it);
+                q.push_back(null);
+                d = new[2];
+                d[1] = new;
+                a[0] = new;
+                $display("q=%p d=%p a=%p", q, d, a);
+                q.delete();
+                $display("empty=%p", q);
+            end
         endmodule
-    )",
-                "%p of a queue / dynamic array of class handles is not supported");
+    )") == "q='{Item, null} d='{null, Item} a='{Item, null}\nempty='{}\n");
 }
 
 TEST_CASE("an event element is a distinct event per slot") {

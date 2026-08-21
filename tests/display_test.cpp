@@ -476,15 +476,51 @@ TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"
             endmodule
         )") == "'{r:1.5, s:\"hi\", n:-3} \"top\" \"lit\" 0.333333\n");
     }
-    SUBCASE("a class handle operand is refused loudly") {
-        // 21.2.1.6 wants an implementation-defined handle form with `null` for a null
-        // handle; printing the raw handle word as a decimal would be silently wrong.
+    SUBCASE("a chandle operand is still refused loudly") {
+        // A class handle now renders (see the %p handle test below); a chandle has no
+        // name to print in place of the object, so it stays refused.
         check_rejected(R"(
             module m;
-                class C; int x; endclass
-                C c;
-                initial $display("%p", c);
+                import "DPI-C" function chandle mk();
+                chandle h;
+                initial begin h = mk(); $display("%p", h); end
             endmodule
         )", "handle is not supported");
     }
+}
+
+// `%p` of a class handle. 21.2.1.6 describes %p over aggregate VALUES and a handle is
+// not one, so the form is implementation-defined; clotho prints `null` for a null
+// handle and the class name otherwise, at every depth. That uniformity is what makes
+// it cycle-safe -- UVM's graphs are cyclic (uvm_component holds m_parent and
+// m_children), so expanding properties would not terminate. Verilator 5.050 expands a
+// direct operand (`'{x:'h5}`) but prints the type name inside a container
+// (`'{t::C}`), so there is no consistent reference behaviour to match.
+TEST_CASE("%p of a class handle prints null or the class name") {
+    const std::string out = run_capture(R"(
+        module m;
+            class Inner;
+                int y = 9;
+            endclass
+            class Outer;
+                int   x = 5;
+                Inner i;
+            endclass
+            typedef struct { int a; Outer h; } st;
+            Outer o, nul;
+            st    s;
+            initial begin
+                o = new;
+                o.i = new;
+                $display("null:   %p", nul);
+                $display("live:   %p", o);
+                s.a = 3;
+                s.h = o;
+                $display("member: %p", s);
+                s.h = null;
+                $display("mnull:  %p", s);
+            end
+        endmodule
+    )");
+    CHECK(out == "null:   null\nlive:   Outer\nmember: '{a:3, h:Outer}\nmnull:  '{a:3, h:null}\n");
 }

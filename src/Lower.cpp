@@ -18351,6 +18351,23 @@ private:
         return false;
     }
 
+    // The `%p` text of a class handle value `v`: `null` when the handle is null, else
+    // the class's name. A select over two string constants, so nothing dereferences
+    // the handle and there is no branch to build -- see expand_p_scalar for why the
+    // name rather than the object's properties.
+    //
+    // The name is unqualified. A specialization prints the name slang gives it, which
+    // already carries its arguments (`uvm_queue#(uvm_callback)`); the scope is left
+    // off, where Verilator writes `pkg::C`. Implementation-defined either way.
+    ir::Index class_p_render(ir::Index v, const slang::ast::ClassType& clt, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Ref   u64  = make_int_type(64, false, false);
+        const ir::Index null = b.constant(module_.pool.put_int(u64, 0), l);
+        return b.select(b.binary(ir::Inst::Tag::Eq, v, null, l),
+                        b.constant(string_value_ref("null"), l),
+                        b.constant(string_value_ref(clt.name), l),
+                        l);
+    }
+
     // A `%p` element that is already an rvalue: one of the four named singular
     // cases, else the per-element leaf rules that close LRM 21.2.1.6's list. An
     // integral leaf prints "as [it] would unformatted", i.e. minimal decimal signed
@@ -18374,6 +18391,33 @@ private:
             frag += "\"%s\"";
         } else if (!sty.isIntegral()) {
             const ir::Ref cl = lower_type(sty);
+            if (sty.getCanonicalType().isClass()) {
+                // A class handle. LRM 21.2.1.6 describes %p over aggregate VALUES, and
+                // a handle is not one -- the clause says nothing about what a handle
+                // prints, beyond `null` for a null one. So the form is
+                // implementation-defined, and this is the choice, recorded in
+                // docs/TODO.md:
+                //
+                //   a null handle prints `null`; any other prints its CLASS NAME.
+                //
+                // One rule at every depth -- a direct %p operand, a struct member, a
+                // queue element -- which is what makes it cycle-safe by construction.
+                // Expanding an object's properties instead is more informative and is
+                // what Verilator does for a DIRECT operand, but it needs a depth cap
+                // or a visited set the LRM does not define, and UVM's object graphs
+                // are cyclic (uvm_component holds m_parent and m_children, so
+                // `%p` on one would not terminate). Verilator is itself inconsistent
+                // here -- it expands a direct operand but prints the type name for a
+                // handle inside a container -- so there is no reference behaviour to
+                // match, only a decision to make.
+                //
+                // TODO: expand the properties of a DIRECT %p operand (the one depth
+                // where a cycle cannot be reached in one step), leaving nested handles
+                // as names.
+                frag += "%s";
+                args.push_back(class_p_render(v, sty.getCanonicalType().as<slang::ast::ClassType>(), b, l));
+                return;
+            }
             if (is_handle_ref(cl) || is_agg_abi_ref(cl)) {
                 // TODO: %p of a container or aggregate ELEMENT. 21.2.1.6 recurses
                 // into one, but the runtime renderer works from a flat element
@@ -18382,12 +18426,9 @@ private:
                 // falling into the handle case below, whose reason is different.
                 fail("%p of a container or aggregate element is not supported");
             }
-            // TODO: %p of a class / chandle / event / virtual-interface handle. The
-            // clause wants an implementation-defined form with `null` for a null
-            // handle; Clotho has no handle rendering, and printing the raw pointer
-            // word as a decimal (what this used to do) is silently wrong.
-            fail("%p of a class / chandle / event / virtual interface handle is not "
-                 "supported");
+            // TODO: %p of a chandle / event / virtual-interface handle. Unlike a class
+            // handle above, none of these has a name to print in place of the object.
+            fail("%p of a chandle / event / virtual interface handle is not supported");
         } else {
             frag += "%0d";
         }
@@ -18467,8 +18508,15 @@ private:
             // element goes through the ordinary aggregate expansion.
             frag += "%s";
             const slang::ast::Type* est = sty != nullptr ? sty->getCanonicalType().getArrayElementType() : nullptr;
+            const bool              elem_is_class =
+              std::get<ir::Type>(module_.pool.get(t.element)).kind == ir::Type::Kind::Class;
+            // A class-handle element is a 64-bit word, so the flat runtime formatter
+            // would take it and print the pointer. It has a name to print instead
+            // (class_p_render), but only the frontend knows it, so route it through
+            // the loop like any other element the descriptor cannot describe.
             const bool              loop_render = value_cat(t.element) != ValueCat::scalar ||
                                                   module_.pool.layout(t.element).width > 64 ||
+                                                  elem_is_class ||
                                                   (est != nullptr && est->isTaggedUnion());
             if (loop_render && value_cat(t.element) != ValueCat::string) {
                 args.push_back(build_container_p_string(lv, ty, t, sty, b, l));
