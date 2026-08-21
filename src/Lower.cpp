@@ -23494,23 +23494,13 @@ private:
             build_dpi_import(sub, id);
             return id;
         }
-        for (const FormalArgumentSymbol* fa : sub.getArguments()) {
-            const auto dir = fa->direction;
-            if (dir == slang::ast::ArgumentDirection::Ref) {
-                // ref / const ref (LRM 13.5.2): the formal aliases the actual's live
-                // storage through a fat pointer carrying the storage address, the
-                // relocation epoch of the container the actual is rooted in, and the
-                // report site (docs/design/data-model.md §3). Every storage class
-                // passes the same way — a plane slot, a managed handle, an aggregate
-                // image — so there is no per-type restriction here.
-                continue;
-            }
-            if (dir != slang::ast::ArgumentDirection::In && fa->getType().getCanonicalType().isString()) {
-                // TODO: output / inout string formals (the copy-out path passes
-                // plane pointers, not string handles).
-                fail("output/inout string arguments are not supported");
-            }
-        }
+        // No per-formal type guard here: every storage class now passes in every
+        // direction. `ref` aliases the actual's live storage through a fat pointer
+        // (docs/design/data-model.md §3); a Managed handle — string, dynamic array,
+        // queue, assoc — passes as one handle pointer with a deep copy in and a
+        // move / deep copy back (§6); an aggregate passes as one storage pointer.
+        // The residual restrictions are per-ACTUAL and live at the call site
+        // (build_call_args) or on the formal's own type in build_function.
 
         const ir::FunctionId id = module_.reserve_function();
         fnmap_[&sub]            = id;
@@ -25593,10 +25583,24 @@ private:
             if (actual->kind == ExpressionKind::Assignment) {
                 actual = &actual->as<AssignmentExpression>().left();
             }
+            if (is_string_ref(pty) != is_string_expr(*actual)) {
+                // Backstop, not a gap: the copy-out is an assignment from the formal
+                // to the actual, and neither direction of string <-> packed is
+                // assignment compatible (LRM 6.16 wants an explicit cast), so slang
+                // already rejects the mismatch at the call ("value of type 'string'
+                // cannot be assigned to ..."). If one ever reached here the caller
+                // temp would carry the FORMAL's type and both hops would need a
+                // conversion -- StrFromPacked in, StrToPacked back -- which neither
+                // `coerce` (a plane resize) nor a plain Store performs.
+                fail("an output/inout string argument requires a string actual");
+            }
             const ir::Index temp = make_arg_temp(pty, b, l);
             if (dir == slang::ast::ArgumentDirection::InOut) {
-                // Copy-in: temp = (parameter type) actual.
-                b.binary(ir::Inst::Tag::Store, temp, coerce(lower_expr(*actual, b), *actual->type, pty, b, l), l);
+                // Copy-in: temp = (parameter type) actual. A string handle passes with
+                // no resize (the Store deep-copies it), like the In case above.
+                const ir::Index in = is_string_ref(pty) ? lower_expr(*actual, b)
+                                                        : coerce(lower_expr(*actual, b), *actual->type, pty, b, l);
+                b.binary(ir::Inst::Tag::Store, temp, in, l);
             }
             args.push_back(temp);
             outs.push_back(CopyOutArg{ temp, actual, lower_type(*actual->type), &formals[i]->getType() });
@@ -25626,16 +25630,17 @@ private:
                 continue;
             }
             const ir::Index tv = b.unary(ir::Inst::Tag::Load, oc.temp, l);
+            // A string temp's Load is its handle, and formal type == actual type (a
+            // mixed string / packed argument is refused in build_call_args), so there
+            // is nothing to coerce: the Store below deep-copies the handle into the
+            // actual, releasing whatever it held.
+            const bool      str = is_string_ref(oc.actual_ty);
+            const ir::Index val = str ? tv : coerce(tv, *oc.formal_ty, oc.actual_ty, b, l);
             // The copy-back is an ordinary procedural write to the actual, so a
             // forced / `assign`-driven actual drops it and keeps the override's
             // value (LRM 10.6.2, matching iverilog 13); the call itself and the
             // callee's write to its own temp are unaffected.
-            store_or_gate(pca_info_of_lvalue(*oc.actual),
-                          ir::Inst::Tag::Store,
-                          dst,
-                          coerce(tv, *oc.formal_ty, oc.actual_ty, b, l),
-                          b,
-                          l);
+            store_or_gate(pca_info_of_lvalue(*oc.actual), ir::Inst::Tag::Store, dst, val, b, l);
         }
     }
 

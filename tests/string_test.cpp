@@ -478,6 +478,267 @@ TEST_CASE("strings pass to task inputs by value") {
     CHECK(run_capture(src) == "[<a><bc>]\n");
 }
 
+// -- `output` / `inout` string formals (LRM 13.5) --
+//
+// A string is Managed (docs/design/data-model.md §6): the formal is passed as one
+// rt_string handle pointer aimed at a caller temp, the callee deep-copies in
+// (`inout` only) and moves its frame slot back out at completion, and the frontend
+// then copies the temp into the actual. Oracle: iverilog 13 for every TASK case
+// below (each expectation is byte-identical to it). iverilog rejects an output
+// formal on a FUNCTION outright ("Function arguments must be input ports"), so the
+// function cases rest on LRM 13.5.1 / 13.5.3 directly, like the existing scalar
+// function out / inout support.
+
+// The direction table: an `output` formal starts EMPTY however full the actual is
+// (nothing is copied in), an `inout` formal starts from the actual, and both land
+// in the actual at completion.
+TEST_CASE("output string starts empty and inout string starts from the actual") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic app(output string o, inout string u);
+                o = {o, "o"};
+                u = {u, "u"};
+            endtask
+            string a, b;
+            initial begin
+                a = "PRE";
+                b = "PRE";
+                app(a, b);
+                $display("a=[%s] b=[%s]", a, b);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a=[o] b=[PREu]\n");
+}
+
+// A function's out / inout string coexists with its return value, and the callee's
+// own frame copy is what it mutates.
+TEST_CASE("function output and inout string arguments alongside a return value") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int bump(output string o, inout string io, input string i);
+                o  = {"o<", i, ">"};
+                io = {io, "+", i};
+                return io.len();
+            endfunction
+            string a, b;
+            int    r;
+            initial begin
+                b = "B";
+                r = bump(a, b, "in");
+                $display("a=[%s] b=[%s] r=%0d", a, b, r);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a=[o<in>] b=[B+in] r=4\n");
+}
+
+// Copy-out re-resolves the actual's lvalue AFTER the call, so any place a string
+// store can name is a legal actual: a queue / dynamic-array / associative-array
+// element, an unpacked-struct member, a fixed-array element and a class property.
+// Two actuals of the same call may name elements of one container (`q[0]`, `q[1]`).
+TEST_CASE("output/inout string actual can be a container element, member or property") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                string p;
+            endclass
+            typedef struct { string f; int n; } S;
+            task automatic fill(output string o, inout string io, input string tag);
+                o  = {"[", tag, "]"};
+                io = {io, "+", tag};
+            endtask
+            string q[$];
+            string d[];
+            string mi[int];
+            string ms[string];
+            string arr[2];
+            S      st;
+            C      obj;
+            initial begin
+                q.push_back("q0");
+                q.push_back("q1");
+                d = new[2];
+                d[0] = "d0";
+                d[1] = "d1";
+                mi[7]   = "m7";
+                ms["k"] = "mk";
+                arr[1]  = "a1";
+                st.f    = "sf";
+                obj     = new;
+                obj.p   = "op";
+                fill(q[0], q[1], "Q");
+                $display("q=[%s][%s]", q[0], q[1]);
+                fill(d[1], d[0], "D");
+                $display("d=[%s][%s]", d[0], d[1]);
+                fill(mi[7], ms["k"], "M");
+                $display("m=[%s][%s]", mi[7], ms["k"]);
+                fill(arr[1], st.f, "S");
+                $display("s=[%s][%s]", arr[1], st.f);
+                fill(obj.p, st.f, "C");
+                $display("c=[%s][%s]", obj.p, st.f);
+            end
+        endmodule
+    )";
+    // The queue / dynamic-array lines are byte-identical to iverilog 13; it
+    // supports neither a string-keyed associative array nor these class / struct
+    // actuals, so those follow LRM 13.5 (an ordinary write to the actual's place).
+    CHECK(run_capture(src) == "q=[[Q]][q1+Q]\nd=[d0+D][[D]]\nm=[[M]][mk+M]\n"
+                              "s=[[S]][sf+S]\nc=[[C]][sf+S+C]\n");
+}
+
+// An out / inout formal is a private copy, not an alias (that is `ref`): the callee
+// reading the caller's variable directly sees its pre-call value, and the actual
+// changes only at completion.
+TEST_CASE("output/inout string formals are copies, not aliases") {
+    constexpr std::string_view src = R"(
+        module m;
+            string g;
+            task automatic peek(output string o, inout string u);
+                o = {"saw:", g};
+                u = {"saw:", g};
+                g = "callee-wrote-g";
+            endtask
+            string a, b;
+            initial begin
+                g = "G0";
+                a = "A0";
+                b = "B0";
+                peek(a, b);
+                $display("a=[%s] b=[%s] g=[%s]", a, b, g);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a=[saw:G0] b=[saw:G0] g=[callee-wrote-g]\n");
+}
+
+// A task's copy-out rides its completion epilogue, so a write before a `#delay` is
+// NOT visible to a witness process mid-body — it lands when the caller resumes.
+TEST_CASE("task output/inout string lands at completion, not at the write") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s, io;
+            task automatic slow(output string o, inout string u);
+                o = "early";
+                #5;
+                o = {o, "-late"};
+                u = {u, "-done"};
+            endtask
+            initial begin
+                io = "K";
+                slow(s, io);
+                $display("caller resumed at %0t: s=[%s] io=[%s]", $time, s, io);
+            end
+            initial begin
+                #1 $display("witness at %0t: s=[%s] io=[%s]", $time, s, io);
+                #10 $display("witness at %0t: s=[%s] io=[%s]", $time, s, io);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "witness at 1: s=[] io=[K]\n"
+                              "caller resumed at 5: s=[early-late] io=[K-done]\n"
+                              "witness at 11: s=[early-late] io=[K-done]\n");
+}
+
+// A `disable`d activation takes the ordinary epilogue with the CALLEE's copy-out
+// skipped (LRM 9.6.2 leaves out / inout results undefined), so each actual receives
+// whatever its caller temp holds: for an `output` the untouched temp (an empty
+// string, a zero scalar), for an `inout` the value copied in before the call. The
+// callee's frame slot is still deinit'd, so the abandoned string is freed, not
+// leaked. DELIBERATE DIVERGENCE from iverilog 13, which copies out the values the
+// body wrote before the abort (`k1=[pre] k2=[K2-pre] n=7`); 9.6.2 makes both
+// conforming, and this is clotho's pre-existing policy for scalar out / inout args
+// (the scalar `n` in this design), which a string now matches exactly rather than
+// growing a second rule.
+TEST_CASE("disable of a task skips its string copy-out") {
+    constexpr std::string_view src = R"(
+        module m;
+            string k1, k2;
+            int    n;
+            task automatic killme(output string o, inout string io, output int cnt);
+                o   = "pre";
+                io  = {io, "-pre"};
+                cnt = 7;
+                #20;
+                o   = "post";
+                io  = {io, "-post"};
+                cnt = 9;
+            endtask
+            initial begin
+                k1 = "K1";
+                k2 = "K2";
+                n  = 3;
+                killme(k1, k2, n);
+                $display("resumed at %0t: k1=[%s] k2=[%s] n=%0d", $time, k1, k2, n);
+            end
+            initial #2 disable killme;
+        endmodule
+    )";
+    CHECK(run_capture(src) == "resumed at 2: k1=[] k2=[K2] n=0\n");
+}
+
+// Recursion through an inout string: each activation owns its frame handle, so the
+// accumulated value threads down and back up one copy per level. The loop is a
+// leak smoke test — 200 iterations x 20 levels of copy-in / copy-out.
+TEST_CASE("recursion through an inout string argument (leak smoke)") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic grow(inout string acc, input int n);
+                if (n == 0) return;
+                acc = {acc, "ab"};
+                grow(acc, n - 1);
+            endtask
+            string s;
+            int    i;
+            initial begin
+                s = "";
+                grow(s, 6);
+                $display("%0d [%s]", s.len(), s);
+                for (i = 0; i < 200; i++) begin
+                    s = "";
+                    grow(s, 20);
+                end
+                $display("loop end %0d", s.len());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "12 [abababababab]\nloop end 40\n");
+}
+
+// A class method's out / inout string: `this` is formal 0, so the string formals
+// sit at shifted parameter indices — the per-signature index table has to stride
+// one pointer for each of them.
+TEST_CASE("class method with output and inout string arguments") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                string p;
+                task automatic mt(output string s, inout string u);
+                    s = {"C:", p};
+                    u = {u, "!"};
+                endtask
+                function automatic int mf(output string s);
+                    s = {"F:", p};
+                    return 1;
+                endfunction
+            endclass
+            C      obj;
+            string c;
+            int    r;
+            initial begin
+                obj   = new;
+                obj.p = "P";
+                c     = "C0";
+                obj.mt(obj.p, c);
+                $display("p=[%s] c=[%s]", obj.p, c);
+                r = obj.mf(obj.p);
+                $display("p=[%s] r=%0d", obj.p, r);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "p=[C:P] c=[C0!]\np=[F:C:P] r=1\n");
+}
+
 TEST_CASE("unpacked arrays of string init empty and assign per element") {
     constexpr std::string_view src = R"(
         module m;
@@ -852,17 +1113,6 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
                 initial begin n = 2; s = {n{"ab"}}; end
             endmodule
         )", "constant");
-    }
-    SUBCASE("output string task argument") {
-        check_rejected(R"(
-            module m;
-                string s;
-                task t(output string o);
-                    o = "x";
-                endtask
-                initial t(s);
-            endmodule
-        )", "output/inout string arguments");
     }
     SUBCASE("string argument to a non-%s specifier") {
         check_rejected(R"(

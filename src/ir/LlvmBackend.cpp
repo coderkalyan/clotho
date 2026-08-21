@@ -4898,17 +4898,17 @@ private:
                 params.push_back(ptr); // &actual (rt_dynarr* / rt_queue*)
                 continue;
             }
-            if ((dir == ArgDir::Out || dir == ArgDir::Inout) && !is_agg_abi(pt)) {
+            if ((dir == ArgDir::Out || dir == ArgDir::Inout) && !is_agg_abi(pt) && !is_string_type(pt)) {
                 params.push_back(ptr); // &caller_temp.mm
                 params.push_back(ptr); // &caller_temp.z (copy-out at each return)
                 continue;
             }
             if (is_string_type(pt) || is_agg_abi(pt)) {
-                // A string handle (In only — the frontend guards out/inout string
-                // formals) or an aggregate's storage passes by ONE pointer in every
-                // direction: In copies in through it, a struct-bearing out / inout
-                // formal copies the frame Local back out through it (the same actual
-                // pointer). (A dynamic array is handled above, one pointer too.)
+                // A string handle or an aggregate's storage passes by ONE pointer in
+                // every direction: In copies in through it, an out / inout formal
+                // copies the frame Local back out through the same pointer (a string
+                // by rt_string_move, a struct-bearing aggregate by storage copy).
+                // (A dynamic array is handled above, one pointer too.)
                 params.push_back(ptr);
                 continue;
             }
@@ -4968,11 +4968,12 @@ private:
                 // copies an output / inout Local back through it (emit_copyout), so
                 // the pass-by-value copy straddles the task's suspends.
                 params.push_back(ptr);
+            } else if (is_string_type(f.param_types[k])) {
+                // One rt_string handle pointer in every direction, like a container:
+                // In deep-copies it into the frame slot, an out / inout formal moves
+                // the frame slot back through it in the completion epilogue.
+                params.push_back(ptr);
             } else if (f.arg_dirs[k] == ArgDir::In) {
-                if (is_string_type(f.param_types[k])) {
-                    params.push_back(ptr); // rt_string handle
-                    continue;
-                }
                 const uint32_t w = width_of(f.param_types[k]);
                 params.push_back(int_ty(2 * w)); // must|may
                 params.push_back(int_ty(w));     // z
@@ -4993,7 +4994,7 @@ private:
     // How many LLVM parameters formal k occupies:
     //   4 — a `ref` fat pointer { &storage, &epoch, expect, site }
     //   1 — an aggregate storage pointer, a container handle pointer, or a string
-    //       input handle (each one pointer in every direction it is allowed in)
+    //       handle (each one pointer in every direction)
     //   2 — everything else: the (must|may, z) plane pair, or the
     //       (&mm, &z) out / inout pointer pair
     // Whether ref formal k of `f` carries the relocation-epoch words. Only a formal
@@ -5020,9 +5021,13 @@ private:
         if (is_handle_type(f.param_types[k])) {
             return 1;
         }
-        const bool str_one =
-          is_string_type(f.param_types[k]) && (!f.is_task || f.arg_dirs[k] == ArgDir::In);
-        return str_one ? 1u : 2u;
+        // A string is one rt_string handle pointer in every direction, like the other
+        // Managed types (docs/design/data-model.md §6): In deep-copies through it,
+        // out / inout moves the callee's frame slot back through it.
+        if (is_string_type(f.param_types[k])) {
+            return 1;
+        }
+        return 2;
     }
 
     // LLVM arg index of each formal's first parameter for `f`'s signature shape:
@@ -5380,9 +5385,10 @@ private:
 
     // Copy each aggregate input / inout formal's caller storage (passed by pointer)
     // into its frame slot at entry (LRM 13.5 pass-by-value). Scalar / string formals
-    // copy in via the frontend's Store(Local, Arg); an aggregate formal emits no
-    // Arg, so the copy is done here. Shared by functions (entry) and tasks (the
-    // body's start block, after the ramp's initial suspend).
+    // copy in via emit_copyin, which reads their parameters directly; an aggregate
+    // formal's copy is the whole storage image, so it is done here. Shared by
+    // functions (entry) and tasks (the body's start block, after the ramp's initial
+    // suspend).
     void emit_agg_copyin(const Function& f) {
         for (uint32_t k = 0; k < f.param_types.size(); ++k) {
             if (!is_agg_abi(f.param_types[k])) {
@@ -5798,18 +5804,22 @@ private:
                 }
                 continue;
             }
-            if (f.arg_dirs[k] == ArgDir::In) {
-                if (is_string_type(f.param_types[k])) {
-                    // Deep copy the caller's handle into the frame local (value
-                    // semantics; the frame slot was init'd by init_frame). Prologue
-                    // copy-in is ABI plumbing with no Index in scope, so the
-                    // allocation reports its location as "<unknown>".
+            if (is_string_type(f.param_types[k])) {
+                // Deep copy the caller's handle into the frame local for input /
+                // inout (value semantics; the frame slot was init'd by init_frame).
+                // An output formal keeps that empty string — the body fills it and
+                // the epilogue moves it out (LRM 13.5). Prologue copy-in is ABI
+                // plumbing with no Index in scope, so the allocation reports its
+                // location as "<unknown>".
+                if (f.arg_dirs[k] == ArgDir::In || f.arg_dirs[k] == ArgDir::Inout) {
                     b_.CreateCall(str_assign_fn(),
-                                  { b_.CreateStructGEP(frame_ty_, frame_, k), fn_->getArg(base),
-                                    alloc_site_global(SourceText{ .where = "<unknown>" },
-                                                      "string") });
-                    continue;
+                                  { b_.CreateStructGEP(frame_ty_, frame_, k),
+                                    fn_->getArg(base),
+                                    alloc_site_global(SourceText{ .where = "<unknown>" }, "string") });
                 }
+                continue;
+            }
+            if (f.arg_dirs[k] == ArgDir::In) {
                 lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) });
             } else if (f.arg_dirs[k] == ArgDir::Inout) {
                 llvm::Value* mm = b_.CreateLoad(int_ty(2 * w), fn_->getArg(base));
@@ -5844,6 +5854,17 @@ private:
             if (is_handle_type(f.param_types[k])) {
                 emit_handle_assign(fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k),
                                    f.param_types[k]);
+                continue;
+            }
+            // A string output / inout formal transfers its frame handle into the
+            // caller's (the single passed pointer): rt_string_move releases the
+            // caller's old buffer, takes the frame slot's image whole, and re-inits
+            // the frame slot. Legal here — and cheaper than a deep copy — because
+            // copy-out is immediately followed by deinit_body_strings on every exit
+            // path (function ret, task completion epilogue), so nothing reads the
+            // frame slot again and its own deinit finds an empty string.
+            if (is_string_type(f.param_types[k])) {
+                b_.CreateCall(str_move_fn(), { fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k) });
                 continue;
             }
             // The caller's out-target is still the packed word; lift a narrow local.
@@ -21770,8 +21791,16 @@ private:
                 if (dir == ArgDir::Out || dir == ArgDir::Inout) {
                     emit_gc_barrier_for(lvalue_of(a));
                 }
-            } else if ((dir == ArgDir::Out || dir == ArgDir::Inout) &&
-                       !is_agg_abi(f.param_types[k])) {
+            } else if (is_string_type(f.param_types[k])) {
+                // One rt_string handle pointer in every direction (data-model.md §6):
+                // In passes the actual's handle and the callee deep-copies it into
+                // its frame slot; out / inout passes the caller TEMP's handle, which
+                // the callee moves its frame slot into at completion (the frontend
+                // then copies the temp to the actual — emit_call_copyouts). No GC
+                // barrier: a string leaf can never hold a class handle, so the
+                // caller's storage acquires no reference through this write.
+                argv.push_back(dir == ArgDir::In ? str_of(a) : lv_string_ptr(lvalue_of(a)));
+            } else if ((dir == ArgDir::Out || dir == ArgDir::Inout) && !is_agg_abi(f.param_types[k])) {
                 // An output / inout scalar temp: pass pointers to its mm and z
                 // planes; the callee copies out through them (the caller copies the
                 // temp back to the actual after the call — frontend
@@ -21792,8 +21821,6 @@ private:
                 if (dir == ArgDir::Out || dir == ArgDir::Inout) {
                     emit_gc_barrier_for(lvalue_of(a));
                 }
-            } else if (is_string_type(f.param_types[k])) {
-                argv.push_back(str_of(a));
             } else {
                 Plane pl = value_of(a);
                 pl       = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
@@ -23023,11 +23050,16 @@ private:
                 if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
                     emit_gc_barrier_for(lvalue_of(args[k]));
                 }
+            } else if (is_string_type(tf.param_types[k])) {
+                // One rt_string handle pointer in every direction: In passes the
+                // actual's handle (deep-copied into the frame slot at body start),
+                // out / inout passes the caller temp's handle, which the completion
+                // epilogue moves the frame slot into. The temp is a caller frame Local
+                // or a module signal — never a short-lived alloca — so the pointer
+                // stays valid across the task's suspends, like the aggregate case
+                // above. No GC barrier: a string can never hold a class handle.
+                argv.push_back(tf.arg_dirs[k] == ArgDir::In ? str_of(args[k]) : lv_string_ptr(lvalue_of(args[k])));
             } else if (tf.arg_dirs[k] == ArgDir::In) {
-                if (is_string_type(tf.param_types[k])) {
-                    argv.push_back(str_of(args[k]));
-                    continue;
-                }
                 Plane pl = value_of(args[k]);
                 pl       = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
                 argv.push_back(pl.mm);
