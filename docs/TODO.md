@@ -1171,10 +1171,14 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   entry by DIRECTION: a mutating method creates it, a query reads through get_ptr
   and falls back to the empty-container default, so `a["absent"].size()` is 0 and
   leaves `num()` alone (LRM 7.8.6).
-  Still guarded loud, each for a stated reason (docs/design/data-model.md §7): an
-  element select THROUGH a container-valued entry (`a[k][i]`) needs composed
-  deferral, since the select would have to pick a direction that belongs to its
-  consumer; and a `string` or dynamically-sized member inside a struct KEY needs
+  An element select THROUGH a container-valued entry (`a[k][i]`) works, to any
+  nesting depth, in both directions and for a mutating method's receiver: the access
+  direction is threaded down the select chain (`ir::ElemSelect::for_write`) rather
+  than deferred to the consumer, so a read resolves get_ptr and creates nothing (LRM
+  7.8.6) while a write and a mutating receiver resolve put_ptr (7.8 / 7.10). A `ref`
+  bound through one is checked at every level (docs/design/data-model.md §3.1).
+  Still guarded loud, for a stated reason (§7): a `string` or dynamically-sized
+  member inside a struct KEY needs
   the order-preserving escaped encoding (the normalized span would otherwise be
   variable-length). Whole-array NBA works (`HandleCopyNb`); a literal RHS under
   NBA does not. An x/z index is invalid per 7.8.4 / 7.8.5: the read yields the
@@ -1273,7 +1277,16 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 - [x] **`foreach`** (12.7.3) — fixed-size arrays + `string`; dynamic arrays and
   queues iterate the runtime size; associative arrays iterate keys in ascending
   order via first/next (a `[*]`-wildcard index has no key type, so foreach over
-  it is illegal per LRM and rejected by slang).
+  it is illegal per LRM and rejected by slang). A NESTED runtime dimension
+  (`foreach (a[k, i])` over an assoc of queues, a queue of queues, an assoc of
+  assocs) measures and iterates the entry the outer dimension is sitting on,
+  rebuilt per region from the outer loop variables (`foreach_base_lv`); dimensions
+  are peeled through the interned IR type, since slang answers
+  `isDynamicallySizedArray()` for a map as well. Before that every runtime
+  dimension measured the whole array, so the inner dimension re-walked the OUTER
+  container with the inner loop variable bound to a key — wrong trip count, wrong
+  index, and silent. Refused loud: a skipped outer dimension over a nested runtime
+  one (`foreach (a[, i])`), which names no entry to descend into.
 - [x] **`do … while`**.
 - [x] **`break` / `continue`**.
 - [x] **`case … inside`** (12.5.4 / 11.4.13) — singular labels via wildcard

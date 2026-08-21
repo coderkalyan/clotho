@@ -14883,7 +14883,8 @@ private:
                 LValue         lv     = lvalue_of(p.op_extra.op);
                 const auto     es     = ir_->extra_data<ElemSelect>(p.op_extra.extra);
                 const Type&    at     = std::get<Type>(mod_.pool.get(es.array_type));
-                if (lv.is_assoc) {
+                const bool     inner_container = at.kind == Type::Kind::DynArray || at.kind == Type::Kind::Queue;
+                if (lv.is_assoc && inner_container) {
                     // `a[k][i]`: the base is a DEFERRED assoc entry, and the ring /
                     // bounds arithmetic below needs its slot address now, so the
                     // entry is resolved here rather than at the consumer. Which way
@@ -14894,6 +14895,13 @@ private:
                     // default -- while a write resolves put_ptr and creates the
                     // entry (LRM 7.8), after which an index past the fresh empty
                     // container drops its write (7.10).
+                    //
+                    // Only a dyn/queue value needs this: its element address is not a
+                    // function of the base alone (it loads base/head/len/cap), so the
+                    // entry must be resolved first. An AGGREGATE value still composes
+                    // deferred -- the select only extends the GEP path, and the
+                    // consumer resolves with its own direction, which is both cheaper
+                    // and what already worked.
                     lv = assoc_elem_lvalue(lv, es.for_write != 0);
                 }
                 if (at.kind == Type::Kind::DynArray) {

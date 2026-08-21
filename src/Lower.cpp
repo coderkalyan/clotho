@@ -18373,6 +18373,15 @@ private:
             // that is also how a queue's string elements already print.
             frag += "\"%s\"";
         } else if (!sty.isIntegral()) {
+            const ir::Ref cl = lower_type(sty);
+            if (is_handle_ref(cl) || is_agg_abi_ref(cl)) {
+                // TODO: %p of a container or aggregate ELEMENT. 21.2.1.6 recurses
+                // into one, but the runtime renderer works from a flat element
+                // descriptor (one integral / real / string per element), so a nested
+                // container has no image to hand it. Reported here rather than
+                // falling into the handle case below, whose reason is different.
+                fail("%p of a container or aggregate element is not supported");
+            }
             // TODO: %p of a class / chandle / event / virtual-interface handle. The
             // clause wants an implementation-defined form with `null` for a null
             // handle; Clotho has no handle rendering, and printing the raw pointer
@@ -19448,7 +19457,8 @@ private:
                                      const CallExpression& call,
                                      ir::Builder&          b,
                                      ir::SourceLoc         l) {
-        const ir::Index arr = lower_lvalue(*call.arguments()[0], b);
+        // See lower_queue_method for why the receiver carries a direction.
+        const ir::Index arr = lower_lvalue(*call.arguments()[0], b, mutates_container(name));
         const ir::Ref   aty = lower_type(*call.arguments()[0]->type);
         if (name == "size") {
             return b.resize(b.dyn_array_size(arr, aty, l), lower_type(*call.type), l);
@@ -20117,11 +20127,28 @@ private:
         return temp;
     }
 
+    // Whether a container built-in method WRITES its receiver (LRM 7.9 / 7.10 /
+    // 7.12). Only used to pick get_ptr vs put_ptr when the receiver's select chain
+    // contains an associative entry that an inner select has to resolve eagerly; the
+    // ordinary one-level receiver stays deferred and the backend decides per op.
+    static bool mutates_container(std::string_view name) {
+        return name == "push_back" || name == "push_front" || name == "pop_back" || name == "pop_front" ||
+               name == "insert" || name == "delete" || name == "reverse" || name == "sort" || name == "rsort" ||
+               name == "shuffle" || name == "new";
+    }
+
     // A queue built-in method used as an rvalue or statement (LRM 7.10.2). The
     // receiver arrives as arguments()[0], like a string / dynamic-array method.
     ir::Index lower_queue_method(std::string_view name, const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
         const auto&     args = call.arguments();
-        const ir::Index q    = lower_lvalue(*args[0], b);
+        // A MUTATING method operates on the receiver as a variable (LRM 7.10), so a
+        // deferred associative entry in its select chain resolves with put_ptr and the
+        // entry comes into existence; a query must create nothing (7.8.6). The
+        // distinction only bites a NESTED receiver (`a[k1][k2].push_back(v)`), where an
+        // inner select resolves the outer entry eagerly -- a one-level `a[k].push_back`
+        // stays deferred and the backend picks the direction per op.
+        const bool      recv_write = mutates_container(name);
+        const ir::Index q          = lower_lvalue(*args[0], b, recv_write);
         const ir::Ref   qty  = lower_type(*args[0]->type);
         if (name == "size") {
             return b.resize(b.queue_size(q, qty, l), lower_type(*call.type), l);
@@ -20168,7 +20195,9 @@ private:
     // AssignmentExpression.
     ir::Index lower_assoc_method(std::string_view name, const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
         const auto&     args = call.arguments();
-        const ir::Index a    = lower_lvalue(*args[0], b);
+        // See lower_queue_method: a mutating method's receiver resolves a deferred
+        // outer entry with put_ptr, a query's must not create one.
+        const ir::Index a    = lower_lvalue(*args[0], b, mutates_container(name));
         const ir::Ref   aty  = lower_type(*args[0]->type);
         if (name == "num" || name == "size") {
             return b.resize(b.assoc_num(a, aty, l), lower_type(*call.type), l);

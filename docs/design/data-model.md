@@ -157,15 +157,28 @@ live outside the object that can move. Put the epoch in the ring buffer and a
 stale `slot` would read its witness out of freed memory — the pointer whose
 validity is in question would be the one used to check it.
 
-Which formals need it is therefore a property of the ACTUALS, and
-`Analysis::call_actuals` already visits every one. `heap_rooted()` walks the
-select chain of each `ref` actual: any `ElemSelect` over a dynamic array or queue,
-or any `AssocSelect`, at any depth, makes the place heap-rooted (a further member
-or bit step off such a place stays heap-rooted, so the walk continues to the
+**Nesting therefore needs a CHAIN, not a witness.** For `a[k][i]` the inner queue's
+handle — and with it the epoch word — lives *inside the map's payload*, so that
+witness is itself destructible: `a.delete(k)` frees it. One pair per container level
+travels with the ref, outermost first, and the callee checks them in that order,
+short-circuiting on the first mismatch. Level n's witness is read only once level
+n-1 is proven current, which is exactly what makes reading it safe. A call site that
+binds shallower than the formal's declared depth pads with the `clotho.ref.noepoch`
+zero word.
+
+A single field forced the opposite: each element select OVERWROTE the witness, so a
+two-level place kept the inner one — the only one that can die — and a restructuring
+of the outer container went unreported while the check read freed memory.
+
+Which formals need it, and how deep, is therefore a property of the ACTUALS, and
+`Analysis::call_actuals` already visits every one. `heap_depth()` walks the select
+chain of each `ref` actual and COUNTS the relocatable levels: each `ElemSelect` over
+a dynamic array or queue, and each `AssocSelect`, at any depth (a further member or
+bit step off such a place stays at the same depth, so the walk continues to the
 root). A ref to a variable, a fixed-array element, a struct member, a class
-property, a `HandleDeref` (class bodies never move and are never freed), or a
-whole container handle is one plain pointer, and its callee emits no check at all.
-`DesignFacts::ref_epoch_formals` holds the answer keyed `(fid << 32) | formal`.
+property or a whole container handle counts zero and stays one plain pointer.
+`DesignFacts::ref_epoch_formals` holds the answer keyed `(fid << 32) | formal`,
+mapping to that depth, maxed over call sites.
 
 Two obligations, both discharged in `analyze()`:
 
@@ -401,11 +414,15 @@ Deliberately **not** closed, each with a reason rather than a TODO:
   record range (assign at sample, `rt_string_move` at commit — the Managed analogue
   of `HandleCopyNb`, see queue-nba-and-nonpod.md §3). A single character is a
   masked write into an existing value, which that record shape does not express.
-- **`a[k][i]` where the assoc value is a container.** The element select would
-  have to choose get_ptr or put_ptr, a direction that belongs to its own consumer;
-  choosing put_ptr would create an entry on a read, which LRM 7.8.6 forbids. The
-  fix is composed deferral. Whole-value assignment either way and the container's
-  own methods on `a[k]` do work.
+- ~~**`a[k][i]` where the assoc value is a container.**~~ **Closed.** The direction
+  is threaded down the select chain instead of deferred: `ir::ElemSelect` and
+  `ir::AssocArg` carry the access's own `for_write`, so an inner select resolves the
+  entry with get_ptr for a read (creating nothing, LRM 7.8.6) and put_ptr for a
+  write (7.8), and a mutating method's receiver resolves as a write (7.10). Only a
+  dyn/queue value needs the eager resolution — its element address loads
+  base/head/len/cap, so it is not a function of the base alone; an AGGREGATE value
+  still composes deferred through the GEP path. Nests to any depth, and a
+  `ref` through it is checked at every level (§3.1).
 
 ## 8. Lifetime summary
 
