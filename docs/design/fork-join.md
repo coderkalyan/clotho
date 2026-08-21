@@ -589,11 +589,16 @@ function's interesting state IS its formals, so V5 admits only children touching
 module signals, static locals and static class properties: a monitor spawned by a
 helper function, not the LRM's idiom.
 
-That is an argument for finishing V4, not for widening the ref ABI. For a detached
-child the right model is **copy-in by value at spawn** (per-spawn automatic lifetime,
-V4): a class handle, an `int` or a string copied into the child's own frame removes
-the lifetime problem `ArgDir::Ref` has, and for a function it is the only model
-available, since the frame is gone the moment the call returns.
+That is an argument for finishing V4, not for widening the ref ABI. This paragraph
+used to say the right model for a detached child is "copy-in by value at spawn"; see
+the corrected V4 bullet in the phased plan for why that is wrong in general — LRM
+9.3.2 makes an enclosing automatic ONE variable, and iverilog agrees where Verilator
+does not. What the child needs is the same variable with a longer life: a GC-owned
+box, whose POINTER is copied in by value. That is what removes the lifetime problem
+`ArgDir::Ref` has, and it is the only model available to a function, whose frame is
+gone the moment the call returns. `watch_for_zero` reads `p` and never writes it, so
+it cannot tell the two apart — but a child that WRITES a captured local can, which is
+why the box and not the copy is the answer.
 
 Adjacent friction cleared since: `$time` / `$stime` / `$realtime` inside a function
 is supported. The refusal's stated reason ("no wheel pointer in its ABI") was
@@ -785,9 +790,51 @@ record/awaiter pattern); `$finish` mid-fork leaks suspended child frames
     now for two reasons rather than one: a `join_none` parent can return, and a killed
     parent's frame goes away under live children.
 
-- **V4 — true per-spawn automatic lifetime.** Give fork-captured automatics
-  real per-spawn copies (frame locals), fixing `for … fork … i … join_none`.
-  Cross-cutting with the broader automatic-lifetime gap (`declare_local`).
+- **V4 — captured-automatic LIFETIME, not per-spawn copies.** This bullet used to
+  read "give fork-captured automatics real per-spawn copies (frame locals), fixing
+  `for … fork … i … join_none`". **That is the wrong target**, and §V2.5's own
+  parenthetical already said so ("rather than reading a shared final `i`"): under
+  LRM 9.3.2 a reference to an automatic of an ENCLOSING scope is a reference to that
+  one variable, which is the entire reason 9.3.2's example has to write
+  `automatic int k = j;` to get a copy. Copying implicitly would delete the
+  distinction the clause is built around.
+
+  Measured on the clause's own idiom,
+  `for (int j = 1; j <= 3; ++j) fork $write("%0d ", j); join_none`:
+
+  | | result |
+  |---|---|
+  | iverilog 13 | `4 4 4` — shared, the strict reading |
+  | Verilator 5.050 | `1 2 3` — per-spawn copies, a deviation |
+  | clotho today | `4 4 4` |
+
+  So clotho is already right here, and per-spawn copying would have regressed it.
+  It is right for an incidental reason worth keeping in view: a process-scope local
+  goes through `declare_local`, which gives static signal-like storage (documented
+  there), so the three children genuinely share one `j`. The refusal only bites where
+  the local really is frame-resident — a task or function body.
+
+  **The actual gap is lifetime.** A detached child holding a reference into its
+  parent's frame outlives that frame: a `join_none` parent can return, and V3's
+  `kill` can take the parent out from under live children. Two things follow:
+
+  - Per-spawn copies stay correct for an automatic declared INSIDE the fork block
+    (9.3.2's `automatic int k = j;`), which is a child frame local by construction
+    and needs nothing new.
+  - A captured ENCLOSING automatic needs storage that outlives the parent activation
+    while staying one variable. The mechanism already exists: box it and let the GC
+    own it. Live coroutine frames are conservative, pinning GC roots linked at the
+    ramp (garbage-collection.md §5.1), so a box reachable from the child's frame
+    stays alive with no new lifetime machinery, no refcount and no frame-ownership
+    surgery. The child receives the box POINTER by value, which also retires the
+    second objection standing in the way today — nothing needs the fat `ArgDir::Ref`,
+    so the "only packed integral and dynamic-array locals can be captured" restriction
+    goes with it, and 13.4.4's `watch_for_zero` (a captured class-handle formal) works
+    for the same reason as an `int`.
+
+  Still cross-cutting with the broader automatic-lifetime gap (`declare_local`): the
+  boxing decision is per captured variable, so it is a strictly smaller change than
+  giving every automatic true per-activation lifetime.
 - **V5 — `fork … join_none` inside a function (LRM 13.4.4). LANDED:** §"V5 scope"
   above. The spawn path needed almost nothing a function lacks — one `!none` gate on
   V3's `fork_live_slot` publish, which `join_none` never needed anyway. The work was
