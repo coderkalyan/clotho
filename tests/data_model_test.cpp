@@ -603,16 +603,6 @@ const Allow allowlist[] = {
     // An event passes and triggers like any other 64-bit handle, so the remaining
     // exclusions are narrow and each has its own reason.
     //
-    // Inside a FUNCTION every event op is refused for the same missing parameter
-    // $time is: a function carries no wheel, and an event op needs the current tick
-    // to stamp or compare. Not event-specific -- lifting it is an ABI change that
-    // lifts the $time restriction too.
-    { [](const Cell& k) { return is_event(k) &&
-                                 (k.m->kind == P::func_in || k.m->kind == P::func_out ||
-                                  k.m->kind == P::func_inout || k.m->kind == P::func_ref ||
-                                  k.m->kind == P::func_cref); },
-      "inside a function is not supported",
-      "an event op needs the current tick; a function has no wheel in its ABI." },
     // A function return needs a local to hold the result, and an automatic-lifetime
     // event local would need a FRESH object per activation.
     { [](const Cell& k) { return is_event(k) && k.m->kind == P::func_return; },

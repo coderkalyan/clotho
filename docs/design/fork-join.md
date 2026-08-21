@@ -595,18 +595,18 @@ V4): a class handle, an `int` or a string copied into the child's own frame remo
 the lifetime problem `ArgDir::Ref` has, and for a function it is the only model
 available, since the frame is gone the moment the call returns.
 
-Adjacent friction NOT cleared here: `$time` / `$realtime` inside a function is still
-refused, and its stated reason ("no wheel pointer in its ABI") is stale —
-`lower_function` binds `wheel_` to the `clotho.wheel` global and `has_wheel()` is
-unconditionally true. It is left alone because lifting it is a timescale question,
-not an ABI one: LRM 20.3.1 scales `$time` to the time unit of the module that
-invoked the call, and a function body is lowered ONCE with its own definition's
-`time_mul_`, so a package function called from two modules with different
-timescales has no single right answer to bake in. Refusing beats guessing, and it
-is a separate piece of work. Practical consequence for this feature: print `%0t`
-in the CHILD (a task body, where `$time` works) rather than in the spawning
-function. `$strobe` / `$monitor` in a function keep a second, still-real reason (no
-`coro_begin_` to hang the ramp's record slot off).
+Adjacent friction cleared since: `$time` / `$stime` / `$realtime` inside a function
+is supported. The refusal's stated reason ("no wheel pointer in its ABI") was
+always stale — `lower_function` binds `wheel_` to the `clotho.wheel` global, so a
+function reads the clock exactly as a task does — and the timescale objection
+(LRM 20.3.1 scales `$time` to the invoking module's unit, while one shared body
+has a single `time_mul_`) is settled by LRM 3.14.2.3: a read inside a subroutine
+is in the units of the scope that DECLARES it, which is what `function_id` already
+applies to subroutine delays and to `$time` in a task. Cross-checked against
+iverilog, which scales a package function's `$time` by the package. So `%0t` may
+be printed in the spawning function as well as in the child. `$strobe` /
+`$monitor` in a function keep the second, still-real reason (no `coro_begin_` to
+hang the ramp's record slot off).
 
 ### V5.6 Cost
 

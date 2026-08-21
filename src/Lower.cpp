@@ -17159,20 +17159,15 @@ private:
             fail("`." + std::string(method) + "` on a named sequence is not supported");
         }
 
-        if (fn_ctx_ != nullptr && !fn_ctx_->is_task && (name == "$time" || name == "$stime" || name == "$realtime")) {
-            // A function is a plain callable with no wheel pointer in its ABI, so
-            // it cannot read the simulation clock. Reject rather than emit a
-            // SimTime that would dereference a stale wheel. A task is a coroutine
-            // and does carry the wheel, so $time is allowed there.
-            // TODO: thread the wheel into the function ABI to support this.
-            fail("$time / $stime / $realtime inside a function is not supported");
-        }
-
-        // $time: 64-bit, scaled to the calling module's time unit (LRM §20.3.1).
-        // $stime: same value truncated to the low 32 bits (LRM §20.3.2). The
-        // backend divides the wheel tick by time_mul_ (1 when unitless) to scale
-        // the finest-precision clock down to the module unit; $stime resizes the
-        // result to its 32-bit return type.
+        // $time: 64-bit, scaled to the time unit of the scope whose code does the
+        // read (LRM §20.3.1, narrowed by §3.14.2.3 for a subroutine body -- see
+        // function_id, which sets time_mul_ from the DECLARING scope). $stime: the
+        // same value truncated to the low 32 bits (LRM §20.3.2). The backend
+        // divides the wheel tick by time_mul_ (1 when unitless) to scale the
+        // finest-precision clock down to that unit; $stime resizes the result to
+        // its 32-bit return type. Legal in a plain function too: the wheel is a
+        // module global (clotho.wheel), not a body parameter, so a function reads
+        // the clock exactly as a task does.
         if (name == "$time") {
             return b.sim_time(time_mul_, l);
         }
@@ -18513,16 +18508,13 @@ private:
     // advanced"). The call site just pends that task.
     void lower_strobe(const CallExpression& call, ir::Builder& b, char default_conv, bool fd_arg) {
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
-            // A function is a plain callable with no wheel pointer in its ABI
-            // (the same restriction as $time / $realtime, see lower_sysfunc)
-            // and no coroutine frame to ramp the deferred body's task-call
-            // record through.
-            // TODO: threading the wheel into the function ABI (the $time TODO
-            // in lower_sysfunc) would lift this too, but $strobe additionally
-            // needs a record slot to ramp its deferred body, which currently
-            // only exists on a coroutine (record_slot() anchors on
-            // coro_begin_) — a plain function has neither.
-            fail("$strobe inside a function is not supported (no wheel in the ABI)");
+            // The deferred body is ramped through the caller's task-call record
+            // slot, and record_slot() anchors on coro_begin_ -- a plain function
+            // is not a coroutine and has neither. (The clock itself is reachable
+            // here: the wheel is a global, so $time in a function works.)
+            // TODO: a record slot for a non-coroutine body would lift this.
+            fail("$strobe inside a function is not supported (no record slot to ramp "
+                 "the deferred body)");
         }
         const ir::FunctionId fid =
           build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/false);
@@ -18536,7 +18528,8 @@ private:
     // $monitor replaces the previous; $monitoron/$monitoroff enable/disable.
     void lower_monitor(const CallExpression& call, ir::Builder& b, char default_conv, bool fd_arg) {
         if (fn_ctx_ != nullptr && !fn_ctx_->is_task) {
-            fail("$monitor inside a function is not supported (no wheel in the ABI)");
+            fail("$monitor inside a function is not supported (no record slot to ramp "
+                 "the deferred body)");
         }
         const ir::FunctionId fid =
           build_deferred_body(call.arguments(), default_conv, loc(call), fd_arg, /*monitor=*/true);

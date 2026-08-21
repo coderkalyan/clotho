@@ -107,7 +107,14 @@ professional parity; M5 makes it complete.
     an op that memcpys the type's proto image, valid only for a trivially-copyable
     aggregate — a managed leaf has to keep the per-leaf path, which frees the
     previous entry's string / container instead of leaking it.
-- [ ] **`$time` in a function**.
+- [x] **`$time` / `$stime` / `$realtime` in a function** — the wheel is a module
+  global (`clotho.wheel`), not a body parameter, so a plain function reads the
+  clock exactly as a task does; the guard that refused it was stale. The value
+  scales to the unit of the scope that DECLARES the function (LRM 3.14.2.3, the
+  same rule as a subroutine delay), which is what makes one shared body correct
+  for callers of different timescales. `$strobe` / `$monitor` stay refused there:
+  their deferred body rides the caller's task-call record slot, which only a
+  coroutine has.
 - [ ] **NBA to a task frame local / output-inout formal**.
 - [x] **Functions** — combinational callables (not inlined); `automatic`/`static`
   locals, recursion, early `return`, callee-descending sensitivity, NBA to a
@@ -346,9 +353,10 @@ professional parity; M5 makes it complete.
   backend backstop. Children spawned in a function belong to the CALLING thread, so
   `wait fork` / `disable fork` in the caller reach them (LRM 9.6.3). A child still
   cannot read the function's own formals or locals — exactly what the LRM's own
-  `watch_for_zero` example does — which lifts with V4's per-spawn copies, and
-  `$time` in a function stays refused for a timescale reason (LRM 20.3.1), not an
-  ABI one. Design: docs/design/fork-join.md §"V5 scope".
+  `watch_for_zero` example does — which lifts with V4's per-spawn copies. (`$time`
+  in a function was refused when V5 landed; it is supported now — see "`$time` /
+  `$stime` / `$realtime` in a function" under Subroutines.) Design:
+  docs/design/fork-join.md §"V5 scope".
 - [ ] **`fork`-child capture of a local the ref ABI cannot carry** — an unpacked
   array / struct / string / real / queue / class-handle local, or a class property
   reached through the enclosing method's implicit `this`. Each is refused by name;
@@ -515,6 +523,20 @@ professional parity; M5 makes it complete.
   win is to set the tick to the GCD of a module's *constant* real-delay values
   instead of its full precision when the module has no runtime real delay. (b)
   negative / NaN / inf real delays are not clamped (parity with the integer path).
+- [ ] **A `$unit`-scope subroutine / class has no time unit** — a `timescale`
+  directive applies to design elements (LRM 3.14.2.2), so slang leaves
+  `CompilationUnitSymbol::timeScale` unset unless `$unit` carries an explicit
+  `timeunit` / `timeprecision`, and `apply_time_scale` then falls back to unitless
+  (multiplier 1). A function, task or class method declared directly in `$unit`
+  therefore reads `$time` in *wheel ticks* and writes `#5` as five ticks — a unit
+  that moves with unrelated parts of the design (adding a `#0.5` anywhere shifts
+  the tick from 1 ns to 1 ps and with it every `$unit` reading). Measured on
+  `` `timescale 1ns/1ps `` + a `$unit` function: clotho reports 3000 where the
+  module reports 3; iverilog reports 0, i.e. its own 1 s default. The fix is a
+  fixed tool-default timescale for a scope slang hands back no timescale for
+  (and folding that unit into the wheel tick, like `global_scope_tick_fs` already
+  does for package / `$unit` scopes that DO declare one). Declaring the class or
+  subroutine in a package or module — the usual case — is unaffected.
 - [x] **Subroutine delays and `$time` use the declaring scope's timescale**
   (LRM 3.14.2.3) — a `#5` or a `$time` read inside a task/function is in the time
   units of the scope that *declares* it, not the one that calls it. Clotho lowers
@@ -534,7 +556,8 @@ professional parity; M5 makes it complete.
 - [x] **`real` / `shortreal` types** — storage, arithmetic, conversions, literals,
   parameters, comparisons, `?:`, sensitivity / NBA / continuous / ports / unpacked
   arrays, display formats.
-- [x] **`$realtime`** — rejected inside plain functions (no wheel in the ABI).
+- [x] **`$realtime`** — including inside a plain function, in the units of the
+  scope that declares it.
 - [x] **Real `$display` formats** (`%f`, `%e`, `%g`) and the 21 real math system
   functions (LRM 20.8.2). A real under `%d`/`%h`/`%x`/`%o`/`%b` also converts to
   its rounded integer (LRM 21.2.1.2 / Table 21-1, rounding per 6.12.1) and formats
@@ -576,8 +599,9 @@ professional parity; M5 makes it complete.
   the drain (`emit_active_run`, after the `$strobe` loop, gated by
   `design_uses_monitor_`) indirectly ramps + resumes it each settled instant.
   `$monitoron`/`$monitoroff` toggle (reon reprints). Rejected inside a plain
-  function (no wheel), like `$strobe`. Caveat: change-detection is on the rendered
-  output, so `$time`/`%t` in the arg list reprints every step.
+  function (no record slot for the deferred body), like `$strobe`. Caveat:
+  change-detection is on the rendered output, so `$time`/`%t` in the arg list
+  reprints every step.
 - [ ] **`$timeformat` dynamic-string suffix & zero-arg reset form** (only a
   string-literal suffix accepted).
 - [x] **VCD dump** (`$dumpfile`, `$dumpvars`, `$dumpon`/`$dumpoff`, `$dumpall`,
@@ -588,9 +612,9 @@ professional parity; M5 makes it complete.
   a synthesized zero-formal task holds the deferred arg evaluation, ramped (not
   resumed) at the call site and drained once per settled instant in the
   Postponed region, just before the wheel advances. Rejected inside a plain
-  function (no wheel in the ABI) and of an automatic-lifetime argument (its
-  storage cannot outlive the call — slang's own binder catches this, matching
-  iverilog).
+  function (its deferred body rides the caller's task-call record slot, which only
+  a coroutine has) and of an automatic-lifetime argument (its storage cannot
+  outlive the call — slang's own binder catches this, matching iverilog).
 
 ### File and string I/O
 

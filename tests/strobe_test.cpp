@@ -190,8 +190,9 @@ TEST_CASE("$strobe inside a task") {
     )") == "in task v=7\n");
 }
 
-// $strobe is rejected inside a plain (non-task) function: no wheel in the ABI,
-// mirroring the existing $time / $realtime restriction.
+// $strobe is rejected inside a plain (non-task) function: the deferred body is
+// ramped through the caller's task-call record slot, which only a coroutine has.
+// (Reading the clock there is fine -- $time in a function works.)
 TEST_CASE("$strobe inside a plain function is rejected") {
     check_rejected(R"(
         module m;
@@ -274,7 +275,8 @@ TEST_CASE("$monitor on/off and replacement") {
     )") == "mon1 a=0\nmon1 a=1\nmon1 a=2\nmon1 a=3\nmon2 b=0\nmon2 b=7\n");
 }
 
-// $monitor inside a function has no wheel in the ABI; guard loud (like $strobe).
+// $monitor pends its body the same way $strobe does, so it needs the same record
+// slot a plain function has not got; guard loud (like $strobe).
 TEST_CASE("$monitor in a function is rejected") {
     check_rejected(R"(
         module m;

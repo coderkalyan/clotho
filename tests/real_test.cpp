@@ -440,13 +440,22 @@ TEST_CASE("$realtime keeps the sub-unit fraction and %t accepts reals") {
     CHECK(out == "1.6\n2\n  16.00 ns\n  15.00 ns\n");
 }
 
-TEST_CASE("$realtime inside a function is rejected loudly") {
-    expect_reject(R"(
+// $realtime is readable inside a plain function: the wheel is a module global
+// (clotho.wheel), not a body parameter, so a function reaches the clock exactly
+// as a task does. The value is scaled to the unit of the scope that DECLARES the
+// function (LRM 3.14.2.3) and keeps the sub-unit fraction $time rounds away.
+// Cross-checked against iverilog.
+TEST_CASE("$realtime inside a function keeps the sub-unit fraction") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
         module m;
-            function real f(); return $realtime; endfunction
-            initial $display("%g", f());
+            function automatic real rt(); return $realtime; endfunction
+            initial begin
+                #1.5 $display("%0.4f %0d", rt(), $time);
+                #0.25 $display("%0.4f %0d", rt(), $time);
+            end
         endmodule
-    )", "$realtime inside a function is not supported");
+    )");
+    CHECK(out == "1.5000 2\n1.7500 2\n");
 }
 
 TEST_CASE("real function arguments, returns, and recursion") {

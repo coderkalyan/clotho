@@ -622,3 +622,69 @@ TEST_CASE("unpacked array and struct as output / inout function arguments") {
            "mk a=7 b=11\n"
            "inc a=8\n");
 }
+
+// $time / $stime / $realtime inside a plain function (LRM 20.3). A function is
+// not a coroutine and carries no wheel parameter, but the wheel is a module
+// global (clotho.wheel) that every body binds, so a function reads the clock
+// exactly as a task does. $time rounds the tick count to the time unit of the
+// scope that DECLARES the function -- 1ns here -- while $realtime keeps the
+// sub-unit fraction. The inner $display runs during argument evaluation, so it
+// precedes the caller's line. Cross-checked against iverilog.
+TEST_CASE("$time / $stime / $realtime inside a function read the live clock") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+            function automatic longint unsigned stamp();
+                $display("fn t=%0d st=%0d rt=%0.3f", $time, $stime, $realtime);
+                return $time;
+            endfunction
+            initial begin
+                #5   $display("ret=%0d", stamp());
+                #2.5 $display("ret=%0d", stamp());
+            end
+        endmodule
+    )");
+    CHECK(out == "fn t=5 st=5 rt=5.000\nret=5\n"
+                 "fn t=8 st=8 rt=7.500\nret=8\n");
+}
+
+// LRM 3.14.2.3: the read is in the units of the scope that DECLARES the
+// function, never the one that calls it -- the body is lowered once and shared
+// by every call site (function_id), so scaling it by the caller would leave at
+// most one caller correct. The package function reads nanoseconds while its
+// caller, whose unit is microseconds, reads the same instant as 5000.
+// Cross-checked against iverilog.
+TEST_CASE("a package function's $time uses the declaring scope's timescale") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        package p;
+            function automatic longint unsigned now_ns; return $time; endfunction
+        endpackage
+        `timescale 1us/1ns
+        module m;
+            import p::*;
+            initial begin #5000; $display("fn %0d caller %0d", now_ns(), $time); end
+        endmodule
+    )");
+    CHECK(out == "fn 5000000 caller 5000\n");
+}
+
+// A class method is a function too, and its declaring scope is the class's
+// enclosing package (Scope::getTimeScale walks out to it), so the method reads
+// picoseconds while the calling module reads nanoseconds. Also covers the
+// this-carrying ABI: the wheel is a global, not an added formal, so nothing about
+// the call shape changes. Cross-checked against iverilog.
+TEST_CASE("a class method reads $time in its declaring package's timescale") {
+    const std::string out = run_capture(R"(`timescale 1ps/1ps
+        package p;
+            class C;
+                function longint unsigned t(); return $time; endfunction
+            endclass
+        endpackage
+        `timescale 1ns/1ps
+        module m;
+            import p::*;
+            C c = new;
+            initial begin #4; $display("method=%0d caller=%0d", c.t(), $time); end
+        endmodule
+    )");
+    CHECK(out == "method=4000 caller=4\n");
+}
