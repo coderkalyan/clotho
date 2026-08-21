@@ -5671,6 +5671,32 @@ extern "C" void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32
     str_assign(dst, scratch.buf, out_len, site);
 }
 
+// Append a packed value's bytes to `dst`, most significant byte first: one
+// operand of a streaming concatenation whose destination is a string
+// (LRM 11.4.14). Same 8-bit-chunk rule as rt_string_from_packed, including the
+// dropped 0x00 chunk (LRM 6.16), because a stream reaching a string destination
+// converts through exactly that rule -- slang's constant evaluator routes it
+// through ConstantValue::convertToStr(), so a folded `localparam string P =
+// {>>{...}}` and this runtime append must agree, and they only do if both drop.
+extern "C" void rt_string_append_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits,
+                                        const rt_alloc_site* site) {
+    const uint32_t nbytes = (width_bits + 7) / 8;
+    const uint64_t base   = str_len(dst);
+    str_reserve(dst, base + nbytes, site);
+    char*    out = str_data(dst);
+    uint64_t len = base;
+    for (uint32_t k = 0; k < nbytes; ++k) {
+        uint8_t c = val[nbytes - 1 - k];
+        if (k == 0 && width_bits % 8 != 0) {
+            c &= static_cast<uint8_t>((1u << (width_bits % 8)) - 1);
+        }
+        if (c != 0) {
+            out[len++] = static_cast<char>(c);
+        }
+    }
+    str_set_len(dst, len);
+}
+
 extern "C" void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t width_bits) {
     // Buffer sizing mirrors ir::plane_bytes (InternPool.h) — the backend allocas
     // exactly one val plane and loads an iW from it.

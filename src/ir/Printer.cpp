@@ -374,6 +374,8 @@ const char* tag_name(Inst::Tag tag) {
             return "str_from_packed";
         case T::StrToPacked:
             return "str_to_packed";
+        case T::StrAppendPacked:
+            return "str_append_packed";
         case T::StrAtoi:
             return "str_atoi";
         case T::StrAtohex:

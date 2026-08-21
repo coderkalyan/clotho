@@ -421,6 +421,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_string_putc", &rt_string_putc);
     expose("rt_string_getc", &rt_string_getc);
     expose("rt_string_from_packed", &rt_string_from_packed);
+    expose("rt_string_append_packed", &rt_string_append_packed);
     expose("rt_string_to_packed", &rt_string_to_packed);
     expose("rt_string_atoi", &rt_string_atoi);
     expose("rt_string_atohex", &rt_string_atohex);
