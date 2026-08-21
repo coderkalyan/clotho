@@ -1770,6 +1770,13 @@ struct Inst {
         // the target type's width (payload: op_type — op is the string, type the
         // target packed type).
         StrToPacked,
+        // Append a packed value's bytes to a string lvalue, MSB-first, with the
+        // same 8-bit-chunk rule as StrFromPacked (a 0x00 chunk is dropped, LRM
+        // 6.16): one operand of a streaming concatenation whose destination is a
+        // string (LRM 11.4.14), which converts through exactly that rule -- so
+        // this and a constant-folded stream agree (payload: binary — l is the
+        // string lvalue, like Store's lhs, r is the packed value).
+        StrAppendPacked,
         // s.atoi() / s.atohex() / s.atooct() / s.atobin() -> 32-bit signed
         // `integer` (LRM 6.16.9: the declared type is 4-state, though the
         // conversion itself never yields x — it scans leading digits, and '_'
@@ -2360,6 +2367,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrOctoa:
         case T::StrBintoa:
         case T::StrRealtoa:
+        case T::StrAppendPacked:
         case T::FAdd:
         case T::FSub:
         case T::FMul:

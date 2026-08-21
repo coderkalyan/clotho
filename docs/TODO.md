@@ -1133,8 +1133,15 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   width. See tests/wide_select_test.cpp.
 - [ ] **Dynamic part-select** (`sig[msb_expr:lsb_expr]`) — variable bounds
   (const-bounds only today).
-- [ ] **Streaming operators LHS** — unpack (assignment target); `with` clause;
-  dynamic/string operands.
+- [ ] **Streaming operators, what still needs a bit-level buffer** — `with`
+  clause; an operand or destination whose width does not divide into whole
+  destination granules (`bit [5:0] q[$]` into a string, a 12-bit value into a byte
+  queue); `{<<S{...}}` over a dynamically sized stream (which block a bit lands in
+  depends on the total width, so the whole stream has to exist first); a
+  dynamically sized SOURCE in an unpack (`{>>{q}} = s`); a dynamically sized
+  stream into a FIXED packed target (`int v = {>>{q}}`, where LRM 11.4.14.3's
+  overflow answer is still open — verilator's is not derivable from the text).
+  Each is refused loudly with the width in the message.
 - [x] **Logical implication / equivalence** (`->`, `<->`) in expressions
   (LRM 11.4.7) — dedicated `Limplies`/`Lequiv` IR ops with direct 3-valued
   truth tables. `->` short-circuits (skips lowering the right operand
@@ -1162,8 +1169,21 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   key walk, not an index loop), a queue / dynamic-array member whose elements
   are themselves non-singular, tolerance ranges and `$` bounds.
 - [x] **Indexed part-select** (`sig[base +: width]`, `sig[base -: width]`).
-- [x] **Streaming operators RHS** (`{<<{...}}`, `{>>{...}}`) — pack, fixed-width,
-  nested.
+- [x] **Streaming operators** (`{<<{...}}`, `{>>{...}}`, LRM 11.4.14) — pack and
+  unpack. A fixed-size stream is one packed value (reversal included); a stream
+  with a queue / dynamic-array / string operand keeps its operands apart as chunks
+  and the destination consumes them granule by granule: bytes for a string
+  (`StrAppendPacked` / whole-string concat, which makes `s = {>>{string_q}}` the
+  join UVM's `m_uvm_string_queue_join` wants, one runtime call per element),
+  elements for a queue (pushed) or dynamic array (counted, then sized and stored).
+  Unpack takes the source's leftmost bits, LRM 11.4.14.3's greedy rule giving the
+  first dynamically sized destination everything the fixed ones leave; a fixed
+  unpacked array / struct destination walks leaves in declared order
+  (`unpack_stream_agg`, the inverse of `serialize_agg_lvalue`). A packed operand
+  reaching a string converts through LRM 6.16's 8-bit-chunk rule, dropped 0x00
+  chunk included, so a folded `localparam` and the runtime path agree. Oracle:
+  verilator for every shape it supports (fixed unpack, `<<` reversal, unpacked
+  struct, string join), slang's constant evaluator otherwise.
 
 ### Procedural control
 

@@ -265,6 +265,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::ContainerFmtP:
         case Inst::Tag::StrFromPacked:
         case Inst::Tag::StrToPacked:
+        case Inst::Tag::StrAppendPacked:
         case Inst::Tag::StrAtoi:
         case Inst::Tag::StrAtohex:
         case Inst::Tag::StrAtooct:
@@ -1517,6 +1518,7 @@ struct ValueSweep {
                 case Inst::Tag::ContainerFmtP:
                 case Inst::Tag::StrFromPacked:
                 case Inst::Tag::StrToPacked:
+                case Inst::Tag::StrAppendPacked:
                 case Inst::Tag::StrAtoi:
                 case Inst::Tag::StrAtohex:
                 case Inst::Tag::StrAtooct:

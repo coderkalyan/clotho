@@ -1385,6 +1385,14 @@ uint32_t rt_string_getc(const rt_string* s, int32_t i);
 // an allocation-failure report.
 void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits, const rt_alloc_site* site);
 
+// Append `val`'s bytes to `dst`, most significant byte first: one operand of a
+// streaming concatenation whose destination is a string (LRM §11.4.14). Byte
+// handling is rt_string_from_packed's, dropped 0x00 chunk included (LRM §6.16):
+// a stream into a string converts through that same rule, so this and a
+// constant-folded `localparam string P = {>>{...}}` agree. X/Z bits read as 0
+// (the caller passes the val plane only).
+void rt_string_append_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits, const rt_alloc_site* site);
+
 // Packed-integral cast of a string: writes the little-endian val plane of the
 // result into `out`, which is plane_bytes(width_bits) long. Characters pack
 // most-significant first, right-justified: truncated on the left when the

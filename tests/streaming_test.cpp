@@ -1,6 +1,8 @@
 // Streaming operator (pack/unpack) tests.
-// RHS-only for now; fixed-width operands per LRM §11.4.14.
-// Oracle: slang constant evaluator (iverilog 13 does not support streaming operators).
+// Pack into a packed value, a string, a queue or a dynamic array; unpack from a
+// fixed-width source into any of those (LRM §11.4.14).
+// Oracle: verilator where it supports the shape (noted per case), otherwise
+// slang's constant evaluator -- iverilog 13 has no streaming operators at all.
 
 #include <doctest/doctest.h>
 
@@ -238,8 +240,11 @@ TEST_CASE("stream << x propagation") {
     CHECK(out == "10xx\n");
 }
 
-// Dynamically-sized operands (string) should fail loudly.
-TEST_CASE("stream dynamic operand rejected") {
+// A dynamically sized stream reaching a FIXED packed target: the runtime bit
+// count decides whether it fits, and LRM 11.4.14.3's answer for the overflow is
+// still open, so this stays refused rather than guessed. (A string / queue /
+// dynamic-array target has no such question and works -- see the cases below.)
+TEST_CASE("stream dynamic operand into a packed target rejected") {
     check_rejected(R"(
         module t;
             string s = "hello";
@@ -265,4 +270,212 @@ TEST_CASE("whole unpacked array as a streaming-concat operand (LRM 11.4.14)") {
             end
         endmodule
     )") == "10111213 13121110\n");
+}
+
+// -- A string destination (LRM 11.4.14: a string is a bit-stream type of 8*len
+// bits, so it is byte-granular in both directions) --
+
+// The shape UVM's m_uvm_string_queue_join uses (uvm_misc.svh): streaming a queue
+// of strings into a string is a join. Cross-checked against verilator, which
+// prints the same "abcde".
+TEST_CASE("stream a queue of strings into a string joins them (LRM 11.4.14)") {
+    CHECK(run_capture(R"(
+        module m;
+            string q[$];
+            string r;
+            initial begin
+                q = {q, "ab"};
+                q = {q, "cde"};
+                r = {>>{q}};
+                $display("[%s] %0d", r, r.len());
+            end
+        endmodule
+    )") == "[abcde] 5\n");
+}
+
+TEST_CASE("stream a byte queue and a string into a string") {
+    CHECK(run_capture(R"(
+        module m;
+            byte q[$];
+            string s = "hi";
+            string r;
+            initial begin
+                q = {q, 8'h61};
+                q = {q, 8'h62};
+                r = {>>{q}};
+                $display("[%s]", r);
+                r = {>>{s, q}};
+                $display("[%s]", r);
+            end
+        endmodule
+    )") == "[ab]\n[hiab]\n");
+}
+
+// A packed operand converts through the 8-bit-chunk rule of LRM 6.16, dropped
+// 0x00 chunk included -- the same rule slang's constant evaluator applies, so the
+// folded parameter and the runtime assignment must agree. They are checked
+// together here because a divergence between them is the failure mode.
+TEST_CASE("stream a packed value into a string drops zero bytes") {
+    CHECK(run_capture(R"(
+        module m;
+            localparam string P = {>>{32'h41004243}};
+            string s;
+            initial begin
+                s = {>>{32'h41004243}};
+                $display("%0d %0d [%s] [%s]", s.len(), P.len(), s, P);
+            end
+        endmodule
+    )") == "3 3 [ABC] [ABC]\n");
+}
+
+// -- A queue / dynamic-array destination --
+
+TEST_CASE("stream a packed value into a queue and a dynamic array") {
+    CHECK(run_capture(R"(
+        module m;
+            byte q[$];
+            byte d[];
+            int v = 32'h01020304;
+            initial begin
+                q = {>>{v}};
+                d = {>>{v}};
+                $display("%0d %h %h %h %h", q.size(), q[0], q[1], q[2], q[3]);
+                $display("%0d %h %h", d.size(), d[0], d[3]);
+            end
+        endmodule
+    )") == "4 01 02 03 04\n4 01 04\n");
+}
+
+TEST_CASE("stream a string into a byte queue") {
+    CHECK(run_capture(R"(
+        module m;
+            byte q[$];
+            string s = "abc";
+            initial begin
+                q = {>>{s}};
+                $display("%0d %h %h %h", q.size(), q[0], q[1], q[2]);
+            end
+        endmodule
+    )") == "3 61 62 63\n");
+}
+
+// The source is materialized into a temp before the target is cleared, the same
+// rule `q = {q, e}` relies on, so a self-referential stream keeps its elements.
+TEST_CASE("stream a queue into itself") {
+    CHECK(run_capture(R"(
+        module m;
+            byte q[$];
+            initial begin
+                q = {q, 8'h11};
+                q = {q, 8'h22};
+                q = {>>{q}};
+                $display("%0d %h %h", q.size(), q[0], q[1]);
+            end
+        endmodule
+    )") == "2 11 22\n");
+}
+
+// -- Unpack: a streaming concatenation as the assignment target (LRM 11.4.14.3) --
+
+// Bits are consumed from the source's left. Cross-checked against verilator for
+// the fixed-array, `<<` and unpacked-struct forms.
+TEST_CASE("unpack a packed value into a fixed unpacked array") {
+    CHECK(run_capture(R"(
+        module m;
+            byte a[4];
+            byte c[4];
+            initial begin
+                {>>{a}} = 32'hdeadbeef;
+                {<<8{c}} = 32'hdeadbeef;
+                $display("%h %h %h %h", a[0], a[1], a[2], a[3]);
+                $display("%h %h %h %h", c[0], c[1], c[2], c[3]);
+            end
+        endmodule
+    )") == "de ad be ef\nef be ad de\n");
+}
+
+TEST_CASE("unpack a packed value into an unpacked struct") {
+    CHECK(run_capture(R"(
+        typedef struct { byte x; shortint y; } s_t;
+        module m;
+            s_t v;
+            initial begin
+                {>>{v}} = 24'h112233;
+                $display("%h %h", v.x, v.y);
+            end
+        endmodule
+    )") == "11 2233\n");
+}
+
+// LRM 11.4.14.3 is greedy: the first dynamically sized destination takes every
+// bit the fixed ones leave, so `h` takes the top byte and the queue the rest.
+TEST_CASE("unpack into a queue, a dynamic array and a string") {
+    CHECK(run_capture(R"(
+        module m;
+            byte h;
+            byte q[$];
+            byte d[];
+            string s;
+            initial begin
+                {>>{q}} = 32'hdeadbeef;
+                $display("%0d %h %h", q.size(), q[0], q[3]);
+                {>>{h, q}} = 32'hdeadbeef;
+                $display("%h %0d %h %h", h, q.size(), q[0], q[2]);
+                {>>{d}} = 16'h1234;
+                $display("%0d %h %h", d.size(), d[0], d[1]);
+                {>>{s}} = 32'h41424344;
+                $display("[%s] %0d", s, s.len());
+            end
+        endmodule
+    )") == "4 de ef\nde 3 ad ef\n2 12 34\n[ABCD] 4\n");
+}
+
+// -- What stays refused, loudly (each needs a bit-level buffer or an LRM answer
+// this implementation does not have) --
+
+TEST_CASE("streaming shapes that need bit-level realignment are rejected") {
+    SUBCASE("slice size over a dynamically-sized stream") {
+        check_rejected(R"(
+            module m;
+                byte q[$];
+                string s;
+                initial s = {<<8{q}};
+            endmodule
+        )", "slice size on a dynamically-sized streaming concatenation");
+    }
+    SUBCASE("operand that is not a whole number of bytes into a string") {
+        check_rejected(R"(
+            module m;
+                bit [5:0] q[$];
+                string s;
+                initial s = {>>{q}};
+            endmodule
+        )", "not a whole number of bytes");
+    }
+    SUBCASE("operand that does not divide into whole elements") {
+        check_rejected(R"(
+            module m;
+                byte q[$];
+                bit [11:0] v;
+                initial q = {>>{v}};
+            endmodule
+        )", "not a whole number of elements");
+    }
+    SUBCASE("dynamically-sized source in an unpack") {
+        check_rejected(R"(
+            module m;
+                byte q[$];
+                string s = "hi";
+                initial {>>{q}} = s;
+            endmodule
+        )", "dynamically-sized source");
+    }
+    SUBCASE("container of strings as an unpack destination") {
+        check_rejected(R"(
+            module m;
+                string q[$];
+                initial {>>{q}} = 16'h4142;
+            endmodule
+        )", "not integral or string");
+    }
 }

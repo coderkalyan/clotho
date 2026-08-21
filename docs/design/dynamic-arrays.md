@@ -80,6 +80,18 @@ First cut restrictions, each keeping a guard and a documented TODO:
   7.8.3) and **unpacked struct / fixed array** (LRM 7.8.5). All unified under the
   normalized byte-span key model (§4a); the only remaining exclusion is a string
   or dynamically-sized member *inside* a struct key (variable-length span).
+- **Streaming operators — granule-aligned only** (LRM 11.4.14, added with
+  pack/unpack into containers). A queue, dynamic array or string on either side of
+  `{>>{...}}` has no lower-time width, so the stream stays a list of chunks
+  (`StreamChunk` in `Lower.cpp`) and the destination consumes it granule by
+  granule: one element per element width, one byte per byte. Everything whose
+  chunk boundaries do not line up with the destination's granule is refused with
+  the offending width in the message and needs a bit-level buffer instead: a
+  6-bit-element queue into a string, a 12-bit value into a byte queue, `{<<S{...}}`
+  over a dynamically sized stream, a dynamically sized source in an unpack. Only
+  the dynamic-array destination needs the element count up front (it is allocated,
+  not pushed onto), and `stream_granule_count` computes it — with a runtime
+  accumulation loop when the count depends on string lengths.
 
 ## 3. Element value model
 
@@ -420,6 +432,15 @@ violates LRM 7.8 by *creating* an entry on a read of an absent key (its
 values, absent-key no-create, `foreach`/first/next order (integral, signed,
 string, `[*]`-wildcard cross-width), absent-key element default by domain,
 deep-copy independence, and input-argument copy-in.
+
+**Streaming into or out of a container has no iverilog oracle either** — iverilog
+13 answers `sorry: Streaming concatenation not supported`. verilator covers the
+fixed shapes (unpack into an array or unpacked struct, `<<` block reversal, and
+the queue-of-strings join) and agrees on all of them; everything it refuses
+(`{>>{q}} = v`, a string destination, a string source into a byte queue) is pinned
+against LRM 11.4.14 plus slang's own constant evaluator, which
+`tests/streaming_test.cpp` exercises directly by folding the same expression into
+a `localparam` and comparing it with the runtime result.
 
 ## 13. Confirmed at implementation
 

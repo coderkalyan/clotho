@@ -12913,6 +12913,10 @@ private:
         return rt_fn("rt_string_from_packed", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
+    llvm::FunctionCallee str_append_packed_fn() {
+        return rt_fn("rt_string_append_packed", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
+    }
     llvm::FunctionCallee str_to_packed_fn() {
         return rt_fn("rt_string_to_packed", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
     }
@@ -14230,6 +14234,7 @@ private:
             case Inst::Tag::StrOctoa:
             case Inst::Tag::StrBintoa:
             case Inst::Tag::StrRealtoa:
+            case Inst::Tag::StrAppendPacked:
                 return { 0, false, false };
 
             case Inst::Tag::Store:
@@ -15987,6 +15992,18 @@ private:
                 b_.CreateCall(str_to_packed_fn(), { str_of(p.op_type.op), buf, b_.getInt32(to.width) });
                 llvm::Value* v = b_.CreateAlignedLoad(int_ty(to.width), buf, llvm::Align(1));
                 set_value(i, packed(v, v, zero(to.width)));
+                return;
+            }
+            case Inst::Tag::StrAppendPacked: {
+                // Same must-plane spill as StrFromPacked above; the runtime keeps
+                // 0x00 bytes here because a stream has a known bit count.
+                const ValType  t   = type_of(p.binary.r);
+                const uint32_t pb  = plane_bytes(t.width);
+                llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.append");
+                b_.CreateAlignedStore(must_of(value_of(p.binary.r)), buf, llvm::Align(1));
+                b_.CreateCall(str_append_packed_fn(),
+                              { lv_string_ptr(lvalue_of(p.binary.l)), buf, b_.getInt32(t.width),
+                                alloc_site_global(loc_text(i), "string") });
                 return;
             }
 
