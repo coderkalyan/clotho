@@ -843,8 +843,35 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   container element, which the old array-only walk let through to the plane-copy
   path (now guarded).
 - [ ] **String event control / sensitivity**.
-- [ ] **`case` over strings** — needs its own comparison chain over the existing
-  string `Eq` (the shape `lower_case_real` uses), not a value merge.
+- [x] **`case` over strings** (LRM 12.5 / 6.16.9) — **an LRM ambiguity resolved
+  deliberately, not a sanctioned construct.** 12.5 words matching as a bit-for-bit
+  `===` over operands zero-extended to the widest, and Table 11-1 bars `===` on a
+  string exactly as it does on a real, so the standard defines the comparison only
+  for integral operands; 6.16.9 defines `==` over string content and no `===`. But
+  12.5 puts no type restriction on the case expression and nothing prohibits the
+  spelling, so it is read as content equality — the only well-defined reading, and
+  the one `===` degenerates to on an operand with no x/z, which is the same call the
+  real path makes. The zero-extension half is dropped: there is no width to extend
+  to, and padding one side would contradict 6.16.9. A literal's NUL bytes are
+  already dropped where it becomes a string (6.16), so `"\000A"` and `"A"` are one
+  value and match.
+  A string selector routes the statement to `lower_case_string`, which matches with
+  the existing string `Eq`. It keeps 12.5's lazy first-match chain (a later label's
+  side effects never run once an earlier item matched), keeps the `unique` /
+  `unique0` / `priority` 12.5.3 overlap and no-match checks off the same per-item
+  predicates, and handles multi-label items and `case ... inside` over a label SET.
+  `(* full_case *)` / `(* parallel_case *)` are skipped — they enumerate the
+  selector's integral value space. Guarded loud: a `case ... inside` string RANGE
+  bound (11.4.13 over 6.16.9's relational operators — implementable, unreached).
+  `casez` / `casex` over a string and a mixed string/integral label list are both
+  refused by slang's binder before clotho sees them; the clotho-side guards are
+  kept and labelled unreachable.
+  **No oracle**: iverilog 13 cannot compile a string `case` at all (it aborts
+  in `draw_eval_vec4`), so this is pinned to the LRM text rather than to a
+  simulator. Verilator 5.050 accepts it and agrees on content equality, which is
+  corroboration, not authority. Motivated by UVM: `uvm_string_to_verbosity` /
+  `uvm_string_to_action` dispatch `+UVM_VERBOSITY=` this way, nine such statements
+  in the reachable part of uvm-core.
 - [x] **`?:` over strings** — the arms are borrowed `rt_string` handles, so the
   eager path selects a pointer (`lower_string_mux`) and the lazy path merges the
   two arms with a pointer PHI; no string temp and no deep copy. An ambiguous
@@ -1144,10 +1171,14 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   entry by DIRECTION: a mutating method creates it, a query reads through get_ptr
   and falls back to the empty-container default, so `a["absent"].size()` is 0 and
   leaves `num()` alone (LRM 7.8.6).
-  Still guarded loud, each for a stated reason (docs/design/data-model.md §7): an
-  element select THROUGH a container-valued entry (`a[k][i]`) needs composed
-  deferral, since the select would have to pick a direction that belongs to its
-  consumer; and a `string` or dynamically-sized member inside a struct KEY needs
+  An element select THROUGH a container-valued entry (`a[k][i]`) works, to any
+  nesting depth, in both directions and for a mutating method's receiver: the access
+  direction is threaded down the select chain (`ir::ElemSelect::for_write`) rather
+  than deferred to the consumer, so a read resolves get_ptr and creates nothing (LRM
+  7.8.6) while a write and a mutating receiver resolve put_ptr (7.8 / 7.10). A `ref`
+  bound through one is checked at every level (docs/design/data-model.md §3.1).
+  Still guarded loud, for a stated reason (§7): a `string` or dynamically-sized
+  member inside a struct KEY needs
   the order-preserving escaped encoding (the normalized span would otherwise be
   variable-length). Whole-array NBA works (`HandleCopyNb`); a literal RHS under
   NBA does not. An x/z index is invalid per 7.8.4 / 7.8.5: the read yields the
@@ -1246,7 +1277,16 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 - [x] **`foreach`** (12.7.3) — fixed-size arrays + `string`; dynamic arrays and
   queues iterate the runtime size; associative arrays iterate keys in ascending
   order via first/next (a `[*]`-wildcard index has no key type, so foreach over
-  it is illegal per LRM and rejected by slang).
+  it is illegal per LRM and rejected by slang). A NESTED runtime dimension
+  (`foreach (a[k, i])` over an assoc of queues, a queue of queues, an assoc of
+  assocs) measures and iterates the entry the outer dimension is sitting on,
+  rebuilt per region from the outer loop variables (`foreach_base_lv`); dimensions
+  are peeled through the interned IR type, since slang answers
+  `isDynamicallySizedArray()` for a map as well. Before that every runtime
+  dimension measured the whole array, so the inner dimension re-walked the OUTER
+  container with the inner loop variable bound to a key — wrong trip count, wrong
+  index, and silent. Refused loud: a skipped outer dimension over a nested runtime
+  one (`foreach (a[, i])`), which names no entry to descend into.
 - [x] **`do … while`**.
 - [x] **`break` / `continue`**.
 - [x] **`case … inside`** (12.5.4 / 11.4.13) — singular labels via wildcard

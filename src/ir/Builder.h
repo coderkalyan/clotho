@@ -99,7 +99,9 @@ public:
     Index dyn_part_select(Index base, Index offset, uint32_t width, SourceLoc loc);
     // Unpacked-array element select base[index]. `array_type` is the interned
     // UnpackedArray type being indexed (gives element stride + declared bounds).
-    Index elem_select(Index base, Index index, Ref array_type, SourceLoc loc);
+    // `for_write` marks the access this select serves as a write; it matters only
+    // when the base is a deferred assoc element (see ir::ElemSelect).
+    Index elem_select(Index base, Index index, Ref array_type, SourceLoc loc, bool for_write = false);
     // Constant-bounds slice of a fixed unpacked array. `slice_type` is the
     // slice's own UnpackedArray type; `first_pos` the 0-based storage position
     // of its first element in the base array. Yields a position-0-anchored
@@ -189,7 +191,7 @@ public:
     // docs/design/dynamic-arrays.md §4a/§6.
     // a[key] element select producing an lvalue: a Load calls rt_assoc_get_ptr
     // (absent -> element default, no create); a Store calls rt_assoc_put_ptr.
-    Index assoc_select(Index a, Index key, Ref assoc_type, SourceLoc loc);
+    Index assoc_select(Index a, Index key, Ref assoc_type, SourceLoc loc, bool for_write = false);
     // a.num() / a.size(): entry count (32-bit int).
     Index assoc_num(Index a, Ref assoc_type, SourceLoc loc);
     // a.exists(key): 32-bit int 0/1.

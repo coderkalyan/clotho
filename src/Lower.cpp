@@ -14645,6 +14645,54 @@ private:
         lower_foreach_dim(f, 0, b);
     }
 
+    // The container dimension `dim` iterates: the array the `foreach` names, with one
+    // dimension peeled per preceding slot. Peeled through the interned IR type, whose
+    // kinds are exact — slang answers isDynamicallySizedArray() for an associative
+    // array too, so peeling by slang predicate measured a map as a dynamic array. A
+    // skipped slot (`a[,j]`) peels as well: it names a dimension without iterating it.
+    ir::Ref foreach_dim_ref(const ForeachLoopStatement& f, size_t dim) {
+        ir::Ref t = lower_type(*f.arrayRef.type);
+        for (size_t k = 0; k < dim; ++k) {
+            const ir::Type& ty = std::get<ir::Type>(module_.pool.get(t));
+            if (ty.element == ir::Ref::Invalid) {
+                return t;
+            }
+            t = ty.element;
+        }
+        return t;
+    }
+
+    // An lvalue for dimension `dim`'s container: the array the `foreach` names, with
+    // one element select per already-iterated dimension, each keyed by that
+    // dimension's live loop variable. `a[k, i]` over an assoc of queues therefore
+    // measures and indexes `a[k]`, not `a`.
+    //
+    // Re-emitted on demand rather than cached, because a loop's cond / body / step are
+    // three separate instruction regions and each needs its own leaf — the same reason
+    // TempCell::lv re-emits. Read-only: measuring a container never creates an entry
+    // (LRM 7.8.6), and the body's own accesses carry their own direction.
+    ir::Index foreach_base_lv(const ForeachLoopStatement& f, size_t dim, ir::Builder& b, ir::SourceLoc l) {
+        ir::Index base = lower_lvalue(f.arrayRef, b);
+        for (size_t k = 0; k < dim; ++k) {
+            const ir::Ref   cref = foreach_dim_ref(f, k);
+            const ir::Type& cty  = std::get<ir::Type>(module_.pool.get(cref));
+            const ForeachLoopStatement::LoopDim& d = f.loopDims[k];
+            if (d.loopVar == nullptr) {
+                // `foreach (a[, i])` where dimension k is runtime-sized: there is no
+                // loop variable, so no entry to descend into and no per-entry bound to
+                // read. A fixed dimension needs no descent (its range is declared),
+                // which is why only the nested runtime case reaches this.
+                // TODO: iterate every entry of a skipped runtime dimension implicitly.
+                fail("foreach over a runtime-sized dimension whose outer dimension is "
+                     "skipped is not supported");
+            }
+            const ir::Index iter = b.unary(ir::Inst::Tag::Load, value_lvalue(*d.loopVar, b, l), l);
+            base = cty.kind == ir::Type::Kind::Assoc ? b.assoc_select(base, iter, cref, l)
+                                                     : b.elem_select(base, iter, cref, l);
+        }
+        return base;
+    }
+
     void lower_foreach_dim(const ForeachLoopStatement& f, size_t dim, ir::Builder& b) {
         if (dim == f.loopDims.size()) {
             lower_stmt(f.body, b);
@@ -14662,26 +14710,36 @@ private:
         const ir::Index iter_lv = value_lvalue(*d.loopVar, b, l);
 
         if (!d.range.has_value()) {
-            // A runtime-sized dimension (string or dynamic array): snapshot the
-            // length once and iterate 0..len-1 (0-based, matching StrGetc and
-            // dynamic-array element addressing).
-            if (is_string_expr(f.arrayRef)) {
-                const ir::Index len = b.unary(ir::Inst::Tag::StrLen, lower_expr(f.arrayRef, b), l);
+            // A runtime-sized dimension: snapshot the length once and iterate
+            // 0..len-1 (0-based, matching StrGetc and element addressing), or walk the
+            // keys for an assoc.
+            //
+            // The container measured is THIS dimension's, not `f.arrayRef`: for a
+            // nested runtime dimension (`foreach (a[k, i])` over an assoc of queues)
+            // the bound is the length of the entry the outer dimension is currently
+            // sitting on. Measuring `f.arrayRef` for every dimension re-walked the
+            // OUTER container with the inner loop variable, which for an assoc of
+            // queues bound the inner index to a key.
+            const ir::Ref cref = foreach_dim_ref(f, dim);
+            if (ir::types::is_string(module_.pool, cref)) {
+                const ir::Index len =
+                  b.unary(ir::Inst::Tag::StrLen,
+                          b.unary(ir::Inst::Tag::Load, foreach_base_lv(f, dim, b, l), l), l);
                 lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
                 return;
             }
-            if (is_dyn_array(f.arrayRef)) {
-                const ir::Index len = b.dyn_array_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
-                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
-                return;
-            }
-            if (is_queue(f.arrayRef)) {
-                const ir::Index len = b.queue_size(lower_lvalue(f.arrayRef, b), lower_type(*f.arrayRef.type), l);
-                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
-                return;
-            }
-            if (is_assoc(f.arrayRef)) {
+            if (ir::types::is_assoc(module_.pool, cref)) {
                 lower_foreach_assoc_dim(f, dim, ty, iter_lv, b, l);
+                return;
+            }
+            if (ir::types::is_queue(module_.pool, cref)) {
+                const ir::Index len = b.queue_size(foreach_base_lv(f, dim, b, l), cref, l);
+                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
+                return;
+            }
+            if (ir::types::is_dynarr(module_.pool, cref)) {
+                const ir::Index len = b.dyn_array_size(foreach_base_lv(f, dim, b, l), cref, l);
+                lower_foreach_runtime_dim(f, dim, ty, iter_lv, len, b, l);
                 return;
             }
             fail("foreach over an unsupported runtime-sized dimension");
@@ -14767,12 +14825,12 @@ private:
                                  ir::Builder&  b,
                                  ir::SourceLoc l) {
         const ir::Ref    bit1 = make_int_type(1, false, false);
-        const ir::Ref    aty  = lower_type(*f.arrayRef.type);
+        const ir::Ref    aty  = foreach_dim_ref(f, dim);
         const TempCell   ok   = make_temp_cell(bit1, "foreach_ok");
         using Step            = ir::Builder::AssocStep;
         b.binary(ir::Inst::Tag::Store,
                  ok.lv(b, l),
-                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::First, aty, l), bit1, l),
+                 b.resize(b.assoc_traverse(foreach_base_lv(f, dim, b, l), iter_lv, Step::First, aty, l), bit1, l),
                  l);
 
         b.open_region();
@@ -14786,7 +14844,7 @@ private:
         b.open_region();
         b.binary(ir::Inst::Tag::Store,
                  ok.lv(b, l),
-                 b.resize(b.assoc_traverse(lower_lvalue(f.arrayRef, b), iter_lv, Step::Next, aty, l), bit1, l),
+                 b.resize(b.assoc_traverse(foreach_base_lv(f, dim, b, l), iter_lv, Step::Next, aty, l), bit1, l),
                  l);
         const ir::ExtraSlice step = b.close_region();
 
@@ -15356,6 +15414,142 @@ private:
         return pred;
     }
 
+    // -- `case` over a string selector --
+    //
+    // LRM AMBIGUITY, decided here. 12.5 words a `case` match as a bit-for-bit `===`
+    // between selector and label, over operands zero-extended to the widest. Neither
+    // half of that is defined for `string`: Table 11-1 bars `===` on a string exactly
+    // as it does on a real, and 6.16 makes `string` a dynamic-length type with no bits
+    // and no width to extend to. 6.16.9 defines `==` / `!=` (and the relational
+    // operators) over string content, and defines no `===`. So a string `case` is not
+    // *sanctioned* by 12.5 -- and it is not prohibited either: 12.5 puts no type
+    // restriction on the case expression, and slang binds it.
+    //
+    // Read as content equality (`==`, 6.16.9). It is the only reading that is both
+    // well defined and degenerates correctly: a string carries no x/z, which is the
+    // whole content of the 4-state rule, so `===` collapses onto `==` -- the same call
+    // the real path already makes (lower_case_real, TODO.md "case on a real
+    // selector"). The zero-extension half is dropped rather than reinterpreted: there
+    // is no width to extend to, and padding one side would contradict 6.16.9's
+    // content comparison. A string literal's NUL bytes are already dropped where the
+    // literal becomes a string (6.16), so `"\000A"` and `"A"` are one value here and
+    // match -- Verilator 5.050 agrees.
+    //
+    // No oracle: iverilog 13 does not compile a string `case` at all (it dies
+    // in `draw_eval_vec4` on an assertion), so this is pinned to the
+    // LRM text above rather than to a simulator. Verilator 5.050 does accept it and
+    // agrees with content equality, which is corroboration and not authority.
+    //
+    // UVM is why this exists: `uvm_string_to_verbosity` and `uvm_string_to_action`
+    // (uvm_globals.svh) dispatch `+UVM_VERBOSITY=` and `+uvm_set_action` this way,
+    // and there are nine such statements in the parts of uvm-core a testbench reaches.
+    ir::Index string_case_label_pred(const Expression& label, ir::Index sel, ir::Builder& b) {
+        if (label.kind == ExpressionKind::ValueRange) {
+            // TODO: `case (s) inside ["a":"z"]` — 11.4.13 membership over a range is
+            // the pair of relational comparisons, which 6.16.9 does define for strings
+            // (lexicographic), so this is implementable; nothing reaches it yet.
+            fail("case ... inside with a string range bound is not supported");
+        }
+        if (!is_string_expr(label)) {
+            // Unreachable from source: slang rejects a mixed string case itself
+            // ("case expression of type 'bit[7:0]' is not comparable to common type
+            // 'string'"), because 12.5 needs one common type across selector and
+            // labels. Kept because the reading below assumes both sides are strings,
+            // and 6.16 does define string/packed conversion, so a future slang could
+            // start admitting it.
+            fail("a non-string label in a case statement over strings is not supported");
+        }
+        return b.binary(ir::Inst::Tag::Eq, sel, lower_expr(label, b), loc(label));
+    }
+
+    // OR of one case_item's label predicates, as every other case path builds it.
+    ir::Index string_case_item_pred(const CaseStatement::ItemGroup& item, ir::Index sel, ir::Builder& b) {
+        ir::Index pred = string_case_label_pred(*item.expressions[0], sel, b);
+        for (size_t j = 1; j < item.expressions.size(); j++) {
+            const Expression* e   = item.expressions[j];
+            const ir::Index   one = string_case_label_pred(*e, sel, b);
+            pred                  = b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e));
+        }
+        return pred;
+    }
+
+    // Lazy first-match chain, the shape lower_case_real_item uses and for the same
+    // reason: item k's predicate is built in the enclosing else region, so a later
+    // label -- and any side effect in it -- is evaluated only if every earlier item
+    // missed (12.5).
+    void lower_case_string_item(const CaseStatement& c, size_t k, ir::Index sel, bool report_viol, ir::Builder& b) {
+        if (k == c.items.size()) {
+            if (c.defaultCase != nullptr) {
+                lower_stmt(*c.defaultCase, b);
+            } else if (report_viol) {
+                b.case_violation(case_banner(c), 0, loc(c));
+            }
+            return;
+        }
+        const ir::Index pred = string_case_item_pred(c.items[k], sel, b);
+
+        b.open_region();
+        lower_stmt(*c.items[k].stmt, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        lower_case_string_item(c, k + 1, sel, report_viol, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, loc(*c.items[k].stmt));
+    }
+
+    // `case` with a string selector. The selector is lowered ONCE (12.5: the case
+    // expression is evaluated once, before any label), and every label compares
+    // against that value.
+    //
+    // `(* full_case *)` / `(* parallel_case *)` are skipped for the reason the real
+    // path skips them: both enumerate the selector's integral value space, and a
+    // string does not have one. unique / unique0 / priority keep their 12.5.3 checks.
+    void lower_case_string(const CaseStatement& c, ir::Builder& b) {
+        using Check = slang::ast::UniquePriorityCheck;
+        if (c.condition == CaseStatementCondition::WildcardJustZ ||
+            c.condition == CaseStatementCondition::WildcardXOrZ) {
+            // Unreachable from source: slang rejects it itself ("invalid type 'string'
+            // for casez expression"). Kept because the do-not-care positions of
+            // `casez` / `casex` are bits of a 4-state vector (12.5.1) and a string has
+            // none, so if it ever did arrive there would be nothing for the wildcard
+            // to mean -- and silently demoting it to `case` would be a wrong answer
+            // rather than a refusal.
+            fail("casez / casex over strings is not supported");
+        }
+        const bool no_match_report =
+          (c.check == Check::Priority || c.check == Check::Unique) && c.defaultCase == nullptr;
+        const bool needs_overlap = c.check == Check::Unique || c.check == Check::Unique0;
+
+        const ir::Index sel = lower_expr(c.expr, b);
+        if (!needs_overlap) {
+            lower_case_string_item(c, 0, sel, no_match_report, b);
+            return;
+        }
+        // unique / unique0 evaluate every item's predicate once up front (12.5.3
+        // permits it), share them with the overlap check, and dispatch off the same
+        // temps -- the real path's arrangement, and `allow_switch=false` for the same
+        // reason: there is no integral key to switch on.
+        std::vector<ir::Index> preds;
+        preds.reserve(c.items.size());
+        for (const CaseStatement::ItemGroup& item : c.items) {
+            preds.push_back(string_case_item_pred(item, sel, b));
+        }
+        emit_overlap_check(preds, case_banner(c), loc(c), b);
+        slang::ast::ASTContext astCtx(*scope_, slang::ast::LookupLocation::max);
+        dispatch_preds(c,
+                       0,
+                       sel,
+                       /*width=*/0,
+                       /*key_width=*/0,
+                       astCtx,
+                       preds,
+                       no_match_report,
+                       b,
+                       /*allow_switch=*/false);
+    }
+
     // Lazy first-match chain for a real case, mirroring lower_case_item without
     // its jump-table attempt (a real has no integral key) and without case_dedup
     // (which compares labels as SVInt constants). Item k's predicate is built in
@@ -15822,9 +16016,11 @@ private:
             return;
         }
         if (is_string_expr(c.expr)) {
-            // TODO: case over strings (labels compare with rt_string_cmp; the
-            // common-type/resize machinery below is packed-only).
-            fail("case statement over strings is not supported");
+            // String selector: its own comparison chain, because everything below is
+            // packed-only (a common compare width, an SVInt label dedup, a jump table
+            // keyed on the selector). See lower_case_string for the LRM reading.
+            lower_case_string(c, b);
+            return;
         }
         if (has_real_case_operand(c)) {
             // Real selector or real label, `inside` included: its own comparison
@@ -18177,6 +18373,15 @@ private:
             // that is also how a queue's string elements already print.
             frag += "\"%s\"";
         } else if (!sty.isIntegral()) {
+            const ir::Ref cl = lower_type(sty);
+            if (is_handle_ref(cl) || is_agg_abi_ref(cl)) {
+                // TODO: %p of a container or aggregate ELEMENT. 21.2.1.6 recurses
+                // into one, but the runtime renderer works from a flat element
+                // descriptor (one integral / real / string per element), so a nested
+                // container has no image to hand it. Reported here rather than
+                // falling into the handle case below, whose reason is different.
+                fail("%p of a container or aggregate element is not supported");
+            }
             // TODO: %p of a class / chandle / event / virtual-interface handle. The
             // clause wants an implementation-defined form with `null` for a null
             // handle; Clotho has no handle rendering, and printing the raw pointer
@@ -19252,7 +19457,8 @@ private:
                                      const CallExpression& call,
                                      ir::Builder&          b,
                                      ir::SourceLoc         l) {
-        const ir::Index arr = lower_lvalue(*call.arguments()[0], b);
+        // See lower_queue_method for why the receiver carries a direction.
+        const ir::Index arr = lower_lvalue(*call.arguments()[0], b, mutates_container(name));
         const ir::Ref   aty = lower_type(*call.arguments()[0]->type);
         if (name == "size") {
             return b.resize(b.dyn_array_size(arr, aty, l), lower_type(*call.type), l);
@@ -19633,30 +19839,22 @@ private:
     // over the handle lvalue `base`. Handles the queue `$` selector (q[$] is the
     // last element, index size-1; size-1 == -1 selects the OOB default on an
     // empty queue).
-    ir::Index var_elem_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
-        if (is_assoc_element_select(es.value()) && is_handle_expr(es.value())) {
-            // `a[k][i]`: the inner container is an associative-array ENTRY, whose
-            // slot address depends on the access direction (get_ptr must not create
-            // the entry, LRM 7.8.6; put_ptr must), and that direction belongs to the
-            // consumer of this select, not to the select itself.
-            //
-            // TODO: compose the deferral so an ElemSelect over a deferred AssocSelect
-            // stays deferred, carrying the pending index alongside the pending key.
-            // Whole-value assignment (`a[k] = q`, `q = a[k]`) and the container's own
-            // methods (`a[k].push_back(v)`, `a[k].size()`) all work today, each being
-            // unambiguously one direction.
-            fail("an element select through an associative-array element that is "
-                 "itself a queue or dynamic array is not supported (whole-value "
-                 "assignment and its own methods are)");
-        }
+    //
+    // `is_write` marks the direction of the access this select serves. It is only
+    // consulted when `base` is a DEFERRED associative-array element (`a[k][i]`),
+    // where the ring arithmetic below forces the entry's slot to be resolved before
+    // any consumer is in sight: a read resolves with get_ptr and must not create the
+    // entry (LRM 7.8.6), a write with put_ptr and must (LRM 7.8).
+    ir::Index var_elem_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b,
+                              ir::SourceLoc l, bool is_write) {
         const ir::Ref arr_ty = lower_type(*es.value().type);
         if (is_queue(es.value()) && es.selector().type->isUnbounded()) {
             const ir::Ref   i32  = make_int_type(32, false, true);
             const ir::Index size = b.queue_size(base, arr_ty, l);
             const ir::Index idx  = b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
-            return b.elem_select(base, idx, arr_ty, l);
+            return b.elem_select(base, idx, arr_ty, l, is_write);
         }
-        const ir::Index sel = b.elem_select(base, lower_index(es.selector(), b), arr_ty, l);
+        const ir::Index sel = b.elem_select(base, lower_index(es.selector(), b), arr_ty, l, is_write);
         // The select carries the extent of what was indexed, so a bounds report
         // can underline `grid[a]` under the `[b]` of `grid[a][b]` rather than
         // guess the width from the array's name.
@@ -19689,10 +19887,13 @@ private:
 
     // Element address for an associative array (LRM 7.8): `a[key]` over the
     // handle lvalue `base`. The backend normalizes the key into its byte span and
-    // resolves get_ptr (read) / put_ptr (write).
-    ir::Index var_assoc_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b, ir::SourceLoc l) {
+    // resolves get_ptr (read) / put_ptr (write) at the consumer — except when THIS
+    // select's base is itself a deferred entry (`a[k1][k2]`), where the inner select
+    // must resolve the outer entry eagerly and `is_write` decides how.
+    ir::Index var_assoc_select(const ElementSelectExpression& es, ir::Index base, ir::Builder& b,
+                               ir::SourceLoc l, bool is_write) {
         const ir::Ref aty = lower_type(*es.value().type);
-        return b.assoc_select(base, lower_assoc_key(es.selector(), aty, b, l), aty, l);
+        return b.assoc_select(base, lower_assoc_key(es.selector(), aty, b, l), aty, l, is_write);
     }
 
     // Materialize a queue-typed rvalue into a handle lvalue Index. A plain queue
@@ -19926,11 +20127,28 @@ private:
         return temp;
     }
 
+    // Whether a container built-in method WRITES its receiver (LRM 7.9 / 7.10 /
+    // 7.12). Only used to pick get_ptr vs put_ptr when the receiver's select chain
+    // contains an associative entry that an inner select has to resolve eagerly; the
+    // ordinary one-level receiver stays deferred and the backend decides per op.
+    static bool mutates_container(std::string_view name) {
+        return name == "push_back" || name == "push_front" || name == "pop_back" || name == "pop_front" ||
+               name == "insert" || name == "delete" || name == "reverse" || name == "sort" || name == "rsort" ||
+               name == "shuffle" || name == "new";
+    }
+
     // A queue built-in method used as an rvalue or statement (LRM 7.10.2). The
     // receiver arrives as arguments()[0], like a string / dynamic-array method.
     ir::Index lower_queue_method(std::string_view name, const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
         const auto&     args = call.arguments();
-        const ir::Index q    = lower_lvalue(*args[0], b);
+        // A MUTATING method operates on the receiver as a variable (LRM 7.10), so a
+        // deferred associative entry in its select chain resolves with put_ptr and the
+        // entry comes into existence; a query must create nothing (7.8.6). The
+        // distinction only bites a NESTED receiver (`a[k1][k2].push_back(v)`), where an
+        // inner select resolves the outer entry eagerly -- a one-level `a[k].push_back`
+        // stays deferred and the backend picks the direction per op.
+        const bool      recv_write = mutates_container(name);
+        const ir::Index q          = lower_lvalue(*args[0], b, recv_write);
         const ir::Ref   qty  = lower_type(*args[0]->type);
         if (name == "size") {
             return b.resize(b.queue_size(q, qty, l), lower_type(*call.type), l);
@@ -19977,7 +20195,9 @@ private:
     // AssignmentExpression.
     ir::Index lower_assoc_method(std::string_view name, const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
         const auto&     args = call.arguments();
-        const ir::Index a    = lower_lvalue(*args[0], b);
+        // See lower_queue_method: a mutating method's receiver resolves a deferred
+        // outer entry with put_ptr, a query's must not create one.
+        const ir::Index a    = lower_lvalue(*args[0], b, mutates_container(name));
         const ir::Ref   aty  = lower_type(*args[0]->type);
         if (name == "num" || name == "size") {
             return b.resize(b.assoc_num(a, aty, l), lower_type(*call.type), l);
@@ -21098,9 +21318,9 @@ private:
                 }
                 const ir::Index base = select_base_lvalue(es.value(), b, l);
                 const ir::Index sel =
-                  is_assoc(es.value()) ? var_assoc_select(es, base, b, l)
+                  is_assoc(es.value()) ? var_assoc_select(es, base, b, l, /*is_write=*/false)
                   : is_unpacked_array(es.value()) || is_dyn_array(es.value()) || is_queue(es.value())
-                    ? var_elem_select(es, base, b, l)
+                    ? var_elem_select(es, base, b, l, /*is_write=*/false)
                     : lower_packed_element_lvalue(es, base, b, l);
                 const ir::Index v = b.unary(ir::Inst::Tag::Load, sel, l);
                 // See narrow_to_declared / the MemberAccess case below: a
@@ -22634,13 +22854,16 @@ private:
                 // ordinary signal path (selects below recurse to this base).
                 return value_lvalue(expr.as<ValueExpressionBase>().symbol, b, l);
             case ExpressionKind::ElementSelect: {
-                const ElementSelectExpression& es   = expr.as<ElementSelectExpression>();
-                const ir::Index                base = lower_lvalue(es.value(), b);
+                const ElementSelectExpression& es = expr.as<ElementSelectExpression>();
+                // The direction travels down the chain: `a[k][i] = v` writes the outer
+                // entry too, since the entry must exist for its element to be
+                // written (LRM 7.8), while a read must leave the map alone (7.8.6).
+                const ir::Index base = lower_lvalue(es.value(), b, is_write);
                 if (is_assoc(es.value())) {
-                    return var_assoc_select(es, base, b, l);
+                    return var_assoc_select(es, base, b, l, is_write);
                 }
                 if (is_unpacked_array(es.value()) || is_dyn_array(es.value()) || is_queue(es.value())) {
-                    return var_elem_select(es, base, b, l);
+                    return var_elem_select(es, base, b, l, is_write);
                 }
                 return lower_packed_element_lvalue(es, base, b, l);
             }
@@ -23446,6 +23669,19 @@ private:
     // delay rounds to (design_tick_fs / global_scope_tick_fs), and every
     // timescale value is a power of ten. Callers guard on tick_fs_ != 0; unitless
     // mode leaves both at 1 and scales nothing.
+    //
+    // TODO: a scope slang hands back no timescale for falls into that unitless
+    // branch even when the design HAS a tick, and then reads/writes time in raw
+    // wheel ticks. The case that reaches it is a subroutine or class declared
+    // directly in `$unit`: a `timescale directive applies to design elements
+    // (LRM 3.14.2.2), so CompilationUnitSymbol::timeScale stays unset unless
+    // `$unit` carries its own `timeunit` / `timeprecision`. So a `$unit` function
+    // under `timescale 1ns/1ps` reports 3000 where its 1ns caller reports 3 --
+    // and the number moves with unrelated code, since dropping a `#0.5` anywhere
+    // shifts the tick from 1ns to 1ps. iverilog reports 0 there (its own 1s
+    // default). The fix is a fixed tool-default timescale for such a scope, folded
+    // into the wheel tick the way global_scope_tick_fs already folds the scopes
+    // that DO declare one. Declaring in a package or module is unaffected.
     void apply_time_scale(const Scope& scope) {
         const auto ts   = scope.getTimeScale();
         time_mul_       = ts ? tsv_to_fs(ts->base) / tick_fs_ : 1;
@@ -24551,11 +24787,29 @@ private:
         }
         const ir::FunctionId id      = function_id(*ctor); // splices `this` as formal 0
         const auto           formals = ctor->getArguments();
-        if (formals.size() != actuals.size()) {
+        if (actuals.size() > formals.size()) {
             fail("constructor argument count mismatch");
         }
+        // A class that declares no `new` constructs its base with an implicit
+        // `super.new()` and therefore supplies no actuals (LRM 8.7 / 8.15) -- but the
+        // base constructor may still declare formals, every one of which must then
+        // have a default for that to be legal (13.5.3). slang materializes defaults
+        // into the argument list of a real CallExpression, which is why a written
+        // `super.new()` or `new()` needs nothing here; this call is synthesized by
+        // emit_base_construction, so its defaults are filled in below.
+        //
+        // `uvm_callbacks_base extends uvm_object` is the shape: no `new` of its own,
+        // and uvm_object's takes `string name=""`.
+        std::vector<const Expression*> filled(actuals.begin(), actuals.end());
+        for (size_t k = actuals.size(); k < formals.size(); k++) {
+            const Expression* def = formals[k]->getDefaultValue();
+            if (def == nullptr) {
+                fail("constructor argument count mismatch");
+            }
+            filled.push_back(def);
+        }
         std::vector<CopyOutArg> outs;
-        std::vector<ir::Index>  args = build_call_args(formals, actuals, outs, b, l);
+        std::vector<ir::Index>  args = build_call_args(formals, filled, outs, b, l);
         args.insert(args.begin(), handle);
         b.call(id, args, l); // the constructor is void
         emit_call_copyouts(outs, b, l);

@@ -137,3 +137,25 @@ does today (`Lower.cpp:1701-1703`) — not the synthetic-temp path `repeat` uses
   nested foreach, string foreach.
 - Loud-fail tests: dynamic array / queue / associative array / wildcard-assoc
   `foreach` all reject at compile with a clear diagnostic, not silently.
+
+## Nested runtime dimensions (amended)
+
+The claim above that no `ElemSelect` synthesis is needed holds only while every
+runtime-sized dimension belongs to the array the `foreach` names. It does not for a
+NESTED runtime dimension: `foreach (a[k, i])` over an associative array of queues
+measures and iterates `a[k]`, an entry slang gives no AST node for.
+
+`lower_foreach_dim` therefore rebuilds each dimension's container itself
+(`foreach_base_lv`): the array the `foreach` names, plus one select per
+already-iterated dimension keyed by that dimension's live loop variable, re-emitted
+per region because a loop's cond / body / step are three regions. Dimensions are
+peeled through the interned IR type rather than slang's predicates, since slang
+answers `isDynamicallySizedArray()` for an associative array too — peeling by
+predicate measured a map with `dyn_array_size`.
+
+Before this, every runtime dimension measured `f.arrayRef`, so dimension 2 of an
+assoc-of-queue re-walked the outer map with the inner loop variable bound to a key:
+wrong trip count, wrong index, no diagnostic.
+
+Still refused: a skipped outer dimension over a nested runtime dimension
+(`foreach (a[, i])`), which has no entry to descend into.

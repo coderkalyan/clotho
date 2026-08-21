@@ -826,3 +826,125 @@ TEST_CASE("assoc literal over a wildcard index and a real element") {
     CHECK(run_capture(src) == "w=5 num=0\n"
                               "r1=1.50 rmiss=2.50\n");
 }
+
+// -- Selects THROUGH an associative entry (LRM 7.8 x 7.10 / 7.5) --
+//
+// `a[k][i]` has to resolve the entry before it can do the inner container's ring
+// arithmetic, so the get_ptr / put_ptr choice cannot wait for the consumer the way a
+// bare `a[k]` can: the access direction is threaded down the select chain instead
+// (ir::ElemSelect::for_write). The LRM constraint both halves must respect is 7.8.6 —
+// a READ creates nothing — and 7.8: a WRITE creates the entry, after which the fresh
+// empty container drops the element write (7.10).
+//
+// No oracle: iverilog compiles neither a nested associative array nor a `foreach`
+// over one.
+TEST_CASE("element select through an associative entry that is a queue") {
+    constexpr std::string_view src = R"(
+        module m;
+            int all[string][$];
+            initial begin
+                all["k"].push_back(5);
+                all["k"].push_back(6);
+                $display("read %0d %0d size=%0d", all["k"][0], all["k"][1], all["k"].size());
+                all["k"][1] = 9;
+                $display("wrote %0d num=%0d", all["k"][1], all.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "read 5 6 size=2\nwrote 9 num=1\n");
+}
+
+TEST_CASE("element select through an associative entry that is a dynamic array") {
+    constexpr std::string_view src = R"(
+        module m;
+            int all[string][];
+            initial begin
+                all["k"] = new[3];
+                all["k"][2] = 8;
+                $display("%0d %0d num=%0d", all["k"][0], all["k"][2], all.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 8 num=1\n");
+}
+
+// The 7.8.6 half, stated as an assertion rather than a comment: a read of an absent
+// key yields the element default and leaves num / exists alone. Checked at all three
+// nesting shapes, because each resolves the entry through a different path — the
+// container-element ring math, the inner map's handle, and a struct member's GEP.
+TEST_CASE("a nested read never creates the entry") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int f[$]; } S;
+            int aq[string][$];
+            int aa[string][string];
+            S   as[string];
+            initial begin
+                aq["k"].push_back(1);
+                aa["a"]["b"] = 2;
+                as["k"].f.push_back(3);
+                $display("%0d %0d %0d", aq["miss"][0], aa["miss"]["x"], as["miss"].f[0]);
+                $display("num %0d %0d %0d", aq.num(), aa.num(), as.num());
+                $display("exists %0d %0d %0d", aq.exists("miss"), aa.exists("miss"), as.exists("miss"));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "0 0 0\nnum 1 1 1\nexists 0 0 0\n");
+}
+
+// The 7.8 half: writing through an absent key creates the entry, and the element
+// write then falls off the end of the fresh empty container (7.10) rather than
+// growing it.
+TEST_CASE("a nested write creates the entry and drops the out-of-range element") {
+    constexpr std::string_view src = R"(
+        module m;
+            int all[string][$];
+            initial begin
+                all["new"][0] = 7;
+                $display("num=%0d size=%0d", all.num(), all["new"].size());
+                all["new"].push_back(1);
+                all["new"][0] = 7;
+                $display("num=%0d size=%0d v=%0d", all.num(), all["new"].size(), all["new"][0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=1 size=0\nnum=1 size=1 v=7\n");
+}
+
+// Three levels, and a mutating method on a nested receiver: `all[a][b].push_back(v)`
+// must create BOTH entries (the receiver of a mutating method is a variable, 7.10),
+// while the read leaves the map alone.
+TEST_CASE("three levels of nesting, and a mutating method through two entries") {
+    constexpr std::string_view src = R"(
+        module m;
+            int all[string][string][$];
+            initial begin
+                all["a"]["b"].push_back(4);
+                $display("v=%0d num=%0d inner=%0d", all["a"]["b"][0], all.num(), all["a"].num());
+                $display("absent=%0d num=%0d", all["x"]["y"][0], all.num());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "v=4 num=1 inner=1\nabsent=0 num=1\n");
+}
+
+// A `ref` bound THROUGH an entry aliases the element live, and both nesting levels
+// are watched: the map's own epoch (a delete frees the entry) and the entry's
+// container epoch (a push moves the element). The witnesses are checked
+// outermost-first, which is what makes the inner one safe to read at all — it lives
+// inside the map's payload. See docs/design/data-model.md §3.1.
+TEST_CASE("ref through an associative entry sees writes and detects both levels") {
+    CHECK(run_capture(R"(
+        module m;
+            int all[string][$];
+            task automatic bump(ref int x);
+                #5 x = x + 100;
+            endtask
+            initial begin
+                all["k"].push_back(7);
+                bump(all["k"][0]);
+                $display("v=%0d num=%0d", all["k"][0], all.num());
+            end
+        endmodule
+    )") == "v=107 num=1\n");
+}

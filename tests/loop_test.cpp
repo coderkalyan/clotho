@@ -1520,3 +1520,77 @@ TEST_CASE("a static local in an automatic subroutine still initializes once") {
         endmodule
     )") == "11 21 31\n");
 }
+
+// -- foreach over a NESTED runtime-sized dimension (LRM 12.7.3) --
+//
+// Each dimension iterates its own container: dimension 2 of an assoc of queues is
+// the entry the outer dimension is sitting on, so its bound is that entry's size and
+// its index is 0-based. Deriving every dimension's bound from the whole array (what
+// the lowering used to do) re-walked the OUTER container, which bound the inner index
+// to a key and gave every entry the same trip count.
+//
+// No oracle: iverilog does not compile a `foreach` over an associative array of
+// queues.
+TEST_CASE("foreach over an associative array of queues iterates each entry's own size") {
+    CHECK(run_capture(R"(
+        module m;
+            int all[string][$];
+            initial begin
+                all["a"].push_back(10);
+                all["a"].push_back(20);
+                all["b"].push_back(30);
+                foreach (all[k, i]) $display("%s %0d %0d", k, i, all[k][i]);
+            end
+        endmodule
+    )") == "a 0 10\na 1 20\nb 0 30\n");
+}
+
+TEST_CASE("foreach over nested containers: assoc of assoc, queue of queue, assoc of dynarr") {
+    CHECK(run_capture(R"(
+        module m;
+            int aa[string][string];
+            int qq[$][$];
+            int ad[string][];
+            initial begin
+                aa["a"]["x"] = 1;
+                aa["a"]["y"] = 2;
+                aa["b"]["z"] = 3;
+                foreach (aa[i, j]) $display("aa %s %s %0d", i, j, aa[i][j]);
+                begin
+                    int inner[$];
+                    inner.push_back(7);
+                    inner.push_back(8);
+                    qq.push_back(inner);
+                    inner.delete();
+                    inner.push_back(9);
+                    qq.push_back(inner);
+                end
+                foreach (qq[i, j]) $display("qq %0d %0d %0d", i, j, qq[i][j]);
+                ad["k"] = new[2];
+                ad["k"][1] = 5;
+                foreach (ad[i, j]) $display("ad %s %0d %0d", i, j, ad[i][j]);
+            end
+        endmodule
+    )") == "aa a x 1\naa a y 2\naa b z 3\n"
+           "qq 0 0 7\nqq 0 1 8\nqq 1 0 9\n"
+           "ad k 0 0\nad k 1 5\n");
+}
+
+// The shape that motivated the fix (uvm_resource_pool.svh): iterate an associative
+// array of queues and read each element. Both halves — the per-entry bound and the
+// select through the entry — are needed for this to run at all.
+TEST_CASE("foreach over an assoc of queues, reading each element") {
+    CHECK(run_capture(R"(
+        module m;
+            int all[string][$];
+            int q[$];
+            initial begin
+                all["a"].push_back(1);
+                all["a"].push_back(2);
+                all["b"].push_back(3);
+                foreach (all[aa_iter, q_iter]) q.push_front(all[aa_iter][q_iter]);
+                $display("%0d %0d %0d size=%0d", q[0], q[1], q[2], q.size());
+            end
+        endmodule
+    )") == "3 2 1 size=3\n");
+}

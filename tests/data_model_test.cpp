@@ -630,16 +630,6 @@ const Allow allowlist[] = {
       "nonblocking assignment to a class property is not supported",
       "§7: NBA staging is signal-keyed; a per-object shadow does not exist "
       "(docs/design/classes.md §8)." },
-    // `a[k][i]` where the entry is itself a container: the select would have to
-    // pick get_ptr or put_ptr, a direction that belongs to its own consumer.
-    { [](const Cell& k) {
-          return (k.c->kind == C::assoc_int || k.c->kind == C::assoc_str) &&
-                 (k.e->traits & t_managed) != 0;
-      },
-      "element select through an associative-array element that is itself a queue "
-      "or dynamic array is not supported",
-      "§7: needs composed deferral; put_ptr would create an entry on a read "
-      "(LRM 7.8.6)." },
     // LRM 7.9 defines an associative-array right-hand side as a variable, a call
     // result or a literal; anything else has no defined whole-array value.
     { [](const Cell& k) {
