@@ -4915,11 +4915,6 @@ private:
             params.push_back(int_ty(2 * w)); // must|may
             params.push_back(int_ty(w));     // z
         }
-        if (f.return_type == Ref::Invalid) {
-            std::fprintf(stderr, "DEBUG unbuilt fn id=%u name='%s' nparams=%zu\n",
-                         static_cast<uint32_t>(id), std::string(f.name).c_str(),
-                         f.param_types.size());
-        }
         // A string, aggregate, dynamic-array, or queue result returns through a
         // trailing out-param the caller owns (its call-site temp) — no plane form.
         llvm::Type* rty = fn_return_ty(f.return_type);
