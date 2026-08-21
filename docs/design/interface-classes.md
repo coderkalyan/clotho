@@ -892,11 +892,18 @@ through an interface handle; the `rand_mode` refusal; the `%p` refusal.
   output.
 - The IR printer on the `$cast` probe, so the new dispatch and op are inspectable:
   `call_virtual(vfn9@iface0, ...)`, `class_implements(%9 -> class{})`.
+- **Sanitizers** (`-DCLOTHO_SANITIZE=ON`, ASan + UBSan, `detect_leaks=1`): the 19
+  interface cases plus the GC case are clean and leak **zero bytes** — better than the
+  `process` suite's 6096 bytes in 30 allocations, which the same build reports and
+  which is what proves leak detection was live. No UBSan finding anywhere in them.
+  The full suite under ASan reproduces one pre-existing failure unrelated to this
+  work: `tests/data_model_test.cpp`'s matrix spawns child designs and treats a
+  nonzero child exit as a finding, and with `detect_leaks=1` a child's own 8192-byte
+  teardown leak makes LSan exit 1. The matrix passes with `detect_leaks=0`, and the
+  leaking allocation is in the child's runtime, not in anything this change touches.
 
 **Still owed:**
 
-- A leak/ASan count for the interface cases, in the shape
-  `docs/design/process-class.md:901-926` records for `process`.
 - The legality corner cases from slang's own suite
   (`build/_deps/slang-src/tests/unittests/ast/ClassTests.cpp:1230-1645`) as `fails()`
   cases wherever clotho's message differs from slang's.
