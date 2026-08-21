@@ -24702,11 +24702,29 @@ private:
         }
         const ir::FunctionId id      = function_id(*ctor); // splices `this` as formal 0
         const auto           formals = ctor->getArguments();
-        if (formals.size() != actuals.size()) {
+        if (actuals.size() > formals.size()) {
             fail("constructor argument count mismatch");
         }
+        // A class that declares no `new` constructs its base with an implicit
+        // `super.new()` and therefore supplies no actuals (LRM 8.7 / 8.15) -- but the
+        // base constructor may still declare formals, every one of which must then
+        // have a default for that to be legal (13.5.3). slang materializes defaults
+        // into the argument list of a real CallExpression, which is why a written
+        // `super.new()` or `new()` needs nothing here; this call is synthesized by
+        // emit_base_construction, so its defaults are filled in below.
+        //
+        // `uvm_callbacks_base extends uvm_object` is the shape: no `new` of its own,
+        // and uvm_object's takes `string name=""`.
+        std::vector<const Expression*> filled(actuals.begin(), actuals.end());
+        for (size_t k = actuals.size(); k < formals.size(); k++) {
+            const Expression* def = formals[k]->getDefaultValue();
+            if (def == nullptr) {
+                fail("constructor argument count mismatch");
+            }
+            filled.push_back(def);
+        }
         std::vector<CopyOutArg> outs;
-        std::vector<ir::Index>  args = build_call_args(formals, actuals, outs, b, l);
+        std::vector<ir::Index>  args = build_call_args(formals, filled, outs, b, l);
         args.insert(args.begin(), handle);
         b.call(id, args, l); // the constructor is void
         emit_call_copyouts(outs, b, l);
