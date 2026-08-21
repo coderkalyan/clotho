@@ -1,6 +1,7 @@
 #include "Lower.h"
 
 #include <algorithm>
+#include <any>
 #include <bit>
 #include <cctype>
 #include <cmath>
@@ -60,6 +61,7 @@
 #include <slang/diagnostics/DeclarationsDiags.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/LookupDiags.h>
+#include <slang/diagnostics/SysFuncsDiags.h>
 #include <slang/diagnostics/TextDiagnosticClient.h>
 #include <slang/driver/Driver.h>
 #include <slang/numeric/Time.h>
@@ -1044,6 +1046,31 @@ struct ClassIds {
     uint32_t next = 1;
 };
 
+// Design-wide interface-class registry (LRM 8.26). Two numbering spaces, both
+// minted on demand and for the same reason ClassIds is: an entry is a bit or an
+// index and nothing more, so minting one needs no view of the design and no
+// whole-program numbering pass.
+//
+//  * `ids` -- one dense id per interface ClassType. It is the bit this interface
+//    occupies in every implementing class's descriptor bitmap, which is what a
+//    `$cast` to an interface type tests. Dense from 0 (unlike a class type id,
+//    which reserves 0 for "no class") because a bitmap has no padding entry.
+//  * `slots` -- one dense index per interface method NAME. Name keying is LRM
+//    8.26.6.1: one implementation satisfies every same-named prototype of every
+//    interface a class implements, and two prototypes of one name with different
+//    signatures make the class illegal. Two UNRELATED classes may still hold
+//    different signatures at one index; that is safe because a call site takes its
+//    signature from the interface's own prototype and the receiver is guaranteed
+//    to implement that interface.
+//
+// Shared by every Lowerer, like ClassIds: one interface has one id and one method
+// name has one index across the design, even where two tops intern the interface
+// as two nominal Refs.
+struct IfaceIds {
+    ankerl::unordered_dense::map<const slang::ast::ClassType*, uint32_t> ids;
+    ankerl::unordered_dense::map<std::string_view, uint32_t>             slots;
+};
+
 // Design-wide registry backing virtual interfaces (LRM 25.9).
 //
 // slang resolves `vif.sig` against a PLACEHOLDER instance body it caches once per
@@ -1626,6 +1653,13 @@ public:
 
     void set_class_ids(ClassIds* ids) {
         class_ids_ = ids;
+    }
+
+    // Point this Lowerer at the design-wide interface-class registry (LRM 8.26).
+    // Shared for the same reason ClassIds is: one interface must get one bit and
+    // one interface method name one index, whichever Lowerer sees it first.
+    void set_iface_ids(IfaceIds* ids) {
+        iface_ids_ = ids;
     }
 
     // Point this Lowerer at the design-wide virtual interface registry. `defs`
@@ -2603,10 +2637,30 @@ private:
             }
             fail("the built-in '" + std::string(clt.name) + "' class is not supported");
         }
-        // Phase 3 features (docs/design/classes.md §2): guarded loud.
+        // An interface class (LRM 8.26) is a handle TYPE with no object: it declares
+        // only pure virtual prototypes, typedefs and parameters (slang rejects
+        // anything else in the parser), it can never be `new`d, and `implements`
+        // inherits nothing. So it interns as an ordinary nominal Kind::Class with an
+        // EMPTY field table -- which is all dispatch needs from a receiver's static
+        // type, since the vtable pointer lives at body field 0 of every class -- and
+        // stops there: no property chain, no ancestor display id, no vtable, no
+        // copy thunk and no randomization body, all of which describe an object that
+        // cannot exist. Its own id space is the descriptor bitmap's
+        // (docs/design/interface-classes.md §4).
         if (clt.isInterface) {
-            // TODO: interface classes (`interface class` / `implements`) — M4.
-            fail("interface classes are not supported");
+            const uint32_t fid = module_.pool.reserve_struct_fields();
+            ir::Type       t;
+            t.kind      = ir::Type::Kind::Class;
+            t.fields_id = fid;
+            // No base: slang routes an interface class's `extends` list into the
+            // IMPLEMENTS clause (Parser_members.cpp:1160-1166), so getBaseClass() is
+            // always null here and the interface DAG lives in iface_closure().
+            t.element         = ir::Ref::Invalid;
+            const ir::Ref ref = module_.pool.put(ir::Item{ t });
+            class_type_cache_.emplace(&clt, ref);
+            module_.pool.set_struct_fields(fid, {});
+            module_.set_iface_type_id(ref, iface_id(clt));
+            return ref;
         }
         // An abstract class (`virtual class`) is lowered normally (it can be a
         // handle type and a base); slang rejects a direct `new` on it (LRM 8.21),
@@ -3056,13 +3110,91 @@ private:
         return id;
     }
 
+    // Design-wide bit of an interface class in every implementing class's
+    // descriptor bitmap (LRM 8.26.5), minted on first sight. Dense from 0.
+    uint32_t iface_id(const slang::ast::ClassType& clt) {
+        const auto it = iface_ids_->ids.find(&clt);
+        if (it != iface_ids_->ids.end()) {
+            return it->second;
+        }
+        const auto id = static_cast<uint32_t>(iface_ids_->ids.size());
+        iface_ids_->ids.emplace(&clt, id);
+        return id;
+    }
+
+    // Design-wide index of an interface METHOD NAME in every implementing class's
+    // interface-method table, minted on first sight. Name keying is LRM 8.26.6.1;
+    // see IfaceIds.
+    uint32_t iface_slot(std::string_view name) {
+        const auto it = iface_ids_->slots.find(name);
+        if (it != iface_ids_->slots.end()) {
+            return it->second;
+        }
+        const auto idx = static_cast<uint32_t>(iface_ids_->slots.size());
+        iface_ids_->slots.emplace(name, idx);
+        return idx;
+    }
+
+    // Every interface class `clt` implements, transitively (LRM 8.26).
+    //
+    // slang's `getImplementedInterfaces()` is already closed over the interface
+    // `extends` DAG, but NOT over the class's own base chain: it is written only
+    // when a class carries its own `implements` clause, so
+    // `class D extends B;` where `B implements I` reports nothing (the doc comment
+    // at ClassSymbols.h:86-87 says otherwise and is wrong; slang's own
+    // `Type::implements` walks the base chain at query time for exactly this
+    // reason). LRM 8.26.2 is explicit that a subclass implicitly implements
+    // everything its superclass implements, so the base walk is mandatory -- and
+    // omitting it is the bug Verilator 5.050 ships
+    // (docs/design/interface-classes.md §11.1).
+    //
+    // For an interface class this is its own `extends` closure, which is what
+    // slang stores in the same list.
+    std::vector<const slang::ast::ClassType*> iface_closure(const slang::ast::ClassType& clt) {
+        std::vector<const slang::ast::ClassType*> out;
+        const auto push = [&](const slang::ast::ClassType& iface) {
+            // getDeclaredInterfaces is not deduplicated by slang and the flattened
+            // list of two parents can name one interface twice (a diamond, LRM
+            // 8.26.6.3), so dedupe here. The set is small enough that a linear scan
+            // beats a hash set.
+            if (std::ranges::find(out, &iface) == out.end()) {
+                out.push_back(&iface);
+            }
+        };
+        for (const slang::ast::ClassType* k = &clt; k != nullptr; k = base_class_of(*k)) {
+            for (const slang::ast::Type* it : k->getImplementedInterfaces()) {
+                const slang::ast::Type& canon = it->getCanonicalType();
+                if (!canon.isClass()) {
+                    // An erroneous `implements` operand; slang has already reported it.
+                    continue;
+                }
+                push(canon.as<slang::ast::ClassType>());
+            }
+        }
+        return out;
+    }
+
     // The pure-virtual prototype named `name` reachable in `clt`'s hierarchy (LRM
-    // 8.21), or null. Used to build a stub for an abstract class's un-overridden
-    // slot.
-    static const slang::ast::MethodPrototypeSymbol* find_pure_proto(const slang::ast::ClassType& clt,
-                                                                    std::string_view             name) {
+    // 8.21) or in an interface class it implements (LRM 8.26), or null. Two uses:
+    // the stub that fills an abstract class's un-overridden slot, and the signature
+    // of a dispatch bound to a pure method.
+    //
+    // The interface search cannot be folded into the base-chain walk: prototypes an
+    // interface inherited from its parents are TransparentMemberSymbols in its
+    // scope, and membersOfType<T> filters on the symbol kind without unwrapping
+    // them (Scope.h:224-227), so each interface must be visited in its own right --
+    // which is what iface_closure yields.
+    const slang::ast::MethodPrototypeSymbol* find_pure_proto(const slang::ast::ClassType& clt,
+                                                             std::string_view             name) {
         for (const slang::ast::ClassType* k = &clt; k != nullptr; k = base_class_of(*k)) {
             for (const auto& p : k->membersOfType<slang::ast::MethodPrototypeSymbol>()) {
+                if (p.name == name && p.flags.has(slang::ast::MethodFlags::Pure)) {
+                    return &p;
+                }
+            }
+        }
+        for (const slang::ast::ClassType* iface : iface_closure(clt)) {
+            for (const auto& p : iface->membersOfType<slang::ast::MethodPrototypeSymbol>()) {
                 if (p.name == name && p.flags.has(slang::ast::MethodFlags::Pure)) {
                     return &p;
                 }
@@ -3193,7 +3325,101 @@ private:
             }
             table[s] = pure_stub_id(*proto);
         }
-        module_.set_class_desc(class_ref, std::move(table), class_type_id(clt));
+        auto [iface_slots, iface_ids] = build_iface_table(clt, slots, table);
+        module_.set_class_desc(
+          class_ref, std::move(table), class_type_id(clt), std::move(iface_slots), std::move(iface_ids));
+    }
+
+    // The interface-dispatch half of a class's descriptor (LRM 8.26): the bodies it
+    // supplies for the interface methods it implements, indexed by the DESIGN-WIDE
+    // method name index, and the ids of every interface it implements.
+    //
+    // Both are empty for a class that implements nothing, which is also why nothing
+    // is emitted for a design with no interface class at all. A class that does
+    // implement one gets a table whose holes -- indices whose name belongs only to
+    // interfaces this class does not implement -- point at a shared never-executed
+    // body, so a dispatch bug is a located fatal rather than a jump to address 0.
+    //
+    // `slots` / `table` are this class's own name-keyed vtable numbering and its
+    // filled entries: an interface method's implementation is by construction the
+    // same body that occupies the ordinary slot of that name, whether the class
+    // declares it, inherits it from a base (LRM 8.26.2), or re-declares it as a
+    // pure prototype in a partially-implemented virtual class (LRM 8.26.7).
+    std::pair<std::vector<ir::FunctionId>, std::vector<uint32_t>> build_iface_table(
+      const slang::ast::ClassType&       clt,
+      const VtableSlots&                 slots,
+      const std::vector<ir::FunctionId>& table) {
+        const std::vector<const slang::ast::ClassType*> ifaces = iface_closure(clt);
+        if (ifaces.empty()) {
+            return {};
+        }
+        std::vector<uint32_t> ids;
+        ids.reserve(ifaces.size());
+        // name index -> the body, collected first because the table's extent is the
+        // highest index this class needs and the indices are minted as we walk.
+        std::vector<std::pair<uint32_t, ir::FunctionId>> entries;
+        for (const slang::ast::ClassType* iface : ifaces) {
+            ids.push_back(iface_id(*iface));
+            for (const auto& p : iface->membersOfType<slang::ast::MethodPrototypeSymbol>()) {
+                if (!p.flags.has(slang::ast::MethodFlags::Pure)) {
+                    continue;
+                }
+                const auto it = slots.find(p.name);
+                if (it == slots.end()) {
+                    // slang requires an implementation for every prototype reachable
+                    // through `implements` (diag::IfaceMethodNoImpl), and a virtual
+                    // class that re-declares one keeps a prototype of that name, so
+                    // the name is in this class's own numbering either way.
+                    fail("internal: implemented interface method '" + std::string(p.name) +
+                         "' has no vtable slot");
+                }
+                entries.emplace_back(iface_slot(p.name), table[it->second]);
+            }
+        }
+        // `randomize()` is legal through an interface-class handle (LRM 8.26.9), and
+        // the two reserved randomization slots are numbered per hierarchy, so an
+        // interface handle cannot reach them by slot. Give them design-wide indices
+        // too; every consumer already looks them up by name, so this costs nothing
+        // but two entries.
+        entries.emplace_back(iface_slot(kRandomizeSlot), table[slots.at(kRandomizeSlot)]);
+        entries.emplace_back(iface_slot(kRandOpsSlot), table[slots.at(kRandOpsSlot)]);
+        uint32_t extent = 0;
+        for (const auto& [idx, fid] : entries) {
+            extent = std::max(extent, idx + 1);
+        }
+        std::vector<ir::FunctionId> iface_slots(extent, iface_unreachable_id());
+        for (const auto& [idx, fid] : entries) {
+            iface_slots[idx] = fid;
+        }
+        return { std::move(iface_slots), std::move(ids) };
+    }
+
+    // The shared never-executed body an interface-method table hole points at (see
+    // build_iface_table). Reaching it means a dispatch resolved to a class that does
+    // not implement the interface, which the assignment rules make impossible -- so
+    // it is a clotho bug, and it says so with a location rather than faulting.
+    ir::FunctionId iface_unreachable_id() {
+        // Cached on the MODULE, not this Lowerer: several Lowerers share one module
+        // (one per top plus the globals one), and the backend also pads short tables
+        // with this body, so there must be exactly one.
+        if (module_.iface_unreachable.has_value()) {
+            return *module_.iface_unreachable;
+        }
+        const ir::FunctionId id   = module_.reserve_function();
+        module_.iface_unreachable = id;
+        ir::Builder b(module_.pool);
+        b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
+                   "",
+                   "internal: interface method dispatched on a class that does not implement it",
+                   {},
+                   ir::SourceLoc{});
+        b.finish("", 1, ir::SourceLoc{});
+        b.ret_void(ir::SourceLoc{});
+        module_.set_function(id,
+                            ir::Function{ .name        = "$iface.unreachable",
+                                          .return_type = module_.pool.void_type,
+                                          .ir          = b.finish() });
+        return id;
     }
 
     // The FunctionId of the never-executed stub for a pure virtual prototype (its
@@ -17024,6 +17250,12 @@ private:
         const ir::Index int0    = b.constant(svint_to_ref(slang::SVInt(32, 0, true), int_ty), l);
         const ir::Ref   dest_ty = lower_type(*dest_expr.type);
         const ir::Index dst     = lower_lvalue(dest_expr, b);
+        // True for an interface class type (LRM 8.26). `isClass()` holds for one too,
+        // so every place that reasons about class identity has to distinguish them.
+        const auto is_iface_class = [](const slang::ast::Type& t) {
+            const slang::ast::Type& c = t.getCanonicalType();
+            return c.isClass() && c.as<slang::ast::ClassType>().isInterface;
+        };
         if (dt.isClass()) {
             // The source is evaluated whatever the verdict: it is an expression and
             // may have side effects.
@@ -17037,21 +17269,33 @@ private:
                 b.binary(ir::Inst::Tag::Store, dst, coerce(src, st, dest_ty, b, l), l);
                 return int1;
             }
+            // Which run-time test applies depends on the DESTINATION: an interface
+            // class asks whether the object's class implements it (LRM 8.26.5), any
+            // other class asks the ancestor display (LRM 8.16).
+            const bool dest_iface = is_iface_class(dt);
+            const bool src_iface  = is_iface_class(st);
             // Neither direction relates the two types, so no object can satisfy the
             // cast: it always fails, and slang has already warned (DynamicCastConst).
             // Single inheritance is what makes this conclusive -- with two bases a
             // common descendant could satisfy both.
-            if (!st.isClass() || !st.isAssignmentCompatible(dt)) {
+            //
+            // An interface class on either side breaks exactly that: a class the
+            // destination descends from can still implement the source interface, and
+            // two unrelated interfaces can share an implementer -- which is LRM
+            // 8.26.5's own `$cast(get_ref, put_ref)` example. So the fold is
+            // restricted to a pair of ordinary classes, and everything else takes the
+            // run-time test (docs/design/interface-classes.md §6.2).
+            if (!st.isClass() || (!dest_iface && !src_iface && !st.isAssignmentCompatible(dt))) {
                 if (task_form) {
                     emit_cast_fatal(call, b, l);
                 }
                 return int0;
             }
-            // Case 2: the destination descends from the source's static type, so
-            // only the object's own class decides. Assign on success, keep the
-            // current value on failure.
-            const ir::Index valid = b.class_is_a(src, dest_ty, l);
-            const ir::Index cur   = b.unary(ir::Inst::Tag::Load, dst, l);
+            // Case 2: only the object's own class decides. Assign on success, keep
+            // the current value on failure.
+            const ir::Index valid =
+              dest_iface ? b.class_implements(src, dest_ty, l) : b.class_is_a(src, dest_ty, l);
+            const ir::Index cur = b.unary(ir::Inst::Tag::Load, dst, l);
             b.binary(ir::Inst::Tag::Store, dst, b.select(valid, src, cur, l), l);
             if (task_form) {
                 emit_cast_fatal_unless(valid, call, b, l);
@@ -25019,10 +25263,17 @@ private:
         // A virtual method invoked through an object handle dispatches dynamically
         // (LRM 8.20), except a `super.method()` call, which binds statically to the
         // base method. The receiver's static class type selects the vtable layout.
+        //
+        // Through an INTERFACE-class handle (LRM 8.26) the same call dispatches on
+        // the design-wide index of the method's name instead of a vtable slot: slot
+        // numbers are per single-inheritance hierarchy, so two unrelated implementers
+        // of one interface do not agree on one (docs/design/interface-classes.md §5).
         ir::Index c;
         if (is_virtual) {
-            const ir::Ref recv = virtual_recv_class(call);
-            c = b.call_virtual(virtual_sig_id(sub), virtual_slot_of(sub), recv, args, l);
+            const ir::Ref    recv  = virtual_recv_class(call);
+            const uint32_t   iface = iface_dispatch_index(sub);
+            const uint32_t   slot  = iface == ir::kNoIface ? virtual_slot_of(sub) : 0;
+            c = b.call_virtual(virtual_sig_id(sub), slot, recv, args, l, iface);
         } else {
             c = b.call(direct_id, args, l);
         }
@@ -25073,8 +25324,10 @@ private:
             args.insert(args.begin(), *this_val);
         }
         if (is_virtual) {
-            const ir::Ref recv = virtual_recv_class(call);
-            b.task_call_virtual(virtual_sig_id(sub), virtual_slot_of(sub), recv, args, l);
+            const ir::Ref  recv  = virtual_recv_class(call);
+            const uint32_t iface = iface_dispatch_index(sub);
+            const uint32_t slot  = iface == ir::kNoIface ? virtual_slot_of(sub) : 0;
+            b.task_call_virtual(virtual_sig_id(sub), slot, recv, args, l, iface);
         } else {
             b.task_call(id, args, l);
         }
@@ -25096,6 +25349,23 @@ private:
             return ctor_this_->cls;
         }
         return fn_ctx_->this_class;
+    }
+
+    // The design-wide interface-method index a dispatch bound through an
+    // interface-class handle uses (LRM 8.26), or kNoIface for an ordinary virtual
+    // call.
+    //
+    // slang hands a call through an interface handle the PROTOTYPE's fabricated stub
+    // subroutine -- bodyless, flagged Pure|Virtual, parented by the interface class
+    // (SubroutineSymbols.cpp:1177, Lookup.cpp:1988-1992) -- so the declaring class
+    // is what distinguishes the two dispatch kinds. A method inherited from a parent
+    // interface resolves to that parent's prototype, which yields the same name
+    // index, as LRM 8.26.6.1 requires.
+    uint32_t iface_dispatch_index(const slang::ast::SubroutineSymbol& sub) {
+        if (!declaring_class(sub).isInterface) {
+            return ir::kNoIface;
+        }
+        return iface_slot(sub.name);
     }
 
     // Resolve the `this` object handle for a possible method call (LRM 8.11). An
@@ -25303,6 +25573,38 @@ private:
         return it->second;
     }
 
+    // Signature source for a randomization dispatch through an INTERFACE-class
+    // handle (LRM 8.26.9 makes `randomize()` legal there). Every class's synthesized
+    // body has the same shape -- `(this, mask) -> int` for randomize,
+    // `(this, op, arg) -> u64` for randops -- but no concrete class is named at such
+    // a site, so a never-executed stub over the interface Ref supplies the
+    // FunctionType, exactly as build_pure_stub does for a pure virtual.
+    ir::FunctionId iface_rand_sig(ir::Ref iface_ref, bool ops) {
+        auto& cache = ops ? iface_randops_sig_ : iface_randomize_sig_;
+        if (const auto it = cache.find(iface_ref); it != cache.end()) {
+            return it->second;
+        }
+        const ir::Ref        u64 = make_int_type(64, false, false);
+        const ir::Ref        i32 = make_int_type(32, false, true);
+        const ir::Ref        ret = ops ? u64 : i32;
+        std::vector<ir::Ref> params =
+          ops ? std::vector<ir::Ref>{ iface_ref, u64, u64 } : std::vector<ir::Ref>{ iface_ref, u64 };
+        std::vector<ir::ArgDir> dirs(params.size(), ir::ArgDir::In);
+        std::vector<ir::Ref>    locals = params;
+        ir::Builder             b(module_.pool);
+        b.unary(ir::Inst::Tag::Ret, b.constant(module_.pool.put_int(ret, 0), ir::SourceLoc{}), ir::SourceLoc{});
+        const ir::FunctionId id = module_.reserve_function();
+        module_.set_function(id,
+                             ir::Function{ .name        = ops ? "$iface.randops" : "$iface.randomize",
+                                           .return_type = ret,
+                                           .param_types = std::move(params),
+                                           .arg_dirs    = std::move(dirs),
+                                           .local_types = std::move(locals),
+                                           .ir          = b.finish() });
+        cache.emplace(iface_ref, id);
+        return id;
+    }
+
     ir::Index emit_randops_dispatch(const slang::ast::ClassType& clt,
                                     ir::Index                    self,
                                     ir::Index                    op,
@@ -25311,6 +25613,12 @@ private:
                                     ir::SourceLoc                l) {
         const ir::Ref                  ref = lower_class_type(clt);
         const std::array<ir::Index, 3> args{ self, op, arg };
+        if (clt.isInterface) {
+            // Through an interface handle the reserved slot is unreachable by index
+            // (it is numbered per hierarchy), so the design-wide interface index of
+            // the same reserved NAME carries the dispatch.
+            return b.call_virtual(iface_rand_sig(ref, /*ops=*/true), 0, ref, args, l, iface_slot(kRandOpsSlot));
+        }
         return b.call_virtual(rand_slot_sig(clt, randops_fn_), rand_slot_of(clt, kRandOpsSlot), ref, args, l);
     }
 
@@ -25322,6 +25630,10 @@ private:
         const ir::Ref                  ref = lower_class_type(clt);
         const ir::Ref                  u64 = make_int_type(64, false, false);
         const std::array<ir::Index, 2> args{ self, b.constant(module_.pool.put_int(u64, mask), l) };
+        if (clt.isInterface) {
+            return b.call_virtual(
+              iface_rand_sig(ref, /*ops=*/false), 0, ref, args, l, iface_slot(kRandomizeSlot));
+        }
         return b.call_virtual(rand_slot_sig(clt, randomize_fn_), rand_slot_of(clt, kRandomizeSlot), ref, args, l);
     }
 
@@ -25351,6 +25663,14 @@ private:
                                            lower_expr(*call.thisClass(), b),
                                            &call.thisClass()->type->getCanonicalType().as<slang::ast::ClassType>() }
                                        : implicit_this(b, l);
+            if (clt->isInterface && sub.name == "rand_mode") {
+                // LRM 8.26.9: "Use of rand_mode and constraint_mode shall not be
+                // legal as a consequence of the name resolution rules and the fact
+                // that interface classes are not permitted to contain data members."
+                // slang installs the built-in on every class including an interface
+                // one (ClassSymbols.cpp:233-249), so this is clotho's to reject.
+                fail("rand_mode through an interface class handle is not legal (LRM 8.26.9)");
+            }
             if (args.size() != 1) {
                 fail("built-in class method '" + std::string(sub.name) + "' takes one argument");
             }
@@ -25845,6 +26165,10 @@ private:
     // The reserved vtable slot name of a class's shallow-copy thunk (LRM 8.12). Not
     // a legal method name, so it cannot collide with a virtual method's slot.
     static constexpr std::string_view kCopySlot = "$copy";
+    // Interface Ref -> the never-executed signature stub a randomization dispatch
+    // through a handle of that interface uses (iface_rand_sig).
+    ankerl::unordered_dense::map<ir::Ref, ir::FunctionId> iface_randomize_sig_;
+    ankerl::unordered_dense::map<ir::Ref, ir::FunctionId> iface_randops_sig_;
     // Polymorphic class -> the FunctionId of its shallow-copy thunk (copy_thunk_id).
     ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::FunctionId> copy_thunk_;
     // Constrained randomization, step 1 (docs/design/constrained-randomization.md).
@@ -25925,6 +26249,10 @@ private:
     bool in_vif_body_ = false;
     ClassIds  own_class_ids_;
     ClassIds* class_ids_ = &own_class_ids_;
+    // Interface classes (LRM 8.26). Owned so a standalone Lowerer works;
+    // lower_compilation shares one registry across every top, like ClassIds.
+    IfaceIds  own_iface_ids_;
+    IfaceIds* iface_ids_ = &own_iface_ids_;
     // Design-wide virtual interface registry (see VifDefs). Owned here so a
     // standalone Lowerer works; lower_compilation shares one across every top.
     VifDefs  own_vif_defs_;
@@ -26475,6 +26803,10 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     // One id per class for the whole design, shared by every Lowerer below (see
     // ClassIds).
     ClassIds class_ids;
+    // Design-wide interface-class registry (LRM 8.26), shared for the same reason:
+    // one interface must get one bitmap bit and one interface method name one table
+    // index across the whole design, whichever top's Lowerer sees it first.
+    IfaceIds iface_ids;
     // Design-wide virtual interface registry, shared by every Lowerer below.
     VifDefs vif_defs;
     if (sm != nullptr) {
@@ -26482,10 +26814,41 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         auto                    client = std::make_shared<slang::TextDiagnosticClient>();
         engine.addClient(client);
         apply_severity_policy(engine, DiagnosticPolicy::Sim, partial);
+        // slang's "$cast will always fail" warning is WRONG in the presence of
+        // interface classes. Its condition is "both are class types and neither is
+        // assignment compatible with the other" (SystemTasks.cpp:622-625), which is
+        // exactly LRM 8.26.5's legal diagonal cast between two interface handles that
+        // a common implementer satisfies -- `$cast(get_ref, put_ref)` in the LRM's own
+        // example, which clotho lowers to the run-time implements test. Reporting it
+        // would tell the user to delete correct code. Dropped when either operand type
+        // is an interface class; every other DynamicCastConst is still reported.
+        const auto wrong_iface_cast_warning = [](const slang::Diagnostic& d) {
+            if (d.code != slang::diag::DynamicCastConst) {
+                return false;
+            }
+            for (const slang::Diagnostic::Arg& a : d.args) {
+                const auto* custom = std::get_if<slang::Diagnostic::CustomArgType>(&a);
+                if (custom == nullptr) {
+                    continue;
+                }
+                const auto* const* ty = std::any_cast<const slang::ast::Type*>(&custom->second);
+                if (ty == nullptr) {
+                    continue;
+                }
+                const slang::ast::Type& canon = (*ty)->getCanonicalType();
+                if (canon.isClass() && canon.as<slang::ast::ClassType>().isInterface) {
+                    return true;
+                }
+            }
+            return false;
+        };
         // Issue each diagnostic on its own so the text client's buffer holds
         // exactly one item's pretty rendering (snippet + caret) when we harvest it.
         // A diagnostic mapped to Ignored produces no report, hence the empty check.
         const auto harvest = [&](const slang::Diagnostic& d) {
+            if (wrong_iface_cast_warning(d)) {
+                return;
+            }
             client->clear();
             engine.issue(d);
             if (client->empty()) {
@@ -26671,6 +27034,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         Lowerer globals(*module, tick_fs, allow_system);
         globals.set_events_merge(events_merge);
         globals.set_class_ids(&class_ids);
+        globals.set_iface_ids(&iface_ids);
         globals.set_vif_defs(&vif_defs);
         globals.lower_globals(comp, root);
 
@@ -26680,6 +27044,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.set_class_ids(&class_ids);
+            lw.set_iface_ids(&iface_ids);
             lw.set_vif_defs(&vif_defs);
             lw.set_events_merge(events_merge);
             lw.set_inferred_clocks(&inferred_clocks);
@@ -26713,6 +27078,13 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
                 module->vif_scopes.push_back(inst.scope);
             }
         }
+        // Interface classes (LRM 8.26): the two design-wide extents every
+        // descriptor's interface regions are sized to. Only complete now, after
+        // every top -- one top can declare an interface a class under the next one
+        // implements -- and both stay zero for a design that declares none, which is
+        // what keeps such a design's descriptors bit-identical (§9).
+        module->iface_count      = static_cast<uint32_t>(iface_ids.ids.size());
+        module->iface_slot_count = static_cast<uint32_t>(iface_ids.slots.size());
     } catch (const LowerError& e) {
         // A structural failure (an instance, generate block or instance array),
         // which the member walk deliberately does not recover from because

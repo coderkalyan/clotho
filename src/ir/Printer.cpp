@@ -132,6 +132,8 @@ const char* tag_name(Inst::Tag tag) {
             return "handle_deref";
         case T::ClassIsA:
             return "class_is_a";
+        case T::ClassImplements:
+            return "class_implements";
         case T::AggCopy:
             return "agg_copy";
         case T::AggEq:
@@ -752,7 +754,12 @@ private:
             }
             case Inst::PayloadKind::CallVirtual: {
                 const auto vci = ir_.extra_data<VirtualCallInfo>(p.extra);
-                os_ << "vfn" << static_cast<uint32_t>(vci.func) << "@slot" << vci.slot;
+                os_ << "vfn" << static_cast<uint32_t>(vci.func);
+                if (vci.iface_index != kNoIface) {
+                    os_ << "@iface" << vci.iface_index;
+                } else {
+                    os_ << "@slot" << vci.slot;
+                }
                 for (Index a : ir_.region(vci.args)) {
                     os_ << ", ";
                     ref(a);

@@ -3412,3 +3412,49 @@ TEST_CASE("gc: --gc-stress alternates young and full collections") {
     CHECK(st.young_collections >= st.collections / 2u - 1u);
     CHECK(st.promoted > 0u);
 }
+
+// An object whose only root is an INTERFACE-class handle (LRM 8.26). The declared
+// type of a handle says nothing about tracing -- it is a class handle either way,
+// and the object's own trace map is reached through its descriptor -- but the
+// interface regions of that descriptor sit BELOW the trace-map pointer, so this is
+// the case that would break if their placement ever moved the map's offset. The
+// `string` property turns a wrongly-freed object into a sanitizer
+// heap-use-after-free rather than a stale read (see check_both_cadences).
+TEST_CASE("gc: an object rooted only by an interface-class handle survives") {
+    constexpr std::string_view src = R"(
+        interface class Named;
+            pure virtual function int id();
+            pure virtual function string label();
+        endclass
+        class Item implements Named;
+            int    v;
+            string tag;
+            virtual function int id(); return v; endfunction
+            virtual function string label(); return tag; endfunction
+        endclass
+        module m;
+            Named held;
+            int   made = 0;
+            function automatic void churn(input int c);
+                Item fresh;
+                for (int i = 0; i < 8; i++) begin
+                    fresh     = new;
+                    fresh.v   = c * 8 + i;
+                    fresh.tag = "churn";
+                    made      = made + 1;
+                end
+                // The concrete handle dies here; only the interface-typed root keeps
+                // the last object alive.
+                held = fresh;
+            endfunction
+            initial begin
+                for (int c = 0; c < 40; c++) begin
+                    churn(c);
+                    #1;
+                end
+                $display("%0d %0d %s", made, held.id(), held.label());
+            end
+        endmodule
+    )";
+    check_both_cadences(src, "320 319 churn\n");
+}

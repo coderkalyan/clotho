@@ -439,6 +439,10 @@ struct TaskCallInfo {
     ExtraSlice args;
 };
 
+// "Not an interface dispatch": VirtualCallInfo::iface_index of an ordinary
+// virtual call, which resolves through the receiver's vtable slot instead.
+inline constexpr uint32_t kNoIface = UINT32_MAX;
+
 // Extra payload for `CallVirtual` (LRM 8.20): a dynamically-dispatched virtual
 // method call. Resolved via the object's vtable at run time rather than a static
 // FunctionId.
@@ -450,6 +454,12 @@ struct VirtualCallInfo {
     FunctionId func;
     // Vtable slot index of the virtual method (stable across the whole hierarchy).
     uint32_t slot;
+    // Design-wide interface-method index when this call dispatches through an
+    // interface-class HANDLE (LRM 8.26): `slot` is then meaningless, because slot
+    // numbers are per single-inheritance hierarchy and two unrelated implementers
+    // of one interface do not agree on one. kNoIface for an ordinary virtual call.
+    // See docs/design/interface-classes.md §5.
+    uint32_t iface_index;
     // Static class type of the receiver: gives the object-body layout (the vtable
     // pointer sits at body field 0 of a polymorphic class).
     Ref class_ref;
@@ -2151,6 +2161,16 @@ struct Inst {
         // Statement, zero-time: leave a queue (`Leave`, which also hands off to the
         // new head) or wake it (`WakeHead` / `WakeAll`).
         SyncCtl,
+
+        // -- Interface classes (LRM 8.26, docs/design/interface-classes.md) --
+        // Does the object a handle refers to belong to a class that implements the
+        // payload interface class? (payload: op_type -> op is the handle value,
+        // type is the interned interface Kind::Class.) Yields a 1-bit 2-state
+        // value; a null handle answers 1, exactly as ClassIsA does and for the same
+        // reason (LRM 8.26.5 defers a null source to 8.16). Appended at the end of
+        // this enum deliberately: inserting mid-enum renumbers every later tag and
+        // changes the monitor digests sva_test pins.
+        ClassImplements,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2404,6 +2424,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::FResize:
         case T::HandleDeref:
         case T::ClassIsA:
+        case T::ClassImplements:
         // Handle-lvalue queue / dynamic-array ops with no extra operand: op is
         // the handle, type the interned Queue / DynArray type.
         case T::QueueSize:

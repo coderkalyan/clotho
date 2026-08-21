@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -637,6 +638,19 @@ struct ClassDesc {
     // more -- no order, no density -- so minting one needs no knowledge of any
     // class but this one. See docs/design/classes.md.
     uint32_t type_id;
+    // Interface classes (LRM 8.26). `iface_slots[i]` is the body this class
+    // supplies for the interface method whose design-wide NAME index is i; a hole
+    // (a name declared only by interfaces this class does not implement) holds
+    // Module::iface_unreachable, which no legal dispatch reaches. Shorter than
+    // Module::iface_slot_count when the class needs no high index -- the backend
+    // pads, because the offset of an entry must be one design-wide constant.
+    // Empty for a class that implements no interface class: such a class can never
+    // be the object behind an interface handle, so its table is never read.
+    std::vector<FunctionId> iface_slots;
+    // Ids of every interface class this class implements, transitively AND through
+    // its base chain (LRM 8.26.2: a subclass implicitly implements everything its
+    // superclass implements). One bit each in the descriptor's bitmap.
+    std::vector<uint32_t> iface_ids;
 };
 
 class Module {
@@ -669,6 +683,24 @@ public:
     // across all design timescales (LRM Table 20-3). Seeds the runtime's
     // $timeformat default at startup.
     int32_t timeformat_units = 0;
+    // Interface classes (LRM 8.26, docs/design/interface-classes.md). All three are
+    // zero / unset in a design that declares no interface class, and then no
+    // descriptor grows a byte: the two counts are what gate the interface regions
+    // of class_desc_ty, so the emitted layout is bit-identical to what a design
+    // without the feature has always had.
+    //
+    // `iface_count` is the number of distinct interface classes, i.e. the number of
+    // bits (rounded up to whole words) in every descriptor's implemented-interface
+    // bitmap. `iface_slot_count` is the number of distinct interface method NAMES,
+    // i.e. the number of entries in every implementing class's interface-method
+    // table. Both must be design-wide for a dispatch or an implements test to reach
+    // its datum at a constant offset from a handle whose class it does not know.
+    uint32_t iface_count      = 0;
+    uint32_t iface_slot_count = 0;
+    // The never-executed body a hole in an interface-method table points at
+    // (ClassDesc::iface_slots). Built at most once, by whichever Lowerer first
+    // registers a class that implements an interface class.
+    std::optional<FunctionId> iface_unreachable;
 
     // Allot the next design-unique InstanceScope id (frontend, at node creation).
     uint32_t alloc_scope_id() {
@@ -752,9 +784,34 @@ public:
 
     // Register a class's runtime descriptor. Every class has one: the slots drive
     // virtual dispatch (LRM 8.20) and `type_id` plus the base chain give the
-    // ancestor display a dynamic `$cast` tests (LRM 8.16).
-    void set_class_desc(Ref class_ref, std::vector<FunctionId> slots, uint32_t type_id) {
-        class_descs_.push_back({ class_ref, std::move(slots), type_id });
+    // ancestor display a dynamic `$cast` tests (LRM 8.16). `iface_slots` and
+    // `iface_ids` are empty unless the class implements an interface class (LRM
+    // 8.26).
+    void set_class_desc(Ref                     class_ref,
+                        std::vector<FunctionId> slots,
+                        uint32_t                type_id,
+                        std::vector<FunctionId> iface_slots = {},
+                        std::vector<uint32_t>   iface_ids   = {}) {
+        class_descs_.push_back(
+          { class_ref, std::move(slots), type_id, std::move(iface_slots), std::move(iface_ids) });
+    }
+
+    // Record an interface class's bitmap bit (LRM 8.26). Keyed on the interned Ref
+    // because that is what a `$cast` site carries; two tops interning one interface
+    // as two nominal Refs register the same id twice, which is exactly what keeps
+    // the test sound across that duplication (see class_desc).
+    void set_iface_type_id(Ref iface_ref, uint32_t id) {
+        iface_type_ids_.push_back({ iface_ref, id });
+    }
+
+    // The bitmap bit of an interface class type, or nullopt when the Ref is not one.
+    std::optional<uint32_t> iface_type_id(Ref iface_ref) const {
+        for (const auto& [ref, id] : iface_type_ids_) {
+            if (ref == iface_ref) {
+                return id;
+            }
+        }
+        return std::nullopt;
     }
 
     // The descriptor of a class type, or null when the type has not been lowered
@@ -788,6 +845,9 @@ private:
     std::vector<InstanceScope> tops_;
     // Class descriptors, one per lowered class.
     std::vector<ClassDesc> class_descs_;
+    // Interned interface class Ref -> bitmap bit (LRM 8.26). One entry per Ref, so
+    // an interface reached through two Lowerers appears twice with one id.
+    std::vector<std::pair<Ref, uint32_t>> iface_type_ids_;
     // Next InstanceScope::id (see alloc_scope_id).
     uint32_t next_scope_id_ = 0;
 };

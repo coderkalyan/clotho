@@ -1937,3 +1937,492 @@ TEST_CASE("class vtable: a virtual call reached before its class is numbered") {
     )";
     CHECK(run_capture(src) == "1 2 2\n");
 }
+
+// -- Interface classes (LRM 8.26) --
+//
+// Oracle situation, measured on this workstation (docs/design/interface-classes.md
+// §14): iverilog 13 cannot parse an `interface class` at all ("syntax error" on the
+// declaration), so it is no oracle here. Verilator 5.050 implements a large subset
+// and every expectation below that it can run was cross-checked against it; the two
+// it gets WRONG against explicit LRM text are marked LRM-pinned at their case, so a
+// later Verilator release cannot silently reclassify them.
+
+// LRM 8.26: a handle whose declared type is an interface class holds any instance of
+// an implementing class, and a call through it dispatches to that object's body.
+// Cross-checked vs Verilator 5.050 (`put 3` / `done`).
+TEST_CASE("interface class: dispatch through an interface handle") {
+    constexpr std::string_view src = R"(
+        interface class PutImp;
+            pure virtual function void put(int a);
+        endclass
+        class Fifo implements PutImp;
+            int q[$];
+            virtual function void put(int a); q.push_back(a); $display("put %0d", a); endfunction
+        endclass
+        module m;
+            initial begin
+                Fifo   f = new;
+                PutImp p = f;
+                p.put(3);
+                $display("done");
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "put 3\ndone\n");
+}
+
+// `implements` inherits nothing (LRM 8.26.2), so a class that implements an
+// interface and is never used through one is an ordinary class. This lowered
+// correctly even before interface classes were supported -- the type guard fired
+// only on an interface-TYPED entity -- and this case pins that it still does.
+// Cross-checked vs Verilator 5.050.
+TEST_CASE("interface class: an implements clause alone changes nothing") {
+    constexpr std::string_view src = R"(
+        interface class PutImp;
+            pure virtual function void put(int a);
+        endclass
+        class Fifo implements PutImp;
+            virtual function void put(int a); $display("put %0d", a); endfunction
+        endclass
+        module m;
+            initial begin
+                Fifo f = new;
+                f.put(7);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "put 7\n");
+}
+
+// LRM 8.26.6.1: one implementation satisfies every same-named prototype of every
+// implemented interface -- which is exactly what keying the interface-method table
+// by NAME expresses. Both handles reach the one body.
+// Cross-checked vs Verilator 5.050 (`1 1`).
+TEST_CASE("interface class: two interfaces sharing a method name") {
+    constexpr std::string_view src = R"(
+        interface class I1; pure virtual function bit f(); endclass
+        interface class I2; pure virtual function bit f(); endclass
+        class C implements I1, I2;
+            virtual function bit f(); return 1; endfunction
+        endclass
+        module m;
+            initial begin
+                C  c = new;
+                I1 a = c;
+                I2 b = c;
+                $display("%0b %0b", a.f(), b.f());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 1\n");
+}
+
+// LRM 8.26.2: an interface class may extend one or more interface classes, and the
+// implementer must satisfy the inherited prototypes too. A prototype inherited by an
+// interface is a TransparentMemberSymbol in its scope, invisible to
+// membersOfType<MethodPrototypeSymbol>, so the closure walk (not the member walk) is
+// what finds it. Both the derived and the parent interface handle dispatch.
+TEST_CASE("interface class: extends, and dispatch through a parent interface") {
+    constexpr std::string_view src = R"(
+        interface class A; pure virtual function int a(); endclass
+        interface class B extends A; pure virtual function int b(); endclass
+        class C implements B;
+            virtual function int a(); return 1; endfunction
+            virtual function int b(); return 2; endfunction
+        endclass
+        module m;
+            initial begin
+                C c = new;
+                B bh = c;
+                A ah = c;
+                $display("%0d %0d %0d", bh.a(), bh.b(), ah.a());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 1\n");
+}
+
+// LRM 8.26.6.3: a diamond merges one copy of the shared interface's symbols, so
+// nothing conflicts and the shared parameter is reachable through `::`.
+// Cross-checked vs Verilator 5.050 (`7 1 2 7 64`).
+TEST_CASE("interface class: a diamond and an inherited parameter") {
+    constexpr std::string_view src = R"(
+        interface class Base; parameter SIZE = 64; pure virtual function int f(); endclass
+        interface class E1 extends Base; pure virtual function int g1(); endclass
+        interface class E2 extends Base; pure virtual function int g2(); endclass
+        interface class E3 extends E1, E2; endclass
+        class Impl implements E3;
+            virtual function int f(); return 7; endfunction
+            virtual function int g1(); return 1; endfunction
+            virtual function int g2(); return 2; endfunction
+        endclass
+        module m;
+            initial begin
+                Impl i = new;
+                E3   h = i;
+                Base bh = i;
+                $display("%0d %0d %0d %0d %0d", h.f(), h.g1(), h.g2(), bh.f(), Base::SIZE);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "7 1 2 7 64\n");
+}
+
+// LRM 8.26.2, and the LRM's own example (p. 209): an inherited virtual method
+// provides the implementation of an interface method, and a subclass implicitly
+// implements everything its superclass implements.
+//
+// **LRM 8.26.2 only.** Verilator 5.050 REJECTS this legal design: "Class 'Ext'
+// implements 'I' but is missing implementation for 'f'". slang's flattened
+// `getImplementedInterfaces()` has the same blind spot -- it is written only for the
+// class carrying the `implements` clause -- which is why the interface closure here
+// unions the whole base chain (docs/design/interface-classes.md §11.1).
+TEST_CASE("interface class: the implementation comes from a base class") {
+    constexpr std::string_view src = R"(
+        interface class I; pure virtual function int f(); endclass
+        class Base; virtual function int f(); return 4; endfunction endclass
+        class Ext extends Base implements I; endclass
+        class Deeper extends Ext; endclass
+        module m;
+            initial begin
+                Ext    e = new;
+                Deeper dd = new;
+                I      i = e;
+                I      j = dd;
+                $display("%0d %0d", i.f(), j.f());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4 4\n");
+}
+
+// LRM 8.26.7: a virtual class may partially implement an interface by re-declaring
+// the remaining prototypes as pure; a subclass completes it. The re-declared slot
+// takes the same prototype-built stub an abstract class's pure slot does.
+// Cross-checked vs Verilator 5.050 (`1 2`).
+TEST_CASE("interface class: partial implementation in a virtual class") {
+    constexpr std::string_view src = R"(
+        interface class I;
+            pure virtual function int a();
+            pure virtual function int b();
+        endclass
+        virtual class Half implements I;
+            virtual function int a(); return 1; endfunction
+            pure virtual function int b();
+        endclass
+        class Full extends Half;
+            virtual function int b(); return 2; endfunction
+        endclass
+        module m;
+            initial begin
+                Full h = new;
+                I    i = h;
+                $display("%0d %0d", i.a(), i.b());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2\n");
+}
+
+// LRM 8.26 / 8.26.6.3: each specialization of a parameterized interface class is a
+// distinct interface type, and slang monomorphizes both sides, so this needs no
+// machinery beyond the nominal class Ref each specialization already gets.
+// Cross-checked vs Verilator 5.050 (`put 9`).
+TEST_CASE("interface class: a parameterized interface and implementer") {
+    constexpr std::string_view src = R"(
+        interface class PutImp#(type T = logic);
+            pure virtual function void put(T a);
+        endclass
+        class Fifo#(type T = logic) implements PutImp#(T);
+            virtual function void put(T a); $display("put %0d", a); endfunction
+        endclass
+        module m;
+            initial begin
+                Fifo#(int)   f = new;
+                PutImp#(int) p = f;
+                p.put(9);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "put 9\n");
+}
+
+// LRM 8.26.1: an interface class may declare types and parameters, which are NOT
+// inherited by an implementing class and so are reached through `::` (8.26.3).
+TEST_CASE("interface class: typedef and parameter through the class scope operator") {
+    constexpr std::string_view src = R"(
+        interface class IntfC;
+            typedef enum {ONE, TWO, THREE} t1_t;
+            parameter int W = 3;
+            pure virtual function t1_t f();
+        endclass
+        class A implements IntfC;
+            virtual function IntfC::t1_t f(); return IntfC::TWO; endfunction
+        endclass
+        module m;
+            initial begin
+                A     a = new;
+                IntfC h = a;
+                $display("%0d %0d", h.f(), IntfC::W);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 3\n");
+}
+
+// A `pure virtual task` in an interface class dispatches over the coroutine ABI and
+// may consume time: the interface-method table entry holds the override's ramp, the
+// same way an ordinary virtual task slot does.
+TEST_CASE("interface class: a pure virtual task consumes time through the handle") {
+    constexpr std::string_view src = R"(
+        interface class Drv; pure virtual task run(int n); endclass
+        class D implements Drv;
+            virtual task run(int n); #(n) $display("ran @%0t", $time); endtask
+        endclass
+        module m;
+            initial begin
+                D   d = new;
+                Drv h = d;
+                h.run(5);
+                $display("after @%0t", $time);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "ran @5\nafter @5\n");
+}
+
+// LRM 8.26.5: it is legal to cast BETWEEN interface class variables when the actual
+// object satisfies the destination -- the LRM's own `$cast(get_ref, put_ref)`.
+//
+// **LRM 8.26.5 only.** Verilator 5.050 folds this to a guaranteed failure
+// (`%Warning-CASTCONST: $cast will always return zero`) and then dereferences null at
+// run time; slang emits the same wrong verdict as a warning, which clotho drops for
+// an interface operand (docs/design/interface-classes.md §6.4).
+TEST_CASE("interface class: $cast between two interface handles") {
+    constexpr std::string_view src = R"(
+        interface class PutImp; pure virtual function void put(int a); endclass
+        interface class GetImp; pure virtual function int get(); endclass
+        class Fifo implements PutImp, GetImp;
+            int v;
+            virtual function void put(int a); v = a; endfunction
+            virtual function int get(); return v; endfunction
+        endclass
+        module m;
+            initial begin
+                Fifo   f = new;
+                PutImp p = f;
+                GetImp g;
+                int    ok;
+                p.put(5);
+                ok = $cast(g, p);
+                $display("cast %0d get %0d", ok, g.get());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "cast 1 get 5\n");
+}
+
+// LRM 8.26.5: a cast FROM an interface handle to a class type is the ordinary
+// display test -- the object behind an interface handle is always a real class. The
+// destination need not itself implement the interface (`Base` does not), which is
+// precisely the case the old "unrelated types always fail" fold got wrong.
+TEST_CASE("interface class: $cast from an interface handle to a class") {
+    constexpr std::string_view src = R"(
+        interface class I; pure virtual function int v(); endclass
+        class Base; endclass
+        class Derived extends Base implements I;
+            virtual function int v(); return 3; endfunction
+        endclass
+        module m;
+            initial begin
+                Derived dd = new;
+                I       h = dd;
+                Base    b;
+                Derived d2;
+                int     r1, r2;
+                r1 = $cast(b, h);
+                r2 = $cast(d2, h);
+                $display("%0d %0d %0d", r1, r2, d2.v());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 1 3\n");
+}
+
+// A miss answers 0 and leaves the destination alone; a run-time null source succeeds
+// and assigns null, the same reading LRM 8.16 gets here (8.26.5 defers to it).
+TEST_CASE("interface class: $cast miss and null source") {
+    constexpr std::string_view src = R"(
+        interface class I; pure virtual function int v(); endclass
+        interface class J; pure virtual function int w(); endclass
+        class OnlyI implements I; virtual function int v(); return 1; endfunction endclass
+        module m;
+            initial begin
+                OnlyI o = new;
+                I     h = o;
+                I     hn = null;
+                J     j;
+                J     jn;
+                int   r1, r2;
+                r1 = $cast(j, h);
+                r2 = $cast(jn, hn);
+                $display("miss %0d null %0d", r1, r2);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "miss 0 null 1\n");
+}
+
+// The bitmap is one bit per interface class in the design, so an id past the first
+// word exercises the word index of the implements test. 70 interfaces, and the
+// handles taken are in the second word.
+TEST_CASE("interface class: an interface id in the second bitmap word") {
+    constexpr std::string_view src = R"(
+        interface class I0;  pure virtual function int f0();  endclass
+        interface class I64; pure virtual function int f64(); endclass
+        interface class I65; pure virtual function int f65(); endclass
+        class Big implements I0, I64, I65;
+            virtual function int f0();  return 0;  endfunction
+            virtual function int f64(); return 64; endfunction
+            virtual function int f65(); return 65; endfunction
+        endclass
+        class Small implements I0;
+            virtual function int f0(); return 1; endfunction
+        endclass
+        module m;
+            initial begin
+                Big   bg = new;
+                Small sm = new;
+                I0    a = bg;
+                I65   b = bg;
+                I65   miss;
+                I0    c = sm;
+                int   r1, r2;
+                r1 = $cast(miss, a);
+                r2 = $cast(miss, c);
+                $display("%0d %0d %0d %0d", b.f65(), a.f0(), r1, r2);
+            end
+        endmodule
+    )";
+    // `a` and `c` are both I0 handles; only the Big object also implements I65.
+    CHECK(run_capture(src) == "65 0 1 0\n");
+}
+
+// An interface-typed handle is an ordinary 64-bit handle: identity, `null` and
+// argument passing all reuse the scalar path, and an interface-typed class property
+// and return value work like any other handle.
+TEST_CASE("interface class: identity, arguments, properties") {
+    constexpr std::string_view src = R"(
+        interface class I; pure virtual function int v(); endclass
+        class C implements I; int x; virtual function int v(); return x; endfunction endclass
+        class Holder; I held; function I get(); return held; endfunction endclass
+        module m;
+            function automatic int use_it(I arg);
+                return arg.v() * 2;
+            endfunction
+            initial begin
+                C      c;
+                Holder hd;
+                I      h1, h2, hn;
+                c = new; c.x = 21;
+                hd = new;
+                hd.held = c;
+                h1 = c; h2 = c; hn = null;
+                $display("%0d %0d %0d %0d %0d",
+                         use_it(c), hd.get().v(), h1 == h2, h1 == hn, hn == null);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "42 21 1 0 1\n");
+}
+
+// An object reachable only through interface-typed handles is traced: the handle is
+// a class handle whatever its declared type, and the concrete object's own trace map
+// applies at the other end. Run under both collection cadences.
+TEST_CASE("interface class: objects held only through interface handles survive") {
+    constexpr std::string_view src = R"(
+        interface class I; pure virtual function int v(); endclass
+        class Obj implements I;
+            int x;
+            virtual function int v(); return x; endfunction
+        endclass
+        module m;
+            initial begin
+                I   q[$];
+                Obj o;
+                int total = 0;
+                // `o` is declared outside the loop deliberately: a declaration with
+                // an initializer inside a procedural block has STATIC lifetime (LRM
+                // 6.21), so `Obj o = new;` in the body would allocate one object and
+                // push 200 handles to it.
+                for (int k = 0; k < 200; k++) begin
+                    o = new;
+                    o.x = k;
+                    q.push_back(o);
+                end
+                o = null;
+                foreach (q[k]) total += q[k].v();
+                $display("total %0d size %0d", total, q.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "total 19900 size 200\n");
+}
+
+// LRM 8.26.9: "A randomize() method call shall be legal with interface class
+// handles." The two reserved randomization entry points are numbered per hierarchy,
+// so an interface handle cannot reach them by slot -- they get design-wide interface
+// indices under their reserved names instead.
+TEST_CASE("interface class: randomize() through an interface handle") {
+    constexpr std::string_view src = R"(
+        interface class I; pure virtual function int v(); endclass
+        class Obj implements I;
+            rand bit [7:0] x;
+            virtual function int v(); return x; endfunction
+        endclass
+        module m;
+            initial begin
+                Obj o = new;
+                I   h = o;
+                int ok = h.randomize();
+                $display("ok %0d same %0d", ok, o.x == h.v());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "ok 1 same 1\n");
+}
+
+// LRM 8.26.9: "Use of rand_mode and constraint_mode shall not be legal" through an
+// interface class handle. slang installs both built-ins on every class including an
+// interface one, so the refusal is clotho's.
+TEST_CASE("interface class: rand_mode through an interface handle is refused") {
+    constexpr std::string_view src = R"(
+        interface class I; pure virtual function int v(); endclass
+        class Obj implements I; rand bit [3:0] x; virtual function int v(); return x; endfunction endclass
+        module m;
+            initial begin
+                Obj o = new;
+                I   h = o;
+                h.rand_mode(0);
+            end
+        endmodule
+    )";
+    CHECK(fails(src).find("rand_mode through an interface class handle is not legal") != std::string::npos);
+}
+
+// `%p` of a handle is still unimplemented (TODO.md), and an interface-typed handle
+// must hit the same loud refusal rather than a new silent path.
+TEST_CASE("interface class: %p of an interface handle is refused") {
+    constexpr std::string_view src = R"(
+        interface class I; pure virtual function int v(); endclass
+        class C implements I; virtual function int v(); return 1; endfunction endclass
+        module m;
+            initial begin
+                C c = new;
+                I h = c;
+                $display("%p", h);
+            end
+        endmodule
+    )";
+    CHECK(fails(src).find("%p of a class") != std::string::npos);
+}

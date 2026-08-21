@@ -240,6 +240,10 @@ Index Builder::class_is_a(Index handle, Ref class_type, SourceLoc loc) {
     return emit({ Inst::Tag::ClassIsA, Inst::Payload{ .op_type = { handle, class_type } } }, loc);
 }
 
+Index Builder::class_implements(Index handle, Ref iface_type, SourceLoc loc) {
+    return emit({ Inst::Tag::ClassImplements, Inst::Payload{ .op_type = { handle, iface_type } } }, loc);
+}
+
 Index Builder::agg_copy(Index dst, Index src, Ref type, SourceLoc loc) {
     const ExtraIndex extra = add_extra(AggCopyInfo{ src, type });
 
@@ -654,9 +658,14 @@ Index Builder::call(FunctionId func, std::span<const Index> args, SourceLoc loc)
     return emit({ Inst::Tag::Call, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::call_virtual(FunctionId func, uint32_t slot, Ref class_ref, std::span<const Index> args, SourceLoc loc) {
+Index Builder::call_virtual(FunctionId             func,
+                            uint32_t               slot,
+                            Ref                    class_ref,
+                            std::span<const Index> args,
+                            SourceLoc              loc,
+                            uint32_t               iface_index) {
     const ExtraSlice slice = add_slice(args);
-    const ExtraIndex extra = add_extra(VirtualCallInfo{ func, slot, class_ref, slice });
+    const ExtraIndex extra = add_extra(VirtualCallInfo{ func, slot, iface_index, class_ref, slice });
 
     return emit({ Inst::Tag::CallVirtual, pay(&Inst::Payload::extra, extra) }, loc);
 }
@@ -672,9 +681,10 @@ Index Builder::task_call_virtual(FunctionId             func,
                                  uint32_t               slot,
                                  Ref                    class_ref,
                                  std::span<const Index> args,
-                                 SourceLoc              loc) {
+                                 SourceLoc              loc,
+                                 uint32_t               iface_index) {
     const ExtraSlice slice = add_slice(args);
-    const ExtraIndex extra = add_extra(VirtualCallInfo{ func, slot, class_ref, slice });
+    const ExtraIndex extra = add_extra(VirtualCallInfo{ func, slot, iface_index, class_ref, slice });
 
     return emit({ Inst::Tag::TaskCallVirtual, pay(&Inst::Payload::extra, extra) }, loc);
 }
