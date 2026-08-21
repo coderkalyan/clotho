@@ -1557,6 +1557,10 @@ public:
         lower_instance(top, prefix, Pass::Classify, &top_scope_, top.name);
         lower_instance(top, prefix, Pass::Emit, &top_scope_, top.name);
         emit_wire_resolvers();
+        // Every body compute_vtable reserved while lowering this top's types, now
+        // that the top's signals and scope tree are complete. Before the finalizers,
+        // which close the processes a body's own lowering can still contribute to.
+        drain_pending_bodies();
         // Before finalize_preinit, which closes the process the seeds go into.
         finalize_sva_history();
         finalize_preinit();
@@ -1573,12 +1577,27 @@ public:
     // in this Lowerer's PreInit process, so a package variable initializes
     // exactly once regardless of how many tops import it.
     void lower_globals(const Compilation& comp, const RootSymbol& root) {
+        // Three phases, in this order, because each one lowers code that may read
+        // whatever the previous one produced. Registration only needs types, so it
+        // cannot observe a half-built anything; an initializer can call a function
+        // that reads any global, so every global has to exist first; and a deferred
+        // body can read a global AND run an initializer's side effects, so it goes
+        // last. Doing all three per-variable, as one loop, is what left
+        // `uvm_object::m_set_local_rsrc` unregistered when a variable declared above
+        // it pulled its class's vtable in.
         for (const PackageSymbol* pkg : comp.getPackages()) {
-            collect_global_scope_signals(*pkg);
+            register_global_scope_signals(*pkg);
         }
         for (const CompilationUnitSymbol* unit : root.compilationUnits) {
-            collect_global_scope_signals(*unit);
+            register_global_scope_signals(*unit);
         }
+        for (const PackageSymbol* pkg : comp.getPackages()) {
+            init_global_scope_signals(*pkg);
+        }
+        for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+            init_global_scope_signals(*unit);
+        }
+        drain_pending_bodies();
         finalize_preinit();
     }
 
@@ -3136,6 +3155,14 @@ private:
         class_vslot_[&clt] = slots;
         // Fill each slot with the most-derived body of that name (an override is an
         // override regardless of its own `virtual` keyword — match by name).
+        //
+        // Reserved, not built. Everything from here is reached from lowering a TYPE,
+        // and a body lowers arbitrary code: it reads globals, constructs objects, and
+        // pulls in further classes. Building one here ran it against whatever
+        // half-finished state the type lowering above us was in the middle of -- a
+        // property table mid-index, a package scope mid-registration, a class not yet
+        // numbered. drain_pending_bodies builds them all at the next phase boundary.
+        const Restore<bool>         defer(defer_bodies_, true);
         std::vector<ir::FunctionId> table(size);
         std::vector<bool>           filled(size, false);
         for (const slang::ast::ClassType* k = &clt; k != nullptr; k = base_class_of(*k)) {
@@ -4660,7 +4687,7 @@ private:
     // an initializer expression (ASTContext-driven constant fold, format-arg
     // eval, ...) has a scope to resolve against, matching every other
     // signal-collection path.
-    void collect_global_scope_signals(const Scope& scope) {
+    void register_global_scope_signals(const Scope& scope) {
         scope_ = &scope;
         for (const Symbol& m : scope.members()) {
             if (m.kind != SymbolKind::Variable) {
@@ -4677,6 +4704,21 @@ private:
             info.dir      = ir::SignalInfo::Direction::Internal;
 
             sigmap_[&vs] = register_signal(std::move(info));
+        }
+    }
+
+    // The declaration initializers of the same scope, as this Lowerer's pre-init
+    // process. Separate from registration because an initializer lowers arbitrary
+    // code -- a call whose body reads another global -- and must therefore run only
+    // once EVERY global scope is registered (lower_globals sequences the two).
+    void init_global_scope_signals(const Scope& scope) {
+        scope_ = &scope;
+        for (const Symbol& m : scope.members()) {
+            if (m.kind != SymbolKind::Variable) {
+                continue;
+            }
+            const auto& vs = m.as<VariableSymbol>();
+            cur_range_     = slang::SourceRange{ vs.location, vs.location };
             lower_var_initializer(vs);
         }
     }
@@ -23452,7 +23494,6 @@ private:
             build_dpi_import(sub, id);
             return id;
         }
-        const bool is_task = sub.subroutineKind == SubroutineKind::Task;
         for (const FormalArgumentSymbol* fa : sub.getArguments()) {
             const auto dir = fa->direction;
             if (dir == slang::ast::ArgumentDirection::Ref) {
@@ -23473,28 +23514,73 @@ private:
 
         const ir::FunctionId id = module_.reserve_function();
         fnmap_[&sub]            = id;
-        // A delay written inside a subroutine is in the time units of the scope
-        // that DECLARES it, not the one that calls it (LRM 3.14.2.3) -- and the
-        // same for a $time read in its body. The body is lowered once and shared
-        // by every call site (fnmap_ above), so this is not merely more correct
-        // but the only self-consistent choice: scaled by the caller, at most one
-        // caller could ever be right. Scope::getTimeScale walks out to the
-        // enclosing module / package / compilation unit, so a class method picks
-        // up its declaring unit's scale too.
-        const Restore<uint64_t> mul(time_mul_);
-        const Restore<uint64_t> prec(prec_over_tick_);
+        if (defer_bodies_) {
+            // Reserved, not built: we are inside lowering a TYPE (compute_vtable), and
+            // a body reaches arbitrary code -- another class still laying itself out,
+            // a global not yet registered. The id is all the caller needs; the body is
+            // built by drain_pending_bodies at the next phase boundary.
+            body_pending_.emplace_back(&sub, id);
+            return id;
+        }
+        build_reserved_body(sub, id);
+        return id;
+    }
+
+    // Lower one reserved body. The time scale comes from the scope that DECLARES the
+    // subroutine, not the one that calls it (LRM 3.14.2.3) -- and the same for a
+    // `$time` read in its body. The body is lowered once and shared by every call
+    // site (fnmap_), so this is not merely more correct but the only self-consistent
+    // choice: scaled by the caller, at most one caller could ever be right.
+    // Scope::getTimeScale walks out to the enclosing module / package / compilation
+    // unit, so a class method picks up its declaring unit's scale too.
+    //
+    // `scope_` follows the declaring scope for the same reason function_id's globals
+    // delegation sets it: a constant fold inside the body resolves against it, and at
+    // drain time the scope we were lowering when the body was reserved is long gone.
+    void build_reserved_body(const SubroutineSymbol& sub, ir::FunctionId id) {
+        const Restore<const Scope*> scope(scope_, sub.getParentScope());
+        const Restore<uint64_t>     mul(time_mul_);
+        const Restore<uint64_t>     prec(prec_over_tick_);
         if (tick_fs_ != 0) {
             if (const Scope* decl = sub.getParentScope()) {
                 apply_time_scale(*decl);
             }
         }
-        if (is_task) {
+        if (sub.subroutineKind == SubroutineKind::Task) {
             build_task(sub, id);
         } else {
             build_function(sub, id);
         }
+    }
 
-        return id;
+    bool has_pending_bodies() const {
+        return !body_pending_.empty();
+    }
+
+    // Build every body reserved but not yet built, until none is left: a body reaches
+    // classes of its own, whose vtables reserve more. Runs at a phase boundary -- the
+    // end of lower_globals, the end of each top -- which is the whole point, because
+    // that is where the state a body reads is complete.
+    //
+    // The shared globals Lowerer owns package/$unit bodies (function_id delegates
+    // them), so a top's drain has to reach into it too, and either drain can feed the
+    // other: a global body lowers a class, whose vtable reserves a method this
+    // Lowerer owns. Hence the loop rather than two calls.
+    void drain_pending_bodies() {
+        const Restore<bool> immediate(defer_bodies_, false);
+        while (true) {
+            if (!body_pending_.empty()) {
+                const auto [sub, id] = body_pending_.back();
+                body_pending_.pop_back();
+                build_reserved_body(*sub, id);
+                continue;
+            }
+            if (globals_ != nullptr && globals_ != this && globals_->has_pending_bodies()) {
+                globals_->drain_pending_bodies();
+                continue;
+            }
+            return;
+        }
     }
 
     // Whether a call's receiver is a virtual interface handle, so the callee is the
@@ -25821,6 +25907,13 @@ private:
     // package function called from multiple top instances still gets exactly
     // one FunctionId and one copy of any static local's storage.
     ankerl::unordered_dense::map<const SubroutineSymbol*, ir::FunctionId> fnmap_;
+    // Bodies reserved by compute_vtable but not yet lowered, and the flag that says
+    // to reserve rather than build. Set only while a vtable is being filled, which
+    // is the one place a body build hangs off lowering a TYPE; every other
+    // function_id call site is a statement or an expression, already a stable point.
+    // Drained at a phase boundary by drain_pending_bodies.
+    bool                                                                     defer_bodies_ = false;
+    std::vector<std::pair<const SubroutineSymbol*, ir::FunctionId>>          body_pending_;
     // Canonical slang struct/union type -> its lowered ir::Ref, so a type used by
     // many variables (e.g. a bus of the same struct) interns its field table
     // once. The pool's own structural dedup can't do this: two independently

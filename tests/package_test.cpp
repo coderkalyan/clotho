@@ -398,3 +398,82 @@ TEST_CASE("package function's static local is shared across top-level modules") 
     )");
     CHECK(out == "m1 counter=1 counter=2\nm2 counter=3\n");
 }
+
+// A package variable's TYPE pulls its class in, and the class's vtable used to build
+// every virtual body right there -- from inside lowering a type, i.e. from inside the
+// loop still registering this scope's signals. A body that read a variable declared
+// further down the package therefore read one that had no signal yet ("reference to
+// unknown signal"). uvm_pkg reaches `uvm_object::m_set_local_rsrc` exactly this way,
+// from a `uvm_phase` variable declared above it. Bodies are now reserved during
+// vtable construction and built at a phase boundary, once every global is registered.
+//
+// `g_first` is declared before `g_later` on purpose: the declaration order is what
+// used to decide whether this worked.
+TEST_CASE("package: a class method reads a package variable declared after it") {
+    const std::string out = run_capture(R"(
+        package p;
+            class R;
+                int x = 7;
+            endclass
+            class C;
+                extern virtual function int f();
+            endclass
+
+            C g_first;
+            R g_later;
+
+            function int C::f();
+                if (g_later == null) begin
+                    return -1;
+                end
+                return g_later.x;
+            endfunction
+        endpackage
+        module m;
+            import p::*;
+            initial begin
+                static C c = new;
+                $display("null=%0d", c.f());
+                g_later = new;
+                $display("set=%0d", c.f());
+            end
+        endmodule
+    )");
+    CHECK(out == "null=-1\nset=7\n");
+}
+
+// The same ordering, driven by an INITIALIZER rather than a type: `g_first`'s
+// initializer calls a function whose body reads `g_later`, declared below it. Every
+// global is registered before any initializer runs, so the read resolves.
+TEST_CASE("package: an initializer calls a body that reads a later package variable") {
+    const std::string out = run_capture(R"(
+        package p;
+            class R;
+                int x = 7;
+            endclass
+            class C;
+                extern function int f();
+            endclass
+
+            function automatic int mk();
+                C c = new;
+                return c.f();
+            endfunction
+
+            int g_first = mk();
+            R   g_later;
+
+            function int C::f();
+                if (g_later == null) begin
+                    return -1;
+                end
+                return g_later.x;
+            endfunction
+        endpackage
+        module m;
+            import p::*;
+            initial $display("g_first=%0d", g_first);
+        endmodule
+    )");
+    CHECK(out == "g_first=-1\n");
+}
