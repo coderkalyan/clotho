@@ -1097,13 +1097,13 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
             endmodule
         )", "string in an event control");
     }
-    SUBCASE("case over strings") {
+    SUBCASE("case ... inside with a string range bound") {
         check_rejected(R"(
             module m;
                 string s;
-                initial case (s) "a": $display("a"); endcase
+                initial case (s) inside ["a":"z"]: $display("a"); endcase
             endmodule
-        )", "case statement over strings");
+        )", "string range bound");
     }
     SUBCASE("non-constant string replication count") {
         check_rejected(R"(
@@ -1176,4 +1176,109 @@ TEST_CASE("dynamic-string $fopen filename/mode and $sscanf source") {
         endmodule
     )");
     CHECK(out == "file rc=2 a=12 b=34\nsscanf rc=2 a=77 b=88\n");
+}
+
+// `case` over a string selector. Not sanctioned by LRM 12.5 -- it words matching as
+// `===`, which Table 11-1 bars on a string -- but not prohibited either, and read as
+// content equality (6.16.9) because that is what `===` degenerates to on an operand
+// with no x/z. See lower_case_string and docs/TODO.md. UVM needs it:
+// uvm_string_to_verbosity dispatches `+UVM_VERBOSITY=` exactly this way.
+//
+// No oracle: iverilog 13 aborts compiling a string `case` (draw_eval_vec4
+// assertion). Verilator 5.050 agrees with every expectation here.
+TEST_CASE("case over a string selector matches on content") {
+    const std::string out = run_capture(R"(
+        module m;
+            string s;
+            initial begin
+                s = "MEDIUM";
+                case (s)
+                    "LOW":    $display("1:low");
+                    "MEDIUM": $display("1:medium");
+                    default:  $display("1:other");
+                endcase
+
+                s = "zzz";
+                case (s)
+                    "LOW":   $display("2:low");
+                    default: $display("2:default");
+                endcase
+
+                // A literal's NUL bytes are dropped where it becomes a string
+                // (6.16), so this label IS "A" and matches -- there is no
+                // zero-extension to a common width, which a string has no part in.
+                s = "A";
+                case (s)
+                    "\000A": $display("3:nul-dropped");
+                    default: $display("3:default");
+                endcase
+
+                s = "";
+                case (s)
+                    "":      $display("4:empty");
+                    default: $display("4:default");
+                endcase
+
+                // First match wins (12.5), and a multi-label item is an OR.
+                s = "b";
+                case (s)
+                    "a", "b": $display("5:set");
+                    "b":      $display("5:later");
+                    default:  $display("5:default");
+                endcase
+
+                // A label set through `inside` is the same comparison.
+                s = "q";
+                case (s) inside
+                    "p", "q": $display("6:inside-set");
+                    default:  $display("6:default");
+                endcase
+            end
+        endmodule
+    )");
+    CHECK(out ==
+          "1:medium\n2:default\n3:nul-dropped\n4:empty\n5:set\n6:inside-set\n");
+}
+
+// A later label -- and any side effect in it -- must not be evaluated once an earlier
+// item has matched (12.5's first-match chain), which is why the string path builds
+// each predicate in the previous item's else region rather than all of them up front.
+TEST_CASE("case over strings does not evaluate a later label after a match") {
+    const std::string out = run_capture(R"(
+        module m;
+            int calls = 0;
+            function automatic string tag();
+                calls++;
+                return "LATER";
+            endfunction
+            initial begin
+                string s = "FIRST";
+                case (s)
+                    "FIRST": $display("matched first");
+                    tag():   $display("matched later");
+                    default: $display("default");
+                endcase
+                $display("calls=%0d", calls);
+            end
+        endmodule
+    )");
+    CHECK(out == "matched first\ncalls=0\n");
+}
+
+// `unique` keeps its 12.5.3 checks on the string path: the overlap report comes off
+// the same per-item predicates the integral and real paths use. Two items match "X"
+// here, so the statement runs the first and reports the overlap.
+TEST_CASE("unique case over strings reports an overlap") {
+    const test::DesignRun run = test::run_design_captured(
+        "module m;\n"
+        "    initial begin\n"
+        "        string s = \"X\";\n"
+        "        unique case (s)\n"
+        "            \"X\": $display(\"first\");\n"
+        "            \"X\": $display(\"second\");\n"
+        "        endcase\n"
+        "    end\n"
+        "endmodule\n");
+    CHECK(run.out == "first\n");
+    CHECK(run.err.find("unique") != std::string::npos);
 }

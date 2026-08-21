@@ -812,8 +812,35 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   container element, which the old array-only walk let through to the plane-copy
   path (now guarded).
 - [ ] **String event control / sensitivity**.
-- [ ] **`case` over strings** — needs its own comparison chain over the existing
-  string `Eq` (the shape `lower_case_real` uses), not a value merge.
+- [x] **`case` over strings** (LRM 12.5 / 6.16.9) — **an LRM ambiguity resolved
+  deliberately, not a sanctioned construct.** 12.5 words matching as a bit-for-bit
+  `===` over operands zero-extended to the widest, and Table 11-1 bars `===` on a
+  string exactly as it does on a real, so the standard defines the comparison only
+  for integral operands; 6.16.9 defines `==` over string content and no `===`. But
+  12.5 puts no type restriction on the case expression and nothing prohibits the
+  spelling, so it is read as content equality — the only well-defined reading, and
+  the one `===` degenerates to on an operand with no x/z, which is the same call the
+  real path makes. The zero-extension half is dropped: there is no width to extend
+  to, and padding one side would contradict 6.16.9. A literal's NUL bytes are
+  already dropped where it becomes a string (6.16), so `"\000A"` and `"A"` are one
+  value and match.
+  A string selector routes the statement to `lower_case_string`, which matches with
+  the existing string `Eq`. It keeps 12.5's lazy first-match chain (a later label's
+  side effects never run once an earlier item matched), keeps the `unique` /
+  `unique0` / `priority` 12.5.3 overlap and no-match checks off the same per-item
+  predicates, and handles multi-label items and `case ... inside` over a label SET.
+  `(* full_case *)` / `(* parallel_case *)` are skipped — they enumerate the
+  selector's integral value space. Guarded loud: a `case ... inside` string RANGE
+  bound (11.4.13 over 6.16.9's relational operators — implementable, unreached).
+  `casez` / `casex` over a string and a mixed string/integral label list are both
+  refused by slang's binder before clotho sees them; the clotho-side guards are
+  kept and labelled unreachable.
+  **No oracle**: iverilog 13 cannot compile a string `case` at all (it aborts
+  in `draw_eval_vec4`), so this is pinned to the LRM text rather than to a
+  simulator. Verilator 5.050 accepts it and agrees on content equality, which is
+  corroboration, not authority. Motivated by UVM: `uvm_string_to_verbosity` /
+  `uvm_string_to_action` dispatch `+UVM_VERBOSITY=` this way, nine such statements
+  in the reachable part of uvm-core.
 - [x] **`?:` over strings** — the arms are borrowed `rt_string` handles, so the
   eager path selects a pointer (`lower_string_mux`) and the lazy path merges the
   two arms with a pointer PHI; no string temp and no deep copy. An ambiguous
