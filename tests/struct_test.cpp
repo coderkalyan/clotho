@@ -1687,25 +1687,31 @@ TEST_CASE("an aggregate output argument's copy-out wakes the actual's waiters") 
            "seen_s=1 seen_q=1\n");
 }
 
+// A string-bearing aggregate now passes by value: the copy is per leaf, so the
+// callee's copy is independent of the caller's and neither frees the other's heap.
+TEST_CASE("string-bearing aggregate passes to a task by value") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { string s; int x; } sv_t;
+            sv_t v;
+            task automatic t(sv_t a);
+                a.s = "callee";
+                $display("%0d [%s]", a.x, a.s);
+            endtask
+            initial begin
+                v.s = "caller";
+                v.x = 3;
+                t(v);
+                $display("[%s]", v.s);
+            end
+        endmodule
+    )") == "3 [callee]\n[caller]\n");
+}
+
 TEST_CASE("aggregate subroutine arguments Clotho still refuses loudly") {
-    // Orthogonal, pre-existing gaps, both shared with the function path: a
-    // string-bearing aggregate has no memcpy-able storage for the by-value copy,
-    // and a non-lvalue actual has no storage to point at. (`ref` of an aggregate
-    // is no longer among them — it aliases through the fat ref, covered in
-    // task_test.cpp.)
-    SUBCASE("string-bearing aggregate by value") {
-        const LowerResult r = lower_text(R"(
-            module m;
-                typedef struct { string s; int x; } sv_t;
-                sv_t v;
-                task automatic t(sv_t a); $display("%0d", a.x); endtask
-                initial t(v);
-            endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("string-containing aggregate is not supported") !=
-              std::string::npos);
-    }
+    // A non-lvalue actual has no storage to point at, and the by-value ABI passes a
+    // pointer. (`ref` of an aggregate is not among these — it aliases through the
+    // fat ref, covered in task_test.cpp.)
     SUBCASE("an assignment-pattern actual") {
         const LowerResult r = lower_text(R"(
             module m;

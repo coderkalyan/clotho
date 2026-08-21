@@ -171,15 +171,27 @@ professional parity; M5 makes it complete.
   per-position invalid-index rule for free: a position past the bound reads the
   element default and drops its write, and an x/z base invalidates every
   position. The base is evaluated once. A read is
-  staged in a canonical temp, so the remaining gaps are the ones the constant-
-  bounds form has: aggregate / string elements, and a general by-value read.
-- [ ] **Unpacked arrays of `string`**.
+  staged in a canonical temp. A string / handle-element slice works too (the copy
+  is per element, each leaf a deep copy); the remaining gap the constant-bounds
+  form shares is a general by-value read.
+- [x] **Unpacked arrays of `string`** — a fixed array whose leaves own heap is now
+  a first-class value: subroutine local, by-value argument in every direction,
+  by-value return, whole-array assignment and slice. The copy that made it work is
+  `emit_agg_deep_copy`, the per-leaf sibling of `emit_agg_init`/`emit_agg_deinit`:
+  every string leaf is `rt_string_assign`'d and every container leaf deep-copied,
+  with a memcpy short-circuit for any subtree that owns no heap. It replaces the
+  raw memcpy at the three ABI copies (`emit_agg_copyin`, `emit_copyout`'s aggregate
+  arm, the aggregate `Ret`), which would otherwise have duplicated ownership of one
+  allocation and freed it twice. A managed-leaf RESULT also gets a body-lifetime,
+  proto-initialized, GC-registered return buffer (`build_agg_elem_temps`) instead
+  of a bare per-call `alloca`, since the callee assigns into its leaves and the
+  heap it hands back has to be released at a body exit.
 - [x] **Unpacked array as a function / task local, by-value argument, or return**
   (LRM 13.4/13.5): canonical aggregate frame storage; value semantics via a
   canonical-temp copy-in (the flat-vs-canonical z-elision layout hazard).
   `input` / `output` / `inout` all work for both functions and tasks; a task's
   copy-out rides its completion epilogue, so it lands when the task returns.
-  String / handle-element arrays and `ref` aggregate formals stay guarded.
+  Managed-leaf arrays included; `ref` aggregate formals stay guarded.
 - [ ] **Sliced memory target** for `$readmem*` / `$fread`.
 - [x] **Unpacked arrays / memories** — element-addressed; decl, read,
   blocking/nonblocking write, nested bit/part-select, multidimensional,
@@ -796,7 +808,26 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 
 - [ ] **2-state call-ABI micro-opt** — the function/task ABI still passes a 2-state
   formal as the packed (mm, z) pair (constant-0 z). Size opt, not a correctness gap.
-- [ ] **NBA to a string**.
+- [x] **NBA to a string** (`s <= t`, LRM 10.4.2 / 4.9.4) — a fourth range of the
+  shared `rt_nba_arr_*` record space holding `{ ptr dest, rt_string staged }`: the
+  Active region `rt_string_init`s the staged handle and `rt_string_assign`s the RHS
+  into it (sample-now with owned storage), the NBA region `rt_string_move`s it into
+  the destination (release-and-take, so a target written twice keeps the last write
+  and frees the superseded buffer once). Reuses `StoreNb` — no new IR tag — because
+  `HandleCopyNb`'s payload is a source handle LVALUE and a string rvalue is often a
+  body temp with none. Since the record carries the destination POINTER, a string
+  member of an unpacked struct and an element of a fixed unpacked array come free,
+  and with them a whole-aggregate NBA carrying a string member (decomposed per
+  leaf). No wake and no VCD touch: a string is refused from sensitivity lists and
+  has no `$var` form. Two traps documented in
+  docs/design/queue-nba-and-nonpod.md §3: an empty `rt_string` is NOT all-zero (so
+  `init`, never `memset`), and the classify branch must precede the array /
+  aggregate ones. Still refused: `s[i] <= c` (a masked CHARACTER record, a
+  different shape), `s <= #5 t` (the separate intra-assignment pool), and a string
+  class property (signal-keyed staging). Fixed in passing: an UNQUALIFIED class
+  property NBA inside a method (`p <= v`) reached the backend as an unaddressable
+  root and failed with no source location, for every type — now a located refusal
+  in `check_subroutine_nba_target`.
 - [ ] **NBA to a class property** (`c.x <= v`) — legal SV, refused loudly. Every
   NBA staging buffer (the scalar shadow slot, the aggregate image, the container
   handle record) is indexed by `Signal`; an object body is a heap block with no
@@ -1428,7 +1459,7 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   (`--gc-stress`, `--gc-stats`, `--gc-nursery`, `--gc-heap-max`,
   `--gc-full-every`); docs/design/garbage-collection.md 12a records why.
 
-- [~] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
+- [x] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
   landed. Every class carries a descriptor pointer at object-body field 0
   (`class_body_ty`); each class registers a per-concrete-type dispatch
   table (`Module::set_class_desc`) whose slots are keyed by method NAME per hierarchy
@@ -1480,9 +1511,8 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   stub. Covered: an abstract root whose extern body is the slot's implementation, a
   derived class overriding one extern with another and inheriting the other, a leaf
   overriding an inherited extern with an inline body, functions and tasks.
-  **Deferred, guarded loud:** a pure virtual returning a by-value aggregate that owns
-  heap (a string member) — the same per-leaf-deep-copy gap `build_function` guards for
-  a concrete body, which is why this bullet stays `[~]`.
+  A pure virtual returning a by-value aggregate that owns heap (a string member)
+  works too, now that the return ABI's copy is per-leaf.
 - [x] **Parameterized classes** (`class C #(...)`, LRM 8.25) — type and value
   parameters, param-sized members, methods over the type parameter, inheritance
   from a specialization (`extends base#(5)`), per-specialization static members,
