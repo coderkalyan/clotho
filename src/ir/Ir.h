@@ -521,6 +521,43 @@ struct ProcCtlInfo {
     ProcOp op   = ProcOp::Self;
 };
 
+// Which wait-queue primitive a SyncWait / SyncCtl instruction performs, for the
+// built-in `semaphore` (LRM 15.3) and `mailbox #(T)` (LRM 15.4). Split across two
+// tags for the reason the `process` family is split across three: suspension is a
+// property of the TAG, which every analysis keys on.
+// u32-wide (not u8) so SyncInfo has no padding: the ExtraPayload concept requires a
+// unique object representation.
+enum class SyncOp : uint32_t {
+    // SyncWait: link this thread onto the queue (if it is not already on it) and
+    // park. A node stays linked across an unsatisfied retest, which is what
+    // preserves arrival order (LRM 15.3.3 / 15.4.5: "their arrival order shall be
+    // preserved").
+    Park,
+    // SyncCtl: take this thread's node off the queue, then wake the new head --
+    // one `put` of several keys can satisfy several waiters, and only the thread
+    // leaving knows the queue changed.
+    Leave,
+    // SyncCtl: wake the head of the queue, if any. The woken thread re-tests.
+    WakeHead,
+    // SyncCtl: wake every waiter on the queue. `mailbox::peek` waiters take this,
+    // because a peek consumes nothing (LRM 15.4.7's "any process blocked in either
+    // a peek() or get() operation shall become unblocked").
+    WakeAll,
+};
+
+// Extra payload for the two wait-queue tags.
+struct SyncInfo {
+    // SSA operands, in order: the queue's head-word lvalue, then its tail-word
+    // lvalue. Both are ordinary members of the object's synthetic body, so the
+    // backend needs no layout knowledge -- the frontend selects the field.
+    ExtraSlice args;
+    // Wait SITE identity, unique design-wide. A `Park` and the `Leave` that
+    // discharges it carry the same site, which is how they share one
+    // frame-resident node (the backend allocates one per site per body).
+    uint32_t site = 0;
+    SyncOp   op   = SyncOp::Park;
+};
+
 // Extra payload for `cond`: the then / else regions (the condition is the op).
 struct Regions {
     // Instructions executed when the condition is true.
@@ -2091,6 +2128,22 @@ struct Inst {
         // ExpectWait, a body holding one is forced to a coroutine (is_simple_always)
         // and the tag blocks the thunk path.
         ProcWait,
+
+        // -- Wait queue of a built-in synchronization object (LRM 15.3, 15.4) --
+        // The park/wake primitive `semaphore` and `mailbox #(T)` are built out of;
+        // every one carries `extra -> SyncInfo`. The object itself is an ordinary
+        // class object whose synthetic body holds the resource (a key count, a
+        // message FIFO) plus one FIFO wait queue per resource, and the frontend
+        // expands each method into ordinary IR around these two tags.
+        // See docs/design/mailbox-and-semaphore.md.
+        //
+        // Statement that PARKS the calling thread on a queue, -> 1 when it resumed
+        // as that queue's head (the frontend ANDs that with its own resource test).
+        // Like ProcWait it joins tag_suspends and blocks the thunk path.
+        SyncWait,
+        // Statement, zero-time: leave a queue (`Leave`, which also hands off to the
+        // new head) or wake it (`WakeHead` / `WakeAll`).
+        SyncCtl,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2435,10 +2488,13 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::ExpectWait:
             return K::Extra;
         // process control: extra -> ProcCtlInfo, whose `args` run is the operands
-        // (receiver handle, then a value argument).
         case T::ProcQuery:
         case T::ProcCtl:
         case T::ProcWait:
+        // wait queue: extra -> SyncInfo, whose `args` run is the two queue-word
+        // lvalues.
+        case T::SyncWait:
+        case T::SyncCtl:
             return K::Extra;
         case T::MonitorEmit:
             return K::FDisplay; // op = descriptor, extra = DisplayInfo
@@ -2536,8 +2592,11 @@ enum class ExtraOperandShape : uint8_t {
     // frame lvalues each child aliases); `children` are FunctionIds, not operands.
     ForkArgs,
     // `extra` is a ProcCtlInfo whose `args` slice is the operand run (the receiver
-    // handle and, for srandom / set_randstate, the value argument).
+    // handle, then any value argument); the op selector and result type are not.
     ProcArgs,
+    // `extra` is a SyncInfo whose `args` slice is the operand run (the queue's
+    // head-word and tail-word lvalues); the site id and op selector are not.
+    SyncArgs,
 };
 
 // Constexpr for the same reason as payload_kind(): operand walks inline it.
@@ -2559,6 +2618,11 @@ constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
         case T::ProcCtl:
         case T::ProcWait:
             return S::ProcArgs;
+        // wait queue: the two queue-word lvalues are operands; the site and op are
+        // not.
+        case T::SyncWait:
+        case T::SyncCtl:
+            return S::SyncArgs;
         // loop: the predicate and regions are not top-level operands (the
         // predicate is defined inside the cond region, walked via region()).
         case T::Loop:

@@ -96,7 +96,7 @@ module m;
   logic a;
   initial begin : blk
     a = 1;
-    begin semaphore s; s = new(1); end
+    begin mailbox b; b = new(1); end
   end
 endmodule
 )");
@@ -117,7 +117,7 @@ endmodule
     CHECK(d.origin == DiagnosticOrigin::Unsupported);
     CHECK(d.code == "unsupported-construct");
     // The message is the bare complaint: no location baked into the text.
-    CHECK(d.message.find("semaphore") != std::string::npos);
+    CHECK(d.message.find("mailbox") != std::string::npos);
     CHECK(d.message.find(".sv") == std::string::npos);
     CHECK(d.message.find(":6:") == std::string::npos);
     // The location lives in the span instead, and points at the `disable`.

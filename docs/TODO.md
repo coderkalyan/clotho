@@ -1529,13 +1529,42 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   counts, as 9.6.3 requires). Both stay refused inside an assertion action block,
   which runs on the MONITOR's thread rather than one of its own.
   Design: docs/design/process-class.md §8.
-- [ ] **`std::mailbox` / `std::semaphore`** (parameterized, bounded/unbounded).
-  Slang synthesizes both into the `std` package with signatures but no bodies,
-  so a real runtime is needed: a key count plus a wait queue for `semaphore`, a
-  bounded FIFO with blocking `put`/`get`/`peek` for `mailbox`. Guarded loud in
-  `lower_class_type` (any class whose parent scope is the `std` package) — a
-  `semaphore` used to abort on an out-of-range formal index and a `mailbox` to
-  report only "unsupported non-integral type".
+- [x] **`std::semaphore` / `std::mailbox #(T)`** (LRM 15.3 / 15.4) — both are
+  ordinary class objects whose synthetic body carries the resource and its wait
+  queues: a signed 64-bit key count for `semaphore` (15.3.1 lets the count grow past
+  the constructor's), and for `mailbox` an UNBOUNDED queue of T plus three queues of
+  waiters (receive, send, peek). The bound is enforced in emitted IR, NOT by the
+  queue type, whose overflow silently drops the far end instead of blocking. So the
+  whole payload surface — int, string, class handle, 96-bit vector, unpacked struct
+  with a string leaf, nested queue — comes from the container element descriptor with
+  no mailbox-specific code, as does GC tracing of a handle payload.
+
+  New surface is two IR tags: `SyncWait` (parks on a queue, -> 1 when it resumed as
+  that queue's head) and `SyncCtl` (`Leave` / `WakeHead` / `WakeAll`); everything
+  else expands in the frontend into ordinary IR over the body. No runtime symbol, no
+  pool, no ABI change, no `DesignUses` gate. The waiter node is frame-resident and
+  STAYS linked across an unsatisfied retest — that is what preserves LRM 15.3.3 /
+  15.4.5 arrival order, and it is why the abort test lives inside `SyncWait`: a retry
+  loop never reaches the end of its instruction, the same shape that made a killed
+  `await` unkillable. A thread killed while blocked in `get` / `put` / `peek`
+  terminates, and a suspended one does not consume.
+
+  Head-of-line admission per 15.3.3 and Accellera's Interpretation #1: a blocked head
+  blocks a later smaller request, where Verilator 5.050 serves the later one and then
+  deadlocks the head — so those cases are pinned from the LRM text. `peek` is exempt
+  (it consumes nothing) and a `put` wakes every peeker before the receive head, which
+  is the only order that makes 15.4.7's broad unblock observable. `try_*` stay
+  availability-only (15.3.4, 15.4.4/6/8).
+
+  Guarded loud, each with a TODO: the **typeless mailbox** (15.4.9's `dynamic_type`,
+  legal SV that slang type-checks) — it needs a dynamically typed element plus a
+  run-time type identity for 15.4.5's check and 15.4.6's negative return;
+  `mailbox #(event)` (an element's construction mints an event object the copy then
+  overwrites, and event objects are never freed); deriving from either built-in
+  class; and a **negative bound**, which 15.4.1 calls illegal and which reports at
+  run time since the bound need not be constant. 22 cases in `tests/sync_test.cpp`.
+  `std::weak_reference` (LRM 8.30) keeps the std-package guard alone.
+  Design: docs/design/mailbox-and-semaphore.md.
 - [x] **`process` class** (LRM 9.7) — all nine methods: `self`, `status`, `kill`,
   `await`, `suspend`, `resume`, `srandom`, `get_randstate`, `set_randstate`. A
   thread's control block is native, untraced storage in two tiers -- a static slot per

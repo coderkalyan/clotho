@@ -4424,6 +4424,7 @@ private:
             disable_node_     = nullptr;
             block_nodes_.clear();
             event_wait_nodes_.clear();
+        sync_nodes_.clear();
             cur_is_task_      = false;
             silent_stores_ = false;
             hdl_              = nullptr;
@@ -5491,6 +5492,7 @@ private:
         disable_node_ = nullptr;
         block_nodes_.clear();
         event_wait_nodes_.clear();
+        sync_nodes_.clear();
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -13947,6 +13949,13 @@ private:
             case Inst::Tag::ProcWait:
                 // Statements, never values.
                 return { 1, false, false };
+            case Inst::Tag::SyncWait:
+                // 1 when the park resumed as its queue's head: a definite 2-state
+                // bit the frontend ANDs with its own resource test.
+                return { 1, false, false };
+            case Inst::Tag::SyncCtl:
+                // A statement, never a value.
+                return { 1, false, false };
             case Inst::Tag::EventTriggered:
                 // `e.triggered` (LRM 15.5.3): a definite 2-state 1-bit `bit`.
                 return { 1, false, false };
@@ -16120,6 +16129,12 @@ private:
                 return;
             case Inst::Tag::ProcWait:
                 lower_proc_wait(i);
+                return;
+            case Inst::Tag::SyncWait:
+                lower_sync_wait(i);
+                return;
+            case Inst::Tag::SyncCtl:
+                lower_sync_ctl(i);
                 return;
             case Inst::Tag::MonitorSet:
                 b_.CreateCall(monitor_set_fn(),
@@ -25386,6 +25401,7 @@ private:
             case Inst::Tag::Fork:
             case Inst::Tag::ExpectWait:
             case Inst::Tag::ProcWait:
+            case Inst::Tag::SyncWait:
                 return true;
             default:
                 return false;
@@ -26273,6 +26289,293 @@ private:
         b_.CreateStore(null, b_.CreateStructGEP(nty, node, kNodeNext));
     }
 
+    // -- Wait queue of a built-in synchronization object (LRM 15.3, 15.4) --
+    //
+    // A `semaphore` / `mailbox` object is an ordinary class object whose synthetic
+    // body carries the resource plus one FIFO wait queue per resource, each two
+    // words: a head pointer and a tail pointer, held as the 2-state 64-bit
+    // (chandle-shaped) members the frontend selects and hands over as lvalues. So
+    // nothing here knows the object's layout, and the collector never sees a
+    // coroutine frame pointer (a `chandle` member carries no class handle).
+    //
+    // The node is the event waiter node plus the two queue words it is linked into,
+    // which is what lets `Leave` repair the tail without assuming the head and tail
+    // members are adjacent in the body. See docs/design/mailbox-and-semaphore.md
+    // §5.
+    llvm::StructType* sync_node_ty() {
+        auto* ptr = llvm::PointerType::getUnqual(ctx_);
+        return llvm::StructType::get(ctx_, { ptr, ptr, ptr, ptr, ptr, ptr });
+    }
+    static constexpr unsigned kSyncNext   = 0;
+    static constexpr unsigned kSyncPrev   = 1;
+    // The parked coroutine handle, region tag intact (parked_handle), and the
+    // parked thread's scheduled-flag address -- the two words a wait-bucket entry
+    // holds, read back by the wake walk.
+    static constexpr unsigned kSyncHandle = 2;
+    static constexpr unsigned kSyncFlag   = 3;
+    // The queue this node is on: the head word's address, then the tail word's.
+    // Null `q_head` means "not linked", which is what makes the enqueue idempotent
+    // across an unsatisfied retest (FIFO: the node keeps its arrival position).
+    static constexpr unsigned kSyncQHead  = 4;
+    static constexpr unsigned kSyncQTail  = 5;
+
+    // The frame-resident node of one wait SITE, hoisted to the ramp so CoroSplit
+    // spills it into the coroutine frame -- event_wait_node's placement, and for
+    // the same reason: the object holds a pointer to it while this thread is
+    // parked. Zeroed there too, because the enqueue guard READS `q_head` before
+    // anything has written it.
+    llvm::Value* sync_wait_node(uint32_t site) {
+        auto [it, fresh] = sync_nodes_.try_emplace(site, nullptr);
+        if (fresh || it->second == nullptr ||
+            llvm::cast<llvm::Instruction>(it->second)->getFunction() != b_.GetInsertBlock()->getParent()) {
+            llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+            auto*             node = ab.CreateAlloca(sync_node_ty(), nullptr, "sync_node");
+            ab.CreateStore(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)),
+                           ab.CreateStructGEP(sync_node_ty(), node, kSyncQHead));
+            it->second = node;
+        }
+        return it->second;
+    }
+
+    // The address of one queue word, from the frontend's member lvalue. The word is
+    // a 2-state 64-bit member, so a node pointer rides it as an integer -- the same
+    // shape the `process` object's `chandle` field uses for its control block.
+    llvm::Value* sync_word_ptr(Index lv) { return lv_handle_ptr(lvalue_of(lv)); }
+
+    llvm::Value* sync_word_load(llvm::Value* word) {
+        return b_.CreateIntToPtr(b_.CreateLoad(b_.getInt64Ty(), word), llvm::PointerType::getUnqual(ctx_));
+    }
+
+    void sync_word_store(llvm::Value* word, llvm::Value* node) {
+        b_.CreateStore(b_.CreatePtrToInt(node, b_.getInt64Ty()), word);
+    }
+
+    // Link `node` at the TAIL, so the queue is FIFO (LRM 15.3.3 / 15.4.5: arrival
+    // order is preserved). A node already on a queue is left where it is: that is
+    // the whole point of the guard, since a woken waiter whose resource test fails
+    // must not go to the back of the line.
+    void emit_sync_enqueue(llvm::Value* node, llvm::Value* qhead, llvm::Value* qtail) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* nty  = sync_node_ty();
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+
+        auto*        link = llvm::BasicBlock::Create(ctx_, "sync.link", fn);
+        auto*        done = llvm::BasicBlock::Create(ctx_, "sync.linked", fn);
+        llvm::Value* onq  = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, kSyncQHead));
+        b_.CreateCondBr(b_.CreateICmpEQ(onq, null), link, done);
+
+        b_.SetInsertPoint(link);
+        b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(nty, node, kSyncHandle));
+        b_.CreateStore(sched_ptr_, b_.CreateStructGEP(nty, node, kSyncFlag));
+        b_.CreateStore(qhead, b_.CreateStructGEP(nty, node, kSyncQHead));
+        b_.CreateStore(qtail, b_.CreateStructGEP(nty, node, kSyncQTail));
+        b_.CreateStore(null, b_.CreateStructGEP(nty, node, kSyncNext));
+        llvm::Value* tail = sync_word_load(qtail);
+        b_.CreateStore(tail, b_.CreateStructGEP(nty, node, kSyncPrev));
+        auto* append = llvm::BasicBlock::Create(ctx_, "sync.append", fn);
+        auto* first  = llvm::BasicBlock::Create(ctx_, "sync.first", fn);
+        auto* settle = llvm::BasicBlock::Create(ctx_, "sync.settle", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(tail, null), append, first);
+        b_.SetInsertPoint(append);
+        b_.CreateStore(node, b_.CreateStructGEP(nty, tail, kSyncNext));
+        b_.CreateBr(settle);
+        b_.SetInsertPoint(first);
+        sync_word_store(qhead, node);
+        b_.CreateBr(settle);
+        b_.SetInsertPoint(settle);
+        // Either way this node is now last.
+        sync_word_store(qtail, node);
+        b_.CreateBr(done);
+        b_.SetInsertPoint(done);
+    }
+
+    // Take `node` off its queue and clear the links, so a second unlink is a no-op
+    // and the enqueue guard reads "not linked" again.
+    void emit_sync_unlink(llvm::Value* node) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* nty  = sync_node_ty();
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+
+        llvm::Value* qhead = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, kSyncQHead));
+        auto*        work  = llvm::BasicBlock::Create(ctx_, "sync.unlink", fn);
+        auto*        skip  = llvm::BasicBlock::Create(ctx_, "sync.unlinked", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(qhead, null), work, skip);
+
+        b_.SetInsertPoint(work);
+        llvm::Value* qtail = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, kSyncQTail));
+        llvm::Value* prev  = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, kSyncPrev));
+        llvm::Value* next  = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, node, kSyncNext));
+
+        auto* has_prev = llvm::BasicBlock::Create(ctx_, "sync.un.prev", fn);
+        auto* no_prev  = llvm::BasicBlock::Create(ctx_, "sync.un.head", fn);
+        auto* mid      = llvm::BasicBlock::Create(ctx_, "sync.un.mid", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(prev, null), has_prev, no_prev);
+        b_.SetInsertPoint(has_prev);
+        b_.CreateStore(next, b_.CreateStructGEP(nty, prev, kSyncNext));
+        b_.CreateBr(mid);
+        b_.SetInsertPoint(no_prev);
+        sync_word_store(qhead, next);
+        b_.CreateBr(mid);
+
+        b_.SetInsertPoint(mid);
+        auto* has_next = llvm::BasicBlock::Create(ctx_, "sync.un.next", fn);
+        auto* no_next  = llvm::BasicBlock::Create(ctx_, "sync.un.tail", fn);
+        auto* tail     = llvm::BasicBlock::Create(ctx_, "sync.un.done", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(next, null), has_next, no_next);
+        b_.SetInsertPoint(has_next);
+        b_.CreateStore(prev, b_.CreateStructGEP(nty, next, kSyncPrev));
+        b_.CreateBr(tail);
+        b_.SetInsertPoint(no_next);
+        sync_word_store(qtail, prev);
+        b_.CreateBr(tail);
+
+        b_.SetInsertPoint(tail);
+        b_.CreateStore(null, b_.CreateStructGEP(nty, node, kSyncPrev));
+        b_.CreateStore(null, b_.CreateStructGEP(nty, node, kSyncNext));
+        b_.CreateStore(null, b_.CreateStructGEP(nty, node, kSyncQHead));
+        b_.CreateBr(skip);
+        b_.SetInsertPoint(skip);
+    }
+
+    // Wake the queue's head, or every waiter on it. Each woken thread re-tests and
+    // either takes the resource or parks again on the node it never left, so a
+    // spurious wake costs one activation and no queue surgery. `next` is read
+    // before the wake for the reason emit_event_wake_list reads it first: the woken
+    // activation may unlink its own node as soon as it runs.
+    void emit_sync_wake(llvm::Value* qhead, bool all) {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* nty  = sync_node_ty();
+        auto* null = llvm::ConstantPointerNull::get(ptr);
+        auto* fn   = b_.GetInsertBlock()->getParent();
+
+        // One waiter: read the head, wake it if its flag is clear. No loop, so a
+        // hand-off costs a load and a compare.
+        const auto wake_one = [&](llvm::Value* n) {
+            auto* push = llvm::BasicBlock::Create(ctx_, "sync.wake.push", fn);
+            auto* skip = llvm::BasicBlock::Create(ctx_, "sync.wake.skip", fn);
+            llvm::Value* hdl  = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kSyncHandle));
+            llvm::Value* flag = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kSyncFlag));
+            // One wake per thread per instant, the design's existing scheduled-flag
+            // token: a thread already queued elsewhere is not pushed twice.
+            b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(b_.getInt32Ty(), flag), b_.getInt32(0)), push,
+                            skip);
+            b_.SetInsertPoint(push);
+            emit_wake_push(b_, hdl);
+            b_.CreateStore(b_.getInt32(1), flag);
+            b_.CreateBr(skip);
+            b_.SetInsertPoint(skip);
+        };
+
+        if (!all) {
+            auto*        one  = llvm::BasicBlock::Create(ctx_, "sync.wake.one", fn);
+            auto*        done = llvm::BasicBlock::Create(ctx_, "sync.wake.done", fn);
+            llvm::Value* head = sync_word_load(qhead);
+            b_.CreateCondBr(b_.CreateICmpNE(head, null), one, done);
+            b_.SetInsertPoint(one);
+            wake_one(head);
+            b_.CreateBr(done);
+            b_.SetInsertPoint(done);
+            return;
+        }
+
+        auto*        walk  = llvm::BasicBlock::Create(ctx_, "sync.wake.walk", fn);
+        auto*        body  = llvm::BasicBlock::Create(ctx_, "sync.wake.node", fn);
+        auto*        done  = llvm::BasicBlock::Create(ctx_, "sync.wake.done", fn);
+        llvm::Value* first = sync_word_load(qhead);
+        auto*        pre   = b_.GetInsertBlock();
+        b_.CreateBr(walk);
+
+        b_.SetInsertPoint(walk);
+        llvm::PHINode* n = b_.CreatePHI(ptr, 2, "n");
+        n->addIncoming(first, pre);
+        b_.CreateCondBr(b_.CreateICmpNE(n, null), body, done);
+
+        b_.SetInsertPoint(body);
+        // Read `next` BEFORE the wake: a woken activation may unlink its own node
+        // as soon as it runs, exactly as emit_event_wake_list must.
+        llvm::Value* nxt = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kSyncNext));
+        wake_one(n);
+        n->addIncoming(nxt, b_.GetInsertBlock());
+        b_.CreateBr(walk);
+
+        b_.SetInsertPoint(done);
+    }
+
+    // `SyncWait`: park on a queue until something wakes us, and report whether we
+    // came back as its head. The abort test is HERE rather than left to
+    // lower_region's poll because the frontend's retest loop re-parks without
+    // reaching the end of the instruction -- the shape that made a killed `await`
+    // unkillable (docs/design/mailbox-and-semaphore.md §6.3).
+    void lower_sync_wait(Index i) {
+        if (hdl_ == nullptr || sched_ptr_ == nullptr) {
+            throw BackendError{ "internal: a blocking synchronization method with no thread" };
+        }
+        const auto info = ir_->extra_data<SyncInfo>(ir_->payload(i).extra);
+        const auto args = ir_->region(info.args);
+        if (args.size() != 2) {
+            throw BackendError{ "internal: sync_wait takes a head and a tail word" };
+        }
+        auto*        ptr   = llvm::PointerType::getUnqual(ctx_);
+        llvm::Value* qhead = sync_word_ptr(args[0]);
+        llvm::Value* qtail = sync_word_ptr(args[1]);
+        llvm::Value* node  = sync_wait_node(info.site);
+
+        emit_sync_enqueue(node, qhead, qtail);
+        // Armed for the reason every intra-body park arms: parked here this thread
+        // sits in no other queue, so the flag must read "not scheduled" or the wake
+        // is dropped as a duplicate.
+        b_.CreateStore(b_.getInt32(0), sched_ptr_);
+        emit_suspend("coro.sync_resume");
+        if (llvm::Value* aborting = emit_abort_pending(); aborting != nullptr) {
+            auto* fn    = b_.GetInsertBlock()->getParent();
+            auto* leave = llvm::BasicBlock::Create(ctx_, "sync.abort", fn);
+            auto* alive = llvm::BasicBlock::Create(ctx_, "sync.alive", fn);
+            b_.CreateCondBr(aborting, leave, alive);
+            b_.SetInsertPoint(leave);
+            // Off the queue before the poll takes this activation's exit: nothing
+            // may be left pointing into a frame that is about to unwind.
+            emit_sync_unlink(node);
+            // And hand off, for the reason `Leave` hands off: an aborting thread may
+            // be the HEAD, and the resource it was about to take is still there --
+            // one `put` of several keys satisfies several waiters. Without this the
+            // wake dies with the killed thread and every waiter behind it strands,
+            // which a `put(2)` racing a `kill` of the head reproduces exactly.
+            emit_sync_wake(qhead, /*all=*/false);
+            b_.CreateBr(alive);
+            b_.SetInsertPoint(alive);
+        }
+        llvm::Value* head = b_.CreateICmpEQ(sync_word_load(qhead), node);
+        set_value(i, two_val(head));
+    }
+
+    // `SyncCtl`: leave a queue (and hand off to the new head), or wake one.
+    void lower_sync_ctl(Index i) {
+        const auto info = ir_->extra_data<SyncInfo>(ir_->payload(i).extra);
+        const auto args = ir_->region(info.args);
+        if (args.size() != 2) {
+            throw BackendError{ "internal: sync_ctl takes a head and a tail word" };
+        }
+        llvm::Value* qhead = sync_word_ptr(args[0]);
+        switch (info.op) {
+            case SyncOp::Leave:
+                emit_sync_unlink(sync_wait_node(info.site));
+                // A `put` of several keys can satisfy several waiters, and only the
+                // thread leaving knows the queue moved.
+                emit_sync_wake(qhead, /*all=*/false);
+                return;
+            case SyncOp::WakeHead:
+                emit_sync_wake(qhead, /*all=*/false);
+                return;
+            case SyncOp::WakeAll:
+                emit_sync_wake(qhead, /*all=*/true);
+                return;
+            case SyncOp::Park:
+                throw BackendError{ "internal: Park is SyncWait's op, not SyncCtl's" };
+        }
+    }
+
     // The per-target tables the remote form needs, sized by the frontend's target
     // count and emitted only for a design that has a remote `disable`. Flat arrays,
     // not the per-instance anchored shape proc_sched uses: an id is allocated per
@@ -26607,6 +26910,10 @@ private:
     // Frame-resident event waiter nodes for the body being lowered, by event index
     // within a wait (event_wait_node). Cleared with block_nodes_ per body.
     ankerl::unordered_dense::map<uint32_t, llvm::Value*> event_wait_nodes_;
+    // Frame-resident waiter nodes for the body being lowered, by wait SITE
+    // (SyncInfo::site), so a `Park` and the `Leave` that discharges it share one
+    // node. Cleared with the maps above, per body.
+    ankerl::unordered_dense::map<uint32_t, llvm::Value*> sync_nodes_;
     // Per-function `join` record slot { i32 count, ptr parent, ... } (lazy, reused
     // across a coroutine's join sites — `join` serializes them, and its parent
     // outlives every child). Reset per fn. join_any / join_none heap-allocate

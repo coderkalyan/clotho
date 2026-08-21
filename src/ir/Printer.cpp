@@ -412,6 +412,10 @@ const char* tag_name(Inst::Tag tag) {
             return "proc_ctl";
         case T::ProcWait:
             return "proc_wait";
+        case T::SyncWait:
+            return "sync_wait";
+        case T::SyncCtl:
+            return "sync_ctl";
         case T::MonitorSet:
             return "monitor_set";
         case T::MonitorEmit:
