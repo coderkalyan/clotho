@@ -987,21 +987,62 @@ TEST_CASE("a uvm_queue-shaped class returns a struct from a queue pop") {
     )") == "back 2 beta\nfront 1 alpha\nsize 0\n");
 }
 
+// LRM 13.4 defines `return expr` as assigning `expr` to the function's implicit
+// return variable, so `return` accepts exactly the rvalues an assignment does --
+// which now includes an aggregate `?:` (LRM 11.4.11). agg_return_operand needs no
+// case of its own for it: the operand falls through to emit_agg_store, which
+// branches and builds the selected arm straight into the return variable, so
+// neither arm is staged anywhere first.
+TEST_CASE("aggregate return of a conditional operator") {
+    SUBCASE("a struct, both directions, other arm unevaluated") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; byte b; } st;
+                int nt = 0, nf = 0;
+                function automatic st ft(); nt++; return '{a:1, b:2}; endfunction
+                function automatic st ff(); nf++; return '{a:3, b:4}; endfunction
+                function automatic st pick(input bit c); return c ? ft() : ff(); endfunction
+                initial begin
+                    $display("%p nt=%0d nf=%0d", pick(1), nt, nf);
+                    $display("%p nt=%0d nf=%0d", pick(0), nt, nf);
+                end
+            endmodule
+        )") == "'{a:1, b:2} nt=1 nf=0\n'{a:3, b:4} nt=1 nf=1\n");
+    }
+    SUBCASE("a fixed unpacked array") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef int ai [0:2];
+                ai p, q;
+                function automatic ai pick(input bit c); return c ? p : q; endfunction
+                initial begin
+                    p = '{1, 2, 3};
+                    q = '{4, 5, 6};
+                    $display("%p %p", pick(1), pick(0));
+                end
+            endmodule
+        )") == "'{1, 2, 3} '{4, 5, 6}\n");
+    }
+    SUBCASE("an ambiguous condition takes the Table 7-1 default") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; byte b; } st;
+                st x, y;
+                function automatic st pick(input logic c); return c ? x : y; endfunction
+                initial begin
+                    x = '{a:1, b:2};
+                    y = '{a:3, b:4};
+                    $display("%p", pick(1'bx));
+                end
+            endmodule
+        )") == "'{a:0, b:0}\n");
+    }
+}
+
 TEST_CASE("aggregate returns Clotho still refuses loudly") {
     // Bounding `return` by exactly what assignment supports is what makes the LRM
-    // 13.4 equivalence honest, so both refusals below are the ASSIGNMENT path's own
-    // diagnostics, reached because the return operand is staged through it.
-    SUBCASE("a ternary rvalue, as in a plain assignment") {
-        const std::string d = reject(R"(
-            module m;
-                typedef struct { int a; } st;
-                st x, y;
-                function automatic st pick(input bit c); return c ? x : y; endfunction
-                initial $display("%0d", pick(1).a);
-            endmodule
-        )");
-        CHECK(d.find("unsupported unpacked struct rvalue") != std::string::npos);
-    }
+    // 13.4 equivalence honest, so the refusal below is the ASSIGNMENT path's own
+    // diagnostic, reached because the return operand is staged through it.
     // Not a return-path limit: inside a subroutine the slice source and the return
     // variable are both canonical aggregate frame storage, and the backend has no
     // aggregate-element slice, so a plain `o = x[0:1]` between two frame locals

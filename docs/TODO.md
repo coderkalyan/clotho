@@ -57,6 +57,150 @@ professional parity; M5 makes it complete.
   an out-of-range index into a fixed / dynamic array or queue, a missing
   associative-array key, integer divide / modulo by zero (all-x), real divide by zero,
   and a string index out of range.
+- [x] **Aggregate `?:`** (LRM 11.4.11 over an unpacked struct / fixed unpacked
+  array) — `o = c ? x : y;`, `st d = c ? x : y;`, `return c ? x : y;`,
+  `(c ? x : y).m`, `$display("%p", c ? x : y)`, `(c ? x : y) == z`. The clause's
+  last legality rule is what routes an aggregate here — "For all other cases, the
+  type of the first expression and second expression shall be equivalent (see
+  6.22.2)" — so both arms and the result share one layout and the only question is
+  which arm reaches the destination. Motivated by Accellera UVM's
+  `uvm_factory.svh:2318`,
+  `m_uvm_factory_type_pair_t match_type_pair = match_original_type ? override.orig : override.ovrd;`
+  over a `{ uvm_object_wrapper, string }` struct, which fataled on
+  "unsupported unpacked struct rvalue".
+  DESTINATION-DIRECTED, not staged: `emit_agg_conditional` opens two `Cond`
+  regions and recurses into `emit_agg_store` with the SAME destination lvalue, so
+  the selected arm is built straight into the target and no temp exists on either
+  definite path. A variable arm is one `AggCopy` memcpy, a `'{...}` arm is built
+  in place, a call arm writes through its own out-param, and a nested chain
+  (`c1 ? x : c2 ? y : z`) falls out of the recursion for free. `return` needed no
+  case of its own for the same reason — `agg_return_operand` already falls
+  through to `emit_agg_store`, whose destination is the return variable.
+  Arm evaluation is CONDITIONAL, never speculative, and `is_speculation_safe` is
+  not consulted at all: the whitelist exists to preserve the branchless packed
+  select, and an aggregate has none — a copy is a sequence of stores whichever arm
+  wins — so there is nothing to trade against the clause's "without evaluating".
+  A call arm, a trapping arm and a pure arm all take the same branch, which is
+  strictly stronger than the integral path's guarantee.
+  A 2-STATE CONDITION EMITS NO AMBIGUITY MACHINERY. `conditions_may_be_ambiguous`
+  proves the ambiguous rule unreachable from the condition's type, mirroring
+  `lower_predicate`, which is what fixes the predicate's representation: a string
+  condition reduces `StrLen` and a real condition compares against 0.0, both
+  definite; everything else reduces the operand's own bits, which can be x exactly
+  when those bits have an unknown plane to carry one, and a 2-state type has none
+  by construction. So a `bit` condition emits one `Cond` over two `AggCopy`s and
+  nothing else — verified with `clotho build --emit ir`: 46 IR lines, zero
+  `agg_eq`, zero `case_eq`, against 84 lines with one `agg_eq` and three `case_eq`
+  for the same design on a `logic` condition. That is the case UVM takes, and it
+  also WIDENS what compiles: with no 11.4.5 compare emitted, a 2-state condition
+  works over a struct with an associative-array member, which the compare itself
+  cannot handle. A `matches` condition counts as possibly ambiguous even though
+  `lower_pattern` builds its result from definite `CaseEq` tests — same
+  fails-CLOSED polarity `is_speculation_safe` uses, since being conservative costs
+  one dead compare and being wrong silently drops the merge.
+  THE AMBIGUOUS PATH follows the clause in its own order: "then both the first
+  expression and the second expression shall be evaluated, and compared for
+  logical equivalence as described in 11.4.5. If that comparison is true (1), the
+  operator shall return either the first or second expression." Both arms are
+  staged into `make_canonical_agg_temp` temps rather than one being built into the
+  destination first, because the destination may ALIAS an arm (`v = c ? y : v`)
+  and `emit_agg_store` is handed only the destination's `ir::Index`, never the
+  expression, so there is nothing to test aliasing against the way
+  `array_copy_source` can. It costs nothing where it matters — this is the cold
+  path and neither definite branch allocates. The compare is `AggEq` narrowed with
+  `CaseEq` against 1, because 11.4.5 propagates X and the clause says TRUE (1).
+  Then the two shapes split, and the split is the whole point:
+  - An unpacked STRUCT takes "For all other data types, the value specified in
+    Table 7-1 for the resulting type as defined previously shall be returned" —
+    the WHOLE type default, not a member-wise merge. `struct {int a; byte b;}`
+    with differing arms is `'{a:0, b:0}`.
+  - A fixed unpacked ARRAY takes "their results shall be combined element by
+    element. If the elements match, the element shall be returned. If they do not
+    match, then the value specified in Table 7-1 for that element's type shall be
+    returned." So `'{1,2,3}` against `'{1,9,3}` is `'{1, 0, 3}`.
+    Read LITERALLY and one level deep: a mismatching element that is itself an
+    array or struct takes Table 7-1 for the ELEMENT TYPE, not a recursive merge,
+    because the clause names the table rather than reapplying itself. No
+    whole-array compare precedes the walk — `AggEq` over an array is the
+    AND-reduce of exactly these per-element compares, so it would be dead weight.
+  Neither Verilator nor iverilog is an oracle for the ambiguous path, and clotho is deliberately stricter
+  than both. Verilator 5.050 is NON-CONFORMANT here: for
+  `c = 1'bx` it returns the FALSE arm, `'{a:3, b:4}`, where the clause requires
+  `'{a:0, b:0}` (its definite branches do agree). iverilog 13.0 cannot compile an
+  unpacked struct at all — "sorry: Unpacked structs not supported." So the
+  ambiguous expectations in `struct_test.cpp` come from the clause text, and are
+  labelled as such rather than cross-checked.
+- [x] **Table 7-1 defaults, separately from Table 6-7** — `emit_table7_1_default`
+  is its own recursion and deliberately NOT a call into `emit_default_init`, which
+  implements Table 6-7 (declaration defaults). Three rows disagree, so reusing it
+  would have been silently wrong:
+  1. EVENT. `emit_default_init` binds a FRESH event (`EventNew`) because Table 6-7
+     says "New event" and two concurrent activations of one task must not share a
+     synchronization object. Table 7-1 says `null`, which for clotho's event
+     handle is the all-zero word (`InternPool` `Type::Kind::Event`: "`null` is the
+     all-zero handle, which resolves to the reserved null object at slot 0"). The
+     Table 7-1 path stores zero.
+  2. UNPACKED UNION. Table 7-1 returns "Value specified in this table for the type
+     of the FIRST member of the union". Refused loud rather than approximated, and
+     the guard has to key on the SLANG type: clotho interns an unpacked union with
+     `is_packed` SET (`lower_type` lowers it "identically to a packed union", one
+     flat plane sized to the widest member), so the IR `is_union` flag does not
+     distinguish one and a first attempt at this guard was dead code. The
+     singular-leaf fill it fell through to is observably wrong, which is what makes
+     the refusal necessary rather than pedantic: the blob's domain is the union of
+     ALL members (`four |= mt.isFourState()`), while the table wants the first
+     member's. For `union { int i; logic [7:0] w; }` inside a struct, an ambiguous
+     condition filled all-x and `v.u.w` read back `xx`, where the first member is
+     2-state and the table therefore requires `'0`. Writing only the first member's
+     low bits instead would leave the blob's high bits undefined, and LRM 7.3 fixes
+     no bit-level overlay for the unpacked case to say what they should become.
+  3. MEMBER INITIALIZERS. `emit_default_init` has no notion of them; Table 7-1
+     keeps a member's declared initial assignment in preference to its type
+     default — "unless the member has an initial assignment as part of its
+     declaration (see 7.2.2), in which case the member's value shall be as given
+     by its initial assignment". Applied inline, one store per member, rather than
+     as a second overlay pass over a default that would be thrown away.
+     `struct {int a; int b = 7; string s = "keep";}` defaults to
+     `'{a:0, b:7, s:"keep"}`.
+  Every other row checked and agreeing: 4-state integral `'x`, 2-state `'0`, enum
+  via its base type (an enum interns as its base, so the integral branch already
+  answers at the base's domain), real/shortreal `0.0`, string `""`, class /
+  interface-class / chandle / virtual-interface `null` (all-zero, which is what the
+  2-state branch writes), variable-size unpacked array (dynamic / queue /
+  associative) empty, fixed-size unpacked array per element.
+- [ ] **`?:` over a queue / dynamic array / associative array** (LRM 11.4.11) —
+  refused loud with its own message naming the clause. The two definite branches
+  are reachable (they are the existing handle copy inside a `Cond`), but the
+  ambiguous half is not: it has to stage BOTH arms in temps of the container's own
+  type to compare them, and `make_canonical_agg_temp` builds aggregate storage,
+  not a container handle. Refused whole rather than only for a 4-state condition,
+  so the supported set does not depend on the condition's domain. For an
+  ASSOCIATIVE operand the clause is explicit that the element-wise merge does not
+  apply — "For aggregate array data types, EXCEPT associative arrays" — so the
+  mismatch result would be the whole-type Table 7-1 default, an empty array.
+  A struct with a queue or associative MEMBER is a different matter and already
+  works under a 2-state condition (no compare is emitted); under a 4-state one an
+  associative member is refused by `guard_agg_eq_members`, which owns that gap.
+- [ ] **`?:` over an aggregate whose result type interns differently from the
+  assignment target's** — refused loud. 11.4.11 requires the two ARMS be
+  equivalent (6.22.2) to each other, not that either match the target, so slang
+  can hand over a distinct-but-equivalent type; every member / element walk
+  addresses the target's interned type, so a merely equivalent layout needs a
+  converting copy rather than the direct one.
+- [ ] **BACKEND: `AggEq` miscompares a `real` leaf** — found while adding the
+  aggregate `?:`, whose ambiguous path reaches the same node, but it PREDATES that
+  and reproduces on `main`: `x == y` over `struct { real r; string s; }`
+  SEGFAULTED with no diagnostic at all (exit 139). `LlvmBackend.cpp`'s
+  `lower_agg_eq` converts a real leaf to a real plane in its `vt.is_real` tail and
+  then compares it with `lower_compare(Inst::Tag::Eq, ...)` — the INTEGER compare
+  — where a real needs `FEq`, the way the frontend's `lower_real_binary` does for
+  a scalar `==`. Held to a loud frontend refusal for now
+  (`guard_agg_eq_members` rejects a float leaf: "equality of an aggregate with a
+  real member is not supported"), because a crash is the one outcome worse than a
+  refusal; the real fix is the tag in the backend and belongs with whoever owns
+  `lower_compare`. Note the ELEMENT-wise path is unaffected and correct: the
+  aggregate `?:`'s per-element merge picks `FEq` for a real element itself, so
+  `real p[0:1]` merges to `'{1.5, 0}` as the clause requires.
 - [ ] **Eager predicate evaluation outside `?:`** — the same deficiency, in three
   places that do not consult `is_speculation_safe` at all because they evaluate
   predicates up front unconditionally: `&&&` conjuncts in a `cond_predicate`
@@ -1052,10 +1196,12 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   caller's copy of that temp into its own — with no temp→temp staging, and
   `return '{...}` allocates no temp at all (verified in the emitted LLVM IR).
   Deciding it this way is also what keeps the LRM's assignment-equivalence
-  honest: `return` now accepts exactly what an assignment accepts, so an
-  aggregate TERNARY return reports the assignment path's own
-  "unsupported unpacked struct rvalue" rather than a stale return-specific
-  message. The `%p` case had a standing hazard — a `%p` operand was once lowered
+  honest: `return` accepts exactly what an assignment accepts, so when the
+  aggregate `?:` landed (Operators & expressions above) `return c ? x : y;` began
+  working through the assignment path with no case of its own in
+  `agg_return_operand` — the operand falls through to `emit_agg_store`, which
+  branches and builds the selected arm straight into the return variable.
+  The `%p` case had a standing hazard — a `%p` operand was once lowered
   twice, running a call operand twice (see String formatting below) — so the
   call is lowered once for the whole leaf walk and a counter test pins the
   operand at exactly one evaluation. Motivated by Accellera UVM's
@@ -1063,10 +1209,9 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `virtual function T pop_back(); return queue.pop_back(); endfunction`, which is
   covered end to end with a struct `T` that owns a string.
   Remaining gaps:
-  - [ ] **Aggregate ternary rvalue** (`o = c ? x : y;`, and so `return c ? x : y;`)
-    — refused loud by the assignment path. LRM 11.4.11 defines the bitwise merge
-    for integral results only, so an aggregate `?:` needs a select over whole
-    objects, not a value mux; the same gap `real` has.
+  - [x] **Aggregate ternary rvalue** (`o = c ? x : y;`, and so
+    `return c ? x : y;`) — done; see **Aggregate `?:`** under Operators &
+    expressions.
   - [ ] **Return of an unpacked-array slice** (`return x[0:1];`) — refused loud
     with its own message. Not a return-path limit: inside a subroutine both the
     slice source and the return variable are canonical aggregate frame storage,

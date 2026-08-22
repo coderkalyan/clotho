@@ -614,3 +614,59 @@ TEST_CASE("a %p call operand is evaluated exactly once") {
     )");
     CHECK(out == "before 0\np '{a:1, b:10}\nafter 1\np '{a:2, b:20}\nafter 2\n");
 }
+
+// An aggregate `?:` as a `%p` operand (LRM 11.4.11 + 21.2.1.6). The expansion
+// walks the operand leaf by leaf and so needs anchored storage, which a
+// conditional has none of; lower_lvalue stages it into one canonical aggregate
+// temp. Like the call operand above, the arms must be evaluated the clause's
+// number of times and no more -- once for the chosen arm of a definite condition,
+// never for the other -- so the counters carry the real assertion.
+TEST_CASE("a %p conditional operand") {
+    SUBCASE("a struct, only the chosen arm evaluated") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; int b; } st;
+                int nt = 0, nf = 0;
+                function automatic st ft(); nt++; return '{a:1, b:2}; endfunction
+                function automatic st ff(); nf++; return '{a:3, b:4}; endfunction
+                initial begin
+                    bit c;
+                    c = 1;
+                    $display("p %p nt=%0d nf=%0d", c ? ft() : ff(), nt, nf);
+                    c = 0;
+                    $display("p %p nt=%0d nf=%0d", c ? ft() : ff(), nt, nf);
+                end
+            endmodule
+        )") == "p '{a:1, b:2} nt=1 nf=0\np '{a:3, b:4} nt=1 nf=1\n");
+    }
+    SUBCASE("a fixed unpacked array") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef int ai [0:2];
+                ai p, q;
+                initial begin
+                    bit c;
+                    p = '{1, 2, 3};
+                    q = '{4, 5, 6};
+                    c = 0;
+                    $display("%p", c ? p : q);
+                end
+            endmodule
+        )") == "'{4, 5, 6}\n");
+    }
+    SUBCASE("an ambiguous condition renders the merged result") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef int ai [0:2];
+                ai p, q;
+                initial begin
+                    logic c;
+                    p = '{1, 2, 3};
+                    q = '{1, 9, 3};
+                    c = 1'bx;
+                    $display("%p", c ? p : q);
+                end
+            endmodule
+        )") == "'{1, 0, 3}\n");
+    }
+}

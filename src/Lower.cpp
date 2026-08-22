@@ -4121,6 +4121,16 @@ private:
             b.binary(tag, lhs, lower_expr(rhs, b), l);
             return;
         }
+        // LRM 11.4.11 over an aggregate operand, intercepted ahead of every RHS
+        // shape below: the clause's "without evaluating" makes the arms
+        // CONDITIONAL, so neither may be lowered into the straight-line sequence
+        // those shapes assume. A packed target already returned above through the
+        // integral path (lower_lazy_conditional), which implements the same clause
+        // for a flat value.
+        if (const ConditionalExpression* cond = as_agg_conditional(rhs, type)) {
+            emit_agg_conditional(lhs, type, *cond, tag, b, l);
+            return;
+        }
         const auto* pat = as_assignment_pattern(rhs);
         // A bare `{...}` concatenation literal targeting a queue / dynamic array /
         // fixed unpacked array is an unpacked-array concatenation (LRM 11.4.14),
@@ -4255,6 +4265,483 @@ private:
             return;
         }
         emit_agg_copy(lhs, src_lv, type, tag, b, l);
+    }
+
+    // -- LRM 11.4.11 conditional operator over an aggregate operand --
+    //
+    // The clause's last legality rule is what puts an aggregate `?:` here: "For
+    // all other cases, the type of the first expression and second expression
+    // shall be equivalent (see 6.22.2)." slang enforces that upstream, so both
+    // arms and the result share one layout and the only question left is which
+    // arm's value reaches the destination.
+    //
+    // The `?:` whose result is an unpacked struct or a fixed unpacked array -- the
+    // aggregate ABI (is_agg_abi_ref) -- as the RHS emit_agg_store must branch on
+    // rather than evaluate. Deliberately no wider than that:
+    //
+    //   * A packed result never arrives; it returned through emit_agg_store's
+    //     ValueCat::scalar arm into the integral path, which already implements
+    //     this whole clause for a flat value (lower_lazy_conditional + Table
+    //     11-20). That covers a packed struct / union too, which is a flat bit
+    //     vector (LRM 7.2.1).
+    //   * A `string` leaf keeps its existing single-plane select. It is one plane
+    //     value with a working lower_expr path, and routing it through the
+    //     aggregate branch would buy nothing.
+    //   * A queue / dynamic-array / associative-array result keeps
+    //     emit_handle_member_copy, which refuses it loudly. The ambiguous half of
+    //     the clause is what blocks those: it needs both arms staged in temps of
+    //     the container's own type, and make_canonical_agg_temp builds aggregate
+    //     storage, not a container handle.
+    const ConditionalExpression* as_agg_conditional(const Expression& rhs, ir::Ref type) const {
+        const Expression& e = unwrap_conversion(rhs);
+        if (e.kind != ExpressionKind::ConditionalOp || !is_agg_abi_ref(type)) {
+            return nullptr;
+        }
+        return &e.as<ConditionalExpression>();
+    }
+
+    // Whether a `?:` cond_predicate can evaluate to an ambiguous value at all,
+    // which is what decides whether LRM 11.4.11's ambiguous-condition rule is
+    // REACHABLE -- and so whether any of its machinery is emitted.
+    //
+    // The answer is fixed by lower_predicate, which is what builds the predicate:
+    // a string condition reduces StrLen and a real condition compares against
+    // 0.0, both definite ("a real condition is true iff nonzero -- a definite
+    // 1-bit result (reals carry no x/z)"); everything else reduces the operand's
+    // own bits with RedOr, which can be x exactly when those bits have an unknown
+    // plane to carry one. A 2-state type has none by construction (InternPool
+    // Type::Kind::Bit is "2-state scalar bit (0, 1)"), so for a `bit` / `int` /
+    // class-handle condition the entire ambiguous branch below is statically dead
+    // and none of it is built: no arm staging temps, no AggEq, no Table 7-1 fill.
+    // That is the case UVM takes (uvm_factory.svh:2318 conditions on a `bit`).
+    //
+    // A `matches` condition counts as possibly ambiguous even though lower_pattern
+    // assembles its result out of definite CaseEq tests. The polarity is
+    // deliberate and is the one commit "lower: a ?: arm is speculated only when it cannot trap" established for
+    // is_speculation_safe: an unclassified condition shape must fail CLOSED,
+    // because being conservative costs one dead compare while being wrong
+    // silently drops the clause's merge.
+    bool conditions_may_be_ambiguous(std::span<const ConditionalExpression::Condition> conds) {
+        for (const auto& c : conds) {
+            if (c.pattern != nullptr) {
+                return true;
+            }
+            if (is_string_expr(*c.expr) || c.expr->type->isFloating()) {
+                continue;
+            }
+            if (c.expr->type->isFourState()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Lower `cond ? a : b` whose result is an aggregate, writing the selected arm
+    // into `lhs` (LRM 11.4.11).
+    //
+    // DESTINATION-DIRECTED: the chosen arm is built straight into `lhs` by a
+    // recursive emit_agg_store inside a Cond region, so a variable arm is one
+    // aggregate copy, a `'{...}` arm is built in place, a call arm writes through
+    // its own out-param, and no staging temp exists on either definite path.
+    // Nesting (`c1 ? x : c2 ? y : z`) falls out of that recursion, as does every
+    // arm shape emit_agg_store already accepts.
+    //
+    // Arm evaluation is CONDITIONAL, never speculative: "If cond_predicate is
+    // true, the operator returns the value of the first expression without
+    // evaluating the second expression; if false, it returns the value of the
+    // second expression without evaluating the first expression." Unlike the
+    // integral path there is nothing to trade that requirement against -- an
+    // aggregate copy is a sequence of stores whichever arm wins, so there is no
+    // branchless aggregate select to preserve and is_speculation_safe is not
+    // consulted here at all. A call arm, a trapping arm and a pure arm all take
+    // the same branch.
+    void emit_agg_conditional(ir::Index                    lhs,
+                              ir::Ref                      type,
+                              const ConditionalExpression& c,
+                              ir::Inst::Tag                tag,
+                              ir::Builder&                 b,
+                              ir::SourceLoc                l) {
+        if (lower_type(*c.type) != type) {
+            // TODO: an aggregate ternary whose own result type interns differently
+            // from the destination's. 11.4.11 requires the two ARMS be equivalent
+            // (6.22.2) to each other, not that either match the target, so slang
+            // can hand over a distinct-but-equivalent type; every member / element
+            // walk below addresses `type`, so a merely equivalent layout would need
+            // a converting copy instead of this one.
+            fail("an aggregate conditional whose result type differs from the "
+                 "assignment target's type is not supported");
+        }
+        // "If cond_predicate is true" -- evaluated ONCE, before either arm. The
+        // pattern-aware form (`x matches pat &&& f ? a : b`) binds its variables
+        // here, so both arms below see them.
+        const ir::Index pred = lower_conditions(c.conditions, b, l);
+
+        if (!conditions_may_be_ambiguous(c.conditions)) {
+            // A cond_predicate that cannot be x or z makes the ambiguous-condition
+            // rule unreachable, so it is not emitted: two regions and one Cond.
+            b.open_region();
+            emit_agg_store(lhs, type, c.left(), tag, b, l);
+            const ir::ExtraSlice t_region = b.close_region();
+
+            b.open_region();
+            emit_agg_store(lhs, type, c.right(), tag, b, l);
+            const ir::ExtraSlice f_region = b.close_region();
+
+            b.cond(pred, t_region, f_region, l);
+            return;
+        }
+
+        // A 4-state cond_predicate: three ways, in the clause's own order.
+        // Case-equality against the definite bits gives the two definite branches,
+        // exactly as lower_lazy_conditional does for an integral result; whatever
+        // is left over is x or z and takes the ambiguous merge.
+        const ir::Ref   bit      = make_int_type(1, true, false);
+        const ir::Index one      = b.constant(module_.pool.put_int(bit, 1), l);
+        const ir::Index zero     = b.constant(module_.pool.put_int(bit, 0), l);
+        const ir::Index is_true  = b.binary(ir::Inst::Tag::CaseEq, pred, one, l);
+
+        b.open_region();
+        emit_agg_store(lhs, type, c.left(), tag, b, l);
+        const ir::ExtraSlice t_region = b.close_region();
+
+        b.open_region();
+        const ir::Index is_false = b.binary(ir::Inst::Tag::CaseEq, pred, zero, l);
+
+        b.open_region();
+        emit_agg_store(lhs, type, c.right(), tag, b, l);
+        const ir::ExtraSlice f_region = b.close_region();
+
+        b.open_region();
+        emit_agg_cond_ambiguous(lhs, type, *c.type, c, tag, b, l);
+        const ir::ExtraSlice x_region = b.close_region();
+
+        b.cond(is_false, f_region, x_region, l);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(is_true, t_region, else_region, l);
+    }
+
+    // The ambiguous-condition arm of an aggregate `?:` (LRM 11.4.11): "If
+    // cond_predicate evaluates to an ambiguous value (x or z), then both the first
+    // expression and the second expression shall be evaluated, and compared for
+    // logical equivalence as described in 11.4.5. If that comparison is true (1),
+    // the operator shall return either the first or second expression. Otherwise
+    // the operator returns a result based on the data types of the expressions."
+    //
+    // Both arms are staged into private temps rather than one of them being built
+    // straight into `lhs`: the destination may ALIAS an arm (`v = c ? y : v`), and
+    // writing arm 1 into `lhs` first would clobber the storage arm 2 still has to
+    // read. emit_agg_store is handed the destination's ir::Index and never the
+    // destination expression, so there is nothing here to test aliasing against
+    // the way array_copy_source can. It costs nothing where it matters: this is
+    // the cold path, reached only when a 4-state condition actually sits at x, and
+    // neither definite branch allocates a temp.
+    //
+    // The staging stores are BLOCKING even under a nonblocking assignment -- the
+    // temp is a private cell holding the arm as evaluated now, and it is the copy
+    // OUT of it that defers (LRM 10.4.2). Same rule array_rvalue_lvalue documents.
+    void emit_agg_cond_ambiguous(ir::Index                    lhs,
+                                 ir::Ref                      type,
+                                 const slang::ast::Type&      sv_type,
+                                 const ConditionalExpression& c,
+                                 ir::Inst::Tag                tag,
+                                 ir::Builder&                 b,
+                                 ir::SourceLoc                l) {
+        const ir::Index ta = make_canonical_agg_temp(type, b, l);
+        emit_agg_store(ta, type, c.left(), ir::Inst::Tag::Store, b, l);
+        const ir::Index tb = make_canonical_agg_temp(type, b, l);
+        emit_agg_store(tb, type, c.right(), ir::Inst::Tag::Store, b, l);
+
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::UnpackedArray) {
+            emit_agg_cond_elementwise(lhs, type, sv_type, ta, tb, tag, b, l);
+            return;
+        }
+        // Everything that is not an aggregate ARRAY is one unit: "For all other
+        // data types, the value specified in Table 7-1 for the resulting type as
+        // defined previously shall be returned." So an unpacked STRUCT whose arms
+        // differ becomes its Table 7-1 default WHOLE -- not a member-by-member
+        // merge, which is the array rule and only the array rule. (Verilator
+        // returns the false arm here instead; see docs/TODO.md.)
+        guard_agg_eq_members(type);
+        const ir::Index eq = b.agg_eq(ta, tb, type, l);
+
+        b.open_region();
+        emit_agg_copy(lhs, ta, type, tag, b, l);
+        const ir::ExtraSlice same = b.close_region();
+
+        b.open_region();
+        emit_table7_1_default(lhs, type, sv_type, tag, b, l);
+        const ir::ExtraSlice diff = b.close_region();
+
+        // "If that comparison is TRUE (1)". AggEq AND-reduces the per-leaf
+        // compares with Land, which carries 11.4.5's X-propagation, so an x result
+        // is not true and the test has to be the definite one.
+        b.cond(b.binary(ir::Inst::Tag::CaseEq, eq, b.constant(module_.pool.put_int(make_int_type(1, true, false), 1), l), l),
+               same, diff, l);
+    }
+
+    // The array half of the ambiguous-condition rule (LRM 11.4.11): "For
+    // aggregate array data types, except associative arrays, where both
+    // expressions contain the same number of elements their results shall be
+    // combined element by element. If the elements match, the element shall be
+    // returned. If they do not match, then the value specified in Table 7-1 for
+    // that element's type shall be returned."
+    //
+    // Per element, and NOT recursively. A mismatching element that is itself an
+    // array or a struct takes "the value specified in Table 7-1 for that
+    // element's type" -- that element's whole default -- and not a further
+    // element-wise or member-wise merge, because the clause names Table 7-1 for
+    // the element type rather than reapplying itself. So `int a[2][3]` whose
+    // sub-array [0] differs in one position defaults that entire sub-array.
+    //
+    // No whole-array compare precedes the walk. AggEq over the array is the
+    // AND-reduce of precisely these per-element compares (see lower_struct_eq), so
+    // the clause's "comparison is true (1)" holds iff every element matches, and
+    // in that case this walk already returns every element unchanged. Emitting the
+    // whole-array compare as well would be dead weight, not a fast path.
+    void emit_agg_cond_elementwise(ir::Index               lhs,
+                                   ir::Ref                 type,
+                                   const slang::ast::Type& sv_type,
+                                   ir::Index               ta,
+                                   ir::Index               tb,
+                                   ir::Inst::Tag           tag,
+                                   ir::Builder&            b,
+                                   ir::SourceLoc           l) {
+        // By value: interning below can reallocate the pool (see emit_agg_store).
+        const ir::Type          t   = std::get<ir::Type>(module_.pool.get(type));
+        const slang::ast::Type* est = sv_type.getCanonicalType().getArrayElementType();
+        if (est == nullptr) {
+            fail("an ambiguous aggregate conditional over an array with no element "
+                 "type is not supported");
+        }
+        const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+        for (uint32_t k = 0; k < n; ++k) {
+            const int32_t coord =
+              t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
+            const ir::Index idx =
+              b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                              static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                         l);
+            const ir::Index sa      = b.elem_select(ta, idx, type, l);
+            const ir::Index sb      = b.elem_select(tb, idx, type, l);
+            const ir::Index matched = agg_cond_elem_match(sa, sb, t.element, b, l);
+
+            b.open_region();
+            emit_agg_copy(b.elem_select(lhs, idx, type, l), sa, t.element, tag, b, l);
+            const ir::ExtraSlice same = b.close_region();
+
+            b.open_region();
+            emit_table7_1_default(b.elem_select(lhs, idx, type, l), t.element, *est, tag, b, l);
+            const ir::ExtraSlice diff = b.close_region();
+
+            b.cond(matched, same, diff, l);
+        }
+    }
+
+    // The definite "these two elements match" predicate for the element-by-element
+    // merge, under LRM 11.4.5 logical equivalence: an aggregate element compares
+    // with one AggEq (the same node a whole-aggregate `==` emits), a leaf element
+    // with the ordinary `==` for its own value kind. 11.4.5 propagates X and the
+    // clause returns the element only when the comparison is TRUE (1), so a
+    // compare that can be x is narrowed to a definite bit; a compare of 2-state
+    // (or real, or string) operands is already definite and needs no narrowing.
+    ir::Index agg_cond_elem_match(ir::Index a, ir::Index other, ir::Ref ety, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Index one = b.constant(module_.pool.put_int(make_int_type(1, true, false), 1), l);
+        if (is_agg_abi_ref(ety)) {
+            guard_agg_eq_members(ety);
+            return b.binary(ir::Inst::Tag::CaseEq, b.agg_eq(a, other, ety, l), one, l);
+        }
+        if (value_cat(ety) == ValueCat::handle) {
+            // TODO: the ambiguous merge over a fixed array whose element is a
+            // queue, dynamic array or associative array. The element compare is
+            // the ordered element walk guard_agg_eq_members refuses for an
+            // associative member, and a mismatching element's Table 7-1 fill would
+            // have to clear a container per element.
+            fail("an ambiguous aggregate conditional over a fixed unpacked array of "
+                 "queues, dynamic arrays or associative arrays is not supported "
+                 "(LRM 11.4.11)");
+        }
+        const ir::Index cmp = b.binary(module_.pool.is_float(ety) ? ir::Inst::Tag::FEq : ir::Inst::Tag::Eq,
+                                       b.unary(ir::Inst::Tag::Load, a, l),
+                                       b.unary(ir::Inst::Tag::Load, other, l),
+                                       l);
+        if (module_.pool.layout(ety).domain != ir::Domain::Four) {
+            return cmp;
+        }
+        return b.binary(ir::Inst::Tag::CaseEq, cmp, one, l);
+    }
+
+    // Write the LRM Table 7-1 (7.4.5) value for `ty` into `lv`.
+    //
+    // This is Table 7-1, NOT Table 6-7, and the two disagree -- which is why this
+    // is its own recursion rather than a call into emit_default_init. Table 7-1's
+    // rows, verbatim: 4-state integral `'x`; 2-state integral `'0`; "Enumeration"
+    // -> "Value specified in this table for the enumeration's base type";
+    // real/shortreal `0.0`; string `""`; class, interface class, event, chandle
+    // and virtual interface all `null`; "Variable-size unpacked array (dynamic,
+    // queue or associative)" -> "Array of size zero (no elements)"; "Fixed-size
+    // unpacked array" -> "Array, all of whose elements have the value specified in
+    // this table for that array's element type"; "Unpacked struct" -> "struct,
+    // each of whose members has the value specified in this table for that
+    // member's type, unless the member has an initial assignment as part of its
+    // declaration (see 7.2.2), in which case the member's value shall be as given
+    // by its initial assignment"; "Unpacked union" -> "Value specified in this
+    // table for the type of the first member of the union".
+    //
+    // Three rows where emit_default_init gives a different answer, so reusing it
+    // would have been silently wrong:
+    //
+    //   1. EVENT. emit_default_init binds a FRESH event (EventNew) because Table
+    //      6-7 says "New event" for a declaration, and two concurrent activations
+    //      of one task must not share a synchronization object. Table 7-1 says
+    //      `null`, which for clotho's event handle is the all-zero word --
+    //      InternPool Type::Kind::Event: "`null` is the all-zero handle, which
+    //      resolves to the reserved null object at slot 0". So this stores zero.
+    //   2. UNPACKED UNION. Table 7-1 wants the FIRST member's value, while
+    //      emit_default_init walks every member of an unpacked struct-or-union
+    //      alike. Refused below rather than guessed: clotho lays an unpacked union
+    //      out as one flat blob whose members are reached by part-select
+    //      (lower_member_lvalue), not the field-indexed MemberSelect this
+    //      recursion addresses members with.
+    //   3. MEMBER INITIALIZERS. emit_default_init has no notion of them at all;
+    //      Table 7-1 keeps a member's declared initial assignment in preference to
+    //      its type default. Applied inline below, one store per member, rather
+    //      than as a second overlay pass on top of a default that would then be
+    //      thrown away.
+    void emit_table7_1_default(ir::Index               lv,
+                               ir::Ref                 ty,
+                               const slang::ast::Type& sv_type,
+                               ir::Inst::Tag           tag,
+                               ir::Builder&            b,
+                               ir::SourceLoc           l) {
+        const ir::Type          t  = std::get<ir::Type>(module_.pool.get(ty));
+        const slang::ast::Type& ct = sv_type.getCanonicalType();
+        if (ct.isUnpackedUnion()) {
+            // Divergence 2 above, and it has to be detected on the SLANG type: an
+            // unpacked union interns with is_packed SET (lower_type's
+            // isUnpackedUnion arm lowers it "identically to a packed union"), so
+            // the IR is_union flag never distinguishes one here and this would
+            // otherwise fall through to the singular-leaf fill below.
+            //
+            // That fill is observably wrong for a union, which is why this refuses
+            // rather than approximating. The blob's domain is the union of ALL
+            // members (`four |= mt.isFourState()`), while Table 7-1 asks for the
+            // FIRST member's value: for `union { int i; logic [7:0] w; }` the fill
+            // writes all-x, and reading `.w` back yields `xx` where the first
+            // member is 2-state and the table therefore requires '0. Writing only
+            // the first member's low bits instead would leave the blob's high bits
+            // undefined, and LRM 7.3 fixes no bit-level overlay for the unpacked
+            // case to say what they should become.
+            //
+            // TODO: Table 7-1 for an unpacked union. Needs a decision on the high
+            // bits above the first member's width, which the LRM does not make.
+            fail("a Table 7-1 default for an unpacked union is not supported (LRM "
+                 "Table 7-1 returns the value of the union's FIRST member, and "
+                 "clotho's flat unpacked-union blob cannot represent that without "
+                 "defining the bits above it)");
+        }
+        switch (t.kind) {
+            case ir::Type::Kind::Queue:
+            case ir::Type::Kind::DynArray:
+            case ir::Type::Kind::Assoc:
+                // "Array of size zero (no elements)". None of the three clear ops
+                // has a deferred form, so a nonblocking merge cannot use them.
+                if (tag != ir::Inst::Tag::Store) {
+                    // TODO: nonblocking ambiguous merge whose Table 7-1 fill has to
+                    // empty a container (needs the same handle-aware NBA staging
+                    // path the sibling queue / dynamic-array NBA guards want).
+                    fail("nonblocking assignment of an ambiguous aggregate conditional "
+                         "over a queue, dynamic array or associative array is not "
+                         "supported");
+                }
+                if (t.kind == ir::Type::Kind::Queue) {
+                    b.queue_delete(lv, lv, /*has_idx=*/false, ty, l);
+                } else if (t.kind == ir::Type::Kind::DynArray) {
+                    b.dyn_array_delete(lv, ty, l);
+                } else {
+                    // Whole-value replacement, so the old pattern default goes with
+                    // the entries -- a.delete() would keep it.
+                    b.assoc_reset(lv, ty, l);
+                }
+                return;
+            case ir::Type::Kind::Event:
+                // Divergence 1 above: `null`, not a fresh event.
+                b.binary(tag, lv, b.constant(module_.pool.put_int(ty, 0), l), l);
+                return;
+            case ir::Type::Kind::String:
+                b.binary(tag, lv, b.constant(string_value_ref(""), l), l);
+                return;
+            case ir::Type::Kind::UnpackedArray: {
+                const slang::ast::Type* est = ct.getArrayElementType();
+                if (est == nullptr) {
+                    fail("a Table 7-1 default over an array with no element type is "
+                         "not supported");
+                }
+                const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
+                for (uint32_t k = 0; k < n; ++k) {
+                    const int32_t coord =
+                      t.left <= t.right ? static_cast<int32_t>(t.left + k) : static_cast<int32_t>(t.left - k);
+                    const ir::Index idx =
+                      b.constant(module_.pool.put_int(make_int_type(32, false, true),
+                                                      static_cast<uint64_t>(static_cast<int64_t>(coord))),
+                                 l);
+                    emit_table7_1_default(b.elem_select(lv, idx, ty, l), t.element, *est, tag, b, l);
+                }
+                return;
+            }
+            case ir::Type::Kind::Struct:
+                if (!t.is_packed) {
+                    uint32_t i = 0;
+                    for (const auto& f : ct.as<slang::ast::UnpackedStructType>()
+                                           .membersOfType<slang::ast::FieldSymbol>()) {
+                        const ir::Index fld = b.member_select(lv, i, ty, l);
+                        // Divergence 3 above: "unless the member has an initial
+                        // assignment as part of its declaration (see 7.2.2), in
+                        // which case the member's value shall be as given by its
+                        // initial assignment". Same coerce shape as
+                        // emit_struct_field_defaults, which does this for the
+                        // declaration path.
+                        if (const Expression* init = f.getInitializer()) {
+                            const ir::Index rhs = lower_expr(*init, b);
+                            if (f.getType().getCanonicalType().isString()) {
+                                b.binary(tag, fld, rhs, l);
+                            } else {
+                                b.binary(tag, fld, coerce(rhs, *init->type, lower_type(f.getType()), b, l), l);
+                            }
+                        } else {
+                            // Re-fetch the row: lowering anything above can intern a
+                            // type and invalidate a held struct_fields span (see
+                            // InternPool::struct_fields).
+                            emit_table7_1_default(
+                              fld, module_.pool.struct_fields(t.fields_id)[i].type, f.getType(), tag, b, l);
+                        }
+                        ++i;
+                    }
+                    return;
+                }
+                break;
+            default:
+                break;
+        }
+        if (module_.pool.is_float(ty)) {
+            // "real, shortreal" -> 0.0.
+            b.binary(tag, lv, b.constant(module_.pool.put_real(ty, 0.0), l), l);
+            return;
+        }
+        // What is left is a single plane value, and one branch covers every
+        // remaining row: a 4-state integral is `'x`; a 2-state integral is `'0`; an
+        // enum is "the value specified in this table for the enumeration's base
+        // type", which is that same integral answer taken at the base type's own
+        // domain (the enum interns as its base); a packed struct / union is
+        // integral (LRM 7.2.1); and a class handle, interface-class handle, chandle
+        // or virtual interface is `null`, which is all-zero -- already what the
+        // 2-state side writes.
+        const ir::Layout lay = module_.pool.layout(ty);
+        const uint32_t   w   = lay.width == 0 ? 1 : lay.width;
+        const ir::Ref dv = lay.domain == ir::Domain::Four ? svint_to_ref(slang::SVInt::createFillX(w, t.is_signed), ty)
+                                                          : module_.pool.put_int(ty, 0);
+        b.binary(tag, lv, b.constant(dv, l), l);
     }
 
     // Build a dynamic-array or queue handle from a flat positional element list
@@ -4457,6 +4944,21 @@ private:
         const bool        src_is_handle_lvalue =
           src.kind == ExpressionKind::NamedValue || src.kind == ExpressionKind::HierarchicalValue ||
           src.kind == ExpressionKind::MemberAccess || src.kind == ExpressionKind::ElementSelect;
+        if (src.kind == ExpressionKind::ConditionalOp) {
+            // TODO: `?:` over a queue / dynamic-array / associative-array operand
+            // (LRM 11.4.11). The two definite branches are reachable -- they are
+            // just this same handle copy inside a Cond -- but the ambiguous half is
+            // not: it has to stage BOTH arms in temps of the container's own type
+            // to compare them (11.4.5), and make_canonical_agg_temp builds
+            // aggregate storage, not a container handle. For an associative operand
+            // the clause is explicit that the element-wise merge does not apply
+            // ("For aggregate array data types, EXCEPT associative arrays"), so the
+            // mismatch result is the whole-type Table 7-1 default, an empty array.
+            // Refused whole rather than only for a 4-state condition, so the
+            // supported set does not depend on the condition's domain.
+            fail("a conditional operator over a queue, dynamic array or associative "
+                 "array operand is not supported (LRM 11.4.11)");
+        }
         if (!src_is_handle_lvalue) {
             // TODO: queue / dynamic-array member init from a '{...} pattern or
             // concatenation needs an element-wise build (dynamic-arrays doc
@@ -4637,9 +5139,13 @@ private:
         const Expression& re = unwrap_conversion(rhs);
         // An aggregate lvalue: a variable / member / element, or a fixed
         // unpacked-array slice — a constant-bounds one is an ArrSlice lvalue, an
-        // indexed one materializes into a temp (lower_array_operand).
+        // indexed one materializes into a temp (lower_array_operand). A `?:`
+        // (LRM 11.4.11) is accepted too: lower_lvalue stages it into a canonical
+        // aggregate temp, so `(c ? x : y) == z` compares anchored storage exactly
+        // as a variable operand does.
         const auto agg_eq_operand = [](const Expression& e) {
-            return is_struct_lvalue_shape(e) || (e.kind == ExpressionKind::RangeSelect && is_unpacked_array(e));
+            return is_struct_lvalue_shape(e) || e.kind == ExpressionKind::ConditionalOp ||
+                   (e.kind == ExpressionKind::RangeSelect && is_unpacked_array(e));
         };
         if (!agg_eq_operand(le) || !agg_eq_operand(re)) {
             fail("unpacked aggregate equality is only supported between aggregate variables");
@@ -4651,9 +5157,23 @@ private:
 
     // Reject comparable-aggregate leaf shapes the backend AggEq expansion does
     // not cover. An unpacked-array member is walked element-wise (supported);
-    // only a queue / dynamic-array leaf still needs the length+element compare.
+    // a queue / dynamic-array leaf needs the length+element compare, and a REAL
+    // leaf is miscompiled outright.
     void guard_agg_eq_members(ir::Ref type) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
+        if (module_.pool.is_float(type)) {
+            // FIXME: the backend's AggEq expansion converts a real leaf to a real
+            // plane and then compares it with `lower_compare(Inst::Tag::Eq, ...)`
+            // -- the INTEGER compare (LlvmBackend.cpp lower_agg_eq, the `vt.is_real`
+            // tail). A real needs FEq, the way lower_real_binary uses it for a
+            // scalar `==`, so this SEGFAULTED: `x == y` over
+            // `struct { real r; string s; }` crashed with no diagnostic, and does so
+            // on main too -- it predates the aggregate `?:` that now also reaches
+            // here. Refused in the frontend rather than fixed in the backend, which
+            // is where the real fix belongs; a loud refusal is strictly better than
+            // a crash in the meantime.
+            fail("equality of an aggregate with a real member is not supported");
+        }
         if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
             // A queue / dynamic-array leaf compares element-wise. An aggregate, a
             // nested container or an element wider than one word walks in the backend
@@ -19914,6 +20434,15 @@ private:
                 emit_agg_copy(lower_lvalue(a.left(), b), *cv, ty, tag, b, loc(a));
                 return true_const(b, loc(a));
             }
+            if (src.kind == ExpressionKind::ConditionalOp) {
+                // `arr = c ? p : q` (LRM 11.4.11). A flat (scalar-element) array
+                // never reaches the emit_struct_store dispatch, so the conditional
+                // is handed to emit_agg_store here for the same destination-directed
+                // branch an array of aggregates gets: the selected arm is copied
+                // straight into the target and the other arm is not evaluated.
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a));
+                return true_const(b, loc(a));
+            }
             // A whole-array assignment whose source is none of the shapes above (a
             // non-lvalue, non-pattern, non-call expression) has no array value to
             // copy from.
@@ -23518,6 +24047,35 @@ private:
                     return lower_expr(expr, b);
                 }
                 fail("unsupported assignment target kind=Call");
+            case ExpressionKind::ConditionalOp: {
+                // An aggregate `?:` in a position that structurally requires an
+                // lvalue (LRM 11.4.11), for the same reason the aggregate call above
+                // is one: the value has no plane representation, so a structural read
+                // has to address storage. Staged into a canonical aggregate temp and
+                // handed over as that temp's lvalue -- `%p` of it (LRM 21.2.1.6), a
+                // member select `(c ? x : y).m`, an element select `(c ? x : y)[i]`,
+                // an `==` operand. emit_agg_store owns the branch itself, so the arms
+                // stay conditional even here, and the staging costs one temp in an
+                // expression position that by definition has no destination of its
+                // own to be written into.
+                //
+                // A WRITE never arrives: slang rejects a conditional as assignable
+                // ("expression is not assignable"), exactly as it does `f().m = v`,
+                // so no store can be silently discarded into the temp. Guarded
+                // anyway, because silently writing a temp is the one failure mode
+                // here that would produce no diagnostic at all.
+                if (!is_agg_abi_type(*expr.type)) {
+                    fail("unsupported assignment target kind=ConditionalOp");
+                }
+                if (is_write) {
+                    fail("a conditional operator is not a legal assignment target "
+                         "(LRM 11.4.11)");
+                }
+                const ir::Ref   cty  = lower_type(*expr.type);
+                const ir::Index temp = make_canonical_agg_temp(cty, b, l);
+                emit_agg_store(temp, cty, expr, ir::Inst::Tag::Store, b, l);
+                return temp;
+            }
             default:
                 fail("unsupported assignment target kind=" + std::string(slang::ast::toString(expr.kind)));
         }

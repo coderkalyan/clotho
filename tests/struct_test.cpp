@@ -964,6 +964,68 @@ TEST_CASE("unpacked struct equality with a string member") {
     )") == "eq=1\neq=0 ne=1\n");
 }
 
+// A real member is refused rather than compared, because the backend's AggEq
+// expansion miscompiles it: lower_agg_eq converts the leaf to a real plane and
+// then runs `lower_compare(Inst::Tag::Eq, ...)`, the INTEGER compare, where a real
+// needs FEq. That SEGFAULTED with no diagnostic, on main as well -- found while
+// adding the aggregate `?:`, whose ambiguous path reaches the same node. The real
+// fix belongs in the backend; until then the frontend refuses loudly, which is
+// strictly better than crashing.
+TEST_CASE("unpacked struct equality with a real member is refused, not a crash") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { real r; string s; } s_t;
+            s_t x, y;
+            initial begin
+                x = '{r:1.5, s:"p"};
+                y = '{r:2.5, s:"q"};
+                $display("%0d", x == y);
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("equality of an aggregate with a real member is not supported") !=
+          std::string::npos);
+}
+
+// A real / string ELEMENT of a fixed array is fine under the same ambiguous
+// conditional, because the element-by-element merge compares each element with
+// the tag for its own value kind (FEq for a real) instead of going through AggEq.
+TEST_CASE("ambiguous conditional over an array of reals or strings") {
+    SUBCASE("real elements") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef real ra [0:1];
+                initial begin
+                    ra p, q, r;
+                    logic c;
+                    c = 1'bx;
+                    p = '{1.5, 2.5};
+                    q = '{1.5, 9.5};
+                    r = c ? p : q;
+                    $display("%p", r);
+                end
+            endmodule
+        )") == "'{1.5, 0}\n");
+    }
+    SUBCASE("string elements") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef string sa [0:1];
+                initial begin
+                    sa p, q, r;
+                    logic c;
+                    c = 1'bx;
+                    p = '{"a", "b"};
+                    q = '{"a", "z"};
+                    r = c ? p : q;
+                    $display("%p", r);
+                end
+            endmodule
+        )") == "'{\"a\", \"\"}\n");
+    }
+}
+
 TEST_CASE("arithmetic on a mixed-domain unpacked struct member") {
     // A 2-state `bit` member beside a 4-state `logic` member: the member read
     // must carry the member's own declared domain, not the aggregate's.
@@ -1991,5 +2053,398 @@ TEST_CASE("member and element selects on an aggregate function result") {
                 end
             endmodule
         )") == "sel 1\ncalls 1\n");
+    }
+}
+
+// LRM 11.4.11's conditional operator over an aggregate operand. The clause's
+// last legality rule puts an unpacked struct / fixed unpacked array here ("For
+// all other cases, the type of the first expression and second expression shall
+// be equivalent"), and its ambiguous-condition rule is what makes the aggregate
+// case differ from the integral one: an array merges element by element, while
+// everything else -- a struct included -- takes its whole Table 7-1 default.
+//
+// Neither simulator serves for the ambiguous half: Verilator returns the
+// false arm instead of the clause's default, and iverilog cannot compile an
+// unpacked struct at all. So these expectations come from the clause text, not
+// from a cross-check (see docs/TODO.md).
+TEST_CASE("conditional operator over an unpacked struct") {
+    SUBCASE("a definite condition evaluates only its own arm") {
+        // "If cond_predicate is true, the operator returns the value of the first
+        // expression without evaluating the second expression; if false, it
+        // returns the value of the second expression without evaluating the
+        // first expression." The counters are the observable half of that.
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; byte b; } st;
+                int nt = 0, nf = 0;
+                function automatic st ft(); nt++; return '{a:1, b:2}; endfunction
+                function automatic st ff(); nf++; return '{a:3, b:4}; endfunction
+                initial begin
+                    st v;
+                    bit c;
+                    c = 1;
+                    v = c ? ft() : ff();
+                    $display("%p nt=%0d nf=%0d", v, nt, nf);
+                    c = 0;
+                    v = c ? ft() : ff();
+                    $display("%p nt=%0d nf=%0d", v, nt, nf);
+                end
+            endmodule
+        )") == "'{a:1, b:2} nt=1 nf=0\n'{a:3, b:4} nt=1 nf=1\n");
+    }
+    SUBCASE("declaration initializer and return operand positions") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; byte b; } st;
+                function automatic st pick(bit c, st x, st y); return c ? x : y; endfunction
+                initial begin
+                    static st x = '{a:1, b:2};
+                    static st y = '{a:3, b:4};
+                    bit c;
+                    c = 0;
+                    begin
+                        st d = c ? x : y;
+                        $display("%p", d);
+                    end
+                    $display("%p %p", pick(1, x, y), pick(0, x, y));
+                end
+            endmodule
+        )") == "'{a:3, b:4}\n'{a:1, b:2} '{a:3, b:4}\n");
+    }
+    SUBCASE("an ambiguous condition with differing arms is the Table 7-1 default") {
+        // "For all other data types, the value specified in Table 7-1 for the
+        // resulting type as defined previously shall be returned." Both members
+        // are 2-state, so Table 7-1 gives '0 for each -- NOT the false arm, which
+        // is what Verilator returns here.
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; byte b; } st;
+                initial begin
+                    static st x = '{a:1, b:2};
+                    static st y = '{a:3, b:4};
+                    st v;
+                    logic c;
+                    c = 1'bx;
+                    v = c ? x : y;
+                    $display("x %p", v);
+                    c = 1'bz;
+                    v = c ? x : y;
+                    $display("z %p", v);
+                end
+            endmodule
+        )") == "x '{a:0, b:0}\nz '{a:0, b:0}\n");
+    }
+    SUBCASE("an ambiguous condition with equal arms returns that value") {
+        // "compared for logical equivalence as described in 11.4.5. If that
+        // comparison is true (1), the operator shall return either the first or
+        // second expression."
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; byte b; } st;
+                initial begin
+                    static st x = '{a:1, b:2};
+                    st v;
+                    logic c;
+                    c = 1'bx;
+                    v = c ? x : x;
+                    $display("%p", v);
+                end
+            endmodule
+        )") == "'{a:1, b:2}\n");
+    }
+    SUBCASE("an ambiguous condition evaluates BOTH arms") {
+        // "then both the first expression and the second expression shall be
+        // evaluated" -- unlike a definite condition, this one is required to run
+        // each arm exactly once.
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; } st;
+                int nt = 0, nf = 0;
+                function automatic st ft(); nt++; return '{a:5}; endfunction
+                function automatic st ff(); nf++; return '{a:5}; endfunction
+                initial begin
+                    st v;
+                    logic c;
+                    c = 1'bx;
+                    v = c ? ft() : ff();
+                    $display("%p nt=%0d nf=%0d", v, nt, nf);
+                end
+            endmodule
+        )") == "'{a:5} nt=1 nf=1\n");
+    }
+    SUBCASE("a 4-state member defaults to x, a 2-state one to 0") {
+        // Table 7-1 is applied per member: "4-state integral type" -> 'x,
+        // "2-state integral type" -> '0.
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { logic [7:0] w; int a; } st;
+                initial begin
+                    static st x = '{w:8'hAA, a:1};
+                    static st y = '{w:8'h55, a:2};
+                    st v;
+                    logic c;
+                    c = 1'bx;
+                    v = c ? x : y;
+                    $display("%p", v);
+                end
+            endmodule
+        )") == "'{w:x, a:0}\n");
+    }
+    SUBCASE("a member with a declaration initializer keeps that value") {
+        // Table 7-1, unpacked struct: "each of whose members has the value
+        // specified in this table for that member's type, UNLESS the member has an
+        // initial assignment as part of its declaration (see 7.2.2), in which case
+        // the member's value shall be as given by its initial assignment".
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; int b = 7; string s = "keep"; } st;
+                initial begin
+                    static st x = '{a:1, b:1, s:"x"};
+                    static st y = '{a:2, b:2, s:"y"};
+                    st v;
+                    logic c;
+                    c = 1'bx;
+                    v = c ? x : y;
+                    $display("%p", v);
+                end
+            endmodule
+        )") == "'{a:0, b:7, s:\"keep\"}\n");
+    }
+    SUBCASE("the UVM shape: a class handle plus a string") {
+        // uvm_factory.svh:2318, which is what this construct was implemented for:
+        // `match_original_type ? override.orig : override.ovrd` over
+        // `struct { uvm_object_wrapper m_type; string m_type_name; }`. The
+        // condition is a `bit`, so no ambiguity machinery is emitted at all.
+        CHECK(run_capture(R"(
+            module m;
+                class wrapper;
+                    int id;
+                    function new(int i); id = i; endfunction
+                endclass
+                typedef struct { wrapper m_type; string m_type_name; } pair_t;
+                typedef struct { pair_t orig, ovrd; } ovr_t;
+                initial begin
+                    ovr_t o;
+                    pair_t got;
+                    bit match;
+                    o.orig.m_type = new(1); o.orig.m_type_name = "orig";
+                    o.ovrd.m_type = new(2); o.ovrd.m_type_name = "ovrd";
+                    match = 1;
+                    got = match ? o.orig : o.ovrd;
+                    $display("%0d %s", got.m_type.id, got.m_type_name);
+                    match = 0;
+                    got = match ? o.orig : o.ovrd;
+                    $display("%0d %s", got.m_type.id, got.m_type_name);
+                end
+            endmodule
+        )") == "1 orig\n2 ovrd\n");
+    }
+    SUBCASE("nested rvalue positions") {
+        // A conditional in a position that structurally needs an lvalue: a member
+        // select of it, a %p operand, an aggregate equality operand. Each stages
+        // the result in a canonical aggregate temp (lower_lvalue).
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; byte b; } st;
+                initial begin
+                    static st x = '{a:1, b:2};
+                    static st y = '{a:3, b:4};
+                    bit c;
+                    c = 0;
+                    $display("%0d", (c ? x : y).a);
+                    $display("%p", c ? x : y);
+                    $display("%0d %0d", (c ? x : y) == y, (c ? x : y) == x);
+                end
+            endmodule
+        )") == "3\n'{a:3, b:4}\n1 0\n");
+    }
+    SUBCASE("a nested conditional chain") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; } st;
+                initial begin
+                    static st x = '{a:1};
+                    static st y = '{a:2};
+                    static st z = '{a:3};
+                    bit c1, c2;
+                    c1 = 0; c2 = 1;
+                    $display("%p %0d", c1 ? x : (c2 ? y : z), (c1 ? x : (c2 ? y : z)).a);
+                end
+            endmodule
+        )") == "'{a:2} 2\n");
+    }
+    SUBCASE("a 2-state condition works even over container members") {
+        // A consequence of proving ambiguity impossible for a 2-state condition:
+        // no 11.4.5 compare is emitted, so a member shape the compare cannot
+        // handle (an associative array) is still assignable this way.
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int m[string]; int a; } st;
+                initial begin
+                    st x, y, v;
+                    bit c;
+                    c = 1;
+                    x.a = 1; x.m["k"] = 11;
+                    y.a = 2; y.m["k"] = 22;
+                    v = c ? x : y;
+                    $display("%0d %0d", v.a, v.m["k"]);
+                end
+            endmodule
+        )") == "1 11\n");
+    }
+    SUBCASE("an ambiguous condition over an associative member is refused") {
+        // The 11.4.5 compare has no ordered element walk for an associative
+        // member, so the ambiguous path refuses rather than guessing.
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef struct { int m[string]; int a; } st;
+                initial begin
+                    st x, y, v;
+                    logic c;
+                    c = 1'bx;
+                    v = c ? x : y;
+                end
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("equality of an aggregate with an associative-array member is not supported") !=
+              std::string::npos);
+    }
+    SUBCASE("a conditional over a whole queue is refused") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                initial begin
+                    int p[$], q[$], v[$];
+                    bit c;
+                    c = 1;
+                    v = c ? p : q;
+                end
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("not supported") != std::string::npos);
+    }
+    SUBCASE("an ambiguous condition over an unpacked-union member is refused") {
+        // Table 7-1 returns the union's FIRST member's value, and clotho's flat
+        // unpacked-union blob cannot represent that: its domain is the union of
+        // every member's, so the fill wrote all-x here and `v.u.w` read back `xx`
+        // where the first member (`int`) is 2-state and the table requires '0.
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef union { int i; logic [7:0] w; } u_t;
+                typedef struct { u_t u; int a; } su;
+                initial begin
+                    su x, y, v;
+                    logic c;
+                    c = 1'bx;
+                    v = c ? x : y;
+                end
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("Table 7-1 default for an unpacked union is not supported") !=
+              std::string::npos);
+    }
+    SUBCASE("a 2-state condition over an unpacked-union member still works") {
+        // The refusal above is scoped to the Table 7-1 fill, so a condition that
+        // cannot be ambiguous never reaches it.
+        CHECK(run_capture(R"(
+            module m;
+                typedef union { int i; logic [7:0] w; } u_t;
+                typedef struct { u_t u; int a; } su;
+                initial begin
+                    su x, y, v;
+                    bit c;
+                    c = 1;
+                    x.u.i = 7; x.a = 1;
+                    y.u.i = 9; y.a = 2;
+                    v = c ? x : y;
+                    $display("%0d %0d", v.u.i, v.a);
+                end
+            endmodule
+        )") == "7 1\n");
+    }
+}
+
+// The array half of LRM 11.4.11's ambiguous-condition rule, which is where the
+// aggregate case splits: an array merges element by element and keeps the
+// elements that match, while a struct (above) defaults as a whole.
+TEST_CASE("conditional operator over a fixed unpacked array") {
+    SUBCASE("a definite condition selects one arm, unevaluated other arm") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef int ai [0:2];
+                int nt = 0, nf = 0;
+                function automatic ai ft(); nt++; return '{1, 2, 3}; endfunction
+                function automatic ai ff(); nf++; return '{4, 5, 6}; endfunction
+                initial begin
+                    ai v;
+                    bit c;
+                    c = 1;
+                    v = c ? ft() : ff();
+                    $display("%p nt=%0d nf=%0d", v, nt, nf);
+                    c = 0;
+                    v = c ? ft() : ff();
+                    $display("%p nt=%0d nf=%0d", v, nt, nf);
+                end
+            endmodule
+        )") == "'{1, 2, 3} nt=1 nf=0\n'{4, 5, 6} nt=1 nf=1\n");
+    }
+    SUBCASE("an ambiguous condition merges element by element") {
+        // "For aggregate array data types, except associative arrays, where both
+        // expressions contain the same number of elements their results shall be
+        // combined element by element. If the elements match, the element shall be
+        // returned. If they do not match, then the value specified in Table 7-1
+        // for that element's type shall be returned." Positions 0 and 2 match and
+        // survive; position 1 differs and takes int's '0.
+        CHECK(run_capture(R"(
+            module m;
+                typedef int ai [0:2];
+                initial begin
+                    ai p, q, r;
+                    logic c;
+                    c = 1'bx;
+                    p = '{1, 2, 3};
+                    q = '{1, 9, 3};
+                    r = c ? p : q;
+                    $display("%p", r);
+                end
+            endmodule
+        )") == "'{1, 0, 3}\n");
+    }
+    SUBCASE("a mismatching aggregate element defaults whole") {
+        // The clause names "the value specified in Table 7-1 for that element's
+        // type", so a struct element that differs in one member defaults ENTIRELY
+        // rather than merging member-wise -- the merge is one level deep.
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; byte b; } st;
+                typedef st sa [0:1];
+                initial begin
+                    sa p, q, r;
+                    logic c;
+                    c = 1'bx;
+                    p = '{'{a:1, b:2}, '{a:5, b:6}};
+                    q = '{'{a:1, b:2}, '{a:5, b:9}};
+                    r = c ? p : q;
+                    $display("%p", r);
+                end
+            endmodule
+        )") == "'{'{a:1, b:2}, '{a:0, b:0}}\n");
+    }
+    SUBCASE("an ambiguous condition with equal arms returns that value") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef int ai [0:2];
+                initial begin
+                    ai p, r;
+                    logic c;
+                    c = 1'bx;
+                    p = '{1, 2, 3};
+                    r = c ? p : p;
+                    $display("%p", r);
+                end
+            endmodule
+        )") == "'{1, 2, 3}\n");
     }
 }
