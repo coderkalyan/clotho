@@ -23505,6 +23505,18 @@ private:
                     }
                     return *v;
                 }
+                // An aggregate-returning call is an lvalue for the same reason: the
+                // callee writes its result through the caller-side out-param temp the
+                // call allocates, and the call's value IS that temp's lvalue. Every
+                // structural READ of an aggregate result needs exactly that -- `%p` of
+                // it (LRM 21.2.1.6), a member select `f().m`, an element select
+                // `f()[i]`, and LRM 13.4's `return f();`, which all route here. Lowered
+                // once, so a call operand is evaluated exactly once. A WRITE never
+                // arrives: slang rejects `f().m = v` as "expression is not assignable",
+                // so no store can be silently discarded into the temp.
+                if (is_agg_abi_type(*expr.type)) {
+                    return lower_expr(expr, b);
+                }
                 fail("unsupported assignment target kind=Call");
             default:
                 fail("unsupported assignment target kind=" + std::string(slang::ast::toString(expr.kind)));
@@ -24082,6 +24094,48 @@ private:
         return b.signal(signal_of(vs), l);
     }
 
+    // The Ret operand for an aggregate result. LRM 13.4 defines `return expr` as
+    // assigning `expr` to the function's implicit return variable and then
+    // returning that variable, and this follows the clause literally -- which is
+    // also what keeps `return` accepting exactly the rvalues an assignment
+    // accepts, no more and no less.
+    //
+    // An operand that already has anchored storage is returned IN PLACE, so the
+    // backend's copy-out through the return out-param is the only copy: a
+    // variable or a select (is_struct_lvalue_shape), and a call, whose result the
+    // callee already wrote into the caller-side out-param temp that is the call's
+    // lvalue. Staging either in the return variable first would copy twice.
+    //
+    // Everything else -- a `'{...}` pattern, a byte-array string literal -- has no
+    // storage of its own, so it is built by the ordinary aggregate assignment path
+    // directly INTO the return variable, whose frame storage already exists for
+    // the bare-`return;` path. That costs no temp and no extra copy, and it leaves
+    // emit_agg_store owning the diagnostic for any form assignment cannot lower
+    // either (an aggregate ternary, LRM 11.4.11).
+    ir::Index agg_return_operand(const Expression& src, ir::Builder& b, ir::SourceLoc l) {
+        if (is_struct_lvalue_shape(src)) {
+            return lower_lvalue(src, b);
+        }
+        if (src.kind == ExpressionKind::Call) {
+            return lower_lvalue(src, b);
+        }
+        if (src.kind == ExpressionKind::RangeSelect) {
+            // TODO: return an unpacked-array slice. Assignment already accepts one
+            // as a whole-array source, so 13.4 equivalence wants this too, but the
+            // gap is below the frontend: inside a subroutine the slice source and
+            // the return variable are both canonical aggregate frame storage, and
+            // the backend has no aggregate-element slice ("aggregate-element
+            // unpacked-array slice not supported"). A plain `o = x[0:1]` between two
+            // frame-local arrays hits the identical wall, so lowering a slice here
+            // would only move the failure later. Refused with its own message so it
+            // does not read as a struct diagnostic.
+            fail("return of an unpacked-array slice is not supported");
+        }
+        const ir::Index rv = ret_var_ref(*fn_ctx_, l, b);
+        emit_agg_store(rv, fn_ctx_->ret_type, src, ir::Inst::Tag::Store, b, l);
+        return rv;
+    }
+
     void lower_return(const ReturnStatement& r, ir::Builder& b) {
         if (fn_ctx_ == nullptr) {
             fail("return statement outside of a function");
@@ -24095,13 +24149,7 @@ private:
             // object's lvalue (the backend copies its storage out through the
             // return out-param).
             if (is_agg_abi_ref(fn_ctx_->ret_type)) {
-                const Expression& src = unwrap_conversion(*r.expr);
-                if (!is_struct_lvalue_shape(src)) {
-                    // TODO: return of a `'{...}` pattern / call result / slice —
-                    // materialize into a temp first.
-                    fail("aggregate return of a non-lvalue expression is not supported");
-                }
-                b.unary(ir::Inst::Tag::Ret, lower_lvalue(src, b), l);
+                b.unary(ir::Inst::Tag::Ret, agg_return_operand(unwrap_conversion(*r.expr), b, l), l);
                 return;
             }
             // A dynamic-array result is returned as its handle lvalue; the backend

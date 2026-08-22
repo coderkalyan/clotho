@@ -1023,6 +1023,56 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 - [ ] **Non-lvalue aggregate actual** (`'{...}` pattern / call result) — needs a
   materialized caller temp; guarded loud today for functions and tasks alike.
 - [ ] **String-containing aggregate by value** through a function.
+- [x] **Non-lvalue aggregate RETURN, and an aggregate call result in a read
+  context** (LRM 13.4) — `return g();`, `return '{1,2};`,
+  `return q.pop_back();`, plus `$display("%p", g())`, `g().a` and `ga()[1]`, for
+  an unpacked struct and a fixed unpacked array alike. Two separate refusals sat
+  behind this. The return path guarded its operand with `is_struct_lvalue_shape`
+  (NamedValue / HierarchicalValue / MemberAccess / ElementSelect) and failed with
+  "aggregate return of a non-lvalue expression is not supported"; the read
+  contexts hit `lower_lvalue`'s `case Call:`, which handled only a
+  HANDLE-returning call and fell through to "unsupported assignment target
+  kind=Call" — an assignment-target message for a pure read. The root cause was
+  the same in both: an aggregate call result HAS anchored storage (the callee
+  writes through the caller-side out-param temp the call allocates, and the
+  call's value IS that temp's lvalue), but nothing said so, so every consumer
+  that structurally needs an lvalue refused it. Teaching the `Call` arm that one
+  fact fixes the read contexts and the returned-call form together, since
+  `lower_return` routes through `lower_lvalue`.
+  The non-call rvalues take 13.4 literally instead: the clause defines
+  `return expr` as assigning `expr` to the function's implicit return variable
+  and returning it, so a `'{...}` pattern is built by the ordinary
+  `emit_agg_store` path directly INTO that variable, whose frame storage already
+  existed for the bare-`return;` path. **Deliberately not** staged through
+  `array_rvalue_lvalue` or a struct-flavoured sibling of it: both allocate a
+  fresh `make_canonical_agg_temp`, and `return` already owns its destination, so
+  reusing the layer below both (`emit_agg_store`) costs one fewer frame local and
+  no extra copy. `return g();` therefore performs exactly two memcpys, one per
+  ABI boundary crossed — the callee's copy-out into its out-param, then the
+  caller's copy of that temp into its own — with no temp→temp staging, and
+  `return '{...}` allocates no temp at all (verified in the emitted LLVM IR).
+  Deciding it this way is also what keeps the LRM's assignment-equivalence
+  honest: `return` now accepts exactly what an assignment accepts, so an
+  aggregate TERNARY return reports the assignment path's own
+  "unsupported unpacked struct rvalue" rather than a stale return-specific
+  message. The `%p` case had a standing hazard — a `%p` operand was once lowered
+  twice, running a call operand twice (see String formatting below) — so the
+  call is lowered once for the whole leaf walk and a counter test pins the
+  operand at exactly one evaluation. Motivated by Accellera UVM's
+  `uvm_queue.svh:189`,
+  `virtual function T pop_back(); return queue.pop_back(); endfunction`, which is
+  covered end to end with a struct `T` that owns a string.
+  Remaining gaps:
+  - [ ] **Aggregate ternary rvalue** (`o = c ? x : y;`, and so `return c ? x : y;`)
+    — refused loud by the assignment path. LRM 11.4.11 defines the bitwise merge
+    for integral results only, so an aggregate `?:` needs a select over whole
+    objects, not a value mux; the same gap `real` has.
+  - [ ] **Return of an unpacked-array slice** (`return x[0:1];`) — refused loud
+    with its own message. Not a return-path limit: inside a subroutine both the
+    slice source and the return variable are canonical aggregate frame storage,
+    and the backend has no aggregate-element slice, so a plain `o = x[0:1];`
+    between two frame locals already fails the same way. Lowering it here would
+    only move the failure into the backend.
 - [x] **Whole aggregate in a general rvalue context** — `$display %p`
   (LRM 21.2.1.6, lower-time `'{...}` expansion; a tagged union and a
   queue / dynamic array render at runtime instead) and streaming-concat operand
@@ -2239,6 +2289,13 @@ project with its own algorithm, not tail cleanup on the property layer:
   corrupted the output (the splice did not skip `%%` escapes, so it substituted
   inside the literal and left the real specifier for the runtime formatter to abort
   on), and a `%p` operand was lowered twice (a call operand ran twice). Remaining:
+  - [x] **`%p` of an aggregate CALL result** (`$display("%p", g())`) — the operand
+    is expanded at lower time and needs an lvalue to walk, so a call used to be
+    refused with an assignment-target message. The call's value is the caller-side
+    out-param temp the callee wrote through, which is that lvalue; the call is
+    lowered once for the whole leaf walk, so the double-lowering bug above is not
+    reintroduced, pinned by a counter test. See the aggregate-return entry under
+    the subroutine ABI.
   - [x] **`%p` of a class handle** (LRM 21.2.1.6) — **another implementation-defined
     form decided deliberately.** The clause describes `%p` over aggregate VALUES and
     a handle is not one; it says nothing about what a handle prints beyond `null` for

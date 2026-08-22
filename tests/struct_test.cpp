@@ -1943,3 +1943,53 @@ TEST_CASE("nested replicated patterns into a 2-D array of structs with an array 
     )";
     CHECK(run_capture(src) == "10 20 30 20 30\n10 20 30 20 30\n");
 }
+
+// Selecting out of an aggregate function result -- `f().m`, `f()[i]` -- used to be
+// refused with an assignment-target message ("unsupported assignment target
+// kind=Call") for what is a pure read. `f().m` in particular is an everyday
+// SystemVerilog idiom. The select's base is the caller-side out-param temp the
+// callee wrote through, and the call is lowered once for the whole select chain, so
+// a side-effecting callee runs exactly once per select.
+TEST_CASE("member and element selects on an aggregate function result") {
+    SUBCASE("struct member select") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; int b; } st;
+                function automatic st g(); st s; s.a = 1; s.b = 2; return s; endfunction
+                initial $display("%0d %0d", g().a, g().b);
+            endmodule
+        )") == "1 2\n");
+    }
+    SUBCASE("array element select") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef int ai [0:2];
+                function automatic ai ga(); ai r; r[0] = 7; r[1] = 8; r[2] = 9; return r; endfunction
+                initial $display("%0d %0d", ga()[1], ga()[2]);
+            endmodule
+        )") == "8 9\n");
+    }
+    SUBCASE("a nested select reaches through both") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int v; } inner_t;
+                typedef inner_t nest_t [0:1];
+                function automatic nest_t gn(); nest_t r; r[0].v = 4; r[1].v = 5; return r; endfunction
+                initial $display("%0d", gn()[1].v);
+            endmodule
+        )") == "5\n");
+    }
+    SUBCASE("the selected call runs exactly once") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; } st;
+                int calls = 0;
+                function automatic st bump(); calls = calls + 1; return '{calls}; endfunction
+                initial begin
+                    $display("sel %0d", bump().a);
+                    $display("calls %0d", calls);
+                end
+            endmodule
+        )") == "sel 1\ncalls 1\n");
+    }
+}

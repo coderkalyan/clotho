@@ -46,7 +46,7 @@ std::string run_capture(std::string_view source) {
 }
 
 // Lower and return the rendered diagnostics; ok must be false (a rejected design).
-[[maybe_unused]] std::string reject(std::string_view source) {
+std::string reject(std::string_view source) {
     const LowerResult r = lower_text(source);
     CHECK_FALSE(r.ok);
     return r.diagnostic_text();
@@ -855,4 +855,167 @@ TEST_CASE("a class method reads $time in its declaring package's timescale") {
         endmodule
     )");
     CHECK(out == "method=4000 caller=4\n");
+}
+
+// LRM 13.4 defines `return expr` as assigning `expr` to the function's implicit
+// return variable and returning that variable, so `return` must accept exactly the
+// rvalues an assignment accepts. Clotho used to refuse every non-lvalue aggregate
+// ("aggregate return of a non-lvalue expression is not supported"), which is what
+// blocked the UVM shape below. The three rvalue forms take two different routes:
+// a call result already sits in the caller-side out-param temp the call allocates,
+// so it is returned in place; a `'{...}` pattern has no storage yet and is built
+// straight into the return variable, which costs no temp.
+TEST_CASE("aggregate rvalue forms returned from a function (LRM 13.4)") {
+    SUBCASE("unpacked struct") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; int b; } st;
+                function automatic st g(); st s; s.a = 1; s.b = 2; return s; endfunction
+                function automatic st from_call();    return g();      endfunction
+                function automatic st from_pattern(); return '{3, 4};  endfunction
+                function automatic st from_pop();
+                    st q[$]; q.push_back('{5, 6}); return q.pop_back();
+                endfunction
+                initial begin
+                    st o;
+                    o = from_call();    $display("call %0d %0d", o.a, o.b);
+                    o = from_pattern(); $display("pat %0d %0d", o.a, o.b);
+                    o = from_pop();     $display("pop %0d %0d", o.a, o.b);
+                end
+            endmodule
+        )") == "call 1 2\npat 3 4\npop 5 6\n");
+    }
+    SUBCASE("fixed unpacked array") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef int ai [0:2];
+                function automatic ai g(); ai r; r[0] = 7; r[1] = 8; r[2] = 9; return r; endfunction
+                function automatic ai from_call();    return g();          endfunction
+                function automatic ai from_pattern(); return '{4, 5, 6};   endfunction
+                function automatic ai from_pop();
+                    ai q[$]; q.push_back('{1, 2, 3}); return q.pop_back();
+                endfunction
+                initial begin
+                    $display("call %p", from_call());
+                    $display("pat %p", from_pattern());
+                    $display("pop %p", from_pop());
+                end
+            endmodule
+        )") == "call '{7, 8, 9}\npat '{4, 5, 6}\npop '{1, 2, 3}\n");
+    }
+}
+
+// A subroutine variable declared without `automatic` has STATIC lifetime (LRM
+// 13.4.2) and becomes a module signal with FLAT storage, while an `automatic` one
+// is a frame local in the canonical aggregate mirror. The result copy-out resolves
+// either model ("abi: an aggregate result copy-out resolves either storage model"), and the new rvalue return paths must reach both: the
+// pattern form stores into the return variable, whose own storage is always a frame
+// local, but the returned OBJECT of the inner call is the static signal.
+TEST_CASE("aggregate rvalue return from a static function local") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; int b; } st;
+            typedef int ai [0:1];
+            function st sg(); st s; s.a = 1; s.b = 2; return s; endfunction
+            function st s_call();    return sg();     endfunction
+            function st s_pattern(); return '{3, 4};  endfunction
+            function ai sga(); ai r; r[0] = 7; r[1] = 8; return r; endfunction
+            function ai sa_call();    return sga();    endfunction
+            function ai sa_pattern(); return '{5, 6};  endfunction
+            initial begin
+                $display("scall %p", s_call());
+                $display("spat %p", s_pattern());
+                $display("acall %p", sa_call());
+                $display("apat %p", sa_pattern());
+            end
+        endmodule
+    )") == "scall '{a:1, b:2}\nspat '{a:3, b:4}\nacall '{7, 8}\napat '{5, 6}\n");
+}
+
+// A string leaf owns heap, so the staged and returned copies must each be a deep
+// copy: the pattern form stores the literal into the return variable's own slot,
+// and the call form copies the callee's out-param temp out again. A shallow copy
+// would either alias one buffer across two owners or double-free it at frame exit.
+TEST_CASE("aggregate return of a struct with a string member deep-copies") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; string s; } sst;
+            function automatic sst mk();  return '{7, "hello"};  endfunction
+            function automatic sst fwd(); return mk();           endfunction
+            function automatic sst pop();
+                sst q[$]; q.push_back('{9, "world"}); return q.pop_back();
+            endfunction
+            initial begin
+                sst o;
+                o = mk();  $display("mk %0d %s", o.a, o.s);
+                o = fwd(); $display("fwd %0d %s", o.a, o.s);
+                o = pop(); $display("pop %0d %s", o.a, o.s);
+                $display("nested %p", fwd());
+            end
+        endmodule
+    )") == "mk 7 hello\nfwd 7 hello\npop 9 world\nnested '{a:7, s:\"hello\"}\n");
+}
+
+// The construct that motivated the whole path: Accellera's uvm_queue.svh:189 is
+// `virtual function T pop_back(); return queue.pop_back(); endfunction`. The
+// returned expression is a queue-method call whose result is an aggregate, reached
+// through a virtual method on a parameterized class, so it exercises the call arm
+// of the lvalue path under the this-carrying ABI.
+TEST_CASE("a uvm_queue-shaped class returns a struct from a queue pop") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int id; string nm; } item_t;
+            class uvm_queue #(type T = int);
+                T queue[$];
+                function void push_back(T item); queue.push_back(item); endfunction
+                virtual function T pop_back();  return queue.pop_back();  endfunction
+                virtual function T pop_front(); return queue.pop_front(); endfunction
+                function int size(); return queue.size(); endfunction
+            endclass
+            initial begin
+                uvm_queue #(item_t) q = new();
+                item_t first, second, x;
+                first  = '{1, "alpha"};
+                second = '{2, "beta"};
+                q.push_back(first);
+                q.push_back(second);
+                x = q.pop_back();  $display("back %0d %s", x.id, x.nm);
+                x = q.pop_front(); $display("front %0d %s", x.id, x.nm);
+                $display("size %0d", q.size());
+            end
+        endmodule
+    )") == "back 2 beta\nfront 1 alpha\nsize 0\n");
+}
+
+TEST_CASE("aggregate returns Clotho still refuses loudly") {
+    // Bounding `return` by exactly what assignment supports is what makes the LRM
+    // 13.4 equivalence honest, so both refusals below are the ASSIGNMENT path's own
+    // diagnostics, reached because the return operand is staged through it.
+    SUBCASE("a ternary rvalue, as in a plain assignment") {
+        const std::string d = reject(R"(
+            module m;
+                typedef struct { int a; } st;
+                st x, y;
+                function automatic st pick(input bit c); return c ? x : y; endfunction
+                initial $display("%0d", pick(1).a);
+            endmodule
+        )");
+        CHECK(d.find("unsupported unpacked struct rvalue") != std::string::npos);
+    }
+    // Not a return-path limit: inside a subroutine the slice source and the return
+    // variable are both canonical aggregate frame storage, and the backend has no
+    // aggregate-element slice, so a plain `o = x[0:1]` between two frame locals
+    // already fails the same way. Refused here with its own message rather than
+    // lowering into a backend error.
+    SUBCASE("an unpacked-array slice") {
+        const std::string d = reject(R"(
+            module m;
+                typedef int a3 [0:2];
+                typedef int a2 [0:1];
+                function automatic a2 sl(); a3 x; x[0] = 1; return x[0:1]; endfunction
+                initial $display("%p", sl());
+            endmodule
+        )");
+        CHECK(d.find("return of an unpacked-array slice is not supported") != std::string::npos);
+    }
 }

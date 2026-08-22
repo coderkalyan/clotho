@@ -570,3 +570,47 @@ TEST_CASE("%p of a class handle prints null or the class name") {
     )");
     CHECK(out == "null:   null\nlive:   Outer\nmember: '{a:3, h:Outer}\nmnull:  '{a:3, h:null}\n");
 }
+
+// A `%p` operand is expanded at lower time and needs an lvalue to walk, so an
+// aggregate-returning call used to be refused here with an assignment-target
+// message ("unsupported assignment target kind=Call") for what is a pure read. The
+// call's value IS the caller-side out-param temp the callee wrote through, which is
+// exactly the lvalue the walk wants.
+TEST_CASE("%p of an aggregate function result (LRM 21.2.1.6)") {
+    const std::string out = run_capture(R"(
+        module m;
+            typedef struct { logic [7:0] a; int b; } st;
+            typedef int ai [0:2];
+            function automatic st gs(); st s; s.a = 8'hAB; s.b = 42; return s; endfunction
+            function automatic ai ga(); ai r; r[0] = 7; r[1] = 8; r[2] = 9; return r; endfunction
+            initial begin
+                $display("struct %p", gs());
+                $display("array %p", ga());
+            end
+        endmodule
+    )");
+    CHECK(out == "struct '{a:171, b:42}\narray '{7, 8, 9}\n");
+}
+
+// A `%p` operand was once lowered TWICE, which ran a call operand twice. The
+// aggregate call result is precisely the shape that would reintroduce it, since the
+// expansion walks the operand leaf by leaf: each leaf must select out of ONE
+// evaluation, not re-lower the call. Counted with an observable side effect rather
+// than by inspecting IR -- `calls` must advance by exactly one per printed call.
+TEST_CASE("a %p call operand is evaluated exactly once") {
+    const std::string out = run_capture(R"(
+        module m;
+            typedef struct { int a; int b; } st;
+            int calls = 0;
+            function automatic st bump(); calls = calls + 1; return '{calls, calls * 10}; endfunction
+            initial begin
+                $display("before %0d", calls);
+                $display("p %p", bump());
+                $display("after %0d", calls);
+                $display("p %p", bump());
+                $display("after %0d", calls);
+            end
+        endmodule
+    )");
+    CHECK(out == "before 0\np '{a:1, b:10}\nafter 1\np '{a:2, b:20}\nafter 2\n");
+}
