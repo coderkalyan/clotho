@@ -37,7 +37,37 @@ professional parity; M5 makes it complete.
 - [x] **Signed arithmetic** — sign extension, signed compare/divide/modulo/shift,
   mixed-sign rule (§11.8.1), `$signed`/`$unsigned`, shift-amount >= width.
 - [x] **Multi-bit `if` / `?:` / loop condition** — reduced to 1-bit truth (§12.4, §12.7).
-- [x] **Lazy `?:` arm evaluation** (LRM 11.4.11).
+- [x] **Lazy `?:` arm evaluation** (LRM 11.4.11) — a definite condition evaluates
+  only its arm; an ambiguous one evaluates both and blends them bitwise (Table 11-20),
+  which is a run-time branch inside `lower_lazy_conditional`, not a compile-time
+  choice. Which arms may instead take the branchless packed select is decided by
+  `is_speculation_safe` (`Lower.cpp`'s `SpeculationScan`), a WHITELIST over
+  `ExpressionKind`.
+  It used to be a blacklist of three node kinds — a call, an embedded assignment, an
+  increment / decrement — and that polarity fails OPEN: every construct clotho lowers
+  to a trapping runtime check silently became a wrong answer at this one site, and
+  five such traps exist that are none of those three. `(h == null) ? -1 : h.x` fataled
+  on a null handle deref from the arm the condition had ruled out; so did a null
+  virtual-interface deref, a read of a non-active tagged-union member (LRM 11.9), a
+  read of a stale `ref` formal (LRM 13.5.2), and `new src`'s virtual dispatch through
+  a possibly-null source. A whitelist fails CLOSED: an unlisted kind merely takes the
+  branching path, which is correct for every expression by construction, so being
+  conservative costs one `SelectLazy` and being wrong costs a fatal on legal code.
+  Deliberately still speculatable, because each has an LRM-defined value and no trap:
+  an out-of-range index into a fixed / dynamic array or queue, a missing
+  associative-array key, integer divide / modulo by zero (all-x), real divide by zero,
+  and a string index out of range.
+- [ ] **Eager predicate evaluation outside `?:`** — the same deficiency, in three
+  places that do not consult `is_speculation_safe` at all because they evaluate
+  predicates up front unconditionally: `&&&` conjuncts in a `cond_predicate`
+  (`lower_conditions` ANDs every `cond.expr`, so `if (h != null &&& h.x)` fatals
+  where LRM 12.4 reads as short-circuiting), every `case` flavour's item-label
+  predicates (built before dispatch, while LRM 12.5 specifies in-order comparison),
+  and `unique` / `unique0` / `priority` `if` arm conditions (defensible under 12.4.2's
+  any-order licence for overlap detection, but it still fatals). `&&` / `||` / `->`
+  are already correctly lazy via `lower_short_circuit`; `<->` is eagerly evaluated by
+  definition. Fixing these is a structural change to each lowering (a `SelectLazy`
+  chain plus pattern-variable binding order), not a reuse of the predicate.
 
 ### Subroutines
 

@@ -509,6 +509,62 @@ TEST_CASE("?: evaluates one arm on a definite condition, both on x") {
                               "f(01)\nf(10)\nr=xx\nf(11)\nf(11)\nr=11\n");
 }
 
+// The same clause, for an arm that is PURE but can trap. Deciding which arms may be
+// speculated used to be a blacklist of three AST node kinds (a call, an assignment,
+// an increment), so every one of these read like a pure expression, was evaluated on
+// both arms, and killed the simulation from the arm the condition had ruled out. The
+// predicate is a whitelist now, so an unlisted shape merely takes the branching path
+// (Lower.cpp's SpeculationScan).
+TEST_CASE("?: does not evaluate a trapping arm the condition rules out") {
+    SUBCASE("null class-handle property") {
+        constexpr std::string_view src = R"##(
+            module m;
+                class C; int x = 7; endclass
+                initial begin
+                    C h;
+                    $display("%0d", (h == null) ? -1 : h.x);
+                    h = new();
+                    $display("%0d", (h == null) ? -1 : h.x);
+                end
+            endmodule
+        )##";
+        CHECK(run_capture(src) == "-1\n7\n");
+    }
+    SUBCASE("non-active tagged-union member (LRM 11.9)") {
+        constexpr std::string_view src = R"##(
+            module m;
+                typedef union tagged packed { int a; int b; } u_t;
+                logic sel;
+                initial begin
+                    u_t u;
+                    u   = tagged a 3;
+                    sel = 1;
+                    // Reading `u.b` while the tag says `a` is an LRM 11.9 violation
+                    // and a located fatal, so the arm must not run.
+                    $display("%0d", sel ? u.a : u.b);
+                end
+            endmodule
+        )##";
+        CHECK(run_capture(src) == "3\n");
+    }
+    SUBCASE("null virtual interface (LRM 25.9)") {
+        constexpr std::string_view src = R"##(
+            interface bus_if; logic [3:0] d; endinterface
+            module m;
+                bus_if b();
+                virtual bus_if v;
+                initial begin
+                    b.d = 4'h5;
+                    $display("%0d", (v == null) ? 4'hf : v.d);
+                    v = b;
+                    $display("%0d", (v == null) ? 4'hf : v.d);
+                end
+            endmodule
+        )##";
+        CHECK(run_capture(src) == "15\n5\n");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Whole unpacked arrays through the function/task ABI (LRM 13.4/13.5): by-value
 // arguments (value semantics), array return, and array frame locals. iverilog

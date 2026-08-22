@@ -636,39 +636,136 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     }
 };
 
-// Whether evaluating an expression is observable beyond its value: any call
-// (a user function body may display or write module state; system calls like
-// $display always are), an embedded assignment, or an increment / decrement.
-// Decides whether a ?: arm may be evaluated eagerly — LRM 11.4.11 forbids
-// evaluating the unchosen arm of a definite condition, but for a pure arm the
-// extra evaluation is unobservable and keeps the branchless packed select.
-struct EffectDetector : ASTVisitor<EffectDetector, VisitFlags::AllGood> {
-    bool found = false;
+// Whether an expression may be evaluated even when its value turns out not to
+// be needed. The one consumer is the `?:` strategy choice: LRM 11.4.11 forbids
+// evaluating the unchosen arm of a DEFINITE condition, but for a speculation-safe
+// arm the extra evaluation is unobservable and keeps the branchless packed select.
+//
+// This is a WHITELIST, and the polarity is the whole point. It used to be a
+// blacklist of three AST node kinds (a call, an embedded assignment, an
+// increment / decrement), which fails OPEN: every construct clotho lowers to a
+// trapping runtime check silently became a wrong answer at this one site. Five
+// such traps exist and not one of them is a call, an assignment or an increment --
+// a null class-handle deref (`(h == null) ? -1 : h.x` fataled), a null
+// virtual-interface deref (Ir.h's IfaceSignal), a read of a non-active
+// tagged-union member (LRM 11.9, rt_tagged_access), a read of a stale `ref`
+// formal (LRM 13.5.2, rt_ref_stale), and `new src`'s virtual dispatch through a
+// possibly-null source. A whitelist fails CLOSED instead: an unlisted kind merely
+// takes the branching path, which is correct for every expression by construction
+// (lower_lazy_conditional is the only LRM-exact path). So the cost of being
+// conservative is one SelectLazy, and the cost of being wrong is a fatal on legal
+// code.
+//
+// Deliberately SAFE, because each has an LRM-defined value and no trap: an
+// out-of-range index into a fixed / dynamic array or queue (x, or the element
+// default -- LValue::dyn_inrange), a read of a missing associative-array key (the
+// element default), integer divide / modulo by zero (all-x -- lower_divmod guards
+// the divisor), real divide by zero (IEEE inf / NaN), and a string index out of
+// range (0).
+//
+// The ambiguous-condition case is unaffected either way: LRM 11.4.11 Table 11-20
+// requires BOTH arms there, and lower_lazy_conditional's x region evaluates both
+// exactly as the eager select did.
+struct SpeculationScan : ASTVisitor<SpeculationScan, VisitFlags::Expressions> {
+    bool unsafe = false;
 
-    void handle(const CallExpression&) {
-        found = true;
-    }
-    void handle(const AssignmentExpression&) {
-        found = true;
-    }
-    void handle(const UnaryExpression& u) {
-        switch (u.op) {
-            case UnaryOperator::Preincrement:
-            case UnaryOperator::Postincrement:
-            case UnaryOperator::Predecrement:
-            case UnaryOperator::Postdecrement:
-                found = true;
-                return;
-            default:
-                visitDefault(u);
+    // The generic hook. slang's ASTVisitor routes a node with no specific overload
+    // through a templated handler, which is exactly what a whitelist needs: a
+    // future ExpressionKind is unsafe until someone lists it. Children are visited
+    // only after this node itself is cleared.
+    template<typename T>
+    void handle(const T& node) {
+        if (unsafe) {
+            return;
         }
+        if constexpr (std::is_base_of_v<slang::ast::Expression, T>) {
+            if (!node_safe(node)) {
+                unsafe = true;
+                return;
+            }
+        }
+        visitDefault(node);
+    }
+
+    // Whether this node, ignoring its children, is safe to evaluate eagerly.
+    static bool node_safe(const slang::ast::Expression& e) {
+        switch (e.kind) {
+            // Literals: no storage read, nothing to trap on.
+            case ExpressionKind::IntegerLiteral:
+            case ExpressionKind::RealLiteral:
+            case ExpressionKind::TimeLiteral:
+            case ExpressionKind::UnbasedUnsizedIntegerLiteral:
+            case ExpressionKind::NullLiteral:
+            case ExpressionKind::UnboundedLiteral:
+            case ExpressionKind::StringLiteral:
+            // Pure value construction over the operands.
+            case ExpressionKind::BinaryOp:
+            case ExpressionKind::ConditionalOp:
+            case ExpressionKind::Inside:
+            case ExpressionKind::ValueRange:
+            case ExpressionKind::Concatenation:
+            case ExpressionKind::Replication:
+            case ExpressionKind::Streaming:
+            case ExpressionKind::Conversion:
+            case ExpressionKind::TaggedUnion:
+            case ExpressionKind::SimpleAssignmentPattern:
+            case ExpressionKind::StructuredAssignmentPattern:
+            case ExpressionKind::ReplicatedAssignmentPattern:
+            // Indexing: out of range is a defined default, never a trap.
+            case ExpressionKind::ElementSelect:
+            case ExpressionKind::RangeSelect:
+            // A named interface instance where a virtual interface is expected
+            // (LRM 25.9); unlike a virtual-interface handle it cannot be null.
+            case ExpressionKind::ArbitrarySymbol:
+                return true;
+            case ExpressionKind::UnaryOp:
+                switch (e.as<UnaryExpression>().op) {
+                    case UnaryOperator::Preincrement:
+                    case UnaryOperator::Postincrement:
+                    case UnaryOperator::Predecrement:
+                    case UnaryOperator::Postdecrement:
+                        return false;
+                    default:
+                        return true;
+                }
+            case ExpressionKind::NamedValue:
+                return !is_ref_formal(e.as<NamedValueExpression>().symbol);
+            case ExpressionKind::HierarchicalValue:
+                return !is_ref_formal(e.as<HierarchicalValueExpression>().symbol);
+            case ExpressionKind::MemberAccess:
+                return member_base_safe(e.as<MemberAccessExpression>());
+            default:
+                // Call; Assignment; NewClass / NewArray / NewCovergroup (a heap
+                // allocation and a GC safepoint -- and a constructor-less `new` has
+                // no call inside it for a blacklist to have caught); CopyClass (a
+                // virtual dispatch through a possibly-null source); Dist; MinTypMax;
+                // ClockingEvent; AssertionInstance; DataType; TypeReference;
+                // LValueReference; EmptyArgument; Invalid.
+                return false;
+        }
+    }
+
+    // A read of a `ref` formal emits a relocation-epoch check that is a located
+    // fatal by default (docs/design/ref-args.md, docs/design/data-model.md), so it
+    // is not speculatable even though it is spelled as a bare name.
+    static bool is_ref_formal(const slang::ast::Symbol& sym) {
+        const auto* fa = sym.as_if<slang::ast::FormalArgumentSymbol>();
+        return fa != nullptr && fa->direction == slang::ast::ArgumentDirection::Ref;
+    }
+
+    // `obj.m` traps whenever the base has to be dereferenced or tag-checked. A
+    // BARE property inside a method is not this case: it arrives as a NamedValue on
+    // the ClassPropertySymbol and derefs `this`, which cannot be null.
+    static bool member_base_safe(const MemberAccessExpression& ma) {
+        const slang::ast::Type& bt = ma.value().type->getCanonicalType();
+        return !bt.isClass() && !bt.isVirtualInterface() && !bt.isTaggedUnion();
     }
 };
 
-bool has_observable_effect(const slang::ast::Expression& e) {
-    EffectDetector d;
-    e.visit(d);
-    return d.found;
+bool is_speculation_safe(const slang::ast::Expression& e) {
+    SpeculationScan s;
+    e.visit(s);
+    return !s.unsafe;
 }
 
 // Detects whether an expression reads any symbol in a given set (used to find
@@ -15786,7 +15883,7 @@ private:
     // safe when the label and every label between the two occurrences are
     // side-effect-free -- else an intervening f() or ++ could mutate the
     // variables it reads, or a conforming sim must still run the dropped label's
-    // own effect (has_observable_effect + a pure-label memo cleared at any impure
+    // own effect (is_speculation_safe + a pure-label memo cleared at any impure
     // label gates it). Dropped for now: rare, and the constant path is what the
     // downstream jump-table lowering needs.
     //
@@ -21474,12 +21571,12 @@ private:
                 // dispatch paths. `x matches pat ? a : b` binds the pattern's
                 // variables here, so the arms below see them.
                 const ir::Index pred = lower_conditions(c.conditions, b, l);
-                // An arm whose evaluation is observable must not run unless
-                // chosen (LRM 11.4.11: a definite condition evaluates only its
-                // arm; an ambiguous one evaluates both and blends). Pure arms
-                // keep the branchless packed select — evaluating the unchosen
-                // arm is then unobservable.
-                if (has_observable_effect(c.left()) || has_observable_effect(c.right())) {
+                // An arm that is not safe to speculate must not run unless chosen
+                // (LRM 11.4.11: a definite condition evaluates only its arm; an
+                // ambiguous one evaluates both and blends). A speculation-safe arm
+                // keeps the branchless packed select — evaluating the unchosen arm
+                // is then unobservable, and bit-identical to the ambiguous blend.
+                if (!is_speculation_safe(c.left()) || !is_speculation_safe(c.right())) {
                     return lower_lazy_conditional(c, pred, b);
                 }
                 const ir::Index a  = lower_expr(c.left(), b);
