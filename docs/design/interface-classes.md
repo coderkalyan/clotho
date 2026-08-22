@@ -862,7 +862,7 @@ A Verilator-scored case must say so in its comment, and an LRM-pinned case must
 quote the clause, so a later Verilator release changing behaviour cannot silently
 reclassify a pinned case.
 
-**Landed:** 19 cases in `tests/class_test.cpp` under a
+**Landed:** 20 cases in `tests/class_test.cpp` under a
 `// -- Interface classes (LRM 8.26) --` banner, using that file's own harness
 (`run_capture(src)` for an exact-stdout `CHECK`, `fails(src)` for a refusal
 substring), plus one in `tests/gc_test.cpp` through `check_both_cadences`. A new TU
@@ -880,7 +880,10 @@ parameterized interface and implementer; typedef and parameter through `::`; a
 `$cast` from an interface handle to a class the interface knows nothing about; a
 `$cast` miss and a null source; an interface id in the second bitmap word (70
 interfaces, so the word index is exercised); handle identity, arguments and
-properties; an object rooted only by an interface handle across a GC; `randomize()`
+properties; a fork child dispatching a virtual method through a CAPTURED
+interface-class handle (the one case that only exists because interface classes and
+fork V4's capture boxes landed on separate branches and met at the merge -- see
+below); an object rooted only by an interface handle across a GC; `randomize()`
 through an interface handle; the `rand_mode` refusal; `%p` of an interface handle.
 
 **Also measured, outside the suite:**
@@ -941,3 +944,38 @@ through an interface handle; the `rand_mode` refusal; `%p` of an interface handl
 - **`randomize()` through an interface handle is legal and must dispatch to the
   object's own body** (LRM 8.26.9), which is why the two reserved randomization
   names get interface indices rather than a refusal.
+
+## Interaction with fork capture boxes
+
+This feature and fork V4's capture boxes (`docs/design/fork-join.md` V4) were
+developed on separate branches and met at the merge, which is exactly where a
+cross-feature hole would hide: neither branch's tests could reach the combination,
+and the merge was textually clean, so nothing would have flagged it.
+
+They compose with no work, and the reason is that each is expressed in a mechanism
+the other already understands. An interface-class handle is an ordinary class handle
+at run time (§"Representation" — the type is a bitmap test, not a different
+pointer), and a capture box is a synthetic one-field class whose field type is the
+captured variable's declared type. So capturing an interface-class-typed automatic
+boxes a handle, and reading it back yields a handle that dispatches exactly as it
+would have in the enclosing frame. Nothing in `lower_fork` or `box_class_type`
+consults a slang type, and nothing in the interface-class path consults storage
+class.
+
+What that buys, pinned by `interface class: a fork child dispatches through a
+captured handle` in `tests/class_test.cpp`:
+
+- a fork child reaching a class property through the enclosing method's implicit
+  `this`, then calling a **virtual** method on it — `this` is a captured automatic
+  like any other, so the child re-roots bare property references at the boxed handle;
+- a captured `string` property, which the predecessor packed-slot ref ABI could not
+  carry at all;
+- a **detached** (`join_none`) child dispatching through a captured
+  interface-class-typed local *after the method that spawned it has returned*, which
+  is the lifetime the box exists for and the case an `ArgDir::Ref` pointer into the
+  parent frame could never have served.
+
+Every capture in that design was refused outright before V4, so the interaction is
+not a regression risk that was always latent — it is new surface, and it is the
+merge's semantic proof rather than a formality.
+

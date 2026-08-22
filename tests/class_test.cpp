@@ -1989,6 +1989,69 @@ TEST_CASE("interface class: dispatch through an interface handle") {
     CHECK(run_capture(src) == "put 3\ndone\n");
 }
 
+// The intersection of interface classes (LRM 8.26) and fork V4's capture boxes,
+// which arrived on separate branches and meet here for the first time. Every
+// capture in this design was refused outright before V4 -- `this` reached through a
+// bare property, a string property, and an interface-class-typed local -- and each
+// of them now rides a GC box, so the child dispatches a VIRTUAL method through a
+// captured handle, and the detached child does it after the method that spawned it
+// has returned. Cross-checked vs Verilator 5.050.
+TEST_CASE("interface class: a fork child dispatches through a captured handle") {
+    constexpr std::string_view src = R"(
+        interface class PutImp;
+            pure virtual function void put(int a);
+        endclass
+        class Fifo implements PutImp;
+            int    n   = 0;
+            string tag = "f";
+            virtual function void put(int a);
+                n = n + a;
+                $display("put %0d n=%0d", a, n);
+            endfunction
+            // Captures `this` through a bare property, then calls a virtual method
+            // on it and reads a string property -- neither of which the old
+            // packed-slot ref ABI could carry.
+            task go();
+                fork
+                    #1 begin put(5); $display("child n=%0d tag=%s", n, tag); end
+                    #2 $display("later n=%0d", n);
+                join
+                $display("after n=%0d", n);
+            endtask
+            // A detached child capturing an interface-class-TYPED automatic. It
+            // dispatches at #3, after this activation has returned, which is the
+            // lifetime the box exists for.
+            task spawn();
+                PutImp p = this;
+                fork
+                    #3 begin p.put(7); $display("detached n=%0d", n); end
+                join_none
+            endtask
+        endclass
+        module m;
+            initial begin
+                Fifo   f;
+                PutImp p;
+                f = new;
+                p = f;
+                p.put(3);
+                f.spawn();
+                f.go();
+                #5 $display("end n=%0d %p", f.n, f.tag);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "put 3 n=3\n"
+          "put 5 n=8\n"
+          "child n=8 tag=f\n"
+          "later n=8\n"
+          "after n=8\n"
+          "put 7 n=15\n"
+          "detached n=15\n"
+          "end n=15 \"f\"\n");
+}
+
 // `implements` inherits nothing (LRM 8.26.2), so a class that implements an
 // interface and is never used through one is an ordinary class. This lowered
 // correctly even before interface classes were supported -- the type guard fired
