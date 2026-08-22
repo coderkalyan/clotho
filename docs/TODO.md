@@ -378,27 +378,49 @@ professional parity; M5 makes it complete.
   record and the child frame. `reject_resume_once` now closes over calls as the
   backend backstop. Children spawned in a function belong to the CALLING thread, so
   `wait fork` / `disable fork` in the caller reach them (LRM 9.6.3). A child still
-  cannot read the function's own formals or locals — exactly what the LRM's own
-  `watch_for_zero` example does — which lifts with V4's per-spawn copies. (`$time`
+  can now read the function's own formals and locals — exactly what the LRM's own
+  `watch_for_zero` example does — since they ride GC boxes rather than frame pointers
+  (see "Captured-automatic lifetime"). (`$time`
   in a function was refused when V5 landed; it is supported now — see "`$time` /
   `$stime` / `$realtime` in a function" under Subroutines.) Design:
   docs/design/fork-join.md §"V5 scope".
-- [ ] **`fork`-child capture of a local the ref ABI cannot carry** — an unpacked
-  array / struct / string / real / queue / class-handle local, or a class property
-  reached through the enclosing method's implicit `this`. Each is refused by name;
-  they lift when `ref` arguments cover those types (docs/design/ref-args.md). Under
-  `join_any` / `join_none` NO capture is carried, whatever its type: the ABI hands
-  out a pointer into the enclosing frame and only `join` keeps that frame alive.
+- [~] **`fork`-child capture of a local the ref ABI cannot carry** — under
+  `join_any` / `join_none` this no longer goes through the `ref` ABI at all, so the
+  type restriction is gone with it: the capture rides a per-variable GC box and only
+  the box HANDLE is passed (see "Captured-automatic lifetime" below). A string, a
+  class handle and a formal all capture. Under `join` the by-ref path is unchanged, so
+  an unpacked array / struct / string / real / queue / class-handle local is still
+  refused by name there, and lifts when `ref` arguments cover those types
+  (docs/design/ref-args.md). A class property reached through the enclosing method's
+  implicit `this` is still refused for either kind.
 - [x] **`wait fork` / `disable fork`** — landed, but not here: the live-descendant SET
   V2's count-and-`wake_at` record could not carry is the `process` control-block tree
   (LRM 9.7), so both statements came with it. `disable fork` is `kill` over the
   caller's subtree; `wait fork` is `first_child == null`, exact because a completing
   thread re-parents its live children. Design: docs/design/process-class.md §8.
-- [ ] **Per-spawn automatic-variable lifetime** — what the classic
-  `for (int i…) fork … i … join_none` needs (fork-join.md V4). Refused by name rather
-  than reading a shared final `i`. Note the capture refusal for the detaching kinds is
-  now load-bearing for a second reason: a killed parent's frame goes away under its
-  live children, so V4's per-spawn copies are what would make a capture safe there.
+- [~] **Captured-automatic lifetime** (LRM 9.3.2, fork-join.md V4) — this entry used
+  to ask for "per-spawn automatic-variable lifetime", i.e. copies. **That was the wrong
+  target**: 9.3.2 makes a reference to an enclosing scope's automatic a reference to
+  THAT variable, which is why the clause has to write `automatic int k = j;` to get a
+  copy. Measured on the clause's own idiom: iverilog `4 4 4` (shared), Verilator
+  `1 2 3` (copies, a deviation), and slang warns by name (-Wfork-loop-var, "all loop
+  iterations will see the same stale value"). Copying would have regressed a case
+  clotho already got right in a process, where a local has static signal-like storage.
+  The real gap was LIFETIME, and it is closed: a captured automatic lives in a
+  per-variable GC box (a synthetic one-field class, so ClassNew allocates it, the trace
+  map falls out of the field table, and the place is HandleDeref + MemberSelect 0), and
+  the child receives the box handle by value. Live coroutine frames are already
+  conservative pinning GC roots, so nothing refcounts and no frame ownership moves.
+  Landed: shared reads in a task/function (`4 4 4`), a child's WRITE seen by the
+  parent, a captured class-handle formal outliving the call (13.4.4's
+  `watch_for_zero`), a string capture, `join_any` with several children. Also fixed on
+  the way: a capture referenced from a child's DECLARATION INITIALIZER was invisible to
+  the capture walk (an initializer hangs off the symbol, not the statement), so 9.3.2's
+  own idiom failed as an unknown signal instead of capturing.
+  **Remaining: spawn-time initialization.** A child-block `automatic` must be
+  initialized AT THE SPAWN for each child to see its own `j`; clotho runs a child's
+  declaration initializers when the child is first scheduled, so it is refused loudly
+  rather than answered with the later value.
 - [ ] **1024 concurrent detached children** is the ceiling: an unbounded spawn edge
   saturates the activation bound, and past it the scheduler-buffer guards report a
   located FATAL. Lifting it means a spill on the already-emitted overflow edge; the

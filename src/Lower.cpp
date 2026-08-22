@@ -690,6 +690,91 @@ struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
     }
 };
 
+// Every value symbol an expression references. Used by BoxCandidateScan below, which
+// needs the references of a fork child before any storage exists to filter them
+// against.
+struct ValueRefScan : ASTVisitor<ValueRefScan, VisitFlags::AllGood> {
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*>* out;
+
+    // A declaration's initializer hangs off the SYMBOL, not the statement, so a
+    // statement walk does not reach it. Without this, `fork begin automatic int k = j;
+    // ... end join_none` -- LRM 9.3.2's own idiom -- never records the reference to
+    // `j`, and the child then failed to resolve it as an unknown signal instead of
+    // capturing it.
+    void handle(const VariableDeclStatement& d) {
+        if (const Expression* init = d.symbol.getInitializer()) {
+            init->visit(*this);
+        }
+        visitDefault(d);
+    }
+
+    void handle(const NamedValueExpression& nv) {
+        out->insert(&nv.symbol);
+    }
+    void handle(const HierarchicalValueExpression& hv) {
+        out->insert(&hv.symbol);
+    }
+};
+
+// Symbols a DETACHING fork's children reference anywhere in a subroutine body, which
+// is the set whose frame locals have to be boxed (docs/design/fork-join.md V4). Run
+// before the frame is laid out, because a boxed local is boxed for every access in the
+// activation -- including accesses lowered before the `fork` is reached.
+//
+// Deliberately an over-approximation: it collects every reference, not just the ones
+// that turn out to be this frame's locals, so it needs no notion of storage class at a
+// point where storage does not exist yet. A module signal or a static in the set is
+// never a frame local, so it never boxes.
+//
+// `fork..join` is excluded: its parent outlives every child by construction, so its
+// captures stay plain frame pointers. (A `kill` on a joining parent breaks that -- an
+// existing hole, tracked in the design doc, not widened here.)
+struct BoxCandidateScan : ASTVisitor<BoxCandidateScan, VisitFlags::AllGood> {
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> candidates;
+
+    void handle(const BlockStatement& blk) {
+        if (blk.blockKind == StatementBlockKind::JoinAny || blk.blockKind == StatementBlockKind::JoinNone) {
+            ValueRefScan rs;
+            rs.out = &candidates;
+            blk.body.visit(rs);
+        }
+        visitDefault(blk);
+    }
+};
+
+// A child-block `automatic` whose initializer reads one of the captured variables.
+// LRM 9.3.2's own idiom -- `fork begin automatic int k = j; ... end join_none` -- wants
+// `k` initialized AT SPAWN, which is what makes each child see its own `j`; the comment
+// on the clause's example ("local copy, k, for each value of j") is only true under that
+// reading, and Verilator agrees. clotho runs a child's body, declaration initializers
+// included, when the child is first scheduled, which for join_none is after the parent
+// has moved on -- so every child would read the captured variable's LATER value.
+//
+// Detected so it can be refused rather than answered wrongly. Lifting it means
+// evaluating such an initializer in the PARENT at spawn and passing the value in, which
+// is the remaining half of V4 (docs/design/fork-join.md).
+struct SpawnInitScan : ASTVisitor<SpawnInitScan, VisitFlags::AllGood> {
+    const std::vector<const slang::ast::ValueSymbol*>* captured;
+    const slang::ast::VariableSymbol*                  hit = nullptr;
+
+    void handle(const VariableDeclStatement& d) {
+        if (d.symbol.lifetime == slang::ast::VariableLifetime::Automatic) {
+            if (const Expression* init = d.symbol.getInitializer()) {
+                ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> refs;
+                ValueRefScan                                                rs;
+                rs.out = &refs;
+                init->visit(rs);
+                for (const slang::ast::ValueSymbol* c : *captured) {
+                    if (refs.contains(c) && hit == nullptr) {
+                        hit = &d.symbol;
+                    }
+                }
+            }
+        }
+        visitDefault(d);
+    }
+};
+
 // Collects what a `fork` child body reads or writes out of the ENCLOSING
 // subroutine's frame (LRM 9.3.2 with 13.4.2): a child is lowered into its own
 // coroutine with its own frame, so every such symbol has to be passed in as a
@@ -703,6 +788,10 @@ struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
 // the capture type check.
 struct ForkCaptureDetector : ASTVisitor<ForkCaptureDetector, VisitFlags::AllGood> {
     const ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, uint32_t>* locals;
+    // Boxed captures are NOT in `locals`: a boxed declared local has no frame slot of
+    // its own, precisely so nothing initializes the variable through a slot typed as
+    // the box. They are still this frame's, so they still have to be captured.
+    const ankerl::unordered_dense::set<const slang::ast::ValueSymbol*>* boxed = nullptr;
     std::vector<const slang::ast::ValueSymbol*>                                   captured;
     bool                                                                          implicit_this = false;
 
@@ -713,7 +802,7 @@ struct ForkCaptureDetector : ASTVisitor<ForkCaptureDetector, VisitFlags::AllGood
                 return;
             }
         }
-        if (!locals->contains(&sym)) {
+        if (!locals->contains(&sym) && !(boxed != nullptr && boxed->contains(&sym))) {
             return; // a module signal or a static local: shared storage already
         }
         if (std::find(captured.begin(), captured.end(), &sym) == captured.end()) {
@@ -725,6 +814,18 @@ struct ForkCaptureDetector : ASTVisitor<ForkCaptureDetector, VisitFlags::AllGood
     }
     void handle(const HierarchicalValueExpression& hv) {
         check(hv.symbol);
+    }
+
+    // A declaration's initializer hangs off the SYMBOL, not the statement, so a
+    // statement walk does not reach it. Without this, `fork begin automatic int k = j;
+    // ... end join_none` -- LRM 9.3.2's own idiom -- never records the reference to
+    // `j`, and the child then failed to resolve it as an unknown signal instead of
+    // capturing it.
+    void handle(const VariableDeclStatement& d) {
+        if (const Expression* init = d.symbol.getInitializer()) {
+            init->visit(*this);
+        }
+        visitDefault(d);
     }
 };
 
@@ -8847,6 +8948,9 @@ private:
         // is still holding a pointer into it. Refused below rather than mis-lowered;
         // it lifts with V4's per-spawn copies (docs/design/fork-join.md).
         std::vector<const ValueSymbol*> captures;
+        // Whether the captures travel as box handles by value rather than as fat refs
+        // into this frame. Set with the guards below.
+        bool box_captures = false;
         if (fn_ctx_ != nullptr) {
             // LRM 13.4.4 allows `fork … join_none` in a function -- it schedules
             // processes and returns, consuming no time -- and slang enforces the rest
@@ -8866,6 +8970,11 @@ private:
             const char* enclosing = fn_ctx_->is_task ? "task" : "function";
             ForkCaptureDetector d;
             d.locals = &fn_ctx_->localmap;
+            ankerl::unordered_dense::set<const ValueSymbol*> boxed_syms;
+            for (const auto& [sym, bx] : fn_ctx_->boxed) {
+                boxed_syms.insert(sym);
+            }
+            d.boxed = &boxed_syms;
             for (const Statement* c : children) {
                 c->visit(d);
             }
@@ -8877,8 +8986,21 @@ private:
                      " child that reads a class property of the enclosing "
                      "method is not supported");
             }
+            // A detaching fork's captures ride GC boxes installed at body entry
+            // (install_capture_boxes), so neither refusal below applies to them: the
+            // box outlives the frame, and only its handle is passed, so the fat ref
+            // ABI is not involved. A symbol reaching here unboxed under a detaching
+            // kind would be a lowering bug, not a source-level refusal.
+            box_captures = kind != ir::ForkKind::Join;
             for (const ValueSymbol* sym : d.captured) {
                 const auto& ct = sym->getType().getCanonicalType();
+                if (box_captures) {
+                    if (!fn_ctx_->boxed.contains(sym)) {
+                        fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
+                             std::string(sym->name) + "' is not supported (internal: no capture box)");
+                    }
+                    continue;
+                }
                 if (kind != ir::ForkKind::Join) {
                     fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
                          std::string(sym->name) +
@@ -8896,12 +9018,28 @@ private:
                 }
             }
             captures = std::move(d.captured);
+            if (box_captures) {
+                for (const Statement* c : children) {
+                    SpawnInitScan si;
+                    si.captured = &captures;
+                    c->visit(si);
+                    if (si.hit != nullptr) {
+                        // TODO: spawn-time initialization of a child-block automatic
+                        // (LRM 9.3.2). See SpawnInitScan.
+                        fail(std::string(kind_name) + " child declaring '" + std::string(si.hit->name) +
+                             "' initialized from the captured '" +
+                             std::string(captures.empty() ? "" : captures.front()->name) +
+                             "' is not supported: LRM 9.3.2 initializes it at the spawn, and the "
+                             "body runs later, so it would read a later value");
+                    }
+                }
+            }
         }
 
         std::vector<ir::FunctionId> ids;
         ids.reserve(children.size());
         for (const Statement* c : children) {
-            ids.push_back(build_fork_child(*c, captures, kind));
+            ids.push_back(build_fork_child(*c, captures, kind, box_captures));
         }
 
         // The capture actuals, in the order the children took their formals.
@@ -8913,6 +9051,13 @@ private:
         std::vector<ir::Index> args;
         args.reserve(captures.size());
         for (const ValueSymbol* sym : captures) {
+            if (box_captures) {
+                // The box HANDLE, by value: an rvalue, not the box's own frame slot,
+                // so nothing the child holds points into this activation.
+                const FnCtx::Boxed& bx = fn_ctx_->boxed.at(sym);
+                args.push_back(b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l));
+                continue;
+            }
             args.push_back(value_lvalue(*sym, b, l));
         }
         b.fork(ids, args, kind, l);
@@ -23085,7 +23230,162 @@ private:
         bool     has_this   = false;
         uint32_t this_local = 0;
         ir::Ref  this_class = ir::Ref::Invalid;
+        // Captured automatics that live in a GC box rather than in the frame, so a
+        // detached fork child can share them after this activation is gone (LRM 9.3.2
+        // makes an enclosing automatic ONE variable; docs/design/fork-join.md V4).
+        // Consulted by value_lvalue BEFORE localmap: a boxed symbol keeps its localmap
+        // entry so ForkCaptureDetector still sees it as this frame's, but every access
+        // goes through the box.
+        struct Boxed {
+            uint32_t local; // frame Local holding the box handle
+            ir::Ref  cls;   // the box's one-field synthetic class
+        };
+        ankerl::unordered_dense::map<const ValueSymbol*, Boxed> boxed;
     };
+
+    // Inner storage type -> its capture-box class (box_class_type). The field name is
+    // not a legal SV identifier, so it cannot collide with a property.
+    static constexpr std::string_view                          kCaptureBoxField = "$capture";
+    ankerl::unordered_dense::map<ir::Ref, ir::Ref>             box_class_;
+
+    // The synthetic one-field class a captured automatic of type `inner` lives in
+    // (docs/design/fork-join.md V4). Interned per inner type.
+    //
+    // A class and not a new kind of heap cell because a class already is everything a
+    // box needs: ClassNew allocates it on the GC fast path, its trace map falls out of
+    // the field table (so a boxed handle is traced precisely and a boxed `int` is
+    // traced not at all), a handle has reference semantics -- which IS the sharing
+    // 9.3.2 asks for -- and the place is HandleDeref + MemberSelect 0. It is the shape
+    // lower_process_class already uses for the PCB handle.
+    //
+    // Nothing here is keyed on a slang type: set_class_desc takes a bare Ref, and the
+    // id is minted straight off the counter without joining the symbol map. A box has
+    // no methods, is never a base and is never `$cast` to, so its slot table is empty.
+    ir::Ref box_class_type(ir::Ref inner) {
+        if (const auto it = box_class_.find(inner); it != box_class_.end()) {
+            return it->second;
+        }
+        const uint32_t fid = module_.pool.reserve_struct_fields();
+        ir::Type       t;
+        t.kind      = ir::Type::Kind::Class;
+        t.fields_id = fid;
+        t.element   = ir::Ref::Invalid;
+        const ir::Ref ref = module_.pool.put(ir::Item{ t });
+        std::vector<ir::FieldRow> fields;
+        fields.push_back({ kCaptureBoxField, inner, 0 });
+        module_.pool.set_struct_fields(fid, std::move(fields));
+        module_.set_class_desc(ref, std::vector<ir::FunctionId>{}, class_ids_->next++);
+        box_class_.emplace(inner, ref);
+        return ref;
+    }
+
+    // The lvalue of a boxed local: dereference the handle in its frame slot and select
+    // the single field. Re-emitted per access, like every other place.
+    ir::Index boxed_lvalue(const FnCtx::Boxed& bx, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Index handle = b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l);
+        return b.member_select(b.handle_deref(handle, bx.cls, l), 0, bx.cls, l);
+    }
+
+    // Allocate a box for every automatic of THIS activation that a detaching fork's
+    // children reference, before the body is lowered (docs/design/fork-join.md V4).
+    //
+    // Entry, not first use: a box has to exist on every path that can reach an access,
+    // and first use may sit inside a conditional region. One ClassNew per boxed
+    // variable per activation is the cost, paid only by a body that actually spawns a
+    // detached child touching its locals.
+    //
+    // A boxed symbol keeps its localmap entry -- for a formal that is the ABI's
+    // copy-in slot, which stays formal k == Local k; for a declared local it is what
+    // ForkCaptureDetector matches against, so the child still receives it. value_lvalue
+    // consults `boxed` first, so the localmap slot of a boxed local is never read.
+    void install_capture_boxes(const SubroutineSymbol& sub, const Statement& body, ir::Builder& b) {
+        BoxCandidateScan scan;
+        body.visit(scan);
+        if (scan.candidates.empty()) {
+            return;
+        }
+        const ir::SourceLoc l = to_source_loc(sub.location);
+        // Formals first, in declaration order, then automatics declared in the body:
+        // a stable order keeps the emitted IR deterministic.
+        for (const FormalArgumentSymbol* fa : sub.getArguments()) {
+            if (!scan.candidates.contains(fa)) {
+                continue;
+            }
+            if (fa->direction != slang::ast::ArgumentDirection::In) {
+                // TODO: capture of an output / inout formal. Its copy-out reads the
+                // formal's own frame slot, which does not see writes made through the
+                // box, so the box would have to be copied back before every return.
+                fail("fork..join_any / fork..join_none child that reads the enclosing "
+                     "subroutine's '" + std::string(fa->name) +
+                     "' is not supported: capturing an output or inout formal would lose "
+                     "the writes made through it");
+            }
+            box_one_capture(*fa, /*copy_in=*/true, b, l);
+        }
+        for (const ValueSymbol* vs : body_automatics(sub, body)) {
+            if (scan.candidates.contains(vs)) {
+                box_one_capture(*vs, /*copy_in=*/false, b, l);
+            }
+        }
+    }
+
+    // One box: a frame slot holding the handle, a ClassNew into it, and for a formal
+    // the one store that moves the incoming argument into the box.
+    void box_one_capture(const ValueSymbol& vs, bool copy_in, ir::Builder& b, ir::SourceLoc l) {
+        if (fn_ctx_->boxed.contains(&vs)) {
+            return;
+        }
+        const ir::Ref  inner = lower_type(vs.getType());
+        const ir::Ref  cls   = box_class_type(inner);
+        const uint32_t slot  = static_cast<uint32_t>(fn_ctx_->local_types.size());
+        fn_ctx_->local_types.push_back(cls);
+        b.binary(ir::Inst::Tag::Store, b.local(slot, cls, l), b.class_new(cls, l), l);
+        if (copy_in) {
+            // The formal's own Local, which the backend's prologue has filled.
+            const uint32_t k = fn_local(vs);
+            b.binary(ir::Inst::Tag::Store,
+                     boxed_lvalue({ slot, cls }, b, l),
+                     b.unary(ir::Inst::Tag::Load, b.local(k, inner, l), l),
+                     l);
+        }
+        // Deliberately NOT registered in localmap for a declared local: a boxed local
+        // has no frame slot of its own, so lower_var_decl cannot initialize the
+        // variable through a slot typed as the box. value_lvalue routes every access
+        // (the declaration's own initializer included) through the box.
+        fn_ctx_->boxed[&vs] = { slot, cls };
+    }
+
+    // The automatic-lifetime variables `body` declares, in declaration order. Only
+    // these can box: a static local keeps persistent storage that already outlives
+    // every child, and anything else in the candidate set is not this frame's.
+    std::vector<const ValueSymbol*> body_automatics(const SubroutineSymbol& sub, const Statement& body) {
+        // Declarations are reached through their STATEMENTS -- a statement visitor does
+        // not visit a VariableSymbol on its own -- so both forms that introduce an
+        // automatic are picked up here: a declaration statement and a `for`'s own loop
+        // variables, which is the shape LRM 9.3.2's example uses.
+        struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
+            std::vector<const ValueSymbol*> out;
+            void take(const VariableSymbol& vs) {
+                if (vs.lifetime == slang::ast::VariableLifetime::Automatic) {
+                    out.push_back(&vs);
+                }
+            }
+            void handle(const VariableDeclStatement& d) {
+                take(d.symbol);
+                visitDefault(d);
+            }
+            void handle(const ForLoopStatement& f) {
+                for (const VariableSymbol* v : f.loopVars) {
+                    take(*v);
+                }
+                visitDefault(f);
+            }
+        };
+        Scan sc;
+        body.visit(sc);
+        (void)sub;
+        return std::move(sc.out);
+    }
 
     // Restore a saved piece of Lowerer state when the scope exits — on the throwing
     // path too. A lowering failure is an exception that `recover` catches per member
@@ -23299,6 +23599,13 @@ private:
             }
         }
         if (fn_ctx_ != nullptr) {
+            // A captured automatic living in a GC box: every access in this activation
+            // goes through the box, so the fork child that shares it sees the same
+            // variable (LRM 9.3.2). Ahead of the frame path, which for a boxed FORMAL
+            // still holds the ABI's copy-in slot.
+            if (const auto bx = fn_ctx_->boxed.find(&vs); bx != fn_ctx_->boxed.end()) {
+                return boxed_lvalue(bx->second, b, l);
+            }
             const auto it = fn_ctx_->localmap.find(&vs);
             if (it != fn_ctx_->localmap.end()) {
                 return b.local(it->second, fn_ctx_->local_types[it->second], l);
@@ -24038,6 +24345,7 @@ private:
             fn_local(*fa);
         }
 
+        install_capture_boxes(sub, sub.getBody(), b);
         lower_stmt(sub.getBody(), b);
 
         // Fall-through return: the void Ret drives the backend's copy-out epilogue.
@@ -24080,7 +24388,8 @@ private:
     // pointer parameter. Returns the reserved FunctionId.
     ir::FunctionId build_fork_child(const Statement&                      body,
                                     std::span<const ValueSymbol* const>   captures,
-                                    ir::ForkKind                          kind) {
+                                    ir::ForkKind                          kind,
+                                    bool                                  box_captures) {
         const ir::FunctionId id = module_.reserve_function();
 
         FnCtx ctx;
@@ -24095,6 +24404,18 @@ private:
         param_types.reserve(captures.size());
         arg_dirs.reserve(captures.size());
         for (const ValueSymbol* sym : captures) {
+            if (box_captures) {
+                // The box handle, by value. Reference semantics come from the box, not
+                // from the ABI, so nothing points into the parent's frame and the
+                // child may outlive it (docs/design/fork-join.md V4).
+                const ir::Ref cls = box_class_type(lower_type(sym->getType()));
+                param_types.push_back(cls);
+                arg_dirs.push_back(ir::ArgDir::In);
+                const uint32_t k    = fn_local(*sym);
+                ctx.local_types[k]  = cls;
+                ctx.boxed[sym]      = { k, cls };
+                continue;
+            }
             param_types.push_back(lower_type(sym->getType()));
             arg_dirs.push_back(ir::ArgDir::Ref);
             fn_local(*sym);
@@ -24245,6 +24566,8 @@ private:
             // persisting it would leak the prior call's value on the unwritten path.
             ctx.ret_local = fn_local(*sub.returnValVar);
         }
+
+        install_capture_boxes(sub, sub.getBody(), b);
 
         // A constructor constructs its base part first (LRM 8.15), before the body:
         // implicitly (no-arg), via `extends B(args)`, or via an explicit `super.new`

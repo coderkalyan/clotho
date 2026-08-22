@@ -790,7 +790,8 @@ record/awaiter pattern); `$finish` mid-fork leaks suspended child frames
     now for two reasons rather than one: a `join_none` parent can return, and a killed
     parent's frame goes away under live children.
 
-- **V4 — captured-automatic LIFETIME, not per-spawn copies.** This bullet used to
+- **V4 — captured-automatic LIFETIME, not per-spawn copies. LANDED, except
+  spawn-time initialization (below).** This bullet used to
   read "give fork-captured automatics real per-spawn copies (frame locals), fixing
   `for … fork … i … join_none`". **That is the wrong target**, and §V2.5's own
   parenthetical already said so ("rather than reading a shared final `i`"): under
@@ -872,6 +873,31 @@ record/awaiter pattern); `$finish` mid-fork leaks suspended child frames
   children, so its by-ref capture stays correct and stays a plain pointer; process
   control breaks exactly that, because `kill` can take the parent's frame out from
   under a live child (§V3), which is the second reason the refusal exists today.
+
+  **What landed.** A detaching child's captures are boxed and shared, so LRM 9.3.2's
+  reading holds in a task and a function as it already did in a process: the children
+  of `for (int j…) fork … join_none` read the shared final `j` (`4 4 4`), a child's
+  WRITE to a capture is visible to the parent, a captured class-handle formal survives
+  the function returning (13.4.4's `watch_for_zero`), and a string capture works -- the
+  `ArgDir::Ref` type restriction is gone with the ref itself. Both old refusals are
+  lifted. Backend: `lower_fork_inst` marshals a boxed capture as an ordinary `In`
+  scalar (must|may and z), not through `ref_actual_arg`.
+
+  Two things this needed that were not in the plan:
+
+  - A capture reference inside a child's DECLARATION INITIALIZER was invisible to
+    `ForkCaptureDetector`, because an initializer hangs off the symbol rather than the
+    statement. That made `fork begin automatic int k = j; … end join_none` fail as an
+    unknown signal instead of capturing -- a pre-existing hole, now fixed in both
+    walks.
+  - **Spawn-time initialization is NOT done, and is refused.** 9.3.2 initializes a
+    child-block `automatic` at the SPAWN, which is what makes each child see its own
+    `j` (the clause's "local copy, k, for each value of j"; Verilator prints `1 2 3`).
+    clotho runs a child's body, declaration initializers included, when the child is
+    first scheduled, so every child would read the later value. Refused loudly rather
+    than answered wrongly -- before boxing, the capture refusal hid this shape
+    entirely. Lifting it means evaluating such an initializer in the parent at the
+    spawn and passing the value in, alongside the box.
 
   Still cross-cutting with the broader automatic-lifetime gap (`declare_local`): the
   boxing decision is per captured variable, so it is a strictly smaller change than

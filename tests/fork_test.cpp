@@ -612,24 +612,33 @@ TEST_CASE("fork: join_any inside a task resumes it on the first completion") {
     CHECK(out == "mid n=1@1\nend n=11@11\n");
 }
 
-// The ref-capture ABI hands a child a raw pointer into the enclosing frame, which
-// needs that frame to outlive every child. `join` guarantees it; the detaching
-// kinds do not, so a capture is refused by name rather than dangling. Lifts with
-// V4's per-spawn copies (docs/design/fork-join.md).
-TEST_CASE("fork: a join_any / join_none child capturing a task local is rejected") {
-    check_rejected(R"(
+// A detaching child capturing a task automatic. LRM 9.3.2 makes a reference to an
+// enclosing scope's automatic a reference to THAT variable -- which is why the clause
+// has to spell `automatic int k = j;` to get a copy -- so parent and child share one
+// `k` and the child's write is visible to the parent. Copying at spawn would lose it.
+// iverilog agrees on the sharing; Verilator copies and deviates
+// (docs/design/fork-join.md V4 records the three-way measurement).
+//
+// The storage is a per-variable GC box, which is what lets the child outlive the
+// activation the variable was declared in.
+TEST_CASE("fork: a join_none child shares the task automatic it captures") {
+    const std::string out = run_capture(R"(
         module t;
           task automatic go;
             int k = 1;
             fork
               #1 k = k + 1;
             join_none
+            #2 $display("parent k=%0d", k);
           endtask
           initial go;
         endmodule
-    )",
-                   "fork..join_none child that reads the enclosing task's 'k' is not supported");
-    check_rejected(R"(
+    )");
+    CHECK(out == "parent k=2\n");
+}
+
+TEST_CASE("fork: join_any children share the task automatic they capture") {
+    const std::string out = run_capture(R"(
         module t;
           task automatic go;
             int k = 1;
@@ -637,11 +646,13 @@ TEST_CASE("fork: a join_any / join_none child capturing a task local is rejected
               #1 k = k + 1;
               #2 k = k + 2;
             join_any
+            $display("after join_any k=%0d", k);
+            #3 $display("end k=%0d", k);
           endtask
           initial go;
         endmodule
-    )",
-                   "fork..join_any child that reads the enclosing task's 'k' is not supported");
+    )");
+    CHECK(out == "after join_any k=2\nend k=4\n");
 }
 
 TEST_CASE("fork: join_none in an assertion action block queues into Reactive") {
@@ -812,20 +823,106 @@ TEST_CASE("fork: wait fork and disable fork reach a child spawned in a function"
     CHECK(killed == "killed n=1@7\n");
 }
 
-// The refusal names the enclosing FUNCTION, whose formals are exactly what LRM
-// 13.4.4's own `watch_for_zero` example captures. Lifts with V4.
-TEST_CASE("fork: a join_none child capturing a function local is rejected") {
-    check_rejected(R"(
+// A function's formals are exactly what LRM 13.4.4's own `watch_for_zero` example
+// captures, and the function's frame is gone the moment it returns -- so this is the
+// case that made copy-into-the-frame unworkable and the GC box necessary. The child
+// runs after the call has returned and still reads the captured handle.
+TEST_CASE("fork: a join_none child outlives the function whose local it captured") {
+    const std::string out = run_capture(R"(
         module t;
           function void spawn(int k);
             fork
-              #1 $display("%0d", k);
+              #1 $display("child k=%0d", k);
             join_none
           endfunction
-          initial spawn(3);
+          initial begin
+            spawn(3);
+            $display("returned");
+            #2 $display("end");
+          end
+        endmodule
+    )");
+    CHECK(out == "returned\nchild k=3\nend\n");
+}
+
+// 13.4.4's example itself, in the shape clotho can express today: a captured class
+// HANDLE formal, read by the child two units after the function returned. The old ABI
+// refused this twice over -- a detached child could not capture at all, and a handle
+// was not one of the capturable types.
+TEST_CASE("fork: a join_none child reads a captured class handle after the call returns") {
+    const std::string out = run_capture(R"(
+        class IntClass;
+          int a = 5;
+        endclass
+        module t;
+          function automatic bit watch(IntClass p);
+            fork
+              begin #2 $display("child a=%0d", p.a); end
+            join_none
+            return (p.a == 0);
+          endfunction
+          IntClass c;
+          initial begin
+            c = new;
+            $display("ret=%0b", watch(c));
+            #1 c.a = 9;
+            #3 $display("end a=%0d", c.a);
+          end
+        endmodule
+    )");
+    CHECK(out == "ret=0\nchild a=9\nend a=9\n");
+}
+
+// LRM 9.3.2's own idiom, which is the case the whole model turns on. Without an
+// explicit `automatic` copy the children share the loop variable, so all three read
+// its final value -- iverilog prints `4 4 4` and slang warns about it by name
+// (-Wfork-loop-var, "all loop iterations will see the same stale value"). Verilator
+// prints `1 2 3`, which is the deviation this deliberately does not copy.
+//
+// In a process this already held, because a process local gets static signal-like
+// storage; the point of the test is that it now holds in a TASK, where the variable
+// really is frame-resident and the capture used to be refused outright.
+TEST_CASE("fork: join_none children in a task share the loop variable") {
+    const std::string out = run_capture(R"(
+        module t;
+          task automatic go;
+            for (int j = 1; j <= 3; ++j)
+              fork
+                $write("%0d ", j);
+              join_none
+            #1 $display("| shared");
+          endtask
+          initial go;
+        endmodule
+    )");
+    CHECK(out == "4 4 4 | shared\n");
+}
+
+// The copy the clause prescribes is NOT yet supported, and is refused rather than
+// answered wrongly. `automatic int k = j;` inside the fork block has to be initialized
+// AT THE SPAWN for each child to see its own `j` -- that is what the clause's own
+// comment ("local copy, k, for each value of j") means, and Verilator prints 1 2 3.
+// clotho runs a child's body, declaration initializers included, when the child is
+// first scheduled, which for join_none is after the parent has moved on, so every
+// child would read the later value. Lifting it means evaluating the initializer in the
+// parent at spawn: the remaining half of V4 (docs/design/fork-join.md).
+TEST_CASE("fork: an automatic initialized from a capture is refused, not mis-timed") {
+    check_rejected(R"(
+        module t;
+          task automatic go;
+            for (int j = 1; j <= 3; ++j)
+              fork
+                begin
+                  automatic int k = j;
+                  #k $write("%0d ", k);
+                end
+              join_none
+            #5 $display("| copies");
+          endtask
+          initial go;
         endmodule
     )",
-                   "fork..join_none child that reads the enclosing function's 'k' is not supported");
+                   "LRM 9.3.2 initializes it at the spawn");
 }
 
 // LRM 13.4.4 second paragraph: the calling thread must be created by an initial or

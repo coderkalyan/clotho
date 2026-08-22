@@ -23141,7 +23141,21 @@ private:
             // decide the ABI for all of them.
             const Function& child = mod_.function(static_cast<FunctionId>(kids[0]));
             for (uint32_t k = 0; k < caps.size(); ++k) {
-                // A fork capture is a ref to an enclosing frame local, which is a
+                if (child.arg_dirs[k] != ArgDir::Ref) {
+                    // A BOXED capture (docs/design/fork-join.md V4): the frontend hands
+                    // over the box handle as a VALUE, not a place, because the box and
+                    // not the frame is what the child shares. Nothing to bind and no
+                    // epoch to carry -- a handle is a handle whoever holds it, and the
+                    // GC keeps the box alive off the child's own frame.
+                    //
+                    // An `In` scalar formal is two params, must|may and z, exactly as
+                    // an ordinary call marshals one (lower_task_call_inst's last arm).
+                    const Plane pl = to_four(value_of(caps[k]));
+                    argv.push_back(pl.mm);
+                    argv.push_back(pl.z);
+                    continue;
+                }
+                // A ref capture is a ref to an enclosing frame local, which is a
                 // stable place: the parent's frame outlives every child (the join
                 // waits for them), so the epoch is the compile-time zero word.
                 // No barrier, and structurally so: a capture is always a frame Local of
