@@ -1561,8 +1561,13 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `$onehot`/`$onehot0`, `$isunknown`, `$typename`, `$isunbounded` (LRM 20.6.1).
   Sub-gaps:
   - [ ] `$countbits` with a **non-constant** control bit.
-  - [ ] `$typename` of an enum / struct / union / class / interface / dynamic
-    type (lands with each type's own support).
+  - [x] `$typename` of an enum / struct / union / class / container type — every
+    kind, from slang's own `TypePrinter` (which implements the clause in full)
+    rather than a second hand-written formatter. The old refusal reasoned that
+    Clotho must not name a type it does not lower; that expired once those types
+    landed, and the hand-rolled output was byte-identical to slang's for every kind
+    it covered. An anonymous type gets the clause's implementation-generated unique
+    name, which is load-bearing: `$typename` strings match only for equivalent types.
   - [ ] `$isunbounded` of a **hierarchical** reference (slang refuses to
     constant-evaluate it, and Clotho has no cross-instance constant context).
 

@@ -57,6 +57,7 @@
 #include <slang/ast/types/AllTypes.h>
 #include <slang/ast/types/NetType.h>
 #include <slang/ast/types/Type.h>
+#include <slang/ast/types/TypePrinter.h>
 #include <slang/diagnostics/AnalysisDiags.h>
 #include <slang/diagnostics/DeclarationsDiags.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
@@ -17592,84 +17593,30 @@ private:
         fail("internal: unhandled enum method '" + std::string(name) + "'");
     }
 
-    // Format a type as its LRM 20.6.1 $typename string, for the type kinds
-    // Clotho lowers. The LRM's own examples are self-contradictory on the space
-    // before a packed dimension (`node[2:0]` -> "bit [2:0]" but the very next
-    // example, `typedef bit [9:1] word`, -> "A::bit[9:1]"); slang resolves it as
-    // no-space, which also matches the second LRM example, so Clotho emits
-    // `logic[7:0]`. Rule (b): the default signing is dropped, so only a
-    // non-default sign (`int unsigned`, `logic signed`) is spelled out.
-    // Unsupported type kinds (enum / struct / union / class / interface /
-    // dynamic) fail loudly — Clotho does not lower them, so it must not
-    // fabricate a name for them.
+    // Format a type as its LRM 20.6.1 $typename string.
+    //
+    // slang implements $typename in full (`TypenameFunction`, QueryFuncs.cpp) over its
+    // own `TypePrinter`, so Clotho asks for that string rather than deriving a second
+    // one. This used to be hand-rolled for the kinds Clotho lowers, with everything
+    // else failing loudly on the grounds that Clotho could not vouch for a name for a
+    // type it did not lower; that premise expired once classes, enums, structs, unions
+    // and the containers landed, and the formatter's output was byte-identical to
+    // slang's for every kind it did cover (including a resolved typedef and the `$`
+    // placeholder of an anonymous unpacked dimension).
+    //
+    // The options are pinned rather than defaulted because `TypePrinter` is also the
+    // diagnostics printer: `printAKA` appends "aka" glosses, and `FriendlyName` spells
+    // an anonymous type structurally where 20.6.1 wants the implementation-generated
+    // unique name -- and uniqueness is load-bearing here, since $typename strings are
+    // specified to compare equal only for equivalent types.
     std::string format_typename(const slang::ast::Type& type) {
-        const slang::ast::Type& t = type.getCanonicalType();
-
-        // Non-default signing suffix (LRM 20.6.1 rule b).
-        const auto signing = [](const slang::ast::Type& ty, bool default_signed) -> std::string {
-            if (ty.isSigned() == default_signed) {
-                return "";
-            }
-            return ty.isSigned() ? " signed" : " unsigned";
-        };
-        const auto range_str = [](slang::ConstantRange r) {
-            return "[" + std::to_string(r.left) + ":" + std::to_string(r.right) + "]";
-        };
-
-        if (const auto* st = t.as_if<slang::ast::ScalarType>()) {
-            // Predefined 1-bit types; default unsigned.
-            const char* base = st->scalarKind == slang::ast::ScalarType::Bit   ? "bit"
-                               : st->scalarKind == slang::ast::ScalarType::Reg ? "reg"
-                                                                               : "logic";
-            return base + signing(*st, false);
-        }
-        if (const auto* it = t.as_if<slang::ast::PredefinedIntegerType>()) {
-            using K          = slang::ast::PredefinedIntegerType::Kind;
-            const char* base = it->integerKind == K::Int        ? "int"
-                               : it->integerKind == K::Byte     ? "byte"
-                               : it->integerKind == K::ShortInt ? "shortint"
-                               : it->integerKind == K::LongInt  ? "longint"
-                               : it->integerKind == K::Integer  ? "integer"
-                                                                : "time";
-            return base + signing(*it, slang::ast::PredefinedIntegerType::isDefaultSigned(it->integerKind));
-        }
-        if (const auto* pa = t.as_if<slang::ast::PackedArrayType>()) {
-            // Collect the packed dimensions outermost-first down to the base
-            // scalar; the whole vector's signing sits between base and dims.
-            std::string             dims;
-            const slang::ast::Type* cur = pa;
-            while (const auto* p = cur->as_if<slang::ast::PackedArrayType>()) {
-                dims += range_str(p->range);
-                cur = &p->elementType.getCanonicalType();
-            }
-            const auto* base = cur->as_if<slang::ast::ScalarType>();
-            if (base == nullptr) {
-                // A packed array of enum / struct — unsupported base.
-                fail("$typename of this packed type is not supported");
-            }
-            const char* name = base->scalarKind == slang::ast::ScalarType::Bit   ? "bit"
-                               : base->scalarKind == slang::ast::ScalarType::Reg ? "reg"
-                                                                                 : "logic";
-            return name + signing(*pa, false) + dims;
-        }
-        if (const auto* ua = t.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
-            // Unpacked dimension: a "$" placeholder for the anonymous array name
-            // (rule d), then the range (LRM: "logic[7:0]$[0:9]").
-            return format_typename(ua->elementType) + "$" + range_str(ua->range);
-        }
-        if (t.isFloating()) {
-            const auto& ft = t.as<slang::ast::FloatingType>();
-            return ft.floatKind == slang::ast::FloatingType::ShortReal  ? "shortreal"
-                   : ft.floatKind == slang::ast::FloatingType::RealTime ? "realtime"
-                                                                        : "real";
-        }
-        if (t.isString()) {
-            return "string";
-        }
-        // enum / struct / union / class / interface / dynamic array / queue /
-        // associative array / chandle / event — Clotho does not lower these, so
-        // it cannot vouch for their $typename string.
-        fail("$typename of this type is not supported");
+        slang::ast::TypePrinter printer;
+        printer.options.printAKA = false;
+        printer.options.anonymousTypeStyle = slang::ast::TypePrintingOptions::SystemName;
+        printer.options.elideScopeNames = false;
+        printer.options.skipScopedTypeNames = false;
+        printer.append(type);
+        return printer.toString();
     }
 
     // Classify a $countbits control-bit argument (LRM 20.9): a constant 1-bit
@@ -18168,13 +18115,12 @@ private:
             fail("$isunbounded of a hierarchical reference is not supported");
         }
 
-        // TODO: $typename (LRM 20.6.1). slang folds it to a string, but its type
         // $typename (LRM 20.6.1): the operand's resolved type name as a string
-        // constant. Clotho formats the type itself (format_typename) rather than
-        // trusting slang's Type::toString, so it emits only names for the type
-        // kinds it actually lowers and controls the exact LRM format. The
-        // argument's self-determined type is named; the type is resolved during
-        // elaboration but never evaluated.
+        // constant, from slang's own type printer (format_typename). The argument's
+        // self-determined TYPE is named; the argument is resolved during elaboration
+        // but never evaluated, so this folds for every type kind -- which is why the
+        // same query already worked in a constant context, where slang's own
+        // $typename fold answers before this path is reached at all.
         if (name == "$typename") {
             if (call.arguments().size() != 1) {
                 fail("$typename expects exactly one argument");

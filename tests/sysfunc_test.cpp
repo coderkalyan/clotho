@@ -224,15 +224,38 @@ TEST_CASE("$typename of a data-type argument") {
     CHECK(out == "logic[7:0] int\n");
 }
 
-// enum / struct / union / class are legal types whose $typename string
-// Clotho does not produce yet, so $typename rejects them loudly rather than
-// fabricating a string.
-TEST_CASE("$typename of an unsupported type kind fails loudly") {
-    CHECK(lower_error("module m; typedef enum {A,B} e; e x; initial $display($typename(x)); endmodule")
-            .find("$typename") != std::string::npos);
-    CHECK(lower_error("module m; typedef struct packed {logic a;} s; s x;"
-                      " initial $display($typename(x)); endmodule")
-            .find("$typename") != std::string::npos);
+// The aggregate and container kinds, which Clotho used to refuse rather than name.
+// A named type carries its declaring scope, exactly as LRM 20.6.1's own `A::bit[9:1]`
+// example does; an enum spells its members with their sized values; a specialization
+// carries its arguments (`P#(byte)`), which is the form UVM's `uvm_typename(T)` needs.
+TEST_CASE("$typename names the aggregate and container kinds") {
+    const std::string out = run_capture(prog(
+      "typedef enum {A,B} e; e x;"
+      " typedef struct packed {logic a;} sp; sp y;"
+      " typedef union {int i; byte b;} un; un u;"
+      " class C; int n; endclass class P #(type T = int); T v; endclass"
+      " typedef int qt[$]; qt q; typedef int dt[]; dt d; typedef int at[string]; at aa;"
+      " C k; P#(byte) pk; chandle ch; event ev;",
+      "$write(\"%s|%s|%s|\", $typename(x), $typename(y), $typename(u));"
+      "$write(\"%s|%s|\", $typename(k), $typename(pk));"
+      "$display(\"%s|%s|%s|%s|%s\", $typename(q), $typename(d), $typename(aa),"
+      " $typename(ch), $typename(ev));"));
+    CHECK(out ==
+          "enum{A=32'sd0,B=32'sd1}m.e|struct packed{logic a;}m.sp|union{int i;byte b;}m.un|"
+          "C|P#(byte)|"
+          "int$[$]|int$[]|int$[string]|chandle|event\n");
+}
+
+// 20.6.1 gives an anonymous type an implementation-generated name, and the clause is
+// only usable because those names are UNIQUE: $typename strings are specified to match
+// for equivalent types, so two identically-shaped anonymous structs -- distinct types --
+// must not collide. That uniqueness is the reason for pinning the printer to
+// `SystemName` over the friendlier structural spelling.
+TEST_CASE("$typename gives distinct anonymous types distinct names") {
+    const std::string out =
+      run_capture(prog("struct {int a;} p; struct {int a;} q;",
+                       "$display(\"%s|%s\", $typename(p), $typename(q));"));
+    CHECK(out == "struct{int a;}m.s$1|struct{int a;}m.s$2\n");
 }
 
 // -- $random(seed) / $dist_* / $urandom (LRM 20.15, 18.13) ------------------
