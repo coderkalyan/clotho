@@ -1141,8 +1141,7 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   now render through a frontend loop instead: one `$sformatf` per element built by
   the ORDINARY aggregate expansion, concatenated over the live element count. So
   member names, nested arrays, string leaves and tag names all print exactly as
-  they do outside a container (`'{'{a:1, s:"hi"}, ...}`). Still guarded: an
-  associative-array leaf, and a class-handle element (no handle rendering at all).
+  they do outside a container (`'{'{a:1, s:"hi"}, ...}`).
 - [x] **NBA to a whole queue** (`q <= rhs`, LRM 10.4.2) — `QueueCopyNb` stages a
   deep copy of the RHS in the Active region (per-queue `rt_nba_arr` buffer), then
   `rt_queue_move`s it into the live handle in the NBA region (managed-element
@@ -2177,8 +2176,26 @@ project with its own algorithm, not tail cleanup on the property layer:
   - [ ] `%p` of a chandle / event / virtual-interface handle — rejected loud; unlike
     a class handle, none of these has a name to print in place of the object.
   - [ ] `%0p` — a field width / flags on the whole pattern is rejected loud.
-  - [ ] `%p` of a queue / dynamic array of tagged unions — rejected loud.
-  - [ ] `%p` of an associative-array leaf inside an aggregate — rejected loud.
+  - [x] `%p` of an associative array (LRM 21.2.1.6) — renders
+    `'{key:value, ...}` over the live entries in ascending key order. The one
+    deficiency behind this was that `%p` had no ordered walk for a KEYED container:
+    the escape hatch a container with a non-flat element already used
+    (`build_container_p_string`) is driven by an index space, and a keyed table has
+    none. `build_assoc_p_string` is the same loop keyed by
+    `assoc_traverse(First/Next)` + `assoc_select`, i.e. the shape
+    `lower_foreach_assoc_dim` already uses for `foreach`, so the value renders through
+    the ORDINARY aggregate expansion and a struct / nested container / class-handle /
+    wide value works for free. Keys print by the same leaf rules, so an enum key
+    prints its name and a string key prints quoted. Ordering is asserted only for
+    integral and string keys (LRM 7.8.5 leaves it implementation-defined otherwise).
+    A direct operand takes the same path — `Assoc` is now in `expand_p_arg`'s
+    container predicate, where its absence used to send `$display("%p", a)` down the
+    singular path to die as an unrenderable handle.
+    Retired with it: `guard_container_p_element`, whose four `%p` refusals (tagged
+    union, class handle, element wider than 64 bits, nested aggregate) had all become
+    unreachable when the loop render landed — every condition it tested forces
+    `loop_render` — and whose one live caller was `guard_agg_eq_members`, i.e. an
+    aggregate `==` refusal wearing `%p` wording.
 - [ ] **Containers of handles** — queues/dynamic/associative arrays of class
   objects, and class objects holding them.
 

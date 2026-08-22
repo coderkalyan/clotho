@@ -948,3 +948,73 @@ TEST_CASE("ref through an associative entry sees writes and detects both levels"
         endmodule
     )") == "v=107 num=1\n");
 }
+
+// `%p` of an associative array (LRM 21.2.1.6). The flat runtime container formatter
+// addresses an element as `base + i*stride`, which a keyed table cannot answer, so
+// this renders through the same frontend IR loop a queue with a non-flat element
+// already uses -- keyed by rt_assoc_first / next instead of by an index
+// (Lower.cpp's build_assoc_p_string). Ordering is asserted only for integral and
+// string keys; LRM 7.8.5 leaves it implementation-defined otherwise
+// (docs/design/assoc-keys.md).
+TEST_CASE("%p of an associative array renders '{key:value} in key order") {
+    SUBCASE("integral key, integral value, as a direct operand") {
+        const std::string out = run_capture(R"(
+            module t;
+              int a[int];
+              initial begin
+                $display("%p", a);
+                a[3] = 30; a[1] = 10; a[2] = 20;
+                $display("%p", a);
+              end
+            endmodule
+        )");
+        CHECK(out == "'{}\n'{1:10, 2:20, 3:30}\n");
+    }
+    SUBCASE("string key, string value") {
+        const std::string out = run_capture(R"(
+            module t;
+              string a[string];
+              initial begin
+                a["b"] = "two"; a["a"] = "one";
+                $display("%p", a);
+              end
+            endmodule
+        )");
+        CHECK(out == "'{\"a\":\"one\", \"b\":\"two\"}\n");
+    }
+    SUBCASE("aggregate and container values recurse like any other leaf") {
+        const std::string out = run_capture(R"(
+            module t;
+              typedef struct { int a; string s; } pair_t;
+              pair_t p[int];
+              int    q[int][$];
+              initial begin
+                p[1] = '{7, "hi"};
+                p[2] = '{8, "yo"};
+                q[5].push_back(1);
+                q[5].push_back(2);
+                $display("%p", p);
+                $display("%p", q);
+              end
+            endmodule
+        )");
+        CHECK(out == "'{1:'{a:7, s:\"hi\"}, 2:'{a:8, s:\"yo\"}}\n'{5:'{1, 2}}\n");
+    }
+    SUBCASE("as a leaf of an unpacked struct, and over a wildcard index") {
+        const std::string out = run_capture(R"(
+            module t;
+              typedef struct { int n; int m[int]; } holder_t;
+              holder_t h;
+              int      w[*];
+              initial begin
+                h.n = 4;
+                h.m[9] = 90;
+                w[7] = 70;
+                $display("%p", h);
+                $display("%p", w);
+              end
+            endmodule
+        )");
+        CHECK(out == "'{n:4, m:'{9:90}}\n'{7:70}\n");
+    }
+}

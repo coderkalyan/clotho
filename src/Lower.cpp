@@ -4349,15 +4349,12 @@ private:
             // A queue / dynamic-array leaf compares element-wise. An aggregate, a
             // nested container or an element wider than one word walks in the backend
             // (emit_container_eq_loop, which recurses through this same compare, so
-            // only the element's own shape has to be checked here); a narrower scalar
-            // element goes through the flat runtime comparator, which is what still
-            // restricts the element kinds it can read.
+            // only the element's own shape has to be checked here); anything narrower
+            // is a scalar / real / string the flat runtime comparator reads directly.
             if (is_agg_abi_ref(t.element) || value_cat(t.element) == ValueCat::handle ||
                 module_.pool.layout(t.element).width > 64) {
                 guard_agg_eq_members(t.element);
-                return;
             }
-            guard_container_p_element(t.element, /*sty=*/nullptr);
             return;
         }
         if (value_cat(type) == ValueCat::handle) {
@@ -18436,7 +18433,12 @@ private:
         }
         const ir::Ref           ty        = lower_type(*arg.type);
         const ir::Type::Kind    k         = std::get<ir::Type>(module_.pool.get(ty)).kind;
-        const bool              container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray;
+        // Every managed container renders through expand_p_lvalue, which walks it.
+        // An Assoc is not is_agg_abi_ref either, so without naming it here a bare
+        // `$display("%p", my_assoc)` took the singular path and died as an
+        // unrenderable handle.
+        const bool              container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray ||
+                                            k == ir::Type::Kind::Assoc;
         const slang::ast::Type& sty       = *arg.type;
         const ir::SourceLoc     l         = loc(arg);
         if (!is_agg_abi_ref(ty) && !container) {
@@ -18449,48 +18451,6 @@ private:
             return;
         }
         expand_p_lvalue(lower_lvalue(unwrap_conversion(arg), b), ty, &sty, frag, args, b, l);
-    }
-
-    // Guard the element type of a `%p`'d queue / dynamic array: the runtime
-    // formatter renders integral (width <= 64), real, and string leaves; a
-    // wider or nested-aggregate element is a documented follow-up (a non-POD
-    // element is already rejected in lower_type).
-    // A tagged-union element is refused rather than rendered flat: the runtime
-    // container descriptor carries no member names, so it could only print the raw
-    // bit-vector where LRM 21.2.1.6 requires `tag:value`. `sty` is the container's
-    // slang type when known.
-    void guard_container_p_element(ir::Ref elem, const slang::ast::Type* sty) {
-        if (sty != nullptr) {
-            const slang::ast::Type* et = sty->getCanonicalType().getArrayElementType();
-            if (et != nullptr && et->isTaggedUnion()) {
-                // TODO: %p of a queue / dynamic array of tagged unions (needs the
-                // per-member name table threaded into rt_container_format_p).
-                fail("%p of a queue / dynamic array of tagged unions is not supported");
-            }
-        }
-        const ir::Type e = std::get<ir::Type>(module_.pool.get(elem));
-        if (e.kind == ir::Type::Kind::String || module_.pool.is_float(elem)) {
-            return;
-        }
-        if (e.kind == ir::Type::Kind::Class) {
-            // A class handle is a 64-bit word, so it would otherwise fall into the
-            // scalar arm below and print as a heap address.
-            // TODO: %p of a queue / dynamic array of class handles (it would need
-            // a per-object id, which the flat container descriptor cannot reach).
-            // The same refusal already covers a bare handle -- see display_test.
-            fail("%p of a queue / dynamic array of class handles is not supported");
-        }
-        if (value_cat(elem) == ValueCat::scalar) {
-            if (module_.pool.layout(elem).width > 64) {
-                // TODO: %p of a queue / dynamic array element wider than 64 bits
-                // (the runtime plane extraction is single-word).
-                fail("%p of a queue / dynamic array element wider than 64 bits is not supported");
-            }
-            return;
-        }
-        // TODO: %p of a queue / dynamic array of nested aggregate / handle
-        // elements (needs recursive runtime rendering).
-        fail("%p of a queue / dynamic array with a nested aggregate element is not supported");
     }
 
     // The Scope side of a union type, whose members carry the names and payload
@@ -18764,16 +18724,27 @@ private:
                 args.push_back(build_container_p_string(lv, ty, t, sty, b, l));
                 return;
             }
-            guard_container_p_element(t.element, sty);
+            // What is left is exactly what the flat descriptor describes: a scalar
+            // of one word or less, a real, or a string.
             args.push_back(b.container_fmt_p(lv, ty, l));
             return;
         }
+        if (t.kind == ir::Type::Kind::Assoc) {
+            // An associative-array leaf renders over its live entries in ascending
+            // key order, spliced in as a `%s` string argument like a queue's. It
+            // cannot use the flat runtime formatter at all: that addresses an element
+            // as `base + i*stride`, which a keyed table has no answer for, and the
+            // ordered walk exists only as the four-call rt_assoc_first / next ABI.
+            // So it takes the same IR-loop render a container with a non-flat element
+            // already takes -- see build_assoc_p_string.
+            frag += "%s";
+            args.push_back(build_assoc_p_string(lv, ty, t, sty, b, l));
+            return;
+        }
         if (value_cat(ty) != ValueCat::scalar && value_cat(ty) != ValueCat::string) {
-            // Assoc arrays are the only handle left (a queue / dynamic array took the
-            // branch above).
-            // TODO: %p of an associative-array leaf (its runtime table carries no
-            // ordered element walk for the formatter).
-            fail("%p of an associative-array aggregate leaf is not supported");
+            // Every managed container has an arm above, so what reaches here is a
+            // handle with no aggregate value to render at all.
+            fail("%p of a handle aggregate leaf is not supported");
         }
         // A singular leaf. With the slang type in hand this may still be one of LRM
         // 21.2.1.6's named cases (a nested tagged union, packed struct, plain union,
@@ -18845,6 +18816,94 @@ private:
                  idx.lv(b, l),
                  b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
                  l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+        append(str_const("}"));
+        return b.unary(T::Load, out.lv(b, l), l);
+    }
+
+    // `%p` of an associative array, as a string value: `'{k0:v0, k1:v1, ...}` over
+    // the live entries in ascending key order (LRM 7.9.3's traversal order, which
+    // 7.8.5 defines for integral and string keys and leaves implementation-defined
+    // for the rest -- see docs/design/assoc-keys.md).
+    //
+    // Structurally build_container_p_string with the index space replaced by a key
+    // walk: assoc_traverse(First) seeds, assoc_traverse(Next) advances, assoc_select
+    // reads the entry -- exactly the shape lower_foreach_assoc_dim already uses for
+    // `foreach`. That key walk is also why this cannot be a runtime formatter the way
+    // a queue of flat elements is: a stored key is an order-preserving byte span and
+    // has to be DENORMALIZED into a typed cell before it can be printed, which lives
+    // in the backend's AssocFirst / AssocNext lowering, and a struct value or nested
+    // container then renders through the ordinary aggregate expansion.
+    ir::Index build_assoc_p_string(ir::Index               lv,
+                                   ir::Ref                 ty,
+                                   const ir::Type&         t,
+                                   const slang::ast::Type* sty,
+                                   ir::Builder&            b,
+                                   ir::SourceLoc           l) {
+        using T    = ir::Inst::Tag;
+        using Step = ir::Builder::AssocStep;
+        const slang::ast::AssociativeArrayType* ast =
+          sty != nullptr ? &sty->getCanonicalType().as<slang::ast::AssociativeArrayType>() : nullptr;
+        const slang::ast::Type* est = ast != nullptr ? &ast->elementType : nullptr;
+        // A wildcard `[*]` index has no slang index type, and its lowered key is a
+        // synthetic u64 placeholder, so it renders as a plain integral key.
+        const slang::ast::Type* kst = ast != nullptr ? ast->indexType : nullptr;
+        const ir::Ref kr = t.right != 0 ? make_int_type(64, false, false) : static_cast<ir::Ref>(t.fields_id);
+        const ir::Ref  bit1 = make_int_type(1, false, false);
+        const TempCell out  = make_temp_cell(module_.pool.string_type, "pstr");
+        const TempCell key  = make_temp_cell(kr, "pkey");
+        const TempCell ok   = make_temp_cell(bit1, "pstr_ok");
+        const TempCell more = make_temp_cell(bit1, "pstr_more");
+        const auto     str_const = [&](std::string_view s) { return b.constant(string_value_ref(s), l); };
+        const auto     append    = [&](ir::Index piece) {
+            const std::array<ir::Index, 2> parts{ b.unary(T::Load, out.lv(b, l), l), piece };
+            b.binary(T::Store, out.lv(b, l), b.concat(parts, l), l);
+        };
+        // An aggregate key has no plane value, so it travels as an lvalue -- the same
+        // split lower_assoc_key makes for `a[k]`.
+        const auto key_operand = [&] {
+            return is_agg_abi_ref(kr) ? key.lv(b, l) : b.unary(T::Load, key.lv(b, l), l);
+        };
+
+        b.binary(T::Store, out.lv(b, l), str_const("'{"), l);
+        // `more` is "an entry has already been emitted", i.e. the separator flag. A
+        // key walk has no index to compare against zero the way the queue loop does.
+        b.binary(T::Store, more.lv(b, l), b.constant(module_.pool.put_int(bit1, 0), l), l);
+        b.binary(
+          T::Store, ok.lv(b, l), b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::First, ty, l), bit1, l), l);
+
+        b.open_region();
+        const ir::Index      pred = b.unary(T::Load, ok.lv(b, l), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        b.open_region();
+        append(str_const(", "));
+        const ir::ExtraSlice sep_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice nosep_r = b.close_region();
+        b.cond(b.unary(T::Load, more.lv(b, l), l), sep_r, nosep_r, l);
+        b.binary(T::Store, more.lv(b, l), b.constant(module_.pool.put_int(bit1, 1), l), l);
+        std::string            efrag;
+        std::vector<ir::Index> eargs;
+        // The key prints by the same leaf rules as any other %p element, so an enum
+        // key prints its name and a string key prints quoted.
+        if (kst != nullptr) {
+            expand_p_scalar(b.unary(T::Load, key.lv(b, l), l), *kst, efrag, eargs, b, l);
+        } else {
+            efrag += "%0d";
+            eargs.push_back(b.unary(T::Load, key.lv(b, l), l));
+        }
+        efrag += ':';
+        expand_p_lvalue(b.assoc_select(lv, key_operand(), ty, l), t.element, est, efrag, eargs, b, l);
+        append(b.sformatf(efrag, eargs, l));
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        b.binary(
+          T::Store, ok.lv(b, l), b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::Next, ty, l), bit1, l), l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
