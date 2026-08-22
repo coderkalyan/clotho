@@ -344,10 +344,21 @@ is the hard half of that work, not the ring.
   a draw, so an ordinary fork costs nothing and does not perturb the parent's
   stream (`build_rng_fns`).
 
-Still open, and unchanged by V2: `Structural::walk` has no `Fork` case, so children
-are absent from `BodyFacts::calls`; and `scan_finish` omits `Fork`, so a `$finish` in
-a child does not mark the parent may-finish. Harmless while `$finish` is a longjmp, a
-live hazard for the cooperative-finish migration.
+**Closed since V2.** Both holes were call-edge discovery re-derived per consumer, so
+both are fixed at the source: `ir::inst_callees` / `ir::collect_callees`
+(`src/ir/Analysis.h`) are now the single authority on where a call edge lives in the
+IR, and `Structural::walk`, the backend's reactive/program reachability walks and
+`scan_finish` all read them. `BodyFacts::calls` therefore carries `Call`,
+`CallVirtual`, `TaskCall`, `TaskCallVirtual` and every `ForkInfo::children` entry, and
+a `$finish` in a child now marks the forking body may-finish.
+
+Two bounds survive and are documented at the declaration. Virtual dispatch
+contributes its STATICALLY resolved target only (`VirtualCallInfo::func`), so an
+override reached through a handle is missed and the may-finish figure stays a lower
+bound. And for `join_any` / `join_none` a child outlives the fork, so a write of its
+may land in a later instant than the edge claims — the edge is conservative rather
+than exact, which is the safe direction for a wake graph that is
+over-approximation-tolerant by construction.
 
 ### V2.5 What V2 does not do
 
@@ -654,17 +665,48 @@ needs an SVA build (`-DCLOTHO_SVA=ON`) — the frontend refuses it by the root r
 and `reject_resume_once`'s new closure is the backstop, both by construction rather
 than by test.
 
-### V5.8 Adjacent gaps this widens but does not own
+### V5.8 Adjacent gaps this widens but does not own (**closed**)
 
-`BodyFacts::calls` is fed only by `TaskCall` / `TaskCallVirtual` — the `Call` arms
-push nothing and there is no `Fork` arm — so `compute_subscription_order`'s closure
-misses signals a fork child, or any plain function, blocking-writes, and
-`wake_adj_` / `scc_nontrivial_` / `sub_order_` are computed on an incomplete graph
-that `compute_fusion_groups` then reads. Pre-existing (a fork in a task has it too)
-and unchanged in kind by V5, which only widens its reach. Likewise `scan_finish`
-omits `Fork`, so a `$finish` in a child does not mark the parent may-finish —
-harmless while `$finish` is a longjmp, a live hazard for the cooperative-finish
-migration.
+`BodyFacts::calls` was fed only by `TaskCall` / `TaskCallVirtual` — the `Call` arms
+pushed nothing and there was no `Fork` arm — so `compute_subscription_order`'s
+closure missed every signal a fork child, or any plain function, blocking-writes, and
+`wake_adj_` / `scc_nontrivial_` / `sub_order_` were computed on an incomplete graph
+that `compute_fusion_groups` then read. Likewise `scan_finish` omitted `Fork`. Both
+now route through `ir::collect_callees`; see the "Closed since V2" note under §V2.4.
+
+**This was a latent-correctness fix, not a live wrong-value bug, and the reason is
+worth writing down because it is recorded nowhere else.** No settled-value divergence
+is reproducible from either hole. For the missing edge to produce a wrong VALUE it
+would have to defeat the held-sched-flag argument, which requires a combinational
+cycle *inside* one fused group. `compute_fusion_groups` blocks that independently,
+by two facts that compose:
+
+- Candidacy (`LlvmBackend.cpp:8989-9000`): a body holding `Call` / `CallVirtual` /
+  `TaskCall` / `TaskCallVirtual` / `Fork` is never `CombFuse::Eligible` (it scores
+  `HasCall` or `ImpureOp`), so the SOURCE of a hidden edge is never a group member.
+- The interior guard (`LlvmBackend.cpp:9001-9038`): a candidate merges only when its
+  ENTIRE sensitivity set is written by another candidate. Group members are therefore
+  triggered only by candidates, whose writes are all direct `Store`s and hence all
+  visible in the graph.
+
+Together those force the in-group candidate chain to be acyclic and fully visible: a
+hidden edge can only ever close a cycle OUTSIDE a group, where the sched flag is not
+held and ordinary re-wake-on-change still reaches the fixpoint. Confirmed
+empirically — a fork child in a loop, a value function in a loop, a task in a loop
+(control) and a fork child feeding a comb chain all produce byte-identical output
+under `{fuse=true}` and `{fuse=false}`, both before and after the fix. What the fix
+DOES change is the fusion decision: on a shape crafted to keep the members interior
+while the back edge hides in a function, the loop stops fusing, which is what
+`tests/comb_fusion_test.cpp` now pins. The `scan_finish` hole is latent for the
+separate reason the §V2.4 note gives — `$finish` is still a longjmp.
+
+**Residual bound, and the sentence a future reader needs: the interior guard is what
+makes this latent.** Anything that relaxes it — admitting a member whose sensitivity
+is written by a non-candidate, or admitting a callable body as a fusion candidate
+once purity closure over callees lands (the `CombFuse::HasCall` verdict exists
+precisely as a placeholder for that) — makes the hidden edge live, and a wrong
+settled value becomes reachable. Do not relax it without the complete call graph this
+change installs.
 
 ## Hard parts (V1)
 

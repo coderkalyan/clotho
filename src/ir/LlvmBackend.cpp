@@ -6583,40 +6583,6 @@ private:
         return sym(program_live_gv_);
     }
 
-    // Every function this body enables, calls or forks, appended to `work`.
-    // Virtual dispatch contributes its statically named target only -- see the
-    // bound documented on build_reactive_fns.
-    //
-    // Fork children count. They are bodies of this one, split out by the
-    // frontend, and they suspend on their own account (that is what a fork is
-    // for), so leaving them out would let a child of an action block or of a
-    // program `initial` park a handle with no home region and resume in Active.
-    static void collect_callees(const Ir& ir, std::vector<FunctionId>& work) {
-        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
-            const auto           i = static_cast<Index>(k);
-            const Inst::Payload& p = ir.payload(i);
-            switch (ir.tag(i)) {
-                case Inst::Tag::TaskCall:
-                    work.push_back(ir.extra_data<TaskCallInfo>(p.extra).func);
-                    break;
-                case Inst::Tag::Call:
-                    work.push_back(ir.extra_data<CallInfo>(p.extra).func);
-                    break;
-                case Inst::Tag::TaskCallVirtual:
-                case Inst::Tag::CallVirtual:
-                    work.push_back(ir.extra_data<VirtualCallInfo>(p.extra).func);
-                    break;
-                case Inst::Tag::Fork:
-                    for (const Index kid : ir.region(ir.extra_data<ForkInfo>(p.extra).children)) {
-                        work.push_back(static_cast<FunctionId>(kid));
-                    }
-                    break;
-                default:
-                    break;
-            }
-        }
-    }
-
     // Classify every function reachable as reactive code -- the action-block
     // tasks a ReactivePend names, plus their transitive callees -- and reject
     // what the reactive region set cannot yet run. The set decides which region a
@@ -8790,33 +8756,20 @@ private:
     // by-pointer argument scan resolves them; an override that finishes where
     // its prototype does not would be missed, so treat the virtual figure as a
     // lower bound.
-    // Scan one body for a Finish, collecting its callees on the way.
+    //
+    // Scan one body for a Finish, collecting its call edges on the way. The edges
+    // are ir::collect_callees', so a `$finish` inside a fork child marks the
+    // forking body may-finish: a child is a body of its parent, and the parent
+    // blocks on it at a `join`.
     static bool scan_finish(const Ir& ir, std::vector<FunctionId>* out) {
         bool finishes = false;
-        for (size_t k = 0; k < ir.inst_count(); ++k) {
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             const auto idx = static_cast<Index>(k);
-            switch (ir.tag(idx)) {
-                case Inst::Tag::Finish:
-                    finishes = true;
-                    break;
-                case Inst::Tag::Call:
-                    if (out != nullptr) {
-                        out->push_back(ir.extra_data<CallInfo>(ir.payload(idx).extra).func);
-                    }
-                    break;
-                case Inst::Tag::TaskCall:
-                    if (out != nullptr) {
-                        out->push_back(ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func);
-                    }
-                    break;
-                case Inst::Tag::CallVirtual:
-                case Inst::Tag::TaskCallVirtual:
-                    if (out != nullptr) {
-                        out->push_back(ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func);
-                    }
-                    break;
-                default:
-                    break;
+            if (ir.tag(idx) == Inst::Tag::Finish) {
+                finishes = true;
+            }
+            if (out != nullptr) {
+                inst_callees(ir, idx, *out);
             }
         }
         return finishes;
@@ -8862,76 +8815,25 @@ private:
     void report_finish_stat() const {
         const auto nf = static_cast<uint32_t>(mod_.function_count());
 
-        // Direct seeds, plus each body's callee list, in one pass.
-        std::vector<uint8_t>                 direct(nf, 0);
-        std::vector<std::vector<FunctionId>> callees(nf);
-        const auto scan = [](const Ir& ir, std::vector<FunctionId>* out) {
-            bool finishes = false;
-            for (size_t k = 0; k < ir.inst_count(); ++k) {
-                const auto idx = static_cast<Index>(k);
-                switch (ir.tag(idx)) {
-                    case Inst::Tag::Finish:
-                        finishes = true;
-                        break;
-                    case Inst::Tag::Call:
-                        if (out != nullptr) {
-                            out->push_back(ir.extra_data<CallInfo>(ir.payload(idx).extra).func);
-                        }
-                        break;
-                    case Inst::Tag::TaskCall:
-                        if (out != nullptr) {
-                            out->push_back(ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func);
-                        }
-                        break;
-                    case Inst::Tag::CallVirtual:
-                    case Inst::Tag::TaskCallVirtual:
-                        if (out != nullptr) {
-                            out->push_back(
-                              ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func);
-                        }
-                        break;
-                    default:
-                        break;
-                }
-            }
-            return finishes;
-        };
-        for (uint32_t f = 0; f < nf; ++f) {
-            direct[f] = scan(mod_.function(static_cast<FunctionId>(f)).ir, &callees[f]) ? 1 : 0;
-        }
-
-        // Memoized DFS, same shape as the per-function write-set closure. A cycle
-        // (recursion) contributes what the in-progress callee has so far; a
-        // recursive subroutine that finishes is still caught by its own seed.
-        std::vector<uint8_t> may(direct);
-        std::vector<uint8_t> state(nf, 0); // 0 new, 1 visiting, 2 done
-        const auto close = [&](this const auto& self, uint32_t f) -> void {
-            if (state[f] != 0) {
-                return;
-            }
-            state[f] = 1;
-            for (const FunctionId c : callees[f]) {
-                const auto ci = static_cast<uint32_t>(c);
-                self(ci);
-                may[f] = static_cast<uint8_t>(may[f] | may[ci]);
-            }
-            state[f] = 2;
-        };
-        for (uint32_t f = 0; f < nf; ++f) {
-            close(f);
-        }
+        // Seeds and closure from the very computation the emitter gates on. This
+        // used to be a byte-for-byte second copy of compute_may_finish, scan
+        // lambda included, and it drifted: the copy could not gain a fix the
+        // original got. A stat that disagrees with the code it reports on is worse
+        // than no stat.
+        std::vector<uint8_t>       direct;
+        const std::vector<uint8_t> may = compute_may_finish(&direct);
 
         // The population that matters: call sites needing a post-call test.
         uint64_t   sites = 0, proc_direct = 0, fn_direct = 0, fn_may = 0;
         const auto count_sites = [&](const Ir& ir) {
             std::vector<FunctionId> cs;
-            scan(ir, &cs);
+            scan_finish(ir, &cs);
             for (const FunctionId c : cs) {
                 sites += may[static_cast<uint32_t>(c)] != 0 ? 1 : 0;
             }
         };
         for (const Process& p : mod_.processes()) {
-            proc_direct += scan(p.ir, nullptr) ? 1 : 0;
+            proc_direct += scan_finish(p.ir, nullptr) ? 1 : 0;
             count_sites(p.ir);
         }
         for (uint32_t f = 0; f < nf; ++f) {

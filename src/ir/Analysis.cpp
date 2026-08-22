@@ -330,6 +330,41 @@ TagInfo tag_info(Inst::Tag tag) {
 
     return none;
 }
+
+void inst_callees(const Ir& ir, Index i, std::vector<FunctionId>& out) {
+    const Inst::Payload& p = ir.payload(i);
+    switch (ir.tag(i)) {
+        case Inst::Tag::TaskCall:
+            out.push_back(ir.extra_data<TaskCallInfo>(p.extra).func);
+            break;
+        case Inst::Tag::Call:
+            out.push_back(ir.extra_data<CallInfo>(p.extra).func);
+            break;
+        case Inst::Tag::TaskCallVirtual:
+        case Inst::Tag::CallVirtual:
+            // The statically bound target, not the one dispatch picks. See the
+            // bound on the declaration -- consumers needing every override union
+            // the vtable slots themselves.
+            out.push_back(ir.extra_data<VirtualCallInfo>(p.extra).func);
+            break;
+        case Inst::Tag::Fork:
+            // ForkInfo::children holds FunctionIds as raw u32s, one per parallel
+            // child body.
+            for (const Index kid : ir.region(ir.extra_data<ForkInfo>(p.extra).children)) {
+                out.push_back(static_cast<FunctionId>(kid));
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void collect_callees(const Ir& ir, std::vector<FunctionId>& out) {
+    for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+        inst_callees(ir, static_cast<Index>(k), out);
+    }
+}
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -612,6 +647,12 @@ struct Structural {
             const Inst::Payload& p = ir.payload(i);
             const Inst::Tag      t = ir.tag(i);
 
+            // Call edges, from the one walker that knows them all. Unconditional
+            // and ahead of every arm below, so no tag can acquire per-arm handling
+            // (or lose it) and silently drop its edge -- the failure that left
+            // `Call` and `Fork` out of `facts.calls` while `TaskCall` was in.
+            inst_callees(ir, i, facts.calls);
+
             // Comb-fusion purity: a whitelist, so anything unclassified objects.
             // Tags with their own handling below (loads, stores, calls) are
             // exempted there; everything else must be `pure`.
@@ -683,13 +724,11 @@ struct Structural {
                 case Inst::Tag::TaskCall: {
                     const TaskCallInfo ti = ir.extra_data<TaskCallInfo>(p.extra);
                     call_actuals(ir, ti.func, ti.args, /*copy_out=*/true, &facts.writes);
-                    facts.calls.push_back(ti.func);
                     break;
                 }
                 case Inst::Tag::TaskCallVirtual: {
                     const VirtualCallInfo vci = ir.extra_data<VirtualCallInfo>(p.extra);
                     call_actuals(ir, vci.func, vci.args, /*copy_out=*/true, &facts.writes);
-                    facts.calls.push_back(vci.func);
                     break;
                 }
                 case Inst::Tag::Call: {
