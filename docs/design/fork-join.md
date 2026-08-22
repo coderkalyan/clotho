@@ -832,6 +832,47 @@ record/awaiter pattern); `$finish` mid-fork leaks suspended child frames
     goes with it, and 13.4.4's `watch_for_zero` (a captured class-handle formal) works
     for the same reason as an `int`.
 
+  **The box, per variable.** One box per captured variable, not one per activation:
+  per-variable keeps the trace precise and does not hold an unrelated local alive for
+  as long as any child of that activation runs, which for a `join_none` in a loop is
+  the whole loop's worth of captures.
+
+  A box is a **synthetic one-field class**, the shape `lower_process_class` already
+  uses for the PCB handle. That buys the whole mechanism with no new IR: `ClassNew`
+  allocates it through the GC fast path, the trace map falls out of the field table
+  (`class_gc_map_global`), reference semantics are what a class handle already has, and
+  the place is `HandleDeref` + `MemberSelect 0`. Nothing about it is keyed on a slang
+  type: `Module::set_class_desc` takes a bare `Ref`, and a fresh `type_id` is
+  `ClassIds::next++` without registering in the symbol map — the box is never `$cast`
+  to, never a base, and has no methods, so its slot table is empty.
+
+  **The wrinkle, and it decides the data structure.** `build_task` / `build_function`
+  keep the invariant *formal k == frame Local k*, which the backend prologue and
+  copy-out rely on. So a boxed FORMAL cannot simply become the box: the formal keeps
+  Local k as the ABI's copy-in target, and the box is a second slot. `FnCtx` therefore
+  needs `boxed: sym -> {box_local, box_class}` ALONGSIDE `localmap`, consulted first in
+  `value_lvalue`, with a prologue store copying Local k into the box once. The formal
+  slot is then write-only.
+
+  That leaves one case to refuse rather than get wrong: an `output` / `inout` formal
+  that is also captured. Its copy-out reads Local k, which no longer sees writes made
+  through the box, so the box would have to be copied back before every return.
+  Guarded loud until it has a reason to exist.
+
+  **Which locals box** is decided before the frame is laid out, because a boxed local
+  is boxed for every access in the activation, including ones lowered before the
+  `fork` is reached. A pre-pass over the body collects every `ValueSymbol` referenced
+  by a boxing fork's children; `fn_local` boxes a symbol in that set. The set is an
+  over-approximation on purpose — a module signal or a static in it is simply never a
+  frame local, so it never boxes — which keeps the pre-pass from having to resolve
+  storage class before storage exists.
+
+  **Which forks box:** the same predicate the join record already uses,
+  `kind != Join || design_uses_process_`. A plain `fork … join` parent outlives its
+  children, so its by-ref capture stays correct and stays a plain pointer; process
+  control breaks exactly that, because `kill` can take the parent's frame out from
+  under a live child (§V3), which is the second reason the refusal exists today.
+
   Still cross-cutting with the broader automatic-lifetime gap (`declare_local`): the
   boxing decision is per captured variable, so it is a strictly smaller change than
   giving every automatic true per-activation lifetime.
