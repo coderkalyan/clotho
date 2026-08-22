@@ -213,6 +213,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::ClassNew:
         case Inst::Tag::HandleDeref:
         case Inst::Tag::ClassIsA:
+        case Inst::Tag::ClassImplements:
         case Inst::Tag::IfaceRef:
         case Inst::Tag::IfaceSignal:
         case Inst::Tag::DynArrayNew:
@@ -1061,6 +1062,7 @@ struct ValueSweep {
                     val_x[raw] = 0;
                     break;
                 case Inst::Tag::ClassIsA:
+                case Inst::Tag::ClassImplements:
                     // A definite 1-bit answer: the test reads a compile-time
                     // constant table through the object's descriptor.
                     val_z[raw] = 0;
@@ -1740,38 +1742,49 @@ DesignFacts analyze(const Module& m) {
     // shallower pads the unused levels with the never-stale zero witness.
     facts.ref_epoch_formals = std::move(st.ref_epoch_formals);
     {
-        // slot index -> formal index -> epoch depth.
-        std::vector<std::vector<uint32_t>> slot_depth;
-        const auto                         note = [&](size_t slot, size_t k, uint32_t v) {
-            if (slot_depth.size() <= slot) {
-                slot_depth.resize(slot + 1);
-            }
-            if (slot_depth[slot].size() <= k) {
-                slot_depth[slot].resize(k + 1, 0);
-            }
-            slot_depth[slot][k] = std::max(slot_depth[slot][k], v);
-        };
-        for (const ClassDesc& vt : m.class_descs()) {
-            for (size_t slot = 0; slot < vt.slots.size(); ++slot) {
-                const auto      fid = static_cast<uint32_t>(vt.slots[slot]);
-                const Function& f   = m.function(vt.slots[slot]);
-                for (size_t k = 0; k < f.param_types.size(); ++k) {
-                    note(slot, k, facts.ref_epoch_depth(fid, k));
+        // slot index -> formal index -> epoch depth. TWO numbering spaces, run
+        // independently: the ordinary per-hierarchy vtable slots, and the
+        // design-wide interface-method indices an interface-handle dispatch uses
+        // (LRM 8.26, docs/design/interface-classes.md §5.4). A call site names one
+        // or the other, never both, so unioning them together would be sound but
+        // needlessly coarse.
+        const auto unify = [&](std::vector<FunctionId> ClassDesc::*table) {
+            std::vector<std::vector<uint32_t>> slot_depth;
+            const auto                         note = [&](size_t slot, size_t k, uint32_t v) {
+                if (slot_depth.size() <= slot) {
+                    slot_depth.resize(slot + 1);
                 }
-            }
-        }
-        for (const ClassDesc& vt : m.class_descs()) {
-            for (size_t slot = 0; slot < vt.slots.size(); ++slot) {
-                const auto      fid = static_cast<uint32_t>(vt.slots[slot]);
-                const Function& f   = m.function(vt.slots[slot]);
-                for (size_t k = 0; k < f.param_types.size() && k < slot_depth[slot].size(); ++k) {
-                    if (slot_depth[slot][k] != 0 && !f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
-                        uint32_t& cur = facts.ref_epoch_formals[(static_cast<uint64_t>(fid) << 32) | k];
-                        cur           = std::max(cur, slot_depth[slot][k]);
+                if (slot_depth[slot].size() <= k) {
+                    slot_depth[slot].resize(k + 1, 0);
+                }
+                slot_depth[slot][k] = std::max(slot_depth[slot][k], v);
+            };
+            for (const ClassDesc& vt : m.class_descs()) {
+                const std::vector<FunctionId>& entries = vt.*table;
+                for (size_t slot = 0; slot < entries.size(); ++slot) {
+                    const auto      fid = static_cast<uint32_t>(entries[slot]);
+                    const Function& f   = m.function(entries[slot]);
+                    for (size_t k = 0; k < f.param_types.size(); ++k) {
+                        note(slot, k, facts.ref_epoch_depth(fid, k));
                     }
                 }
             }
-        }
+            for (const ClassDesc& vt : m.class_descs()) {
+                const std::vector<FunctionId>& entries = vt.*table;
+                for (size_t slot = 0; slot < entries.size(); ++slot) {
+                    const auto      fid = static_cast<uint32_t>(entries[slot]);
+                    const Function& f   = m.function(entries[slot]);
+                    for (size_t k = 0; k < f.param_types.size() && k < slot_depth[slot].size(); ++k) {
+                        if (slot_depth[slot][k] != 0 && !f.arg_dirs.empty() && f.arg_dirs[k] == ArgDir::Ref) {
+                            uint32_t& cur = facts.ref_epoch_formals[(static_cast<uint64_t>(fid) << 32) | k];
+                            cur           = std::max(cur, slot_depth[slot][k]);
+                        }
+                    }
+                }
+            }
+        };
+        unify(&ClassDesc::slots);
+        unify(&ClassDesc::iface_slots);
     }
     facts.uses = st.uses;
 

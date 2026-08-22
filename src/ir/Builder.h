@@ -130,6 +130,10 @@ public:
     // is of `class_type` or of a class derived from it, else 0. A null handle
     // answers 1; the frontend emits this only for a cast-compatible pair.
     Index class_is_a(Index handle, Ref class_type, SourceLoc loc);
+    // Does the object `handle` refers to belong to a class that implements the
+    // interface class `iface_type` (LRM 8.26.5)? -> 1-bit 2-state; a null handle
+    // answers 1, like class_is_a.
+    Index class_implements(Index handle, Ref iface_type, SourceLoc loc);
     // Whole-object blocking copy `dst = src` of two aggregate lvalues of `type`
     // (lowered to llvm.memcpy of the storage; caller ensures no string leaf).
     Index agg_copy(Index dst, Index src, Ref type, SourceLoc loc);
@@ -344,11 +348,21 @@ public:
     // statically-resolved method (supplies the signature + result type); `slot` is
     // its vtable slot; `class_ref` the receiver's static class type; `args` is the
     // receiver handle followed by the formals (each resized to its parameter type).
-    Index call_virtual(FunctionId func, uint32_t slot, Ref class_ref, std::span<const Index> args, SourceLoc loc);
+    Index call_virtual(FunctionId             func,
+                       uint32_t               slot,
+                       Ref                    class_ref,
+                       std::span<const Index> args,
+                       SourceLoc              loc,
+                       uint32_t               iface_index = kNoIface);
 
     // Dynamically-dispatched virtual TASK call (LRM 8.20) — the task (coroutine)
     // ABI counterpart of call_virtual. Same operand shape.
-    Index task_call_virtual(FunctionId func, uint32_t slot, Ref class_ref, std::span<const Index> args, SourceLoc loc);
+    Index task_call_virtual(FunctionId             func,
+                            uint32_t               slot,
+                            Ref                    class_ref,
+                            std::span<const Index> args,
+                            SourceLoc              loc,
+                            uint32_t               iface_index = kNoIface);
 
     // Enable task `func`. `args` has one operand per formal in order: an rvalue for
     // an input formal, an lvalue leaf (a caller temp) for an output / inout formal,

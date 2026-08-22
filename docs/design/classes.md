@@ -215,14 +215,21 @@ Randomization has since landed alongside `$copy`, and by the same mechanism: two
 more reserved slots, `$randomize` and `$randops`, hold per-class synthesized bodies
 (docs/design/constrained-randomization.md). slang's built-in virtual `randomize` is
 still excluded from ordinary dispatch via `MethodFlags::BuiltIn`; the slot is
-reserved by name instead. **Interface
-classes** (LRM 8.26) are a separate gap, and a DAG rather than a tree: a display
-cannot answer "does this class implement interface I". The descriptor grows a
-sorted, transitively closed set of implemented interface ids (plus a bloom word
-for a one-load reject) beside the display, which is still computable from the
-class's own declaration and its ancestors. A `$cast` *from* an interface-class
-handle needs nothing new — the object behind it is always a real class, so its
-display answers as usual.
+reserved by name instead. **Interface classes** (LRM 8.26) have since landed, and
+they are a DAG rather than a tree: a display cannot answer "does this class implement
+interface I". So the descriptor grew a **bitmap of implemented interface ids** (ids
+are dense, so the test is exact: one load and one AND — no bloom word and no
+sorted-list scan, which is what the sketch this paragraph used to carry proposed)
+plus an **interface-method table** indexed by a design-wide interface method NAME
+index, so a dispatch through an interface handle is one vptr load and one
+constant-offset load, exactly what an ordinary virtual call costs. Both regions sit
+below the trace-map pointer, so the map's offset and the display's arithmetic are
+unchanged, and both are emitted only in a design that declares an interface class.
+The implemented set is the class's own declaration unioned with every base's, because
+slang's flattened list stops at the class that declares `implements`. A `$cast`
+*from* an interface-class handle needs nothing new — the object behind it is always a
+real class, so its display answers as usual. Full design and measurements in
+docs/design/interface-classes.md.
 
 **Null-handle dereference** (LRM 8.4) is a located fatal, not a fault. LRM 8.4
 calls an access to a non-static member through a null handle illegal, leaves the

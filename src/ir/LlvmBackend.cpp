@@ -2243,23 +2243,60 @@ private:
     // is at `vptr - 4*kMaxClassDepth + 4*d` -- literally the offset ClassIsA computes
     // below (`4 * class_depth(dest) - 4 * kMaxClassDepth`). The map pointer lands
     // BELOW the display, i.e. further negative, so no display offset depends on it.
+    // Interface classes (LRM 8.26) add two more regions, and BOTH sit below the
+    // trace-map pointer: the implemented-interface bitmap a `$cast` to an interface
+    // type tests, then the interface-method table an interface-handle dispatch loads
+    // its callee from. Placing them further negative is what keeps every offset
+    // above them -- the map's and the whole display's -- exactly where they were, so
+    // the runtime's own computation of the map offset and its startup cross-check
+    // need no notion of interface classes at all.
+    //
+    // Both regions have DESIGN-WIDE extents (Module::iface_count /
+    // iface_slot_count), which is what makes an entry's offset a constant at a site
+    // that does not know the object's class. They are emitted only when the design
+    // declares an interface class; otherwise this is byte-for-byte the descriptor
+    // clotho has always emitted (docs/design/interface-classes.md §4.3, §9).
     llvm::StructType* class_desc_ty(size_t slots) {
         auto* display = llvm::ArrayType::get(b_.getInt32Ty(), kMaxClassDepth);
         auto* vtable  = llvm::ArrayType::get(raw_ptr_ty(), slots);
-        return llvm::StructType::get(ctx_, { raw_ptr_ty(), display, vtable });
+        if (mod_.iface_count == 0) {
+            return llvm::StructType::get(ctx_, { raw_ptr_ty(), display, vtable });
+        }
+        auto* islots = llvm::ArrayType::get(raw_ptr_ty(), mod_.iface_slot_count);
+        auto* impl   = llvm::ArrayType::get(b_.getInt64Ty(), iface_bitmap_words());
+        return llvm::StructType::get(ctx_, { islots, impl, raw_ptr_ty(), display, vtable });
     }
 
-    // The constant negative byte offset from a vptr to its rt_gc_map pointer,
-    // computed from the DataLayout of the descriptor rather than hardcoded, and
-    // handed to the runtime in rt_gc_config::map_vptr_offset so that a descriptor
-    // layout change fails loudly at rt_gc_init instead of reading garbage
-    // (Gc.h:167-170). The slot count cannot affect it: the map and the display
-    // both precede the vtable.
-    int32_t gc_map_vptr_offset() {
+    // Words in the implemented-interface bitmap: one bit per interface class in the
+    // design, rounded up. Zero when the design declares none.
+    uint32_t iface_bitmap_words() const {
+        return (mod_.iface_count + 63) / 64;
+    }
+
+    // Element indices into class_desc_ty, which gains two leading fields when the
+    // design declares an interface class.
+    unsigned desc_map_field() const {
+        return mod_.iface_count == 0 ? 0 : 2;
+    }
+    unsigned desc_vtable_field() const {
+        return mod_.iface_count == 0 ? 2 : 4;
+    }
+
+    // The constant negative byte offset from a vptr to element `field` of its own
+    // descriptor, computed from the DataLayout rather than hardcoded. The slot count
+    // cannot affect it: every field this is asked about precedes the vtable.
+    int64_t desc_field_vptr_offset(unsigned field) {
         auto*       ty = class_desc_ty(/*slots=*/1);
         const auto* sl = env_->llmod.getDataLayout().getStructLayout(ty);
-        const auto  off = static_cast<int64_t>(sl->getElementOffset(0)) -
-                          static_cast<int64_t>(sl->getElementOffset(2));
+        return static_cast<int64_t>(sl->getElementOffset(field)) -
+               static_cast<int64_t>(sl->getElementOffset(desc_vtable_field()));
+    }
+
+    // The offset handed to the runtime in rt_gc_config::map_vptr_offset, so a
+    // descriptor layout change fails loudly at rt_gc_init instead of reading garbage
+    // (Gc.h:167-170). Unchanged by the interface regions, deliberately (above).
+    int32_t gc_map_vptr_offset() {
+        const int64_t off = desc_field_vptr_offset(desc_map_field());
         assert(off < 0 && "the map pointer sits below the vptr");
         return static_cast<int32_t>(off);
     }
@@ -2291,6 +2328,41 @@ private:
         }
         auto*                        ty = class_desc_ty(entries.size());
         std::vector<llvm::Constant*> init_fields;
+        if (mod_.iface_count != 0) {
+            // The interface-method table, padded to the design-wide extent so an
+            // entry's offset is one constant (LRM 8.26). A class that implements no
+            // interface class emits an all-holes table: it can never be the object
+            // behind an interface handle, so no dispatch reads it.
+            std::vector<llvm::Constant*> islots;
+            islots.reserve(mod_.iface_slot_count);
+            for (uint32_t i = 0; i < mod_.iface_slot_count; ++i) {
+                if (i < cd->iface_slots.size()) {
+                    islots.push_back(sym(fn_decls_[static_cast<uint32_t>(cd->iface_slots[i])]));
+                } else if (mod_.iface_unreachable.has_value()) {
+                    islots.push_back(sym(fn_decls_[static_cast<uint32_t>(*mod_.iface_unreachable)]));
+                } else {
+                    // The design declares an interface class but nothing implements
+                    // one, so no dispatch can land in this table at all: the only
+                    // handle that could reach it is null, and the null guard ahead of
+                    // the vtable load fires first (LRM 8.4).
+                    islots.push_back(llvm::Constant::getNullValue(raw_ptr_ty()));
+                }
+            }
+            init_fields.push_back(
+              llvm::ConstantArray::get(llvm::ArrayType::get(raw_ptr_ty(), mod_.iface_slot_count), islots));
+            // The implemented-interface bitmap: bit `id` of word `id / 64`.
+            std::vector<uint64_t> words(iface_bitmap_words(), 0);
+            for (const uint32_t id : cd->iface_ids) {
+                words[id / 64] |= uint64_t{ 1 } << (id % 64);
+            }
+            std::vector<llvm::Constant*> bits;
+            bits.reserve(words.size());
+            for (const uint64_t w : words) {
+                bits.push_back(b_.getInt64(w));
+            }
+            init_fields.push_back(
+              llvm::ConstantArray::get(llvm::ArrayType::get(b_.getInt64Ty(), words.size()), bits));
+        }
         init_fields.push_back(class_gc_map_global(class_ref));
         init_fields.push_back(
           llvm::ConstantArray::get(llvm::ArrayType::get(b_.getInt32Ty(), kMaxClassDepth), disp));
@@ -2312,32 +2384,55 @@ private:
     }
 
     // The value an object body's header holds: the address of its class's vtable
-    // slot 0, i.e. the descriptor global past the trace map pointer and the display
-    // that precede it -- field 2, element 0.
+    // slot 0, i.e. the descriptor global past the trace map pointer, the display,
+    // and (in a design with interface classes) the two interface regions that
+    // precede them.
     llvm::Constant* class_vptr(Ref class_ref) {
         llvm::GlobalVariable* g = class_desc_global(class_ref);
         return llvm::ConstantExpr::getGetElementPtr(
           g->getValueType(), g,
-          std::array<llvm::Constant*, 3>{ b_.getInt32(0), b_.getInt32(2), b_.getInt32(0) });
+          std::array<llvm::Constant*, 3>{ b_.getInt32(0), b_.getInt32(desc_vtable_field()), b_.getInt32(0) });
     }
 
     // A stand-in object body for a null handle in a `$cast` type test: one word
     // pointing just past an all-zero display, so reading any display entry off it
     // yields 0 ("no class") instead of faulting. Lets the test stay branch-free;
     // the null answer itself comes from the separate compare against 0.
+    //
+    // With interface classes in the design the same word must also stand in for the
+    // implemented-interface bitmap an interface test reads, which sits below the
+    // display -- so the zero region becomes a whole slot-less descriptor and the
+    // word points at where its vtable would start. A zeroed bitmap reads as
+    // "implements nothing", the closed-fail answer, exactly as a zeroed display
+    // reads as "no class".
     llvm::Constant* null_object_global() {
         if (auto* g = env_->llmod.getNamedGlobal("clotho.nullobj")) {
             return g;
         }
-        auto* disp_ty = llvm::ArrayType::get(b_.getInt32Ty(), kMaxClassDepth);
-        auto* disp    = new llvm::GlobalVariable(env_->llmod,
-                                                 disp_ty,
-                                                 /*isConstant=*/true,
-                                                 llvm::GlobalValue::PrivateLinkage,
-                                                 llvm::ConstantAggregateZero::get(disp_ty),
-                                                 "clotho.nulldisplay");
-        auto* past    = llvm::ConstantExpr::getGetElementPtr(
-          disp_ty, disp, std::array<llvm::Constant*, 2>{ b_.getInt32(0), b_.getInt32(kMaxClassDepth) });
+        llvm::Constant* past = nullptr;
+        if (mod_.iface_count == 0) {
+            auto* disp_ty = llvm::ArrayType::get(b_.getInt32Ty(), kMaxClassDepth);
+            auto* disp    = new llvm::GlobalVariable(env_->llmod,
+                                                     disp_ty,
+                                                     /*isConstant=*/true,
+                                                     llvm::GlobalValue::PrivateLinkage,
+                                                     llvm::ConstantAggregateZero::get(disp_ty),
+                                                     "clotho.nulldisplay");
+            past          = llvm::ConstantExpr::getGetElementPtr(
+              disp_ty, disp, std::array<llvm::Constant*, 2>{ b_.getInt32(0), b_.getInt32(kMaxClassDepth) });
+        } else {
+            auto* desc_ty = class_desc_ty(/*slots=*/0);
+            auto* desc    = new llvm::GlobalVariable(env_->llmod,
+                                                     desc_ty,
+                                                     /*isConstant=*/true,
+                                                     llvm::GlobalValue::PrivateLinkage,
+                                                     llvm::ConstantAggregateZero::get(desc_ty),
+                                                     "clotho.nulldesc");
+            past          = llvm::ConstantExpr::getGetElementPtr(
+              desc_ty,
+              desc,
+              std::array<llvm::Constant*, 3>{ b_.getInt32(0), b_.getInt32(desc_vtable_field()), b_.getInt32(0) });
+        }
         return new llvm::GlobalVariable(
           env_->llmod, raw_ptr_ty(), /*isConstant=*/true, llvm::GlobalValue::PrivateLinkage, past, "clotho.nullobj");
     }
@@ -8159,14 +8254,21 @@ private:
         // union the ref ABI takes (Analysis.cpp). Following the statically named
         // target alone, as collect_callees does, would miss an override's draw and
         // silently leave its caller without a state to hand it.
+        // Two numbering spaces: ordinary vtable slots, and the design-wide
+        // interface-method indices an interface-handle dispatch uses (LRM 8.26).
         std::vector<std::vector<FunctionId>> slot_fns;
+        std::vector<std::vector<FunctionId>> iface_fns;
+        const auto collect = [](std::vector<std::vector<FunctionId>>& into, const std::vector<FunctionId>& from) {
+            if (into.size() < from.size()) {
+                into.resize(from.size());
+            }
+            for (size_t s = 0; s < from.size(); ++s) {
+                into[s].push_back(from[s]);
+            }
+        };
         for (const ClassDesc& vt : mod_.class_descs()) {
-            if (slot_fns.size() < vt.slots.size()) {
-                slot_fns.resize(vt.slots.size());
-            }
-            for (size_t s = 0; s < vt.slots.size(); ++s) {
-                slot_fns[s].push_back(vt.slots[s]);
-            }
+            collect(slot_fns, vt.slots);
+            collect(iface_fns, vt.iface_slots);
         }
 
         // Every body whose draws are charged to `ir`'s own state: its callees, the
@@ -8187,9 +8289,12 @@ private:
                         break;
                     case Inst::Tag::CallVirtual:
                     case Inst::Tag::TaskCallVirtual: {
-                        const uint32_t slot = ir.extra_data<VirtualCallInfo>(p.extra).slot;
-                        if (slot < slot_fns.size()) {
-                            out.insert(out.end(), slot_fns[slot].begin(), slot_fns[slot].end());
+                        const auto vci = ir.extra_data<VirtualCallInfo>(p.extra);
+                        const std::vector<std::vector<FunctionId>>& table =
+                          vci.iface_index != kNoIface ? iface_fns : slot_fns;
+                        const uint32_t idx = vci.iface_index != kNoIface ? vci.iface_index : vci.slot;
+                        if (idx < table.size()) {
+                            out.insert(out.end(), table[idx].begin(), table[idx].end());
                         }
                         break;
                     }
@@ -12080,9 +12185,9 @@ private:
             const auto           i = static_cast<Index>(k);
             const Inst::Payload& p = ir.payload(i);
             switch (ir.tag(i)) {
-                case Inst::Tag::ClassNew:
                 case Inst::Tag::HandleDeref:
                 case Inst::Tag::ClassIsA:
+                case Inst::Tag::ClassImplements:
                 // A virtual dispatch loads the vtable out of its receiver's object
                 // body (load_vtable_callee), so it always has a handle in hand.
                 case Inst::Tag::CallVirtual:
@@ -14366,7 +14471,9 @@ private:
                 return { 1, true, false };
 
             case Inst::Tag::ClassIsA:
-                // A definite bit: the display entry either matches or it does not.
+            case Inst::Tag::ClassImplements:
+                // A definite bit: the display entry or the interface bit either
+                // matches or it does not.
                 return { 1, false, false };
 
             case Inst::Tag::Concat: {
@@ -15377,6 +15484,35 @@ private:
                 const int64_t off  = static_cast<int64_t>(4 * class_depth(dest)) - 4 * kMaxClassDepth;
                 llvm::Value* ent = b_.CreateLoad(b_.getInt32Ty(), b_.CreateGEP(b_.getInt8Ty(), vptr, b_.getInt64(off)));
                 llvm::Value* ok  = b_.CreateICmpEQ(ent, b_.getInt32(cd->type_id));
+                set_value(i, two_val(b_.CreateOr(ok, isnull)));
+                return;
+            }
+            case Inst::Tag::ClassImplements: {
+                // `$cast` to an interface-class type (LRM 8.26.5). The object's
+                // descriptor carries a bitmap of the interfaces its class implements
+                // -- transitively and through its base chain -- so the test is one
+                // load of the word holding the destination interface's bit and one
+                // mask, both offsets constant at the site.
+                //
+                // Branch-free, and null-safe by the same sentinel ClassIsA uses: the
+                // stand-in object's bitmap is all zeros ("implements nothing"), and
+                // the null answer comes from the separate compare against 0.
+                const Ref                     iface = p.op_type.type;
+                const std::optional<uint32_t> id    = mod_.iface_type_id(iface);
+                if (!id.has_value()) {
+                    throw BackendError{ "internal: interface class without an id" };
+                }
+                llvm::Value* handle = must_of(value_of(p.op_type.op));
+                llvm::Value* isnull = b_.CreateICmpEQ(handle, b_.getInt64(0));
+                llvm::Value* obj =
+                  b_.CreateSelect(isnull, null_object_global(), b_.CreateIntToPtr(handle, raw_ptr_ty()));
+                llvm::Value* vptr = b_.CreateLoad(raw_ptr_ty(), obj);
+                const int64_t off = desc_field_vptr_offset(/*field=*/1) +
+                                    static_cast<int64_t>(*id / 64) * 8;
+                llvm::Value* word =
+                  b_.CreateLoad(b_.getInt64Ty(), b_.CreateGEP(b_.getInt8Ty(), vptr, b_.getInt64(off)));
+                llvm::Value* bit = b_.CreateAnd(word, b_.getInt64(uint64_t{ 1 } << (*id % 64)));
+                llvm::Value* ok  = b_.CreateICmpNE(bit, b_.getInt64(0));
                 set_value(i, two_val(b_.CreateOr(ok, isnull)));
                 return;
             }
@@ -22040,6 +22176,17 @@ private:
         llvm::Value* body = b_.CreateIntToPtr(handle, raw_ptr_ty());
         llvm::Value* vptr = b_.CreateLoad(
             raw_ptr_ty(), b_.CreateStructGEP(class_body_ty(vci.class_ref), body, 0));
+        if (vci.iface_index != kNoIface) {
+            // A dispatch through an interface-class handle (LRM 8.26) indexes the
+            // interface-method table instead, which sits at a design-wide constant
+            // NEGATIVE offset from the vptr. Same instruction count as an ordinary
+            // virtual call: one vptr load, one callee load, both at constant offsets
+            // (docs/design/interface-classes.md §5.3).
+            const int64_t off = desc_field_vptr_offset(/*field=*/0) +
+                                static_cast<int64_t>(vci.iface_index) * 8;
+            llvm::Value* entry = b_.CreateGEP(b_.getInt8Ty(), vptr, b_.getInt64(off));
+            return b_.CreateLoad(raw_ptr_ty(), entry);
+        }
         llvm::Value* slot = b_.CreateGEP(raw_ptr_ty(), vptr, { b_.getInt32(vci.slot) });
         return b_.CreateLoad(raw_ptr_ty(), slot);
     }
