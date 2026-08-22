@@ -912,18 +912,23 @@ is a use-after-free, none of which a value check would show.
 The leaks LeakSanitizer does report are accounted for exactly, which is the point of
 citing them rather than the summary line:
 
-- 27 process cases leak **432 bytes in 27 allocations** = one 16-byte `process`
-  object per design. (Derived from the 6064-in-28 measurement this bullet used to
-  carry by striking the single term below; not yet re-measured under
-  `-DCLOTHO_SANITIZE=ON`.) The 5632-byte control-block pool chunk that headed the
-  list is gone: `rt_run_init` frees every chunk in `g_proc_chunks` at the start of
-  the following run (§4.1's pool has no static first chunk, so every chunk is the
-  pool's own), which also bounds a long `clotho_test` process instead of letting
-  one chunk per design accumulate. Class bodies still leak on this branch by
-  direction (`LlvmBackend.cpp`, `ClassNew`: "with --gc off the lifetime is leaked,
-  which LRM 8.4 makes observably correct"), and a `process` object is a class body.
-  For comparison, the class suite leaks 10 648 bytes in 104 allocations for the same
-  reason.
+- `tests/process_test.cpp`, 35 cases: **6096 bytes in 30 allocations** = ONE
+  5632-byte control-block pool chunk plus one 16-byte `process` object per design
+  that leaks one. Measured under `-DCLOTHO_SANITIZE=ON`.
+  The pool term is now O(1) in the process rather than O(designs). `g_proc_chunks`
+  was never cleared and its chunks never freed, so before `rt_run_init` every
+  design's chunks accumulated for the life of the `clotho_test` process; now each
+  run starts by freeing the previous run's (§4.1's pool has no static first chunk,
+  so every chunk is the pool's own). What LeakSanitizer still sees is the FINAL
+  run's chunk, which by construction no later run exists to free — a reset seam
+  bounds the pool, it does not tidy up after the last design, and that is the
+  intended trade (`rt_gc_init` makes the same one).
+  `tests/fork_test.cpp`, 39 cases, reports **384 bytes in 6 allocations and no pool
+  chunk at all**, which is also the check that the V4 capture boxes are collected:
+  a per-capture leak would show up there first.
+  Class bodies still leak on this branch by direction (`LlvmBackend.cpp`,
+  `ClassNew`: "with --gc off the lifetime is leaked, which LRM 8.4 makes observably
+  correct"), and a `process` object is a class body.
 - **The freelist demonstrably works.** 2000 spawn / `disable fork` cycles whose
   children never call `self()` leak *16 bytes in 1 allocation* -- one chunk's worth of
   blocks, recycled 2000 times. The same 2000 cycles where each child DOES call
