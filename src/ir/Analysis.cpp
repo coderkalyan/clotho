@@ -1475,24 +1475,25 @@ struct ValueSweep {
                 }
 
                 case Inst::Tag::Fork: {
-                    // A fork child aliases each captured enclosing local through a
-                    // ref formal (Lower.cpp's lower_fork), so it reads that storage
-                    // on entry and writes whatever x/z it produces straight back --
-                    // exactly an inout/ref task actual, and handled the same way.
-                    // Every child takes the same capture list, so arg k feeds
-                    // formal k of every child.
+                    // A fork child receives each capture as a GC box HANDLE by value
+                    // (Lower.cpp's lower_fork), so an arg is an ordinary In scalar and
+                    // is treated exactly like a Call's In actual. The shared variable's
+                    // own x/z does not travel here at all: it lives in the box's single
+                    // field, and a child's write to it is an ordinary store through a
+                    // class member, which the Store cases already sweep. Every child
+                    // takes the same capture list, so arg k feeds formal k of every
+                    // child.
                     const ForkInfo               fi   = ir.extra_data<ForkInfo>(p.extra);
                     const std::span<const Index> args = ir.region(fi.args);
                     for (const Index kid : ir.region(fi.children)) {
                         FnState& cs = fns[static_cast<uint32_t>(kid)];
                         for (size_t k = 0; k < args.size(); ++k) {
-                            if (storage_z(ir, fn, args[k])) {
+                            if (z_of(args[k]) != 0) {
                                 mark(cs.param_z[k]);
                             }
-                            if (storage_x(ir, fn, args[k])) {
+                            if (x_of(args[k]) != 0) {
                                 mark(cs.param_x[k]);
                             }
-                            store_into(ir, fn, args[k], cs.local_z[k] != 0, cs.local_x[k] != 0);
                         }
                     }
                     val_x[raw] = 0;

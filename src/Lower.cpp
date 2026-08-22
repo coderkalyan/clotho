@@ -792,6 +792,9 @@ struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
 // against.
 struct ValueRefScan : ASTVisitor<ValueRefScan, VisitFlags::AllGood> {
     ankerl::unordered_dense::set<const slang::ast::ValueSymbol*>* out;
+    // Set when a bare non-static class property is referenced, i.e. a read through the
+    // enclosing method's implicit `this`. Optional: only BoxCandidateScan cares.
+    bool* implicit_this = nullptr;
 
     // A declaration's initializer hangs off the SYMBOL, not the statement, so a
     // statement walk does not reach it. Without this, `fork begin automatic int k = j;
@@ -806,33 +809,61 @@ struct ValueRefScan : ASTVisitor<ValueRefScan, VisitFlags::AllGood> {
     }
 
     void handle(const NamedValueExpression& nv) {
-        out->insert(&nv.symbol);
+        take(nv.symbol);
     }
     void handle(const HierarchicalValueExpression& hv) {
-        out->insert(&hv.symbol);
+        take(hv.symbol);
+    }
+
+    void take(const slang::ast::ValueSymbol& sym) {
+        out->insert(&sym);
+        if (implicit_this == nullptr) {
+            return;
+        }
+        // A bare `p` inside a method arrives as a NamedValue on the PROPERTY, not as
+        // anything rooted at `this` (value_lvalue is what re-roots it), so the `this`
+        // reference is implied rather than written and has to be recovered here.
+        if (const auto* prop = sym.as_if<slang::ast::ClassPropertySymbol>()) {
+            if (prop->lifetime != slang::ast::VariableLifetime::Static) {
+                *implicit_this = true;
+            }
+        }
     }
 };
 
-// Symbols a DETACHING fork's children reference anywhere in a subroutine body, which
-// is the set whose frame locals have to be boxed (docs/design/fork-join.md V4). Run
-// before the frame is laid out, because a boxed local is boxed for every access in the
-// activation -- including accesses lowered before the `fork` is reached.
+// Symbols a fork's children reference anywhere in a subroutine body, which is the set
+// whose frame locals have to be boxed (docs/design/fork-join.md V4). Run before the
+// frame is laid out, because a boxed local is boxed for every access in the activation
+// -- including accesses lowered before the `fork` is reached.
 //
 // Deliberately an over-approximation: it collects every reference, not just the ones
 // that turn out to be this frame's locals, so it needs no notion of storage class at a
 // point where storage does not exist yet. A module signal or a static in the set is
 // never a frame local, so it never boxes.
 //
-// `fork..join` is excluded: its parent outlives every child by construction, so its
-// captures stay plain frame pointers. (A `kill` on a joining parent breaks that -- an
-// existing hole, tracked in the design doc, not widened here.)
+// EVERY fork kind, `join` included. The storage a capture needs is not a property of
+// the join kind -- it is a property of the capture, and the fat `ArgDir::Ref` ABI could
+// carry only a packed integral or a dynamic array, which is why `join` refused a
+// string / real / unpacked / queue / handle local outright. `join`'s "the parent
+// outlives every child" also has one real counterexample: `kill` on a joining parent
+// (docs/design/process-class.md §11), which left a child holding a pointer into a freed
+// coroutine frame. One storage rule for all three kinds retires both problems, and
+// costs nothing in a design whose forks capture nothing -- which includes every fork in
+// a PROCESS body, where the parent's variables are module signals.
 struct BoxCandidateScan : ASTVisitor<BoxCandidateScan, VisitFlags::AllGood> {
     ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> candidates;
+    // A child reads a class property of the enclosing method through the implicit
+    // `this`. The handle it needs is the method's own `this` automatic, which is not a
+    // ValueSymbol this scan can name (it hangs off the SubroutineSymbol), so it travels
+    // as a flag and install_capture_boxes resolves it against `sub.thisVar`.
+    bool implicit_this = false;
 
     void handle(const BlockStatement& blk) {
-        if (blk.blockKind == StatementBlockKind::JoinAny || blk.blockKind == StatementBlockKind::JoinNone) {
+        if (blk.blockKind == StatementBlockKind::JoinAll || blk.blockKind == StatementBlockKind::JoinAny ||
+            blk.blockKind == StatementBlockKind::JoinNone) {
             ValueRefScan rs;
-            rs.out = &candidates;
+            rs.out           = &candidates;
+            rs.implicit_this = &implicit_this;
             blk.body.visit(rs);
         }
         visitDefault(blk);
@@ -878,24 +909,30 @@ struct SpawnInitScan : ASTVisitor<SpawnInitScan, VisitFlags::AllGood> {
 // ref formal (lower_fork / build_fork_child). Deduped and kept in first-reference
 // order, because that order IS the child's formal order.
 //
-// `implicit_this` is the case a ref formal cannot carry: a bare property
-// reference inside a class method, which value_lvalue resolves through the
-// enclosing frame's `this` handle. An explicit `this.p` needs no separate flag --
-// it reads the `this` local itself, so it lands in `captured` and is refused by
-// the capture type check.
+// A bare property reference inside a class method captures the enclosing method's
+// `this`, and nothing else: value_lvalue re-roots such a reference at the `this`
+// automatic, so that automatic is the frame symbol the child needs. `this` is a real
+// slang ValueSymbol (SubroutineSymbol::thisVar) living in localmap like any other
+// automatic, so it is captured by exactly the same machinery -- an explicit `this.p`
+// already arrived that way.
 struct ForkCaptureDetector : ASTVisitor<ForkCaptureDetector, VisitFlags::AllGood> {
     const ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, uint32_t>* locals;
     // Boxed captures are NOT in `locals`: a boxed declared local has no frame slot of
     // its own, precisely so nothing initializes the variable through a slot typed as
     // the box. They are still this frame's, so they still have to be captured.
     const ankerl::unordered_dense::set<const slang::ast::ValueSymbol*>* boxed = nullptr;
-    std::vector<const slang::ast::ValueSymbol*>                                   captured;
-    bool                                                                          implicit_this = false;
+    // The enclosing method's `this` automatic, when there is one.
+    const slang::ast::ValueSymbol*                                      this_var = nullptr;
+    std::vector<const slang::ast::ValueSymbol*>                         captured;
 
     void check(const slang::ast::ValueSymbol& sym) {
         if (const auto* prop = sym.as_if<slang::ast::ClassPropertySymbol>()) {
             if (prop->lifetime != slang::ast::VariableLifetime::Static) {
-                implicit_this = true;
+                // The property itself is heap storage the child reaches through the
+                // handle; what has to travel is the handle.
+                if (this_var != nullptr) {
+                    check(*this_var);
+                }
                 return;
             }
         }
@@ -9028,23 +9065,24 @@ private:
             return; // `fork join` with no children: a no-op.
         }
 
-        // Inside a task, a child body gets its OWN frame, so a reference to the
-        // enclosing task's formals or automatics cannot resolve the way it does in
-        // a process (where every parent variable is a module signal). Pass each
-        // such symbol in as an ArgDir::Ref formal — the same live-pointer ABI a
-        // `ref` argument uses (docs/design/ref-args.md).
+        // Inside a task or a function, a child body gets its OWN frame, so a
+        // reference to the enclosing formals or automatics cannot resolve the way it
+        // does in a process (where every parent variable is a module signal). Each
+        // such variable lives in a GC box for the whole activation, and the child
+        // receives the box HANDLE by value (docs/design/fork-join.md V4).
         //
-        // That ABI is a raw pointer into the enclosing frame, so it needs the
-        // enclosing frame to outlive every child. `join` gives that for free. The
-        // other two kinds do not: a `join_none` parent walks straight past the fork
-        // and can return, and a `join_any` parent resumes on the first completion
-        // with siblings still live, so either can free the frame under a child that
-        // is still holding a pointer into it. Refused below rather than mis-lowered;
-        // it lifts with V4's per-spawn copies (docs/design/fork-join.md).
+        // One rule for all three join kinds. The predecessor passed a fat
+        // `ArgDir::Ref` -- a raw pointer into the enclosing frame -- under `join`
+        // only, and that had two independent limits, neither of them about the join
+        // kind: the ref ABI could carry only a packed integral or a dynamic array, so
+        // a string / real / unpacked / queue / handle capture was refused outright;
+        // and a `kill` on a joining parent frees the frame under children that abort
+        // later (docs/design/process-class.md §11), so even `join` did not really
+        // guarantee the lifetime the pointer needed. The box has reference semantics,
+        // which is what LRM 9.3.2 asks for (an enclosing automatic is ONE variable),
+        // and a live coroutine frame is a conservative GC root, so it outlives the
+        // parent activation with no refcount and no ownership surgery.
         std::vector<const ValueSymbol*> captures;
-        // Whether the captures travel as box handles by value rather than as fat refs
-        // into this frame. Set with the guards below.
-        bool box_captures = false;
         if (fn_ctx_ != nullptr) {
             // LRM 13.4.4 allows `fork … join_none` in a function -- it schedules
             // processes and returns, consuming no time -- and slang enforces the rest
@@ -9068,51 +9106,27 @@ private:
             for (const auto& [sym, bx] : fn_ctx_->boxed) {
                 boxed_syms.insert(sym);
             }
-            d.boxed = &boxed_syms;
+            d.boxed    = &boxed_syms;
+            d.this_var = fn_ctx_->this_var;
             for (const Statement* c : children) {
                 c->visit(d);
             }
-            if (d.implicit_this) {
-                // TODO: capture of `this` (LRM 8.11 inside 9.3.2) — a child would
-                // need the enclosing method's handle as a ref formal, which the ref
-                // ABI does not carry (it is a packed-slot pointer).
-                fail(std::string(kind_name) +
-                     " child that reads a class property of the enclosing "
-                     "method is not supported");
-            }
-            // A detaching fork's captures ride GC boxes installed at body entry
-            // (install_capture_boxes), so neither refusal below applies to them: the
-            // box outlives the frame, and only its handle is passed, so the fat ref
-            // ABI is not involved. A symbol reaching here unboxed under a detaching
-            // kind would be a lowering bug, not a source-level refusal.
-            box_captures = kind != ir::ForkKind::Join;
+            // Every capture rides a GC box installed at body entry, by the same
+            // BoxCandidateScan that ran over this fork before the frame was laid out.
+            // A miss is therefore a lowering bug -- the two walks disagreed -- not a
+            // source-level refusal, and it is reported as one.
             for (const ValueSymbol* sym : d.captured) {
-                const auto& ct = sym->getType().getCanonicalType();
-                if (box_captures) {
-                    if (!fn_ctx_->boxed.contains(sym)) {
-                        fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
-                             std::string(sym->name) + "' is not supported (internal: no capture box)");
-                    }
-                    continue;
-                }
-                if (kind != ir::ForkKind::Join) {
+                if (!fn_ctx_->boxed.contains(sym)) {
                     fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
-                         std::string(sym->name) +
-                         "' is not supported (only fork..join can capture an enclosing frame: the "
-                         "parent has to outlive every child for the reference to stay valid)");
-                }
-                if (!ct.isIntegral() && ct.as_if<slang::ast::DynamicArrayType>() == nullptr) {
-                    // TODO: capture of an unpacked array / struct / string / real /
-                    // queue / class-handle local. Exactly the ref ABI's own gap, so
-                    // the two lift together (docs/design/ref-args.md).
-                    fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
-                         std::string(sym->name) +
-                         "' is not supported (only packed integral and dynamic-array "
-                         "locals can be captured)");
+                         std::string(sym->name) + "' is not supported (internal: no capture box)");
                 }
             }
             captures = std::move(d.captured);
-            if (box_captures) {
+            // Spawn-time initialization only matters where the child's body runs
+            // LATER than the spawn. A `join` child is ramped and resumed inline at the
+            // fork (lower_fork_inst), so its declaration initializers run at the spawn
+            // already, which is exactly what 9.3.2 asks for.
+            if (kind != ir::ForkKind::Join) {
                 for (const Statement* c : children) {
                     SpawnInitScan si;
                     si.captured = &captures;
@@ -9133,26 +9147,19 @@ private:
         std::vector<ir::FunctionId> ids;
         ids.reserve(children.size());
         for (const Statement* c : children) {
-            ids.push_back(build_fork_child(*c, captures, kind, box_captures));
+            ids.push_back(build_fork_child(*c, captures, kind));
         }
 
-        // The capture actuals, in the order the children took their formals.
-        // Evaluated here, in the ENCLOSING frame (build_fork_child's FnScope is
-        // already unwound): value_lvalue resolves each to its frame Local, which is
-        // the whole, unmasked, zero-offset lvalue the backend's ref_actual_ptr
-        // requires.
+        // The capture actuals, in the order the children took their formals: each is
+        // the box HANDLE by value, an rvalue rather than the box's own frame slot, so
+        // nothing the child holds points into this activation. Evaluated here, in the
+        // ENCLOSING frame (build_fork_child's FnScope is already unwound).
         const ir::SourceLoc    l = loc(blk);
         std::vector<ir::Index> args;
         args.reserve(captures.size());
         for (const ValueSymbol* sym : captures) {
-            if (box_captures) {
-                // The box HANDLE, by value: an rvalue, not the box's own frame slot,
-                // so nothing the child holds points into this activation.
-                const FnCtx::Boxed& bx = fn_ctx_->boxed.at(sym);
-                args.push_back(b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l));
-                continue;
-            }
-            args.push_back(value_lvalue(*sym, b, l));
+            const FnCtx::Boxed& bx = fn_ctx_->boxed.at(sym);
+            args.push_back(b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l));
         }
         b.fork(ids, args, kind, l);
     }
@@ -23382,10 +23389,15 @@ private:
         const SubroutineSymbol* sym = nullptr;
         // Class method context (valid iff has_this): `this` is spliced as frame
         // Local 0, `this_class` is its Kind::Class handle type. A bare property
-        // reference inside the body roots at this Local (value_lvalue).
+        // reference inside the body roots at this handle (value_lvalue -> this_handle).
         bool     has_this   = false;
         uint32_t this_local = 0;
         ir::Ref  this_class = ir::Ref::Invalid;
+        // slang's own symbol for `this` (SubroutineSymbol::thisVar). It is an ordinary
+        // automatic of this frame, which is what lets a fork child capture it; every
+        // reader of the handle goes through this_handle so a BOXED `this` is read out
+        // of its box rather than out of Local 0.
+        const ValueSymbol* this_var = nullptr;
         // Captured automatics that live in a GC box rather than in the frame, so a
         // detached fork child can share them after this activation is gone (LRM 9.3.2
         // makes an enclosing automatic ONE variable; docs/design/fork-join.md V4).
@@ -23442,6 +23454,19 @@ private:
         return b.member_select(b.handle_deref(handle, bx.cls, l), 0, bx.cls, l);
     }
 
+    // The enclosing method's `this` handle, as a value. One helper rather than four
+    // copies of the load, because `this` is now a capturable automatic like any other:
+    // when a fork child reads a class property of the enclosing method, `this` is boxed
+    // and the handle has to be read out of the box.
+    ir::Index this_handle(ir::Builder& b, ir::SourceLoc l) {
+        if (fn_ctx_->this_var != nullptr) {
+            if (const auto bx = fn_ctx_->boxed.find(fn_ctx_->this_var); bx != fn_ctx_->boxed.end()) {
+                return b.unary(ir::Inst::Tag::Load, boxed_lvalue(bx->second, b, l), l);
+            }
+        }
+        return b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
+    }
+
     // Allocate a box for every automatic of THIS activation that a detaching fork's
     // children reference, before the body is lowered (docs/design/fork-join.md V4).
     //
@@ -23471,8 +23496,9 @@ private:
                 // TODO: capture of an output / inout formal. Its copy-out reads the
                 // formal's own frame slot, which does not see writes made through the
                 // box, so the box would have to be copied back before every return.
-                fail("fork..join_any / fork..join_none child that reads the enclosing "
-                     "subroutine's '" + std::string(fa->name) +
+                // Raised here, where the fork's join kind is not in scope, so the
+                // wording names the construct rather than a kind.
+                fail("a fork child that reads the enclosing subroutine's '" + std::string(fa->name) +
                      "' is not supported: capturing an output or inout formal would lose "
                      "the writes made through it");
             }
@@ -23482,6 +23508,17 @@ private:
             if (scan.candidates.contains(vs)) {
                 box_one_capture(*vs, /*copy_in=*/false, b, l);
             }
+        }
+        // `this` last, and only if a child needs it. It is an ordinary automatic of
+        // this frame -- slang makes it a VariableSymbol with Automatic lifetime -- but
+        // it is in neither getArguments() nor the body's declarations, so neither loop
+        // above reaches it. `copy_in` is right for the same reason it is right for a
+        // formal: splice_this already gave it Local 0 and the backend's prologue fills
+        // that slot from argument 0. It is also `const`, so the box's only job is
+        // lifetime -- but uniformity is worth more here than saving one indirection in
+        // a method that spawns.
+        if (sub.thisVar != nullptr && (scan.implicit_this || scan.candidates.contains(sub.thisVar))) {
+            box_one_capture(*sub.thisVar, /*copy_in=*/true, b, l);
         }
     }
 
@@ -23769,10 +23806,8 @@ private:
             if (fn_ctx_->has_this) {
                 if (const auto* prop = vs.as_if<slang::ast::ClassPropertySymbol>()) {
                     // A bare property reference inside a method (implicit `this`):
-                    // load the `this` handle (Local 0) and select the property.
-                    const ir::Index handle =
-                      b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
-                    return class_member_lvalue(handle, *prop, fn_ctx_->this_class, b, l);
+                    // load the `this` handle and select the property.
+                    return class_member_lvalue(this_handle(b, l), *prop, fn_ctx_->this_class, b, l);
                 }
             }
         }
@@ -24424,6 +24459,7 @@ private:
         fn_ctx_->this_local = fn_local(*sub.thisVar);
         fn_ctx_->has_this   = true;
         fn_ctx_->this_class = hty;
+        fn_ctx_->this_var   = sub.thisVar;
     }
 
     // The lvalue of a class property `prop` reached through an object handle value
@@ -24536,16 +24572,15 @@ private:
     // localmap first, then signal_of).
     //
     // `captures` are the enclosing subroutine's frame symbols the fork's children
-    // touch (lower_fork collected them). Each becomes an ArgDir::Ref formal
-    // aliasing the enclosing frame's slot, registered in this child's localmap
-    // under the SAME ValueSymbol -- which is what makes the child's reference to it
-    // resolve to the formal's Local instead of falling through to signal_of. Every
-    // child of one fork takes the same list, so an unused capture costs one dead
-    // pointer parameter. Returns the reserved FunctionId.
-    ir::FunctionId build_fork_child(const Statement&                      body,
-                                    std::span<const ValueSymbol* const>   captures,
-                                    ir::ForkKind                          kind,
-                                    bool                                  box_captures) {
+    // touch (lower_fork collected them). Each becomes an ArgDir::In formal carrying
+    // the variable's GC box handle, registered in this child's `boxed` map under the
+    // SAME ValueSymbol -- which is what makes the child's reference to it resolve
+    // through the box instead of falling through to signal_of. Every child of one fork
+    // takes the same list, so an unused capture costs one dead scalar parameter.
+    // Returns the reserved FunctionId.
+    ir::FunctionId build_fork_child(const Statement&                    body,
+                                    std::span<const ValueSymbol* const> captures,
+                                    ir::ForkKind                        kind) {
         const ir::FunctionId id = module_.reserve_function();
 
         FnCtx ctx;
@@ -24560,21 +24595,24 @@ private:
         param_types.reserve(captures.size());
         arg_dirs.reserve(captures.size());
         for (const ValueSymbol* sym : captures) {
-            if (box_captures) {
-                // The box handle, by value. Reference semantics come from the box, not
-                // from the ABI, so nothing points into the parent's frame and the
-                // child may outlive it (docs/design/fork-join.md V4).
-                const ir::Ref cls = box_class_type(lower_type(sym->getType()));
-                param_types.push_back(cls);
-                arg_dirs.push_back(ir::ArgDir::In);
-                const uint32_t k    = fn_local(*sym);
-                ctx.local_types[k]  = cls;
-                ctx.boxed[sym]      = { k, cls };
-                continue;
+            // The box handle, by value. Reference semantics come from the box, not
+            // from the ABI, so nothing points into the parent's frame and the child
+            // may outlive it (docs/design/fork-join.md V4).
+            const ir::Ref cls = box_class_type(lower_type(sym->getType()));
+            param_types.push_back(cls);
+            arg_dirs.push_back(ir::ArgDir::In);
+            const uint32_t k   = fn_local(*sym);
+            ctx.local_types[k] = cls;
+            ctx.boxed[sym]     = { k, cls };
+            // A captured `this` makes this child a method body for lookup purposes: a
+            // bare property reference inside it re-roots at the handle exactly as it
+            // did in the enclosing method (value_lvalue -> this_handle), which reads
+            // the box rather than a frame slot.
+            if (sym->name == "this") {
+                ctx.has_this   = true;
+                ctx.this_var   = sym;
+                ctx.this_class = lower_type(sym->getType());
             }
-            param_types.push_back(lower_type(sym->getType()));
-            arg_dirs.push_back(ir::ArgDir::Ref);
-            fn_local(*sym);
         }
 
         ir::Builder b(module_.pool);
@@ -24735,9 +24773,7 @@ private:
             const auto& clt = sub.thisVar->getType().getCanonicalType().as<slang::ast::ClassType>();
             if (clt.getBaseClass() != nullptr) {
                 const ir::SourceLoc bl = to_source_loc(sub.location);
-                const ir::Index     handle =
-                  b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, bl), bl);
-                emit_base_construction(clt, handle, b, bl);
+                emit_base_construction(clt, this_handle(b, bl), b, bl);
             }
         }
 
@@ -26002,7 +26038,7 @@ private:
             fail("class method call without an object handle is not supported");
         }
         const ir::SourceLoc l = loc(call);
-        return b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
+        return this_handle(b, l);
     }
 
     // The enclosing `this` handle and its class, for a built-in randomization call
@@ -26014,8 +26050,7 @@ private:
         if (fn_ctx_ == nullptr || !fn_ctx_->has_this) {
             fail("a randomization method call outside a class method needs an object handle");
         }
-        return { b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l),
-                 class_of_ref(fn_ctx_->this_class) };
+        return { this_handle(b, l), class_of_ref(fn_ctx_->this_class) };
     }
 
     // The ClassType a lowered Kind::Class Ref came from (class_type_cache_ inverted).

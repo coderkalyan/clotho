@@ -384,8 +384,9 @@ professional parity; M5 makes it complete.
   because the parent no longer outlives its children; `join`'s stays a frame slot and
   its codegen is byte-identical. Unbounded live children saturate the activation
   bound, which sizes the rings, the `#0` batches and the wait buckets alike.
-  A capture of an enclosing task frame is refused for the detaching kinds (the ref
-  ABI needs the frame to outlive the child) — lifts with V4.
+  A capture of an enclosing task frame was refused for the detaching kinds (the ref
+  ABI needed the frame to outlive the child); lifted by V4, which made a capture a GC
+  box handle for every kind.
   Design: docs/design/fork-join.md §"V2 scope".
 - [x] **`fork … join_none` inside a function** (LRM 13.4.4) — the only kind the LRM
   allows there ("fork-join_none constructs shall be allowed inside a function", with
@@ -414,15 +415,40 @@ professional parity; M5 makes it complete.
   in a function was refused when V5 landed; it is supported now — see "`$time` /
   `$stime` / `$realtime` in a function" under Subroutines.) Design:
   docs/design/fork-join.md §"V5 scope".
-- [~] **`fork`-child capture of a local the ref ABI cannot carry** — under
-  `join_any` / `join_none` this no longer goes through the `ref` ABI at all, so the
-  type restriction is gone with it: the capture rides a per-variable GC box and only
-  the box HANDLE is passed (see "Captured-automatic lifetime" below). A string, a
-  class handle and a formal all capture. Under `join` the by-ref path is unchanged, so
-  an unpacked array / struct / string / real / queue / class-handle local is still
-  refused by name there, and lifts when `ref` arguments cover those types
-  (docs/design/ref-args.md). A class property reached through the enclosing method's
-  implicit `this` is still refused for either kind.
+- [x] **`fork`-child capture of a local the ref ABI cannot carry** — no fork capture
+  goes through the `ref` ABI any more, for any join kind, so the type restriction is
+  gone with it: the capture rides a per-variable GC box and only the box HANDLE is
+  passed (see "Captured-automatic lifetime" below). A string, a real, an unpacked
+  struct, a queue, a class handle and a formal all capture, under `join` as much as
+  under the detaching kinds.
+  The generalization is the point. Keying the capture ABI on the JOIN KIND produced
+  two refusals that both read as fork limitations and were neither about forking: the
+  fat ref could only carry a packed integral or a dynamic array (a type limit), and
+  `join`'s "the parent outlives every child" is false under `kill`
+  (process-class.md §11 hazard 3 — reachable with a plain `logic [7:0]` capture, so
+  `join`'s by-ref path was not sound either). One storage rule for all three kinds
+  retires both. It also cannot be written any other way: the boxing decision is made
+  per subroutine before its frame is laid out, and `design_uses_process_` — which the
+  design doc used to prescribe as half the predicate — is an IR fact computed after
+  the whole module has lowered.
+  Cost: one `ClassNew` per captured variable per activation, paid only by a body that
+  forks over its own frame variables. A fork in a PROCESS body has no captures at all
+  (a process-scope local is signal-like storage), so the common testbench idiom is
+  unaffected and emits the same code.
+- [x] **`fork`-child capture of a class property through the implicit `this`** — a
+  bare property reference inside a method needs the method's `this`, not the property,
+  and `this` is an ordinary automatic of the frame: slang's
+  `SubroutineSymbol::thisVar` is a real `VariableSymbol` already living in `localmap`
+  as Local 0. So `ForkCaptureDetector` maps a non-static `ClassPropertySymbol` onto
+  `thisVar` and captures that; an explicit `this.p` already arrived that way. The
+  refusal existed only because the ref ABI carried a packed-slot pointer rather than a
+  handle, so it died with the ref. Three supporting pieces: `install_capture_boxes`
+  boxes `thisVar` explicitly (it is in neither `getArguments()` nor the body's
+  declarations, and the implied `this` reference is not written anywhere in the AST, so
+  `ValueRefScan` flags it); the four sites that loaded `this` out of Local 0 now share
+  one `this_handle()` that consults the box first; and `build_fork_child` installs
+  `has_this` / `this_var` / `this_class` from a captured `this` so a bare property
+  inside the CHILD re-roots the same way.
 - [x] **`wait fork` / `disable fork`** — landed, but not here: the live-descendant SET
   V2's count-and-`wake_at` record could not carry is the `process` control-block tree
   (LRM 9.7), so both statements came with it. `disable fork` is `kill` over the
@@ -447,10 +473,13 @@ professional parity; M5 makes it complete.
   the way: a capture referenced from a child's DECLARATION INITIALIZER was invisible to
   the capture walk (an initializer hangs off the symbol, not the statement), so 9.3.2's
   own idiom failed as an unknown signal instead of capturing.
-  **Remaining: spawn-time initialization.** A child-block `automatic` must be
-  initialized AT THE SPAWN for each child to see its own `j`; clotho runs a child's
-  declaration initializers when the child is first scheduled, so it is refused loudly
-  rather than answered with the later value.
+  **Remaining: spawn-time initialization**, and only for the detaching kinds. A
+  child-block `automatic` must be initialized AT THE SPAWN for each child to see its
+  own `j`; clotho runs a child's declaration initializers when the child is first
+  scheduled, so it is refused loudly rather than answered with the later value. A
+  `join` child is exempt and is NOT refused: it is ramped and resumed inline at the
+  fork, so its initializers already run at the spawn. (That guard is keyed on the join
+  kind, deliberately — it is the one thing in the capture path that still is.)
 - [ ] **1024 concurrent detached children** is the ceiling: an unbounded spawn edge
   saturates the activation bound, and past it the scheduler-buffer guards report a
   located FATAL. Lifting it means a spill on the already-emitted overflow edge; the

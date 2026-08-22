@@ -5180,10 +5180,9 @@ private:
                 const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
                 mark_packed_args(vci.func, vci.args);
             } else if (ir.tag(idx) == Inst::Tag::Fork) {
-                // Every fork capture is an ArgDir::Ref formal of every child
-                // (Lower.cpp's lower_fork), so like any other ref actual the capture
-                // keeps its canonical type-derived slot rather than being forced
-                // packed -- the child's formal takes the same shape. Nothing to mark.
+                // Every fork capture is an ArgDir::In box HANDLE of every child
+                // (Lower.cpp's lower_fork), i.e. an rvalue, not a place at all, so
+                // there is no frame slot to force packed. Nothing to mark.
                 continue;
             }
         }
@@ -23024,10 +23023,11 @@ private:
         // Ramp arguments, shared by every child: (state, wheel, one pointer per
         // captured enclosing-frame local, rec). Each capture is an ArgDir::Ref
         // formal of every child (Lower.cpp's lower_fork), passed exactly as
-        // lower_task_call_inst passes a ref actual. No signal-waiter snapshot is
-        // needed here, unlike there: a capture is always a frame Local of this
-        // coroutine, never a module signal with a wait queue. Only `join` can have
-        // captures at all — the ref ABI needs this frame to outlive the children.
+        // A capture is a GC box HANDLE by value, for every join kind
+        // (docs/design/fork-join.md V4), so there is no place to bind, no relocation
+        // epoch to carry and no signal-waiter snapshot to take: a handle is a handle
+        // whoever holds it, and the box stays alive off the child's own frame, which
+        // is a conservative GC root.
         const std::span<const Index> caps = ir_->region(fi.args);
         std::vector<llvm::Value*>    argv;
         argv.reserve(caps.size() + 4);
@@ -23043,39 +23043,12 @@ private:
         if (design_uses_process_) {
             argv.push_back(proc_arg());
         }
-        if (!caps.empty()) {
-            // Every child took the same formal list, so one child's declared types
-            // decide the ABI for all of them.
-            const Function& child = mod_.function(static_cast<FunctionId>(kids[0]));
-            for (uint32_t k = 0; k < caps.size(); ++k) {
-                if (child.arg_dirs[k] != ArgDir::Ref) {
-                    // A BOXED capture (docs/design/fork-join.md V4): the frontend hands
-                    // over the box handle as a VALUE, not a place, because the box and
-                    // not the frame is what the child shares. Nothing to bind and no
-                    // epoch to carry -- a handle is a handle whoever holds it, and the
-                    // GC keeps the box alive off the child's own frame.
-                    //
-                    // An `In` scalar formal is two params, must|may and z, exactly as
-                    // an ordinary call marshals one (lower_task_call_inst's last arm).
-                    const Plane pl = to_four(value_of(caps[k]));
-                    argv.push_back(pl.mm);
-                    argv.push_back(pl.z);
-                    continue;
-                }
-                // A ref capture is a ref to an enclosing frame local, which is a
-                // stable place: the parent's frame outlives every child (the join
-                // waits for them), so the epoch is the compile-time zero word.
-                // No barrier, and structurally so: a capture is always a frame Local of
-                // this coroutine (see above), and a frame is scanned in full at every
-                // collection, young or not (Gc.h:105-107). A capture that could reach
-                // inside an object would need lower_task_call_inst's barrier, so the
-                // shape is asserted away rather than trusted.
-                const LValue& clv = lvalue_of(caps[k]);
-                assert(clv.gc_owner == nullptr && "a fork capture is a frame local");
-                const RefBinding rb = ref_actual_arg(clv);
-                argv.push_back(rb.slot);
-                push_ref_epochs(argv, rb, ref_epoch_depth(child, k));
-            }
+        // An `In` scalar formal is two params, must|may and z, exactly as an ordinary
+        // call marshals one (lower_task_call_inst's last arm).
+        for (const Index cap : caps) {
+            const Plane pl = to_four(value_of(cap));
+            argv.push_back(pl.mm);
+            argv.push_back(pl.z);
         }
         argv.push_back(rec);
 

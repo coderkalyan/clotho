@@ -484,19 +484,24 @@ enum class ForkKind : uint32_t {
 // lowered into its own fork-child task (Function::is_fork_child); `children`
 // holds their FunctionIds as raw u32s (one per parallel process).
 //
-// `args` are the lvalues of the enclosing body's frame locals that any child
-// reads or writes -- a fork inside a task, where a child's references to the
-// task's formals and automatics cannot resolve to module signals. Each is passed
-// to EVERY child as an ArgDir::Ref formal, in this order, so formal k of each
-// child aliases args[k]'s storage (Lower.cpp's lower_fork / build_fork_child).
-// The list is shared rather than per-child because a child that never touches a
-// capture only carries one unused pointer parameter, and one list keeps the
-// children's ABIs identical. Empty for a fork in a process body, which is every
-// fork whose parent variables are module signals.
+// `args` are the GC-box HANDLES of the enclosing body's frame locals that any
+// child reads or writes -- a fork inside a task or a function, where a child's
+// references to the enclosing formals and automatics cannot resolve to module
+// signals. Each is passed to EVERY child as an ArgDir::In formal, in this order,
+// so formal k of each child holds the box for args[k]'s variable (Lower.cpp's
+// lower_fork / build_fork_child). They are rvalues, not places: the shared
+// variable lives in the box, which the GC keeps alive off each child's own frame,
+// so a child may outlive the activation that declared the variable. That holds for
+// every join kind, `join` included -- see docs/design/fork-join.md V4 for why the
+// predecessor's ArgDir::Ref pointer into the parent frame was not sound even
+// there. The list is shared rather than per-child because a child that never
+// touches a capture only carries one unused scalar parameter, and one list keeps
+// the children's ABIs identical. Empty for a fork in a process body, which is
+// every fork whose parent variables are module signals.
 struct ForkInfo {
     // FunctionIds of the child bodies, stored as u32 (FunctionId is a u32 enum).
     ExtraSlice children;
-    // Captured-lvalue operands, one ref formal per entry in every child.
+    // Captured box-handle operands, one In formal per entry in every child.
     ExtraSlice args;
     ForkKind   kind;
 };

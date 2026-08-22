@@ -717,16 +717,20 @@ Ranked by how much damage a naive implementation does.
    dies, is a use-after-free until every fork in a process-control design uses the
    heap refcounted record. Four distinct failure shapes are enumerated at
    `disable.md:598-608`.
-3. **A `join_any`/`join_none` child's `ArgDir::Ref` captures point into the
-   parent's frame.** Killing the parent leaves the child holding dangling formals.
-   Today captures are refused outright for the detaching kinds
-   (`src/Lower.cpp:7790-7795`), which is what makes this latent rather than live —
-   so **that refusal must stay until fork V4's per-spawn copies land**, and a
-   `join` parent that is killed with live children must be treated as the same
-   hazard (its children are killed too, but they abort *later*, after the frame is
-   gone). The conservative rule: a killed thread's children are marked before the
-   thread takes its own exit, and a child's abort path must not touch a capture
-   before its own poll.
+3. **CLOSED by fork V4. A fork child's captures used to point into the parent's
+   frame** (`ArgDir::Ref`), so killing the parent left the child holding dangling
+   formals. This was latent only because captures were refused outright for the
+   detaching kinds — and the note here used to say that refusal "must stay until fork
+   V4's per-spawn copies land", plus that a killed `join` parent is the same hazard
+   (its children are killed too, but they abort *later*, after the frame is gone).
+   That second half is what mattered: the `join` case was REACHABLE, with an ordinary
+   `logic [7:0]` capture, because `join` was allowed to capture. A fork capture is now
+   a GC box handle for every join kind (`docs/design/fork-join.md` V4) — the child's
+   frame holds a traced handle, a live coroutine frame is a conservative GC root, and
+   the box outlives the parent activation with no refcount — so there is no pointer
+   into a parent frame left to dangle and no refusal propping the hazard up. What
+   remains is the ordinary rule, unchanged: a killed thread's children are marked
+   before the thread takes its own exit.
 4. **Double wake.** A force-wake does not cancel the park it interrupts
    (`disable.md` Hazard 18). Every wake must go through the claim/flag protocol; a
    second resume lands at whatever suspend point the thread has since reached.

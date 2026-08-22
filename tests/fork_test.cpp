@@ -312,36 +312,76 @@ TEST_CASE("fork: one task's fork, two concurrent calls, children reading its for
     CHECK(out == "inner d=2 t=4\ninner d=5 t=10\nx=17 y=17 t=10\n");
 }
 
-// What capture cannot carry. A ref formal is a pointer to a packed slot, so the
-// captures are exactly the ref ABI's own repertoire (docs/design/ref-args.md);
-// anything else is named rather than mis-lowered, and both lift together.
-TEST_CASE("fork: a child reading an uncapturable task local is rejected by name") {
-    check_rejected(R"(
+// What capture used to refuse, under `join`. The old ABI passed a pointer to a
+// packed slot, so a `fork..join` child could capture only what that could carry (a
+// packed integral or a dynamic array); a string, real, unpacked, queue or class
+// handle was named and refused. The storage rule is now one GC box per captured
+// variable for every join kind, so the repertoire is the declared type
+// (docs/design/fork-join.md V4).
+TEST_CASE("fork: a join child captures a non-integral task local") {
+    const std::string out = run_capture(R"(
         module t;
+          typedef struct { int a; string s; } pair_t;
           task automatic show;
-            string s = "hi";
+            string  s = "hi";
+            real    r = 1.5;
+            pair_t  p = '{7, "in"};
+            int     q[$];
+            q.push_back(3);
             fork
-              #1 $display("%s", s);
+              #1 $display("%s %0.1f %0d %s %0d", s, r, p.a, p.s, q[0]);
+              #2 begin s = "bye"; r = 2.5; end
             join
+            $display("after %s %0.1f", s, r);
           endtask
           initial show;
         endmodule
-    )",
-                   "reads the enclosing task's 's' is not supported");
-    check_rejected(R"(
+    )");
+    CHECK(out == "hi 1.5 7 in 3\nafter bye 2.5\n");
+}
+
+// A bare property reference inside a method captures the METHOD'S `this`, not the
+// property: value_lvalue re-roots such a reference at the `this` automatic, and that
+// automatic is a real slang ValueSymbol living in the frame like any other, so it
+// boxes and travels by exactly the same machinery. Refused outright before, for every
+// join kind, because a handle was not one of the ref ABI's carryable types.
+TEST_CASE("fork: a child reads and writes a class property through the implicit this") {
+    const std::string out = run_capture(R"(
         module t;
           class C;
-            int v;
-            task go(); fork #1 v = 5; join endtask
+            int    v = 1;
+            string n = "c";
+            task go();
+              fork
+                #1 begin v = v + 10; $display("child v=%0d n=%s", v, n); end
+                #2 $display("later v=%0d", v);
+              join
+              $display("after v=%0d", v);
+            endtask
+            task spawn();
+              fork
+                #3 $display("detached v=%0d this.n=%s", v, this.n);
+              join_none
+            endtask
           endclass
           initial begin
             C c;
             c = new();
+            c.spawn();
             c.go();
+            #5 $display("end v=%0d", c.v);
           end
         endmodule
-    )",
-                   "reads a class property of the enclosing method is not supported");
+    )");
+    // `go`'s join holds the caller to t=2, so `after` precedes the detached child
+    // `spawn` left on the wheel for t=3 -- which still runs, and still reads the same
+    // object, after the activation that spawned it returned.
+    CHECK(out ==
+          "child v=11 n=c\n"
+          "later v=11\n"
+          "after v=11\n"
+          "detached v=11 this.n=c\n"
+          "end v=11\n");
 }
 
 // `disable fork` (LRM 9.6.3) and `wait fork` (LRM 9.6.1) both land with the
