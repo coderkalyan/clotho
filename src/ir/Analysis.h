@@ -91,6 +91,32 @@ struct TagInfo {
 // exact duplication this module exists to remove.
 [[nodiscard]] TagInfo tag_info(Inst::Tag tag);
 
+// Where a call edge lives in the IR, and the only place that answers it. Seven
+// independent per-body scans used to each re-derive the tag set and disagree:
+// some had no `Fork` arm, some collected nothing for a value `Call`. Classifying
+// a new call-shaped opcode now means editing one switch, and every consumer
+// gains the edge at once.
+//
+// Fork children count. The frontend splits each child statement of a `fork` into
+// its own fork-child task and records their FunctionIds in `ForkInfo::children`
+// (Ir.h:483-503), so a child is a body of THIS one that the parent enables. Leave
+// them out and a child of an action block or of a program `initial` parks a
+// handle with no home region, and a combinational cycle whose back edge closes
+// through a child never forms an SCC.
+//
+// Virtual dispatch contributes its STATICALLY resolved target only --
+// `VirtualCallInfo::func`, documented at Ir.h:461-473 as not necessarily the
+// function actually called. A consumer that must cover every override unions the
+// per-slot lists itself, as the by-pointer argument scan does; a consumer that
+// only needs a lower bound (may-finish) treats the figure as one and says so.
+//
+// `out` is APPENDED to, in encounter order, neither sorted nor deduplicated:
+// every caller either worklists with a seen-stamp or closes with a memo, so an
+// order or a set here would buy nothing but an allocation.
+void inst_callees(const Ir& ir, Index i, std::vector<FunctionId>& out);
+// Every call edge of a whole body: `inst_callees` over each instruction of `ir`.
+void collect_callees(const Ir& ir, std::vector<FunctionId>& out);
+
 // Why a process is or is not eligible for combinational fusion. Ordered, and the
 // order is load bearing: `report_comb_fuse_stat` indexes a histogram by the
 // enumerator value, and `Count` sizes it.
@@ -138,8 +164,24 @@ struct BodyFacts {
     // Signals this body reads, resolved to the base signal of each `Load`'s select
     // chain. Also undeduplicated -- every consumer does membership tests.
     std::vector<Signal> reads;
-    // Tasks this body enables, in encounter order. The edge set for closing
-    // `writes` transitively.
+    // Every function this body calls, enables or forks, in encounter order --
+    // `inst_callees` above defines that set, and this is exactly it. The edge set
+    // for closing `writes` transitively.
+    //
+    // Conservative rather than exact, in two directions, deliberately. A
+    // `join_any` / `join_none` child outlives the fork, so a write of its may land
+    // in a LATER instant than the edge claims; and a virtual call contributes its
+    // static target, which need not be the body that runs. The sole consumer --
+    // the wake graph in `compute_subscription_order` -- is over-approximation
+    // tolerant BY CONSTRUCTION: a spurious edge costs a conservative SCC (fewer
+    // fusions, a longer settle), a missing one costs a dropped loop iteration. So
+    // this set errs towards too many edges, never too few.
+    //
+    // `reads` is NOT closed over this, and must not be. A fork parent does not
+    // inherit its children's sensitivity: docs/design/fork-join.md §D
+    // ("Sensitivity attribution") gives each child its own subscription, and
+    // absorbing a child's reads here would wake the parent on signals its own
+    // body never samples.
     std::vector<FunctionId> calls;
 };
 

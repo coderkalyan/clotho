@@ -37,7 +37,37 @@ professional parity; M5 makes it complete.
 - [x] **Signed arithmetic** — sign extension, signed compare/divide/modulo/shift,
   mixed-sign rule (§11.8.1), `$signed`/`$unsigned`, shift-amount >= width.
 - [x] **Multi-bit `if` / `?:` / loop condition** — reduced to 1-bit truth (§12.4, §12.7).
-- [x] **Lazy `?:` arm evaluation** (LRM 11.4.11).
+- [x] **Lazy `?:` arm evaluation** (LRM 11.4.11) — a definite condition evaluates
+  only its arm; an ambiguous one evaluates both and blends them bitwise (Table 11-20),
+  which is a run-time branch inside `lower_lazy_conditional`, not a compile-time
+  choice. Which arms may instead take the branchless packed select is decided by
+  `is_speculation_safe` (`Lower.cpp`'s `SpeculationScan`), a WHITELIST over
+  `ExpressionKind`.
+  It used to be a blacklist of three node kinds — a call, an embedded assignment, an
+  increment / decrement — and that polarity fails OPEN: every construct clotho lowers
+  to a trapping runtime check silently became a wrong answer at this one site, and
+  five such traps exist that are none of those three. `(h == null) ? -1 : h.x` fataled
+  on a null handle deref from the arm the condition had ruled out; so did a null
+  virtual-interface deref, a read of a non-active tagged-union member (LRM 11.9), a
+  read of a stale `ref` formal (LRM 13.5.2), and `new src`'s virtual dispatch through
+  a possibly-null source. A whitelist fails CLOSED: an unlisted kind merely takes the
+  branching path, which is correct for every expression by construction, so being
+  conservative costs one `SelectLazy` and being wrong costs a fatal on legal code.
+  Deliberately still speculatable, because each has an LRM-defined value and no trap:
+  an out-of-range index into a fixed / dynamic array or queue, a missing
+  associative-array key, integer divide / modulo by zero (all-x), real divide by zero,
+  and a string index out of range.
+- [ ] **Eager predicate evaluation outside `?:`** — the same deficiency, in three
+  places that do not consult `is_speculation_safe` at all because they evaluate
+  predicates up front unconditionally: `&&&` conjuncts in a `cond_predicate`
+  (`lower_conditions` ANDs every `cond.expr`, so `if (h != null &&& h.x)` fatals
+  where LRM 12.4 reads as short-circuiting), every `case` flavour's item-label
+  predicates (built before dispatch, while LRM 12.5 specifies in-order comparison),
+  and `unique` / `unique0` / `priority` `if` arm conditions (defensible under 12.4.2's
+  any-order licence for overlap detection, but it still fatals). `&&` / `||` / `->`
+  are already correctly lazy via `lower_short_circuit`; `<->` is eagerly evaluated by
+  definition. Fixing these is a structural change to each lowering (a `SelectLazy`
+  chain plus pattern-variable binding order), not a reuse of the predicate.
 
 ### Subroutines
 
@@ -354,8 +384,9 @@ professional parity; M5 makes it complete.
   because the parent no longer outlives its children; `join`'s stays a frame slot and
   its codegen is byte-identical. Unbounded live children saturate the activation
   bound, which sizes the rings, the `#0` batches and the wait buckets alike.
-  A capture of an enclosing task frame is refused for the detaching kinds (the ref
-  ABI needs the frame to outlive the child) — lifts with V4.
+  A capture of an enclosing task frame was refused for the detaching kinds (the ref
+  ABI needed the frame to outlive the child); lifted by V4, which made a capture a GC
+  box handle for every kind.
   Design: docs/design/fork-join.md §"V2 scope".
 - [x] **`fork … join_none` inside a function** (LRM 13.4.4) — the only kind the LRM
   allows there ("fork-join_none constructs shall be allowed inside a function", with
@@ -378,27 +409,77 @@ professional parity; M5 makes it complete.
   record and the child frame. `reject_resume_once` now closes over calls as the
   backend backstop. Children spawned in a function belong to the CALLING thread, so
   `wait fork` / `disable fork` in the caller reach them (LRM 9.6.3). A child still
-  cannot read the function's own formals or locals — exactly what the LRM's own
-  `watch_for_zero` example does — which lifts with V4's per-spawn copies. (`$time`
+  can now read the function's own formals and locals — exactly what the LRM's own
+  `watch_for_zero` example does — since they ride GC boxes rather than frame pointers
+  (see "Captured-automatic lifetime"). (`$time`
   in a function was refused when V5 landed; it is supported now — see "`$time` /
   `$stime` / `$realtime` in a function" under Subroutines.) Design:
   docs/design/fork-join.md §"V5 scope".
-- [ ] **`fork`-child capture of a local the ref ABI cannot carry** — an unpacked
-  array / struct / string / real / queue / class-handle local, or a class property
-  reached through the enclosing method's implicit `this`. Each is refused by name;
-  they lift when `ref` arguments cover those types (docs/design/ref-args.md). Under
-  `join_any` / `join_none` NO capture is carried, whatever its type: the ABI hands
-  out a pointer into the enclosing frame and only `join` keeps that frame alive.
+- [x] **`fork`-child capture of a local the ref ABI cannot carry** — no fork capture
+  goes through the `ref` ABI any more, for any join kind, so the type restriction is
+  gone with it: the capture rides a per-variable GC box and only the box HANDLE is
+  passed (see "Captured-automatic lifetime" below). A string, a real, an unpacked
+  struct, a queue, a class handle and a formal all capture, under `join` as much as
+  under the detaching kinds.
+  The generalization is the point. Keying the capture ABI on the JOIN KIND produced
+  two refusals that both read as fork limitations and were neither about forking: the
+  fat ref could only carry a packed integral or a dynamic array (a type limit), and
+  `join`'s "the parent outlives every child" is false under `kill`
+  (process-class.md §11 hazard 3 — reachable with a plain `logic [7:0]` capture, so
+  `join`'s by-ref path was not sound either). One storage rule for all three kinds
+  retires both. It also cannot be written any other way: the boxing decision is made
+  per subroutine before its frame is laid out, and `design_uses_process_` — which the
+  design doc used to prescribe as half the predicate — is an IR fact computed after
+  the whole module has lowered.
+  Cost: one `ClassNew` per captured variable per activation, paid only by a body that
+  forks over its own frame variables. A fork in a PROCESS body has no captures at all
+  (a process-scope local is signal-like storage), so the common testbench idiom is
+  unaffected and emits the same code.
+- [x] **`fork`-child capture of a class property through the implicit `this`** — a
+  bare property reference inside a method needs the method's `this`, not the property,
+  and `this` is an ordinary automatic of the frame: slang's
+  `SubroutineSymbol::thisVar` is a real `VariableSymbol` already living in `localmap`
+  as Local 0. So `ForkCaptureDetector` maps a non-static `ClassPropertySymbol` onto
+  `thisVar` and captures that; an explicit `this.p` already arrived that way. The
+  refusal existed only because the ref ABI carried a packed-slot pointer rather than a
+  handle, so it died with the ref. Three supporting pieces: `install_capture_boxes`
+  boxes `thisVar` explicitly (it is in neither `getArguments()` nor the body's
+  declarations, and the implied `this` reference is not written anywhere in the AST, so
+  `ValueRefScan` flags it); the four sites that loaded `this` out of Local 0 now share
+  one `this_handle()` that consults the box first; and `build_fork_child` installs
+  `has_this` / `this_var` / `this_class` from a captured `this` so a bare property
+  inside the CHILD re-roots the same way.
 - [x] **`wait fork` / `disable fork`** — landed, but not here: the live-descendant SET
   V2's count-and-`wake_at` record could not carry is the `process` control-block tree
   (LRM 9.7), so both statements came with it. `disable fork` is `kill` over the
   caller's subtree; `wait fork` is `first_child == null`, exact because a completing
   thread re-parents its live children. Design: docs/design/process-class.md §8.
-- [ ] **Per-spawn automatic-variable lifetime** — what the classic
-  `for (int i…) fork … i … join_none` needs (fork-join.md V4). Refused by name rather
-  than reading a shared final `i`. Note the capture refusal for the detaching kinds is
-  now load-bearing for a second reason: a killed parent's frame goes away under its
-  live children, so V4's per-spawn copies are what would make a capture safe there.
+- [~] **Captured-automatic lifetime** (LRM 9.3.2, fork-join.md V4) — this entry used
+  to ask for "per-spawn automatic-variable lifetime", i.e. copies. **That was the wrong
+  target**: 9.3.2 makes a reference to an enclosing scope's automatic a reference to
+  THAT variable, which is why the clause has to write `automatic int k = j;` to get a
+  copy. Measured on the clause's own idiom: iverilog `4 4 4` (shared), Verilator
+  `1 2 3` (copies, a deviation), and slang warns by name (-Wfork-loop-var, "all loop
+  iterations will see the same stale value"). Copying would have regressed a case
+  clotho already got right in a process, where a local has static signal-like storage.
+  The real gap was LIFETIME, and it is closed: a captured automatic lives in a
+  per-variable GC box (a synthetic one-field class, so ClassNew allocates it, the trace
+  map falls out of the field table, and the place is HandleDeref + MemberSelect 0), and
+  the child receives the box handle by value. Live coroutine frames are already
+  conservative pinning GC roots, so nothing refcounts and no frame ownership moves.
+  Landed: shared reads in a task/function (`4 4 4`), a child's WRITE seen by the
+  parent, a captured class-handle formal outliving the call (13.4.4's
+  `watch_for_zero`), a string capture, `join_any` with several children. Also fixed on
+  the way: a capture referenced from a child's DECLARATION INITIALIZER was invisible to
+  the capture walk (an initializer hangs off the symbol, not the statement), so 9.3.2's
+  own idiom failed as an unknown signal instead of capturing.
+  **Remaining: spawn-time initialization**, and only for the detaching kinds. A
+  child-block `automatic` must be initialized AT THE SPAWN for each child to see its
+  own `j`; clotho runs a child's declaration initializers when the child is first
+  scheduled, so it is refused loudly rather than answered with the later value. A
+  `join` child is exempt and is NOT refused: it is ramped and resumed inline at the
+  fork, so its initializers already run at the spawn. (That guard is keyed on the join
+  kind, deliberately — it is the one thing in the capture path that still is.)
 - [ ] **1024 concurrent detached children** is the ceiling: an unbounded spawn edge
   saturates the activation bound, and past it the scheduler-buffer guards report a
   located FATAL. Lifting it means a spill on the already-emitted overflow edge; the
@@ -659,6 +740,25 @@ professional parity; M5 makes it complete.
   (`src/SourceContext.h`) owning the Driver / SourceManager / Compilation, so an
   `ir::SourceLoc` stays resolvable after lowering returns. Reuse ACROSS runs
   (parse caching) is still outstanding and needs the content-addressed cache.
+- [x] **Run-start reset of process-global runtime state** — `rt_run_init`
+  (`src/runtime/Runtime.h`, `src/runtime/Runtime.cpp`), emitted unconditionally at
+  the top of the design's main beside `rt_gc_init` and subsuming the old
+  `rt_event_pool_init`. A host that runs more than one design per process — which
+  is every `clotho_test` process, since `ir::run_jit` builds a fresh LLJIT per
+  design — used to carry state across designs: an unclosed `$fopen` kept its MCD
+  channel until the 30-wide space ran out, the unseeded `$random` stream was
+  deterministic only for the first design, a detached `->> @(x) e` record survived
+  `$finish` keyed by a `trig_id` the next design reused, and the PCB and event
+  pools grew without bound. `rt_run_init` returns the PCB pool, the event pool,
+  the detach table, the NBA-array and intra-assignment queues, the file tables,
+  the per-site diagnostic suppression maps and the `$random` seed to power-on.
+  Deliberately out of scope: GC state (`rt_gc_init` owns it and preserves
+  `g.stats`), VCD, and host-armed configuration set before the module runs.
+  `sim_teardown` stays as it is — it drops what would dangle into dead JIT code
+  the moment a run ends, but it cannot be the seam, because it runs before the
+  emitted signal deinit and `rt_gc_shutdown` and is skipped entirely by the fatal
+  `std::exit` paths. Still owed: the wait queues, the observed/deferred queues and
+  the string pools (docs/design/cooperative-finish.md §Why).
 - [ ] **`param-overrides` (`-G`), config/library-map (`--libmap`)** not yet surfaced.
 - [x] **File output** (§21.3) — `$fopen` (MCD + FD), `$fclose`, `$fdisplay`/`$fwrite`,
   `$fflush`.
@@ -1070,8 +1170,7 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   now render through a frontend loop instead: one `$sformatf` per element built by
   the ORDINARY aggregate expansion, concatenated over the live element count. So
   member names, nested arrays, string leaves and tag names all print exactly as
-  they do outside a container (`'{'{a:1, s:"hi"}, ...}`). Still guarded: an
-  associative-array leaf, and a class-handle element (no handle rendering at all).
+  they do outside a container (`'{'{a:1, s:"hi"}, ...}`).
 - [x] **NBA to a whole queue** (`q <= rhs`, LRM 10.4.2) — `QueueCopyNb` stages a
   deep copy of the RHS in the Active region (per-queue `rt_nba_arr` buffer), then
   `rt_queue_move`s it into the live handle in the NBA region (managed-element
@@ -2134,8 +2233,26 @@ project with its own algorithm, not tail cleanup on the property layer:
   - [ ] `%p` of a chandle / event / virtual-interface handle — rejected loud; unlike
     a class handle, none of these has a name to print in place of the object.
   - [ ] `%0p` — a field width / flags on the whole pattern is rejected loud.
-  - [ ] `%p` of a queue / dynamic array of tagged unions — rejected loud.
-  - [ ] `%p` of an associative-array leaf inside an aggregate — rejected loud.
+  - [x] `%p` of an associative array (LRM 21.2.1.6) — renders
+    `'{key:value, ...}` over the live entries in ascending key order. The one
+    deficiency behind this was that `%p` had no ordered walk for a KEYED container:
+    the escape hatch a container with a non-flat element already used
+    (`build_container_p_string`) is driven by an index space, and a keyed table has
+    none. `build_assoc_p_string` is the same loop keyed by
+    `assoc_traverse(First/Next)` + `assoc_select`, i.e. the shape
+    `lower_foreach_assoc_dim` already uses for `foreach`, so the value renders through
+    the ORDINARY aggregate expansion and a struct / nested container / class-handle /
+    wide value works for free. Keys print by the same leaf rules, so an enum key
+    prints its name and a string key prints quoted. Ordering is asserted only for
+    integral and string keys (LRM 7.8.5 leaves it implementation-defined otherwise).
+    A direct operand takes the same path — `Assoc` is now in `expand_p_arg`'s
+    container predicate, where its absence used to send `$display("%p", a)` down the
+    singular path to die as an unrenderable handle.
+    Retired with it: `guard_container_p_element`, whose four `%p` refusals (tagged
+    union, class handle, element wider than 64 bits, nested aggregate) had all become
+    unreachable when the loop render landed — every condition it tested forces
+    `loop_render` — and whose one live caller was `guard_agg_eq_members`, i.e. an
+    aggregate `==` refusal wearing `%p` wording.
 - [ ] **Containers of handles** — queues/dynamic/associative arrays of class
   objects, and class objects holding them.
 

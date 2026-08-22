@@ -638,39 +638,136 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     }
 };
 
-// Whether evaluating an expression is observable beyond its value: any call
-// (a user function body may display or write module state; system calls like
-// $display always are), an embedded assignment, or an increment / decrement.
-// Decides whether a ?: arm may be evaluated eagerly — LRM 11.4.11 forbids
-// evaluating the unchosen arm of a definite condition, but for a pure arm the
-// extra evaluation is unobservable and keeps the branchless packed select.
-struct EffectDetector : ASTVisitor<EffectDetector, VisitFlags::AllGood> {
-    bool found = false;
+// Whether an expression may be evaluated even when its value turns out not to
+// be needed. The one consumer is the `?:` strategy choice: LRM 11.4.11 forbids
+// evaluating the unchosen arm of a DEFINITE condition, but for a speculation-safe
+// arm the extra evaluation is unobservable and keeps the branchless packed select.
+//
+// This is a WHITELIST, and the polarity is the whole point. It used to be a
+// blacklist of three AST node kinds (a call, an embedded assignment, an
+// increment / decrement), which fails OPEN: every construct clotho lowers to a
+// trapping runtime check silently became a wrong answer at this one site. Five
+// such traps exist and not one of them is a call, an assignment or an increment --
+// a null class-handle deref (`(h == null) ? -1 : h.x` fataled), a null
+// virtual-interface deref (Ir.h's IfaceSignal), a read of a non-active
+// tagged-union member (LRM 11.9, rt_tagged_access), a read of a stale `ref`
+// formal (LRM 13.5.2, rt_ref_stale), and `new src`'s virtual dispatch through a
+// possibly-null source. A whitelist fails CLOSED instead: an unlisted kind merely
+// takes the branching path, which is correct for every expression by construction
+// (lower_lazy_conditional is the only LRM-exact path). So the cost of being
+// conservative is one SelectLazy, and the cost of being wrong is a fatal on legal
+// code.
+//
+// Deliberately SAFE, because each has an LRM-defined value and no trap: an
+// out-of-range index into a fixed / dynamic array or queue (x, or the element
+// default -- LValue::dyn_inrange), a read of a missing associative-array key (the
+// element default), integer divide / modulo by zero (all-x -- lower_divmod guards
+// the divisor), real divide by zero (IEEE inf / NaN), and a string index out of
+// range (0).
+//
+// The ambiguous-condition case is unaffected either way: LRM 11.4.11 Table 11-20
+// requires BOTH arms there, and lower_lazy_conditional's x region evaluates both
+// exactly as the eager select did.
+struct SpeculationScan : ASTVisitor<SpeculationScan, VisitFlags::Expressions> {
+    bool unsafe = false;
 
-    void handle(const CallExpression&) {
-        found = true;
-    }
-    void handle(const AssignmentExpression&) {
-        found = true;
-    }
-    void handle(const UnaryExpression& u) {
-        switch (u.op) {
-            case UnaryOperator::Preincrement:
-            case UnaryOperator::Postincrement:
-            case UnaryOperator::Predecrement:
-            case UnaryOperator::Postdecrement:
-                found = true;
-                return;
-            default:
-                visitDefault(u);
+    // The generic hook. slang's ASTVisitor routes a node with no specific overload
+    // through a templated handler, which is exactly what a whitelist needs: a
+    // future ExpressionKind is unsafe until someone lists it. Children are visited
+    // only after this node itself is cleared.
+    template<typename T>
+    void handle(const T& node) {
+        if (unsafe) {
+            return;
         }
+        if constexpr (std::is_base_of_v<slang::ast::Expression, T>) {
+            if (!node_safe(node)) {
+                unsafe = true;
+                return;
+            }
+        }
+        visitDefault(node);
+    }
+
+    // Whether this node, ignoring its children, is safe to evaluate eagerly.
+    static bool node_safe(const slang::ast::Expression& e) {
+        switch (e.kind) {
+            // Literals: no storage read, nothing to trap on.
+            case ExpressionKind::IntegerLiteral:
+            case ExpressionKind::RealLiteral:
+            case ExpressionKind::TimeLiteral:
+            case ExpressionKind::UnbasedUnsizedIntegerLiteral:
+            case ExpressionKind::NullLiteral:
+            case ExpressionKind::UnboundedLiteral:
+            case ExpressionKind::StringLiteral:
+            // Pure value construction over the operands.
+            case ExpressionKind::BinaryOp:
+            case ExpressionKind::ConditionalOp:
+            case ExpressionKind::Inside:
+            case ExpressionKind::ValueRange:
+            case ExpressionKind::Concatenation:
+            case ExpressionKind::Replication:
+            case ExpressionKind::Streaming:
+            case ExpressionKind::Conversion:
+            case ExpressionKind::TaggedUnion:
+            case ExpressionKind::SimpleAssignmentPattern:
+            case ExpressionKind::StructuredAssignmentPattern:
+            case ExpressionKind::ReplicatedAssignmentPattern:
+            // Indexing: out of range is a defined default, never a trap.
+            case ExpressionKind::ElementSelect:
+            case ExpressionKind::RangeSelect:
+            // A named interface instance where a virtual interface is expected
+            // (LRM 25.9); unlike a virtual-interface handle it cannot be null.
+            case ExpressionKind::ArbitrarySymbol:
+                return true;
+            case ExpressionKind::UnaryOp:
+                switch (e.as<UnaryExpression>().op) {
+                    case UnaryOperator::Preincrement:
+                    case UnaryOperator::Postincrement:
+                    case UnaryOperator::Predecrement:
+                    case UnaryOperator::Postdecrement:
+                        return false;
+                    default:
+                        return true;
+                }
+            case ExpressionKind::NamedValue:
+                return !is_ref_formal(e.as<NamedValueExpression>().symbol);
+            case ExpressionKind::HierarchicalValue:
+                return !is_ref_formal(e.as<HierarchicalValueExpression>().symbol);
+            case ExpressionKind::MemberAccess:
+                return member_base_safe(e.as<MemberAccessExpression>());
+            default:
+                // Call; Assignment; NewClass / NewArray / NewCovergroup (a heap
+                // allocation and a GC safepoint -- and a constructor-less `new` has
+                // no call inside it for a blacklist to have caught); CopyClass (a
+                // virtual dispatch through a possibly-null source); Dist; MinTypMax;
+                // ClockingEvent; AssertionInstance; DataType; TypeReference;
+                // LValueReference; EmptyArgument; Invalid.
+                return false;
+        }
+    }
+
+    // A read of a `ref` formal emits a relocation-epoch check that is a located
+    // fatal by default (docs/design/ref-args.md, docs/design/data-model.md), so it
+    // is not speculatable even though it is spelled as a bare name.
+    static bool is_ref_formal(const slang::ast::Symbol& sym) {
+        const auto* fa = sym.as_if<slang::ast::FormalArgumentSymbol>();
+        return fa != nullptr && fa->direction == slang::ast::ArgumentDirection::Ref;
+    }
+
+    // `obj.m` traps whenever the base has to be dereferenced or tag-checked. A
+    // BARE property inside a method is not this case: it arrives as a NamedValue on
+    // the ClassPropertySymbol and derefs `this`, which cannot be null.
+    static bool member_base_safe(const MemberAccessExpression& ma) {
+        const slang::ast::Type& bt = ma.value().type->getCanonicalType();
+        return !bt.isClass() && !bt.isVirtualInterface() && !bt.isTaggedUnion();
     }
 };
 
-bool has_observable_effect(const slang::ast::Expression& e) {
-    EffectDetector d;
-    e.visit(d);
-    return d.found;
+bool is_speculation_safe(const slang::ast::Expression& e) {
+    SpeculationScan s;
+    e.visit(s);
+    return !s.unsafe;
 }
 
 // Detects whether an expression reads any symbol in a given set (used to find
@@ -692,30 +789,156 @@ struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
     }
 };
 
+// Every value symbol an expression references. Used by BoxCandidateScan below, which
+// needs the references of a fork child before any storage exists to filter them
+// against.
+struct ValueRefScan : ASTVisitor<ValueRefScan, VisitFlags::AllGood> {
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*>* out;
+    // Set when a bare non-static class property is referenced, i.e. a read through the
+    // enclosing method's implicit `this`. Optional: only BoxCandidateScan cares.
+    bool* implicit_this = nullptr;
+
+    // A declaration's initializer hangs off the SYMBOL, not the statement, so a
+    // statement walk does not reach it. Without this, `fork begin automatic int k = j;
+    // ... end join_none` -- LRM 9.3.2's own idiom -- never records the reference to
+    // `j`, and the child then failed to resolve it as an unknown signal instead of
+    // capturing it.
+    void handle(const VariableDeclStatement& d) {
+        if (const Expression* init = d.symbol.getInitializer()) {
+            init->visit(*this);
+        }
+        visitDefault(d);
+    }
+
+    void handle(const NamedValueExpression& nv) {
+        take(nv.symbol);
+    }
+    void handle(const HierarchicalValueExpression& hv) {
+        take(hv.symbol);
+    }
+
+    void take(const slang::ast::ValueSymbol& sym) {
+        out->insert(&sym);
+        if (implicit_this == nullptr) {
+            return;
+        }
+        // A bare `p` inside a method arrives as a NamedValue on the PROPERTY, not as
+        // anything rooted at `this` (value_lvalue is what re-roots it), so the `this`
+        // reference is implied rather than written and has to be recovered here.
+        if (const auto* prop = sym.as_if<slang::ast::ClassPropertySymbol>()) {
+            if (prop->lifetime != slang::ast::VariableLifetime::Static) {
+                *implicit_this = true;
+            }
+        }
+    }
+};
+
+// Symbols a fork's children reference anywhere in a subroutine body, which is the set
+// whose frame locals have to be boxed (docs/design/fork-join.md V4). Run before the
+// frame is laid out, because a boxed local is boxed for every access in the activation
+// -- including accesses lowered before the `fork` is reached.
+//
+// Deliberately an over-approximation: it collects every reference, not just the ones
+// that turn out to be this frame's locals, so it needs no notion of storage class at a
+// point where storage does not exist yet. A module signal or a static in the set is
+// never a frame local, so it never boxes.
+//
+// EVERY fork kind, `join` included. The storage a capture needs is not a property of
+// the join kind -- it is a property of the capture, and the fat `ArgDir::Ref` ABI could
+// carry only a packed integral or a dynamic array, which is why `join` refused a
+// string / real / unpacked / queue / handle local outright. `join`'s "the parent
+// outlives every child" also has one real counterexample: `kill` on a joining parent
+// (docs/design/process-class.md §11), which left a child holding a pointer into a freed
+// coroutine frame. One storage rule for all three kinds retires both problems, and
+// costs nothing in a design whose forks capture nothing -- which includes every fork in
+// a PROCESS body, where the parent's variables are module signals.
+struct BoxCandidateScan : ASTVisitor<BoxCandidateScan, VisitFlags::AllGood> {
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> candidates;
+    // A child reads a class property of the enclosing method through the implicit
+    // `this`. The handle it needs is the method's own `this` automatic, which is not a
+    // ValueSymbol this scan can name (it hangs off the SubroutineSymbol), so it travels
+    // as a flag and install_capture_boxes resolves it against `sub.thisVar`.
+    bool implicit_this = false;
+
+    void handle(const BlockStatement& blk) {
+        if (blk.blockKind == StatementBlockKind::JoinAll || blk.blockKind == StatementBlockKind::JoinAny ||
+            blk.blockKind == StatementBlockKind::JoinNone) {
+            ValueRefScan rs;
+            rs.out           = &candidates;
+            rs.implicit_this = &implicit_this;
+            blk.body.visit(rs);
+        }
+        visitDefault(blk);
+    }
+};
+
+// A child-block `automatic` whose initializer reads one of the captured variables.
+// LRM 9.3.2's own idiom -- `fork begin automatic int k = j; ... end join_none` -- wants
+// `k` initialized AT SPAWN, which is what makes each child see its own `j`; the comment
+// on the clause's example ("local copy, k, for each value of j") is only true under that
+// reading, and Verilator agrees. clotho runs a child's body, declaration initializers
+// included, when the child is first scheduled, which for join_none is after the parent
+// has moved on -- so every child would read the captured variable's LATER value.
+//
+// Detected so it can be refused rather than answered wrongly. Lifting it means
+// evaluating such an initializer in the PARENT at spawn and passing the value in, which
+// is the remaining half of V4 (docs/design/fork-join.md).
+struct SpawnInitScan : ASTVisitor<SpawnInitScan, VisitFlags::AllGood> {
+    const std::vector<const slang::ast::ValueSymbol*>* captured;
+    const slang::ast::VariableSymbol*                  hit = nullptr;
+
+    void handle(const VariableDeclStatement& d) {
+        if (d.symbol.lifetime == slang::ast::VariableLifetime::Automatic) {
+            if (const Expression* init = d.symbol.getInitializer()) {
+                ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> refs;
+                ValueRefScan                                                rs;
+                rs.out = &refs;
+                init->visit(rs);
+                for (const slang::ast::ValueSymbol* c : *captured) {
+                    if (refs.contains(c) && hit == nullptr) {
+                        hit = &d.symbol;
+                    }
+                }
+            }
+        }
+        visitDefault(d);
+    }
+};
+
 // Collects what a `fork` child body reads or writes out of the ENCLOSING
 // subroutine's frame (LRM 9.3.2 with 13.4.2): a child is lowered into its own
 // coroutine with its own frame, so every such symbol has to be passed in as a
 // ref formal (lower_fork / build_fork_child). Deduped and kept in first-reference
 // order, because that order IS the child's formal order.
 //
-// `implicit_this` is the case a ref formal cannot carry: a bare property
-// reference inside a class method, which value_lvalue resolves through the
-// enclosing frame's `this` handle. An explicit `this.p` needs no separate flag --
-// it reads the `this` local itself, so it lands in `captured` and is refused by
-// the capture type check.
+// A bare property reference inside a class method captures the enclosing method's
+// `this`, and nothing else: value_lvalue re-roots such a reference at the `this`
+// automatic, so that automatic is the frame symbol the child needs. `this` is a real
+// slang ValueSymbol (SubroutineSymbol::thisVar) living in localmap like any other
+// automatic, so it is captured by exactly the same machinery -- an explicit `this.p`
+// already arrived that way.
 struct ForkCaptureDetector : ASTVisitor<ForkCaptureDetector, VisitFlags::AllGood> {
     const ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, uint32_t>* locals;
-    std::vector<const slang::ast::ValueSymbol*>                                   captured;
-    bool                                                                          implicit_this = false;
+    // Boxed captures are NOT in `locals`: a boxed declared local has no frame slot of
+    // its own, precisely so nothing initializes the variable through a slot typed as
+    // the box. They are still this frame's, so they still have to be captured.
+    const ankerl::unordered_dense::set<const slang::ast::ValueSymbol*>* boxed = nullptr;
+    // The enclosing method's `this` automatic, when there is one.
+    const slang::ast::ValueSymbol*                                      this_var = nullptr;
+    std::vector<const slang::ast::ValueSymbol*>                         captured;
 
     void check(const slang::ast::ValueSymbol& sym) {
         if (const auto* prop = sym.as_if<slang::ast::ClassPropertySymbol>()) {
             if (prop->lifetime != slang::ast::VariableLifetime::Static) {
-                implicit_this = true;
+                // The property itself is heap storage the child reaches through the
+                // handle; what has to travel is the handle.
+                if (this_var != nullptr) {
+                    check(*this_var);
+                }
                 return;
             }
         }
-        if (!locals->contains(&sym)) {
+        if (!locals->contains(&sym) && !(boxed != nullptr && boxed->contains(&sym))) {
             return; // a module signal or a static local: shared storage already
         }
         if (std::find(captured.begin(), captured.end(), &sym) == captured.end()) {
@@ -727,6 +950,18 @@ struct ForkCaptureDetector : ASTVisitor<ForkCaptureDetector, VisitFlags::AllGood
     }
     void handle(const HierarchicalValueExpression& hv) {
         check(hv.symbol);
+    }
+
+    // A declaration's initializer hangs off the SYMBOL, not the statement, so a
+    // statement walk does not reach it. Without this, `fork begin automatic int k = j;
+    // ... end join_none` -- LRM 9.3.2's own idiom -- never records the reference to
+    // `j`, and the child then failed to resolve it as an unknown signal instead of
+    // capturing it.
+    void handle(const VariableDeclStatement& d) {
+        if (const Expression* init = d.symbol.getInitializer()) {
+            init->visit(*this);
+        }
+        visitDefault(d);
     }
 };
 
@@ -4377,15 +4612,12 @@ private:
             // A queue / dynamic-array leaf compares element-wise. An aggregate, a
             // nested container or an element wider than one word walks in the backend
             // (emit_container_eq_loop, which recurses through this same compare, so
-            // only the element's own shape has to be checked here); a narrower scalar
-            // element goes through the flat runtime comparator, which is what still
-            // restricts the element kinds it can read.
+            // only the element's own shape has to be checked here); anything narrower
+            // is a scalar / real / string the flat runtime comparator reads directly.
             if (is_agg_abi_ref(t.element) || value_cat(t.element) == ValueCat::handle ||
                 module_.pool.layout(t.element).width > 64) {
                 guard_agg_eq_members(t.element);
-                return;
             }
-            guard_container_p_element(t.element, /*sty=*/nullptr);
             return;
         }
         if (value_cat(type) == ValueCat::handle) {
@@ -9059,19 +9291,23 @@ private:
             return; // `fork join` with no children: a no-op.
         }
 
-        // Inside a task, a child body gets its OWN frame, so a reference to the
-        // enclosing task's formals or automatics cannot resolve the way it does in
-        // a process (where every parent variable is a module signal). Pass each
-        // such symbol in as an ArgDir::Ref formal — the same live-pointer ABI a
-        // `ref` argument uses (docs/design/ref-args.md).
+        // Inside a task or a function, a child body gets its OWN frame, so a
+        // reference to the enclosing formals or automatics cannot resolve the way it
+        // does in a process (where every parent variable is a module signal). Each
+        // such variable lives in a GC box for the whole activation, and the child
+        // receives the box HANDLE by value (docs/design/fork-join.md V4).
         //
-        // That ABI is a raw pointer into the enclosing frame, so it needs the
-        // enclosing frame to outlive every child. `join` gives that for free. The
-        // other two kinds do not: a `join_none` parent walks straight past the fork
-        // and can return, and a `join_any` parent resumes on the first completion
-        // with siblings still live, so either can free the frame under a child that
-        // is still holding a pointer into it. Refused below rather than mis-lowered;
-        // it lifts with V4's per-spawn copies (docs/design/fork-join.md).
+        // One rule for all three join kinds. The predecessor passed a fat
+        // `ArgDir::Ref` -- a raw pointer into the enclosing frame -- under `join`
+        // only, and that had two independent limits, neither of them about the join
+        // kind: the ref ABI could carry only a packed integral or a dynamic array, so
+        // a string / real / unpacked / queue / handle capture was refused outright;
+        // and a `kill` on a joining parent frees the frame under children that abort
+        // later (docs/design/process-class.md §11), so even `join` did not really
+        // guarantee the lifetime the pointer needed. The box has reference semantics,
+        // which is what LRM 9.3.2 asks for (an enclosing automatic is ONE variable),
+        // and a live coroutine frame is a conservative GC root, so it outlives the
+        // parent activation with no refcount and no ownership surgery.
         std::vector<const ValueSymbol*> captures;
         if (fn_ctx_ != nullptr) {
             // LRM 13.4.4 allows `fork … join_none` in a function -- it schedules
@@ -9092,36 +9328,46 @@ private:
             const char* enclosing = fn_ctx_->is_task ? "task" : "function";
             ForkCaptureDetector d;
             d.locals = &fn_ctx_->localmap;
+            ankerl::unordered_dense::set<const ValueSymbol*> boxed_syms;
+            for (const auto& [sym, bx] : fn_ctx_->boxed) {
+                boxed_syms.insert(sym);
+            }
+            d.boxed    = &boxed_syms;
+            d.this_var = fn_ctx_->this_var;
             for (const Statement* c : children) {
                 c->visit(d);
             }
-            if (d.implicit_this) {
-                // TODO: capture of `this` (LRM 8.11 inside 9.3.2) — a child would
-                // need the enclosing method's handle as a ref formal, which the ref
-                // ABI does not carry (it is a packed-slot pointer).
-                fail(std::string(kind_name) +
-                     " child that reads a class property of the enclosing "
-                     "method is not supported");
-            }
+            // Every capture rides a GC box installed at body entry, by the same
+            // BoxCandidateScan that ran over this fork before the frame was laid out.
+            // A miss is therefore a lowering bug -- the two walks disagreed -- not a
+            // source-level refusal, and it is reported as one.
             for (const ValueSymbol* sym : d.captured) {
-                const auto& ct = sym->getType().getCanonicalType();
-                if (kind != ir::ForkKind::Join) {
+                if (!fn_ctx_->boxed.contains(sym)) {
                     fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
-                         std::string(sym->name) +
-                         "' is not supported (only fork..join can capture an enclosing frame: the "
-                         "parent has to outlive every child for the reference to stay valid)");
-                }
-                if (!ct.isIntegral() && ct.as_if<slang::ast::DynamicArrayType>() == nullptr) {
-                    // TODO: capture of an unpacked array / struct / string / real /
-                    // queue / class-handle local. Exactly the ref ABI's own gap, so
-                    // the two lift together (docs/design/ref-args.md).
-                    fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
-                         std::string(sym->name) +
-                         "' is not supported (only packed integral and dynamic-array "
-                         "locals can be captured)");
+                         std::string(sym->name) + "' is not supported (internal: no capture box)");
                 }
             }
             captures = std::move(d.captured);
+            // Spawn-time initialization only matters where the child's body runs
+            // LATER than the spawn. A `join` child is ramped and resumed inline at the
+            // fork (lower_fork_inst), so its declaration initializers run at the spawn
+            // already, which is exactly what 9.3.2 asks for.
+            if (kind != ir::ForkKind::Join) {
+                for (const Statement* c : children) {
+                    SpawnInitScan si;
+                    si.captured = &captures;
+                    c->visit(si);
+                    if (si.hit != nullptr) {
+                        // TODO: spawn-time initialization of a child-block automatic
+                        // (LRM 9.3.2). See SpawnInitScan.
+                        fail(std::string(kind_name) + " child declaring '" + std::string(si.hit->name) +
+                             "' initialized from the captured '" +
+                             std::string(captures.empty() ? "" : captures.front()->name) +
+                             "' is not supported: LRM 9.3.2 initializes it at the spawn, and the "
+                             "body runs later, so it would read a later value");
+                    }
+                }
+            }
         }
 
         std::vector<ir::FunctionId> ids;
@@ -9130,16 +9376,16 @@ private:
             ids.push_back(build_fork_child(*c, captures, kind));
         }
 
-        // The capture actuals, in the order the children took their formals.
-        // Evaluated here, in the ENCLOSING frame (build_fork_child's FnScope is
-        // already unwound): value_lvalue resolves each to its frame Local, which is
-        // the whole, unmasked, zero-offset lvalue the backend's ref_actual_ptr
-        // requires.
+        // The capture actuals, in the order the children took their formals: each is
+        // the box HANDLE by value, an rvalue rather than the box's own frame slot, so
+        // nothing the child holds points into this activation. Evaluated here, in the
+        // ENCLOSING frame (build_fork_child's FnScope is already unwound).
         const ir::SourceLoc    l = loc(blk);
         std::vector<ir::Index> args;
         args.reserve(captures.size());
         for (const ValueSymbol* sym : captures) {
-            args.push_back(value_lvalue(*sym, b, l));
+            const FnCtx::Boxed& bx = fn_ctx_->boxed.at(sym);
+            args.push_back(b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l));
         }
         b.fork(ids, args, kind, l);
     }
@@ -15867,7 +16113,7 @@ private:
     // safe when the label and every label between the two occurrences are
     // side-effect-free -- else an intervening f() or ++ could mutate the
     // variables it reads, or a conforming sim must still run the dropped label's
-    // own effect (has_observable_effect + a pure-label memo cleared at any impure
+    // own effect (is_speculation_safe + a pure-label memo cleared at any impure
     // label gates it). Dropped for now: rare, and the constant path is what the
     // downstream jump-table lowering needs.
     //
@@ -18438,7 +18684,12 @@ private:
         }
         const ir::Ref           ty        = lower_type(*arg.type);
         const ir::Type::Kind    k         = std::get<ir::Type>(module_.pool.get(ty)).kind;
-        const bool              container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray;
+        // Every managed container renders through expand_p_lvalue, which walks it.
+        // An Assoc is not is_agg_abi_ref either, so without naming it here a bare
+        // `$display("%p", my_assoc)` took the singular path and died as an
+        // unrenderable handle.
+        const bool              container = k == ir::Type::Kind::Queue || k == ir::Type::Kind::DynArray ||
+                                            k == ir::Type::Kind::Assoc;
         const slang::ast::Type& sty       = *arg.type;
         const ir::SourceLoc     l         = loc(arg);
         if (!is_agg_abi_ref(ty) && !container) {
@@ -18451,48 +18702,6 @@ private:
             return;
         }
         expand_p_lvalue(lower_lvalue(unwrap_conversion(arg), b), ty, &sty, frag, args, b, l);
-    }
-
-    // Guard the element type of a `%p`'d queue / dynamic array: the runtime
-    // formatter renders integral (width <= 64), real, and string leaves; a
-    // wider or nested-aggregate element is a documented follow-up (a non-POD
-    // element is already rejected in lower_type).
-    // A tagged-union element is refused rather than rendered flat: the runtime
-    // container descriptor carries no member names, so it could only print the raw
-    // bit-vector where LRM 21.2.1.6 requires `tag:value`. `sty` is the container's
-    // slang type when known.
-    void guard_container_p_element(ir::Ref elem, const slang::ast::Type* sty) {
-        if (sty != nullptr) {
-            const slang::ast::Type* et = sty->getCanonicalType().getArrayElementType();
-            if (et != nullptr && et->isTaggedUnion()) {
-                // TODO: %p of a queue / dynamic array of tagged unions (needs the
-                // per-member name table threaded into rt_container_format_p).
-                fail("%p of a queue / dynamic array of tagged unions is not supported");
-            }
-        }
-        const ir::Type e = std::get<ir::Type>(module_.pool.get(elem));
-        if (e.kind == ir::Type::Kind::String || module_.pool.is_float(elem)) {
-            return;
-        }
-        if (e.kind == ir::Type::Kind::Class) {
-            // A class handle is a 64-bit word, so it would otherwise fall into the
-            // scalar arm below and print as a heap address.
-            // TODO: %p of a queue / dynamic array of class handles (it would need
-            // a per-object id, which the flat container descriptor cannot reach).
-            // The same refusal already covers a bare handle -- see display_test.
-            fail("%p of a queue / dynamic array of class handles is not supported");
-        }
-        if (value_cat(elem) == ValueCat::scalar) {
-            if (module_.pool.layout(elem).width > 64) {
-                // TODO: %p of a queue / dynamic array element wider than 64 bits
-                // (the runtime plane extraction is single-word).
-                fail("%p of a queue / dynamic array element wider than 64 bits is not supported");
-            }
-            return;
-        }
-        // TODO: %p of a queue / dynamic array of nested aggregate / handle
-        // elements (needs recursive runtime rendering).
-        fail("%p of a queue / dynamic array with a nested aggregate element is not supported");
     }
 
     // The Scope side of a union type, whose members carry the names and payload
@@ -18766,16 +18975,27 @@ private:
                 args.push_back(build_container_p_string(lv, ty, t, sty, b, l));
                 return;
             }
-            guard_container_p_element(t.element, sty);
+            // What is left is exactly what the flat descriptor describes: a scalar
+            // of one word or less, a real, or a string.
             args.push_back(b.container_fmt_p(lv, ty, l));
             return;
         }
+        if (t.kind == ir::Type::Kind::Assoc) {
+            // An associative-array leaf renders over its live entries in ascending
+            // key order, spliced in as a `%s` string argument like a queue's. It
+            // cannot use the flat runtime formatter at all: that addresses an element
+            // as `base + i*stride`, which a keyed table has no answer for, and the
+            // ordered walk exists only as the four-call rt_assoc_first / next ABI.
+            // So it takes the same IR-loop render a container with a non-flat element
+            // already takes -- see build_assoc_p_string.
+            frag += "%s";
+            args.push_back(build_assoc_p_string(lv, ty, t, sty, b, l));
+            return;
+        }
         if (value_cat(ty) != ValueCat::scalar && value_cat(ty) != ValueCat::string) {
-            // Assoc arrays are the only handle left (a queue / dynamic array took the
-            // branch above).
-            // TODO: %p of an associative-array leaf (its runtime table carries no
-            // ordered element walk for the formatter).
-            fail("%p of an associative-array aggregate leaf is not supported");
+            // Every managed container has an arm above, so what reaches here is a
+            // handle with no aggregate value to render at all.
+            fail("%p of a handle aggregate leaf is not supported");
         }
         // A singular leaf. With the slang type in hand this may still be one of LRM
         // 21.2.1.6's named cases (a nested tagged union, packed struct, plain union,
@@ -18847,6 +19067,94 @@ private:
                  idx.lv(b, l),
                  b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
                  l);
+        const ir::ExtraSlice step = b.close_region();
+
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+        append(str_const("}"));
+        return b.unary(T::Load, out.lv(b, l), l);
+    }
+
+    // `%p` of an associative array, as a string value: `'{k0:v0, k1:v1, ...}` over
+    // the live entries in ascending key order (LRM 7.9.3's traversal order, which
+    // 7.8.5 defines for integral and string keys and leaves implementation-defined
+    // for the rest -- see docs/design/assoc-keys.md).
+    //
+    // Structurally build_container_p_string with the index space replaced by a key
+    // walk: assoc_traverse(First) seeds, assoc_traverse(Next) advances, assoc_select
+    // reads the entry -- exactly the shape lower_foreach_assoc_dim already uses for
+    // `foreach`. That key walk is also why this cannot be a runtime formatter the way
+    // a queue of flat elements is: a stored key is an order-preserving byte span and
+    // has to be DENORMALIZED into a typed cell before it can be printed, which lives
+    // in the backend's AssocFirst / AssocNext lowering, and a struct value or nested
+    // container then renders through the ordinary aggregate expansion.
+    ir::Index build_assoc_p_string(ir::Index               lv,
+                                   ir::Ref                 ty,
+                                   const ir::Type&         t,
+                                   const slang::ast::Type* sty,
+                                   ir::Builder&            b,
+                                   ir::SourceLoc           l) {
+        using T    = ir::Inst::Tag;
+        using Step = ir::Builder::AssocStep;
+        const slang::ast::AssociativeArrayType* ast =
+          sty != nullptr ? &sty->getCanonicalType().as<slang::ast::AssociativeArrayType>() : nullptr;
+        const slang::ast::Type* est = ast != nullptr ? &ast->elementType : nullptr;
+        // A wildcard `[*]` index has no slang index type, and its lowered key is a
+        // synthetic u64 placeholder, so it renders as a plain integral key.
+        const slang::ast::Type* kst = ast != nullptr ? ast->indexType : nullptr;
+        const ir::Ref kr = t.right != 0 ? make_int_type(64, false, false) : static_cast<ir::Ref>(t.fields_id);
+        const ir::Ref  bit1 = make_int_type(1, false, false);
+        const TempCell out  = make_temp_cell(module_.pool.string_type, "pstr");
+        const TempCell key  = make_temp_cell(kr, "pkey");
+        const TempCell ok   = make_temp_cell(bit1, "pstr_ok");
+        const TempCell more = make_temp_cell(bit1, "pstr_more");
+        const auto     str_const = [&](std::string_view s) { return b.constant(string_value_ref(s), l); };
+        const auto     append    = [&](ir::Index piece) {
+            const std::array<ir::Index, 2> parts{ b.unary(T::Load, out.lv(b, l), l), piece };
+            b.binary(T::Store, out.lv(b, l), b.concat(parts, l), l);
+        };
+        // An aggregate key has no plane value, so it travels as an lvalue -- the same
+        // split lower_assoc_key makes for `a[k]`.
+        const auto key_operand = [&] {
+            return is_agg_abi_ref(kr) ? key.lv(b, l) : b.unary(T::Load, key.lv(b, l), l);
+        };
+
+        b.binary(T::Store, out.lv(b, l), str_const("'{"), l);
+        // `more` is "an entry has already been emitted", i.e. the separator flag. A
+        // key walk has no index to compare against zero the way the queue loop does.
+        b.binary(T::Store, more.lv(b, l), b.constant(module_.pool.put_int(bit1, 0), l), l);
+        b.binary(
+          T::Store, ok.lv(b, l), b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::First, ty, l), bit1, l), l);
+
+        b.open_region();
+        const ir::Index      pred = b.unary(T::Load, ok.lv(b, l), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        b.open_region();
+        append(str_const(", "));
+        const ir::ExtraSlice sep_r = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice nosep_r = b.close_region();
+        b.cond(b.unary(T::Load, more.lv(b, l), l), sep_r, nosep_r, l);
+        b.binary(T::Store, more.lv(b, l), b.constant(module_.pool.put_int(bit1, 1), l), l);
+        std::string            efrag;
+        std::vector<ir::Index> eargs;
+        // The key prints by the same leaf rules as any other %p element, so an enum
+        // key prints its name and a string key prints quoted.
+        if (kst != nullptr) {
+            expand_p_scalar(b.unary(T::Load, key.lv(b, l), l), *kst, efrag, eargs, b, l);
+        } else {
+            efrag += "%0d";
+            eargs.push_back(b.unary(T::Load, key.lv(b, l), l));
+        }
+        efrag += ':';
+        expand_p_lvalue(b.assoc_select(lv, key_operand(), ty, l), t.element, est, efrag, eargs, b, l);
+        append(b.sformatf(efrag, eargs, l));
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        b.binary(
+          T::Store, ok.lv(b, l), b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::Next, ty, l), bit1, l), l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -21573,12 +21881,12 @@ private:
                 // dispatch paths. `x matches pat ? a : b` binds the pattern's
                 // variables here, so the arms below see them.
                 const ir::Index pred = lower_conditions(c.conditions, b, l);
-                // An arm whose evaluation is observable must not run unless
-                // chosen (LRM 11.4.11: a definite condition evaluates only its
-                // arm; an ambiguous one evaluates both and blends). Pure arms
-                // keep the branchless packed select — evaluating the unchosen
-                // arm is then unobservable.
-                if (has_observable_effect(c.left()) || has_observable_effect(c.right())) {
+                // An arm that is not safe to speculate must not run unless chosen
+                // (LRM 11.4.11: a definite condition evaluates only its arm; an
+                // ambiguous one evaluates both and blends). A speculation-safe arm
+                // keeps the branchless packed select — evaluating the unchosen arm
+                // is then unobservable, and bit-identical to the ambiguous blend.
+                if (!is_speculation_safe(c.left()) || !is_speculation_safe(c.right())) {
                     return lower_lazy_conditional(c, pred, b);
                 }
                 const ir::Index a  = lower_expr(c.left(), b);
@@ -23325,11 +23633,196 @@ private:
         const SubroutineSymbol* sym = nullptr;
         // Class method context (valid iff has_this): `this` is spliced as frame
         // Local 0, `this_class` is its Kind::Class handle type. A bare property
-        // reference inside the body roots at this Local (value_lvalue).
+        // reference inside the body roots at this handle (value_lvalue -> this_handle).
         bool     has_this   = false;
         uint32_t this_local = 0;
         ir::Ref  this_class = ir::Ref::Invalid;
+        // slang's own symbol for `this` (SubroutineSymbol::thisVar). It is an ordinary
+        // automatic of this frame, which is what lets a fork child capture it; every
+        // reader of the handle goes through this_handle so a BOXED `this` is read out
+        // of its box rather than out of Local 0.
+        const ValueSymbol* this_var = nullptr;
+        // Captured automatics that live in a GC box rather than in the frame, so a
+        // detached fork child can share them after this activation is gone (LRM 9.3.2
+        // makes an enclosing automatic ONE variable; docs/design/fork-join.md V4).
+        // Consulted by value_lvalue BEFORE localmap: a boxed symbol keeps its localmap
+        // entry so ForkCaptureDetector still sees it as this frame's, but every access
+        // goes through the box.
+        struct Boxed {
+            uint32_t local; // frame Local holding the box handle
+            ir::Ref  cls;   // the box's one-field synthetic class
+        };
+        ankerl::unordered_dense::map<const ValueSymbol*, Boxed> boxed;
     };
+
+    // Inner storage type -> its capture-box class (box_class_type). The field name is
+    // not a legal SV identifier, so it cannot collide with a property.
+    static constexpr std::string_view                          kCaptureBoxField = "$capture";
+    ankerl::unordered_dense::map<ir::Ref, ir::Ref>             box_class_;
+
+    // The synthetic one-field class a captured automatic of type `inner` lives in
+    // (docs/design/fork-join.md V4). Interned per inner type.
+    //
+    // A class and not a new kind of heap cell because a class already is everything a
+    // box needs: ClassNew allocates it on the GC fast path, its trace map falls out of
+    // the field table (so a boxed handle is traced precisely and a boxed `int` is
+    // traced not at all), a handle has reference semantics -- which IS the sharing
+    // 9.3.2 asks for -- and the place is HandleDeref + MemberSelect 0. It is the shape
+    // lower_process_class already uses for the PCB handle.
+    //
+    // Nothing here is keyed on a slang type: set_class_desc takes a bare Ref, and the
+    // id is minted straight off the counter without joining the symbol map. A box has
+    // no methods, is never a base and is never `$cast` to, so its slot table is empty.
+    ir::Ref box_class_type(ir::Ref inner) {
+        if (const auto it = box_class_.find(inner); it != box_class_.end()) {
+            return it->second;
+        }
+        const uint32_t fid = module_.pool.reserve_struct_fields();
+        ir::Type       t;
+        t.kind      = ir::Type::Kind::Class;
+        t.fields_id = fid;
+        t.element   = ir::Ref::Invalid;
+        const ir::Ref ref = module_.pool.put(ir::Item{ t });
+        std::vector<ir::FieldRow> fields;
+        fields.push_back({ kCaptureBoxField, inner, 0 });
+        module_.pool.set_struct_fields(fid, std::move(fields));
+        module_.set_class_desc(ref, std::vector<ir::FunctionId>{}, class_ids_->next++);
+        box_class_.emplace(inner, ref);
+        return ref;
+    }
+
+    // The lvalue of a boxed local: dereference the handle in its frame slot and select
+    // the single field. Re-emitted per access, like every other place.
+    ir::Index boxed_lvalue(const FnCtx::Boxed& bx, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Index handle = b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l);
+        return b.member_select(b.handle_deref(handle, bx.cls, l), 0, bx.cls, l);
+    }
+
+    // The enclosing method's `this` handle, as a value. One helper rather than four
+    // copies of the load, because `this` is now a capturable automatic like any other:
+    // when a fork child reads a class property of the enclosing method, `this` is boxed
+    // and the handle has to be read out of the box.
+    ir::Index this_handle(ir::Builder& b, ir::SourceLoc l) {
+        if (fn_ctx_->this_var != nullptr) {
+            if (const auto bx = fn_ctx_->boxed.find(fn_ctx_->this_var); bx != fn_ctx_->boxed.end()) {
+                return b.unary(ir::Inst::Tag::Load, boxed_lvalue(bx->second, b, l), l);
+            }
+        }
+        return b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
+    }
+
+    // Allocate a box for every automatic of THIS activation that a detaching fork's
+    // children reference, before the body is lowered (docs/design/fork-join.md V4).
+    //
+    // Entry, not first use: a box has to exist on every path that can reach an access,
+    // and first use may sit inside a conditional region. One ClassNew per boxed
+    // variable per activation is the cost, paid only by a body that actually spawns a
+    // detached child touching its locals.
+    //
+    // A boxed symbol keeps its localmap entry -- for a formal that is the ABI's
+    // copy-in slot, which stays formal k == Local k; for a declared local it is what
+    // ForkCaptureDetector matches against, so the child still receives it. value_lvalue
+    // consults `boxed` first, so the localmap slot of a boxed local is never read.
+    void install_capture_boxes(const SubroutineSymbol& sub, const Statement& body, ir::Builder& b) {
+        BoxCandidateScan scan;
+        body.visit(scan);
+        if (scan.candidates.empty()) {
+            return;
+        }
+        const ir::SourceLoc l = to_source_loc(sub.location);
+        // Formals first, in declaration order, then automatics declared in the body:
+        // a stable order keeps the emitted IR deterministic.
+        for (const FormalArgumentSymbol* fa : sub.getArguments()) {
+            if (!scan.candidates.contains(fa)) {
+                continue;
+            }
+            if (fa->direction != slang::ast::ArgumentDirection::In) {
+                // TODO: capture of an output / inout formal. Its copy-out reads the
+                // formal's own frame slot, which does not see writes made through the
+                // box, so the box would have to be copied back before every return.
+                // Raised here, where the fork's join kind is not in scope, so the
+                // wording names the construct rather than a kind.
+                fail("a fork child that reads the enclosing subroutine's '" + std::string(fa->name) +
+                     "' is not supported: capturing an output or inout formal would lose "
+                     "the writes made through it");
+            }
+            box_one_capture(*fa, /*copy_in=*/true, b, l);
+        }
+        for (const ValueSymbol* vs : body_automatics(sub, body)) {
+            if (scan.candidates.contains(vs)) {
+                box_one_capture(*vs, /*copy_in=*/false, b, l);
+            }
+        }
+        // `this` last, and only if a child needs it. It is an ordinary automatic of
+        // this frame -- slang makes it a VariableSymbol with Automatic lifetime -- but
+        // it is in neither getArguments() nor the body's declarations, so neither loop
+        // above reaches it. `copy_in` is right for the same reason it is right for a
+        // formal: splice_this already gave it Local 0 and the backend's prologue fills
+        // that slot from argument 0. It is also `const`, so the box's only job is
+        // lifetime -- but uniformity is worth more here than saving one indirection in
+        // a method that spawns.
+        if (sub.thisVar != nullptr && (scan.implicit_this || scan.candidates.contains(sub.thisVar))) {
+            box_one_capture(*sub.thisVar, /*copy_in=*/true, b, l);
+        }
+    }
+
+    // One box: a frame slot holding the handle, a ClassNew into it, and for a formal
+    // the one store that moves the incoming argument into the box.
+    void box_one_capture(const ValueSymbol& vs, bool copy_in, ir::Builder& b, ir::SourceLoc l) {
+        if (fn_ctx_->boxed.contains(&vs)) {
+            return;
+        }
+        const ir::Ref  inner = lower_type(vs.getType());
+        const ir::Ref  cls   = box_class_type(inner);
+        const uint32_t slot  = static_cast<uint32_t>(fn_ctx_->local_types.size());
+        fn_ctx_->local_types.push_back(cls);
+        b.binary(ir::Inst::Tag::Store, b.local(slot, cls, l), b.class_new(cls, l), l);
+        if (copy_in) {
+            // The formal's own Local, which the backend's prologue has filled.
+            const uint32_t k = fn_local(vs);
+            b.binary(ir::Inst::Tag::Store,
+                     boxed_lvalue({ slot, cls }, b, l),
+                     b.unary(ir::Inst::Tag::Load, b.local(k, inner, l), l),
+                     l);
+        }
+        // Deliberately NOT registered in localmap for a declared local: a boxed local
+        // has no frame slot of its own, so lower_var_decl cannot initialize the
+        // variable through a slot typed as the box. value_lvalue routes every access
+        // (the declaration's own initializer included) through the box.
+        fn_ctx_->boxed[&vs] = { slot, cls };
+    }
+
+    // The automatic-lifetime variables `body` declares, in declaration order. Only
+    // these can box: a static local keeps persistent storage that already outlives
+    // every child, and anything else in the candidate set is not this frame's.
+    std::vector<const ValueSymbol*> body_automatics(const SubroutineSymbol& sub, const Statement& body) {
+        // Declarations are reached through their STATEMENTS -- a statement visitor does
+        // not visit a VariableSymbol on its own -- so both forms that introduce an
+        // automatic are picked up here: a declaration statement and a `for`'s own loop
+        // variables, which is the shape LRM 9.3.2's example uses.
+        struct Scan : ASTVisitor<Scan, VisitFlags::AllGood> {
+            std::vector<const ValueSymbol*> out;
+            void take(const VariableSymbol& vs) {
+                if (vs.lifetime == slang::ast::VariableLifetime::Automatic) {
+                    out.push_back(&vs);
+                }
+            }
+            void handle(const VariableDeclStatement& d) {
+                take(d.symbol);
+                visitDefault(d);
+            }
+            void handle(const ForLoopStatement& f) {
+                for (const VariableSymbol* v : f.loopVars) {
+                    take(*v);
+                }
+                visitDefault(f);
+            }
+        };
+        Scan sc;
+        body.visit(sc);
+        (void)sub;
+        return std::move(sc.out);
+    }
 
     // Restore a saved piece of Lowerer state when the scope exits — on the throwing
     // path too. A lowering failure is an exception that `recover` catches per member
@@ -23543,6 +24036,13 @@ private:
             }
         }
         if (fn_ctx_ != nullptr) {
+            // A captured automatic living in a GC box: every access in this activation
+            // goes through the box, so the fork child that shares it sees the same
+            // variable (LRM 9.3.2). Ahead of the frame path, which for a boxed FORMAL
+            // still holds the ABI's copy-in slot.
+            if (const auto bx = fn_ctx_->boxed.find(&vs); bx != fn_ctx_->boxed.end()) {
+                return boxed_lvalue(bx->second, b, l);
+            }
             const auto it = fn_ctx_->localmap.find(&vs);
             if (it != fn_ctx_->localmap.end()) {
                 return b.local(it->second, fn_ctx_->local_types[it->second], l);
@@ -23550,10 +24050,8 @@ private:
             if (fn_ctx_->has_this) {
                 if (const auto* prop = vs.as_if<slang::ast::ClassPropertySymbol>()) {
                     // A bare property reference inside a method (implicit `this`):
-                    // load the `this` handle (Local 0) and select the property.
-                    const ir::Index handle =
-                      b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
-                    return class_member_lvalue(handle, *prop, fn_ctx_->this_class, b, l);
+                    // load the `this` handle and select the property.
+                    return class_member_lvalue(this_handle(b, l), *prop, fn_ctx_->this_class, b, l);
                 }
             }
         }
@@ -24205,6 +24703,7 @@ private:
         fn_ctx_->this_local = fn_local(*sub.thisVar);
         fn_ctx_->has_this   = true;
         fn_ctx_->this_class = hty;
+        fn_ctx_->this_var   = sub.thisVar;
     }
 
     // The lvalue of a class property `prop` reached through an object handle value
@@ -24282,6 +24781,7 @@ private:
             fn_local(*fa);
         }
 
+        install_capture_boxes(sub, sub.getBody(), b);
         lower_stmt(sub.getBody(), b);
 
         // Fall-through return: the void Ret drives the backend's copy-out epilogue.
@@ -24316,15 +24816,15 @@ private:
     // localmap first, then signal_of).
     //
     // `captures` are the enclosing subroutine's frame symbols the fork's children
-    // touch (lower_fork collected them). Each becomes an ArgDir::Ref formal
-    // aliasing the enclosing frame's slot, registered in this child's localmap
-    // under the SAME ValueSymbol -- which is what makes the child's reference to it
-    // resolve to the formal's Local instead of falling through to signal_of. Every
-    // child of one fork takes the same list, so an unused capture costs one dead
-    // pointer parameter. Returns the reserved FunctionId.
-    ir::FunctionId build_fork_child(const Statement&                      body,
-                                    std::span<const ValueSymbol* const>   captures,
-                                    ir::ForkKind                          kind) {
+    // touch (lower_fork collected them). Each becomes an ArgDir::In formal carrying
+    // the variable's GC box handle, registered in this child's `boxed` map under the
+    // SAME ValueSymbol -- which is what makes the child's reference to it resolve
+    // through the box instead of falling through to signal_of. Every child of one fork
+    // takes the same list, so an unused capture costs one dead scalar parameter.
+    // Returns the reserved FunctionId.
+    ir::FunctionId build_fork_child(const Statement&                    body,
+                                    std::span<const ValueSymbol* const> captures,
+                                    ir::ForkKind                        kind) {
         const ir::FunctionId id = module_.reserve_function();
 
         FnCtx ctx;
@@ -24339,9 +24839,24 @@ private:
         param_types.reserve(captures.size());
         arg_dirs.reserve(captures.size());
         for (const ValueSymbol* sym : captures) {
-            param_types.push_back(lower_type(sym->getType()));
-            arg_dirs.push_back(ir::ArgDir::Ref);
-            fn_local(*sym);
+            // The box handle, by value. Reference semantics come from the box, not
+            // from the ABI, so nothing points into the parent's frame and the child
+            // may outlive it (docs/design/fork-join.md V4).
+            const ir::Ref cls = box_class_type(lower_type(sym->getType()));
+            param_types.push_back(cls);
+            arg_dirs.push_back(ir::ArgDir::In);
+            const uint32_t k   = fn_local(*sym);
+            ctx.local_types[k] = cls;
+            ctx.boxed[sym]     = { k, cls };
+            // A captured `this` makes this child a method body for lookup purposes: a
+            // bare property reference inside it re-roots at the handle exactly as it
+            // did in the enclosing method (value_lvalue -> this_handle), which reads
+            // the box rather than a frame slot.
+            if (sym->name == "this") {
+                ctx.has_this   = true;
+                ctx.this_var   = sym;
+                ctx.this_class = lower_type(sym->getType());
+            }
         }
 
         ir::Builder b(module_.pool);
@@ -24490,6 +25005,8 @@ private:
             ctx.ret_local = fn_local(*sub.returnValVar);
         }
 
+        install_capture_boxes(sub, sub.getBody(), b);
+
         // A constructor constructs its base part first (LRM 8.15), before the body:
         // implicitly (no-arg), via `extends B(args)`, or via an explicit `super.new`
         // (all three surface through getBaseConstructorCall()). Emit it here, in the
@@ -24500,9 +25017,7 @@ private:
             const auto& clt = sub.thisVar->getType().getCanonicalType().as<slang::ast::ClassType>();
             if (clt.getBaseClass() != nullptr) {
                 const ir::SourceLoc bl = to_source_loc(sub.location);
-                const ir::Index     handle =
-                  b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, bl), bl);
-                emit_base_construction(clt, handle, b, bl);
+                emit_base_construction(clt, this_handle(b, bl), b, bl);
             }
         }
 
@@ -25793,7 +26308,7 @@ private:
             fail("class method call without an object handle is not supported");
         }
         const ir::SourceLoc l = loc(call);
-        return b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l);
+        return this_handle(b, l);
     }
 
     // The enclosing `this` handle and its class, for a built-in randomization call
@@ -25805,8 +26320,7 @@ private:
         if (fn_ctx_ == nullptr || !fn_ctx_->has_this) {
             fail("a randomization method call outside a class method needs an object handle");
         }
-        return { b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->this_local, fn_ctx_->this_class, l), l),
-                 class_of_ref(fn_ctx_->this_class) };
+        return { this_handle(b, l), class_of_ref(fn_ctx_->this_class) };
     }
 
     // The ClassType a lowered Kind::Class Ref came from (class_type_cache_ inverted).

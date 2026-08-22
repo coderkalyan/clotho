@@ -7,6 +7,9 @@
 #include "Lower.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
+#include "ir/LlvmBackend.h"
+
+#include <llvm/Support/raw_ostream.h>
 
 using namespace clotho;
 
@@ -50,6 +53,30 @@ void check_all_lowerings(std::string_view source, const std::string& expected) {
     CHECK(run_capture(source) == expected);
     CHECK(run_capture(source, { .thunk = false }) == expected);
     CHECK(run_capture(source, { .fuse = false, .thunk = false }) == expected);
+}
+
+// Lower to LLVM IR text, for the cases that pin a FUSION DECISION rather than a
+// value: a fused group of N > 1 members emits one `.fN` unit, so counting those
+// symbols is how a test observes what compute_fusion_groups decided.
+std::string emit(std::string_view source, ir::SimulationConfig config = {}) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*r.module, os, config));
+    return text;
+}
+
+// Count non-overlapping occurrences of `needle` in `hay`.
+size_t count_substr(const std::string& hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos;
+         at        = hay.find(needle, at + needle.size())) {
+        ++n;
+    }
+    return n;
 }
 
 } // namespace
@@ -178,3 +205,52 @@ endmodule
 // signal and a single WireRes resolver drives the net, so every process still
 // has exactly one write target. No fused group can contain two drivers of the
 // same storage — the shared-target hazard is structurally impossible.
+
+// A write reached only through a call is still a write. The pin below is on the
+// FUSION DECISION rather than on a settled value, deliberately: see
+// docs/design/fork-join.md §V5.8. `compute_fusion_groups`' interior guard
+// independently prevents a hidden edge from ever closing a cycle INSIDE a group,
+// so no value divergence is reachable today and manufacturing one would be a lie.
+// What is reachable, and what this locks, is that the wake graph now SEES the edge.
+TEST_CASE("comb fusion: a write reached only through a call joins the wake graph, "
+          "so the loop stops fusing") {
+    // A four-process combinational loop whose back edge hides inside a function:
+    // `back()` blocking-writes x, so the true graph is
+    //   (@w -> x) -> (@x -> y) -> (@y -> z) -> (@z -> back writes x) -> ...
+    //
+    // The shape is built specifically to defeat the interior guard, which is the
+    // only reason the two middle processes are fusion candidates at all: x has a
+    // SECOND, directly visible writer (`always @(w) x = w;`), so `cand_writes[x]`
+    // is set and `always @(x) y = x;` counts as interior. Without the function's
+    // edge, `@x -> y` and `@y -> z` look like an acyclic pair, Tarjan finds no
+    // nontrivial SCC, and they fuse into one `.f2` unit. With it they are inside a
+    // comb loop, `scc_nontrivial_` excludes them, and re-wake fixpoint iteration
+    // handles the loop instead — which is what the unfused schedule always did.
+    static const char* src = R"(
+module top;
+  reg [7:0] w = 0, x = 0, y = 0, z = 0;
+  integer d = 0;
+  function integer back(input [7:0] v);
+    if (v < 8'd5) x = v + 8'd1;
+    back = 0;
+  endfunction
+  always @(w) x = w;
+  always @(x) y = x;
+  always @(y) z = y;
+  always @(z) d = back(z);
+  initial begin
+    #1 w = 8'd1;
+    #20 $display("%0d %0d %0d %0d", w, x, y, z);
+  end
+endmodule
+)";
+    // No fused comb unit is emitted: a `.fN` symbol exists only for a group of
+    // N > 1. Before the call edge reached `BodyFacts::calls` this design emitted
+    // exactly one `.f2` (measured), so this is the assertion that flips.
+    CHECK(count_substr(emit(src), ".f2.thunk(ptr noalias %state") == 0);
+    CHECK(count_substr(emit(src, { .thunk = false }), ".f2(ptr %state") == 0);
+
+    // And the loop still settles, identically under every lowering — excluding
+    // the pair from fusion must not cost the fixpoint.
+    check_all_lowerings(src, "1 5 5 5\n");
+}

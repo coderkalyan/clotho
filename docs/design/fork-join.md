@@ -282,10 +282,12 @@ child's epilogue:
   parent plus one per child. Whoever drops the last reference frees it, which
   handles both "the parent returned first" and "every child finished
   synchronously inside the spawn loop, but the parent still has to read `count`".
-- **Captures** are refused by name for the detaching kinds, since nothing keeps the
-  frame alive. A fork in a *process* body has no captures at all (parent variables
-  are module signals), which is the common testbench idiom, so this costs little. It
-  lifts with V4's per-spawn copies.
+- **Captures** were refused by name for the detaching kinds, since nothing kept the
+  frame alive. Lifted in V4, and not by keeping the ref ABI for `join`: a capture is
+  a GC box handle for EVERY kind, so this bullet's lifetime argument no longer has a
+  case to make. A fork in a *process* body still has no captures at all (parent
+  variables are module signals), which is why the change is free for the common
+  testbench idiom.
 
 ### V2.3 Unbounded live children (**landed**)
 
@@ -344,10 +346,21 @@ is the hard half of that work, not the ring.
   a draw, so an ordinary fork costs nothing and does not perturb the parent's
   stream (`build_rng_fns`).
 
-Still open, and unchanged by V2: `Structural::walk` has no `Fork` case, so children
-are absent from `BodyFacts::calls`; and `scan_finish` omits `Fork`, so a `$finish` in
-a child does not mark the parent may-finish. Harmless while `$finish` is a longjmp, a
-live hazard for the cooperative-finish migration.
+**Closed since V2.** Both holes were call-edge discovery re-derived per consumer, so
+both are fixed at the source: `ir::inst_callees` / `ir::collect_callees`
+(`src/ir/Analysis.h`) are now the single authority on where a call edge lives in the
+IR, and `Structural::walk`, the backend's reactive/program reachability walks and
+`scan_finish` all read them. `BodyFacts::calls` therefore carries `Call`,
+`CallVirtual`, `TaskCall`, `TaskCallVirtual` and every `ForkInfo::children` entry, and
+a `$finish` in a child now marks the forking body may-finish.
+
+Two bounds survive and are documented at the declaration. Virtual dispatch
+contributes its STATICALLY resolved target only (`VirtualCallInfo::func`), so an
+override reached through a handle is missed and the may-finish figure stays a lower
+bound. And for `join_any` / `join_none` a child outlives the fork, so a write of its
+may land in a later instant than the edge claims — the edge is conservative rather
+than exact, which is the safe direction for a wake graph that is
+over-approximation-tolerant by construction.
 
 ### V2.5 What V2 does not do
 
@@ -355,13 +368,14 @@ live hazard for the cooperative-finish migration.
   per-process live-child *set*, which the count-and-wake_at record does not carry;
   `disable fork` additionally needs the general abort primitive
   (`docs/design/disable.md`).
-- **Per-spawn automatic lifetime** (V4) — the classic
-  `for (int i…) fork … use i … join_none` still cannot capture, and is refused by
-  name rather than reading a shared final `i`.
+- **Per-spawn automatic lifetime** (V4) — LANDED, and as a LIFETIME fix rather than
+  per-spawn copies: `for (int i…) fork … use i … join_none` captures and reads the
+  shared final `i`, which is the strict reading of LRM 9.3.2 (see the V4 bullet's
+  three-way measurement).
 - **Truly unbounded** live children — the ceiling in V2.3 is 1024, reported loudly.
 - **A `fork` inside a function** — LANDED for `join_none` (§"V5 scope" below), which
-  is the only kind LRM 13.4.4 allows there. A child still cannot capture the
-  function's own formals, which is V4's job.
+  is the only kind LRM 13.4.4 allows there. A child capturing the function's own
+  formals landed with V4.
 
 ## V5 scope: `fork … join_none` inside a function
 
@@ -581,15 +595,18 @@ function automatic bit watch_for_zero( IntClass p );
 endfunction
 ```
 
-The child reads `p`, an automatic FORMAL, so the capture guards fire:
+The child reads `p`, an automatic FORMAL, which V5 alone could not carry: the capture
+guards fired with
 `fork..join_none child that reads the enclosing function's 'p' is not supported`.
-(The message used to say "the enclosing task's" whatever the body was; it now names
-the kind, because in a function the captures that matter are its own formals.) A
-function's interesting state IS its formals, so V5 admits only children touching
-module signals, static locals and static class properties: a monitor spawned by a
-helper function, not the LRM's idiom.
+V4 lifted exactly that — `p` is boxed and the child holds the box — so the clause's own
+example now works. The paragraph below is kept because its reasoning is what chose the
+box over a copy. (The message used to say "the enclosing task's" whatever the body was;
+it now names the kind, because in a function the captures that matter are its own
+formals.) A function's interesting state IS its formals, which is why V5 on its own
+admitted only children touching module signals, static locals and static class
+properties: a monitor spawned by a helper function, not the LRM's idiom.
 
-That is an argument for finishing V4, not for widening the ref ABI. This paragraph
+That was an argument for finishing V4, not for widening the ref ABI. This paragraph
 used to say the right model for a detached child is "copy-in by value at spawn"; see
 the corrected V4 bullet in the phased plan for why that is wrong in general — LRM
 9.3.2 makes an enclosing automatic ONE variable, and iverilog agrees where Verilator
@@ -654,17 +671,48 @@ needs an SVA build (`-DCLOTHO_SVA=ON`) — the frontend refuses it by the root r
 and `reject_resume_once`'s new closure is the backstop, both by construction rather
 than by test.
 
-### V5.8 Adjacent gaps this widens but does not own
+### V5.8 Adjacent gaps this widens but does not own (**closed**)
 
-`BodyFacts::calls` is fed only by `TaskCall` / `TaskCallVirtual` — the `Call` arms
-push nothing and there is no `Fork` arm — so `compute_subscription_order`'s closure
-misses signals a fork child, or any plain function, blocking-writes, and
-`wake_adj_` / `scc_nontrivial_` / `sub_order_` are computed on an incomplete graph
-that `compute_fusion_groups` then reads. Pre-existing (a fork in a task has it too)
-and unchanged in kind by V5, which only widens its reach. Likewise `scan_finish`
-omits `Fork`, so a `$finish` in a child does not mark the parent may-finish —
-harmless while `$finish` is a longjmp, a live hazard for the cooperative-finish
-migration.
+`BodyFacts::calls` was fed only by `TaskCall` / `TaskCallVirtual` — the `Call` arms
+pushed nothing and there was no `Fork` arm — so `compute_subscription_order`'s
+closure missed every signal a fork child, or any plain function, blocking-writes, and
+`wake_adj_` / `scc_nontrivial_` / `sub_order_` were computed on an incomplete graph
+that `compute_fusion_groups` then read. Likewise `scan_finish` omitted `Fork`. Both
+now route through `ir::collect_callees`; see the "Closed since V2" note under §V2.4.
+
+**This was a latent-correctness fix, not a live wrong-value bug, and the reason is
+worth writing down because it is recorded nowhere else.** No settled-value divergence
+is reproducible from either hole. For the missing edge to produce a wrong VALUE it
+would have to defeat the held-sched-flag argument, which requires a combinational
+cycle *inside* one fused group. `compute_fusion_groups` blocks that independently,
+by two facts that compose:
+
+- Candidacy (`LlvmBackend.cpp:8989-9000`): a body holding `Call` / `CallVirtual` /
+  `TaskCall` / `TaskCallVirtual` / `Fork` is never `CombFuse::Eligible` (it scores
+  `HasCall` or `ImpureOp`), so the SOURCE of a hidden edge is never a group member.
+- The interior guard (`LlvmBackend.cpp:9001-9038`): a candidate merges only when its
+  ENTIRE sensitivity set is written by another candidate. Group members are therefore
+  triggered only by candidates, whose writes are all direct `Store`s and hence all
+  visible in the graph.
+
+Together those force the in-group candidate chain to be acyclic and fully visible: a
+hidden edge can only ever close a cycle OUTSIDE a group, where the sched flag is not
+held and ordinary re-wake-on-change still reaches the fixpoint. Confirmed
+empirically — a fork child in a loop, a value function in a loop, a task in a loop
+(control) and a fork child feeding a comb chain all produce byte-identical output
+under `{fuse=true}` and `{fuse=false}`, both before and after the fix. What the fix
+DOES change is the fusion decision: on a shape crafted to keep the members interior
+while the back edge hides in a function, the loop stops fusing, which is what
+`tests/comb_fusion_test.cpp` now pins. The `scan_finish` hole is latent for the
+separate reason the §V2.4 note gives — `$finish` is still a longjmp.
+
+**Residual bound, and the sentence a future reader needs: the interior guard is what
+makes this latent.** Anything that relaxes it — admitting a member whose sensitivity
+is written by a non-candidate, or admitting a callable body as a fusion candidate
+once purity closure over callees lands (the `CombFuse::HasCall` verdict exists
+precisely as a placeholder for that) — makes the hidden edge live, and a wrong
+settled value becomes reachable. Do not relax it without the complete call graph this
+change installs.
 
 ## Hard parts (V1)
 
@@ -737,14 +785,20 @@ from the parent's sensitivity, as called-subroutine bodies are handled.
   fork in **`always_comb` / `always_latch`**, are illegal SV and slang rejects them
   itself (`diag::TimingInFuncNotAllowed`, `diag::ForkJoinAlwaysComb`).
 - a captured local the ref ABI cannot carry (unpacked array / struct / string /
-  real / queue / class handle) — rejected by name, and lifts when the ref ABI
-  does.
+  real / queue / class handle) — **gone with the ref ABI (V4).** A capture is a GC
+  box handle, so the repertoire is the declared type.
 - a child reading a class property of the enclosing method through the implicit
-  `this` — rejected: the ref ABI carries a packed-slot pointer, not a handle.
+  `this` — **gone with the ref ABI (V4).** `this` is a capturable automatic like any
+  other; the box carries a handle.
+- a capture under `join_any` / `join_none` — **gone with the ref ABI (V4).** The box
+  does not need the enclosing frame to outlive anything.
+- a captured `output` / `inout` formal — rejected by name (V4): its copy-out reads
+  the formal's own frame slot, which does not see writes made through the box.
+- a child-block `automatic` initialized from a capture, under a detaching kind —
+  rejected by name (V4): 9.3.2 initializes it at the spawn and clotho runs it when
+  the child is first scheduled.
 - `disable` / `wait fork` / `disable fork` — reject (V3).
 - child-body constructs needing the unwind machinery — reject.
-- a capture under `join_any` / `join_none` — reject (§V2.2): the ref ABI needs the
-  enclosing frame to outlive every child, which only `join` guarantees.
 
 Mechanical / low-risk: the join record + parent frame live across the join
 suspend (alloca after `coro.begin`, spilled into the frame — reuse the task
@@ -786,11 +840,13 @@ record/awaiter pattern); `$finish` mid-fork leaks suspended child frames
     additionally nulls the record's `parent` before releasing its reference so a
     surviving child wakes nobody. §V2.2's byte-identical `join` codegen therefore holds
     only while process control is unused — which is the gate, and is verified.
-  - **The `ArgDir::Ref` capture refusal for the detaching kinds must STAY until V4**,
-    now for two reasons rather than one: a `join_none` parent can return, and a killed
-    parent's frame goes away under live children.
+  - **The `ArgDir::Ref` capture refusal for the detaching kinds had two reasons, not
+    one**: a `join_none` parent can return, and a killed parent's frame goes away under
+    live children. V4 retired both by retiring the ref — and the second reason is why
+    it had to retire it for `join` too, not just for the detaching kinds.
 
-- **V4 — captured-automatic LIFETIME, not per-spawn copies.** This bullet used to
+- **V4 — captured-automatic LIFETIME, not per-spawn copies. LANDED, except
+  spawn-time initialization (below).** This bullet used to
   read "give fork-captured automatics real per-spawn copies (frame locals), fixing
   `for … fork … i … join_none`". **That is the wrong target**, and §V2.5's own
   parenthetical already said so ("rather than reading a shared final `i`"): under
@@ -832,6 +888,141 @@ record/awaiter pattern); `$finish` mid-fork leaks suspended child frames
     goes with it, and 13.4.4's `watch_for_zero` (a captured class-handle formal) works
     for the same reason as an `int`.
 
+  **The box, per variable.** One box per captured variable, not one per activation:
+  per-variable keeps the trace precise and does not hold an unrelated local alive for
+  as long as any child of that activation runs, which for a `join_none` in a loop is
+  the whole loop's worth of captures.
+
+  A box is a **synthetic one-field class**, the shape `lower_process_class` already
+  uses for the PCB handle. That buys the whole mechanism with no new IR: `ClassNew`
+  allocates it through the GC fast path, the trace map falls out of the field table
+  (`class_gc_map_global`), reference semantics are what a class handle already has, and
+  the place is `HandleDeref` + `MemberSelect 0`. Nothing about it is keyed on a slang
+  type: `Module::set_class_desc` takes a bare `Ref`, and a fresh `type_id` is
+  `ClassIds::next++` without registering in the symbol map — the box is never `$cast`
+  to, never a base, and has no methods, so its slot table is empty.
+
+  **The wrinkle, and it decides the data structure.** `build_task` / `build_function`
+  keep the invariant *formal k == frame Local k*, which the backend prologue and
+  copy-out rely on. So a boxed FORMAL cannot simply become the box: the formal keeps
+  Local k as the ABI's copy-in target, and the box is a second slot. `FnCtx` therefore
+  needs `boxed: sym -> {box_local, box_class}` ALONGSIDE `localmap`, consulted first in
+  `value_lvalue`, with a prologue store copying Local k into the box once. The formal
+  slot is then write-only.
+
+  That leaves one case to refuse rather than get wrong: an `output` / `inout` formal
+  that is also captured. Its copy-out reads Local k, which no longer sees writes made
+  through the box, so the box would have to be copied back before every return.
+  Guarded loud until it has a reason to exist.
+
+  **Which locals box** is decided before the frame is laid out, because a boxed local
+  is boxed for every access in the activation, including ones lowered before the
+  `fork` is reached. A pre-pass over the body collects every `ValueSymbol` referenced
+  by a boxing fork's children; `fn_local` boxes a symbol in that set. The set is an
+  over-approximation on purpose — a module signal or a static in it is simply never a
+  frame local, so it never boxes — which keeps the pre-pass from having to resolve
+  storage class before storage exists.
+
+  **Which forks box: all of them.** This paragraph used to prescribe
+  `kind != Join || design_uses_process_`, the same predicate the join record uses, and
+  that was wrong twice over.
+
+  It is not implementable where the decision has to be made. `design_uses_process_` is
+  `facts_.uses.process`, computed by an IR scan (`Analysis.cpp`, on `ProcQuery` /
+  `ProcCtl` / `ProcWait`) after the whole module is lowered; the boxing decision has to
+  be made per subroutine BEFORE its frame is laid out. The frontend has no whole-design
+  fact to consult and no pre-pass that could produce one (`check_spawn_roots`, the only
+  design-wide frontend question, also runs after lowering).
+
+  It is also the wrong shape. The storage a capture needs is a property of the CAPTURE,
+  not of the join kind, and keying it on the kind is what produced two unrelated
+  refusals that both read as fork limitations:
+
+  - the fat `ArgDir::Ref` could carry only a packed integral or a dynamic array, so
+    `fork … join` refused a string / real / unpacked / queue / class-handle capture by
+    name — nothing to do with `join`;
+  - `join`'s "the parent outlives every child" is false under `kill`
+    (process-class.md §11 hazard 3), so even `join` did not really guarantee the
+    lifetime the pointer needed.
+
+  So the rule is one storage rule for every kind: a fork capture is a GC box handle.
+  `BoxCandidateScan` takes `JoinAll` alongside `JoinAny` / `JoinNone`, and the kind
+  disappears from the capture path entirely — `lower_fork` no longer has a
+  `box_captures` flag, `build_fork_child` no longer takes one, and `lower_fork_inst`
+  stops consulting `arg_dirs` because there is nothing but `In` left to find.
+
+  **What it costs, and where.** One `ClassNew` per captured variable per activation,
+  plus a load-and-deref per access instead of the ref ABI's load-and-epoch-check —
+  which is not obviously worse, since a `ref` read emits `emit_ref_epoch_check` and a
+  box read emits a null check on a handle that is never null. It is paid only by a body
+  that forks over its own frame variables. A fork in a PROCESS body has no captures at
+  all (a process-scope local is signal-like storage via `declare_local`), which is the
+  common testbench idiom, so `ForkInfo::args` stays empty and no box is created.
+
+  One kind-conditional survives and is not about storage: **spawn-time initialization**
+  (the refusal below) is gated on `kind != Join`, because a `join` child is ramped and
+  `coro.resume`d inline at the fork, so its declaration initializers already run at the
+  spawn — which is exactly what 9.3.2 asks for. Keying that guard on the boxing
+  decision instead would have started refusing `fork begin automatic int k = j; … end
+  join` which is correct today.
+
+  **`this` is an ordinary capture.** A bare property reference inside a method was
+  refused for every kind ("child that reads a class property of the enclosing method"),
+  on the stated grounds that the ref ABI carries a packed-slot pointer and not a
+  handle. That reason dies with the ref, and the construct needs no special case at
+  all: `value_lvalue` re-roots a bare property at the method's `this` automatic, and
+  that automatic is a real slang `ValueSymbol` (`SubroutineSymbol::thisVar`, a
+  `VariableSymbol` with `Automatic` lifetime) already living in `localmap` as Local 0.
+  So `ForkCaptureDetector::check` maps a non-static `ClassPropertySymbol` onto
+  `thisVar` and captures THAT; an explicit `this.p` already arrived that way. Three
+  details make it work:
+
+  - `thisVar` is in neither `getArguments()` nor the body's declarations, so
+    `install_capture_boxes` boxes it explicitly, driven by a flag `ValueRefScan` sets
+    when it sees a bare non-static property (the implied `this` reference is not
+    written anywhere in the AST). `copy_in` is right for the same reason it is right
+    for a formal — `splice_this` already gave it Local 0 and the prologue fills it.
+  - The four sites that loaded `this` out of Local 0 now go through one
+    `this_handle(b, l)`, which consults `boxed` first. Without that, a boxed `this`
+    would be read as if the box slot were the handle.
+  - `build_fork_child` sets `has_this` / `this_var` / `this_class` from a captured
+    `this`, so a bare property inside the CHILD re-roots the same way. `this_class`
+    stays the real class type; only the handle comes from the box.
+
+  `this` is `const` (slang marks it so), so a by-value `In` formal would have been
+  semantically identical and one indirection cheaper. Boxing it anyway keeps one path
+  through the capture machinery rather than two.
+
+  **What landed.** Every child's captures are boxed and shared, so LRM 9.3.2's
+  reading holds in a task and a function as it already did in a process: the children
+  of `for (int j…) fork … join_none` read the shared final `j` (`4 4 4`), a child's
+  WRITE to a capture is visible to the parent, a captured class-handle formal survives
+  the function returning (13.4.4's `watch_for_zero`), and a string capture works -- the
+  `ArgDir::Ref` type restriction is gone with the ref itself. Both old refusals are
+  lifted, for every join kind, and so is the implicit-`this` refusal. Backend:
+  `lower_fork_inst` marshals a capture as an ordinary `In` scalar (must|may and z);
+  `ref_actual_arg`, `push_ref_epochs` and the `gc_owner` assertion are gone from the
+  fork path, `frame_out_targets`' `Fork` arm no longer reasons about a ref actual, and
+  the x/z sweep's `Fork` arm treats an arg as an `In` scalar — the shared variable's
+  own x/z lives in the box's single field and travels through the ordinary
+  class-member Store cases instead.
+
+  Two things this needed that were not in the plan:
+
+  - A capture reference inside a child's DECLARATION INITIALIZER was invisible to
+    `ForkCaptureDetector`, because an initializer hangs off the symbol rather than the
+    statement. That made `fork begin automatic int k = j; … end join_none` fail as an
+    unknown signal instead of capturing -- a pre-existing hole, now fixed in both
+    walks.
+  - **Spawn-time initialization is NOT done, and is refused.** 9.3.2 initializes a
+    child-block `automatic` at the SPAWN, which is what makes each child see its own
+    `j` (the clause's "local copy, k, for each value of j"; Verilator prints `1 2 3`).
+    clotho runs a child's body, declaration initializers included, when the child is
+    first scheduled, so every child would read the later value. Refused loudly rather
+    than answered wrongly -- before boxing, the capture refusal hid this shape
+    entirely. Lifting it means evaluating such an initializer in the parent at the
+    spawn and passing the value in, alongside the box.
+
   Still cross-cutting with the broader automatic-lifetime gap (`declare_local`): the
   boxing decision is per captured variable, so it is a strictly smaller change than
   giving every automatic true per-activation lifetime.
@@ -841,7 +1032,7 @@ record/awaiter pattern); `$finish` mid-fork leaks suspended child frames
   13.4.4's caller-legality rule (`check_spawn_roots` plus `Process::spawn_root`,
   since a static initializer, a continuous assignment, a `final` block, a `$strobe`
   body and a DPI export all accepted a spawn silently before) and closing
-  `reject_resume_once` over calls. Captures stay refused until V4.
+  `reject_resume_once` over calls. Captures landed with V4.
 
 ## Verification
 
@@ -868,10 +1059,13 @@ an automatic task. Those are pinned from the LRM and flagged as such in the test
 comment.
 
 No-regression gate: the full doctest suite, plus **byte-identical emitted LLVM IR**
-for a design that does not fork (picorv32, 52 133 lines) and for one that uses only
-`fork … join`. That is a stronger check than a timing comparison and is why the
-record type is split in two — the short `{ count, parent }` record keeps `join`
-codegen bit-for-bit unchanged.
+for a design that does not fork (picorv32, 52 133 lines). The record type is still
+split in two — the short `{ count, parent }` record keeps `join`'s join-record codegen
+bit-for-bit unchanged when process control is unused. The stronger claim that used to
+sit here, byte-identical IR for a design using only `fork … join`, no longer holds and
+should not be restored: V4 made a `join` capture a box handle rather than a frame
+pointer, so a `fork … join` that CAPTURES emits different (and correct) code. A
+`fork … join` with no captures — which is every fork in a process body — is unchanged.
 
 Not covered: the overflow FATAL itself has no unit test. There is no cap knob in
 `SimulationConfig`, so reaching it needs a design whose static bound saturates AND

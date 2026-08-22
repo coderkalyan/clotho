@@ -25,8 +25,16 @@ process on the stack. Consequences:
 - **Everywhere.** The abandoned frames leak, and any runtime global caught
   mid-update stays that way. `emit_active_run` already compensates at *startup*
   — `nba_arr_reset`, `intra_reset`, both commented "a prior `$finish`" — which
-  is the wrong end of the problem and does not cover the rest (wait queues, the
-  observed/deferred queues, string pools, monitor and RNG state).
+  is the wrong end of the problem. Those two now also run from `rt_run_init`
+  (`src/runtime/Runtime.cpp:5899`), the general run-start seam emitted at the
+  top of the design's main, which additionally returns the process control-block
+  pool, the event pool, the detached `->> @(x) e` table, the file-descriptor
+  tables and the `$random` seed to power-on. That widens the compensation and
+  extends it to the paths a drain prologue never reaches — a fatal `std::exit`,
+  or a design that never enters a drain — but it does not change its direction:
+  it still repairs the *next* run instead of making `$finish` leave a clean one,
+  and the abandoned frames, the wait queues, the observed/deferred queues and
+  the string pools stay uncovered.
 
 ## The overhead constraint
 

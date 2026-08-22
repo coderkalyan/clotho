@@ -268,8 +268,11 @@ than the missing feature:
   `const_table_signal`). Currently unreachable for aggregate keys because a
   struct localparam is separately unsupported; it becomes reachable as soon as
   key types widen.
-- **P4d — `%p` of an assoc leaf is refused** (`Lower.cpp:16729`), which will read
-  as a regression once exotic keys are printable.
+- **P4d — `%p` of an assoc renders** (`build_assoc_p_string`), keyed by
+  `assoc_traverse(First/Next)`, so a printable key type prints. The key goes through
+  the ordinary `%p` leaf rules, which means a key type those rules cannot render is
+  refused by the leaf and not by the walk — the same refusal a value of that type
+  would take. Ordering is asserted in tests only for integral and string keys, per §8.
 
 ## 8. Test and oracle plan
 

@@ -299,7 +299,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_gc_containers_add", &rt_gc_containers_add);
     expose("rt_gc_container_add", &rt_gc_container_add);
     expose("rt_gc_container_remove", &rt_gc_container_remove);
-    expose("rt_event_pool_init", &rt_event_pool_init);
+    expose("rt_run_init", &rt_run_init);
     expose("rt_event_new", &rt_event_new);
     expose("rt_event_ptr", &rt_event_ptr);
     expose("rt_proc_alloc", &rt_proc_alloc);

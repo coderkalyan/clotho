@@ -145,8 +145,11 @@ This is where these live:
 **One real hazard.** CSE of anything reading state is illegal across a `Store`,
 an effectful `Call`, or a suspension (`Delay`/`Wait`). So hash-consing must be
 keyed on a **memory generation counter** that bumps on any of those, and pure
-computations only. `EffectDetector` (`Lower.cpp:552`) already exists for the
-adjacent question. This is the one genuine correctness risk in the plan and it
+computations only. `SpeculationScan` / `is_speculation_safe` (`Lower.cpp:641`)
+already exists for the adjacent question, though note its polarity: it answers
+"safe to evaluate eagerly", which is strictly stronger than "pure" (it also
+excludes the trapping reads a CSE pass may legally keep).
+This is the one genuine correctness risk in the plan and it
 wants a differential test against `--no-fold` from day one.
 
 **(b) A read-only analysis producing a side table.** The established pattern —

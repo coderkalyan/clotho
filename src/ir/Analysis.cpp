@@ -331,6 +331,41 @@ TagInfo tag_info(Inst::Tag tag) {
 
     return none;
 }
+
+void inst_callees(const Ir& ir, Index i, std::vector<FunctionId>& out) {
+    const Inst::Payload& p = ir.payload(i);
+    switch (ir.tag(i)) {
+        case Inst::Tag::TaskCall:
+            out.push_back(ir.extra_data<TaskCallInfo>(p.extra).func);
+            break;
+        case Inst::Tag::Call:
+            out.push_back(ir.extra_data<CallInfo>(p.extra).func);
+            break;
+        case Inst::Tag::TaskCallVirtual:
+        case Inst::Tag::CallVirtual:
+            // The statically bound target, not the one dispatch picks. See the
+            // bound on the declaration -- consumers needing every override union
+            // the vtable slots themselves.
+            out.push_back(ir.extra_data<VirtualCallInfo>(p.extra).func);
+            break;
+        case Inst::Tag::Fork:
+            // ForkInfo::children holds FunctionIds as raw u32s, one per parallel
+            // child body.
+            for (const Index kid : ir.region(ir.extra_data<ForkInfo>(p.extra).children)) {
+                out.push_back(static_cast<FunctionId>(kid));
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void collect_callees(const Ir& ir, std::vector<FunctionId>& out) {
+    for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+        inst_callees(ir, static_cast<Index>(k), out);
+    }
+}
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -613,6 +648,12 @@ struct Structural {
             const Inst::Payload& p = ir.payload(i);
             const Inst::Tag      t = ir.tag(i);
 
+            // Call edges, from the one walker that knows them all. Unconditional
+            // and ahead of every arm below, so no tag can acquire per-arm handling
+            // (or lose it) and silently drop its edge -- the failure that left
+            // `Call` and `Fork` out of `facts.calls` while `TaskCall` was in.
+            inst_callees(ir, i, facts.calls);
+
             // Comb-fusion purity: a whitelist, so anything unclassified objects.
             // Tags with their own handling below (loads, stores, calls) are
             // exempted there; everything else must be `pure`.
@@ -684,13 +725,11 @@ struct Structural {
                 case Inst::Tag::TaskCall: {
                     const TaskCallInfo ti = ir.extra_data<TaskCallInfo>(p.extra);
                     call_actuals(ir, ti.func, ti.args, /*copy_out=*/true, &facts.writes);
-                    facts.calls.push_back(ti.func);
                     break;
                 }
                 case Inst::Tag::TaskCallVirtual: {
                     const VirtualCallInfo vci = ir.extra_data<VirtualCallInfo>(p.extra);
                     call_actuals(ir, vci.func, vci.args, /*copy_out=*/true, &facts.writes);
-                    facts.calls.push_back(vci.func);
                     break;
                 }
                 case Inst::Tag::Call: {
@@ -1438,24 +1477,25 @@ struct ValueSweep {
                 }
 
                 case Inst::Tag::Fork: {
-                    // A fork child aliases each captured enclosing local through a
-                    // ref formal (Lower.cpp's lower_fork), so it reads that storage
-                    // on entry and writes whatever x/z it produces straight back --
-                    // exactly an inout/ref task actual, and handled the same way.
-                    // Every child takes the same capture list, so arg k feeds
-                    // formal k of every child.
+                    // A fork child receives each capture as a GC box HANDLE by value
+                    // (Lower.cpp's lower_fork), so an arg is an ordinary In scalar and
+                    // is treated exactly like a Call's In actual. The shared variable's
+                    // own x/z does not travel here at all: it lives in the box's single
+                    // field, and a child's write to it is an ordinary store through a
+                    // class member, which the Store cases already sweep. Every child
+                    // takes the same capture list, so arg k feeds formal k of every
+                    // child.
                     const ForkInfo               fi   = ir.extra_data<ForkInfo>(p.extra);
                     const std::span<const Index> args = ir.region(fi.args);
                     for (const Index kid : ir.region(fi.children)) {
                         FnState& cs = fns[static_cast<uint32_t>(kid)];
                         for (size_t k = 0; k < args.size(); ++k) {
-                            if (storage_z(ir, fn, args[k])) {
+                            if (z_of(args[k]) != 0) {
                                 mark(cs.param_z[k]);
                             }
-                            if (storage_x(ir, fn, args[k])) {
+                            if (x_of(args[k]) != 0) {
                                 mark(cs.param_x[k]);
                             }
-                            store_into(ir, fn, args[k], cs.local_z[k] != 0, cs.local_x[k] != 0);
                         }
                     }
                     val_x[raw] = 0;

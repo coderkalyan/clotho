@@ -5756,13 +5756,6 @@ uint32_t               g_event_pooled = 0; // pool objects handed out so far
 
 } // namespace
 
-extern "C" void rt_event_pool_init(void* static_block, uint32_t count) {
-    g_event_chunks.clear();
-    g_event_chunks.push_back(static_cast<rt_event*>(static_block));
-    g_event_static = count;
-    g_event_pooled = 0;
-}
-
 extern "C" void* rt_event_ptr(uint32_t slot) {
     if (slot < g_event_static) {
         return g_event_chunks[0] + slot;
@@ -5856,6 +5849,103 @@ void proc_maybe_free(rt_proc* p) {
 }
 
 } // namespace
+
+// Every process-global growable pool back to power-on (declared Runtime.h:1472).
+// The backend emits one call at the top of the design's main, before anything can
+// allocate. Frees run before re-registrations, and the pointer that came out of
+// the incoming JIT module is installed last.
+//
+// Why a run-START seam and not sim_teardown (:4534). Teardown runs inside
+// rt_sim_run, strictly BEFORE the emitted signal deinit and rt_gc_shutdown, and a
+// process object's finalizer calls rt_proc_obj_release out of exactly that later
+// window; $finish leaves suspended child frames whose blocks still carry
+// refs != 0; and the fatal paths (rt_oscillation_abort :3496, rt_null_handle,
+// alloc_fatal :4325) std::exit(1) without ever reaching rt_sim_run's tail.
+// Teardown drops what would dangle into dead JIT code the moment a run ends;
+// run-init guarantees a clean start on the paths teardown never reaches. Neither
+// subsumes the other, so both stay -- as does rt_sim_run's own `rt_finishing = 0`.
+//
+// Deliberately NOT reset here. GC state belongs to rt_gc_init (emitted right
+// beside this call), which preserves g.stats on purpose so a finished run leaves
+// a readable oracle -- the same run-start rule this seam generalises
+// (Gc.cpp:2984-2987). VCD belongs to rt_vcd_close / vcd_shutdown_writer. And the
+// host-armed configuration -- g_plusargs, g_system_access, g_ref_stale_warn -- is
+// installed by the embedder BEFORE the module runs (src/ir/Jit.cpp:681/686/692),
+// so touching it here would discard the run's own options.
+extern "C" void rt_run_init(void* event_static_block, uint32_t event_static_count) {
+    // 1. Process control blocks, first: the only pool that can hold pointers into
+    // the outgoing module, since rt_proc::parent chains through blocks a dead
+    // design's fork tree linked. proc_take (:5824) allocates chunks and never
+    // frees them, which is the leak docs/design/process-class.md §7 accounted for.
+    // There is no static first chunk to preserve: a statically created process
+    // lives in the backend's clotho.proc_pcb array, is addressed by direct GEP,
+    // and is kept off the freelist by RT_PROC_STATIC (Runtime.h:1520-1530), so
+    // every chunk here came from this pool.
+    for (rt_proc* chunk : g_proc_chunks) {
+        ::operator delete(chunk, frame_align);
+    }
+    g_proc_chunks.clear();
+    g_proc_used = 0;
+    g_proc_free = nullptr;
+
+    // 2. Event objects. Chunk 0 is the PREVIOUS module's static block -- a JIT
+    // global, not ours to free -- so the walk starts at 1. Re-registering chunk 0
+    // alone would orphan every chunk rt_event_new (:5791) had allocated, which is
+    // what this pool's reset did before it moved here: freeing 1..N is a fix.
+    for (size_t i = 1; i < g_event_chunks.size(); ++i) {
+        ::operator delete(g_event_chunks[i], frame_align);
+    }
+    g_event_chunks.clear();
+    g_event_chunks.push_back(static_cast<rt_event*>(event_static_block));
+    g_event_static = event_static_count;
+    g_event_pooled = 0;
+
+    // 3. Detached `->> @(x) e` subscriptions, keyed by the dense trigger id the
+    // next design reuses from zero. A record surviving a $finish would let
+    // rt_event_detach_fire (:2594) hand rt_event_detach_ready a handle minted by
+    // the destroyed module.
+    event_detach_pending.clear();
+    event_detach_ready.clear();
+
+    // 4, 5. The two queues the drain prologue also resets, conditionally
+    // (docs/design/cooperative-finish.md §2). Doing it from here as well covers
+    // the runs that take a fatal exit or never enter a drain at all.
+    rt_nba_arr_reset();
+    rt_intra_reset();
+
+    // 6. File I/O. An unclosed $fopen holds its channel forever and the MCD space
+    // is 30 wide, so ~30 leaky designs in one process make $fopen return 0 for
+    // every design after them. Close what the design left open, then return both
+    // tables to power-on so io_ensure_init (:539) re-primes them lazily -- which
+    // requires mcd_channels[0] to end up null, since it doubles as the init flag.
+    // Only the design's own streams are closed: mcd_channels[0] IS stdout and
+    // fd_streams[0..2] are stdin/stdout/stderr (:529-535), and closing those would
+    // take the process's own output down with them.
+    for (int b = 1; b < 31; ++b) {
+        if (mcd_channels[b] != nullptr) {
+            std::fclose(mcd_channels[b]);
+        }
+    }
+    mcd_channels = {};
+    for (size_t i = 3; i < fd_streams.size(); ++i) {
+        if (fd_streams[i] != nullptr) {
+            std::fclose(fd_streams[i]);
+        }
+    }
+    fd_streams.clear();
+
+    // 7. Per-site diagnostic suppression. Both are keyed on the addresses of JIT
+    // globals, so carrying them across runs grows them without bound AND charges a
+    // new design's first report against a dead design's count.
+    g_bounds_hits.clear();
+    g_ref_stale_seen.clear();
+
+    // 8. The unseeded $random stream, back to the 0 that :4904-4906 says makes an
+    // unseeded run draw the same sequence every time -- which held only for the
+    // first design in a process, since rt_random (:4937) mutates the state in
+    // place and nothing else ever writes it.
+    g_random_seed = 0;
+}
 
 extern "C" void* rt_proc_alloc(void* parent) {
     rt_proc* p = proc_take();

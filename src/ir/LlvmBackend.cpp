@@ -5275,10 +5275,9 @@ private:
                 const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
                 mark_packed_args(vci.func, vci.args);
             } else if (ir.tag(idx) == Inst::Tag::Fork) {
-                // Every fork capture is an ArgDir::Ref formal of every child
-                // (Lower.cpp's lower_fork), so like any other ref actual the capture
-                // keeps its canonical type-derived slot rather than being forced
-                // packed -- the child's formal takes the same shape. Nothing to mark.
+                // Every fork capture is an ArgDir::In box HANDLE of every child
+                // (Lower.cpp's lower_fork), i.e. an rvalue, not a place at all, so
+                // there is no frame slot to force packed. Nothing to mark.
                 continue;
             }
         }
@@ -6678,40 +6677,6 @@ private:
         return sym(program_live_gv_);
     }
 
-    // Every function this body enables, calls or forks, appended to `work`.
-    // Virtual dispatch contributes its statically named target only -- see the
-    // bound documented on build_reactive_fns.
-    //
-    // Fork children count. They are bodies of this one, split out by the
-    // frontend, and they suspend on their own account (that is what a fork is
-    // for), so leaving them out would let a child of an action block or of a
-    // program `initial` park a handle with no home region and resume in Active.
-    static void collect_callees(const Ir& ir, std::vector<FunctionId>& work) {
-        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
-            const auto           i = static_cast<Index>(k);
-            const Inst::Payload& p = ir.payload(i);
-            switch (ir.tag(i)) {
-                case Inst::Tag::TaskCall:
-                    work.push_back(ir.extra_data<TaskCallInfo>(p.extra).func);
-                    break;
-                case Inst::Tag::Call:
-                    work.push_back(ir.extra_data<CallInfo>(p.extra).func);
-                    break;
-                case Inst::Tag::TaskCallVirtual:
-                case Inst::Tag::CallVirtual:
-                    work.push_back(ir.extra_data<VirtualCallInfo>(p.extra).func);
-                    break;
-                case Inst::Tag::Fork:
-                    for (const Index kid : ir.region(ir.extra_data<ForkInfo>(p.extra).children)) {
-                        work.push_back(static_cast<FunctionId>(kid));
-                    }
-                    break;
-                default:
-                    break;
-            }
-        }
-    }
-
     // Classify every function reachable as reactive code -- the action-block
     // tasks a ReactivePend names, plus their transitive callees -- and reject
     // what the reactive region set cannot yet run. The set decides which region a
@@ -7004,6 +6969,16 @@ private:
         // trace or polling the wrong byte at the first safepoint
         // (Gc.h:167-173).
         b_.CreateCall(gc_init_fn(), { gc_config_global() });
+        // Every process-global runtime pool back to power-on, before anything can
+        // allocate out of one. Unconditional: build_wait_queues runs for every
+        // design and always creates clotho.events with at least the reserved null
+        // slot, and the static block has to be re-registered as the pool's chunk 0
+        // on every run because it is a JIT global that died with the previous
+        // LLJIT — init_state below already binds aggregate event leaves through it.
+        // The same seam owns the process control-block pool and the detached
+        // `->> @(x) e` subscription table, which otherwise carry a finished
+        // design's pointers and trigger ids into this one (Runtime.h:1472).
+        b_.CreateCall(run_init_fn(), { sym(events_gv_), b_.getInt32(event_slot_count_) });
         emit_gc_root_tables();
         // The fallback RNG (LRM 18.13), seeded before anything can draw from it.
         // Its selector is deliberately outside the process-index space every
@@ -7058,11 +7033,6 @@ private:
         }
         for (const auto& [aid, field, first_id] : ctx_blk_fills_) {
             b_.CreateStore(b_.getInt32(first_id), ctx_ptr(anchors_[aid], field));
-        }
-        // Hand the static event block to the pool before anything can allocate an
-        // event object or resolve a handle: init_state binds aggregate event leaves.
-        if (events_gv_ != nullptr) {
-            b_.CreateCall(event_pool_init_fn(), { sym(events_gv_), b_.getInt32(event_slot_count_) });
         }
         init_state();
         // Shadow bases fill only when some shadow access loaded them (lazy):
@@ -8895,33 +8865,20 @@ private:
     // by-pointer argument scan resolves them; an override that finishes where
     // its prototype does not would be missed, so treat the virtual figure as a
     // lower bound.
-    // Scan one body for a Finish, collecting its callees on the way.
+    //
+    // Scan one body for a Finish, collecting its call edges on the way. The edges
+    // are ir::collect_callees', so a `$finish` inside a fork child marks the
+    // forking body may-finish: a child is a body of its parent, and the parent
+    // blocks on it at a `join`.
     static bool scan_finish(const Ir& ir, std::vector<FunctionId>* out) {
         bool finishes = false;
-        for (size_t k = 0; k < ir.inst_count(); ++k) {
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             const auto idx = static_cast<Index>(k);
-            switch (ir.tag(idx)) {
-                case Inst::Tag::Finish:
-                    finishes = true;
-                    break;
-                case Inst::Tag::Call:
-                    if (out != nullptr) {
-                        out->push_back(ir.extra_data<CallInfo>(ir.payload(idx).extra).func);
-                    }
-                    break;
-                case Inst::Tag::TaskCall:
-                    if (out != nullptr) {
-                        out->push_back(ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func);
-                    }
-                    break;
-                case Inst::Tag::CallVirtual:
-                case Inst::Tag::TaskCallVirtual:
-                    if (out != nullptr) {
-                        out->push_back(ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func);
-                    }
-                    break;
-                default:
-                    break;
+            if (ir.tag(idx) == Inst::Tag::Finish) {
+                finishes = true;
+            }
+            if (out != nullptr) {
+                inst_callees(ir, idx, *out);
             }
         }
         return finishes;
@@ -8967,76 +8924,25 @@ private:
     void report_finish_stat() const {
         const auto nf = static_cast<uint32_t>(mod_.function_count());
 
-        // Direct seeds, plus each body's callee list, in one pass.
-        std::vector<uint8_t>                 direct(nf, 0);
-        std::vector<std::vector<FunctionId>> callees(nf);
-        const auto scan = [](const Ir& ir, std::vector<FunctionId>* out) {
-            bool finishes = false;
-            for (size_t k = 0; k < ir.inst_count(); ++k) {
-                const auto idx = static_cast<Index>(k);
-                switch (ir.tag(idx)) {
-                    case Inst::Tag::Finish:
-                        finishes = true;
-                        break;
-                    case Inst::Tag::Call:
-                        if (out != nullptr) {
-                            out->push_back(ir.extra_data<CallInfo>(ir.payload(idx).extra).func);
-                        }
-                        break;
-                    case Inst::Tag::TaskCall:
-                        if (out != nullptr) {
-                            out->push_back(ir.extra_data<TaskCallInfo>(ir.payload(idx).extra).func);
-                        }
-                        break;
-                    case Inst::Tag::CallVirtual:
-                    case Inst::Tag::TaskCallVirtual:
-                        if (out != nullptr) {
-                            out->push_back(
-                              ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra).func);
-                        }
-                        break;
-                    default:
-                        break;
-                }
-            }
-            return finishes;
-        };
-        for (uint32_t f = 0; f < nf; ++f) {
-            direct[f] = scan(mod_.function(static_cast<FunctionId>(f)).ir, &callees[f]) ? 1 : 0;
-        }
-
-        // Memoized DFS, same shape as the per-function write-set closure. A cycle
-        // (recursion) contributes what the in-progress callee has so far; a
-        // recursive subroutine that finishes is still caught by its own seed.
-        std::vector<uint8_t> may(direct);
-        std::vector<uint8_t> state(nf, 0); // 0 new, 1 visiting, 2 done
-        const auto close = [&](this const auto& self, uint32_t f) -> void {
-            if (state[f] != 0) {
-                return;
-            }
-            state[f] = 1;
-            for (const FunctionId c : callees[f]) {
-                const auto ci = static_cast<uint32_t>(c);
-                self(ci);
-                may[f] = static_cast<uint8_t>(may[f] | may[ci]);
-            }
-            state[f] = 2;
-        };
-        for (uint32_t f = 0; f < nf; ++f) {
-            close(f);
-        }
+        // Seeds and closure from the very computation the emitter gates on. This
+        // used to be a byte-for-byte second copy of compute_may_finish, scan
+        // lambda included, and it drifted: the copy could not gain a fix the
+        // original got. A stat that disagrees with the code it reports on is worse
+        // than no stat.
+        std::vector<uint8_t>       direct;
+        const std::vector<uint8_t> may = compute_may_finish(&direct);
 
         // The population that matters: call sites needing a post-call test.
         uint64_t   sites = 0, proc_direct = 0, fn_direct = 0, fn_may = 0;
         const auto count_sites = [&](const Ir& ir) {
             std::vector<FunctionId> cs;
-            scan(ir, &cs);
+            scan_finish(ir, &cs);
             for (const FunctionId c : cs) {
                 sites += may[static_cast<uint32_t>(c)] != 0 ? 1 : 0;
             }
         };
         for (const Process& p : mod_.processes()) {
-            proc_direct += scan(p.ir, nullptr) ? 1 : 0;
+            proc_direct += scan_finish(p.ir, nullptr) ? 1 : 0;
             count_sites(p.ir);
         }
         for (uint32_t f = 0; f < nf; ++f) {
@@ -13210,8 +13116,8 @@ private:
     llvm::FunctionCallee event_ptr_fn() {
         return rt_fn("rt_event_ptr", raw_ptr_ty(), { b_.getInt32Ty() });
     }
-    llvm::FunctionCallee event_pool_init_fn() {
-        return rt_fn("rt_event_pool_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    llvm::FunctionCallee run_init_fn() {
+        return rt_fn("rt_run_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
     }
     llvm::FunctionCallee wheel_now_fn() {
         return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
@@ -23264,10 +23170,11 @@ private:
         // Ramp arguments, shared by every child: (state, wheel, one pointer per
         // captured enclosing-frame local, rec). Each capture is an ArgDir::Ref
         // formal of every child (Lower.cpp's lower_fork), passed exactly as
-        // lower_task_call_inst passes a ref actual. No signal-waiter snapshot is
-        // needed here, unlike there: a capture is always a frame Local of this
-        // coroutine, never a module signal with a wait queue. Only `join` can have
-        // captures at all — the ref ABI needs this frame to outlive the children.
+        // A capture is a GC box HANDLE by value, for every join kind
+        // (docs/design/fork-join.md V4), so there is no place to bind, no relocation
+        // epoch to carry and no signal-waiter snapshot to take: a handle is a handle
+        // whoever holds it, and the box stays alive off the child's own frame, which
+        // is a conservative GC root.
         const std::span<const Index> caps = ir_->region(fi.args);
         std::vector<llvm::Value*>    argv;
         argv.reserve(caps.size() + 4);
@@ -23283,25 +23190,12 @@ private:
         if (design_uses_process_) {
             argv.push_back(proc_arg());
         }
-        if (!caps.empty()) {
-            // Every child took the same formal list, so one child's declared types
-            // decide the ABI for all of them.
-            const Function& child = mod_.function(static_cast<FunctionId>(kids[0]));
-            for (uint32_t k = 0; k < caps.size(); ++k) {
-                // A fork capture is a ref to an enclosing frame local, which is a
-                // stable place: the parent's frame outlives every child (the join
-                // waits for them), so the epoch is the compile-time zero word.
-                // No barrier, and structurally so: a capture is always a frame Local of
-                // this coroutine (see above), and a frame is scanned in full at every
-                // collection, young or not (Gc.h:105-107). A capture that could reach
-                // inside an object would need lower_task_call_inst's barrier, so the
-                // shape is asserted away rather than trusted.
-                const LValue& clv = lvalue_of(caps[k]);
-                assert(clv.gc_owner == nullptr && "a fork capture is a frame local");
-                const RefBinding rb = ref_actual_arg(clv);
-                argv.push_back(rb.slot);
-                push_ref_epochs(argv, rb, ref_epoch_depth(child, k));
-            }
+        // An `In` scalar formal is two params, must|may and z, exactly as an ordinary
+        // call marshals one (lower_task_call_inst's last arm).
+        for (const Index cap : caps) {
+            const Plane pl = to_four(value_of(cap));
+            argv.push_back(pl.mm);
+            argv.push_back(pl.z);
         }
         argv.push_back(rec);
 

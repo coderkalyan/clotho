@@ -215,9 +215,9 @@ independently rules out a purely static scheme:
 
 Hence two tiers for the block and a third, lazy tier for the object. This is the
 shape `event-handles.md` already ships for `rt_event`: a codegen-owned static block
-registered as the runtime pool's first chunk, one address space, one resolver
-(`rt_event_pool_init`, `src/runtime/Runtime.cpp:5474-5479`, called from
-`:5729`).
+registered as the runtime pool's first chunk, one address space, one resolver. Both
+pools are re-registered at run start by `rt_run_init`
+(`src/runtime/Runtime.cpp:5899`), emitted at the top of the design's main.
 
 ### 4.1 The control block (native, untraced)
 
@@ -717,16 +717,20 @@ Ranked by how much damage a naive implementation does.
    dies, is a use-after-free until every fork in a process-control design uses the
    heap refcounted record. Four distinct failure shapes are enumerated at
    `disable.md:598-608`.
-3. **A `join_any`/`join_none` child's `ArgDir::Ref` captures point into the
-   parent's frame.** Killing the parent leaves the child holding dangling formals.
-   Today captures are refused outright for the detaching kinds
-   (`src/Lower.cpp:7790-7795`), which is what makes this latent rather than live —
-   so **that refusal must stay until fork V4's per-spawn copies land**, and a
-   `join` parent that is killed with live children must be treated as the same
-   hazard (its children are killed too, but they abort *later*, after the frame is
-   gone). The conservative rule: a killed thread's children are marked before the
-   thread takes its own exit, and a child's abort path must not touch a capture
-   before its own poll.
+3. **CLOSED by fork V4. A fork child's captures used to point into the parent's
+   frame** (`ArgDir::Ref`), so killing the parent left the child holding dangling
+   formals. This was latent only because captures were refused outright for the
+   detaching kinds — and the note here used to say that refusal "must stay until fork
+   V4's per-spawn copies land", plus that a killed `join` parent is the same hazard
+   (its children are killed too, but they abort *later*, after the frame is gone).
+   That second half is what mattered: the `join` case was REACHABLE, with an ordinary
+   `logic [7:0]` capture, because `join` was allowed to capture. A fork capture is now
+   a GC box handle for every join kind (`docs/design/fork-join.md` V4) — the child's
+   frame holds a traced handle, a live coroutine frame is a conservative GC root, and
+   the box outlives the parent activation with no refcount — so there is no pointer
+   into a parent frame left to dangle and no refusal propping the hazard up. What
+   remains is the ordinary rule, unchanged: a killed thread's children are marked
+   before the thread takes its own exit.
 4. **Double wake.** A force-wake does not cancel the park it interrupts
    (`disable.md` Hazard 18). Every wake must go through the claim/flag protocol; a
    second resume lands at whatever suspend point the thread has since reached.
@@ -908,13 +912,23 @@ is a use-after-free, none of which a value check would show.
 The leaks LeakSanitizer does report are accounted for exactly, which is the point of
 citing them rather than the summary line:
 
-- 27 process cases leak **6064 bytes in 28 allocations** = one 5632-byte control-block
-  pool chunk (64 blocks, allocated once, never returned -- the event pool's discipline)
-  plus one 16-byte `process` object per design. Class bodies leak on this branch by
-  direction (`LlvmBackend.cpp`, `ClassNew`: "with --gc off the lifetime is leaked,
-  which LRM 8.4 makes observably correct"), and a `process` object is a class body.
-  For comparison, the class suite leaks 10 648 bytes in 104 allocations for the same
-  reason.
+- `tests/process_test.cpp`, 35 cases: **6096 bytes in 30 allocations** = ONE
+  5632-byte control-block pool chunk plus one 16-byte `process` object per design
+  that leaks one. Measured under `-DCLOTHO_SANITIZE=ON`.
+  The pool term is now O(1) in the process rather than O(designs). `g_proc_chunks`
+  was never cleared and its chunks never freed, so before `rt_run_init` every
+  design's chunks accumulated for the life of the `clotho_test` process; now each
+  run starts by freeing the previous run's (§4.1's pool has no static first chunk,
+  so every chunk is the pool's own). What LeakSanitizer still sees is the FINAL
+  run's chunk, which by construction no later run exists to free — a reset seam
+  bounds the pool, it does not tidy up after the last design, and that is the
+  intended trade (`rt_gc_init` makes the same one).
+  `tests/fork_test.cpp`, 39 cases, reports **384 bytes in 6 allocations and no pool
+  chunk at all**, which is also the check that the V4 capture boxes are collected:
+  a per-capture leak would show up there first.
+  Class bodies still leak on this branch by direction (`LlvmBackend.cpp`,
+  `ClassNew`: "with --gc off the lifetime is leaked, which LRM 8.4 makes observably
+  correct"), and a `process` object is a class body.
 - **The freelist demonstrably works.** 2000 spawn / `disable fork` cycles whose
   children never call `self()` leak *16 bytes in 1 allocation* -- one chunk's worth of
   blocks, recycled 2000 times. The same 2000 cycles where each child DOES call

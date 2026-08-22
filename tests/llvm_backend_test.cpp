@@ -1540,11 +1540,12 @@ TEST_CASE("single-element concat and replication produce correct bits") {
 }
 
 // $random's global stream is the IEEE 1800-2023 Annex N reference PRNG from an
-// unseeded start (seed 0), so the sequence is fully determined. This is the only
-// test in the suite that draws from it, so it observes the stream from its first
-// value. These exact numbers are produced bit-for-bit by iverilog as well
-// (verified), which is the point of using the reference PRNG; negatives prove
-// the signed return type and the distinct values prove variation.
+// unseeded start (seed 0), so the sequence is fully determined. It observes the
+// stream from its first value no matter what else in this process drew before
+// it, because rt_run_init returns the seed to 0 at every run start -- which is
+// the property the next test pins. These exact numbers are produced bit-for-bit
+// by iverilog as well (verified), which is the point of using the reference PRNG;
+// negatives prove the signed return type and the distinct values prove variation.
 TEST_CASE("$random yields the deterministic signed-32 stream") {
     const std::string out = run_capture(R"(
         module top;
@@ -1563,6 +1564,28 @@ TEST_CASE("$random yields the deterministic signed-32 stream") {
           "1189058957\n"
           "-1295874971\n"
           "-1992863214\n");
+}
+
+// The unseeded global $random stream restarts from power-on for EVERY design, not
+// merely the first one in the process. rt_random mutates the seed in place
+// (Runtime.cpp:4937) and nothing else writes it, so before the run-start seam
+// existed the determinism Runtime.cpp:4904-4906 claims held only for whichever
+// design happened to draw first in a clotho_test process -- and the pinned stream
+// above was silently order-dependent. Two designs in one TEST_CASE because that
+// is the whole property: run_jit builds a fresh LLJIT per design, but the seed is
+// a runtime global that outlives it.
+TEST_CASE("the unseeded $random stream restarts at power-on for every design") {
+    const std::string src = R"(
+        module top;
+            initial $display("%0d", $random);
+        endmodule
+    )";
+    const std::string first  = run_capture(src);
+    const std::string second = run_capture(src);
+    CHECK(first == second);
+    // Anchored to the seed-0 head of the reference stream, so this pins "restarts
+    // at power-on" rather than the weaker "restarts somewhere consistent".
+    CHECK(first == "303379748\n");
 }
 
 TEST_CASE("$random lowers to an rt_random call") {
@@ -2749,6 +2772,51 @@ TEST_CASE("$fdisplay to a combined MCD writes both files") {
     CHECK(read_file(p2) == "both 7\n");
     std::remove(p1);
     std::remove(p2);
+}
+
+// The MCD channel space is 30 wide and process-global, so a design that leaks its
+// channels must not spend the next design's. rt_run_init closes whatever a run
+// left open at the START of the following run (Runtime.cpp:5940-5959) -- the only
+// seam that also covers a design ending in $finish or a fatal exit, neither of
+// which reaches rt_sim_run's tail. Two designs in one TEST_CASE because that is
+// the whole property: the file tables outlive the LLJIT that used them.
+TEST_CASE("a design's leaked $fopen channels do not exhaust the next design's") {
+    const char* leaky = "clotho_mcd_exhaust.txt";
+    const char* after = "clotho_mcd_after.txt";
+    std::remove(leaky);
+    std::remove(after);
+    // Thirty opens and no $fclose spends every channel in [1, 30]. The same path
+    // thirty times is deliberate: each $fopen claims a channel of its own, and one
+    // file keeps the test from littering thirty. Requiring all thirty to succeed
+    // also pins that this design started from a clean table itself.
+    const std::string leak_src = std::string(R"(
+        module m;
+            integer mcd, i, got;
+            initial begin
+                got = 0;
+                for (i = 0; i < 30; i = i + 1) begin
+                    mcd = $fopen(")") + leaky + R"(");
+                    if (mcd != 0) got = got + 1;
+                end
+                $display("opened %0d", got);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(leak_src) == "opened 30\n");
+
+    const std::string after_src = std::string(R"(
+        module m;
+            integer mcd;
+            initial begin
+                mcd = $fopen(")") + after + R"(");
+                $display("reopened %0d", mcd != 0);
+                $fclose(mcd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(after_src) == "reopened 1\n");
+    std::remove(leaky);
+    std::remove(after);
 }
 
 // $fflush forces buffered output to disk without closing: the file is readable
