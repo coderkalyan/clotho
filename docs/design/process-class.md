@@ -215,9 +215,9 @@ independently rules out a purely static scheme:
 
 Hence two tiers for the block and a third, lazy tier for the object. This is the
 shape `event-handles.md` already ships for `rt_event`: a codegen-owned static block
-registered as the runtime pool's first chunk, one address space, one resolver
-(`rt_event_pool_init`, `src/runtime/Runtime.cpp:5474-5479`, called from
-`:5729`).
+registered as the runtime pool's first chunk, one address space, one resolver. Both
+pools are re-registered at run start by `rt_run_init`
+(`src/runtime/Runtime.cpp:5899`), emitted at the top of the design's main.
 
 ### 4.1 The control block (native, untraced)
 
@@ -908,9 +908,14 @@ is a use-after-free, none of which a value check would show.
 The leaks LeakSanitizer does report are accounted for exactly, which is the point of
 citing them rather than the summary line:
 
-- 27 process cases leak **6064 bytes in 28 allocations** = one 5632-byte control-block
-  pool chunk (64 blocks, allocated once, never returned -- the event pool's discipline)
-  plus one 16-byte `process` object per design. Class bodies leak on this branch by
+- 27 process cases leak **432 bytes in 27 allocations** = one 16-byte `process`
+  object per design. (Derived from the 6064-in-28 measurement this bullet used to
+  carry by striking the single term below; not yet re-measured under
+  `-DCLOTHO_SANITIZE=ON`.) The 5632-byte control-block pool chunk that headed the
+  list is gone: `rt_run_init` frees every chunk in `g_proc_chunks` at the start of
+  the following run (§4.1's pool has no static first chunk, so every chunk is the
+  pool's own), which also bounds a long `clotho_test` process instead of letting
+  one chunk per design accumulate. Class bodies still leak on this branch by
   direction (`LlvmBackend.cpp`, `ClassNew`: "with --gc off the lifetime is leaked,
   which LRM 8.4 makes observably correct"), and a `process` object is a class body.
   For comparison, the class suite leaks 10 648 bytes in 104 allocations for the same

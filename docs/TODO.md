@@ -681,6 +681,25 @@ professional parity; M5 makes it complete.
   (`src/SourceContext.h`) owning the Driver / SourceManager / Compilation, so an
   `ir::SourceLoc` stays resolvable after lowering returns. Reuse ACROSS runs
   (parse caching) is still outstanding and needs the content-addressed cache.
+- [x] **Run-start reset of process-global runtime state** — `rt_run_init`
+  (`src/runtime/Runtime.h`, `src/runtime/Runtime.cpp`), emitted unconditionally at
+  the top of the design's main beside `rt_gc_init` and subsuming the old
+  `rt_event_pool_init`. A host that runs more than one design per process — which
+  is every `clotho_test` process, since `ir::run_jit` builds a fresh LLJIT per
+  design — used to carry state across designs: an unclosed `$fopen` kept its MCD
+  channel until the 30-wide space ran out, the unseeded `$random` stream was
+  deterministic only for the first design, a detached `->> @(x) e` record survived
+  `$finish` keyed by a `trig_id` the next design reused, and the PCB and event
+  pools grew without bound. `rt_run_init` returns the PCB pool, the event pool,
+  the detach table, the NBA-array and intra-assignment queues, the file tables,
+  the per-site diagnostic suppression maps and the `$random` seed to power-on.
+  Deliberately out of scope: GC state (`rt_gc_init` owns it and preserves
+  `g.stats`), VCD, and host-armed configuration set before the module runs.
+  `sim_teardown` stays as it is — it drops what would dangle into dead JIT code
+  the moment a run ends, but it cannot be the seam, because it runs before the
+  emitted signal deinit and `rt_gc_shutdown` and is skipped entirely by the fatal
+  `std::exit` paths. Still owed: the wait queues, the observed/deferred queues and
+  the string pools (docs/design/cooperative-finish.md §Why).
 - [ ] **`param-overrides` (`-G`), config/library-map (`--libmap`)** not yet surfaced.
 - [x] **File output** (§21.3) — `$fopen` (MCD + FD), `$fclose`, `$fdisplay`/`$fwrite`,
   `$fflush`.

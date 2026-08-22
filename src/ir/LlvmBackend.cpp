@@ -6875,6 +6875,16 @@ private:
         // trace or polling the wrong byte at the first safepoint
         // (Gc.h:167-173).
         b_.CreateCall(gc_init_fn(), { gc_config_global() });
+        // Every process-global runtime pool back to power-on, before anything can
+        // allocate out of one. Unconditional: build_wait_queues runs for every
+        // design and always creates clotho.events with at least the reserved null
+        // slot, and the static block has to be re-registered as the pool's chunk 0
+        // on every run because it is a JIT global that died with the previous
+        // LLJIT — init_state below already binds aggregate event leaves through it.
+        // The same seam owns the process control-block pool and the detached
+        // `->> @(x) e` subscription table, which otherwise carry a finished
+        // design's pointers and trigger ids into this one (Runtime.h:1472).
+        b_.CreateCall(run_init_fn(), { sym(events_gv_), b_.getInt32(event_slot_count_) });
         emit_gc_root_tables();
         // The fallback RNG (LRM 18.13), seeded before anything can draw from it.
         // Its selector is deliberately outside the process-index space every
@@ -6929,11 +6939,6 @@ private:
         }
         for (const auto& [aid, field, first_id] : ctx_blk_fills_) {
             b_.CreateStore(b_.getInt32(first_id), ctx_ptr(anchors_[aid], field));
-        }
-        // Hand the static event block to the pool before anything can allocate an
-        // event object or resolve a handle: init_state binds aggregate event leaves.
-        if (events_gv_ != nullptr) {
-            b_.CreateCall(event_pool_init_fn(), { sym(events_gv_), b_.getInt32(event_slot_count_) });
         }
         init_state();
         // Shadow bases fill only when some shadow access loaded them (lazy):
@@ -13007,8 +13012,8 @@ private:
     llvm::FunctionCallee event_ptr_fn() {
         return rt_fn("rt_event_ptr", raw_ptr_ty(), { b_.getInt32Ty() });
     }
-    llvm::FunctionCallee event_pool_init_fn() {
-        return rt_fn("rt_event_pool_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    llvm::FunctionCallee run_init_fn() {
+        return rt_fn("rt_run_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
     }
     llvm::FunctionCallee wheel_now_fn() {
         return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });

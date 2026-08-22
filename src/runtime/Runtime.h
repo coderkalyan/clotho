@@ -1469,9 +1469,30 @@ typedef struct rt_event {
     void*    next_pend; // next object on the NBA pending chain
 } rt_event;
 
-// Register the backend's static object block as the pool's first chunk. `count`
-// includes the reserved null object at slot 0.
-void rt_event_pool_init(void* static_block, uint32_t count);
+// -- Run start (the process-global reset seam) --
+//
+// Every process-global growable pool back to power-on. The backend emits one call
+// at the very top of the design's main, before anything can allocate, so a host
+// that runs more than one design per process starts each run from the state the
+// first one saw: ir::run_jit (src/ir/Jit.cpp) builds a fresh LLJIT per design and
+// clotho_test drives thousands of them through a single process. Without it the
+// leftovers are not merely untidy -- a detached `->> @(x) e` record keyed by a
+// dense trigger id the next design reuses hands out a handle minted by the dead
+// module, an unclosed $fopen keeps its channel bit until $fopen runs out of
+// channels, and the unseeded $random stream is only deterministic for the first
+// design in the process.
+//
+// This is rt_gc_init's rule (Gc.cpp:2984-2987) applied to the rest of the
+// runtime: reset at the START of a run, never at shutdown, so a finished run
+// leaves a readable oracle behind for the harness that just ran it.
+//
+// The parameters are the event pool's first chunk -- the backend's static object
+// block, re-registered on every run because it is a JIT global that dies with the
+// previous LLJIT. `count` includes the reserved null object at slot 0. The seam
+// also owns the process control-block pool and the detached-subscription table;
+// rt_run_init's own definition lists what it resets and what it deliberately does
+// not.
+void rt_run_init(void* event_static_block, uint32_t event_static_count);
 
 // Detached one-shot event subscriptions (`->> @(x) e`, LRM 15.5.1), keyed by the
 // dense (signal, edge) trigger id. Growable: a `->> @(x) e` in a loop makes one
