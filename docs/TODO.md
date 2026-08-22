@@ -2237,7 +2237,19 @@ project with its own algorithm, not tail cleanup on the property layer:
     cycle cannot be reached in one step, leaving nested handles as names.
   - [ ] `%p` of a chandle / event / virtual-interface handle — rejected loud; unlike
     a class handle, none of these has a name to print in place of the object.
-  - [ ] `%0p` — a field width / flags on the whole pattern is rejected loud.
+  - [x] **`%0p`** (LRM 21.2.1.6) — a **separate specifier**, not a width applied to
+    `%p`: the clause gives it its own sentence, "shall print aggregate expressions
+    ... in a shorter, implementation specific form". slang draws the same line
+    ("Pattern args allow the zero-pad specifier" — `%p` forbids every other width and
+    left-justify, so those never reach Clotho and its own check is a backstop). The
+    `0` reads as it does everywhere else in 21.2.1.2 — drop the `%d`-width padding on
+    the integral leaves — and Clotho's `%p` already renders every leaf minimally,
+    scalars included, so the shorter form **coincides** with the plain one. Recorded
+    because the equality is a decision: if `%p` ever adopted padded leaves, `%0p`
+    would have to keep the minimal ones. Verilator makes the two identical as well;
+    iverilog cannot `%p` an aggregate at all (`vpiMemory`), so it is no oracle. The
+    splice carries the spec's real length, since the token is 3 characters here and a
+    fixed 2 left a stray `p`. Needed by uvm_get_to_lock_dap and friends.
   - [x] `%p` of an associative array (LRM 21.2.1.6) — renders
     `'{key:value, ...}` over the live entries in ascending key order. The one
     deficiency behind this was that `%p` had no ordered walk for a KEYED container:

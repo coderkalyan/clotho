@@ -489,6 +489,52 @@ TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"
     }
 }
 
+// `%0p` is a SEPARATE specifier in 21.2.1.6, not a width applied to `%p`: it "shall
+// print aggregate expressions ... in a shorter, implementation specific form". slang
+// enforces the distinction ("Pattern args allow the zero-pad specifier"; every other
+// width and left-justify is rejected for %p).
+//
+// The 0 reads as it does elsewhere -- drop the %d-width padding on integral leaves --
+// and clotho's `%p` already renders every leaf minimally, so the two forms coincide.
+// Pinned because the equality is a decision, not an accident: were `%p` ever to adopt
+// padded leaves, `%0p` would have to keep the minimal ones. Verilator agrees the two
+// are identical; iverilog cannot `%p` an aggregate at all, so it is no oracle here.
+TEST_CASE("%0p is the shorter form of %p (LRM 21.2.1.6)") {
+    // A scalar operand is the case the padding question actually bites: a bare %d of
+    // an int pads to 11 columns, and neither %p nor %0p may.
+    SUBCASE("scalar, struct and array agree with %p") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; byte b; } s_t;
+                s_t s; int arr [0:1]; int i;
+                initial begin
+                    s.a = 7; s.b = -3; arr[0] = 1; arr[1] = -2; i = 42;
+                    $display("%p|%p|%p", s, arr, i);
+                    $display("%0p|%0p|%0p", s, arr, i);
+                end
+            endmodule
+        )") == "'{a:7, b:-3}|'{1, -2}|42\n"
+               "'{a:7, b:-3}|'{1, -2}|42\n");
+    }
+    // The token is 3 characters, so the splice has to use the spec's real length: a
+    // fixed 2 leaves a stray `p`. Mixed with `%p` it also pins that the FIFO order
+    // survives, and the `%%p` escape is not mistaken for a conversion to splice over.
+    SUBCASE("token length: mixed with %p and after a %%p escape") {
+        CHECK(run_capture(R"(
+            module m;
+                typedef struct { int a; } s_t;
+                s_t s; int arr [0:1];
+                initial begin
+                    s.a = 5; arr[0] = 1; arr[1] = 2;
+                    $display("%0p-%p-%0d", s, arr, 9);
+                    $display("%%p=%0p", s);
+                end
+            endmodule
+        )") == "'{a:5}-'{1, 2}-9\n"
+               "%p='{a:5}\n");
+    }
+}
+
 // `%p` of a class handle. 21.2.1.6 describes %p over aggregate VALUES and a handle is
 // not one, so the form is implementation-defined; clotho prints `null` for a null
 // handle and the class name otherwise, at every depth. That uniformity is what makes

@@ -18595,12 +18595,28 @@ private:
                 // stays loud until the strength model lands (docs/TODO.md).
                 fail("%v (net signal strength) is not supported");
             case 'p':
-                // %p renders an aggregate as an assignment pattern (LRM §21.2.1.6);
+                // %p renders an aggregate as an assignment pattern (LRM 21.2.1.6);
                 // build_format expands it at lower time into `'{...}` text plus a
-                // per-leaf spec. Only the bare form is supported (a width / flags on
-                // the whole pattern is not modeled).
-                if (spec.has_width || spec.has_prec || spec.left_justify) {
-                    fail("%p does not take a field width, precision, or justification");
+                // per-leaf spec.
+                //
+                // `%0p` is a SEPARATE specifier in the clause, not a width applied to
+                // %p: it "shall print aggregate expressions ... in a shorter,
+                // implementation specific form". The 0 reads as it does everywhere else
+                // (21.2.1.2) -- drop the %d-width padding on the integral leaves -- and
+                // Clotho's %p already renders every leaf minimally, scalars included,
+                // so the shorter form coincides with the plain one and both accept
+                // here. Verilator agrees (byte-identical for the two), so nothing is
+                // lost by the coincidence; see docs/TODO.md.
+                //
+                // A non-zero width, a precision and left-justification are none of them
+                // defined for %p by the clause. Unreachable from source: slang checks
+                // this first and more precisely (SFormat.cpp, "Pattern args allow the
+                // zero-pad specifier" -- `%p` sets widthAllowed = false, and only the
+                // bare zero-pad flag is let through for it). Kept as a backstop because
+                // this is the only place that knows what Clotho's own expansion accepts.
+                if ((spec.has_width && spec.width != 0) || spec.has_prec || spec.left_justify) {
+                    fail("%p takes no field width, precision, or justification other than "
+                         "the '%0p' shorter form (LRM 21.2.1.6)");
                 }
                 break;
             default:
@@ -19153,13 +19169,17 @@ private:
         return b.unary(T::Load, out.lv(b, l), l);
     }
 
-    // Offset of the first `%p` in `fmt` that is a real conversion, skipping any
-    // `%%` escape. `%%p` is a literal percent followed by the letter p, so its
-    // `%p` substring must not be spliced over — doing so both corrupts the escape
+    // Offset AND length of the first `%p` / `%0p` in `fmt` that is a real conversion,
+    // skipping any `%%` escape. `%%p` is a literal percent followed by the letter p, so
+    // its `%p` substring must not be spliced over — doing so both corrupts the escape
     // and leaves the actual specifier behind for the runtime formatter to reject.
-    // Fragments already spliced for earlier `%p` args never contain a bare `%p`,
-    // so scanning from the start always lands on the pending one.
-    static size_t find_p_spec(std::string_view fmt) {
+    // Fragments already spliced for earlier `%p` args never contain a bare `%p`, so
+    // scanning from the start always lands on the pending one.
+    //
+    // The length is returned rather than assumed because the token is 2 characters for
+    // `%p` and 3 for the `%0p` shorter form; splicing a fixed 2 over the latter would
+    // leave a stray `p` in the output.
+    static std::pair<size_t, size_t> find_p_spec(std::string_view fmt) {
         for (size_t i = 0; i + 1 < fmt.size(); ++i) {
             if (fmt[i] != '%') {
                 continue;
@@ -19168,11 +19188,12 @@ private:
                 ++i; // consume the escape, so its second % cannot start a match
                 continue;
             }
-            if (fmt[i + 1] == 'p') {
-                return i;
+            const clotho::FormatSpec spec = clotho::parse_format_spec(fmt.substr(i + 1));
+            if (spec.ok && spec.conv == 'p') {
+                return { i, 1 + spec.len };
             }
         }
-        return std::string::npos;
+        return { std::string::npos, 0 };
     }
 
     void build_format(std::span<const Expression* const> format_args,
@@ -19227,8 +19248,9 @@ private:
                     // spliced specs appear, so positional matching stays correct.
                     std::string frag;
                     expand_p_arg(*arg, frag, args, b);
-                    if (const size_t pos = find_p_spec(fmt); pos != std::string::npos) {
-                        fmt.replace(pos, 2, frag);
+                    const auto [pos, len] = find_p_spec(fmt);
+                    if (pos != std::string::npos) {
+                        fmt.replace(pos, len, frag);
                     }
                     continue;
                 }
