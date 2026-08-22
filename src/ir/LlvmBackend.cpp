@@ -13842,6 +13842,81 @@ private:
         }
     }
 
+    // The copy-out of a whole aggregate FUNCTION RESULT (LRM 13.4.1's by-value
+    // return): the callee writes the returned object into the trailing out-param
+    // the caller owns, which lower_call_common always allocates in the CANONICAL
+    // storage mirror (agg_storage_ty).
+    //
+    // The returned object need not be in that model, and usually is not. A
+    // function local declared without `automatic` has STATIC lifetime (LRM
+    // 13.4.2), so `return a;` returns a module SIGNAL -- and a plain scalar-leaf
+    // array signal keeps FLAT `[N x slot]` storage whose element slot is may-z
+    // analysed per signal, which is NARROWER than the type-derived canonical leaf
+    // whenever the analysis wins. `logic [7:0] a[0:1]` written only with 2-state
+    // constants gets `[2 x { i16 }]`, four bytes, against the canonical
+    // `[2 x { i16, i8 }]`'s eight. A memcpy of agg_storage_ty bytes would read
+    // four bytes past the end of the signal, so the element SHAPES decide the copy
+    // here exactly as they do for a place-to-place AggCopy above.
+    void emit_agg_ret_copy(llvm::Value* dst, const LValue& slv, Ref type) {
+        // Resolves either storage model, and keeps agg_slot_ptr's loud refusal of
+        // a deferred associative place (its base is null; nothing to copy from).
+        llvm::Value* const src = agg_image_ptr(slv);
+        if (slv.is_agg) {
+            // Both ends are the same type-derived mirror, so the whole-storage
+            // copy -- deep, when a leaf owns heap -- is exact.
+            emit_agg_storage_copy(dst, src, type);
+            return;
+        }
+        // A flat aggregate place is always a module signal: build_frame_layout
+        // gives every is_agg_abi local the canonical mirror, and every other
+        // aggregate lvalue is rooted in one (a call temp, a class property, a
+        // container element). Loud rather than an assert, because the Release
+        // fallback would be slot_of(Signal{ 0 }) -- some unrelated signal's element
+        // shape, i.e. the silent corruption this function exists to prevent.
+        if (!slv.is_signal) {
+            throw BackendError{ "internal: flat aggregate return value is not a signal" };
+        }
+        assert(!needs_agg_storage(type) &&
+               "a struct- or container-bearing type is in the mirror on both sides");
+        const SignalSlot& ss = slot_of(slv.sig);
+        if (is_string_type(type)) {
+            // A string-leaf array is flat `[N x rt_string]` and its mirror is that
+            // same leaf slot nested once per dimension: identical bytes in the same
+            // row-major order. So the per-leaf deep copy a string leaf needs (it
+            // GEPs the mirror from BOTH pointers) addresses the flat source
+            // correctly, and no shape conversion arises -- a string slot carries no
+            // planes for the may-z analysis to narrow.
+            assert(ss.slot_ty == str_slot_ty() && "a string leaf has one slot shape");
+            emit_agg_storage_copy(dst, src, type);
+            return;
+        }
+        // Nothing past the string case owns heap: a container leaf would have made
+        // needs_agg_storage true, and a struct leaf with a managed member likewise.
+        assert(!has_heap_leaf(type) && "a plane-leaf array's byte image is its value");
+        llvm::StructType* const canon = agg_leaf_slot_ty(leaf_type(type));
+        const uint32_t          count = array_leaf_count(type);
+        if (ss.slot_ty == canon) {
+            // Equal element slots make the two images byte-identical, since a
+            // nested mirror and a flat run of the same leaf are both row-major with
+            // no padding between elements. Asserted rather than trusted: it is the
+            // whole licence for the memcpy.
+            assert(env_->llmod.getDataLayout().getTypeAllocSize(agg_storage_ty(type)) ==
+                     env_->llmod.getDataLayout().getTypeAllocSize(
+                       llvm::ArrayType::get(canon, count)) &&
+                   "the nested mirror and the flat run are the same bytes");
+            emit_agg_storage_copy(dst, src, type);
+            return;
+        }
+        // The shapes differ, so convert element by element. Both images are
+        // row-major over their own leaf slot, which is what lets the multi-dim
+        // destination mirror be addressed as one flat run of `count` leaves. No
+        // wait service: the destination is the caller's private buffer, not state.
+        const Layout lay = mod_.pool.layout(leaf_type(type));
+        emit_array_zdiff_copy(dst, src, canon, ss.slot_ty, lay.width == 0 ? 1 : lay.width,
+                              lay.domain == Domain::Four, count, Signal{ 0 },
+                              /*service=*/false);
+    }
+
     // Element-wise whole-(sub-)array copy for two plain (non-struct) 4-state
     // unpacked arrays of the SAME element width whose z-elided slots differ only in
     // the z word's presence (the dest is may-z, the source proven never-z, or vice
@@ -22019,8 +22094,8 @@ private:
         if (is_agg_abi(cur_fn_->return_type)) {
             // Copy the aggregate result (the Ret operand is its lvalue) out through
             // the trailing storage-pointer out-param the caller owns.
-            emit_agg_storage_copy(fn_->getArg(fn_->arg_size() - 1),
-                                  agg_slot_ptr(lvalue_of(value)), cur_fn_->return_type);
+            emit_agg_ret_copy(fn_->getArg(fn_->arg_size() - 1), lvalue_of(value),
+                              cur_fn_->return_type);
             deinit_body_strings();
             b_.CreateRetVoid();
             return;

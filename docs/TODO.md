@@ -222,6 +222,31 @@ professional parity; M5 makes it complete.
   `input` / `output` / `inout` all work for both functions and tasks; a task's
   copy-out rides its completion epilogue, so it lands when the task returns.
   Managed-leaf arrays included; `ref` aggregate formals stay guarded.
+  The RESULT copy-out carried the mirrored hazard and crashed on it. It resolved
+  the returned object with `agg_slot_ptr` unconditionally -- the RECURSIVE
+  addressing mode, which reads `LValue::root_ty` -- and that field is filled only
+  for a place in the canonical mirror. The two predicates part company exactly
+  there: `is_agg_abi` is true for ANY fixed unpacked array, since it names the
+  by-pointer ABI role, while `needs_agg_storage` / `contains_struct` are false for
+  a plain scalar-leaf array, which stays FLAT `[N x slot]`. Nothing forces a
+  returned object into the mirror, and a subroutine variable declared without
+  `automatic` is static (13.4.2), so `return a;` returns a module SIGNAL: flat,
+  `root_ty` null, GEP off null -- the compiler segfaulted on
+  `function arr_t f(); arr_t a; ... return a;` with no diagnostic at all. Missed
+  because every test here returned an `automatic` local, which
+  `build_frame_layout` always puts in the mirror. `emit_agg_ret_copy` now resolves
+  the source through `agg_image_ptr`, the one whole-object image resolver, and
+  picks the copy from the two ELEMENT slots instead of assuming they agree --
+  because they routinely do not. A flat slot is may-z analysed per signal while an
+  aggregate leaf's is fixed by its type, so a never-z `logic [7:0] a[0:1]` is
+  `[2 x { i16 }]` against the canonical `[2 x { i16, i8 }]`, and a 2-state array
+  the analysis cannot clear is `[2 x { i64, i32 }]` against `[2 x { i32 }]`. The
+  memcpy the crash was hiding would have over-read the signal by four bytes in the
+  first and taken one element's low half for the whole array in the second, so
+  equal slots memcpy and unequal ones convert per element through
+  `emit_array_zdiff_copy`. A string-leaf array needs no conversion (a managed slot
+  has no planes to narrow) and its flat `[N x rt_string]` is the mirror's bytes
+  exactly, so the per-leaf deep copy addresses it unchanged.
 - [ ] **Sliced memory target** for `$readmem*` / `$fread`.
 - [x] **Unpacked arrays / memories** — element-addressed; decl, read,
   blocking/nonblocking write, nested bit/part-select, multidimensional,

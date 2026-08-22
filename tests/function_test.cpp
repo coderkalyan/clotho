@@ -620,6 +620,118 @@ TEST_CASE("unpacked array returned by value from a function") {
     )") == "2 4 6 8\n");
 }
 
+// A subroutine variable declared without `automatic` has STATIC lifetime (LRM
+// 13.4.2), so the frontend gives it a module signal rather than a frame slot --
+// and a plain scalar-leaf array signal keeps FLAT `[N x slot]` storage, not the
+// canonical aggregate mirror a frame local always gets. The result copy-out used
+// to resolve the returned object through the aggregate GEP path unconditionally,
+// which dereferences a null root type for a flat place: the compiler segfaulted
+// with no diagnostic at all. Every array-return case above returns an
+// `automatic` local, which is why none of them reached it.
+TEST_CASE("fixed array returned from a static function local") {
+    CHECK(run_capture(R"(
+        typedef int intarr_t [0:1];
+        module m;
+            function intarr_t mk();
+                intarr_t r;
+                r[0] = 7; r[1] = 8;
+                return r;
+            endfunction
+            intarr_t o;
+            initial begin
+                static intarr_t d = mk();
+                o = mk();
+                $display("assign %p", o);
+                $display("declinit %p", d);
+            end
+        endmodule
+    )") == "assign '{7, 8}\n"
+           "declinit '{7, 8}\n");
+}
+
+// The flat and canonical images are NOT interchangeable, so the copy-out cannot
+// simply memcpy the mirror's byte count over flat storage. A flat element slot is
+// may-z analysed per signal while an aggregate leaf's is fixed by its type, and
+// they disagree in both directions: a never-z `logic [7:0]` array is `[2 x
+// { i16 }]` against the canonical `[2 x { i16, i8 }]` (a memcpy would read four
+// bytes past the signal), and a 2-state array the analysis cannot prove z-free is
+// `[2 x { i64, i32 }]` against the canonical `[2 x { i32 }]` (a memcpy would take
+// the first element's low half as the whole array). Both shapes convert per
+// element instead.
+TEST_CASE("fixed array return converts a may-z-narrowed element slot") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef logic [7:0] larr_t [0:1];
+            typedef int iarr_t [0:1];
+            logic signed [31:0] zsrc;
+            function larr_t mkl();
+                larr_t r;
+                r[0] = 8'hA5; r[1] = 8'h3C;
+                return r;
+            endfunction
+            function iarr_t mki();
+                iarr_t r;
+                r[0] = zsrc; r[1] = 9;
+                return r;
+            endfunction
+            larr_t lo;
+            iarr_t io;
+            initial begin
+                zsrc = 32'bz;
+                lo = mkl();
+                io = mki();
+                $display("nz4 %0h %0h", lo[0], lo[1]);
+                $display("mayz2 %0d %0d", io[0], io[1]);
+            end
+        endmodule
+    )") == "nz4 a5 3c\n"
+           "mayz2 0 9\n");
+}
+
+// Flat storage flattens every dimension into one run of leaves while the mirror
+// nests one ArrayType per dimension. The two are the same bytes in the same
+// row-major order, which is what lets one copy serve both shapes.
+TEST_CASE("multidimensional fixed array returned from a static local") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef int m2_t [0:1][0:1];
+            typedef int m3_t [0:1][0:1][0:1];
+            function m2_t mk2(); m2_t r; r[0][0] = 1; r[1][1] = 4; return r; endfunction
+            function m3_t mk3(); m3_t r; r[0][0][0] = 5; r[1][1][1] = 6; return r; endfunction
+            m2_t a2; m3_t a3;
+            initial begin
+                a2 = mk2(); a3 = mk3();
+                $display("d2 %p", a2);
+                $display("d3 %p", a3);
+            end
+        endmodule
+    )") == "d2 '{'{1, 0}, '{0, 4}}\n"
+           "d3 '{'{'{5, 0}, '{0, 0}}, '{'{0, 0}, '{0, 6}}}\n");
+}
+
+// A `real` leaf is a 2-state 64-bit slot, so its flat and canonical shapes
+// coincide and the copy is the plain storage memcpy. A `string` leaf owns heap,
+// so the same copy-out routes through the per-leaf deep copy instead -- over flat
+// `[N x rt_string]`, whose bytes are the mirror's exactly, since a managed slot
+// has no planes for the may-z analysis to narrow.
+TEST_CASE("real and string element arrays returned from a static local") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef real rarr_t [0:1];
+            typedef string sarr_t [0:1];
+            function rarr_t mkr(); rarr_t r; r[0] = 1.5; r[1] = -2.25; return r; endfunction
+            function sarr_t mks(); sarr_t r; r[0] = "hi"; r[1] = "there"; return r; endfunction
+            rarr_t ro; sarr_t so;
+            initial begin
+                ro = mkr(); so = mks();
+                $display("real %p", ro);
+                $display("str %p", so);
+            end
+        endmodule
+    )") == "real '{1.5, -2.25}\n"
+           "str '{\"hi\", \"there\"}\n");
+}
+
 TEST_CASE("unpacked array as a function frame local") {
     CHECK(run_capture(R"(
         module m;
