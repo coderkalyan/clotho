@@ -810,6 +810,30 @@ struct ValueRefScan : ASTVisitor<ValueRefScan, VisitFlags::AllGood> {
         visitDefault(d);
     }
 
+    // A bare in-method CALL is the other way `this` is referenced without being
+    // written: `exec_task(comp, phase)` inside a method resolves against the enclosing
+    // `this` (resolve_method_this), and nothing in the expression names it. Without
+    // this, `this` was not treated as a capture and a fork child calling a sibling
+    // method failed with "class method call without an object handle" -- which is
+    // exactly what uvm_task_phase::execute does.
+    //
+    // The condition mirrors resolve_method_this: no explicit receiver, and a callee
+    // that is an instance method. A pure virtual has a null thisVar in slang's
+    // degenerate representation yet is still one, hence the virtualness test; the
+    // BuiltIn exclusion keeps slang's synthesized `randomize` out, as is_user_virtual
+    // does.
+    void handle(const CallExpression& call) {
+        if (implicit_this != nullptr && call.thisClass() == nullptr && call.subroutine.index() == 0) {
+            const auto& sub = *std::get<0>(call.subroutine);
+            const bool  virt =
+              sub.isVirtual() && !sub.flags.has(slang::ast::MethodFlags::BuiltIn);
+            if (sub.thisVar != nullptr || virt) {
+                *implicit_this = true;
+            }
+        }
+        visitDefault(call);
+    }
+
     void handle(const NamedValueExpression& nv) {
         take(nv.symbol);
     }
@@ -962,6 +986,27 @@ struct ForkCaptureDetector : ASTVisitor<ForkCaptureDetector, VisitFlags::AllGood
             init->visit(*this);
         }
         visitDefault(d);
+    }
+
+    // A bare in-method CALL references `this` without naming it, exactly as a bare
+    // property reference does: resolve_method_this resolves it against the enclosing
+    // method's handle, so that handle is what has to travel. Without this a child
+    // calling a sibling method compiled to a call with no receiver and was refused
+    // ("class method call without an object handle") -- which is what
+    // uvm_task_phase::execute does with `exec_task(comp, phase)`.
+    //
+    // Same condition as resolve_method_this: no explicit receiver and an instance
+    // callee. A pure virtual has a null thisVar in slang's degenerate representation
+    // yet is still one, hence the virtualness test.
+    void handle(const CallExpression& call) {
+        if (this_var != nullptr && call.thisClass() == nullptr && call.subroutine.index() == 0) {
+            const auto& sub  = *std::get<0>(call.subroutine);
+            const bool  virt = sub.isVirtual() && !sub.flags.has(slang::ast::MethodFlags::BuiltIn);
+            if (sub.thisVar != nullptr || virt) {
+                check(*this_var);
+            }
+        }
+        visitDefault(call);
     }
 };
 
@@ -23726,7 +23771,10 @@ private:
     void install_capture_boxes(const SubroutineSymbol& sub, const Statement& body, ir::Builder& b) {
         BoxCandidateScan scan;
         body.visit(scan);
-        if (scan.candidates.empty()) {
+        if (scan.candidates.empty() && !scan.implicit_this) {
+            // `implicit_this` on its own is enough: a child whose only reference to the
+            // enclosing activation is a BARE METHOD CALL (`bump();`) names no value
+            // symbol at all, so `candidates` is empty while `this` still has to travel.
             return;
         }
         const ir::SourceLoc l = to_source_loc(sub.location);

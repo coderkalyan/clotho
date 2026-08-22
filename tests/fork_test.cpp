@@ -913,6 +913,40 @@ TEST_CASE("fork: a join_none child reads a captured class handle after the call 
     CHECK(out == "ret=0\nchild a=9\nend a=9\n");
 }
 
+// A child whose ONLY reference to the enclosing activation is a bare call to a sibling
+// method. `bump();` resolves against the enclosing `this` (resolve_method_this) without
+// naming it, so neither the capture walk nor the box scan saw a reference: the walk
+// only recognised `this` through a bare PROPERTY read, and install_capture_boxes
+// early-returned on an empty candidate set. The child then lowered a call with no
+// receiver and was refused ("class method call without an object handle"), which is
+// what uvm_task_phase::execute does with `exec_task(comp, phase)`.
+//
+// `n` is read through the captured handle, so the assertion also pins that the child
+// mutates the SAME object the caller holds, not a copy.
+TEST_CASE("fork: a join_none child may call a sibling method on the captured this") {
+    const std::string out = run_capture(R"(
+        class W;
+          int n;
+          task automatic bump(); n++; endtask
+          virtual function void go();
+            fork
+              begin #1 bump(); end
+            join_none
+          endfunction
+        endclass
+        module t;
+          W w;
+          initial begin
+            w = new;
+            w.go();
+            $display("after go n=%0d", w.n);
+            #2 $display("later n=%0d", w.n);
+          end
+        endmodule
+    )");
+    CHECK(out == "after go n=0\nlater n=1\n");
+}
+
 // LRM 9.3.2's own idiom, which is the case the whole model turns on. Without an
 // explicit `automatic` copy the children share the loop variable, so all three read
 // its final value -- iverilog prints `4 4 4` and slang warns about it by name
