@@ -949,6 +949,135 @@ TEST_CASE("signed arithmetic obeys LRM signedness across the operator set") {
     CHECK(out == "-3\n15\n-1\n1\n0\n1\n-3 -3 -1 1\n-2147483648 0\n-6\n-4\n");
 }
 
+TEST_CASE("a widening cast extends by the source's signedness, not the target's") {
+    // LRM 6.24.1: a cast "shall return the value that a variable of the casting
+    // type would hold after being assigned the expression", which sends it to
+    // LRM 11.8.3: "extend the size of the right-hand side, performing sign
+    // extension if, and only if, the type of the right-hand side is signed".
+    // `bit` and `logic` are unsigned, so int'(1'b1) is 1.
+    //
+    // Regression: the cast lowered to a single Resize, whose extension follows
+    // its TARGET type, so every unsigned source widened into a signed target
+    // sign-extended. slang splits an IMPLICIT assignment conversion into a
+    // widen-then-retag pair itself, which is why the plain assignments below
+    // were already right and only the cast was wrong. Every value here agrees
+    // between iverilog 13 and Verilator 5.050.
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                bit b1 = 1'b1; logic l1 = 1'b1; bit [1:0] b2 = 2'b11;
+                byte nb = -1; int y;
+                y = int'(b1); $display("%0d", y);   // 1
+                y = b1;       $display("%0d", y);   // 1
+                y = int'(l1); $display("%0d", y);   // 1
+                y = int'(b2); $display("%0d", y);   // 3
+                y = int'(nb); $display("%0d", y);   // -1: a signed source still sign-extends
+                y = b2;       $display("%0d", y);   // 3
+                y = nb;       $display("%0d", y);   // -1
+            end
+        endmodule
+    )");
+    CHECK(out == "1\n1\n1\n3\n-1\n3\n-1\n");
+}
+
+TEST_CASE("cast signedness matrix over source kinds, targets, and widths") {
+    // Every source below has its MSB set, so a sign-extension bug is visible as
+    // a negative result. The bug reached every unsigned source widened into a
+    // signed target -- 1, 2, 7, 8, 31, 32 and 33 bits alike, and packed structs
+    // and enums as much as plain vectors -- so this is not a width-1 story.
+    // Signed sources are the negative control: they must keep sign-extending.
+    // Cross-checked against iverilog 13 and Verilator 5.050, which agree.
+    const std::string out = run_capture(R"(
+        module m;
+            typedef struct packed { bit [3:0] a; bit [3:0] b; } sp_t;
+            typedef enum bit [2:0] { E7 = 3'd7 } en_t;
+            initial begin
+                bit [1:0] u2 = 2'b11; logic [6:0] u7 = 7'h7F;
+                bit [30:0] u31 = 31'h7FFF_FFFF; logic [31:0] u32 = 32'hFFFF_FFFF;
+                bit [32:0] u33 = 33'h1_FFFF_FFFF;
+                byte unsigned ub = 8'hFF; sp_t sp = 8'hFF; en_t en = E7;
+                bit signed [1:0] s2 = 2'b11; logic signed [6:0] s7 = 7'h7F;
+                bit signed [30:0] s31 = 31'h7FFF_FFFF;
+                $display("%0d %0d %0d", int'(u2), longint'(u7), shortint'(u2));
+                $display("%0d %0d", int'(u31), longint'(u32));
+                $display("%0d %0d", longint'(u33), int'(ub));
+                $display("%0d %0d %0d", int'(sp), longint'(en), byte'(en));
+                $display("%0d %0d %0d", int'(s2), longint'(s7), int'(s31));
+            end
+        endmodule
+    )");
+    CHECK(out == "3 127 3\n2147483647 4294967295\n8589934591 255\n255 7 7\n-1 -1 -1\n");
+}
+
+TEST_CASE("the resize path's other conversions keep their own extension rule") {
+    // The operators that share the resize path, and which of them the cast bug
+    // could have reached:
+    //   - `signed'` / `unsigned'` and $signed / $unsigned never widen (LRM
+    //     6.24.1, 20.5: the result keeps $bits(expression)), so they were right.
+    //   - a size cast N'(expr) passes the operand's signedness through unchanged
+    //     (LRM 6.24.1), so source and target always agree and it was right.
+    //   - an implicit assignment conversion was right, because slang splits it.
+    //   - a call argument and a return value are frontend-manufactured coercions
+    //     with nothing to split them, so both carried the bug.
+    //   - LRM 11.8.2's propagated-operand rule is the opposite one and must
+    //     survive: in `u8 + s4` the propagated type is unsigned (any unsigned
+    //     operand makes it so, 11.8.1), so the SIGNED operand zero-extends.
+    // Values cross-checked against iverilog 13 and Verilator 5.050.
+    const std::string out = run_capture(R"(
+        module m;
+            function automatic int widen(int v); return v; endfunction
+            function automatic int ret_u2(bit [1:0] v); return v; endfunction
+            initial begin
+                bit [1:0] u2 = 2'b11; logic [7:0] u8 = 8'd1;
+                logic signed [3:0] s4 = -1; logic [7:0] z8; logic signed [7:0] t8;
+                $display("%0d %0d", signed'(u2), unsigned'(s4));      // -1 15
+                $display("%0d %0d", $signed(u2), $unsigned(s4));      // -1 15
+                $display("%0d %0d", 8'(u2), 8'(s4));                  // 3 -1
+                $display("%0d %0d", widen(u2), ret_u2(u2));           // 3 3
+                z8 = s4; t8 = u2; $display("%0d %0d", z8, t8);        // 255 3
+                $display("%0d %0d", u8 + s4, u8 * s4);                // 16 15
+            end
+        endmodule
+    )");
+    CHECK(out == "-1 15\n-1 15\n3 -1\n3 3\n255 3\n16 15\n");
+}
+
+TEST_CASE("LRM 7.12.3 sum with (int'(item)) over set bits") {
+    // The standard's own worked example for forcing a bit-array reduction to 32
+    // bits. Each `item` is an unsigned 1-bit value, so int'(item) is 1 and four
+    // set bits sum to 4; sign-extending them summed to -4. The receiver is a
+    // queue so this does not depend on fixed-size-array reduction support.
+    // iverilog cannot parse a queue reduction; checked against Verilator 5.050.
+    const std::string out = run_capture(R"(
+        module m;
+            initial begin
+                bit bit_arr[$] = '{ 1'b1, 1'b1, 1'b1, 1'b1 };
+                logic lq[$] = '{ 1'b1, 1'b1, 1'b1, 1'b1 };
+                int y;
+                y = bit_arr.sum with ( int'(item) ); $display("%0d", y);  // 4
+                y = lq.sum with ( int'(item) );      $display("%0d", y);  // 4
+            end
+        endmodule
+    )");
+    CHECK(out == "4\n4\n");
+}
+
+TEST_CASE("a constant-folded cast extends by the source's signedness too") {
+    // The elaboration-time path is slang's constant evaluator, not the resize
+    // instruction, so it answers separately from the runtime one and is checked
+    // separately. Same LRM 6.24.1 / 11.8.3 rule, same oracle agreement.
+    const std::string out = run_capture(R"(
+        module m;
+            localparam int P1 = int'(1'b1);
+            localparam int P2 = int'(2'b11);
+            localparam int P3 = int'(-1);
+            localparam int P4 = longint'(8'hFF);
+            initial $display("%0d %0d %0d %0d", P1, P2, P3, P4);
+        endmodule
+    )");
+    CHECK(out == "1 3 -1 255\n");
+}
+
 TEST_CASE("shifts define the out-of-range amount instead of emitting poison") {
     // LRM §11.4.10: a shift amount >= the operand width yields 0 for <<, >>, and
     // unsigned >>>, while signed >>> fills with the sign bit. LLVM shift ops are

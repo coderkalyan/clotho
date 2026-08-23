@@ -5348,13 +5348,39 @@ private:
         return module_.pool.put(ir::Item{ vec });
     }
 
+    // Which operand's signedness picks the fill bits of an integral WIDENING.
+    // The LRM gives two different answers and the IR's Resize instruction
+    // implements the second one: it extends according to the signedness of its
+    // TARGET type.
+    enum class Extend : uint8_t {
+        // LRM 11.8.3 (assignment): "extend the size of the right-hand side,
+        // performing sign extension if, and only if, the type of the right-hand
+        // side is signed" — the SOURCE decides. LRM 6.24.1 puts a cast under the
+        // same rule: a cast "shall return the value that a variable of the
+        // casting type would hold after being assigned the expression".
+        Source,
+        // LRM 11.8.2, last step: a context-determined operand "shall be
+        // converted to the propagated type and size... sign-extended only if the
+        // propagated type is signed" — the TARGET decides. The two rules really
+        // do disagree, in both directions: with `logic [7:0] u; logic signed
+        // [3:0] s = -1`, `u + s` zero-extends s (16), while `u = s` sign-extends
+        // it (255). Both iverilog 13 and Verilator 5.050 agree on both.
+        Target,
+    };
+
     // Resize / convert an already-lowered rvalue of slang type `from` to the
     // interned target `to`. Integral-to-integral resizes; any real endpoint
     // picks the matching float conversion (assignment semantics: real ->
     // integral rounds half away from zero, LRM 6.12.1). Used where the
     // frontend coerces manually (port copies, call arguments, returns) rather
-    // than through a slang-inserted Conversion.
-    ir::Index coerce(ir::Index v, const slang::ast::Type& from, ir::Ref to, ir::Builder& b, ir::SourceLoc l) {
+    // than through a slang-inserted Conversion. Every such site is
+    // assignment-like, so `ext` defaults to the 11.8.3 rule.
+    ir::Index coerce(ir::Index               v,
+                     const slang::ast::Type& from,
+                     ir::Ref                 to,
+                     ir::Builder&            b,
+                     ir::SourceLoc           l,
+                     Extend                  ext = Extend::Source) {
         const bool from_f = from.isFloating();
         const bool to_f   = module_.pool.is_float(to);
         if (to_f && from_f) {
@@ -5366,7 +5392,42 @@ private:
         if (from_f) {
             return b.float_cvt(ir::Inst::Tag::FtoI, v, to, l);
         }
+        if (ext == Extend::Source) {
+            v = extend_by_source_sign(v, from, to, b, l);
+        }
         return b.resize(v, to, l);
+    }
+
+    // The LRM 11.8.3 half of `coerce`: when the value widens into a target of
+    // the OTHER signedness, do the extension first, at the target width but
+    // under the source's own sign, so the following Resize is width-preserving
+    // and only retags the value. Returns `v` untouched for a narrowing, an
+    // equal-width retag, or a matching signedness, which is every case a design
+    // that never mixes signedness hits. Non-integral endpoints (an unpacked
+    // aggregate, a handle, a bit-stream target) have no sign to extend under and
+    // pass straight through.
+    ir::Index extend_by_source_sign(ir::Index               v,
+                                    const slang::ast::Type& from,
+                                    ir::Ref                 to,
+                                    ir::Builder&            b,
+                                    ir::SourceLoc           l) {
+        if (!from.isIntegral()) {
+            return v;
+        }
+        const auto& ty         = std::get<ir::Type>(module_.pool.get(to));
+        const bool  packed_int = ty.kind == ir::Type::Kind::Logic || ty.kind == ir::Type::Kind::Bit ||
+                                 ty.kind == ir::Type::Kind::PackedArray ||
+                                 (ty.kind == ir::Type::Kind::Struct && ty.is_packed);
+        if (!packed_int) {
+            return v;
+        }
+        const bool       src_signed = from.isSigned();
+        const ir::Layout lay        = module_.pool.layout(to);
+        if (lay.width <= from.getBitWidth() || ty.is_signed == src_signed) {
+            return v;
+        }
+
+        return b.resize(v, make_int_type(lay.width, lay.domain == ir::Domain::Four, src_signed), l);
     }
 
     // Narrow/widen an already-loaded rvalue to its expression's own declared
@@ -23461,7 +23522,13 @@ private:
                     // temporary return handle).
                     fail("bit-stream cast from a dynamic array or queue to a packed type is not supported");
                 }
-                return coerce(lower_expr(cv.operand(), b), *cv.operand().type, lower_type(*expr.type), b, l);
+                // A Propagated conversion is slang's record of LRM 11.8.2 step 3
+                // pushing an operator's result type down onto a context-determined
+                // operand, so it extends under the propagated type; every other
+                // kind (Implicit assignment, Explicit cast, BitstreamCast) is
+                // assignment-shaped and extends under the operand's own sign.
+                const Extend ext = cv.conversionKind == ConversionKind::Propagated ? Extend::Target : Extend::Source;
+                return coerce(lower_expr(cv.operand(), b), *cv.operand().type, lower_type(*expr.type), b, l, ext);
             }
             case ExpressionKind::Call: {
                 const CallExpression& call = expr.as<CallExpression>();
