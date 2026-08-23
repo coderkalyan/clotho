@@ -514,6 +514,26 @@ enum class HandleUse : uint8_t {
     Place,
 };
 
+// Why an rt_string handle pointer is being taken (lv_string_ptr).
+//
+// The same device HandleUse is, for the same reason and with the same absence of a
+// default. A waited-on STRING class property fires its change notifier from a
+// content comparison bracketing the write (LRM 9.4.2 / 6.16), so every call site
+// has to say whether it is about to write; `Write` is checked against an open
+// bracket, so a site that forgets one fails loudly at compile time instead of
+// parking a waiter forever.
+enum class StringUse : uint8_t {
+    // The characters are only read through this pointer.
+    Read,
+    // The op about to run replaces the string's content. Must sit inside a
+    // str_chg_snapshot / str_chg_after bracket.
+    Write,
+    // Handing the pointer to someone who writes LATER -- a `ref` / `out` / `inout`
+    // formal, a forwarded concat target, an NBA staging record. Fires nothing here:
+    // whoever performs the write notifies, or the call bracket does.
+    Place,
+};
+
 // A scalar / string leaf of an aggregate signal reachable by a STATIC path
 // (struct fields only, never an array index), so its location is a compile-time
 // constant GEP. Used for nonblocking staging: the block-commit path can shadow
@@ -2204,14 +2224,80 @@ private:
         if (lv.chg == nullptr || !lv.chg->container) {
             return;
         }
-        const uint32_t at = lv.chg->field[static_cast<uint32_t>(Edge::Any)];
-        if (at == kNoNotify) {
+        if (lv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
             throw BackendError{ "internal: container change notifier with no any-change field" };
         }
-        // The notifier is an `event` property of this same object, minted by
-        // emit_class_body_init at `new`, so its handle is always live.
-        llvm::Value* slot = b_.CreateStructGEP(lv.chg_body_ty, lv.chg_body, at + class_header_words(lv.chg->class_ref));
+        fire_prop_notifier(lv, Edge::Any);
+    }
+
+    // Wake everything parked on one of a class property's change notifiers. Shared
+    // by the three write paths that reach a notifier -- the classified integral /
+    // handle / real store, the container mutation and the string content compare --
+    // because the addressing is delicate: the notifier is an `event` PROPERTY of the
+    // same object, so its slot is the object body's GEP past the class header, and
+    // it is minted by emit_class_body_init at `new`, so the handle is always live
+    // and needs no null guard (as a plain `-> e` on a declared event needs none).
+    void fire_prop_notifier(const LValue& lv, Edge edge) {
+        const uint32_t at = lv.chg->field[static_cast<uint32_t>(edge)];
+        llvm::Value*   slot =
+          b_.CreateStructGEP(lv.chg_body_ty, lv.chg_body, at + class_header_words(lv.chg->class_ref));
         emit_event_wake_list(event_obj_of(b_.CreateLoad(b_.getInt64Ty(), slot)));
+    }
+
+    // Pre-write CONTENT snapshot of a waited-on STRING class property (LRM 9.4.2 on
+    // a 6.16 value), or null when nothing waits on this place -- which is every
+    // string place in a design that waits on no string property.
+    //
+    // A string is the one notified type whose value is NOT the word the place holds.
+    // `obj.s = t` replaces the rt_string's buffer, so comparing handles would call
+    // every write a change; and two distinct handles over the same characters are
+    // the SAME value, which LRM 9.4.2's "any change in the value" makes observable
+    // -- re-assigning the same text must fire nothing. So the content is copied out
+    // before the write and compared with rt_string_cmp after it.
+    //
+    // The copy costs a malloc, paid only for a property some `@` / `wait` names. The
+    // scratch handle is an ENTRY-block alloca, so a bracket inside a loop reuses one
+    // slot rather than growing the stack, and the init / deinit pair is balanced
+    // across the bracket so each pass copies into a fresh handle.
+    llvm::Value* str_chg_snapshot(const LValue& lv) {
+        if (lv.chg == nullptr) {
+            return nullptr;
+        }
+        if (lv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
+            // `@(posedge s)` is refused in the frontend (no LSB lattice, Table 9-2),
+            // so a notified string property carries the any-change field and nothing
+            // else. A gap means the two sides disagreed.
+            throw BackendError{ "internal: string change notifier with no any-change field" };
+        }
+        auto* snap = entry_alloca(str_slot_ty(), "chg.str");
+        snap->setAlignment(llvm::Align(alignof(rt_string)));
+        ++str_chg_open_;
+        b_.CreateCall(str_init_fn(), { snap });
+        b_.CreateCall(str_assign_fn(),
+                      { snap, lv_string_ptr(lv, StringUse::Read),
+                        alloc_site_global(SourceText{ .where = "<change notifier>" }, "string") });
+        return snap;
+    }
+
+    // Close a str_chg_snapshot bracket: fire the property's any-change notifier iff
+    // the characters differ, then release the snapshot.
+    void str_chg_after(const LValue& lv, llvm::Value* snap) {
+        if (snap == nullptr) {
+            return;
+        }
+        --str_chg_open_;
+        llvm::Value* changed =
+          b_.CreateICmpNE(b_.CreateCall(str_cmp_fn(), { snap, lv_string_ptr(lv, StringUse::Read) }),
+                          b_.getInt32(0));
+        auto* fn   = b_.GetInsertBlock()->getParent();
+        auto* body = llvm::BasicBlock::Create(ctx_, "chgs.body", fn);
+        auto* cont = llvm::BasicBlock::Create(ctx_, "chgs.cont", fn);
+        b_.CreateCondBr(changed, body, cont);
+        b_.SetInsertPoint(body);
+        fire_prop_notifier(lv, Edge::Any);
+        b_.CreateBr(cont);
+        b_.SetInsertPoint(cont);
+        b_.CreateCall(str_deinit_fn(), { snap });
     }
 
     // Whether a type is a string, or an unpacked array whose leaf element is.
@@ -4508,7 +4594,7 @@ private:
         if (lv.is_string || lv.is_handle) {
             // A managed place: the ref aliases the handle itself, so the callee's
             // deep-copy / mutation lands on the actual.
-            return lv.is_string ? lv_string_ptr(lv) : lv_handle_ptr(lv, HandleUse::Place);
+            return lv.is_string ? lv_string_ptr(lv, StringUse::Place) : lv_handle_ptr(lv, HandleUse::Place);
         }
         const bool whole =
           lv.range_mask == nullptr && is_zero_const(lv.bit_off) && lv.width == lv.store_width;
@@ -10067,9 +10153,12 @@ private:
     struct ServiceSnapshot {
         llvm::Value* mm = nullptr;
         llvm::Value* z  = nullptr;
-        // Whether the target is a change-notified INTEGRAL class property rather than
+        // Whether the target is a change-notified SCALAR class property rather than
         // a signal is read back off the lvalue, which service_after_write holds too;
-        // nothing about it can change across the store.
+        // nothing about it can change across the store. That covers every type whose
+        // value is one stored word: integral, a class / chandle / virtual interface
+        // handle (the word IS the value) and real / shortreal (a 2-state IEEE-754
+        // pattern), all classified by the same emit_edge_facts.
         //
         // A waited-on CONTAINER property: there is nothing to snapshot (its value is
         // the container's contents), so the bracket carries only the fact that the
@@ -10077,6 +10166,10 @@ private:
         // the callers that hand a container's handle to a callee, which is the one
         // mutation shape that must notify AFTER the write rather than at it.
         bool container = false;
+        // A waited-on STRING property: the pre-write content copy, compared with
+        // rt_string_cmp after the write (str_chg_snapshot). Non-null only for a
+        // string place carrying a notifier.
+        llvm::Value* str = nullptr;
     };
 
     // A blocking write to a module signal must service the signal's wait queues
@@ -10092,6 +10185,13 @@ private:
             // A PreInit store: declaration initializers generate no events, and no
             // waiter can exist yet anyway.
             return {};
+        }
+        if (lv.is_string) {
+            // A string's value is its CONTENT, not the handle the place holds, so the
+            // old value has to be copied out rather than loaded as a word. Covers
+            // every string write path by construction, including a `ref` / `out` /
+            // `inout` string formal, which reaches this same bracket.
+            return ServiceSnapshot{ .str = str_chg_snapshot(lv) };
         }
         if (lv.chg != nullptr && lv.chg->container) {
             // A container property never reaches here through a plane store (the
@@ -10121,7 +10221,9 @@ private:
     }
 
     void service_after_write(const LValue& lv, ServiceSnapshot old) {
-        if (old.container) {
+        if (old.str != nullptr) {
+            str_chg_after(lv, old.str);
+        } else if (old.container) {
             notify_container_mutation(lv);
         } else if (old.mm != nullptr && lv.chg != nullptr) {
             service_change_notify(lv, old.mm, load_lv_mm(lv), old.z, old.z != nullptr ? load_lv_z(lv) : nullptr);
@@ -10300,13 +10402,7 @@ private:
             b_.CreateCondBr(fact, body, cont);
 
             b_.SetInsertPoint(body);
-            // The notifier is an `event` property of this same object, minted by
-            // emit_class_body_init at `new` like any event leaf, so its handle is
-            // always live -- no null guard, the way a plain `-> e` on a declared event
-            // needs none.
-            llvm::Value* slot = b_.CreateStructGEP(
-              lv.chg_body_ty, lv.chg_body, cn.field[static_cast<uint32_t>(edge)] + class_header_words(cn.class_ref));
-            emit_event_wake_list(event_obj_of(b_.CreateLoad(b_.getInt64Ty(), slot)));
+            fire_prop_notifier(lv, edge);
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }
@@ -15112,7 +15208,17 @@ private:
 
     // The rt_string handle pointer of a string lvalue (one array element when
     // elem_idx selects it).
-    llvm::Value* lv_string_ptr(const LValue& lv) {
+    //
+    // `use` says WHY, and it has no default on purpose (StringUse). A waited-on
+    // string class property notifies from a content comparison around the write, so
+    // a `Write` here must sit inside a str_chg_snapshot / str_chg_after bracket;
+    // that is checked rather than trusted, because a missing notify is a silent
+    // permanent park and the check can only fire for a property someone waits on.
+    llvm::Value* lv_string_ptr(const LValue& lv, StringUse use) {
+        if (use == StringUse::Write && lv.chg != nullptr && str_chg_open_ == 0) {
+            throw BackendError{ "internal: write to a waited-on string class property "
+                                "outside a change-notify bracket (LRM 9.4.2)" };
+        }
         llvm::Value* ptr = nullptr;
         if (lv.array_ty != nullptr) {
             llvm::Value* idx = lv.elem_idx != nullptr ? lv.elem_idx : b_.getInt32(0);
@@ -15256,7 +15362,7 @@ private:
                 const LValue lv = ir_->tag(static_cast<Index>(k + 1)) == Inst::Tag::Signal
                                     ? signal_lvalue(lp.signal)
                                     : local_lvalue(lp.local.index);
-                set_str(i, lv_string_ptr(lv));
+                set_str(i, lv_string_ptr(lv, StringUse::Place));
                 continue;
             }
             auto* temp = b_.CreateAlloca(str_slot_ty(), nullptr, "str.tmp");
@@ -16029,7 +16135,7 @@ private:
                     // producers write into distinct temps. Out of range (or an absent
                     // key) lv_string_ptr redirects to the owned-empty sink, so the
                     // read yields "".
-                    set_str(i, lv_string_ptr(lv));
+                    set_str(i, lv_string_ptr(lv, StringUse::Read));
                     return;
                 }
                 const ValType t = type_of(i);
@@ -16067,10 +16173,16 @@ private:
                     if (!deferred && forwarded_string_store(i)) {
                         return;
                     }
-                    // Deep copy. Strings are guarded out of sensitivity lists in
-                    // the frontend, so there is no wait queue to service.
-                    b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv), str_of(p.binary.r),
+                    // Deep copy, bracketed by the property's CONTENT compare: a
+                    // waited-on `obj.s` fires only when the characters differ (LRM
+                    // 9.4.2 over a 6.16 value), so `obj.s = obj.s` and a re-assignment
+                    // of equal text from a different handle wake nobody. A string
+                    // SIGNAL carries no notifier (refused in the frontend), so this
+                    // emits nothing for one.
+                    llvm::Value* snap = str_chg_snapshot(lv);
+                    b_.CreateCall(str_assign_fn(), { lv_string_ptr(lv, StringUse::Write), str_of(p.binary.r),
                                                      alloc_site_global(loc_text(i), "string") });
+                    str_chg_after(lv, snap);
                     return;
                 }
                 // The generational write barrier (§7). One site covers all three store
@@ -16675,12 +16787,14 @@ private:
                 const auto    sp = ir_->extra_data<StrPutcInfo>(p.op_extra.extra);
                 const LValue& lv = lvalue_of(p.op_extra.op);
                 emit_bounds_reports(lv, /*is_write=*/true);
-                llvm::Value*  str = lv_string_ptr(lv);
+                llvm::Value*  snap = str_chg_snapshot(lv);
+                llvm::Value*  str  = lv_string_ptr(lv, StringUse::Write);
                 llvm::Value*  idx =
                   cast(must_of(value_of(sp.index)), 32, type_of(sp.index).is_signed);
                 llvm::Value* ch = cast(must_of(value_of(sp.ch)), 32, false);
                 emit_string_bounds_check(i, str, sp.index, bounds_name(lv), /*is_write=*/true);
                 b_.CreateCall(str_putc_fn(), { str, idx, ch });
+                str_chg_after(lv, snap);
                 return;
             }
             case Inst::Tag::StrAtoi:
@@ -16715,15 +16829,19 @@ private:
                 const LValue& lv = lvalue_of(p.binary.l);
                 llvm::Value*  v =
                   cast(must_of(value_of(p.binary.r)), 32, type_of(p.binary.r).is_signed);
+                llvm::Value* snap = str_chg_snapshot(lv);
                 b_.CreateCall(
-                  fn, { lv_string_ptr(lv), v, alloc_site_global(loc_text(i), "string") });
+                  fn, { lv_string_ptr(lv, StringUse::Write), v, alloc_site_global(loc_text(i), "string") });
+                str_chg_after(lv, snap);
                 return;
             }
             case Inst::Tag::StrRealtoa: {
                 const LValue& lv = lvalue_of(p.binary.l);
                 llvm::Value*  v  = fp_of(value_of(p.binary.r));
-                b_.CreateCall(str_realtoa_fn(), { lv_string_ptr(lv), v,
+                llvm::Value* snap = str_chg_snapshot(lv);
+                b_.CreateCall(str_realtoa_fn(), { lv_string_ptr(lv, StringUse::Write), v,
                                                   alloc_site_global(loc_text(i), "string") });
+                str_chg_after(lv, snap);
                 return;
             }
             case Inst::Tag::StrCmp:
@@ -16884,9 +17002,12 @@ private:
                 const uint32_t pb  = plane_bytes(t.width);
                 llvm::Value*   buf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(pb), "str.append");
                 b_.CreateAlignedStore(must_of(value_of(p.binary.r)), buf, llvm::Align(1));
+                const LValue& alv  = lvalue_of(p.binary.l);
+                llvm::Value*  snap = str_chg_snapshot(alv);
                 b_.CreateCall(str_append_packed_fn(),
-                              { lv_string_ptr(lvalue_of(p.binary.l)), buf, b_.getInt32(t.width),
+                              { lv_string_ptr(alv, StringUse::Write), buf, b_.getInt32(t.width),
                                 alloc_site_global(loc_text(i), "string") });
+                str_chg_after(alv, snap);
                 return;
             }
 
@@ -18378,7 +18499,7 @@ private:
     AssocKeySpan normalize_assoc_key_lvalue(const LValue& key_lv, Ref assoc_type) {
         const AssocKeyInfo info = assoc_key_info(assoc_type);
         if (info.is_string) {
-            llvm::Value* sh = lv_string_ptr(key_lv);
+            llvm::Value* sh = lv_string_ptr(key_lv, StringUse::Read);
             return { b_.CreateCall(str_data_fn(), { sh }),
                      cast(b_.CreateCall(str_len_fn(), { sh }), 32, false),
                      nullptr };
@@ -18397,9 +18518,11 @@ private:
                                const LValue& key_lv, Index at) {
         const AssocKeyInfo info = assoc_key_info(assoc_type);
         if (info.is_string) {
-            b_.CreateCall(str_assign_bytes_fn(), { lv_string_ptr(key_lv), kptr,
+            llvm::Value* snap = str_chg_snapshot(key_lv);
+            b_.CreateCall(str_assign_bytes_fn(), { lv_string_ptr(key_lv, StringUse::Write), kptr,
                                                    cast(klen, 64, false),
                                                    alloc_site_global(loc_text(at), "string") });
+            str_chg_after(key_lv, snap);
             return;
         }
         if (info.is_agg) {
@@ -19134,7 +19257,7 @@ private:
         auto*        rt   = str_rec_ty();
         const auto   strd = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         llvm::Value* rec  = b_.CreateCall(nba_arr_slot_fn(), { b_.getInt32(str_buf_idx(lv.sig)), b_.getInt32(strd) });
-        b_.CreateAlignedStore(lv_string_ptr(lv), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
+        b_.CreateAlignedStore(lv_string_ptr(lv, StringUse::Place), b_.CreateStructGEP(rt, rec, 0), llvm::Align{ 1 });
         llvm::Value* staged = b_.CreateStructGEP(rt, rec, 1);
         b_.CreateCall(str_init_fn(), { staged });
         b_.CreateCall(str_assign_fn(),
@@ -21547,8 +21670,10 @@ private:
         llvm::Value* fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
         const LValue& lv = lvalue_of(dst);
         if (lv.is_string) {
-            llvm::Value* r = b_.CreateCall(
-              fgets_str_fn(), { lv_string_ptr(lv), fd, alloc_site_global(loc_text(i), "string") });
+            llvm::Value* snap = str_chg_snapshot(lv);
+            llvm::Value* r    = b_.CreateCall(
+              fgets_str_fn(), { lv_string_ptr(lv, StringUse::Write), fd, alloc_site_global(loc_text(i), "string") });
+            str_chg_after(lv, snap);
             set_value(i, packed(r, r, zero(32)));
             return;
         }
@@ -21656,8 +21781,10 @@ private:
         const FormatArg f = format_arg(i, info.fmt_value, info.fmt, info.fmt_len, info.tick_scale);
         const LValue&   lv = lvalue_of(info.dst);
         if (lv.is_string) {
-            b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv), f.fmt, argc, arr,
+            llvm::Value* snap = str_chg_snapshot(lv);
+            b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv, StringUse::Write), f.fmt, argc, arr,
                                               alloc_site_global(loc_text(i), "string"), f.dyn });
+            str_chg_after(lv, snap);
             return;
         }
         const auto [mm, z, width, flags] = string_dest(info.dst, "$sformat / $swrite");
@@ -21704,8 +21831,10 @@ private:
         llvm::Value*  fd  = cast(must_of(value_of(ir_->payload(i).binary.r)), 32, true);
         const LValue& lv  = lvalue_of(dst);
         if (lv.is_string) {
-            llvm::Value* r = b_.CreateCall(
-              ferror_str_fn(), { fd, lv_string_ptr(lv), alloc_site_global(loc_text(i), "string") });
+            llvm::Value* snap = str_chg_snapshot(lv);
+            llvm::Value* r    = b_.CreateCall(
+              ferror_str_fn(), { fd, lv_string_ptr(lv, StringUse::Write), alloc_site_global(loc_text(i), "string") });
+            str_chg_after(lv, snap);
             set_value(i, packed(r, r, zero(32)));
             return;
         }
@@ -21873,9 +22002,12 @@ private:
                                     static_cast<char>(info.conv) +
                                     " into a string object is not supported" };
             }
-            llvm::Value* r = b_.CreateCall(
+            llvm::Value* snap = str_chg_snapshot(lv);
+            llvm::Value* r    = b_.CreateCall(
               value_plusargs_str_fn(),
-              { prefix_ptr, prefix_len, lv_string_ptr(lv), alloc_site_global(loc_text(i), "string") });
+              { prefix_ptr, prefix_len, lv_string_ptr(lv, StringUse::Write),
+                alloc_site_global(loc_text(i), "string") });
+            str_chg_after(lv, snap);
             set_value(i, packed(r, r, zero(32)));
             return;
         }
@@ -22884,7 +23016,7 @@ private:
                 // then copies the temp to the actual — emit_call_copyouts). No GC
                 // barrier: a string leaf can never hold a class handle, so the
                 // caller's storage acquires no reference through this write.
-                argv.push_back(dir == ArgDir::In ? str_of(a) : lv_string_ptr(lvalue_of(a)));
+                argv.push_back(dir == ArgDir::In ? str_of(a) : lv_string_ptr(lvalue_of(a), StringUse::Place));
             } else if ((dir == ArgDir::Out || dir == ArgDir::Inout) && !is_agg_abi(f.param_types[k])) {
                 // An output / inout scalar temp: pass pointers to its mm and z
                 // planes; the callee copies out through them (the caller copies the
@@ -24143,7 +24275,8 @@ private:
                 // or a module signal — never a short-lived alloca — so the pointer
                 // stays valid across the task's suspends, like the aggregate case
                 // above. No GC barrier: a string can never hold a class handle.
-                argv.push_back(tf.arg_dirs[k] == ArgDir::In ? str_of(args[k]) : lv_string_ptr(lvalue_of(args[k])));
+                argv.push_back(tf.arg_dirs[k] == ArgDir::In ? str_of(args[k])
+                                                            : lv_string_ptr(lvalue_of(args[k]), StringUse::Place));
             } else if (tf.arg_dirs[k] == ArgDir::In) {
                 Plane pl = value_of(args[k]);
                 pl       = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
@@ -25639,7 +25772,8 @@ private:
             return acc;
         }
         if (t.kind == Type::Kind::String) {
-            llvm::Value* c = b_.CreateCall(str_cmp_fn(), { lv_string_ptr(lhs), lv_string_ptr(rhs) });
+            llvm::Value* c = b_.CreateCall(
+              str_cmp_fn(), { lv_string_ptr(lhs, StringUse::Read), lv_string_ptr(rhs, StringUse::Read) });
             llvm::Value* bit = b_.CreateICmpEQ(c, b_.getInt32(0));
             return bit_plane(bit, bit);
         }
@@ -28429,6 +28563,11 @@ private:
     std::vector<llvm::Value*> str_vals_;
     // The current body's string rvalue temporaries, deinit'd at its exits.
     std::vector<llvm::Value*> str_temp_list_;
+    // Open str_chg_snapshot brackets. Consulted only by lv_string_ptr's `Write`
+    // check, and only for a property some `@` / `wait` names, so it is the
+    // completeness device HandleUse::Mutate is for containers: a string write site
+    // that forgets its bracket fails the build instead of parking a waiter forever.
+    uint32_t str_chg_open_ = 0;
     // Memoized `%clotho.string` handle slot type.
     llvm::StructType* str_slot_ty_ = nullptr;
     // Memoized class object-body StructType per Kind::Class Ref (see class_body_ty).

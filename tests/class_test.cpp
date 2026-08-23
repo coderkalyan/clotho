@@ -2727,3 +2727,99 @@ TEST_CASE("a container notifier keeps the base layout a prefix of the derived on
     )");
     CHECK(f == std::vector<std::string>{ "q", "$chg.q", "pad", "extra" });
 }
+
+// -- Change-notifier layout for SCALAR properties (LRM 9.4.2) ----------------
+//
+// The zero-cost claim again, on the types the third rung added. The same class is
+// pinned on both sides of the line: every property is written in both designs, and
+// what differs is only whether something waits.
+
+TEST_CASE("a class with no waited-on scalar property carries no change notifier") {
+    const std::vector<std::string> f = class_field_names(R"(
+        module m;
+            class C;
+                C      h;
+                string s;
+                real   r;
+                int    n;
+                task churn(); h = null; s = "x"; r = 1.5; n++; endtask
+            endclass
+            C c;
+            initial begin c = new; c.churn(); $display("n=%0d s=%s", c.n, c.s); end
+        endmodule
+    )");
+    CHECK(f == std::vector<std::string>{ "h", "s", "r", "n" });
+}
+
+// The same class with each scalar property waited on: exactly one notifier per
+// property, each immediately after the property it belongs to, and `n` -- which
+// nothing waits on -- still bare. One field and never three, because an edge on
+// these types is not a thing the language admits (see event_test).
+TEST_CASE("waited-on scalar properties each carry one any-change notifier") {
+    const std::vector<std::string> f = class_field_names(R"(
+        module m;
+            class C;
+                C      h;
+                string s;
+                real   r;
+                int    n;
+                task churn(); h = null; s = "x"; r = 1.5; n++; endtask
+                task w();
+                    fork begin wait (h == null); end join_none
+                    fork begin @s; end join_none
+                    fork begin @(r); end join_none
+                endtask
+            endclass
+            C c;
+            initial begin c = new; fork c.w(); join_none #1 c.churn(); #1; end
+        endmodule
+    )");
+    CHECK(f == std::vector<std::string>{ "h", "$chg.h", "s", "$chg.s", "r", "$chg.r", "n" });
+}
+
+// A chandle and a virtual interface handle are notified on the same footing, which
+// is the half of the chandle story SystemVerilog can express without DPI (there is
+// no way to MAKE a non-null chandle otherwise).
+TEST_CASE("a waited-on chandle and virtual interface property each carry a notifier") {
+    const std::vector<std::string> f = class_field_names(R"(
+        interface layout_if; logic c; endinterface
+        module m;
+            layout_if bi();
+            class C;
+                chandle           ch;
+                virtual layout_if v;
+                int               pad;
+                task w();
+                    fork begin wait (ch == null); end join_none
+                    fork begin wait (v != null); end join_none
+                endtask
+            endclass
+            C c;
+            initial begin c = new; fork c.w(); join_none #1 c.v = bi; #1; end
+        endmodule
+    )");
+    CHECK(f == std::vector<std::string>{ "ch", "$chg.ch", "v", "$chg.v", "pad" });
+}
+
+// Prefix layout (LRM 8.13) with a scalar notifier in place: the base's flattened
+// table must stay a prefix of the derived class's, because a base-class method
+// writes the inherited property -- and fires its notifier -- at its BASE-relative
+// field index. B's own layout is { h, $chg.h, pad }.
+TEST_CASE("an inherited scalar property's notifier keeps the base's field index") {
+    const std::vector<std::string> f = class_field_names(R"(
+        module m;
+            class B;
+                B   h;
+                int pad;
+                function void hit(); h = null; endfunction
+            endclass
+            class D extends B;
+                int extra;
+                task w(); wait (h == null); $display("woke %0t", $time); endtask
+            endclass
+            D d;
+            initial begin d = new; d.h = new; fork d.w(); join_none #1 d.hit(); #1; end
+        endmodule
+    )");
+    CHECK(f == std::vector<std::string>{ "h", "$chg.h", "pad", "extra" });
+}

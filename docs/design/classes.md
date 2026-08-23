@@ -510,8 +510,9 @@ sites that fire from the call bracket instead.
   deliberately clears the notifier when descending into an interior aggregate.
   Supporting it means making the notifier survive that descent, which is a
   separate change. `wait(a[0] == 1)` on an `int a[4]` property fails loudly.
-- **String, real, class handle, unpacked struct / union properties** — unchanged
-  from the integral work: no transition, no mutation surface.
+- **Unpacked struct / union and string / real / class-handle properties** — were
+  unchanged from the integral work at the time this section was written. The
+  scalar rung below took the last three; the aggregates remain.
 
 ### Zero cost, again asserted
 
@@ -530,6 +531,150 @@ one waiter: class{q:queue, $chg.q:event, n:signed bit[31:0]}
 
 and pins prefix layout with the notifier in place:
 `B{q, $chg.q, pad}` / `D{q, $chg.q, pad, extra}`.
+
+## Waiting on a scalar property (LRM 9.4.2 / 9.4.3)
+
+The third rung, and the one the UVM run stopped on: `uvm_sequence_base.svh:430` is
+
+```systemverilog
+wait (m_killing_process == null);
+```
+
+on a CLASS HANDLE property. Both constructs now work for every property type whose
+value is one thing a single store can compare: a class or interface-class handle, a
+`chandle` (LRM 6.14), a virtual interface handle (25.9), `real` / `shortreal`
+(6.12), and `string` (6.16).
+
+### Why most of this is the first section with a wider door
+
+`Type::Kind::Class`, `Event` and `VirtualIface` all report `layout()` width 64,
+`Domain::Two`, and a chandle is *lowered to* a plain 2-state 64-bit integer; a real
+is its 64-bit IEEE-754 pattern in a single val plane, a shortreal its 32-bit one. So
+every one of these is already a `narrow` single-word slot in the object body, and
+`emit_edge_facts`'s `changed` fact — `ICmpNE(old_mm, new_mm)` — is exactly the right
+predicate. **The store path needed no backend change at all**; only the frontend's
+eligibility test had to widen (`prop_notify_kind`).
+
+For the three handle kinds that is not luck. LRM 8.4 / 6.14 / 25.9 each give the
+variable only assignment, `==`/`!=` and `null`, so the value IS the handle: a change
+is an identity change, which is precisely what `== null` tests.
+
+For a real, it is worth naming what a word compare decides, because it is a
+BIT-PATTERN compare and is deliberately the same thing a real SIGNAL store already
+does:
+
+- `-0.0` -> `+0.0` **is** a change (different patterns, `==` would disagree).
+- A store of a bit-identical `NaN` is **not** a change (`!=` would disagree).
+
+Consistency with the signal path is the tie-breaker: this rung's whole premise is
+that a property store classifies itself the way a signal store does.
+
+### A string is the one type whose value is not the word the place holds
+
+`obj.s = t` replaces the rt_string's buffer. Comparing the handle would therefore
+call every write a change. Worse in the other direction, two distinct handles over
+the same characters are the SAME value, and LRM 9.4.2's "any change in the value"
+makes that observable — re-assigning equal text must fire nothing.
+
+So a string property is **bracketed**: `str_chg_snapshot` copies the old CONTENT
+into a scratch handle before the write, and `str_chg_after` compares it with
+`rt_string_cmp` after, firing the any-change notifier only on a difference. The
+scratch is an entry-block alloca so a bracket inside a loop reuses one slot, and its
+`rt_string_init` / `rt_string_deinit` pair is balanced across the bracket. The copy
+costs a malloc, paid only for a property something waits on.
+
+### The string write surface, and why the list is closed
+
+The same device the container section used, for the same reason. `lv_string_ptr` is
+the only thing that yields a writable rt_string handle, and its second parameter is
+now a three-valued `StringUse` **with no default**, so all 18 call sites had to be
+classified:
+
+| `StringUse` | Meaning | Notifies |
+|---|---|---|
+| `Read` | characters only read through the pointer | no |
+| `Write` | the op about to run replaces the content | yes — must sit inside a bracket |
+| `Place` | handed to someone who writes LATER (a `ref`/`out`/`inout` formal, a forwarded concat target, an NBA staging record) | no — whoever writes notifies |
+
+`Write` is not merely documentation: it is **checked** against `str_chg_open_`, so a
+write site that forgets its bracket throws a `BackendError` instead of silently
+parking a waiter forever. The check can only fire for a property something waits on,
+so it costs nothing elsewhere.
+
+What that covers, enumerated from the classified sites:
+
+- **`Store`** — which is also how `$copy` arrives (`emit_class_body_copy` emits a
+  per-property `Store`) and how an `output` / `inout` string formal's copy-out
+  arrives.
+- **Runtime write-backs**: `$sformat` / `$swrite`, `$fgets`, `$ferror`,
+  `$value$plusargs`.
+- **String methods that mutate in place**: `.putc()`, `itoa` / `hextoa` / `octtoa` /
+  `bintoa` / `realtoa`, and the packed-append.
+- **An associative array's string KEY write-back** (`denormalize_assoc_key`), which
+  `a.next(obj.k)` reaches with `obj.k` a real property.
+- **Through a `ref` / `output` / `inout` string formal**, at a function call and at a
+  task call. `Place`, riding the existing `service_snapshot` /
+  `service_after_write` bracket — which now has a string arm — so the notify lands
+  at the call's RETURN. Same reasoning as the container case: a `ref` is a raw
+  aliased pointer never copied back, and a task callee may suspend first.
+- **`$fscanf` / `$sscanf` into a string object** is still refused outright, as it was
+  before this rung (a pre-existing gap in the scan-descriptor ABI, not a notifier
+  question).
+
+### Edges: meaningless here, and the language already says so
+
+LRM 9.4.2 with Table 9-2 defines posedge and negedge as the LEAST SIGNIFICANT BIT of
+the expression moving through the `0 < x/z < 1` lattice. An edge-qualified event
+expression must therefore be integral. Bit 0 of a heap pointer, of an IEEE-754
+significand and of a string's first character are not logic levels, and the LRM
+assigns them none — so there is no edge to detect and none was invented.
+
+**slang enforces this directly.** `@(posedge p)` on a real, shortreal, string,
+chandle, class handle or virtual interface is rejected as `expression type 'T' is
+not integral` before lowering runs, so no clotho diagnostic was needed and the one
+in `push_prop_wait_events` is an unreachable backstop kept only so the message stays
+accurate if it ever becomes reachable.
+
+The pre-pass still refuses to MINT `.pos` / `.neg` for such a property, and that
+part IS load-bearing for a different reason: a stray notifier row would shift every
+later field and break the prefix invariant a base-class method writes through.
+
+Consequence: a scalar property of these types carries exactly one hidden field,
+`$chg.<prop>`, never `.pos` / `.neg` — the same shape a container property has, for
+an unrelated reason.
+
+### Refused, and why
+
+- **An unpacked struct / union property**, and **a FIXED unpacked-array property**.
+  Both need a comparison over the whole aggregate rather than over one word, which
+  is a different mechanism. `wait` over one of their leaves keeps failing with
+  "no change notifier"; `@` on a whole aggregate is rejected by slang
+  (`invalid type 'T' for event expression`).
+- **An `event`-typed property** is excluded from the notified set on purpose:
+  `@(obj.ev)` parks on the event OBJECT the property names, which is what `-> obj.ev`
+  fires, so a notifier here would be a field nothing ever reads.
+
+### Zero cost, again asserted
+
+A scalar property nothing waits on gains no field and no fire, and the string
+bracket emits nothing when `lv.chg` is null. `tests/class_test.cpp` pins it on the
+same class, which writes its handle, string, real and int in both designs:
+
+```
+no waiter:  class{h, s, r, n}
+one waiter: class{h, $chg.h, s, $chg.s, r, $chg.r, n}
+```
+
+plus `{ch, $chg.ch, v, $chg.v, pad}` for the chandle / virtual-interface pair, and
+prefix layout with a scalar notifier in place:
+`B{h, $chg.h, pad}` / `D{h, $chg.h, pad, extra}`.
+
+### The honest gap
+
+SystemVerilog offers no way to MAKE a non-null `chandle` without DPI, so the chandle
+*transition* is not exercised end to end. What is pinned is that the property is
+notifiable, that its notifier is laid out, and that a `null -> null` store is not a
+change.
 
 ## Implementation deviations from the scope-out below
 

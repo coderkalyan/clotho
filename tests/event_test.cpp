@@ -1395,10 +1395,153 @@ TEST_CASE("the uvm_event wait_off shape resumes when its protected bit changes")
     CHECK(out == "wait_off resumed at 1 on=0 waiters=0\nalready off at 2\n");
 }
 
-// A property whose type has no old -> new transition to classify carries no
-// notifier, so it must be refused rather than accepted and never woken.
-TEST_CASE("an event control on a non-integral class property is rejected") {
-    CHECK(reject("module m; class C; string s; task w(); @s; $display(\"x\"); endtask endclass "
-                 "C c; initial begin c = new; c.w(); end endmodule")
-            .find("string in an event control") != std::string::npos);
+// -- Event control on a SCALAR class property (LRM 9.4.2) --------------------
+//
+// `@p` on every property type whose value one store can compare: a class /
+// chandle / virtual interface handle, real / shortreal, and a string. Unlike
+// `wait`, `@` is change-DETECTING, so these cases are where "any change in the
+// value of the expression" has to be exact -- a store of the value already there
+// must not wake, which is the assertion a notify-on-every-write implementation
+// fails.
+
+TEST_CASE("a bare class-handle property in an event control wakes on a change") {
+    const std::string out = run_capture(R"(
+        module m;
+            class T; int x; endclass
+            class C;
+                T h;
+                task w(); @h; $display("woke at %0t", $time); endtask
+            endclass
+            C c;
+            initial begin
+                c = new;
+                fork c.w(); join_none
+                #1 c.h = new;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "woke at 1\n");
+}
+
+TEST_CASE("an event control on a real and a shortreal property wakes on a change") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C; real r; shortreal q; endclass
+            C c;
+            initial begin
+                c = new;
+                fork begin @(c.r); $display("r at %0t", $time); end join_none
+                fork begin @(c.q); $display("q at %0t", $time); end join_none
+                #1 c.r = 3.25;
+                #1 c.q = -1.5;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "r at 1\nq at 2\n");
+}
+
+TEST_CASE("an event control on a string property wakes on a content change") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C; string s; endclass
+            C c;
+            initial begin
+                c = new;
+                fork begin @(c.s); $display("s at %0t", $time); end join_none
+                #1 c.s = "hello";
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "s at 1\n");
+}
+
+TEST_CASE("an event control on a virtual interface property wakes when it is bound") {
+    const std::string out = run_capture(R"(
+        interface ev_if; logic c; endinterface
+        module m;
+            ev_if bi();
+            class C; virtual ev_if v; endclass
+            C c;
+            initial begin
+                c = new;
+                fork begin @(c.v); $display("v at %0t", $time); end join_none
+                #1 c.v = bi;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "v at 1\n");
+}
+
+// LRM 9.4.2's "any CHANGE in the value" doing observable work, once per type.
+// The handle case is identity: re-assigning the SAME handle is not a change. The
+// real case is the stored IEEE-754 pattern. The string case is the one that
+// catches comparing POINTERS instead of content -- `t` is a different rt_string
+// holding the same characters, so a handle compare would call it a change and
+// wake at t=1 instead of t=4.
+TEST_CASE("a scalar property store with no value change does not wake a non-edge waiter") {
+    const std::string out = run_capture(R"(
+        module m;
+            class T; int x; endclass
+            class C;
+                string s = "same";
+                real   r = 1.25;
+                T      h;
+            endclass
+            C c; T k; string t;
+            initial begin
+                c = new; k = new; c.h = k; t = "same";
+                fork begin @(c.s); $display("s at %0t", $time); end join_none
+                fork begin @(c.r); $display("r at %0t", $time); end join_none
+                fork begin @(c.h); $display("h at %0t", $time); end join_none
+                #1 c.s = t;
+                #1 c.r = 1.25;
+                #1 c.h = k;
+                #1 c.s = "other"; c.r = 9.5; c.h = null;
+                #1;
+            end
+        endmodule
+    )");
+    // Nothing at t=1, 2 or 3: none of those stores changed a value.
+    CHECK(out == "s at 4\nr at 4\nh at 4\n");
+}
+
+// An unpacked struct is what is left unsupported after this rung: comparing one
+// needs a walk over its leaves rather than a word compare. `@` on the whole
+// property is refused by the LANGUAGE -- an event expression must be integral or a
+// named event (LRM 9.4.2), which slang enforces -- so this is pinned to the
+// diagnostic a user actually sees, not to a clotho message. `wait` over one of its
+// leaves is refused by clotho instead, with "no change notifier"
+// (tests/wait_test.cpp), because the level path is where the silent park lived.
+TEST_CASE("an event control on an aggregate class property is rejected") {
+    const std::string err =
+      reject("module m; typedef struct { int a; int b; } pr_t; class C; pr_t p; "
+             "task w(); @p; $display(\"x\"); endtask endclass "
+             "C c; initial begin c = new; c.w(); end endmodule");
+    CHECK(err.find("invalid type 'pr_t' for event expression") != std::string::npos);
+}
+
+// An EDGE on any of these types is meaningless and the LANGUAGE says so, not just
+// clotho: LRM 9.4.2 with Table 9-2 defines posedge / negedge as the least
+// significant bit of the expression moving through the 0 < x/z < 1 lattice, so an
+// edge-qualified event expression must be integral. Bit 0 of a heap pointer, of an
+// IEEE-754 significand or of a string's first character is not a logic level. slang
+// enforces exactly that, so the diagnostic is a type error and arrives before
+// lowering; clotho keeps a backstop only to keep the message accurate if it ever
+// becomes reachable. Pinned here so that a future relaxation cannot silently invent
+// an edge for these types.
+TEST_CASE("an edge event control on a non-integral class property is rejected") {
+    const char* decls[] = { "real r; task w(); @(posedge r); endtask",
+                            "shortreal q; task w(); @(posedge q); endtask",
+                            "string s; task w(); @(edge s); endtask",
+                            "chandle ch; task w(); @(negedge ch); endtask" };
+    for (const char* d : decls) {
+        const std::string err =
+          reject(std::string("module m; class C; ") + d +
+                 " endclass C c; initial begin c = new; c.w(); end endmodule");
+        CHECK(err.find("is not integral") != std::string::npos);
+    }
 }

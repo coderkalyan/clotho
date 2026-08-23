@@ -259,15 +259,62 @@ bool is_notified_container(const slang::ast::Type& ty) {
     return ty.isQueue() || ty.isAssociativeArray() || ty.isDynamicallySizedArray();
 }
 
-// The property an `@` operand names (LRM 9.4.2). INTEGRAL only: a non-edge
-// implicit event fires on a change in the expression's VALUE, which the store
-// path classifies from the old -> new word, and no other property type has such a
-// word. A container property is excluded here on purpose and refused loudly in
+// What a store to a property of this type can classify, and therefore which change
+// notifiers the property may carry (LRM 9.4.2: "any change in the value").
+enum class PropNotify : uint8_t {
+    // Neither an old -> new word nor a mutation surface: an unpacked struct or
+    // union, a FIXED unpacked array. Refused loudly in both constructs.
+    None,
+    // The value IS one stored word, so a store compares old against new through
+    // the same emit_edge_facts a signal store uses. Every integral type; the three
+    // handle kinds whose value IS the handle (a class or interface-class handle,
+    // LRM 8.4; a chandle, 6.14; a virtual interface, 25.9 -- each admitting only
+    // assignment, `==`/`!=` and `null`, so identity is exactly what a condition
+    // over one tests); and real / shortreal, whose IEEE-754 pattern is one 2-state
+    // word (LRM 6.12: no x/z, hence nothing to classify beyond equality).
+    Word,
+    // The value is the string's CONTENT (LRM 6.16), not the rt_string handle, so
+    // the store compares with rt_string_cmp. Two distinct handles over the same
+    // characters are the same value and must fire nothing.
+    String,
+};
+
+PropNotify prop_notify_kind(const slang::ast::Type& ty) {
+    if (ty.isString()) {
+        return PropNotify::String;
+    }
+    if (ty.isEvent()) {
+        // Excluded deliberately: `@(obj.ev)` parks on the event OBJECT the property
+        // names (event_wait_needs_handle), which is what `-> obj.ev` fires, so a
+        // notifier here would be a field nothing ever reads.
+        return PropNotify::None;
+    }
+    if (ty.isIntegral() || ty.isFloating() || ty.isClass() || ty.isCHandle() ||
+        ty.isVirtualInterface()) {
+        return PropNotify::Word;
+    }
+    return PropNotify::None;
+}
+
+// Whether `@(posedge p)` / `@(negedge p)` mean anything for this property's type.
+//
+// LRM 9.4.2 with Table 9-2 defines an edge as the LEAST SIGNIFICANT BIT of the
+// expression moving through the 0 < x/z < 1 lattice. Only an integral value has
+// such a bit: bit 0 of a heap pointer, of an IEEE-754 significand and of a
+// string's first character are not logic levels, and the LRM assigns them none.
+// So an edge control on any other notified type is refused rather than invented.
+bool prop_has_edges(const slang::ast::Type& ty) {
+    return ty.isIntegral();
+}
+
+// The property an `@` operand names (LRM 9.4.2), whose value one store can
+// classify. A container property is excluded here on purpose and refused loudly in
 // collect_wait_events_impl -- firing its mutation notifier from `@` would wake a
 // process with no value change to observe.
 const slang::ast::ClassPropertySymbol* waited_class_prop(const Expression& e) {
     const auto* prop = instance_class_prop(e);
-    if (prop == nullptr || !prop->getType().getCanonicalType().isIntegral()) {
+    if (prop == nullptr ||
+        prop_notify_kind(prop->getType().getCanonicalType()) == PropNotify::None) {
         return nullptr;
     }
     return prop;
@@ -393,19 +440,32 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
 
     void handle(const slang::ast::SignalEventControl& ev) {
         if (const auto* prop = waited_class_prop(ev.expr); prop != nullptr) {
+            // An edge on a property whose type has no LSB lattice mints no notifier.
+            // slang rejects such a design outright ("expression type 'T' is not
+            // integral", LRM 9.4.2 / Table 9-2), so this is not the diagnostic; it is
+            // what keeps the LAYOUT correct-by-construction, since a stray `.pos` row
+            // here would shift every later field and break the prefix invariant a
+            // base-class method writes through.
+            const bool edges = prop_has_edges(prop->getType().getCanonicalType());
             switch (ev.edge) {
                 case slang::ast::EdgeKind::PosEdge:
-                    out->add(*prop, ir::Edge::Positive);
+                    if (edges) {
+                        out->add(*prop, ir::Edge::Positive);
+                    }
                     break;
                 case slang::ast::EdgeKind::NegEdge:
-                    out->add(*prop, ir::Edge::Negative);
+                    if (edges) {
+                        out->add(*prop, ir::Edge::Negative);
+                    }
                     break;
                 case slang::ast::EdgeKind::BothEdges:
                     // `edge` is posedge-or-negedge (LRM 9.4.2), not any change, so it
                     // takes both edge notifiers and NOT the any-change one -- an
                     // x <-> z transition must not wake it.
-                    out->add(*prop, ir::Edge::Positive);
-                    out->add(*prop, ir::Edge::Negative);
+                    if (edges) {
+                        out->add(*prop, ir::Edge::Positive);
+                        out->add(*prop, ir::Edge::Negative);
+                    }
                     break;
                 default:
                     out->add(*prop, ir::Edge::Any);
@@ -9280,6 +9340,26 @@ private:
             // control must have been left in the body (sensitivity_needs_handle).
             fail("internal: a class-property event control with no body builder");
         }
+        if (ev.edge != slang::ast::EdgeKind::None &&
+            !prop_has_edges(prop.getType().getCanonicalType())) {
+            // Unreachable through slang, and kept as the backstop that keeps the
+            // MESSAGE accurate if it ever becomes reachable. An edge on any of these
+            // types is meaningless and the LANGUAGE already says so: LRM 9.4.2 with
+            // Table 9-2 defines posedge and negedge as the least significant bit of
+            // the expression moving through the 0 < x/z < 1 lattice, so an
+            // edge-qualified event expression must be integral -- and slang enforces
+            // exactly that, rejecting `@(posedge p)` on a real, shortreal, string,
+            // chandle, class handle or virtual interface with "expression type 'T' is
+            // not integral" before lowering runs at all. Bit 0 of a heap pointer, of
+            // an IEEE-754 significand or of the first character is not a logic level,
+            // so there is nothing to classify; without this guard the design would
+            // reach prop_notifier_handle and report an "internal:" gap instead.
+            fail("an edge event control on a class property of type '" +
+                 std::string(prop.getType().toString()) +
+                 "' is not supported: LRM 9.4.2 and Table 9-2 define posedge and "
+                 "negedge on the least significant bit of the expression, which this "
+                 "type does not have (use a non-edge `@` or `wait`)");
+        }
         const auto park = [&](ir::Edge edge) {
             out.push_back(ir::WaitEvent{ .signal = ir::Signal{ 0 },
                                          .edge   = ir::Edge::Any,
@@ -16122,22 +16202,22 @@ private:
         ClassPropReadScan prop_reads;
         w.cond.visit(prop_reads);
         if (reads.empty() && vif_reads.empty() && prop_reads.notifiable.empty() && prop_reads.any_prop) {
-            // The condition reads a class property that can carry no notifier -- a
-            // string, a real, a class handle, an unpacked struct, a FIXED unpacked
-            // array -- and nothing else that can wake this process. Lowering it
-            // anyway is what used to happen, and it produced a suspend with an EMPTY
-            // event list: a permanent park with no diagnostic, in a design whose
-            // author had every reason to expect a working wait. `wait(0)` still parks
-            // silently, because that one reads nothing at all and is the documented
-            // LRM 9.4.3 behaviour.
+            // The condition reads a class property that can carry no notifier -- an
+            // unpacked struct or union, or a FIXED unpacked array -- and nothing else
+            // that can wake this process. Lowering it anyway is what used to happen,
+            // and it produced a suspend with an EMPTY event list: a permanent park
+            // with no diagnostic, in a design whose author had every reason to expect
+            // a working wait. `wait(0)` still parks silently, because that one reads
+            // nothing at all and is the documented LRM 9.4.3 behaviour.
             //
-            // TODO: the remaining property types. A string or a real needs the
-            // classify-at-the-store path widened to a non-integral compare; a fixed
-            // unpacked array needs the notifier to survive the element-store descent
-            // (agg_member clears it on purpose today, see LlvmBackend.cpp).
+            // TODO: the two aggregate shapes. Both need a comparison over the whole
+            // aggregate rather than over one word: an unpacked struct or union needs
+            // the store path to walk its leaves, and a fixed unpacked array needs the
+            // notifier to survive the element-store descent (agg_member clears it on
+            // purpose today, see LlvmBackend.cpp).
             fail("wait on a class property of a type with no change notifier is not "
-                 "supported (only integral, queue, dynamic-array and associative-array "
-                 "properties can be waited on)");
+                 "supported (an unpacked struct, union or fixed unpacked array "
+                 "property cannot be waited on)");
         }
 
         // forever { if (cond) break; @(reads); }

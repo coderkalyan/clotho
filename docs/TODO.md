@@ -909,8 +909,9 @@ professional parity; M5 makes it complete.
   **Also refused loudly**: a FIXED unpacked-array property (its extent never
   changes, so it has no mutation op — every write is an element store, and
   `agg_member` deliberately clears the notifier when descending into an interior
-  aggregate, so it needs a separate change), and, unchanged, string / real / class
-  handle / unpacked struct properties. NBA to a class property was already refused.
+  aggregate, so it needs a separate change). NBA to a class property was already
+  refused. (String / real / class-handle properties were refused here too; the
+  entry below is what changed that.)
   **Zero cost** for a container nothing waits on, by construction and asserted:
   the pre-pass admits a container property only from a `wait` condition, and
   `class_test.cpp` pins the same class — one that churns its queue through
@@ -923,6 +924,81 @@ professional parity; M5 makes it complete.
   a base-class mutation, a mixed container + integral condition, containers of two
   objects, a nested container, and the negative space — a push-then-pop and an
   unrelated-key delete must leave the waiter parked) and tests/class_test.cpp.
+- [x] **`@` and `wait` on a SCALAR class property** (LRM 9.4.2 / 9.4.3) — the third
+  rung, and the one the UVM run actually stopped on: `uvm_sequence_base.svh:430` is
+  `wait (m_killing_process == null)` on a CLASS HANDLE property, which failed with
+  "wait on a class property of a type with no change notifier is not supported".
+  Now covered, in both constructs: a class or interface-class handle, a `chandle`
+  (6.14), a virtual interface handle (25.9), `real` and `shortreal` (6.12), and
+  `string` (6.16).
+  **Most of it is the first rung with a wider door.** A class handle, a chandle and
+  a virtual interface handle are each a 2-state 64-bit word in the object body, and
+  a real is its 64-bit IEEE-754 pattern (a shortreal, 32), so `emit_edge_facts`'s
+  `changed` fact — a plain `!=` over the stored word — is already exactly the right
+  predicate, and the store path needed NO backend change at all. For the three
+  handle kinds that is not a coincidence: LRM 8.4 / 6.14 / 25.9 give the variable
+  only assignment, `==`/`!=` and `null`, so the value IS the handle and a change is
+  an identity change — precisely what `== null` tests. For a real it is worth
+  naming what the word compare decides, since it is a BIT-PATTERN compare and
+  matches what a real SIGNAL store already does: `-0.0` -> `+0.0` counts as a
+  change, and a store of a bit-identical `NaN` does not.
+  **A string is the one type whose value is not the word the place holds.**
+  `obj.s = t` replaces the rt_string's buffer, so comparing handles would call
+  every write a change; and two distinct handles over the same characters are the
+  SAME value, which 9.4.2's "any change in the value" makes observable — assigning
+  equal text must fire nothing. So a string property is bracketed:
+  `str_chg_snapshot` copies the old CONTENT out before the write and
+  `str_chg_after` compares it with `rt_string_cmp` after, firing only on a
+  difference. The copy costs a malloc, paid only for a property something waits on.
+  **The string write surface is closed the way the container one was.**
+  `lv_string_ptr` is the only thing that yields a writable rt_string handle, and its
+  second parameter is now a three-valued `StringUse` (`Read` / `Write` / `Place`)
+  **with no default**, so all 18 call sites had to be classified. `Write` is also
+  CHECKED against an open bracket, so a write site that forgets one fails the build
+  instead of parking a waiter forever — and the check can only fire for a property
+  someone waits on. Covered: `Store` (which is also how `$copy` and an
+  `output` / `inout` copy-out arrive), `$sformat` / `$swrite`, `$fgets`, `$ferror`,
+  `$value$plusargs`, `.putc()`, `itoa` / `hextoa` / `octtoa` / `bintoa` /
+  `realtoa`, the packed-append, and an associative array's string KEY write-back
+  (`a.next(obj.k)`, which is a real property write). A `ref` / `output` / `inout`
+  string formal is `Place` and rides the existing `service_snapshot` /
+  `service_after_write` bracket — which now has a string arm — so the notify lands
+  at the call's RETURN, for the same reason the container case does.
+  **Edges are meaningless for every type here, and the LANGUAGE already says so.**
+  9.4.2 with Table 9-2 defines posedge / negedge as the LEAST SIGNIFICANT BIT of
+  the expression moving through the `0 < x/z < 1` lattice, so an edge-qualified
+  event expression must be integral; bit 0 of a heap pointer, of an IEEE-754
+  significand or of a string's first character is not a logic level, and the LRM
+  assigns it none. slang enforces that directly — `@(posedge <real | shortreal |
+  string | chandle | class handle | virtual interface>)` is rejected as "expression
+  type 'T' is not integral" before lowering runs — so nothing was invented and no
+  clotho diagnostic was needed. The pre-pass still refuses to MINT `.pos` / `.neg`
+  for such a property, which is load-bearing for a different reason: a stray
+  notifier row would shift every later field and break the prefix invariant a
+  base-class method writes through. A non-edge `@p` and `wait(...)` are what these
+  types support, and each carries exactly one hidden `$chg.<prop>` field.
+  **Still refused loudly**: an unpacked struct / union property and a FIXED
+  unpacked-array property. Both need a comparison over the whole aggregate rather
+  than over one word, which is a different mechanism; `wait` over one of their
+  leaves keeps failing with "no change notifier", and `@` on a whole aggregate is
+  rejected by slang ("invalid type 'T' for event expression").
+  **Zero cost** unchanged and re-asserted on these types: `class_test.cpp` pins the
+  same class — one that writes its handle, string, real and int in both designs —
+  on both sides of the line, `{h, s, r, n}` versus
+  `{h, $chg.h, s, $chg.s, r, $chg.r, n}`, plus `{ch, $chg.ch, v, $chg.v, pad}` for
+  the chandle / virtual-interface pair and prefix layout with a scalar notifier in
+  place (`B{h, $chg.h, pad}` / `D{h, $chg.h, pad, extra}`).
+  Design: docs/design/classes.md, "Waiting on a scalar property". Covered in
+  tests/wait_test.cpp (the `uvm_sequence_base` kill shape, each type in scope, a
+  store through a `ref` formal and from a base-class method, and two objects of one
+  class each with a waiter), tests/event_test.cpp (bare `@p` per type, the
+  no-value-change cases — the same handle, the same real, and the same string
+  CONTENT through a different handle, which is the one that catches comparing
+  pointers — and the edge / aggregate refusals) and tests/class_test.cpp.
+  One honest gap: SystemVerilog offers no way to MAKE a non-null `chandle` without
+  DPI, so the chandle transition itself is not exercised end to end; what is pinned
+  is that the property is notifiable, that its notifier is laid out, and that a
+  null -> null store is not a change.
 - [x] **Named events** (LRM 15.5) — `event e;`, `-> e`, `->> e`, `->> #d e`,
   `@(e)` / `always @(e)`, `wait(e.triggered)`, at module, package, generate,
   procedural-block and `static`-local scope. An event is an OBJECT (trigger tick +

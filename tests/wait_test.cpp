@@ -282,17 +282,21 @@ TEST_CASE("wait on a property of an assoc-array element resumes when it changes"
     CHECK(run_capture_finish(src) == "woke 1\n");
 }
 
-// A property whose type carries no old -> new transition to classify gets no
-// notifier, so there is nothing to park on. It must be REFUSED: lowering it
-// anyway is what produced the silent permanent park this whole feature exists to
-// remove. `wait(0)` is unaffected -- it reads no property at all and keeps the
-// documented LRM 9.4.3 behaviour (the case above).
+// A property whose type carries neither an old -> new WORD to classify nor a
+// mutation surface gets no notifier, so there is nothing to park on. It must be
+// REFUSED: lowering it anyway is what produced the silent permanent park this
+// whole feature exists to remove. `wait(0)` is unaffected -- it reads no property
+// at all and keeps the documented LRM 9.4.3 behaviour (the case above).
+//
+// An unpacked struct is what is left after the scalar rung: comparing one needs a
+// walk over its leaves, not a word compare, which is a different mechanism.
 TEST_CASE("wait on a class property with no change notifier fails loudly") {
     const std::string err = lower_error(R"(
         module m;
+            typedef struct { int a; int b; } pair_t;
             class C;
-                string s;
-                task w(); wait(s == "go"); $display("x"); endtask
+                pair_t p;
+                task w(); wait(p.a == 1); $display("x"); endtask
             endclass
             C c;
             initial begin c = new; c.w(); end
@@ -647,4 +651,222 @@ TEST_CASE("wait on a fixed unpacked-array class property fails loudly") {
         endmodule
     )");
     CHECK(err.find("no change notifier") != std::string::npos);
+}
+
+// -- wait on a SCALAR class property (LRM 9.4.3) -----------------------------
+//
+// The third rung: every property type whose value is one thing a single store can
+// compare. A class / chandle / virtual interface handle (the value IS the handle,
+// so a change is an identity change and `== null` is exactly what the condition
+// tests), and real / shortreal (a 2-state IEEE-754 pattern, LRM 6.12 -- no x/z,
+// so equality is the whole classification). A string is here too but compares
+// CONTENT, not the handle; see its own cases below.
+//
+// Each case asserts the resume TIME rather than merely that it resumed, because a
+// missing notify does not fail loudly -- it hangs, or resumes at whatever later
+// store happens to fire.
+
+// The UVM blocker itself: uvm_sequence_base.svh:430 is `wait (m_killing_process ==
+// null)` on a class-handle property, inside a fork, with the handle cleared by
+// another process. This is the shape the whole rung exists for.
+TEST_CASE("wait on a class-handle property resumes when the handle is cleared") {
+    constexpr std::string_view src = R"(
+        module m;
+            class process_mock; int id; endclass
+            class sequence_base;
+                protected process_mock m_killing_process;
+                virtual task wait_for_kill();
+                    wait (m_killing_process == null);
+                endtask
+                virtual function void arm();  m_killing_process = new; endfunction
+                virtual function void done(); m_killing_process = null; endfunction
+            endclass
+            sequence_base s;
+            initial begin
+                s = new;
+                s.arm();
+                fork begin s.wait_for_kill(); $display("killed %0t", $time); end join_none
+                #10 s.done();
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "killed 10\n");
+}
+
+// The same shape the other way round: parking until a handle becomes NON-null,
+// which is the `wait (h != null)` half of the same idiom.
+TEST_CASE("wait on a class-handle property resumes when the handle is assigned") {
+    constexpr std::string_view src = R"(
+        module m;
+            class T; int x; endclass
+            class C; T h; endclass
+            C c;
+            initial begin
+                c = new;
+                fork begin wait (c.h != null); $display("set %0t", $time); end join_none
+                #4 c.h = new;
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "set 4\n");
+}
+
+// A real property. LRM 6.12 gives a real no x/z, so there are no edge semantics to
+// classify and the notifier is the any-change one; the compare is over the stored
+// 64-bit IEEE-754 pattern, exactly as a real SIGNAL store compares.
+TEST_CASE("wait on a real class property resumes when the value changes") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; real r; endclass
+            C c;
+            initial begin
+                c = new;
+                fork begin wait (c.r > 2.0); $display("r %0t", $time); end join_none
+                #2 c.r = 1.0;
+                #2 c.r = 2.5;
+                #1 $finish;
+            end
+        endmodule
+    )";
+    // The store at t=2 fires the notifier and the level wait re-tests false; the
+    // one at t=4 is what satisfies it.
+    CHECK(run_capture_finish(src) == "r 4\n");
+}
+
+TEST_CASE("wait on a shortreal class property resumes when the value changes") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; shortreal q; endclass
+            C c;
+            initial begin
+                c = new;
+                fork begin wait (c.q == 1.5); $display("q %0t", $time); end join_none
+                #3 c.q = 1.5;
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "q 3\n");
+}
+
+// A string property compares CONTENT (LRM 6.16 / 9.4.2 "any change in the
+// value"), through rt_string_cmp, because `obj.s = t` replaces the rt_string's
+// buffer -- comparing handles would call every write a change.
+TEST_CASE("wait on a string class property resumes when the content changes") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; string s; endclass
+            C c;
+            initial begin
+                c = new;
+                fork begin wait (c.s == "go"); $display("s %0t", $time); end join_none
+                #2 c.s = "wait";
+                #3 c.s = "go";
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "s 5\n");
+}
+
+// A virtual interface handle property (LRM 25.9): assignment, `==`/`!=` and `null`
+// are all the type admits, and all of them read the handle word this compares.
+TEST_CASE("wait on a virtual interface class property resumes when it is bound") {
+    constexpr std::string_view src = R"(
+        interface vif_if; logic clk; endinterface
+        module m;
+            vif_if bi();
+            class C; virtual vif_if v; endclass
+            C c;
+            initial begin
+                c = new;
+                fork begin wait (c.v != null); $display("v %0t", $time); end join_none
+                #6 c.v = bi;
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "v 6\n");
+}
+
+// A chandle property (LRM 6.14). SystemVerilog gives no way to MAKE a non-null
+// chandle without DPI, so what is asserted here is the half that is reachable:
+// the property is notifiable (it lowers rather than being refused), an
+// already-true condition falls through per LRM 9.4.3, and a null -> null store is
+// not a change and does not satisfy a waiter parked on one. The DPI-fed
+// transition is covered by the layout case in class_test.
+TEST_CASE("wait on a chandle class property is notifiable and sees no false change") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; chandle ch; int n; endclass
+            C c;
+            initial begin
+                c = new;
+                wait (c.ch == null);
+                $display("null at %0t", $time);
+                fork begin wait (c.ch != null); $display("BAD %0t", $time); end join_none
+                #1 c.ch = c.ch;
+                #1 c.n = 1;
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "null at 0\n");
+}
+
+// The notifiers live in the OBJECT, so two instances of one class do not share
+// them: a store to one must leave the other's waiter parked. Asserted per type
+// because each one reaches the notifier through its own compare.
+TEST_CASE("a scalar property store wakes only the written object's waiter") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C; string s; real r; C h; endclass
+            C a, b;
+            initial begin
+                a = new; b = new;
+                fork begin wait (a.s == "x"); $display("as %0t", $time); end join_none
+                fork begin wait (b.s == "x"); $display("bs %0t", $time); end join_none
+                fork begin wait (a.r == 1.0); $display("ar %0t", $time); end join_none
+                fork begin wait (b.r == 1.0); $display("br %0t", $time); end join_none
+                #1 a.s = "x";
+                #1 a.r = 1.0;
+                #1 b.s = "x";
+                #1 b.r = 1.0;
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "as 1\nar 2\nbs 3\nbr 4\n");
+}
+
+// Through a `ref` formal, which is a raw aliased pointer the callee writes and
+// never copies back, so the notify can only land at the call's return -- the
+// existing service_snapshot / service_after_write bracket, which a string reaches
+// too. And from a base-class method, which writes the inherited property at its
+// BASE-relative field index, so this is also the prefix-layout invariant working.
+TEST_CASE("a scalar property written through a ref formal or a base method wakes its waiter") {
+    constexpr std::string_view src = R"(
+        module m;
+            function void set_s(ref string r); r = "done"; endfunction
+            class D; int id; endclass
+            class B;
+                D      h;
+                string s;
+                function void hit(); h = new; endfunction
+            endclass
+            class E extends B; int extra; endclass
+            E e, f;
+            initial begin
+                e = new; f = new;
+                fork begin wait (e.h != null); $display("base %0t", $time); end join_none
+                fork begin wait (f.s == "done"); $display("ref %0t", $time); end join_none
+                #1 e.hit();
+                #1 set_s(f.s);
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "base 1\nref 2\n");
 }
