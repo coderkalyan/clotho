@@ -21898,10 +21898,12 @@ private:
         set_value(i, packed(r, r, zero(32)));
     }
 
-    // { ptr mm, ptr z, i32 width, i32 flags } — mirrors rt_scan_arg in runtime/Runtime.h.
+    // { ptr mm, ptr z, i32 width, i32 flags, ptr str, ptr site } — mirrors
+    // rt_scan_arg in runtime/Runtime.h.
     llvm::StructType* scan_arg_struct_ty() {
         auto* ptr = llvm::PointerType::getUnqual(ctx_);
-        return llvm::StructType::get(ctx_, { ptr, ptr, b_.getInt32Ty(), b_.getInt32Ty() });
+        return llvm::StructType::get(
+          ctx_, { ptr, ptr, b_.getInt32Ty(), b_.getInt32Ty(), ptr, ptr });
     }
 
     // i32 rt_fscanf(i32 fd, const char* fmt, i32 argc, const rt_scan_arg* args)
@@ -21923,8 +21925,8 @@ private:
 
     // Lower a $fscanf / $sscanf: build the rt_scan_arg[] descriptor array from the
     // output lvalues, then call the runtime scanner with the source (an FD, or a
-    // spilled string for $sscanf). Each output target must be whole-storage and
-    // <=64 bits (the runtime writes one 64-bit word per conversion).
+    // spilled string for $sscanf). A packed target must be whole-storage; a
+    // `string` object target rides the descriptor's flags-bit1 variant.
     void lower_scanf(Index i) {
         const auto        info = ir_->extra_data<ScanfInfo>(ir_->payload(i).extra);
         const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
@@ -21940,18 +21942,25 @@ private:
         if (n > 0) {
             arr = b_.CreateAlloca(sty, b_.getInt32(n), "scan_args");
             for (uint32_t k = 0; k < n; ++k) {
-                const LValue& lv = lvalue_of(outs[k]);
+                const LValue& lv  = lvalue_of(outs[k]);
+                llvm::Value*  elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                llvm::Value*  nul = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
                 if (lv.is_string) {
-                    // TODO: $*scanf write-back into a dynamic string object. NOT the
-                    // same change $value$plusargs's string destination was: this path
-                    // interleaves several targets through one shared rt_scan_arg
-                    // descriptor array, so the descriptor has to grow a string-handle
-                    // variant (plus its alloc site) and the scan engine's store step a
-                    // branch on it, and `%5s` into an unbounded string needs its own
-                    // answer. Real code reaches it: uvm_root.svh:916 does
-                    // `$sscanf(timeout, "%d,%s", timeout_int, override_spec)` with a
-                    // `string` override_spec.
-                    throw BackendError{ "$fscanf / $sscanf into a string object is not supported" };
+                    // A `string` object destination (flags bit1): the descriptor
+                    // carries the rt_string handle and its alloc site instead of
+                    // plane pointers, and the engine assigns the %s token verbatim.
+                    // Only %s pairs with a string (the frontend refuses the other
+                    // conversions per LRM 21.3.4.3), and a `%5s` field width caps
+                    // the token like any other %s. The snapshot must open before
+                    // the Write-use handle is taken (str_chg bracket).
+                    olds[k] = service_snapshot(lv);
+                    b_.CreateStore(nul, b_.CreateStructGEP(sty, elt, 0));
+                    b_.CreateStore(nul, b_.CreateStructGEP(sty, elt, 1));
+                    b_.CreateStore(b_.getInt32(0), b_.CreateStructGEP(sty, elt, 2));
+                    b_.CreateStore(b_.getInt32(2u), b_.CreateStructGEP(sty, elt, 3));
+                    b_.CreateStore(lv_string_ptr(lv, StringUse::Write), b_.CreateStructGEP(sty, elt, 4));
+                    b_.CreateStore(alloc_site_global(loc_text(i), "string"), b_.CreateStructGEP(sty, elt, 5));
+                    continue;
                 }
                 if (lv.width != lv.store_width) {
                     // TODO: a part-select scan target (x[7:0]).
@@ -21960,14 +21969,14 @@ private:
                 // A never-z target (z elision) passes a null z pointer. Flags bit0
                 // marks a narrow 2-state slot: the runtime writes only the iW value
                 // word (parsed x/z digits drop to 0 per LRM 6.3.1).
-                llvm::Value* mm  = lv_mm_ptr(lv);
-                llvm::Value* z   = lv.has_z ? lv_z_ptr(lv)
-                                            : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
-                llvm::Value* elt = b_.CreateConstInBoundsGEP1_32(sty, arr, k);
+                llvm::Value* mm = lv_mm_ptr(lv);
+                llvm::Value* z  = lv.has_z ? lv_z_ptr(lv) : nul;
                 b_.CreateStore(mm, b_.CreateStructGEP(sty, elt, 0));
                 b_.CreateStore(z, b_.CreateStructGEP(sty, elt, 1));
                 b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, elt, 2));
                 b_.CreateStore(b_.getInt32(lv.narrow ? 1u : 0u), b_.CreateStructGEP(sty, elt, 3));
+                b_.CreateStore(nul, b_.CreateStructGEP(sty, elt, 4));
+                b_.CreateStore(nul, b_.CreateStructGEP(sty, elt, 5));
                 olds[k] = service_snapshot(lv);
             }
         }

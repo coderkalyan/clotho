@@ -3482,9 +3482,17 @@ void skip_ws(ScanSource& src) {
 // the first conversion (matching $fscanf's EOF result). Unsupported conversions are
 // rejected by the frontend, so `fmt` only carries the above.
 int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_arg* args) {
-    uint32_t ai        = 0;
-    int32_t  count     = 0;
-    bool     any_input = false;
+    uint32_t ai    = 0;
+    int32_t  count = 0;
+    // The clause's two failure kinds (LRM 21.3.4.3): the scan returns EOF (-1)
+    // only when input ENDS before the first matching failure or conversion.
+    // `input_failed` marks a directive that hit EOF before matching anything;
+    // `converted` marks a completed conversion, including a %*-suppressed one
+    // (a matched literal is neither). A conflicting non-EOF character is a
+    // matching failure and yields the count, so $sscanf("abc", "%d") is 0,
+    // while $sscanf("", "%d") is -1.
+    bool input_failed = false;
+    bool converted    = false;
 
     // Value planes accumulate into word arrays sized to the widest target: a
     // target wider than 64 bits assembles multi-word, a <= 64-bit target uses
@@ -3506,10 +3514,12 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
         if (*p != '%') {
             const int c = src.get();
             if (c != static_cast<unsigned char>(*p)) {
+                if (c == EOF) {
+                    input_failed = true;
+                }
                 src.unget(c);
                 break; // literal mismatch (or EOF) ends the scan
             }
-            any_input = true;
             continue;
         }
 
@@ -3517,6 +3527,9 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
         if (*p == '%') {
             const int c = src.get();
             if (c != '%') {
+                if (c == EOF) {
+                    input_failed = true;
+                }
                 src.unget(c);
                 break;
             }
@@ -3542,18 +3555,22 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
         std::fill(may.begin(), may.end(), 0);
         std::fill(z.begin(), z.end(), 0);
         bool ok = false;
+        // The %s token bytes, kept verbatim past the plane packing: a string-object
+        // destination stores these, not the planes.
+        std::vector<uint8_t> tok;
 
         if (conv == 'c') {
             const int c = src.get();
-            if (c != EOF) {
-                any_input   = true;
+            if (c == EOF) {
+                input_failed = true;
+            } else {
+                converted        = true;
                 must[0] = may[0] = static_cast<uint8_t>(c);
                 ok               = true;
             }
         } else if (conv == 's') {
             skip_ws(src);
-            std::vector<uint8_t> tok;
-            int                  c;
+            int c;
             while ((c = src.get()) != EOF && !scan_ws(c)) {
                 if (maxw != 0 && tok.size() >= maxw) {
                     src.unget(c);
@@ -3564,8 +3581,12 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             if (scan_ws(c)) {
                 src.unget(c);
             }
-            if (!tok.empty()) {
-                any_input = true;
+            if (tok.empty()) {
+                // After the whitespace skip a non-EOF character joins the token,
+                // so an empty token IS input ending at this directive.
+                input_failed = true;
+            } else {
+                converted = true;
                 // Right-justify the token bytes (byte 0 = last char) into `must`,
                 // capped at the widest target; write_word_planes masks to width.
                 const size_t cap  = static_cast<size_t>(words) * 8;
@@ -3633,11 +3654,14 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
                     z[0] |= zz;
                 }
                 ok        = true;
-                any_input = true;
+                converted = true;
                 ++used;
                 c = src.get();
             }
             src.unget(c);
+            if (!ok && c == EOF) {
+                input_failed = true;
+            }
             if (ok && base == 10) {
                 if (neg) {
                     wide_negate(must.data(), words);
@@ -3653,18 +3677,31 @@ int32_t scan_run(ScanSource& src, const char* fmt, uint32_t argc, const rt_scan_
             if (ai >= argc) {
                 break; // more conversions than output args
             }
-            const rt_scan_arg& a      = args[ai++];
-            const bool         narrow = (a.flags & 1u) != 0;
-            if (a.width > 64) {
-                write_word_planes_wide(a.mm, a.z, a.width, must.data(), may.data(), z.data(), narrow);
+            const rt_scan_arg& a = args[ai++];
+            if ((a.flags & 2u) != 0) {
+                // A `string` object destination: the token IS the value, assigned
+                // verbatim with no width cap, right-justification or padding (LRM
+                // 21.3.4.3 sanctions only %s here; the frontend refuses the rest).
+                assert(conv == 's' && "a string destination pairs only with %s");
+                assert(a.str != nullptr && "a string destination carries its handle");
+                assert(!tok.empty() && "an empty %s token is an input failure, not a store");
+                rt_string_assign_bytes(a.str, reinterpret_cast<const char*>(tok.data()),
+                                       tok.size(), a.site);
             } else {
-                write_word_planes(a.mm, a.z, a.width, must[0], may[0], z[0], narrow);
+                const bool narrow = (a.flags & 1u) != 0;
+                if (a.width > 64) {
+                    write_word_planes_wide(a.mm, a.z, a.width, must.data(), may.data(), z.data(), narrow);
+                } else {
+                    write_word_planes(a.mm, a.z, a.width, must[0], may[0], z[0], narrow);
+                }
             }
             ++count;
         }
     }
 
-    return (count == 0 && !any_input) ? -1 : count;
+    // LRM 21.3.4.3: EOF (-1) only when input ends before the first matching
+    // failure or conversion; a matching failure returns the count (possibly 0).
+    return (count == 0 && !converted && input_failed) ? -1 : count;
 }
 
 } // namespace

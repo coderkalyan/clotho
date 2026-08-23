@@ -659,11 +659,17 @@ int32_t rt_ferror_str(int32_t fd, struct rt_string* dst, const rt_alloc_site* si
 // `flags` bit0: `mm` is a narrow 2-state slot holding the bare iW value — only
 // `width` bits are written (x/z parsed digits drop to 0 per LRM 6.3.1) and `z`
 // is null.
+// `flags` bit1: the destination is a `string` object. `str` / `site` are set and
+// the plane fields are null / 0 — the scanned %s token is assigned to the handle
+// verbatim (LRM 21.3.4.3 sanctions only %s into a string; the frontend refuses
+// every other conversion, so the engine never pairs one with this variant).
 typedef struct rt_scan_arg {
     uint8_t* mm;
     uint8_t* z;
     uint32_t width;
     uint32_t flags;
+    struct rt_string*           str;
+    const struct rt_alloc_site* site;
 } rt_scan_arg;
 
 // $fscanf(fd, fmt, args) (LRM §21.3.4): parse the descriptor's input per `fmt`,

@@ -1420,14 +1420,71 @@ professional parity; M5 makes it complete.
   character code), which is a separate question from the `%s` "no conversion"
   form above and is what real code uses. Refused in the backend, where the
   destination's storage kind is known.
-- [ ] **`$fscanf` / `$sscanf` write-back into a `string` object**. NOT the change
-  `$value$plusargs` above was: that path has one destination and got its own
-  runtime entry point, while the scan engine interleaves several targets through
-  one shared `rt_scan_arg` array, so the descriptor needs a string-handle variant
-  (plus its alloc site), the engine's store step a branch on it, and `%5s` into
-  an unbounded string its own answer. Real code reaches it: `uvm_root.svh:916` is
-  `$sscanf(timeout, "%d,%s", timeout_int, override_spec)` with a `string`
-  `override_spec`.
+- [x] **`$fscanf` / `$sscanf` write-back into a `string` object** (§21.3.4.3) —
+  the shape the old entry predicted: the shared `rt_scan_arg` descriptor grew a
+  string-handle variant (`str` + `site`, flags bit1) and the scan engine's store
+  step a branch on it, so several targets still interleave through one array and
+  `rt_fscanf` / `rt_sscanf` needed no new JIT-exposed entry point. The `%s`
+  token is assigned to the `rt_string` handle verbatim — no width cap, no
+  right-justification, no padding — like `rt_value_plusargs_str`; `%5s` into an
+  unbounded string needed no "own answer" after all, because the field width
+  already caps the TOKEN in the engine and the capped token is the value.
+  Unblocks `uvm_root.svh:916`,
+  `$sscanf(timeout, "%d,%s", timeout_int, override_spec)`.
+
+  The `%s` delimiter decision: an input field is "a string of nonspace
+  characters" and `%s` "matches a string, which is a sequence of nonwhite space
+  characters" (Table 21-7), so `%s` skips leading whitespace and stops at
+  whitespace or end of input — NOT at a format literal. `"%d,%s"` over
+  `"1000,YES"` therefore stores `YES` (the ',' was already consumed by the
+  literal match), which is what UVM's case-over-`override_spec` needs; with the
+  string FIRST, `"%s,%d"` over `"YES,1000"` stores `YES,1000` and returns 1,
+  because the bare `%s` swallows the comma before the literal can match. Both
+  cross-checked against Icarus Verilog, which agrees byte-for-byte.
+
+  The specifier matrix for scan destinations, per §21.3.4.3's own sentences
+  ("The integer format specifiers ... may be used to read into any of the
+  integral data types"; "The string format specifier %s (or %S) may be used to
+  read into a variable of integral, unpacked array of byte, or string data
+  types"; integer specifiers "shall not be used with any unpacked aggregate
+  data type"):
+
+  | conv | packed / integral | `string` | `real` | unpacked aggregate |
+  |------|-------------------|----------|--------|--------------------|
+  | `%d`, `%o`, `%h`/`%x`, `%b` | yes | refused (frontend, names the specifier) | refused | refused |
+  | `%c` | yes | refused (a string destination under `%c` is not in the clause's list; `.putc`/6.16 territory) | refused | refused |
+  | `%s` | yes (width-capped, right-justified) | **yes** (verbatim token) | refused | refused (see below) |
+  | `%e`, `%f`, `%g`, `%v`, `%t`, `%u`, `%z`, `%m` | refused | refused | refused | refused |
+
+  Two silent wrong answers found while tabulating, both now loud:
+  - An unpacked aggregate destination flat-plane-stored, so the clause's own
+    sanctioned `%s` into an unpacked array of byte landed the token
+    right-justified — REVERSED across elements (`$sscanf("hello", "%s", b)` put
+    `'o'` in `b[0]`) — and the integer specifiers accepted a destination the
+    clause forbids outright. Both refuse in the frontend now.
+  - The scan return value conflated the clause's two failure kinds: a directive
+    failing on a CONFLICTING character is a matching failure and returns the
+    count so far ("this number can be 0 in the event of an early matching
+    failure"), while EOF (-1) is only "if the input ends before the first
+    matching failure or conversion". The engine returned -1 for both, so
+    `$sscanf("abc", "%d")` read -1 where the clause, glibc and Icarus all say
+    0. The engine now tracks input-end vs conflict per directive; the one
+    deliberate divergence from Icarus is `$sscanf("a", "a%d")`, where a matched
+    LITERAL is neither a matching failure nor a conversion, so the clause (and
+    glibc) return -1 while Icarus returns 0 — clotho sides with the clause.
+
+  `$sformat` / `$swrite` were audited for the same gap and DO NOT have it:
+  their backend `lower_sformat` already branches on `lv.is_string` into
+  `rt_sformat_str` with the change-notify bracket, verified end-to-end through
+  the CLI. A failed conversion leaves its destination untouched, and earlier
+  conversions in the same call still count and store — the UVM mixed shape
+  works in both orders.
+- [ ] **`$fscanf` / `$sscanf` `%s` into an unpacked array of byte** — sanctioned
+  by §21.3.4.3 but refused today (see the matrix above): the store must be
+  element-ordered (`b[0]` = first character), so it needs a descriptor variant
+  carrying element stride and count like `rt_fread`'s, not the flat plane
+  right-justification the engine does for packed targets. No known real-code
+  blocker reaches it; UVM's paths use `string` and packed destinations.
 - [ ] **`$value$plusargs` runtime (non-literal) `str` argument**. Shared with
   `$test$plusargs`, whose query string is under the same restriction; §21.6's own
   `ieee1364_example` exercises it through a `pstring` variable. Both refuse in
@@ -1555,7 +1612,8 @@ professional parity; M5 makes it complete.
   — an empty argument contributes format TEXT (LRM 21.2.1), and there is no format
   text at compile time to contribute to. Would need a "renders as a space,
   consumes no specifier" marker in `rt_arg`.
-- [x] **Format scanning** (§21.3.4) — `$fscanf`, `$sscanf`.
+- [x] **Format scanning** (§21.3.4) — `$fscanf`, `$sscanf`, into packed targets
+  or (for `%s`) a `string` object.
 - [x] **Binary read** (§21.3.4) — `$fread` into a scalar or unpacked-array memory.
 - [x] **Command-line plusargs** (§21.6) — `$test$plusargs` / `$value$plusargs`,
   the latter into a packed vector or (for `%s`) a `string` object.

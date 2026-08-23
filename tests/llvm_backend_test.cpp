@@ -3265,6 +3265,150 @@ TEST_CASE("$fscanf returns -1 at end of file") {
     std::remove(path);
 }
 
+// $sscanf %s into a `string` object (LRM 21.3.4.3: "The string format specifier
+// %s (or %S) may be used to read into a variable of integral, unpacked array of
+// byte, or string data types"). The token is assigned verbatim — no width cap,
+// no right-justification — and an input field is "a string of nonspace
+// characters", so %s stops at whitespace, not at a format literal like ','.
+// This is UVM's +UVM_TIMEOUT shape (uvm_root.svh:916,
+// `$sscanf(timeout, "%d,%s", timeout_int, override_spec)`). Output
+// cross-checked against Icarus Verilog.
+TEST_CASE("$sscanf %s into a string object, mixed with an integral field") {
+    CHECK(run_capture(R"(
+        module m;
+            string s;
+            int i, n;
+            initial begin
+                n = $sscanf("1000,YES", "%d,%s", i, s);
+                $display("%0d %0d %s", n, i, s);
+                n = $sscanf("2000,NO", "%d,%s", i, s);
+                $display("%0d %0d %s", n, i, s);
+                // Trailing whitespace is left unread, not folded into the token.
+                n = $sscanf("3000,YES  ", "%d,%s", i, s);
+                $display("%0d %0d [%s]", n, i, s);
+            end
+        endmodule
+    )") == "2 1000 YES\n2 2000 NO\n2 3000 [YES]\n");
+}
+
+// %s delimiter behavior into a string: whitespace-delimited (leading whitespace
+// skipped), a %5s field width caps the token, and with the string FIRST a bare
+// %s swallows the whole nonspace field — including a ',' the format then fails
+// to match, so "%s,%d" over "YES,1000" is ONE conversion. Cross-checked against
+// Icarus Verilog.
+TEST_CASE("$sscanf %s string-destination delimiters and ordering") {
+    CHECK(run_capture(R"(
+        module m;
+            string s;
+            int i, n;
+            initial begin
+                n = $sscanf("42 hello", "%d %s", i, s);
+                $display("%0d %0d %s", n, i, s);
+                n = $sscanf("   tok", "%s", s);
+                $display("%0d [%s]", n, s);
+                n = $sscanf("abcdefgh", "%5s", s);
+                $display("%0d %s", n, s);
+                // String destination first, whitespace-separated: both convert.
+                n = $sscanf("YES 1000", "%s %d", s, i);
+                $display("%0d %s %0d", n, s, i);
+                // String destination first, comma format: %s eats "YES,1000".
+                i = -1;
+                n = $sscanf("YES,1000", "%s,%d", s, i);
+                $display("%0d %s %0d", n, s, i);
+            end
+        endmodule
+    )") == "2 42 hello\n1 [tok]\n1 abcde\n2 YES 1000\n1 YES,1000 -1\n");
+}
+
+// The clause's two zero-store outcomes (LRM 21.3.4.3): a matching failure on a
+// conflicting character returns the count so far (possibly 0) and leaves every
+// unconverted destination untouched; EOF (-1) is returned only when input ends
+// before the first matching failure or conversion. A matched literal is
+// neither, so "a" against "a%d" is still -1 (glibc agrees; Icarus returns 0
+// here and deviates from the clause's own words). All other rows cross-checked
+// against Icarus Verilog.
+TEST_CASE("$sscanf mismatch and end-of-input results with a string destination") {
+    CHECK(run_capture(R"(
+        module m;
+            string s;
+            int i, n;
+            initial begin
+                // 'a' conflicts with %d: matching failure, both untouched.
+                s = "keep"; i = 7;
+                n = $sscanf("abc", "%d,%s", i, s);
+                $display("%0d %0d %s", n, i, s);
+                // Empty input: input ends before anything, EOF.
+                n = $sscanf("", "%d,%s", i, s);
+                $display("%0d %0d %s", n, i, s);
+                // %s against an empty remainder is an input failure, not an
+                // empty-string store: the %d already converted still counts.
+                n = $sscanf("5,", "%d,%s", i, s);
+                $display("%0d %0d %s", n, i, s);
+                // A matched literal is not a conversion: EOF at %d wins.
+                n = $sscanf("a", "a%d", i);
+                $display("%0d", n);
+                // A literal-only format that matches in full converts nothing: 0.
+                n = $sscanf("abc", "abc");
+                $display("%0d", n);
+            end
+        endmodule
+    )") == "0 7 keep\n-1 7 keep\n1 5 keep\n-1\n0\n");
+}
+
+// $fscanf shares the descriptor path: a string destination reads from a real
+// file, mixed with an integral field. Cross-checked against Icarus Verilog.
+TEST_CASE("$fscanf %s into a string object from a file") {
+    const char* path = "clotho_fscanf_str_test.txt";
+    write_file(path, "321,MAYBE trail\n");
+    const std::string src = std::string(R"(
+        module m;
+            string s;
+            int fd, i, n;
+            initial begin
+                fd = $fopen(")") + path + R"(", "r");
+                n = $fscanf(fd, "%d,%s", i, s);
+                $display("%0d %0d %s", n, i, s);
+                n = $fscanf(fd, "%s", s);
+                $display("%0d %s", n, s);
+                $fclose(fd);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 321 MAYBE\n1 trail\n");
+    std::remove(path);
+}
+
+// A string destination is sanctioned for %s alone: the integer specifiers "may
+// be used to read into any of the integral data types" (LRM 21.3.4.3), which a
+// string object is not, and storing them would need 6.16's integral-to-string
+// conversion the scan engine does not do. Loud frontend refusal, per specifier.
+TEST_CASE("a non-%s conversion into a string destination is rejected") {
+    for (const char* conv : { "%d", "%h", "%c" }) {
+        const LowerResult r = lower_text(
+          std::string("module m; string s; int n; initial n = $sscanf(\"A\", \"") + conv +
+          "\", s); endmodule");
+        CHECK(!r.ok);
+        CHECK(r.diagnostic_text().find(std::string("$fscanf / $sscanf ") + conv +
+                                       " into a string object is not supported") !=
+              std::string::npos);
+    }
+}
+
+// An unpacked aggregate destination: the integer specifiers "shall not be used
+// with any unpacked aggregate data type" (LRM 21.3.4.3), and the flat plane
+// store would land a %s token right-justified — reversed across the elements
+// of the clause's sanctioned "unpacked array of byte" form ($sscanf("hello",
+// "%s", b) put 'o' in b[0]) — so both pairings refuse instead of storing a
+// silently wrong answer.
+TEST_CASE("an unpacked aggregate scan destination is rejected") {
+    const LowerResult r = lower_text(
+      R"(module m; byte b[8]; int n; initial n = $sscanf("hello", "%s", b); endmodule)");
+    CHECK(!r.ok);
+    CHECK(r.diagnostic_text().find(
+            "$fscanf / $sscanf into an unpacked aggregate destination is not supported") !=
+          std::string::npos);
+}
+
 // The file-io write-backs are blocking writes: each must service the target
 // signal's wait queues like an ordinary assignment. Verified against iverilog.
 TEST_CASE("$sscanf / $sformat / $fgets / scalar $fread wake waiting processes") {

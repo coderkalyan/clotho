@@ -18607,12 +18607,14 @@ private:
         return lower_expr(*e, b);
     }
 
-    // Count the non-suppressed conversions in a $fscanf / $sscanf format literal,
-    // rejecting unsupported conversion characters. Mirrors the runtime scanner: a
-    // leading '*' suppresses (consumes no arg), an optional field width follows,
-    // then the conversion char. Blocks %f/%e/%g (no reals) and %v/%m/%t/%u/%z.
-    size_t count_scan_conversions(std::string_view fmt) {
-        size_t n = 0;
+    // Collect the non-suppressed conversion characters of a $fscanf / $sscanf
+    // format literal, in argument order, rejecting unsupported conversions.
+    // Mirrors the runtime scanner: a leading '*' suppresses (consumes no arg), an
+    // optional field width follows, then the conversion char. Blocks %f/%e/%g (no
+    // reals) and %v/%m/%t/%u/%z. The caller pairs each returned char with its
+    // output argument to check the destination kind.
+    std::vector<char> scan_conversion_chars(std::string_view fmt) {
+        std::vector<char> convs;
         for (size_t i = 0; i < fmt.size(); ++i) {
             if (fmt[i] != '%') {
                 continue;
@@ -18649,10 +18651,10 @@ private:
                     fail(std::string("$fscanf / $sscanf conversion %") + fmt[i] + " is not supported");
             }
             if (!suppress) {
-                ++n;
+                convs.push_back(fmt[i]);
             }
         }
-        return n;
+        return convs;
     }
 
     // Lower $fscanf / $sscanf (LRM §21.3.4): the source is the first argument (an
@@ -18671,27 +18673,50 @@ private:
             // TODO: a runtime (non-literal) format string needs dynamic string support.
             fail("$fscanf / $sscanf format must be a string literal");
         }
-        const std::string_view fmt      = fmt_e->as<StringLiteral>().getValue();
-        const size_t           want     = count_scan_conversions(fmt);
-        const auto             out_args = args.subspan(2);
-        if (out_args.size() != want) {
-            fail("$fscanf / $sscanf has " + std::to_string(want) + " conversion(s) but " +
+        const std::string_view  fmt      = fmt_e->as<StringLiteral>().getValue();
+        const std::vector<char> convs    = scan_conversion_chars(fmt);
+        const auto              out_args = args.subspan(2);
+        if (out_args.size() != convs.size()) {
+            fail("$fscanf / $sscanf has " + std::to_string(convs.size()) + " conversion(s) but " +
                  std::to_string(out_args.size()) + " output argument(s)");
         }
         // The source lowers as a value (FD) or a packed string ($sscanf).
         const ir::Index        source = is_sscanf ? lower_string_arg(*args[0], b) : lower_expr(*args[0], b);
         std::vector<ir::Index> outs;
         outs.reserve(out_args.size());
-        for (const Expression* a : out_args) {
+        for (size_t k = 0; k < out_args.size(); ++k) {
+            const Expression* a = out_args[k];
             // The scan engine writes every conversion as must/may plane words
             // (rt_scan_arg), and a real slot holds an IEEE-754 double -- the parsed
             // bits would land in its mantissa and the design would read a silently
             // wrong number ($sscanf("12", "%d", r) left r at 0.000000 and still
             // returned 1). The clause's own real conversions (%f/%e/%g) are already
-            // refused by count_scan_conversions, so this closes the integral spelling
+            // refused by scan_conversion_chars, so this closes the integral spelling
             // of the same gap. Same guard, same reason, as $value$plusargs's.
             if (a->type->isFloating()) {
                 fail("$fscanf / $sscanf into a real variable is not supported");
+            }
+            // A `string` object destination is sanctioned for %s alone (LRM
+            // 21.3.4.3: "The string format specifier %s (or %S) may be used to
+            // read into a variable of integral, unpacked array of byte, or string
+            // data types" -- the integer specifiers list integral types only). The
+            // scan engine's string store relies on this pairing: it assigns the %s
+            // token verbatim and never converts.
+            if (a->type->getCanonicalType().isString() && convs[k] != 's') {
+                fail(std::string("$fscanf / $sscanf %") + convs[k] +
+                     " into a string object is not supported");
+            }
+            // An unpacked aggregate destination. The integer specifiers "shall not
+            // be used with any unpacked aggregate data type" (LRM 21.3.4.3), and
+            // the flat plane store the engine does would land a %s token
+            // right-justified -- reversed across the elements of the clause's own
+            // sanctioned "unpacked array of byte" form ($sscanf("hello", "%s", b)
+            // put 'o' in b[0]) -- so either pairing was a silent wrong answer.
+            // TODO: %s into an unpacked array of byte needs an element-ordered
+            // store (a descriptor variant like the string one).
+            const slang::ast::Type& ct = a->type->getCanonicalType();
+            if (ct.isUnpackedArray() || ct.isUnpackedStruct() || ct.isUnpackedUnion()) {
+                fail("$fscanf / $sscanf into an unpacked aggregate destination is not supported");
             }
             outs.push_back(lower_lvalue(*a, b));
         }
@@ -19490,7 +19515,7 @@ private:
         // for now (a runtime user_string, which the LRM's own ieee1364_example
         // exercises via a `pstring` variable, is a documented gap). Supported
         // conversions: d/o/b/h/x/s; %e/%f/%g need real support (the same gap
-        // as $fscanf/$sscanf's own %f/%e/%g, see count_scan_conversions).
+        // as $fscanf/$sscanf's own %f/%e/%g, see scan_conversion_chars).
         if (name == "$value$plusargs") {
             const auto args = call.arguments();
             if (args.size() != 2) {
