@@ -2495,7 +2495,7 @@ TEST_CASE("interface class: rand_mode through an interface handle is refused") {
 
 // `%p` of a class handle prints `null` or the handle's own class name, and an
 // interface-typed handle is no different: the name printed is the STATIC type's, so
-// an `I` handle holding a `C` prints `I`. That falls out of `class_p_render` taking
+// an `I` handle holding a `C` prints `I`. That falls out of `handle_p_name` taking
 // the handle's declared class, and it is the same implementation-defined choice
 // recorded for an ordinary handle — LRM 21.2.1.6 says nothing about handles beyond
 // `null`.

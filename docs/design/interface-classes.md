@@ -614,7 +614,7 @@ silently accepted. All were measured against the built binary:
   distinguishable case; it becomes one when constraint blocks land.
 - **`%p` of an interface handle** — no longer a refusal: `%p` of a class handle now
   prints `null` or the handle's own class name, and an interface handle prints its
-  DECLARED name (`class_p_render` takes the static type). Measured: an `I` handle on
+  DECLARED name (`handle_p_name` takes the static type). Measured: an `I` handle on
   a `C` object prints `I`, a null one `null`. Pinned by a test.
 - **`$bits` / bitstream casts of an interface handle** — slang rejects these itself:
   measured *"invalid argument type 'I' to system function"* (`$bits` of a handle) and
