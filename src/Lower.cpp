@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -197,6 +198,164 @@ bool subroutine_has_real_delay(const SubroutineSymbol& sub) {
     sub.getBody().visit(f);
     return f.found;
 }
+
+// -- Waited-on class properties (LRM 9.4.2 / 9.4.3) --------------------------
+//
+// A class property is heap storage inside an object, not a signal, so it owns none
+// of the per-signal wait machinery an `@` or a `wait` normally parks on. The three
+// shapes below therefore all failed: `@p` in a method and `@(obj.p)` reported the
+// property as an unknown signal, and `wait(p)` -- whose sensitivity is the read set
+// of its condition, which contains no signal at all -- parked on an EMPTY event
+// list and hung forever with no diagnostic.
+//
+// The fix gives such a property hidden `event`-typed sibling properties (its change
+// notifiers, ir::ChangeNotify) and makes a store to it classify its own old -> new
+// transition, exactly as a blocking store to a signal already does. These two
+// resolvers decide which properties get them; the design-wide pre-pass and the
+// wait lowering MUST agree, so both call these and nothing else.
+
+// The class INSTANCE property a `@` operand names, or null when the expression is
+// not a plain reference to one.
+//
+// `@p` inside a method (an implicit-`this` reference, so a NamedValue) and
+// `@(obj.p)` (a MemberAccess) are the two shapes. Excluded on purpose:
+//
+//   - a STATIC property, which has persistent module-signal storage of its own
+//     (declare_static_prop) and already resolves through event_signal;
+//   - an EVENT property, which is already an object with a waiter list, so
+//     `@(obj.e)` works today through the event-handle path;
+//   - a non-integral property (string, real, class handle, aggregate, container),
+//     which has no old -> new transition the store path can classify. Those keep
+//     failing loudly rather than silently gaining a notifier that never fires.
+const slang::ast::ClassPropertySymbol* waited_class_prop(const Expression& e) {
+    const slang::ast::Symbol* member = nullptr;
+    if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
+        member = &e.as<ValueExpressionBase>().symbol;
+    } else if (e.kind == ExpressionKind::MemberAccess) {
+        const auto& ma = e.as<MemberAccessExpression>();
+        // A virtual-interface member is a signal in some instance, not a property;
+        // it has its own per-(member, edge) waiter head (LRM 25.9).
+        if (ma.value().type->getCanonicalType().isVirtualInterface()) {
+            return nullptr;
+        }
+        member = &ma.member;
+    } else {
+        return nullptr;
+    }
+    const auto* prop = member->as_if<slang::ast::ClassPropertySymbol>();
+    if (prop == nullptr || prop->lifetime == slang::ast::VariableLifetime::Static) {
+        return nullptr;
+    }
+    const slang::ast::Type& ty = prop->getType().getCanonicalType();
+    if (!ty.isIntegral()) {
+        return nullptr;
+    }
+    return prop;
+}
+
+// Every class-property reference in an expression, whether or not it is notifiable.
+// `wait` needs both halves: the notifiable ones become sensitivity, and the mere
+// PRESENCE of a non-notifiable one is what turns an otherwise empty sensitivity
+// from a silent permanent park into a loud failure (lower_wait_stmt).
+struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags::AllGood> {
+    // Notifiable property references, in source order, deduped by expression node.
+    std::vector<const Expression*> notifiable;
+    // Any non-static class property was referenced, notifiable or not.
+    bool any_prop = false;
+
+    void take(const Expression& e) {
+        if (waited_class_prop(e) != nullptr) {
+            notifiable.push_back(&e);
+            any_prop = true;
+            return;
+        }
+        const slang::ast::Symbol* member = nullptr;
+        if (e.kind == ExpressionKind::MemberAccess) {
+            member = &e.as<MemberAccessExpression>().member;
+        } else {
+            member = &e.as<ValueExpressionBase>().symbol;
+        }
+        if (const auto* p = member->as_if<slang::ast::ClassPropertySymbol>();
+            p != nullptr && p->lifetime != slang::ast::VariableLifetime::Static) {
+            any_prop = true;
+        }
+    }
+
+    void handle(const slang::ast::NamedValueExpression& e) {
+        take(e);
+        visitDefault(e);
+    }
+    void handle(const slang::ast::HierarchicalValueExpression& e) {
+        take(e);
+        visitDefault(e);
+    }
+    void handle(const MemberAccessExpression& ma) {
+        take(ma);
+        // Descended into on purpose: the object expression of `a.b.p` can itself
+        // read properties, and a compound condition nests member accesses.
+        visitDefault(ma);
+    }
+};
+
+// Which (class property, edge) pairs the whole design waits on. Design-wide because
+// a class's object body must carry the notifiers BEFORE it is laid out, and
+// lower_class_type runs on demand from the first reference under any top -- which
+// can be lexically far from, or in another top than, the `@` that needs one.
+// Modelled on EventMergeScan (the events_merge design-wide fact) in `lower`.
+struct WaitedProps {
+    // Property -> bitmask over ir::Edge of the edges waited on.
+    ankerl::unordered_dense::map<const slang::ast::ClassPropertySymbol*, uint8_t> edges;
+
+    void add(const slang::ast::ClassPropertySymbol& prop, ir::Edge edge) {
+        edges[&prop] |= static_cast<uint8_t>(1u << static_cast<uint32_t>(edge));
+    }
+
+    bool has(const slang::ast::ClassPropertySymbol& prop, ir::Edge edge) const {
+        const auto it = edges.find(&prop);
+        return it != edges.end() && (it->second & static_cast<uint8_t>(1u << static_cast<uint32_t>(edge))) != 0;
+    }
+};
+
+// The pre-pass itself: every `@`/`wait` in the design, contributing the edges its
+// operand's property needs. Runs once over the whole AST before any top is lowered.
+struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> {
+    WaitedProps* out = nullptr;
+
+    void handle(const slang::ast::SignalEventControl& ev) {
+        if (const auto* prop = waited_class_prop(ev.expr); prop != nullptr) {
+            switch (ev.edge) {
+                case slang::ast::EdgeKind::PosEdge:
+                    out->add(*prop, ir::Edge::Positive);
+                    break;
+                case slang::ast::EdgeKind::NegEdge:
+                    out->add(*prop, ir::Edge::Negative);
+                    break;
+                case slang::ast::EdgeKind::BothEdges:
+                    // `edge` is posedge-or-negedge (LRM 9.4.2), not any change, so it
+                    // takes both edge notifiers and NOT the any-change one -- an
+                    // x <-> z transition must not wake it.
+                    out->add(*prop, ir::Edge::Positive);
+                    out->add(*prop, ir::Edge::Negative);
+                    break;
+                default:
+                    out->add(*prop, ir::Edge::Any);
+                    break;
+            }
+        }
+        visitDefault(ev);
+    }
+
+    void handle(const slang::ast::WaitStatement& w) {
+        // A level wait re-tests its condition on every wake, so any change in any
+        // property the condition reads is enough: the any-change notifier only.
+        ClassPropReadScan scan;
+        w.cond.visit(scan);
+        for (const Expression* e : scan.notifiable) {
+            out->add(*waited_class_prop(*e), ir::Edge::Any);
+        }
+        visitDefault(w);
+    }
+};
 
 // True iff this scope (an instance body or one of its generate blocks — sharing
 // the enclosing instance's timescale — or a package / `$unit` compilation unit)
@@ -1969,6 +2128,13 @@ public:
         events_merge_ = v;
     }
 
+    // Point this Lowerer at the design-wide waited-on-property table (WaitPropScan).
+    // Shared for the same reason ClassIds is, and consulted at exactly one place:
+    // lower_class_type, laying out a class's change notifiers.
+    void set_waited_props(const WaitedProps* wp) {
+        waited_props_ = wp;
+    }
+
     void set_class_ids(ClassIds* ids) {
         class_ids_ = ids;
     }
@@ -3036,8 +3202,11 @@ private:
         // declared after the recursing one unindexed (`uvm_report_object`'s
         // `local bit m_rh_set`, declared after `m_rh`).
         std::vector<ir::FieldRow> fields;
-        uint32_t                  idx = 0;
-        ClassRand                 rand;
+        // Owns the composed change-notifier field names; see
+        // emit_change_notifier_fields for why the rows cannot hold a temporary.
+        std::deque<std::string> chg_names;
+        uint32_t                idx = 0;
+        ClassRand               rand;
         for (const slang::ast::ClassType* k : chain) {
             guard_constraint_blocks(*k);
             for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
@@ -3052,7 +3221,18 @@ private:
                     rand.props.push_back(admit_rand_prop(prop, idx, static_cast<uint32_t>(rand.props.size())));
                 }
                 class_prop_index_.emplace(&prop, idx);
+                const uint32_t prop_idx = idx;
                 ++idx;
+                // A property something in the design waits on carries one hidden
+                // `event` property per waited edge (ir::ChangeNotify), placed
+                // IMMEDIATELY AFTER it. Immediately after, rather than appended at
+                // the end like the rand block, because a BASE-class method writing
+                // an inherited property must find the notifier at the index the
+                // base's own layout gave it: interleaving keeps the base's whole
+                // flattened layout a prefix of every derived class's, which is the
+                // invariant prefix layout already rests on. A class no `@` / `wait`
+                // names gets nothing here.
+                idx += reserve_change_notifiers(prop, ref, prop_idx, idx);
             }
         }
         // The rand block (docs/design/constrained-randomization.md §5): the object's
@@ -3091,6 +3271,7 @@ private:
                     continue;
                 }
                 fields.push_back({ prop.name, lower_type(prop.getType()), class_prop_index_.at(&prop) });
+                emit_change_notifier_fields(prop, fields, chg_names);
             }
         }
         if (rand.present) {
@@ -3113,6 +3294,73 @@ private:
             drain_rand_bodies();
         }
         return ref;
+    }
+
+    // Reserve the object-body field indices of one property's change notifiers, and
+    // publish them for both the store path (ir::ChangeNotify, read by the backend at
+    // every member select) and the wait path (prop_notify_, read when lowering the
+    // `@`). Returns how many indices were taken, starting at `next`.
+    //
+    // Called from BOTH the base's and the derived class's layout pass over the same
+    // property, and must answer identically in each: it keys only on the design-wide
+    // pre-pass and on `next`, never on which class is being laid out.
+    uint32_t reserve_change_notifiers(const slang::ast::ClassPropertySymbol& prop,
+                                      ir::Ref                                class_ref,
+                                      uint32_t                               prop_field,
+                                      uint32_t                               next) {
+        if (waited_props_ == nullptr || !waited_props_->edges.contains(&prop)) {
+            return 0;
+        }
+        constexpr std::array<uint32_t, 3> none{ ir::kNoNotify, ir::kNoNotify, ir::kNoNotify };
+        auto [slot, fresh] = prop_notify_.try_emplace(&prop, none);
+        uint32_t taken     = 0;
+        for (const ir::Edge edge : { ir::Edge::Positive, ir::Edge::Negative, ir::Edge::Any }) {
+            if (!waited_props_->has(prop, edge)) {
+                continue;
+            }
+            const auto     e  = static_cast<uint32_t>(edge);
+            const uint32_t at = next + taken++;
+            if (!fresh && slot->second[e] != at) {
+                // Prefix layout: a base's own pass over this property saw the same
+                // running index, so a derived class's pass must land on the same slot.
+                // Checked rather than assumed -- a mismatch would make a base-class
+                // method fire whatever field happened to sit there.
+                fail("internal: change-notifier index moved between a base and a "
+                     "derived class for property '" +
+                     std::string(prop.name) + "'");
+            }
+            slot->second[e] = at;
+            module_.set_change_notify(class_ref, prop_field, edge, at);
+        }
+        return taken;
+    }
+
+    // The field rows for one property's notifiers, in the index order
+    // reserve_change_notifiers handed out. Named `$chg.` so they cannot collide with
+    // a declared property (a SystemVerilog identifier has no `$`), the same way the
+    // rand block's `$rand.` rows are kept out of the user's namespace.
+    //
+    // `names` owns the composed strings, because ir::FieldRow::name is a
+    // string_view the pool copies only at set_struct_fields -- a temporary here
+    // dangles, and did: two notifiers in one class printed a corrupted name.
+    // A deque, so an earlier row's view survives a later push_back.
+    void emit_change_notifier_fields(const slang::ast::ClassPropertySymbol& prop,
+                                     std::vector<ir::FieldRow>&             fields,
+                                     std::deque<std::string>&               names) {
+        const auto slots = prop_notify_.find(&prop);
+        if (slots == prop_notify_.end()) {
+            return;
+        }
+        const ir::Ref ev = module_.pool.event_type;
+        for (const auto [edge, suffix] : { std::pair{ ir::Edge::Positive, ".pos" },
+                                           std::pair{ ir::Edge::Negative, ".neg" },
+                                           std::pair{ ir::Edge::Any, "" } }) {
+            const uint32_t at = slots->second[static_cast<uint32_t>(edge)];
+            if (at != ir::kNoNotify) {
+                names.push_back("$chg." + std::string(prop.name) + suffix);
+                fields.push_back({ names.back(), ev, at });
+            }
+        }
     }
 
     // Admit one `rand` / `randc` property (LRM 18.3) and describe it for the
@@ -8871,6 +9119,15 @@ private:
                                                  .handle = lower_expr(ev.expr, *wait_builder_) });
                     break;
                 }
+                if (const auto* prop = waited_class_prop(ev.expr); prop != nullptr) {
+                    // A class property (LRM 9.4.2 on a heap value). Park on its hidden
+                    // change notifier for this edge, resolving the OBJECT here, right
+                    // before the wait -- which is the whole point: resolving it when
+                    // the process was created instead dereferenced a handle that
+                    // `new` had not yet filled in.
+                    push_prop_wait_events(ev, *prop, out);
+                    break;
+                }
                 const ir::Signal sig = event_signal(ev.expr);
                 if (ev.edge == slang::ast::EdgeKind::BothEdges) {
                     // `edge` means posedge-or-negedge (LRM 9.4.2), not any change:
@@ -8931,6 +9188,82 @@ private:
         }
     }
 
+    // The wait events for `@[edge] <class property>` (LRM 9.4.2). One per edge the
+    // control asks for, each parking on that edge's hidden change notifier.
+    //
+    // The WaitEvent's own edge is Any for all of them, and that is the point of the
+    // design: the old -> new classification happens at the STORE, which then fires
+    // only the notifiers whose edge the transition actually produced. So which
+    // notifier a waiter picks IS its edge test, and a fire is never spurious --
+    // a write that does not change the value fires nothing at all.
+    void push_prop_wait_events(const SignalEventControl&              ev,
+                               const slang::ast::ClassPropertySymbol& prop,
+                               std::vector<ir::WaitEvent>&            out) {
+        if (wait_builder_ == nullptr) {
+            // A process's static sensitivity cannot carry a handle, so a property
+            // control must have been left in the body (sensitivity_needs_handle).
+            fail("internal: a class-property event control with no body builder");
+        }
+        const auto park = [&](ir::Edge edge) {
+            out.push_back(ir::WaitEvent{ .signal = ir::Signal{ 0 },
+                                         .edge   = ir::Edge::Any,
+                                         .handle = prop_notifier_handle(ev.expr, prop, edge, *wait_builder_) });
+        };
+        if (ev.edge == slang::ast::EdgeKind::BothEdges) {
+            // `edge` is posedge-or-negedge, not any change (LRM 9.4.2): an x <-> z
+            // transition is neither, so this takes the two edge notifiers rather than
+            // the any-change one. The scheduled flag dedups a double wake.
+            park(ir::Edge::Positive);
+            park(ir::Edge::Negative);
+            return;
+        }
+        park(to_edge(ev.edge));
+    }
+
+    // Load the handle of one change notifier of a class property, dereferencing the
+    // object the reference names AT THIS POINT in the body. That timing is the fix
+    // for `@(c.p)` in a forked process: the handle used to be resolved while the
+    // process was being built, which read `c` before `c = new` had run and aborted on
+    // a null dereference at 0 s.
+    ir::Index prop_notifier_handle(const Expression&                      e,
+                                   const slang::ast::ClassPropertySymbol& prop,
+                                   ir::Edge                               edge,
+                                   ir::Builder&                           b) {
+        const ir::SourceLoc l    = to_source_loc(e.sourceRange.start());
+        const auto          slot = prop_notify_.find(&prop);
+        if (slot == prop_notify_.end() || slot->second[static_cast<uint32_t>(edge)] == ir::kNoNotify) {
+            // The design-wide pre-pass decides which notifiers exist and this decides
+            // which are used; they read the same resolver, so a gap is a bug here, not
+            // an unsupported design.
+            fail("internal: no change notifier for class property '" + std::string(prop.name) + "'");
+        }
+        ir::Index      handle{};
+        ir::Ref        cls{};
+        ir::SourceSpan span{};
+        if (e.kind == ExpressionKind::MemberAccess) {
+            const auto& ma = e.as<MemberAccessExpression>();
+            handle         = lower_expr(ma.value(), b);
+            cls            = lower_type(*ma.value().type);
+            span           = to_source_span(ma.value().sourceRange);
+        } else if (ctor_this_) {
+            // A property default initializer: `this` is the object being built. Same
+            // precedence as value_lvalue's, and for the same reason.
+            handle = ctor_this_->handle;
+            cls    = ctor_this_->cls;
+        } else if (fn_ctx_ != nullptr && fn_ctx_->has_this) {
+            handle = this_handle(b, l);
+            cls    = fn_ctx_->this_class;
+        } else {
+            fail("a bare class property in an event control needs an enclosing method");
+        }
+        const ir::Index body = b.handle_deref(handle, cls, span.valid() ? span.start : l);
+        if (span.end != ir::SourceLoc{ 0 }) {
+            b.set_end(body, span.end);
+        }
+        return b.unary(
+          ir::Inst::Tag::Load, b.member_select(body, slot->second[static_cast<uint32_t>(edge)], cls, l), l);
+    }
+
     // True when a `@(...)` on this expression needs a runtime event HANDLE rather
     // than a signal: it is event-typed but is not a plain reference to a declared
     // event variable. `@(ev[i])`, `@(obj.e)`, `@(s.e)` and `@(<formal>)` are the
@@ -8964,8 +9297,13 @@ private:
     // static subscription cannot carry. build_process leaves such a list in the body.
     bool sensitivity_needs_handle(const TimingControl& tc) {
         switch (tc.kind) {
-            case TimingControlKind::SignalEvent:
-                return event_wait_needs_handle(tc.as<SignalEventControl>().expr);
+            case TimingControlKind::SignalEvent: {
+                const Expression& e = tc.as<SignalEventControl>().expr;
+                // A class property's notifier is reached through the object handle, so
+                // `always @(c.p)` has to stay in the body too -- the seed loop that
+                // issues a static subscription cannot evaluate `c`.
+                return event_wait_needs_handle(e) || waited_class_prop(e) != nullptr;
+            }
             case TimingControlKind::EventList:
                 for (const TimingControl* e : tc.as<EventListControl>().events) {
                     if (sensitivity_needs_handle(*e)) {
@@ -15674,6 +16012,24 @@ private:
         // handles are evaluated inside the loop body, so a retargeted handle is
         // re-read on every pass, and so that the values dominate the wait.
         const std::vector<const MemberAccessExpression*> vif_reads = vif_member_reads(w.cond);
+        // Class properties the condition reads (LRM 9.4.3). They are not signals
+        // either -- a property is heap storage inside an object -- so each one parks
+        // on its own hidden any-change notifier, whose object handle is lowered inside
+        // the loop body like a virtual interface's, so a reassigned handle is re-read
+        // on every pass.
+        ClassPropReadScan prop_reads;
+        w.cond.visit(prop_reads);
+        if (reads.empty() && vif_reads.empty() && prop_reads.notifiable.empty() && prop_reads.any_prop) {
+            // The condition reads a class property that can carry no notifier -- a
+            // string, a real, a handle, an aggregate, a container -- and nothing else
+            // that can wake this process. Lowering it anyway is what used to happen,
+            // and it produced a suspend with an EMPTY event list: a permanent park with
+            // no diagnostic, in a design whose author had every reason to expect a
+            // working wait. `wait(0)` still parks silently, because that one reads
+            // nothing at all and is the documented LRM 9.4.3 behaviour.
+            fail("wait on a class property of a type with no change notifier is not "
+                 "supported (only integral properties can be waited on)");
+        }
 
         // forever { if (cond) break; @(reads); }
         b.open_region();
@@ -15690,7 +16046,7 @@ private:
             const ir::ExtraSlice else_r = b.close_region(); // empty
             b.cond(c, then_r, else_r, l);
             std::vector<ir::WaitEdge> edges;
-            edges.reserve(reads.size() + vif_reads.size());
+            edges.reserve(reads.size() + vif_reads.size() + prop_reads.notifiable.size());
             for (const ir::WaitEvent& e : reads) {
                 edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
             }
@@ -15703,6 +16059,11 @@ private:
                     edges.push_back(ir::WaitEdge{ *rep, static_cast<uint32_t>(ir::Edge::Any),
                                                   ir::kNoWaitHandle, inst });
                 }
+            }
+            for (const Expression* pe : prop_reads.notifiable) {
+                edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
+                                              static_cast<uint32_t>(ir::Edge::Any),
+                                              prop_notifier_handle(*pe, *waited_class_prop(*pe), ir::Edge::Any, b) });
             }
             // An empty list is legal and meaningful: `wait(0)` reads nothing and
             // parks the process for the rest of the run.
@@ -26870,7 +27231,19 @@ private:
         const ir::Index src_body = b.handle_deref(src, class_ref, l);
         const ir::Type  t        = std::get<ir::Type>(module_.pool.get(class_ref));
         const auto      n        = static_cast<uint32_t>(module_.pool.struct_fields(t.fields_id).size());
+        // A change notifier is NOT part of the copied value (LRM 9.4.2 gives it no
+        // source-level existence at all). Copying the source's handle over the
+        // destination's would alias one waiter list into two objects AND orphan every
+        // waiter already parked on the destination's own notifier -- a silent hang for
+        // a process that was correctly waiting. Skipped by name, the one thing that
+        // marks these rows apart from properties.
+        const auto is_notifier = [&](uint32_t i) {
+            return module_.pool.field_name(module_.pool.struct_fields(t.fields_id)[i]).starts_with("$chg.");
+        };
         for (uint32_t i = 0; i < n; ++i) {
+            if (is_notifier(i)) {
+                continue;
+            }
             // Re-read the row each iteration: emit_agg_copy can intern a type and
             // reallocate the field table underneath a held span (Lower.cpp's
             // emit_agg_store documents the same hazard).
@@ -28750,6 +29123,15 @@ private:
     // Class property symbol -> its declaration-order field index in the owning
     // class's property table (used to lower a member access to a MemberSelect).
     ankerl::unordered_dense::map<const slang::ast::Symbol*, uint32_t> class_prop_index_;
+    // Design-wide waited-on class properties (WaitPropScan), or null on a standalone
+    // Lowerer with no pre-pass -- which then lays out no notifier, so `@p` / `wait(p)`
+    // fails loudly rather than parking on nothing.
+    const WaitedProps* waited_props_ = nullptr;
+    // (waited-on class property, ir::Edge) -> the object-body field index of its
+    // hidden change-notifier event property (ir::ChangeNotify). Filled by
+    // lower_class_type at the same time as class_prop_index_, and read by the wait
+    // lowering to build `@(obj.<notifier>)`.
+    ankerl::unordered_dense::map<const slang::ast::Symbol*, std::array<uint32_t, 3>> prop_notify_;
     // Virtual dispatch (LRM 8.20/8.21). class_vslot_: a class -> its method NAME ->
     // vtable slot map (inheriting the base's numbering, extended with
     // the class's own virtuals). Name-keyed so a pure virtual (a
@@ -29626,12 +30008,24 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     EventMergeScan merge_scan;
     root.visit(merge_scan);
     const bool events_merge = merge_scan.found;
+    // Design-wide: which class properties does some `@` or `wait` in the design wait
+    // on, and with which edges (LRM 9.4.2 / 9.4.3)? Each one's object body carries a
+    // hidden change-notifier event per waited edge, and the answer has to be complete
+    // BEFORE the first class is laid out -- lower_class_type runs on demand from the
+    // first reference anywhere under any top, which can precede the `@` that needs
+    // the notifier. A design that waits on no property gets an empty table and every
+    // class body, every store and every descriptor stays byte-identical.
+    WaitedProps  waited_props;
+    WaitPropScan wait_prop_scan;
+    wait_prop_scan.out = &waited_props;
+    root.visit(wait_prop_scan);
     try {
         Lowerer globals(*module, tick_fs, allow_system);
         globals.set_events_merge(events_merge);
         globals.set_class_ids(&class_ids);
         globals.set_iface_ids(&iface_ids);
         globals.set_vif_defs(&vif_defs);
+        globals.set_waited_props(&waited_props);
         globals.lower_globals(comp, root);
 
         for (const InstanceSymbol* top : root.topInstances) {
@@ -29643,6 +30037,7 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             lw.set_iface_ids(&iface_ids);
             lw.set_vif_defs(&vif_defs);
             lw.set_events_merge(events_merge);
+            lw.set_waited_props(&waited_props);
             lw.set_inferred_clocks(&inferred_clocks);
             lw.lower_top(*top, prefix);
             // Exported functions resolve in the scope that owns them: this top's

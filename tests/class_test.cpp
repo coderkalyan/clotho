@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <variant>
+#include <vector>
 
 #include "Lower.h"
 #include "PosixIo.h"
@@ -2513,4 +2515,148 @@ TEST_CASE("interface class: %p of an interface handle prints its declared name")
         endmodule
     )";
     CHECK(run_capture(src) == "I null C\n");
+}
+
+// -- Change-notifier layout (LRM 9.4.2, docs/design/classes.md) --------------
+//
+// A property some `@` / `wait` in the design waits on carries a hidden
+// `event`-typed sibling property per waited edge -- its change notifier. These
+// cases pin the two layout properties the design rests on: a class nothing waits
+// on is bit-identical to before the feature existed, and a notifier sits
+// immediately after its property so a base class's flattened layout stays a
+// prefix of every derived class's.
+
+// The field names of the one class type in a design's signal table.
+std::vector<std::string> class_field_names(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+    const ir::Module& m = *r.module;
+    for (const ir::SignalInfo& s : m.signals()) {
+        const auto& t = std::get<ir::Type>(m.pool.get(s.type));
+        if (t.kind != ir::Type::Kind::Class) {
+            continue;
+        }
+        std::vector<std::string> out;
+        for (const ir::Field& f : m.pool.struct_fields(t.fields_id)) {
+            out.emplace_back(m.pool.field_name(f));
+        }
+        return out;
+    }
+    return {};
+}
+
+// The zero-cost claim, asserted rather than argued: a class no `@` / `wait`
+// names gains NO field. Every property of the design below is written, and one
+// is even the same `bit on` the waiting case uses -- what differs is only that
+// nothing waits on it.
+TEST_CASE("a class with no waited-on property carries no change notifier") {
+    const std::vector<std::string> f = class_field_names(R"(
+        module m;
+            class C;
+                bit on;
+                int n;
+                task bump(); on = 1; n++; endtask
+            endclass
+            C c;
+            initial begin c = new; c.bump(); $display("n=%0d on=%b", c.n, c.on); end
+        endmodule
+    )");
+    CHECK(f == std::vector<std::string>{ "on", "n" });
+}
+
+// The same class, with one property waited on: exactly one notifier appears, it
+// sits immediately after the property it belongs to, and the property nothing
+// waits on (`n`) is untouched.
+TEST_CASE("a waited-on class property carries one notifier, placed after it") {
+    const std::vector<std::string> f = class_field_names(R"(
+        module m;
+            class C;
+                bit on;
+                int n;
+                task bump(); on = 1; n++; endtask
+                task w(); @on; $display("woke"); endtask
+            endclass
+            C c;
+            initial begin c = new; fork c.w(); join_none #1 c.bump(); #1; end
+        endmodule
+    )");
+    CHECK(f == std::vector<std::string>{ "on", "$chg.on", "n" });
+}
+
+// Only the edges the design actually uses are laid out, so `@(posedge f)` alone
+// costs one notifier and not three. The suffix says which edge each one serves.
+TEST_CASE("only the waited edges of a class property get notifiers") {
+    const std::vector<std::string> pos = class_field_names(R"(
+        module m;
+            class C;
+                logic f;
+                task w(); @(posedge f); $display("p"); endtask
+            endclass
+            C c;
+            initial begin c = new; fork c.w(); join_none #1 c.f = 1; #1; end
+        endmodule
+    )");
+    CHECK(pos == std::vector<std::string>{ "f", "$chg.f.pos" });
+
+    const std::vector<std::string> both = class_field_names(R"(
+        module m;
+            class C;
+                logic f;
+                task p(); @(posedge f); $display("p"); endtask
+                task a(); @f; $display("a"); endtask
+            endclass
+            C c;
+            initial begin c = new; fork c.p(); join_none fork c.a(); join_none #1 c.f = 1; #1; end
+        endmodule
+    )");
+    CHECK(both == std::vector<std::string>{ "f", "$chg.f.pos", "$chg.f" });
+}
+
+// Prefix layout (LRM 8.13): the base's flattened table must remain a prefix of
+// the derived class's, notifiers included, because a base-class method writes an
+// inherited property -- and fires its notifier -- at its BASE-relative field
+// index. Appending notifiers after all properties would break exactly that.
+TEST_CASE("an inherited property's notifier keeps the base's field index") {
+    const std::vector<std::string> f = class_field_names(R"(
+        module m;
+            class B;
+                bit on;
+                int pad;
+                function void hit(); on = 1; endfunction
+            endclass
+            class D extends B;
+                int extra;
+                task w(); @on; $display("woke %0t", $time); endtask
+            endclass
+            D d;
+            initial begin d = new; fork d.w(); join_none #1 d.hit(); #1; end
+        endmodule
+    )");
+    // B's own layout is { on, $chg.on, pad } -- a prefix of this.
+    CHECK(f == std::vector<std::string>{ "on", "$chg.on", "pad", "extra" });
+}
+
+// And the write from the base method actually reaches the derived object's
+// waiter, which is the behaviour the layout invariant exists to protect.
+TEST_CASE("a base-class method writing an inherited property wakes a derived waiter") {
+    constexpr std::string_view src = R"(
+        module m;
+            class B;
+                bit on;
+                function void hit(); on = 1; endfunction
+            endclass
+            class D extends B;
+                task w(); @on; $display("woke %0t", $time); endtask
+            endclass
+            D d;
+            initial begin
+                d = new;
+                fork d.w(); join_none
+                #1 d.hit();
+                #1;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "woke 1\n");
 }

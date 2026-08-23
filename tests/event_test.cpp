@@ -6,6 +6,7 @@
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
@@ -1001,4 +1002,403 @@ TEST_CASE("iff on a multi-event control is rejected") {
     CHECK(reject("module m; logic a=0,b=0,en=0; int c=0; "
                  "always @(posedge a iff en or posedge b) c++; endmodule")
             .find("iff qualifier on a multi-event control") != std::string::npos);
+}
+
+// -- Event control on a class property (LRM 9.4.2) ---------------------------
+//
+// A class property is heap storage inside an object, so it owns none of the
+// per-signal wait machinery. All three shapes below failed before the change
+// notifiers landed: `@p` and `@(obj.p)` reported the property as an unknown
+// signal, and `wait(p)` (tests/wait_test.cpp) parked on an empty event list and
+// hung with no diagnostic at all. Verilator 5.050 is the oracle -- it prints
+// `woke at 1` for the first two -- while iverilog 13 rejects every one of them
+// ("cannot synthesize expression: @.<0>"), so it is no oracle here.
+
+// The uvm_event.svh:120 shape: a bare `@p` in a method, on the enclosing `this`.
+TEST_CASE("a bare class property in an event control wakes on a change") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                bit on;
+                task w(); @on; $display("woke at %0t", $time); endtask
+            endclass
+            C c;
+            initial begin
+                c = new;
+                fork c.w(); join_none
+                #1 c.on = 1;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "woke at 1\n");
+}
+
+// `@(obj.p)` from outside the class. The OBJECT must be resolved when the
+// statement executes, not when the process is built: `c` is still null at time
+// zero here, and resolving it there aborted with "dereference of a null class
+// handle, at 0 s" -- while Verilator prints `woke at 1`.
+TEST_CASE("an event control on a property through a handle resolves the object at execution") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C; bit on; endclass
+            C c;
+            initial begin
+                c = new;
+                fork begin @(c.on); $display("woke at %0t", $time); end join_none
+                #1 c.on = 1;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "woke at 1\n");
+}
+
+// LRM 9.4.2: "a non-edge implicit event shall be detected on any CHANGE in the
+// value of the expression". A write of the value already there is not a change,
+// so it must not satisfy the wait. This is the assertion a notify-on-every-write
+// implementation fails, and it holds here because the store itself classifies
+// the transition and fires nothing when there is none.
+TEST_CASE("a write that does not change a class property does not wake a non-edge waiter") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                bit on = 1;
+                task w(); @on; $display("woke at %0t", $time); endtask
+            endclass
+            C c;
+            initial begin
+                c = new;
+                fork c.w(); join_none
+                #1 c.on = c.on;
+                #1 c.on = 0;
+                #1;
+            end
+        endmodule
+    )");
+    // The unchanged write at t=1 is NOT a wake; the real change at t=2 is.
+    CHECK(out == "woke at 2\n");
+}
+
+// The notifiers live in the OBJECT, so two instances of one class do not share
+// them: writing one must leave the other's waiter parked.
+TEST_CASE("a class property change wakes only the written object's waiters") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                bit on;
+                task w(string n); @on; $display("%s woke at %0t", n, $time); endtask
+            endclass
+            C a, b;
+            initial begin
+                a = new; b = new;
+                fork a.w("a"); join_none
+                fork b.w("b"); join_none
+                #1 a.on = 1;
+                #1 b.on = 1;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "a woke at 1\nb woke at 2\n");
+}
+
+// One change wakes every waiter on that property: the notifier is an intrusive
+// list, not a single slot. Wake ORDER within an instant is unspecified (LRM
+// 4.7), so only the set and the time are asserted.
+TEST_CASE("two waiters on one class property both wake") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                bit on;
+                task w(string n); @on; $display("%s woke at %0t", n, $time); endtask
+            endclass
+            C c;
+            initial begin
+                c = new;
+                fork c.w("p"); join_none
+                fork c.w("q"); join_none
+                #1 c.on = 1;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out.find("p woke at 1\n") != std::string::npos);
+    CHECK(out.find("q woke at 1\n") != std::string::npos);
+    // Exactly those two lines: no third wake, no missing one.
+    CHECK(out.size() == std::string_view("p woke at 1\nq woke at 1\n").size());
+}
+
+// Writes reach a property from more than a plain store. A `ref` formal is a raw
+// aliased pointer the callee writes through, and a base-class method writes an
+// inherited property at its BASE-relative field index -- which is why the
+// notifier is laid out immediately after the property rather than appended,
+// keeping the base's layout a prefix of the derived class's.
+TEST_CASE("a class property written through a ref argument or a base method wakes its waiter") {
+    const std::string out = run_capture(R"(
+        module m;
+            class B;
+                bit on;
+                function void set_base(bit v); on = v; endfunction
+            endclass
+            class D extends B;
+                task w(); @on; $display("woke at %0t", $time); endtask
+            endclass
+            function automatic void flip(ref bit x); x = 1; endfunction
+            D d, e;
+            initial begin
+                d = new; e = new;
+                fork d.w(); join_none
+                fork e.w(); join_none
+                #1 flip(d.on);
+                #1 e.set_base(1);
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "woke at 1\nwoke at 2\n");
+}
+
+// A runtime pointer write-back is a write path too. $sscanf writes through the
+// property's storage pointer, and it wakes because the notifier rides the same
+// snapshot/service bracket every blocking write path already goes through.
+TEST_CASE("a class property written by $sscanf wakes its waiter") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                int v;
+                task w(); @v; $display("woke at %0t v=%0d", $time, v); endtask
+            endclass
+            C c;
+            int n;
+            initial begin
+                c = new;
+                fork c.w(); join_none
+                #1 n = $sscanf("42", "%d", c.v);
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "woke at 1 v=42\n");
+}
+
+// randomize() writes its rand properties through the same store path, so a
+// waited-on rand property wakes.
+TEST_CASE("a rand class property written by randomize wakes its waiter") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                rand bit [7:0] v;
+                task w(); @v; $display("woke at %0t", $time); endtask
+            endclass
+            C c;
+            int ok;
+            initial begin
+                c = new;
+                fork c.w(); join_none
+                #1 ok = c.randomize();
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "woke at 1\n");
+}
+
+// Edges on a property are the SAME classification a signal store performs
+// (emit_edge_facts), so Table 9-2 applies unchanged: x->x is no edge at all,
+// x->0 is a negedge, 0->1 a posedge. Asserted against the identical signal-only
+// design, which is the claim that matters -- the mechanism is uniform, not
+// merely plausible. (Verilator disagrees on x->0 for SIGNALS too, so the
+// divergence is clotho's existing Table 9-2 position, not new here.)
+TEST_CASE("edge event controls on a class property follow Table 9-2") {
+    // Asserted against the identical signal-only design below.
+    const std::string prop = run_capture(R"(
+        module m;
+            class C;
+                logic f;
+                task p(); @(posedge f); $display("pos at %0t f=%b", $time, f); endtask
+                task n(); @(negedge f); $display("neg at %0t f=%b", $time, f); endtask
+            endclass
+            C c;
+            initial begin
+                c = new;
+                fork c.p(); join_none
+                fork c.n(); join_none
+                #1 c.f = 1'bx;
+                #1 c.f = 0;
+                #1 c.f = 1;
+                #1;
+            end
+        endmodule
+    )");
+    const std::string sig  = run_capture(R"(
+        module m;
+            logic f;
+            initial begin @(posedge f); $display("pos at %0t f=%b", $time, f); end
+            initial begin @(negedge f); $display("neg at %0t f=%b", $time, f); end
+            initial begin
+                #1 f = 1'bx;
+                #1 f = 0;
+                #1 f = 1;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(prop == "neg at 2 f=0\npos at 3 f=1\n");
+    CHECK(prop == sig);
+}
+
+// A property control in a process's SENSITIVITY list, not its body. It cannot be
+// hoisted to a static subscription (the seed loop cannot evaluate `c`), so
+// sensitivity_needs_handle keeps it in the body as an intra-body wait.
+TEST_CASE("always on a class property re-arms each change") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C; bit on; endclass
+            C c;
+            initial c = new;
+            always @(c.on) $display("woke at %0t", $time);
+            initial begin
+                #1 c.on = 1;
+                #1 c.on = 0;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "woke at 1\nwoke at 2\n");
+}
+
+// The object need not be named by a variable. The notifier handle is loaded from
+// whatever object the expression evaluates to at the moment the statement runs,
+// so an element of an associative array keyed by a class handle -- the
+// uvm_objection.svh:1078 shape, `@(m_events[obj].raised)` -- works with nothing
+// added, and keeps per-element identity.
+TEST_CASE("an event control on a property of an assoc-array element wakes per element") {
+    const std::string out = run_capture(R"(
+        module m;
+            class K; int id; endclass
+            class E; bit raised; endclass
+            E m_events[K];
+            K k1, k2;
+            initial begin
+                k1 = new; k2 = new;
+                m_events[k1] = new; m_events[k2] = new;
+                fork begin @(m_events[k1].raised); $display("k1 at %0t", $time); end join_none
+                fork begin @(m_events[k2].raised); $display("k2 at %0t", $time); end join_none
+                #1 m_events[k2].raised = 1;
+                #1 m_events[k1].raised = 1;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "k2 at 1\nk1 at 2\n");
+}
+
+// Same for a queue and a fixed unpacked array of handles.
+TEST_CASE("an event control on a property of a queue or array element wakes per element") {
+    const std::string out = run_capture(R"(
+        module m;
+            class E; bit raised; endclass
+            E q[$]; E arr[2]; E tmp;
+            initial begin
+                tmp = new; q.push_back(tmp); arr[0] = new; arr[1] = new;
+                fork begin @(q[0].raised); $display("q at %0t", $time); end join_none
+                fork begin @(arr[1].raised); $display("arr at %0t", $time); end join_none
+                #1 arr[1].raised = 1;
+                #1 q[0].raised = 1;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "arr at 1\nq at 2\n");
+}
+
+// LRM 8.4: reaching a non-static member through a null handle is a located
+// fatal, and the object is resolved when the statement RUNS -- so the report
+// carries the time the `@` was reached (1 s), not time zero. The point of the
+// case is that an unresolvable object is loud, never a silent park.
+TEST_CASE("an event control on a property of a null handle is a located fatal") {
+    constexpr std::string_view src = R"(
+        module m;
+            class E; bit raised; endclass
+            E e;
+            initial begin
+                #1 @(e.raised);
+                $display("UNREACHABLE");
+            end
+        endmodule
+    )";
+    const LowerResult          r   = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    // The fatal exits the process, so the run needs one of its own. The report
+    // itself goes to stderr (rt_null_handle); what stdout must show is that the
+    // statement after the `@` never ran -- loud abort, not a silent fall-through
+    // and not a silent park.
+    CHECK(test::run_design_subprocess(src).find("UNREACHABLE") == std::string::npos);
+}
+
+// A shallow copy (LRM 8.12) copies the property VALUES. It must not copy the
+// notifier handle: doing so would alias one waiter list into two objects and
+// orphan every waiter already parked on the destination's own notifier -- a
+// silent hang for a process that was correctly waiting.
+TEST_CASE("a shallow copy does not alias or steal a change notifier") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C; bit on; endclass
+            C a, b;
+            initial begin
+                a = new;
+                fork begin @(a.on); $display("a woke at %0t", $time); end join_none
+                #1 b = new a;
+                #1 b.on = 1;
+                #1 a.on = 1;
+                #1 $display("a.on=%b b.on=%b", a.on, b.on);
+            end
+        endmodule
+    )");
+    CHECK(out == "a woke at 3\na.on=1 b.on=1\n");
+}
+
+// The blocker this work exists for: Accellera UVM's uvm_event_base::wait_off
+// (base/uvm_event.svh:120) parks on `@on`, where `on` is a `protected bit`
+// property declared at :54. Byte-identical to Verilator 5.050 on this design.
+TEST_CASE("the uvm_event wait_off shape resumes when its protected bit changes") {
+    const std::string out = run_capture(R"(
+        module m;
+            class uvm_event_base;
+                protected bit on;
+                protected int num_waiters;
+                virtual task wait_off(bit delta = 0);
+                    if (!on) begin
+                        $display("already off at %0t", $time);
+                        return;
+                    end
+                    num_waiters++;
+                    @on;
+                    num_waiters--;
+                    $display("wait_off resumed at %0t on=%b waiters=%0d", $time, on, num_waiters);
+                endtask
+                virtual function void reset(); on = 0; endfunction
+                virtual function void trigger(); on = 1; endfunction
+            endclass
+            uvm_event_base e;
+            initial begin
+                e = new;
+                e.trigger();
+                fork e.wait_off(); join_none
+                #1 e.reset();
+                #1 e.wait_off();
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "wait_off resumed at 1 on=0 waiters=0\nalready off at 2\n");
+}
+
+// A property whose type has no old -> new transition to classify carries no
+// notifier, so it must be refused rather than accepted and never woken.
+TEST_CASE("an event control on a non-integral class property is rejected") {
+    CHECK(reject("module m; class C; string s; task w(); @s; $display(\"x\"); endtask endclass "
+                 "C c; initial begin c = new; c.w(); end endmodule")
+            .find("string in an event control") != std::string::npos);
 }

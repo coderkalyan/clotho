@@ -479,6 +479,21 @@ struct LValue {
     // container root for the call's duration (emit_gc_ref_container_add).
     llvm::Value* gc_container_root = nullptr;
     Ref          gc_container_type = Ref::Invalid;
+    // -- Class-property change notifier (LRM 9.4.2, docs/design/classes.md) ------
+    //
+    // The notifiers of the class property this place selects, when some `@` / `wait`
+    // in the design waits on it, plus the object body they live in. Null for every
+    // other place -- and null for EVERY place in a design that waits on no property,
+    // which is what makes that design pay nothing.
+    //
+    // Set at exactly one place, agg_member, off the interned class Ref plus the
+    // property's field index. A blocking store then classifies its own old -> new
+    // transition and wakes the notifiers whose edge it produced -- literally
+    // service_wait_queue's job, with the waiter lists reached through the object
+    // instead of through per-signal globals.
+    const ChangeNotify* chg         = nullptr;
+    llvm::Value*        chg_body    = nullptr;
+    llvm::Type*         chg_body_ty = nullptr;
 };
 
 // A scalar / string leaf of an aggregate signal reachable by a STATIC path
@@ -3071,8 +3086,21 @@ private:
         // Skip a polymorphic class's vtable-pointer header (LLVM field 0); the
         // logical field path stays 0-based (only signal-shadow leaf matching uses
         // it, and class objects are heap, not signals).
+        // True while nothing has been selected yet, i.e. this member is reached
+        // DIRECTLY off the object body -- read before the push below.
+        const bool off_body = lv.agg_path.empty();
         lv.agg_path.push_back(b_.getInt32(field_index + class_header_words(struct_type)));
         lv.agg_field_path.push_back(field_index);
+        // The change notifiers of a waited-on class property (LRM 9.4.2), resolved
+        // here because this is the one member-GEP chokepoint. Only for a property off
+        // the body, so `chg_body` is that body and a notifier is a sibling field of
+        // it. Assigned unconditionally, so descending into an interior aggregate
+        // clears it: a notifier belongs to the whole property, not to a leaf in it.
+        lv.chg = off_body ? mod_.change_notify(struct_type, field_index) : nullptr;
+        if (lv.chg != nullptr) {
+            lv.chg_body    = lv.base;
+            lv.chg_body_ty = lv.root_ty;
+        }
         // The write barrier's precision knob (§7): a member that cannot reach a class
         // handle cannot be the store that needs remembering, so `obj.count = 5` and
         // `obj.name = "x"` drop the owner here and emit nothing, while `obj.h`,
@@ -9719,6 +9747,9 @@ private:
     struct ServiceSnapshot {
         llvm::Value* mm = nullptr;
         llvm::Value* z  = nullptr;
+        // Whether the target is a change-notified class property rather than a signal
+        // is read back off the lvalue, which service_after_write holds too; nothing
+        // about it can change across the store.
     };
 
     // A blocking write to a module signal must service the signal's wait queues
@@ -9730,8 +9761,22 @@ private:
     // signal without waiters, or a PreInit store (variable declaration initializers
     // generate no events).
     ServiceSnapshot service_snapshot(const LValue& lv) {
-        const bool service = !silent_stores_ && lv.is_signal && signal_has_waiters(lv.sig);
-        if (!service) {
+        if (silent_stores_) {
+            // A PreInit store: declaration initializers generate no events, and no
+            // waiter can exist yet anyway.
+            return {};
+        }
+        if (lv.chg != nullptr) {
+            // A waited-on class property (LRM 9.4.2). Snapshot unconditionally: the
+            // notifier that exists is the one some `@`/`wait` asked for, so there is no
+            // "has waiters" question to fold in -- an empty waiter list makes the wake
+            // walk a single null load.
+            ServiceSnapshot old;
+            old.mm = load_lv_mm(lv);
+            old.z  = lv.has_z ? load_lv_z(lv) : nullptr;
+            return old;
+        }
+        if (!lv.is_signal || !signal_has_waiters(lv.sig)) {
             return {};
         }
         ServiceSnapshot old;
@@ -9743,7 +9788,9 @@ private:
     }
 
     void service_after_write(const LValue& lv, ServiceSnapshot old) {
-        if (old.mm != nullptr) {
+        if (old.mm != nullptr && lv.chg != nullptr) {
+            service_change_notify(lv, old.mm, load_lv_mm(lv), old.z, old.z != nullptr ? load_lv_z(lv) : nullptr);
+        } else if (old.mm != nullptr) {
             service_wait_queue(lv.sig, old.mm, load_lv_mm(lv), old.z,
                                old.z != nullptr ? load_lv_z(lv) : nullptr);
         }
@@ -9866,6 +9913,65 @@ private:
                 emit_event_wake_list(vif_head_ptr(sig, e));
             }
             fire_event_trigger(sig, e);
+            b_.CreateBr(cont);
+            b_.SetInsertPoint(cont);
+        }
+    }
+
+    // Service a waited-on class property's change notifiers after a blocking write to
+    // it (LRM 9.4.2). Structurally service_wait_queue with the waiter lists reached
+    // through the OBJECT rather than through per-signal globals: classify the old ->
+    // new transition once, then for each notifier the design laid out, guard its whole
+    // wake walk on the matching fact.
+    //
+    // Classifying HERE, at the write, is what makes the waiter side trivial and exact.
+    // A fire means the value genuinely changed in the way that waiter asked for, so
+    // `@obj.p` wakes unconditionally on resume -- no snapshot in the waiter's frame,
+    // no re-comparison, and `p = p` fires nothing at all rather than waking a waiter
+    // that then has to discover the write was a no-op.
+    //
+    // The three notifiers are serviced independently, not else-if, for the same reason
+    // the three buckets are: a 0->1 transition is both `changed` and `pos`.
+    void service_change_notify(const LValue& lv,
+                               llvm::Value*  old_mm,
+                               llvm::Value*  new_mm,
+                               llvm::Value*  old_z,
+                               llvm::Value*  new_z) {
+        const ChangeNotify& cn   = *lv.chg;
+        const auto          have = [&](Edge e) { return cn.field[static_cast<uint32_t>(e)] != kNoNotify; };
+        // `!narrow` is exactly "the mm word is the packed must|may pair", which is what
+        // emit_edge_facts means by four_state (slot_mm_bits reads the same flag).
+        const EdgeFacts                                    f         = emit_edge_facts(old_mm,
+                                                                                       new_mm,
+                                                                                       lv.store_width,
+                                                                                       !lv.narrow,
+                                                                                       old_z,
+                                                                                       new_z,
+                                                                                       have(Edge::Positive),
+                                                                                       have(Edge::Negative),
+                                                                                       have(Edge::Any));
+        const std::array<std::pair<Edge, llvm::Value*>, 3> notifiers = {
+            std::make_pair(Edge::Any, f.changed),
+            std::make_pair(Edge::Positive, f.pos),
+            std::make_pair(Edge::Negative, f.neg),
+        };
+        for (const auto& [edge, fact] : notifiers) {
+            if (fact == nullptr) {
+                continue;
+            }
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* body = llvm::BasicBlock::Create(ctx_, "chg.body", fn);
+            auto* cont = llvm::BasicBlock::Create(ctx_, "chg.cont", fn);
+            b_.CreateCondBr(fact, body, cont);
+
+            b_.SetInsertPoint(body);
+            // The notifier is an `event` property of this same object, minted by
+            // emit_class_body_init at `new` like any event leaf, so its handle is
+            // always live -- no null guard, the way a plain `-> e` on a declared event
+            // needs none.
+            llvm::Value* slot = b_.CreateStructGEP(
+              lv.chg_body_ty, lv.chg_body, cn.field[static_cast<uint32_t>(edge)] + class_header_words(cn.class_ref));
+            emit_event_wake_list(event_obj_of(b_.CreateLoad(b_.getInt64Ty(), slot)));
             b_.CreateBr(cont);
             b_.SetInsertPoint(cont);
         }

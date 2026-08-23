@@ -10,6 +10,7 @@
 // (and thus the Module) is non-movable, so a Module is the owning root,
 // typically held behind a unique_ptr by the front-end.
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -653,6 +654,30 @@ struct ClassDesc {
     std::vector<uint32_t> iface_ids;
 };
 
+// `ChangeNotify::field` entry for an edge no `@` / `wait` in the design asks for,
+// so no notifier is laid out and no store classifies that transition.
+inline constexpr uint32_t kNoNotify = ~uint32_t{ 0 };
+
+// Where a class property's change notifiers live in the object body (LRM 9.4.2).
+//
+// A non-edge `@obj.p` fires on any change in p's value and an edge one on the LSB
+// transition of Table 9-2 -- the same classification a blocking store to a SIGNAL
+// already performs. So a waited-on property carries one hidden `event`-typed
+// property per edge kind actually waited on somewhere in the design, laid out
+// immediately after the property itself, and a store to p classifies its old ->
+// new transition and wakes the matching notifier's waiter list. Waiting is then
+// literally `@(obj.<hidden event>)`, which needs no new wait machinery at all.
+//
+// Only the edges the design uses are laid out, so `@obj.p` alone costs one hidden
+// property and `@(posedge obj.p)` alone costs one, not three.
+struct ChangeNotify {
+    Ref class_ref = Ref::Invalid;
+    // Object-body field index of the notified property.
+    uint32_t prop_field = 0;
+    // Object-body field index of the notifier event per Edge, or kNoNotify.
+    std::array<uint32_t, 3> field{ kNoNotify, kNoNotify, kNoNotify };
+};
+
 class Module {
 public:
     // Shared intern pool backing every process's constant / type handles. Owned
@@ -832,6 +857,40 @@ public:
         return class_descs_;
     }
 
+    // Record the object-body field index of one change-notifier event of a class
+    // property (LRM 9.4.2). Keyed on the interned class Ref plus the property's own
+    // field index, so a base-class method writing an inherited property finds the
+    // notifier at the base-relative index prefix layout gives it, while the derived
+    // class registers the same property again under its own Ref.
+    void set_change_notify(Ref class_ref, uint32_t prop_field, Edge edge, uint32_t notify_field) {
+        for (ChangeNotify& cn : change_notifies_) {
+            if (cn.class_ref == class_ref && cn.prop_field == prop_field) {
+                cn.field[static_cast<uint32_t>(edge)] = notify_field;
+                return;
+            }
+        }
+        ChangeNotify cn;
+        cn.class_ref                          = class_ref;
+        cn.prop_field                         = prop_field;
+        cn.field[static_cast<uint32_t>(edge)] = notify_field;
+        change_notifies_.push_back(cn);
+    }
+
+    // The change notifiers of one class property, or null when nothing in the design
+    // waits on it. The empty-table early-out is what makes a design that waits on no
+    // property pay nothing here: the store path asks this at every member select.
+    const ChangeNotify* change_notify(Ref class_ref, uint32_t prop_field) const {
+        if (change_notifies_.empty()) {
+            return nullptr;
+        }
+        for (const ChangeNotify& cn : change_notifies_) {
+            if (cn.class_ref == class_ref && cn.prop_field == prop_field) {
+                return &cn;
+            }
+        }
+        return nullptr;
+    }
+
 private:
     // Signal table; index == Signal handle.
     std::vector<SignalInfo> signals_;
@@ -848,6 +907,10 @@ private:
     // Interned interface class Ref -> bitmap bit (LRM 8.26). One entry per Ref, so
     // an interface reached through two Lowerers appears twice with one id.
     std::vector<std::pair<Ref, uint32_t>> iface_type_ids_;
+    // Change notifiers of waited-on class properties (LRM 9.4.2), one entry per
+    // (class Ref, property field). Empty in a design that waits on no property,
+    // which is what change_notify's early-out keys on.
+    std::vector<ChangeNotify> change_notifies_;
     // Next InstanceScope::id (see alloc_scope_id).
     uint32_t next_scope_id_ = 0;
 };
