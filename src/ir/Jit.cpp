@@ -413,6 +413,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_string_data", &rt_string_data);
     expose("rt_string_concat", &rt_string_concat);
     expose("rt_string_repl", &rt_string_repl);
+    expose("rt_string_repl_invalid", &rt_string_repl_invalid);
     expose("rt_string_cmp", &rt_string_cmp);
     expose("rt_string_icmp", &rt_string_icmp);
     expose("rt_string_substr", &rt_string_substr);

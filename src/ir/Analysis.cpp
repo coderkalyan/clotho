@@ -259,6 +259,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::StrCmp:
         case Inst::Tag::TaggedFmtP:
         case Inst::Tag::StrICmp:
+        case Inst::Tag::StrRepl:
         case Inst::Tag::StrUpper:
         case Inst::Tag::StrLower:
         case Inst::Tag::StrSubstr:
@@ -1567,6 +1568,7 @@ struct ValueSweep {
                 case Inst::Tag::StrPutc:
                 case Inst::Tag::StrCmp:
                 case Inst::Tag::StrICmp:
+                case Inst::Tag::StrRepl:
                 case Inst::Tag::TaggedFmtP:
                 case Inst::Tag::StrUpper:
                 case Inst::Tag::StrLower:

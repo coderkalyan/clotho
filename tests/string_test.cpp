@@ -179,6 +179,114 @@ TEST_CASE("string concatenation and replication, including self-append") {
     CHECK(run_capture(src) == "[ababc]\n[xyxyxy]\n0\n[H]\n");
 }
 
+// -- Runtime (non-constant) replication multiplier, string result only --
+//
+// A DELIBERATE DEVIATION from LRM 11.4.12.1, which requires the multiplier to
+// be a non-negative, non-x, non-z constant expression (see lower_expr's
+// Replication case and the OPEN M3 ledger item in docs/TODO.md). The clause
+// demands a constant so a packed result's width is known at elaboration; a
+// string result has no elaboration-time width. iverilog 13 refuses the
+// construct, Verilator 5.050 accepts it; UVM ships it (uvm_printer.svh:1501).
+
+// The exact uvm_printer shape: the `dash.len() < m` guard around `{m{"-"}}`.
+TEST_CASE("string replication with a runtime multiplier (the UVM guard shape)") {
+    constexpr std::string_view src = R"(
+        module m;
+            string dash, m_space;
+            int mx;
+            initial begin
+                dash = "";
+                mx = 5;
+                if (dash.len() < mx) begin
+                    dash    = {mx{"-"}};
+                    m_space = {mx{" "}};
+                end
+                $display("[%s][%s]", dash, m_space);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[-----][     ]\n");
+}
+
+// Two evaluations with different counts prove the multiplier is read at run
+// time, not folded once. Zero is the clause's own blessed case ("a size of
+// zero"): a runtime zero yields the empty string. (A CONSTANT zero outside a
+// concatenation is refused by slang at elaboration, per the clause; no runtime
+// check can apply there.)
+TEST_CASE("runtime replication multiplier is read at each evaluation, zero gives empty") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            int n;
+            integer k;
+            initial begin
+                n = 2;
+                s = {n{"ab"}};
+                $display("[%s]", s);
+                n = 4;
+                s = {n{"ab"}};
+                $display("[%s]", s);
+                n = 0;
+                s = {n{"ab"}};
+                $display("%0d[%s]", s.len(), s);
+                // A DEFINITE 4-state count passes the x/z probe and replicates
+                // like a 2-state one.
+                k = 2;
+                s = {k{"cd"}};
+                $display("[%s]", s);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[abab]\n[abababab]\n0[]\n[cdcd]\n");
+}
+
+// The replication repeats the whole braced concatenation: a multi-character
+// operand, a multi-piece operand, and a string VARIABLE operand with a
+// constant count (the pre-deviation string shape, must not regress).
+TEST_CASE("runtime replication of multi-character and multi-piece operands") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s, t;
+            int n;
+            initial begin
+                n = 3;
+                s = {n{"ab"}};
+                $display("[%s]", s);
+                s = {n{"a","b"}};
+                $display("[%s]", s);
+                t = "xy";
+                s = {2{t}};
+                $display("[%s]", s);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[ababab]\n[ababab]\n[xyxy]\n");
+}
+
+// A nested replication (constant and runtime inner counts) and a replication
+// embedded in a larger concatenation, all with a runtime multiplier somewhere
+// and a string result.
+TEST_CASE("nested and embedded runtime string replication") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            int n, k;
+            initial begin
+                n = 2;
+                s = {n{{2{"ab"}}}};
+                $display("[%s]", s);
+                k = 3;
+                s = {n{{k{"x"}}}};
+                $display("[%s]", s);
+                n = 3;
+                s = {"<", {n{"-"}}, ">"};
+                $display("[%s]", s);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "[abababab]\n[xxxxxx]\n[<--->]\n");
+}
+
 // The concat-into-store forwarding path (build_str_temps) plus the alias-aware
 // in-place append in rt_string_concat. Each case cross-checked vs iverilog 13.
 TEST_CASE("self-append concat grows in place, including multiple self-occurrences") {
@@ -1410,6 +1518,75 @@ TEST_CASE("logical negation of a string is rejected") {
     )", "logical negation of a string is not legal (LRM Table 11-1)");
 }
 
+// A negative runtime replication multiplier is an ILLEGAL value, not a defined
+// case: LRM 11.4.12.1 blesses only zero. Clamping to zero would invent
+// semantics the clause does not grant, and Verilator gives no answer to match
+// either way (its generated C++ for `{-2{"ab"}}` fails to compile, make exits
+// 2). So: a located fatal naming the construct and the value, the same shape
+// as `new[]` with a negative size. Out of process because the fatal exits.
+TEST_CASE("negative runtime replication multiplier is a located fatal") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    string s;\n"
+                                     "    int n;\n"
+                                     "    initial begin\n"
+                                     "        n = -2;\n"
+                                     "        s = {n{\"ab\"}};\n"
+                                     "        $display(\"unreachable\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(run.out.empty());
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("invalid negative multiplier for this string replication: -2 "
+                       "(LRM 11.4.12.1 requires a non-negative multiplier)") != std::string::npos);
+    // The site record points the report at the design, not at the runtime.
+    CHECK(run.err.find("source:6:") != std::string::npos);
+    CHECK(run.err.find("s = {n{\"ab\"}};") != std::string::npos);
+}
+
+// An x/z multiplier is the clause's other illegal value. Only a 4-state count
+// can hold one — the probe is emitted only for a 4-state count plane, so the
+// 2-state `int` multiplier above pays nothing for this check.
+TEST_CASE("x/z runtime replication multiplier is a located fatal") {
+    constexpr std::string_view src = "module m;\n"
+                                     "    string s;\n"
+                                     "    integer n;\n"
+                                     "    initial begin\n"
+                                     "        n = 'x;\n"
+                                     "        s = {n{\"ab\"}};\n"
+                                     "        $display(\"unreachable\");\n"
+                                     "    end\n"
+                                     "endmodule\n";
+
+    const test::DesignRun run = test::run_design_captured(src);
+
+    CHECK(run.out.empty());
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("invalid x/z multiplier for this string replication "
+                       "(LRM 11.4.12.1 requires a non-x, non-z multiplier)") != std::string::npos);
+    CHECK(run.err.find("source:6:") != std::string::npos);
+}
+
+// The deviation is ONLY for a string result: a runtime multiplier with a
+// PACKED result still has a width that must be known at elaboration, so it
+// stays refused. slang itself rejects the shape (the multiplier fails constant
+// evaluation) before clotho's backstop in lower_expr's Replication case — the
+// needle below is slang's diagnostic.
+TEST_CASE("runtime replication multiplier with a packed result stays refused") {
+    check_rejected(R"(
+        module m;
+            logic [7:0] p;
+            int n;
+            initial begin
+                n = 4;
+                p = {n{2'b01}};
+            end
+        endmodule
+    )", "reference to non-constant variable 'n' is not allowed in a constant expression");
+}
+
 // Still refused, each for its own reason: a single CHARACTER needs a masked record
 // rather than a whole handle, a class property has no per-object shadow at all
 // (whether or not the reference is qualified), and intra-assignment timing rides a
@@ -1479,15 +1656,6 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
             endmodule
         )",
                        "string range bound");
-    }
-    SUBCASE("non-constant string replication count") {
-        check_rejected(R"(
-            module m;
-                string s;
-                integer n;
-                initial begin n = 2; s = {n{"ab"}}; end
-            endmodule
-        )", "constant");
     }
     SUBCASE("string argument to a non-%s specifier") {
         check_rejected(R"(

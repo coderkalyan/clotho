@@ -390,6 +390,8 @@ const char* tag_name(Inst::Tag tag) {
             return "str_upper";
         case T::StrLower:
             return "str_lower";
+        case T::StrRepl:
+            return "str_repl";
         case T::StrSubstr:
             return "str_substr";
         case T::EnumName:

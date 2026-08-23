@@ -4807,6 +4807,23 @@ extern "C" void rt_alloc_negative(int64_t n, const rt_alloc_site* site, uint64_t
                 fmt::format("invalid negative size for this {}: {}", site_noun(site), n));
 }
 
+// A runtime replication multiplier with an illegal value (see Runtime.h). Two
+// headlines, one shape: the negative one names the value the design computed,
+// the x/z one cannot (an unknown has no value to print).
+extern "C" void rt_string_repl_invalid(int64_t count, uint32_t unknown, const rt_alloc_site* site,
+                                       uint64_t now) {
+    if (unknown != 0) {
+        alloc_fatal(site, now,
+                    fmt::format("invalid x/z multiplier for this {} (LRM 11.4.12.1 requires a "
+                                "non-x, non-z multiplier)",
+                                site_noun(site)));
+    }
+    alloc_fatal(site, now,
+                fmt::format("invalid negative multiplier for this {}: {} (LRM 11.4.12.1 requires "
+                            "a non-negative multiplier)",
+                            site_noun(site), count));
+}
+
 // ---- Deferred immediate assertion reports (LRM 16.4) ----
 //
 // A deferred assertion's action (a single severity system task, or the default
@@ -5808,15 +5825,24 @@ extern "C" void rt_string_concat(rt_string* dst, const rt_string* const* parts, 
     str_assign(dst, scratch.buf, total, site);
 }
 
-extern "C" void rt_string_repl(rt_string* dst, const rt_string* src, uint64_t count, const rt_alloc_site* site) {
+extern "C" void rt_string_repl(rt_string* dst, const rt_string* src, int64_t count, const rt_alloc_site* site) {
+    // A negative multiplier is an illegal value under LRM 11.4.12.1 (zero is the
+    // clause's one blessed edge case and falls through to the empty string), and
+    // it can only arrive from the RUNTIME-multiplier string deviation — a
+    // constant one was refused at elaboration. Checked before the size product,
+    // which would otherwise see it zero-extended as a huge element count.
+    if (count < 0) {
+        rt_string_repl_invalid(count, /*unknown=*/0, site, rt_diag_now());
+    }
+    const uint64_t n   = static_cast<uint64_t>(count);
     const uint64_t len = str_len(src);
     // `count` is a design-controlled replication factor ({N{s}}), so the byte
     // total is the one product here that a program can push past 2^64. A wrapping
     // one would size the scratch buffer from the wrapped value and then write
     // `count` copies into it.
-    const uint64_t total = rt_alloc_elems_size(count, len, site, rt_diag_now());
+    const uint64_t total = rt_alloc_elems_size(n, len, site, rt_diag_now());
     StrScratch     scratch(total, site);
-    for (uint64_t k = 0; k < count; ++k) {
+    for (uint64_t k = 0; k < n; ++k) {
         std::memcpy(scratch.buf + k * len, str_data(src), len);
     }
     str_assign(dst, scratch.buf, total, site);

@@ -1001,7 +1001,6 @@ struct SpeculationScan : ASTVisitor<SpeculationScan, VisitFlags::Expressions> {
             case ExpressionKind::Inside:
             case ExpressionKind::ValueRange:
             case ExpressionKind::Concatenation:
-            case ExpressionKind::Replication:
             case ExpressionKind::Streaming:
             case ExpressionKind::Conversion:
             case ExpressionKind::TaggedUnion:
@@ -1015,6 +1014,14 @@ struct SpeculationScan : ASTVisitor<SpeculationScan, VisitFlags::Expressions> {
             // (LRM 25.9); unlike a virtual-interface handle it cannot be null.
             case ExpressionKind::ArbitrarySymbol:
                 return true;
+            case ExpressionKind::Replication:
+                // A packed replication's multiplier is an elaboration-time
+                // constant: pure value construction, no trap. A STRING
+                // replication may carry a RUNTIME multiplier (the deliberate
+                // LRM 11.4.12.1 deviation, see lower_expr's Replication case),
+                // and a negative or x/z value there is a located fatal — a
+                // trap, so it must not run unless its arm is chosen.
+                return !e.type->getCanonicalType().isString();
             case ExpressionKind::UnaryOp:
                 switch (e.as<UnaryExpression>().op) {
                     case UnaryOperator::Preincrement:
@@ -4579,7 +4586,8 @@ private:
             const auto     elems = pat != nullptr ? pat->elements() : rhs.as<ConcatenationExpression>().operands();
             const uint32_t reps =
               pat != nullptr && rhs.kind == ExpressionKind::ReplicatedAssignmentPattern
-                ? static_cast<uint32_t>(const_uint(rhs.as<ReplicatedAssignmentPatternExpression>().count()))
+                ? static_cast<uint32_t>(const_uint(rhs.as<ReplicatedAssignmentPatternExpression>().count(),
+                                                   "an assignment-pattern replication count (LRM 10.9.1)"))
                 : 1;
             if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
                 if (pat == nullptr) {
@@ -5551,7 +5559,8 @@ private:
             }
         }
         if (expr.kind == ExpressionKind::ReplicatedAssignmentPattern) {
-            const uint64_t count = const_uint(expr.as<ReplicatedAssignmentPatternExpression>().count());
+            const uint64_t count = const_uint(expr.as<ReplicatedAssignmentPatternExpression>().count(),
+                                              "an assignment-pattern replication count (LRM 10.9.1)");
             return b.repl(b.concat(parts, l), static_cast<uint32_t>(count), l);
         }
         return b.concat(parts, l);
@@ -6936,7 +6945,8 @@ private:
                 if (!base) {
                     return std::nullopt;
                 }
-                const auto    count = static_cast<uint32_t>(const_uint(rs.right()));
+                const auto    count = static_cast<uint32_t>(
+                  const_uint(rs.right(), "an indexed part-select width (LRM 11.5.1)"));
                 const bool    down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
                 const int32_t bias  = down == range.isDescending() ? static_cast<int32_t>(count) - 1 : 0;
                 const auto    lo    = static_cast<uint32_t>(range.translateIndex(*base) - bias) * w;
@@ -15696,7 +15706,8 @@ private:
         if (skew.delay->kind == TimingControlKind::OneStepDelay) {
             return false;
         }
-        if (skew.delay->kind == TimingControlKind::Delay && const_uint(skew.delay->as<DelayControl>().expr) == 0) {
+        if (skew.delay->kind == TimingControlKind::Delay &&
+            const_uint(skew.delay->as<DelayControl>().expr, "a clocking skew delay (LRM 14.4)") == 0) {
             return true;
         }
         // TODO: a nonzero input skew other than `#1step`. The value sampled is the
@@ -15719,7 +15730,8 @@ private:
             // drives on the named edge of the clocking signal instead.
             fail("an edge-based clocking skew is not supported");
         }
-        if (skew.delay->kind == TimingControlKind::Delay && const_uint(skew.delay->as<DelayControl>().expr) == 0) {
+        if (skew.delay->kind == TimingControlKind::Delay &&
+            const_uint(skew.delay->as<DelayControl>().expr, "a clocking skew delay (LRM 14.4)") == 0) {
             return;
         }
         // TODO: a nonzero output skew, which drives in the Re-NBA region of a FUTURE
@@ -21527,7 +21539,8 @@ private:
         const uint32_t n     = static_cast<uint32_t>(elems.size());
         const uint32_t reps =
           pat.kind == ExpressionKind::ReplicatedAssignmentPattern
-            ? static_cast<uint32_t>(const_uint(pat.as<ReplicatedAssignmentPatternExpression>().count()))
+            ? static_cast<uint32_t>(const_uint(pat.as<ReplicatedAssignmentPatternExpression>().count(),
+                                               "an assignment-pattern replication count (LRM 10.9.1)"))
             : 1;
         for (uint32_t k = 0; k < n * reps; ++k) {
             const ir::Index idx = b.constant(module_.pool.put_int(make_int_type(32, false, true), k), l);
@@ -22289,7 +22302,8 @@ private:
         if (sym.kind != slang::ast::SymbolKind::Iterator) {
             return std::nullopt;
         }
-        if (args.size() > 1 && const_uint(*args[1]) != 1) {
+        if (args.size() > 1 &&
+            const_uint(*args[1], "the dimension argument of an iterator index method (LRM 7.12.1)") != 1) {
             // TODO: `item.index(d)` for d > 1 needs multidimensional array
             // manipulation methods, which need multidimensional dynamic arrays.
             fail("the iterator index method is only supported for dimension 1");
@@ -24039,8 +24053,36 @@ private:
                 return b.concat(parts, l);
             }
             case ExpressionKind::Replication: {
-                const ReplicationExpression& r     = expr.as<ReplicationExpression>();
-                const uint64_t               count = const_uint(r.count());
+                const ReplicationExpression& r = expr.as<ReplicationExpression>();
+                // DELIBERATE DEVIATION from LRM 11.4.12.1, which requires the
+                // multiplier to be a non-negative, non-x, non-z CONSTANT
+                // expression: a runtime multiplier is accepted when — and only
+                // when — the result is a string. The clause demands a constant
+                // because a concatenation's WIDTH must be known at elaboration;
+                // a string result has no elaboration-time width, so the
+                // restriction's own reason does not apply there. That boundary —
+                // not "UVM needs it" — is what keeps the deviation narrow, though
+                // UVM is why it exists (uvm_printer.svh:1501, `dash = {m{"-"}}`).
+                // iverilog 13 refuses the construct; Verilator 5.050 accepts it.
+                // String-ness is slang's own typing of the expression
+                // (ReplicationExpression::fromSyntax types a non-constant
+                // multiplier over an implicitly-string operand as `string`), not
+                // a syntax pattern. The clause's other two demands bind at RUN
+                // TIME instead: a zero multiplier yields the empty string (the
+                // clause's own zero rule), a negative or x/z multiplier is an
+                // illegal value and a located fatal (rt_string_repl /
+                // rt_string_repl_invalid). A packed result stays refused below.
+                // TODO: MUST BE REVISITED — tracked as the OPEN M3 item
+                // "Non-constant string replication count" in docs/TODO.md.
+                if (is_string_expr(expr)) {
+                    return b.binary(ir::Inst::Tag::StrRepl, lower_expr(r.concat(), b),
+                                    lower_expr(r.count(), b), l);
+                }
+                const uint64_t count = const_uint(
+                  r.count(), "a replication multiplier with a packed result (LRM 11.4.12.1: the "
+                             "result's width is the multiplier times the operand's width, so it "
+                             "must be known at elaboration; only a string result may carry a "
+                             "runtime multiplier)");
                 return b.repl(lower_expr(r.concat(), b), static_cast<uint32_t>(count), l);
             }
             case ExpressionKind::ElementSelect: {
@@ -24933,7 +24975,8 @@ private:
         // out-of-range or X/Z base is bounds-checked in the backend per LRM
         // 11.5.1 (out-of-range read -> X, write -> no-op; a fully-out-of-range
         // W-wide window fills X / no-ops as a whole).
-        const auto      count = static_cast<uint32_t>(const_uint(rs.right()));
+        const auto      count = static_cast<uint32_t>(
+          const_uint(rs.right(), "an indexed part-select width (LRM 11.5.1)"));
         const bool      down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
         const int32_t   bias  = down == range.isDescending() ? static_cast<int32_t>(count) - 1 : 0;
         const ir::Index off   = lower_packed_offset(rs.left(), range, bias, b, l, w);
@@ -25001,7 +25044,8 @@ private:
         const ir::Ref  slice_ty = lower_type(*rs.type);
         const ir::Type at       = std::get<ir::Type>(module_.pool.get(arr_ty));
         const ir::Type st       = std::get<ir::Type>(module_.pool.get(slice_ty));
-        const auto     n        = static_cast<uint32_t>(const_uint(rs.right()));
+        const auto     n        = static_cast<uint32_t>(
+          const_uint(rs.right(), "an indexed part-select width (LRM 11.5.1)"));
         const bool     down     = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
         const bool     asc      = at.left <= at.right;
 
@@ -25687,12 +25731,14 @@ private:
     // or any constant-foldable expression over them, e.g. `W-1` or `W*2`).
     // Folded with slang against the current instance scope so parameterized
     // widths, replication counts and part-select bounds resolve to a value.
-    uint64_t const_uint(const Expression& e) {
+    // `what` names the construct whose grammar demands the constant, so the
+    // refusal reads as a language rule, not a parse error.
+    uint64_t const_uint(const Expression& e, std::string_view what) {
         slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
         slang::ast::EvalContext    evalCtx(astCtx);
         const slang::ConstantValue cv = e.eval(evalCtx);
         if (!cv.isInteger()) {
-            fail("expected a constant integer");
+            fail(std::string(what) + " must be a constant integer expression");
         }
         return cv.integer().as<uint64_t>().value_or(0);
     }

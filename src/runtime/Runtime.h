@@ -1378,9 +1378,23 @@ const char* rt_string_data(const rt_string* s);
 // `site` locates the concatenation for an allocation-failure report.
 void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n, const rt_alloc_site* site);
 
-// dst = src repeated `count` times ({count{src}}); count == 0 yields "".
-// `site` locates the replication for an allocation-failure report.
-void rt_string_repl(rt_string* dst, const rt_string* src, uint64_t count, const rt_alloc_site* site);
+// dst = src repeated `count` times ({count{src}}); count == 0 yields "". The
+// count crosses the ABI SIGNED (like rt_dynarr_new's): the multiplier may be a
+// RUNTIME value under the LRM 11.4.12.1 string deviation (Lower.cpp's
+// Replication case), and a negative one must be seen as the negative the design
+// wrote, not zero-extended into a huge request. Negative is refused with
+// rt_string_repl_invalid. `site` locates the replication for the reports.
+void rt_string_repl(rt_string* dst, const rt_string* src, int64_t count, const rt_alloc_site* site);
+
+// A runtime replication multiplier holding an illegal value: negative
+// (unknown == 0, `count` holds it) or x/z (unknown != 0, `count` is
+// meaningless). LRM 11.4.12.1 requires a non-negative, non-x, non-z
+// multiplier; zero is its one blessed edge case, so these two have no defined
+// result and end the run with the located-fatal block (headline, source caret,
+// simulation time). The x/z caller is JIT code (only it sees the planes); the
+// negative caller is rt_string_repl itself.
+[[noreturn]] void rt_string_repl_invalid(int64_t count, uint32_t unknown, const rt_alloc_site* site,
+                                         uint64_t now);
 
 // Lexicographic comparison in strcmp order over (bytes, then length): returns
 // < 0, 0, or > 0. The LRM (§6.16.9) specifies only the sign.

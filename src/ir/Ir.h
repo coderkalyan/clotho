@@ -1802,6 +1802,14 @@ struct Inst {
         // s.toupper() / s.tolower() -> new string value (payload: unary).
         StrUpper,
         StrLower,
+        // {count{s}} -> new string value: `s` repeated `count` times, where
+        // `count` is a RUNTIME operand (payload: binary — l is the string, r the
+        // count). Distinct from Repl, which replicates a PACKED value and needs
+        // its count as an elaboration-time immediate because the result's width
+        // is that count times the operand's. A string result has no width, so
+        // nothing here has to be known before the run. See lower_expr's
+        // Replication case for the LRM 11.4.12.1 deviation this exists for.
+        StrRepl,
         // s.substr(i, j) -> new string value; "" when the range is invalid
         // (payload: op_extra -> StrSubstrInfo; the op is the source string).
         StrSubstr,
@@ -2437,6 +2445,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::StrGetc:
         case T::StrCmp:
         case T::StrICmp:
+        case T::StrRepl:
         case T::StrItoa:
         case T::StrHextoa:
         case T::StrOctoa:

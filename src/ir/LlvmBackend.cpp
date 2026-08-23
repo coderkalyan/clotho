@@ -13543,6 +13543,13 @@ private:
         return rt_fn("rt_string_repl", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
     }
+    // [[noreturn]] void rt_string_repl_invalid(i64 count, i32 unknown, ptr site, i64 now)
+    // — the located fatal for a negative or x/z runtime replication multiplier
+    // (the LRM 11.4.12.1 string deviation; see Lower.cpp's Replication case).
+    llvm::FunctionCallee str_repl_invalid_fn() {
+        return rt_fn("rt_string_repl_invalid", b_.getVoidTy(),
+                     { b_.getInt64Ty(), b_.getInt32Ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
     llvm::FunctionCallee str_cmp_fn() {
         return rt_fn("rt_string_cmp", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
     }
@@ -15056,12 +15063,12 @@ private:
                 return { width, four, false };
             }
             case Inst::Tag::Repl: {
+                // Packed only: a string replication is StrRepl (runtime count).
                 const ValType v = type_of(p.repl.value);
-                if (v.is_string) {
-                    return { 0, false, false, true };
-                }
                 return { v.width * p.repl.count, v.four_state, false };
             }
+            case Inst::Tag::StrRepl:
+                return { 0, false, false, true };
 
             case Inst::Tag::StrLen:
             case Inst::Tag::StrCmp:
@@ -15295,6 +15302,7 @@ private:
             case Inst::Tag::EnumName:
             case Inst::Tag::ContainerFmtP:
             case Inst::Tag::TaggedFmtP:
+            case Inst::Tag::StrRepl:
                 return true;
             // `p.get_randstate()` renders a fresh string (LRM 9.7); every other
             // process query yields a word.
@@ -15302,7 +15310,6 @@ private:
                 return type_of(i).is_string;
             case Inst::Tag::Constant:
             case Inst::Tag::Concat:
-            case Inst::Tag::Repl:
             case Inst::Tag::Call:
             case Inst::Tag::CallVirtual:
             // A pop of a string-element queue relocates the element into the
@@ -16749,14 +16756,45 @@ private:
                 set_value(i, lower_concat(i));
                 return;
             case Inst::Tag::Repl:
-                if (type_of(i).is_string) {
-                    b_.CreateCall(str_repl_fn(), { str_of(i), str_of(p.repl.value),
-                                                   b_.getInt64(p.repl.count),
-                                                   alloc_site_global(loc_text(i), "string") });
-                    return;
+                // Depth guard: a string replication lowers to StrRepl (runtime
+                // count); Repl's count-times-width result type has no meaning
+                // for a string operand.
+                if (type_of(p.repl.value).is_string) {
+                    throw BackendError{ "internal: string value in repl" };
                 }
                 set_value(i, lower_repl(value_of(p.repl.value), type_of(p.repl.value).width, p.repl.count));
                 return;
+            case Inst::Tag::StrRepl: {
+                // {count{s}} with a RUNTIME count — the deliberate LRM 11.4.12.1
+                // string deviation (see Lower.cpp's Replication case). Zero is
+                // the clause's own legal case and yields "" in rt_string_repl;
+                // a negative count is refused there (the count crosses the ABI
+                // signed, like rt_dynarr_new's). An x/z count is probed HERE,
+                // because only the JIT still sees the planes — and only when the
+                // count's plane is 4-state, so a 2-state count (`int m`, the UVM
+                // shape) pays nothing.
+                const Plane     count = value_of(p.binary.r);
+                llvm::Constant* site  = alloc_site_global(loc_text(i), "string replication");
+                if (!count.two) {
+                    auto* fn   = b_.GetInsertBlock()->getParent();
+                    auto* bad  = llvm::BasicBlock::Create(ctx_, "strrepl.xz", fn);
+                    auto* cont = llvm::BasicBlock::Create(ctx_, "strrepl.ok", fn);
+                    auto* br   = b_.CreateCondBr(any_unknown(count), bad, cont);
+                    br->setMetadata(llvm::LLVMContext::MD_prof,
+                                    llvm::MDBuilder(ctx_).createBranchWeights(1, 1u << 20));
+                    b_.SetInsertPoint(bad);
+                    llvm::Value* now  = b_.CreateCall(wheel_now_fn(), { wheel_ });
+                    auto*        call = b_.CreateCall(str_repl_invalid_fn(),
+                                                      { b_.getInt64(0), b_.getInt32(1), site, now });
+                    call->addFnAttr(llvm::Attribute::NoReturn);
+                    call->addFnAttr(llvm::Attribute::Cold);
+                    b_.CreateUnreachable();
+                    b_.SetInsertPoint(cont);
+                }
+                llvm::Value* n = cast(must_of(count), 64, type_of(p.binary.r).is_signed);
+                b_.CreateCall(str_repl_fn(), { str_of(i), str_of(p.binary.l), n, site });
+                return;
+            }
             case Inst::Tag::StreamReverse:
                 set_value(i, lower_stream_reverse(value_of(p.op_imm.op), p.op_imm.imm));
                 return;

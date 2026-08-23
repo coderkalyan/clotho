@@ -1679,7 +1679,35 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   The intra-assignment path stages an integral or real value, an unpacked-array
   element or a struct field; a container handle needs the HandleCopyNb record to
   survive to the delayed commit. See docs/design/intra-assignment-timing.md.
-- [ ] **Non-constant string replication count**.
+- [ ] **Non-constant string replication count** — **a deliberate deviation from
+  LRM 11.4.12.1, implemented; kept OPEN because the deviation itself must be
+  revisited, not because work remains.** The clause requires the multiplier of
+  `{N{...}}` to be a non-negative, non-x, non-z CONSTANT expression, so clotho
+  was CONFORMANT to refuse `int m; dash = {m{"-"}}` (uvm_printer.svh:1501, the
+  only two such sites in uvm-core), and so is iverilog 13 ("a reference to a net
+  or variable (`m`) is not allowed in a constant expression"). Verilator 5.050
+  accepts it and yields `-----`. UVM ships it regardless. A runtime multiplier
+  is now accepted when — and only when — the replication's own slang type is
+  `string`: the clause demands a constant because a concatenation's WIDTH must
+  be known at elaboration, and a string result has no elaboration-time width, so
+  the restriction's own reason does not apply there. That boundary — not "UVM
+  needs it" — is what makes the narrow form defensible. String-ness is slang's
+  typing (`ReplicationExpression::fromSyntax` types a non-constant multiplier
+  over an implicitly-string operand as `string`), never a syntax pattern.
+  Lowered as `StrRepl` (a runtime count operand, unlike packed `Repl`'s
+  immediate) into `rt_string_repl`. The clause's other two demands bind at RUN
+  TIME, where a variable can violate them and a constant could not: ZERO yields
+  the empty string (the clause's own zero rule); NEGATIVE and X/Z are located
+  fatals (`rt_string_repl_invalid`) naming the construct and, for the negative,
+  the value — clamping to zero would invent semantics the clause does not grant,
+  and Verilator is NO oracle for the negative case (its generated C++ for
+  `{-2{"ab"}}` fails to compile, make exits 2), so there is no reference
+  behaviour to match. The x/z probe is emitted only for a 4-state count plane,
+  so the UVM `int m` shape pays nothing. Still refused: a non-constant
+  multiplier with a PACKED result — slang rejects it at elaboration (the
+  multiplier fails constant evaluation), and clotho's own backstop in
+  `lower_expr`'s Replication case names the construct and the clause instead of
+  the old bare "expected a constant integer".
 - [ ] **String ports** — including a string reached through a struct member or a
   container element, which the old array-only walk let through to the plane-copy
   path (now guarded).
