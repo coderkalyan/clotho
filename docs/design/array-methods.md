@@ -111,9 +111,8 @@ locator call therefore reaches consumers through `lower_lvalue`'s Call case, whi
 routes container methods to this path (a builtin method is a system call, which
 `lower_user_call` refuses).
 
-Receivers: dynamic array and queue. LRM 7.12 also allows a fixed-size unpacked
-array and an associative array; both fail loudly (see "Remaining work").
-
+Receivers: fixed-size unpacked array, dynamic array and queue. LRM 7.12 also
+allows an associative array, which fails loudly (see "Remaining work").
 iverilog implements none of LRM 7.12; verilator 5.050 agrees with Clotho apart
 from a struct-member-select bug of its own and the empty-array reduction. Three
 points have no single answer to match in any case: the empty-array reduction and
@@ -162,19 +161,104 @@ quiescent edge (`LlvmBackend.cpp:11850`). A 400-element sort whose key allocates
 string per evaluation reports one collection under `--gc-stress`, none of it
 inside the sort.
 
-### 2. Fixed-size unpacked-array and associative-array receivers
+### 2. Fixed-size unpacked-array receiver — landed
 
-LRM 7.12 applies to any unpacked array, and the locator/index families have
-defined associative-array behaviour (index results are key-typed; first/last
-follow `first()`/`last()`). Both fail loudly today.
+All three families on `int q[5]`, `int q[3:7]` and the descending `int q[7:3]`.
+7.12 applies to "any unpacked array" and 7.12.2 spells it out ("fixed or
+dynamically sized"), so the refusal that stood at the shared container-method
+dispatch was clotho's own gap. It cost Accellera UVM `uvm_printer.svh:1498` —
+`int q[5]; int qq[$]; qq = q.max; m = qq[0];` — the only one of uvm-core's 41
+array-method call sites not on a queue.
 
-- **Fixed-size**: the loop shape carries over, but the declared range does not.
-  `_index` results and `item.index` must yield declared indices, not 0-based
-  offsets, so the loop needs the dimension's range and a bias.
-- **Associative**: no dense index exists; the walk is the
-  `assoc_traverse(First/Next)` chain `lower_foreach_assoc_dim` uses, and the
-  index-family result queue is keyed by the index type. `[*]`-wildcard keys are
-  illegal for the index family (7.12.1).
+**The one thing a fixed receiver changes is that its indices are its DECLARED
+range**, not `0 .. n-1`. That is threaded as a `DeclIndexMap`
+(`{first, step, count}`) carried beside the receiver: iteration position `p` holds
+the element at declared index `first + step*p`. A queue or dynamic array is
+`{0, +1}`, for which every expression the map builds collapses to the position
+itself — so this is ONE path with the old receivers as its degenerate case rather
+than a fork, and the queue paths emit the instructions they emitted before. The
+walk stays 0-based; the map is applied only where an index is REPORTED or an
+element is ADDRESSED:
+
+- `find_index` / `find_first_index` / `find_last_index` / `unique_index` push
+  `decl_of(k)`.
+- `item.index` (7.12.4) reads it through the `IterBinding` that the clause
+  already resolved by iterator-symbol identity, so a nested clause and `unique`'s
+  dedup scan each map their own index.
+- `elem_select` takes it directly, because an `ir::ElemSelect` index into a fixed
+  array is ALREADY a declared-range coordinate the backend normalizes against
+  `at.left` in either direction. One computation feeds all three, which is what
+  keeps a reported index and the element it names from disagreeing.
+
+**Range direction is the part a 0-based test cannot catch.** 7.12.1 defines the
+first element as the one "closest to the leftmost indexed element", so the walk
+starts at the declared LEFT bound whichever side of the range it is on: position 0
+is index 3 for `int b[3:7]` and index 7 for `int c[7:3]`, where `step` is -1.
+Ordering permutes in declared-address order for the same reason, so `sort` puts
+the smallest element at the left bound and `c.sort()` reads ascending from index 7
+down to 3. Negative bounds (`int a[-1:1]`) are still refused, by the pre-existing
+`lower_type` guard.
+
+**Ordering reuses the dynamic-array implementations instead of growing a second
+copy of any of them.** `lower_fixed_array_order` mirrors the elements into a
+temporary dynamic array in declared-address order, reorders THERE, and copies
+back. A fixed array has no handle, so it cannot be handed to `rt_dynarr_*`
+directly; a mirror is what makes the whole existing stack apply unchanged.
+
+- `reverse` and bare `sort` / `rsort` keep the runtime fast path, including the
+  4-state comparator kinds — so §3's total order for unknowns holds on a fixed
+  receiver with nothing added (`'{8'd3, 8'hxx, 8'd1, 8'd2}` sorts to
+  `xx 1 2 3` and rsorts to `3 2 1 xx`).
+- `shuffle` is the same `rt_dynarr_shuffle` call on a mirror of the same length,
+  so it draws the SAME RNG stream: a six-element fixed shuffle produces the
+  permutation the dynamic-array test already pins and leaves `$urandom` at the
+  same value. An IR Fisher-Yates would have diverged here, since `urandom_range`
+  maps a draw by multiply-shift where the runtime takes a modulo.
+- A keyed `sort` goes through `lower_array_sort_iter` unchanged, with the
+  receiver's map installed in the iterator binding so `item.index` still reports
+  declared indices while `ord` holds mirror positions.
+
+Reuse is pinned by RESULT rather than by assertion: stability and the
+per-comparison clause count come out to the same `12 13 15 10 11 14` and
+`calls=8` that the queue cases pin.
+
+**One real bug the mirror exposed, fixed here.** An aggregate element crosses the
+`rt_*` ABI as a pointer to a CANONICAL aggregate image, but a fixed array of
+scalar-element sub-arrays stores FLAT leaf slots that may be independently
+z-widened — a different image size. Handing that pointer to `queue_push` made the
+runtime copy the wrong byte count, and `int m[2][3]; mq = m.max with (item.sum);`
+segfaulted. Result pushes now stage such an element through a canonical temp
+(`canonical_elem_ptr`, the rule `lower_container_element_value` already applies to
+a pushed actual), and the mirror copy decomposes per leaf rather than taking the
+whole-image `agg_copy` memcpy. A queue receiver is unaffected — its elements
+already live in a canonical image — and emits what it emitted before.
+
+**Multidimensional receivers work through the clause's own nested form.** 7.12.3's
+worked example `logic [7:0] m [2][2]; m.sum with (item.sum with (item))` gives
+50, because the ELEMENTS of `m` are its sub-arrays and the inner clause reduces
+one of them per iteration — a bare `m.sum` is NOT the flattened leaf sum. Index
+results name the outer dimension in declared coordinates (`int n[2:3][3]` answers
+3), `min` / `max` return a queue OF sub-arrays, and `reverse` / `shuffle` reorder
+sub-arrays because they move whole slots and need no comparison. A BARE `m.sum` or
+`m.max` is refused in slang's binder with 7.12.3's and 7.12.1's own words
+("unpacked arrays of integral values" / "of comparable values"), which is the
+right place for a type rule; no arithmetic or relational operator is defined for a
+sub-array. `item.index(2)` for the second dimension is still refused by clotho.
+
+Refused loudly, each on the clause: a bare reduction of a non-integral element
+(multidimensional, `string`, `real`) and a bare `min` / `max` / `sort` of a
+non-comparable one, both by slang ahead of lowering; an aggregate element with no
+`with` clause, by clotho, now citing 7.12.1 and 7.12.3 together; an element a
+dynamic array cannot hold (a `chandle`), which only the ordering mirror needs
+(`guard_container_element`); and `item.index(d)` for `d > 1`.
+
+### 2a. Associative-array receiver
+
+LRM 7.12 allows it, and the locator/index families have defined behaviour (index
+results are key-typed; first/last follow `first()`/`last()`). It fails loudly
+today: no dense index exists, so the walk is the `assoc_traverse(First/Next)`
+chain `lower_foreach_assoc_dim` uses, and the index-family result queue is keyed
+by the index type. `[*]`-wildcard keys are illegal for the index family (7.12.1).
 
 ### 3. 4-state `sort` / `rsort` ordering — landed
 
@@ -285,8 +369,7 @@ any width.
 
 ## Priority
 
-The receiver gaps (2) are the remaining scope, fixed-size first since its loop is
-the one already written — and it is what the clause's `struct {...} c [512]`
-example actually needs, so the two struct-key examples are pinned on a queue
-receiver instead. Ordering itself has no remaining element or key restriction: the
-receiver shape is the only gap left.
+The associative receiver (2a) is the remaining scope. Ordering has no remaining
+element, key or receiver restriction bar that one; the clause's
+`struct {...} c [512]` example now runs on the fixed receiver it was written for,
+rather than being pinned on a queue.

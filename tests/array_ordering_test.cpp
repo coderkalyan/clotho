@@ -713,23 +713,25 @@ TEST_CASE("keyed ordering on empty / single element is a no-op") {
     CHECK(run_capture(src) == "7 9 z calls=0\n");
 }
 
-// What clotho still cannot order, refused loudly. The receiver gap is clotho's
-// own; a non-comparable element or key is 7.12.2's own restriction ("the
-// relational operators shall be defined for..."), which slang's binder enforces
-// ahead of lowering -- pinned here so the pair of them cannot regress into a
-// silent accept. A 4-state element or key is no longer among these: it is
-// ordered, by the total order the cases above pin.
+// What clotho still cannot order, refused loudly. A non-comparable element or
+// key is 7.12.2's own restriction ("the relational operators shall be defined
+// for..."), which slang's binder enforces ahead of lowering -- pinned here so
+// the pair of them cannot regress into a silent accept. A 4-state element or key
+// is not among these: it is ordered, by the total order the cases above pin.
+// Neither is a fixed-size receiver, which 7.12.2 admits in as many words
+// ("fixed or dynamically sized") and which the cases below order.
 TEST_CASE("ordering shapes Clotho still refuses loudly") {
-    SUBCASE("fixed-size unpacked array receiver") {
+    SUBCASE("a multidimensional element has no relational operators") {
+        // The elements of `int a[2][3]` are its sub-arrays, so a bare sort has
+        // nothing defined to compare -- 7.12.2 again, on a fixed receiver.
         const LowerResult r = lower_text(R"(
             module m;
-                int a[4];
-                initial begin a[0] = 1; a.sort(); end
+                int a[2][3];
+                initial begin a[0][0] = 1; a.sort(); end
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("'sort' on a fixed-size unpacked array is not supported") !=
-              std::string::npos);
+        CHECK(r.diagnostic_text().find("unpacked arrays of comparable values") != std::string::npos);
     }
     SUBCASE("an element with no relational operators") {
         const LowerResult r = lower_text(R"(
@@ -824,4 +826,180 @@ TEST_CASE("a `with` clause that mutates the receiver is bounded, not corrupting"
         endmodule
     )";
     CHECK(run_capture(src) == "n=14: 1 3 5 8 99 99 99 99 99 99 99 99 99 99\n");
+}
+
+// A fixed-size unpacked-array receiver, which 7.12.2 admits explicitly:
+// "Array ordering methods reorder the elements of any unpacked array (fixed or
+// dynamically sized) except for associative arrays." All four run over a mirror
+// dynamic array (lower_fixed_array_order), so a fixed receiver reaches the SAME
+// implementation of each method a dynamic array does rather than a second copy
+// of any of it -- which the reuse cases further down pin by result, not by
+// assertion. The string case is the clause's own reverse example, and the struct
+// case is its `struct { byte red, green, blue; } c [512]` keyed sort, which was
+// written for a fixed receiver in the first place.
+TEST_CASE("ordering methods on a fixed-size unpacked array (LRM 7.12.2)") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[5];
+            string s[3];
+            struct { byte red, green, blue; } c [4];
+            initial begin
+                a[0]=3; a[1]=7; a[2]=1; a[3]=7; a[4]=9;
+                a.sort();    $write("sort:");  foreach (a[k]) $write(" %0d", a[k]); $display;
+                a.rsort();   $write("rsort:"); foreach (a[k]) $write(" %0d", a[k]); $display;
+                a.reverse(); $write("rev:");   foreach (a[k]) $write(" %0d", a[k]); $display;
+                s[0]="hello"; s[1]="sad"; s[2]="world";
+                s.reverse(); $display("s.rev: %s %s %s", s[0], s[1], s[2]);
+                s.sort();    $display("s.sort: %s %s %s", s[0], s[1], s[2]);
+                c[0]='{3,1,1}; c[1]='{1,2,2}; c[2]='{4,3,3}; c[3]='{2,4,4};
+                c.sort with ( item.red );
+                $display("c.red: %0d %0d %0d %0d", c[0].red, c[1].red, c[2].red, c[3].red);
+                c.reverse();
+                $display("c.rev: %0d %0d %0d %0d", c[0].red, c[1].red, c[2].red, c[3].red);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "sort: 1 3 7 7 9\n"
+                              "rsort: 9 7 7 3 1\n"
+                              "rev: 1 3 7 7 9\n"
+                              "s.rev: world sad hello\n"
+                              "s.sort: hello sad world\n"
+                              "c.red: 1 2 3 4\n"
+                              "c.rev: 4 3 2 1\n");
+}
+
+// A fixed array is reordered in DECLARED-ADDRESS order, so `sort` puts the
+// smallest element at the declared LEFT bound whichever side of the range it is
+// on -- index 3 for `int b[3:7]` and index 7 for the descending `int c[7:3]`.
+// Each line below reads the array back left bound first, so an implementation
+// that mistook the storage order for the index order would print these reversed.
+TEST_CASE("fixed-array ordering permutes in declared-address order (LRM 7.12.2)") {
+    constexpr std::string_view src = R"(
+        module m;
+            int b[3:7];
+            int c[7:3];
+            initial begin
+                b[3]=10; b[4]=40; b[5]=20; b[6]=40; b[7]=30;
+                b.sort();    $write("b.sort: ");  for (int k=3;k<=7;k++) $write("%0d ", b[k]); $display;
+                b.rsort();   $write("b.rsort: "); for (int k=3;k<=7;k++) $write("%0d ", b[k]); $display;
+                b.reverse(); $write("b.rev: ");   for (int k=3;k<=7;k++) $write("%0d ", b[k]); $display;
+                c[7]=10; c[6]=40; c[5]=20; c[4]=40; c[3]=30;
+                c.sort();    $write("c.sort: ");  for (int k=7;k>=3;k--) $write("%0d ", c[k]); $display;
+                c.rsort();   $write("c.rsort: "); for (int k=7;k>=3;k--) $write("%0d ", c[k]); $display;
+                c.reverse(); $write("c.rev: ");   for (int k=7;k>=3;k--) $write("%0d ", c[k]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "b.sort: 10 20 30 40 40 \n"
+                              "b.rsort: 40 40 30 20 10 \n"
+                              "b.rev: 10 20 30 40 40 \n"
+                              "c.sort: 10 20 30 40 40 \n"
+                              "c.rsort: 40 40 30 20 10 \n"
+                              "c.rev: 10 20 30 40 40 \n");
+}
+
+// That a fixed receiver reuses the existing machinery rather than duplicating
+// it, pinned by results that would differ under any second implementation:
+//
+//  - the 4-state total order (unknown first ascending, last descending) comes
+//    out of the runtime comparator sort_run4 -- the bare integral form still
+//    takes the runtime fast path, on the mirror;
+//  - the keyed forms are STABLE and cost the same number of clause evaluations
+//    as the queue receiver ("sort / rsort with a `with` clause are stable" and
+//    "a `with` clause key is evaluated per comparison" pin 12/13/15/10/11/14 and
+//    calls=8 for a queue; the same numbers here mean the same merge sort);
+//  - `item.index` inside a keyed sort is the element's ORIGINAL declared index,
+//    so an rsort by it reverses a non-zero-based array.
+TEST_CASE("fixed-array ordering reuses the queue / dynamic-array machinery") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int key; int tag; } kv;
+            kv          c[3:8];
+            logic [7:0] fs[4];
+            int         fa[4];
+            int         calls;
+            function automatic int key(int v); calls++; return v; endfunction
+            initial begin
+                fs[0]=8'd3; fs[1]=8'hxx; fs[2]=8'd1; fs[3]=8'd2;
+                fs.sort();  $display("4state: %0h %0h %0h %0h", fs[0], fs[1], fs[2], fs[3]);
+                fs.rsort(); $display("4rsort: %0h %0h %0h %0h", fs[0], fs[1], fs[2], fs[3]);
+
+                c[3]='{1,10}; c[4]='{1,11}; c[5]='{0,12};
+                c[6]='{0,13}; c[7]='{1,14}; c[8]='{0,15};
+                c.sort  with ( item.key );
+                $write("asc: ");  for (int k=3;k<=8;k++) $write("%0d ", c[k].tag); $display;
+                c.rsort with ( item.key );
+                $write("desc: "); for (int k=3;k<=8;k++) $write("%0d ", c[k].tag); $display;
+                c.rsort with ( item.index );
+                $write("byidx: "); for (int k=3;k<=8;k++) $write("%0d ", c[k].tag); $display;
+
+                fa[0]=4; fa[1]=5; fa[2]=3; fa[3]=1;
+                calls = 0;
+                fa.sort with ( key(item) );
+                $write("fa:"); foreach (fa[k]) $write(" %0d", fa[k]);
+                $display(" calls=%0d", calls);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "4state: xx 1 2 3\n"
+                              "4rsort: 3 2 1 xx\n"
+                              "asc: 12 13 15 10 11 14 \n"
+                              "desc: 10 11 14 12 13 15 \n"
+                              "byidx: 15 13 12 14 11 10 \n"
+                              "fa: 1 3 4 5 calls=8\n");
+}
+
+// A fixed-array shuffle draws the SAME RNG stream as a dynamic-array shuffle,
+// because it is the same runtime call (rt_dynarr_shuffle) on a mirror of the same
+// length. The permutation below is the one "dynamic array + queue shuffle is a
+// stable permutation" already pins for `int a[]` with six elements in the first
+// process, and the trailing $urandom shows the stream left at the same point --
+// so the two receivers cannot silently diverge into two Fisher-Yates loops.
+TEST_CASE("fixed-array shuffle draws the dynamic-array RNG stream") {
+    constexpr std::string_view fixed_src = R"(
+        module m;
+            int fa[6];
+            initial begin
+                for (int k = 0; k < 6; k++) fa[k] = k;
+                fa.shuffle();
+                $write("perm:"); foreach (fa[k]) $write(" %0d", fa[k]); $display;
+                $display("next=%0d", $urandom);
+            end
+        endmodule
+    )";
+    constexpr std::string_view dyn_src   = R"(
+        module m;
+            int da[];
+            initial begin
+                da = new[6];
+                for (int k = 0; k < 6; k++) da[k] = k;
+                da.shuffle();
+                $write("perm:"); foreach (da[k]) $write(" %0d", da[k]); $display;
+                $display("next=%0d", $urandom);
+            end
+        endmodule
+    )";
+    const std::string          fixed_out = run_capture(fixed_src);
+    CHECK(fixed_out == "perm: 2 3 1 4 0 5\nnext=88327031\n");
+    CHECK(fixed_out == run_capture(dyn_src));
+}
+
+// A multidimensional fixed array reorders its SUB-ARRAYS, which reverse and
+// shuffle can do because they move whole element slots and need no comparison
+// (7.12.2 excludes only associative arrays). A bare sort of the same array is
+// refused above, for want of relational operators on a sub-array.
+TEST_CASE("multidimensional fixed array reverses its sub-arrays (LRM 7.12.2)") {
+    constexpr std::string_view src = R"(
+        module m;
+            int n [2:3][3];
+            initial begin
+                n[2][0]=1;  n[2][1]=2;  n[2][2]=3;
+                n[3][0]=40; n[3][1]=50; n[3][2]=60;
+                n.reverse();
+                $display("%0d %0d %0d / %0d %0d %0d",
+                         n[2][0], n[2][1], n[2][2], n[3][0], n[3][1], n[3][2]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "40 50 60 / 1 2 3\n");
 }

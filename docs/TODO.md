@@ -1483,7 +1483,9 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   literal / `new[n]` right-hand side is still refused (it builds in place rather
   than deep-copying a handle the commit can move).
 - [x] **Array ordering methods** (LRM 7.12.2) — `reverse` / `sort` / `rsort` /
-  `shuffle` on a dynamic array or queue (`rt_dynarr_*` / `rt_queue_*` helpers).
+  `shuffle` on a dynamic array or queue (`rt_dynarr_*` / `rt_queue_*` helpers),
+  and on a fixed-size unpacked array through a mirror of one (see the fixed-size
+  entry below).
   `reverse` / `shuffle` are element-agnostic; `sort` / `rsort` are value-keyed,
   taking an integral (width <= 64) or real element. `shuffle` draws
   from the calling thread's RNG (which forces its process to a coroutine, and
@@ -1515,11 +1517,11 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `min`/`max` skip unknowns. An unpacked struct / array element works through
   the same loop: the iterator variable binds by
   aggregate copy and a locator's result queue receives whole elements, so
-  `q.find(x) with (x.f > 2)` / `q.sum(x) with (x.f)` are ordinary. Guarded loud: a
-  fixed-size unpacked-array or associative-array receiver (7.12 allows both; the
-  former needs declared-range index mapping, the latter key traversal), and an
+  `q.find(x) with (x.f > 2)` / `q.sum(x) with (x.f)` are ordinary. Guarded loud: an
+  associative-array receiver (7.12 allows it; it needs key traversal), and an
   aggregate element with NO `with` clause — the bare form makes the element itself
-  the key (7.12.1), and an unpacked aggregate has no ordering or fold.
+  the key (7.12.1), and an unpacked aggregate has no ordering or fold. A
+  fixed-size receiver is no longer among these (see the fixed-size entry below).
 - [x] **`with` clause on `sort` / `rsort`** (LRM 7.12.2) — and, from the same
   mechanism, `sort` of a **string** and a **wide (> 64-bit)** element. The
   motivating shape is Accellera UVM `uvm_phase_hopper.svh:763`,
@@ -1631,6 +1633,83 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   inventing a value for it. **iverilog 13 does not implement `sort()` at all**:
   "sorry: 'sort()' array sorting method is not currently supported"; it cannot
   even parse `s.sort()` on a string array, let alone a `with` clause.
+- [x] **Fixed-size unpacked-array receiver** (LRM 7.12) — all three families on
+  `int q[5]`, `int q[3:7]` and the descending `int q[7:3]`. 7.12 applies to "any
+  unpacked array" and 7.12.2 spells it out ("fixed or dynamically sized"), so the
+  refusal that stood at the shared container-method dispatch was clotho's own gap,
+  not the clause's. The motivating shape is Accellera UVM
+  `uvm_printer.svh:1498`, `int q[5]; int qq[$]; qq = q.max; m = qq[0];` — one of
+  41 array-method call sites in uvm-core, and the only one not on a queue.
+  * **What a fixed receiver actually changes is one thing: its indices are its
+    DECLARED range, not 0 .. n-1.** That is threaded as a `DeclIndexMap`
+    (`{first, step, count}`) carried beside the receiver: iteration position `p`
+    holds the element at declared index `first + step*p`. A queue or dynamic array
+    is `{0, +1}`, for which every expression the map builds collapses to the
+    position itself — so this is ONE path with the old receivers as its
+    degenerate case, not a fork, and the queue paths emit the instructions they
+    emitted before. The walk itself stays 0-based; the map is applied only where
+    an index is REPORTED or an element is ADDRESSED.
+  * **Three consumers, one map.** `find_index` / `find_first_index` /
+    `find_last_index` / `unique_index` push `decl_of(k)`; `item.index` (7.12.4)
+    reads it through the `IterBinding` the clause already resolved by symbol
+    identity; and `elem_select` takes it directly, because an `ir::ElemSelect`
+    index into a fixed array is ALREADY a declared-range coordinate that the
+    backend normalizes (`at.left`, either direction). Computing it once is what
+    keeps a reported index and the element it names from disagreeing.
+  * **Direction is the part a 0-based test cannot catch.** 7.12.1 defines the
+    first element as the one "closest to the leftmost indexed element", so the
+    walk starts at the declared LEFT bound whichever side it is on: position 0 is
+    index 3 for `int b[3:7]` and index 7 for `int c[7:3]`, and `step` is -1 for
+    the latter. Ordering likewise permutes in declared-address order, so `sort`
+    puts the smallest element at the left bound and `c.sort()` reads ascending
+    from index 7 down to 3. Both ranges are pinned by tests; negative bounds
+    (`int a[-1:1]`) are still refused by the existing `lower_type` guard.
+  * **Ordering reuses the dynamic-array implementations rather than growing a
+    second copy.** The elements are mirrored into a temporary dynamic array in
+    declared-address order, reordered THERE, and copied back
+    (`lower_fixed_array_order`). So `reverse` / bare `sort` / `rsort` keep the
+    runtime fast path including the 4-state comparators (`sort_run4`, so the total
+    order for unknowns applies unchanged), `shuffle` is the same
+    `rt_dynarr_shuffle` call and therefore draws the SAME RNG stream — a
+    six-element fixed shuffle produces the permutation the dynamic-array test
+    already pins and leaves `$urandom` at the same point — and a keyed `sort` goes
+    through `lower_array_sort_iter` unchanged, with the receiver's map installed
+    so `item.index` still reports declared indices. Reuse is pinned by RESULT:
+    stability and the per-comparison clause count come out to the same
+    `12 13 15 10 11 14` / `calls=8` the queue cases pin.
+  * **One real bug the mirror exposed, fixed here.** An aggregate element crosses
+    the `rt_*` ABI as a pointer to a CANONICAL aggregate image, but a fixed array
+    of scalar-element sub-arrays stores FLAT leaf slots that may be independently
+    z-widened — a different image size. Handing that pointer to `queue_push` made
+    the runtime copy the wrong byte count and segfaulted on
+    `int m[2][3]; mq = m.max with (item.sum);`. Result pushes now stage such an
+    element through a canonical temp (`canonical_elem_ptr`, the rule
+    `lower_container_element_value` already applies to a pushed actual), and the
+    mirror copy decomposes per leaf instead of taking the whole-image memcpy
+    shortcut. A queue receiver is unaffected: its elements already live in a
+    canonical image, and it emits what it emitted before.
+  * **Multidimensional receivers work through the clause's own nested form.**
+    7.12.3's worked example `logic [7:0] m [2][2]; m.sum with (item.sum with
+    (item))` gives 50, because the ELEMENTS of `m` are its sub-arrays and the
+    inner clause reduces one of them per iteration — not a flattened leaf sum.
+    Index results name the outer dimension in declared coordinates
+    (`int n[2:3][3]` answers 3), `min`/`max` return a queue OF sub-arrays, and
+    `reverse` / `shuffle` reorder sub-arrays because they move whole slots. A
+    BARE `m.sum` or `m.max` is refused — with 7.12.3's and 7.12.1's own words, by
+    slang's binder ("unpacked arrays of integral values" / "of comparable
+    values"), which is the right place for a type rule — since no arithmetic or
+    relational operator is defined for a sub-array. `item.index(2)` for the
+    second dimension is still refused by clotho.
+  * **Refused loudly, each on the clause:** a bare reduction of a
+    non-integral element (multidimensional, `string`, `real`) and a bare
+    `min`/`max`/`sort` of a non-comparable one, both by slang ahead of lowering
+    (7.12.3 "any unpacked array of integral values"; 7.12.1 / 7.12.2 "the
+    relational operators shall be defined for"); an aggregate element with no
+    `with` clause, by clotho, now citing both clauses; an element a dynamic array
+    cannot hold (a `chandle`), which only the ordering mirror needs
+    (`guard_container_element`); and `item.index(d)` for `d > 1`.
+  * Remaining receiver gap: the **associative** array, whose index family is
+    key-typed and whose walk is the `assoc_traverse` chain.
 - [ ] **`map`** (LRM 7.12.5, 1800-2023 only) — the one array manipulation method
   slang binds that clotho does not lower, so `q.map(x) with (x * 2)` hits the
   container-method guard (`--std 1800-2023`; older versions reject it in the

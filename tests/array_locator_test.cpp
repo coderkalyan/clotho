@@ -349,13 +349,196 @@ TEST_CASE("locator result chains into another method") {
     CHECK(run_capture(src) == "3 30\n");
 }
 
-// LRM 7.12 allows these methods on any unpacked array, and on an associative
-// array. Both are refused loudly rather than silently mislowered.
+// A fixed-size unpacked-array receiver (LRM 7.12: "any unpacked array"). Both
+// families walk it in place; the only thing that differs from a queue is that
+// the indices it REPORTS are its declared range, which the cases below pin on a
+// non-zero-based and a descending one. This is the UVM shape's family:
+// uvm_printer.svh:1498 assigns `q.max` of an `int q[5]` into a queue and reads
+// element 0.
+TEST_CASE("locator and reduction methods on a fixed-size unpacked array (LRM 7.12)") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[5];
+            int q[$];
+            int m;
+            initial begin
+                a[0]=3; a[1]=7; a[2]=1; a[3]=7; a[4]=9;
+                $display("%0d %0d %0d %0d %0d", a.sum, a.product, a.and, a.or, a.xor);
+                q = a.min; $display("min=%0d", q[0]);
+                q = a.max; $display("max=%0d", q[0]);
+                q = a.find(x) with (x > 3);
+                $write("find:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = a.find_index with (item > 3);
+                $write("find_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = a.find_first with (item > 6);
+                $write("first:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = a.find_last_index with (item == 7);
+                $write("last_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = a.unique;
+                $write("unique:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = a.unique_index;
+                $write("unique_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = a.find(x) with (x > 100);
+                $display("nomatch=%0d", q.size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "27 1323 1 15 11\n"
+                              "min=1\n"
+                              "max=9\n"
+                              "find: 7 7 9\n"
+                              "find_index: 1 3 4\n"
+                              "first: 7\n"
+                              "last_index: 3\n"
+                              "unique: 3 7 1 9\n"
+                              "unique_index: 0 1 2 4\n"
+                              "nomatch=0\n");
+}
+
+// The crux of a fixed receiver: an index result is a DECLARED index, not a
+// 0-based offset. 7.12.1 defines the first element as the one "closest to the
+// leftmost indexed element", so `int b[3:7]` starts at 3 and the DESCENDING
+// `int c[7:3]` starts at 7 and walks down to 3 -- the left bound either way. A
+// 0-based implementation passes nothing here.
+TEST_CASE("index results on a fixed array are declared indices (LRM 7.12.1)") {
+    constexpr std::string_view src = R"(
+        module m;
+            int b[3:7];
+            int c[7:3];
+            int q[$];
+            initial begin
+                b[3]=10; b[4]=40; b[5]=20; b[6]=40; b[7]=30;
+                $display("b.sum=%0d", b.sum);
+                q = b.find_index with (item == 40);
+                $write("b.find_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = b.find_first_index with (item > 15);
+                $write("b.first_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = b.find_last_index with (item > 15);
+                $write("b.last_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = b.unique_index;
+                $write("b.unique_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+
+                c[7]=10; c[6]=40; c[5]=20; c[4]=40; c[3]=30;
+                $display("c.sum=%0d", c.sum);
+                q = c.find_index with (item == 40);
+                $write("c.find_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = c.find_first_index with (item > 15);
+                $write("c.first_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = c.find_last_index with (item > 15);
+                $write("c.last_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = c.unique_index;
+                $write("c.unique_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "b.sum=140\n"
+                              "b.find_index: 4 6\n"
+                              "b.first_index: 4\n"
+                              "b.last_index: 7\n"
+                              "b.unique_index: 3 4 5 7\n"
+                              "c.sum=140\n"
+                              "c.find_index: 6 4\n"
+                              "c.first_index: 6\n"
+                              "c.last_index: 3\n"
+                              "c.unique_index: 7 6 5 3\n");
+}
+
+// `item.index` (LRM 7.12.4) inside the clause is the declared index too, for
+// either range direction, and it resolves through the same binding stack the
+// queue receiver uses.
+TEST_CASE("item.index on a fixed array is the declared index (LRM 7.12.4)") {
+    constexpr std::string_view src = R"(
+        module m;
+            int b[3:7];
+            int c[7:3];
+            int q[$];
+            initial begin
+                foreach (b[k]) b[k] = k * 10;
+                foreach (c[k]) c[k] = k * 10;
+                q = b.find_index with (item.index == 5);
+                $write("b.at5:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = b.find with (item.index == 5);
+                $write("b.val5:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                q = c.find_index with (item.index == 5);
+                $write("c.at5:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                // Every element equals ten times its own declared index, so the
+                // clause holds for all five whichever way the range runs.
+                q = b.find_index with (item == item.index * 10);
+                $display("b.all=%0d", q.size());
+                q = c.find_index with (item == item.index * 10);
+                $display("c.all=%0d", q.size());
+                $display("b.idxsum=%0d c.idxsum=%0d",
+                         b.sum with (item.index), c.sum with (item.index));
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "b.at5: 5\n"
+                              "b.val5: 50\n"
+                              "c.at5: 5\n"
+                              "b.all=5\n"
+                              "c.all=5\n"
+                              "b.idxsum=25 c.idxsum=25\n");
+}
+
+// A multidimensional fixed array. 7.12.3's own worked example is the nested
+// form -- `m.sum with (item.sum with (item))` -- because the ELEMENTS of `m` are
+// its sub-arrays, not its leaves: the outer clause reduces one sub-array per
+// iteration and the inner one reduces that sub-array's leaves. A bare `m.sum` is
+// therefore not the flattened sum and is refused (see the loud-refusal case).
+// Index results name the OUTER dimension, in declared coordinates.
+TEST_CASE("multidimensional fixed array reduces through a nested clause (LRM 7.12.3)") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] md [2][2] = '{ '{5, 10}, '{15, 20} };
+            int n [2:3][3];
+            int y;
+            int q[$];
+            int mq[$][3];
+            initial begin
+                y = md.sum with (item.sum with (item));
+                $display("nested=%0d", y);
+                y = md.sum with (item.sum with (item.index));
+                $display("inner_index=%0d", y);
+                n[2][0]=1; n[2][1]=2; n[2][2]=3;
+                n[3][0]=40; n[3][1]=50; n[3][2]=60;
+                q = n.find_index with (item.sum > 10);
+                $write("outer_index:"); foreach (q[k]) $write(" %0d", q[k]); $display;
+                mq = n.max with (item.sum);
+                $display("max=%0d %0d %0d", mq[0][0], mq[0][1], mq[0][2]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "nested=50\n"
+                              "inner_index=2\n"
+                              "outer_index: 3\n"
+                              "max=40 50 60\n");
+}
+
+// What 7.12 itself does not allow, refused loudly with the clause's own words.
+// slang's binder gets to most of these first, which is the right place for them
+// -- they are type rules, not lowering gaps -- so these pin that the pair of
+// clotho and slang cannot regress into a silent accept.
 TEST_CASE("array manipulation methods on unsupported receivers fail loudly") {
-    expect_fail("module m; int a[5]; int q[$];\n"
-                " initial q = a.find(x) with (x > 1); endmodule",
-                "fixed-size unpacked array");
+    // An associative array is still clotho's own gap.
     expect_fail("module m; int a[int]; int q[$];\n"
                 " initial q = a.find(x) with (x > 1); endmodule",
                 "associative array method 'find'");
+    // 7.12.3 applies "to any unpacked array of integral values". A
+    // multidimensional array's elements are its sub-arrays, so a bare reduction
+    // has no defined operation for them; so do a string and a real element.
+    expect_fail("module m; int a[2][3];\n initial $display(a.sum); endmodule", "unpacked arrays of integral values");
+    expect_fail("module m; string s[4];\n initial $display(s.sum); endmodule", "unpacked arrays of integral values");
+    expect_fail("module m; real r[4];\n initial $display(r.sum); endmodule", "unpacked arrays of integral values");
+    // 7.12.1's min/max/unique need the relational operators defined for what is
+    // compared, which a sub-array does not have either.
+    expect_fail("module m; int a[2][3]; int q[$];\n initial q = a.max; endmodule",
+                "unpacked arrays of comparable values");
+    // 7.12.4's index method takes a dimension; only the first is supported.
+    expect_fail("module m; int a[5]; int q[$];\n"
+                " initial q = a.find_index with (item.index(2) == 1); endmodule",
+                "only supported for dimension 1");
 }

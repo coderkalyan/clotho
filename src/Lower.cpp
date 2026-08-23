@@ -20827,7 +20827,7 @@ private:
         if (name == "sort" || name == "rsort") {
             guard_ordering_sort(name, call);
             if (sort_uses_iter_path(call)) {
-                return lower_array_sort_iter(name, call, arr, b, l);
+                return lower_array_sort_iter(name, call, arr, aty, /*queue=*/false, DeclIndexMap{}, b, l);
             }
             return b.dyn_array_sort(arr, name == "rsort", aty, l);
         }
@@ -20922,6 +20922,53 @@ private:
     // An integer constant of the given interned type.
     ir::Index iconst(ir::Ref ty, uint64_t v, ir::Builder& b, ir::SourceLoc l) {
         return b.constant(module_.pool.put_int(ty, v), l);
+    }
+
+    // How an array-method receiver's iteration positions map to the indices the
+    // LRM reports for them. Position `p` (0 .. count-1, walked in the order
+    // 7.12.1 defines as leftmost-indexed element first) holds the element whose
+    // declared index is `first + step * p`.
+    //
+    // A queue or dynamic array is 0-based ascending, so `first == 0 && step == 1`
+    // and every expression built from the map collapses back to the position
+    // itself -- which is why one path serves every receiver instead of two. A
+    // fixed-size unpacked array carries its declared range: `int q[3:7]` puts
+    // index 3 at position 0, and the DESCENDING `int q[7:3]` puts index 7 there,
+    // because 7.12.1's first element is "closest to the leftmost indexed
+    // element" -- the left bound, whichever side of the range it is.
+    struct DeclIndexMap {
+        int32_t first = 0;
+        int32_t step  = 1;
+        // Element count. Only meaningful (and only known at lower time) when the
+        // receiver is fixed-size; the others query their handle.
+        uint32_t fixed_count = 0;
+        bool     fixed       = false;
+    };
+
+    static DeclIndexMap decl_index_map(const Expression& recv) {
+        DeclIndexMap m;
+        const auto*  arr = recv.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>();
+        if (arr == nullptr) {
+            return m;
+        }
+        const slang::ConstantRange r = arr->range;
+        m.fixed                      = true;
+        m.first                      = r.left;
+        m.step                       = r.left <= r.right ? 1 : -1;
+        m.fixed_count                = r.width();
+        return m;
+    }
+
+    // The declared index of iteration position `pos`, as a 32-bit value. Emits
+    // nothing at all for a 0-based ascending receiver, so the queue and
+    // dynamic-array paths keep the code they had.
+    ir::Index decl_index_at(const DeclIndexMap& m, ir::Index pos, ir::Ref i32, ir::Builder& b, ir::SourceLoc l) {
+        using T = ir::Inst::Tag;
+        if (m.first == 0 && m.step == 1) {
+            return pos;
+        }
+        const ir::Index first = iconst(i32, static_cast<uint64_t>(static_cast<uint32_t>(m.first)), b, l);
+        return m.step == 1 ? b.binary(T::Add, pos, first, l) : b.binary(T::Sub, first, pos, l);
     }
 
     // Bind the `with` iterator to the element at logical position `pos`, and aim
@@ -21171,20 +21218,29 @@ private:
     // element access goes through elem_select, which re-resolves from the handle,
     // so a key expression that pushes or deletes cannot leave a stale pointer
     // behind.
+    //
+    // `cty` is the interned type of the container actually permuted and `queue`
+    // its shape; `map` is the RECEIVER's declared-index map. The three are
+    // separate because a fixed-size receiver is permuted through a mirror
+    // dynamic array (lower_fixed_array_order): the container is then not the
+    // receiver, while `item.index` must still report the receiver's own
+    // declared indices.
     ir::Index lower_array_sort_iter(std::string_view      name,
                                     const CallExpression& call,
                                     ir::Index             arr,
+                                    ir::Ref               cty,
+                                    bool                  queue,
+                                    const DeclIndexMap&   map,
                                     ir::Builder&          b,
                                     ir::SourceLoc         l) {
         using T                          = ir::Inst::Tag;
         const Expression& recv           = *call.arguments()[0];
         const auto&       sci            = std::get<CallExpression::SystemCallInfo>(call.subroutine);
         const auto [iter_expr, iter_var] = sci.getIteratorInfo();
-        const bool        queue          = is_queue(recv);
 
         SortIter s;
         s.arr       = arr;
-        s.aty       = lower_type(*recv.type);
+        s.aty       = cty;
         s.i32       = make_int_type(32, false, true);
         s.i64       = make_int_type(64, false, true);
         s.bit1      = make_int_type(1, false, false);
@@ -21223,7 +21279,7 @@ private:
 
         s.ord = make_arg_temp(s.oty, b, l);
         s.buf = make_arg_temp(s.oty, b, l);
-        iter_stack_.push_back(IterBinding{ .var = iter_var, .index = s.pos_a });
+        iter_stack_.push_back(IterBinding{ .var = iter_var, .index = s.pos_a, .map = map });
         emit_sort_body(s, queue, b, l);
         iter_stack_.pop_back();
         return arr;
@@ -21320,17 +21376,161 @@ private:
             return lower_assoc_method(name, call, b, l);
         }
         // LRM 7.12 allows the manipulation methods on any unpacked array, and a
-        // fixed-size one reaches none of the dispatches above. Refused by name
-        // here, on the path every caller shares, so it does not surface as
-        // "system call used where a user subroutine was expected".
-        // TODO: array manipulation methods on a fixed-size unpacked array. Needs
-        // declared-range index mapping -- an `_index` result and the iterator index
-        // are declared indices, not 0-based offsets.
+        // fixed-size one reaches none of the dispatches above: it has no handle,
+        // so it is not a container in clotho's sense. Dispatched by name here, on
+        // the path every caller shares, so it does not surface as "system call
+        // used where a user subroutine was expected".
         if (is_unpacked_array(recv) &&
             (is_locator_method(name) || is_reduction_method(name) || is_ordering_method(name))) {
-            fail("array method '" + std::string(name) + "' on a fixed-size unpacked array is not supported");
+            return lower_fixed_array_method(name, call, b, l);
         }
         return std::nullopt;
+    }
+
+    // A locator (LRM 7.12.1), ordering (7.12.2) or reduction (7.12.3) method on a
+    // fixed-size unpacked array. 7.12 applies to "any unpacked array" and 7.12.2
+    // says so in as many words ("fixed or dynamically sized"). What a fixed
+    // receiver adds is that its indices are its DECLARED range rather than
+    // 0 .. n-1, which DeclIndexMap threads through both shapes below.
+    //
+    // The locator and reduction families read the receiver in place: they already
+    // walk it with elem_select, whose index is a declared-range coordinate for a
+    // fixed array (ir::ElemSelect), so the map is all they need.
+    //
+    // The ordering family borrows the dynamic-array implementations whole rather
+    // than growing a second copy of any of them: the elements are mirrored into a
+    // temporary dynamic array in declared-address order, reordered THERE, and
+    // copied back. That keeps a fixed receiver on the one implementation of each
+    // ordering method -- the runtime comparators including the 4-state total
+    // order, Fisher-Yates over the same process RNG stream, and the IR
+    // permutation sort with its `with` clause and stability.
+    ir::Index lower_fixed_array_method(std::string_view      name,
+                                       const CallExpression& call,
+                                       ir::Builder&          b,
+                                       ir::SourceLoc         l) {
+        const Expression& recv = *call.arguments()[0];
+        const ir::Index   arr  = lower_lvalue(recv, b, mutates_container(name));
+        if (is_locator_method(name) || is_reduction_method(name)) {
+            return lower_array_iter_method(name, call, arr, b, l);
+        }
+        if (name == "sort" || name == "rsort") {
+            guard_ordering_sort(name, call);
+        }
+        return lower_fixed_array_order(name, call, arr, b, l);
+    }
+
+    // reverse / sort / rsort / shuffle (LRM 7.12.2) on a fixed-size unpacked
+    // array, run over a mirror dynamic array (see lower_fixed_array_method).
+    ir::Index lower_fixed_array_order(std::string_view      name,
+                                      const CallExpression& call,
+                                      ir::Index             arr,
+                                      ir::Builder&          b,
+                                      ir::SourceLoc         l) {
+        const Expression&  recv = *call.arguments()[0];
+        const DeclIndexMap map  = decl_index_map(recv);
+        const ir::Ref      aty  = lower_type(*recv.type);
+        const ir::Ref      er   = std::get<ir::Type>(module_.pool.get(aty)).element;
+        // The mirror is a real dynamic array, so its element has to be one a
+        // dynamic array admits. Every element a fixed array can hold is, bar the
+        // handful guard_container_element names -- a chandle element, say, which
+        // 7.12.2 does not exclude but clotho cannot put in a container.
+        guard_container_element(recv.type->getArrayElementType()->getCanonicalType(), er, "fixed-size array ordering");
+
+        ir::Type mt;
+        mt.kind           = ir::Type::Kind::DynArray;
+        mt.element        = er;
+        const ir::Ref mty = module_.pool.put(ir::Item{ mt });
+        const ir::Ref i32 = make_int_type(32, false, true);
+
+        const ir::Index mirror = make_arg_temp(mty, b, l);
+        b.dyn_array_new(mirror, iconst(i32, map.fixed_count, b, l), mirror, /*has_init*/ false, mty, l);
+        emit_fixed_mirror_copy(arr, aty, mirror, mty, map, /*to_mirror=*/true, b, l);
+
+        if (name == "reverse") {
+            b.dyn_array_reverse(mirror, mty, l);
+        } else if (name == "shuffle") {
+            b.dyn_array_shuffle(mirror, mty, l);
+        } else if (sort_uses_iter_path(call)) {
+            lower_array_sort_iter(name, call, mirror, mty, /*queue=*/false, map, b, l);
+        } else {
+            b.dyn_array_sort(mirror, name == "rsort", mty, l);
+        }
+
+        emit_fixed_mirror_copy(arr, aty, mirror, mty, map, /*to_mirror=*/false, b, l);
+        b.dyn_array_delete(mirror, mty, l);
+        return arr;
+    }
+
+    // Copy a fixed-size array's elements into the ordering mirror in
+    // declared-address order (mirror position p <- declared index
+    // first + step * p), or copy the reordered result back out. 7.12.2 reorders
+    // "the elements of the array", and for a fixed array that sequence is its
+    // declared one: leftmost index first, so a descending `int q[7:3]` puts index
+    // 7 at position 0 and sorts toward index 3.
+    void emit_fixed_mirror_copy(ir::Index           arr,
+                                ir::Ref             aty,
+                                ir::Index           mirror,
+                                ir::Ref             mty,
+                                const DeclIndexMap& map,
+                                bool                to_mirror,
+                                ir::Builder&        b,
+                                ir::SourceLoc       l) {
+        using T            = ir::Inst::Tag;
+        const ir::Ref  er  = std::get<ir::Type>(module_.pool.get(aty)).element;
+        const bool     agg = is_agg_abi_ref(er);
+        const ir::Ref  i32 = make_int_type(32, false, true);
+        const TempCell pos = make_temp_cell(i32, "fxord_pos");
+        b.binary(T::Store, pos.lv(b, l), iconst(i32, 0, b, l), l);
+
+        b.open_region();
+        const ir::Index pred =
+          b.binary(T::Lt, b.unary(T::Load, pos.lv(b, l), l), iconst(i32, map.fixed_count, b, l), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        const ir::Index p    = b.unary(T::Load, pos.lv(b, l), l);
+        const ir::Index in_a = b.elem_select(arr, decl_index_at(map, p, i32, b, l), aty, l, /*for_write=*/!to_mirror);
+        const ir::Index in_m = b.elem_select(mirror, p, mty, l, /*for_write=*/to_mirror);
+        const ir::Index dst  = to_mirror ? in_m : in_a;
+        const ir::Index src  = to_mirror ? in_a : in_m;
+        if (!agg) {
+            b.binary(T::Store, dst, b.unary(T::Load, src, l), l);
+        } else {
+            // Per-leaf, never the whole-image agg_copy memcpy the other aggregate
+            // copies in this file can take: one side here is a fixed array's
+            // storage and the other a container element. A fixed array of
+            // scalar-element sub-arrays stores FLAT leaf slots that may be
+            // independently z-widened, while the container's element image is the
+            // CANONICAL aggregate layout rt_elem_ops::stride was computed from, so
+            // the two images can differ in size. Decomposing resolves each side's
+            // own layout.
+            emit_agg_copy(dst, src, er, T::Store, b, l);
+        }
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        b.binary(
+          T::Store, pos.lv(b, l), b.binary(T::Add, b.unary(T::Load, pos.lv(b, l), l), iconst(i32, 1, b, l), l), l);
+        const ir::ExtraSlice step = b.close_region();
+        b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
+    }
+
+    // An aggregate element on its way from a fixed-size array into a result
+    // queue. The runtime copies rt_elem_ops::stride bytes from the pointer handed
+    // over, and that stride comes from the CANONICAL aggregate image; a fixed
+    // array of scalar-element sub-arrays has flat storage whose leaf slots may be
+    // independently z-widened, so its element image is a different size and
+    // handing its pointer over would make the runtime read the wrong byte count.
+    // Stage those through a canonical temp, exactly as
+    // lower_container_element_value does for a pushed actual; a struct-bearing
+    // element is already canonical and needs no copy.
+    ir::Index canonical_elem_ptr(ir::Index elem, ir::Ref er, ir::Builder& b, ir::SourceLoc l) {
+        if (contains_struct_ref(er)) {
+            return elem;
+        }
+        const ir::Index temp = make_canonical_agg_temp(er, b, l);
+        emit_agg_copy(temp, elem, er, ir::Inst::Tag::Store, b, l);
+        return temp;
     }
 
     // An active `with` iterator clause (LRM 7.12 / 7.12.4): the element variable
@@ -21341,6 +21541,9 @@ private:
     struct IterBinding {
         const slang::ast::ValueSymbol* var = nullptr;
         TempCell                       index;
+        // The receiver's declared-index map, so `item.index` reports the declared
+        // index (LRM 7.12.4) and not the 0-based iteration position the cell holds.
+        DeclIndexMap map;
     };
     std::vector<IterBinding> iter_stack_;
 
@@ -21364,8 +21567,10 @@ private:
         }
         for (size_t k = iter_stack_.size(); k-- > 0;) {
             if (iter_stack_[k].var == &sym) {
-                const ir::Index cur = b.unary(ir::Inst::Tag::Load, iter_stack_[k].index.lv(b, l), l);
-                return b.resize(cur, lower_type(*call.type), l);
+                const ir::Index cur  = b.unary(ir::Inst::Tag::Load, iter_stack_[k].index.lv(b, l), l);
+                const ir::Ref   i32  = make_int_type(32, false, true);
+                const ir::Index decl = decl_index_at(iter_stack_[k].map, cur, i32, b, l);
+                return b.resize(decl, lower_type(*call.type), l);
             }
         }
         fail("the iterator index method is only supported inside its own `with` clause");
@@ -21398,6 +21603,10 @@ private:
 
         const bool      queue = is_queue(recv);
         const ir::Ref   aty   = lower_type(*recv.type);
+        // A fixed-size receiver differs in exactly two ways: its element count is
+        // a compile-time constant rather than a handle query, and the indices it
+        // REPORTS are its declared range. The walk itself stays 0-based.
+        const DeclIndexMap map      = decl_index_map(recv);
         const ir::Ref   elem_ref = std::get<ir::Type>(module_.pool.get(aty)).element;
         const bool      agg_elem = is_agg_abi_ref(elem_ref);
         // With no `with` clause the key IS the element (7.12.1 defines the bare form
@@ -21407,7 +21616,8 @@ private:
         if (agg_elem && iter_expr == nullptr) {
             fail("array method '" + std::string(name) +
                  "' on a container with an unpacked struct or array element needs a `with` clause "
-                 "(the element itself is not a key)");
+                 "(the element itself is not a key: LRM 7.12.1 and 7.12.3 both require the operation "
+                 "to be defined for the element type)");
         }
         const ir::Ref   i32   = make_int_type(32, false, true);
         const ir::Ref   bit1  = make_int_type(1, false, false);
@@ -21417,8 +21627,10 @@ private:
         // 0 .. size-1, with the count snapshotted like a foreach bound.
         const TempCell  idx   = make_temp_cell(i32, "arrm_idx");
         const TempCell  bound = make_temp_cell(i32, "arrm_bound");
-        const ir::Index size  = queue ? b.queue_size(arr, aty, l) : b.dyn_array_size(arr, aty, l);
-        b.binary(T::Store, bound.lv(b, l), b.resize(size, i32, l), l);
+        const ir::Index size  = map.fixed
+                                  ? iconst(i32, map.fixed_count, b, l)
+                                  : b.resize(queue ? b.queue_size(arr, aty, l) : b.dyn_array_size(arr, aty, l), i32, l);
+        b.binary(T::Store, bound.lv(b, l), size, l);
         b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
 
         if (iter_var != nullptr) {
@@ -21431,8 +21643,25 @@ private:
         // The element at k: an ordinary value for a scalar element, and the element
         // LVALUE for an aggregate one -- which is what both an aggregate copy and
         // queue_push (whose element crosses by pointer) want.
-        const auto elem_lv = [&](ir::Index k) { return b.elem_select(arr, k, aty, l); };
+        //
+        // `decl_of` is the index this call REPORTS for position k: the receiver's
+        // declared one (7.12.1's "indices of all such items", 7.12.4's index
+        // method). It is also what addresses the element, because a fixed array's
+        // elem_select takes a declared-range coordinate (ir::ElemSelect).
+        const auto decl_of = [&](ir::Index k) { return decl_index_at(map, k, i32, b, l); };
+        const auto elem_lv = [&](ir::Index k) { return b.elem_select(arr, decl_of(k), aty, l); };
         const auto elem_at = [&](ir::Index k) { return agg_elem ? elem_lv(k) : b.unary(T::Load, elem_lv(k), l); };
+        // The element at k in the form queue_push wants: a value for a scalar
+        // element, and for an aggregate one a pointer to a CANONICAL image, which
+        // a fixed-size receiver's flat storage may not be (canonical_elem_ptr). A
+        // queue's or dynamic array's element already lives in a canonical image,
+        // so those emit exactly what they emitted before.
+        const auto push_val = [&](ir::Index k) {
+            if (!agg_elem || !map.fixed) {
+                return elem_at(k);
+            }
+            return canonical_elem_ptr(elem_lv(k), elem_ref, b, l);
+        };
         const auto bind    = [&](ir::Index k) {
             if (iter_var == nullptr) {
                 return;
@@ -21488,7 +21717,7 @@ private:
             scan     = make_temp_cell(i32, "arrm_scan");
         }
 
-        iter_stack_.push_back(IterBinding{ .var = iter_var, .index = idx });
+        iter_stack_.push_back(IterBinding{ .var = iter_var, .index = idx, .map = map });
 
         b.open_region();
         const ir::Index      cur   = b.unary(T::Load, idx.lv(b, l), l);
@@ -21520,7 +21749,7 @@ private:
             b.binary(T::Store, have.lv(b, l), one1, l);
             b.binary(T::Store, best.lv(b, l), key, l);
             b.queue_delete(res, res, /*has_idx=*/false, rty, l);
-            b.queue_push(res, elem_at(k), /*front=*/false, rty, l);
+            b.queue_push(res, push_val(k), /*front=*/false, rty, l);
             const ir::ExtraSlice take_r = b.close_region();
             b.open_region();
             const ir::ExtraSlice skip_r = b.close_region();
@@ -21567,7 +21796,7 @@ private:
             b.loop(scond, spred, sbody, sstep, /*bottom_test*/ false, l);
 
             b.open_region();
-            b.queue_push(res, indexed ? k : elem_at(k), /*front=*/false, rty, l);
+            b.queue_push(res, indexed ? decl_of(k) : push_val(k), /*front=*/false, rty, l);
             const ir::ExtraSlice keep_r = b.close_region();
             b.open_region();
             const ir::ExtraSlice drop_r = b.close_region();
@@ -21581,7 +21810,7 @@ private:
             if (name.starts_with("find_last")) {
                 b.queue_delete(res, res, /*has_idx=*/false, rty, l);
             }
-            b.queue_push(res, indexed ? k : elem_at(k), /*front=*/false, rty, l);
+            b.queue_push(res, indexed ? decl_of(k) : push_val(k), /*front=*/false, rty, l);
             if (name.starts_with("find_first")) {
                 b.break_(l);
             }
@@ -21954,7 +22183,7 @@ private:
         if (name == "sort" || name == "rsort") {
             guard_ordering_sort(name, call);
             if (sort_uses_iter_path(call)) {
-                return lower_array_sort_iter(name, call, q, b, l);
+                return lower_array_sort_iter(name, call, q, qty, /*queue=*/true, DeclIndexMap{}, b, l);
             }
             return b.queue_sort(q, name == "rsort", qty, l);
         }
