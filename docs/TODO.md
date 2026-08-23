@@ -724,6 +724,86 @@ professional parity; M5 makes it complete.
   `lower_assign`. Design: docs/design/intra-assignment-timing.md.
 - [x] **`wait (expr)` statement** (LRM 9.4.3) — level-sensitive suspend; subsumes
   `wait(e.triggered)`.
+- [x] **Event control and `wait` on a class PROPERTY** (LRM 9.4.2 / 9.4.3) — `@p`
+  on the enclosing `this`, `@(obj.p)` through any handle expression, and
+  `wait(<cond reading properties>)`, for integral instance properties, non-edge and
+  edge. This unblocks Accellera UVM: `uvm_event_base::wait_off`
+  (`base/uvm_event.svh:120`) parks on `@on`, where `on` is the `protected bit`
+  property declared at :54, and nothing in a UVM run gets past it.
+  All three shapes failed before, and the third failed SILENTLY, which is the part
+  that mattered most. `lower_wait_stmt` lowers `wait(c)` to
+  `forever { if (c) break; @(read set of c); }` and the read set is built from
+  SIGNALS; a property is heap storage inside an object, so the set came back empty
+  and the process suspended on an event list nothing could ever fire — a permanent
+  park with no diagnostic at lowering, at elaboration or at run time. The `@` forms
+  were at least loud: `@p` reported "reference to unknown signal 'on'", and
+  `@(c.p)` resolved the object while the process was being BUILT and aborted with
+  "dereference of a null class handle, at 0 s" because `c = new` had not run yet.
+  **Mechanism** (docs/design/classes.md, "Waiting on a property"): a property some
+  `@` / `wait` in the design waits on carries hidden `event`-typed sibling
+  properties — its change notifiers, one per waited edge — and a blocking store to
+  the property classifies its own old -> new transition through the *same*
+  `emit_edge_facts` a signal store uses, then wakes the notifiers whose edge that
+  transition produced. Waiting is then literally `@(obj.<hidden event>)`, an
+  existing tested path, so there is no new IR op, no new runtime state and no new
+  wait engine. Because the classification is at the write, a fire always means a
+  real change of the kind that waiter asked for: `p = p` fires nothing at all, and
+  the waiter needs no snapshot and no re-comparison on resume.
+  **Granularity: per property per edge, not per object.** A per-object notifier
+  would also have been correct (9.4.2 forces a value comparison somewhere), but it
+  is strictly worse here for one concrete reason: `uvm_event` writes `num_waiters`,
+  `m_event`, `trigger_data` and `on` through the same object, so every unrelated
+  write would wake every `@on` waiter and each would have to re-compare. Per
+  property costs one hidden field per waited property and gives exact wakes.
+  Per-EDGE on top of that is what makes edges exact rather than approximate: with
+  one shared notifier a same-instant `0->1->0` pulse would wake a `posedge` waiter
+  that then re-reads 0 and misses the edge, whereas classifying at the write cannot
+  miss it. Only the edges the design uses are laid out, so `@p` alone costs one
+  field and `@(posedge p)` alone costs one, never three.
+  **Zero cost for a class nothing waits on**, by construction and asserted:
+  a design-wide pre-pass (`WaitPropScan`, modelled on `EventMergeScan`) collects the
+  (property, edge) pairs before any class is laid out — it must, since
+  `lower_class_type` runs on demand from the first reference anywhere and can
+  precede the `@` that needs a notifier. An unnamed class gets no field, no store
+  barrier and no descriptor change; `Module::change_notify`'s empty-table early-out
+  means even the compile-time question folds away. `tests/class_test.cpp` pins the
+  field lists on both sides of that line.
+  **Write paths**, enumerated from the code rather than guessed. The notifier rides
+  `service_snapshot` / `service_after_write`, which is already documented as THE
+  bracket around every blocking write path, so all ten sites are covered by
+  construction and a new one cannot forget: `Store`, the dyn/queue element store,
+  `$fgets`, `$sformat`/`$swrite`, `$ferror`, `$fscanf`/`$sscanf`, `$value$plusargs`,
+  `$fread`, and the `ref` actual bracket at a function call and at a task call.
+  That last pair is what makes a `ref` formal work at all, since a `ref` is a raw
+  aliased pointer the callee writes through and never copies back. Also covered,
+  through `Store`: a base-class method writing an inherited property (which is why
+  a notifier is laid out immediately AFTER its property — appending after all
+  properties would give the base and the derived class different indices and break
+  prefix layout), `randomize()` writeback, and `output`/`inout` copy-out. Refused
+  loudly, not silently: a non-integral property in either construct (no old -> new
+  transition to classify), and `wait` over a condition whose only class-property
+  reads are non-notifiable — that one used to be the silent park. NBA to a class
+  property was already refused (TODO.md:1242), so that path cannot exist.
+  **One inherited imprecision, uniform with signals**: a `ref` bound to a property
+  and written by a task AFTER an intervening suspend wakes at the task's RETURN
+  rather than at the write, because the bracket is at the call site and the callee
+  writes through a bare pointer. Measured identical for a `ref` to an ordinary
+  signal, so it is a property of clotho's `ref` ABI, not of this feature.
+  **Oracle**: Verilator 5.050 agrees on every shape it can run (`woke at 1` for all
+  three headline cases, and byte-identical on the mock `uvm_event`); it *aborts*
+  with "Null pointer dereferenced" on `wait(c.on && g)`, resolving the handle too
+  early — the bug clotho just fixed. iverilog 13 is no oracle: it rejects all three
+  ("cannot synthesize expression: @.<0>", and for the `wait` form "Empty NexusSet
+  from wait expression", which is the very same root cause named out loud).
+  Table 9-2 edge behaviour is pinned to clotho's existing signal path, asserted
+  equal to it in the same test; Verilator diverges there for signals too (it does
+  not treat `x -> 0` as a negedge).
+  Covered in tests/event_test.cpp, tests/wait_test.cpp and tests/class_test.cpp,
+  including the four distinct UVM call shapes: `@on`, `@(obj.p)`,
+  `wait(obj.p)`, and `@(m_events[obj].raised)` on an object held in an associative
+  array keyed by a class handle (uvm_objection.svh:1078) — the last works with
+  nothing added, because the notifier handle is loaded from whatever object the
+  expression evaluates to at the moment the statement runs.
 - [x] **Named events** (LRM 15.5) — `event e;`, `-> e`, `->> e`, `->> #d e`,
   `@(e)` / `always @(e)`, `wait(e.triggered)`, at module, package, generate,
   procedural-block and `static`-local scope. An event is an OBJECT (trigger tick +

@@ -247,6 +247,157 @@ dereference that skips the guard is the one rooted directly at `ClassNew` — th
 property default-initializer stores every `new` emits — since that handle is the
 address `rt_alloc` just returned.
 
+## Waiting on a property (LRM 9.4.2 / 9.4.3)
+
+`@p`, `@(obj.p)`, `@(posedge obj.p)` and `wait(<cond reading p>)` work for an
+integral instance property. This section records the granularity decision, because
+a future reader must not have to re-derive it.
+
+The blocker was Accellera UVM. `uvm_event_base::wait_off`
+(`base/uvm_event.svh:120`) parks on `@on`, where `on` is the `protected bit`
+declared at :54, and nothing in a UVM run gets past it. Three failure modes,
+one of them silent:
+
+| Shape | Before |
+|---|---|
+| `@p` in a method | `error: reference to unknown signal 'on'` |
+| `@(obj.p)` | `fatal: dereference of a null class handle, at 0 s` — the object was resolved while the process was being BUILT, before `obj = new` ran |
+| `wait(p)` | **silently never woke.** No diagnostic anywhere |
+
+The silent one is the important one. `lower_wait_stmt` lowers `wait(c)` to
+`forever { if (c) break; @(read set of c); }`, and `collect_expr_reads` collects
+**signals**. A property is heap storage inside an object and is not a signal, so
+the read set came back empty, the `@()` had no sensitivity, and the process parked
+on something nothing could ever fire. iverilog names the same root cause out loud
+("Empty NexusSet from wait expression"); clotho said nothing.
+
+### The mechanism
+
+A property that some `@` / `wait` in the design waits on carries hidden
+`event`-typed **sibling properties** — its change notifiers, one per waited edge
+(`ir::ChangeNotify`, named `$chg.<prop>[.pos|.neg]` the way the rand block's rows
+are named `$rand.*`). A blocking store to the property classifies its own
+`old -> new` transition through the *same* `emit_edge_facts` a store to a signal
+uses, then wakes the waiter lists of the notifiers whose edge that transition
+produced (`service_change_notify`, structurally `service_wait_queue` with the
+lists reached through the object instead of through per-signal globals).
+
+Waiting is then *literally* `@(obj.<hidden event>)`: an existing, tested path
+(`WaitEvent::handle`, `emit_event_link`). So the feature adds **no** IR op, **no**
+runtime state and **no** wait engine — the notifier is an ordinary event property,
+minted by `emit_class_body_init` at `new` like any event leaf, with the waiter
+list, the wake walk and the GC treatment it already had.
+
+Two consequences worth stating, because they are what make the waiter side
+trivial:
+
+- **A fire always means a real change of the kind that waiter asked for.** So the
+  waiter wakes unconditionally on resume: no value snapshot in its frame, no
+  re-comparison. `p = p` fires nothing at all rather than waking a waiter that
+  then has to discover the write was a no-op — which is 9.4.2's "any CHANGE in the
+  value" doing observable work at the cheapest possible place.
+- **The object is resolved when the statement EXECUTES**, because the notifier
+  handle is loaded from whatever the object expression evaluates to right there.
+  That is what fixes `@(c.p)` in a forked process, and it is why
+  `@(m_events[obj].raised)` — an object held in an associative array keyed by a
+  class handle, `uvm_objection.svh:1078` — works with nothing added. A null object
+  is the ordinary located fatal (LRM 8.4), reported at the time the statement ran.
+
+### Granularity: per property, per edge
+
+The alternative was **one notifier per object**, waking every waiter of that
+object on any write to any waited property. That is also *correct* — 9.4.2 forces
+a value comparison somewhere, so a coarse notifier only ever over-wakes — and it
+is less memory and a simpler barrier. It was rejected for one concrete reason:
+`uvm_event` writes `num_waiters`, `m_event` and `trigger_data` through the same
+object as `on`, so every unrelated write would wake every `@on` waiter, and each
+would then need the value comparison the per-property scheme deletes outright.
+One hidden field per waited property buys exact wakes and a barrier that is not
+meaningfully harder.
+
+Splitting **per edge** on top of that is what makes edges exact rather than
+approximate, and it is the reason edges came out uniform instead of refused. With
+one shared notifier an edge waiter has to classify on resume, and a same-instant
+`0 -> 1 -> 0` pulse then wakes it to a re-read of 0 — the posedge is missed.
+Classifying at the write cannot miss it. Table 9-2 therefore applies unchanged,
+x/z included, and `tests/event_test.cpp` asserts the property result *equal to*
+the identical signal-only design rather than merely correct-looking: the claim is
+uniformity, not plausibility.
+
+Only the edges the design actually uses are laid out. `@p` alone costs one hidden
+field, `@(posedge p)` alone costs one, never three.
+
+### Layout: immediately after the property, not appended
+
+The rand block sits *after* every declared property, which is sound only because
+nothing addresses it from a statically unknown type. A notifier cannot do that: a
+**base-class method** writing an inherited property has to fire the notifier at
+the base-relative field index, and appending would give the base and each derived
+class different offsets. So a notifier is interleaved immediately after its
+property, which keeps the base's whole flattened table a prefix of every derived
+class's — the invariant prefix layout already rests on. `B { on, pad }` with `on`
+waited on becomes `{ on, $chg.on, pad }`, and `D extends B` becomes
+`{ on, $chg.on, pad, extra }`. `reserve_change_notifiers` re-derives the index on
+each pass over the chain and fails loudly if the two disagree.
+
+`$copy` (LRM 8.12) **skips** notifier rows. Copying the source's handle would
+alias one waiter list into two objects and orphan every waiter already parked on
+the destination's own notifier — a silent hang for a process that was correctly
+waiting, i.e. the exact bug class this work removes.
+
+### Zero cost for a class nothing waits on
+
+By construction, and asserted. A design-wide pre-pass (`WaitPropScan`, modelled
+on the `EventMergeScan` that computes `events_merge`) collects the
+(property, edge) pairs before any class is laid out. It has to run there: a
+`lower_class_type` fires on demand from the first reference anywhere under any
+top, which can precede the `@` that needs the notifier.
+
+A class no `@` / `wait` names gains no field, no store barrier and no descriptor
+change, and `Module::change_notify`'s empty-table early-out folds away even the
+compile-time question at every member select. `tests/class_test.cpp` pins the
+field lists on both sides of the line, on the same class, differing only in
+whether something waits:
+
+```
+no waiter:  class{on:bit, n:signed bit[31:0]}
+one waiter: class{on:bit, $chg.on:event, n:signed bit[31:0]}
+```
+
+`n` is written in both designs and gains nothing either way — the barrier is per
+property, not per class.
+
+### Write paths
+
+The notifier rides `service_snapshot` / `service_after_write`, which is already
+*the* bracket around every blocking write path, so every site is covered by
+construction and a newly added one cannot forget: `Store`, the dyn/queue element
+store, `$fgets`, `$sformat` / `$swrite`, `$ferror`, `$fscanf` / `$sscanf`,
+`$value$plusargs`, `$fread`, and the `ref`-actual bracket at a function call and
+at a task call. That last pair is the whole reason a `ref` formal works, since a
+`ref` is a raw aliased pointer the callee writes through and never copies back.
+Also covered through `Store`: a base-class method, `randomize()` writeback, and
+`output` / `inout` copy-out.
+
+Refused loudly rather than silently: a non-integral property in either construct
+(no `old -> new` transition to classify), and a `wait` whose only class-property
+reads are non-notifiable — that last one *was* the silent park. NBA to a class
+property is already refused elsewhere, so that path cannot arise.
+
+One imprecision is inherited rather than introduced: a `ref` bound to a property
+and written by a task *after* an intervening suspend wakes at the task's return
+rather than at the write, because the bracket is at the call site. Measured
+identical for a `ref` to an ordinary signal, so it is a property of the `ref` ABI.
+
+### Oracle
+
+Verilator 5.050 agrees on every shape it can run, including byte-identically on a
+mock `uvm_event`. It *aborts* with "Null pointer dereferenced" on
+`wait(c.on && g)` — resolving the handle too early, the bug clotho just fixed.
+iverilog 13 is no oracle here: it rejects all three headline shapes. Table 9-2
+behaviour is pinned to clotho's own signal path (Verilator diverges there for
+signals too, not treating `x -> 0` as a negedge).
+
 ## Implementation deviations from the scope-out below
 
 Two simplifications versus the original plan; both reduce code and risk while
