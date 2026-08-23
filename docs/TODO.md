@@ -939,6 +939,93 @@ professional parity; M5 makes it complete.
 - [x] **String formatting** (§21.3.3, §21.3.6) — `$sformat`, `$swrite`,
   `$ferror`. `$ferror` into a `string` object writes the message via
   `rt_ferror_str`, same error-code semantics as the packed-vector path.
+- [x] **A `$sformat` / `$sformatf` format that is not a string literal**
+  (§21.3.3). The clause makes these two the one exception in the family: "The
+  format arguments to these tasks must be string literals, i.e., they cannot be
+  expressions of string data type. The only exception is `$sformat`, whose second
+  argument can be an expression of string data type." Clotho used to refuse every
+  non-literal format with a TODO claiming a runtime format "needs dynamic string
+  support, which Clotho lacks". **That premise was stale**: `rt_sformat` /
+  `rt_sformat_str` have always parsed the format at run time, and `rt_arg` has
+  always been a tagged descriptor carrying width, signedness and the string / real
+  flags. Only the frontend was baking the format into a constant. Two paths now:
+
+  **A CONSTANT format folds and costs nothing.** The blocker that motivated this
+  is Accellera UVM's `uvm_phase.svh:1963`, whose jump-failure message is a
+  four-piece concatenation of string literals — not a literal, but a compile-time
+  constant, as are a `localparam string` and a stringified macro.
+  `const_format_text` evaluates the format expression through slang's
+  `ASTContext` / `EvalContext` and hands the text to the EXISTING compile-time
+  path (`build_format`'s new `lead_text`), so specifier validation, `%m` / `%l`
+  splicing and `%p` expansion all come for free. A concatenation has type
+  `bit[N]` (LRM 5.9), so the constant arrives as an integral whose bytes are the
+  text; `ConstantValue::convertToStr()` is slang's own LRM 6.16 conversion (8-bit
+  chunks most significant first, a zero chunk dropped, a short leading chunk when
+  `N` is not a multiple of 8) and is the same rule `rt_string_from_packed` applies
+  at run time, so a folded format and a computed one that hold the same bits
+  agree. Verified free: `clotho build --emit ir` for `$sformat(s, "a=%0d b=%0d",
+  1, 2)` and for the equivalent concatenation are IDENTICAL modulo the file name
+  in the source locations, and both emit the same `rt_sformat_str` call with the
+  baked format global and a null dynamic context.
+
+  **A genuinely RUNTIME format pays only for itself.** The format's `rt_string`
+  hands the renderer its own NUL-terminated character buffer (`rt_string_data`,
+  the guarantee the DPI `string` argument path already relies on) — no copy, read
+  only within the call, never retained; an empty string is a pointer to a NUL and
+  renders nothing. Text past an embedded NUL is unreachable, since a `const char*`
+  format cannot express one. Each value argument is marshalled raw into an
+  `rt_arg`, because which specifier it will meet is not knowable at compile time,
+  and the renderer then does everything `build_format` used to do in the IR: the
+  LRM 6.12.1 integral↔real reconciliation, the `%t` tick scaling, and `%p`. The
+  one call-site fact it cannot derive is the calling module's ticks-per-time-unit,
+  which rides a new `rt_fmt_dyn` (null on the constant path, so that path takes no
+  extra branch). `%p` of a singular value gained a runtime case
+  (`render_p_scalar`), which mirrors `expand_p_scalar` deliberately and says so on
+  both sides: minimal decimal at the operand's own signedness, `%g` for a real,
+  quotes around a string. The IR carries the format as a real SSA operand
+  (`SformatInfo` / `SformatfInfo::fmt_value`, reported through
+  `ExtraOperandTail`), so def-use, liveness and DCE see it.
+
+  **Refused loudly, never approximated.** An aggregate or container argument
+  against a runtime format is a COMPILE error naming the argument position and the
+  type kind ("$sformat argument 4 is an unpacked struct"): `rt_arg` has no image of
+  an aggregate, and with a format unknown until run time the frontend cannot tell
+  whether the argument will meet a `%p` and so cannot expand one. At run time,
+  every rejection `check_specifier` makes at compile time is made again with the
+  text in hand — an undefined conversion, `%v`, more specifiers than arguments, a
+  string under a numeric conversion, `%c` / `%u` / `%z` of a real — each a located
+  fatal naming the specifier, with a source caret and the simulation time, never
+  wrong text.
+
+  **`$display` / `$write` are deliberately unchanged and clause-backed.** Their
+  format must be a literal, so `$display({"a=%0d ", "b=%0d"}, 1, 2)` correctly
+  prints the concatenation as one integral value and `$display(f, 7)` prints `f`
+  under `%s` followed by a bare `7`. Verilator 5.050 agrees byte for byte;
+  iverilog is lenient that treats both as formats, and is wrong on the
+  clause. Pinned by a regression test in `display_test.cpp` so nothing added to
+  the shared `build_format` can leak `$sformat`'s exception into the family.
+  iverilog 13 and Verilator 5.050 do agree with each other, and with Clotho, on
+  every `$sformat` shape above.
+- [ ] **`%m` / `%l` in a runtime `$sformat` format** — they name the invoking
+  scope, which only the compiler knows; `append_format_literal` splices the text
+  in for a constant format and the renderer never learns either name. Would need
+  the hierarchical name and the `library.cell` to ride the IR record (two more
+  byte runs on `SformatInfo` / `SformatfInfo`) and reach the renderer through
+  `rt_fmt_dyn`.
+- [ ] **An aggregate or container argument to a runtime `$sformat` format** —
+  refused today (above). Clotho already has runtime container descriptors for
+  `%p` of a queue / dynamic array (`ir::Inst::Tag::ContainerFmtP` →
+  `rt_container_fmt_p`), so a future version could pass a type descriptor
+  alongside each `rt_arg` and let the renderer walk the value once it turns out
+  to meet a `%p`.
+- [ ] **An operand wider than 64 bits under `%e` / `%f` / `%g` from a runtime
+  format** — the constant path handles it (`ItoF` lowers to `SIToFP` on the full
+  `iW`); accumulating the planes in the renderer would round at every word
+  boundary instead of once, so it refuses rather than being quietly off.
+- [ ] **An empty argument (adjacent commas) against a runtime `$sformat` format**
+  — an empty argument contributes format TEXT (LRM 21.2.1), and there is no format
+  text at compile time to contribute to. Would need a "renders as a space,
+  consumes no specifier" marker in `rt_arg`.
 - [x] **Format scanning** (§21.3.4) — `$fscanf`, `$sscanf`.
 - [x] **Binary read** (§21.3.4) — `$fread` into a scalar or unpacked-array memory.
 - [x] **Command-line plusargs** (§21.6) — `$test$plusargs` / `$value$plusargs`.

@@ -868,6 +868,27 @@ struct DistBinaryInfo {
     uint32_t fn;
 };
 
+// `SformatInfo::fmt_value` / `SformatfInfo::fmt_value` is absent: the format is
+// the constant bytes at `fmt`, validated and %p-expanded at lower time.
+inline constexpr Index kNoFormatValue = static_cast<Index>(~uint32_t{ 0 });
+
+// Design ticks per the calling module's time unit -- the multiplier a %t operand
+// needs (LRM §20.4.3) -- carried as two words rather than one uint64_t: an extra
+// payload must have no padding (see the ExtraPayload concept), and an 8-byte
+// member would introduce some in the odd-worded SformatfInfo.
+struct TickScale {
+    uint32_t lo;
+    uint32_t hi;
+
+    uint64_t value() const {
+        return (uint64_t{ hi } << 32) | uint64_t{ lo };
+    }
+
+    static TickScale of(uint64_t v) {
+        return TickScale{ static_cast<uint32_t>(v), static_cast<uint32_t>(v >> 32) };
+    }
+};
+
 // Extra payload for `sformat`: $sformat / $swrite (LRM §21.3.3) format the value
 // args per the packed format-string bytes at `fmt` (`fmt_len` bytes) and store the
 // result into the destination string lvalue `dst`. `args` is the value-operand
@@ -881,6 +902,13 @@ struct SformatInfo {
     uint32_t fmt_len;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // The format as a runtime STRING VALUE, for the $sformat form LRM §21.3.3
+    // exempts from the literal-format rule; kNoFormatValue on the ordinary path,
+    // where `fmt` / `fmt_len` carry the text instead. Never both.
+    Index fmt_value;
+    // Only read with `fmt_value`: with a constant format the frontend has already
+    // scaled every %t operand (Lower.cpp scale_to_ticks).
+    TickScale tick_scale;
 };
 
 // Extra payload for `sformatf`: $sformatf (LRM §21.3.3) formats the value args
@@ -893,6 +921,10 @@ struct SformatfInfo {
     uint32_t fmt_len;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // As SformatInfo::fmt_value.
+    Index fmt_value;
+    // As SformatInfo::tick_scale.
+    TickScale tick_scale;
 };
 
 // Extra payload for `fscanf` / `sscanf` (LRM §21.3.4): parse `source` per the
@@ -2720,9 +2752,13 @@ static_assert(extra_operand_shapes_total(), "every PayloadKind::Extra tag needs 
 // operands() returns one `std::span`, so a tag whose variadic run lives in the
 // extra buffer cannot also expose a scalar that lives elsewhere -- the two are
 // not contiguous and copying the run out is the cost the zero-copy view exists
-// to avoid. Six tags are in that position. This table names what each one keeps
+// to avoid. Seven tags are in that position. This table names what each one keeps
 // back, and `Ir::for_each_operand` visits it, so a walk that must see every use
 // (def-use, liveness, DCE) has a total interface while the span stays fast.
+//
+// Two tails are CONDITIONAL -- WaitHandles (an edge may name its signal directly)
+// and SformatfFmt (the format is a value only for the runtime-format form) -- so
+// a tail-classified tag does not always contribute an operand.
 enum class ExtraOperandTail : uint8_t {
     // operands() is already total for this tag.
     None,
@@ -2731,8 +2767,13 @@ enum class ExtraOperandTail : uint8_t {
     Descriptor,
     // + SformatInfo::dst: $sformat's destination lvalue. An lvalue IS an
     // operand by this codebase's convention -- Store's lhs, AggCopy's op/src
-    // and every queue handle are all reported.
+    // and every queue handle are all reported. Plus SformatInfo::fmt_value when
+    // the format is a runtime string value rather than constant bytes.
     SformatDst,
+    // + SformatfInfo::fmt_value, when $sformatf's format is a runtime string
+    // value. $sformatf has no destination operand -- its result IS the value --
+    // so this is the whole tail.
+    SformatfFmt,
     // + ScanfInfo::source: the string or descriptor being scanned. The span
     // holds the output lvalues.
     ScanfSource,
@@ -2761,6 +2802,8 @@ constexpr ExtraOperandTail extra_operand_tail(Inst::Tag tag) {
         case T::Fscanf:
         case T::Sscanf:
             return E::ScanfSource;
+        case T::Sformatf:
+            return E::SformatfFmt;
         case T::InsideSet:
             return E::InsideSetMembers;
         case T::Wait:
@@ -2770,11 +2813,12 @@ constexpr ExtraOperandTail extra_operand_tail(Inst::Tag tag) {
     }
 }
 
-// Three of the four tails are implied by the payload kind, so they can be
+// Four of the five tails are implied by the payload kind, so they can be
 // checked as a biconditional: a new tag on PayloadKind::FDisplay / Sformat /
-// Scanf fails the build until it is classified, and a tag wrongly given one of
-// those tails fails too. InsideSetMembers is tag-specific (InsideSet shares
-// PayloadKind::OpExtra with ~40 others), so it gets the one-way check.
+// Sformatf / Scanf fails the build until it is classified, and a tag wrongly
+// given one of those tails fails too. InsideSetMembers is tag-specific
+// (InsideSet shares PayloadKind::OpExtra with ~40 others), so it gets the
+// one-way check.
 constexpr bool extra_operand_tails_total() {
     for (unsigned v = 0; v <= 0xFF; ++v) {
         const auto tag  = static_cast<Inst::Tag>(v);
@@ -2790,6 +2834,9 @@ constexpr bool extra_operand_tails_total() {
         if ((kind == Inst::PayloadKind::Scanf) != (tail == ExtraOperandTail::ScanfSource)) {
             return false;
         }
+        if ((kind == Inst::PayloadKind::Sformatf) != (tail == ExtraOperandTail::SformatfFmt)) {
+            return false;
+        }
         if (tail == ExtraOperandTail::InsideSetMembers && tag != Inst::Tag::InsideSet) {
             return false;
         }
@@ -2799,7 +2846,8 @@ constexpr bool extra_operand_tails_total() {
 }
 
 static_assert(extra_operand_tails_total(),
-              "a tag on PayloadKind::FDisplay / Sformat / Scanf needs its extra_operand_tail() case");
+              "a tag on PayloadKind::FDisplay / Sformat / Sformatf / Scanf needs its "
+              "extra_operand_tail() case");
 
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
@@ -2946,9 +2994,21 @@ public:
             case ExtraOperandTail::Descriptor:
                 fn(p.op_extra.op);
                 return;
-            case ExtraOperandTail::SformatDst:
-                fn(extra_data<SformatInfo>(p.extra).dst);
+            case ExtraOperandTail::SformatDst: {
+                const auto info = extra_data<SformatInfo>(p.extra);
+                fn(info.dst);
+                if (info.fmt_value != kNoFormatValue) {
+                    fn(info.fmt_value);
+                }
                 return;
+            }
+            case ExtraOperandTail::SformatfFmt: {
+                const auto info = extra_data<SformatfInfo>(p.extra);
+                if (info.fmt_value != kNoFormatValue) {
+                    fn(info.fmt_value);
+                }
+                return;
+            }
             case ExtraOperandTail::ScanfSource:
                 fn(extra_data<ScanfInfo>(p.extra).source);
                 return;

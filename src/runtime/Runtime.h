@@ -597,20 +597,44 @@ int32_t rt_rewind(int32_t fd);
 // iW value — only `width` bits are written and `z` is null.
 int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd, uint32_t flags);
 
+// What a format string that only exists at RUN TIME needs from its call site,
+// and a compile-time one does not. LRM §21.3.3 exempts $sformat / $sformatf from
+// the literal-format rule ("The only exception is $sformat, whose second
+// argument can be an expression of string data type"), so their format text may
+// first exist as an rt_string. With a literal format the frontend resolves
+// everything call-site-dependent at lower time -- Lower.cpp's
+// append_format_literal splices %m / %l, scale_to_ticks pre-scales a %t operand,
+// build_format picks each argument's conversion -- and none of it reaches here.
+// A runtime format leaves all of it to the renderer, which needs these facts.
+//
+// Null selects the compile-time path: `fmt` then carries nothing the frontend
+// left behind, so the renderer takes no extra branch and the descriptors are
+// already conversion-matched.
+typedef struct rt_fmt_dyn {
+    // Design ticks per the calling module's time unit: the multiplier
+    // Lower.cpp's scale_to_ticks would have applied to a %t operand (LRM
+    // §20.4.3). 1 when the two coincide.
+    uint64_t time_mul;
+    // The $sformat / $sformatf statement, so a report about the format's own
+    // contents can point at the call rather than at the renderer.
+    const rt_alloc_site* site;
+} rt_fmt_dyn;
+
 // $sformat / $swrite (LRM §21.3.3): format `fmt` with `argc` descriptors (as
 // rt_fwrite) and store the result into the destination string variable, whose
 // must|may plane is at `mm` (2*`width` bits) and z plane at `z` (`width` bits).
 // Stored right-justified; an oversized result keeps its low bytes. `width` must be
-// a multiple of 8. `flags` as rt_fgets.
+// a multiple of 8. `flags` as rt_fgets. `dyn` non-null when `fmt` came from a
+// runtime string expression.
 void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc, const rt_arg* argv,
-                uint32_t flags);
+                uint32_t flags, const rt_fmt_dyn* dyn);
 
 // $sformatf / $sformat into a string-object destination: format as rt_fwrite
 // and assign the result to the rt_string at `dst` (declared below). `site`
-// locates the format call for an allocation-failure report.
+// locates the format call for an allocation-failure report. `dyn` as rt_sformat.
 struct rt_string;
 void rt_sformat_str(struct rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv,
-                    const rt_alloc_site* site);
+                    const rt_alloc_site* site, const rt_fmt_dyn* dyn);
 
 // $fgets(str, fd) into a `string` destination: no fixed width, so the whole
 // line is read (stopping after a newline or at EOF) and assigned to `dst`.

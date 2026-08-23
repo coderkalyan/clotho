@@ -19704,17 +19704,26 @@ private:
         return { std::string::npos, 0 };
     }
 
+    // `lead_text` is format text that is not one of `format_args`: the constant a
+    // $sformat / $sformatf format expression folded to (see const_format_text).
+    // It is consumed exactly as a string-literal argument would be, so a folded
+    // format gets the same specifier validation, %m / %l splicing and %p
+    // expansion, and queues its specifiers for the value args that follow.
     void build_format(std::span<const Expression* const> format_args,
                       std::string&                       fmt,
                       std::vector<ir::Index>&            args,
                       ir::Builder&                       b,
-                      char                               default_conv = 'd') {
+                      char                               default_conv = 'd',
+                      std::string_view                   lead_text    = {}) {
         // Conversion chars (lowercase) of specifiers seen but not yet matched to
         // a value arg, in order (FIFO). Needed so a `%t` argument can be scaled
         // to ticks and a string object checked against %s.
         std::vector<char> pending;
         size_t            next = 0; // front of `pending`
 
+        if (!lead_text.empty()) {
+            append_format_literal(fmt, lead_text, pending);
+        }
         for (const Expression* arg : format_args) {
             if (arg->kind == ExpressionKind::EmptyArgument) {
                 // An empty argument (adjacent commas) displays one space
@@ -19933,56 +19942,216 @@ private:
         b.fdisplay(fd, fmt, newline, args, loc(call));
     }
 
+    // The constant text of a $sformat / $sformatf format argument, when it has
+    // one. LRM §21.3.3 makes these two the exception to the literal-format rule
+    // ("The only exception is $sformat, whose second argument can be an
+    // expression of string data type"), but most formats that are not literals
+    // are still CONSTANT: the shape that motivated this is a concatenation of
+    // string literals (Accellera UVM uvm_phase.svh:1963 builds its jump-failure
+    // message that way), and a `localparam string` or a stringified macro is the
+    // same situation. Folding one recovers the whole compile-time path --
+    // specifier validation, %m / %l splicing, %p expansion, a baked format global
+    // -- and leaves nothing to parse at run time.
+    //
+    // A concatenation of string literals has type bit[N] (LRM 5.9), not string, so
+    // the folded value arrives as an integral whose bytes are the text.
+    // convertToStr() is slang's LRM 6.16 conversion: 8-bit chunks most
+    // significant first, a zero chunk dropped, and a short leading chunk when N is
+    // not a multiple of 8. That is the same rule rt_string_from_packed applies at
+    // run time, so a folded format and a computed one that hold the same bits
+    // agree. It also answers the leading/trailing NUL question outright: a NUL
+    // byte is not part of the string, so `{"ab", 8'h00, "cd"}` folds to "abcd".
+    std::optional<std::string> const_format_text(const Expression& e) {
+        slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    ectx(actx);
+        const slang::ConstantValue cv = e.eval(ectx).convertToStr();
+        if (!cv) {
+            return std::nullopt;
+        }
+        return cv.str();
+    }
+
+    // The noun a refusal names an argument type by. Only the kinds a runtime
+    // format cannot describe reach here -- rt_arg carries exactly one integral,
+    // real or string value -- so the list is the complement of that.
+    static std::string_view value_type_noun(const slang::ast::Type& t) {
+        if (t.isUnpackedStruct()) {
+            return "an unpacked struct";
+        }
+        if (t.isUnpackedUnion()) {
+            return "an unpacked union";
+        }
+        if (t.isQueue()) {
+            return "a queue";
+        }
+        if (t.isAssociativeArray()) {
+            return "an associative array";
+        }
+        if (t.isDynamicallySizedArray()) {
+            return "a dynamic array";
+        }
+        if (t.isUnpackedArray()) {
+            return "a fixed unpacked array";
+        }
+        if (t.isClass()) {
+            return "a class handle";
+        }
+        if (t.isCHandle()) {
+            return "a chandle";
+        }
+        if (t.isEvent()) {
+            return "an event";
+        }
+        if (t.isVirtualInterface()) {
+            return "a virtual interface handle";
+        }
+        return "neither an integral, a real nor a string";
+    }
+
+    // Lower the format expression and the value arguments of a $sformat /
+    // $sformatf whose format only exists at run time. Yields the format's string
+    // value; the value args are appended to `args` raw.
+    //
+    // Raw, because which specifier an argument will meet is not knowable here --
+    // that is the whole difference from build_format, which reads the conversion
+    // out of the format text and fixes the argument up in the IR (%t scaling, the
+    // real/integral conversion, %p expansion). All of that moves to the runtime
+    // renderer, which sees both at once; rt_fmt_dyn carries the one call-site fact
+    // it cannot derive, the tick multiplier.
+    //
+    // `first_pos` is the 1-based call-argument position of value_args[0], so a
+    // refusal can name the argument the user wrote.
+    ir::Index lower_dynamic_format(const Expression&                  fmt_expr,
+                                   std::span<const Expression* const> value_args,
+                                   size_t                             first_pos,
+                                   std::vector<ir::Index>&            args,
+                                   ir::Builder&                       b,
+                                   std::string_view                   who) {
+        if (!is_string_expr(fmt_expr) && !fmt_expr.type->isIntegral()) {
+            // slang admits any canBeStringLike format operand, which leaves one
+            // shape with no conversion to format text here: a byte array (an
+            // unpacked array of bytes), whose characters live one per element
+            // rather than packed.
+            // TODO: a byte-array / byte-queue $sformat format. It would lower as a
+            // stream to a string (LRM 11.4.14) before reaching the renderer.
+            fail(std::string(who) + " format is " +
+                 std::string(value_type_noun(fmt_expr.type->getCanonicalType())) +
+                 "; a runtime format must be a string or a packed value (LRM 21.3.3)");
+        }
+        // A format that is not a `string` is still string-like: convert it by the
+        // LRM 6.16 rule, exactly the conversion const_format_text applies to a
+        // constant one, so the same source shape renders the same text whether or
+        // not it folds.
+        const ir::Index fv =
+          is_string_expr(fmt_expr)
+            ? lower_expr(fmt_expr, b)
+            : b.unary(ir::Inst::Tag::StrFromPacked, lower_expr(fmt_expr, b), loc(fmt_expr));
+
+        for (size_t k = 0; k < value_args.size(); ++k) {
+            const Expression& arg = *value_args[k];
+            const std::string at  = std::string(who) + " argument " + std::to_string(first_pos + k);
+            if (arg.kind == ExpressionKind::EmptyArgument) {
+                // An empty argument (adjacent commas) contributes a space to the
+                // FORMAT (LRM 21.2.1), which only exists here when the format text
+                // is known. With a runtime format there is nothing to contribute
+                // to, and the argument consumes no specifier either.
+                // TODO: an empty argument against a runtime format string. It
+                // would need a per-argument "renders as a space, consumes no
+                // specifier" marker in rt_arg for the renderer to honor.
+                fail(at + " is empty, which a runtime format string cannot render: an "
+                          "empty argument contributes format text, and there is no "
+                          "format text here to contribute to");
+            }
+            const slang::ast::Type& ct = arg.type->getCanonicalType();
+            if (!ct.isIntegral() && !ct.isFloating() && !ct.isString()) {
+                // TODO: an aggregate or container argument against a runtime format
+                // string. Clotho already has runtime container descriptors for %p
+                // of a queue / dynamic array (ir::Inst::Tag::ContainerFmtP ->
+                // rt_container_fmt_p), so a future version could pass a type
+                // descriptor alongside each rt_arg and let the renderer walk the
+                // value when it turns out to meet a %p. Refused rather than
+                // approximated: rt_arg has no image of an aggregate at all, so the
+                // alternative is silently wrong text.
+                fail(at + " is " + std::string(value_type_noun(ct)) +
+                     ", which a runtime format string cannot render: the runtime argument "
+                     "descriptor carries one integral, real or string value, and with a "
+                     "format that is not known until run time the frontend cannot tell "
+                     "which specifier the argument will meet, so it cannot expand %p "
+                     "either (LRM 21.2.1.6)");
+            }
+            args.push_back(lower_expr(arg, b));
+        }
+        return fv;
+    }
+
     // Lower $sformat / $swrite (LRM §21.3.3): render the trailing arguments like
     // $write and store the result into the destination string lvalue (the first
-    // argument). $sformat's format (its second argument) must be a string literal;
-    // $swrite takes $write-style interleaved literals and values.
+    // argument). $swrite takes $write-style interleaved literals and values.
+    //
+    // $sformat's format is its second argument, and LRM §21.3.3 exempts it from
+    // the literal-format rule the rest of the format tasks obey. Three cases, in
+    // decreasing order of what is known: a literal, a constant expression (folded
+    // by const_format_text onto the same path), and a genuinely runtime string.
     void lower_sformat(const CallExpression& call, bool is_sformat, ir::Builder& b, char default_conv = 'd') {
         const auto args = call.arguments();
         if (args.empty()) {
             fail("$sformat / $swrite requires a destination string argument");
         }
-        if (is_sformat) {
-            if (args.size() < 2) {
-                fail("$sformat requires a format-string argument");
-            }
-            const Expression* fmt = args[1];
-            while (fmt->kind == ExpressionKind::Conversion) {
-                fmt = &fmt->as<ConversionExpression>().operand();
-            }
-            if (fmt->kind != ExpressionKind::StringLiteral) {
-                // TODO: a runtime (non-literal) $sformat format string needs
-                // dynamic string support, which Clotho lacks.
-                fail("$sformat format must be a string literal");
-            }
-        }
-        const ir::Index        dst = lower_lvalue(*args[0], b);
         std::string            fmt;
         std::vector<ir::Index> values;
-        build_format(args.subspan(1), fmt, values, b, default_conv);
-        b.sformat(dst, fmt, values, loc(call));
+        if (!is_sformat) {
+            const ir::Index dst = lower_lvalue(*args[0], b);
+            build_format(args.subspan(1), fmt, values, b, default_conv);
+            b.sformat(dst, fmt, values, loc(call));
+            return;
+        }
+        if (args.size() < 2) {
+            fail("$sformat requires a format-string argument");
+        }
+        const Expression* lit = args[1];
+        while (lit->kind == ExpressionKind::Conversion) {
+            lit = &lit->as<ConversionExpression>().operand();
+        }
+        const ir::Index dst = lower_lvalue(*args[0], b);
+        if (lit->kind == ExpressionKind::StringLiteral) {
+            build_format(args.subspan(1), fmt, values, b, default_conv);
+            b.sformat(dst, fmt, values, loc(call));
+            return;
+        }
+        if (const std::optional<std::string> text = const_format_text(*args[1])) {
+            build_format(args.subspan(2), fmt, values, b, default_conv, *text);
+            b.sformat(dst, fmt, values, loc(call));
+            return;
+        }
+        const ir::Index fv =
+          lower_dynamic_format(*args[1], args.subspan(2), 3, values, b, "$sformat");
+        b.sformat_dyn(dst, fv, values, time_mul_, loc(call));
     }
 
     // Lower $sformatf (LRM §21.3.3): render like $sformat but yield a new string
-    // value. The format (first argument) must be a string literal, like $sformat.
+    // value. Its format is the first argument and takes the same three cases.
     ir::Index lower_sformatf(const CallExpression& call, ir::Builder& b) {
         const auto args = call.arguments();
         if (args.empty()) {
             fail("$sformatf requires a format-string argument");
         }
-        const Expression* fa = args[0];
-        while (fa->kind == ExpressionKind::Conversion) {
-            fa = &fa->as<ConversionExpression>().operand();
-        }
-        if (fa->kind != ExpressionKind::StringLiteral) {
-            // TODO: a runtime (non-literal) $sformatf format string needs
-            // dynamic format parsing, which Clotho lacks.
-            fail("$sformatf format must be a string literal");
+        const Expression* lit = args[0];
+        while (lit->kind == ExpressionKind::Conversion) {
+            lit = &lit->as<ConversionExpression>().operand();
         }
         std::string            fmt;
         std::vector<ir::Index> values;
-        build_format(args, fmt, values, b);
-        return b.sformatf(fmt, values, loc(call));
+        if (lit->kind == ExpressionKind::StringLiteral) {
+            build_format(args, fmt, values, b);
+            return b.sformatf(fmt, values, loc(call));
+        }
+        if (const std::optional<std::string> text = const_format_text(*args[0])) {
+            build_format(args.subspan(1), fmt, values, b, 'd', *text);
+            return b.sformatf(fmt, values, loc(call));
+        }
+        const ir::Index fv =
+          lower_dynamic_format(*args[0], args.subspan(1), 2, values, b, "$sformatf");
+        return b.sformatf_dyn(fv, values, time_mul_, loc(call));
     }
 
     // Scale a %t argument from its module's time unit to design ticks: the runtime

@@ -855,7 +855,12 @@ private:
             case Inst::PayloadKind::Sformat: {
                 const auto info = ir_.extra_data<SformatInfo>(p.extra);
                 ref(info.dst);
-                os_ << ", \"" << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                os_ << ", ";
+                if (info.fmt_value != kNoFormatValue) {
+                    ref(info.fmt_value);
+                } else {
+                    os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                }
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);
@@ -864,7 +869,11 @@ private:
             }
             case Inst::PayloadKind::Sformatf: {
                 const auto info = ir_.extra_data<SformatfInfo>(p.extra);
-                os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                if (info.fmt_value != kNoFormatValue) {
+                    ref(info.fmt_value);
+                } else {
+                    os_ << '"' << ir_.extra_bytes(info.fmt, info.fmt_len) << '"';
+                }
                 for (Index a : ir_.region(info.args)) {
                     os_ << ", ";
                     ref(a);

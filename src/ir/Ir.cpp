@@ -118,15 +118,17 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
         }
 
         case Inst::PayloadKind::Sformat: {
-            // sformat: the value args live in the SformatInfo record; the format
-            // bytes and the destination lvalue are not value operands.
+            // sformat: the value args live in the SformatInfo record. The format
+            // bytes are not operands, the destination lvalue and a runtime format
+            // value are (both held back to the tail; see for_each_operand).
             const auto info = extra_data<SformatInfo>(p.extra);
             return index_slice(info.args);
         }
 
         case Inst::PayloadKind::Sformatf: {
-            // sformatf: the value args live in the SformatfInfo record; the
-            // format bytes are not value operands.
+            // sformatf: the value args live in the SformatfInfo record. The format
+            // bytes are not operands; a runtime format value is, held back to the
+            // tail.
             const auto info = extra_data<SformatfInfo>(p.extra);
             return index_slice(info.args);
         }
