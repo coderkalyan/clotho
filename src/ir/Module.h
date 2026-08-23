@@ -670,12 +670,22 @@ inline constexpr uint32_t kNoNotify = ~uint32_t{ 0 };
 //
 // Only the edges the design uses are laid out, so `@obj.p` alone costs one hidden
 // property and `@(posedge obj.p)` alone costs one, not three.
+//
+// A CONTAINER property (queue / dynamic array / associative array) is the one
+// exception to "classify at the store": its value is the container's CONTENTS,
+// which no old -> new word comparison can describe, and `q.size()` is computed
+// rather than stored. It therefore carries a single Any notifier that fires on
+// every MUTATION, which is sound only for the level-sensitive `wait` of LRM
+// 9.4.3 -- see docs/design/classes.md, "Waiting on a container property".
 struct ChangeNotify {
     Ref class_ref = Ref::Invalid;
     // Object-body field index of the notified property.
     uint32_t prop_field = 0;
     // Object-body field index of the notifier event per Edge, or kNoNotify.
     std::array<uint32_t, 3> field{ kNoNotify, kNoNotify, kNoNotify };
+    // The property is a container, so `field[Any]` fires on mutation and the
+    // other two are always kNoNotify (`@` over a container is refused).
+    bool container = false;
 };
 
 class Module {
@@ -862,10 +872,11 @@ public:
     // field index, so a base-class method writing an inherited property finds the
     // notifier at the base-relative index prefix layout gives it, while the derived
     // class registers the same property again under its own Ref.
-    void set_change_notify(Ref class_ref, uint32_t prop_field, Edge edge, uint32_t notify_field) {
+    void set_change_notify(Ref class_ref, uint32_t prop_field, Edge edge, uint32_t notify_field, bool container) {
         for (ChangeNotify& cn : change_notifies_) {
             if (cn.class_ref == class_ref && cn.prop_field == prop_field) {
                 cn.field[static_cast<uint32_t>(edge)] = notify_field;
+                cn.container                          = container;
                 return;
             }
         }
@@ -873,6 +884,7 @@ public:
         cn.class_ref                          = class_ref;
         cn.prop_field                         = prop_field;
         cn.field[static_cast<uint32_t>(edge)] = notify_field;
+        cn.container                          = container;
         change_notifies_.push_back(cn);
     }
 

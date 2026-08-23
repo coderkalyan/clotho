@@ -2660,3 +2660,70 @@ TEST_CASE("a base-class method writing an inherited property wakes a derived wai
     )";
     CHECK(run_capture(src) == "woke 1\n");
 }
+
+// The same zero-cost line for a CONTAINER property. The class below mutates its
+// queue through the full method surface and gains NO field, because nothing waits
+// on it: the mutation notify is per waited property, so an unwaited container
+// pays neither a field nor a fire at any of its mutation sites.
+TEST_CASE("a class with a container property nothing waits on carries no notifier") {
+    const std::vector<std::string> f = class_field_names(R"(
+        module m;
+            class C;
+                int q[$];
+                int n;
+                function void churn();
+                    q.push_back(1);
+                    q.push_front(2);
+                    q[0] = 3;
+                    q.delete();
+                    n++;
+                endfunction
+            endclass
+            C c;
+            initial begin c = new; c.churn(); $display("n=%0d s=%0d", c.n, c.q.size()); end
+        endmodule
+    )");
+    CHECK(f == std::vector<std::string>{ "q", "n" });
+}
+
+// The same class with one `wait` on the queue: exactly ONE notifier, any-change
+// only (a container can carry no edge notifier, since `@` over one is refused),
+// placed immediately after the property it serves. `n` gains nothing.
+TEST_CASE("a waited-on container class property carries one any-change notifier") {
+    const std::vector<std::string> f = class_field_names(R"(
+        module m;
+            class C;
+                int q[$];
+                int n;
+                function void churn(); q.push_back(1); n++; endfunction
+                task w(); wait(q.size() > 0); $display("woke"); endtask
+            endclass
+            C c;
+            initial begin c = new; fork c.w(); join_none #1 c.churn(); #1; end
+        endmodule
+    )");
+    CHECK(f == std::vector<std::string>{ "q", "$chg.q", "n" });
+}
+
+// Prefix layout holds for a container notifier too: the base's flattened table,
+// notifier included, is a prefix of the derived class's. A base-class method
+// mutates the queue at its base-relative index, so a moved notifier would fire
+// whatever field happened to sit there.
+TEST_CASE("a container notifier keeps the base layout a prefix of the derived one") {
+    const std::vector<std::string> f = class_field_names(R"(
+        module m;
+            class B;
+                int q[$];
+                int pad;
+                function void add(int v); q.push_back(v); endfunction
+            endclass
+            class D extends B;
+                int extra;
+                task w(); wait(q.size() > 0); $display("woke"); endtask
+            endclass
+            D d;
+            initial begin d = new; fork d.w(); join_none #1 d.add(1); #1; end
+        endmodule
+    )");
+    CHECK(f == std::vector<std::string>{ "q", "$chg.q", "pad", "extra" });
+}

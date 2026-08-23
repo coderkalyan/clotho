@@ -379,10 +379,11 @@ at a task call. That last pair is the whole reason a `ref` formal works, since a
 Also covered through `Store`: a base-class method, `randomize()` writeback, and
 `output` / `inout` copy-out.
 
-Refused loudly rather than silently: a non-integral property in either construct
-(no `old -> new` transition to classify), and a `wait` whose only class-property
-reads are non-notifiable — that last one *was* the silent park. NBA to a class
-property is already refused elsewhere, so that path cannot arise.
+Refused loudly rather than silently: a property whose type carries neither an
+`old -> new` transition nor a mutation surface, in either construct, and a `wait`
+whose only class-property reads are non-notifiable — that last one *was* the
+silent park. NBA to a class property is already refused elsewhere, so that path
+cannot arise.
 
 One imprecision is inherited rather than introduced: a `ref` bound to a property
 and written by a task *after* an intervening suspend wakes at the task's return
@@ -397,6 +398,138 @@ mock `uvm_event`. It *aborts* with "Null pointer dereferenced" on
 iverilog 13 is no oracle here: it rejects all three headline shapes. Table 9-2
 behaviour is pinned to clotho's own signal path (Verilator diverges there for
 signals too, not treating `x -> 0` as a negedge).
+
+## Waiting on a container property (LRM 9.4.3)
+
+`wait(queue.size() > 0)` on a `T queue[$]` class property works, and so does the
+same shape over a dynamic array or an associative array. This is the second UVM
+blocker on this mechanism: `uvm_queue#(T)::wait_until_not_empty`
+(`base/uvm_queue.svh:218`) is exactly that statement over the `protected T
+queue[$]` declared at :58.
+
+### Why it cannot reuse classify-at-the-store
+
+The section above rests on a store having an old and a new WORD to compare. A
+container property has neither. Its value is the container's *contents*, and the
+thing the condition actually reads — `q.size()`, `q[0]`, `a.num()` — is computed
+from the handle, not stored anywhere a write could snapshot. There is no
+transition for `emit_edge_facts` to classify.
+
+So a container property's notifier fires on **mutation**: any op that replaces,
+extends, shrinks, reorders or writes into the container wakes every waiter, with
+no comparison at all.
+
+### The `wait` / `@` asymmetry, which is what makes that sound
+
+This is the whole load-bearing argument, so it is worth stating flatly.
+
+- **LRM 9.4.3 `wait`** is level-sensitive. It re-evaluates its condition and
+  parks again. A fire that leaves the condition false therefore costs exactly one
+  re-test and is *unobservable*. A fire that never happens is a permanent park.
+  Over-firing is free; under-firing is a silent hang.
+- **LRM 9.4.2 `@`** is change-detecting: "a non-edge implicit event shall be
+  detected on any change in the value of the expression". A spurious fire there
+  is an observable wrong wake. And mutation is genuinely not change:
+  `q.push_back(x); q.pop_back();` is two mutations and leaves `q.size()` exactly
+  where it started.
+
+`@` over a container-dependent expression is therefore **refused loudly**
+(`refuse_container_event_control`, "an event control on a container class
+property … is not supported; only `wait` can park on one"), not silently given
+the mutation notifier. Implementing it properly needs the expression's value
+snapshotted in the WAITER's own frame and compared on every wake — a different
+mechanism from this file's, since the write side has nothing to classify. That is
+the `TODO:` on the refusal.
+
+Because only `wait` can reach a container notifier, only `Edge::Any` is ever
+asked for: a container property carries exactly one hidden field, never `.pos` or
+`.neg`.
+
+### The mutation surface, and why the list is closed
+
+Two facts close it.
+
+**A SystemVerilog container is a value type.** There is no handle to a queue,
+dynamic array or associative array — assignment copies. So the only reachable
+mutations are through an lvalue *rooted at the property*, or through a `ref`
+formal *bound to* such an lvalue. There is no third way to reach the storage.
+
+**Every mutation needs a writable pointer to the container's rt handle slot**,
+and `lv_handle_ptr` is the only thing that produces one; every runtime mutator
+takes it as its first argument. Its second parameter is now a three-valued
+`HandleUse` **with no default**, so all 47 call sites had to be classified and a
+call site added later cannot compile without answering:
+
+| `HandleUse` | Meaning | Fires |
+|---|---|---|
+| `Read` | contents only read through the pointer | no |
+| `Mutate` | the op about to run replaces / extends / shrinks / reorders the container | yes |
+| `Place` | addressing a place inside it, or handing the pointer to someone who mutates later | no — whoever mutates notifies |
+
+What that covers, enumerated from the classified sites rather than guessed:
+
+- **Queue** (7.10): `push_back`, `push_front`, `pop_back`, `pop_front`, `insert`,
+  `delete(i)`, `delete()`, `sort`, `rsort`, `reverse`, `shuffle`, whole-queue
+  assignment (from a queue and from a dynamic array) and the `{q, x}` append-range
+  form.
+- **Dynamic array** (7.5): `new[n]`, `new[n](src)`, whole assignment, `delete()`,
+  `sort`, `rsort`, `reverse`, `shuffle`.
+- **Associative array** (7.8): `delete(key)`, `delete()`, whole assignment and the
+  `'{...}` reset.
+- **Element writes** are the one shape that does not touch the handle, so they
+  are `Place` and fire from the direction the frontend already threads:
+  `ir::ElemSelect::for_write` for `q[i] = v` / `d[i] = v`, and
+  `assoc_elem_lvalue(for_write)` for `a[k] = v` and the `'{default: v}` slot.
+  The assoc case must fire even when the stored value equals the element default,
+  because creating the entry changes `a.num()`.
+- **Through a `ref` / `output` / `inout` container formal**, at a function call
+  and at a task call. A `ref` is a raw aliased pointer the callee mutates and
+  never copies back, so the notify cannot be at the argument bind — the callee may
+  suspend first. Those sites are `Place` and ride the existing
+  `service_snapshot` / `service_after_write` bracket, which now carries a
+  `container` flag and fires at the call's return. One fire per call rather than
+  one per mutation inside it, which a level `wait` absorbs.
+- **Through a base-class method**, via the same member select, at the
+  base-relative field index prefix layout gives it.
+- **`$copy`**: the copy emits the same container ops into the destination, so the
+  destination's own notifier fires. (Notifier ROWS are still skipped, for the
+  reason above: copying the handle would alias one waiter list into two objects.)
+
+A `Mutate` fire is emitted *before* the runtime call it precedes. That is sound
+and deliberate: `emit_event_wake_list` only pushes woken activations onto the
+ready list, and a woken process cannot run before this one suspends. Every
+`Mutate` site completes its mutation with no intervening suspend; the two that
+cannot — a container bound to a `ref`/`inout` formal of a *task* — are the `Place`
+sites that fire from the call bracket instead.
+
+### Refused, and why
+
+- **`@` over a container-dependent expression** — above.
+- **A FIXED unpacked array property.** Its extent never changes, so it has no
+  mutation op at all; every write to one is an element store, and `agg_member`
+  deliberately clears the notifier when descending into an interior aggregate.
+  Supporting it means making the notifier survive that descent, which is a
+  separate change. `wait(a[0] == 1)` on an `int a[4]` property fails loudly.
+- **String, real, class handle, unpacked struct / union properties** — unchanged
+  from the integral work: no transition, no mutation surface.
+
+### Zero cost, again asserted
+
+A container property nothing waits on gains no field and no fire. The pre-pass
+admits a container property only from a `wait` condition (`is_notified_container`
+/ `waited_container_prop`), `Module::change_notify`'s empty-table early-out folds
+away the question at every member select, and `notify_container_mutation` emits
+nothing when the place carries no notifier. `tests/class_test.cpp` pins it on the
+same class, which churns its queue through `push_back` / `push_front` / an element
+write / `delete` in both designs:
+
+```
+no waiter:  class{q:queue, n:signed bit[31:0]}
+one waiter: class{q:queue, $chg.q:event, n:signed bit[31:0]}
+```
+
+and pins prefix layout with the notifier in place:
+`B{q, $chg.q, pad}` / `D{q, $chg.q, pad, extra}`.
 
 ## Implementation deviations from the scope-out below
 
