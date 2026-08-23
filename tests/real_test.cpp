@@ -358,6 +358,23 @@ TEST_CASE("%c of a real is still rejected loudly") {
     expect_reject(R"(module m; initial $display("%c", 1.5); endmodule)", "%c with a real argument is not supported");
 }
 
+// A scan destination is written as must/may plane words, and a real slot is an
+// IEEE-754 double, so the parsed bits used to land in its mantissa: this
+// returned 1 and left `r` reading 0.000000, with no diagnostic at all. %f/%e/%g
+// (the clause's own real conversions) were already refused, so the integral
+// spelling was the way in. Same guard, same reason, as $value$plusargs's.
+TEST_CASE("a real $fscanf / $sscanf destination is rejected") {
+    expect_reject(R"(module m; real r; initial void'($sscanf("12", "%d", r)); endmodule)",
+                  "$fscanf / $sscanf into a real variable is not supported");
+    expect_reject(R"(module m; shortreal s; initial void'($sscanf("12", "%h", s)); endmodule)",
+                  "$fscanf / $sscanf into a real variable is not supported");
+    // The integral destination beside it must still work, so the guard is not a
+    // blanket refusal of the family.
+    CHECK(run_capture(
+            R"(module m; int n, a; initial begin n = $sscanf("12", "%d", a); $display("%0d %0d", n, a); end endmodule)")
+          == "1 12\n");
+}
+
 TEST_CASE("LRM 20.5 conversion system functions") {
     const std::string out = run_capture(R"(
         module t;

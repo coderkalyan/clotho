@@ -242,6 +242,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_randc_next", &rt_randc_next);
     expose("rt_test_plusargs", &rt_test_plusargs);
     expose("rt_value_plusargs", &rt_value_plusargs);
+    expose("rt_value_plusargs_str", &rt_value_plusargs_str);
     expose("rt_vcd_open", &rt_vcd_open);
     expose("rt_vcd_begin", &rt_vcd_begin);
     expose("rt_vcd_scope", &rt_vcd_scope);

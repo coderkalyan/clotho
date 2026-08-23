@@ -18020,6 +18020,16 @@ private:
         std::vector<ir::Index> outs;
         outs.reserve(out_args.size());
         for (const Expression* a : out_args) {
+            // The scan engine writes every conversion as must/may plane words
+            // (rt_scan_arg), and a real slot holds an IEEE-754 double -- the parsed
+            // bits would land in its mantissa and the design would read a silently
+            // wrong number ($sscanf("12", "%d", r) left r at 0.000000 and still
+            // returned 1). The clause's own real conversions (%f/%e/%g) are already
+            // refused by count_scan_conversions, so this closes the integral spelling
+            // of the same gap. Same guard, same reason, as $value$plusargs's.
+            if (a->type->isFloating()) {
+                fail("$fscanf / $sscanf into a real variable is not supported");
+            }
             outs.push_back(lower_lvalue(*a, b));
         }
         return b.scanf(source, is_sscanf, fmt, outs, l);
@@ -18855,6 +18865,17 @@ private:
                 default:
                     // TODO: %e/%f/%g need real support.
                     fail(std::string("$value$plusargs conversion %") + us[i] + " is not supported");
+            }
+            // A `real` destination is only ever reachable with %e/%f/%g, which the
+            // switch above already refuses. The integral conversions have no plane
+            // storage to write here -- a real slot holds an IEEE-754 double, so the
+            // parsed bit pattern would land in its mantissa and the design would read
+            // a silently wrong number (`+V=12` with %d read back as 0.000000). Refused
+            // rather than guessed; the LRM gives no meaning to an integral conversion
+            // into a real variable.
+            if (args[1]->type->isFloating()) {
+                fail(std::string("$value$plusargs %") + us[i] +
+                     " into a real variable is not supported");
             }
             const std::string_view prefix = us.substr(0, pct);
             const ir::Index        dst    = lower_lvalue(*args[1], b);

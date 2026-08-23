@@ -22,8 +22,9 @@ namespace clotho::ir {
 // forwarded to build_module. `plusargs` are the command-line arguments that
 // followed a leading `+` (LRM §21.6), in source order, with the `+` itself
 // stripped; made available to $test$plusargs / $value$plusargs. `resolve`
-// renders the source locations a sanitizer bakes into its reports; without it
-// they read "<unknown>".
+// decodes the source locations a sanitizer bakes into its reports and the one a
+// backend refusal points at (see build_modules); without it they read
+// "<unknown>".
 int run_jit(const Module& m, Timings* timings = nullptr, const SimulationConfig& config = {},
            std::span<const std::string_view> plusargs = {}, const LocResolver& resolve = {});
 

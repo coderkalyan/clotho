@@ -4,7 +4,26 @@ This is a TODO **spec**, not a changelog or design doc. Treat it as such: when a
 line item is partially implemented, split it so the unimplemented remainder
 stays tracked. Clotho must never silently accept a construct it does not
 correctly lower; every unimplemented gap below is guarded by a loud
-frontend `fail`, or must grow one when its surrounding feature lands.
+`fail`, or must grow one when its surrounding feature lands.
+
+Most of those guards are in the frontend, and a few are necessarily in the
+backend: whether a destination is a `string` handle, a part-select or a whole
+slot is not known until storage is assigned. Both kinds now report identically —
+`file:line:col: error: <message> [<code>]`, the shape `render` (src/Diagnostic.cpp)
+gives a frontend item. A backend refusal used to print `llvm backend error:
+<prose>` with no location and no code, so there was nothing to jump to and
+nothing to filter on, and it named an internal pipeline stage at a user whose
+language feature had been refused. `lower_region` (src/ir/LlvmBackend.cpp)
+attaches the offending instruction's source extent to the `BackendError` on its
+way out, which covers every refusal raised while lowering an instruction, and
+`report_backend_error` renders it: `unsupported-construct` for a legal construct
+the backend does not lower, `internal-error` for a broken invariant (the guards
+whose message opens with `internal:`). Still outstanding: the refusals raised
+OUTSIDE instruction lowering have no instruction to point at and stay unlocated
+— the per-process reactive / `program`-region pre-passes, DPI signature and
+declaration emission, class-descriptor and id-global emission, and VCD variable
+emission. Each names the process or symbol it is about in its message instead,
+so they are legible but not navigable.
 
 Items are organized by the five delivery milestones, then grouped by logical
 similarity. Within each group, unimplemented items come first for visibility,
@@ -956,8 +975,62 @@ professional parity; M5 makes it complete.
   that fd. `$fstrobe` reuses the `$strobe` Postponed drain; `$fmonitor` reuses the
   `$monitor` per-instant run and change-detection (`build_deferred_body` handles
   both the fd and monitor variants).
-- [ ] **`$value$plusargs` `%e`/`%f`/`%g` (real) conversion**.
-- [ ] **`$value$plusargs` runtime (non-literal) `str` argument**.
+- [x] **`$value$plusargs` into a `string` object** (§21.6) — the `%s` form, which
+  is "string (no conversion)": the plusarg remainder IS the value, so
+  `rt_value_plusargs_str` assigns it to the `rt_string` handle verbatim with no
+  width cap, no right-justification and no padding, unlike the packed-vector
+  path's `rt_value_plusargs`. Same pattern as `$fgets` / `$ferror` into a string
+  (`rt_fgets_str` / `rt_ferror_str`), and the same LRM answers as the integral
+  destinations: a match returns nonzero, no match returns 0 and leaves the
+  variable untouched, an empty remainder stores the empty string ("either a zero
+  or an empty string value"). Load-bearing for UVM: `uvm_root.svh:551`
+  (`+UVM_TESTNAME`, into `run_test`'s own `string test_name=""` formal) and
+  `uvm_cmdline_report.svh:66` (`+UVM_VERBOSITY`, into a function local) are the
+  only two `$value$plusargs` sites in the library, and UVM cannot select a test
+  without the first.
+
+  The specifier matrix as it now stands, per §21.6's list (uppercase and leading-0
+  forms are accepted spellings of each, folded by `tolower` in the frontend):
+
+  | conv | packed / integral | `string` | `real` |
+  |------|-------------------|----------|--------|
+  | `%d` | yes | refused | refused |
+  | `%o` | yes | refused | refused |
+  | `%h`, `%x` | yes | refused | refused |
+  | `%b` | yes | refused | refused |
+  | `%s` | yes (width-capped, right-justified) | **yes** | refused |
+  | `%e`, `%f`, `%g` | refused | refused | refused |
+
+  A part-select destination (`v[7:0]`) is refused for every conversion; a whole
+  aggregate or class handle slang itself rejects as an argument type. Truncation
+  to a narrower destination and the all-`'bx` illegal-character result are the
+  clause's own rules and are unchanged.
+- [ ] **`$value$plusargs` `%e`/`%f`/`%g` (real) conversion**, and with it any
+  `real` destination at all. Refused in the frontend for every conversion now: an
+  integral conversion into a real used to be accepted and write the parsed bit
+  pattern into the IEEE-754 mantissa, so `+V=12` with `%d` read back as
+  `0.000000` with no diagnostic. Needs the same ASCII->real scan
+  `$fscanf`/`$sscanf`'s own `%f`/`%e`/`%g` needs, plus a real-slot write-back
+  (`rt_value_plusargs`'s `rt_scan_arg` is must/may planes).
+- [ ] **`$value$plusargs` numeric conversion into a `string` object** — `%d` and
+  friends with a `string` destination. §21.6 stores the CONVERTED value, so this
+  is 6.16's integral-to-string assignment of it (a one-byte string holding a
+  character code), which is a separate question from the `%s` "no conversion"
+  form above and is what real code uses. Refused in the backend, where the
+  destination's storage kind is known.
+- [ ] **`$fscanf` / `$sscanf` write-back into a `string` object**. NOT the change
+  `$value$plusargs` above was: that path has one destination and got its own
+  runtime entry point, while the scan engine interleaves several targets through
+  one shared `rt_scan_arg` array, so the descriptor needs a string-handle variant
+  (plus its alloc site), the engine's store step a branch on it, and `%5s` into
+  an unbounded string its own answer. Real code reaches it: `uvm_root.svh:916` is
+  `$sscanf(timeout, "%d,%s", timeout_int, override_spec)` with a `string`
+  `override_spec`.
+- [ ] **`$value$plusargs` runtime (non-literal) `str` argument**. Shared with
+  `$test$plusargs`, whose query string is under the same restriction; §21.6's own
+  `ieee1364_example` exercises it through a `pstring` variable. Both refuse in
+  the frontend today. One feature, not two: the prefix has to be materialized and
+  handed to the runtime as bytes at the call rather than baked into a global.
 - [~] **Persist the Driver / SourceManager across runs** for buffer + parse
   caching (SM/loader/trees are public so a cache layer can sit above them).
   Within-process retention has landed: `lower_*` returns a `SourceContext`
@@ -1082,7 +1155,8 @@ professional parity; M5 makes it complete.
   consumes no specifier" marker in `rt_arg`.
 - [x] **Format scanning** (§21.3.4) — `$fscanf`, `$sscanf`.
 - [x] **Binary read** (§21.3.4) — `$fread` into a scalar or unpacked-array memory.
-- [x] **Command-line plusargs** (§21.6) — `$test$plusargs` / `$value$plusargs`.
+- [x] **Command-line plusargs** (§21.6) — `$test$plusargs` / `$value$plusargs`,
+  the latter into a packed vector or (for `%s`) a `string` object.
 - [x] **slang `driver::Driver` frontend** — `-D`/`+define+`, `-I`/`+incdir+`, `-f`
   command files, `-y`/`-v` libraries, `--top`, `--timescale`, `--std`; single-unit
   compile. `--loose-timescale` accepts a design mixing elements that declare a

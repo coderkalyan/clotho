@@ -5703,6 +5703,21 @@ rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const 
     return 1;
 }
 
+extern "C" int32_t rt_value_plusargs_str(const char* prefix, uint32_t prefix_len, rt_string* dst,
+                                         const rt_alloc_site* site) {
+    const std::string* pa = find_plusarg(std::string_view(prefix, prefix_len));
+    if (pa == nullptr) {
+        return 0; // LRM §21.6: no match leaves the variable alone and returns 0.
+    }
+    // "%s -- string (no conversion)": the remainder IS the value, verbatim. No
+    // right-justification and no width cap, unlike the packed-vector form above --
+    // a `string` grows to whatever the command line supplied. An empty remainder
+    // stores the empty string, which is the clause's stated result.
+    assert(pa->size() >= prefix_len);
+    rt_string_assign_bytes(dst, pa->data() + prefix_len, pa->size() - prefix_len, site);
+    return 1;
+}
+
 extern "C" void rt_string_init(rt_string* s) {
     s->storage[0]  = 0;              // NUL terminator for the empty string
     s->storage[31] = str_inline_cap; // Inline form, length 0.
