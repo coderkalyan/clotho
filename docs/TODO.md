@@ -624,7 +624,7 @@ professional parity; M5 makes it complete.
   (LRM 9.7), so both statements came with it. `disable fork` is `kill` over the
   caller's subtree; `wait fork` is `first_child == null`, exact because a completing
   thread re-parents its live children. Design: docs/design/process-class.md §8.
-- [~] **Captured-automatic lifetime** (LRM 9.3.2, fork-join.md V4) — this entry used
+- [x] **Captured-automatic lifetime** (LRM 9.3.2, fork-join.md V4) — this entry used
   to ask for "per-spawn automatic-variable lifetime", i.e. copies. **That was the wrong
   target**: 9.3.2 makes a reference to an enclosing scope's automatic a reference to
   THAT variable, which is why the clause has to write `automatic int k = j;` to get a
@@ -643,13 +643,67 @@ professional parity; M5 makes it complete.
   the way: a capture referenced from a child's DECLARATION INITIALIZER was invisible to
   the capture walk (an initializer hangs off the symbol, not the statement), so 9.3.2's
   own idiom failed as an unknown signal instead of capturing.
-  **Remaining: spawn-time initialization**, and only for the detaching kinds. A
-  child-block `automatic` must be initialized AT THE SPAWN for each child to see its
-  own `j`; clotho runs a child's declaration initializers when the child is first
-  scheduled, so it is refused loudly rather than answered with the later value. A
-  `join` child is exempt and is NOT refused: it is ramped and resumed inline at the
-  fork, so its initializers already run at the spawn. (That guard is keyed on the join
-  kind, deliberately — it is the one thing in the capture path that still is.)
+- [x] **Spawn-time initialization of a fork's own declarations** (LRM 9.3.2,
+  fork-join.md §V4b) — the other half of V4, and the entry above listed it as the
+  remainder. The clause: variables declared in the `block_item_declaration` of a
+  fork-join block "shall be initialized to their initialization value expression
+  whenever execution enters their scope and **before any processes are spawned**". So
+  they are lowered IN THE PARENT at the fork, in declaration order, before any child is
+  built or spawned — which also makes a later initializer able to read an earlier
+  declaration (`automatic int a = j; automatic int b = a + 1;`). Once the variable is
+  parent-side storage a child referencing it is an ORDINARY CAPTURE, and V4's box
+  machinery carried that unchanged: no new IR, no backend change, no child-side
+  mechanism.
+  **TWO POSITIONS, and the old refusal conflated them.** `SpawnInitScan` fired for a
+  declaration of the FORK's scope and for one of a child's own `begin … end` alike,
+  while its message described only the first. The clause's own example settles the
+  second: `fork automatic int k = j; … begin automatic int m = j; … end join_none` —
+  `k` is "a local copy, k, for each value of j" (1, 2, 3) while `m` is annotated "the
+  value of m is 4", because the nested block is a DIFFERENT block whose scope is
+  entered when the child body runs. So the fork-scope form needed implementing and the
+  body-local form needed the guard to stop firing: clotho's ordinary late lowering was
+  already right there. Both are now pinned side by side with the bare capture —
+  `444|123|444` — so the three cannot decay into each other.
+  **PER ENTRY, NOT PER ACTIVATION.** This is the part that looks like a working feature
+  when it is wrong. The box must be fresh per EXECUTION of the fork statement; reusing
+  the per-activation box `install_capture_boxes` hands out makes the clause's example
+  print `333` (one box, rewritten by each iteration, every child reading the last
+  value) instead of `123`. What buys it is that lowering happens once while the fork
+  executes many times: the home holding the handle is allocated once at lower time — a
+  frame Local in a subroutine, a design-state signal in a process body, which has no
+  frame and whose storage is a precise GC root (garbage-collection.md §5.4) — and the
+  `ClassNew` that fills it is emitted AT the fork. Cost per fork execution: one
+  `ClassNew` plus one handle store per declared variable, plus the initializer itself.
+  A fork that declares nothing emits nothing.
+  **THE REF-FORMAL CARVE-OUT.** 9.3.2 makes it illegal to refer to a formal passed by
+  reference inside a `join_any` / `join_none` block "other than in the initialization
+  value expressions of variables declared in a `block_item_declaration` of the fork".
+  clotho refused capturing an `output` / `inout` formal outright, which refused this
+  legal position too. Legal and implementable for the same reason: the initializer is
+  evaluated in the PARENT, so no child-side access and no lost copy-out. Implemented by
+  narrowing the scan rather than adding a check — `BoxCandidateScan` no longer collects
+  references inside a fork-scope initializer — so a child BODY reading such a formal is
+  still refused, now as the exact complement.
+  **The `join` exemption was wrong.** The old guard exempted `join`, on the grounds that
+  a `join` child is ramped and resumed inline at the fork so its initializers already
+  run at the spawn. Measured: that held only in a subroutine body, and only by accident
+  of the per-activation box; `fork automatic int k = 5; … join` in a PROCESS body failed
+  outright with `reference to unknown signal 'k'`, and under `join_any` the declaration
+  — lowered as a child process — completes immediately and satisfies the join before any
+  real child runs. All three are the same root cause: a flat walk made every top-level
+  statement of the fork body a child, so a declaration became a process.
+  **Refused loudly:** a STATIC declaration in a fork's `block_item_declaration`, where
+  6.21 (initialize once before time zero) and 9.3.2 (initialize on every entry to the
+  scope) disagree and nothing implements either.
+  **Oracles.** Verilator 5.050 `--timing` agrees on every fork-scope case measured —
+  the clause example, both UVM shapes including the labelled `fork : guard`, all six
+  initializer sources, the once-per-execution side effect, sharing, and all three join
+  kinds with timestamps — but is NOT an oracle for the body-local form: it prints
+  `1 2 3` for the nested `m`, contradicting the clause's own comment. **iverilog 13
+  cannot compile the construct at all** ("sorry: Overriding the default variable
+  lifetime is not yet supported"), so the oracle that covered V1–V3 is unavailable.
+  Unchanged: the bare captured loop variable stays `4 4 4`. Verilator's `1 2 3`
+  deviation there is process-body-specific — in a task body it prints `444` too.
 - [ ] **1024 concurrent detached children** is the ceiling: an unbounded spawn edge
   saturates the activation bound, and past it the scheduler-buffer guards report a
   located FATAL. Lifting it means a spill on the already-emitted overflow edge; the

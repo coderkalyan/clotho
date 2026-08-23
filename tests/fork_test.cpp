@@ -972,31 +972,375 @@ TEST_CASE("fork: join_none children in a task share the loop variable") {
     CHECK(out == "4 4 4 | shared\n");
 }
 
-// The copy the clause prescribes is NOT yet supported, and is refused rather than
-// answered wrongly. `automatic int k = j;` inside the fork block has to be initialized
-// AT THE SPAWN for each child to see its own `j` -- that is what the clause's own
-// comment ("local copy, k, for each value of j") means, and Verilator prints 1 2 3.
-// clotho runs a child's body, declaration initializers included, when the child is
-// first scheduled, which for join_none is after the parent has moved on, so every
-// child would read the later value. Lifting it means evaluating the initializer in the
-// parent at spawn: the remaining half of V4 (docs/design/fork-join.md).
-TEST_CASE("fork: an automatic initialized from a capture is refused, not mis-timed") {
-    check_rejected(R"(
+// LRM 9.3.2's spawn-time initialization, which is the other half of V4:
+//
+//   "Variables declared in the block_item_declaration of a fork-join block shall be
+//    initialized to their initialization value expression whenever execution enters
+//    their scope and before any processes are spawned."
+//
+// The clause's own example, verbatim, and it exercises BOTH declaration positions at
+// once -- which is why it is the case to pin. `k` is declared in the FORK's
+// block_item_declaration, so it is initialized in the parent at each execution of the
+// fork and each child sees its own value ("local copy, k, for each value of j"): 1, 2,
+// 3. `m` is declared in a `begin ... end` NESTED in the fork, which is a different
+// block, so it is initialized when that block is entered -- when the child body runs,
+// after the loop -- and the clause states the answer in a comment of its own: "the
+// value of m is 4".
+//
+// Verilator 5.050 prints `123` for `k`, agreeing on the fork-scope half, and `<m1>
+// <m2><m3>` for `m`, which contradicts the clause's own comment; the value below is
+// the clause's. iverilog 13 cannot oracle any of this -- it rejects the construct
+// outright with "sorry: Overriding the default variable lifetime is not yet
+// supported".
+TEST_CASE("fork: LRM 9.3.2's own example initializes a fork-scope declaration at the spawn") {
+    const std::string out = run_capture(R"(
         module t;
-          task automatic go;
+          initial
+            for (int j = 1; j <= 3; ++j)
+              fork
+                automatic int k = j;
+                #k $write("%0d", k);
+                begin
+                  automatic int m = j;
+                  #(3 + j) $write("<m%0d>", m);
+                end
+              join_none
+          initial #20 $display("|");
+        endmodule
+    )");
+    CHECK(out == "123<m4><m4><m4>|\n");
+}
+
+// The three positions a loop variable can be read from, side by side, because the
+// whole clause turns on their being different and a single implementation mistake
+// collapses any two of them into one answer. This replaces the refusal that used to
+// stand here (the guard read "LRM 9.3.2 initializes it at the spawn"), which refused
+// the body-local form as well as the fork-scope one.
+//
+//   bare `j`        -- a reference to the enclosing automatic IS that one variable
+//                      (9.3.2), so every child reads its final value: 444. This is the
+//                      deliberate reading recorded in docs/design/fork-join.md and it
+//                      is NOT changed by spawn-time initialization.
+//   fork-scope `k`  -- the clause's opt-in to a per-iteration copy: 123.
+//   body-local `m`  -- a declaration of the CHILD's own block, entered when the child
+//                      runs: 444, the clause's "the value of m is 4".
+//
+// The failure modes this catches, all of which look like a working feature:
+// per-ACTIVATION rather than per-ENTRY storage for `k` prints 333 (one box written
+// three times, every child reading the last value); treating the fork-scope
+// declaration as a child-body-local prints 444; treating a body-local as fork-scope
+// prints 123 for `m`, which is what Verilator does.
+//
+// Measured on Verilator 5.050 --timing: `444|123|123|` -- it agrees on the first two
+// and conflates the third.
+TEST_CASE("fork: a fork's own declaration, a child block's declaration and a bare capture differ") {
+    const std::string out = run_capture(R"(
+        module t;
+          task automatic bare();
+            for (int j = 1; j <= 3; ++j)
+              fork
+                #4 $write("%0d", j);
+              join_none
+            #9 $write("|");
+          endtask
+          task automatic fork_scope();
+            for (int j = 1; j <= 3; ++j)
+              fork
+                automatic int k = j;
+                #k $write("%0d", k);
+              join_none
+            #9 $write("|");
+          endtask
+          task automatic body_local();
             for (int j = 1; j <= 3; ++j)
               fork
                 begin
-                  automatic int k = j;
-                  #k $write("%0d ", k);
+                  automatic int m = j;
+                  #m $write("%0d", m);
                 end
               join_none
-            #5 $display("| copies");
+            #9 $display("|");
           endtask
-          initial go;
+          initial begin
+            bare();
+            fork_scope();
+            body_local();
+          end
+        endmodule
+    )");
+    CHECK(out == "444|123|444|\n");
+}
+
+// The idiom Accellera UVM uses in three critical paths -- uvm_phase_hopper.svh:381,
+// uvm_objection.svh:818 (a LABELLED fork) and uvm_sequencer_base.svh:855 -- reduced to
+// its shape: a class-handle-typed fork-scope declaration copied from a formal, with the
+// parent overwriting the source before either child runs. Each child must see the
+// handle its own spawn captured.
+//
+// The label is the part an implementation misses silently: `fork : guard` carries its
+// children as the body's top-level statements exactly as a bare fork does, so keying
+// the split on blockKind (is_fork_block) is what keeps both on one path. Verilator
+// 5.050 agrees with every line below.
+TEST_CASE("fork: a class-handle fork-scope declaration captures the handle at the spawn") {
+    const std::string out = run_capture(R"(
+        class ph_t;
+          int id;
+          function new(int i); id = i; endfunction
+        endclass
+        module t;
+          ph_t src;
+          task automatic plain(ph_t p);
+            fork
+              automatic ph_t phase = p;
+              begin #1 $display("plain id=%0d", phase.id); end
+            join_none
+          endtask
+          task automatic labelled(ph_t p);
+            fork : guard
+              automatic ph_t phase = p;
+              begin #2 $display("labelled id=%0d", phase.id); end
+            join_none
+          endtask
+          initial begin
+            src = new(7);
+            plain(src);
+            src = new(8);
+            labelled(src);
+            src = new(99);
+            $display("parent overwrote src to %0d", src.id);
+            #5 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "parent overwrote src to 99\n"
+          "plain id=7\n"
+          "labelled id=8\n"
+          "|\n");
+}
+
+// Everything a fork-scope initializer is allowed to read, in one fork. The last two
+// are the clause's own carve-out:
+//
+//   "Within a fork-join_any or fork-join_none block, it shall be illegal to refer to
+//    formal arguments passed by reference other than in the initialization value
+//    expressions of variables declared in a block_item_declaration of the fork"
+//
+// so an `output` / `ref` formal is legal HERE and nowhere else in a detaching fork.
+// It is implementable for the same reason it is legal: the initializer is evaluated in
+// the PARENT at the fork, so no child-side access to the formal exists and the
+// copy-out that a captured formal would lose is never in question. The refusal for a
+// child BODY reading such a formal is unaffected -- see the rejection test below.
+// Verilator 5.050 agrees with both lines.
+TEST_CASE("fork: a fork-scope initializer reads signals, locals, formals, ref formals and this") {
+    const std::string out = run_capture(R"(
+        module t;
+          int sig = 5;
+          class C;
+            int p = 3;
+            task automatic go();
+              fork
+                automatic int fromthis = p;
+                begin #4 $display("this p=%0d", fromthis); end
+              join_none
+            endtask
+          endclass
+          task automatic srcs(int inarg, output int o, ref int r);
+            int loc = 20;
+            o = 30;
+            fork
+              automatic int a = sig;
+              automatic int b = loc;
+              automatic int c = inarg;
+              automatic int d = o;
+              automatic int e = r;
+              begin #3 $display("a=%0d b=%0d c=%0d d=%0d e=%0d", a, b, c, d, e); end
+            join_none
+          endtask
+          C  cc;
+          int oo, rr;
+          initial begin
+            cc = new();
+            cc.go();
+            rr = 40;
+            srcs(10, oo, rr);
+            sig = 0; rr = 0;
+            #9 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "a=5 b=20 c=10 d=30 e=40\n"
+          "this p=3\n"
+          "|\n");
+}
+
+// "Before any processes are spawned", made observable with a side effect. The
+// initializer is a function call, so the count says both how many times it ran and
+// when: three fork executions produce exactly three calls, and the parent already sees
+// all three before any child body has run.
+TEST_CASE("fork: a fork-scope initializer runs once per fork execution, in the parent") {
+    const std::string out = run_capture(R"(
+        module t;
+          int calls = 0;
+          function automatic int bump();
+            calls++;
+            return calls;
+          endfunction
+          task automatic go();
+            for (int i = 0; i < 3; i++)
+              fork
+                automatic int seq = bump();
+                begin #(seq) $display("child seq=%0d", seq); end
+              join_none
+            $display("parent after 3 forks: calls=%0d", calls);
+          endtask
+          initial begin
+            go();
+            #9 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "parent after 3 forks: calls=3\n"
+          "child seq=1\n"
+          "child seq=2\n"
+          "child seq=3\n"
+          "|\n");
+}
+
+// One variable per ENTRY, shared by every child of that entry -- not a per-child copy.
+// A write by one child is visible to the next, in both directions, which is what makes
+// the box a variable rather than a value passed at the spawn.
+//
+// Second half: several declarations in one fork, a later initializer reading an earlier
+// one. Declaration order decides it, per the clause's "whenever execution enters their
+// scope": each box is registered and filled before the next declaration is reached, so
+// `b = a + 1` reads the `a` just written.
+TEST_CASE("fork: one shared variable per fork entry, and declarations initialize in order") {
+    const std::string out = run_capture(R"(
+        module t;
+          task automatic sharing();
+            fork
+              automatic int s = 1;
+              begin #1 s = 42; end
+              begin #2 $display("sibling sees s=%0d", s); end
+              begin #3 s = s + 1; end
+              begin #4 $display("finally s=%0d", s); end
+            join_none
+          endtask
+          task automatic multi(int j);
+            fork
+              automatic int a = j;
+              automatic int b = a + 1;
+              automatic int c = a + b;
+              begin #5 $display("a=%0d b=%0d c=%0d", a, b, c); end
+            join_none
+          endtask
+          initial begin
+            sharing();
+            multi(5);
+            #9 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "sibling sees s=42\n"
+          "finally s=43\n"
+          "a=5 b=6 c=11\n"
+          "|\n");
+}
+
+// All three join kinds carry a fork-scope declaration, and the last case keeps V4's
+// lifetime property: `outlive`'s activation has returned by the time its child reads
+// `k`, so the box has to outlive the frame that made it. Verilator 5.050 agrees with
+// every line, timestamps included.
+TEST_CASE("fork: a fork-scope declaration works under join, join_any and join_none") {
+    const std::string out = run_capture(R"(
+        module t;
+          task automatic j_none(int v);
+            fork
+              automatic int k = v;
+              begin #1 $display("join_none k=%0d", k); end
+            join_none
+            $display("join_none parent returned");
+          endtask
+          task automatic j_any(int v);
+            fork
+              automatic int k = v;
+              begin #2 $display("join_any first k=%0d", k); end
+              begin #6 $display("join_any second k=%0d", k); end
+            join_any
+            $display("join_any parent resumed at %0t", $time);
+          endtask
+          task automatic j_all(int v);
+            fork
+              automatic int k = v;
+              begin #1 $display("join a k=%0d", k); end
+              begin #2 $display("join b k=%0d", k); end
+            join
+            $display("join parent resumed at %0t", $time);
+          endtask
+          task automatic outlive(int v);
+            fork
+              automatic int k = v;
+              begin #3 $display("outlive k=%0d", k); end
+            join_none
+          endtask
+          initial begin
+            j_none(11);
+            #5 j_any(22);
+            #10 j_all(33);
+            #5 outlive(44);
+            $display("outlive caller returned at %0t", $time);
+            #10 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "join_none parent returned\n"
+          "join_none k=11\n"
+          "join_any first k=22\n"
+          "join_any parent resumed at 7\n"
+          "join_any second k=22\n"
+          "join a k=33\n"
+          "join b k=33\n"
+          "join parent resumed at 19\n"
+          "outlive caller returned at 24\n"
+          "outlive k=44\n"
+          "|\n");
+}
+
+// The two gaps around spawn-time initialization that are still refused rather than
+// answered. The first is the clause's carve-out read at its exact width: legal in an
+// initializer, still illegal in a child body, where the copy-out of an output formal
+// would lose whatever the child wrote through the box.
+TEST_CASE("fork: a child body reading an output formal, and a static fork declaration, are rejected") {
+    check_rejected(R"(
+        module t;
+          task automatic go(output int o);
+            fork
+              begin #1 o = 5; end
+            join_none
+          endtask
+          int oo;
+          initial go(oo);
         endmodule
     )",
-                   "LRM 9.3.2 initializes it at the spawn");
+                   "capturing an output or inout formal would lose");
+
+    check_rejected(R"(
+        module t;
+          task automatic go();
+            fork
+              static int k = 1;
+              begin #1 $display("k=%0d", k); end
+            join_none
+          endtask
+          initial go();
+        endmodule
+    )",
+                   "initializes a fork's declarations on every entry to its scope");
 }
 
 // LRM 13.4.4 second paragraph: the calling thread must be created by an initial or

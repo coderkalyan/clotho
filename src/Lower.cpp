@@ -858,6 +858,29 @@ struct ValueRefScan : ASTVisitor<ValueRefScan, VisitFlags::AllGood> {
     }
 };
 
+// Whether `blk` is a fork of any join kind. A LABEL changes neither this nor the
+// shape below: `fork : guard a; b; join` still carries its children as the body's
+// top-level statements, so keying on blockKind is what keeps a labelled fork -- the
+// shape uvm_objection.svh:818 uses -- on the same path as a bare one.
+inline bool is_fork_block(const BlockStatement& blk) {
+    return blk.blockKind == StatementBlockKind::JoinAll || blk.blockKind == StatementBlockKind::JoinAny ||
+           blk.blockKind == StatementBlockKind::JoinNone;
+}
+
+// A fork body's top-level statements, in source order: the members of its
+// StatementList, or the single statement, or nothing at all for an empty body.
+// A callback rather than a returned vector because every caller walks it once.
+template <typename F>
+inline void for_each_fork_stmt(const BlockStatement& blk, F&& fn) {
+    if (blk.body.kind == StatementKind::List) {
+        for (const Statement* s : blk.body.as<StatementList>().list) {
+            fn(*s);
+        }
+    } else if (blk.body.kind != StatementKind::Empty) {
+        fn(blk.body);
+    }
+}
+
 // Symbols a fork's children reference anywhere in a subroutine body, which is the set
 // whose frame locals have to be boxed (docs/design/fork-join.md V4). Run before the
 // frame is laid out, because a boxed local is boxed for every access in the activation
@@ -885,48 +908,43 @@ struct BoxCandidateScan : ASTVisitor<BoxCandidateScan, VisitFlags::AllGood> {
     // as a flag and install_capture_boxes resolves it against `sub.thisVar`.
     bool implicit_this = false;
 
+    // The declared variables of every fork body walked here -- the fork's OWN
+    // block_item_declarations, which are not per-activation captures. Subtracted by
+    // install_capture_boxes.
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> fork_scope_decls;
+
     void handle(const BlockStatement& blk) {
-        if (blk.blockKind == StatementBlockKind::JoinAll || blk.blockKind == StatementBlockKind::JoinAny ||
-            blk.blockKind == StatementBlockKind::JoinNone) {
+        if (is_fork_block(blk)) {
             ValueRefScan rs;
             rs.out           = &candidates;
             rs.implicit_this = &implicit_this;
-            blk.body.visit(rs);
+            // NEITHER HALF of one of the fork's own declarations is a capture, because
+            // LRM 9.3.2 initializes such a variable "before any processes are spawned":
+            // lower_fork materializes it in the PARENT at the fork and gives it a fresh
+            // box per ENTRY, not the per-activation box install_capture_boxes hands out.
+            // Two consequences, and the clause's example turns on both:
+            //
+            //   - the variable itself must not be boxed per activation, or one box
+            //     would be shared by every iteration's children and the clause's
+            //     example would print 333 instead of 123;
+            //   - its INITIALIZER is evaluated in the parent, so what that initializer
+            //     reads is not captured at all. That is what makes the clause's own
+            //     carve-out implementable -- referring to a formal passed by reference
+            //     is legal there even under join_any / join_none, precisely because no
+            //     child-side access is involved.
+            //
+            // A `begin ... end` nested inside the fork is a DIFFERENT block, so its
+            // declarations are none of this and keep the ordinary late path: the
+            // clause's own example says the nested `automatic int m = j` "is 4".
+            for_each_fork_stmt(blk, [&](const Statement& s) {
+                if (const auto* d = s.as_if<VariableDeclStatement>()) {
+                    fork_scope_decls.insert(&d->symbol);
+                    return;
+                }
+                s.visit(rs);
+            });
         }
         visitDefault(blk);
-    }
-};
-
-// A child-block `automatic` whose initializer reads one of the captured variables.
-// LRM 9.3.2's own idiom -- `fork begin automatic int k = j; ... end join_none` -- wants
-// `k` initialized AT SPAWN, which is what makes each child see its own `j`; the comment
-// on the clause's example ("local copy, k, for each value of j") is only true under that
-// reading, and Verilator agrees. clotho runs a child's body, declaration initializers
-// included, when the child is first scheduled, which for join_none is after the parent
-// has moved on -- so every child would read the captured variable's LATER value.
-//
-// Detected so it can be refused rather than answered wrongly. Lifting it means
-// evaluating such an initializer in the PARENT at spawn and passing the value in, which
-// is the remaining half of V4 (docs/design/fork-join.md).
-struct SpawnInitScan : ASTVisitor<SpawnInitScan, VisitFlags::AllGood> {
-    const std::vector<const slang::ast::ValueSymbol*>* captured;
-    const slang::ast::VariableSymbol*                  hit = nullptr;
-
-    void handle(const VariableDeclStatement& d) {
-        if (d.symbol.lifetime == slang::ast::VariableLifetime::Automatic) {
-            if (const Expression* init = d.symbol.getInitializer()) {
-                ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> refs;
-                ValueRefScan                                                rs;
-                rs.out = &refs;
-                init->visit(rs);
-                for (const slang::ast::ValueSymbol* c : *captured) {
-                    if (refs.contains(c) && hit == nullptr) {
-                        hit = &d.symbol;
-                    }
-                }
-            }
-        }
-        visitDefault(d);
     }
 };
 
@@ -9831,17 +9849,26 @@ private:
                               : kind == ir::ForkKind::JoinNone   ? "fork..join_none"
                                                                  : "fork..join";
 
-        // Children are the fork body's top-level statements (a StatementList),
-        // or the single statement / empty body.
-        std::vector<const Statement*> children;
-        if (blk.body.kind == StatementKind::List) {
-            for (const Statement* s : blk.body.as<StatementList>().list) {
-                children.push_back(s);
+        // The fork body's top-level statements split into TWO different things, and LRM
+        // 9.3.2 is what separates them: the fork's own block_item_declarations, which
+        // are initialized in the parent "before any processes are spawned", and the
+        // remaining statements, each of which is one child process.
+        //
+        // A flat walk that made every top-level statement a child was wrong twice over.
+        // The declared variable landed in that declaration-child's own frame, where its
+        // siblings could not see it -- reported as `reference to unknown signal 'k'` for
+        // the clause's own example -- and under join_any the declaration child completes
+        // immediately, satisfying the join before any real child has run.
+        std::vector<const Statement*>           children;
+        std::vector<const VariableDeclStatement*> decls;
+        for_each_fork_stmt(blk, [&](const Statement& s) {
+            if (const auto* d = s.as_if<VariableDeclStatement>()) {
+                decls.push_back(d);
+                return;
             }
-        } else if (blk.body.kind != StatementKind::Empty) {
-            children.push_back(&blk.body);
-        }
-        if (children.empty()) {
+            children.push_back(&s);
+        });
+        if (children.empty() && decls.empty()) {
             return; // `fork join` with no children: a no-op.
         }
 
@@ -9862,7 +9889,39 @@ private:
         // which is what LRM 9.3.2 asks for (an enclosing automatic is ONE variable),
         // and a live coroutine frame is a conservative GC root, so it outlives the
         // parent activation with no refcount and no ownership surgery.
+        const ir::SourceLoc             l = loc(blk);
         std::vector<const ValueSymbol*> captures;
+
+        // The fork's own block_item_declarations, materialized IN THE PARENT before any
+        // child is built or spawned, in declaration order (LRM 9.3.2: "initialized to
+        // their initialization value expression whenever execution enters their scope
+        // and before any processes are spawned").
+        //
+        // Declaration order is load-bearing rather than incidental: each box is
+        // registered before its own initializer is lowered and before the next
+        // declaration is reached, so `automatic int a = j; automatic int b = a + 1;`
+        // resolves `a` through the box just written. Once the variable is parent-side
+        // storage a child referencing it is an ORDINARY CAPTURE, which is why the rest
+        // of this function needs nothing new for it.
+        for (const VariableDeclStatement* d : decls) {
+            if (d->symbol.lifetime != slang::ast::VariableLifetime::Automatic) {
+                // TODO: a static-lifetime declaration in a fork's block_item_declaration.
+                // LRM 6.21 initializes static storage once before time zero, while 9.3.2
+                // asks for initialization on every entry to the fork's scope; the two
+                // readings disagree and nothing here implements either, so it is refused
+                // rather than silently given one of them.
+                fail(std::string(kind_name) + " declaring the static '" + std::string(d->symbol.name) +
+                     "' is not supported: LRM 9.3.2 initializes a fork's declarations on every "
+                     "entry to its scope, which static storage does not do");
+            }
+            install_fork_decl_box(d->symbol, b, l);
+            captures.push_back(&d->symbol);
+            // Ordinary declaration lowering, which routes the store through the box just
+            // installed (value_lvalue) and so covers an aggregate, a field default and
+            // the no-initializer type default (LRM Table 6-7) exactly as anywhere else.
+            lower_var_decl(d->symbol, b);
+        }
+
         if (fn_ctx_ != nullptr) {
             // LRM 13.4.4 allows `fork … join_none` in a function -- it schedules
             // processes and returns, consuming no time -- and slang enforces the rest
@@ -9888,13 +9947,19 @@ private:
             }
             d.boxed    = &boxed_syms;
             d.this_var = fn_ctx_->this_var;
+            // Seeded with the fork's own declarations so the detector's dedupe keeps
+            // them at the front (their box is already installed) while appending
+            // everything else in first-reference order -- which IS the child's formal
+            // order.
+            d.captured = captures;
             for (const Statement* c : children) {
                 c->visit(d);
             }
-            // Every capture rides a GC box installed at body entry, by the same
-            // BoxCandidateScan that ran over this fork before the frame was laid out.
-            // A miss is therefore a lowering bug -- the two walks disagreed -- not a
-            // source-level refusal, and it is reported as one.
+            // Every capture rides a GC box: installed at body entry for an enclosing
+            // automatic (BoxCandidateScan, which ran over this fork before the frame was
+            // laid out), or at the fork for one of the fork's own declarations. A miss is
+            // therefore a lowering bug -- the two walks disagreed -- not a source-level
+            // refusal, and it is reported as one.
             for (const ValueSymbol* sym : d.captured) {
                 if (!fn_ctx_->boxed.contains(sym)) {
                     fail(std::string(kind_name) + " child that reads the enclosing " + enclosing + "'s '" +
@@ -9902,26 +9967,19 @@ private:
                 }
             }
             captures = std::move(d.captured);
-            // Spawn-time initialization only matters where the child's body runs
-            // LATER than the spawn. A `join` child is ramped and resumed inline at the
-            // fork (lower_fork_inst), so its declaration initializers run at the spawn
-            // already, which is exactly what 9.3.2 asks for.
-            if (kind != ir::ForkKind::Join) {
-                for (const Statement* c : children) {
-                    SpawnInitScan si;
-                    si.captured = &captures;
-                    c->visit(si);
-                    if (si.hit != nullptr) {
-                        // TODO: spawn-time initialization of a child-block automatic
-                        // (LRM 9.3.2). See SpawnInitScan.
-                        fail(std::string(kind_name) + " child declaring '" + std::string(si.hit->name) +
-                             "' initialized from the captured '" +
-                             std::string(captures.empty() ? "" : captures.front()->name) +
-                             "' is not supported: LRM 9.3.2 initializes it at the spawn, and the "
-                             "body runs later, so it would read a later value");
-                    }
-                }
-            }
+            // No spawn-time-initialization guard any more: the fork's own declarations
+            // are evaluated above, in the parent, before any child exists. A
+            // declaration inside a child's `begin ... end` is a different block and
+            // keeps the ordinary late path, which is what 9.3.2's own example asks for
+            // ("automatic int m = j; // the value of m is 4").
+        }
+
+        if (children.empty()) {
+            // Declarations but no child statement, e.g. `fork automatic int k = f(); join`.
+            // Their initializers have run above -- LRM 9.3.2 initializes them on entry to
+            // the scope, so a side-effecting initializer still happens -- and there is
+            // nothing to spawn and nothing to join.
+            return;
         }
 
         std::vector<ir::FunctionId> ids;
@@ -9931,15 +9989,13 @@ private:
         }
 
         // The capture actuals, in the order the children took their formals: each is
-        // the box HANDLE by value, an rvalue rather than the box's own frame slot, so
-        // nothing the child holds points into this activation. Evaluated here, in the
-        // ENCLOSING frame (build_fork_child's FnScope is already unwound).
-        const ir::SourceLoc    l = loc(blk);
+        // the box HANDLE by value, an rvalue rather than the box's own home, so nothing
+        // the child holds points into this activation. Evaluated here, in the ENCLOSING
+        // frame (build_fork_child's FnScope is already unwound).
         std::vector<ir::Index> args;
         args.reserve(captures.size());
         for (const ValueSymbol* sym : captures) {
-            const FnCtx::Boxed& bx = fn_ctx_->boxed.at(sym);
-            args.push_back(b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l));
+            args.push_back(capture_handle(*sym, b, l));
         }
         b.fork(ids, args, kind, l);
     }
@@ -24800,6 +24856,20 @@ private:
     static constexpr std::string_view                          kCaptureBoxField = "$capture";
     ankerl::unordered_dense::map<ir::Ref, ir::Ref>             box_class_;
 
+    // The per-entry box of a fork-scope declaration in a PROCESS body, where there is
+    // no frame to hold the handle (an initial/always block's own variables are design
+    // state, not frame locals -- docs/design/garbage-collection.md 5.4). Keyed by the
+    // declared symbol, which belongs to exactly one fork block, so entries never
+    // collide; in a subroutine the home is a frame slot and FnCtx::boxed carries it
+    // instead. Consulted by value_lvalue after the frame path, which is why a fork
+    // CHILD -- which has a frame of its own and receives the handle as a formal --
+    // resolves through its own `boxed` entry rather than through this map.
+    struct ProcForkBox {
+        ir::Signal sig; // design-state signal holding the box handle
+        ir::Ref    cls; // the box's one-field synthetic class
+    };
+    ankerl::unordered_dense::map<const ValueSymbol*, ProcForkBox> proc_fork_boxes_;
+
     // The synthetic one-field class a captured automatic of type `inner` lives in
     // (docs/design/fork-join.md V4). Interned per inner type.
     //
@@ -24831,11 +24901,17 @@ private:
         return ref;
     }
 
+    // The lvalue of a box's single field, given the box HANDLE as a value. Split out
+    // because a box's home is a frame slot for a captured automatic and a design-state
+    // signal for a fork-scope declaration in a process body (proc_fork_boxes_).
+    ir::Index box_field_lvalue(ir::Index handle, ir::Ref cls, ir::Builder& b, ir::SourceLoc l) {
+        return b.member_select(b.handle_deref(handle, cls, l), 0, cls, l);
+    }
+
     // The lvalue of a boxed local: dereference the handle in its frame slot and select
     // the single field. Re-emitted per access, like every other place.
     ir::Index boxed_lvalue(const FnCtx::Boxed& bx, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Index handle = b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l);
-        return b.member_select(b.handle_deref(handle, bx.cls, l), 0, bx.cls, l);
+        return box_field_lvalue(b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l), bx.cls, b, l);
     }
 
     // The enclosing method's `this` handle, as a value. One helper rather than four
@@ -24892,7 +24968,11 @@ private:
             box_one_capture(*fa, /*copy_in=*/true, b, l);
         }
         for (const ValueSymbol* vs : body_automatics(sub, body)) {
-            if (scan.candidates.contains(vs)) {
+            // A fork's OWN block_item_declaration is skipped here: lower_fork gives it
+            // a fresh box per ENTRY to the fork, and a per-activation box would make it
+            // one variable shared by every entry (LRM 9.3.2; the clause's example would
+            // print 333 instead of 123).
+            if (scan.candidates.contains(vs) && !scan.fork_scope_decls.contains(vs)) {
                 box_one_capture(*vs, /*copy_in=*/false, b, l);
             }
         }
@@ -24933,6 +25013,68 @@ private:
         // variable through a slot typed as the box. value_lvalue routes every access
         // (the declaration's own initializer included) through the box.
         fn_ctx_->boxed[&vs] = { slot, cls };
+    }
+
+    // Give one of a fork's own block_item_declarations (LRM 9.3.2) its per-ENTRY box,
+    // and emit the allocation. Called from lower_fork at the fork statement, so the
+    // ClassNew below runs on every EXECUTION of the fork while the home holding the
+    // handle is allocated once, at lower time. That split is the whole mechanism:
+    //
+    //   for (int j = 1; j <= 3; ++j) fork automatic int k = j; ... join_none
+    //
+    // executes the fork three times, so three boxes exist and each iteration's
+    // children hold the one made for them -- the clause's "local copy, k, for each
+    // value of j", which prints 123. A per-activation box (install_capture_boxes) would
+    // be ONE box written three times and every child would read the last value, 3.
+    //
+    // The handle is stored into its home immediately, before any initializer can
+    // allocate, so the box is reachable from a GC root for its whole life: a frame slot
+    // in a subroutine (a conservative pinned frame root) or a design-state signal in a
+    // process body, where there is no frame (a precise root -- an `initial` block's
+    // storage is design state, docs/design/garbage-collection.md 5.4).
+    void install_fork_decl_box(const VariableSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
+        const ir::Ref cls = box_class_type(lower_type(vs.getType()));
+        if (fn_ctx_ != nullptr) {
+            // Reuse the ordinary capture-box home so value_lvalue, ForkCaptureDetector
+            // and a nested fork's own capture of this variable all need nothing new.
+            const auto it = fn_ctx_->boxed.find(&vs);
+            const uint32_t slot = it != fn_ctx_->boxed.end() ? it->second.local
+                                                             : static_cast<uint32_t>(fn_ctx_->local_types.size());
+            if (it == fn_ctx_->boxed.end()) {
+                fn_ctx_->local_types.push_back(cls);
+                fn_ctx_->boxed[&vs] = { slot, cls };
+            }
+            b.binary(ir::Inst::Tag::Store, b.local(slot, cls, l), b.class_new(cls, l), l);
+            return;
+        }
+        const auto it = proc_fork_boxes_.find(&vs);
+        if (it == proc_fork_boxes_.end()) {
+            ir::SignalInfo info;
+            info.name = prefix_ + std::string(vs.name) + ".$forkbox";
+            info.loc  = to_source_loc(vs.location);
+            info.type = cls;
+            info.dir  = ir::SignalInfo::Direction::Internal;
+            proc_fork_boxes_[&vs] = { register_signal(std::move(info)), cls };
+        }
+        const ProcForkBox& pb = proc_fork_boxes_.at(&vs);
+        b.binary(ir::Inst::Tag::Store, b.signal(pb.sig, l), b.class_new(cls, l), l);
+    }
+
+    // The box handle a fork child's formal takes, by value: an rvalue, so nothing the
+    // child holds points into the parent's activation (docs/design/fork-join.md V4).
+    ir::Index capture_handle(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
+        if (fn_ctx_ != nullptr) {
+            if (const auto bx = fn_ctx_->boxed.find(&vs); bx != fn_ctx_->boxed.end()) {
+                return b.unary(ir::Inst::Tag::Load, b.local(bx->second.local, bx->second.cls, l), l);
+            }
+        }
+        if (const auto fb = proc_fork_boxes_.find(&vs); fb != proc_fork_boxes_.end()) {
+            return b.unary(ir::Inst::Tag::Load, b.signal(fb->second.sig, l), l);
+        }
+        // The two walks that decide captures disagreed, which is a lowering bug rather
+        // than a source-level refusal.
+        fail("a fork child that reads '" + std::string(vs.name) +
+             "' is not supported (internal: no capture box)");
     }
 
     // The automatic-lifetime variables `body` declares, in declaration order. Only
@@ -25130,6 +25272,14 @@ private:
     // Outside a function: a module Signal. Inside a function: a persistent Signal
     // for a static local, else a per-call frame Local.
     void declare_storage(const VariableSymbol& vs, bool force_frame) {
+        // A variable living in a GC box has no storage of its own: value_lvalue routes
+        // every access through the box, so a slot allocated here would never be read,
+        // and in a process body a SIGNAL allocated here would sit in the design state
+        // (and in a dump) never written. Covers a captured automatic and a fork-scope
+        // declaration alike.
+        if ((fn_ctx_ != nullptr && fn_ctx_->boxed.contains(&vs)) || proc_fork_boxes_.contains(&vs)) {
+            return;
+        }
         // A fixed unpacked array frame local is a per-call frame Local with the
         // canonical aggregate storage mirror (build_frame_layout); its managed leaves
         // are constructed by init_frame and released by deinit_body_strings, so a
@@ -25197,6 +25347,17 @@ private:
                     return class_member_lvalue(this_handle(b, l), *prop, fn_ctx_->this_class, b, l);
                 }
             }
+        }
+
+        // A fork-scope declaration of a fork in a PROCESS body: its per-entry box lives
+        // in a design-state signal because the parent has no frame. AFTER the frame path
+        // above, so inside a fork CHILD -- which received the handle as a formal and has
+        // a `boxed` entry of its own -- the child's own box wins.
+        if (const auto fb = proc_fork_boxes_.find(&vs); fb != proc_fork_boxes_.end()) {
+            return box_field_lvalue(b.unary(ir::Inst::Tag::Load, b.signal(fb->second.sig, l), l),
+                                    fb->second.cls,
+                                    b,
+                                    l);
         }
 
         if (is_const_table_symbol(vs)) {
