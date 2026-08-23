@@ -153,6 +153,123 @@ TEST_CASE("real ?: follows the LRM 11.4.11 ambiguous-condition rule") {
     CHECK(out == "10\n0\n4\n");
 }
 
+// A mixed real/integral `?:` used to reach the backend's integer-plane depth
+// guard ("internal: integer plane of a real value") whenever one arm was not
+// speculatable, because the lazy path's PHI merge only knew integer planes and
+// string handles. iverilog 13 and Verilator 5.050 agree on all three lines.
+TEST_CASE("a mixed real / integral ?: yields a real (LRM 11.4.11)") {
+    const std::string out = run_capture(R"(
+        module t;
+            time et; real r; int i;
+            initial begin
+                i = 0;
+                et = (i == 0) ? $realtime : et; // real arm + integral arm
+                $display("et=%0t", et);
+                r = (i == 0) ? 1.5 : i;         // real + int
+                $display("r=%0g", r);
+                r = (i == 1) ? i : 2.5;         // int + real
+                $display("r2=%0g", r);
+            end
+        endmodule
+    )");
+    CHECK(out == "et=0\nr=1.5\nr2=2.5\n");
+}
+
+// LRM 11.4.11: "If both expressions are real, then the resulting type is real.
+// If one expression is real and the other expression is shortreal or integral,
+// the other expression is cast to real, and the resulting type is real. If one
+// expression is shortreal and the other expression is integral, the integral
+// expression is cast to shortreal, and the resulting type is shortreal."
+// Every row runs twice: with two speculation-safe arms (the branchless packed
+// select) and with a function-call arm, which `is_speculation_safe` refuses and
+// so routes through `lower_lazy_conditional`'s SelectLazy merge. The last row
+// pins the RESULT TYPE rather than the value: `(c ? 1 : 2.5) / 2` is 0.5 only
+// if the chosen integral arm became 1.0, and 0 if it stayed an int.
+TEST_CASE("the LRM 11.4.11 real promotion matrix over ?: arms") {
+    const std::string out = run_capture(R"(
+        module t;
+            real r; shortreal s; time tm; longint li; int i; logic [3:0] q; bit c;
+            function automatic real      fr(); return 7.25; endfunction
+            function automatic shortreal fs(); return 7.25; endfunction
+            function automatic int       fi(); return 3;    endfunction
+            initial begin
+                c = 1; i = 3; li = -5; tm = 40; q = 4'b10x1; s = 1.25;
+                $display("%g %g", c ? 1.5 : i,   c ? i : 2.5);
+                $display("%g %g", c ? 1.5 : s,   c ? s : 1.5);
+                $display("%g %g", c ? s : i,     c ? i : s);
+                $display("%g %g", c ? 1.5 : 2.5, c ? shortreal'(1.5) : shortreal'(2.5));
+                $display("%g %g", c ? 1.5 : tm,  c ? 1.5 : li);
+                $display("%g %g", c ? q : 1.5,   (i == 0) ? 1.5 : q); // x/z bits read as 0
+                $display("%g %g", c ? fr() : i,  c ? fi() : 2.5);
+                $display("%g %g", c ? fr() : shortreal'(2.5), c ? fs() : i);
+                $display("%g %g", c ? fi() : fs(), c ? fr() : 2.5);
+                $display("%g %g", c ? fr() : tm, c ? fr() : q);
+                $display("%g", (i == 0) ? fr() : tm);
+                $display("%g %g %g", (c ? 1 : 2.5) / 2, (c ? fi() : 2.5) / 2,
+                                     (c ? 1 : shortreal'(2.5)) / 2);
+            end
+        endmodule
+    )");
+    CHECK(out == "1.5 3\n1.5 1.25\n1.25 3\n1.5 1.5\n1.5 1.5\n9 9\n7.25 3\n7.25 7.25\n"
+                 "3 7.25\n7.25 7.25\n40\n0.5 1.5 0.5\n");
+}
+
+// The ambiguous-condition rule sees the PROMOTED arms, so `(1'bx) ? 3.0 : i`
+// with i == 3 compares 3.0 against 3.0 and is logically equivalent. Table 11-20
+// is defined for integral results only, so a non-equivalent real pair falls to
+// the type default 0.0 — same reading as the string case, and what iverilog 13
+// does. Verilator 5.050 instead returns the false arm here and is not an oracle
+// for these three columns.
+TEST_CASE("the ambiguous ?: rule applies after the real promotion") {
+    const std::string out = run_capture(R"(
+        module t;
+            int i;
+            function automatic real fr(); return 7.25; endfunction
+            initial begin
+                i = 3;
+                $display("%g %g", (1'bx) ? fr() : 7.25, (1'bx) ? fr() : 5.0);
+                $display("%g %g", (1'bx) ? 3.0 : i,     (1'bx) ? fr() : i);
+                $display("%g %g", (1'bz) ? i : 3.0,     (1'bx) ? fr() : fr());
+            end
+        endmodule
+    )");
+    CHECK(out == "7.25 0\n3 0\n3 7.25\n");
+}
+
+// Accellera UVM `uvm_transaction::end_tr` (uvm_transaction.svh:829):
+//     this.end_time = (end_time == 0) ? $realtime : end_time;
+// $realtime is real and end_time is a `time`, so 11.4.11 makes the conditional
+// real and the store back into `time` is an ordinary 6.12.1 conversion — which
+// ROUNDS, not truncates, and rounds a half away from zero. Checked at nonzero,
+// fractional simulation times so the conversion is not trivially exact.
+// Byte-checked against iverilog 13.
+TEST_CASE("a time destination from `cond ? $realtime : time_var` rounds") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module t;
+            time et;
+            function automatic time end_tr(time end_time = 0);
+                return (end_time == 0) ? $realtime : end_time;
+            endfunction
+            initial begin
+                #1.5;
+                et = end_tr();
+                $display("frac  %0d", et);  // 1.5 -> 2
+                et = end_tr(7);
+                $display("given %0d", et);
+                #0.75;
+                et = 0;
+                et = (et == 0) ? $realtime : et;
+                $display("inline %0d", et); // 2.25 -> 2
+                #0.5;
+                et = 0;
+                et = (et == 0) ? $realtime : et;
+                $display("half  %0d", et);  // 2.75 -> 3
+            end
+        endmodule
+    )");
+    CHECK(out == "frac  2\ngiven 7\ninline 2\nhalf  3\n");
+}
+
 TEST_CASE("real signals: sensitivity, NBA, continuous assign, ports, arrays") {
     const std::string out = run_capture(R"(
         module sub(input var real in, output var real out);
