@@ -76,6 +76,52 @@ professional parity; M5 makes it complete.
   an out-of-range index into a fixed / dynamic array or queue, a missing
   associative-array key, integer divide / modulo by zero (all-x), real divide by zero,
   and a string index out of range.
+- [x] **Real result through the lazy `?:` merge** (LRM 11.4.11) — a mixed
+  real/integral conditional with a non-speculatable arm fataled
+  "internal: integer plane of a real value". Motivated by Accellera UVM's
+  `uvm_transaction.svh:829`,
+  `this.end_time = (end_time == 0) ? $realtime : end_time;` on the
+  transaction-recording path ($realtime real, end_time a `time`).
+  THE CLAUSE'S PROMOTION WAS NEVER THE DEFECT. 11.4.11's rule — real+integral
+  and real+shortreal cast the other arm to real, shortreal+integral casts to
+  shortreal — is slang's to apply, and slang applies it: propagateType wraps
+  the integral arm in a Conversion, `--emit ir` shows `itof` on BOTH arms, and
+  the eager Select's is_real dispatch (lower_real_mux) consumed the result
+  correctly all along. The full promotion matrix passes eagerly,
+  type-observability included: `(c ? 1 : 2.5) / 2` is 0.5, so the chosen
+  integral arm really became 1.0 before the divide. What was missing was one
+  CARRIER: lower_select_lazy merged an integer Plane or a string handle and
+  nothing else, so a REAL-typed `?:` routed through lower_lazy_conditional
+  (here because $realtime is a SystemCall, unsafe by the whitelist's default
+  arm) sent an fp-only Plane into must_of and tripped its depth guard. The
+  guard's comment blames the frontend, but the frontend had done its job — the
+  merge node was incomplete. A real result now merges as one fp PHI, the lazy
+  analogue of the eager dispatch and the exact shape of the string pointer PHI
+  beside it. Short-circuit &&/||/-> cannot reach the new arm:
+  lower_short_circuit reduces a real operand to its truth bit (FNe against
+  0.0) before the merge, so its select_lazy values are always 1-bit.
+  THE AMBIGUOUS CONDITION NEEDED NO NEW DECISION, and that is worth recording
+  because falling through to the integer path is exactly how the fatal arose:
+  lower_lazy_conditional's x region re-lowers both arms into an eager Select,
+  so an x/z condition lands in lower_real_mux's existing rule — arms equal
+  after promotion return the common value, unequal fall to the real default
+  0.0 (Table 7-1), Table 11-20 being defined for integral results only. Same
+  reading as the string mux and the aggregate whole-type default above.
+  iverilog 13 agrees byte-for-byte (`(1'bx) ? fr() : 7.25` is 7.25,
+  `(1'bx) ? fr() : 5.0` is 0, with the promoted `(1'bx) ? 3.0 : i` at i == 3
+  logically equivalent, so 3); Verilator 5.050 returns the false arm and is
+  not an oracle here.
+  SIBLING AUDIT — every other context sharing the promotion rule was already
+  correct, and at the same seam (slang's inserted Conversion plus an
+  isFloating() dispatch in the consumer): mixed compare and arithmetic
+  (lower_binary routes either floating operand to lower_real_binary), a real
+  case selector or item (has_real_case_operand routes the whole statement to
+  lower_case_real, FEq over operands coerced to real), an int actual bound to
+  a real formal and an int return from a real function (both assignment
+  contexts, so slang's Conversion lowers through coerce's ItoF). The store
+  back into the `time` destination is the ordinary FtoI, which rounds half
+  away from zero (LRM 6.12.1, llvm.round + fptosi.sat) — pinned at fractional
+  NONZERO sim times in real_test.cpp so the conversion is not trivially exact.
 - [x] **Aggregate `?:`** (LRM 11.4.11 over an unpacked struct / fixed unpacked
   array) — `o = c ? x : y;`, `st d = c ? x : y;`, `return c ? x : y;`,
   `(c ? x : y).m`, `$display("%p", c ? x : y)`, `(c ? x : y) == z`. The clause's

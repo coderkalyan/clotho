@@ -26422,12 +26422,14 @@ private:
         b_.SetInsertPoint(cont_bb);
     }
 
-    // Value-producing short-circuit conditional (&&/||). Branches on the
-    // predicate's must bit (a definite 2-state value), lowers only the taken
-    // branch's region, and merges the two branch values with a PHI. The
-    // side-effecting right operand lives inside the then-region, so it is never
-    // evaluated when the predicate is 0. LLVM folds the whole thing back to a
-    // straight-line select when both branches are side-effect free.
+    // Value-producing conditional with lazily evaluated branches: short-circuit
+    // &&/||/-> (lower_short_circuit) and a `?:` whose arm must not be
+    // speculated (lower_lazy_conditional). Branches on the predicate's must bit
+    // (a definite 2-state value), lowers only the taken branch's region, and
+    // merges the two branch values with a PHI. A side-effecting operand lives
+    // inside its own region, so it is never evaluated when the predicate rules
+    // it out. LLVM folds the whole thing back to a straight-line select when
+    // both branches are side-effect free.
     void lower_select_lazy(Index i) {
         const Inst::Payload& p    = ir_->payload(i);
         const auto           sel  = ir_->extra_data<SelectLazy>(p.op_extra.extra);
@@ -26447,6 +26449,17 @@ private:
         // holds "" even though its producer never ran, and the PHI only forwards
         // the pointer from the block that did execute.
         const bool is_str = type_of(i).is_string;
+        // A real arm carries no integer plane at all — it rides Plane.fp — so
+        // its merge is one fp PHI, the lazy analogue of the eager Select's
+        // lower_real_mux dispatch. Reached from lower_lazy_conditional whenever
+        // LRM 11.4.11 makes a `?:` real (one arm real, the other cast to real
+        // by slang) and an arm is not speculation-safe, which is what
+        // `(t == 0) ? $realtime : t` is. Without it the arm's fp-only Plane
+        // reached must_of and tripped its real-value depth guard. The
+        // short-circuit operators never arrive here with a real:
+        // lower_short_circuit reduces a real operand to a truth bit (FNe
+        // against 0.0) before the merge.
+        const bool is_real = type_of(i).is_real;
         // The two arms may disagree in Plane domain (a 2-state constant against a
         // 4-state Land/Lor result), so each is normalized to the instruction's own
         // domain inside its block — the PHIs need identical value types.
@@ -26455,15 +26468,17 @@ private:
 
         b_.SetInsertPoint(then_bb);
         lower_region(ir_->region(sel.then_));
-        const Plane       tv       = is_str ? Plane{} : norm(sel.then_val);
+        const Plane       tv       = is_str || is_real ? Plane{} : norm(sel.then_val);
         llvm::Value*      ts       = is_str ? str_of(sel.then_val) : nullptr;
+        llvm::Value*      tf       = is_real ? fp_of(value_of(sel.then_val)) : nullptr;
         llvm::BasicBlock* then_end = b_.GetInsertBlock();
         branch_to(cont_bb);
 
         b_.SetInsertPoint(else_bb);
         lower_region(ir_->region(sel.else_));
-        const Plane       ev       = is_str ? Plane{} : norm(sel.else_val);
+        const Plane       ev       = is_str || is_real ? Plane{} : norm(sel.else_val);
         llvm::Value*      es       = is_str ? str_of(sel.else_val) : nullptr;
+        llvm::Value*      ef       = is_real ? fp_of(value_of(sel.else_val)) : nullptr;
         llvm::BasicBlock* else_end = b_.GetInsertBlock();
         branch_to(cont_bb);
 
@@ -26473,6 +26488,13 @@ private:
             h->addIncoming(ts, then_end);
             h->addIncoming(es, else_end);
             set_str(i, h);
+            return;
+        }
+        if (is_real) {
+            llvm::PHINode* f = b_.CreatePHI(tf->getType(), 2);
+            f->addIncoming(tf, then_end);
+            f->addIncoming(ef, else_end);
+            set_value(i, real_plane(f));
             return;
         }
         llvm::PHINode* mm = b_.CreatePHI(tv.mm->getType(), 2);
