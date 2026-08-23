@@ -1912,8 +1912,10 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   storage. Lifetime: leaked by default (LRM 8.4 objects are GC'd — unobservable);
   collected under `--gc`, see docs/design/garbage-collection.md and the M4 item
   below. See docs/design/classes.md; verified vs iverilog in tests/class_test.cpp.
-  Deferred within Phase 1, each guarded loud: nonblocking assignment to a class
-  property; `$display("%p")` of a handle. (Class handles as queue /
+  Deferred within Phase 1, guarded loud: nonblocking assignment to a class
+  property. (`$display("%p")` of a handle was listed here too and is not:
+  a class handle prints its class name and the other four reference types print
+  theirs — String formatting, under UVM enablers.) (Class handles as queue /
   dynamic-array / assoc-array elements were listed here as guarded and are not:
   all three work. They are refused only under `--gc`, which cannot yet trace
   through a container — garbage-collection.md §3.3.) A property initializer may
@@ -2711,15 +2713,63 @@ project with its own algorithm, not tail cleanup on the property layer:
     record. iverilog is no oracle either: it cannot compile a queue of class handles
     at all. The name is unqualified (a specialization carries its own arguments,
     `uvm_queue#(uvm_callback)`); Verilator writes `pkg::C`. Rendered by
-    `class_p_render` as a select over two string constants, so nothing dereferences
+    `handle_p_render` as a select over two string constants, so nothing dereferences
     the handle. A class-handle container ELEMENT routes the container through the
     loop render (`build_container_p_string`) rather than the flat runtime descriptor,
     which would have printed the pointer word. Needed by uvm_queue's
     `convert2string`, which is `%p` over a queue of handles.
     Follow-up: expand the properties of a DIRECT operand, the one depth where a
     cycle cannot be reached in one step, leaving nested handles as names.
-  - [ ] `%p` of a chandle / event / virtual-interface handle — rejected loud; unlike
-    a class handle, none of these has a name to print in place of the object.
+  - [x] **`%p` of a chandle / event / virtual-interface handle** (LRM 21.2.1.6) — was
+    **a refusal of a `shall`**, which is the part that makes this different from the
+    class-handle entry above. The clause names five reference types in one sentence:
+    "a chandle, class handle, interface class handle, event, or virtual interface
+    shall print its value in an implementation-dependent format, except that a null
+    handle value shall print the word **null**". So only the non-null form was ever
+    open; printing nothing at all was never an option, and every
+    `uvm_config_db#(virtual X)` in every UVM testbench hit it — `uvm_resource#(T)`'s
+    `m_value_as_string` is `$sformatf("%p", val)` (uvm_resource.svh:93) and `T` is the
+    virtual interface.
+    Decision, extending the class-handle rule rather than inventing a second one: a
+    null handle prints `null`, any other prints **the name of what it points at**, at
+    every depth. A chandle prints `chandle` and an event prints `event` — LRM 6.14 and
+    15.5 give those types no other name, the type IS the name. A virtual interface
+    prints the interface **definition's** name (`virtual some_if` → `some_if`), taken
+    from the placeholder body `vif_named_body` already resolves members against, so
+    `%p` and `vif.sig` agree about which interface it is.
+    Two more informative renderings were weighed and rejected. The interface
+    INSTANCE's hierarchical path is the most useful thing a virtual interface could
+    print, and it is what the class-name choice would look like if that choice were
+    about identity — but it is not: the class arm prints a TYPE, so a path would make
+    one of the five reference types disagree with the other four. It is also not cheap
+    here: the handle is the address of an instance's context record
+    (docs/design/interfaces.md) and there is no runtime address → path table, so a
+    path would take a compare chain over every elaborated instance of the definition,
+    emitted at every `%p`. A raw pointer value is rejected outright — informative but
+    unstable across runs, i.e. useless in a golden file, which is the same reason the
+    bug below was a bug.
+    Fixed with it, and the reason the container depth was not merely a refusal one
+    level down: `%p` of a container whose element is an EVENT printed the handle WORD
+    (`'{1, 2}` for two events — a slot index, neither `null` nor a name, and not
+    stable). The flat runtime element descriptor describes one integral / real /
+    string, and an event handle is a 64-bit integral, so it took that path silently.
+    `loop_render`'s class-handle test is now a handle test over all four kinds
+    (`elem_is_handle`), and it needs BOTH halves: a class handle is decidable from the
+    IR type, while a chandle is a plain unsigned 64-bit int there and only the AST
+    tells it apart. An event queue / dynamic array / associative array is the one
+    handle container the element type system admits today, so it is where that is
+    pinned; a chandle or virtual-interface element is still refused by
+    `guard_container_element`, which is the container-of-handles gap below and NOT a
+    `%p` deficiency — and for a chandle 6.14's closed list of legal uses names an
+    associative array but no queue or dynamic array, so the queue form is doubtful
+    SystemVerilog in the first place.
+    The RUNTIME-format path (`lower_dynamic_format`) keeps refusing a handle argument
+    and the refusal is accurate as written: `rt_arg` carries one integral / real /
+    string, and with the format unknown the frontend cannot tell which specifier the
+    argument will meet. Pre-rendering the name as a string was considered and is
+    unsound — `$display("%d", ch)` is accepted and prints the handle word, so a handle
+    genuinely may meet a numeric conversion, and a pre-rendered name would be silently
+    wrong text there.
   - [x] **`%0p`** (LRM 21.2.1.6) — a **separate specifier**, not a width applied to
     `%p`: the clause gives it its own sentence, "shall print aggregate expressions
     ... in a shorter, implementation specific form". slang draws the same line

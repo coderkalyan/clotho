@@ -476,17 +476,6 @@ TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"
             endmodule
         )") == "'{r:1.5, s:\"hi\", n:-3} \"top\" \"lit\" 0.333333\n");
     }
-    SUBCASE("a chandle operand is still refused loudly") {
-        // A class handle now renders (see the %p handle test below); a chandle has no
-        // name to print in place of the object, so it stays refused.
-        check_rejected(R"(
-            module m;
-                import "DPI-C" function chandle mk();
-                chandle h;
-                initial begin h = mk(); $display("%p", h); end
-            endmodule
-        )", "handle is not supported");
-    }
 }
 
 // `%0p` is a SEPARATE specifier in 21.2.1.6, not a width applied to `%p`: it "shall
@@ -569,6 +558,182 @@ TEST_CASE("%p of a class handle prints null or the class name") {
         endmodule
     )");
     CHECK(out == "null:   null\nlive:   Outer\nmember: '{a:3, h:Outer}\nmnull:  '{a:3, h:null}\n");
+}
+
+// `%p` of a chandle, an event and a virtual-interface handle. This used to be
+// refused loud, which was a refusal of an LRM `shall`: 21.2.1.6 says "a chandle,
+// class handle, interface class handle, event, or virtual interface shall print its
+// value in an implementation-dependent format, except that a null handle value shall
+// print the word null". Only the non-null form is ours to choose, and it is chosen
+// the same way the class-handle case above was -- the NAME of what the handle points
+// at, at every depth, which is cycle-safe by construction:
+//
+//   a chandle -> `chandle`, an event -> `event` (LRM 6.14 / 15.5 give these types no
+//   other name), a virtual interface -> the interface DEFINITION's name.
+//
+// The instance's hierarchical path was weighed for the virtual interface and rejected:
+// it is instance identity where the class arm prints a type, and the handle is a
+// context-record address with no runtime path table behind it. A raw pointer value
+// was rejected because it is unstable across runs.
+//
+// libc malloc is the no-.so probe for a NON-NULL chandle: without DPI every chandle
+// in a design is null (LRM 6.14 admits assignment only from another chandle or null),
+// so it is the only way to exercise the non-null arm at run time.
+TEST_CASE("%p of a chandle / event / virtual-interface handle (LRM 21.2.1.6)") {
+    SUBCASE("direct operand, struct member and fixed-array element") {
+        const std::string out = run_capture(R"(
+            interface some_if;
+                logic [7:0] d;
+            endinterface
+            module m;
+                import "DPI-C" function chandle malloc(input longint size);
+                import "DPI-C" function void    free(input chandle p);
+                typedef struct { int a; chandle c; event e; virtual some_if v; } st;
+                some_if bus();
+                chandle         ch, chnul;
+                event           ev, evnul;
+                virtual some_if vif, vifnul;
+                st              s;
+                chandle         ca [0:1];
+                event           ea [0:1];
+                virtual some_if va [0:1];
+                initial begin
+                    ch    = malloc(64);
+                    vif   = bus;
+                    evnul = null;
+                    $display("cnull: %p", chnul);
+                    $display("clive: %p", ch);
+                    $display("enull: %p", evnul);
+                    $display("elive: %p", ev);
+                    $display("vnull: %p", vifnul);
+                    $display("vlive: %p", vif);
+                    s = '{7, ch, ev, vif};
+                    $display("mem:   %p", s);
+                    s = '{7, null, null, null};
+                    $display("mnul:  %p", s);
+                    ca[1] = ch;
+                    ea[0] = null;
+                    va[1] = bus;
+                    $display("arr:   %p %p %p", ca, ea, va);
+                    $display("arr0:  %0p %0p %0p", ca, ea, va);
+                    free(ch);
+                end
+            endmodule
+        )");
+        // An `event` declared without an initializer is bound to a NEW object (LRM
+        // Table 6-7), so `ev` and `ea[1]` are non-null while an explicit `null` is not.
+        CHECK(out == "cnull: null\n"
+                     "clive: chandle\n"
+                     "enull: null\n"
+                     "elive: event\n"
+                     "vnull: null\n"
+                     "vlive: some_if\n"
+                     "mem:   '{a:7, c:chandle, e:event, v:some_if}\n"
+                     "mnul:  '{a:7, c:null, e:null, v:null}\n"
+                     "arr:   '{null, chandle} '{null, event} '{null, some_if}\n"
+                     "arr0:  '{null, chandle} '{null, event} '{null, some_if}\n");
+    }
+    // A container ELEMENT is the depth the runtime formatter serves from a FLAT
+    // element descriptor, which describes one integral / real / string -- so a handle
+    // element took it and printed the handle WORD (`'{1, 2}` for two events, a slot
+    // index that is neither `null` nor a name and not stable). A queue of events is
+    // the one handle element the container type system admits today, so it is the live
+    // regression: it forces the frontend loop render, where the element goes through
+    // the ordinary expansion and gets its name.
+    SUBCASE("an event container element renders its name, not the handle word") {
+        const std::string out = run_capture(R"(
+            module m;
+                event e0, e1;
+                event q [$];
+                event da [];
+                event aa [int];
+                initial begin
+                    q.push_back(e0);
+                    q.push_back(null);
+                    da = new[2];
+                    aa[3] = e1;
+                    aa[9] = null;
+                    $display("q:   %p", q);
+                    $display("da:  %p", da);
+                    $display("aa:  %p", aa);
+                    $display("q0:  %0p", q);
+                end
+            endmodule
+        )");
+        // A dynamic array's elements are constructed, not defaulted to null (LRM
+        // Table 6-7 again, via rt_elem_event), so `new[2]` yields two live events.
+        CHECK(out == "q:   '{event, null}\n"
+                     "da:  '{event, event}\n"
+                     "aa:  '{3:event, 9:null}\n"
+                     "q0:  '{event, null}\n");
+    }
+    // A queue / dynamic / associative array of chandles or of virtual-interface
+    // handles is still refused, at TYPE lowering rather than by `%p` -- the
+    // container-of-handles gap in docs/TODO.md. Pinned so the diagnostic that fires
+    // stays the accurate one, and does not silently become a `%p` refusal again.
+    SUBCASE("a queue of chandles is refused by the container, not by %p") {
+        check_rejected(R"(
+            module m;
+                chandle q [$];
+                initial $display("%p", q);
+            endmodule
+        )", "queue element type is not supported");
+    }
+    // A RUNTIME format string marshals its arguments through `rt_arg`, which carries
+    // one integral / real / string value, and the frontend cannot know which specifier
+    // an argument will meet -- so it cannot pre-render the handle either. That is not
+    // hypothetical: `$display("%d", ch)` is accepted and prints the handle word, so a
+    // handle genuinely may meet a numeric conversion and a pre-rendered name would be
+    // wrong text. The refusal stays, and this pins that it names the type precisely.
+    SUBCASE("a runtime format string refuses a handle argument, accurately") {
+        check_rejected(R"(
+            interface some_if; logic [7:0] d; endinterface
+            module m;
+                some_if bus();
+                virtual some_if vif;
+                string f, s;
+                initial begin
+                    vif = bus;
+                    f   = "%p";
+                    s   = $sformatf(f, vif);
+                end
+            endmodule
+        )", "argument 2 is a virtual interface handle, which a runtime format string cannot render");
+    }
+}
+
+// The uvm_resource#(T) shape (uvm-core/src/base/uvm_resource.svh:93): a parameterized
+// class whose only view of T is `$sformatf("%p", val)`, specialized at
+// T = virtual some_if by every `uvm_config_db#(virtual X)` in every UVM testbench.
+// This exact site was the refusal that motivated the work, so it is pinned end to end
+// rather than only through the pieces above.
+TEST_CASE("%p of a virtual interface through a class parameter (uvm_resource shape)") {
+    const std::string out = run_capture(R"(
+        interface some_if;
+            logic [7:0] d;
+        endinterface
+        class res #(type T = int);
+            T val;
+            virtual function string m_value_as_string();
+                return $sformatf("%p", val);
+            endfunction
+        endclass
+        module top;
+            some_if bus();
+            res #(virtual some_if) r;
+            res #(int)             ri;
+            initial begin
+                r = new;
+                ri = new;
+                $display("unset: %s", r.m_value_as_string());
+                r.val = bus;
+                $display("bound: %s", r.m_value_as_string());
+                ri.val = 42;
+                $display("int:   %s", ri.m_value_as_string());
+            end
+        endmodule
+    )");
+    CHECK(out == "unset: null\nbound: some_if\nint:   42\n");
 }
 
 // A `%p` operand is expanded at lower time and needs an lvalue to walk, so an

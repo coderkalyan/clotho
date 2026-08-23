@@ -19375,20 +19375,51 @@ private:
         return false;
     }
 
-    // The `%p` text of a class handle value `v`: `null` when the handle is null, else
-    // the class's name. A select over two string constants, so nothing dereferences
-    // the handle and there is no branch to build -- see expand_p_scalar for why the
-    // name rather than the object's properties.
+    // The name `%p` prints for a NON-NULL handle, or nullopt when the type is not a
+    // handle at all. LRM 21.2.1.6 names five reference types together -- "a chandle,
+    // class handle, interface class handle, event, or virtual interface" -- and
+    // leaves their form implementation-dependent, so one rule covers all of them:
+    // the name of the thing the handle points AT. See expand_p_scalar for why a name
+    // rather than the pointee's contents.
     //
-    // The name is unqualified. A specialization prints the name slang gives it, which
-    // already carries its arguments (`uvm_queue#(uvm_callback)`); the scope is left
-    // off, where Verilator writes `pkg::C`. Implementation-defined either way.
-    ir::Index class_p_render(ir::Index v, const slang::ast::ClassType& clt, ir::Builder& b, ir::SourceLoc l) {
+    // A class name is unqualified. A specialization prints the name slang gives it,
+    // which already carries its arguments (`uvm_queue#(uvm_callback)`); the scope is
+    // left off, where Verilator writes `pkg::C`. Implementation-defined either way.
+    // An interface class is a ClassType too, so it takes the same arm.
+    static std::optional<std::string_view> handle_p_name(const slang::ast::Type& ct) {
+        if (ct.isClass()) {
+            return ct.as<slang::ast::ClassType>().name;
+        }
+        if (ct.isVirtualInterface()) {
+            // The interface DEFINITION's name, which is what the handle's TYPE names
+            // (`virtual input_if` prints `input_if`). The placeholder body slang
+            // caches per (definition, parameters) is the same one a vif member access
+            // resolves against (vif_named_body), so this agrees with `vif.sig` about
+            // which interface it is.
+            return ct.as<slang::ast::VirtualInterfaceType>().iface.body.getDefinition().name;
+        }
+        if (ct.isCHandle()) {
+            // LRM 6.14: an opaque pointer. The type is the only name it has.
+            return "chandle";
+        }
+        if (ct.isEvent()) {
+            return "event";
+        }
+        return std::nullopt;
+    }
+
+    // The `%p` text of a handle value `v`: `null` when the handle word is zero, else
+    // `name`. A select over two string constants, so nothing dereferences the handle
+    // and there is no branch to build. Zero is `null` for all five reference types --
+    // a class handle and a chandle by Table 7-1's default, an event because slot 0 is
+    // the reserved null object, a virtual interface because the handle is the address
+    // of an instance's context record.
+    ir::Index handle_p_render(ir::Index v, std::string_view name, ir::Builder& b, ir::SourceLoc l) {
         const ir::Ref   u64  = make_int_type(64, false, false);
         const ir::Index null = b.constant(module_.pool.put_int(u64, 0), l);
         return b.select(b.binary(ir::Inst::Tag::Eq, v, null, l),
                         b.constant(string_value_ref("null"), l),
-                        b.constant(string_value_ref(clt.name), l),
+                        b.constant(string_value_ref(name), l),
                         l);
     }
 
@@ -19415,31 +19446,45 @@ private:
             frag += "\"%s\"";
         } else if (!sty.isIntegral()) {
             const ir::Ref cl = lower_type(sty);
-            if (sty.getCanonicalType().isClass()) {
-                // A class handle. LRM 21.2.1.6 describes %p over aggregate VALUES, and
-                // a handle is not one -- the clause says nothing about what a handle
-                // prints, beyond `null` for a null one. So the form is
-                // implementation-defined, and this is the choice, recorded in
-                // docs/TODO.md:
+            if (const std::optional<std::string_view> hn = handle_p_name(sty.getCanonicalType())) {
+                // A handle. LRM 21.2.1.6 REQUIRES this to print -- "a chandle, class
+                // handle, interface class handle, event, or virtual interface shall
+                // print its value in an implementation-dependent format, except that
+                // a null handle value shall print the word null" -- but the clause
+                // otherwise describes %p over aggregate VALUES, and a handle is not
+                // one. So the non-null form is ours to pick, and this is the choice,
+                // recorded in docs/TODO.md:
                 //
-                //   a null handle prints `null`; any other prints its CLASS NAME.
+                //   a null handle prints `null`; any other prints the NAME of what it
+                //   points at -- a class name, an interface definition name, or the
+                //   type's own name for a chandle / event, which have no other.
                 //
                 // One rule at every depth -- a direct %p operand, a struct member, a
                 // queue element -- which is what makes it cycle-safe by construction.
-                // Expanding an object's properties instead is more informative and is
-                // what Verilator does for a DIRECT operand, but it needs a depth cap
-                // or a visited set the LRM does not define, and UVM's object graphs
-                // are cyclic (uvm_component holds m_parent and m_children, so
+                // Expanding a class object's properties instead is more informative
+                // and is what Verilator does for a DIRECT operand, but it needs a
+                // depth cap or a visited set the LRM does not define, and UVM's object
+                // graphs are cyclic (uvm_component holds m_parent and m_children, so
                 // `%p` on one would not terminate). Verilator is itself inconsistent
                 // here -- it expands a direct operand but prints the type name for a
                 // handle inside a container -- so there is no reference behaviour to
                 // match, only a decision to make.
                 //
-                // TODO: expand the properties of a DIRECT %p operand (the one depth
-                // where a cycle cannot be reached in one step), leaving nested handles
-                // as names.
+                // A virtual interface could instead print the hierarchical path of the
+                // instance the handle names, which is genuinely more informative. It
+                // is rejected for two reasons: it is instance IDENTITY where the class
+                // arm prints a TYPE, so the five reference types would stop agreeing
+                // with each other; and the handle is a context-record address with no
+                // runtime address -> path table behind it, so a path would take a
+                // compare chain over every elaborated instance of the definition,
+                // emitted per %p. A raw pointer value is rejected outright: it is
+                // unstable across runs, which makes it useless in a golden file.
+                //
+                // TODO: expand the properties of a DIRECT class-handle %p operand (the
+                // one depth where a cycle cannot be reached in one step), leaving
+                // nested handles as names.
                 frag += "%s";
-                args.push_back(class_p_render(v, sty.getCanonicalType().as<slang::ast::ClassType>(), b, l));
+                args.push_back(handle_p_render(v, *hn, b, l));
                 return;
             }
             if (is_handle_ref(cl) || is_agg_abi_ref(cl)) {
@@ -19447,12 +19492,15 @@ private:
                 // into one, but the runtime renderer works from a flat element
                 // descriptor (one integral / real / string per element), so a nested
                 // container has no image to hand it. Reported here rather than
-                // falling into the handle case below, whose reason is different.
+                // falling into the case below, whose reason is different.
                 fail("%p of a container or aggregate element is not supported");
             }
-            // TODO: %p of a chandle / event / virtual-interface handle. Unlike a class
-            // handle above, none of these has a name to print in place of the object.
-            fail("%p of a chandle / event / virtual interface handle is not supported");
+            // Not one of the five reference types and not an aggregate, so there is
+            // neither a value nor a name to print. Nothing in the language reaches
+            // here today -- the `null` literal has no lowered type at all and dies
+            // earlier, in lower_type -- so this is the backstop, named by type so a
+            // future arrival is identifiable from the diagnostic alone.
+            fail("%p of a value of type '" + sty.toString() + "' is not supported");
         } else {
             frag += "%0d";
         }
@@ -19532,15 +19580,19 @@ private:
             // element goes through the ordinary aggregate expansion.
             frag += "%s";
             const slang::ast::Type* est = sty != nullptr ? sty->getCanonicalType().getArrayElementType() : nullptr;
-            const bool              elem_is_class =
-              std::get<ir::Type>(module_.pool.get(t.element)).kind == ir::Type::Kind::Class;
-            // A class-handle element is a 64-bit word, so the flat runtime formatter
-            // would take it and print the pointer. It has a name to print instead
-            // (class_p_render), but only the frontend knows it, so route it through
-            // the loop like any other element the descriptor cannot describe.
+            // A handle element -- class, chandle, event or virtual interface -- is a
+            // 64-bit word, so the flat runtime formatter would take it and print the
+            // pointer. It has a name to print instead (handle_p_render), but only the
+            // frontend knows it, so route it through the loop like any other element
+            // the descriptor cannot describe. A class handle is decidable from the IR
+            // type; a chandle is a plain unsigned 64-bit int there and only the AST
+            // tells it apart, so both tests are needed.
+            const bool              elem_is_handle =
+              std::get<ir::Type>(module_.pool.get(t.element)).kind == ir::Type::Kind::Class ||
+              (est != nullptr && handle_p_name(est->getCanonicalType()).has_value());
             const bool              loop_render = value_cat(t.element) != ValueCat::scalar ||
                                                   module_.pool.layout(t.element).width > 64 ||
-                                                  elem_is_class ||
+                                                  elem_is_handle ||
                                                   (est != nullptr && est->isTaggedUnion());
             if (loop_render && value_cat(t.element) != ValueCat::string) {
                 args.push_back(build_container_p_string(lv, ty, t, sty, b, l));
