@@ -214,8 +214,8 @@ bool subroutine_has_real_delay(const SubroutineSymbol& sub) {
 // resolvers decide which properties get them; the design-wide pre-pass and the
 // wait lowering MUST agree, so both call these and nothing else.
 
-// The class INSTANCE property a `@` operand names, or null when the expression is
-// not a plain reference to one.
+// The class INSTANCE property an expression names, or null when the expression is
+// not a plain reference to one. Shared by the two type-specific resolvers below.
 //
 // `@p` inside a method (an implicit-`this` reference, so a NamedValue) and
 // `@(obj.p)` (a MemberAccess) are the two shapes. Excluded on purpose:
@@ -223,11 +223,9 @@ bool subroutine_has_real_delay(const SubroutineSymbol& sub) {
 //   - a STATIC property, which has persistent module-signal storage of its own
 //     (declare_static_prop) and already resolves through event_signal;
 //   - an EVENT property, which is already an object with a waiter list, so
-//     `@(obj.e)` works today through the event-handle path;
-//   - a non-integral property (string, real, class handle, aggregate, container),
-//     which has no old -> new transition the store path can classify. Those keep
-//     failing loudly rather than silently gaining a notifier that never fires.
-const slang::ast::ClassPropertySymbol* waited_class_prop(const Expression& e) {
+//     `@(obj.e)` works today through the event-handle path. Neither resolver
+//     below admits one, since an event type is neither integral nor a container.
+const slang::ast::ClassPropertySymbol* instance_class_prop(const Expression& e) {
     const slang::ast::Symbol* member = nullptr;
     if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
         member = &e.as<ValueExpressionBase>().symbol;
@@ -246,11 +244,54 @@ const slang::ast::ClassPropertySymbol* waited_class_prop(const Expression& e) {
     if (prop == nullptr || prop->lifetime == slang::ast::VariableLifetime::Static) {
         return nullptr;
     }
-    const slang::ast::Type& ty = prop->getType().getCanonicalType();
-    if (!ty.isIntegral()) {
+    return prop;
+}
+
+// The three container kinds whose mutation surface a change notifier covers: a
+// queue (LRM 7.10), an associative array (7.8) and a dynamic array (7.5). Tested
+// in that order because slang answers isDynamicallySizedArray() for an
+// associative array too (foreach_dim_ref was bitten by exactly that).
+//
+// A FIXED unpacked array is deliberately absent. Its storage never changes
+// extent, so it has no mutation op at all -- every write to one is an element
+// store -- and it is refused rather than given a notifier nothing would fire.
+bool is_notified_container(const slang::ast::Type& ty) {
+    return ty.isQueue() || ty.isAssociativeArray() || ty.isDynamicallySizedArray();
+}
+
+// The property an `@` operand names (LRM 9.4.2). INTEGRAL only: a non-edge
+// implicit event fires on a change in the expression's VALUE, which the store
+// path classifies from the old -> new word, and no other property type has such a
+// word. A container property is excluded here on purpose and refused loudly in
+// collect_wait_events_impl -- firing its mutation notifier from `@` would wake a
+// process with no value change to observe.
+const slang::ast::ClassPropertySymbol* waited_class_prop(const Expression& e) {
+    const auto* prop = instance_class_prop(e);
+    if (prop == nullptr || !prop->getType().getCanonicalType().isIntegral()) {
         return nullptr;
     }
     return prop;
+}
+
+// The CONTAINER property an expression names, whose notifier fires on mutation.
+// Only a `wait` may park on one: LRM 9.4.3 re-tests the condition and parks
+// again, so a fire that leaves it false costs one re-test, while a MISSED
+// mutation is a permanent park.
+const slang::ast::ClassPropertySymbol* waited_container_prop(const Expression& e) {
+    const auto* prop = instance_class_prop(e);
+    if (prop == nullptr || !is_notified_container(prop->getType().getCanonicalType())) {
+        return nullptr;
+    }
+    return prop;
+}
+
+// Either kind: what a `wait` condition can park on. The design-wide pre-pass and
+// the wait lowering MUST agree on this set, so both call this and nothing else.
+const slang::ast::ClassPropertySymbol* level_waited_prop(const Expression& e) {
+    if (const auto* p = waited_class_prop(e); p != nullptr) {
+        return p;
+    }
+    return waited_container_prop(e);
 }
 
 // Every class-property reference in an expression, whether or not it is notifiable.
@@ -262,11 +303,17 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
     std::vector<const Expression*> notifiable;
     // Any non-static class property was referenced, notifiable or not.
     bool any_prop = false;
+    // A CONTAINER property was referenced. `wait` parks on its mutation notifier;
+    // `@` refuses, because a mutation is not a change in value (LRM 9.4.2).
+    bool any_container = false;
 
     void take(const Expression& e) {
-        if (waited_class_prop(e) != nullptr) {
+        if (const auto* p = level_waited_prop(e); p != nullptr) {
             notifiable.push_back(&e);
             any_prop = true;
+            if (is_notified_container(p->getType().getCanonicalType())) {
+                any_container = true;
+            }
             return;
         }
         const slang::ast::Symbol* member = nullptr;
@@ -303,16 +350,39 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
 // can be lexically far from, or in another top than, the `@` that needs one.
 // Modelled on EventMergeScan (the events_merge design-wide fact) in `lower`.
 struct WaitedProps {
-    // Property -> bitmask over ir::Edge of the edges waited on.
-    ankerl::unordered_dense::map<const slang::ast::ClassPropertySymbol*, uint8_t> edges;
+    struct Waited {
+        // Bitmask over ir::Edge of the edges waited on.
+        uint8_t edges = 0;
+        // A container property: exactly one Any notifier, fired on mutation
+        // rather than on a classified transition.
+        bool container = false;
+    };
+    ankerl::unordered_dense::map<const slang::ast::ClassPropertySymbol*, Waited> props;
 
     void add(const slang::ast::ClassPropertySymbol& prop, ir::Edge edge) {
-        edges[&prop] |= static_cast<uint8_t>(1u << static_cast<uint32_t>(edge));
+        props[&prop].edges |= static_cast<uint8_t>(1u << static_cast<uint32_t>(edge));
+    }
+
+    // A container property is always and only any-change: `@` over one is refused,
+    // so no edge notifier can ever be asked for.
+    void add_container(const slang::ast::ClassPropertySymbol& prop) {
+        Waited& w = props[&prop];
+        w.edges |= static_cast<uint8_t>(1u << static_cast<uint32_t>(ir::Edge::Any));
+        w.container = true;
+    }
+
+    bool contains(const slang::ast::ClassPropertySymbol& prop) const {
+        return props.contains(&prop);
     }
 
     bool has(const slang::ast::ClassPropertySymbol& prop, ir::Edge edge) const {
-        const auto it = edges.find(&prop);
-        return it != edges.end() && (it->second & static_cast<uint8_t>(1u << static_cast<uint32_t>(edge))) != 0;
+        const auto it = props.find(&prop);
+        return it != props.end() && (it->second.edges & static_cast<uint8_t>(1u << static_cast<uint32_t>(edge))) != 0;
+    }
+
+    bool is_container(const slang::ast::ClassPropertySymbol& prop) const {
+        const auto it = props.find(&prop);
+        return it != props.end() && it->second.container;
     }
 };
 
@@ -351,7 +421,12 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
         ClassPropReadScan scan;
         w.cond.visit(scan);
         for (const Expression* e : scan.notifiable) {
-            out->add(*waited_class_prop(*e), ir::Edge::Any);
+            const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
+            if (is_notified_container(prop.getType().getCanonicalType())) {
+                out->add_container(prop);
+            } else {
+                out->add(prop, ir::Edge::Any);
+            }
         }
         visitDefault(w);
     }
@@ -3308,7 +3383,7 @@ private:
                                       ir::Ref                                class_ref,
                                       uint32_t                               prop_field,
                                       uint32_t                               next) {
-        if (waited_props_ == nullptr || !waited_props_->edges.contains(&prop)) {
+        if (waited_props_ == nullptr || !waited_props_->contains(prop)) {
             return 0;
         }
         constexpr std::array<uint32_t, 3> none{ ir::kNoNotify, ir::kNoNotify, ir::kNoNotify };
@@ -3330,7 +3405,7 @@ private:
                      std::string(prop.name) + "'");
             }
             slot->second[e] = at;
-            module_.set_change_notify(class_ref, prop_field, edge, at);
+            module_.set_change_notify(class_ref, prop_field, edge, at, waited_props_->is_container(prop));
         }
         return taken;
     }
@@ -9128,6 +9203,7 @@ private:
                     push_prop_wait_events(ev, *prop, out);
                     break;
                 }
+                refuse_container_event_control(ev);
                 const ir::Signal sig = event_signal(ev.expr);
                 if (ev.edge == slang::ast::EdgeKind::BothEdges) {
                     // `edge` means posedge-or-negedge (LRM 9.4.2), not any change:
@@ -9218,6 +9294,32 @@ private:
             return;
         }
         park(to_edge(ev.edge));
+    }
+
+    // Refuse `@` over an expression that reads a CONTAINER class property, loudly.
+    //
+    // LRM 9.4.2: "a non-edge implicit event shall be detected on any CHANGE in the
+    // value of the expression". A container property's notifier fires on MUTATION,
+    // and the two are different predicates -- `q.push_back(x); q.pop_back();`
+    // mutates twice and leaves `q.size()` exactly where it started -- so handing
+    // `@` the mutation notifier would be an observable wrong wake, not a harmless
+    // extra one. `wait` (9.4.3) is level-sensitive: it re-tests the condition and
+    // parks again, so the same fire costs it one re-test. That asymmetry is the
+    // whole reason `wait` is supported here and `@` is not.
+    //
+    // TODO: `@` over a container-dependent expression (LRM 9.4.2). It needs the
+    // expression's value snapshotted in the WAITER's own frame and compared on
+    // every wake, since the value is computed rather than stored and the write
+    // side has nothing to classify. That is a different mechanism from the
+    // classify-at-the-store one this file implements, not an extension of it.
+    void refuse_container_event_control(const SignalEventControl& ev) {
+        ClassPropReadScan scan;
+        ev.expr.visit(scan);
+        if (!scan.any_container) {
+            return;
+        }
+        fail("an event control on a container class property (queue / dynamic array / "
+             "associative array) is not supported; only `wait` can park on one");
     }
 
     // Load the handle of one change notifier of a class property, dereferencing the
@@ -16021,14 +16123,21 @@ private:
         w.cond.visit(prop_reads);
         if (reads.empty() && vif_reads.empty() && prop_reads.notifiable.empty() && prop_reads.any_prop) {
             // The condition reads a class property that can carry no notifier -- a
-            // string, a real, a handle, an aggregate, a container -- and nothing else
-            // that can wake this process. Lowering it anyway is what used to happen,
-            // and it produced a suspend with an EMPTY event list: a permanent park with
-            // no diagnostic, in a design whose author had every reason to expect a
-            // working wait. `wait(0)` still parks silently, because that one reads
-            // nothing at all and is the documented LRM 9.4.3 behaviour.
+            // string, a real, a class handle, an unpacked struct, a FIXED unpacked
+            // array -- and nothing else that can wake this process. Lowering it
+            // anyway is what used to happen, and it produced a suspend with an EMPTY
+            // event list: a permanent park with no diagnostic, in a design whose
+            // author had every reason to expect a working wait. `wait(0)` still parks
+            // silently, because that one reads nothing at all and is the documented
+            // LRM 9.4.3 behaviour.
+            //
+            // TODO: the remaining property types. A string or a real needs the
+            // classify-at-the-store path widened to a non-integral compare; a fixed
+            // unpacked array needs the notifier to survive the element-store descent
+            // (agg_member clears it on purpose today, see LlvmBackend.cpp).
             fail("wait on a class property of a type with no change notifier is not "
-                 "supported (only integral properties can be waited on)");
+                 "supported (only integral, queue, dynamic-array and associative-array "
+                 "properties can be waited on)");
         }
 
         // forever { if (cond) break; @(reads); }
@@ -16063,7 +16172,7 @@ private:
             for (const Expression* pe : prop_reads.notifiable) {
                 edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
                                               static_cast<uint32_t>(ir::Edge::Any),
-                                              prop_notifier_handle(*pe, *waited_class_prop(*pe), ir::Edge::Any, b) });
+                                              prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b) });
             }
             // An empty list is legal and meaningful: `wait(0)` reads nothing and
             // parks the process for the rest of the run.

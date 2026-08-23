@@ -822,6 +822,88 @@ professional parity; M5 makes it complete.
   array keyed by a class handle (uvm_objection.svh:1078) — the last works with
   nothing added, because the notifier handle is loaded from whatever object the
   expression evaluates to at the moment the statement runs.
+- [x] **`wait` on a CONTAINER class property** (LRM 9.4.3) — `wait(q.size() > 0)`,
+  `wait(q[0] == 3)`, `wait(a.num() > 0)` and the like on a queue (7.10), dynamic
+  array (7.5) or associative array (7.8) instance property, including a nested
+  container (`q[0].size()`) and a mix of a container and an integral property in
+  one condition. This unblocks the next UVM site after `uvm_event_base::wait_off`:
+  `uvm_queue#(T)::wait_until_not_empty` (`base/uvm_queue.svh:218`) is
+  `wait(queue.size() > 0)` over the `protected T queue[$]` at :58, and it failed
+  with "wait on a class property of a type with no change notifier is not
+  supported".
+  **Why it is not just a wider type test.** The entry above rests on the STORE
+  having an old and a new word to compare. A container has neither: its value is
+  its contents, and `q.size()` is computed from the handle, not stored anywhere a
+  write could snapshot. So a container property's single any-change notifier fires
+  on MUTATION, with no comparison at all.
+  **The `wait` / `@` asymmetry is what makes that sound, and it is the whole
+  argument.** 9.4.3 `wait` is level-sensitive: it re-evaluates and parks again, so
+  a fire that leaves the condition false costs one re-test and is unobservable,
+  while a fire that never happens is a permanent park. Over-firing is free;
+  under-firing is a silent hang. 9.4.2 `@` is the opposite: "a non-edge implicit
+  event shall be detected on any CHANGE in the value of the expression", so a
+  spurious fire there is an observable wrong wake — and mutation genuinely is not
+  change, since `q.push_back(x); q.pop_back();` is two mutations and leaves
+  `q.size()` where it started. **`@` over a container-dependent expression is
+  therefore REFUSED LOUDLY** ("an event control on a container class property … is
+  not supported; only `wait` can park on one") rather than silently given the
+  mutation notifier. Doing it properly needs the expression's value snapshotted in
+  the WAITER's frame and compared on each wake — a different mechanism, since the
+  write side has nothing to classify; that is the `TODO:` on the refusal. A
+  consequence worth naming: because only `wait` can reach a container notifier,
+  only `Edge::Any` is ever requested, so a container property carries exactly one
+  hidden field and never `.pos` / `.neg`.
+  **The mutation surface, and why the list is closed** — two facts, not a survey.
+  First, a SystemVerilog container is a VALUE TYPE: there is no handle to one, so
+  the only reachable mutations are through an lvalue rooted at the property or
+  through a `ref` formal bound to such an lvalue. Second, every mutation needs a
+  writable pointer to the container's rt handle slot, and `lv_handle_ptr` is the
+  only thing that produces one — every runtime mutator takes it as its first
+  argument. Its second parameter is now a three-valued `HandleUse`
+  (`Read` / `Mutate` / `Place`) **with no default**, so all 47 call sites had to be
+  classified and one added later cannot compile without answering. Covered:
+  queue `push_back` / `push_front` / `pop_back` / `pop_front` / `insert` /
+  `delete(i)` / `delete()` / `sort` / `rsort` / `reverse` / `shuffle` / whole
+  assignment (from a queue and from a dynamic array) / append-range; dynamic array
+  `new[]` / `new[](src)` / whole assignment / `delete()` / the four ordering
+  methods; associative array `delete(key)` / `delete()` / whole assignment /
+  `'{...}` reset. An ELEMENT write is the one shape that does not touch the
+  handle, so it is `Place` and fires from the direction the frontend already
+  threads — `ir::ElemSelect::for_write` for `q[i] = v` / `d[i] = v`, and
+  `assoc_elem_lvalue(for_write)` for `a[k] = v` and the `'{default: v}` slot; the
+  assoc case must fire even when the value written equals the element default,
+  because creating the entry changes `a.num()`. A `ref` / `output` / `inout`
+  container formal is `Place` too and rides the existing `service_snapshot` /
+  `service_after_write` bracket, which now carries a `container` flag: a `ref` is a
+  raw aliased pointer the callee mutates and never copies back, and a task callee
+  may suspend first, so the notify has to be at the call's RETURN. One fire per
+  call instead of one per mutation inside it, which a level wait absorbs.
+  A base-class method mutating an inherited container works through the same
+  member select at the base-relative index, and `$copy` fires the DESTINATION's own
+  notifier because the copy emits the same container ops (notifier rows are still
+  skipped, for the aliasing reason above).
+  A `Mutate` fire is emitted immediately BEFORE the runtime call it precedes, which
+  is sound because `emit_event_wake_list` only pushes onto the ready list and a
+  woken process cannot run before this one suspends; the only sites where a suspend
+  can intervene are the `ref` / `inout` ones, which is exactly why those use the
+  call bracket instead.
+  **Also refused loudly**: a FIXED unpacked-array property (its extent never
+  changes, so it has no mutation op — every write is an element store, and
+  `agg_member` deliberately clears the notifier when descending into an interior
+  aggregate, so it needs a separate change), and, unchanged, string / real / class
+  handle / unpacked struct properties. NBA to a class property was already refused.
+  **Zero cost** for a container nothing waits on, by construction and asserted:
+  the pre-pass admits a container property only from a `wait` condition, and
+  `class_test.cpp` pins the same class — one that churns its queue through
+  `push_back`, `push_front`, an element write and `delete` — on both sides of the
+  line, `{q, n}` versus `{q, $chg.q, n}`, plus prefix layout with the notifier in
+  place (`B{q, $chg.q, pad}` / `D{q, $chg.q, pad, extra}`).
+  Design: docs/design/classes.md, "Waiting on a container property". Covered in
+  tests/wait_test.cpp (the UVM `uvm_queue` shape with a producer and a parked
+  consumer, one case per mutation op, all three container kinds, a `ref` mutation,
+  a base-class mutation, a mixed container + integral condition, containers of two
+  objects, a nested container, and the negative space — a push-then-pop and an
+  unrelated-key delete must leave the waiter parked) and tests/class_test.cpp.
 - [x] **Named events** (LRM 15.5) — `event e;`, `-> e`, `->> e`, `->> #d e`,
   `@(e)` / `always @(e)`, `wait(e.triggered)`, at module, package, generate,
   procedural-block and `static`-local scope. An event is an OBJECT (trigger tick +
