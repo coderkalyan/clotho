@@ -250,4 +250,37 @@ std::span<const Field> InternPool::struct_fields(uint32_t fields_id) const {
     return { struct_fields_.data() + start, count };
 }
 
+void InternPool::set_class_name(Ref class_ref, std::string_view name) {
+    const auto* t = std::get_if<Type>(&get(class_ref));
+    assert(t != nullptr && "a class name belongs to a type");
+    assert(t->kind == Type::Kind::Class && "a class name belongs to a Kind::Class type");
+    const auto at = static_cast<uint32_t>(class_names_.size());
+    class_names_.insert(class_names_.end(), name.begin(), name.end());
+
+    // Uniqueness is decided here rather than at lookup so the printer's label is a
+    // plain read: a shared name loses the right to print bare on BOTH rows, not just
+    // on the later one, because a reader seeing `class C` next to `class C#19` would
+    // have no reason to think the first is a different class.
+    bool unique = true;
+    for (ClassNameRow& row : class_name_rows_) {
+        assert(row.ref != class_ref && "a class registers its name exactly once");
+        if (std::string_view{ class_names_.data() + row.at, row.len } != name) {
+            continue;
+        }
+        row.unique = false;
+        unique     = false;
+    }
+    class_name_rows_.push_back({ class_ref, at, static_cast<uint32_t>(name.size()), unique });
+}
+
+InternPool::ClassLabel InternPool::class_label(Ref class_ref) const {
+    for (const ClassNameRow& row : class_name_rows_) {
+        if (row.ref == class_ref) {
+            return { std::string_view{ class_names_.data() + row.at, row.len }, row.unique };
+        }
+    }
+
+    return { {}, true };
+}
+
 } // namespace clotho::ir
