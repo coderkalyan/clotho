@@ -25036,8 +25036,15 @@ private:
         Plane pb = rhs.is_assoc ? dyn_elem_load(assoc_elem_lvalue(rhs, /*for_write=*/false))
                                 : lower_load(rhs);
         if (vt.is_real) {
-            pa = real_plane(planes_to_real(pa, vt.width));
-            pb = real_plane(planes_to_real(pb, vt.width));
+            // A real leaf needs the FLOAT compare. `lower_compare` is the integer
+            // one: handed a real plane it read the `double` bit pattern as an
+            // integer image and walked planes that a real plane does not carry,
+            // which segfaulted outright on `struct { real r; string s; }`. Reals
+            // carry no x/z, so FEq's definite 1-bit result needs none of
+            // lower_compare's unknown-plane machinery; this is the same helper the
+            // scalar `==` reaches through Inst::Tag::FEq.
+            return lower_real_compare(Inst::Tag::FEq, real_plane(planes_to_real(pa, vt.width)),
+                                      real_plane(planes_to_real(pb, vt.width)));
         }
         return lower_compare(Inst::Tag::Eq, pa, pb, vt.is_signed);
     }

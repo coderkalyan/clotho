@@ -187,20 +187,21 @@ professional parity; M5 makes it complete.
   can hand over a distinct-but-equivalent type; every member / element walk
   addresses the target's interned type, so a merely equivalent layout needs a
   converting copy rather than the direct one.
-- [ ] **BACKEND: `AggEq` miscompares a `real` leaf** — found while adding the
-  aggregate `?:`, whose ambiguous path reaches the same node, but it PREDATES that
-  and reproduces on `main`: `x == y` over `struct { real r; string s; }`
-  SEGFAULTED with no diagnostic at all (exit 139). `LlvmBackend.cpp`'s
-  `lower_agg_eq` converts a real leaf to a real plane in its `vt.is_real` tail and
-  then compares it with `lower_compare(Inst::Tag::Eq, ...)` — the INTEGER compare
-  — where a real needs `FEq`, the way the frontend's `lower_real_binary` does for
-  a scalar `==`. Held to a loud frontend refusal for now
-  (`guard_agg_eq_members` rejects a float leaf: "equality of an aggregate with a
-  real member is not supported"), because a crash is the one outcome worse than a
-  refusal; the real fix is the tag in the backend and belongs with whoever owns
-  `lower_compare`. Note the ELEMENT-wise path is unaffected and correct: the
-  aggregate `?:`'s per-element merge picks `FEq` for a real element itself, so
-  `real p[0:1]` merges to `'{1.5, 0}` as the clause requires.
+- [x] **`AggEq` miscompared a `real` leaf** — found while adding the aggregate `?:`,
+  whose ambiguous path reaches the same node, but it PREDATED that and reproduced on
+  `main`: `x == y` over `struct { real r; string s; }` SEGFAULTED with no diagnostic
+  at all (exit 139). `LlvmBackend.cpp`'s `lower_agg_eq` converted a real leaf to a
+  real plane in its `vt.is_real` tail and then compared it with
+  `lower_compare(Inst::Tag::Eq, ...)` — the INTEGER compare — which read the
+  `double`'s bit pattern as an integer image and walked unknown planes that a real
+  plane does not carry. The leaf compare now picks `FEq` through
+  `lower_real_compare`, the same helper the scalar `==` reaches; reals carry no x/z,
+  so the definite 1-bit result needs none of `lower_compare`'s unknown-plane
+  machinery. The stopgap frontend refusal in `guard_agg_eq_members` is gone and its
+  test is now a behaviour test, cross-checked against Verilator on a real+string
+  struct, a real+int struct, and `!=`. The ELEMENT-wise path was never affected: the
+  aggregate `?:`'s per-element merge already picked `FEq` for a real element, so
+  `real p[0:1]` merged to `'{1.5, 0}` correctly throughout.
 - [ ] **Eager predicate evaluation outside `?:`** — the same deficiency, in three
   places that do not consult `is_speculation_safe` at all because they evaluate
   predicates up front unconditionally: `&&&` conjuncts in a `cond_predicate`

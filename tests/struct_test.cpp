@@ -964,28 +964,29 @@ TEST_CASE("unpacked struct equality with a string member") {
     )") == "eq=1\neq=0 ne=1\n");
 }
 
-// A real member is refused rather than compared, because the backend's AggEq
-// expansion miscompiles it: lower_agg_eq converts the leaf to a real plane and
-// then runs `lower_compare(Inst::Tag::Eq, ...)`, the INTEGER compare, where a real
-// needs FEq. That SEGFAULTED with no diagnostic, on main as well -- found while
-// adding the aggregate `?:`, whose ambiguous path reaches the same node. The real
-// fix belongs in the backend; until then the frontend refuses loudly, which is
-// strictly better than crashing.
-TEST_CASE("unpacked struct equality with a real member is refused, not a crash") {
-    const LowerResult r = lower_text(R"(
+// A real member compares through the FLOAT tag. This used to SEGFAULT with no
+// diagnostic: the backend's AggEq leaf compare converted the leaf to a real plane
+// and then ran `lower_compare(Inst::Tag::Eq, ...)`, the INTEGER compare, which read
+// the double's bit pattern as an integer image and walked planes a real plane does
+// not carry. Found while adding the aggregate `?:`, whose ambiguous path reaches the
+// same node, but it predated that. Verilator agrees on every line below.
+TEST_CASE("unpacked struct equality with a real member") {
+    CHECK(run_capture(R"(
         module m;
             typedef struct { real r; string s; } s_t;
-            s_t x, y;
+            typedef struct { real r; int n; } n_t;
+            s_t x, y; n_t p, q;
             initial begin
-                x = '{r:1.5, s:"p"};
-                y = '{r:2.5, s:"q"};
-                $display("%0d", x == y);
+                x = '{r:1.5, s:"a"}; y = '{r:1.5, s:"a"};
+                $display("same=%0d", x == y);
+                y.r = 2.5; $display("diffreal=%0d", x == y);
+                y.r = 1.5; y.s = "b"; $display("diffstr=%0d", x == y);
+                p = '{r:0.1, n:3}; q = '{r:0.1, n:3};
+                $display("mixed=%0d ne=%0d", p == q, p != q);
+                q.r = 0.2; $display("mixeddiff=%0d", p == q);
             end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("equality of an aggregate with a real member is not supported") !=
-          std::string::npos);
+    )") == "same=1\ndiffreal=0\ndiffstr=0\nmixed=1 ne=0\nmixeddiff=0\n");
 }
 
 // A real / string ELEMENT of a fixed array is fine under the same ambiguous

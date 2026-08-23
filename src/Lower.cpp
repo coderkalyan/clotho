@@ -5157,23 +5157,11 @@ private:
 
     // Reject comparable-aggregate leaf shapes the backend AggEq expansion does
     // not cover. An unpacked-array member is walked element-wise (supported);
-    // a queue / dynamic-array leaf needs the length+element compare, and a REAL
-    // leaf is miscompiled outright.
+    // only a queue / dynamic-array leaf still needs the length+element compare.
+    // A REAL leaf works: the backend's leaf compare picks FEq for one (it used to
+    // hand a real plane to the integer compare and crash).
     void guard_agg_eq_members(ir::Ref type) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
-        if (module_.pool.is_float(type)) {
-            // FIXME: the backend's AggEq expansion converts a real leaf to a real
-            // plane and then compares it with `lower_compare(Inst::Tag::Eq, ...)`
-            // -- the INTEGER compare (LlvmBackend.cpp lower_agg_eq, the `vt.is_real`
-            // tail). A real needs FEq, the way lower_real_binary uses it for a
-            // scalar `==`, so this SEGFAULTED: `x == y` over
-            // `struct { real r; string s; }` crashed with no diagnostic, and does so
-            // on main too -- it predates the aggregate `?:` that now also reaches
-            // here. Refused in the frontend rather than fixed in the backend, which
-            // is where the real fix belongs; a loud refusal is strictly better than
-            // a crash in the meantime.
-            fail("equality of an aggregate with a real member is not supported");
-        }
         if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
             // A queue / dynamic-array leaf compares element-wise. An aggregate, a
             // nested container or an element wider than one word walks in the backend
