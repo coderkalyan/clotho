@@ -390,6 +390,33 @@ public:
         return { field_names_.data() + f.name_at, f.name_len };
     }
 
+    // Number of interned items. Every Ref is an index below this, so a whole-pool
+    // walk is a counted loop; the IR printer uses it to describe each class type in
+    // the pool exactly once.
+    size_t item_count() const {
+        return items_.size();
+    }
+
+    // What the IR printer prints for a class type in place of its body.
+    struct ClassLabel {
+        // Declared source name (LRM 8.3), empty when none was recorded: a
+        // compiler-synthesized class, or one built straight into the pool.
+        std::string_view name;
+        // False when another class type in this pool carries the same name, which
+        // happens both across scopes and because one ClassType lowers once per top
+        // (each Lowerer mints its own nominal Ref). The printer then qualifies the
+        // label with the Ref, so a label always names one class.
+        bool unique;
+    };
+
+    // Record a class type's declared name, at the moment its Ref becomes the
+    // design's handle on the class. This is what lets the printer name a class
+    // rather than inline its body, which is what keeps `--emit ir` linear in the
+    // class count (see Printer.cpp's render_class_label).
+    void set_class_name(Ref class_ref, std::string_view name);
+    // The label of a class type. An unregistered class answers an empty name.
+    ClassLabel class_label(Ref class_ref) const;
+
 private:
     // Transparent functors: a stored u32 index and an ItemView probe both fold
     // into the same view, so hashing / equality have one implementation and a
@@ -436,6 +463,21 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> field_runs_;
     // Flat member-name byte arena; Field::name_at / name_len index here.
     std::vector<char> field_names_;
+    // One class type's declared name; `at` / `len` slice class_names_. `unique` is
+    // maintained by set_class_name: registering a second class under a name clears
+    // it on both rows, so neither can be printed unqualified.
+    struct ClassNameRow {
+        Ref      ref;
+        uint32_t at;
+        uint32_t len;
+        bool     unique;
+    };
+    // Class type -> declared name, one row per registered class. A vector scanned
+    // linearly, like Module's own class side tables: it is written once per class at
+    // lower time and read only by the printer.
+    std::vector<ClassNameRow> class_name_rows_;
+    // Flat class-name byte arena; ClassNameRow::at / len index here.
+    std::vector<char> class_names_;
     // Dedup index: u32 handles into items_, hashed / compared via the store.
     ankerl::unordered_dense::set<uint32_t, Hash, Eq> set_;
     // Lazily-filled layout() memo, indexed by Ref (grown to items_.size() on

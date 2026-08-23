@@ -1,34 +1,52 @@
 #include "Printer.h"
 
-#include <cassert>
 #include <sstream>
-#include <vector>
 
 namespace clotho::ir {
 
 namespace {
 
+// The label the dump uses for a class type, at a mention and at its definition in
+// the class table alike. One function for both, so a mention and the body it points
+// at can never disagree about the name.
+//
+// A class prints by NAME and never as an inlined body. Expanding the body at every
+// occurrence made the dump grow exponentially in the class count -- a class
+// reachable by k paths was printed k times, measured on a strictly acyclic chain at
+// 7 KB for 10 classes and 10.7 MB for 22 -- which put `--emit ir` on UVM past any
+// size a person can read, and `--emit ir` is the tool for diagnosing a backend
+// problem. Naming is also what retires the cycle guard this replaces: render_type
+// can no longer re-enter a class body, so there is no cycle to elide and no
+// `class^N` back-reference to read. A cycle now shows as a name recurring, which is
+// how the source writes it.
+//
+// The name is the UNQUALIFIED declared name, matching what `%p` prints for a handle
+// (Lower.cpp's handle_p_name); a specialization carries its own arguments there
+// (`uvm_queue#(uvm_callback)`) and so carries them here. Scope qualification was
+// rejected because it would not make the label unique on its own -- one ClassType
+// lowers once per top, each Lowerer minting its own nominal Ref -- so the Ref
+// qualifier below is needed either way, and `uvm_pkg::` on every mention would be
+// paid by every design to disambiguate the designs that need it.
+//
+// A shared name, and a class the pool has no name for at all, take the Ref:
+// `class C#19`, or `class#19` when there is no name. That is the backend's own name
+// for the class (`clotho.classdesc.<ref>`, LlvmBackend.cpp:2315), so where the dump
+// has to fall back on a number it is the number that cross-references the backend
+// output the reader is here to diagnose.
+void render_class_label(const InternPool& pool, Ref type, std::ostream& os) {
+    const InternPool::ClassLabel label = pool.class_label(type);
+    os << "class";
+    if (!label.name.empty()) {
+        os << " " << label.name;
+    }
+    if (label.name.empty() || !label.unique) {
+        os << "#" << static_cast<uint32_t>(type);
+    }
+}
+
 // Render an interned type compactly, e.g. `logic[7:0]`. Free function so both
 // the instruction printer and the module signal table can reuse it.
-//
-// `open_classes` holds the classes whose bodies this walk is currently inside,
-// outermost first. Kind::Class is the ONLY cyclic node in the type graph: a value
-// struct cannot contain itself, so only a class may reach itself -- directly, or
-// through a container element or a struct member -- and the pool mints exactly
-// that shape through reserve_struct_fields (InternPool.h:371-378). One stack of
-// open classes therefore closes every cycle shape at once: direct self-reference,
-// mutual A<->B, a three-hop A->B->C->A, and a cycle that runs through a queue,
-// dynamic array, associative array or struct member alike.
-//
-// A re-entered class renders as `class^N` in place of its body, where N counts
-// outward from the class being expanded right now, so `class^1` is the innermost
-// one. It is a de Bruijn index for the recursion binder: it names the elided
-// class positionally, which it has to, because the pool carries no source name
-// for a class (the backend identifies one by its Ref alone -- see
-// `clotho.classdesc.<ref>`, LlvmBackend.cpp:2315). `^` appears in no other
-// rendering, so a reader can always tell a cycle-elided reference from a genuine
-// leaf.
-void render_type(const InternPool& pool, Ref type, std::ostream& os, std::vector<Ref>& open_classes) {
+void render_type(const InternPool& pool, Ref type, std::ostream& os) {
     if (type == Ref::Invalid) {
         os << "<?>";
         return;
@@ -54,11 +72,11 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os, std::vector
             os << "shortreal";
             break;
         case Type::Kind::PackedArray:
-            render_type(pool, t.element, os, open_classes);
+            render_type(pool, t.element, os);
             os << "[" << t.left << ":" << t.right << "]";
             break;
         case Type::Kind::UnpackedArray:
-            render_type(pool, t.element, os, open_classes);
+            render_type(pool, t.element, os);
             os << " [" << t.left << ":" << t.right << "]";
             break;
         case Type::Kind::String:
@@ -78,60 +96,33 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os, std::vector
                     os << ", ";
                 }
                 os << pool.field_name(fields[i]) << ":";
-                render_type(pool, fields[i].type, os, open_classes);
+                render_type(pool, fields[i].type, os);
             }
             os << "}";
             break;
         }
         case Type::Kind::DynArray:
-            render_type(pool, t.element, os, open_classes);
+            render_type(pool, t.element, os);
             os << " []";
             break;
         case Type::Kind::Queue:
-            render_type(pool, t.element, os, open_classes);
+            render_type(pool, t.element, os);
             os << " [$]";
             break;
         case Type::Kind::Assoc:
-            render_type(pool, t.element, os, open_classes);
+            render_type(pool, t.element, os);
             if (t.right != 0) {
                 os << " [*]";
             } else {
                 os << " [";
-                render_type(pool, static_cast<Ref>(t.fields_id), os, open_classes);
+                render_type(pool, static_cast<Ref>(t.fields_id), os);
                 os << "]";
             }
             break;
-        case Type::Kind::Class: {
-            for (size_t i = open_classes.size(); i-- > 0;) {
-                if (open_classes[i] == type) {
-                    os << "class^" << (open_classes.size() - i);
-                    return;
-                }
-            }
-            open_classes.push_back(type);
-            const auto fields = pool.struct_fields(t.fields_id);
-            os << "class{";
-            for (size_t i = 0; i < fields.size(); ++i) {
-                if (i != 0) {
-                    os << ", ";
-                }
-                os << pool.field_name(fields[i]) << ":";
-                render_type(pool, fields[i].type, os, open_classes);
-            }
-            os << "}";
-            assert(!open_classes.empty() && "the class stack must still hold this class");
-            assert(open_classes.back() == type && "the class stack must unwind in order");
-            open_classes.pop_back();
+        case Type::Kind::Class:
+            render_class_label(pool, type, os);
             break;
-        }
     }
-}
-
-// Entry point: starts the walk with no class open. The stack stays empty (and so
-// allocates nothing) unless the type actually reaches a class.
-void render_type(const InternPool& pool, Ref type, std::ostream& os) {
-    std::vector<Ref> open_classes;
-    render_type(pool, type, os, open_classes);
 }
 
 } // namespace
@@ -1140,6 +1131,66 @@ const char* direction_name(SignalInfo::Direction dir) {
     return "?";
 }
 
+const char* activation_name(Activation a) {
+    switch (a) {
+        case Activation::PreInit:
+            return "preinit";
+        case Activation::Preponed:
+            return "preponed";
+        case Activation::Observed:
+            return "observed";
+        case Activation::ReNba:
+            return "re_nba";
+        case Activation::Initial:
+            return "initial";
+        case Activation::Reactive:
+            return "reactive";
+        case Activation::Always:
+            return "always";
+        case Activation::Final:
+            return "final";
+    }
+
+    return "?";
+}
+
+// The class table: one line per class type in the pool, `class <label> {<body>}`,
+// its property list expanded exactly ONCE. It is the whole reason a mention can be
+// a bare name (render_class_label): every class the design lowered is described
+// here, so the dump is linear in the class count instead of exponential in it.
+//
+// Walked over the pool rather than over what the signals reach, because a class can
+// be named from a function local or an instruction operand and never from a signal,
+// and because the pool belongs to this Module -- every class in it was lowered for
+// this design.
+//
+// Ref order, which is intern order: a base class precedes anything derived from it
+// (lower_class_type interns the base before the class itself), and a class precedes
+// the classes only its properties name (its own Ref is interned before its property
+// types are lowered), so the table reads outward from the design's roots. A design
+// with no classes prints no table, leaving its dump byte-identical to before.
+void render_class_table(const InternPool& pool, std::ostream& os) {
+    for (size_t i = 0; i < pool.item_count(); ++i) {
+        const auto  ref = static_cast<Ref>(i);
+        const auto* t   = std::get_if<Type>(&pool.get(ref));
+        if (t == nullptr || t->kind != Type::Kind::Class) {
+            continue;
+        }
+        os << "  ";
+        render_class_label(pool, ref, os);
+        os << " {";
+        const auto fields = pool.struct_fields(t->fields_id);
+        for (size_t f = 0; f < fields.size(); ++f) {
+            if (f != 0) {
+                os << ", ";
+            }
+            os << pool.field_name(fields[f]) << ":";
+            render_type(pool, fields[f].type, os);
+        }
+        os << "}\n";
+    }
+}
+
 } // namespace
 
 void print_module(const Module& m, std::ostream& os, const LocResolver& resolve) {
@@ -1152,6 +1203,7 @@ void print_module(const Module& m, std::ostream& os, const LocResolver& resolve)
     };
 
     os << "module " << m.name << "\n";
+    render_class_table(m.pool, os);
 
     const auto signals = m.signals();
     for (size_t i = 0; i < signals.size(); ++i) {
@@ -1166,33 +1218,7 @@ void print_module(const Module& m, std::ostream& os, const LocResolver& resolve)
     const auto processes = m.processes();
     for (size_t i = 0; i < processes.size(); ++i) {
         const Process& p = processes[i];
-        os << "process[" << i << "] ";
-        switch (p.activation) {
-            case Activation::PreInit:
-                os << "preinit";
-                break;
-            case Activation::Preponed:
-                os << "preponed";
-                break;
-            case Activation::Observed:
-                os << "observed";
-                break;
-            case Activation::ReNba:
-                os << "re_nba";
-                break;
-            case Activation::Initial:
-                os << "initial";
-                break;
-            case Activation::Reactive:
-                os << "reactive";
-                break;
-            case Activation::Always:
-                os << "always";
-                break;
-            case Activation::Final:
-                os << "final";
-                break;
-        }
+        os << "process[" << i << "] " << activation_name(p.activation);
         for (const WaitEvent& w : p.wait_events) {
             os << " @";
             switch (w.edge) {

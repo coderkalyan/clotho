@@ -1260,27 +1260,67 @@ professional parity; M5 makes it complete.
   reading its property table, `unsynthesizable_type` and `guard_agg_key_leaves`
   stop at the same boundary, and `%p` deliberately prints a handle's class name at
   every depth for exactly this reason (Lower.cpp:19419-19440). `--stat` emits
-  counts and timings only, and no LSP / DAP path renders an IR type today.
-- [ ] **`--emit ir` expands a class DAG once per PATH, not once per class** — a
-  separate unboundedness in the same walk, pre-existing and untouched by the cycle
-  guard above: `render_type` prints a class body structurally at every occurrence,
-  so a class reachable by k distinct paths is expanded k times and the dump grows
-  exponentially in the class count. Measured on a strictly ACYCLIC chain where
-  class i holds handles to i+1, i+2 and i+3 (no cycle, so the guard never fires --
-  the 10.7 MB dump contains zero `^`, which is what proves it is the old output
-  byte for byte): 10 classes 7 KB, 14 classes 82 KB, 18 classes 933 KB, 22 classes
-  10.7 MB, i.e. ~1.8x per class added. UVM has hundreds of densely
-  cross-referencing classes, so `--emit ir` on it stays impractical for a reason
-  that has nothing to do with the cycle: it terminates, but not at a size anyone
-  can read. NOT fixed here because the obvious fix conflicts with a harder
-  requirement — eliding a class already expanded ANYWHERE in the current rendering
-  (rather than only one still open) makes the walk linear in the class count, but
-  it also rewrites ordinary non-recursive output, where a class referenced by two
-  properties legitimately prints twice today. The fix that costs no churn is to
-  stop inlining class bodies at all and print a class by NAME, which needs a
-  class-name side table on `Module`: `Lower` has the name (it prints one for `%p`
-  via `class_p_render`) but drops it, and the pool identifies a class by its `Ref`
-  alone. Do that when the IR dump is next touched.
+  counts and timings only, and no LSP / DAP path renders an IR type today. The
+  `class^N` notation this describes is SUPERSEDED by the item below: a class is now
+  named rather than expanded, so render_type never re-enters a class body and there is
+  no cycle left to guard. The audit above still holds.
+- [x] **`--emit ir` prints a class by NAME, once per class** — the second, pre-existing
+  unboundedness in the same walk, untouched by the cycle guard above: `render_type`
+  expanded a class body structurally at every occurrence, so a class reachable by k
+  distinct paths was printed k times and the dump grew exponentially in the class
+  count. Measured on a strictly ACYCLIC chain where class i holds handles to i+1, i+2
+  and i+3 (no cycle, so the guard never fires — the dump contains zero `^`, which is
+  what proves it was the old output byte for byte): 7.3 KB at 10 classes, 88 KB at 14,
+  1.02 MB at 18, 11.7 MB at 22, i.e. ~1.8x per class added. It cost the tool on the
+  design that needs it: the easyuvm testbench's dump did not complete in 600 s, having
+  emitted 64 KB of a single unterminated signal line.
+
+  A class now renders as `class <name>`, and `print_module` describes each one exactly
+  once in a class table ahead of the signals: `class node {nm:string, kids:class node
+  [$]}`. Same chain now: 655 B, 887 B, 1119 B, 1351 B — 58 bytes per added class, flat.
+  The easyuvm dump completes in under a second at 183 KB / 1268 lines, describing 457
+  UVM classes. Always naming, rather than expanding the first mention and naming
+  after, because a first-mention expansion is keyed on traversal order: it makes the
+  dump churn under unrelated edits, and it still inlines the whole reachable class DAG
+  into whichever signal line comes first. A small design does not get worse — one
+  table line per class replaces the same braces inlined in the signal line, and the
+  signal line becomes `s0: class plain p (internal)`.
+
+  Naming also RETIRES the `class^N` cycle marker rather than coexisting with it:
+  render_type can no longer enter a class body, so there is no recursion to guard and
+  nothing to elide, and a cycle reads as the name recurring inside the body the way
+  the source writes it. `^` is gone from the type grammar; the cycle shapes "printer: a cycle guard for the IR type printer"
+  pinned still terminate and now read as named classes.
+
+  The name is threaded through a class-name side table on `InternPool`, not on
+  `Module` as this item first guessed: `print(const Ir&)` renders local, argument and
+  operand types with nothing but `Ir::pool()` in hand, so a table on `Module` would
+  leave every instruction-level mention unnamed. Registered by `Lower`'s
+  `bind_class_type` at the one moment a Ref becomes the design's handle on a
+  ClassType, which is also the only moment the name is available. It is the type's own
+  rendering (`ClassType::toString()`): unqualified by scope, but WITH a
+  specialization's arguments — `uvm_queue#(uvm_callback)`, not `uvm_queue`. slang
+  monomorphizes each `C#(args)` into its own ClassType yet names every one of them
+  plainly `C` (the arguments live in genericParameters and only the type printer
+  appends them, TypePrinter.cpp:373-379), so a bare name would collide across every
+  specialization of a generic class, which in UVM is most of them. That is where the
+  label deliberately differs from what `%p` prints for a handle, which is the bare
+  `ClassType::name`: `%p` renders a value for someone reading simulation output and
+  LRM 21.2.1.6 leaves its form implementation-defined, so it owes no uniqueness (the
+  comment there claiming slang's name already carried the arguments was wrong, and is
+  corrected).
+
+  A label has to name ONE class, because the class table is keyed by it and every
+  mention resolves through it, so two classes sharing a name both take the Ref:
+  `class c#8` beside `class c#13`, never `class c` beside `class c#13`, which would
+  read as one class described twice. A class the pool has no name for prints
+  `class#<ref>` — the compiler-synthesized fork-capture box (named `$capture`) and any
+  class interned straight into the pool. The Ref is the disambiguator rather than a
+  scope qualifier for two reasons: qualification would not make a label unique on its
+  own, since one ClassType lowers once per top and each Lowerer mints its own nominal
+  Ref, so the Ref is needed either way; and the Ref is the backend's own name for the
+  class (`clotho.classdesc.<ref>`), so where the dump falls back on a number it is the
+  number that cross-references the output the reader came to diagnose.
 
 ### File and string I/O
 

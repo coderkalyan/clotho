@@ -3210,6 +3210,34 @@ private:
         std::vector<RandProp> props;
     };
 
+    // Publish a lowered class: cache it against its ClassType and record its declared
+    // name in the pool. One call for both because they are one fact -- this Ref is now
+    // the design's handle on this class -- and because the name has exactly one chance
+    // to be recorded. The IR printer prints a class BY NAME instead of expanding its
+    // body (Printer.cpp's render_class_label), so a class lowered without this shows up
+    // in `--emit ir` as a bare `class#<ref>`.
+    //
+    // The name is the type's own rendering, UNQUALIFIED by scope but carrying a
+    // specialization's arguments: `uvm_queue#(uvm_callback)`, not `uvm_queue`. Both
+    // halves of that matter to the printer, whose label has to identify ONE class --
+    // slang monomorphizes each `C#(args)` into its own ClassType but leaves every one
+    // of them named plainly `C` (ClassType::name is the syntax name; the arguments live
+    // in genericParameters, which only the type printer appends --
+    // TypePrinter.cpp:373-379), so a bare name would collide across every
+    // specialization of a generic class, of which UVM has many.
+    //
+    // This is where the label differs from what `%p` prints for a handle
+    // (handle_p_name), which is the bare `ClassType::name`: `%p` renders a value for
+    // someone reading simulation output and LRM 21.2.1.6 leaves its form
+    // implementation-defined, so it owes no uniqueness. Scope qualification is left
+    // off in both, because it would not make a label unique on its own -- one
+    // ClassType lowers once per top, each Lowerer minting its own nominal Ref -- so
+    // the printer's Ref qualifier is needed either way.
+    void bind_class_type(const slang::ast::ClassType& clt, ir::Ref ref) {
+        class_type_cache_.emplace(&clt, ref);
+        module_.pool.set_class_name(ref, clt.toString());
+    }
+
     // Lower a class type (LRM 8) to a Kind::Class reference type. A class variable
     // holds a handle (a pointer, stored as a 2-state 64-bit value); the object body
     // layout is the property table, reused from the struct Field machinery but
@@ -3276,7 +3304,7 @@ private:
             // always null here and the interface DAG lives in iface_closure().
             t.element         = ir::Ref::Invalid;
             const ir::Ref ref = module_.pool.put(ir::Item{ t });
-            class_type_cache_.emplace(&clt, ref);
+            bind_class_type(clt, ref);
             module_.pool.set_struct_fields(fid, {});
             module_.set_iface_type_id(ref, iface_id(clt));
             return ref;
@@ -3310,7 +3338,7 @@ private:
         }
         t.element         = base_ref;
         const ir::Ref ref = module_.pool.put(ir::Item{ t });
-        class_type_cache_.emplace(&clt, ref);
+        bind_class_type(clt, ref);
 
         // The chain, deepest base first — the field order of the object body.
         std::vector<const slang::ast::ClassType*> chain;
@@ -3609,7 +3637,7 @@ private:
         t.fields_id = fid;
         t.element   = ir::Ref::Invalid;
         const ir::Ref ref = module_.pool.put(ir::Item{ t });
-        class_type_cache_.emplace(&clt, ref);
+        bind_class_type(clt, ref);
         std::vector<ir::FieldRow> fields;
         fields.push_back({ kProcessCtlField, make_int_type(64, false, false), 0 });
         module_.pool.set_struct_fields(fid, std::move(fields));
@@ -3640,7 +3668,7 @@ private:
         t.fields_id = fid;
         t.element   = ir::Ref::Invalid;
         const ir::Ref ref = module_.pool.put(ir::Item{ t });
-        class_type_cache_.emplace(&clt, ref);
+        bind_class_type(clt, ref);
         std::vector<ir::FieldRow> fields;
         fields.push_back({ kSemKeysField, make_int_type(64, false, true), kSemKeys });
         fields.push_back({ kSemHeadField, make_int_type(64, false, false), kSemQHead });
@@ -3738,7 +3766,7 @@ private:
         t.fields_id = fid;
         t.element   = ir::Ref::Invalid;
         const ir::Ref ref = module_.pool.put(ir::Item{ t });
-        class_type_cache_.emplace(&clt, ref);
+        bind_class_type(clt, ref);
         const ir::Ref word = make_int_type(64, false, false);
         std::vector<ir::FieldRow> fields;
         fields.push_back({ kMbxBoundField, make_int_type(64, false, true), kMbxBound });
@@ -20026,9 +20054,14 @@ private:
     // the name of the thing the handle points AT. See expand_p_scalar for why a name
     // rather than the pointee's contents.
     //
-    // A class name is unqualified. A specialization prints the name slang gives it,
-    // which already carries its arguments (`uvm_queue#(uvm_callback)`); the scope is
-    // left off, where Verilator writes `pkg::C`. Implementation-defined either way.
+    // A class name is the bare `ClassType::name`: unqualified, where Verilator writes
+    // `pkg::C`, and WITHOUT a specialization's arguments -- slang leaves every
+    // specialization of a generic class named plainly `C`, since the arguments live in
+    // genericParameters and only the type printer appends them
+    // (TypePrinter.cpp:373-379), so `$display("%p", b)` of a `box#(int)` prints `box`.
+    // Implementation-defined either way (LRM 21.2.1.6). The IR printer's class label
+    // deliberately differs and takes the arguments, because a label there has to
+    // identify one class; see bind_class_type.
     // An interface class is a ClassType too, so it takes the same arm.
     static std::optional<std::string_view> handle_p_name(const slang::ast::Type& ct) {
         if (ct.isClass()) {
@@ -25849,6 +25882,11 @@ private:
         t.fields_id = fid;
         t.element   = ir::Ref::Invalid;
         const ir::Ref ref = module_.pool.put(ir::Item{ t });
+        // Named, like the `$capture` field it holds, so the IR dump reads
+        // `class $capture` rather than a bare Ref. A design that boxes two different
+        // types mints two of these, and the printer then qualifies both labels with
+        // their Ref (see InternPool::class_label).
+        module_.pool.set_class_name(ref, kCaptureBoxField);
         std::vector<ir::FieldRow> fields;
         fields.push_back({ kCaptureBoxField, inner, 0 });
         module_.pool.set_struct_fields(fid, std::move(fields));

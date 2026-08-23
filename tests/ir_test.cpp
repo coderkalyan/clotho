@@ -552,13 +552,18 @@ TEST_CASE("one-operand real math rides the op_imm payload") {
     CHECK(ops[0] == x);
 }
 
-// The type printer's cycle guard (Printer.cpp's render_type). A module-scope
-// signal of a self-referential class type used to make `--emit ir` recurse until
-// the stack ran out -- 2.3 MB of `class{nm:string, kids:class{...` and a SIGSEGV.
-// That shape is what every UVM design has (uvm_printer.svh:419 declares
-// `uvm_printer_element m_children[$]`, a queue of the enclosing class), so it made
-// the one tool for diagnosing a backend problem unusable on UVM.
-TEST_CASE("--emit ir elides a cycle back to a class being printed") {
+// The IR type printer's class rendering (Printer.cpp's render_class_label). A class
+// prints by NAME, and print_module describes each one exactly once in a class table
+// ahead of the signals. Expanding the body inline at every occurrence, as the printer
+// once did, was unbounded twice over: a class that reached itself made `--emit ir`
+// recurse until the stack ran out -- 2.3 MB of `class{nm:string, kids:class{...` then
+// SIGSEGV, on every UVM design, since uvm_printer.svh:419 declares
+// `uvm_printer_element m_children[$]`, a queue of the enclosing class -- and an
+// ACYCLIC class DAG was printed once per PATH, so the dump grew exponentially in the
+// class count. Naming closes both at once: render_type never enters a class body, so
+// there is nothing to recurse into and nothing to repeat, and the `class^N` cycle
+// back-reference the first fix introduced is gone with it.
+TEST_CASE("--emit ir describes a self-referential class once, by name") {
     const std::string ir = emit_ir(R"(
 class node;
   string nm;
@@ -570,14 +575,15 @@ module top;
 endmodule
 )");
 
-    // The class body is expanded once; the queue element that closes the cycle is
-    // the back-reference `class^1` -- one level out, the class being expanded.
-    CHECK(ir.find("s0: class{nm:string, kids:class^1 [$]} n (internal)") != std::string::npos);
-    // Nothing anywhere in the dump re-expands the recursive property.
-    CHECK(ir.find("kids:class{") == std::string::npos);
+    CHECK(ir.find("\n  class node {nm:string, kids:class node [$]}\n") != std::string::npos);
+    CHECK(ir.find("s0: class node n (internal)") != std::string::npos);
+    // The cycle reads as the name recurring inside the body, which is how the source
+    // writes it. One description, and no `^` anywhere: there is no elision to mark.
+    CHECK(occurrences(ir, "class node {") == 1);
+    CHECK(occurrences(ir, "^") == 0);
 }
 
-TEST_CASE("--emit ir elides a mutual class cycle at the outer class") {
+TEST_CASE("--emit ir describes a mutual class cycle as two named classes") {
     const std::string ir = emit_ir(R"(
 typedef class pong;
 class ping; pong p; endclass
@@ -588,12 +594,13 @@ module top;
 endmodule
 )");
 
-    // A <-> B: `ping` is open at depth 1 and `pong` at depth 2, so the hop back to
-    // `ping` counts two levels out.
-    CHECK(ir.find("s0: class{p:class{q:class^2}} a (internal)") != std::string::npos);
+    // A <-> B closes without a depth marker: each body names the other class.
+    CHECK(ir.find("\n  class ping {p:class pong}\n  class pong {q:class ping}\n") != std::string::npos);
+    CHECK(ir.find("s0: class ping a (internal)") != std::string::npos);
+    CHECK(occurrences(ir, "^") == 0);
 }
 
-TEST_CASE("--emit ir elides a cycle through a container element") {
+TEST_CASE("--emit ir describes a cycle through a container element") {
     const std::string ir = emit_ir(R"(
 class box;
   box dyn[];
@@ -605,18 +612,20 @@ module top;
 endmodule
 )");
 
-    // One guard covers every container kind, because the cycle runs through the
-    // class node in each and that is the only cyclic node there is.
-    CHECK(ir.find("s0: class{dyn:class^1 [], map:class^1 [string]} c (internal)") != std::string::npos);
+    // Every container kind terminates for one reason: the element is a class and a
+    // class is named, never expanded.
+    CHECK(ir.find("\n  class box {dyn:class box [], map:class box [string]}\n") != std::string::npos);
+    CHECK(occurrences(ir, "class box {") == 1);
 }
 
-TEST_CASE("the type printer elides a cycle through a struct member") {
-    // Built through the pool rather than from source: slang refuses a struct type
-    // that transitively reaches itself through a class handle ("'wrap' recursively
-    // depends on its own definition"), so this shape is currently unreachable from
-    // SystemVerilog even though the type graph models it and the printer must
-    // survive it. Pinned here so the guard keeps covering the shape if the frontend
-    // ever admits it.
+TEST_CASE("the type printer names a class with no recorded name by its Ref") {
+    // Built through the pool rather than from source for two reasons. slang refuses a
+    // struct type that transitively reaches itself through a class handle ("'wrap'
+    // recursively depends on its own definition"), so this cycle shape is currently
+    // unreachable from SystemVerilog even though the type graph models it and the
+    // printer must survive it. And a class interned straight into the pool registers
+    // no name, which is the other case the label has to cover: it falls back on the
+    // Ref, the same number the backend names the class by (`clotho.classdesc.<ref>`).
     // The type has to be built in the MODULE's pool: print_module resolves a
     // signal's Ref against `m.pool`, so a Ref minted anywhere else names a
     // different item.
@@ -634,10 +643,13 @@ TEST_CASE("the type printer elides a cycle through a struct member") {
 
     m.add_signal(SignalInfo{ .name = "c", .type = box });
 
-    CHECK(toString(m) == "module top\n  s0: class{w:struct{inner:class^1, k:bit}} c (internal)\n");
+    const std::string label = "class#" + std::to_string(static_cast<uint32_t>(box));
+    CHECK(toString(m)
+          == "module top\n  " + label + " {w:struct{inner:" + label + ", k:bit}}\n  s0: " + label
+               + " c (internal)\n");
 }
 
-TEST_CASE("--emit ir elides a three-hop class cycle") {
+TEST_CASE("--emit ir describes a three-hop class cycle as three named classes") {
     const std::string ir = emit_ir(R"(
 typedef class cb;
 typedef class cc;
@@ -650,11 +662,14 @@ module top;
 endmodule
 )");
 
-    // A -> B -> C -> A: three classes are open when the last hop closes the cycle.
-    CHECK(ir.find("s0: class{b:class{c:class{a:class^3}}} t (internal)") != std::string::npos);
+    // A -> B -> C -> A. The table is in intern order, which is the order the cycle is
+    // walked, so the hop that closes it is the last body's last property.
+    CHECK(ir.find("\n  class ca {b:class cb}\n  class cb {c:class cc}\n  class cc {a:class ca}\n")
+          != std::string::npos);
+    CHECK(occurrences(ir, "^") == 0);
 }
 
-TEST_CASE("--emit ir renders a non-recursive class exactly as it did before the guard") {
+TEST_CASE("--emit ir of a small class design stays readable") {
     const std::string ir = emit_ir(R"(
 class leaf; int x; endclass
 class plain;
@@ -670,11 +685,137 @@ module top;
 endmodule
 )");
 
-    // The guard adds output only where it elides, so an acyclic type renders byte
-    // for byte as it always has -- including a nested class expanded in full. Pinned
-    // here so the guard cannot start labelling, numbering or reordering the common
-    // case.
-    CHECK(ir.find("s0: class{x:signed bit[31:0], s:string, l:class{x:signed bit[31:0]}, "
-                  "q:logic [$], m:class{x:signed bit[31:0]} [signed bit[31:0]]} p (internal)") != std::string::npos);
+    // The whole head of the dump, pinned: two class-table lines then the signal. The
+    // common case must not get worse for the sake of the large one, so this holds the
+    // table to one line per class, the signal line to a bare name, and both to the
+    // exact spelling the old inline form used inside its braces.
+    CHECK(ir.find("module top\n"
+                  "  class plain {x:signed bit[31:0], s:string, l:class leaf, q:logic [$], "
+                  "m:class leaf [signed bit[31:0]]}\n"
+                  "  class leaf {x:signed bit[31:0]}\n"
+                  "  s0: class plain p (internal)")
+          == 0);
     CHECK(occurrences(ir, "^") == 0);
+}
+
+TEST_CASE("--emit ir is linear in the class count") {
+    // Class i holds handles to i+1, i+2 and i+3: strictly ACYCLIC, so no cycle guard
+    // can account for the old growth, but a class is reachable from c0 by
+    // exponentially many distinct PATHS and used to be printed once per path. Measured
+    // then: 10 classes 7 KB, 14 classes 82 KB, 18 classes 933 KB, 22 classes 10.7 MB,
+    // i.e. ~1.8x per class added (docs/TODO.md).
+    const auto chain = [](int n) {
+        std::string src;
+        for (int i = 0; i < n; ++i) {
+            src += "typedef class c" + std::to_string(i) + ";\n";
+        }
+        for (int i = 0; i < n; ++i) {
+            src += "class c" + std::to_string(i) + ";";
+            for (int d = 1; d <= 3; ++d) {
+                if (i + d < n) {
+                    const std::string k = std::to_string(i + d);
+                    src += " c" + k + " p" + k + ";";
+                }
+            }
+            src += " endclass\n";
+        }
+        src += "module top;\n  c0 t;\n"
+               "  initial begin t = new(); $display(\"ok\"); end\nendmodule\n";
+
+        return src;
+    };
+
+    const std::string small = emit_ir(chain(10));
+    const std::string large = emit_ir(chain(20));
+
+    // A concrete cap: twenty classes of three properties each cannot need 8 KB to
+    // describe. The old printer spent ~3 MB on this design.
+    CHECK(large.size() < 8 * 1024);
+    // And the growth is linear, not exponential: each added class costs one
+    // class-table line and one property mention in up to three others, which is a
+    // per-class constant. The same ten classes multiplied the old dump ~350-fold.
+    CHECK(large.size() > small.size());
+    CHECK(large.size() - small.size() < 10 * 128);
+    // Nothing was elided to get there.
+    CHECK(occurrences(large, "^") == 0);
+}
+
+TEST_CASE("--emit ir describes a class reachable by two paths once") {
+    const std::string ir = emit_ir(R"(
+class leaf; int x; endclass
+class mid; leaf a; endclass
+class holder; mid m; leaf b; endclass
+module top;
+  holder h;
+  initial begin h = new(); $display("ok"); end
+endmodule
+)");
+
+    // `leaf` is reachable as h.b and as h.m.a. One description, two mentions.
+    CHECK(occurrences(ir, "class leaf {") == 1);
+    CHECK(ir.find("\n  class holder {m:class mid, b:class leaf}\n") != std::string::npos);
+    CHECK(ir.find("\n  class mid {a:class leaf}\n") != std::string::npos);
+}
+
+TEST_CASE("--emit ir names a class specialization by its arguments") {
+    const std::string ir = emit_ir(R"(
+class box #(type T = int, int N = 1); T v; endclass
+module top;
+  box #(int)       bi;
+  box #(string, 2) bs;
+  initial begin bi = new(); bs = new(); $display("ok"); end
+endmodule
+)");
+
+    // slang monomorphizes each `box#(args)` into its own ClassType but names every one
+    // of them plainly `box`, so the label has to take the arguments from the type's
+    // own rendering or every specialization of a generic class would collide -- which
+    // in UVM is most of them (`uvm_queue#(uvm_callback)`).
+    CHECK(ir.find("\n  class box#(int,1) {v:signed bit[31:0]}\n") != std::string::npos);
+    CHECK(ir.find("\n  class box#(string,2) {v:string}\n") != std::string::npos);
+    CHECK(ir.find("s0: class box#(int,1) bi (internal)") != std::string::npos);
+    CHECK(ir.find("s1: class box#(string,2) bs (internal)") != std::string::npos);
+}
+
+TEST_CASE("--emit ir tells two same-named classes in different scopes apart") {
+    const std::string ir = emit_ir(R"(
+package p1; class c; int a; endclass endpackage
+package p2; class c; string b; endclass endpackage
+module top;
+  p1::c x;
+  p2::c y;
+  initial begin x = new(); y = new(); $display("ok"); end
+endmodule
+)");
+
+    // Names are unqualified, so these two collide -- and a label that names two
+    // classes would make the class table unreadable, since every mention resolves
+    // through it. Both then take the Ref, and NEITHER keeps the bare name: `class c`
+    // next to `class c#13` would read as one class described twice. Asserted as an
+    // invariant over the whole dump rather than a count, because the Refs depend on
+    // what else the design interned.
+    CHECK(occurrences(ir, "class c") > 0);
+    CHECK(occurrences(ir, "class c") == occurrences(ir, "class c#"));
+    // One table line each, and the bodies say which is which.
+    CHECK(occurrences(ir, " {a:signed bit[31:0]}\n") == 1);
+    CHECK(occurrences(ir, " {b:string}\n") == 1);
+}
+
+TEST_CASE("--emit ir names a nested class by its own name") {
+    const std::string ir = emit_ir(R"(
+class outer;
+  class inner; int y; endclass
+  inner i;
+endclass
+module top;
+  outer o;
+  initial begin o = new(); $display("ok"); end
+endmodule
+)");
+
+    // A nested class (LRM 8.24) is named by its own identifier, not by a path through
+    // its enclosing class: the enclosing scope is dropped for the same reason a
+    // package's is.
+    CHECK(ir.find("\n  class outer {i:class inner}\n") != std::string::npos);
+    CHECK(ir.find("\n  class inner {y:signed bit[31:0]}\n") != std::string::npos);
 }
