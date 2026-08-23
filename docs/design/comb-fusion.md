@@ -126,12 +126,17 @@ is not overfit to the target benchmark.
   honest fix is per-member dirty bits (phase 2); until then
   `SimulationConfig::comb_fuse` is the differential gate and `--stat=comb-fuse` shows
   the formed groups.
-- Both of the above are what regions.md P2 builds: a per-member guard derived
-  from the wake site's own edge facts is the per-member dirty bit, and it lets
-  the interior guard relax from a hard reject to a cost model. It also retires
-  five of the eight `CombFuse` verdicts (`EdgeSensitive`, `ImpureOp`,
-  `HasCall`, `UnsupportedWrite`, `ReadOutsideSens`), which exist only because a
-  fused member may run when its own trigger did not.
+- Both of the above are **fixed** by regions.md P2 (landed): each member is
+  guarded on its own sensitivity, tested against the trigger bits the wake site
+  ORs into the process's wake word, so a stimulus touching one branch of a
+  component no longer re-runs the rest. That is the per-member dirty bit this
+  entry asked for, and it makes the interior guard a cost model rather than a
+  hard reject whenever that is worth measuring. Measured on a laundered star:
+  1.29x at 16 consumers, 2.02x at 64, 3.32x at 256, output byte-identical.
+  The same mechanism retires five of the eight `CombFuse` verdicts as fusion
+  blockers (`EdgeSensitive`, `ImpureOp`, `HasCall`, `UnsupportedWrite`,
+  `ReadOutsideSens`), which exist only because a fused member may run when its
+  own trigger did not; regions.md P3 is where that gets taken up.
 
 Verified: fused vs `--no-comb-fuse` byte-identical on combchain (20k
 cycles), picorv32 default and VERBOSE traces, tri networks across 4

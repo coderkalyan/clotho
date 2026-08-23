@@ -137,6 +137,21 @@ struct SimulationConfig {
     // the thunk path in LlvmBackend.cpp). Disable for bisection / debugging;
     // semantics are byte-identical (same sched-flag timeline, same FIFO order).
     bool thunk = true;
+    // Guard each member of a fused group on its OWN sensitivity, instead of
+    // running every member on any union event. The per-process scheduled flag
+    // carries the trigger bits: bit 0 is the existing queued flag, bits 1..63
+    // are per-(signal, edge) colours a wake site ORs in, and a group body tests
+    // its members' masks against the word it was woken with (see
+    // compute_trigger_masks / the guard in lower_group, and
+    // docs/design/regions.md for the argument).
+    //
+    // A guard can only ever REMOVE an execution that the union subscription
+    // would have performed, and a wake path that cannot name its trigger sets
+    // every bit, so the gate off and the gate on differ only in how many
+    // spurious member runs happen — output is byte-identical either way. Off
+    // also emits no masks and no guards, so the wake sites are exactly the
+    // unguarded ones. Disable for bisection / differential testing.
+    bool regions = true;
     // Share one compiled body across twin instances of a reused module
     // definition: thunk groups whose lowered functions are identical modulo
     // their instance-context symbol collapse to ONE shared body (ctx passed

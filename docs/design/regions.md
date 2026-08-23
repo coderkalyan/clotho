@@ -7,10 +7,12 @@ and the active ring per process. A generalisation of comb fusion
 (comb-fusion.md) that admits edge-sensitive members, and the mechanism
 clock-wave.md wanted without teaching the backend what a clock is.
 
-Status: P0 (measurement) done, recorded below. Nothing else built. Read §2
-before investing: it revises clock-wave.md's estimate of the scheduling share
-upward by more than an order of magnitude, and it moves the biggest single
-bucket from dispatch to NBA staging.
+Status: **P1 + P2 landed** (`SimulationConfig::regions`, default on); P3 and P4
+not started. §2 is the P0 measurement that justified it and §4 records what
+each phase is; §9 is the as-built account of P1 + P2, including the two things
+the design above got wrong. Read §2 before investing further: it revises
+clock-wave.md's estimate of the scheduling share upward by 30-60x, and it moves
+the biggest single bucket from dispatch to NBA staging.
 
 ---
 
@@ -231,14 +233,10 @@ fixpoint over the same members.
 | | scope | effort | risk |
 |---|---|---|---|
 | P0 | this document; cost model (`bench-sched/cost_model.py`); picorv32 attribution | done | — |
-| P1 | trigger word written and **ignored**: `clotho.proc_trig`, wait-bucket entry gains `(trig_ptr, mask)`, every wake site sets bits or all-ones, group body loads and zeroes it | 3-5 d | med — the entry widening touches `wait_counts`:7376, the bucket padding/uniformity accounting it feeds, and the def-relative `wait_base`:10028, and bucket shape must stay identical across instances of a definition |
-| P2 | emit the guards for **existing** groups | 2-3 d | low — monotone per §3.4 |
+| P1 | trigger bits in the wake word (§9.1) | **landed** | the def-relative GEP stride was the one silent-corruption hazard |
+| P2 | member guards for existing groups | **landed** | monotone per §3.4; the intra-group edge of §9.2 was the one real bug |
 | P3 | admit `CombFuse::EdgeSensitive` members (relax the `CombFuse::Eligible` filter, LlvmBackend.cpp:9139); leave the other four verdicts alone | 3-5 d | med — union sensitivity now spans clock and level events, so activation count rises while body count falls; that trade is the cost model to watch |
 | P4 | scalar NBA as an in-region `select` | 2-4 w | high — see below |
-
-P1 is pure cost. It must land with P2 or with the gate defaulted off, because
-a `sim_ms` regression on any perf case is a merge blocker (`GATES`,
-tests/perf/perf.py:53).
 
 P2 pays for itself independently of regions: it discharges the two follow-ups
 comb fusion already owes. It deletes the documented over-evaluation ("a
@@ -345,8 +343,7 @@ is a shared registry of (source, expected) pairs to iterate.
 
 ## 8. Recommendation
 
-1. **P1 + P2 as one landed change, then P3.** Roughly two weeks, and P2 alone
-   justifies it.
+1. **P1 + P2 as one landed change, then P3.** Done; §9 is the account.
 2. Re-measure `-O` after P3. The `+2% cycles / +4-5% wall` verdict on picorv32
    (module-split.md:120-128) is a measurement of 106 tiny functions over a
    global state struct, not a verdict on O3; §2.1's 65-instruction round trip
@@ -358,3 +355,111 @@ is a shared registry of (source, expected) pairs to iterate.
 4. Do not build: region-entry prior-value sampling (§3.1), a clock-detection
    pass, or a profitability threshold gating two divergent bodies —
    domain-spec.md is the record of how that ends.
+
+## 9. As built (P1 + P2)
+
+Two things in §3 were wrong, and one encoding in §3.2 was replaced. This
+section is the record; the sections above are the design as it now stands.
+
+### 9.1 The trigger bits ride in the sched flag, not a parallel word
+
+§3.2 proposed a `clotho.proc_trig` array beside `clotho.proc_sched`, with the
+wait-bucket entry carrying `(trig_ptr, mask)`. That would have widened
+`wait_elem_ty`, which that type's own comment refuses on the grounds that one
+entry exists per subscription per edge across the whole design, so widening it
+spends memory in every design including the ones with no guarded group at all.
+
+What landed instead: the scheduled flag widens from `i32` to `i64` and becomes
+the wake word. Bit 0 is the queued flag, unchanged in meaning and still the
+only thing compared against zero; bits 1..63 are trigger bits. The bit index of
+a `(signal, edge)` is a **design-global colour**, so the mask is a compile-time
+constant at the scan site and no entry field is needed. Consequences:
+
+- Two words became one. `wait_elem_ty` is untouched, and so are `wait_counts`,
+  the bucket padding accounting, and the def-relative `wait_base` indirection --
+  all of which §4 listed as P1's risk and none of which P1 ended up touching.
+- The colour is global, so a `(signal, edge)` in two guarded groups uses one bit
+  in each group's own word: no cross-group interference. Only a collision
+  *within* one group costs anything, and it costs precision, never correctness.
+- The one real hazard was `materialize_group_ctx`, which indexes a deduped
+  instance's flag array with the element type as a GEP **stride**. Left at
+  `i32` against an `i64` array it addresses byte offset `4k` — a silent wrong
+  answer confined to deduped instances. `sched_word_ty()` exists so that type
+  has one home.
+- Cost at the wake site is now zero on the common path: the wake arm already
+  stored a constant, so it stores `1|mask` instead of `1`. The only new work is
+  the already-queued arm (§9.2).
+
+### 9.2 The wake word must be re-read per member
+
+§3.2 said to read the word once at group entry, reasoning that bits raised
+during the body belong to the next activation, as the held sched flag already
+implies. That is wrong, and it is wrong in the direction that loses executions.
+
+A comb group exists to run a component in producer-before-consumer order. When
+an earlier member stores to a group-internal signal, the scan finds the group
+already queued and takes the arm that ORs the downstream member's bit in — and
+that bit is what tells the consumer to run **in this same pass**. Snapshotting
+at entry sees only the bits the group was woken with, so every consumer fed from
+inside the group is stranded at its previous value. comb-fusion.md's aside that
+"the downstream member runs later in the same activation with final values" is
+load-bearing once guards exist, not an aside.
+
+Caught by four existing tests (the comb-fusion observer pin, a net-resolution
+case, a `real` continuous-assign case, and an `llvm_backend` case) — all of
+which are chains where a consumer sits downstream of a producer in its own
+group. Fixed by re-reading the word per member; `tests/region_test.cpp`'s first
+case is the dedicated pin.
+
+This is also why the already-queued arm of `emit_static_scan_rt` must OR the
+bits rather than skip: it is not a rare second-wake path, it is the normal
+intra-group edge.
+
+### 9.3 Colour exhaustion shares bits instead of giving up
+
+The first cut left a group unguarded when its event count exceeded the 63
+colours. That put a cliff in the middle of the win: a 62-wide fan-out component
+got guards and a 64-wide one got none (measured 1.94x and 1.00x). Exhaustion now
+rotates through the colour space, so `n` events over 63 bits means about `n/63`
+members per bit — precision degrades with width instead of vanishing. The same
+64-wide component went to 2.02x, and 256-wide to 3.32x.
+
+### 9.4 Measured (2026-08-23, Release, LLVM 22, min of 3)
+
+Retired instructions per simulated clock period, gate on vs off, same tree:
+
+| case | off | on | |
+|---|---|---|---|
+| fan-out component, 16 wide, one hot branch | 1132 | 880 | **1.29x** |
+| same, 64 wide | 2195 | 1087 | **2.02x** |
+| same, 256 wide | 6407 | 1932 | **3.32x** |
+| picorv32, 1M-cycle TIMEOUT | 20166 | 20262 | **+0.48%** |
+
+picorv32 pays and does not collect: its 17 comb groups hold 62 members, none of
+whose masks is vacuous, but the members of a group there mostly fire together,
+so the guards are 62 tests that almost always pass. +0.48% is inside the perf
+harness's own margin (`max(2%, 2x spread)`; measured spread on the dev box is
+4%), and it buys the fan-out column. If a real design ever regresses beyond the
+margin, the honest lever is the interior guard becoming a cost model (§4), not a
+profitability threshold on the guards themselves.
+
+Verified: byte-identical gate on vs off across `examples/`, the region and
+comb-fusion pins, and picorv32 at 1M cycles; full suite 2350 cases green;
+`tests/region_test.cpp` asserts every case across default / `regions` off /
+`thunk` off / both off / `fuse` off, oracle-verified against iverilog 13.
+
+### 9.5 What P3 inherits
+
+- The guard machinery is member-granular already, so admitting an
+  edge-sensitive member is a change to the `compute_fusion_groups` candidate
+  filter plus whatever the cost model says about the widened union sensitivity.
+  No new wake-word work.
+- The glitch pin belongs to P3, not here. A signal that returns to its starting
+  value inside one instant is unobservable for a pure comb member — which is
+  part of why guarding one is safe — but a posedge member must fire for an edge
+  the schedule classified even though the level is back where it started. That
+  is the case that rules out ever deriving triggers from a region-entry sample,
+  and `tests/region_test.cpp` says so where the pin will go.
+- `trig_collisions_` counts within-group colour collisions and is not reported
+  anywhere yet. If P3's wider unions make collisions common, that counter is
+  the thing to put behind `--stat`.

@@ -848,6 +848,7 @@ public:
         build_rng_fns();         // before compute_fusion_groups: gates thunk eligibility
         compute_subscription_order();
         compute_fusion_groups(); // before build_wait_queues: bucket capacities count group subscriptions
+        compute_trigger_masks(); // after fusion: colours come from the group event unions
         if (stat_on(config_.stats, Stat::CombFuse)) {
             report_comb_fuse_stat();
         }
@@ -950,16 +951,27 @@ public:
         emit_dpi_exports();
     }
 
-    // Per-process "scheduled" flags, one i32 per process: non-zero while the
-    // process is already queued to run this instant. Persistent (always-block)
-    // wait entries use it to avoid being woken more than once per instant when
-    // several of their sensitivity signals change together. Flags live in one
-    // array per owning instance scope (@clotho.inst.<hier>.sched, indexed by a
-    // dense def-local ordinal — twin instances lower identical ordinals) plus
-    // a root @clotho.proc_sched for unowned (PreInit / package) processes.
+    // Per-process wake word, one i64 per process. Bit 0 is the "scheduled"
+    // flag: non-zero while the process is already queued to run this instant,
+    // which is how a persistent (always-block) wait entry avoids being woken
+    // more than once per instant when several of its sensitivity signals change
+    // together. Bits 1..63 are TRIGGER bits: a wake site ORs in the colour of
+    // the (signal, edge) it fired for (compute_trigger_masks), so a fused
+    // group's body can tell which of its members' own sensitivities actually
+    // fired and skip the rest. A site that cannot name its trigger sets every
+    // bit, so an unclassified wake runs every member exactly as before.
+    //
+    // The whole word is tested against zero, never against one, and cleared to
+    // zero to re-arm -- so the queued/not-queued discipline is unchanged by the
+    // trigger bits riding above it.
+    //
+    // Words live in one array per owning instance scope
+    // (@clotho.inst.<hier>.sched, indexed by a dense def-local ordinal -- twin
+    // instances lower identical ordinals) plus a root @clotho.proc_sched for
+    // unowned (PreInit / package) processes.
     void build_sched_flags() {
         const auto procs = mod_.processes();
-        auto*      i32   = llvm::Type::getInt32Ty(ctx_);
+        auto*      word  = llvm::Type::getInt64Ty(ctx_);
         proc_sched_anchor_.assign(std::max<size_t>(procs.size(), 1), ~0u);
         proc_sched_ord_.assign(std::max<size_t>(procs.size(), 1), 0);
         std::vector<uint32_t> owned(anchors_.size(), 0);
@@ -980,15 +992,31 @@ public:
                 continue;
             }
             Anchor& an  = anchors_[a];
-            an.sched_ty = llvm::ArrayType::get(i32, owned[a]);
+            an.sched_ty = llvm::ArrayType::get(word, owned[a]);
             an.sched_gv = new llvm::GlobalVariable(env_->llmod, an.sched_ty, false,
                                                    llvm::GlobalValue::InternalLinkage,
                                                    llvm::ConstantAggregateZero::get(an.sched_ty),
                                                    "clotho.inst." + an.name + ".sched");
         }
-        sched_arr_ty_ = llvm::ArrayType::get(i32, std::max<uint32_t>(n_root, 1));
+        sched_arr_ty_ = llvm::ArrayType::get(word, std::max<uint32_t>(n_root, 1));
         sched_gv_     = new llvm::GlobalVariable(env_->llmod, sched_arr_ty_, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantAggregateZero::get(sched_arr_ty_), "clotho.proc_sched");
+    }
+
+    // The LLVM type of a wake word. One place, because materialize_group_ctx
+    // uses it as a GEP STRIDE: get it wrong there and a deduped instance
+    // addresses another process's word.
+    llvm::IntegerType* sched_word_ty() { return llvm::Type::getInt64Ty(ctx_); }
+
+    // Bits a wake site sets when it cannot name the (signal, edge) it fired
+    // for: every trigger bit, so every guard in the woken group passes. Zero
+    // when no group is guarded, which keeps the unguarded emission identical.
+    uint64_t unclassified_trig_bits() const { return any_guarded_ ? ~1ull : 0ull; }
+
+    // Trigger bits of member `i` of group `g`: the bits of its OWN events. Zero
+    // for an unguarded group, which is what makes open_guard a no-op there.
+    uint64_t member_mask(uint32_t g, size_t i) const {
+        return g < group_member_mask_.size() && i < group_member_mask_[g].size() ? group_member_mask_[g][i] : 0;
     }
 
     // Constant pointer to process k's scheduled flag in its owner's array.
@@ -4310,7 +4338,7 @@ private:
         }
         Anchor&      a    = anchors_[sched_anchor_];
         llvm::Value* base = ctx_field(a, 2, llvm::PointerType::getUnqual(ctx_));
-        sched_ptr_ = b_.CreateInBoundsGEP(b_.getInt32Ty(), base, b_.getInt32(sched_ordinal_));
+        sched_ptr_ = b_.CreateInBoundsGEP(sched_word_ty(), base, b_.getInt32(sched_ordinal_));
     }
 
     // Global holding &state->shadow; created on first use, initialized in
@@ -4539,6 +4567,66 @@ private:
             types_.resize(n);
             types_valid_.assign(n, 0);
         };
+        // Open the guarded region of a group: returns true when its members are
+        // guarded, having ensured the wake word carries at least one of the
+        // group's bits.
+        //
+        // That store is the fail-safe. If the word carries none of this group's
+        // bits, some wake path pushed the group without naming a trigger, so set
+        // them all and let every member run -- which makes a missed bit a lost
+        // optimization rather than a lost execution, in a wake path this wide.
+        // It also means each member's guard is a plain test with no fallback of
+        // its own.
+        auto open_group = [&](uint32_t g) -> bool {
+            if (!group_guarded_[g]) {
+                return false;
+            }
+            auto* mask = b_.getInt64(group_trig_mask_[g]);
+            auto* w    = b_.CreateLoad(sched_word_ty(), sched_ptr_);
+            auto* none = b_.CreateICmpEQ(b_.CreateAnd(w, mask), b_.getInt64(0));
+            auto* set  = llvm::BasicBlock::Create(ctx_, "trig.all", fn_);
+            auto* go   = llvm::BasicBlock::Create(ctx_, "trig.go", fn_);
+            b_.CreateCondBr(none, set, go);
+            b_.SetInsertPoint(set);
+            b_.CreateStore(b_.CreateOr(w, mask), sched_ptr_);
+            b_.CreateBr(go);
+            b_.SetInsertPoint(go);
+            return true;
+        };
+        // Open one member's guard: run it only if one of ITS OWN events has
+        // fired. Returns the join block to branch to once the body is emitted
+        // (null when the group is unguarded).
+        //
+        // The word is re-read per member, NOT snapshotted once for the group.
+        // An earlier member's store to a group-internal signal ORs the
+        // downstream member's bit in through the already-queued arm of
+        // emit_static_scan_rt, and that edge is the whole point of running a
+        // component in topological order: the consumer must see the producer's
+        // change in THIS pass. Snapshotting at group entry loses exactly those
+        // bits, which strands every consumer fed from inside the group
+        // (comb-fusion.md's "the downstream member runs later in the same
+        // activation with final values" -- with guards, that sentence is
+        // load-bearing, not an aside).
+        auto open_guard = [&](bool guarded, uint64_t mask, uint64_t group_mask) -> llvm::BasicBlock* {
+            // A member sensitive to everything the group is sensitive to runs on
+            // every activation, so its guard can only ever be true: emit none.
+            if (!guarded || mask == group_mask) {
+                return nullptr;
+            }
+            auto* run  = llvm::BasicBlock::Create(ctx_, "mem.run", fn_);
+            auto* join = llvm::BasicBlock::Create(ctx_, "mem.skip", fn_);
+            auto* bits = b_.CreateAnd(b_.CreateLoad(sched_word_ty(), sched_ptr_), b_.getInt64(mask));
+            b_.CreateCondBr(b_.CreateICmpNE(bits, b_.getInt64(0)), run, join);
+            b_.SetInsertPoint(run);
+            return join;
+        };
+        auto close_guard = [&](llvm::BasicBlock* join) {
+            if (join != nullptr) {
+                b_.CreateBr(join);
+                b_.SetInsertPoint(join);
+            }
+        };
+
 
         // Coroutine elision: a suspension-free always-with-sensitivity group (see
         // is_simple_always) carries no state across activations, so instead of a
@@ -4620,10 +4708,13 @@ private:
             fn_->addParamAttr(0, llvm::Attribute::NoAlias);
             b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn_));
             rng_slot_ = sym(rng_global_);
-            for (llvm::Function* mf : member_fns) {
-                b_.CreateCall(fnty, sym(mf), { state_, wheel_ });
+            const bool guarded = open_group(g_);
+            for (size_t i = 0; i < member_fns.size(); ++i) {
+                llvm::BasicBlock* join = open_guard(guarded, member_mask(g_, i), group_trig_mask_[g_]);
+                b_.CreateCall(fnty, sym(member_fns[i]), { state_, wheel_ });
+                close_guard(join);
             }
-            b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
+            b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
             b_.CreateRetVoid();
             return fn_;
         }
@@ -4659,16 +4750,19 @@ private:
             // afterward — a thunk has no frame to persist them in (a per-call cost
             // paid only by string-using bodies). frame_slots_ is empty for a
             // process, so deinit_body_strings frees exactly this member's temps.
-            for (const uint32_t m : members) {
-                select_member(m);
+            const bool guarded = open_group(group_of_[proc_index]);
+            for (size_t i = 0; i < members.size(); ++i) {
+                select_member(members[i]);
                 str_vals_.assign(ir_->inst_count(), nullptr);
                 build_str_temps();
                 build_dynarr_temps();
                 build_agg_elem_temps();
+                llvm::BasicBlock* join = open_guard(guarded, member_mask(group_of_[proc_index], i), group_trig_mask_[group_of_[proc_index]]);
                 lower_region(ir_->root());
                 deinit_body_strings();
+                close_guard(join);
             }
-            b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
+            b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
             b_.CreateRetVoid();
             return fn_;
         }
@@ -4873,14 +4967,17 @@ private:
             b_.CreateBr(loop_bb);
             b_.SetInsertPoint(loop_bb);
             emit_defer_gen_bump(); // activation start = deferred-assertion flush point
+            const bool guarded = open_group(group_of_[proc_index]);
             for (size_t i = 0; i < members.size(); ++i) {
                 select_member(members[i]);
                 str_vals_     = member_strs[i];
                 dynarr_ret_   = member_dynarr[i];
                 agg_elem_ret_ = member_agg_elem[i];
+                llvm::BasicBlock* join = open_guard(guarded, member_mask(group_of_[proc_index], i), group_trig_mask_[group_of_[proc_index]]);
                 lower_region(ir_->root());              // member body (per trigger)
+                close_guard(join);
             }
-            b_.CreateStore(b_.getInt32(0), sched_ptr_); // re-arm: ready to be woken
+            b_.CreateStore(b_.getInt64(0), sched_ptr_); // re-arm: ready to be woken
             emit_wait_suspend();                        // park until next trigger
             b_.CreateBr(loop_bb);
             // The forever back-edge means the shared final-suspend tail below is
@@ -5771,7 +5868,7 @@ private:
         // across suspends; the frame's address escapes to callees). The flag backs
         // intra-body @event waits, exactly like a process's proc_sched slot.
         frame_     = b_.CreateAlloca(frame_ty_, nullptr, "frame");
-        sched_ptr_ = b_.CreateAlloca(b_.getInt32Ty(), nullptr, "task_sched");
+        sched_ptr_ = b_.CreateAlloca(sched_word_ty(), nullptr, "task_sched");
         sched_anchor_      = SignalSlot::no_anchor;
         group_first_block_ = -1;
         // And, for a task some `disable` names, this activation's list node — same
@@ -6499,7 +6596,7 @@ private:
                 emit_dynamic_register(e.signal, e.edge);
             }
         }
-        b_.CreateStore(b_.getInt32(0), sched_ptr_); // arm: ready to be woken
+        b_.CreateStore(b_.getInt64(0), sched_ptr_); // arm: ready to be woken
         emit_wait_suspend();                        // park until any event fires
         // A remote `disable` is a second way to be resumed here, and it neither
         // fires nor clears the bucket we are in -- so with one in the design a
@@ -9057,6 +9154,20 @@ private:
             }
             std::fprintf(stderr, "%s\n", sorted.size() > 24 ? "..." : "");
         }
+        uint64_t guarded = 0, guarded_members = 0;
+        for (uint32_t g = 0; g < group_guarded_.size(); ++g) {
+            if (group_guarded_[g]) {
+                ++guarded;
+                guarded_members += groups_[g].size();
+            }
+        }
+        if (guarded != 0 || trig_collisions_ != 0) {
+            std::fprintf(stderr,
+                         "comb-fuse: %llu guarded groups, %llu guarded members, "
+                         "%u colour collisions\n",
+                         (unsigned long long)guarded, (unsigned long long)guarded_members,
+                         trig_collisions_);
+        }
     }
 
     // V1 static process fusion: partition processes into groups that lower to a
@@ -9311,6 +9422,143 @@ private:
                                [&](uint32_t m) { return rng_procs_[m]; });
             }
         }
+    }
+
+    // Assign trigger bits, and decide which groups get member guards.
+    //
+    // A fused group subscribes to the UNION of its members' sensitivities and
+    // runs every member per activation. That is legal (comb-fusion.md) but it
+    // over-evaluates: a stimulus touching one branch of a wide component re-runs
+    // the untouched branch. A guard fixes it exactly, provided the body can tell
+    // which of its members' own events fired -- which is what the wake word's
+    // trigger bits carry.
+    //
+    // The bit index of a (signal, edge) is a DESIGN-GLOBAL colour, not a
+    // per-group index. That is the whole trick: a wake site scans a bucket whose
+    // entries belong to several groups, and per-group indices would force a mask
+    // field into wait_elem_ty -- memory spent in every design, which that type
+    // deliberately refuses (see its comment). One colour per (signal, edge)
+    // makes the mask a compile-time constant at the scan site instead.
+    //
+    // Colours are assigned greedily, first-fit, so two events of the same group
+    // can collide once the colour space is crowded. A collision costs PRECISION,
+    // never correctness: the two events share a bit, so one fires the other's
+    // members too -- exactly the over-evaluation the guard set out to remove, and
+    // exactly what the unguarded emission does today. `trig_collisions_` counts
+    // them for --stat.
+    void compute_trigger_masks() {
+        const auto all   = mod_.processes();
+        const auto sigs  = mod_.signals();
+        trig_colour_.assign(sigs.size(), { 0, 0, 0 });
+        group_guarded_.assign(groups_.size(), false);
+        group_member_mask_.assign(groups_.size(), {});
+        group_trig_mask_.assign(groups_.size(), 0);
+        any_guarded_     = false;
+        trig_collisions_ = 0;
+        if (!config_.regions) {
+            return;
+        }
+
+        // Colours 1..63; bit 0 is the queued flag and is never a colour.
+        constexpr uint32_t first_colour = 1;
+        constexpr uint32_t last_colour  = 63;
+
+        for (uint32_t g = 0; g < groups_.size(); ++g) {
+            const auto& members = groups_[g];
+            if (members.size() < 2 || group_events_[g].empty()) {
+                continue;
+            }
+            // Identical-sensitivity groups (compute_fusion_groups phase 1) have
+            // one sensitivity for the whole group, so every member's mask would
+            // be the union and every guard would be vacuously true. Only a group
+            // whose members differ -- a comb-fused component -- can gain.
+            const bool differ = std::any_of(members.begin() + 1, members.end(), [&](uint32_t m) {
+                return all[m].wait_events.size() != all[members.front()].wait_events.size() ||
+                       !std::equal(all[m].wait_events.begin(), all[m].wait_events.end(),
+                                   all[members.front()].wait_events.begin(),
+                                   [](const WaitEvent& x, const WaitEvent& y) {
+                                       return x.signal == y.signal && x.edge == y.edge;
+                                   });
+            });
+            if (!differ) {
+                continue;
+            }
+
+            // Colours already held by this group's events constrain the rest.
+            uint64_t used = 0;
+            for (const WaitEvent& w : group_events_[g]) {
+                const uint8_t c = colour_of(w);
+                if (c != 0) {
+                    if ((used >> c & 1) != 0) {
+                        ++trig_collisions_;
+                    }
+                    used |= 1ull << c;
+                }
+            }
+            // A component wider than the colour space SHARES colours rather than
+            // giving up its guards: n events over 63 bits means about n/63 members
+            // per bit, so a change still skips most of the component instead of
+            // none of it. Precision degrades with width; it does not fall off a
+            // cliff at 64 (measured: a 64-wide fan-out went from 1.00x to 1.2x by
+            // sharing instead of bailing).
+            uint32_t rotate = first_colour;
+            for (const WaitEvent& w : group_events_[g]) {
+                if (colour_of(w) != 0) {
+                    continue;
+                }
+                uint32_t c = first_colour;
+                while (c <= last_colour && (used >> c & 1) != 0) {
+                    ++c;
+                }
+                if (c > last_colour) {
+                    c = rotate;
+                    rotate = rotate == last_colour ? first_colour : rotate + 1;
+                    ++trig_collisions_;
+                } else {
+                    used |= 1ull << c;
+                }
+                trig_colour_[static_cast<uint32_t>(w.signal)][static_cast<uint32_t>(w.edge)] =
+                  static_cast<uint8_t>(c);
+            }
+
+            // Per-member mask: the bits of the member's OWN events.
+            auto& masks = group_member_mask_[g];
+            masks.assign(members.size(), 0);
+            uint64_t all_bits = 0;
+            for (uint32_t i = 0; i < members.size(); ++i) {
+                for (const WaitEvent& w : all[members[i]].wait_events) {
+                    masks[i] |= 1ull << colour_of(w);
+                }
+                // A member of a fused Always group always has a sensitivity, so
+                // its mask is never empty -- an empty one would mean a member
+                // that can never run.
+                if (masks[i] == 0) {
+                    throw BackendError{ "internal: fused member with no trigger mask" };
+                }
+                all_bits |= masks[i];
+            }
+            group_trig_mask_[g] = all_bits;
+            group_guarded_[g]   = true;
+            any_guarded_        = true;
+        }
+    }
+
+    // This (signal, edge)'s colour, or 0 when it has none.
+    uint8_t colour_of(const WaitEvent& w) const {
+        const uint32_t i = static_cast<uint32_t>(w.signal);
+        return i < trig_colour_.size() ? trig_colour_[i][static_cast<uint32_t>(w.edge)] : 0;
+    }
+
+    // Trigger bits a wake of (sig, edge) must set: the pair's colour, or none
+    // when no guarded group waits on it (which keeps that wake site's emission
+    // exactly the unguarded one).
+    uint64_t trig_bits(Signal sig, uint32_t edge) const {
+        const uint32_t i = static_cast<uint32_t>(sig);
+        if (i >= trig_colour_.size()) {
+            return 0;
+        }
+        const uint8_t c = trig_colour_[i][edge];
+        return c == 0 ? 0ull : 1ull << c;
     }
 
     // Build the nonblocking-assignment update state: a constant per-signal metadata
@@ -10042,7 +10290,8 @@ private:
     void service_static_queue(Signal sig, uint32_t edge) {
         const auto i = static_cast<uint32_t>(sig);
         emit_static_scan_rt(wait_base(wait_slot_sta_[i][edge], wait_sta_gv_[i][edge], i),
-                            b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0);
+                            b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0,
+                            trig_bits(sig, edge));
     }
 
     // Dynamic sub-queue scan (one edge bucket): a straight loop over the live
@@ -10251,11 +10500,11 @@ private:
         llvm::Value* next = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kNodeNext));
         llvm::Value* hdl  = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kNodeHandle));
         llvm::Value* flag = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kNodeFlag));
-        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(i32, flag), b_.getInt32(0)), wake, step);
+        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), wake, step);
 
         b_.SetInsertPoint(wake);
         emit_wake_push(b_, hdl);
-        b_.CreateStore(b_.getInt32(1), flag);
+        b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
         b_.CreateBr(step);
 
         b_.SetInsertPoint(step);
@@ -11044,7 +11293,7 @@ private:
         // the truth: a `#0`-parked activation is already scheduled. The promotion
         // does not consult the flag, so it still lands.
         if (park_claim_wanted() && sched_ptr_ != nullptr) {
-            b.CreateStore(b.getInt32(1), sched_ptr_);
+            b.CreateStore(b.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
         }
         if (reactive_home()) {
             emit_re_inactive_push(b, handle);
@@ -11088,9 +11337,16 @@ private:
     // build_wait_queues), so trailing slots are zeroinit — skip a null flag
     // pointer instead of dereferencing it. Exact buckets keep the check-free
     // scan.
-    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded = false) {
+    // `trig`: trigger bits this (signal, edge) contributes to the wake word
+    // (compute_trigger_masks), or 0 when no guarded group waits on it. Note the
+    // already-queued path: it must still OR the bits in, or a group woken by two
+    // of its events in one instant loses the second one's bit and skips the
+    // members that were waiting for it. With `trig` 0 that path is empty and the
+    // emission is exactly the unguarded scan.
+    void emit_static_scan_rt(llvm::Value* base, llvm::Value* cap, bool padded = false, uint64_t trig = 0) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
+        auto* word = sched_word_ty();
         auto* elem = wait_elem_ty();
         auto* fn   = b_.GetInsertBlock()->getParent();
         auto* head = llvm::BasicBlock::Create(ctx_, "nsta.head", fn);
@@ -11115,11 +11371,21 @@ private:
             b_.CreateCondBr(b_.CreateICmpNE(fptr, llvm::ConstantPointerNull::get(ptr)), live, cont);
             b_.SetInsertPoint(live);
         }
-        b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0)), cont, wake);
+        llvm::Value* old   = b_.CreateLoad(word, fptr);
+        auto*        queued = b_.CreateICmpNE(old, b_.getInt64(0));
+        if (trig != 0) {
+            auto* arm = llvm::BasicBlock::Create(ctx_, "nsta.arm", fn);
+            b_.CreateCondBr(queued, arm, wake);
+            b_.SetInsertPoint(arm);
+            b_.CreateStore(b_.CreateOr(old, b_.getInt64(trig)), fptr);
+            b_.CreateBr(cont);
+        } else {
+            b_.CreateCondBr(queued, cont, wake);
+        }
 
         b_.SetInsertPoint(wake);
         emit_wake_push(b_, h);
-        b_.CreateStore(b_.getInt32(1), fptr);
+        b_.CreateStore(b_.getInt64(1 | trig), fptr);
         b_.CreateBr(cont);
 
         b_.SetInsertPoint(cont);
@@ -11159,11 +11425,14 @@ private:
         llvm::Value* src  = b_.CreateInBoundsGEP(elem, base, idx);
         llvm::Value* h    = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 0));
         llvm::Value* fptr = b_.CreateLoad(ptr, b_.CreateStructGEP(elem, src, 1));
-        b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(i32, fptr), b_.getInt32(0)), cont, wake);
+        // No trigger bits: a dynamic entry is an intra-body park (`@(...)`, a
+        // task wait), and a guarded group is suspension-free by construction, so
+        // no entry here can name one.
+        b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(sched_word_ty(), fptr), b_.getInt64(0)), cont, wake);
 
         b_.SetInsertPoint(wake);
         emit_wake_push(b_, h);
-        b_.CreateStore(b_.getInt32(1), fptr);
+        b_.CreateStore(b_.getInt64(1), fptr);
         b_.CreateBr(cont);
 
         b_.SetInsertPoint(cont);
@@ -11205,7 +11474,8 @@ private:
             b_.SetInsertPoint(body);
             auto* ptr = raw_ptr_ty();
             auto* i32 = b_.getInt32Ty();
-            emit_static_scan_rt(meta_at(meta, 0, e, ptr), meta_at(meta, 1, e, i32));
+            emit_static_scan_rt(meta_at(meta, 0, e, ptr), meta_at(meta, 1, e, i32), false,
+                                trig_bits(sig, e));
             emit_dynamic_scan_rt(meta_at(meta, 2, e, ptr), meta_at(meta, 3, e, ptr));
             if (vif_wait_[static_cast<uint32_t>(sig)][e]) {
                 // Waiters that reached this member through a virtual interface. The
@@ -11483,7 +11753,8 @@ private:
                 // when the body reaches its wait-suspend (lower_process always-loop).
                 if (p.self_start) {
                     llvm::Constant* flag = sched_flag_ptr(k);
-                    b_.CreateStore(b_.getInt32(1), flag);
+                    // The time-zero settle run must evaluate every member.
+                    b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
                     emit_active_push(b_, hdl);
                 }
             } else if (p.activation == Activation::Reactive) {
@@ -20076,7 +20347,7 @@ private:
         // Armed for the same reason a `wait` arms: while parked here this process
         // sits in no other queue, so the flag must say "not scheduled" or a later
         // event wake would be dropped as a duplicate.
-        b_.CreateStore(b_.getInt32(0), sched_ptr_);
+        b_.CreateStore(b_.getInt64(0), sched_ptr_);
         emit_suspend_raw("expect.resume");
 
         // Past the resume point, so this thread is now running in the Reactive
@@ -23560,7 +23831,7 @@ private:
             // so it still lands. Every later park re-arms the flag before suspending,
             // so leaving it set here strands nothing.
             if (park_claim_wanted() && sched_ptr_ != nullptr) {
-                b_.CreateStore(b_.getInt32(1), sched_ptr_);
+                b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
             }
             emit_suspend("fork.join.resume");
             b_.CreateBr(cont);
@@ -26024,11 +26295,11 @@ private:
 
         b_.SetInsertPoint(evt);
         llvm::Value* flag = b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, node, 4));
-        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(b_.getInt32Ty(), flag), b_.getInt32(0)), push, after);
+        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), push, after);
 
         b_.SetInsertPoint(push);
         emit_wake_push(b_, hdl);
-        b_.CreateStore(b_.getInt32(1), b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, node, 4)));
+        b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), b_.CreateLoad(ptr_ty, b_.CreateStructGEP(nty, node, 4)));
         b_.CreateBr(after);
     }
 
@@ -26402,11 +26673,11 @@ private:
         llvm::Value* next = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kNodeNext));
         llvm::Value* hdl  = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kNodeHandle));
         llvm::Value* flag = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kNodeFlag));
-        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(i32, flag), b_.getInt32(0)), wake, step);
+        b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), wake, step);
 
         b_.SetInsertPoint(wake);
         emit_wake_push(b_, hdl);
-        b_.CreateStore(b_.getInt32(1), flag);
+        b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
         b_.CreateBr(step);
 
         b_.SetInsertPoint(step);
@@ -26756,7 +27027,7 @@ private:
         b_.SetInsertPoint(push);
         llvm::Value* hdl = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, acts, 2));
         emit_wake_push(b_, hdl);
-        b_.CreateStore(b_.getInt32(1), b_.CreateLoad(ptr, b_.CreateStructGEP(nty, acts, 4)));
+        b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), b_.CreateLoad(ptr, b_.CreateStructGEP(nty, acts, 4)));
         b_.CreateBr(skip);
 
         b_.SetInsertPoint(skip);
@@ -26805,7 +27076,7 @@ private:
         b_.CreateBr(armed);
         b_.SetInsertPoint(armed);
         b_.CreateStore(node, headp);
-        b_.CreateStore(b_.getInt32(0), sched_ptr_);
+        b_.CreateStore(b_.getInt64(0), sched_ptr_);
         emit_suspend_raw("waitfork.resume");
         emit_proc_unlink_node(node);
         // Killed while parked (LRM 9.7): leave the barrier now. Re-testing instead
@@ -26959,7 +27230,7 @@ private:
         // Armed for the reason `wait` and `expect` arm: parked here this thread sits
         // in no other queue, so the flag has to read "not scheduled" or the wake is
         // dropped as a duplicate.
-        b_.CreateStore(b_.getInt32(0), sched_ptr_);
+        b_.CreateStore(b_.getInt64(0), sched_ptr_);
         emit_suspend_raw("await.resume");
         // Unlink on resume, whoever woke us: the waker only walks and pushes, it does
         // not unlink, which is what keeps a multi-waiter list correct without a
@@ -27178,11 +27449,11 @@ private:
             llvm::Value* flag = b_.CreateLoad(ptr, b_.CreateStructGEP(nty, n, kSyncFlag));
             // One wake per thread per instant, the design's existing scheduled-flag
             // token: a thread already queued elsewhere is not pushed twice.
-            b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(b_.getInt32Ty(), flag), b_.getInt32(0)), push,
+            b_.CreateCondBr(b_.CreateICmpEQ(b_.CreateLoad(sched_word_ty(), flag), b_.getInt64(0)), push,
                             skip);
             b_.SetInsertPoint(push);
             emit_wake_push(b_, hdl);
-            b_.CreateStore(b_.getInt32(1), flag);
+            b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
             b_.CreateBr(skip);
             b_.SetInsertPoint(skip);
         };
@@ -27245,7 +27516,7 @@ private:
         // Armed for the reason every intra-body park arms: parked here this thread
         // sits in no other queue, so the flag must read "not scheduled" or the wake
         // is dropped as a duplicate.
-        b_.CreateStore(b_.getInt32(0), sched_ptr_);
+        b_.CreateStore(b_.getInt64(0), sched_ptr_);
         emit_suspend("coro.sync_resume");
         if (llvm::Value* aborting = emit_abort_pending(); aborting != nullptr) {
             auto* fn    = b_.GetInsertBlock()->getParent();
@@ -27794,6 +28065,22 @@ private:
     // group is suspension-free), not a coroutine. Drives lower_group's emission
     // and the seed/drain dispatch, kept as one table so all three agree.
     std::vector<bool>                   thunk_group_;
+    // Per-(signal, edge) trigger colour: the wake word bit a wake of that pair
+    // sets, or 0 for "no guarded group waits on it". Design-global so the mask
+    // is a constant at the scan site (compute_trigger_masks).
+    std::vector<std::array<uint8_t, 3>> trig_colour_;
+    // Per-group: guard each member on its own sensitivity, the per-member masks
+    // in member order, and the union of those masks. Empty / false / 0 for a
+    // group that runs every member unconditionally, which is every group with
+    // `regions` off.
+    std::vector<bool>                   group_guarded_;
+    std::vector<std::vector<uint64_t>>  group_member_mask_;
+    std::vector<uint64_t>               group_trig_mask_;
+    // Any group guarded at all. Gates whether an unclassified wake has to set
+    // every trigger bit, so a design with no guarded group emits the wake sites
+    // it always did.
+    bool                                any_guarded_     = false;
+    uint32_t                            trig_collisions_ = 0;
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
     // (`[signal][static_cast<uint32_t>(edge)]`: 0=pos, 1=neg, 2=any); null where the
     // signal has no waiter of that (kind, edge). Splitting by edge hoists the
