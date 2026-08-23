@@ -850,13 +850,44 @@ hold, and the gate is gone:
 All three follow from the same root cause: a flat walk of the fork body made every
 top-level statement a child, so a declaration became a process.
 
-### V4b.4 What is refused
+### V4b.4 The other lifetime, and what is refused
 
-- A **static-lifetime** declaration in a fork's block_item_declaration. LRM 6.21
-  initializes static storage once before time zero; 9.3.2 asks for initialization on
-  every entry to the fork's scope. The two readings disagree, nothing here implements
-  either, so it fails loudly and names the conflict.
-- A child **body** reading an `output` / `inout` formal — unchanged.
+A **static-lifetime** declaration in a fork's block_item_declaration is ordinary static
+storage in the block's own scope, which is what clotho did before V4b landed and what
+it does again. V4b briefly refused it, on the recorded grounds that 6.21 and 9.3.2
+disagree. They do not, and 6.21 says so in as many words:
+
+> an explicit `static` keyword shall be required when an initialization value is
+> specified as part of a static variable's declaration to indicate the user's intent of
+> executing that initialization only once at the beginning of simulation.
+
+`static` is precisely the modifier that opts OUT of per-entry initialization. So
+9.3.2's "whenever execution enters their scope" is the rule the OTHER lifetime selects
+— which is why the clause's own example spells it `automatic int k = j` — and 9.3.2's
+"before any processes are spawned" is a rule about WHERE, satisfied for either lifetime
+by lowering in the parent at the fork. There was never a conflict to resolve, and the
+refusal additionally fired for a declaration with NO initializer, where neither clause
+is engaged at all.
+
+The static path in `lower_fork` is therefore just `lower_var_decl`, the same call the
+automatic path makes after installing its box: `declare_storage` gives a module signal
+in a process body and a persistent signal in a subroutine, and the initializer goes to
+PreInit. No box and no capture — shared storage already outlives every child, which is
+why `ForkCaptureDetector::check` skips it — and no entry in `BoxCandidateScan`'s
+per-activation set, since `body_automatics` never offered one.
+
+A named fork block is a hierarchical scope, so its declaration stays reachable by name.
+That is the shape the refusal actually broke: `initial fork : c reg x; join` with
+`a.c.x` written from another process failed with the refusal and then, as a cascade,
+`reference to unknown signal 'x'`.
+
+**Still refused:** a child **body** reading an `output` / `inout` formal — unchanged,
+and now the only V4b refusal. The same guard also catches a `ref` / `const ref` formal,
+where its wording is wrong but the refusal is not: a ref formal's frame slot holds a
+POINTER to the actual (`docs/design/ref-args.md`), so a value box would carry the
+pointer where the child expects the value. `ref static`, which 9.3.2 explicitly exempts
+from the join_any/join_none restriction, is refused with it and needs a by-reference
+capture ABI rather than a wording fix.
 
 ### V4b.5 Verification
 
@@ -869,10 +900,18 @@ It is **not** an oracle for (b): it prints `1 2 3` for the nested `m`, contradic
 clause's own `// the value of m is 4`, so it conflates the two positions that
 `tests/fork_test.cpp` now pins apart.
 
-**iverilog 13 cannot compile the construct at all** — "sorry: Overriding the default
-variable lifetime is not yet supported" for any `automatic` declaration in a fork — so
-the oracle that covered V1–V3 is unavailable here. Its `vvp` additionally aborts on the
-bare-capture loop shape (`vthread.cc:3793`, `of_JOIN_DETACH`).
+**iverilog 13 cannot compile the `automatic` form at all** — "sorry: Overriding the
+default variable lifetime is not yet supported" for any `automatic` declaration in a
+fork — so the oracle that covered V1–V3 is unavailable there. Its `vvp` additionally
+aborts on the bare-capture loop shape (`vthread.cc:3793`, `of_JOIN_DETACH`).
+
+It IS an oracle for the static form, and is used as one. iverilog and Verilator both
+print `PASSED x=1` for `initial fork : c reg x; join` with a hierarchical `a.c.x`, and
+`101 102 103` / `201 202 203` for a once-only initializer in a looping module fork and
+a task fork — a per-entry re-initialization would print `101` and `201` three times.
+Verilator alone can compile a fork holding BOTH lifetimes, and agrees line for line on
+`101|102|103` against `101|101|101` under `join`, and on the `join_none` aliasing case
+where three entries share one `hits` while each keeps its own `mine`.
 
 The bare-capture reading is unchanged, and is now pinned side by side with the other two
 positions in one test so the distinction cannot decay: `444|123|444`. Worth recording
@@ -962,10 +1001,11 @@ from the parent's sensitivity, as called-subroutine bodies are handled.
   copy-out reads the formal's own frame slot, which does not see writes made through
   the box. Reading one in the initializer of a fork's own declaration is LEGAL and
   supported, which is the clause's own carve-out (§V4b.2).
-- a STATIC declaration in a fork's block_item_declaration — rejected by name (§V4b.4):
-  6.21 initializes static storage once before time zero, 9.3.2 on every entry to the
-  fork's scope, and nothing implements either reading. An AUTOMATIC one is supported
-  for every join kind (§V4b).
+- a STATIC declaration in a fork's block_item_declaration — **never a refusal, and the
+  one V4b briefly added was wrong (§V4b.4).** It is ordinary static storage in the
+  block's scope; `static` is the modifier that opts out of 9.3.2's per-entry
+  initialization, so 6.21 and the clause never disagreed. An AUTOMATIC one gets the
+  per-entry box, for every join kind (§V4b).
 - `disable` / `wait fork` / `disable fork` — reject (V3).
 - child-body constructs needing the unwind machinery — reject.
 
