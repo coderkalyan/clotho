@@ -1311,11 +1311,119 @@ TEST_CASE("fork: a fork-scope declaration works under join, join_any and join_no
           "|\n");
 }
 
-// The two gaps around spawn-time initialization that are still refused rather than
-// answered. The first is the clause's carve-out read at its exact width: legal in an
-// initializer, still illegal in a child body, where the copy-out of an output formal
-// would lose whatever the child wrote through the box.
-TEST_CASE("fork: a child body reading an output formal, and a static fork declaration, are rejected") {
+// LRM 6.21 settles what 9.3.2 leaves to the other lifetime. `static` is precisely the
+// modifier that opts OUT of per-entry initialization -- the keyword "shall be required
+// when an initialization value is specified as part of a static variable's declaration
+// to indicate the user's intent of executing that initialization only once at the
+// beginning of simulation" -- so 9.3.2's "whenever execution enters their scope" is the
+// rule `automatic` selects, and its "before any processes are spawned" is a rule about
+// WHERE, satisfied for either lifetime by lowering in the parent at the fork.
+//
+// This first case engages neither reading: it has no initializer at all. What it does
+// exercise is that a NAMED fork block is a hierarchical scope, so its own declaration
+// stays reachable as `a.c.x` from another process. iverilog 13 and Verilator 5.050 both
+// print `PASSED x=1`.
+TEST_CASE("fork: a named fork's own declaration is reachable by hierarchical name") {
+    const std::string out = run_capture(R"(
+        module a;
+          initial fork : c
+            reg x;
+          join
+          initial begin a.c.x = 1'b1; $display("PASSED x=%b", a.c.x); end
+        endmodule
+    )");
+    CHECK(out == "PASSED x=1\n");
+}
+
+// Once, before time zero -- NOT on every entry to the fork's scope. The fork sits in a
+// loop and its child mutates the variable, so a per-entry re-initialization would print
+// 101 and 201 three times instead of counting up. Both spellings are covered: `int n`
+// in a module-scope fork, which is implicitly static (LRM 6.21), and the explicit
+// `static` keyword inside a task. iverilog 13 and Verilator 5.050 agree line for line.
+TEST_CASE("fork: a fork's static declaration initializes once, not on every entry") {
+    const std::string out = run_capture(R"(
+        module t;
+          task go(int i);
+            fork
+              static int m = 200;
+              begin m++; $display("task i=%0d m=%0d", i, m); end
+            join
+          endtask
+          initial begin
+            for (int i = 0; i < 3; i++)
+              fork
+                int n = 100;
+                begin n++; $display("proc i=%0d n=%0d", i, n); end
+              join
+            for (int i = 0; i < 3; i++) go(i);
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "proc i=0 n=101\n"
+          "proc i=1 n=102\n"
+          "proc i=2 n=103\n"
+          "task i=0 m=201\n"
+          "task i=1 m=202\n"
+          "task i=2 m=203\n");
+}
+
+// The two lifetimes in ONE fork, so the distinction cannot be conflated again. Under
+// `join` the loop makes it plain: `st` is one variable that survives every entry
+// (101, 102, 103) while `au` is remade on each (101, 101, 101). Under `join_none` it is
+// an aliasing question instead -- all three entries' children share the one `hits`, and
+// each has its own `mine` -- and it is also what shows the static needs no capture box
+// to outlive the activation that declared it. Verilator 5.050 agrees on all three; the
+// `automatic` half is not compilable by iverilog 13 at all.
+TEST_CASE("fork: a static and an automatic declaration in one fork keep their own lifetimes") {
+    const std::string out = run_capture(R"(
+        module t;
+          task automatic in_task(int i);
+            fork
+              static    int st = 100;
+              automatic int au = 100;
+              begin st++; au++; $display("task i=%0d st=%0d au=%0d", i, st, au); end
+            join
+          endtask
+          task automatic later(int j);
+            fork
+              static    int hits = 0;
+              automatic int mine = j * 10;
+              begin #j hits++; #5 $display("j=%0d mine=%0d hits=%0d", j, mine, hits); end
+            join_none
+          endtask
+          initial begin
+            for (int i = 0; i < 3; i++)
+              fork
+                static    int st = 100;
+                automatic int au = 100;
+                begin st++; au++; $display("proc i=%0d st=%0d au=%0d", i, st, au); end
+              join
+            for (int i = 0; i < 3; i++) in_task(i);
+            later(1); later(2); later(3);
+            #12 $display("|");
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "proc i=0 st=101 au=101\n"
+          "proc i=1 st=102 au=101\n"
+          "proc i=2 st=103 au=101\n"
+          "task i=0 st=101 au=101\n"
+          "task i=1 st=102 au=101\n"
+          "task i=2 st=103 au=101\n"
+          "j=1 mine=10 hits=3\n"
+          "j=2 mine=20 hits=3\n"
+          "j=3 mine=30 hits=3\n"
+          "|\n");
+}
+
+// The one gap around spawn-time initialization that is still refused rather than
+// answered, and it is the clause's carve-out read at its exact width: an output formal
+// is legal in a fork-scope initializer (pinned above) and still illegal in a child body,
+// where the copy-out reads the formal's own frame slot and would lose whatever the child
+// wrote through the box.
+TEST_CASE("fork: a child body reading an output formal is rejected") {
     check_rejected(R"(
         module t;
           task automatic go(output int o);
@@ -1328,19 +1436,6 @@ TEST_CASE("fork: a child body reading an output formal, and a static fork declar
         endmodule
     )",
                    "capturing an output or inout formal would lose");
-
-    check_rejected(R"(
-        module t;
-          task automatic go();
-            fork
-              static int k = 1;
-              begin #1 $display("k=%0d", k); end
-            join_none
-          endtask
-          initial go();
-        endmodule
-    )",
-                   "initializes a fork's declarations on every entry to its scope");
 }
 
 // LRM 13.4.4 second paragraph: the calling thread must be created by an initial or

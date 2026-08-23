@@ -692,18 +692,36 @@ professional parity; M5 makes it complete.
   — lowered as a child process — completes immediately and satisfies the join before any
   real child runs. All three are the same root cause: a flat walk made every top-level
   statement of the fork body a child, so a declaration became a process.
-  **Refused loudly:** a STATIC declaration in a fork's `block_item_declaration`, where
-  6.21 (initialize once before time zero) and 9.3.2 (initialize on every entry to the
-  scope) disagree and nothing implements either.
+  **THE OTHER LIFETIME, and this entry first recorded it as a refusal by mistake.** A
+  STATIC declaration in a fork's `block_item_declaration` was rejected on the grounds
+  that 6.21 and 9.3.2 disagree. They do not, and 6.21 says so outright: the `static`
+  keyword "shall be required when an initialization value is specified … to indicate the
+  user's intent of executing that initialization only once at the beginning of
+  simulation". `static` is exactly the modifier that opts OUT of per-entry
+  initialization, so 9.3.2's "whenever execution enters their scope" is the rule
+  `automatic` selects — which is why the clause's own example spells it
+  `automatic int k = j` — and its "before any processes are spawned" is a rule about
+  WHERE, satisfied for either lifetime by lowering in the parent at the fork. The
+  refusal also fired for a declaration with NO initializer, where neither clause is even
+  engaged, and took a working construct with it: `initial fork : c reg x; join` plus a
+  hierarchical `a.c.x` passed before that commit and failed after. Restored to what it
+  was — ordinary static storage in the block's own scope (`lower_var_decl`, so a module
+  signal in a process body and a persistent signal in a subroutine, initializer in
+  PreInit) — which needs no box and is no capture, since shared storage already outlives
+  every child and a named fork stays a hierarchical scope.
   **Oracles.** Verilator 5.050 `--timing` agrees on every fork-scope case measured —
   the clause example, both UVM shapes including the labelled `fork : guard`, all six
   initializer sources, the once-per-execution side effect, sharing, and all three join
   kinds with timestamps — but is NOT an oracle for the body-local form: it prints
   `1 2 3` for the nested `m`, contradicting the clause's own comment. **iverilog 13
-  cannot compile the construct at all** ("sorry: Overriding the default variable
-  lifetime is not yet supported"), so the oracle that covered V1–V3 is unavailable.
-  Unchanged: the bare captured loop variable stays `4 4 4`. Verilator's `1 2 3`
-  deviation there is process-body-specific — in a task body it prints `444` too.
+  cannot compile the `automatic` form at all** ("sorry: Overriding the default variable
+  lifetime is not yet supported"), so the oracle that covered V1–V3 is unavailable
+  there — but it does compile the STATIC form, and it and Verilator both print
+  `PASSED x=1` for the hierarchical `a.c.x` case and `101 102 103` / `201 202 203` for
+  the once-only initializer in a looping module fork and a task fork. Verilator alone
+  covers the mixed fork, and agrees. Unchanged: the bare captured loop variable stays
+  `4 4 4`. Verilator's `1 2 3` deviation there is process-body-specific — in a task
+  body it prints `444` too.
 - [ ] **1024 concurrent detached children** is the ceiling: an unbounded spawn edge
   saturates the activation bound, and past it the scheduler-buffer guards report a
   located FATAL. Lifting it means a spill on the already-emitted overflow edge; the

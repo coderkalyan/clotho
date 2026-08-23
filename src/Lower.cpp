@@ -9905,14 +9905,26 @@ private:
         // of this function needs nothing new for it.
         for (const VariableDeclStatement* d : decls) {
             if (d->symbol.lifetime != slang::ast::VariableLifetime::Automatic) {
-                // TODO: a static-lifetime declaration in a fork's block_item_declaration.
-                // LRM 6.21 initializes static storage once before time zero, while 9.3.2
-                // asks for initialization on every entry to the fork's scope; the two
-                // readings disagree and nothing here implements either, so it is refused
-                // rather than silently given one of them.
-                fail(std::string(kind_name) + " declaring the static '" + std::string(d->symbol.name) +
-                     "' is not supported: LRM 9.3.2 initializes a fork's declarations on every "
-                     "entry to its scope, which static storage does not do");
+                // A STATIC declaration is precisely the one that opts OUT of the
+                // per-entry initialization above, so 9.3.2 and 6.21 do not disagree
+                // here. 6.21 is explicit: the `static` keyword "shall be required when
+                // an initialization value is specified as part of a static variable's
+                // declaration to indicate the user's intent of executing that
+                // initialization only once at the beginning of simulation". 9.3.2's
+                // "whenever execution enters their scope" is the per-entry rule that
+                // `automatic` selects -- which is what makes the clause's own example
+                // spell it `automatic int k = j` -- while its "before any processes are
+                // spawned" is a rule about WHERE, and lowering in the parent at the fork
+                // satisfies that for either lifetime.
+                //
+                // So this is ordinary static storage in the block's own scope: a module
+                // signal in a process body, a persistent signal in a subroutine
+                // (declare_storage), with the initializer run once in PreInit. No box
+                // and no capture -- shared storage already outlives every child, which
+                // is why ForkCaptureDetector skips it -- and a named fork is a
+                // hierarchical scope, so `blk.decl` stays reachable by name.
+                lower_var_decl(d->symbol, b);
+                continue;
             }
             install_fork_decl_box(d->symbol, b, l);
             captures.push_back(&d->symbol);
