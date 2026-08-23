@@ -28586,10 +28586,28 @@ private:
     // explicit receiver (`obj.method()`) is call.thisClass(); a bare call uses the
     // enclosing `this` — a method's own `this` Local, or the object under
     // construction when the call sits in a property declaration initializer.
-    // Returns nullopt for a free subroutine (no thisVar).
+    // Returns nullopt for a free subroutine (no thisVar) and for a static method.
     std::optional<ir::Index> resolve_method_this(const CallExpression&   call,
                                                  const SubroutineSymbol& sub,
                                                  ir::Builder&            b) {
+        // A static method has no `this` (LRM 8.10), and slang gives it no thisVar, so
+        // build_function splices no receiver formal -- whichever way the call was
+        // written. Written with an object handle (`p.f()`, which LRM 8.9 allows for
+        // any static member: its own example reads `p.fileID` through a handle that
+        // was never assigned), slang still reports the receiver as thisClass(), and
+        // splicing it shifts every actual one formal to the left. The backend then
+        // reads the handle under the NEXT formal's direction, so a `ref` formal asked
+        // a value operand for its lvalue -- a segfault with no diagnostic.
+        if (sub.flags.has(slang::ast::MethodFlags::Static)) {
+            if (call.thisClass() != nullptr) {
+                // Evaluated for its side effects, then dropped: the receiver can be any
+                // expression (`make_pool().f()`), and the static-PROPERTY path
+                // (value_lvalue) evaluates its prefix the same way before resolving to
+                // the shared slot.
+                lower_expr(*call.thisClass(), b);
+            }
+            return std::nullopt;
+        }
         if (call.thisClass() != nullptr) {
             // For a virtual interface receiver this is the handle, which the
             // ctx-parameterized body takes as formal 0 (vif_function_id) exactly as

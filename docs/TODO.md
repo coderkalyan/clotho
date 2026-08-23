@@ -2500,6 +2500,42 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   a static property of aggregate type with FIELD-level defaults and no initializer
   of its own reads the power-on default instead (`declare_static_prop` returns early
   on a null initializer) — silent, not guarded.
+  A `static` method is now callable through an OBJECT HANDLE (`p.f(x)`), not only
+  as `C::f(x)` or bare inside the class — LRM 8.9 grants a static member that
+  freedom explicitly, and its own example reads `p.fileID` through a handle that
+  was never assigned, so a null receiver is legal and dereferences nothing.
+  `resolve_method_this` returned the receiver for any non-null `thisClass()`
+  without asking whether the callee was static, and slang gives a static method no
+  `thisVar`, so `build_function`/`splice_this` had built no receiver formal: the
+  spliced handle shifted every actual one formal to the LEFT. The IR shape that
+  turned that into a crash is a static method whose first formal is `ref` —
+  `lower_call_common` read `arg_dirs[0] == Ref` for the handle operand and asked
+  `lvalue_of` for a place, but a handle is a VALUE, so `lvals_` held a DISENGAGED
+  `std::optional<LValue>`; dereferencing it read the all-zero buffer as an LValue
+  and faulted on the first null member (`bit_off`, in `ref_actual_ptr` →
+  `is_zero_const` → `dyn_cast<ConstantInt>(nullptr)`) with NO diagnostic at all,
+  exit 139. Found compiling `uvm_component::apply_config_settings`, whose
+  `rp.sort_by_precedence(rq)` calls `static function void (ref rsrc_q_t)`; the
+  11-line repro needs no UVM. The gate is slang's `MethodFlags::Static`, not
+  `thisVar == nullptr`: a PURE VIRTUAL also has a null `thisVar` in slang's
+  degenerate representation and must keep taking a receiver. The receiver
+  expression is still LOWERED for its side effects and then dropped, matching what
+  the static-PROPERTY path already does with its prefix (`make_pool().f()` bumps
+  its counter exactly once). Sibling audit: the same misalignment hit every static
+  shape reached through a handle, not just `ref` — a `void` method with a plain
+  argument, a zero-argument function (which indexed `param_types[0]` on an EMPTY
+  vector), and a static task all produced LLVM's own unlocated `Incorrect number of
+  arguments passed to called function!`; all four now agree with the `C::f` form.
+  `super.f()` and bare in-method calls were already correct (both reach the
+  `thisVar == nullptr && !is_user_virtual` arm), and the two capture detectors that
+  mirror this condition (`ForkCaptureDetector` and the implicit-`this` visitor) test
+  `thisVar` directly, so they already excluded static callees. Two backend guards
+  close the class of defect rather than this one instance: `lvalue_of` refuses a
+  disengaged entry (the single chokepoint every place consumer funnels through), and
+  `lower_call_common` / `lower_task_call_inst` refuse an actual list whose length
+  does not match `param_types` before any of the seven per-formal indexing sites
+  runs. Both are located `BackendError`s, so a future marshalling slip is a
+  `file:line:col` refusal instead of a silent segfault.
 - [ ] **Cross-module class type identity** — the class type cache is per-Lowerer,
   so a `$unit`/package-scope class referenced by two modules interns two distinct
   (nominal) Refs; V1 exercises classes only within one module. Route
