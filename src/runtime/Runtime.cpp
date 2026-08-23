@@ -1550,8 +1550,17 @@ extern "C" void rt_dynarr_move(rt_dynarr* dst, rt_dynarr* src, const rt_elem_ops
 
 namespace {
 
-// Sort-key kind for the ordering comparator; mirrors the backend descriptor.
-enum : uint32_t { sort_unsigned = 0, sort_signed = 1, sort_real = 2 };
+// Sort-key kind for the ordering comparator; mirrors the backend descriptor
+// (LlvmBackend.cpp dynarr_sort_desc). The 4-state kinds are separate rather than
+// a flag on the first two so that a 2-state element never tests a plane it does
+// not have: the comparator is chosen once per sort, outside the compare loop.
+enum : uint32_t {
+    sort_unsigned  = 0,
+    sort_signed    = 1,
+    sort_real      = 2,
+    sort_unsigned4 = 3,
+    sort_signed4   = 4
+};
 
 // One xoshiro256++ step against a thread's RNG state. Byte-for-byte the
 // same recurrence the backend inlines at each $urandom site
@@ -1623,6 +1632,54 @@ bool slot_less(const uint8_t* a, const uint8_t* b, uint64_t stride, uint32_t kin
     return ua < ub;
 }
 
+// Whether `kind` orders 4-state slots (must/may planes) rather than flat values.
+bool sort_kind_four(uint32_t kind) {
+    return kind == sort_unsigned4 || kind == sort_signed4;
+}
+
+// One 4-state element slot decoded: the definite value (the must plane) and the
+// mask of bits that are x or z. A 4-state slot is `{ i(2W) must|may, iW z }` with
+// must in bits [0,W) and may in [W,2W) (LlvmBackend.cpp:48), so `must ^ may` is
+// the unknown mask -- the same decode rt_container_eq does, and the same bounded
+// (2W+7)/8-byte read inside the mm field. The z plane is never read: Z is encoded
+// as X in must/may with the z bit set alongside, and the ordering does not
+// distinguish x from z.
+struct FourSlot {
+    uint64_t must;
+    uint64_t unknown;
+};
+FourSlot slot_four(const uint8_t* p, uint32_t width) {
+    const uint64_t    mask = width < 64 ? (uint64_t{ 1 } << width) - 1 : ~uint64_t{ 0 };
+    unsigned __int128 f    = 0;
+    std::memcpy(&f, p, static_cast<size_t>((2 * width + 7) / 8));
+    const uint64_t must = static_cast<uint64_t>(f) & mask;
+    return { must, must ^ (static_cast<uint64_t>(f >> width) & mask) };
+}
+
+// Ascending three-way compare of two 4-state slots under clotho's total order
+// (docs/design/array-methods.md): a slot carrying ANY x or z bit is unknown, all
+// unknowns are mutually equal, and an unknown precedes every defined value.
+// Defined values compare numerically at the element's signedness. Returns < 0,
+// 0 or > 0. LRM 11.4.4's own answer -- x -- is not an ordering at all, so it
+// cannot be what a comparison sort consumes.
+int slot_cmp4(const uint8_t* a, const uint8_t* b, uint32_t kind, uint32_t width) {
+    const FourSlot fa = slot_four(a, width);
+    const FourSlot fb = slot_four(b, width);
+    const bool     ua = fa.unknown != 0;
+    const bool     ub = fb.unknown != 0;
+    if (ua || ub) {
+        return ua == ub ? 0 : (ua ? -1 : 1);
+    }
+    if (kind == sort_signed4) {
+        // Sign-extend the width-bit value so the compare is arithmetic.
+        const uint64_t sbit = uint64_t{ 1 } << (width - 1);
+        const int64_t  va   = static_cast<int64_t>((fa.must ^ sbit) - sbit);
+        const int64_t  vb   = static_cast<int64_t>((fb.must ^ sbit) - sbit);
+        return va < vb ? -1 : (vb < va ? 1 : 0);
+    }
+    return fa.must < fb.must ? -1 : (fb.must < fa.must ? 1 : 0);
+}
+
 // Sort `n` contiguous slots ascending; `rev` then flips to descending (rsort).
 //
 // This is the flat-value path only: the caller reached it because the element IS
@@ -1638,7 +1695,9 @@ bool slot_less(const uint8_t* a, const uint8_t* b, uint64_t stride, uint32_t kin
 // order becomes observable and reversing an ascending sort would reverse each tie
 // group. That form is therefore not lowered here at all -- it is a stable merge
 // sort emitted as IR, which orders descending directly (lower_array_sort_iter,
-// src/Lower.cpp).
+// src/Lower.cpp). A 4-STATE element breaks both the same way and has its own
+// driver below; this function and its comparator are reached only by the two
+// kinds above, and pay nothing for the existence of the other path.
 void sort_run(uint8_t* data, uint64_t n, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev) {
     if (n < 2) {
         return;
@@ -1660,12 +1719,46 @@ void sort_run(uint8_t* data, uint64_t n, uint64_t stride, uint32_t kind, uint32_
     }
 }
 
+// Sort `n` contiguous 4-state slots under clotho's ordering for unknowns
+// (slot_cmp4): `rev` orders descending. Neither of sort_run's two invariants
+// survives the unknowns, so this is a separate driver rather than a flag on it:
+//
+//   * Ties ARE observable -- `8'b1111_111x` and `8'b0000_000x` compare equal and
+//     are not byte-equal -- so the order must be stable. Tie-breaking on the
+//     original index is exactly that, and costs no storage: the index vector is
+//     already here.
+//   * Ascending-then-reverse is NOT a descending sort, because every unknown is
+//     one tie group and a reverse would flip it. So `rev` inverts the comparator
+//     instead, which keeps the tie-break ascending in both directions.
+void sort_run4(uint8_t* data, uint64_t n, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev) {
+    if (n < 2) {
+        return;
+    }
+    std::vector<uint64_t> order(static_cast<size_t>(n));
+    for (uint64_t i = 0; i < n; ++i) {
+        order[i] = i;
+    }
+    const bool desc = rev != 0;
+    std::sort(order.begin(), order.end(), [&](uint64_t x, uint64_t y) {
+        const int c = slot_cmp4(data + x * stride, data + y * stride, kind, width);
+        if (c != 0) {
+            return desc ? c > 0 : c < 0;
+        }
+        return x < y;
+    });
+    std::vector<uint8_t> tmp(static_cast<size_t>(n * stride));
+    for (uint64_t i = 0; i < n; ++i) {
+        std::memcpy(tmp.data() + i * stride, data + order[i] * stride, static_cast<size_t>(stride));
+    }
+    std::memcpy(data, tmp.data(), static_cast<size_t>(n * stride));
+}
+
 } // namespace
 
 // The three ordering entry points take the element descriptor rather than a
 // bare stride: they reindex the container, so each bumps the relocation epoch,
 // and `ops` keeps every container entry point on one signature shape. The
-// reverse_run / sort_run / swap_slots helpers above stay on a bare stride --
+// reverse_run / sort_run* / swap_slots helpers above stay on a bare stride --
 // they move slots and know nothing about epochs. Fewer than two elements is a
 // genuine no-op, so it reorders nothing and leaves the epoch alone.
 extern "C" void rt_dynarr_reverse(rt_dynarr* h, const rt_elem_ops* ops) {
@@ -1681,7 +1774,14 @@ extern "C" void rt_dynarr_sort(rt_dynarr* h, const rt_elem_ops* ops, uint32_t ki
     if (h->len < 2) {
         return;
     }
-    sort_run(static_cast<uint8_t*>(h->data), h->len, ops->stride, kind, width, rev);
+    // Which driver is decided by the element's domain, once per call, next to the
+    // length test that was already here -- the comparators themselves stay
+    // domain-specific and test nothing.
+    if (sort_kind_four(kind)) {
+        sort_run4(static_cast<uint8_t*>(h->data), h->len, ops->stride, kind, width, rev);
+    } else {
+        sort_run(static_cast<uint8_t*>(h->data), h->len, ops->stride, kind, width, rev);
+    }
     ++h->epoch;
 }
 
@@ -2300,7 +2400,11 @@ extern "C" void rt_queue_sort(rt_queue* h, const rt_elem_ops* ops, uint32_t kind
     for (uint64_t i = 0; i < n; ++i) {
         std::memcpy(buf.data() + i * stride, q_elem(h, stride, i), static_cast<size_t>(stride));
     }
-    sort_run(buf.data(), n, stride, kind, width, rev);
+    if (sort_kind_four(kind)) {
+        sort_run4(buf.data(), n, stride, kind, width, rev);
+    } else {
+        sort_run(buf.data(), n, stride, kind, width, rev);
+    }
     for (uint64_t i = 0; i < n; ++i) {
         std::memcpy(q_elem(h, stride, i), buf.data() + i * stride, static_cast<size_t>(stride));
     }

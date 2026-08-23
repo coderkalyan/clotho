@@ -20837,8 +20837,7 @@ private:
         if (is_locator_method(name) || is_reduction_method(name)) {
             return lower_array_iter_method(name, call, arr, b, l);
         }
-        // TODO: `map` (LRM 7.12.5). 4-state sort stays refused on purpose, not
-        // deferred: 7.12.2 leaves x/z placement undefined (guard_ordering_sort).
+        // TODO: `map` (LRM 7.12.5).
         fail("dynamic array method '" + std::string(name) + "' is not supported");
     }
 
@@ -20850,11 +20849,12 @@ private:
     // That admits an integral of any width, a real and a string; an enum is
     // integral, so it orders by its base value.
     //
-    // 4-state stays refused, and not for want of a comparator: a 4-state `<`
-    // yields x rather than a total order, so 7.12.2's "ascending" is undefined for
-    // an element or key carrying x/z. Any placement clotho picked would become a
-    // de-facto commitment; a loud refusal is recoverable, a silently invented
-    // order is not.
+    // A 4-state element or key is ORDERED, not refused. LRM 11.4.4 makes `<`
+    // yield x when either operand carries an unknown, which is not a strict weak
+    // ordering and therefore not something a comparison sort can be driven by at
+    // all; clotho defines a total order instead of refusing (unknown before every
+    // defined value, all unknowns mutually equal). See sort_right_wins and
+    // docs/design/array-methods.md.
     void guard_ordering_sort(std::string_view name, const CallExpression& call) {
         const auto&             sci  = std::get<CallExpression::SystemCallInfo>(call.subroutine);
         const Expression* const iter = sci.getIteratorInfo().first;
@@ -20862,11 +20862,6 @@ private:
           iter != nullptr ? *iter->type : *call.arguments()[0]->type->getArrayElementType();
         const slang::ast::Type& kc   = kty.getCanonicalType();
         const std::string       what = iter != nullptr ? "`with` clause key" : "element";
-        if (kc.isIntegral() && kc.isFourState()) {
-            fail("'" + std::string(name) + "' with a 4-state " + what +
-                 " is not supported: LRM 7.12.2 leaves the ordering of x and z undefined, so there "
-                 "is no correct position for an unknown");
-        }
         if (kc.isIntegral() || kc.isFloating() || kc.isString()) {
             return;
         }
@@ -20878,9 +20873,11 @@ private:
     // the runtime's flat value comparator (rt_*_sort). Three cases need it: a
     // `with` clause, whose key is arbitrary IR; a string element, which is a heap
     // handle rather than a value the comparator can load; and an element wider
-    // than the one 64-bit word slot_less reads. Everything else -- a 2-state
-    // integral of width <= 64, and a real -- keeps the runtime fast path, which is
-    // a straight std::sort with no call back into generated code.
+    // than the one 64-bit word slot_less reads. Everything else -- an integral of
+    // width <= 64 in either domain, and a real -- keeps the runtime fast path,
+    // which is a straight std::sort with no call back into generated code. A
+    // 4-state element of width <= 64 belongs there too: its slot carries the
+    // must/may planes the runtime comparator needs (sort_unsigned4 / sort_signed4).
     bool sort_uses_iter_path(const CallExpression& call) {
         const auto& sci = std::get<CallExpression::SystemCallInfo>(call.subroutine);
         if (sci.getIteratorInfo().first != nullptr) {
@@ -20915,6 +20912,10 @@ private:
         const slang::ast::ValueSymbol* iter_var  = nullptr;
         bool                           agg_elem  = false;
         bool                           key_real  = false;
+        // A 4-state key, hence one that can be unknown and needs the total order
+        // sort_right_wins defines. Decided at lower time, so a 2-state key emits
+        // exactly the compare it did before.
+        bool                           key_four  = false;
         bool                           desc      = false; // rsort
     };
 
@@ -20967,7 +20968,9 @@ private:
     // rsort compares with the operands swapped rather than sorting ascending and
     // reversing. Those stop being equivalent the moment a `with` clause makes ties
     // observable, because reversing an ascending sort also reverses each tie
-    // GROUP, so equal keys would come back in reverse original order.
+    // GROUP, so equal keys would come back in reverse original order. The same
+    // trap is why the 4-state ordering below is mirrored rather than reversed:
+    // every unknown key is one tie group.
     //
     // The clause is evaluated HERE, once per element per comparison, and is never
     // cached in a key buffer. 7.12.2 does not fix an evaluation count, so a clause
@@ -20990,7 +20993,29 @@ private:
         const ir::Index right   = b.unary(T::Load, s.key_hold.lv(b, l), l);
         const T         ascend  = s.key_real ? T::FLt : T::Lt;
         const T         descend = s.key_real ? T::FGt : T::Gt;
-        return b.binary(s.desc ? descend : ascend, right, left, l);
+        const ir::Index cmp     = b.binary(s.desc ? descend : ascend, right, left, l);
+        if (!s.key_four) {
+            return cmp;
+        }
+        // Clotho's 4-state ordering (docs/design/array-methods.md): a key with ANY
+        // x or z bit is "unknown", every unknown is equal to every other one, and
+        // an unknown precedes every defined key ascending (so it follows every
+        // defined key descending). `cmp` above is LRM 11.4.4's compare, which is x
+        // whenever either key is unknown, and x is not an ordering -- so the
+        // unknown tests decide those pairs and `cmp` only settles defined pairs:
+        //
+        //   ascending   right wins iff  !unknown(left)  && (unknown(right) || right < left)
+        //   descending  right wins iff  !unknown(right) && (unknown(left)  || right > left)
+        //
+        // No x reaches the result even though `cmp` may be one: the bitwise ops are
+        // monotone (LRM 11.4.7 tables give 0 & x == 0 and 1 | x == 1), and `cmp` is
+        // definite in exactly the case where it is the deciding operand. The Resize
+        // is the 2-state landing (LRM 6.3.1) for the `take` cell.
+        const ir::Index lu   = b.unary(T::IsUnknown, left, l);
+        const ir::Index ru   = b.unary(T::IsUnknown, right, l);
+        const ir::Index open = b.unary(T::Bnot, s.desc ? ru : lu, l);
+        const ir::Index win  = b.binary(T::Bor, s.desc ? lu : ru, cmp, l);
+        return b.resize(b.binary(T::Band, open, win, l), s.bit1, l);
     }
 
     // One merge step: choose the next index from the left or the right run and
@@ -21170,6 +21195,7 @@ private:
         const slang::ast::Type& kty =
           iter_expr != nullptr ? *iter_expr->type : *recv.type->getArrayElementType();
         s.key_real = kty.isFloating();
+        s.key_four = kty.getCanonicalType().isIntegral() && kty.getCanonicalType().isFourState();
 
         ir::Type ot;
         ot.kind    = ir::Type::Kind::DynArray;
@@ -21938,8 +21964,7 @@ private:
         if (is_locator_method(name) || is_reduction_method(name)) {
             return lower_array_iter_method(name, call, q, b, l);
         }
-        // TODO: `map` (LRM 7.12.5). 4-state sort stays refused on purpose, not
-        // deferred: 7.12.2 leaves x/z placement undefined (guard_ordering_sort).
+        // TODO: `map` (LRM 7.12.5).
         fail("queue method '" + std::string(name) + "' is not supported");
     }
 

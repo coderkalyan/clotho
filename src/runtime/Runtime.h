@@ -1073,9 +1073,17 @@ void rt_dynarr_move(rt_dynarr* dst, rt_dynarr* src, const rt_elem_ops* ops);
 // -- Array ordering methods (LRM 7.12.2) --
 //
 // `kind` selects the sort comparator over an element's `width`-bit value:
-// 0 = unsigned integral, 1 = signed integral, 2 = IEEE real (double). The
-// frontend restricts sort()/rsort() to a 2-state integral (width <= 64) or real
-// element; reverse() is element-agnostic (whole-slot move) and takes no kind.
+// 0 = unsigned integral, 1 = signed integral, 2 = IEEE real (double),
+// 3 = unsigned 4-state integral, 4 = signed 4-state integral. The frontend
+// restricts sort()/rsort() to an integral (width <= 64) or real element;
+// reverse() is element-agnostic (whole-slot move) and takes no kind.
+//
+// The 4-state kinds read the slot's must/may planes and order under clotho's
+// total order for unknowns (docs/design/array-methods.md): an element with any
+// x or z bit precedes every defined element ascending, all unknowns are mutually
+// equal, and the sort is stable so their input order survives. `rev` orders
+// descending directly there rather than reversing an ascending sort, which would
+// flip that one tie group.
 //
 // All three take the element descriptor rather than a bare stride: they reindex
 // the container, so they bump the relocation epoch, and taking `ops` keeps every

@@ -1960,8 +1960,12 @@ private:
 
     // Sort comparator descriptor for the element of `array_type` (LRM 7.12.2
     // sort()/rsort()). `kind`: 0 = unsigned integral, 1 = signed integral,
-    // 2 = real. Derived from the element value type; the frontend has already
-    // restricted the element to a 2-state integral (width <= 64) or real.
+    // 2 = real, 3 = unsigned 4-state integral, 4 = signed 4-state integral.
+    // Derived from the element value type; the frontend has already restricted the
+    // element to an integral of width <= 64 or a real (sort_uses_iter_path routes
+    // everything else through the IR permutation sort). The 4-state kinds read the
+    // slot's must/may planes, which is why they are separate kinds rather than a
+    // flag on the other two -- a 2-state element must not pay a plane test.
     struct SortDesc {
         uint32_t kind;
         uint32_t width;
@@ -1969,7 +1973,13 @@ private:
     SortDesc dynarr_sort_desc(Ref array_type) const {
         const Ref     elem = std::get<Type>(mod_.pool.get(array_type)).element;
         const ValType vt   = from_ref(elem);
-        return { vt.is_real ? 2u : (vt.is_signed ? 1u : 0u), vt.width };
+        if (vt.is_real) {
+            return { 2u, vt.width };
+        }
+        if (vt.four_state) {
+            return { vt.is_signed ? 4u : 3u, vt.width };
+        }
+        return { vt.is_signed ? 1u : 0u, vt.width };
     }
 
     // The opaque rt_queue ring handle slot type

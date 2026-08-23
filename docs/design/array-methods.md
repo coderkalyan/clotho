@@ -27,14 +27,15 @@ ring's logical order).
 
 - **reverse / shuffle** are element-agnostic (whole-slot move), so they support
   any element type.
-- **sort / rsort** split by whether the element is its own key. A **2-state
-  integral (width ≤ 64) or real** element takes the runtime path: the backend
-  derives the comparator descriptor `{kind: unsigned|signed|real, width}` from the
-  element value type, and `rsort` sorts ascending then reverses. Both shortcuts
-  are sound only because the element IS the key there — equal keys mean
-  byte-equal elements, so tie order is unobservable and reversing a tie group
-  changes nothing. A `with` clause, a **string** element or an element **wider
-  than 64 bits** goes through the IR permutation sort instead (see below).
+- **sort / rsort** split by whether the element is its own key. An **integral
+  (width ≤ 64) or real** element takes the runtime path: the backend derives the
+  comparator descriptor `{kind: unsigned|signed|real|unsigned4|signed4, width}`
+  from the element value type, and `rsort` sorts ascending then reverses — except
+  for the 4-state kinds, which order descending directly (§3). Both shortcuts are
+  sound for a 2-state or real element only because the element IS the key there —
+  equal keys mean byte-equal elements, so tie order is unobservable and reversing
+  a tie group changes nothing. A `with` clause, a **string** element or an element
+  **wider than 64 bits** goes through the IR permutation sort instead (see below).
 - **shuffle** is Fisher-Yates driven by the calling thread's RNG (xoshiro256++,
   LRM 18.13). The runtime replicates the backend's inlined `emit_xoshiro_next`
   byte-for-byte, so a shuffle leaves the `$urandom` stream consistent. A
@@ -42,8 +43,9 @@ ring's logical order).
   shuffle in a subroutine uses the caller's, threaded through the call ABI.
 
 Oracle: iverilog implements none of these ("sorry: not currently supported").
-verilator matches Clotho byte-for-byte on the value cases. shuffle's permutation
-is LRM-unspecified (18.13-class tool-private), so tests pin Clotho's own stream.
+verilator matches Clotho byte-for-byte on the DEFINED value cases; on an unknown
+it fabricates a value and sorts that (§3). shuffle's permutation is
+LRM-unspecified (18.13-class tool-private), so tests pin Clotho's own stream.
 
 ## Landed: the `with` iterator clause and the locator / reduction families
 
@@ -74,9 +76,9 @@ Consequences of going through the ordinary expression path rather than a runtime
 comparator, which is the reason for choosing it:
 
 - **Any element type works**: 4-state (x propagates per LRM 11.4.x), wider than
-  64 bits, `real` (the F* compare tags), `string`, packed struct. None of
-  `sort`'s element restrictions apply, because there is no C comparator that
-  needs a `{kind, width}` descriptor.
+  64 bits, `real` (the F* compare tags), `string`, packed struct. No element ever
+  needs a `{kind, width}` descriptor here, because there is no C comparator to
+  describe one to — which is why this family never had `sort`'s routing split.
 - **The clause can be anything Clotho lowers**, including a member access, a cast
   or a nested method call.
 - `item.index` resolves through a binding stack keyed on the iterator symbol, so
@@ -174,40 +176,117 @@ follow `first()`/`last()`). Both fail loudly today.
   index-family result queue is keyed by the index type. `[*]`-wildcard keys are
   illegal for the index family (7.12.1).
 
-### 3. 4-state `sort` / `rsort` ordering — deferred, LRM-unspecified
+### 3. 4-state `sort` / `rsort` ordering — landed
 
-Guarded loud (4-state element OR 4-state `with` key → fail), and the message says
-why rather than naming a width limit. Deferred deliberately: **LRM 7.12.2 leaves
-x/z placement in `sort` unspecified.** A 4-state `<` yields x rather than a total
-order, so any order Clotho picked would become a de-facto commitment that later
-code depends on — a loud refusal is recoverable, a silently wrong order is not.
+**Clotho's ordering of unknowns, normatively.** For `sort` / `rsort` on a 4-state
+element or a 4-state `with` key:
 
-Note this is now the ONLY element restriction on ordering, and it is a semantic
-one, not a comparator one: the IR path could compare 4-state values today. What is
-missing is a defined answer, not a mechanism.
+```
+unknown  <  defined,     unknown_i  ==  unknown_j   for all i, j
+```
 
-If revisited, an **unsigned** total order is implementable:
-- 4-state slot = `{ i(2W) must|may, iW z }`, invariant must ⇒ may, Z encoded as
-  must=0 / may=1 / z=1 (see the LlvmBackend header comment).
-- `has_unknown = (may & ~must) != 0` (any X or Z bit).
-- Comparator: `has_unknown` primary (unknown sorts first), then a per-bit rank
-  key with rank `z=0, x=1, 0=2, 1=3` compared MSB-first.
+- **Unknown** means the compared value — the element, or the KEY for a keyed sort
+  — carries **at least one** x or z bit. Not all bits: `8'b1111_111x` and
+  `8'b0000_000x` are both unknown.
+- All unknowns are **mutually equal**. x is not distinguished from z, and two
+  unknowns are not ranked by the bits they do know: the two values above compare
+  equal to each other.
+- An unknown sorts **ahead of** every defined value in `sort`, and **behind**
+  every defined one in `rsort` — the mirror, ordered directly, never
+  ascending-then-reverse (see below).
+- Defined values sort **numerically**, signed or unsigned per the operand type,
+  exactly as 2-state ones do.
+- The order is **stable**, so mutually-equal unknowns keep their input order and
+  the whole result is deterministic, not merely legal.
 
-Signed 4-state ordering stays unresolved pending an LRM clarification.
+**Why a defined order rather than a refusal.** The naive reading of the LRM is
+that this is unspecified and therefore refusable: 11.4.4 says "If either operand
+of a relational operator contains an unknown (x) or high-impedance (z) value,
+then the result shall be 1'bx", so `<` answers x and the values look
+incomparable. But *incomparable* is not what x gives a sort. A comparison sort
+needs a **strict weak ordering**; x collapsed to false yields a relation that is
+neither transitive nor consistent between `less(a,b)` and `less(b,a)`, which is an
+**inconsistent comparator** — undefined behaviour in the algorithm, not an
+unspecified result in the program. The order above IS a strict weak ordering:
+irreflexive (nothing precedes itself), transitive, and with transitive
+incomparability (the unknowns form one equivalence class, the defined values order
+numerically). So it is safe to sort with, and reproducible.
+
+**What refusing cost.** Accellera UVM `uvm_root.svh:827` runs
+`m_time_settings.sort() with ( item.offset )`, and that property is declared
+`time offset` (`uvm_cmdline_report.svh:179`). `time` is a 64-bit FOUR-STATE type,
+so the refusal fired on a sort whose keys are ordinary simulation times with no
+unknown in them — the guard could not tell "might be unknown" from "is unknown",
+because a type is all it had. The three other keyed sorts in that file
+(`sorted_list.sort() with ( item.get_full_name() )`) have string keys and always
+worked.
+
+**Where it is implemented.** Two comparators, because there are two paths:
+
+- **The IR keyed comparator** (`sort_right_wins`, `src/Lower.cpp`) — a `with`
+  clause, a string element, or an element wider than 64 bits. A key is unknown iff
+  its unknown plane is nonzero, which is exactly the `IsUnknown` node ($isunknown,
+  LRM 20.9) and works at any width. Ascending, the right candidate wins iff
+  `!unknown(left) && (unknown(right) || right < left)`; descending is the mirror,
+  `!unknown(right) && (unknown(left) || right > left)`. The `<` / `>` in there is
+  11.4.4's own compare, x and all: it is only ever the deciding operand when both
+  keys are defined, and the bitwise combination is monotone (`0 & x == 0`,
+  `1 | x == 1`), so no x reaches the result. **A 2-state key emits exactly the
+  compare it emitted before** — the domain is decided at lower time
+  (`SortIter::key_four`), not by a runtime test.
+- **The runtime scalar comparator** (`slot_cmp4` / `sort_run4`,
+  `src/runtime/Runtime.cpp`) — the bare form on a 4-state integral of width ≤ 64,
+  which is where `time` lands. The 4-state slot is `{ i(2W) must|may, iW z }` with
+  must in bits [0,W) and may in [W,2W), so `must ^ may` is the unknown mask and
+  `must` is the value — the same decode `rt_container_eq` already does, and the z
+  plane is never read (Z is encoded as X in must/may, and the ordering does not
+  distinguish them anyway). **The 2-state fast path pays nothing**: the 4-state
+  kinds are separate comparator kinds (`sort_unsigned4` / `sort_signed4`) driven by
+  a separate function, `slot_less` and `sort_run` are untouched, and the choice is
+  one test in `rt_dynarr_sort` / `rt_queue_sort` beside the `len < 2` test that was
+  already there.
+
+`sort_run4` is also **stable** and orders descending **directly**, and both are
+load-bearing rather than tidiness: `sort_run`'s two shortcuts (an unstable sort,
+and `rsort` as ascending-then-reverse) rest on equal keys meaning byte-equal
+elements, which unknowns break — `8'b1111_111x` ties with `8'b0000_000x` and is
+not byte-equal to it. All unknowns being one tie group is exactly what an
+ascending-then-reverse `rsort` would flip. Stability comes from tie-breaking on
+the original index, which the index vector `sort_run` already allocates makes free.
+
+**Reals and strings are unaffected, with no check added.** Neither can carry x or
+z — a real is an IEEE-754 double and a string is a handle — so `key_four` is false
+for both by construction and they take the paths they always did.
+
+**Signed 4-state is resolved too**, not left open: unknown-ness is decided
+entirely by the unknown plane, so signedness only ever affects the ordering of
+*defined* values, where it is 11.4.4's ordinary arithmetic compare.
+
+**Oracles.** Verilator 5.050 accepts these sorts but **fabricates a value**: it
+maps each unknown bit to 0 and sorts the result as that value. Measured —
+`'{8'd3, 8'hxx, 8'd1}` sorts to `'{'h0, 'h1, 'h3}`, and `'{8'b0000_0000,
+8'b1111_111x, 8'b0000_000x}` sorts to `'{'b0000_0000, 'b0000_0000, 'b1111_1110}`,
+i.e. a partial unknown is ordered by its defined bits and lands next to the value
+it is not. Clotho gives an unknown an explicit position instead of inventing one
+for it. iverilog 13 does not implement `sort()` at all: "sorry: 'sort()' array
+sorting method is not currently supported".
 
 ### 4. Wide (> 64-bit) `sort` / `rsort` — landed
 
 Not by teaching the runtime comparator a multi-word compare, but by routing a wide
 element through the IR permutation sort above (7.12.2's bare form is
-`with (item)`, so it needs nothing else). `slot_less` still loads one word and is
-still only reached by elements that fit it. Signed and unsigned both work — the
-key's own type carries the signedness, so the emitted `Lt` / `Gt` picks the
-arithmetic, which is the same reason the locator family never needed a descriptor.
+`with (item)`, so it needs nothing else). `slot_less` / `slot_cmp4` still load one
+word each and are still only reached by elements that fit them. Signed and
+unsigned both work — the key's own type carries the signedness, so the emitted
+`Lt` / `Gt` picks the arithmetic, which is the same reason the locator family
+never needed a descriptor. A wide **4-state** element needed nothing further than
+§3's ordering: the unknown test is one reduction of the whole unknown plane, at
+any width.
 
 ## Priority
 
 The receiver gaps (2) are the remaining scope, fixed-size first since its loop is
 the one already written — and it is what the clause's `struct {...} c [512]`
 example actually needs, so the two struct-key examples are pinned on a queue
-receiver instead. 4-state sort (3) can stay guarded indefinitely without silent
-miscompiles.
+receiver instead. Ordering itself has no remaining element or key restriction: the
+receiver shape is the only gap left.

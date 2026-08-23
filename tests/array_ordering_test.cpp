@@ -395,6 +395,245 @@ TEST_CASE("sort an element wider than 64 bits") {
     CHECK(run_capture(src) == "u: 0 0 0 1\ns: -5 0 5\nr: 5 0 -5\n");
 }
 
+// -- 4-state ordering (LRM 7.12.2 under 11.4.4's unknown rule) ---------------
+//
+// LRM 11.4.4 makes a relational compare with an unknown operand yield x, which
+// is not an ordering at all -- feeding it to a comparison sort is an INCONSISTENT
+// comparator, not merely an unspecified result. Clotho therefore defines a total
+// order (docs/design/array-methods.md): an element or key carrying ANY x or z bit
+// is "unknown", all unknowns are mutually equal, and unknown precedes every
+// defined value ascending (so it follows every defined value descending). The
+// sort is stable, which is what makes the position of mutually-equal unknowns
+// deterministic rather than merely legal.
+//
+// Oracles: verilator 5.050 accepts these but fabricates a value -- it maps an
+// unknown to 0 and sorts it as 0; iverilog 13 does not implement sort() at all.
+
+// With no element unknown, a 4-state element orders exactly as the 2-state one
+// of the same shape: the comparator reads the slot's must plane, and a signed
+// 4-state element still compares arithmetically.
+TEST_CASE("4-state element sorts numerically") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0]        a[$];
+            logic signed [7:0] s[$];
+            initial begin
+                a.push_back(8'd3); a.push_back(8'hff); a.push_back(8'd1); a.push_back(8'h80);
+                a.sort();  $write("a:"); foreach (a[i]) $write(" %02x", a[i]); $display;
+                a.rsort(); $write("r:"); foreach (a[i]) $write(" %02x", a[i]); $display;
+                s.push_back(-8'sd2); s.push_back(8'sd5); s.push_back(-8'sd10); s.push_back(8'sd0);
+                s.sort();  $write("s:"); foreach (s[i]) $write(" %0d", s[i]); $display;
+                s.rsort(); $write("d:"); foreach (s[i]) $write(" %0d", s[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a: 01 03 80 ff\nr: ff 80 03 01\n"
+                              "s: -10 -2 0 5\nd: 5 0 -2 -10\n");
+}
+
+// The shape that motivated 4-state ordering, transcribed: Accellera UVM
+// `uvm_root.svh:827` sorts a queue of `uvm_cmdline_set_verbosity` HANDLES with
+// `m_time_settings.sort() with ( item.offset )`, and that property is declared
+// `time offset` (`uvm_cmdline_report.svh:179`) -- a 64-bit FOUR-STATE type, so
+// the whole call used to be refused even with no unknown in sight. Two settings
+// share an offset, so the tie pins stability at the full 64-bit width, and one
+// carries an unknown offset (what an unparsed `+uvm_set_verbosity` leaves
+// behind), which now has a defined place instead of a refusal.
+TEST_CASE("sort with a `time` key (the UVM m_time_settings shape)") {
+    constexpr std::string_view src = R"(
+        module m;
+            class uvm_cmdline_set_verbosity;
+                string id;
+                time   offset;
+            endclass
+            uvm_cmdline_set_verbosity m_time_settings[$];
+            initial begin
+                uvm_cmdline_set_verbosity s;
+                s = new; s.id = "c"; s.offset = 64'd30;          m_time_settings.push_back(s);
+                s = new; s.id = "a"; s.offset = 64'd10;          m_time_settings.push_back(s);
+                s = new; s.id = "w"; s.offset = 64'hFFFF_FFFF_1; m_time_settings.push_back(s);
+                s = new; s.id = "x"; s.offset = 64'bx;           m_time_settings.push_back(s);
+                s = new; s.id = "b"; s.offset = 64'd10;          m_time_settings.push_back(s);
+                if (m_time_settings.size() > 0) begin
+                    m_time_settings.sort() with ( item.offset );
+                end
+                $write("asc:");
+                foreach (m_time_settings[i]) $write(" %s=%0d", m_time_settings[i].id,
+                                                               m_time_settings[i].offset);
+                $display;
+                m_time_settings.rsort() with ( item.offset );
+                $write("desc:");
+                foreach (m_time_settings[i]) $write(" %s", m_time_settings[i].id);
+                $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "asc: x=x a=10 b=10 c=30 w=68719476721\ndesc: w c a b x\n");
+}
+
+// Placement: an unknown is below every defined value, so it sorts first ascending
+// and last descending. The descending direction is ordered directly rather than
+// by reversing an ascending sort -- a reverse would put the unknown first there
+// too, and would flip the unknown tie group besides.
+TEST_CASE("an unknown sorts first ascending and last descending") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a[$];
+            initial begin
+                a.push_back(8'd3); a.push_back(8'hxx); a.push_back(8'd1);
+                a.sort();  $write("asc:");  foreach (a[i]) $write(" %h", a[i]); $display;
+                a.rsort(); $write("desc:"); foreach (a[i]) $write(" %h", a[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "asc: xx 01 03\ndesc: 03 01 xx\n");
+}
+
+// x and z are NOT distinguished: every unknown compares equal to every other one,
+// so the three unknown elements here are one tie group and stability is what
+// decides their order -- input order, in both directions. An implementation that
+// ranked z below x, or that ordered unknowns by their defined bits, would reorder
+// them.
+TEST_CASE("x and z are the same to the ordering, and stability keeps their order") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a[$];
+            initial begin
+                a.push_back(8'hzz); a.push_back(8'd7); a.push_back(8'hxx);
+                a.push_back(8'hxz); a.push_back(8'd2);
+                a.sort();  $write("asc:");  foreach (a[i]) $write(" %h", a[i]); $display;
+                a.rsort(); $write("desc:"); foreach (a[i]) $write(" %h", a[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "asc: zz xx xz 02 07\ndesc: 07 02 zz xx xz\n");
+}
+
+// A value with SOME unknown bits is unknown wholesale, not sorted by the bits it
+// does know. This is the case an implementation that compared the value (must)
+// plane and only checked for an all-unknown word gets wrong: it would order
+// `8'b0000_000x` next to `8'b0000_0000` and put `8'b1111_111x` last, instead of
+// tying the two partial unknowns and putting both ahead of the defined value.
+TEST_CASE("a partly unknown value is unknown wholesale") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] p[$];
+            initial begin
+                p.push_back(8'b0000_0000);
+                p.push_back(8'b1111_111x);
+                p.push_back(8'b0000_000x);
+                p.sort();  $write("asc:");  foreach (p[i]) $write(" %b", p[i]); $display;
+                p.rsort(); $write("desc:"); foreach (p[i]) $write(" %b", p[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "asc: 1111111x 0000000x 00000000\n"
+                              "desc: 00000000 1111111x 0000000x\n");
+}
+
+// What decides is the COMPARED value's domain, not the container's. A 4-state key
+// over a 2-state element hoists the element whose key is unknown; a 2-state key
+// over an element that carries x/z in a field the key does not read hoists
+// nothing, because no key is ever unknown.
+TEST_CASE("4-state ordering follows the key, not the element") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { logic [7:0] v; int k; } rec;
+            int         e[$];
+            logic [3:0] key[$];
+            rec         c[$];
+            initial begin
+                key.push_back(4'd2); key.push_back(4'bxx01); key.push_back(4'd1);
+                e.push_back(0); e.push_back(1); e.push_back(2);
+                e.sort() with ( key[item] );
+                $write("k4:"); foreach (e[i]) $write(" %0d", e[i]); $display;
+                c.push_back('{ v: 8'hxx, k: 2 });
+                c.push_back('{ v: 8'h01, k: 1 });
+                c.push_back('{ v: 8'hzz, k: 0 });
+                c.sort() with ( item.k );
+                $write("k2:"); foreach (c[i]) $write(" %h", c[i].v); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "k4: 1 2 0\nk2: zz 01 xx\n");
+}
+
+// A 4-state element wider than the 64-bit word the runtime comparator loads goes
+// through the IR permutation sort, and needed nothing extra: the unknown test is
+// one reduction of the whole unknown plane, at any width. The third value is
+// unknown in its LOW half only, so it ties with the all-x one -- the any-bit rule
+// holding across the limb boundary.
+TEST_CASE("a 4-state element wider than 64 bits") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [95:0] w[$];
+            initial begin
+                w.push_back(96'h5);
+                w.push_back({96{1'bx}});
+                w.push_back({48'd1, 48'bx});
+                w.push_back(96'h1);
+                w.sort();  $write("asc:");  foreach (w[i]) $write(" %h", w[i]); $display;
+                w.rsort(); $write("desc:"); foreach (w[i]) $write(" %h", w[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "asc: xxxxxxxxxxxxxxxxxxxxxxxx 000000000001xxxxxxxxxxxx"
+          " 000000000000000000000001 000000000000000000000005\n"
+          "desc: 000000000000000000000005 000000000000000000000001"
+          " xxxxxxxxxxxxxxxxxxxxxxxx 000000000001xxxxxxxxxxxx\n");
+}
+
+// The runtime comparator's plane decode is width arithmetic -- it reads
+// `(2W+7)/8` bytes of the slot and masks W bits out of each half -- so the widths
+// where that arithmetic changes shape are the ones worth pinning: 1 (both planes
+// in one byte), 33 (the halves straddle a 32-bit boundary) and 64 (the mask is
+// all ones and the packed word is a full 128 bits, which is `time`'s width).
+// Also the only case here on a DYNAMIC ARRAY rather than a queue, since the two
+// receivers reach the comparator through different entry points.
+TEST_CASE("4-state ordering at the plane-decode width boundaries") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic        w1[$];
+            logic [32:0] w33[$];
+            logic [63:0] w64[];
+            initial begin
+                w1.push_back(1'b1); w1.push_back(1'bx); w1.push_back(1'b0); w1.push_back(1'bz);
+                w1.sort(); $write("w1:"); foreach (w1[i]) $write(" %b", w1[i]); $display;
+                w33.push_back(33'h1_0000_0000); w33.push_back({1'bx, 32'h0}); w33.push_back(33'h1);
+                w33.sort(); $write("w33:"); foreach (w33[i]) $write(" %h", w33[i]); $display;
+                w64 = new[3];
+                w64[0] = 64'hFFFF_FFFF_FFFF_FFFF;
+                w64[1] = {63'h0, 1'bz};
+                w64[2] = 64'h2;
+                w64.sort();  $write("w64:"); foreach (w64[i]) $write(" %h", w64[i]); $display;
+                w64.rsort(); $write("r64:"); foreach (w64[i]) $write(" %h", w64[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "w1: x z 0 1\n"
+                              "w33: x00000000 000000001 100000000\n"
+                              "w64: 000000000000000Z 0000000000000002 ffffffffffffffff\n"
+                              "r64: ffffffffffffffff 0000000000000002 000000000000000Z\n");
+}
+
+// Every element unknown means every pair a tie, so a stable sort is the identity
+// -- in both directions. This is the whole ordering reduced to its degenerate
+// case, and it is what makes the result reproducible rather than merely legal.
+TEST_CASE("an all-unknown array keeps its order") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a[$];
+            initial begin
+                a.push_back(8'hxz); a.push_back(8'hzx); a.push_back(8'hx0);
+                a.sort();  $write("asc:");  foreach (a[i]) $write(" %h", a[i]); $display;
+                a.rsort(); $write("desc:"); foreach (a[i]) $write(" %h", a[i]); $display;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "asc: xz zx x0\ndesc: xz zx x0\n");
+}
+
 // The key is evaluated once per element per COMPARISON, not once per element into
 // a key buffer. This pins that choice: a side-effecting clause observes the
 // per-comparison count, so switching to precomputed keys later has to change this
@@ -474,42 +713,46 @@ TEST_CASE("keyed ordering on empty / single element is a no-op") {
     CHECK(run_capture(src) == "7 9 z calls=0\n");
 }
 
-// What 7.12.2 does not let clotho simulate, refused loudly rather than ordered by
-// an invented rule. 4-state is the deliberate one: a 4-state `<` yields x, not a
-// total order, so there is no defined place for an unknown.
+// What clotho still cannot order, refused loudly. The receiver gap is clotho's
+// own; a non-comparable element or key is 7.12.2's own restriction ("the
+// relational operators shall be defined for..."), which slang's binder enforces
+// ahead of lowering -- pinned here so the pair of them cannot regress into a
+// silent accept. A 4-state element or key is no longer among these: it is
+// ordered, by the total order the cases above pin.
 TEST_CASE("ordering shapes Clotho still refuses loudly") {
-    SUBCASE("4-state element") {
+    SUBCASE("fixed-size unpacked array receiver") {
         const LowerResult r = lower_text(R"(
             module m;
-                logic [7:0] q[$];
-                initial begin q.push_back(1); q.sort(); end
+                int a[4];
+                initial begin a[0] = 1; a.sort(); end
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("4-state element") != std::string::npos);
-        CHECK(r.diagnostic_text().find("ordering of x and z undefined") != std::string::npos);
+        CHECK(r.diagnostic_text().find("'sort' on a fixed-size unpacked array is not supported") !=
+              std::string::npos);
     }
-    SUBCASE("4-state `with` clause key") {
+    SUBCASE("an element with no relational operators") {
         const LowerResult r = lower_text(R"(
             module m;
-                int         q[$];
-                logic [3:0] k[$];
-                initial begin q.push_back(1); q.sort with ( k[item] ); end
+                typedef struct { int a; int b; } pair;
+                pair q[$];
+                initial begin q.push_back('{1, 2}); q.sort(); end
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("4-state `with` clause key") != std::string::npos);
+        CHECK(r.diagnostic_text().find("unpacked arrays of comparable values") != std::string::npos);
     }
-    SUBCASE("4-state enum element") {
+    SUBCASE("a `with` clause key with no relational operators") {
         const LowerResult r = lower_text(R"(
             module m;
-                typedef enum logic [1:0] { A = 0, B = 1 } e4;
-                e4 q[$];
-                initial begin q.push_back(B); q.sort(); end
+                typedef struct { int a; } inner;
+                typedef struct { inner nest; int k; } outer;
+                outer q[$];
+                initial q.sort with ( item.nest );
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("ordering of x and z undefined") != std::string::npos);
+        CHECK(r.diagnostic_text().find("unpacked arrays of comparable values") != std::string::npos);
     }
 }
 

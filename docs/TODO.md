@@ -1485,16 +1485,21 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 - [x] **Array ordering methods** (LRM 7.12.2) — `reverse` / `sort` / `rsort` /
   `shuffle` on a dynamic array or queue (`rt_dynarr_*` / `rt_queue_*` helpers).
   `reverse` / `shuffle` are element-agnostic; `sort` / `rsort` are value-keyed,
-  restricted to a 2-state integral (width <= 64) or real element. `shuffle` draws
+  taking an integral (width <= 64) or real element. `shuffle` draws
   from the calling thread's RNG (which forces its process to a coroutine, and
   reaches a subroutine body through the call ABI). This is the FLAT-VALUE path
   only — the element is its own key, which is what makes an unstable `std::sort`
-  and an ascending-then-reverse `rsort` correct here. A `with` clause, a string
-  element and a wide element go through the IR permutation sort instead (next
-  entry but one). Still guarded loud: 4-state `sort` ordering, deferred
-  deliberately because the LRM (7.12.2) leaves x/z placement unspecified: a
-  4-state `<` yields x rather than a total order, so any ordering would be an
-  invented one, and guarding loud beats silently picking.
+  and an ascending-then-reverse `rsort` correct for a 2-state or real element. A
+  `with` clause, a string element and a wide element go through the IR permutation
+  sort instead (next entry but one). A **4-state** element takes its own
+  comparator kinds (`sort_unsigned4` / `sort_signed4` -> `slot_cmp4` /
+  `sort_run4`), which decode the slot's must/may planes and order under the total
+  order for unknowns (see the 4-state entry below): that path is stable and orders
+  descending directly, because neither flat-value shortcut survives unknowns —
+  `8'b1111_111x` ties with `8'b0000_000x` without being byte-equal to it. Keeping
+  them separate KINDS rather than a flag is what keeps the 2-state comparator free
+  of a plane test: `slot_less` and `sort_run` are untouched, and the choice is one
+  test in `rt_dynarr_sort` / `rt_queue_sort` beside the `len < 2` test.
 - [x] **Array locator + reduction methods** (LRM 7.12.1 / 7.12.3) and the `with`
   iterator clause (7.12 / 7.12.4) — `find` / `find_index` / `find_first` /
   `find_first_index` / `find_last` / `find_last_index` / `min` / `max` /
@@ -1574,11 +1579,13 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
     and anything the clause pushes stays past them; nothing dangles because no raw
     pointer is held across the clause. Refusing would have needed an epoch check
     per comparison to catch a case that cannot corrupt anything.
-  * The plain scalar path is untouched: a bare `sort` / `rsort` on a 2-state
-    integral of width <= 64 or a real still emits `queue_sort` / `dyn_array_sort`
-    and reaches `std::sort` with no call into generated code (verified on
-    `--emit ir`: those four calls, zero merge-sort loops; the keyed and string and
-    wide cases emit the loops and zero runtime sort calls).
+  * The plain scalar path is untouched: a bare `sort` / `rsort` on an integral of
+    width <= 64 (either domain) or a real still emits `queue_sort` /
+    `dyn_array_sort` and reaches `std::sort` with no call into generated code
+    (verified on `--emit ir` / `--emit llvm`: an `int`, a `logic [7:0]` and a
+    `logic [95:0]` queue emit two runtime sort calls — `kind 1 width 32` and
+    `kind 3 width 8` — and exactly one merge-sort loop, the wide one; the keyed
+    and string cases likewise emit loops and no runtime sort call).
   * Fixed en route: a string key, or any key that lowers to a PLACE inside the
     iterator variable rather than a value (a member select of an aggregate
     element), compared the left element against itself and reported every pair a
@@ -1586,11 +1593,44 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
     key was still aiming at. The right key is now stored into a cell of the key
     type before the left is evaluated, which is why `min`/`max` and `unique` hold
     their keys in cells too.
-  Still refused, deliberately: a **4-state** element or key. A 4-state `<` yields
-  x rather than a total order, so 7.12.2's "ascending" has no defined position for
-  an unknown; the message says that rather than naming a width limit. Oracles:
-  verilator 5.050 supports every form here; iverilog cannot even parse `s.sort()`
-  on a string array, let alone a `with` clause.
+  **4-state elements and keys are ordered, not refused** (the refusal this entry
+  used to record is gone). LRM 11.4.4 says a relational compare "shall be 1'bx"
+  when either operand carries an unknown, and the earlier reading was that 7.12.2
+  therefore leaves x/z placement unspecified and refusable. That reading
+  understates the problem and overstates the cost: x is not an unspecified RESULT
+  to a comparison sort, it is an **inconsistent comparator** — collapse it to
+  false and the relation is neither transitive nor consistent between `less(a,b)`
+  and `less(b,a)`, which is UB in the algorithm. So clotho defines a strict weak
+  ordering instead of refusing:
+
+  ```
+  unknown  <  defined,     unknown_i  ==  unknown_j   for all i, j
+  ```
+
+  Unknown means ANY x or z bit, so `8'b1111_111x` and `8'b0000_000x` are both
+  unknown and equal to each other; x is not distinguished from z; defined values
+  order numerically at the operand's signedness; and the order is stable, which is
+  what makes the position of the mutually-equal unknowns deterministic rather than
+  merely legal. `rsort` is the mirror (unknowns last), ordered directly — the one
+  tie group containing every unknown is exactly what an ascending-then-reverse
+  would flip. Signed 4-state is resolved by the same rule, since the unknown plane
+  alone decides unknown-ness and signedness only ever orders DEFINED values. Reals
+  and strings carry no x/z, so they are unaffected and got no new check. The keyed
+  path tests `IsUnknown` (`$isunknown`, LRM 20.9) on each key, which is one
+  reduction of the unknown plane and so needed nothing extra for a wide (> 64-bit)
+  4-state element; the bare scalar path decodes the slot's must/may planes
+  (`slot_cmp4`). The motivating shape is Accellera UVM `uvm_root.svh:827`,
+  `m_time_settings.sort() with ( item.offset )` over `time offset`
+  (`uvm_cmdline_report.svh:179`): `time` is 64-bit 4-STATE, so the refusal fired
+  on a sort of ordinary simulation times with no unknown in them.
+  Oracles: **verilator 5.050 fabricates a value** — it maps an unknown bit to 0
+  and sorts the result as that value. Measured: `'{8'd3, 8'hxx, 8'd1}` sorts to
+  `'{'h0, 'h1, 'h3}`, and `'{8'b0000_0000, 8'b1111_111x, 8'b0000_000x}` to
+  `'{'b0000_0000, 'b0000_0000, 'b1111_1110}`, i.e. a partial unknown is ordered by
+  the bits it does know. Clotho gives an unknown an explicit position instead of
+  inventing a value for it. **iverilog 13 does not implement `sort()` at all**:
+  "sorry: 'sort()' array sorting method is not currently supported"; it cannot
+  even parse `s.sort()` on a string array, let alone a `with` clause.
 - [ ] **`map`** (LRM 7.12.5, 1800-2023 only) — the one array manipulation method
   slang binds that clotho does not lower, so `q.map(x) with (x * 2)` hits the
   container-method guard (`--std 1800-2023`; older versions reject it in the
