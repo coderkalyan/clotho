@@ -1063,6 +1063,66 @@ professional parity; M5 makes it complete.
   function (its deferred body rides the caller's task-call record slot, which only
   a coroutine has) and of an automatic-lifetime argument (its storage cannot
   outlive the call — slang's own binder catches this, matching iverilog).
+- [x] **`--emit ir` of a self-referential class type terminates** — the IR type
+  printer walked a type structurally with no cycle guard, so a MODULE-SCOPE signal
+  whose class type reaches itself made `render_type` recurse until the stack ran
+  out: 2.3 MB of `s0: class{nm:string, kids:class{nm:string, kids:class{...`,
+  truncated mid-identifier, then SIGSEGV (exit 139) with a mutually-recursive frame
+  pair inside `std::__ostream_insert`. A local inside an `initial` did not trigger
+  it — only the signal table renders a signal's type — and `clotho run` on the same
+  file was always fine, because nothing but the printer expands a class body. It
+  fired on ALL of UVM (`uvm_printer.svh:419` declares
+  `local uvm_printer_element m_children[$]`, a queue of the enclosing class), which
+  cost more than a dump: `--emit ir` is THE tool for diagnosing a backend problem,
+  so the one design whose backend problems most need inspecting was the one design
+  that could not be inspected. `render_type` now carries the stack of classes whose
+  bodies it is inside and renders a re-entered one as `class^N` instead of expanding
+  it again — a de Bruijn index counting outward from the class being expanded, so
+  `class^1` is the innermost one. Positional rather than named because the pool
+  carries no source name for a class: it identifies one by its `Ref` alone (the
+  backend's own `clotho.classdesc.<ref>`), and a bare `Ref` in the dump would name
+  nothing a reader could resolve. `^` appears in no other type rendering, so an
+  elided cycle is never mistaken for a leaf. ONE guard covers every cycle shape,
+  because `Kind::Class` is the only cyclic node in the type graph — a value struct
+  cannot contain itself (`reserve_struct_fields` exists for classes and nothing
+  else), so every cycle must pass through a handle: direct self-reference, mutual
+  A<->B, three-hop A->B->C->A, and a cycle through a queue / dynamic-array /
+  associative-array element or a struct member all stop at the same test. The
+  struct-member form is not reachable from source today — slang refuses any struct
+  that transitively reaches itself through a class handle ("'wrap' recursively
+  depends on its own definition") — so it is pinned against a pool-built type
+  instead, since the type graph models it and the printer must survive it either
+  way. Ordinary output is byte-identical by construction — the guard emits only on
+  the re-entry branch — and tests/ir_test.cpp pins a non-recursive class's
+  rendering so it stays that way. Audited every other structural type walk for the
+  same hazard and found none: the backend's `agg_storage_ty` / `class_body_ty` bottom
+  out at the class HANDLE slot rather than descending into the body,
+  `reaches_class_handle` is already an explicit worklist that never expands a Class node,
+  `InternPool::compute_layout` answers Class with the 64-bit handle layout without
+  reading its property table, `unsynthesizable_type` and `guard_agg_key_leaves`
+  stop at the same boundary, and `%p` deliberately prints a handle's class name at
+  every depth for exactly this reason (Lower.cpp:19419-19440). `--stat` emits
+  counts and timings only, and no LSP / DAP path renders an IR type today.
+- [ ] **`--emit ir` expands a class DAG once per PATH, not once per class** — a
+  separate unboundedness in the same walk, pre-existing and untouched by the cycle
+  guard above: `render_type` prints a class body structurally at every occurrence,
+  so a class reachable by k distinct paths is expanded k times and the dump grows
+  exponentially in the class count. Measured on a strictly ACYCLIC chain where
+  class i holds handles to i+1, i+2 and i+3 (no cycle, so the guard never fires --
+  the 10.7 MB dump contains zero `^`, which is what proves it is the old output
+  byte for byte): 10 classes 7 KB, 14 classes 82 KB, 18 classes 933 KB, 22 classes
+  10.7 MB, i.e. ~1.8x per class added. UVM has hundreds of densely
+  cross-referencing classes, so `--emit ir` on it stays impractical for a reason
+  that has nothing to do with the cycle: it terminates, but not at a size anyone
+  can read. NOT fixed here because the obvious fix conflicts with a harder
+  requirement — eliding a class already expanded ANYWHERE in the current rendering
+  (rather than only one still open) makes the walk linear in the class count, but
+  it also rewrites ordinary non-recursive output, where a class referenced by two
+  properties legitimately prints twice today. The fix that costs no churn is to
+  stop inlining class bodies at all and print a class by NAME, which needs a
+  class-name side table on `Module`: `Lower` has the name (it prints one for `%p`
+  via `class_p_render`) but drops it, and the pool identifies a class by its `Ref`
+  alone. Do that when the IR dump is next touched.
 
 ### File and string I/O
 
