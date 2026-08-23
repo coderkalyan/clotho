@@ -670,3 +670,34 @@ TEST_CASE("a %p conditional operand") {
         )") == "'{1, 0, 3}\n");
     }
 }
+
+// $display's format argument MUST be a string literal, and LRM 21.3.3 is explicit
+// that the only exception is $sformat's: "The format arguments to these tasks must
+// be string literals, i.e., they cannot be expressions of string data type. The
+// only exception is $sformat, whose second argument can be an expression of string
+// data type." So neither shape below is a format here:
+//
+//   - a concatenation of string literals is one integral value (LRM 5.9), printed
+//     as such under the task's default radix;
+//   - a `string` variable is a value argument, printed under %s, and the integer
+//     after it is a bare value argument of its own.
+//
+// Verilator 5.050 agrees byte for byte. iverilog is lenient -- it
+// treats both as formats -- and is wrong on the clause, so it is not the oracle.
+//
+// Pinned because $sformat gained a runtime format (see string_test.cpp): the two
+// tasks share build_format, and nothing added there may leak $sformat's exception
+// into the rest of the family.
+TEST_CASE("$display's format argument is not an expression (LRM 21.3.3)") {
+    CHECK(run_capture(R"(
+        module m;
+            string f;
+            initial begin
+                $display({"a=%0d ", "b=%0d"}, 1, 2);
+                f = "c=%0d";
+                $display(f, 7);
+            end
+        endmodule
+    )") == "117554554874552423354282084          1          2\n"
+           "c=%0d          7\n");
+}

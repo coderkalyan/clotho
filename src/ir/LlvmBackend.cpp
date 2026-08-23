@@ -21038,57 +21038,93 @@ private:
         return { mm, z, lv.store_width, lv.narrow ? 1u : 0u };
     }
 
-    // void rt_sformat(i8* mm, i8* z, i32 width, const char* fmt, i32 argc, const rt_arg* argv, i32 flags)
+    // void rt_sformat(i8* mm, i8* z, i32 width, const char* fmt, i32 argc, const rt_arg* argv,
+    //                 i32 flags, const rt_fmt_dyn* dyn)
     llvm::FunctionCallee sformat_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* i32  = b_.getInt32Ty();
-        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, i32, ptr, i32, ptr, i32 }, false);
+        auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, i32, ptr, i32, ptr, i32, ptr }, false);
         return env_->llmod.getOrInsertFunction("rt_sformat", fnty);
     }
 
     // void rt_sformat_str(rt_string* dst, const char* fmt, i32 argc, const rt_arg* argv,
-    //                     const rt_alloc_site*)
+    //                     const rt_alloc_site*, const rt_fmt_dyn* dyn)
     llvm::FunctionCallee sformat_str_fn() {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* fnty =
-          llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty(), ptr, ptr }, false);
+          llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty(), ptr, ptr, ptr }, false);
         return env_->llmod.getOrInsertFunction("rt_sformat_str", fnty);
+    }
+
+    // { i64 time_mul, ptr site } — mirrors rt_fmt_dyn in runtime/Runtime.h.
+    llvm::StructType* fmt_dyn_struct_ty() {
+        return llvm::StructType::get(ctx_, { b_.getInt64Ty(), raw_ptr_ty() });
+    }
+
+    // The format string and the rt_fmt_dyn context of a $sformat / $sformatf.
+    //
+    // A constant format is a private global whose bytes the renderer walks, and a
+    // null context: the frontend already validated every specifier, matched every
+    // descriptor to its conversion, spliced %m / %l in and expanded %p away, so
+    // the runtime has nothing left to decide. Identical code to before.
+    //
+    // A runtime format (LRM §21.3.3) is the string handle's own character buffer.
+    // rt_string keeps it NUL-terminated (rt_string_data, the same guarantee the DPI
+    // `string` argument path relies on), so the pointer goes straight through with
+    // no copy: the renderer only reads it, within this call, and never retains it.
+    // An empty string yields a pointer to a NUL and renders nothing. Text past an
+    // embedded NUL is unreachable -- a `const char*` format cannot express one --
+    // which is why the context carries the call site: a report about the format's
+    // contents points at the statement.
+    struct FormatArg {
+        llvm::Value* fmt;
+        llvm::Value* dyn;
+    };
+    FormatArg format_arg(Index i, Index fmt_value, ExtraIndex fmt, uint32_t fmt_len, TickScale scale) {
+        if (fmt_value == kNoFormatValue) {
+            return { b_.CreateGlobalString(ir_->extra_bytes(fmt, fmt_len)),
+                     llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)) };
+        }
+        llvm::StructType* sty = fmt_dyn_struct_ty();
+        llvm::Value*      ctx = b_.CreateAlloca(sty, nullptr, "fmt_dyn");
+        b_.CreateStore(b_.getInt64(scale.value()), b_.CreateStructGEP(sty, ctx, 0));
+        b_.CreateStore(alloc_site_global(loc_text(i), "format string"), b_.CreateStructGEP(sty, ctx, 1));
+        return { b_.CreateCall(str_data_fn(), { str_of(fmt_value) }), ctx };
     }
 
     // Lower a $sformat / $swrite: build the format-arg descriptor array and hand
     // it, the format string, and the destination — a string object's handle, or
     // a packed vector's planes — to the runtime.
     void lower_sformat(Index i) {
-        const auto        info = ir_->extra_data<SformatInfo>(ir_->payload(i).extra);
-        const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+        const auto info = ir_->extra_data<SformatInfo>(ir_->payload(i).extra);
 
         const std::span<const Index> args = ir_->region(info.args);
         llvm::Value*                 arr  = build_rt_args(args, "$sformat / $swrite");
-        llvm::Value*                 fmt_ptr = b_.CreateGlobalString(fmt);
-        llvm::Value*                 argc    = b_.getInt32(static_cast<uint32_t>(args.size()));
-        const LValue&                lv      = lvalue_of(info.dst);
+        llvm::Value*                 argc = b_.getInt32(static_cast<uint32_t>(args.size()));
+        const FormatArg f = format_arg(i, info.fmt_value, info.fmt, info.fmt_len, info.tick_scale);
+        const LValue&   lv = lvalue_of(info.dst);
         if (lv.is_string) {
-            b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv), fmt_ptr, argc, arr,
-                                              alloc_site_global(loc_text(i), "string") });
+            b_.CreateCall(sformat_str_fn(), { lv_string_ptr(lv), f.fmt, argc, arr,
+                                              alloc_site_global(loc_text(i), "string"), f.dyn });
             return;
         }
         const auto [mm, z, width, flags] = string_dest(info.dst, "$sformat / $swrite");
         const ServiceSnapshot old          = service_snapshot(lvalue_of(info.dst));
-        b_.CreateCall(sformat_fn(), { mm, z, b_.getInt32(width), fmt_ptr, argc, arr, b_.getInt32(flags) });
+        b_.CreateCall(sformat_fn(),
+                      { mm, z, b_.getInt32(width), f.fmt, argc, arr, b_.getInt32(flags), f.dyn });
         service_after_write(lvalue_of(info.dst), old);
     }
 
     // Lower a $sformatf: format into the instruction's string temp.
     void lower_sformatf(Index i) {
-        const auto        info = ir_->extra_data<SformatfInfo>(ir_->payload(i).extra);
-        const std::string fmt  = ir_->extra_bytes(info.fmt, info.fmt_len);
+        const auto info = ir_->extra_data<SformatfInfo>(ir_->payload(i).extra);
 
         const std::span<const Index> args = ir_->region(info.args);
         llvm::Value*                 arr  = build_rt_args(args, "$sformatf");
+        const FormatArg f = format_arg(i, info.fmt_value, info.fmt, info.fmt_len, info.tick_scale);
         b_.CreateCall(sformat_str_fn(),
-                      { str_of(i), b_.CreateGlobalString(fmt),
-                        b_.getInt32(static_cast<uint32_t>(args.size())), arr,
-                        alloc_site_global(loc_text(i), "string") });
+                      { str_of(i), f.fmt, b_.getInt32(static_cast<uint32_t>(args.size())), arr,
+                        alloc_site_global(loc_text(i), "string"), f.dyn });
     }
 
     // i32 rt_ferror(i32 fd, i8* mm, i8* z, i32 width, i32 flags)

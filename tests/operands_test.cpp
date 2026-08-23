@@ -285,8 +285,18 @@ void check_body(const ir::Ir& ir, std::string_view design, std::string_view body
                             " which for_each_operand does not walk");
         }
 
-        const bool has_tail = ir::extra_operand_tail(ir.tag(i)) != ir::ExtraOperandTail::None;
-        REQUIRE_MESSAGE(has_tail == (all.size() > ops.size()),
+        // A tag with no tail must walk exactly its span. A tag WITH one must walk
+        // at least it, and strictly more unless its tail is conditional: a wait
+        // edge may name its signal directly (kNoWaitHandle) and a $sformatf's
+        // format is an operand only for the runtime-format form LRM 21.3.3 allows
+        // ($sformat's tail always contributes, its destination lvalue).
+        const auto tail             = ir::extra_operand_tail(ir.tag(i));
+        const bool conditional_tail = tail == ir::ExtraOperandTail::WaitHandles ||
+                                      tail == ir::ExtraOperandTail::SformatfFmt;
+        const bool ok = tail == ir::ExtraOperandTail::None ? all.size() == ops.size()
+                        : conditional_tail                 ? all.size() >= ops.size()
+                                                           : all.size() > ops.size();
+        REQUIRE_MESSAGE(ok,
                         design,
                         "/",
                         body,
@@ -295,7 +305,7 @@ void check_body(const ir::Ir& ir, std::string_view design, std::string_view body
                         " at %",
                         k,
                         ": classifier says tail=",
-                        has_tail,
+                        static_cast<int>(tail),
                         " but the walk added ",
                         all.size() - ops.size(),
                         " operands");
@@ -437,8 +447,8 @@ TEST_CASE("monitor_set exposes no operands") {
     CHECK(found);
 }
 
-// The tail table's own drift check, mirroring the shape one above. Three of the
-// four tails are implied by PayloadKind, so they are biconditional: a new tag
+// The tail table's own drift check, mirroring the shape one above. Four of the
+// five tails are implied by PayloadKind, so they are biconditional: a new tag
 // added to any of those kinds fails here until classified, and a tag wrongly
 // given one of those tails fails too.
 TEST_CASE("extra_operand_tail classifies exactly the tags whose operands overflow one span") {
@@ -452,16 +462,17 @@ TEST_CASE("extra_operand_tail classifies exactly the tags whose operands overflo
         CHECK((ir::payload_kind(tag) == K::FDisplay) == (tail == E::Descriptor));
         CHECK((ir::payload_kind(tag) == K::Sformat) == (tail == E::SformatDst));
         CHECK((ir::payload_kind(tag) == K::Scanf) == (tail == E::ScanfSource));
+        CHECK((ir::payload_kind(tag) == K::Sformatf) == (tail == E::SformatfFmt));
         if (tail == E::InsideSetMembers) {
             CHECK(tag == ir::Inst::Tag::InsideSet);
         }
     }
 }
 
-// Exactly seven tags, named. The count is the claim the header comment makes, so
-// pin it: an eighth appearing means someone widened a record without extending
+// Exactly eight tags, named. The count is the claim the header comment makes, so
+// pin it: a ninth appearing means someone widened a record without extending
 // the walk, and one disappearing means the walk got a capability nobody noticed.
-TEST_CASE("exactly seven tags hold operands back from the span") {
+TEST_CASE("exactly eight tags hold operands back from the span") {
     std::set<ir::Inst::Tag> tailed;
     for (unsigned v = 0; v <= 0xFF; ++v) {
         const auto tag = static_cast<ir::Inst::Tag>(v);
@@ -473,6 +484,11 @@ TEST_CASE("exactly seven tags hold operands back from the span") {
     const std::set<ir::Inst::Tag> expected = { ir::Inst::Tag::FDisplay, ir::Inst::Tag::MonitorEmit,
                                                ir::Inst::Tag::Fscanf,   ir::Inst::Tag::Sscanf,
                                                ir::Inst::Tag::Sformat,  ir::Inst::Tag::InsideSet,
+                                               // Sformatf: the format is a string
+                                               // VALUE for the runtime-format form
+                                               // LRM 21.3.3 allows, and the span
+                                               // holds the variadic value args.
+                                               ir::Inst::Tag::Sformatf,
                                                // Wait: an event edge may park on a
                                                // handle VALUE, strided inside the
                                                // packed WaitEdge run rather than a

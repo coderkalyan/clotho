@@ -1497,14 +1497,379 @@ TEST_CASE("unsupported string constructs are rejected loudly") {
             endmodule
         )", "requires %s");
     }
-    SUBCASE("$sformatf with a non-literal format") {
+    // LRM 21.3.3 makes $sformat / $sformatf the exception to the literal-format
+    // rule, so a runtime format is accepted (see the cases below). What stays
+    // rejected is an argument the runtime descriptor cannot carry.
+    SUBCASE("aggregate argument against a runtime $sformat format") {
+        check_rejected(R"(
+            module m;
+                typedef struct { int a; int b; } pair_t;
+                pair_t p;
+                string s, f;
+                initial begin f = "%p"; $sformat(s, f, 1, p); end
+            endmodule
+        )", "$sformat argument 4 is an unpacked struct");
+    }
+    SUBCASE("queue argument against a runtime $sformatf format") {
+        check_rejected(R"(
+            module m;
+                int    q[$];
+                string s, f;
+                initial begin f = "%p"; s = $sformatf(f, q); end
+            endmodule
+        )", "$sformatf argument 2 is a queue");
+    }
+    SUBCASE("fixed unpacked array argument against a runtime $sformat format") {
+        check_rejected(R"(
+            module m;
+                int    a[3];
+                string s, f;
+                initial begin f = "%p"; $sformat(s, f, a); end
+            endmodule
+        )", "$sformat argument 3 is a fixed unpacked array");
+    }
+    // Only $sformatf reaches Clotho with one: slang's SFormatFunction permits an
+    // empty argument past the format, while the $sformat TASK rejects it outright.
+    SUBCASE("empty argument against a runtime $sformatf format") {
         check_rejected(R"(
             module m;
                 string s, f;
-                initial s = $sformatf(f, 1);
+                initial begin f = "x"; s = $sformatf(f, , 1); end
             endmodule
-        )", "$sformatf format must be a string literal");
+        )", "$sformatf argument 2 is empty");
     }
+    // slang admits any canBeStringLike format operand, which includes a byte
+    // array -- whose characters live one per element, not packed, so there is no
+    // LRM 6.16 conversion to reach for.
+    SUBCASE("byte-array runtime $sformat format") {
+        check_rejected(R"(
+            module m;
+                byte   ba[];
+                string s;
+                initial begin ba = new[3]; $sformat(s, ba, 1); end
+            endmodule
+        )", "$sformat format is a dynamic array");
+    }
+}
+
+// -- A $sformat / $sformatf format that is not a string literal (LRM 21.3.3) --
+//
+// The clause is explicit that these two are the exception: "The format arguments
+// to these tasks must be string literals ... The only exception is $sformat,
+// whose second argument can be an expression of string data type." $sformatf is
+// the same facility returning a string, so it takes the same format.
+//
+// Every expectation below was cross-checked against iverilog 13 and Verilator
+// 5.050, which agree with each other on all of these shapes.
+
+// The blocker that motivated this: Accellera UVM's uvm_phase.svh:1963 builds its
+// jump-failure message from a four-piece concatenation of string literals. A
+// concatenation is an integral expression of type bit[N] (LRM 5.9), not a string
+// literal, but it IS a constant, so it folds to its text at compile time and takes
+// the ordinary literal path (specifier validation included).
+TEST_CASE("$sformat with a concatenated-literal format (the UVM shape)") {
+    CHECK(run_capture(R"(
+        module m;
+            string s;
+            initial begin
+                $sformat(s, {"phase %s is neither a predecessor or successor of ",
+                             "phase %s or is non-existant, so we cannot jump to it.  ",
+                             "Phase control flow is now undefined so the simulation ",
+                             "must terminate"}, "run", "main");
+                $display("[%s]", s);
+            end
+        endmodule
+    )") == "[phase run is neither a predecessor or successor of phase main or is "
+           "non-existant, so we cannot jump to it.  Phase control flow is now "
+           "undefined so the simulation must terminate]\n");
+}
+
+// The byte-to-text conversion of the folded bit[N] constant is LRM 6.16's: 8-bit
+// chunks most significant first, with a zero chunk dropped. "x" + "%0d" + "yz" is
+// 6 characters = 48 bits, and each piece on its own is 8 / 24 / 16, so the total
+// is a multiple of 8 only by accident of this example -- the interesting case is
+// a piece that is not, which the `%%` case below covers at 6 + 6 = 12 bytes with
+// a 5-byte middle. Both must come out with no stray NUL and no lost character.
+TEST_CASE("$sformat concatenated-literal format: odd lengths and %% escapes") {
+    CHECK(run_capture(R"(
+        module m;
+            string s;
+            initial begin
+                $sformat(s, {"x", "%0d", "yz"}, 5);
+                $display("[%s]", s);
+                $sformat(s, {"pct=%%", " v=%0d"}, 3);
+                $display("[%s]", s);
+                $sformat(s, {"a", "b", "c", "d", "e"});
+                $display("[%s]", s);
+            end
+        endmodule
+    )") == "[x5yz]\n[pct=% v=3]\n[abcde]\n");
+}
+
+// A `localparam string` format is the same situation as the concatenation: not a
+// literal, still constant, so it folds. Here the constant arrives already as a
+// string ConstantValue rather than an integral, which is the other half of
+// const_format_text.
+TEST_CASE("$sformat / $sformatf with a localparam string format") {
+    CHECK(run_capture(R"(
+        module m;
+            localparam string P = "p=%0d%%";
+            string s;
+            initial begin
+                $sformat(s, P, 4);
+                $display("[%s]", s);
+                $display("[%s]", $sformatf(P, 5));
+            end
+        endmodule
+    )") == "[p=4%]\n[p=5%]\n");
+}
+
+// A genuinely runtime format: the string variable is reassigned between the two
+// calls, so the same call site renders two different formats. This is what proves
+// the format is parsed at run time and not folded -- a folding implementation
+// cannot produce two answers from one site.
+TEST_CASE("$sformat with a runtime string format is genuinely dynamic") {
+    CHECK(run_capture(R"(
+        module m;
+            string s, f;
+            initial begin
+                f = "one %0d";
+                $sformat(s, f, 1);
+                $display("[%s]", s);
+                f = "two %0d %0d";
+                $sformat(s, f, 2, 3);
+                $display("[%s]", s);
+                $display("[%s]", $sformatf(f, 4, 5));
+            end
+        endmodule
+    )") == "[one 1]\n[two 2 3]\n[two 4 5]\n");
+}
+
+// The oracle-confirmed shapes, verbatim: iverilog 13 and Verilator 5.050 both
+// produce exactly these three lines.
+TEST_CASE("$sformat / $sformatf runtime format matches iverilog and Verilator") {
+    CHECK(run_capture(R"(
+        module m;
+            string s, f;
+            initial begin
+                $sformat(s, {"a=%0d ", "b=%0d"}, 1, 2);
+                $display("[%s]", s);
+                f = "c=%0d";
+                $sformat(s, f, 7);
+                $display("[%s]", s);
+                $display("[%s]", $sformatf(f, 9));
+            end
+        endmodule
+    )") == "[a=1 b=2]\n[c=7]\n[c=9]\n");
+}
+
+// Degenerate formats: nothing to render, and nothing that consumes an argument.
+// An empty rt_string still hands the renderer a valid NUL-terminated pointer.
+TEST_CASE("$sformat runtime format: empty, specifier-free, and %% only") {
+    CHECK(run_capture(R"(
+        module m;
+            string s, f;
+            initial begin
+                f = "";     $sformat(s, f); $display("[%s]", s);
+                f = "plain"; $sformat(s, f); $display("[%s]", s);
+                f = "a%%b";  $sformat(s, f); $display("[%s]", s);
+                $display("[%s]", $sformatf(f));
+            end
+        endmodule
+    )") == "[]\n[plain]\n[a%b]\n[a%b]\n");
+}
+
+// Every conversion family through a runtime format, so the marshalling is
+// exercised per argument type: an integral under the integer radices, a string
+// object under %s, a character code under %c, a real under the C family, and a
+// time under %t. With a constant format the frontend picks each argument's
+// conversion and fixes it up in the IR; here the runtime does it from the rt_arg
+// flags alone, so the two paths are asserted to produce the same bytes.
+TEST_CASE("$sformat runtime format covers every conversion family") {
+    CHECK(run_capture(R"(
+        module m;
+            string s, f, sv;
+            real   r;
+            initial begin
+                sv = "hi";
+                r  = 1.5;
+                $sformat(s, "%d|%0d|%h|%b|%o|%s|%c", 8'hab, 8'hab, 8'hab, 4'b1010, 8'o17, sv, 65);
+                $display("const [%s]", s);
+                f = "%d|%0d|%h|%b|%o|%s|%c";
+                $sformat(s, f, 8'hab, 8'hab, 8'hab, 4'b1010, 8'o17, sv, 65);
+                $display("dyn   [%s]", s);
+                $sformat(s, "%e|%f|%g", r, r, r);
+                $display("const [%s]", s);
+                f = "%e|%f|%g";
+                $sformat(s, f, r, r, r);
+                $display("dyn   [%s]", s);
+                $sformat(s, "%t", 7);
+                $display("const [%s]", s);
+                f = "%t";
+                $sformat(s, f, 7);
+                $display("dyn   [%s]", s);
+            end
+        endmodule
+    )") == "const [171|171|ab|1010|017|hi|A]\n"
+           "dyn   [171|171|ab|1010|017|hi|A]\n"
+           "const [1.500000e+00|1.500000|1.5]\n"
+           "dyn   [1.500000e+00|1.500000|1.5]\n"
+           "const [                   7]\n"
+           "dyn   [                   7]\n");
+}
+
+// %t needs the calling module's ticks-per-time-unit, which the frontend applies
+// itself for a constant format (scale_to_ticks) and cannot for a runtime one --
+// it does not know which argument will meet the %t. The multiplier rides
+// rt_fmt_dyn instead. `fine` drags the design's tick down to 1 ps while `m`
+// counts in ns, so the multiplier is 1000 rather than the identity, and the real
+// case pins the ORDER: scaling before rounding gives 2.500 ns, rounding first
+// would quantize to a whole ns and give 3.000.
+TEST_CASE("%t through a runtime format scales like the constant path") {
+    CHECK(run_capture(R"(
+        `timescale 1ps/1ps
+        module fine;
+            initial #1 ;
+        endmodule
+        `timescale 1ns/1ns
+        module m;
+            string s, f;
+            real   r;
+            fine u();
+            initial begin
+                $timeformat(-9, 3, " ns", 12);
+                r = 2.5;
+                $sformat(s, "%t", 7);   $display("[%s]", s);
+                $sformat(s, "%t", r);   $display("[%s]", s);
+                f = "%t";
+                $sformat(s, f, 7);      $display("[%s]", s);
+                $sformat(s, f, r);      $display("[%s]", s);
+            end
+        endmodule
+    )") == "[    7.000 ns]\n[    2.500 ns]\n[    7.000 ns]\n[    2.500 ns]\n");
+}
+
+// A conversion whose argument type does not match it is reconciled by the runtime
+// exactly as build_format reconciles it in the IR: an integral under %e/%f/%g
+// converts to real and a real under %d/%h/%b/%o rounds half away from zero into a
+// signed 64-bit (LRM 21.2.1.2 -> 6.12.1), so -3.7 prints as -4 and as the 64-bit
+// two's complement under %h.
+TEST_CASE("runtime format reconciles a mismatched argument like the constant path") {
+    CHECK(run_capture(R"(
+        module m;
+            string  s, f;
+            real    r;
+            integer i;
+            initial begin
+                i = -7;
+                r = -3.7;
+                $sformat(s, "%g|%f", i, i);
+                $display("const [%s]", s);
+                f = "%g|%f";
+                $sformat(s, f, i, i);
+                $display("dyn   [%s]", s);
+                f = "%0d|%h";
+                $sformat(s, f, r, r);
+                $display("dyn   [%s]", s);
+            end
+        endmodule
+    )") == "const [-7|-7.000000]\ndyn   [-7|-7.000000]\ndyn   [-4|fffffffffffffffc]\n");
+}
+
+// %p of a SINGULAR value is defined as that value "as [it] would [print]
+// unformatted" (LRM 21.2.1.6's closing paragraph), which needs no aggregate
+// machinery -- so it works through a runtime format even though the frontend
+// cannot splice it away. The runtime's renderer must agree with the frontend's
+// expand_p_scalar: minimal decimal at the operand's own signedness, %g for a
+// real, quotes around a string.
+//
+// A string LITERAL argument is a packed bit[N] (LRM 5.9), not a string, and with
+// a runtime format nothing can tell the renderer otherwise -- so it prints as the
+// integral it is. Verilator 5.050 produces exactly this (29041 == 16'h7171);
+// iverilog does not implement %p in $sformat at all, so it is not an oracle here.
+TEST_CASE("%p of a scalar, a real and a string through a runtime format") {
+    CHECK(run_capture(R"(
+        module m;
+            string s, f, sv;
+            real   r;
+            initial begin
+                sv = "qq";
+                r  = 1.5;
+                f  = "%p|%p|%p";
+                $sformat(s, f, -3, r, sv);
+                $display("[%s]", s);
+                f = "%0p";
+                $display("[%s]", $sformatf(f, sv));
+                f = "%p";
+                $sformat(s, f, "qq");
+                $display("lit [%s]", s);
+            end
+        endmodule
+    )") == "[-3|1.5|\"qq\"]\n[\"qq\"]\nlit [29041]\n");
+}
+
+// A wide operand and an x/z one go through the runtime path unchanged: rt_arg
+// already carries full planes of any width, so nothing about the marshalling is
+// specific to the constant format.
+TEST_CASE("runtime format renders wide and x/z operands like the constant path") {
+    CHECK(run_capture(R"(
+        module m;
+            string     s, f;
+            reg [95:0] w;
+            reg [7:0]  u;
+            initial begin
+                w = 96'hdeadbeef_cafebabe_12345678;
+                u = 8'bxxxx_zzzz;
+                $sformat(s, "%h|%0d", w, w);
+                $display("const [%s]", s);
+                f = "%h|%0d";
+                $sformat(s, f, w, w);
+                $display("dyn   [%s]", s);
+                $sformat(s, "%0d|%h|%b", u, u, u);
+                $display("const [%s]", s);
+                f = "%0d|%h|%b";
+                $sformat(s, f, u, u, u);
+                $display("dyn   [%s]", s);
+            end
+        endmodule
+    )") == "const [deadbeefcafebabe12345678|68915718020162848918556923512]\n"
+           "dyn   [deadbeefcafebabe12345678|68915718020162848918556923512]\n"
+           "const [X|xz|xxxxzzzz]\n"
+           "dyn   [X|xz|xxxxzzzz]\n");
+}
+
+// A runtime format writing a PACKED destination, not a string object: the other
+// rt_sformat entry point, which stores planes rather than assigning a handle.
+TEST_CASE("$sformat with a runtime format into a packed destination") {
+    CHECK(run_capture(R"(
+        module m;
+            reg [31:0] d;
+            string     f;
+            initial begin
+                f = "ab%0d";
+                $sformat(d, f, 7);
+                $display("%h", d);
+            end
+        endmodule
+    )") == "00616237\n");
+}
+
+// A runtime format that is a PACKED VECTOR rather than a `string`: slang admits
+// any string-like format operand, and the frontend converts one by the same LRM
+// 6.16 rule const_format_text applies to a constant, so the same source shape
+// renders the same text whether or not it folds.
+TEST_CASE("$sformat with a runtime packed-vector format") {
+    CHECK(run_capture(R"(
+        module m;
+            reg [47:0] pf;
+            string     s;
+            initial begin
+                pf = "a=%0d";
+                $sformat(s, pf, 6);
+                $display("[%s]", s);
+            end
+        endmodule
+    )") == "[a=6]\n");
 }
 
 TEST_CASE("$sformatf formats into a string value") {

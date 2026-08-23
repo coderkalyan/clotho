@@ -807,7 +807,8 @@ Index Builder::sformat(Index dst, std::string_view fmt, std::span<const Index> a
     // SformatInfo record pointing at both.
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra  = add_extra(SformatInfo{ dst, fmt_at, static_cast<uint32_t>(fmt.size()), slice });
+    const ExtraIndex extra  = add_extra(SformatInfo{ dst, fmt_at, static_cast<uint32_t>(fmt.size()), slice,
+                                                     kNoFormatValue, TickScale::of(1) });
 
     return emit({ Inst::Tag::Sformat, pay(&Inst::Payload::extra, extra) }, loc);
 }
@@ -815,7 +816,28 @@ Index Builder::sformat(Index dst, std::string_view fmt, std::span<const Index> a
 Index Builder::sformatf(std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
     const ExtraIndex fmt_at = add_bytes(fmt);
     const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra  = add_extra(SformatfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), slice });
+    const ExtraIndex extra  = add_extra(SformatfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), slice,
+                                                      kNoFormatValue, TickScale::of(1) });
+
+    return emit({ Inst::Tag::Sformatf, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
+Index Builder::sformat_dyn(Index dst, Index fmt_value, std::span<const Index> args, uint64_t tick_scale,
+                           SourceLoc loc) {
+    // No format bytes to add: `fmt` / `fmt_len` name an empty run, and fmt_value
+    // carries the format instead.
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra = add_extra(
+      SformatInfo{ dst, ExtraIndex{ 0 }, 0, slice, fmt_value, TickScale::of(tick_scale) });
+
+    return emit({ Inst::Tag::Sformat, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
+Index Builder::sformatf_dyn(Index fmt_value, std::span<const Index> args, uint64_t tick_scale,
+                            SourceLoc loc) {
+    const ExtraSlice slice = add_slice(args);
+    const ExtraIndex extra =
+      add_extra(SformatfInfo{ ExtraIndex{ 0 }, 0, slice, fmt_value, TickScale::of(tick_scale) });
 
     return emit({ Inst::Tag::Sformatf, pay(&Inst::Payload::extra, extra) }, loc);
 }

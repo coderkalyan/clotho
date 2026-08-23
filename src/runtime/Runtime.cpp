@@ -109,12 +109,29 @@ void render_time(std::string& out, uint64_t ticks) {
     out += timeformat.suffix;
 }
 
-// A runtime formatting invariant broke: the frontend validates every specifier
-// before it reaches the runtime, so these paths are unreachable from lowered
-// code. Abort loudly rather than emit silently-wrong output.
-[[noreturn]] void format_fatal(const char* what) {
-    std::fprintf(stderr, "clotho runtime: %s\n", what);
+// A runtime formatting invariant broke: with a COMPILE-TIME format the frontend
+// validates every specifier before it reaches the runtime, so these paths are
+// unreachable from lowered code. Abort loudly rather than emit silently-wrong
+// output. A format string built at run time is validated by dynfmt_fatal
+// instead -- there is nothing broken about a design that writes "%q" into one.
+[[noreturn]] void format_fatal(const std::string& what) {
+    std::fprintf(stderr, "clotho runtime: %s\n", what.c_str());
     std::abort();
+}
+
+// A format string that only existed at RUN TIME asked the renderer for something
+// it cannot do. Unlike format_fatal this is a design error, not a broken
+// invariant: LRM §21.3.3 lets $sformat / $sformatf take a format built at run
+// time, and nothing then checks its contents until here, so every rejection
+// Lower.cpp's check_specifier makes at compile time has to be made again with the
+// text in hand. Reported in the ordinary located-fatal shape (headline, source
+// caret, simulation time) and defined with that block below.
+[[noreturn]] void dynfmt_fatal(const rt_fmt_dyn* dyn, const std::string& what);
+
+// A specifier rendered back as source text, so a dynfmt_fatal headline can name
+// the conversion the format asked for.
+std::string spec_name(char conv) {
+    return std::string("%") + conv;
 }
 
 // -- $display formatting --
@@ -259,7 +276,10 @@ uint32_t dec_digits(uint64_t v) {
 // to $timeformat's min width); width 0 is the minimal form; an explicit width
 // pads on the left (spaces for d/s/c/t, zeros for h/o/b) and never truncates.
 // `-` left-justifies with trailing spaces (an extension).
-void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spec) {
+// `dyn` non-null when the format came from a runtime string, in which case an
+// undefined conversion is a design error and not a broken invariant.
+void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spec,
+                const rt_fmt_dyn* dyn = nullptr) {
     const uint32_t w     = a.width ? a.width : 1;
     const uint32_t words = plane_words(w);
     // Top-word mask; every plane is zero-extended above `w`, so only the top
@@ -440,6 +460,9 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
             break;
         }
         default:
+            if (dyn != nullptr) {
+                dynfmt_fatal(dyn, spec_name(spec.conv) + " is not a defined conversion (LRM §21.2.1.1)");
+            }
             format_fatal("unsupported conversion reached the formatter");
     }
 
@@ -482,12 +505,184 @@ void render_unformatted(std::string& out, const rt_arg& a, bool four_state) {
     }
 }
 
+// Backing storage for a descriptor coerce_dyn_arg had to synthesize. The rt_arg
+// planes are pointers, so the words they name have to outlive the render call --
+// the caller owns one of these per specifier.
+struct CoercedArg {
+    rt_arg   arg{};
+    uint64_t val  = 0;
+    // Every synthesized value is two-state; one shared zero word serves both the
+    // xz and z planes, which render_arg dereferences unconditionally for %d.
+    uint64_t zero = 0;
+};
+
+// Round half away from zero and saturate into a signed 64-bit, the exact pair the
+// backend's lower_ftoi emits for Inst::Tag::FtoI (llvm.round then fptosi.sat):
+// LRM §6.12.1's real-to-integer conversion, with the out-of-range and NaN cases
+// the LRM leaves undefined pinned to the same saturating answer.
+int64_t sat_round_i64(double v) {
+    if (std::isnan(v)) {
+        return 0;
+    }
+    const double r = std::round(v);
+    if (r <= -9223372036854775808.0) {
+        return INT64_MIN;
+    }
+    if (r >= 9223372036854775808.0) {
+        return INT64_MAX;
+    }
+    return static_cast<int64_t>(r);
+}
+
+// Reconcile one descriptor with the conversion a RUNTIME format asked for.
+//
+// With a compile-time format Lower.cpp's build_format has the specifier in hand
+// and fixes the mismatch in the IR: it emits ItoF for an integral under %e/%f/%g,
+// FtoI for a real under %d/%h/%o/%b, scale_to_ticks for %t, and fails the
+// compile for the combinations that have no defined answer. A runtime format
+// reaches the renderer with the argument already marshalled, so the same
+// reconciliation has to happen here -- and the same combinations have to fail,
+// loudly and by name, rather than reinterpret one type's bits as another's.
+//
+// Returns `a` itself when the descriptor already matches; otherwise a descriptor
+// backed by `scratch`.
+const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, const rt_fmt_dyn* dyn) {
+    const char lc        = static_cast<char>(conv | 0x20);
+    const bool real_conv = lc == 'e' || lc == 'f' || lc == 'g';
+    const bool int_conv  = lc == 'd' || lc == 'h' || lc == 'x' || lc == 'o' || lc == 'b';
+    const bool is_real   = (a.flags & 4u) != 0;
+    const bool is_str    = (a.flags & 2u) != 0;
+
+    // A synthesized two-state 64-bit descriptor over `scratch.val`.
+    const auto synth = [&scratch](bool is_signed) -> const rt_arg& {
+        scratch.arg = rt_arg{ 64, is_signed ? 1u : 0u, &scratch.val, &scratch.zero, &scratch.zero };
+        return scratch.arg;
+    };
+
+    if (is_str) {
+        // %s renders the characters, %p the same in quotes (render_p_scalar).
+        // Every other conversion would need the packed reinterpretation of those
+        // characters, which build_format refuses at compile time for exactly this
+        // reason ("a string argument to $display/$write requires %s").
+        // TODO: %d / %h / ... of a string object, on both paths at once.
+        if (lc != 's' && lc != 'p') {
+            dynfmt_fatal(dyn, spec_name(conv) + " of a string argument is not supported: a string "
+                                                "renders under %s, or %p in quotes (LRM §21.2.1.1)");
+        }
+        return a;
+    }
+
+    if (is_real) {
+        if (real_conv || lc == 'p') {
+            return a; // the real specifiers, and %p which renders a real as %g
+        }
+        if (lc == 't') {
+            // One step, not two: scale_to_ticks multiplies in the real domain and
+            // rounds afterwards, so rounding first would quantize to whole time
+            // units before the multiply and report the wrong tick.
+            scratch.val = static_cast<uint64_t>(sat_round_i64(
+              std::bit_cast<double>(a.val[0]) * static_cast<double>(dyn->time_mul)));
+            return synth(/*is_signed=*/false);
+        }
+        if (int_conv) {
+            // Table 21-1 gives these a common integral operand, reached from a
+            // real by LRM §21.2.1.2 -> §6.12.1. Signed 64-bit, so a negative
+            // prints as two's complement under %h (build_format's own choice).
+            scratch.val = static_cast<uint64_t>(sat_round_i64(std::bit_cast<double>(a.val[0])));
+            return synth(/*is_signed=*/true);
+        }
+        // TODO: %c of a real (the rounded integer truncated to a character code)
+        // and %u / %z of a real (its raw bits, LRM §21.2.1.3). build_format
+        // refuses both on the compile-time path; keep the two paths agreeing.
+        dynfmt_fatal(dyn, spec_name(conv) + " with a real argument is not supported");
+    }
+
+    // An integral operand.
+    if (real_conv) {
+        // LRM §6.12.1 integral -> real, so one representation reaches the
+        // formatter. Mirrors build_format's ItoF, which reads the must plane and
+        // therefore takes x/z bits as 0.
+        if (a.width > 64) {
+            // TODO: an operand wider than 64 bits under %e / %f / %g from a
+            // runtime format. The compile-time path handles it (ItoF lowers to
+            // SIToFP on the full iW), but accumulating the planes here would
+            // round at every word boundary instead of once, so it would be
+            // quietly off rather than merely imprecise.
+            dynfmt_fatal(dyn, spec_name(conv) + " of an operand wider than 64 bits is not supported "
+                                                "from a runtime format string");
+        }
+        const uint64_t bits = a.val[0];
+        double         d    = 0.0;
+        if ((a.flags & 1u) != 0 && a.width < 64 && ((bits >> (a.width - 1)) & 1u) != 0) {
+            d = static_cast<double>(static_cast<int64_t>(bits | ~width_mask(a.width)));
+        } else if ((a.flags & 1u) != 0 && a.width == 64) {
+            d = static_cast<double>(static_cast<int64_t>(bits));
+        } else {
+            d = static_cast<double>(bits);
+        }
+        scratch.val = std::bit_cast<uint64_t>(d);
+        scratch.arg = rt_arg{ 64, 0b101u, &scratch.val, nullptr, nullptr };
+        return scratch.arg;
+    }
+    if (lc == 't') {
+        // scale_to_ticks resizes to an unsigned 64-bit and multiplies, so a
+        // narrower signed operand sign-extends first and the product wraps.
+        uint64_t ticks = a.val[0];
+        if ((a.flags & 1u) != 0 && a.width < 64 && ((ticks >> (a.width - 1)) & 1u) != 0) {
+            ticks |= ~width_mask(a.width);
+        }
+        scratch.val = ticks * dyn->time_mul;
+        return synth(/*is_signed=*/false);
+    }
+    return a;
+}
+
+// The `%p` text of a SINGULAR value (LRM §21.2.1.6's closing paragraph: an
+// element of an aggregate expression prints "as [it] would [print] unformatted").
+// Reachable only from a runtime format: with a compile-time one the frontend
+// splices %p away before the renderer sees it, so there is nothing for the
+// specifier switch to do.
+//
+// MUST agree with Lower.cpp's expand_p_scalar, which for the same three cases
+// splices exactly `%0d` (minimal decimal at the operand's own signedness), `%g`
+// for a real, and `"%s"` for a string. A constant format and a runtime format
+// that hold the same text have to render the same value identically; these are
+// the only two places that decide it, so they drift or they match.
+void render_p_scalar(std::string& out, const rt_arg& a) {
+    clotho::FormatSpec spec{};
+    spec.ok = true;
+    if ((a.flags & 4u) != 0) {
+        spec.conv = 'g';
+        render_arg(out, a, spec);
+        return;
+    }
+    if ((a.flags & 2u) != 0) {
+        spec.conv = 's';
+        out += '"';
+        render_arg(out, a, spec);
+        out += '"';
+        return;
+    }
+    // `%0d`: has_width with width 0 is the LRM §21.2.1.2 minimal form. Leaving
+    // has_width false would auto-size the field and pad the number.
+    spec.conv      = 'd';
+    spec.has_width = true;
+    render_arg(out, a, spec);
+}
+
 // Format `fmt` with the argument descriptors, appending to `out`. Shared by every
 // $write-family task ($display / $write / $fdisplay / $fwrite differ only in the
 // destination and the folded-in newline, both handled by the caller; $sformat /
-// $swrite in the stored destination). The frontend validates every specifier at
-// lower time, so a malformed or unsupported one here is an invariant break.
-void render(std::string& out, const char* fmt, uint32_t argc, const rt_arg* argv) {
+// $swrite in the stored destination).
+//
+// `dyn` null means the format was known at compile time: the frontend validated
+// every specifier, matched every descriptor to its conversion and spliced away
+// %m / %l / %p, so a malformed or unsupported one here is an invariant break and
+// no reconciliation is needed. Non-null means the format is a runtime string
+// (LRM §21.3.3's $sformat / $sformatf exception) and none of that happened, so
+// every check is made here against the design instead.
+void render(std::string& out, const char* fmt, uint32_t argc, const rt_arg* argv,
+            const rt_fmt_dyn* dyn = nullptr) {
     const std::string_view f(fmt);
     uint32_t               ai = 0;
     for (size_t pos = 0; pos < f.size();) {
@@ -497,6 +692,10 @@ void render(std::string& out, const char* fmt, uint32_t argc, const rt_arg* argv
         }
         const clotho::FormatSpec spec = clotho::parse_format_spec(f.substr(pos + 1));
         if (!spec.ok) {
+            if (dyn != nullptr) {
+                dynfmt_fatal(dyn, "a runtime format string ends in an incomplete conversion "
+                                  "specification (LRM §21.2.1.1)");
+            }
             format_fatal("malformed format specifier reached the formatter");
         }
         pos += 1 + spec.len;
@@ -504,15 +703,49 @@ void render(std::string& out, const char* fmt, uint32_t argc, const rt_arg* argv
             out += '%';
             continue;
         }
+        if (dyn != nullptr && (spec.conv == 'm' || spec.conv == 'M' || spec.conv == 'l' ||
+                               spec.conv == 'L')) {
+            // %m / %l consume no argument and name the INVOKING SCOPE, which only
+            // the frontend knows: append_format_literal splices the text in at
+            // lower time and the runtime never learns either name.
+            //
+            // TODO: %m / %l in a runtime format string. The hierarchical name and
+            // the library.cell of the call site would have to ride the IR record
+            // (two more byte runs on SformatInfo / SformatfInfo) and reach the
+            // renderer through rt_fmt_dyn.
+            dynfmt_fatal(dyn, spec_name(spec.conv) + " is not supported in a runtime format string: "
+                                                     "it names the invoking scope, which only the "
+                                                     "compiler knows");
+        }
         if (ai >= argc) {
+            if (dyn != nullptr) {
+                dynfmt_fatal(dyn, "a runtime format string has more conversion specifications than "
+                                  "arguments: " + spec_name(spec.conv) + " has none left to consume "
+                                  "(LRM §21.2.1.1)");
+            }
             format_fatal("format specifier without a matching argument");
         }
-        const rt_arg& a = argv[ai++];
+        const rt_arg& raw = argv[ai++];
+        CoercedArg    scratch;
+        const rt_arg& a = dyn != nullptr ? coerce_dyn_arg(raw, spec.conv, scratch, dyn) : raw;
         if (spec.conv == 'u' || spec.conv == 'U' || spec.conv == 'z' || spec.conv == 'Z') {
             render_unformatted(out, a, spec.conv == 'z' || spec.conv == 'Z');
-        } else {
-            render_arg(out, a, spec);
+            continue;
         }
+        if (spec.conv == 'p' || spec.conv == 'P') {
+            // Only a runtime format reaches here; see render_p_scalar. An
+            // aggregate operand cannot: Lower.cpp refuses one outright against a
+            // runtime format, because rt_arg has no image of it.
+            render_p_scalar(out, a);
+            continue;
+        }
+        if (dyn != nullptr && (spec.conv == 'v' || spec.conv == 'V')) {
+            // TODO: %v (per-bit net strength) has no runtime model to read at all
+            // -- Clotho resolves drive strengths away at the resolver. Rejected on
+            // the compile-time path by check_specifier for the same reason.
+            dynfmt_fatal(dyn, "%v (net signal strength) is not supported");
+        }
+        render_arg(out, a, spec, dyn);
     }
 }
 
@@ -2999,20 +3232,20 @@ extern "C" int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd,
 }
 
 extern "C" void rt_sformat(uint8_t* mm, uint8_t* z, uint32_t width, const char* fmt, uint32_t argc,
-                           const rt_arg* argv, uint32_t flags) {
+                           const rt_arg* argv, uint32_t flags, const rt_fmt_dyn* dyn) {
     // $sformat / $swrite: render like $display, then store the result into the
     // destination string variable (LRM §21.3.3). An oversized result keeps its low
     // (rightmost) bytes, matching a string-to-narrower-reg assignment.
     std::string out;
-    render(out, fmt, argc, argv);
+    render(out, fmt, argc, argv, dyn);
     store_string_planes(mm, z, width, reinterpret_cast<const uint8_t*>(out.data()),
                         static_cast<uint32_t>(out.size()), (flags & 1u) != 0);
 }
 
 extern "C" void rt_sformat_str(rt_string* dst, const char* fmt, uint32_t argc, const rt_arg* argv,
-                               const rt_alloc_site* site) {
+                               const rt_alloc_site* site, const rt_fmt_dyn* dyn) {
     std::string out;
-    render(out, fmt, argc, argv);
+    render(out, fmt, argc, argv, dyn);
     rt_string_assign_bytes(dst, out.data(), out.size(), site);
 }
 
@@ -4377,6 +4610,15 @@ std::string bytes_text(uint64_t n) {
         ++u;
     }
     return fmt::format("{} bytes ({:.1f} {})", n, v, unit[u]);
+}
+
+// Declared with the format renderer, defined here because it reports in exactly
+// the shape alloc_fatal already builds: a headline, the statement's location and
+// source caret, and the simulation time. Nothing about that block is specific to
+// allocation -- only its callers were, until LRM §21.3.3's runtime format string
+// gave the renderer design errors of its own to report.
+[[noreturn]] void dynfmt_fatal(const rt_fmt_dyn* dyn, const std::string& what) {
+    alloc_fatal(dyn != nullptr ? dyn->site : nullptr, rt_diag_now(), what);
 }
 
 } // namespace

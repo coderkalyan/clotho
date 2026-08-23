@@ -464,6 +464,15 @@ public:
     Index sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
     // $sformatf: format `args` per `fmt`. Yields a new string value.
     Index sformatf(std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    // The two above with a format that only exists at run time: `fmt_value` is a
+    // string value the runtime renderer parses, not text known here (LRM §21.3.3
+    // exempts $sformat / $sformatf from the literal-format rule). `tick_scale` is
+    // the calling module's ticks-per-time-unit, which a %t operand needs and the
+    // frontend can no longer pre-apply because it does not know which argument
+    // will meet a %t.
+    Index sformat_dyn(Index dst, Index fmt_value, std::span<const Index> args, uint64_t tick_scale,
+                      SourceLoc loc);
+    Index sformatf_dyn(Index fmt_value, std::span<const Index> args, uint64_t tick_scale, SourceLoc loc);
     // %p of a queue / dynamic array: render `'{e0, e1, ...}` over the runtime
     // element count. `handle` is the container lvalue, `container_type` the
     // interned Queue / DynArray type. Yields a new string value.
