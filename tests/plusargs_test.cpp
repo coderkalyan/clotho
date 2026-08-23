@@ -52,6 +52,39 @@ std::string lower_error(std::string_view source) {
     return r.diagnostic_text();
 }
 
+// JIT the design and return everything the BACKEND wrote to stderr, resolved
+// against the real source so a location can be asserted. The frontend must
+// accept the design: this exercises the refusals that only the backend can
+// make, because only it knows what storage a destination actually has.
+std::string backend_error(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+    std::fflush(stderr);
+    const int saved = dup(fileno(stderr));
+    dup2(fileno(tmp), fileno(stderr));
+
+    const int rc = ir::run_jit(*r.module, nullptr, {}, {}, loc_resolver(r));
+
+    std::fflush(stderr);
+    dup2(saved, fileno(stderr));
+    close(saved);
+    CHECK(rc < 0); // the design must not have run
+
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+    return out;
+}
+
 } // namespace
 
 // -- $test$plusargs -----------------------------------------------------
@@ -157,6 +190,175 @@ TEST_CASE("$value$plusargs: %s conversion into a packed-vector target") {
         endmodule
     )";
     CHECK(run_capture(src, { "TESTNAME=t1" }) == " TESTNAME= t1.\n");
+}
+
+// -- %s into a `string` object (LRM §21.6) --------------------------------
+//
+// "%s -- string (no conversion)": the remainder IS the value. A `string` has no
+// declared width, so unlike the packed-vector target above nothing is
+// right-justified, capped or padded. The three cases the clause distinguishes
+// (match, no match, match with an empty remainder) are asserted on both the
+// return value and the destination, because the clause pins both.
+TEST_CASE("$value$plusargs: %s into a string object") {
+    const char* src = R"(
+        module m;
+            string s;
+            initial begin
+                s = "untouched";
+                if ($value$plusargs("FOO=%s", s))
+                    $display("found [%s]", s);
+                else
+                    $display("absent [%s]", s);
+                $finish;
+            end
+        endmodule
+    )";
+    SUBCASE("present") {
+        CHECK(run_capture(src, { "FOO=bar" }) == "found [bar]\n");
+    }
+    SUBCASE("absent leaves the string untouched") {
+        CHECK(run_capture(src) == "absent [untouched]\n");
+    }
+    SUBCASE("an empty remainder stores the empty string") {
+        // LRM: "If there is no remaining string, the value stored into the
+        // variable shall be either a zero or an empty string value." The match
+        // still succeeded, so the return value is nonzero.
+        CHECK(run_capture(src, { "FOO=" }) == "found []\n");
+    }
+}
+
+// No width cap: a value longer than the 64 bits a packed-vector target holds
+// arrives whole. This is the property that distinguishes the string path from
+// the plane path, so it is worth its own case.
+TEST_CASE("$value$plusargs: a string destination is not truncated to 64 bits") {
+    const char* src = R"(
+        module m;
+            string s;
+            initial begin
+                void'($value$plusargs("S=%s", s));
+                $display("%s|%0d", s, s.len());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src, { "S=abcdefghijklmnopqrstuvwxyz" }) ==
+          "abcdefghijklmnopqrstuvwxyz|26\n");
+}
+
+// Uppercase and leading-0 forms are valid spellings of the same conversion
+// (LRM §21.6: "uppercase and lowercase as well as leading 0 forms are valid").
+TEST_CASE("$value$plusargs: %S and %0s into a string object") {
+    const char* src = R"(
+        module m;
+            string a, b;
+            initial begin
+                void'($value$plusargs("A=%S", a));
+                void'($value$plusargs("B=%0s", b));
+                $display("%s %s", a, b);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src, { "A=one", "B=two" }) == "one two\n");
+}
+
+// A string destination and an integral one in the same design, so the two write
+// paths (rt_value_plusargs_str's string handle, rt_value_plusargs's word planes)
+// stay pinned together: neither can be broken without this failing.
+TEST_CASE("$value$plusargs: string and integral destinations in one design") {
+    const char* src = R"(
+        module m;
+            string       s;
+            integer      i;
+            logic [31:0] v;
+            initial begin
+                void'($value$plusargs("S=%s", s));
+                void'($value$plusargs("I=%d", i));
+                void'($value$plusargs("V=%h", v));
+                $display("%s %0d %h", s, i, v);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src, { "S=hello", "I=-7", "V=deadbeef" }) == "hello -7 deadbeef\n");
+}
+
+// The shape UVM depends on: uvm_root.svh:551 selects the test to run with
+// exactly this call, so UVM cannot function without it.
+TEST_CASE("$value$plusargs: the UVM_TESTNAME shape") {
+    const char* src = R"(
+        module m;
+            string test_name;
+            initial begin
+                if ($value$plusargs("UVM_TESTNAME=%s", test_name))
+                    $display("running %s", test_name);
+                else
+                    $display("no test named");
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src, { "UVM_TESTNAME=simple_test" }) == "running simple_test\n");
+    // uvm_cmdline_report.svh:66 keeps the return value rather than branching on
+    // it, so the integer result has to be right too.
+    const char* used = R"(
+        module m;
+            string verb_string;
+            int    verb_count;
+            initial begin
+                verb_count = $value$plusargs("UVM_VERBOSITY=%s", verb_string);
+                $display("%0d %s", verb_count, verb_string);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(used, { "UVM_VERBOSITY=UVM_HIGH" }) == "1 UVM_HIGH\n");
+}
+
+// Both UVM sites write into a SUBROUTINE-local string, not a module-level one:
+// uvm_root.svh's destination is run_test's own `string test_name=""` formal, and
+// uvm_cmdline_report.svh's is a function local. That is a different lvalue --
+// frame storage rather than a signal slot -- so the module-level cases above do
+// not cover it.
+TEST_CASE("$value$plusargs: a string destination in a subroutine") {
+    SUBCASE("a task formal, as uvm_root::run_test declares it") {
+        const char* src = R"(
+            module m;
+                task automatic t(string test_name = "");
+                    if ($value$plusargs("UVM_TESTNAME=%s", test_name))
+                        $display("running %s", test_name);
+                    else
+                        $display("default [%s]", test_name);
+                endtask
+                initial begin
+                    t();
+                    $finish;
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src, { "UVM_TESTNAME=simple_test" }) == "running simple_test\n");
+        CHECK(run_capture(src) == "default []\n");
+    }
+    SUBCASE("a class property, written from a method") {
+        const char* src = R"(
+            module m;
+                class c;
+                    string name;
+                    int    got;
+                    function void grab();
+                        got = $value$plusargs("UVM_TESTNAME=%s", name);
+                    endfunction
+                endclass
+                initial begin
+                    static c o = new();
+                    o.grab();
+                    $display("%0d [%s]", o.got, o.name);
+                    $finish;
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src, { "UVM_TESTNAME=simple_test" }) == "1 [simple_test]\n");
+    }
 }
 
 // Multiple conversions, first-match-in-source-order plusarg wins (LRM: "The
@@ -298,4 +500,66 @@ TEST_CASE("$value$plusargs: real conversion is rejected") {
         endmodule
     )");
     CHECK(diag.find("not supported") != std::string::npos);
+}
+
+// The other half of the same gap, and the one that used to be SILENT: with
+// %e/%f/%g refused above, an integral conversion was the only way to name a real
+// destination, and it wrote the parsed bit pattern into the double's storage --
+// `+V=12` with %d read back as 0.000000, no diagnostic. Refused now.
+TEST_CASE("$value$plusargs: an integral conversion into a real is rejected") {
+    for (const char* conv : { "%d", "%o", "%h", "%b", "%s" }) {
+        const std::string src = std::string("module m;\n"
+                                            "  real f;\n"
+                                            "  shortreal g;\n"
+                                            "  initial begin\n"
+                                            "    void'($value$plusargs(\"V=") +
+                                 conv + "\", f));\n  end\nendmodule\n";
+        CHECK_MESSAGE(lower_error(src).find("into a real variable is not supported") !=
+                        std::string::npos,
+                      conv);
+    }
+    CHECK(lower_error("module m;\n"
+                      "  shortreal g;\n"
+                      "  initial void'($value$plusargs(\"V=%d\", g));\n"
+                      "endmodule\n")
+            .find("into a real variable is not supported")
+          != std::string::npos);
+}
+
+// -- The shape of a backend-stage refusal ---------------------------------
+//
+// Two destination shapes in this path are still refused, and both refusals are
+// made in the BACKEND, because only it knows what storage a destination has.
+// That used to render as a bare `llvm backend error: <prose>` with no location
+// and no code: nothing to jump to and nothing to filter on. These pin the
+// repaired shape -- `file:line:col: error: <message> [<code>]`, the same form
+// Diagnostic.cpp's render gives a frontend guard -- and pin it EXACTLY, since
+// the location and the code are the whole point.
+//
+// The plumbing is general: the span is attached by lower_region for whichever
+// instruction tripped the guard, so every refusal made while lowering an
+// instruction is located, not just these two.
+TEST_CASE("a backend refusal carries a source location and a diagnostic code") {
+    SUBCASE("a numeric conversion into a string object") {
+        // TODO(clotho): LRM §21.6 stores the CONVERTED value, so %d into a
+        // `string` is LRM 6.16's integral-to-string assignment of it.
+        const std::string err = backend_error("module m;\n"
+                                              "    string s;\n"
+                                              "    initial begin\n"
+                                              "        void'($value$plusargs(\"X=%d\", s));\n"
+                                              "    end\n"
+                                              "endmodule\n");
+        CHECK(err == "source:4:15: error: $value$plusargs %d into a string object is not supported "
+                     "[unsupported-construct]\n");
+    }
+    SUBCASE("a part-select target") {
+        const std::string err = backend_error("module m;\n"
+                                              "    logic [31:0] v;\n"
+                                              "    initial begin\n"
+                                              "        void'($value$plusargs(\"X=%d\", v[7:0]));\n"
+                                              "    end\n"
+                                              "endmodule\n");
+        CHECK(err == "source:4:15: error: $value$plusargs into a part-select target is not supported "
+                     "[unsupported-construct]\n");
+    }
 }

@@ -971,7 +971,9 @@ struct TestPlusArgsInfo {
 // before the trailing `%conv`); `conv` is the lowercase format character
 // (d/o/b/h/s — e/f/g are a documented gap, real conversion needs the same
 // ASCII->real scan $fscanf/$sscanf's own %f/%e/%g gap needs). The
-// instruction's `op` (in the enclosing op_extra payload) is the output lvalue.
+// instruction's `op` (in the enclosing op_extra payload) is the output lvalue,
+// and may be a `string` object -- for `s` only, the clause's "no conversion"
+// form, where the plusarg remainder is the value verbatim.
 struct ValuePlusArgsInfo {
     // First extra word of the packed plusarg_string prefix bytes.
     ExtraIndex prefix;

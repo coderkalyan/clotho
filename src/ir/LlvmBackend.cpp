@@ -770,9 +770,17 @@ struct RefBinding {
     std::string               formal;
 };
 
-// Raised on a construct the backend cannot lower; caught at the top level.
+// Raised on a construct the backend cannot lower; caught at the top level and
+// rendered as an ordinary located diagnostic (report_backend_error).
 struct BackendError {
     std::string message;
+    // Source extent of the offending construct. Filled in by lower_region for
+    // any guard tripped while lowering an instruction, so the ~50 refusals under
+    // it need not thread a location by hand -- the same trick Lower.cpp's
+    // cur_range_ plays for the frontend's own ~290 lowering guards. Stays
+    // invalid for a whole-design guard (an instance-hierarchy or DPI-signature
+    // check), which has no construct to point at.
+    SourceSpan span{};
 };
 
 // Per-compilation-unit emission state: the llvm::Module IR is currently being
@@ -14198,7 +14206,20 @@ private:
         ++cur_seg_epoch_;
         for (Index i : region) {
             const Inst::Tag t = ir_->tag(i);
-            lower_inst(i);
+            try {
+                lower_inst(i);
+            } catch (BackendError& e) {
+                // Give the refusal the location of the construct that tripped it, so a
+                // backend-stage refusal reads `file:line:col: error: ... [code]` like
+                // every frontend one instead of arriving as an unlocated wall of prose.
+                // Only fill an EMPTY span: a nested region rethrows through this
+                // handler too, and the innermost instruction is the precise one -- the
+                // `$value$plusargs` call rather than the `if` around it.
+                if (!e.span.valid()) {
+                    e.span = SourceSpan{ ir_->loc(i), ir_->end(i) };
+                }
+                throw;
+            }
             if (b_.GetInsertBlock()->getTerminator() != nullptr) {
                 break;
             }
@@ -21324,7 +21345,15 @@ private:
             for (uint32_t k = 0; k < n; ++k) {
                 const LValue& lv = lvalue_of(outs[k]);
                 if (lv.is_string) {
-                    // TODO: $*scanf write-back into a dynamic string object.
+                    // TODO: $*scanf write-back into a dynamic string object. NOT the
+                    // same change $value$plusargs's string destination was: this path
+                    // interleaves several targets through one shared rt_scan_arg
+                    // descriptor array, so the descriptor has to grow a string-handle
+                    // variant (plus its alloc site) and the scan engine's store step a
+                    // branch on it, and `%5s` into an unbounded string needs its own
+                    // answer. Real code reaches it: uvm_root.svh:916 does
+                    // `$sscanf(timeout, "%d,%s", timeout_int, override_spec)` with a
+                    // `string` override_spec.
                     throw BackendError{ "$fscanf / $sscanf into a string object is not supported" };
                 }
                 if (lv.width != lv.store_width) {
@@ -21390,20 +21419,50 @@ private:
         return env_->llmod.getOrInsertFunction("rt_value_plusargs", fnty);
     }
 
-    // Lower $value$plusargs(user_string, var): build a single rt_scan_arg
-    // descriptor for the output lvalue (as lower_scanf does per conversion),
-    // then call the runtime with the compile-time-literal prefix + format
-    // char. The target must be whole-storage and <=64 bits, like a scanf
-    // target.
+    // i32 rt_value_plusargs_str(const char* prefix, i32 prefix_len, rt_string* dst,
+    //                           const rt_alloc_site*)
+    llvm::FunctionCallee value_plusargs_str_fn() {
+        auto* ptr  = llvm::PointerType::getUnqual(ctx_);
+        auto* fnty = llvm::FunctionType::get(b_.getInt32Ty(), { ptr, b_.getInt32Ty(), ptr, ptr }, false);
+        return env_->llmod.getOrInsertFunction("rt_value_plusargs_str", fnty);
+    }
+
+    // Lower $value$plusargs(user_string, var) (LRM §21.6).
+    //
+    // A `string`-typed destination goes straight to the runtime's rt_string handle
+    // (as lower_fgets / lower_ferror do), which is the form UVM's own
+    // `$value$plusargs("UVM_TESTNAME=%s", test_name)` takes. No plane snapshot: a
+    // string is guarded out of sensitivity lists by the frontend, so there is no
+    // wait queue to service (see the StrAssign store path).
+    //
+    // A packed-vector destination builds a single rt_scan_arg descriptor for the
+    // output lvalue (as lower_scanf does per conversion) and hands the runtime the
+    // compile-time-literal prefix plus the format char. That target must be
+    // whole-storage, like a scanf target.
     void lower_value_plusargs(Index i) {
         const Index dst  = ir_->payload(i).op_extra.op;
         const auto  info = ir_->extra_data<ValuePlusArgsInfo>(ir_->payload(i).op_extra.extra);
         const std::string prefix = ir_->extra_bytes(info.prefix, info.prefix_len);
+        llvm::Value*      prefix_ptr = b_.CreateGlobalString(prefix);
+        llvm::Value*      prefix_len = b_.getInt32(static_cast<uint32_t>(prefix.size()));
 
         const LValue& lv = lvalue_of(dst);
         if (lv.is_string) {
-            // TODO: $value$plusargs into a dynamic string object.
-            throw BackendError{ "$value$plusargs into a string object is not supported" };
+            if (info.conv != 's') {
+                // TODO: a numeric conversion into a `string` object. LRM §21.6 stores
+                // the CONVERTED value, so this is LRM 6.16's integral-to-string
+                // assignment of it -- a one-byte string holding a character code, which
+                // is a separate question from the "%s -- string (no conversion)" form
+                // the clause's examples and UVM actually use.
+                throw BackendError{ std::string("$value$plusargs %") +
+                                    static_cast<char>(info.conv) +
+                                    " into a string object is not supported" };
+            }
+            llvm::Value* r = b_.CreateCall(
+              value_plusargs_str_fn(),
+              { prefix_ptr, prefix_len, lv_string_ptr(lv), alloc_site_global(loc_text(i), "string") });
+            set_value(i, packed(r, r, zero(32)));
+            return;
         }
         if (lv.width != lv.store_width) {
             // TODO: a part-select $value$plusargs target (x[7:0]).
@@ -21420,11 +21479,9 @@ private:
         b_.CreateStore(b_.getInt32(lv.store_width), b_.CreateStructGEP(sty, arg, 2));
         b_.CreateStore(b_.getInt32(lv.narrow ? 1u : 0u), b_.CreateStructGEP(sty, arg, 3));
 
-        const ServiceSnapshot old        = service_snapshot(lv);
-        llvm::Value*          prefix_ptr = b_.CreateGlobalString(prefix);
-        llvm::Value*           r          = b_.CreateCall(
-          value_plusargs_fn(),
-          { prefix_ptr, b_.getInt32(static_cast<uint32_t>(prefix.size())), b_.getInt32(info.conv), arg });
+        const ServiceSnapshot old = service_snapshot(lv);
+        llvm::Value*           r   = b_.CreateCall(
+          value_plusargs_fn(), { prefix_ptr, prefix_len, b_.getInt32(info.conv), arg });
         service_after_write(lv, old);
         set_value(i, packed(r, r, zero(32)));
     }
@@ -27958,6 +28015,37 @@ private:
     llvm::StructType* gc_mutator_ty_ = nullptr;
 };
 
+// Print a backend refusal the way every other Clotho diagnostic prints:
+// `file:line:col: error: <message> [<code>]`, exactly the shape
+// Diagnostic.cpp's render produces for the frontend's own guards.
+//
+// Three properties this buys, all of which the old `llvm backend error: <text>`
+// line lacked. A LOCATION, from the span lower_region attached, so the user can
+// find the construct. A stable CODE, so a refusal is filterable and waivable
+// like any other item. And no stage name: which pass refused is Clotho's
+// business, and "llvm backend" says nothing to someone whose `$value$plusargs`
+// was rejected.
+//
+// The code follows the message, because the message is the classification the
+// user reads. A guard whose text opens with "internal:" reports a broken backend
+// invariant -- a Clotho bug, not a language feature -- and every such guard in
+// this file is spelled that way; everything else is a legal construct the
+// backend does not lower, which is the frontend's own `unsupported-construct`.
+//
+// NOTE: this cannot build a clotho::Diagnostic and hand it back. Diagnostic.h
+// sits ABOVE the IR layer (it includes ir/Ir.h) and clotho_ir must not depend on
+// the frontend -- see the clotho_ir_core / clotho split in CMakeLists.txt. The
+// rendering is duplicated rather than the layering inverted; the two are pinned
+// together by tests/plusargs_test.cpp.
+void report_backend_error(const BackendError& e, const LocResolver& resolve) {
+    const std::string_view code =
+      e.message.starts_with("internal:") ? "internal-error" : "unsupported-construct";
+    if (e.span.valid() && resolve) {
+        llvm::errs() << resolve(e.span).where << ": ";
+    }
+    llvm::errs() << "error: " << e.message << " [" << code << "]\n";
+}
+
 } // namespace
 
 // Lower the coroutine intrinsics emitted for each process and clean up the
@@ -28039,7 +28127,7 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
         be.run();
         built.modules = be.take_unit_modules();
     } catch (const BackendError& e) {
-        llvm::errs() << "llvm backend error: " << e.message << "\n";
+        report_backend_error(e, resolve);
         return {};
     }
     built.modules.insert(built.modules.begin(), std::move(root));

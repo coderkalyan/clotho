@@ -890,6 +890,16 @@ int32_t rt_test_plusargs(const char* s, uint32_t len);
 // returns 0.
 int32_t rt_value_plusargs(const char* prefix, uint32_t prefix_len, uint32_t conv, const rt_scan_arg* arg);
 
+// $value$plusargs(user_string, var) with a `string`-typed var (LRM §21.6). Only
+// the clause's "%s -- string (no conversion)" form reaches here: the remainder
+// is the value, so there is no width to pad or truncate to and no illegal
+// character to reject. On a match the remainder is assigned to `dst` (empty
+// when the plusarg has none, which is the clause's "empty string value") and
+// the function returns nonzero; on no match `dst` is left untouched and it
+// returns 0. `site` locates the assignment for an allocation-failure report.
+int32_t rt_value_plusargs_str(const char* prefix, uint32_t prefix_len, struct rt_string* dst,
+                              const rt_alloc_site* site);
+
 // -- Deferred nonblocking writes to unpacked-array elements --
 //
 // A synchronous memory write `mem[i] <= rhs` cannot use the per-signal NBA shadow

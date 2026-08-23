@@ -34,12 +34,16 @@ struct BuiltDesign {
 };
 
 // Lower every process in `m` to llvm::Modules owned by `ctx`. Returns empty
-// modules (and writes the reason to llvm::errs()) on backend error or if any
-// generated module fails verification. The caller owns the returned modules
-// and must keep `ctx` alive at least as long as them; the JIT links the whole
-// set into one dylib. `resolve` renders the source locations a sanitizer bakes
-// into its reports (in practice `SourceContext::render`); without it they read
-// "<unknown>", which is what a caller with no SourceContext gets.
+// modules on backend error or if any generated module fails verification. The
+// caller owns the returned modules and must keep `ctx` alive at least as long
+// as them; the JIT links the whole set into one dylib.
+//
+// `resolve` (in practice `SourceContext::render`) decodes source locations for
+// two consumers: the reports a sanitizer bakes into the emitted code, and a
+// backend refusal, which is written to llvm::errs() in the same
+// `file:line:col: error: <message> [<code>]` form as a frontend diagnostic.
+// Without it both read "<unknown>", which is what a caller with no
+// SourceContext gets.
 BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx,
                           const SimulationConfig& config = {}, const LocResolver& resolve = {});
 
