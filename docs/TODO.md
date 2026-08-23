@@ -1762,7 +1762,30 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   all, and verilator creates an entry on an absent read, violating LRM 7.8, so
   neither models this behaviour.
 - [x] **Casting (scalar/packed)** — static / size / sign / const cast,
-  string<->packed, real<->int.
+  string<->packed, real<->int. A widening cast extends by the SOURCE's
+  signedness: LRM 6.24.1 defines a cast as "the value that a variable of the
+  casting type would hold after being assigned the expression", which is LRM
+  11.8.3's "sign extension if, and only if, the type of the right-hand side is
+  signed". This was wrong until `fix/int-cast-signedness`: the cast lowered to a
+  single `Resize`, whose extension follows its TARGET type (LRM 11.8.2's
+  propagated-operand rule), so `int'(1'b1)` answered -1. Measured extent over a
+  396-case matrix (source signedness x cast target x widths 1/2/7/8/31/32/33/64,
+  in tests/llvm_backend_test.cpp): 61 wrong, every one of them an UNSIGNED source
+  widened into a SIGNED target — `bit`, `logic`, `byte unsigned`, a packed struct
+  and an enum alike, at every width, so it was never a width-1 story.
+  `signed'` / `unsigned'` / `$signed` / `$unsigned` (LRM 20.5) never widen and a
+  size cast `N'()` passes signedness through, so all four were already right;
+  implicit assignment conversion was right only because slang already splits it
+  into widen-then-retag; call arguments and return values, which the frontend
+  coerces itself with nothing to split them, carried the bug. The constant-folded
+  path (`localparam int P = int'(1'b1)`) is slang's own evaluator and was already
+  correct. iverilog 13 and Verilator 5.050 agree with each other on all 396
+  cases. The fix is in `Lower::coerce`, which now takes an `Extend` selecting
+  between the two LRM rules and, for the 11.8.3 one, emits the widening `Resize`
+  under the source's sign before the retag; a slang `ConversionKind::Propagated`
+  node still gets 11.8.2, which genuinely differs in both directions
+  (`logic [7:0] u; logic signed [3:0] s = -1;` gives `u + s` == 16 but
+  `u = s` == 255).
 - [x] **Parameterized types / type parameters** (LRM 6.20.3).
 
 ### Operators & expressions
