@@ -1,6 +1,8 @@
 #include "Printer.h"
 
+#include <cassert>
 #include <sstream>
+#include <vector>
 
 namespace clotho::ir {
 
@@ -8,7 +10,25 @@ namespace {
 
 // Render an interned type compactly, e.g. `logic[7:0]`. Free function so both
 // the instruction printer and the module signal table can reuse it.
-void render_type(const InternPool& pool, Ref type, std::ostream& os) {
+//
+// `open_classes` holds the classes whose bodies this walk is currently inside,
+// outermost first. Kind::Class is the ONLY cyclic node in the type graph: a value
+// struct cannot contain itself, so only a class may reach itself -- directly, or
+// through a container element or a struct member -- and the pool mints exactly
+// that shape through reserve_struct_fields (InternPool.h:371-378). One stack of
+// open classes therefore closes every cycle shape at once: direct self-reference,
+// mutual A<->B, a three-hop A->B->C->A, and a cycle that runs through a queue,
+// dynamic array, associative array or struct member alike.
+//
+// A re-entered class renders as `class^N` in place of its body, where N counts
+// outward from the class being expanded right now, so `class^1` is the innermost
+// one. It is a de Bruijn index for the recursion binder: it names the elided
+// class positionally, which it has to, because the pool carries no source name
+// for a class (the backend identifies one by its Ref alone -- see
+// `clotho.classdesc.<ref>`, LlvmBackend.cpp:2315). `^` appears in no other
+// rendering, so a reader can always tell a cycle-elided reference from a genuine
+// leaf.
+void render_type(const InternPool& pool, Ref type, std::ostream& os, std::vector<Ref>& open_classes) {
     if (type == Ref::Invalid) {
         os << "<?>";
         return;
@@ -34,11 +54,11 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
             os << "shortreal";
             break;
         case Type::Kind::PackedArray:
-            render_type(pool, t.element, os);
+            render_type(pool, t.element, os, open_classes);
             os << "[" << t.left << ":" << t.right << "]";
             break;
         case Type::Kind::UnpackedArray:
-            render_type(pool, t.element, os);
+            render_type(pool, t.element, os, open_classes);
             os << " [" << t.left << ":" << t.right << "]";
             break;
         case Type::Kind::String:
@@ -58,30 +78,37 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
                     os << ", ";
                 }
                 os << pool.field_name(fields[i]) << ":";
-                render_type(pool, fields[i].type, os);
+                render_type(pool, fields[i].type, os, open_classes);
             }
             os << "}";
             break;
         }
         case Type::Kind::DynArray:
-            render_type(pool, t.element, os);
+            render_type(pool, t.element, os, open_classes);
             os << " []";
             break;
         case Type::Kind::Queue:
-            render_type(pool, t.element, os);
+            render_type(pool, t.element, os, open_classes);
             os << " [$]";
             break;
         case Type::Kind::Assoc:
-            render_type(pool, t.element, os);
+            render_type(pool, t.element, os, open_classes);
             if (t.right != 0) {
                 os << " [*]";
             } else {
                 os << " [";
-                render_type(pool, static_cast<Ref>(t.fields_id), os);
+                render_type(pool, static_cast<Ref>(t.fields_id), os, open_classes);
                 os << "]";
             }
             break;
         case Type::Kind::Class: {
+            for (size_t i = open_classes.size(); i-- > 0;) {
+                if (open_classes[i] == type) {
+                    os << "class^" << (open_classes.size() - i);
+                    return;
+                }
+            }
+            open_classes.push_back(type);
             const auto fields = pool.struct_fields(t.fields_id);
             os << "class{";
             for (size_t i = 0; i < fields.size(); ++i) {
@@ -89,12 +116,22 @@ void render_type(const InternPool& pool, Ref type, std::ostream& os) {
                     os << ", ";
                 }
                 os << pool.field_name(fields[i]) << ":";
-                render_type(pool, fields[i].type, os);
+                render_type(pool, fields[i].type, os, open_classes);
             }
             os << "}";
+            assert(!open_classes.empty() && "the class stack must still hold this class");
+            assert(open_classes.back() == type && "the class stack must unwind in order");
+            open_classes.pop_back();
             break;
         }
     }
+}
+
+// Entry point: starts the walk with no class open. The stack stays empty (and so
+// allocates nothing) unless the type actually reaches a class.
+void render_type(const InternPool& pool, Ref type, std::ostream& os) {
+    std::vector<Ref> open_classes;
+    render_type(pool, type, os, open_classes);
 }
 
 } // namespace

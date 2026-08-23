@@ -2,15 +2,18 @@
 
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
 
+#include "Lower.h"
 #include "ir/Builder.h"
 #include "ir/InternPool.h"
 #include "ir/Ir.h"
@@ -23,6 +26,28 @@ namespace {
 // A 1-bit known constant value.
 Ref konst(InternPool& pool, uint64_t v) {
     return pool.put_int(pool.bit_type, v);
+}
+
+// The exact text `clotho build --emit ir` writes for a design: print_module with
+// the location resolver the CLI installs (main.cpp:401-412).
+std::string emit_ir(std::string_view source) {
+    const clotho::LowerResult r = clotho::lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::ostringstream os;
+    print_module(*r.module, os, clotho::loc_resolver(r));
+
+    return os.str();
+}
+
+size_t occurrences(std::string_view hay, std::string_view needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string_view::npos; at = hay.find(needle, at + 1)) {
+        ++n;
+    }
+
+    return n;
 }
 } // namespace
 
@@ -525,4 +550,131 @@ TEST_CASE("one-operand real math rides the op_imm payload") {
     const auto           ops = ir.operands(sq, scratch);
     REQUIRE(ops.size() == 1);
     CHECK(ops[0] == x);
+}
+
+// The type printer's cycle guard (Printer.cpp's render_type). A module-scope
+// signal of a self-referential class type used to make `--emit ir` recurse until
+// the stack ran out -- 2.3 MB of `class{nm:string, kids:class{...` and a SIGSEGV.
+// That shape is what every UVM design has (uvm_printer.svh:419 declares
+// `uvm_printer_element m_children[$]`, a queue of the enclosing class), so it made
+// the one tool for diagnosing a backend problem unusable on UVM.
+TEST_CASE("--emit ir elides a cycle back to a class being printed") {
+    const std::string ir = emit_ir(R"(
+class node;
+  string nm;
+  node kids[$];
+endclass
+module top;
+  node n;
+  initial begin n = new(); n.nm = "root"; $display("ok %s", n.nm); end
+endmodule
+)");
+
+    // The class body is expanded once; the queue element that closes the cycle is
+    // the back-reference `class^1` -- one level out, the class being expanded.
+    CHECK(ir.find("s0: class{nm:string, kids:class^1 [$]} n (internal)") != std::string::npos);
+    // Nothing anywhere in the dump re-expands the recursive property.
+    CHECK(ir.find("kids:class{") == std::string::npos);
+}
+
+TEST_CASE("--emit ir elides a mutual class cycle at the outer class") {
+    const std::string ir = emit_ir(R"(
+typedef class pong;
+class ping; pong p; endclass
+class pong; ping q; endclass
+module top;
+  ping a;
+  initial begin a = new(); $display("ok"); end
+endmodule
+)");
+
+    // A <-> B: `ping` is open at depth 1 and `pong` at depth 2, so the hop back to
+    // `ping` counts two levels out.
+    CHECK(ir.find("s0: class{p:class{q:class^2}} a (internal)") != std::string::npos);
+}
+
+TEST_CASE("--emit ir elides a cycle through a container element") {
+    const std::string ir = emit_ir(R"(
+class box;
+  box dyn[];
+  box map[string];
+endclass
+module top;
+  box c;
+  initial begin c = new(); $display("ok"); end
+endmodule
+)");
+
+    // One guard covers every container kind, because the cycle runs through the
+    // class node in each and that is the only cyclic node there is.
+    CHECK(ir.find("s0: class{dyn:class^1 [], map:class^1 [string]} c (internal)") != std::string::npos);
+}
+
+TEST_CASE("the type printer elides a cycle through a struct member") {
+    // Built through the pool rather than from source: slang refuses a struct type
+    // that transitively reaches itself through a class handle ("'wrap' recursively
+    // depends on its own definition"), so this shape is currently unreachable from
+    // SystemVerilog even though the type graph models it and the printer must
+    // survive it. Pinned here so the guard keeps covering the shape if the frontend
+    // ever admits it.
+    // The type has to be built in the MODULE's pool: print_module resolves a
+    // signal's Ref against `m.pool`, so a Ref minted anywhere else names a
+    // different item.
+    Module m;
+    m.name = "top";
+
+    // class box { struct { box inner; bit k; } w; } -- the class Ref must exist
+    // before the struct that names it, which is what the reserved field table is
+    // for (InternPool.h:371-378).
+    const uint32_t box_fields  = m.pool.reserve_struct_fields();
+    const Ref      box         = m.pool.put(Type{ .kind = Type::Kind::Class, .fields_id = box_fields });
+    const uint32_t wrap_fields = m.pool.intern_struct_fields({ { "inner", box, 0 }, { "k", m.pool.bit_type, 1 } });
+    const Ref      wrap        = m.pool.put(Type{ .kind = Type::Kind::Struct, .fields_id = wrap_fields });
+    m.pool.set_struct_fields(box_fields, { { "w", wrap, 0 } });
+
+    m.add_signal(SignalInfo{ .name = "c", .type = box });
+
+    CHECK(toString(m) == "module top\n  s0: class{w:struct{inner:class^1, k:bit}} c (internal)\n");
+}
+
+TEST_CASE("--emit ir elides a three-hop class cycle") {
+    const std::string ir = emit_ir(R"(
+typedef class cb;
+typedef class cc;
+class ca; cb b; endclass
+class cb; cc c; endclass
+class cc; ca a; endclass
+module top;
+  ca t;
+  initial begin t = new(); $display("ok"); end
+endmodule
+)");
+
+    // A -> B -> C -> A: three classes are open when the last hop closes the cycle.
+    CHECK(ir.find("s0: class{b:class{c:class{a:class^3}}} t (internal)") != std::string::npos);
+}
+
+TEST_CASE("--emit ir renders a non-recursive class exactly as it did before the guard") {
+    const std::string ir = emit_ir(R"(
+class leaf; int x; endclass
+class plain;
+  int      x;
+  string   s;
+  leaf     l;
+  logic    q[$];
+  leaf     m[int];
+endclass
+module top;
+  plain p;
+  initial begin p = new(); $display("ok"); end
+endmodule
+)");
+
+    // The guard adds output only where it elides, so an acyclic type renders byte
+    // for byte as it always has -- including a nested class expanded in full. Pinned
+    // here so the guard cannot start labelling, numbering or reordering the common
+    // case.
+    CHECK(ir.find("s0: class{x:signed bit[31:0], s:string, l:class{x:signed bit[31:0]}, "
+                  "q:logic [$], m:class{x:signed bit[31:0]} [signed bit[31:0]]} p (internal)") != std::string::npos);
+    CHECK(occurrences(ir, "^") == 0);
 }
