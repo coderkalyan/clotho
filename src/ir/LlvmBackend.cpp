@@ -6,6 +6,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstring>
+#include <format>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -15094,8 +15095,22 @@ private:
         values_[static_cast<uint32_t>(i)] = p;
     }
 
+    // The descriptor an earlier lvalue-derivation instruction recorded for `i`.
+    //
+    // The engaged check is not defensive padding: every place consumer in the backend
+    // funnels through here, so this is the one spot that can turn "an operand the IR
+    // used as a place was lowered as a VALUE" into a located refusal. Without it the
+    // disengaged optional was dereferenced and its all-zero buffer read as an LValue,
+    // which faults on the first null member (bit_off, in ref_actual_ptr) with no
+    // diagnostic at all. A call whose actuals did not line up with its signature was
+    // how that happened; lower_call_common rejects that shape up front now, and this
+    // backstops every other route to it.
     const LValue& lvalue_of(Index i) const {
-        return *lvals_[static_cast<uint32_t>(i)];
+        const std::optional<LValue>& lv = lvals_[static_cast<uint32_t>(i)];
+        if (!lv.has_value()) {
+            throw BackendError{ "internal: operand used as a place was lowered as a value" };
+        }
+        return *lv;
     }
     void set_lvalue(Index i, LValue lv) {
         lvals_[static_cast<uint32_t>(i)] = lv;
@@ -22811,6 +22826,17 @@ private:
     // the returned struct into a Plane. A void callee yields no value.
     void lower_call_common(Index i, const Function& f, llvm::FunctionType* fnty,
                            llvm::Value* callee, ExtraSlice arg_slice) {
+        // Every arm of the marshaling loop indexes the signature by the actual's
+        // position, so an actual list that is not exactly as long as `param_types`
+        // reads a neighbouring formal's direction, or off the end of the vector.
+        // Checked once here rather than trusted at each of the seven indexing sites:
+        // the frontend splicing a receiver the callee has no formal for is exactly
+        // how it went wrong, and it cost a segfault with no diagnostic.
+        if (ir_->region(arg_slice).size() != f.param_types.size()) {
+            throw BackendError{ std::format("internal: call to '{}' passes {} arguments for {} formals",
+                                            f.name, ir_->region(arg_slice).size(),
+                                            f.param_types.size()) };
+        }
         std::vector<llvm::Value*> argv;
         argv.push_back(state_);
         // A function body runs in the caller's thread, so $urandom inside one
@@ -23392,6 +23418,16 @@ private:
     // external symbol directly (no state pointer), and convert the C return back to
     // a Plane. The frontend guards unsupported types, so no ref servicing.
     void lower_dpi_call(Index i, const CallInfo& ci, const Function& f) {
+        // Same signature-arity invariant as lower_call_common / lower_task_call_inst:
+        // the loop below indexes dpi_arg_ctypes / arg_dirs / param_types by the
+        // actual's position. A DPI import is never a class method, so the receiver
+        // splice that motivated the check cannot reach here -- the guard is uniform
+        // across all three marshalling loops so the invariant has one statement.
+        if (ir_->region(ci.args).size() != f.param_types.size()) {
+            throw BackendError{ std::format("internal: DPI call to '{}' passes {} arguments for {} formals",
+                                            f.name, ir_->region(ci.args).size(),
+                                            f.param_types.size()) };
+        }
         llvm::Function*           cf = sym(fn_decls_[static_cast<uint32_t>(ci.func)]);
         std::vector<llvm::Value*> argv;
         // output / inout scratches to read back into the caller temp after the
@@ -24035,6 +24071,14 @@ private:
         // A task runs in the calling process's thread (LRM 13.3), so it draws from
         // the caller's RNG rather than one of its own.
         const std::span<const Index> args = ir_->region(argslice);
+        // The same signature-arity check lower_call_common makes, for the same
+        // reason: the loop below indexes tf.arg_dirs / tf.param_types by the
+        // actual's position, and a task enable is marshaled from the same
+        // frontend argument list a function call is.
+        if (args.size() != tf.param_types.size()) {
+            throw BackendError{ std::format("internal: task enable of '{}' passes {} arguments for {} formals",
+                                            tf.name, args.size(), tf.param_types.size()) };
+        }
         std::vector<llvm::Value*>    argv;
         argv.push_back(state_);
         argv.push_back(rng_slot_);

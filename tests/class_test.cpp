@@ -520,6 +520,140 @@ TEST_CASE("class static property: aggregate and container initializers") {
     CHECK(run_capture(src) == "1 2 3 4 hi\n11 22 5 6 7 8 9\n");
 }
 
+// A STATIC method may be called through an object handle as well as through the
+// class scope (LRM 8.9 shows the same freedom for a static property, reading
+// `p.fileID` through a handle that was never assigned; LRM 8.10 gives a static
+// method no `this`). The two spellings must agree, because the callee has no
+// receiver formal either way.
+//
+// Regression: `p.f(x)` used to splice the receiver handle as argument 0, shifting
+// every actual one formal to the left. With a `ref` formal the backend then asked
+// a VALUE operand for its lvalue and dereferenced a disengaged optional -- a
+// SIGSEGV with no diagnostic (found compiling uvm_component::apply_config_settings,
+// whose `rp.sort_by_precedence(rq)` calls `static function void (ref rsrc_q_t)`).
+// The other shapes reached LLVM's own "Incorrect number of arguments passed to
+// called function!" with no source location.
+TEST_CASE("class static method: called through an object handle") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Pool;
+                static function void bump(ref int q); q = q + 7; endfunction
+                static function void show(int a); $display("show %0d", a); endfunction
+                static function int answer(); return 42; endfunction
+                static task announce(int a); $display("announce %0d", a); endtask
+            endclass
+            initial begin
+                Pool p = new();
+                int  x = 1;
+                int  y = 1;
+                p.bump(x);        // through a handle
+                Pool::bump(y);    // through the class scope: the control
+                p.show(3);
+                Pool::show(3);
+                $display("%0d %0d %0d %0d", x, y, p.answer(), Pool::answer());
+                p.announce(5);
+                Pool::announce(5);
+            end
+        endmodule
+    )";
+    // Both spellings reach the same body: x and y both 1+7.
+    CHECK(run_capture(src) == "show 3\nshow 3\n8 8 42 42\nannounce 5\nannounce 5\n");
+}
+
+// The receiver of a static call is an ordinary expression, so it is evaluated for
+// its side effects even though the handle it produces is discarded -- the same way
+// the static-PROPERTY path evaluates its prefix. `made` counts the evaluations, so
+// a dropped receiver would print 1 instead of 2.
+TEST_CASE("class static method: receiver expression is still evaluated") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Pool;
+                static int made = 0;
+                static function int answer(); return 42; endfunction
+            endclass
+            class Maker;
+                static function Pool make(); Pool::made = Pool::made + 1; return new(); endfunction
+            endclass
+            initial begin
+                $display("%0d", Maker::make().answer());
+                $display("%0d", Maker::make().made);
+                $display("made=%0d", Pool::made);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "42\n2\nmade=2\n");
+}
+
+// A static method dereferences no object, so calling one through a NULL handle is
+// legal and must not fatal -- exactly why LRM 8.9's `Packet p; c = $fgetc(p.fileID);`
+// example needs no `new`. This is the shape that made the old receiver splice
+// unsafe as well as wrong: the discarded handle was a null one.
+TEST_CASE("class static method: null handle receiver does not fatal") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Pool;
+                static int limit = 9;
+                static function int answer(); return 42; endfunction
+            endclass
+            initial begin
+                Pool p;
+                int  x = 0;
+                $display("%0d %0d %0d", p.answer(), p.limit, x);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "42 9 0\n");
+}
+
+// The UVM shape that found the fault, reduced: a static method taking a `ref` to a
+// class handle, called through a handle from inside another class's method, with
+// the actual reloaded from an associative array each iteration.
+TEST_CASE("class static method: ref-to-handle formal through a handle in a loop") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Queue;
+                int items[$];
+                function void add(int v); items.push_back(v); endfunction
+                function int total();
+                    int s = 0;
+                    foreach (items[k]) s = s + items[k];
+                    return s;
+                endfunction
+            endclass
+            class Pool;
+                static function void widen(ref Queue q); q.add(q.total() + 1); endfunction
+            endclass
+            class Component;
+                function int apply();
+                    Queue  all[string];
+                    string order[$];
+                    Queue  rq;
+                    Pool   rp = new();
+                    int    sum = 0;
+                    order.push_back("a");
+                    order.push_back("b");
+                    all["a"] = new();
+                    all["b"] = new();
+                    all["a"].add(10);
+                    all["b"].add(20);
+                    foreach (order[iter]) begin
+                        rq = all[order[iter]];
+                        rp.widen(rq);
+                        sum = sum + rq.total();
+                    end
+                    return sum;
+                endfunction
+            endclass
+            initial begin
+                Component c = new();
+                $display("%0d", c.apply());
+            end
+        endmodule
+    )";
+    // "a": 10 then widen appends 11 -> total 21. "b": 20 then 21 -> total 41. Sum 62.
+    CHECK(run_capture(src) == "62\n");
+}
+
 // -- Virtual methods / dynamic dispatch (LRM 8.20), Phase 3 --
 // A virtual method called through a base handle dispatches on the object's
 // concrete type, not the handle's static type. An override reuses its base
