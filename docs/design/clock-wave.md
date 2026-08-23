@@ -5,9 +5,13 @@ per-edge wait-bucket scan and the per-process active-queue round-trip. A
 stepping stone toward a verilator-style static schedule for the synchronous
 subset (Direction B), retaining the event-driven engine everywhere else.
 
-Status: design only. Read the honest-accounting section before investing —
-static fusion already captured most of what C would, so C's *standalone* win is
-modest and design-dependent; its real role is the on-ramp to B.
+Status: design only, and **superseded as a plan** — regions.md measures the
+scheduling share this document estimates at ~1% (§2) and finds it 33-63%, with
+the largest bucket in NBA staging rather than dispatch, and reaches the same
+static-dispatch goal without a clock domain by compiling sensitivity lists into
+guards. Keep this document for §1 (the current dispatch map) and §5 (the
+comb-settle observer-safety hazards, which regions inherits). Its own §7
+recommendation ("profile first") is discharged in regions.md §2.
 
 ---
 

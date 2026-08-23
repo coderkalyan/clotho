@@ -126,6 +126,12 @@ is not overfit to the target benchmark.
   honest fix is per-member dirty bits (phase 2); until then
   `SimulationConfig::comb_fuse` is the differential gate and `--stat=comb-fuse` shows
   the formed groups.
+- Both of the above are what regions.md P2 builds: a per-member guard derived
+  from the wake site's own edge facts is the per-member dirty bit, and it lets
+  the interior guard relax from a hard reject to a cost model. It also retires
+  five of the eight `CombFuse` verdicts (`EdgeSensitive`, `ImpureOp`,
+  `HasCall`, `UnsupportedWrite`, `ReadOutsideSens`), which exist only because a
+  fused member may run when its own trigger did not.
 
 Verified: fused vs `--no-comb-fuse` byte-identical on combchain (20k
 cycles), picorv32 default and VERBOSE traces, tri networks across 4
