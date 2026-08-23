@@ -20770,6 +20770,9 @@ private:
         }
         if (name == "sort" || name == "rsort") {
             guard_ordering_sort(name, call);
+            if (sort_uses_iter_path(call)) {
+                return lower_array_sort_iter(name, call, arr, b, l);
+            }
             return b.dyn_array_sort(arr, name == "rsort", aty, l);
         }
         if (name == "shuffle") {
@@ -20778,26 +20781,420 @@ private:
         if (is_locator_method(name) || is_reduction_method(name)) {
             return lower_array_iter_method(name, call, arr, b, l);
         }
-        // TODO: `map` (LRM 7.12.5), the sort/rsort `with` clause (7.12.2), and
-        // 4-state / wide sort.
+        // TODO: `map` (LRM 7.12.5). 4-state sort stays refused on purpose, not
+        // deferred: 7.12.2 leaves x/z placement undefined (guard_ordering_sort).
         fail("dynamic array method '" + std::string(name) + "' is not supported");
     }
 
-    // Loud guard for the array ordering methods sort()/rsort() (LRM 7.12.2): the
-    // V1 comparator handles a 2-state integral (width <= 64) or real element and
-    // no `with` clause. 4-state ordering (x/z placement is LRM-unspecified), wide
-    // elements, and a keyed `with` comparator are documented follow-ups.
+    // Loud guard for the array ordering methods sort()/rsort() (LRM 7.12.2). The
+    // clause requires the relational operators (<, >, ==) to be defined for
+    // whatever is ordered: the ELEMENT type for the bare form, and the `with`
+    // expression's type when one is given ("If a with clause is specified, the
+    // relational operators shall be defined for the type of the expression").
+    // That admits an integral of any width, a real and a string; an enum is
+    // integral, so it orders by its base value.
+    //
+    // 4-state stays refused, and not for want of a comparator: a 4-state `<`
+    // yields x rather than a total order, so 7.12.2's "ascending" is undefined for
+    // an element or key carrying x/z. Any placement clotho picked would become a
+    // de-facto commitment; a loud refusal is recoverable, a silently invented
+    // order is not.
     void guard_ordering_sort(std::string_view name, const CallExpression& call) {
+        const auto&             sci  = std::get<CallExpression::SystemCallInfo>(call.subroutine);
+        const Expression* const iter = sci.getIteratorInfo().first;
+        const slang::ast::Type& kty =
+          iter != nullptr ? *iter->type : *call.arguments()[0]->type->getArrayElementType();
+        const slang::ast::Type& kc   = kty.getCanonicalType();
+        const std::string       what = iter != nullptr ? "`with` clause key" : "element";
+        if (kc.isIntegral() && kc.isFourState()) {
+            fail("'" + std::string(name) + "' with a 4-state " + what +
+                 " is not supported: LRM 7.12.2 leaves the ordering of x and z undefined, so there "
+                 "is no correct position for an unknown");
+        }
+        if (kc.isIntegral() || kc.isFloating() || kc.isString()) {
+            return;
+        }
+        fail("'" + std::string(name) + "' needs an " + what +
+             " with the relational operators (<, >, ==) defined (LRM 7.12.2), not '" + kty.toString() + "'");
+    }
+
+    // Whether sort()/rsort() has to go through the IR permutation sort instead of
+    // the runtime's flat value comparator (rt_*_sort). Three cases need it: a
+    // `with` clause, whose key is arbitrary IR; a string element, which is a heap
+    // handle rather than a value the comparator can load; and an element wider
+    // than the one 64-bit word slot_less reads. Everything else -- a 2-state
+    // integral of width <= 64, and a real -- keeps the runtime fast path, which is
+    // a straight std::sort with no call back into generated code.
+    bool sort_uses_iter_path(const CallExpression& call) {
         const auto& sci = std::get<CallExpression::SystemCallInfo>(call.subroutine);
         if (sci.getIteratorInfo().first != nullptr) {
-            fail("'" + std::string(name) + "' with a `with` clause is not supported");
+            return true;
         }
-        const slang::ast::Type* et = call.arguments()[0]->type->getArrayElementType();
-        const slang::ast::Type& ec = et->getCanonicalType();
-        const bool ok = ec.isFloating() || (ec.isIntegral() && !ec.isFourState() && ec.getBitWidth() <= 64);
-        if (!ok) {
-            fail("'" + std::string(name) + "' is only supported for a 2-state integral (width <= 64) or real element");
+        const slang::ast::Type& ec = call.arguments()[0]->type->getArrayElementType()->getCanonicalType();
+        return ec.isString() || (ec.isIntegral() && ec.getBitWidth() > 64);
+    }
+
+    // Emitted state for one keyed sort. A struct so the emit helpers take a
+    // context rather than a dozen cells: the loops are the meat and read better
+    // without the parameter noise (TigerStyle).
+    struct SortIter {
+        ir::Index arr{};
+        ir::Index ord{}; // the permutation being sorted: dynamic array of int
+        ir::Index buf{}; // merge scratch, same shape
+        ir::Ref   aty  = ir::Ref::Invalid;
+        ir::Ref   oty  = ir::Ref::Invalid;
+        ir::Ref   i32  = ir::Ref::Invalid;
+        ir::Ref   i64  = ir::Ref::Invalid;
+        ir::Ref   bit1 = ir::Ref::Invalid;
+        // Element count, merge run width, run start, run midpoint / end, the two
+        // run cursors and the output cursor. 64-bit so `width + width` cannot
+        // overflow at the last doubling, which a 32-bit counter can.
+        TempCell n, w, lo, mid, hi, li, rj, out;
+        // The two element positions a comparison binds, and which side won.
+        TempCell                       pos_a, pos_b, take;
+        // Holds the right-hand key across the left-hand key's evaluation. See
+        // sort_right_wins for why a cell and not an IR value.
+        TempCell                       key_hold;
+        const Expression*              iter_expr = nullptr;
+        const slang::ast::ValueSymbol* iter_var  = nullptr;
+        bool                           agg_elem  = false;
+        bool                           key_real  = false;
+        bool                           desc      = false; // rsort
+    };
+
+    // An integer constant of the given interned type.
+    ir::Index iconst(ir::Ref ty, uint64_t v, ir::Builder& b, ir::SourceLoc l) {
+        return b.constant(module_.pool.put_int(ty, v), l);
+    }
+
+    // Bind the `with` iterator to the element at logical position `pos`, and aim
+    // `item.index` (LRM 7.12.4) at that same cell, so a clause reading it sees the
+    // element's ORIGINAL position -- the permutation moves, the array does not,
+    // until the whole sort is applied.
+    void sort_bind(const SortIter& s, const TempCell& pos, ir::Builder& b, ir::SourceLoc l) {
+        using T                  = ir::Inst::Tag;
+        iter_stack_.back().index = pos;
+        if (s.iter_var == nullptr) {
+            return;
         }
+        const ir::Index src = b.elem_select(s.arr, b.unary(T::Load, pos.lv(b, l), l), s.aty, l);
+        const ir::Index dst = value_lvalue(*s.iter_var, b, l);
+        if (!s.agg_elem) {
+            b.binary(T::Store, dst, b.unary(T::Load, src, l), l);
+            return;
+        }
+        const ir::Ref er = std::get<ir::Type>(module_.pool.get(s.aty)).element;
+        if (is_trivially_copyable(er)) {
+            b.agg_copy(dst, src, er, l);
+            return;
+        }
+        emit_agg_copy(dst, src, er, T::Store, b, l);
+    }
+
+    // The ordering key of the element at `pos`: the `with` clause evaluated
+    // against it, or the element itself when there is no clause -- 7.12.2's bare
+    // form is `with (item)`, which is also what lets a string or wide element
+    // reuse this path with no runtime comparator.
+    ir::Index sort_key(const SortIter& s, const TempCell& pos, ir::Builder& b, ir::SourceLoc l) {
+        using T = ir::Inst::Tag;
+        sort_bind(s, pos, b, l);
+        if (s.iter_expr != nullptr) {
+            return lower_expr(*s.iter_expr, b);
+        }
+        return b.unary(T::Load, b.elem_select(s.arr, b.unary(T::Load, pos.lv(b, l), l), s.aty, l), l);
+    }
+
+    // Does the right candidate strictly precede the left one? The merge takes the
+    // LEFT element unless this is true, which is exactly what makes the sort
+    // stable: equal keys keep the earlier run's element first.
+    //
+    // rsort compares with the operands swapped rather than sorting ascending and
+    // reversing. Those stop being equivalent the moment a `with` clause makes ties
+    // observable, because reversing an ascending sort also reverses each tie
+    // GROUP, so equal keys would come back in reverse original order.
+    //
+    // The clause is evaluated HERE, once per element per comparison, and is never
+    // cached in a key buffer. 7.12.2 does not fix an evaluation count, so a clause
+    // with a side effect observes one call per comparison; the considered
+    // alternative -- precompute n keys, sort those -- was rejected to stay
+    // consistent with the locator family, whose unique() dedup scan likewise
+    // re-evaluates rather than caching.
+    ir::Index sort_right_wins(const SortIter& s, ir::Builder& b, ir::SourceLoc l) {
+        using T = ir::Inst::Tag;
+        // The right key is STORED before the left one is evaluated, and that store
+        // is load-bearing rather than a convenience. Binding the iterator writes
+        // one variable, so a key that lowers to a place inside it -- a string
+        // handle, or a member select of an aggregate element -- would still be
+        // aiming at that variable when the second bind overwrote it, and every
+        // comparison would then compare the left element against itself and report
+        // a tie. Storing forces the value out (a string store deep-copies), which
+        // is the same reason min/max and unique hold their keys in cells.
+        b.binary(T::Store, s.key_hold.lv(b, l), sort_key(s, s.pos_b, b, l), l);
+        const ir::Index left    = sort_key(s, s.pos_a, b, l);
+        const ir::Index right   = b.unary(T::Load, s.key_hold.lv(b, l), l);
+        const T         ascend  = s.key_real ? T::FLt : T::Lt;
+        const T         descend = s.key_real ? T::FGt : T::Gt;
+        return b.binary(s.desc ? descend : ascend, right, left, l);
+    }
+
+    // One merge step: choose the next index from the left or the right run and
+    // append it to `buf`. Both exhaustion tests come BEFORE the compare, so the
+    // clause is never evaluated against a run with nothing left in it.
+    void emit_merge_step(const SortIter& s, ir::Builder& b, ir::SourceLoc l) {
+        using T                 = ir::Inst::Tag;
+        const auto      load    = [&](const TempCell& c) { return b.unary(T::Load, c.lv(b, l), l); };
+        const auto      ord_at  = [&](ir::Index i) {
+            return b.unary(T::Load, b.elem_select(s.ord, b.resize(i, s.i32, l), s.oty, l), l);
+        };
+        b.binary(T::Store, s.take.lv(b, l), iconst(s.bit1, 0, b, l), l);
+
+        b.open_region();
+        b.binary(T::Store, s.take.lv(b, l), iconst(s.bit1, 1, b, l), l);
+        const ir::ExtraSlice left_done = b.close_region();
+
+        b.open_region();
+        b.open_region();
+        b.binary(T::Store, s.pos_a.lv(b, l), ord_at(load(s.li)), l);
+        b.binary(T::Store, s.pos_b.lv(b, l), ord_at(load(s.rj)), l);
+        b.binary(T::Store, s.take.lv(b, l), sort_right_wins(s, b, l), l);
+        const ir::ExtraSlice compare = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice right_done = b.close_region();
+        b.cond(b.binary(T::Lt, load(s.rj), load(s.hi), l), compare, right_done, l);
+        const ir::ExtraSlice left_live = b.close_region();
+
+        b.cond(b.binary(T::Ge, load(s.li), load(s.mid), l), left_done, left_live, l);
+
+        const auto emit_take = [&](const TempCell& cursor) {
+            b.binary(T::Store,
+                     b.elem_select(s.buf, b.resize(load(s.out), s.i32, l), s.oty, l, /*for_write=*/true),
+                     ord_at(load(cursor)),
+                     l);
+            b.binary(T::Store, cursor.lv(b, l), b.binary(T::Add, load(cursor), iconst(s.i64, 1, b, l), l), l);
+        };
+        b.open_region();
+        emit_take(s.rj);
+        const ir::ExtraSlice took_right = b.close_region();
+        b.open_region();
+        emit_take(s.li);
+        const ir::ExtraSlice took_left = b.close_region();
+        b.cond(load(s.take), took_right, took_left, l);
+
+        b.binary(T::Store, s.out.lv(b, l), b.binary(T::Add, load(s.out), iconst(s.i64, 1, b, l), l), l);
+    }
+
+    // One bottom-up merge pass: walk the array in runs of `w`, merge each adjacent
+    // pair from `ord` into `buf`, then copy `buf` back. A trailing run shorter than
+    // `w` (or a missing right run) falls out of the min() clamps, so no pass needs
+    // a special case for a length that is not a power of two.
+    void emit_merge_pass(const SortIter& s, ir::Builder& b, ir::SourceLoc l) {
+        using T            = ir::Inst::Tag;
+        const auto load    = [&](const TempCell& c) { return b.unary(T::Load, c.lv(b, l), l); };
+        const auto clamped = [&](ir::Index v) { return b.select(b.binary(T::Lt, v, load(s.n), l), v, load(s.n), l); };
+
+        b.binary(T::Store, s.lo.lv(b, l), iconst(s.i64, 0, b, l), l);
+
+        b.open_region();
+        const ir::Index      run_pred = b.binary(T::Lt, load(s.lo), load(s.n), l);
+        const ir::ExtraSlice run_cond = b.close_region();
+
+        b.open_region();
+        b.binary(T::Store, s.mid.lv(b, l), clamped(b.binary(T::Add, load(s.lo), load(s.w), l)), l);
+        b.binary(T::Store, s.hi.lv(b, l), clamped(b.binary(T::Add, load(s.mid), load(s.w), l)), l);
+        b.binary(T::Store, s.li.lv(b, l), load(s.lo), l);
+        b.binary(T::Store, s.rj.lv(b, l), load(s.mid), l);
+        b.binary(T::Store, s.out.lv(b, l), load(s.lo), l);
+
+        b.open_region();
+        const ir::Index      step_pred = b.binary(T::Lt, load(s.out), load(s.hi), l);
+        const ir::ExtraSlice step_cond = b.close_region();
+        b.open_region();
+        emit_merge_step(s, b, l);
+        const ir::ExtraSlice step_body = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice step_inc = b.close_region();
+        b.loop(step_cond, step_pred, step_body, step_inc, /*bottom_test*/ false, l);
+
+        // Advance past both runs. `hi` is already the clamped end, so this also
+        // terminates on the trailing partial run.
+        b.binary(T::Store, s.lo.lv(b, l), load(s.hi), l);
+        const ir::ExtraSlice run_body = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice run_inc = b.close_region();
+        b.loop(run_cond, run_pred, run_body, run_inc, /*bottom_test*/ false, l);
+
+        b.dyn_array_copy(s.ord, s.buf, s.oty, l);
+    }
+
+    // Apply the finished permutation to the receiver: copy it aside, then write
+    // element ord[k] back at position k. One container copy plus n element stores;
+    // the O(n log n) work above moved 32-bit indices, not elements.
+    void emit_sort_permute(const SortIter& s, bool queue, ir::Builder& b, ir::SourceLoc l) {
+        using T           = ir::Inst::Tag;
+        const auto   load = [&](const TempCell& c) { return b.unary(T::Load, c.lv(b, l), l); };
+        const ir::Ref er  = std::get<ir::Type>(module_.pool.get(s.aty)).element;
+
+        const ir::Index src = make_arg_temp(s.aty, b, l);
+        if (queue) {
+            b.queue_delete(src, src, /*has_idx=*/false, s.aty, l);
+            b.queue_copy(src, s.arr, s.aty, l);
+        } else {
+            b.dyn_array_delete(src, s.aty, l);
+            b.dyn_array_copy(src, s.arr, s.aty, l);
+        }
+
+        b.binary(T::Store, s.out.lv(b, l), iconst(s.i64, 0, b, l), l);
+        b.open_region();
+        const ir::Index      pred = b.binary(T::Lt, load(s.out), load(s.n), l);
+        const ir::ExtraSlice cond = b.close_region();
+
+        b.open_region();
+        const ir::Index k    = b.resize(load(s.out), s.i32, l);
+        const ir::Index from = b.unary(T::Load, b.elem_select(s.ord, k, s.oty, l), l);
+        const ir::Index dst  = b.elem_select(s.arr, k, s.aty, l, /*for_write=*/true);
+        const ir::Index elem = b.elem_select(src, from, s.aty, l);
+        if (!s.agg_elem) {
+            b.binary(T::Store, dst, b.unary(T::Load, elem, l), l);
+        } else if (is_trivially_copyable(er)) {
+            b.agg_copy(dst, elem, er, l);
+        } else {
+            emit_agg_copy(dst, elem, er, T::Store, b, l);
+        }
+        const ir::ExtraSlice body = b.close_region();
+
+        b.open_region();
+        b.binary(T::Store, s.out.lv(b, l), b.binary(T::Add, load(s.out), iconst(s.i64, 1, b, l), l), l);
+        const ir::ExtraSlice inc = b.close_region();
+        b.loop(cond, pred, body, inc, /*bottom_test*/ false, l);
+
+        if (queue) {
+            b.queue_delete(src, src, /*has_idx=*/false, s.aty, l);
+        } else {
+            b.dyn_array_delete(src, s.aty, l);
+        }
+    }
+
+    // sort() / rsort() whose ordering key the runtime's flat value comparator
+    // cannot produce (sort_uses_iter_path). Lowered as IR rather than a runtime
+    // helper, for the reason the locator family already is
+    // (docs/design/array-methods.md): the key is arbitrary IR, so the ordinary
+    // expression path makes a string, a wide integral, a real, an enum, a struct
+    // field and a concatenation all work with no C comparator and no per-type
+    // descriptor.
+    //
+    // It also removes a hazard rather than managing one. A runtime comparator
+    // calling back into generated code would hold a raw pointer into the element
+    // buffer across USER CODE that can allocate and can restructure the very
+    // container being sorted. Here the runtime is never inside the sort: every
+    // element access goes through elem_select, which re-resolves from the handle,
+    // so a key expression that pushes or deletes cannot leave a stale pointer
+    // behind.
+    ir::Index lower_array_sort_iter(std::string_view      name,
+                                    const CallExpression& call,
+                                    ir::Index             arr,
+                                    ir::Builder&          b,
+                                    ir::SourceLoc         l) {
+        using T                          = ir::Inst::Tag;
+        const Expression& recv           = *call.arguments()[0];
+        const auto&       sci            = std::get<CallExpression::SystemCallInfo>(call.subroutine);
+        const auto [iter_expr, iter_var] = sci.getIteratorInfo();
+        const bool        queue          = is_queue(recv);
+
+        SortIter s;
+        s.arr       = arr;
+        s.aty       = lower_type(*recv.type);
+        s.i32       = make_int_type(32, false, true);
+        s.i64       = make_int_type(64, false, true);
+        s.bit1      = make_int_type(1, false, false);
+        s.iter_expr = iter_expr;
+        s.iter_var  = iter_var;
+        s.agg_elem  = is_agg_abi_ref(std::get<ir::Type>(module_.pool.get(s.aty)).element);
+        s.desc      = name == "rsort";
+        const slang::ast::Type& kty =
+          iter_expr != nullptr ? *iter_expr->type : *recv.type->getArrayElementType();
+        s.key_real = kty.isFloating();
+
+        ir::Type ot;
+        ot.kind    = ir::Type::Kind::DynArray;
+        ot.element = s.i32;
+        s.oty      = module_.pool.put(ir::Item{ ot });
+
+        s.n     = make_temp_cell(s.i64, "sort_n");
+        s.w     = make_temp_cell(s.i64, "sort_w");
+        s.lo    = make_temp_cell(s.i64, "sort_lo");
+        s.mid   = make_temp_cell(s.i64, "sort_mid");
+        s.hi    = make_temp_cell(s.i64, "sort_hi");
+        s.li    = make_temp_cell(s.i64, "sort_li");
+        s.rj    = make_temp_cell(s.i64, "sort_rj");
+        s.out   = make_temp_cell(s.i64, "sort_out");
+        s.pos_a = make_temp_cell(s.i32, "sort_pos_a");
+        s.pos_b = make_temp_cell(s.i32, "sort_pos_b");
+        s.take  = make_temp_cell(s.bit1, "sort_take");
+        s.key_hold = make_temp_cell(lower_type(kty), "sort_key");
+
+        const ir::Index size = queue ? b.queue_size(arr, s.aty, l) : b.dyn_array_size(arr, s.aty, l);
+        b.binary(T::Store, s.n.lv(b, l), b.resize(size, s.i64, l), l);
+        if (iter_var != nullptr) {
+            declare_storage(iter_var->as<slang::ast::VariableSymbol>(), /*force_frame*/ true);
+        }
+
+        s.ord = make_arg_temp(s.oty, b, l);
+        s.buf = make_arg_temp(s.oty, b, l);
+        iter_stack_.push_back(IterBinding{ .var = iter_var, .index = s.pos_a });
+        emit_sort_body(s, queue, b, l);
+        iter_stack_.pop_back();
+        return arr;
+    }
+
+    // The emitted sort itself, split off for length (TigerStyle). Guarded
+    // by n >= 2: an empty or single-element array is already sorted, and 7.12.2
+    // gives a clause no reason to run when nothing can be compared.
+    void emit_sort_body(const SortIter& s, bool queue, ir::Builder& b, ir::SourceLoc l) {
+        using T         = ir::Inst::Tag;
+        const auto load = [&](const TempCell& c) { return b.unary(T::Load, c.lv(b, l), l); };
+
+        b.open_region();
+        const ir::Index n32 = b.resize(load(s.n), s.i32, l);
+        b.dyn_array_new(s.ord, n32, s.ord, /*has_init*/ false, s.oty, l);
+        b.dyn_array_new(s.buf, n32, s.buf, /*has_init*/ false, s.oty, l);
+
+        // ord = identity. The sort permutes THIS, so the comparison always reads
+        // the array in its original layout and `item.index` stays meaningful.
+        b.binary(T::Store, s.out.lv(b, l), iconst(s.i64, 0, b, l), l);
+        b.open_region();
+        const ir::Index      ipred = b.binary(T::Lt, load(s.out), load(s.n), l);
+        const ir::ExtraSlice icond = b.close_region();
+        b.open_region();
+        const ir::Index k = b.resize(load(s.out), s.i32, l);
+        b.binary(T::Store, b.elem_select(s.ord, k, s.oty, l, /*for_write=*/true), k, l);
+        const ir::ExtraSlice ibody = b.close_region();
+        b.open_region();
+        b.binary(T::Store, s.out.lv(b, l), b.binary(T::Add, load(s.out), iconst(s.i64, 1, b, l), l), l);
+        const ir::ExtraSlice iinc = b.close_region();
+        b.loop(icond, ipred, ibody, iinc, /*bottom_test*/ false, l);
+
+        // Bottom-up merge, run width doubling until it spans the array.
+        b.binary(T::Store, s.w.lv(b, l), iconst(s.i64, 1, b, l), l);
+        b.open_region();
+        const ir::Index      wpred = b.binary(T::Lt, load(s.w), load(s.n), l);
+        const ir::ExtraSlice wcond = b.close_region();
+        b.open_region();
+        emit_merge_pass(s, b, l);
+        const ir::ExtraSlice wbody = b.close_region();
+        b.open_region();
+        b.binary(T::Store, s.w.lv(b, l), b.binary(T::Add, load(s.w), load(s.w), l), l);
+        const ir::ExtraSlice winc = b.close_region();
+        b.loop(wcond, wpred, wbody, winc, /*bottom_test*/ false, l);
+
+        emit_sort_permute(s, queue, b, l);
+        b.dyn_array_delete(s.ord, s.oty, l);
+        b.dyn_array_delete(s.buf, s.oty, l);
+        const ir::ExtraSlice sort_r = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice skip_r = b.close_region();
+        b.cond(b.binary(T::Ge, load(s.n), iconst(s.i64, 2, b, l), l), sort_r, skip_r, l);
     }
 
     // The LRM 7.12.1 array locator methods. All ten return a queue: of elements,
@@ -21474,6 +21871,9 @@ private:
         }
         if (name == "sort" || name == "rsort") {
             guard_ordering_sort(name, call);
+            if (sort_uses_iter_path(call)) {
+                return lower_array_sort_iter(name, call, q, b, l);
+            }
             return b.queue_sort(q, name == "rsort", qty, l);
         }
         if (name == "shuffle") {
@@ -21482,8 +21882,8 @@ private:
         if (is_locator_method(name) || is_reduction_method(name)) {
             return lower_array_iter_method(name, call, q, b, l);
         }
-        // TODO: `map` (LRM 7.12.5), the sort/rsort `with` clause (7.12.2), and
-        // 4-state / wide sort.
+        // TODO: `map` (LRM 7.12.5). 4-state sort stays refused on purpose, not
+        // deferred: 7.12.2 leaves x/z placement undefined (guard_ordering_sort).
         fail("queue method '" + std::string(name) + "' is not supported");
     }
 

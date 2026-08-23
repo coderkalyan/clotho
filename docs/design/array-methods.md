@@ -27,11 +27,14 @@ ring's logical order).
 
 - **reverse / shuffle** are element-agnostic (whole-slot move), so they support
   any element type.
-- **sort / rsort** are value-keyed. The backend derives the comparator
-  descriptor `{kind: unsigned|signed|real, width}` from the element value type;
-  `rsort` sorts ascending then reverses (ties are unobservable — a scalar
-  element equals its own key). Restricted to a **2-state integral (width ≤ 64)
-  or real** element.
+- **sort / rsort** split by whether the element is its own key. A **2-state
+  integral (width ≤ 64) or real** element takes the runtime path: the backend
+  derives the comparator descriptor `{kind: unsigned|signed|real, width}` from the
+  element value type, and `rsort` sorts ascending then reverses. Both shortcuts
+  are sound only because the element IS the key there — equal keys mean
+  byte-equal elements, so tie order is unobservable and reversing a tie group
+  changes nothing. A `with` clause, a **string** element or an element **wider
+  than 64 bits** goes through the IR permutation sort instead (see below).
 - **shuffle** is Fisher-Yates driven by the calling thread's RNG (xoshiro256++,
   LRM 18.13). The runtime replicates the backend's inlined `emit_xoshiro_next`
   byte-for-byte, so a shuffle leaves the `$urandom` stream consistent. A
@@ -119,13 +122,43 @@ min/max, `unique` keeps the first of each duplicate group in array order.
 
 ## Remaining work
 
-### 1. `with` clause on sort / rsort
+### 1. `with` clause on sort / rsort — landed
 
-`a.sort with (item.field)` sorts by the mapped key instead of the element value.
-Guarded loud today. The iterator loop above can compute the key per element; what
-is missing is the sort itself — precompute a key buffer, sort a permutation by it
-in the runtime, gather. That is a new `rt_*_sort_by_key` entry point, which is why
-it did not land with the locators.
+`a.sort with (item.field)` sorts by the mapped key. Lowered by
+`lower_array_sort_iter` as a **stable bottom-up merge sort over an index
+permutation**, with one gather applying the permutation at the end — the
+O(n log n) moves are on 32-bit indices and exactly n elements are copied. The
+same entry point carries a bare `sort` of a **string** or **wide** element, since
+7.12.2's bare form is `with (item)`: a string-element sort needs no new
+`slot_less` case, and no multi-word runtime compare was written.
+
+Why IR rather than a runtime comparator taking a generated `less` thunk: the key
+expression can read enclosing frame locals, `this` and the call-ABI RNG pointer,
+and clotho has no closure mechanism to hand a standalone thunk any of them
+(`rt_elem_ops`, the nearest precedent, carries only layout data — no function
+pointers). Going through the ordinary expression path is also what makes every
+key type work with no per-type descriptor, exactly as for the locators.
+
+Three semantics this fixes, none of which the clause states:
+
+- **The key is evaluated per comparison**, not precomputed into a buffer. A
+  side-effecting clause therefore observes two calls per comparison; a test pins
+  the count. Precomputing was the alternative — fewer evaluations, but O(n) key
+  storage and a divergence from `unique`'s re-evaluating dedup scan.
+- **Ordering is stable**, because a clause makes ties observable: two different
+  elements can share a key. `rsort` orders descending directly rather than
+  ascending-then-reverse, which would reverse each tie GROUP.
+- **A clause that mutates the receiver is bounded**: the element count is
+  snapshotted at entry (the `foreach` rule), so the sort orders the elements that
+  were there and pushed ones stay past them. Nothing dangles — no raw pointer is
+  held across the clause, since every access re-resolves through `elem_select`.
+
+On the GC: a container payload is `malloc`'d rather than GC-heap (`Gc.h:333`), so
+no collector relocates it; allocation only sets `mutator->request`
+(`Gc.cpp:1855`) and the sole poll site in emitted code is the drain loop's
+quiescent edge (`LlvmBackend.cpp:11850`). A 400-element sort whose key allocates a
+string per evaluation reports one collection under `--gc-stress`, none of it
+inside the sort.
 
 ### 2. Fixed-size unpacked-array and associative-array receivers
 
@@ -143,38 +176,38 @@ follow `first()`/`last()`). Both fail loudly today.
 
 ### 3. 4-state `sort` / `rsort` ordering — deferred, LRM-unspecified
 
-Guarded loud (4-state element → fail). Deferred deliberately: **LRM 7.12.2
-leaves x/z placement in `sort` unspecified.** Any order Clotho picked would
-become a de-facto commitment that later code depends on, so the guard stays
-until there is a reason to prefer one — a loud refusal is recoverable, a
-silently wrong order is not.
+Guarded loud (4-state element OR 4-state `with` key → fail), and the message says
+why rather than naming a width limit. Deferred deliberately: **LRM 7.12.2 leaves
+x/z placement in `sort` unspecified.** A 4-state `<` yields x rather than a total
+order, so any order Clotho picked would become a de-facto commitment that later
+code depends on — a loud refusal is recoverable, a silently wrong order is not.
+
+Note this is now the ONLY element restriction on ordering, and it is a semantic
+one, not a comparator one: the IR path could compare 4-state values today. What is
+missing is a defined answer, not a mechanism.
 
 If revisited, an **unsigned** total order is implementable:
 - 4-state slot = `{ i(2W) must|may, iW z }`, invariant must ⇒ may, Z encoded as
   must=0 / may=1 / z=1 (see the LlvmBackend header comment).
 - `has_unknown = (may & ~must) != 0` (any X or Z bit).
 - Comparator: `has_unknown` primary (unknown sorts first), then a per-bit rank
-  key with rank `z=0, x=1, 0=2, 1=3` compared MSB-first. The rank key is a base-4
-  number (2 bits per element bit), so it fits a `u64` for **width ≤ 32**; wider
-  needs a multi-word key.
-- The runtime comparator needs the z-plane byte offset within the slot (`z_off`)
-  passed from the backend's struct layout, since the runtime is otherwise
-  element-layout-agnostic.
+  key with rank `z=0, x=1, 0=2, 1=3` compared MSB-first.
 
 Signed 4-state ordering stays unresolved pending an LRM clarification.
 
-### 4. Wide (> 64-bit) `sort` / `rsort`
+### 4. Wide (> 64-bit) `sort` / `rsort` — landed
 
-Guarded loud. The value comparator loads the low ≤ 8 bytes of the slot; a wider
-element needs a multi-word compare (and, for 4-state, the multi-word rank key
-above). Low priority — wide dynamic-array / queue elements are rare. Note that the
-locator and reduction families have no such restriction: they compare and fold in
-IR, not in the runtime.
+Not by teaching the runtime comparator a multi-word compare, but by routing a wide
+element through the IR permutation sort above (7.12.2's bare form is
+`with (item)`, so it needs nothing else). `slot_less` still loads one word and is
+still only reached by elements that fit it. Signed and unsigned both work — the
+key's own type carries the signedness, so the emitted `Lt` / `Gt` picks the
+arithmetic, which is the same reason the locator family never needed a descriptor.
 
 ## Priority
 
-`with` sort (1) is the only remaining gap a common testbench hits, and it is now
-one runtime entry point away. The receiver gaps (2) are next, fixed-size first
-since its loop is the one already written. 4-state sort (3) and wide sort (4) are
-independent, lower value, and can stay guarded indefinitely without silent
+The receiver gaps (2) are the remaining scope, fixed-size first since its loop is
+the one already written — and it is what the clause's `struct {...} c [512]`
+example actually needs, so the two struct-key examples are pinned on a queue
+receiver instead. 4-state sort (3) can stay guarded indefinitely without silent
 miscompiles.

@@ -1624,8 +1624,21 @@ bool slot_less(const uint8_t* a, const uint8_t* b, uint64_t stride, uint32_t kin
 }
 
 // Sort `n` contiguous slots ascending; `rev` then flips to descending (rsort).
-// A scalar element equals its own sort key, so ties are unobservable and an
-// unstable sort suffices (LRM 7.12.2 does not require stability).
+//
+// This is the flat-value path only: the caller reached it because the element IS
+// the sort key (no `with` clause, and a 2-state integral of width <= 64 or a
+// real). Two invariants follow from that and hold ONLY here:
+//
+//   * Ties are unobservable -- equal keys mean byte-equal elements -- so an
+//     unstable std::sort suffices (LRM 7.12.2 does not require stability).
+//   * Ascending-then-reverse IS a descending sort, because reversing a tie group
+//     of indistinguishable elements changes nothing.
+//
+// A `with` clause breaks both: two DIFFERENT elements can share a key, so tie
+// order becomes observable and reversing an ascending sort would reverse each tie
+// group. That form is therefore not lowered here at all -- it is a stable merge
+// sort emitted as IR, which orders descending directly (lower_array_sort_iter,
+// src/Lower.cpp).
 void sort_run(uint8_t* data, uint64_t n, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev) {
     if (n < 2) {
         return;

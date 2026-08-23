@@ -1433,11 +1433,14 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `reverse` / `shuffle` are element-agnostic; `sort` / `rsort` are value-keyed,
   restricted to a 2-state integral (width <= 64) or real element. `shuffle` draws
   from the calling thread's RNG (which forces its process to a coroutine, and
-  reaches a subroutine body through the call ABI). Guarded loud: `sort` / `rsort`
-  `with` iterator clause; wide (> 64-bit) elements; and 4-state `sort` ordering —
-  deferred deliberately because the LRM (7.12.2) leaves x/z placement
-  unspecified: a 4-state `<` yields x rather than a total order, so any ordering
-  would be an invented one, and guarding loud beats silently picking.
+  reaches a subroutine body through the call ABI). This is the FLAT-VALUE path
+  only — the element is its own key, which is what makes an unstable `std::sort`
+  and an ascending-then-reverse `rsort` correct here. A `with` clause, a string
+  element and a wide element go through the IR permutation sort instead (next
+  entry but one). Still guarded loud: 4-state `sort` ordering, deferred
+  deliberately because the LRM (7.12.2) leaves x/z placement unspecified: a
+  4-state `<` yields x rather than a total order, so any ordering would be an
+  invented one, and guarding loud beats silently picking.
 - [x] **Array locator + reduction methods** (LRM 7.12.1 / 7.12.3) and the `with`
   iterator clause (7.12 / 7.12.4) — `find` / `find_index` / `find_first` /
   `find_first_index` / `find_last` / `find_last_index` / `min` / `max` /
@@ -1458,11 +1461,82 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   former needs declared-range index mapping, the latter key traversal), and an
   aggregate element with NO `with` clause — the bare form makes the element itself
   the key (7.12.1), and an unpacked aggregate has no ordering or fold.
-- [ ] **`with` clause on `sort` / `rsort`** (LRM 7.12.2) — needs a key-buffer
-  permutation sort in the runtime; the iterator infra it shares with the locator
-  methods now exists. Plus 4-state `sort` ordering (deferred: the LRM leaves x/z
-  placement unspecified) and wide-element `sort`. Full scope in
-  `docs/design/array-methods.md`.
+- [x] **`with` clause on `sort` / `rsort`** (LRM 7.12.2) — and, from the same
+  mechanism, `sort` of a **string** and a **wide (> 64-bit)** element. The
+  motivating shape is Accellera UVM `uvm_phase_hopper.svh:763`,
+  `succ_q.sort with ( item.get_full_name() )`: a queue of class handles ordered by
+  a string a method call returns, so the key is neither the element nor a field of
+  it. The renameable iterator the prototype allows
+  (`function void ordering_method ( array_type iterator = item )`) works, which is
+  what the clause's own second example needs: `c.sort( x ) with ( {x.blue, x.green} )`.
+  Keys: integral of any width, real, string, enum (integral, so it orders by base
+  value) — the types 7.12.2's "the relational operators shall be defined for the
+  type of the expression" admits. Anything else is refused by name.
+  * **Lowered as IR, not a runtime comparator with a callback.** A keyed sort is a
+    stable bottom-up merge sort over an index permutation emitted by
+    `lower_array_sort_iter`, with one gather applying the permutation at the end —
+    so the O(n log n) moves are on 32-bit indices and exactly n elements are
+    copied. This is the locator family's reasoning (7.12.1) applied to ordering:
+    the key is arbitrary IR, so the ordinary expression path makes string, wide,
+    real, enum, struct-field and concatenation keys work with no C comparator and
+    no `{kind, width}` element descriptor. The considered alternative was a
+    generated `less` thunk handed to the runtime as a function pointer; it was
+    rejected because the key expression can read enclosing frame locals, `this`
+    and the call-ABI RNG pointer, none of which a standalone thunk can reach —
+    clotho has no closure mechanism, and `rt_elem_ops` (which the idea was
+    modelled on) carries no function pointers at all, only layout data.
+  * **The key is evaluated per COMPARISON, not precomputed.** 7.12.2 fixes no
+    evaluation count, so a side-effecting clause observes two calls per
+    comparison; a test pins the count so switching to precomputed keys later is a
+    deliberate, visible change. Precomputing n keys into a buffer was the
+    alternative: fewer evaluations, but O(n) key storage, a second heap container
+    for a string key, and a divergence from `unique`'s dedup scan, which likewise
+    re-evaluates rather than caching.
+  * **Ordering is stable, because a `with` clause makes ties observable.** With no
+    clause the element IS the key, so equal keys mean byte-equal elements and tie
+    order cannot be seen — which is why the flat path's `std::sort` was always
+    fine. A clause breaks that: two DIFFERENT elements can share a key. The
+    trap this creates is `rsort`: the flat path implements it as ascending then
+    `reverse_run`, and that is NOT a descending sort once ties are observable,
+    because it reverses each tie GROUP too. The keyed path therefore orders
+    descending directly (compare with the operands swapped) and keeps equal keys
+    in original order; a test asserts stability for both directions, the `rsort`
+    one specifically to catch a reintroduced ascending-then-reverse.
+  * **The GC-during-callback hazard does not exist on this design, and would not
+    have bitten even on the other one.** Three independent facts: a container's
+    payload is `malloc`'d, not GC-heap memory (`Gc.h:333`), so no collector — even
+    a future evacuating one — relocates it; allocation never collects inline, the
+    slow path only sets `mutator->request` (`Gc.cpp:1855`, `:3011`); and emitted
+    code has exactly ONE poll site, the drain loop's quiescent edge after
+    `rt_wheel_advance` ("THE safepoint", `LlvmBackend.cpp:11850`), which a sort
+    running inside a process body is by construction not at. Measured, not
+    assumed: a 400-element sort whose key allocates a fresh string per evaluation
+    reports `gc: 1 collections` under `--gc-stress`, i.e. none during the sort.
+    On this design the question is moot anyway — the runtime is never inside the
+    sort, and every element access re-resolves through `elem_select`.
+  * **A key expression that MUTATES the receiver is defined, not refused.** 7.12.2
+    is silent. The element count is snapshotted at entry, the same rule `foreach`
+    uses for its bound, so the sort orders exactly the elements that were there
+    and anything the clause pushes stays past them; nothing dangles because no raw
+    pointer is held across the clause. Refusing would have needed an epoch check
+    per comparison to catch a case that cannot corrupt anything.
+  * The plain scalar path is untouched: a bare `sort` / `rsort` on a 2-state
+    integral of width <= 64 or a real still emits `queue_sort` / `dyn_array_sort`
+    and reaches `std::sort` with no call into generated code (verified on
+    `--emit ir`: those four calls, zero merge-sort loops; the keyed and string and
+    wide cases emit the loops and zero runtime sort calls).
+  * Fixed en route: a string key, or any key that lowers to a PLACE inside the
+    iterator variable rather than a value (a member select of an aggregate
+    element), compared the left element against itself and reported every pair a
+    tie — binding the iterator for the second key overwrote the storage the first
+    key was still aiming at. The right key is now stored into a cell of the key
+    type before the left is evaluated, which is why `min`/`max` and `unique` hold
+    their keys in cells too.
+  Still refused, deliberately: a **4-state** element or key. A 4-state `<` yields
+  x rather than a total order, so 7.12.2's "ascending" has no defined position for
+  an unknown; the message says that rather than naming a width limit. Oracles:
+  verilator 5.050 supports every form here; iverilog cannot even parse `s.sort()`
+  on a string array, let alone a `with` clause.
 - [ ] **`map`** (LRM 7.12.5, 1800-2023 only) — the one array manipulation method
   slang binds that clotho does not lower, so `q.map(x) with (x * 2)` hits the
   container-method guard (`--std 1800-2023`; older versions reject it in the
