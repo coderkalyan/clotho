@@ -2781,6 +2781,60 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   (`--gc-stress`, `--gc-stats`, `--gc-nursery`, `--gc-heap-max`,
   `--gc-full-every`); docs/design/garbage-collection.md 12a records why.
 
+- [x] **Wide accesses through a collected object claimed 16-byte alignment the
+  heap never provides** — the easyUVM run SIGSEGV'd inside generated code before
+  UVM's first line of output, with no diagnostic. gdb at the fault:
+  `vmovdqa 0x160(%rax),%xmm0` with rax ≡ 8 (mod 16) — an ALIGNED 16-byte vector
+  load off a class handle. The two halves of the lie: a collected object's handle
+  sits RT_GC_HEADER_BYTES=8 past a 16-aligned cell (Gc.h:54-59), so every object
+  body is 8 mod 16 permanently; and IRBuilder's default load/store claim is the
+  value type's ABI alignment — 16 for the i128-and-wider plane of a 4-state
+  33..64-bit (`time`, `logic [63:0]`) or any >=128-bit slot — and the
+  aggregate-copy memcpys (emit_agg_storage_copy / emit_agg_deep_copy) claim the
+  aggregate's ABI alignment the same way. x86-64 lowers a wide equality compare
+  of such loads to movdqa+pxor+ptest, and movdqa #GPs on the honest address. The
+  defect predates the collector's unconditional landing only in the sense that
+  rt_alloc's 64-byte alignment used to make the claim accidentally true; the
+  class-property wait machinery's full-plane change-notifier compare (the
+  waited-on-property entries above) is what first loaded a whole >=128-bit plane
+  off a GC object and tripped it — in UVM, `uvm_coreservice_t::get()` →
+  `uvm_init` → uvm_root construction, hence "before the banner". DPI was
+  separated explicitly: the crash reproduced with the DPI import stubbed out and
+  no `--dpi-lib`. Fix: `clamp_unproven_align` (LlvmBackend.cpp, run per module in
+  build_modules_unoptimized before verification) clamps every load/store and
+  mem-intrinsic alignment claim that `getKnownAlignment` cannot re-derive from
+  the pointer down to 8, the floor every storage base and slot layout does
+  guarantee (GC handle 8, malloc >= 16, rt_alloc 64; i64-and-wider leaves sit at
+  8-aligned offsets). A provable claim keeps its strength — an alloca, the
+  align-64 state global's fields — and the pipeline only re-raises what it can
+  re-prove, so tier-0 signal traffic is unchanged where it was ever legal.
+  Sibling audit: every load/store in every emitted module is covered by
+  construction; the explicit mem-intrinsic claims were audited one by one — the
+  three ABI-align aggregate memcpys (clamped), the rt_alloc'd process-object
+  memset's MaybeAlign(64) (true but unprovable, now clamped, cost-free), the GC
+  fast path's MaybeAlign(8) and the MaybeAlign(1)s (already honest). No atomic
+  ops are emitted. Cost of an unprovable-but-true 16 (a malloc'd container
+  payload): the unaligned vector encoding, penalty-free on aligned data on this
+  microarchitecture. Three regression tests in tests/class_test.cpp assert
+  values, not survival: the waited-on `logic [63:0]` property (the UVM shape),
+  the `bit [127:0]` cross-object compare, and the wide-leaf struct property copy
+  (the memcpy shape). With the fix the easyUVM invocation boots UVM, prints the
+  1800.2-2020 banner and the report summary, and exits 0.
+
+- [ ] **Static initializers of unreferenced parameterized-class specializations**
+  (LRM 8.19 / 6.21) — a static property initializer must run before time zero
+  whether or not anything references the property. Clotho lowers a
+  specialization's statics only when the specialization is otherwise reachable,
+  so `uvm_component_registry#(simple_test)::me = get()` — the registration
+  pattern behind every `uvm_component_utils` — never runs, the emitted design
+  contains no `uvm_component_registry` body at all, and the factory stays empty.
+  Observable consequence, now that the alignment fix above lets UVM boot: the
+  easyUVM run reaches `UVM_WARNING [BDTYP] Cannot create a component of type
+  'simple_test'` then `UVM_FATAL [INVTST]` at time 0. This is the next wall
+  between clotho and a passing UVM test. It cannot wear a loud guard without
+  refusing all of UVM, so it is the documented exception to the guard rule until
+  it lands: the failure mode is UVM's own located fatal, not silence.
+
 - [x] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
   landed. Every class carries a descriptor pointer at object-body field 0
   (`class_body_ty`); each class registers a per-concrete-type dispatch

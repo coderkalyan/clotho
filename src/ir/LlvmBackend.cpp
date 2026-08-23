@@ -27,6 +27,7 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
@@ -36,6 +37,7 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/Local.h>
 
 #include "ir/Analysis.h"
 #include "ir/InternPool.h"
@@ -28755,6 +28757,71 @@ void report_backend_error(const BackendError& e, const LocResolver& resolve) {
     llvm::errs() << "error: " << e.message << " [" << code << "]\n";
 }
 
+// Clamp every access-alignment CLAIM the pointer cannot prove down to the 8
+// bytes the data model does guarantee.
+//
+// IRBuilder's default load/store claim is the value type's ABI alignment -- 16
+// for the i128-and-wider plane of a 4-state 33..64-bit (or any >=128-bit) slot
+// -- and the aggregate-copy memcpys claim the aggregate's ABI alignment the
+// same way. On x86-64 a claim of 16 makes codegen select the ALIGNED vector
+// move (vmovdqa, #GP on a misaligned address; the wide-compare PTEST lowering
+// is where it first bit). The claim is a lie through a class handle: a
+// collected object's handle sits RT_GC_HEADER_BYTES past a 16-aligned cell
+// (Gc.h:54-59), so it is 8 mod 16 permanently, and a field the DataLayout
+// placed at a 16-aligned offset lands on an 8-mod-16 address.
+//
+// The proof rule: a claim getKnownAlignment can re-derive from the pointer is
+// kept -- an alloca (its own align), a global plus constant offset (the
+// align-64 state global's fields), an argument or call carrying an align
+// attribute. Everything else -- a GC object body (never 16-aligned, by
+// construction), a malloc'd container payload, a ref formal -- is clamped to
+// 8, the floor every storage base and every slot layout does guarantee (GC
+// handle 8, malloc >= 16, rt_alloc 64; i64-and-wider leaves sit at 8-aligned
+// offsets). The later pipeline only re-raises an alignment it can re-prove the
+// same way, so the clamp survives instcombine. Cost: an unprovable-but-true 16
+// (a malloc'd payload) loses the aligned-vector encoding; on this
+// microarchitecture the unaligned encodings are penalty-free on aligned data.
+void clamp_unproven_align(llvm::Module& m) {
+    const llvm::DataLayout& dl = m.getDataLayout();
+    const llvm::Align       floor{ 8 };
+    const auto              proven = [&](llvm::Value* ptr, llvm::Instruction* at,
+                            llvm::Align claimed) {
+        return llvm::getKnownAlignment(ptr, dl, at) >= claimed;
+    };
+    for (llvm::Function& f : m) {
+        for (llvm::BasicBlock& bb : f) {
+            for (llvm::Instruction& inst : bb) {
+                if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+                    if (ld->getAlign() > floor &&
+                        !proven(ld->getPointerOperand(), ld, ld->getAlign())) {
+                        ld->setAlignment(floor);
+                    }
+                } else if (auto* st = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+                    if (st->getAlign() > floor &&
+                        !proven(st->getPointerOperand(), st, st->getAlign())) {
+                        st->setAlignment(floor);
+                    }
+                } else if (auto* mi = llvm::dyn_cast<llvm::MemIntrinsic>(&inst)) {
+                    // The aggregate-copy memcpys (emit_agg_storage_copy /
+                    // emit_agg_deep_copy) claim the aggregate's ABI alignment on
+                    // both ends; codegen expands a small constant-size memcpy
+                    // inline with the same aligned vector moves.
+                    const llvm::MaybeAlign dst = mi->getDestAlign();
+                    if (dst && *dst > floor && !proven(mi->getRawDest(), mi, *dst)) {
+                        mi->setDestAlignment(floor);
+                    }
+                    if (auto* mt = llvm::dyn_cast<llvm::MemTransferInst>(mi)) {
+                        const llvm::MaybeAlign src = mt->getSourceAlign();
+                        if (src && *src > floor && !proven(mt->getRawSource(), mt, *src)) {
+                            mt->setSourceAlignment(floor);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 // Lower the coroutine intrinsics emitted for each process and clean up the
@@ -28840,6 +28907,12 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
         return {};
     }
     built.modules.insert(built.modules.begin(), std::move(root));
+
+    // Correct the over-claimed access alignments before anything downstream
+    // (verification, the coro pipeline, codegen) can act on them.
+    for (const auto& mod : built.modules) {
+        clamp_unproven_align(*mod);
+    }
 
     // Verify every freshly-built (pre-split) module. Coro intrinsics are still
     // intact — the caller decides whether/how to run optimize_module (build_modules

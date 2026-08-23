@@ -2957,3 +2957,95 @@ TEST_CASE("an inherited scalar property's notifier keeps the base's field index"
     )");
     CHECK(f == std::vector<std::string>{ "h", "$chg.h", "pad", "extra" });
 }
+
+// -- Wide properties on collected objects (alignment regression) ---------------
+//
+// A collected object's handle sits RT_GC_HEADER_BYTES past a 16-aligned cell
+// (Gc.h:54-59), so it is 8 mod 16 -- while IRBuilder's default load/store claim
+// is the value type's ABI alignment, 16 for the i128 plane of a 33..64-bit
+// 4-state (or any >=128-bit) slot. x86-64 lowers a wide equality compare of such
+// loads to an ALIGNED vector move (vmovdqa, #GP on a misaligned address), so the
+// over-claim was a silent SIGSEGV, first hit by UVM's waited-on wide properties.
+// clamp_unproven_align (LlvmBackend.cpp) now clamps every claim the pointer
+// cannot prove. Both cases assert the VALUE, not just survival.
+
+// The UVM shape: a store to a waited-on `logic [63:0]` property emits the
+// change-notifier's full-plane old/new compare (i128 loads off the handle).
+TEST_CASE("waiting on a 64-bit 4-state property of a collected object") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                logic [63:0] x;
+            endclass
+            C c;
+            initial begin
+                c = new();
+                c.x = 64'h1;
+                #1 c.x = 64'h123;
+            end
+            initial begin
+                #0;
+                wait (c.x == 64'h123);
+                $display("got %0h", c.x);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "got 123\n");
+}
+
+// The 2-state sibling: comparing bit[127:0] properties of two objects loads each
+// i128 slot whole. The assignment and the compare sit in different processes so
+// no store-forwarding folds the compare away.
+TEST_CASE("comparing 128-bit 2-state properties of two collected objects") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                bit [127:0] y;
+            endclass
+            C a;
+            C b;
+            initial begin
+                a = new();
+                b = new();
+                a.y = 128'hdead_beef_0000_0001;
+                b.y = 128'hdead_beef_0000_0001;
+            end
+            initial begin
+                #1;
+                if (a.y == b.y) $display("EQ");
+                else $display("NE");
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "EQ\n");
+}
+
+// The memcpy sibling: assigning an unpacked struct with an i128 leaf between
+// class properties is one memcpy claiming the aggregate's ABI alignment (16) on
+// both ends (emit_agg_storage_copy), which codegen expands inline with the same
+// aligned vector moves -- so the intrinsic claims are clamped like the direct
+// loads.
+TEST_CASE("copying a wide-leaf struct property between collected objects") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { logic [63:0] v; int tag; } rec_t;
+            class C;
+                rec_t r;
+            endclass
+            C a;
+            C b;
+            initial begin
+                a = new();
+                b = new();
+                a.r.v = 64'hfeed_0000_0000_0007;
+                a.r.tag = 7;
+            end
+            initial begin
+                #1;
+                b.r = a.r;
+                $display("%0h %0d", b.r.v, b.r.tag);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "feed000000000007 7\n");
+}
