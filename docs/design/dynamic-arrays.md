@@ -15,7 +15,12 @@ Associative arrays
 (index read/write, num/size/exists/delete(k)/delete/first/last/next/prev,
 ascending-key foreach, deep-copy assign, `'{key:value, default:v}` literals
 (7.9.11), in/out/inout/ref args) with an integral/real value element — see §4a for
-the key model. `$size` lowers to `.size()` (LRM 20.7). Neither iverilog nor
+the key model. Array query functions (LRM 20.7 — `$size` / `$dimensions` /
+`$unpacked_dimensions` / `$left` / `$right` / `$low` / `$high` / `$increment`)
+const-fold for a fixed-size operand and, for a dynamic array / queue / an
+integral-keyed associative array, take a runtime path built on `.size()` /
+`assoc_num` / `assoc_traverse`; see the array-query ledger entry in
+docs/TODO.md for the per-function breakdown. Neither iverilog nor
 verilator can serve as a reference for assoc — iverilog cannot parse an
 associative-array declaration, and verilator violates the read-no-create rule —
 so the behaviour is pinned against LRM 7.8/7.9 by

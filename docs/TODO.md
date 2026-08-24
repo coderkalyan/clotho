@@ -2626,7 +2626,35 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   select, read + lvalue, constant + dynamic indices, arbitrary nesting (LRM
   7.4.5/7.4.6). Array query functions `$size` / `$dimensions` /
   `$unpacked_dimensions` / `$left` / `$right` / `$low` / `$high` / `$increment`
-  (LRM 20.7).
+  (LRM 20.7) — const-folds for a fixed-size operand; `$dimensions` /
+  `$unpacked_dimensions` fold even for a dynamically-sized one (pure type
+  walks, slang's `ArrayDimensionFunction::eval` never touches the value). A
+  dynamically-sized operand (dynamic array, queue, or an integral-keyed
+  associative array) takes a runtime path reusing `$size`'s
+  `dyn_array_size`/`queue_size`/`assoc_num` mechanism: `$left`/`$low` = 0 and
+  `$increment` = -1 are 20.7's own UNCONDITIONAL rule for a queue/dynamic-array
+  dimension — never a runtime `$left`-vs-`$right` comparison, and an empty or
+  single-element collection is not special (`$increment` stays -1; verified
+  against slang's `QueryFuncs.cpp` and Verilator 5.050, which corrects an
+  earlier assumption that increment needed computing) — so only `$right`/
+  `$high` (`size - 1`, computed in the signed result type so an empty
+  collection lands on -1 rather than an unsigned wraparound) need a runtime
+  call. An associative array (restricted to an integral index type, 20.7; a
+  non-integral key is refused by slang's own `checkArguments` with
+  `QueryOnAssociativeWildcard` before Clotho ever sees the call) additionally
+  needs `$right` = the index type's all-ones bit pattern (a type constant,
+  matching slang's reference eval — for a signed key type this reads back as
+  -1, not the largest positive value) and `$low`/`$high` = the lowest /
+  highest currently ALLOCATED key (`assoc_traverse` First/Last, `'x` if
+  empty, degrading to 0 for a 2-state key type). `$size` gained an
+  `assoc_num` branch alongside its existing dynamic-array / queue ones for
+  this consistency (`$size` of an associative array was previously refused,
+  same as the other six would have been). Refused loud: a dimension argument
+  that is not the constant 1 on a dynamically-sized operand (LRM 20.7.1
+  defines no other runtime shape — a fixed inner dimension or a
+  nested-dynamic dimension already fold or hard-fail above), and a
+  multidimensional dynamic collection (matches `$size`'s pre-existing
+  boundary).
 - [x] **Dynamic arrays** — `[]`, `new[n]` / `new[n](src)`, `.size()`, `.delete()`,
   element r/w, whole-array deep-copy, `foreach`, full subroutine ABI.
 - [x] **Checked container allocation** — every heap buffer a design's containers

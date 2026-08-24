@@ -1018,3 +1018,88 @@ TEST_CASE("%p of an associative array renders '{key:value} in key order") {
         CHECK(out == "'{n:4, m:'{9:90}}\n'{7:70}\n");
     }
 }
+
+// Array query functions (LRM 20.7) on an associative array are legal only
+// for an INTEGRAL index type ("Use on associative array dimensions is
+// restricted to index types with integral values"); $left = 0, $right = the
+// index type's maximum representable bit pattern (for a SIGNED key type
+// this reads back as -1, not the largest positive value -- slang's own
+// RightFunction::eval builds an all-ones SVInt regardless of sign, and the
+// const-fold path for a compile-time-constant assoc array would answer the
+// same value), $increment = -1: all three unconditional per the clause.
+// $low / $high are the lowest / highest currently ALLOCATED key (not
+// $right's type maximum), 'x if the map is empty -- for a 2-state key type
+// (`int` here) 'x degrades to 0, since a 2-state value cannot hold X (see
+// the 4-state case below). Neither iverilog nor verilator is an oracle for associative
+// arrays (see the file header): pinned directly against LRM 20.7 and
+// slang's reference eval (QueryFuncs.cpp), which Clotho's own const-fold
+// path above already reuses for anything that folds.
+TEST_CASE("array query functions (LRM 20.7): integral-keyed associative array runtime path") {
+    constexpr std::string_view src = R"(
+        module t;
+            int m[int];
+            initial begin
+                m[5] = 1; m[2] = 2; m[100] = 3;
+                $display("m: size=%0d left=%0d right=%0d low=%0d high=%0d inc=%0d dims=%0d",
+                         $size(m), $left(m), $right(m), $low(m), $high(m), $increment(m), $dimensions(m));
+                m.delete();
+                $display("m-empty: size=%0d low=%0d high=%0d", $size(m), $low(m), $high(m));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "m: size=3 left=0 right=-1 low=2 high=100 inc=-1 dims=2\n"
+          "m-empty: size=0 low=0 high=0\n");
+}
+
+TEST_CASE("array query functions (LRM 20.7): a 4-state associative key's empty $low/$high is 'x") {
+    constexpr std::string_view src = R"(
+        module t;
+            integer m[integer];
+            initial begin
+                $display("empty low=%0d high=%0d", $low(m), $high(m));
+                m[7] = 1; m[3] = 2;
+                $display("filled low=%0d high=%0d", $low(m), $high(m));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "empty low=x high=x\nfilled low=3 high=7\n");
+}
+
+// The clause's shared ArrayQueryFunction result type is the index type
+// itself (slang: "If the index is known, the result type is the index
+// type"), not a fixed 32-bit `integer` -- so $right / $increment's 32-bit
+// formula (all-ones / -1) truncates to the key's own width: an unsigned
+// 4-bit key's $right is 4'hF = 15, and -1's bit pattern read as unsigned
+// 4-bit is also 15.
+TEST_CASE("array query functions (LRM 20.7): an unsigned key's $right/$increment truncate to the index type") {
+    constexpr std::string_view src = R"(
+        module t;
+            bit [3:0] u[bit [3:0]];
+            initial begin
+                u[4'd5] = 4'd1; u[4'd2] = 4'd2;
+                $display("u: size=%0d left=%0d right=%0d low=%0d high=%0d inc=%0d",
+                         $size(u), $left(u), $right(u), $low(u), $high(u), $increment(u));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "u: size=2 left=0 right=15 low=2 high=5 inc=15\n");
+}
+
+// LRM 20.7: "Use on associative array dimensions is restricted to index
+// types with integral values" -- a string-keyed (non-integral) assoc array
+// is refused at semantic-check time (slang's QueryOnAssociativeWildcard),
+// before Clotho ever lowers the call.
+TEST_CASE("array query functions (LRM 20.7): a non-integral associative key is refused") {
+    const LowerResult r = lower_text(R"(
+        module t;
+            int m[string];
+            initial begin
+                m["a"] = 1;
+                $display("%0d", $left(m));
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("non-integral") != std::string::npos);
+}
