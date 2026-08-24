@@ -310,6 +310,90 @@ TEST_CASE("array query functions (LRM 20.7): $size/$dimensions/$left/... fold to
           "m2 S4 Sd210 D3 UD2\n");
 }
 
+// $left/$right/$low/$high/$increment (LRM 20.7) do not fold for a runtime
+// dynamic array or queue (slang's own ArrayQueryFunction::getDim always
+// evaluates the operand's value, even for $left / $low / $increment, whose
+// results never actually depend on it), so they reach Clotho's own runtime
+// lowering below, alongside $size's existing path. $left / $low = 0 and
+// $increment = -1 are LRM 20.7's own UNCONDITIONAL rule for a queue or
+// dynamic array dimension -- not a runtime $left-vs-$right comparison, and
+// not special-cased for an empty (or single-element) collection: neither is
+// special, $increment stays -1. Only $right / $high (= size - 1) need the
+// runtime size. Cross-checked against Verilator 5.050 (byte-identical).
+TEST_CASE("array query functions (LRM 20.7): dynamic array / queue runtime path") {
+    constexpr std::string_view src = R"(
+        module t;
+            int d[]; int q[$];
+            function automatic int sum_bounds(int a[]);
+                return $left(a) + $right(a) + $low(a) + $high(a) + $increment(a) + $size(a);
+            endfunction
+            initial begin
+                d = new [5]; q = {1,2,3};
+                $display("d: size=%0d left=%0d right=%0d low=%0d high=%0d inc=%0d dims=%0d ud=%0d",
+                         $size(d), $left(d), $right(d), $low(d), $high(d), $increment(d), $dimensions(d),
+                         $unpacked_dimensions(d));
+                $display("q: size=%0d left=%0d right=%0d low=%0d high=%0d inc=%0d dims=%0d ud=%0d",
+                         $size(q), $left(q), $right(q), $low(q), $high(q), $increment(q), $dimensions(q),
+                         $unpacked_dimensions(q));
+                d = new [0];
+                $display("empty: size=%0d right=%0d high=%0d inc=%0d", $size(d), $right(d), $high(d), $increment(d));
+                d = new [1];
+                $display("one: right=%0d inc=%0d", $right(d), $increment(d));
+                d = new [4];
+                $display("dim1: left=%0d right=%0d", $left(d, 1), $right(d, 1));
+                $display("formal: %0d", sum_bounds(d));
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "d: size=5 left=0 right=4 low=0 high=4 inc=-1 dims=2 ud=1\n"
+          "q: size=3 left=0 right=2 low=0 high=2 inc=-1 dims=2 ud=1\n"
+          "empty: size=0 right=-1 high=-1 inc=-1\n"
+          "one: right=0 inc=-1\n"
+          "dim1: left=0 right=3\n"
+          "formal: 9\n");
+}
+
+// A dimension argument out of range for the operand's total dimension count
+// is a slang FRONTEND diagnostic ("N is not a valid dimension for '...'"),
+// not a runtime 'x, for a dynamically-sized operand exactly as for a fixed
+// one -- verified directly against clotho and unaffected by the runtime
+// path above (checkArguments / checkDim run during binding, before Clotho
+// ever lowers the call). Pinned here so a change to that boundary is caught.
+TEST_CASE("array query functions (LRM 20.7): an out-of-range dimension on a dynamic operand is a compile error") {
+    const LowerResult r = lower_text(R"(
+        module t;
+            int d[];
+            initial begin
+                d = new [4];
+                $display("%0d", $left(d, 3));
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("not a valid dimension") != std::string::npos);
+}
+
+// A dimension argument that is not itself a compile-time constant cannot be
+// resolved by Clotho's runtime lowering either (LRM 20.7.1 only defines the
+// dim-absent/dim=1 and fixed-inner-dimension shapes, both of which fold);
+// refused loudly rather than silently treated as dim 1.
+TEST_CASE("array query functions (LRM 20.7): a non-constant dimension argument on a dynamic operand is refused") {
+    const LowerResult r = lower_text(R"(
+        module t;
+            int d[];
+            initial begin
+                int k;
+                d = new [4];
+                k = 1;
+                $display("%0d", $left(d, k));
+            end
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("non-constant dimension argument") != std::string::npos);
+}
+
 // The `iff` guard (LRM 9.4.2.3) must be honored, not dropped: a posedge with the
 // guard false does not run the body, one with it true does. (This construct was
 // formerly rejected; it is now lowered as `always @(ev) if (cond) body`.)

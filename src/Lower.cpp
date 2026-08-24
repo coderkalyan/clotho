@@ -19724,19 +19724,38 @@ private:
                 return b.resize(
                   b.queue_size(lower_lvalue(arr, b), lower_type(*arr.type), l), lower_type(*call.type), l);
             }
+            if (is_assoc(arr)) {
+                return b.resize(
+                  b.assoc_num(lower_lvalue(arr, b), lower_type(*arr.type), l), lower_type(*call.type), l);
+            }
             // TODO: $size(coll, dim) on a multidimensional dynamic collection.
             fail("$size of this operand is not supported");
         }
 
         // Remaining array query functions (LRM 20.7): $dimensions /
         // $unpacked_dimensions / $left / $right / $low / $high / $increment.
-        // Each is a pure type/bounds query, so slang folds it to a 32-bit
-        // constant for a fixed-size operand (the only kind these reach here for)
-        // — including the optional dimension argument, an out-of-range dimension
-        // (folds to 'x), and arbitrary packed/unpacked nesting. A non-constant
-        // result is only possible for a dynamically-sized operand, which Clotho
-        // does not lower for these queries yet ($size has its own runtime path
-        // above).
+        //
+        // $dimensions / $unpacked_dimensions are pure TYPE walks (slang's
+        // ArrayDimensionFunction::eval never reads the operand's value), so they
+        // constant-fold below regardless of whether the operand is dynamically
+        // sized: confirmed against slang's QueryFuncs.cpp and empirically (a
+        // dynamic array / queue / associative array operand still folds).
+        //
+        // The other five need the operand's runtime state per slang's own eval
+        // (ArrayQueryFunction::getDim always evaluates the operand's value, even
+        // though most of the individual results below do not actually depend on
+        // it), so a non-constant fold reaches here. Per 20.7, for a queue or
+        // dynamic array dimension: $left = $low = 0 and $increment = -1
+        // unconditionally (never a runtime $left-vs-$right comparison — the empty
+        // case is not a special case, it falls out of the $right formula below);
+        // only $right / $high (= size - 1) need the runtime size. Per 20.7's
+        // associative-array paragraph (integral-key only; a non-integral key is
+        // already refused by slang's checkArguments with QueryOnAssociativeWildcard
+        // before Clotho ever sees the call): $left = 0 and $increment = -1
+        // unconditionally, $right is the index type's maximum representable value
+        // (a type constant, not a "currently allocated" query), and only $low /
+        // $high need a runtime key walk (lowest / highest currently allocated key,
+        // 'x if the map is empty).
         if (name == "$dimensions" || name == "$unpacked_dimensions" || name == "$left" || name == "$right" ||
             name == "$low" || name == "$high" || name == "$increment") {
             slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
@@ -19745,6 +19764,96 @@ private:
             if (cv.isInteger()) {
                 return b.constant(svint_to_ref(cv.integer(), lower_type(*call.type)), l);
             }
+
+            // Reachable only for $left/$right/$low/$high/$increment on a
+            // dynamically-sized operand. LRM 20.7.1 makes a non-first dimension
+            // argument into a dynamically-sized dimension a compile error (slang
+            // raises it before Clotho runs), and a fixed inner dimension folds
+            // above regardless of an outer dynamic one -- so the only dimension
+            // shape here is "absent, or the constant 1", selecting the operand's
+            // own dynamic (or associative) dimension.
+            if (call.arguments().size() > 1) {
+                slang::ast::ASTContext       dactx(*scope_, slang::ast::LookupLocation::max);
+                slang::ast::EvalContext      dectx(dactx);
+                const slang::ConstantValue   dim_cv = call.arguments()[1]->eval(dectx);
+                const std::optional<int32_t> dim_ix =
+                  dim_cv.isInteger() ? dim_cv.integer().as<int32_t>() : std::nullopt;
+                if (dim_ix != 1) {
+                    // TODO: a non-constant dimension argument on a dynamically-sized
+                    // operand (LRM 20.7.1). A constant dimension other than 1 here
+                    // would already have folded above (a fixed inner dimension) or
+                    // been a compile error (a nested dynamic dimension), so only a
+                    // genuinely runtime dimension index reaches this refusal.
+                    fail("array query function with a non-constant dimension argument on a "
+                         "dynamically-sized operand is not supported");
+                }
+            }
+
+            const Expression& arr       = *call.arguments()[0];
+            const ir::Ref     result_ty = lower_type(*call.type);
+            if (is_dyn_array(arr) || is_queue(arr)) {
+                if (name == "$left" || name == "$low") {
+                    return b.constant(svint_to_ref(slang::SVInt(32, 0, true), result_ty), l);
+                }
+                if (name == "$increment") {
+                    return b.constant(svint_to_ref(slang::SVInt(32, uint64_t(-1), true), result_ty), l);
+                }
+                // $right / $high: size - 1, computed in the signed RESULT type
+                // (never the unsigned size type), so an empty collection's 0 - 1
+                // lands on -1 per 20.7 rather than an unsigned wraparound.
+                const bool      is_da  = is_dyn_array(arr);
+                const ir::Ref   arr_ty = lower_type(*arr.type);
+                const ir::Index arr_lv = lower_lvalue(arr, b);
+                const ir::Index size = is_da ? b.dyn_array_size(arr_lv, arr_ty, l) : b.queue_size(arr_lv, arr_ty, l);
+                const ir::Index one   = b.constant(svint_to_ref(slang::SVInt(32, 1, true), result_ty), l);
+                return b.binary(ir::Inst::Tag::Sub, b.resize(size, result_ty, l), one, l);
+            }
+            if (is_assoc(arr)) {
+                // A non-integral key would already have failed the semantic check
+                // above (QueryOnAssociativeWildcard) for this no-dimension-argument
+                // shape, so the key here is always integral (LRM 20.7's "restricted
+                // to index types with integral values").
+                if (name == "$left") {
+                    return b.constant(svint_to_ref(slang::SVInt(32, 0, true), result_ty), l);
+                }
+                if (name == "$increment") {
+                    return b.constant(svint_to_ref(slang::SVInt(32, uint64_t(-1), true), result_ty), l);
+                }
+                if (name == "$right") {
+                    // The index type's maximum representable BIT PATTERN (all bits
+                    // set), matching slang's RightFunction::eval exactly -- for a
+                    // SIGNED key type this reads back as -1, not the largest
+                    // positive value. That is 20.7's "highest possible index value"
+                    // as slang's own reference eval defines it, and Clotho's
+                    // const-fold path above already returns that same value for any
+                    // case that folds, so the runtime path here has to match it.
+                    slang::SVInt max_val(call.type->getBitWidth(), 0, call.type->isSigned());
+                    max_val.setAllOnes();
+                    return b.constant(svint_to_ref(max_val, result_ty), l);
+                }
+                // $low / $high: the lowest / highest currently ALLOCATED key, or
+                // 'x if the map is empty (LRM 20.7) -- the same assoc_traverse
+                // First/Last primitive a.first(k)/a.last(k) use (LRM 7.9.4), into a
+                // compiler temp, muxed against 'x when the traversal finds nothing.
+                const ir::Ref    aty  = lower_type(*arr.type);
+                const ir::Index  a_lv = lower_lvalue(arr, b);
+                const TempCell   key  = make_temp_cell(result_ty, "arrq_key");
+                const ir::Ref    bit1 = make_int_type(1, false, false);
+                using Step           = ir::Builder::AssocStep;
+                const ir::Index found = b.resize(
+                  b.assoc_traverse(a_lv, key.lv(b, l), name == "$low" ? Step::First : Step::Last, aty, l), bit1, l);
+                const ir::Layout lay = module_.pool.layout(result_ty);
+                const uint32_t   w   = lay.width == 0 ? 1 : lay.width;
+                const ir::Index  x_const =
+                  lay.domain == ir::Domain::Four
+                    ? b.constant(svint_to_ref(slang::SVInt::createFillX(w, call.type->isSigned()), result_ty), l)
+                    : b.constant(module_.pool.put_int(result_ty, 0), l);
+                const ir::Index key_val = b.unary(ir::Inst::Tag::Load, key.lv(b, l), l);
+                return b.select(found, key_val, x_const, l);
+            }
+
+            // TODO: a multidimensional dynamic collection (matches the $size arm's
+            // boundary above) and a runtime `string` operand.
             fail("array query function on a dynamically-sized operand is not supported");
         }
 
