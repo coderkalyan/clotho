@@ -2983,6 +2983,85 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   edge/event waits on a vif member, and the registry-ordering consequence
   above.
 
+- [x] **A default argument's implicit `this` was the caller's, not the
+  receiver's** (LRM 13.5.3) — the easyUVM run-phase SIGSEGV at time 0, inside
+  JIT code with no diagnostic. gdb at the fault: RIP == RAX pointing INTO
+  STRING DATA (`"  const local uvm_event_pool events = new(\"events\");"` —
+  uvm_transaction.svh source text), reached from `mov (%rax),%rax; mov
+  0x140(%rax),%rax; call *%rax` — a virtual dispatch, vtable slot 40. The
+  receiver's descriptor (matched by its ancestor display `[1,3,38,254,585]`
+  to `clotho.classdesc.2934`) is **packet_in, whose vtable has 39 slots**;
+  slots 39+ read past the global into an adjacent severity-site constant,
+  which is why the "callee" was a pointer into a source-line banner. Slot 40
+  is `get_default_data` in **uvm_event#(uvm_object)'s** 44-slot map
+  (`trigger` is 38). The call is uvm_transaction::m_begin_tr's
+  `begin_event.trigger()`, whose declaration is `virtual function void
+  trigger(T data = get_default_data())`: slang binds an omitted actual as the
+  FORMAL'S OWN default expression (CallExpression::bindArgs), bound in the
+  callee's declaration scope — so the implicit `this` inside it is the CALL's
+  receiver (`begin_event`). Clotho lowered it in the caller's frame:
+  resolve_method_this handed it the enclosing method's `this` (the
+  packet_in), while virtual_slot_of correctly took the slot from the
+  DECLARING class's map — wrong object under the right slot number, and
+  8.20's dispatch loaded garbage. Driver path: record_tr → begin_tr(req) →
+  uvm_component::begin_tr → tr.begin_tr → m_begin_tr, req a packet_in.
+  **The same shape without the vtable overrun is a SILENT WRONG-OBJECT
+  READ**: a non-virtual default (`take(int n = dflt())`, `take(int n =
+  amount)`) called on another object read the CALLER's same-named state; and
+  a defaulted call from module scope (no frame `this` at all) was a compile
+  refusal of legal SV.
+  Fix: `default_arg_this_`, a scoped receiver context exactly like
+  `ctor_this_` (handle + the callee's DECLARING class, the static type
+  `this` has inside the callee's own body). build_call_args detects a
+  default by pointer identity (`actuals[i] ==
+  formals[i]->getDefaultValue()`; a written actual is always a fresh bound
+  expression) and installs the override around lowering exactly that actual;
+  a written actual keeps the enclosing context even when the call itself
+  sits inside another call's default. Consulted, ahead of `ctor_this_` (a
+  default is the innermost context and the object under construction is a
+  different object whenever the receiver was spelled out), by
+  resolve_method_this (bare calls), value_lvalue (bare property reads),
+  implicit_this (randomization spellings), and virtual_recv_class (the
+  vtable-layout selector — receiver handle and slot map describe one object
+  again). Threaded from lower_user_call and lower_task_call
+  (default_arg_recv: the resolved receiver + callee's class; nullopt for a
+  free subroutine or vif receiver, whose scope walk finds no ClassType) and
+  from emit_ctor_call (a defaulted CONSTRUCTOR argument evaluates against
+  the object under construction, typed as the class declaring the ctor — a
+  base ctor's default sees the base). build_function / build_task /
+  declare_static_prop reset it across body boundaries exactly as they do
+  ctor_this_, and for the same reason: the handle is another builder's
+  Index.
+  **Stub verdict: innocent.** The three `run-time fatal stub` warnings
+  (do_bus_access, do_unpack, __m_uvm_execute_field_op) name bodies that are
+  never called on this path: the fault PC is a vtable dispatch in m_begin_tr,
+  not a stub body; no stub fatal ever printed; and post-fix the run executes
+  the full sequencer/driver handshake indefinitely with none reached.
+  Sibling audit (what else reaches the default-arg site): instance-method
+  call in a default (the crash, virtual; and non-virtual — silent
+  wrong-object), bare property READ in a default (value_lvalue arm), task
+  defaults (lower_task_call), constructor defaults (emit_ctor_call, both the
+  explicit-call and the implicit-base-construction fill), module-scope
+  callers (no enclosing `this`; previously refused), and the unchanged
+  same-object bare call (receiver == caller's `this`, where the old code was
+  accidentally right). Built-in class methods (semaphore/mailbox `new`,
+  randomize) have literal defaults and keep their intercepts; a
+  virtual-interface receiver contributes no class context by construction.
+  Covered in tests/class_test.cpp (four cases asserting VALUES, not
+  survival: the receiver's-method default across objects, the
+  vtable-overrun shape — callee's slot absent from the caller's map, the
+  property-read/task/module-scope trio, and the ctor default + same-object
+  call).
+  Outcome: easyUVM no longer SIGSEGVs. The run passes begin_tr, executes the
+  TLM pull handshake (sequencer arbitration, randomize, drive_transfer,
+  monitors collecting — confirmed by perf profile of the live run), and
+  simulates indefinitely: the NEXT wall is that the run phase never ENDS
+  under the zero-objection shortcut (uvm_phase_hopper::execute_phase's
+  ALL-DROPPED branch) — a clockless trivial test exits 0 silently without
+  the report phase, and easyUVM's clock keeps the wheel alive forever at
+  ~7 ns of sim time per wall-clock second. That phase-end wall is a separate
+  root cause (phasing/objection machinery, not call lowering).
+
 - [x] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
   landed. Every class carries a descriptor pointer at object-body field 0
   (`class_body_ty`); each class registers a per-concrete-type dispatch

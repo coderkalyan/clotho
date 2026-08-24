@@ -26528,6 +26528,15 @@ private:
         return std::move(sc.out);
     }
 
+    // An object handle paired with the class type that selects its layout, for
+    // the two scoped implicit-`this` overrides (ctor_this_ / default_arg_this_,
+    // declared with the rest of the state at the bottom of the class). Defined
+    // here, ahead of the member-function signatures that name it.
+    struct CtorThis {
+        ir::Index handle;
+        ir::Ref   cls;
+    };
+
     // Restore a saved piece of Lowerer state when the scope exits — on the throwing
     // path too. A lowering failure is an exception that `recover` catches per member
     // and then keeps going, so a restore written after a call that can fail is
@@ -26654,6 +26663,7 @@ private:
             // frame / object happened to be mid-lowering.
             const Restore<FnCtx*>                  no_frame(fn_ctx_, nullptr);
             const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
+            const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
             if (is_aggregate(prop.getType()) || is_unpacked_container(prop.getType())) {
                 // The shared slot is ordinary aggregate signal storage (register_signal
                 // with the lowered type, exactly like a module-level variable), so an
@@ -26739,6 +26749,17 @@ private:
         if (const auto* prop = vs.as_if<slang::ast::ClassPropertySymbol>()) {
             if (prop->lifetime == slang::ast::VariableLifetime::Static) {
                 return b.signal(declare_static_prop(*prop), l);
+            }
+        }
+        if (default_arg_this_) {
+            if (const auto* prop = vs.as_if<slang::ast::ClassPropertySymbol>()) {
+                // A bare property reference inside a DEFAULT argument expression
+                // (LRM 13.5.3): the default was bound in the callee's declaration
+                // scope, so the property belongs to the CALL's receiver. Ahead of
+                // both the ctor and the frame paths, which name different objects
+                // whenever the receiver was spelled out. Same precedence, and the
+                // same reason, as resolve_method_this.
+                return class_member_lvalue(default_arg_this_->handle, *prop, default_arg_this_->cls, b, l);
             }
         }
         if (ctor_this_) {
@@ -27554,12 +27575,14 @@ private:
         ctx.name_prefix = std::string(sub.name) + ".";
         ctx.is_task     = true;
         ctx.sym         = &sub;
-        // A body may be lowered lazily from inside a property initializer, where
-        // `ctor_this_` names the object under construction as an ir::Index of the
-        // CONSTRUCTOR's builder. Inside this body that Index belongs to another
-        // builder entirely, and the body's own `this` formal is the correct handle,
-        // so the ctor scope stops at the call boundary.
+        // A body may be lowered lazily from inside a property initializer or a
+        // default-argument expression, where `ctor_this_` / `default_arg_this_`
+        // name an object as an ir::Index of the CALLER's builder. Inside this body
+        // those Indexes belong to another builder entirely, and the body's own
+        // `this` formal is the correct handle, so both scopes stop at the call
+        // boundary.
         const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
+        const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
         const FnScope fn_scope(*this, &ctx);
         ir::Builder             b(module_.pool);
         std::vector<ir::Ref>    param_types;
@@ -27766,10 +27789,11 @@ private:
         FnCtx ctx;
         ctx.name_prefix = std::string(sub.name) + ".";
         const FnScope fn_scope(*this, &ctx);
-        // Stops the enclosing construction's `this` at the call boundary, as
-        // build_task does and for the same reason (the handle is another builder's
-        // Index; this body's own `this` formal is the right one).
+        // Stops the enclosing construction's / default-argument's `this` at the
+        // call boundary, as build_task does and for the same reason (each handle is
+        // another builder's Index; this body's own `this` formal is the right one).
         const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
+        const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
         ir::Builder             b(module_.pool);
         std::vector<ir::Ref>    param_types;
         std::vector<ir::ArgDir> arg_dirs;
@@ -28472,7 +28496,13 @@ private:
             filled.push_back(def);
         }
         std::vector<CopyOutArg> outs;
-        std::vector<ir::Index>  args = build_call_args(formals, filled, outs, b, l);
+        // A defaulted constructor argument evaluates against the object under
+        // construction (LRM 8.7 + 13.5.3): its implicit `this` is `handle`, typed
+        // as the class DECLARING the constructor — a base ctor's default sees the
+        // base class, not the most-derived one being built.
+        std::vector<ir::Index> args = build_call_args(
+          formals, filled, outs, b, l,
+          CtorThis{ .handle = handle, .cls = lower_type(clt) });
         args.insert(args.begin(), handle);
         b.call(id, args, l); // the constructor is void
         emit_call_copyouts(outs, b, l);
@@ -29018,7 +29048,8 @@ private:
         }
         const ir::SourceLoc     l = loc(call);
         std::vector<CopyOutArg> outs;
-        std::vector<ir::Index>  args = build_call_args(formals, actuals, outs, b, l);
+        std::vector<ir::Index>  args =
+          build_call_args(formals, actuals, outs, b, l, default_arg_recv(sub, this_val));
         if (this_val) {
             args.insert(args.begin(), *this_val);
         }
@@ -29081,7 +29112,8 @@ private:
         }
         const ir::SourceLoc     l = loc(call);
         std::vector<CopyOutArg> outs;
-        std::vector<ir::Index>  args = build_call_args(formals, actuals, outs, b, l);
+        std::vector<ir::Index>  args =
+          build_call_args(formals, actuals, outs, b, l, default_arg_recv(sub, this_val));
         if (this_val) {
             args.insert(args.begin(), *this_val);
         }
@@ -29097,15 +29129,19 @@ private:
     }
 
     // The receiver class type that selects a virtual call's vtable layout (LRM 8.20).
-    // Mirrors resolve_method_this' three receiver shapes IN THE SAME PRECEDENCE, so
-    // the handle it returns and the layout chosen here always describe one object:
-    // an explicit `obj.f()`, else the object under construction in a property
-    // initializer, else the enclosing method's own `this`. Only reached when
-    // resolve_method_this produced a handle, so one of the three holds — which is
-    // what makes the final fn_ctx_ deref safe.
+    // Mirrors resolve_method_this' receiver shapes IN THE SAME PRECEDENCE, so the
+    // handle it returns and the layout chosen here always describe one object: an
+    // explicit `obj.f()`, else the receiver a default-argument expression evaluates
+    // against, else the object under construction in a property initializer, else
+    // the enclosing method's own `this`. Only reached when resolve_method_this
+    // produced a handle, so one of the four holds — which is what makes the final
+    // fn_ctx_ deref safe.
     ir::Ref virtual_recv_class(const CallExpression& call) {
         if (call.thisClass() != nullptr) {
             return lower_type(*call.thisClass()->type);
+        }
+        if (default_arg_this_) {
+            return default_arg_this_->cls;
         }
         if (ctor_this_) {
             return ctor_this_->cls;
@@ -29169,6 +29205,15 @@ private:
         if (sub.thisVar == nullptr && !is_user_virtual(sub)) {
             return std::nullopt;
         }
+        if (default_arg_this_) {
+            // A bare method call inside a DEFAULT argument expression (LRM 13.5.3):
+            // the default was bound in the callee's declaration scope, so its
+            // implicit `this` is the receiver of the call being made — not the
+            // object under construction and not the enclosing method's `this`,
+            // both of which are different objects whenever the receiver was
+            // spelled out (`obj.f()` with a defaulted argument).
+            return default_arg_this_->handle;
+        }
         if (ctor_this_) {
             // A bare method call in a property declaration initializer (`int a =
             // f();`). The initializer runs as part of construction (LRM 8.7), so the
@@ -29185,9 +29230,36 @@ private:
         return this_handle(b, l);
     }
 
+    // The receiver context a default-argument expression of a call to `sub`
+    // evaluates against (LRM 13.5.3), threaded into build_call_args: the resolved
+    // receiver handle plus the callee's DECLARING class, which types a bare
+    // property select and selects the vtable layout of a bare virtual call inside
+    // the default — the static type `this` has in the callee's own body. Nullopt
+    // for a free subroutine and for a virtual-interface receiver (an interface
+    // subroutine has no ClassType scope), whose defaults reference no class state.
+    std::optional<CtorThis> default_arg_recv(const SubroutineSymbol&  sub,
+                                             std::optional<ir::Index> this_val) {
+        if (!this_val.has_value()) {
+            return std::nullopt;
+        }
+        const slang::ast::Scope* sc = sub.getParentScope();
+        while (sc != nullptr && sc->asSymbol().kind != SymbolKind::ClassType) {
+            sc = sc->asSymbol().getParentScope();
+        }
+        if (sc == nullptr) {
+            return std::nullopt;
+        }
+        return CtorThis{ .handle = *this_val,
+                         .cls    = lower_type(sc->asSymbol().as<slang::ast::ClassType>()) };
+    }
+
     // The enclosing `this` handle and its class, for a built-in randomization call
     // written without a receiver (`randomize()`, `x.rand_mode(0)` inside a method).
     std::pair<ir::Index, const slang::ast::ClassType*> implicit_this(ir::Builder& b, ir::SourceLoc l) {
+        if (default_arg_this_) {
+            // Same precedence, and the same reason, as resolve_method_this.
+            return { default_arg_this_->handle, class_of_ref(default_arg_this_->cls) };
+        }
         if (ctor_this_) {
             return { ctor_this_->handle, class_of_ref(ctor_this_->cls) };
         }
@@ -29512,14 +29584,28 @@ private:
     // inout) the backend passes by pointer. Each output / inout is recorded in
     // `outs` for copy-out after the call. Shared by function and task calls — the
     // copy-in / copy-out semantics are identical and delicate to correctness.
+    //
+    // `recv` is the receiver context of a class-method call, or nullopt for a free
+    // subroutine. An actual that IS the formal's default expression (pointer
+    // identity: slang binds an omitted argument as the formal's cached default,
+    // CallExpression.cpp bindArgs) lowers under that context (default_arg_this_),
+    // because LRM 13.5.3 evaluates the default in the callee's declaration scope —
+    // its implicit `this` is the receiver, not whatever object encloses the call.
+    // A written actual keeps the enclosing context, even when this call is itself
+    // nested inside another call's default expression.
     std::vector<ir::Index> build_call_args(std::span<const FormalArgumentSymbol* const> formals,
                                            std::span<const Expression* const>           actuals,
                                            std::vector<CopyOutArg>&                     outs,
                                            ir::Builder&                                 b,
-                                           ir::SourceLoc                                l) {
+                                           ir::SourceLoc                                l,
+                                           const std::optional<CtorThis>& recv = std::nullopt) {
         std::vector<ir::Index> args;
         args.reserve(formals.size());
         for (size_t i = 0; i < formals.size(); ++i) {
+            const bool is_default =
+              recv.has_value() && actuals[i] == formals[i]->getDefaultValue();
+            const Restore<std::optional<CtorThis>> dflt(default_arg_this_,
+                                                        is_default ? recv : default_arg_this_);
             const auto dir = formals[i]->direction;
             // A DPI open-array formal (LRM 35.5.6.2): pass the actual array's lvalue
             // leaf. The backend builds the svOpenArray descriptor from the actual's
@@ -30116,11 +30202,24 @@ private:
     // though, which has no method frame to carry `this` — and whose frame `this`, if
     // it has one, belongs to a DIFFERENT object. Nullopt outside a property
     // initializer; scoped by Restore, never assigned bare.
-    struct CtorThis {
-        ir::Index handle;
-        ir::Ref   cls;
-    };
+    // (CtorThis is defined next to class Restore, ahead of the member-function
+    // signatures that name it.)
     std::optional<CtorThis> ctor_this_;
+    // The receiver context a DEFAULT argument expression evaluates against. LRM
+    // 13.5.3 binds a default in the scope of the subroutine DECLARATION, so an
+    // implicit `this` inside one — a bare method call or property reference of the
+    // callee's class — names the CALL's receiver, never the caller's own `this`.
+    // slang materializes an omitted actual as the formal's cached default
+    // expression (CallExpression::bindArgs), which build_call_args detects by
+    // pointer identity and scopes this override around lowering exactly that
+    // actual. Without it the caller's `this` was dispatched with the callee
+    // class's slot number: past the end of a smaller vtable that is the easyUVM
+    // begin_event.trigger() SIGSEGV, and inside a same-shape one a silent read of
+    // the wrong object. Nullopt outside a default-argument expression; scoped by
+    // Restore, never assigned bare. Checked ahead of ctor_this_ everywhere: a
+    // default is the innermost context, and the object under construction is a
+    // different object whenever the receiver was spelled out.
+    std::optional<CtorThis> default_arg_this_;
     // Monotonic counter naming anonymous output / inout task-argument temps created
     // in a process body (where temps are module signals, not frame locals).
     uint32_t task_temp_seq_ = 0;

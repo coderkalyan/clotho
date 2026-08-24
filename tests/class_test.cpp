@@ -3274,3 +3274,152 @@ TEST_CASE("copying a wide-leaf struct property between collected objects") {
     )";
     CHECK(run_capture(src) == "feed000000000007 7\n");
 }
+
+// A subroutine default argument is bound in the scope of the DECLARATION (LRM
+// 13.5.3), so an implicit `this` inside one — a bare method call or property
+// reference of the callee's class — names the CALL's receiver, never the
+// caller's own `this`. Lowered with the caller's `this`, the default read the
+// wrong object: same-name properties aliased silently.
+TEST_CASE("default argument calling the receiver's own method") {
+    constexpr std::string_view src = R"(
+        module m;
+            class producer;
+                int amount = 7;
+                function int dflt();
+                    return amount;
+                endfunction
+                function int take(int n = dflt());
+                    return n;
+                endfunction
+            endclass
+            class consumer;
+                int amount = 1;
+                producer p;
+                function new();
+                    p = new;
+                endfunction
+                function int go();
+                    return p.take(); // dflt() must run on p (7), not on this (1)
+                endfunction
+            endclass
+            initial begin
+                consumer c = new;
+                $display("%0d", c.go());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "7\n");
+}
+
+// The easyUVM begin_event.trigger() SIGSEGV shape: the default's VIRTUAL call,
+// dispatched with the caller's `this`, indexed the callee class's slot number
+// past the end of the caller class's smaller vtable — a garbage function
+// pointer into adjacent constant data, executed. The receiver fix makes the
+// slot and the object describe one class again.
+TEST_CASE("default argument virtually dispatching past the caller's vtable") {
+    constexpr std::string_view src = R"(
+        module m;
+            class rich;
+                int base = 40;
+                virtual function void v0(); endfunction
+                virtual function void v1(); endfunction
+                virtual function void v2(); endfunction
+                virtual function void v3(); endfunction
+                virtual function void v4(); endfunction
+                virtual function void v5(); endfunction
+                virtual function void v6(); endfunction
+                virtual function void v7(); endfunction
+                virtual function int dflt();
+                    return base + 2;
+                endfunction
+                virtual function int take(int n = dflt());
+                    return n;
+                endfunction
+            endclass
+            class lean;
+                rich r;
+                function new();
+                    r = new;
+                endfunction
+                virtual function int go();
+                    return r.take(); // dflt()'s slot does not exist in lean's vtable
+                endfunction
+            endclass
+            initial begin
+                lean c = new;
+                $display("%0d", c.go());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "42\n");
+}
+
+// Sibling shapes of the same receiver-binding site: a default that READS a
+// property (no call), a default on a TASK, and a call made from module scope,
+// where there is no enclosing `this` at all (previously a compile refusal:
+// "class method call without an object handle is not supported").
+TEST_CASE("default argument reading the receiver's property, task and module-scope callers") {
+    constexpr std::string_view src = R"(
+        module m;
+            class producer;
+                int amount = 5;
+                function int take(int n = amount);
+                    return n;
+                endfunction
+                task fetch(output int o, input int n = amount);
+                    o = n;
+                endtask
+            endclass
+            class consumer;
+                int amount = 1;
+                function int go(producer p);
+                    return p.take();  // property-read default, other class's method
+                endfunction
+                task run(producer p, output int o);
+                    p.fetch(o);       // task default, other class's task
+                endtask
+            endclass
+            initial begin
+                producer p = new;
+                consumer c = new;
+                int direct, via_task;
+                p.fetch(direct);      // task default, no enclosing method at all
+                c.run(p, via_task);
+                $display("%0d %0d %0d %0d", p.take(), c.go(p), direct, via_task);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "5 5 5 5\n");
+}
+
+// A defaulted CONSTRUCTOR argument evaluates against the object under
+// construction: its default may call a method of the class, which reads the
+// property initializers already applied (LRM 8.7 ordering). Also pins the
+// unchanged bare-call case: a default evaluated for a call on the SAME object.
+TEST_CASE("default argument of a constructor and of a bare same-object call") {
+    constexpr std::string_view src = R"(
+        module m;
+            class A;
+                int seed = 30;
+                int got;
+                function int dflt();
+                    return seed + 3;
+                endfunction
+                function new(int x = dflt());
+                    got = x;
+                endfunction
+                function int take(int n = dflt());
+                    return n;
+                endfunction
+                function int self_call();
+                    return take(); // same object: receiver == this
+                endfunction
+            endclass
+            initial begin
+                A a = new;
+                $display("%0d %0d", a.got, a.self_call());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "33 33\n");
+}
