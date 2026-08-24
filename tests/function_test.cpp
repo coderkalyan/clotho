@@ -620,6 +620,34 @@ TEST_CASE("unpacked array returned by value from a function") {
     )") == "2 4 6 8\n");
 }
 
+TEST_CASE("non-lvalue whole-array actuals bound to an input formal") {
+    // LRM 13.5: an input actual "can be any expression" — a `'{...}` pattern
+    // (positional and replicated) is built into a caller-side canonical temp,
+    // and a call result passes the caller-side out-param temp the call already
+    // wrote. iverilog rejects whole-array formals outright; values
+    // cross-checked against verilator 5.050.
+    CHECK(run_capture(R"(
+        module m;
+            typedef int a2_t [0:1];
+            typedef int a4_t [0:3];
+            function automatic a2_t g();
+                a2_t r;
+                r[0] = 5; r[1] = 6;
+                return r;
+            endfunction
+            function automatic int f2(a2_t v); return v[0] + v[1]; endfunction
+            function automatic int f4(a4_t v); return v[0] + v[1] + v[2] + v[3]; endfunction
+            initial begin
+                $display("pat %0d", f2('{5, 6}));
+                $display("repl %0d", f4('{4{7}}));
+                $display("call %0d", f2(g()));
+            end
+        endmodule
+    )") == "pat 11\n"
+           "repl 28\n"
+           "call 11\n");
+}
+
 // A subroutine variable declared without `automatic` has STATIC lifetime (LRM
 // 13.4.2), so the frontend gives it a module signal rather than a frame slot --
 // and a plain scalar-leaf array signal keeps FLAT `[N x slot]` storage, not the

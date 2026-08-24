@@ -1771,20 +1771,164 @@ TEST_CASE("string-bearing aggregate passes to a task by value") {
     )") == "3 [callee]\n[caller]\n");
 }
 
+// LRM 13.5: "If an argument in the subroutine is declared as an input, then the
+// corresponding expression in the subroutine call can be any expression" — a
+// non-lvalue actual is materialized in a caller-side temp (13.5.1 copies it into
+// the subroutine area anyway). iverilog has no unpacked-struct support at all,
+// so every expected value here is cross-checked against verilator 5.050 only.
+TEST_CASE("non-lvalue aggregate actuals bound to an input formal") {
+    // A positional pattern, a named pattern, a `'{default:}` pattern, a call
+    // result, a call chain, a ternary of an lvalue and a pattern, and a task
+    // actual (the task ABI shares build_call_args with functions).
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; int b; } s_t;
+            function automatic s_t h(); h.a = 1; h.b = 2; endfunction
+            function automatic s_t g(s_t i); g.a = i.a + 2; g.b = i.b + 2; endfunction
+            function automatic int f(s_t v); return v.a * 10 + v.b; endfunction
+            task automatic tk(s_t v); $display("task %0d", v.a); endtask
+            s_t x;
+            bit c;
+            initial begin
+                x = '{1, 2};
+                c = 0;
+                $display("pat %0d", f('{3, 4}));
+                $display("named %0d", f('{b:4, a:3}));
+                $display("dflt %0d", f('{default:5}));
+                $display("call %0d", f(h()));
+                $display("chain %0d", f(g(h())));
+                $display("tern %0d", f(c ? x : '{3, 4}));
+                tk('{11, 0});
+            end
+        endmodule
+    )") == "pat 34\n"
+           "named 34\n"
+           "dflt 55\n"
+           "call 12\n"
+           "chain 34\n"
+           "tern 34\n"
+           "task 11\n");
+}
+
+TEST_CASE("a materialized input actual is a copy, evaluated once") {
+    // 13.5.1: "If the arguments are changed within the subroutine, the changes
+    // are not visible outside" — the callee clobbers its formal and the
+    // pattern-element source variable must not move. 13.5's "any expression" is
+    // evaluated exactly once: the side-effecting g() feeds one call, and a
+    // ternary actual keeps its arms conditional (11.4.11 evaluates only the
+    // chosen arm), so the unchosen g() arm bumps nothing.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; int b; } s_t;
+            int n = 0;
+            int src = 3;
+            function automatic s_t g(); n = n + 1; g.a = 3; g.b = 4; endfunction
+            function automatic int f(s_t v); v.a = v.a + 100; return v.a + v.b; endfunction
+            s_t x;
+            initial begin
+                x = '{1, 2};
+                $display("pat %0d src=%0d", f('{src, 4}), src);
+                $display("call %0d n=%0d", f(g()), n);
+                $display("tern %0d n=%0d", f(1 ? x : g()), n);
+            end
+        endmodule
+    )") == "pat 107 src=3\n"
+           "call 107 n=1\n"
+           "tern 103 n=1\n");
+}
+
+TEST_CASE("two materialized actuals in one expression do not alias") {
+    // Each call site gets its own canonical temp (a fresh frame Local / module
+    // signal per make_canonical_agg_temp call), so two live temps in one
+    // expression hold distinct values, and a recursive callee whose actual is a
+    // pattern over its own formal gets a fresh temp per frame.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { int a; int b; } s_t;
+            typedef struct { int a; } r_t;
+            function automatic int f(s_t v); return v.a * 10 + v.b; endfunction
+            function automatic int fr(r_t v);
+                if (v.a <= 0) return 0;
+                return v.a + fr('{v.a - 1});
+            endfunction
+            initial begin
+                $display("sum %0d", f('{1, 2}) + f('{3, 4}));
+                $display("rec %0d", fr('{4}));
+            end
+        endmodule
+    )") == "sum 46\n"
+           "rec 10\n");
+}
+
+TEST_CASE("a pattern actual with managed leaves deep-copies per leaf") {
+    // A string and a queue member cross the by-value boundary as real copies
+    // (emit_agg_store builds the temp per leaf; the callee's copy-in deep-copies
+    // the managed leaves), so the callee's push_back cannot grow the caller's
+    // queue through the temp.
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { string s; int q[$]; int a; } sv_t;
+            int qq[$];
+            function automatic int f(sv_t v);
+                v.q.push_back(9);
+                $display("in s=%s qs=%0d", v.s, v.q.size());
+                return v.a;
+            endfunction
+            initial begin
+                qq.push_back(1); qq.push_back(2);
+                $display("r=%0d caller_qs=%0d", f('{"hi", qq, 7}), qq.size());
+            end
+        endmodule
+    )") == "in s=hi qs=3\n"
+           "r=7 caller_qs=2\n");
+}
+
 TEST_CASE("aggregate subroutine arguments Clotho still refuses loudly") {
-    // A non-lvalue actual has no storage to point at, and the by-value ABI passes a
-    // pointer. (`ref` of an aggregate is not among these — it aliases through the
-    // fat ref, covered in task_test.cpp.)
-    SUBCASE("an assignment-pattern actual") {
+    // The non-input directions require an assignable / lvalue actual (LRM 13.5,
+    // 13.5.2), and slang rejects those upstream — pinned here so a future guard
+    // change cannot let one through. The struct-bearing slice is clotho's own
+    // wall: the backend has no aggregate-element slice copy.
+    SUBCASE("an assignment-pattern actual on an output formal (slang, LRM 13.5)") {
         const LowerResult r = lower_text(R"(
             module m;
                 typedef struct { int x; } s_t;
-                task automatic t(s_t a); $display("%0d", a.x); endtask
-                initial t('{5});
+                function automatic int f(output s_t v); v.x = 1; return 0; endfunction
+                int o;
+                initial o = f('{9});
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("aggregate argument must be a variable") != std::string::npos);
+        CHECK(r.diagnostic_text().find("expression is not assignable") != std::string::npos);
+    }
+    SUBCASE("a call-result actual on a ref formal (slang, LRM 13.5.2)") {
+        // Verilator 5.050 accepts this, but 13.5.2 passes "a reference to the
+        // original argument" and a function result is not an lvalue home.
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef struct { int x; } s_t;
+                function automatic s_t g(); g.x = 5; endfunction
+                function automatic int f(ref s_t v); return v.x; endfunction
+                int o;
+                initial o = f(g());
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("invalid expression for pass by reference") != std::string::npos);
+    }
+    SUBCASE("a slice of a struct-bearing array actual") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef struct { int x; } s_t;
+                typedef s_t sa_t [0:1];
+                s_t big [0:3];
+                function automatic int f(sa_t v); return v[0].x; endfunction
+                int o;
+                initial o = f(big[1:2]);
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("a slice of a struct-bearing array argument is not supported") !=
+              std::string::npos);
     }
 }
 

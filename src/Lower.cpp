@@ -29880,10 +29880,19 @@ private:
                   is_struct_lvalue_shape(src) ||
                   (flat && src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src));
                 if (!lvalue_shape) {
-                    // TODO: a `'{...}` / call aggregate actual — materialize a temp
-                    // from the pattern / call result and pass that.
-                    fail(flat ? "whole-array argument must be a variable or slice"
-                              : "aggregate argument must be a variable");
+                    if (dir != slang::ast::ArgumentDirection::In) {
+                        // An output / inout actual must be valid on the left-hand
+                        // side of a procedural assignment (LRM 13.5), and slang
+                        // enforces that upstream ("expression is not assignable"),
+                        // so what reaches here is an assignable form this path
+                        // cannot decompose into a copy-back home.
+                        // TODO: an aggregate-typed streaming lvalue actual
+                        // (LRM 11.4.14.3).
+                        fail(flat ? "whole-array argument must be a variable or slice"
+                                  : "aggregate argument must be a variable");
+                    }
+                    args.push_back(agg_input_actual(src, pty, b, l));
+                    continue;
                 }
                 if (dir == slang::ast::ArgumentDirection::In && !flat) {
                     args.push_back(lower_lvalue(src, b));
@@ -29955,6 +29964,39 @@ private:
             outs.push_back(CopyOutArg{ temp, actual, lower_type(*actual->type), &formals[i]->getType() });
         }
         return args;
+    }
+
+    // A non-lvalue aggregate actual bound to an `input` formal, as the pointer
+    // operand the by-value ABI wants. LRM 13.5 allows ANY expression as an input
+    // actual, and 13.5.1 copies it into the subroutine area, so the value only
+    // needs a home the callee's copy-in can read.
+    //
+    // A call result already has one: the callee wrote it through the caller-side
+    // out-param temp that is the call's lvalue (the fact agg_return_operand also
+    // relies on), so it passes directly, evaluated once, and the callee's copy-in
+    // is the only copy. Everything else — a `'{...}` pattern, an aggregate `?:`,
+    // a bare concatenation literal — is built into a fresh canonical temp by the
+    // ordinary aggregate store path, which also owns the diagnostic for any form
+    // assignment cannot lower either. Each call site gets its own temp
+    // (make_canonical_agg_temp): a frame Local inside a subroutine, fresh per
+    // frame, so recursion and two actuals in one expression cannot alias; or a
+    // module signal in a process, safe to reuse across calls because the callee
+    // copies the pointee into its own frame before the caller can refill it.
+    ir::Index agg_input_actual(const Expression& src, ir::Ref pty, ir::Builder& b, ir::SourceLoc l) {
+        if (src.kind == ExpressionKind::Call) {
+            return lower_lvalue(src, b);
+        }
+        if (src.kind == ExpressionKind::RangeSelect) {
+            // TODO: a slice of a struct-bearing array as a whole-array actual
+            // (LRM 7.4.5). The backend has no aggregate-element slice copy
+            // (agg_return_operand hits the same wall), so staging it here would
+            // only move the failure later. A flat array's slice never arrives:
+            // it is an lvalue shape at the call site.
+            fail("a slice of a struct-bearing array argument is not supported");
+        }
+        const ir::Index temp = make_canonical_agg_temp(pty, b, l);
+        emit_agg_store(temp, pty, src, ir::Inst::Tag::Store, b, l);
+        return temp;
     }
 
     // Copy each output / inout temp back to its actual after the call: actual =

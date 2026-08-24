@@ -9,8 +9,9 @@ string-free by-value function *and task* arguments (`input` / `output` /
 `inout`) / returns all work.
 Guarded (loud): whole-object copy / equality over a member that is an unpacked
 array, unpacked union members, a string-containing aggregate passed / returned
-by value, a `ref` aggregate formal, a non-lvalue aggregate actual, and a whole
-aggregate in a general rvalue context ($display %p, concat, streaming).
+by value, a `ref` aggregate formal, a struct-bearing array slice as a whole
+actual, and a whole aggregate in a general rvalue context ($display %p, concat,
+streaming).
 
 ## The recursive model
 
@@ -140,10 +141,15 @@ copy (guarded, follow-up).
   frame Local or a signal, so the passed pointer stays valid across the task's
   suspends.
 
-Guarded (loud, follow-ups): a **string-containing** aggregate by value, a `ref`
-aggregate formal (needs the alias ABI, not the storage-pointer one), and a
-non-lvalue aggregate actual / return (`'{...}` pattern or nested call — needs a
-materialized temp). Covered by `tests/struct_test.cpp` and
+A **non-lvalue actual on an `input` formal** is materialized (LRM 13.5: an
+input actual "can be any expression"): a call result passes the caller-side
+out-param temp that is the Call's lvalue, everything else (`'{...}` pattern,
+aggregate `?:`, concat literal) is built into a fresh `make_canonical_agg_temp`
+by `emit_agg_store` (`agg_input_actual`, the call-site twin of
+`agg_return_operand`). Guarded (loud, follow-ups): a **string-containing**
+aggregate by value, a `ref` aggregate formal (needs the alias ABI, not the
+storage-pointer one), and a struct-bearing array slice as a whole actual (the
+backend has no aggregate-element slice). Covered by `tests/struct_test.cpp` and
 `tests/function_test.cpp`: function arg value semantics under mutation, struct
 return, nested struct arg+return, array-of-struct arg, struct-with-array return,
 `output` / `inout` function args, task `input` / `output` / `inout` struct and

@@ -2075,8 +2075,73 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   struct-with-array / array-of-struct / 2-D / slice actuals.
 - [x] **`ref` aggregate formal** — subsumed by the uniform ref above; an aggregate
   ref aliases its image pointer with no copy either way.
-- [ ] **Non-lvalue aggregate actual** (`'{...}` pattern / call result) — needs a
-  materialized caller temp; guarded loud today for functions and tasks alike.
+- [x] **Non-lvalue aggregate actual on an `input` formal** (LRM 13.5: an input
+  actual "can be any expression"; 13.5.1 copies it into the subroutine area) —
+  `f('{3,4})`, `f('{b:4,a:3})`, `f('{default:5})`, `f('{4{7}}')`, `f(g())`,
+  `f(g(h()))`, `f(c ? x : '{...})`, and the task forms, for an unpacked struct
+  and a fixed unpacked array alike. `build_call_args` guarded every by-value
+  aggregate actual with `is_struct_lvalue_shape` and refused the rest
+  ("aggregate argument must be a variable"), which stubbed every
+  `__m_uvm_execute_field_op` in the stock easyUVM testbench:
+  `m_uvm_field_begin`'s UVM_CHECK_FIELDS arm calls
+  `uvm_queue#(uvm_acs_name_struct)::push_back('{`"ARG`", REGEX})` — a
+  string-bearing struct PATTERN on a user method's input formal. The fix is
+  `agg_input_actual`, the call-actual twin of `agg_return_operand` (one
+  boundary over): a CALL result passes `lower_lvalue(src)` directly — the
+  callee already wrote it through the caller-side out-param temp that IS the
+  call's lvalue, so the callee's copy-in is the only copy and the operand is
+  evaluated exactly once; every other rvalue is built into a fresh
+  `make_canonical_agg_temp` by `emit_agg_store`, which already owns the
+  pattern / replication / `?:` / concat-literal shapes and their diagnostics.
+  An aggregate `?:` actual stays destination-directed and CONDITIONAL
+  (11.4.11: the unchosen arm's side effects do not run). Copy semantics
+  (13.5.1: "changes are not visible outside") hold because the temp is private
+  per call site; aliasing cannot happen because each `make_canonical_agg_temp`
+  mints fresh storage — a frame Local per activation inside a subroutine
+  (recursion-safe, `f('{1,2}) + f('{3,4})` holds two live temps), a module
+  signal in a process (safe across sequential calls: a function is zero-time
+  and a task's prologue copies the pointee into its frame before any delay).
+  Managed leaves (a string / queue member in the pattern) deep-copy per leaf —
+  `emit_agg_store` builds the temp leaf-wise and the existing
+  `emit_agg_copyin` deep-copy does the boundary. The non-input directions need
+  no new guard: slang rejects a pattern / call result on an `output` / `inout`
+  ("expression is not assignable", 13.5) and on a `ref` ("invalid expression
+  for pass by reference", 13.5.2; a pattern additionally fails type deduction)
+  — pinned in tests so a guard change cannot let one through. Verilator 5.050
+  accepts a call result on a `ref` formal; 13.5.2 passes "a reference to the
+  original argument" and a call result is no such place, so slang's refusal is
+  the LRM reading and clotho keeps it. Cross-checked against verilator 5.050
+  (iverilog has no unpacked-struct or array-formal support). Covered in
+  tests/struct_test.cpp (shapes, copy + single-evaluation proof, two live
+  temps, recursion, managed leaves, refusals) and tests/function_test.cpp
+  (array shapes).
+  Stock easyUVM after this fix: the aggregate-argument stub is gone, and
+  `__m_uvm_execute_field_op` now stubs on the NEXT gaps in the same generated
+  function — "queue / dynamic array member assignment from a non-variable
+  value", reproduced minimally as `bit __array[] = new [$bits(data)];`, a
+  dynamic-array LOCAL declaration initializer inside a CLASS method (the
+  statically dead SIZE > 64 branch of `uvm_unpack_intN`; the same statements
+  lower fine in a module-scope subroutine), and "array query function on a
+  dynamically-sized operand" in a third class's field op — so the run still
+  fatals at packet_out.sv:4 t=35, now with the do_unpack-family message. NOT
+  fixable by `agg_input_actual`: those values are queues / dynamic arrays —
+  ValueCat::handle, heap-backed — and `make_canonical_agg_temp` builds
+  canonical aggregate storage, not a container handle; the handle twin is
+  `materialize_queue_rvalue` (queues only; the dynamic-array twin is a named
+  TODO in `lower_container_element_value`). With field automation removed
+  the full bench runs: 101 matched, UVM_ERROR 0, UVM_FATAL 0,
+  `$finish` from uvm_root.svh:633 at t=3045.
+  Remaining gaps, refused loud:
+  - [ ] **A slice of a struct-bearing array as an actual** ("a slice of a
+    struct-bearing array argument is not supported") — the same missing
+    backend aggregate-element slice the return path documents; a FLAT array's
+    slice actual works (it is an lvalue shape and copies element-wise into the
+    canonical temp).
+  - [ ] **An aggregate-typed streaming lvalue actual on an `output` / `inout`
+    formal** (LRM 11.4.14.3) — the backstop in `build_call_args` keeps the old
+    message. A streaming RVALUE actual on an input formal is refused by
+    `emit_agg_store` ("unsupported unpacked struct rvalue"; verilator 5.050
+    ICEs on the same cast).
 - [ ] **String-containing aggregate by value** through a function.
 - [x] **Non-lvalue aggregate RETURN, and an aggregate call result in a read
   context** (LRM 13.4) — `return g();`, `return '{1,2};`,
