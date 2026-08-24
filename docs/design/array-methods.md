@@ -248,9 +248,10 @@ sub-array. `item.index(2)` for the second dimension is still refused by clotho.
 Refused loudly, each on the clause: a bare reduction of a non-integral element
 (multidimensional, `string`, `real`) and a bare `min` / `max` / `sort` of a
 non-comparable one, both by slang ahead of lowering; an aggregate element with no
-`with` clause, by clotho, now citing 7.12.1 and 7.12.3 together; an element a
-dynamic array cannot hold (a `chandle`), which only the ordering mirror needs
-(`guard_container_element`); and `item.index(d)` for `d > 1`.
+`with` clause, by clotho, now citing 7.12.1 and 7.12.3 together; a
+virtual-interface element, which the ordering mirror still refuses
+(`guard_container_element` -- a `chandle` element now lowers, see
+docs/design/dynamic-arrays.md); and `item.index(d)` for `d > 1`.
 
 ### 2a. Associative-array receiver
 

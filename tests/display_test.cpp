@@ -667,14 +667,41 @@ TEST_CASE("%p of a chandle / event / virtual-interface handle (LRM 21.2.1.6)") {
                      "aa:  '{3:event, 9:null}\n"
                      "q0:  '{event, null}\n");
     }
-    // A queue / dynamic / associative array of chandles or of virtual-interface
-    // handles is still refused, at TYPE lowering rather than by `%p` -- the
-    // container-of-handles gap in docs/TODO.md. Pinned so the diagnostic that fires
-    // stays the accurate one, and does not silently become a `%p` refusal again.
-    SUBCASE("a queue of chandles is refused by the container, not by %p") {
-        check_rejected(R"(
+    // A queue / dynamic / associative array of chandles now lowers (the
+    // container-element-type entry in docs/TODO.md); a virtual-interface handle is
+    // the one still refused at TYPE lowering rather than by `%p`, tracked by the
+    // same entry. `elem_is_handle` needed no change to print the chandle case --
+    // it was already built chandle-aware, ahead of guard_container_element
+    // catching up (the comment above this SUBCASE). libc malloc is the no-.so
+    // probe for a non-null chandle.
+    SUBCASE("a queue of chandles renders its element, no longer refused by the container") {
+        const std::string out = run_capture(R"(
             module m;
-                chandle q [$];
+                import "DPI-C" function chandle malloc(input longint size);
+                import "DPI-C" function void    free(input chandle p);
+                chandle q[$];
+                chandle ch;
+                initial begin
+                    ch = malloc(8);
+                    q.push_back(ch);
+                    q.push_back(null);
+                    $display("q: %p", q);
+                    free(ch);
+                end
+            endmodule
+        )");
+        CHECK(out == "q: '{chandle, null}\n");
+    }
+    // A virtual-interface handle in a container is the one shape still refused at
+    // TYPE lowering (LRM 25.9; guard_container_element does not admit it), pinned
+    // so the diagnostic stays the accurate one and does not silently become a
+    // `%p` refusal instead.
+    SUBCASE("a queue of virtual-interface handles is refused by the container, not by %p") {
+        check_rejected(R"(
+            interface some_if; logic d; endinterface
+            module m;
+                some_if bus();
+                virtual some_if q [$];
                 initial $display("%p", q);
             endmodule
         )", "queue element type is not supported");

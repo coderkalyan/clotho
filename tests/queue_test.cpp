@@ -956,6 +956,80 @@ TEST_CASE("an event element is a distinct event per slot") {
 }
 
 // -- Aggregate elements (LRM 7.10 with 7.2) ------------------------------------
+
+// -- chandle elements (LRM 7.10 with 6.14) -------------------------------------
+//
+// A chandle element needs no lifecycle either: the value IS the opaque 64-bit
+// word (LRM 6.14), so it rides the exact same POD element path a class handle
+// does -- guard_container_element (src/Lower.cpp) admits the two for the same
+// reason. SystemVerilog offers no way to MAKE a non-null chandle without DPI, so
+// libc malloc/free stand in as the no-.so probe the rest of the chandle test
+// suite already uses (display_test.cpp, dpi_test.cpp).
+
+TEST_CASE("queue of chandles: push, index, and identity") {
+    constexpr std::string_view src = R"(
+        module m;
+            import "DPI-C" function chandle malloc(input longint size);
+            import "DPI-C" function void    free(input chandle p);
+            chandle q[$];
+            chandle a, b;
+            initial begin
+                a = malloc(8);
+                b = malloc(8);
+                q.push_back(a);
+                q.push_back(b);
+                q.push_front(a);
+                $display("n=%0d", q.size());
+                // Identity, not value: q[0] and q[1] are the SAME chandle (both a);
+                // q[1] and q[2] differ (a vs b).
+                $display("same=%0b other=%0b", q[0] == q[1], q[1] == q[2]);
+                q.delete(0);
+                $display("after n=%0d head=%0b", q.size(), q[0] == a);
+                free(a);
+                free(b);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "n=3\n"
+                              "same=1 other=0\n"
+                              "after n=2 head=1\n");
+}
+
+TEST_CASE("queue of chandles: null default and whole-queue copy independence") {
+    constexpr std::string_view src = R"(
+        module m;
+            import "DPI-C" function chandle malloc(input longint size);
+            import "DPI-C" function void    free(input chandle p);
+            chandle q[$], c[$];
+            chandle x, h1, h2;
+            initial begin
+                // An out-of-range read yields the element default, which for a
+                // handle is null (LRM Table 7-1).
+                x = q[0];
+                $display("empty null=%0b", x == null);
+                h1 = malloc(8);
+                h2 = malloc(8);
+                q.push_back(h1);
+                q.push_back(h2);
+                // A whole-queue copy is a value copy of the HANDLES: the copy is
+                // independent as a container (pushing to `c` does not touch `q`)
+                // but shares the chandle identities it already held.
+                c = q;
+                c.push_back(null);
+                $display("q=%0d c=%0d", q.size(), c.size());
+                $display("shared=%0b tail null=%0b", c[0] == q[0], c[$] == null);
+                free(h1);
+                free(h2);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "empty null=1\n"
+                              "q=2 c=3\n"
+                              "shared=1 tail null=1\n");
+}
+
 //
 // The element slot holds the recursive storage image, so `q[i]` is a heap-anchored
 // aggregate lvalue: member and element selects descend it with the ordinary

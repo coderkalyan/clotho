@@ -434,6 +434,53 @@ TEST_CASE("assoc key types Clotho still refuses loudly") {
         CHECK_FALSE(r.ok);
         CHECK(r.diagnostic_text().find("key type is not supported") != std::string::npos);
     }
+    // A chandle VALUE now lowers (see the chandle-value test below); a chandle KEY
+    // is a separate, still-unimplemented admit-list widening tracked in
+    // docs/design/assoc-keys.md's P0 phase ("Status: scoping"), deliberately left
+    // alone here.
+    SUBCASE("chandle key") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                int a [chandle];
+                chandle c;
+                initial a[c] = 1;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("key type is not supported") != std::string::npos);
+    }
+}
+
+// A chandle VALUE element (LRM 6.14): a plain 64-bit POD word, admitted by the
+// same guard_container_element gate a class-handle value uses (see the
+// "assoc class-handle keys" test above for the KEY-side analogue). libc
+// malloc/free is the no-.so probe for a non-null chandle.
+TEST_CASE("assoc chandle value: absent-key null default and identity") {
+    constexpr std::string_view src = R"(
+        module m;
+            import "DPI-C" function chandle malloc(input longint size);
+            import "DPI-C" function void    free(input chandle p);
+            chandle a[int];
+            chandle h1, h2, x;
+            initial begin
+                x = a[5];
+                $display("absent null=%0b", x == null);
+                h1 = malloc(8);
+                h2 = malloc(8);
+                a[1] = h1;
+                a[2] = h2;
+                $display("num=%0d same=%0b other=%0b", a.num(), a[1] == h1, a[1] == a[2]);
+                a.delete(1);
+                $display("num=%0d exists1=%0b", a.num(), a.exists(1));
+                free(h1);
+                free(h2);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "absent null=1\n"
+                              "num=2 same=1 other=0\n"
+                              "num=1 exists1=0\n");
 }
 
 // A 4-state value element reads its power-on default X for an absent key

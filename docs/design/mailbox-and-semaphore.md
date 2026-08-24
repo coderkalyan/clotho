@@ -159,8 +159,8 @@ string, dynarr, queue, aggregate, assoc, event). `rt_queue_push_back` /
 `q[0]` is inline ring math, not a call. The frontend gate that decides the legal
 element set is `guard_container_element` (`src/Lower.cpp:2180-2220`), whose only
 failure is `"<what> element type is not supported"`; it admits integral, real,
-string, class handle, unpacked struct / fixed unpacked array, nested queue /
-dynamic array / associative array, and event.
+string, class handle, `chandle`, unpacked struct / fixed unpacked array,
+nested queue / dynamic array / associative array, and event.
 
 **Two facts about the queue bound that the mailbox must not inherit.** The bound is
 a property of the *interned Queue type*, not of the push site (`QueueArg`,

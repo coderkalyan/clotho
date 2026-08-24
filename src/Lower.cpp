@@ -3087,12 +3087,22 @@ private:
         if (et.isIntegral() || et.isFloating() || et.isString()) {
             return;
         }
-        // A class handle is a plain 64-bit word: objects are never freed
-        // (docs/design/classes.md §7), so an element needs no lifecycle beyond the
-        // POD copy rt_elem_ops already does, `null` is the all-zero power-on default
-        // Table 7-1 asks for, and `==` on two handles is the identity compare a word
-        // compare gives. Nothing else is required of it.
-        if (et.isClass()) {
+        // A class handle or a chandle is a plain 64-bit word: objects are never
+        // freed (docs/design/classes.md §7), so an element needs no lifecycle
+        // beyond the POD copy rt_elem_ops already does, `null` is the all-zero
+        // power-on default Table 7-1 asks for, and `==` on two handles is the
+        // identity compare a word compare gives (LRM 6.14 gives a chandle the
+        // same closed == / != / null / assignment operator set). Nothing else is
+        // required of it.
+        //
+        // The two diverge in exactly one place -- whether the GC traces the word
+        // -- and that fork needs no code here. `lower_type` puts a class handle in
+        // Kind::Class and a chandle in a plain Kind::Int, and collect_class_handles
+        // (LlvmBackend.cpp) keys on Kind::Class alone, so a chandle element's
+        // rt_elem_ops::handles table comes out empty by construction: tracing one
+        // would hand the collector a foreign pointer it never allocated
+        // (docs/design/garbage-collection.md §0, "Never in scope").
+        if (et.isClass() || et.isCHandle()) {
             return;
         }
         // An unpacked struct / union or fixed unpacked array element: the slot holds
@@ -22792,8 +22802,8 @@ private:
         const ir::Ref      er   = std::get<ir::Type>(module_.pool.get(aty)).element;
         // The mirror is a real dynamic array, so its element has to be one a
         // dynamic array admits. Every element a fixed array can hold is, bar the
-        // handful guard_container_element names -- a chandle element, say, which
-        // 7.12.2 does not exclude but clotho cannot put in a container.
+        // handful guard_container_element names -- a virtual-interface element,
+        // say, which 7.12.2 does not exclude but clotho cannot put in a container.
         guard_container_element(recv.type->getArrayElementType()->getCanonicalType(), er, "fixed-size array ordering");
 
         ir::Type mt;
