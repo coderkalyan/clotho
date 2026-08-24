@@ -756,6 +756,24 @@ TEST_CASE("ordering shapes Clotho still refuses loudly") {
         CHECK_FALSE(r.ok);
         CHECK(r.diagnostic_text().find("unpacked arrays of comparable values") != std::string::npos);
     }
+    // LRM 6.14's closed operator list for chandle has only `==`/`!=` -- no
+    // `<`/`>` -- so a bare sort() (no `with` clause) has nothing to compare with.
+    // Caught by slang's own binder ahead of lowering, same as the two cases above;
+    // see "fixed-array reverse and shuffle work on chandle elements" below for the
+    // two ordering methods that need no relational operator and do work.
+    SUBCASE("a chandle element has no relational operators") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                chandle q[$];
+                initial begin
+                    q.push_back(null);
+                    q.sort();
+                end
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("unpacked arrays of comparable values") != std::string::npos);
+    }
 }
 
 // "Specifying a with clause shall be a compiler error" for reverse() and
@@ -1002,4 +1020,40 @@ TEST_CASE("multidimensional fixed array reverses its sub-arrays (LRM 7.12.2)") {
         endmodule
     )";
     CHECK(run_capture(src) == "40 50 60 / 1 2 3\n");
+}
+
+// The fixed-array-ordering mirror (lower_fixed_array_order) copies elements into
+// a real dynamic array, so its element has to be one guard_container_element
+// admits -- and now a chandle is. reverse()/shuffle() need no comparison (they
+// move whole slots), so both work even though chandle has no ordering relation
+// for sort() to use (see "ordering shapes Clotho still refuses loudly" above).
+// libc malloc/free is the no-.so probe for a non-null chandle.
+TEST_CASE("fixed-array reverse and shuffle work on chandle elements") {
+    constexpr std::string_view src = R"(
+        module m;
+            import "DPI-C" function chandle malloc(input longint size);
+            import "DPI-C" function void    free(input chandle p);
+            chandle fa[3];
+            chandle h0, h2;
+            initial begin
+                h0 = malloc(8);
+                h2 = malloc(8);
+                fa[0] = h0;
+                fa[1] = null;
+                fa[2] = h2;
+                fa.reverse();
+                $display("rev %0b %0b %0b", fa[0] == h2, fa[1] == null, fa[2] == h0);
+                fa.shuffle();
+                $display("shuf nulls=%0d present=%0b",
+                         (fa[0]==null)+(fa[1]==null)+(fa[2]==null),
+                         (fa[0]==h0 || fa[1]==h0 || fa[2]==h0) &&
+                         (fa[0]==h2 || fa[1]==h2 || fa[2]==h2));
+                free(h0);
+                free(h2);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "rev 1 1 1\n"
+                              "shuf nulls=1 present=1\n");
 }

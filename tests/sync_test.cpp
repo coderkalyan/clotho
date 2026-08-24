@@ -561,34 +561,41 @@ TEST_CASE("mailbox: the payload matrix") {
         typedef struct { int a; string s; } pkt;
         class obj; int x; function new(int v); x = v; endfunction endclass
         module t;
+          import "DPI-C" function chandle malloc(input longint size);
+          import "DPI-C" function void    free(input chandle p);
           typedef int iq[$];
           mailbox #(string)        ms;
           mailbox #(obj)           mo;
           mailbox #(logic [95:0])  mw;
           mailbox #(pkt)           mp;
           mailbox #(iq)            mq;
+          mailbox #(chandle)       mc;
           initial begin
             string       s = "abc", sr;
             obj          a, b;
             logic [95:0] w = 96'hdead_beef_1234_5678_9abc_def0, wr;
             pkt          p, pr;
             iq           q, qr;
-            ms = new(); mo = new(); mw = new(); mp = new(); mq = new();
+            chandle      ch, chr;
+            ms = new(); mo = new(); mw = new(); mp = new(); mq = new(); mc = new();
             a = new(5);
             p.a = 3; p.s = "hi";
             q.push_back(4); q.push_back(5);
-            ms.put(s); mo.put(a); mw.put(w); mp.put(p); mq.put(q);
-            ms.get(sr); mo.get(b); mw.get(wr); mp.get(pr); mq.get(qr);
+            ch = malloc(8);
+            ms.put(s); mo.put(a); mw.put(w); mp.put(p); mq.put(q); mc.put(ch);
+            ms.get(sr); mo.get(b); mw.get(wr); mp.get(pr); mq.get(qr); mc.get(chr);
             $display("string '%s'", sr);
             $display("handle x=%0d identity=%0d", b.x, a == b);
             $display("wide %h", wr);
             $display("struct a=%0d s=%s", pr.a, pr.s);
             $display("queue size=%0d %0d %0d", qr.size(), qr[0], qr[1]);
+            $display("chandle identity=%0d", ch == chr);
+            free(ch);
           end
         endmodule
     )");
     CHECK(out == "string 'abc'\nhandle x=5 identity=1\nwide deadbeef123456789abcdef0\n"
-                 "struct a=3 s=hi\nqueue size=2 4 5\n");
+                 "struct a=3 s=hi\nqueue size=2 4 5\nchandle identity=1\n");
 }
 
 // Two specializations are two unrelated types with two bodies of their own, which

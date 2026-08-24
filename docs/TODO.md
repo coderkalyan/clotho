@@ -2311,6 +2311,43 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   descriptor. Still guarded loud: an event element, which needs one event OBJECT per
   element; the object slot array is sized at compile time from the declared events
   (docs/design/event-handles.md §9).
+- [x] **`chandle` admitted as a dynamic-array / queue / mailbox-message / assoc-value
+  element, and in the fixed-array ordering mirror** (LRM 6.14 with 7.5 / 7.10 / 15.4) --
+  the same `guard_container_element` gate that already admitted a class handle now
+  admits a chandle too. The two are identical by the same argument: LRM 6.14 gives a
+  chandle the same closed `==`/`!=`/`null`/assignment operator set a class handle has,
+  so it is a plain 64-bit POD word needing no lifecycle beyond the `rt_elem_ops` POD
+  copy, `null` the all-zero Table 7-1 default, and `==` the identity compare a word
+  compare already gives. The two diverge in exactly one place -- whether the GC traces
+  the word -- and that fork costs no new code: `lower_type` puts a class handle in
+  `Kind::Class` and a chandle in a plain `Kind::Int`, and the GC's handle-offset walk
+  (`collect_class_handles`, LlvmBackend.cpp) keys on `Kind::Class` alone, so a chandle
+  element's `rt_elem_ops::handles` table comes out empty by construction -- tracing one
+  would hand the collector a foreign DPI pointer it never allocated
+  (docs/design/garbage-collection.md §0, "Never in scope"). `%p` of a chandle
+  container element needed no new code either (see the `%p` entry below); a bare
+  `sort()`/`rsort()` (no `with` clause) on a chandle array is refused by SLANG's own
+  binder ("unpacked arrays of comparable values"), since 6.14 gives chandle no
+  `<`/`>`, while `reverse()`/`shuffle()` need no ordering relation and work.
+  This was the last thing standing between clotho and any UVM run that does not pass
+  `+define+UVM_NO_DPI`: `uvm_regex_cache` (`class uvm_regex_cache extends
+  uvm_lru_cache#(string, chandle);`) is on UVM's DEFAULT (DPI-enabled) boot path and
+  its base class's `typedef chandle optional_data[$];` used to fail lowering at
+  `uvm_lru_cache.svh:193` with "queue element type is not supported".
+  Associative-array KEY admission is a separate question and is UNTOUCHED here --
+  6.14's own text ("chandles can be inserted into associative arrays ... the relative
+  ordering of any two entries ... can vary") reads, together with 7.8.5's
+  equality-only legality rule, as though a chandle key should already be legal, which
+  is exactly what docs/design/assoc-keys.md's P0 phase already plans to admit later
+  with the class-handle key normalizer reused verbatim -- but that document's own
+  status is "scoping, nothing implemented", so admitting a chandle KEY stays a
+  separate, not-yet-landed change; `int q[chandle]` is still refused, now confirmed by
+  a dedicated test. Verilator's chandle/DPI support does not extend to a container of
+  them, so Verilator is no runtime oracle for the container shapes; behaviour is pinned to
+  the LRM 6.14 / 7.10 / 7.5 / 15.4 / 7.12.2 text directly, the same precedent already
+  used for associative-array tests. Covered in tests/queue_test.cpp,
+  tests/dynamic_array_test.cpp, tests/associative_array_test.cpp,
+  tests/array_ordering_test.cpp, tests/sync_test.cpp and tests/display_test.cpp.
 - [x] **NBA to a dynamic array** — and to an associative array. `HandleCopyNb`
   stages a deep copy in the Active region and MOVES it into the live handle in the
   NBA region, generalizing the queue's path to all three container kinds. A
@@ -2539,9 +2576,10 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
     `min`/`max`/`sort` of a non-comparable one, both by slang ahead of lowering
     (7.12.3 "any unpacked array of integral values"; 7.12.1 / 7.12.2 "the
     relational operators shall be defined for"); an aggregate element with no
-    `with` clause, by clotho, now citing both clauses; an element a dynamic array
-    cannot hold (a `chandle`), which only the ordering mirror needs
-    (`guard_container_element`); and `item.index(d)` for `d > 1`.
+    `with` clause, by clotho, now citing both clauses; a virtual-interface
+    element, which the ordering mirror still refuses
+    (`guard_container_element` -- a `chandle` element now lowers, see the
+    container-element-type entry above); and `item.index(d)` for `d > 1`.
   * Remaining receiver gap: the **associative** array, whose index family is
     key-typed and whose walk is the `assoc_traverse` chain.
 - [ ] **`map`** (LRM 7.12.5, 1800-2023 only) — the one array manipulation method
@@ -3964,13 +4002,22 @@ project with its own algorithm, not tail cleanup on the property layer:
     `loop_render`'s class-handle test is now a handle test over all four kinds
     (`elem_is_handle`), and it needs BOTH halves: a class handle is decidable from the
     IR type, while a chandle is a plain unsigned 64-bit int there and only the AST
-    tells it apart. An event queue / dynamic array / associative array is the one
-    handle container the element type system admits today, so it is where that is
-    pinned; a chandle or virtual-interface element is still refused by
+    tells it apart. An event queue / dynamic array / associative array was the one
+    handle container the element type system admitted at the time this landed; a
+    chandle queue / dynamic array / associative-array value now lowers too (see the
+    container-element-type entry above), and `elem_is_handle` needed no change to
+    render one -- it was already built chandle-aware, ahead of `guard_container_element`
+    catching up. A virtual-interface element remains refused by
     `guard_container_element`, which is the container-of-handles gap below and NOT a
-    `%p` deficiency — and for a chandle 6.14's closed list of legal uses names an
-    associative array but no queue or dynamic array, so the queue form is doubtful
-    SystemVerilog in the first place.
+    `%p` deficiency.
+    The "doubtful SystemVerilog" reading this paragraph used to carry for a chandle
+    queue / dynamic array -- 6.14's closed list of legal uses names an associative
+    array by name but not a queue or dynamic array -- is resolved by
+    `uvm_lru_cache.svh`'s `typedef chandle optional_data[$];` (stock Accellera UVM, on
+    the DEFAULT DPI-enabled boot path of every major commercial simulator): a queue
+    element is an ordinary chandle variable in an assignment context 6.14 already
+    permits, and 6.14 singles out the associative array only for its ordering caveat,
+    not to exclude every other unpacked-array shape.
     The RUNTIME-format path (`lower_dynamic_format`) keeps refusing a handle argument
     and the refusal is accurate as written: `rt_arg` carries one integral / real /
     string, and with the format unknown the frontend cannot tell which specifier the

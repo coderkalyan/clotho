@@ -25,7 +25,13 @@ so the behaviour is pinned against LRM 7.8/7.9 by
 **The POD-only element cut is superseded.** The `rt_elem_ops` element-descriptor
 ABI (feat-compose) threads a per-element-type stride + deinit/copy function
 pointer through every runtime call, so dynarr/queue elements may now be managed
-types (`string`, nested dynarr/queue, class handle) — not just POD. Any new
+types (`string`, nested dynarr/queue, class handle) -- not just POD. `chandle`
+(LRM 6.14) landed alongside a class handle -- both are a bare 64-bit word with
+no lifecycle, admitted by the same `guard_container_element` gate; the two
+differ only in whether the GC traces the word (a chandle is a foreign DPI
+pointer clotho never allocated and must not trace, docs/design/
+garbage-collection.md §0), which falls out of `chandle` lowering to a plain
+`Kind::Int` rather than `Kind::Class` and needs no dedicated code. Any new
 container design (associative arrays below) must be built on `rt_elem_ops` from
 the start, not the original POD-first memcpy path.
 
