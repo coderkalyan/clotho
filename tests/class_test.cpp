@@ -558,6 +558,37 @@ TEST_CASE("class static property: local static with no reader still initializes"
     CHECK(run_capture(src) == "registered=1\n");
 }
 
+// The eager pass's known consequence, removed: a package/$unit class forced to
+// lower BEFORE any top (here by its own static initializer) used to build its
+// vtable-forced method bodies at the end of lower_globals, where a virtual
+// interface member wait found an EMPTY instance registry -- each top's Collect
+// pass fills it -- and warned virtual-interface-never-bound even though the top
+// elaborates the interface. Those bodies now drain at the first top's phase
+// boundary instead, so the wait binds the instance and wakes.
+TEST_CASE("class static property: eager class with a vif wait in a task still binds the interface") {
+    constexpr std::string_view src = R"(
+        interface bus_if; logic clk; endinterface
+        class watcher;
+            static watcher singleton = new;
+            virtual bus_if vif;
+            task run(); @(posedge vif.clk); $display("edge at %0t", $time); endtask
+        endclass
+        module top;
+            bus_if b();
+            watcher w;
+            initial begin
+                b.clk = 0;
+                w = new;
+                w.vif = b;
+                fork w.run(); join_none
+                #5 b.clk = 1;
+                #1;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "edge at 5\n");
+}
+
 // The decisive UVM shape, measured against Verilator (count=2): each
 // specialization of a parameterized class has its own statics (LRM 8.25), a
 // specialization named ONLY in a typedef is still a specialization, and neither

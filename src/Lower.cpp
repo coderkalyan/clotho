@@ -222,9 +222,12 @@ bool subroutine_has_real_delay(const SubroutineSymbol& sub) {
 //
 //   - a STATIC property, which has persistent module-signal storage of its own
 //     (declare_static_prop) and already resolves through event_signal;
-//   - an EVENT property, which is already an object with a waiter list, so
-//     `@(obj.e)` works today through the event-handle path. Neither resolver
-//     below admits one, since an event type is neither integral nor a container.
+//   - an EVENT property is admitted by NEITHER type-specific resolver below (an
+//     event type is neither integral nor a container) and needs no notifier: the
+//     property IS an object with a waiter list, the very one `-> e` fires. The
+//     wait side parks on that object instead -- `@(obj.e)` and a bare `@e` in a
+//     method through event_wait_needs_handle, a `wait` condition reading one
+//     through ClassPropReadScan::event_props.
 const slang::ast::ClassPropertySymbol* instance_class_prop(const Expression& e) {
     const slang::ast::Symbol* member = nullptr;
     if (e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue) {
@@ -353,8 +356,18 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
     // A CONTAINER property was referenced. `wait` parks on its mutation notifier;
     // `@` refuses, because a mutation is not a change in value (LRM 9.4.2).
     bool any_container = false;
+    // Event-typed property references, in source order. `wait` parks on the event
+    // OBJECT the property names -- the thing `-> e` fires -- not on a notifier;
+    // prop_notify_kind mints none for an event on purpose.
+    std::vector<const Expression*> event_props;
 
     void take(const Expression& e) {
+        if (const auto* p = instance_class_prop(e);
+            p != nullptr && p->getType().getCanonicalType().isEvent()) {
+            event_props.push_back(&e);
+            any_prop = true;
+            return;
+        }
         if (const auto* p = level_waited_prop(e); p != nullptr) {
             notifiable.push_back(&e);
             any_prop = true;
@@ -2273,6 +2286,17 @@ public:
         // that the top's signals and scope tree are complete. Before the finalizers,
         // which close the processes a body's own lowering can still contribute to.
         drain_pending_bodies();
+        // The drain above pulls the shared globals Lowerer's queue too. Its
+        // vtable-forced package/$unit class-method bodies wait for THIS boundary
+        // on purpose (see lower_globals): only now has Collect registered the
+        // interface instances this top elaborates, so a virtual-interface member
+        // access inside a class task resolves instead of warning never-bound. A
+        // body drained here may append function-static initializers to the
+        // globals PreInit builder, which lower_globals already finalized; flush
+        // them into a process of their own, still ahead of this top's preinit.
+        if (globals_ != nullptr && globals_ != this) {
+            globals_->finalize_preinit();
+        }
         // Before finalize_preinit, which closes the process the seeds go into.
         finalize_sva_history();
         finalize_preinit();
@@ -2289,15 +2313,23 @@ public:
     // in this Lowerer's PreInit process, so a package variable initializes
     // exactly once regardless of how many tops import it.
     void lower_globals(const Compilation& comp, const RootSymbol& root) {
-        // Four phases, in this order, because each one lowers code that may read
+        // Three phases, in this order, because each one lowers code that may read
         // whatever the previous one produced. Registration only needs types, so it
         // cannot observe a half-built anything; an initializer can call a function
-        // that reads any global, so every global has to exist first; a class
+        // that reads any global, so every global has to exist first; and a class
         // static's initializer may read any of those, so classes follow the
-        // variables; and a deferred body can read a global AND run an initializer's
-        // side effects, so it goes last. Doing these per-variable, as one loop, is
-        // what left `uvm_object::m_set_local_rsrc` unregistered when a variable
-        // declared above it pulled its class's vtable in.
+        // variables. Doing these per-variable, as one loop, is what left
+        // `uvm_object::m_set_local_rsrc` unregistered when a variable declared
+        // above it pulled its class's vtable in.
+        //
+        // A VTABLE-FORCED method body (function_id under defer_bodies_) is NOT
+        // drained here, on purpose: a package/$unit class task may wait on or
+        // assign through a virtual interface member, and the interface instances a
+        // handle can name are registered by each top's Collect pass, which has not
+        // run yet. The first top's drain_pending_bodies pulls this Lowerer's queue
+        // (and lower_compilation drains any remainder), so those bodies build once
+        // the registry is complete. Initializer EXPRESSIONS still lower right
+        // here -- only bodies they merely reserved wait.
         for (const PackageSymbol* pkg : comp.getPackages()) {
             register_global_scope_signals(*pkg);
         }
@@ -2326,6 +2358,17 @@ public:
         for (const CompilationUnitSymbol* unit : root.compilationUnits) {
             init_static_class_props(*unit);
         }
+        finalize_preinit();
+    }
+
+    // The globals Lowerer's last phase, run by lower_compilation once every top
+    // has lowered: build any package/$unit class-method body still queued (a
+    // design with no top instance, or a body the last top's own drain queued) --
+    // every top's interface instances are registered by now, which is what those
+    // bodies were deferred FOR (see lower_globals) -- then flush the
+    // function-static initializers they may have appended into a PreInit process
+    // of their own.
+    void finalize_globals() {
         drain_pending_bodies();
         finalize_preinit();
     }
@@ -9424,8 +9467,14 @@ private:
                                         "'" + std::string(ma.member.name) + "'");
                     const ir::Index inst = lower_expr(ma.value(), *wait_builder_);
                     if (!rep) {
-                        // Null for the whole run: waiting on it blocks forever, which
-                        // an empty event list is. The warning is already reported.
+                        // Null for the whole run (the never-bound analysis warning
+                        // is already reported). LRM 25.9 makes USING a null virtual
+                        // interface a run-time error, and reaching this wait is the
+                        // use -- so emit the same located fatal the access paths
+                        // emit (vif_null_place) instead of silently dropping the
+                        // event from the list.
+                        (void)vif_null_place(*ev.expr.type, *wait_builder_, loc(ev.expr));
+                        wait_dead_ = true;
                         break;
                     }
                     if (ev.edge == slang::ast::EdgeKind::BothEdges) {
@@ -9665,6 +9714,15 @@ private:
         if (fn_ctx_ != nullptr && fn_ctx_->localmap.contains(&e.as<ValueExpressionBase>().symbol)) {
             return true;
         }
+        // A bare `@e` in a method, `e` an event-typed INSTANCE property (LRM 9.4.2
+        // over 15.5.1): the property is the handle slot of the very object `-> e`
+        // fires, so park on the handle it holds when the wait executes -- the same
+        // object `@(this.e)` (a MemberAccess, admitted above) parks on. A STATIC
+        // event property stays on the signal path (signal_of ->
+        // declare_static_prop); instance_class_prop already excludes it.
+        if (instance_class_prop(e) != nullptr) {
+            return true;
+        }
         // With merging anywhere in the design, even a plain `@(e)` has to re-read
         // the handle on each pass, which only the body-resident wait can do.
         return events_merge_;
@@ -9697,6 +9755,10 @@ private:
     // expressions lower into. Null while a process's static sensitivity is
     // collected, which is what makes event_signal refuse a frame-held event there.
     ir::Builder* wait_builder_ = nullptr;
+    // Set when a listed event was a member of a never-bound virtual interface:
+    // the located LRM 25.9 run-time fatal just emitted replaces the wait, so an
+    // empty event list is complete rather than malformed (lower_event_wait).
+    bool wait_dead_ = false;
 
     // Whether an expression reaches through a virtual interface handle anywhere.
     // Such a place names an instance chosen at run time, which the signal-keyed
@@ -9971,8 +10033,21 @@ private:
         wait_builder_            = &b;
         const Expression* iff    = collect_wait_events(tc, events);
         wait_builder_            = saved;
+        const bool dead          = wait_dead_;
+        wait_dead_               = false;
         if (events.empty()) {
-            fail("intra-body event wait has no signal events");
+            if (dead) {
+                // Every listed event was a never-bound virtual interface member;
+                // the located fatal above replaces the wait, and execution cannot
+                // pass it.
+                return;
+            }
+            // Reachable for an event control that resolves to nothing at all --
+            // an implicit `@*` inside a procedural body infers no sensitivity
+            // here. An event class property no longer lands here: it parks on its
+            // object through the handle path (event_wait_needs_handle).
+            fail("an event control here names no signal or event object (an "
+                 "implicit '@*' inside a procedural body is not supported)");
         }
         std::vector<ir::WaitEdge> edges;
         edges.reserve(events.size());
@@ -16398,7 +16473,8 @@ private:
         // on every pass.
         ClassPropReadScan prop_reads;
         w.cond.visit(prop_reads);
-        if (reads.empty() && vif_reads.empty() && prop_reads.notifiable.empty() && prop_reads.any_prop) {
+        if (reads.empty() && vif_reads.empty() && prop_reads.notifiable.empty() &&
+            prop_reads.event_props.empty() && prop_reads.any_prop) {
             // The condition reads a class property that can carry no notifier -- an
             // unpacked struct or union, or a FIXED unpacked array -- and nothing else
             // that can wake this process. Lowering it anyway is what used to happen,
@@ -16432,7 +16508,8 @@ private:
             const ir::ExtraSlice else_r = b.close_region(); // empty
             b.cond(c, then_r, else_r, l);
             std::vector<ir::WaitEdge> edges;
-            edges.reserve(reads.size() + vif_reads.size() + prop_reads.notifiable.size());
+            edges.reserve(reads.size() + vif_reads.size() + prop_reads.notifiable.size() +
+                          prop_reads.event_props.size());
             for (const ir::WaitEvent& e : reads) {
                 edges.push_back(ir::WaitEdge{ e.signal, static_cast<uint32_t>(e.edge) });
             }
@@ -16450,6 +16527,16 @@ private:
                 edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
                                               static_cast<uint32_t>(ir::Edge::Any),
                                               prop_notifier_handle(*pe, *level_waited_prop(*pe), ir::Edge::Any, b) });
+            }
+            for (const Expression* pe : prop_reads.event_props) {
+                // Park on the event OBJECT the property holds right now, exactly
+                // what `-> e` fires (LRM 9.4.3 re-tests the condition on wake, so
+                // a trigger that leaves it false costs one re-test). The handle is
+                // loaded inside the loop body, so a reassigned property is re-read
+                // on every pass, like a vif handle above.
+                edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
+                                              static_cast<uint32_t>(ir::Edge::Any),
+                                              lower_expr(*pe, b) });
             }
             // An empty list is legal and meaningful: `wait(0)` reads nothing and
             // parks the process for the rest of the run.
@@ -30760,6 +30847,11 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             poisoned  = poisoned || lw.poisoned();
             dumps_vcd = dumps_vcd || lw.dumps_vcd();
         }
+        // Any package/$unit class-method body still queued (a design with no top
+        // instance, or a body the last top's own drain queued) builds now, and the
+        // stub warnings it may recover with land before the diagnostics are
+        // collected just below.
+        globals.finalize_globals();
         const std::span<const Diagnostic> global_diags = globals.recovered_diags();
         result.diagnostics.insert(result.diagnostics.end(), global_diags.begin(), global_diags.end());
         poisoned  = poisoned || globals.poisoned();

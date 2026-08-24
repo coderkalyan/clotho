@@ -1045,6 +1045,61 @@ professional parity; M5 makes it complete.
   DPI, so the chandle transition itself is not exercised end to end; what is pinned
   is that the property is notifiable, that its notifier is laid out, and that a
   null -> null store is not a change.
+- [x] **Bare `@e` on an EVENT class property, and `wait(e.triggered)` on one**
+  (LRM 9.4.2 over 15.5) — the fourth rung, and the easyUVM driver's `record_tr`:
+  `@(begin_record)` inside a method, on the `event begin_record` property of
+  `this`. An event property needs NO notifier — the property IS an object with a
+  waiter list, the very one `-> e` fires — which is why the first rung excluded
+  it from the notified set. What was missing was RESOLUTION: `@(obj.e)` and
+  `@(this.e)` already took the event-handle path (a MemberAccess), but a bare
+  `@e` is a NamedValue and fell through to `event_signal` -> `signal_of`, and a
+  property is heap storage, not a signal — "reference to unknown signal
+  'begin_record'". (Under `events_merge` the handle fallback hid the hole, and
+  UVM designs do merge events, which is why the scalar rung could truthfully
+  report event properties working there.) `event_wait_needs_handle` now admits
+  an event-typed INSTANCE property (`instance_class_prop`), so the wait parks on
+  the handle the property holds when the statement executes — object resolution
+  at execution time, and wake times byte-identical to Verilator 5.050 on the
+  easyUVM fork shape. `wait(e.triggered)` parks on the same object
+  (`ClassPropReadScan::event_props` in lower_wait_stmt): `-> e` is the only
+  thing that changes that condition, and the persistent within-step `triggered`
+  still satisfies a wait that starts AFTER the trigger in the same instant,
+  which `@e` would miss. A STATIC event property keeps the signal path
+  (`declare_static_prop`); `->` / `->>` on a property were already the generic
+  rvalue path and are unchanged, as are an event ARRAY / queue element
+  (`@(arr[i])`, the existing element-handle path).
+  **The second message was not this gap.** easyUVM's `FATAL: driver.sv:36:
+  intra-body event wait has no signal events` was `@(negedge vif.rst)` — a
+  virtual-interface member wait inside a $unit class task, whose method body the
+  eager static pass built at the end of lower_globals, BEFORE any top's Collect
+  pass registered `input_if`'s instance: the registry came back empty, the
+  member contributed no event, and the empty list was refused with an internal
+  invariant's wording, stubbing the whole method. Vtable-forced package/$unit
+  bodies now drain at the FIRST TOP's phase boundary instead (a top's
+  drain_pending_bodies already pulls the globals queue, which now still holds
+  them; lower_compilation drains any remainder after every top), so the wait
+  binds the instance the top elaborates. A body drained there can append
+  function-static initializers to the already-finalized globals PreInit builder;
+  they flush into a PreInit process of their own, still ahead of that top's.
+  **A genuinely never-bound vif member wait** is now the located LRM 25.9
+  run-time fatal the ACCESS paths already emit ("use of a null virtual
+  interface", after the analysis warning) — reaching the wait IS the use — not a
+  compile-time stub of the whole method. The empty-list refusal that survives is
+  reworded to name its one remaining construct (an implicit `@*` inside a
+  procedural body).
+  **Still refused / unchanged**: an edge qualifier on an event expression
+  (slang: not integral); `@` on a container property; the aggregate property
+  shapes; and a multi-top design still drains the globals queue at the FIRST
+  top, so a $unit class body waiting on an interface only a LATER top
+  instantiates keeps the never-bound behavior (the same pre-existing cross-top
+  boundary vif_scopes already documents).
+  Design: docs/design/classes.md, "Waiting on an event property". Covered in
+  tests/event_test.cpp (the easyUVM fork shape pinned to Verilator's wake times,
+  all five spellings, `->>`, the wrong-property / wrong-object negatives, two
+  waiters on one property, base-triggers/derived-waits over the prefix
+  invariant, `wait(e.triggered)` including the same-instant start, and the
+  never-bound run-time fatal) and tests/class_test.cpp (the eager class whose
+  vif wait binds the top's interface).
 - [x] **Named events** (LRM 15.5) — `event e;`, `-> e`, `->> e`, `->> #d e`,
   `@(e)` / `always @(e)`, `wait(e.triggered)`, at module, package, generate,
   procedural-block and `static`-local scope. An event is an OBJECT (trigger tick +
@@ -2898,13 +2953,13 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
     dynamic array (`addrs = map_info.addr`, uvm_reg_map) — the guard demanded a
     NamedValue where lower_lvalue already handles a MemberAccess slot.
 
-  Known consequence, documented not fixed: package/$unit class bodies now build
-  on the globals Lowerer BEFORE any top lowers, so `vif_defs_->insts` is empty
-  at that point and a virtual-interface member access in such a body warns
-  `virtual-interface-never-bound` and lowers to the run-time fatal even when a
-  top does instantiate the interface. Today every such body is also stubbed
-  (vif NBA / vif edge waits are unimplemented), so behavior is dominated by the
-  stubs; the vif-in-class-task work must revisit the globals-drain boundary.
+  Known consequence, SINCE FIXED by the event-property rung above: package/$unit
+  class bodies built on the globals Lowerer BEFORE any top lowered, so
+  `vif_defs_->insts` was empty at that point and a virtual-interface member
+  access in such a body warned `virtual-interface-never-bound` even when a top
+  did instantiate the interface. Vtable-forced bodies now stay queued through
+  lower_globals and drain at the first top's phase boundary, after its Collect
+  pass fills the registry.
 
   Outcome: both measured programs match Verilator (`count=1`, `count=2`);
   easyUVM now boots, prints the 1800.2-2020 banner, POPULATES THE FACTORY,

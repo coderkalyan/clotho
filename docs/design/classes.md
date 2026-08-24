@@ -55,9 +55,13 @@ through `sigmap_`, so the initializer is queued exactly once. Order is
 implementation-defined (declaration order within and across classes;
 specializations of one generic by rendered name); an initializer reading another
 class's static forces that property's initialization ahead of the read. A class
-with no initialized statics contributes no PreInit work. See the TODO.md ledger
-entry for the randomization-guard relocation and body-stub policy this
-unlocked.
+with no initialized statics contributes no PreInit work. Vtable-forced method
+bodies this pass reserves are NOT built at the end of lower_globals: a
+package/$unit class task may wait on or assign through a virtual interface
+member, and the instance registry is filled by each top's Collect pass, so those
+bodies drain at the first top's phase boundary ("Waiting on an event property"
+below). See the TODO.md ledger entry for the randomization-guard relocation and
+body-stub policy this unlocked.
 
 **Virtual functions / dynamic dispatch** (LRM 8.20) now work (Phase 3, part 1). A
 class is *polymorphic* iff it or a base declares a virtual method; virtual
@@ -673,7 +677,8 @@ an unrelated reason.
   (`invalid type 'T' for event expression`).
 - **An `event`-typed property** is excluded from the notified set on purpose:
   `@(obj.ev)` parks on the event OBJECT the property names, which is what `-> obj.ev`
-  fires, so a notifier here would be a field nothing ever reads.
+  fires, so a notifier here would be a field nothing ever reads. The bare `@e` and
+  `wait(e.triggered)` spellings of that wait are the rung below.
 
 ### Zero cost, again asserted
 
@@ -696,6 +701,83 @@ SystemVerilog offers no way to MAKE a non-null `chandle` without DPI, so the cha
 *transition* is not exercised end to end. What is pinned is that the property is
 notifiable, that its notifier is laid out, and that a `null -> null` store is not a
 change.
+
+## Waiting on an event property (LRM 9.4.2 over 15.5)
+
+The fourth rung, and the easyUVM driver's `record_tr`: `@(begin_record)` inside a
+method, on an `event` property of `this`, triggered by `-> begin_record` in a
+forked sibling task. Bare `@e`, `@(e)`, `@(this.e)`, another object's `@(o.e)`,
+an event array / queue element `@(arr[i])`, `->>` as the trigger side, and
+`wait(e.triggered)` all work; wake times are byte-identical to Verilator 5.050
+on the easyUVM fork shape.
+
+### No notifier, only resolution
+
+An event property needs none of this file's notifier machinery — the property IS
+an object with a waiter list, the very one `-> e` fires — which is why the first
+rung excluded it from the notified set (`prop_notify_kind` answers `None`). What
+was missing was resolution. `@(obj.e)` and `@(this.e)` are MemberAccess
+expressions and always took the event-handle path; a bare `@e` is a NamedValue
+and fell through to `event_signal` -> `signal_of`, and a property is heap
+storage, not a signal: "reference to unknown signal 'begin_record'". Under
+`events_merge` the handle fallback happened to catch it — UVM designs merge
+events, which is why the scalar rung could truthfully report event properties
+working there — so the hole was only visible in a design that never assigns one
+event to another.
+
+`event_wait_needs_handle` now admits an event-typed INSTANCE property
+(`instance_class_prop`), so the wait parks on the handle the property holds when
+the statement executes — the same execution-time object resolution the notifier
+rungs argue for, and the same `WaitEvent::handle` path an event array element
+uses. A STATIC event property keeps the signal path (`signal_of` ->
+`declare_static_prop`), which `instance_class_prop` already excludes. The
+trigger side needed nothing: `-> e` / `->> e` resolve the target through the
+generic rvalue path (`event_handle`), property or not.
+
+`wait(e.triggered)` parks on the same object (`ClassPropReadScan::event_props`,
+a third category beside the notifiable and container ones in `lower_wait_stmt`):
+`-> e` is the only thing that changes that condition, and LRM 9.4.3's re-test on
+wake absorbs a trigger that leaves it false. The persistent within-step
+`triggered` state still satisfies a wait that STARTS after the trigger in the
+same instant — which `@e` would miss, and which
+`tests/event_test.cpp` pins.
+
+### The second message was a different construct
+
+easyUVM reported the SAME driver with two messages, and only one was this gap.
+`FATAL: driver.sv:36: intra-body event wait has no signal events` was
+`@(negedge vif.rst)` — a virtual-interface member wait inside a $unit class
+task. The eager static pass builds package/$unit class bodies on the globals
+Lowerer, and it used to drain the vtable-forced ones at the end of
+`lower_globals`, BEFORE any top's Collect pass registered `input_if`'s instance:
+`vif_member_signal` found an empty registry, the member contributed no event,
+and the empty list was refused with an internal invariant's wording, stubbing
+the whole method (the "known consequence" the eager-initialization ledger entry
+recorded). Those bodies now stay queued through `lower_globals` and drain at the
+FIRST top's phase boundary — a top's `drain_pending_bodies` already pulls the
+globals queue — with `lower_compilation` draining any remainder after every top,
+so the wait binds the instance the top elaborates. A body drained at a top can
+append function-static initializers to the already-finalized globals PreInit
+builder; they flush into a PreInit process of their own, still ahead of that
+top's own preinit process.
+
+A wait on a member of a GENUINELY never-bound virtual interface is now the
+located LRM 25.9 run-time fatal the access paths already emit ("use of a null
+virtual interface", after the analysis warning) — reaching the wait is the use —
+rather than a compile-time stub of the whole method. The empty-event-list
+refusal that survives in `lower_event_wait` is reworded to name its one
+remaining construct (an implicit `@*` inside a procedural body).
+
+### Refused, and unchanged
+
+- An EDGE qualifier on an event expression: slang rejects it as not integral,
+  as for every non-integral type above.
+- `@` over a container property, and the aggregate property shapes: previous
+  rungs' refusals, untouched.
+- A multi-top design still drains the globals queue at the FIRST top, so a $unit
+  class body waiting on an interface only a LATER top instantiates keeps the
+  never-bound behavior — the same pre-existing cross-top boundary the
+  `vif_scopes` computation already documents.
 
 ## Implementation deviations from the scope-out below
 
