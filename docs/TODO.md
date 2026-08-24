@@ -2131,6 +2131,42 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   TODO in `lower_container_element_value`). With field automation removed
   the full bench runs: 101 matched, UVM_ERROR 0, UVM_FATAL 0,
   `$finish` from uvm_root.svh:633 at t=3045.
+  **`new[]` as a declaration initializer** (LRM 6.21 static/automatic timing,
+  7.5/7.5.1 `new[n]` / `new[n](src)`, 8.7/8.8 a class property) closes the
+  "non-variable value" stub above — the exact minimal repro was
+  `bit __array[] = new[$bits(data)];`. The statement form `arr = new[n]`
+  already special-cased `NewArrayExpression` in `lower_dyn_array_assign`; the
+  declaration-initializer form routed through `emit_handle_member_copy`
+  instead, which only admitted a handle LVALUE as its source (a variable /
+  member / element, never a constructor) and fell into the same refusal.
+  Extracted the construction itself — sizing, and the `has_init` dispatch to
+  the pattern / copy-source / bare forms — into `emit_dyn_array_new_expr`,
+  called from both `lower_dyn_array_assign` and `emit_handle_member_copy`, so
+  an automatic local, a `static` local and a module-scope variable all take
+  one path and a future change to sizing / truncate / fill semantics cannot
+  land in only one of them. A class property hit a SEPARATE, more primitive
+  gap: `emit_class_property_inits` had no aggregate/container gate at all —
+  unlike `lower_var_initializer` and `declare_static_prop`, which already
+  routed an aggregate/container initializer through `emit_struct_store` — so
+  ANY unpacked-struct or container property initializer, not only `new[]`,
+  fell into the generic expression lowerer and its bare
+  `unsupported expression kind=` fallback. Since the gap was a missing gate
+  rather than a missing per-property capability, and LRM 8.7 runs a property
+  initializer "as part of construction" (the same declaration-initializer
+  semantics `lower_var_initializer` / `declare_static_prop` already implement,
+  just per-object instead of per-frame or once), added the gate rather than a
+  separate refusal. Covered in tests/dynamic_array_test.cpp: both `new[n]`
+  forms as a declaration initializer in each of the three lifetimes plus a
+  class property, `n` vs `src.size()` (grow / same / truncate), `n=0`,
+  per-object independence of a class property's array, and the size
+  expression itself as a constant, `$bits`, a runtime argument, a call, and a
+  mix — cross-checked against verilator 5.050 (agreeing on every case) and
+  iverilog 13 where its parser accepts the shape. Stock easyUVM after this
+  fix: the "non-variable value" stub is gone; the array-query-function stub
+  and the two streaming-concatenation stubs below are what remain, so the run
+  still fatals at packet_out.sv:4 t=35 on the do_unpack-family
+  streaming-concatenation message, unchanged from before — the array-query and
+  streaming-concatenation gaps are each their own ticket.
   Remaining gaps, refused loud:
   - [ ] **A slice of a struct-bearing array as an actual** ("a slice of a
     struct-bearing array argument is not supported") — the same missing

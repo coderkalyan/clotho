@@ -664,3 +664,257 @@ TEST_CASE("dynamic array of class handles and of struct with an array member") {
                               "h 2 5\n"
                               "n xx ab\n");
 }
+
+// -- new[] as a declaration initializer (LRM 6.21, 7.5, 7.5.1) -----------------
+//
+// `T x = new[N]` / `new[N](src)` used to be refused wherever it initialized a
+// declaration rather than an assignment statement -- automatic and static
+// locals, module-scope variables, and class properties all hit
+// "queue / dynamic array member assignment from a non-variable value" (a class
+// property hit the more primitive "unsupported expression kind=NewArray").
+// `emit_dyn_array_new_expr` now does the sizing / truncate / default-fill
+// construction once, shared by the statement form (`arr = new[N]`,
+// lower_dyn_array_assign) and every declaration-initializer form
+// (emit_handle_member_copy / emit_class_property_inits). Cross-checked against
+// verilator 5.050 on every case below; iverilog 13 corroborates the ones its
+// parser accepts (noted per test) and is not a full oracle here (no `static`
+// lifetime override, no class array-property indexing, no unpacked-struct
+// `$bits` operand).
+
+TEST_CASE("dynamic array decl initializer from a bare new[]") {
+    constexpr std::string_view src = R"(
+        module m;
+            function int f();
+                int a[] = new[3];
+                $display("%0d %0d %0d %0d", a.size(), a[0], a[1], a[2]);
+                a[0] = 10; a[1] = 20; a[2] = 30;
+                $display("%0d %0d %0d", a[0], a[1], a[2]);
+                return 0;
+            endfunction
+            initial begin int r; r = f(); end
+        endmodule
+    )";
+    // Cross-checked against iverilog 13 and verilator 5.050 (both agree).
+    CHECK(run_capture(src) == "3 0 0 0\n10 20 30\n");
+}
+
+// new[N](src): N > src.size() default-fills the tail, N == src.size() copies
+// every element, N < src.size() truncates (LRM 7.5.1). `automatic` so each
+// call re-evaluates the initializer against `s`'s CURRENT contents rather than
+// capturing it once as a static local would (see the timing tests below).
+TEST_CASE("dynamic array decl initializer using the new[n](src) copy-constructor form") {
+    constexpr std::string_view src = R"(
+        module m;
+            int s[];
+            function automatic int grow();
+                int a[] = new[5](s);
+                $display("grow %0d %0d %0d %0d %0d %0d", a.size(), a[0], a[1], a[2], a[3], a[4]);
+                return 0;
+            endfunction
+            function automatic int same();
+                int a[] = new[3](s);
+                $display("same %0d %0d %0d %0d", a.size(), a[0], a[1], a[2]);
+                return 0;
+            endfunction
+            function automatic int shrink();
+                int a[] = new[2](s);
+                $display("shrink %0d %0d %0d", a.size(), a[0], a[1]);
+                return 0;
+            endfunction
+            initial begin
+                int r;
+                s = new[3]; s[0] = 7; s[1] = 8; s[2] = 9;
+                r = grow(); r = same(); r = shrink();
+            end
+        endmodule
+    )";
+    // Cross-checked against iverilog 13 and verilator 5.050 (both agree).
+    CHECK(run_capture(src) == "grow 5 7 8 9 0 0\n"
+                              "same 3 7 8 9\n"
+                              "shrink 2 7 8\n");
+}
+
+TEST_CASE("dynamic array decl initializer with new[0] and new[0](src)") {
+    constexpr std::string_view src = R"(
+        module m;
+            int s[];
+            function int bare0();
+                int a[] = new[0];
+                return a.size();
+            endfunction
+            function int copy0();
+                int a[] = new[0](s);
+                return a.size();
+            endfunction
+            initial begin
+                s = new[3];
+                $display("%0d %0d", bare0(), copy0());
+            end
+        endmodule
+    )";
+    // Cross-checked against iverilog 13 and verilator 5.050 (both agree).
+    CHECK(run_capture(src) == "0 0\n");
+}
+
+// A class property's `new[]` initializer runs per-object, as part of
+// construction, before any of the object's own statements (LRM 8.7 / 8.8) --
+// this used to fail with the more primitive "unsupported expression
+// kind=NewArray" (emit_class_property_inits had no aggregate/container gate at
+// all, unlike a module-scope or static-local declaration initializer).
+TEST_CASE("dynamic array new[] declaration initializer on a class property (LRM 8.7/8.8)") {
+    constexpr std::string_view src = R"(
+        module m;
+            class c;
+                int a[] = new[3];
+                function void bump();
+                    foreach (a[i]) a[i] = a[i] + (i + 1) * 10;
+                endfunction
+            endclass
+            c obj;
+            initial begin
+                obj = new;
+                $display("%0d %0d %0d %0d", obj.a.size(), obj.a[0], obj.a[1], obj.a[2]);
+                obj.bump();
+                $display("%0d %0d %0d", obj.a[0], obj.a[1], obj.a[2]);
+            end
+        endmodule
+    )";
+    // iverilog 13 cannot index a class array property ("Array index of array
+    // properties not supported") -- verilator 5.050 only.
+    CHECK(run_capture(src) == "3 0 0 0\n10 20 30\n");
+}
+
+// Each object gets its OWN array from the initializer, not a shared one (LRM
+// 8.7: the initializer runs once PER OBJECT, unlike a static property's single
+// shared slot).
+TEST_CASE("dynamic array class property new[] initializer is per-object, not shared") {
+    constexpr std::string_view src = R"(
+        module m;
+            class c;
+                int a[] = new[2];
+            endclass
+            c x, y;
+            initial begin
+                x = new; y = new;
+                x.a[0] = 11;
+                y.a[0] = 22;
+                $display("%0d %0d %0d %0d", x.a.size(), y.a.size(), x.a[0], y.a[0]);
+            end
+        endmodule
+    )";
+    // iverilog 13 cannot index a class array property -- verilator 5.050 only.
+    CHECK(run_capture(src) == "2 2 11 22\n");
+}
+
+TEST_CASE("dynamic array class property new[n](src) copy-constructor initializer") {
+    constexpr std::string_view src = R"(
+        module m;
+            int seed[];
+            class c;
+                int a[] = new[4](seed);
+            endclass
+            c obj;
+            initial begin
+                seed = new[2]; seed[0] = 5; seed[1] = 6;
+                obj = new;
+                $display("%0d %0d %0d %0d %0d", obj.a.size(), obj.a[0], obj.a[1], obj.a[2], obj.a[3]);
+            end
+        endmodule
+    )";
+    // iverilog 13 cannot index a class array property -- verilator 5.050 only.
+    CHECK(run_capture(src) == "4 5 6 0 0\n");
+}
+
+// An AUTOMATIC declaration initializer runs on every entry to its block (LRM
+// 6.21): three calls each get a freshly new[]'d array, so a mutation in one
+// call is never visible to the next.
+TEST_CASE("dynamic array automatic decl initializer new[] re-runs on every call (LRM 6.21)") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int f();
+                int a[] = new[3];
+                int prior;
+                prior = a[0];
+                a[0] = 77;
+                return prior;
+            endfunction
+            initial $display("%0d %0d %0d", f(), f(), f());
+        endmodule
+    )";
+    // Cross-checked against iverilog 13 and verilator 5.050 (both agree).
+    CHECK(run_capture(src) == "0 0 0\n");
+}
+
+// A STATIC local's declaration initializer runs exactly once (LRM 6.21,
+// 13.4.2): the SAME array persists and accumulates the mutation across all
+// three calls, unlike the automatic case above.
+TEST_CASE("dynamic array static-local decl initializer new[] runs once, storage persists (LRM 6.21)") {
+    constexpr std::string_view src = R"(
+        module m;
+            function automatic int g();
+                static int a[] = new[3];
+                a[0] = a[0] + 1;
+                return a[0];
+            endfunction
+            initial $display("%0d %0d %0d", g(), g(), g());
+        endmodule
+    )";
+    // iverilog 13 cannot override the default variable lifetime ("Overriding
+    // the default variable lifetime is not yet supported") -- verilator 5.050 only.
+    CHECK(run_capture(src) == "1 2 3\n");
+}
+
+// A module-scope variable is implicitly static (LRM 6.8): its new[]
+// initializer runs once, in the run-once PreInit process, before any initial
+// block -- so `a` is already sized by the time this initial block reads it,
+// with no assignment statement anywhere in the design.
+TEST_CASE("dynamic array module-scope decl initializer new[] runs once at time zero") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a[] = new[4];
+            initial $display("%0d", a.size());
+        endmodule
+    )";
+    // Cross-checked against iverilog 13 and verilator 5.050 (both agree).
+    CHECK(run_capture(src) == "4\n");
+}
+
+// The `new[N]` size expression is lowered by the ordinary expression path, not
+// a constant-folder, so every expression shape already legal elsewhere in the
+// language works with no special casing: a constant, `$bits` of an aggregate
+// (LRM 20.7), a plain runtime argument, a function-call result, and an
+// expression mixing an argument, a call and `$bits` together.
+TEST_CASE("dynamic array new[] declaration initializer size expression forms") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a; int b; } pair_t;
+            function automatic int extra(); return 2; endfunction
+            function automatic int const_sz();
+                int a[] = new[3];
+                return a.size();
+            endfunction
+            function automatic int bits_sz();
+                pair_t data;
+                int a[] = new[$bits(data)];
+                return a.size();
+            endfunction
+            function automatic int var_sz(int n);
+                int a[] = new[n];
+                return a.size();
+            endfunction
+            function automatic int call_sz();
+                int a[] = new[extra()];
+                return a.size();
+            endfunction
+            function automatic int mixed_sz(int n);
+                int a[] = new[n + extra() + $bits(byte)];
+                return a.size();
+            endfunction
+            initial $display("%0d %0d %0d %0d %0d",
+                              const_sz(), bits_sz(), var_sz(5), call_sz(), mixed_sz(4));
+        endmodule
+    )";
+    // iverilog 13 cannot parse an unpacked-struct $bits operand ("Unpacked
+    // structs not supported") -- verilator 5.050 only.
+    CHECK(run_capture(src) == "3 64 5 2 14\n");
+}

@@ -5668,6 +5668,20 @@ private:
             fail("a conditional operator over a queue, dynamic array or associative "
                  "array operand is not supported (LRM 11.4.11)");
         }
+        if (src.kind == ExpressionKind::NewArray) {
+            // `T x = new[N]` / `new[N](src)` as a declaration initializer, or any
+            // other non-statement store into a handle-typed target (LRM 7.5 /
+            // 7.5.1): construct in place, not a copy of an existing handle --
+            // new[] IS the constructor, so there is nothing to refuse here.
+            // Only a dynamic array admits `new[]` (LRM 7.5); slang rejects it
+            // against a queue or associative-array target at the type-check
+            // level, so `t.kind` is always DynArray when src is a NewArray.
+            // Shares emit_dyn_array_new_expr with the statement form
+            // `arr = new[N]` (lower_dyn_array_assign), so sizing / truncate /
+            // default-fill semantics live in exactly one place.
+            emit_dyn_array_new_expr(lhs, src.as<slang::ast::NewArrayExpression>(), type, b, l);
+            return;
+        }
         if (!src_is_handle_lvalue) {
             // TODO: queue / dynamic-array member init from a '{...} pattern or
             // concatenation needs an element-wise build (dynamic-arrays doc
@@ -21937,6 +21951,39 @@ private:
         return rhs;
     }
 
+    // `arr = new[n]` / `arr = new[n](src)` (LRM 7.5 / 7.5.1) construction into an
+    // already-lvalue-resolved dynamic-array handle `dst`: (re)allocate to `n`
+    // elements, each the element type's default (rt_dynarr_new), then for the
+    // copy-constructor form deep-copy the low `min(n, src.size())` from `src`
+    // and default-fill the rest (rt_dynarr_new_copy, dyn_array_new's `has_init`
+    // arm). `new[n]('{...}')` is a third shape: the pattern is a literal, not a
+    // copyable handle, so it allocates bare and fills element-wise instead.
+    // Shared by the statement-assignment form (lower_dyn_array_assign) and the
+    // declaration-initializer / handle-member-store form (emit_handle_member_copy
+    // -- an automatic, static, module-scope or class-property `T x = new[n]`),
+    // so a change to sizing / truncate / fill semantics cannot land in only one
+    // of them.
+    void emit_dyn_array_new_expr(ir::Index                             dst,
+                                 const slang::ast::NewArrayExpression& na,
+                                 ir::Ref                               aty,
+                                 ir::Builder&                          b,
+                                 ir::SourceLoc                         l) {
+        const ir::Index   size = lower_expr(na.sizeExpr(), b);
+        const Expression* init = na.initExpr();
+        if (init != nullptr && as_assignment_pattern(*init) != nullptr) {
+            // `new[N]('{...}')`: allocate N default-filled, then store each
+            // pattern element at its position (a shorter pattern leaves the tail
+            // at the element default; a longer one is truncated to N). The init
+            // is a literal, not a copyable handle.
+            b.dyn_array_new(dst, size, dst, /*has_init*/ false, aty, l);
+            emit_dyn_pattern_fill(dst, aty, *as_assignment_pattern(*init), b, l);
+        } else if (init != nullptr) {
+            b.dyn_array_new(dst, size, lower_lvalue(*init, b), /*has_init*/ true, aty, l);
+        } else {
+            b.dyn_array_new(dst, size, dst, /*has_init*/ false, aty, l);
+        }
+    }
+
     // Whole dynamic-array assignment (LRM 7.5): `arr = new[n]` / `arr = new[n](src)`
     // (allocate + optional element copy) or `arr = other` (deep copy). Element
     // writes (`arr[i] = x`) are ordinary Stores over an ElemSelect and do not
@@ -21970,21 +22017,7 @@ private:
             return dst;
         }
         if (a.right().kind == ExpressionKind::NewArray) {
-            const auto&       na   = a.right().as<slang::ast::NewArrayExpression>();
-            const ir::Index   size = lower_expr(na.sizeExpr(), b);
-            const Expression* init = na.initExpr();
-            if (init != nullptr && as_assignment_pattern(*init) != nullptr) {
-                // `new[N]('{...}')`: allocate N default-filled, then store each
-                // pattern element at its position (a shorter pattern leaves the tail
-                // at the element default; a longer one is truncated to N). The init
-                // is a literal, not a copyable handle.
-                b.dyn_array_new(dst, size, dst, /*has_init*/ false, aty, l);
-                emit_dyn_pattern_fill(dst, aty, *as_assignment_pattern(*init), b, l);
-            } else if (init != nullptr) {
-                b.dyn_array_new(dst, size, lower_lvalue(*init, b), /*has_init*/ true, aty, l);
-            } else {
-                b.dyn_array_new(dst, size, dst, /*has_init*/ false, aty, l);
-            }
+            emit_dyn_array_new_expr(dst, a.right().as<slang::ast::NewArrayExpression>(), aty, b, l);
             return dst;
         }
         if (unwrap_conversion(a.right()).kind == ExpressionKind::Streaming) {
@@ -28803,7 +28836,19 @@ private:
             }
             const ir::SourceLoc il = loc(*init);
             const ir::Index     lv = class_member_lvalue(handle, prop, class_ref, b, il);
-            if (prop.getType().getCanonicalType().isString()) {
+            if (is_aggregate(prop.getType()) || is_unpacked_container(prop.getType())) {
+                // An unpacked struct / fixed array / queue / dynamic array /
+                // associative array property: the same element-wise, handle-
+                // aware store a module-level declaration initializer takes
+                // (lower_var_initializer) and a static property's shared slot
+                // takes (declare_static_prop) -- LRM 8.7 runs a property
+                // initializer as part of construction, the same declaration-
+                // initializer semantics as those two, just per-object rather
+                // than per-frame or once. A plain Store (the two arms below)
+                // would bit-blast the aggregate's storage, or the container's
+                // {ptr,len}-shaped handle, instead of building it.
+                emit_struct_store(lv, lower_type(prop.getType()), *init, ir::Inst::Tag::Store, b, il);
+            } else if (prop.getType().getCanonicalType().isString()) {
                 b.binary(ir::Inst::Tag::Store, lv, lower_expr(*init, b), il);
             } else {
                 b.binary(ir::Inst::Tag::Store,

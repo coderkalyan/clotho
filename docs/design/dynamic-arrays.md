@@ -414,7 +414,10 @@ illegal SystemVerilog (LRM 10.4.2), not a gap.
    descriptor. No POD-first and no integral-only cut. Value element restricted to
    integral/real (a managed value element is the one guarded gap).
 4. **Landed since v1**: managed (string/handle/nested) elements for dynarr/queue
-   (`rt_elem_ops`); queue reverse/sort/rsort/shuffle.
+   (`rt_elem_ops`); queue reverse/sort/rsort/shuffle; `new[n]` / `new[n](src)`
+   as a DECLARATION initializer (automatic local, `static` local, module-scope
+   variable, and class property — one construction, `emit_dyn_array_new_expr`,
+   shared with the statement-assignment form).
    **Still deferred, each its own guarded TODO** — NBA to these types;
    a string / dynamically-sized member inside a struct assoc key; managed
    (string/nested) assoc *value* elements;
