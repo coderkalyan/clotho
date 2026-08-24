@@ -497,6 +497,16 @@ struct LValue {
     const ChangeNotify* chg         = nullptr;
     llvm::Value*        chg_body    = nullptr;
     llvm::Type*         chg_body_ty = nullptr;
+    // The SIGNAL whose Any bucket a mutation of this place must wake, when the
+    // place defers into a container living in signal storage -- a module-level
+    // assoc array, or one in a static class property's shared slot. The
+    // signal-side analog of `chg`, carried onto the deferred assoc element at
+    // exactly the two sites `chg` is, and consumed by notify_container_mutation.
+    // `is_signal` itself cannot carry this: a deferred assoc ELEMENT is not
+    // plane-addressable signal storage, and setting it would send Store servicing
+    // down the mm-snapshot path with a null base.
+    bool   mut_sig_valid = false;
+    Signal mut_sig{ 0 };
 };
 
 // Why a container handle pointer is being taken (lv_handle_ptr).
@@ -2224,13 +2234,53 @@ private:
     // container bound to a `ref`/`inout` formal of a task -- use `Place` here and
     // fire from the call's own after-write bracket instead.
     void notify_container_mutation(const LValue& lv) {
-        if (lv.chg == nullptr || !lv.chg->container) {
+        if (lv.chg == nullptr) {
+            // A container living in a SIGNAL -- a module-level queue / dynamic /
+            // associative array, or a static class property's shared slot -- has
+            // no hidden notifier object: its waiters park on the signal's own Any
+            // bucket (`wait(q.size() != 0)` registers there). A mutation is not a
+            // Store, so the store-side service bracket never sees it; fire the Any
+            // bucket here, unconditionally, for the same reason the property
+            // notifier below fires unconditionally. `@` over a container is
+            // refused by the type system, so every Any waiter on such a signal is
+            // level-sensitive and re-tests its condition (LRM 9.4.3). PreInit
+            // initializers generate no events (same rule as service_snapshot).
+            if (!silent_stores_) {
+                if (lv.is_signal) {
+                    service_signal_container_mutation(lv.sig);
+                } else if (lv.mut_sig_valid) {
+                    // A deferred assoc element of a signal-resident map.
+                    service_signal_container_mutation(lv.mut_sig);
+                }
+            }
+            return;
+        }
+        if (!lv.chg->container) {
             return;
         }
         if (lv.chg->field[static_cast<uint32_t>(Edge::Any)] == kNoNotify) {
             throw BackendError{ "internal: container change notifier with no any-change field" };
         }
         fire_prop_notifier(lv, Edge::Any);
+    }
+
+    // Wake the Any bucket of a SIGNAL holding a container, after a mutation of it.
+    // The unconditional-fire counterpart of service_wait_queue: a mutation has no
+    // old -> new word to classify (`q.size()` is computed, not stored), so every
+    // Any waiter is woken and re-tests. A signal nothing waits on emits no code.
+    void service_signal_container_mutation(Signal sig) {
+        const auto i = static_cast<uint32_t>(sig);
+        const auto e = static_cast<uint32_t>(Edge::Any);
+        if (wait_sta_gv_[i][e] != nullptr) {
+            service_static_queue(sig, e);
+        }
+        if (wait_dyn_gv_[i][e] != nullptr) {
+            service_dynamic_queue(sig, e);
+        }
+        if (vif_wait_[i][e]) {
+            emit_event_wake_list(vif_head_ptr(sig, e));
+        }
+        fire_event_trigger(sig, e);
     }
 
     // Wake everything parked on one of a class property's change notifiers. Shared
@@ -15846,6 +15896,10 @@ private:
                 el.chg         = hlv.chg;
                 el.chg_body    = hlv.chg_body;
                 el.chg_body_ty = hlv.chg_body_ty;
+                // The signal-map analog of `chg`: `a[k] = v` on a module-level /
+                // static-property map must wake the map SIGNAL's Any waiters.
+                el.mut_sig_valid = hlv.is_signal || hlv.mut_sig_valid;
+                el.mut_sig       = hlv.is_signal ? hlv.sig : hlv.mut_sig;
                 // An entry's slot lives until that entry is erased, so a `ref`
                 // through it records the map's relocation epoch, appended to whatever
                 // containers the MAP itself sits inside (docs/design/data-model.md
@@ -15917,6 +15971,8 @@ private:
                 el.chg              = dlv.chg;
                 el.chg_body         = dlv.chg_body;
                 el.chg_body_ty      = dlv.chg_body_ty;
+                el.mut_sig_valid    = dlv.is_signal || dlv.mut_sig_valid;
+                el.mut_sig          = dlv.is_signal ? dlv.sig : dlv.mut_sig;
                 el.epoch_chain      = dlv.epoch_chain;
                 el.epoch_chain.push_back(b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
                                                             handle_epoch_field(pt.type)));
@@ -23059,7 +23115,8 @@ private:
                 push_ref_epochs(argv, rb, ref_epoch_depth(f, k));
                 if (!is_handle_type(f.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
-                } else if (lv.chg != nullptr && lv.chg->container) {
+                } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
+                           lv.mut_sig_valid) {
                     // A `ref` to a waited-on container property: the callee mutates
                     // through a raw aliased pointer and never copies back, so the
                     // notify can only be at the call's RETURN. The fire is then one
@@ -23079,7 +23136,8 @@ private:
                 // ref case above.
                 if (dir == ArgDir::Out || dir == ArgDir::Inout) {
                     emit_gc_barrier_for(alv);
-                    if (alv.chg != nullptr && alv.chg->container) {
+                    if ((alv.chg != nullptr && alv.chg->container) || alv.is_signal ||
+                        alv.mut_sig_valid) {
                         ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                     }
                 }
@@ -24331,7 +24389,8 @@ private:
                 push_ref_epochs(argv, rb, ref_epoch_depth(tf, k));
                 if (!is_handle_type(tf.param_types[k])) {
                     ref_svc.emplace_back(lv, service_snapshot(lv));
-                } else if (lv.chg != nullptr && lv.chg->container) {
+                } else if ((lv.chg != nullptr && lv.chg->container) || lv.is_signal ||
+                           lv.mut_sig_valid) {
                     // See the function-call site: a `ref` container is mutated
                     // through a raw pointer, so the notify lands at cont_bb, past
                     // every suspend the task took.
@@ -24344,7 +24403,8 @@ private:
                 argv.push_back(lv_handle_ptr(alv, HandleUse::Place));
                 if (tf.arg_dirs[k] == ArgDir::Out || tf.arg_dirs[k] == ArgDir::Inout) {
                     emit_gc_barrier_for(alv);
-                    if (alv.chg != nullptr && alv.chg->container) {
+                    if ((alv.chg != nullptr && alv.chg->container) || alv.is_signal ||
+                        alv.mut_sig_valid) {
                         ref_svc.emplace_back(alv, ServiceSnapshot{ .container = true });
                     }
                 }

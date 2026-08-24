@@ -1100,6 +1100,89 @@ professional parity; M5 makes it complete.
   invariant, `wait(e.triggered)` including the same-instant start, and the
   never-bound run-time fatal) and tests/class_test.cpp (the eager class whose
   vif wait binds the top's interface).
+- [x] **`wait` (and inferred sensitivity) on SIGNAL-resident storage: static class
+  properties and module-level containers** (LRM 9.4.3 / 9.4.2.2) — the fifth rung,
+  and the one that held every UVM phase open: after `drop_objection` at 10ns the
+  run phase never ended, every test sat at the 9200s default timeout
+  (`uvm_phase_hopper.svh:587` PH_TIMEOUT), and `report_phase` never executed.
+  The site is `uvm_objection.svh:805`: the single background drain process
+  (`m_execute_scheduled_forks`) parks on `wait (m_scheduled_list.size() != 0)`,
+  and `m_drop` hands it work by `m_scheduled_list.push_back(ctxt)` (:707). The
+  source-level trace showed the drop propagating fully — five contexts pushed,
+  size 0 -> 5 — and the wait never waking, so `m_forked_drain` never ran,
+  `all_dropped` never fired, and the phase's `wait_for(UVM_ALL_DROPPED)` waited
+  forever. `m_scheduled_list` is a `local static uvm_objection_context_object
+  m_scheduled_list[$]` — SIGNAL storage (declare_static_prop), not an object
+  property — and TWO independent defects each left a waiter on such storage
+  parked forever. Neither fails loudly; both are silent hangs, which is why every
+  regression pins the resume TIME.
+  **Defect 1: the sensitivity walk dropped a static property it was first to
+  reach.** `SensitivityCollector::record_read` resolved reads through `sigmap_`
+  alone, while a static class property's signal is minted LAZILY at its first
+  VALUE access — eagerly only when it has an initializer, and for a module-scope
+  class only AFTER every process body has lowered (lower_top runs
+  init_static_class_props after the Emit pass; packages get it in lower_globals,
+  but an initializer-less property like `m_scheduled_list` is not in that pass at
+  all). A `wait` whose condition was the property's first-lowered reference
+  collected an EMPTY event list: a suspend with no waker, appearing and
+  disappearing with method DECLARATION ORDER (declaring `@(m)` before the wait
+  hid it, since the `@`'s value path minted the signal first). The collector now
+  carries a `declare_static` callback (Lowerer::declare_static_prop through a
+  slang::function_ref) and its `lookup` mints the signal itself, so the walk and
+  the value paths meet at one signal BY CONSTRUCTION — a pre-pass would have had
+  to re-derive the collector's descent rules and drift. All five
+  SensitivityCollector users take the callback: `wait` (collect_expr_reads),
+  `always @*` / always_comb / always_latch (collect_inferred_sensitivity),
+  continuous assigns (continuous_events), gate inputs, and SVA shadow sampling.
+  **Defect 2: a container mutation never serviced a SIGNAL's wait buckets.** The
+  container rung above wakes waiters through the property's hidden notifier
+  (`lv.chg`), which is NULL for a signal-resident container — a module-level
+  queue / dynamic / associative array, or a static property's shared slot — and a
+  mutation is not a Store, so the store-side service bracket never sees it
+  either: `push_back` compiled to a bare rt_queue call and nobody woke. Waiters
+  on such storage park on the signal's own any-change bucket (that half always
+  worked), so `notify_container_mutation` now has a signal arm:
+  `service_signal_container_mutation` fires the Any bucket UNCONDITIONALLY —
+  static queue scan, dynamic queue scan, vif heads, `<= @e` triggers — for
+  exactly the reason the property notifier fires unconditionally (9.4.3 `wait`
+  re-tests, so an over-fire costs one re-test and an under-fire is a permanent
+  park; `@` over a container is rejected by slang's type check, "invalid type
+  'T$[$]' for event expression", so no 9.4.2 wrong-wake exists to make). The
+  audit of the mutation surface is the container rung's own: every mutator
+  reaches storage through `lv_handle_ptr(…, Mutate)`, whose no-default HandleUse
+  already forced all sites to classify, so the signal arm covers the same closed
+  list with no new site enumeration. Two carriers had to be added where the
+  map's identity is otherwise lost: the deferred assoc element (`a[k] = v`,
+  `'{default: v}`) now carries `mut_sig` — the signal-side analog of the `chg`
+  fields it already carried, set at the same two construction sites — because
+  `is_signal` on a deferred element would send Store servicing down the
+  mm-snapshot path with a null base; and the `ref` / `out` / `inout` container
+  brackets at both call sites (function and task) now take the
+  after-return-container arm for a signal (or signal-map-element) actual, not
+  only for a notified property.
+  **PreInit stays silent** (declaration initializers generate no events, same
+  rule as service_snapshot), and a signal nothing waits on emits NO wake code —
+  all four bucket checks are compile-time nulls — so a design that never waits
+  on signal-resident storage pays nothing.
+  **Result**: the reproducer prints `[TB] report_phase at 10` and finishes with
+  no PH_TIMEOUT; the full suite is green. easyUVM is NOT this defect: its
+  sequencer/driver rendezvous still pins a core at ~99.7% with `finish_item`
+  never returning after `start_item` returns at 25 (traced), unchanged by these
+  fixes — a separate zero-delay-loop defect, still open.
+  **One reference divergence, argued**: Verilator 5.050 omits class statics from
+  `@*` inferred sensitivity and does not re-fire; 9.4.2.2 says "sensitive to
+  every operand", and a static property is a variable with module-storage
+  semantics (6.21 / 8.9), so clotho includes it. The continuous-assign shape
+  matches Verilator exactly; so do all four wait shapes (times byte-identical).
+  **Unexercised**: a `wait` on a CONTAINER member reached through a virtual
+  interface (`wait(vif.q.size())`) — the mutation arm fires vif heads, but no
+  test pins that shape end to end.
+  Covered in tests/wait_test.cpp: the uvm_objection shape itself (an
+  initializer-less static queue, the waiter a static task lowered first, a
+  producer ten units later), the declaration-order pair on a static scalar (both
+  orders in one design), one waiter per module-level mutation family (push_back /
+  assoc element create / `new[n]` / `delete()`), the `ref`-formal signal queue
+  and map, and the `@*` + continuous-assign siblings.
 - [x] **Named events** (LRM 15.5) — `event e;`, `-> e`, `->> e`, `->> #d e`,
   `@(e)` / `always @(e)`, `wait(e.triggered)`, at module, package, generate,
   procedural-block and `static`-local scope. An event is an OBJECT (trigger tick +

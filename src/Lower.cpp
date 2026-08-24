@@ -70,6 +70,7 @@
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
+#include <slang/util/Function.h>
 #include <slang/util/SmallVector.h>
 
 #include "SourceMap.h"
@@ -858,27 +859,55 @@ struct SensitivityCollector : ASTVisitor<SensitivityCollector, VisitFlags::AllGo
     // sites (or a recursive one) is walked at most once.
     ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
 
-    SensitivityCollector(const SigMap& m, SensitivityMode mode)
+    // Creates a STATIC class property's module-signal storage and returns it
+    // (Lowerer::declare_static_prop). That storage is minted LAZILY -- at the first
+    // reference, or eagerly only for a property that has an initializer -- so a
+    // sensitivity walk resolving through `sigmap` alone finds nothing for a
+    // property this walk is the first to reach, and drops the read SILENTLY. For a
+    // `wait` that is an empty event list, i.e. a permanent park (LRM 9.4.3) whose
+    // existence depends on the order the enclosing bodies happen to be lowered in.
+    // Resolving here rather than in a pre-pass is what keeps the two exactly in
+    // step: the pre-pass would have to re-derive this walk's descent rules.
+    slang::function_ref<ir::Signal(const slang::ast::ClassPropertySymbol&)> declare_static;
+
+    SensitivityCollector(const SigMap&                                                          m,
+                         SensitivityMode                                                        mode,
+                         slang::function_ref<ir::Signal(const slang::ast::ClassPropertySymbol&)> declare_static = {})
       : sigmap(m)
-      , mode(mode) {}
+      , mode(mode)
+      , declare_static(declare_static) {}
+
+    // The signal backing a symbol, or nullopt when it has none: a genvar, an enum
+    // member, a parameter, or a frame-resident local.
+    std::optional<ir::Signal> lookup(const ValueSymbol& sym) {
+        const ValueSymbol& csym = canonical_value_symbol(sym);
+        if (const auto it = sigmap.find(&csym); it != sigmap.end()) {
+            return it->second;
+        }
+        const auto* prop = csym.as_if<slang::ast::ClassPropertySymbol>();
+        if (prop == nullptr || prop->lifetime != slang::ast::VariableLifetime::Static ||
+            !declare_static) {
+            return std::nullopt;
+        }
+        return declare_static(*prop);
+    }
 
     void record_read(const ValueSymbol& sym) {
         if (sym.kind == SymbolKind::Parameter || sym.kind == SymbolKind::Specparam) {
             return;
         }
-        const auto it = sigmap.find(&canonical_value_symbol(sym));
-        if (it == sigmap.end()) {
+        const std::optional<ir::Signal> sig = lookup(sym);
+        if (!sig) {
             return;
         }
-        if (seen.insert(static_cast<uint32_t>(it->second)).second) {
-            reads.push_back(it->second);
+        if (seen.insert(static_cast<uint32_t>(*sig)).second) {
+            reads.push_back(*sig);
         }
     }
 
     void mark_written(const ValueSymbol& sym) {
-        const auto it = sigmap.find(&canonical_value_symbol(sym));
-        if (it != sigmap.end()) {
-            written.insert(static_cast<uint32_t>(it->second));
+        if (const std::optional<ir::Signal> sig = lookup(sym)) {
+            written.insert(static_cast<uint32_t>(*sig));
         }
     }
 
@@ -7682,7 +7711,10 @@ private:
     // not re-evaluate y.
     std::vector<ir::WaitEvent> continuous_events(const Expression& e) {
         std::vector<ir::WaitEvent> events;
-        SensitivityCollector       c(sigmap_, SensitivityMode::ImplicitEvent);
+        const auto                 declare_static = [this](const slang::ast::ClassPropertySymbol& p) {
+            return declare_static_prop(p);
+        };
+        SensitivityCollector c(sigmap_, SensitivityMode::ImplicitEvent, declare_static);
         e.visit(c);
         for (const ir::Signal s : c.reads) {
             events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
@@ -8505,7 +8537,10 @@ private:
         b.binary(ir::Inst::Tag::Store, b.signal(tmp, l), b.resize(lower_expr(e, b), module_.pool.logic_type, l), l);
 
         std::vector<ir::WaitEvent> wait_events;
-        SensitivityCollector       c(sigmap_, SensitivityMode::ImplicitEvent);
+        const auto                 declare_static = [this](const slang::ast::ClassPropertySymbol& p) {
+            return declare_static_prop(p);
+        };
+        SensitivityCollector c(sigmap_, SensitivityMode::ImplicitEvent, declare_static);
         e.visit(c);
         for (const ir::Signal s : c.reads) {
             wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
@@ -9167,7 +9202,10 @@ private:
         // continuous-assign sensitivity rule: function-internal reads do not
         // contribute (ImplicitEvent), only the expression's own operands and any
         // call arguments.
-        SensitivityCollector c(sigmap_, SensitivityMode::ImplicitEvent);
+        const auto declare_static = [this](const slang::ast::ClassPropertySymbol& p) {
+            return declare_static_prop(p);
+        };
+        SensitivityCollector c(sigmap_, SensitivityMode::ImplicitEvent, declare_static);
         expr.visit(c);
         for (const ir::Signal s : c.reads) {
             if (c.written.contains(static_cast<uint32_t>(s))) {
@@ -9539,7 +9577,10 @@ private:
     // makes `tmp1 = a & b; y = tmp1;` sensitive to tmp1, which another process
     // may legally write (@* permits multiple drivers).
     void collect_inferred_sensitivity(const Statement& body, SensitivityMode mode, std::vector<ir::WaitEvent>& out) {
-        SensitivityCollector c(sigmap_, mode);
+        const auto declare_static = [this](const slang::ast::ClassPropertySymbol& p) {
+            return declare_static_prop(p);
+        };
+        SensitivityCollector c(sigmap_, mode, declare_static);
         body.visit(c);
         for (const ir::Signal s : c.reads) {
             if (mode == SensitivityMode::Comb && c.written.contains(static_cast<uint32_t>(s))) {
@@ -15772,7 +15813,10 @@ private:
             if (!atoms.contains(i) || lowered.atoms[i].expr == nullptr) {
                 continue;
             }
-            SensitivityCollector c(sigmap_, SensitivityMode::ImplicitEvent);
+            const auto declare_static = [this](const slang::ast::ClassPropertySymbol& p) {
+                return declare_static_prop(p);
+            };
+            SensitivityCollector c(sigmap_, SensitivityMode::ImplicitEvent, declare_static);
             lowered.atoms[i].expr->visit(c);
             if (lowered.atoms[i].match != nullptr) {
                 // A `case` property guard reads both sides of its comparison.

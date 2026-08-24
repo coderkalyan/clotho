@@ -870,3 +870,178 @@ TEST_CASE("a scalar property written through a ref formal or a base method wakes
     )";
     CHECK(run_capture_finish(src) == "base 1\nref 2\n");
 }
+
+// -- wait on SIGNAL-resident storage: static class properties and module-level
+//    containers (LRM 9.4.3) ---------------------------------------------------
+//
+// A static class property and a module-level container live in module-signal
+// storage, not in an object, so neither has the hidden per-object notifier the
+// cases above park on. Their waiters park on the SIGNAL's own any-change bucket,
+// and two independent defects each left that bucket dead:
+//
+//   1. The sensitivity walk resolved reads through sigmap_ alone, while a static
+//      class property's signal is minted LAZILY at its first VALUE access
+//      (declare_static_prop) -- eagerly only with an initializer, and for a
+//      module-scope class only after every process body has lowered. A `wait`
+//      whose condition was the property's first-lowered reference collected an
+//      EMPTY event list: a silent permanent park that appeared and disappeared
+//      with method declaration order. The walk now declares the signal itself.
+//
+//   2. A container mutation op (push_back, an assoc element write, new[n], ...)
+//      is not a Store, so the store-side service bracket never saw it, and the
+//      property notifier is null for a signal -- no wake at all. The mutation
+//      sites now fire the signal's any-change bucket unconditionally, exactly as
+//      the property notifier fires: `wait` re-tests, so an extra fire costs one
+//      re-test while a missed one is a permanent park.
+//
+// This is what held every UVM phase open: uvm_objection.svh:805 parks the
+// background drain process on `wait (m_scheduled_list.size() != 0)` -- a `local
+// static uvm_objection_context_object m_scheduled_list[$]`, initializer-less, so
+// its first-lowered reference was the wait itself -- and drop_objection's
+// push_back (:707) was an unserviced mutation besides. The drain never ran,
+// all_dropped never fired, and every test sat at the 9200s default timeout with
+// report_phase never executing. Each case asserts the resume TIME: neither
+// defect fails loudly, both hang.
+
+// The uvm_objection shape itself: an initializer-less static queue property, the
+// waiter a static task whose wait is the property's first-lowered reference, the
+// producer a plain method call ten time units later.
+TEST_CASE("wait on a static queue class property resumes when a producer pushes") {
+    constexpr std::string_view src = R"(
+        module m;
+            class objection_mock;
+                static int scheduled[$];
+                static task background();
+                    wait (scheduled.size() != 0);
+                    $display("drained %0d at %0t", scheduled.pop_front(), $time);
+                endtask
+                static function void schedule(int v);
+                    scheduled.push_back(v);
+                endfunction
+            endclass
+            initial begin
+                fork objection_mock::background(); join_none
+                #10 objection_mock::schedule(7);
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "drained 7 at 10\n");
+}
+
+// Defect 1 in isolation, on a SCALAR: the waiting task is declared before the
+// writer, so its wait is lowered -- and its sensitivity collected -- before any
+// value access has minted the property's signal. The initializer does not save
+// it: a module-scope class's eager pass runs only after every process body.
+// Declaring the methods in the opposite order used to hide the hang, which is
+// exactly why both orders are pinned here.
+TEST_CASE("wait on a static scalar class property is order-independent") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                static int m_val = 0;
+                task w_first();  wait (m_val == 5); $display("first %0t", $time); endtask
+                function void bump(); m_val = 5; endfunction
+            endclass
+            class D;
+                static int m_val = 0;
+                function void bump(); m_val = 5; endfunction
+                task w_last();   wait (m_val == 5); $display("last %0t", $time);  endtask
+            endclass
+            C c;  D d;
+            initial begin
+                c = new; d = new;
+                fork c.w_first(); join_none
+                fork d.w_last();  join_none
+                #10 c.bump();
+                #10 d.bump();
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "first 10\nlast 20\n");
+}
+
+// Defect 2 in isolation: the queue is a module-level signal (declared, in
+// sigmap_ from Collect), so only the mutation-service half is in play. One
+// waiter per mutation-op family, timed so a missing notify hangs rather than
+// shifting a print. Verified against Verilator 5.050 (iverilog's class support
+// cannot host the static shapes; the module-level ones match it too).
+TEST_CASE("module-level container mutations wake a waiter on the signal") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$];
+            int a[int];
+            int d[];
+            initial begin
+                fork begin wait (q.size() != 0); $display("push %0t", $time);   end join_none
+                fork begin wait (a.size() != 0); $display("assoc %0t", $time);  end join_none
+                fork begin wait (d.size() != 0); $display("dynnew %0t", $time); end join_none
+                #1 q.push_back(1);
+                #1 a[3] = 7;
+                #1 d = new[2];
+                fork begin wait (q.size() == 0); $display("delete %0t", $time); end join_none
+                #1 q.delete();
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "push 1\nassoc 2\ndynnew 3\ndelete 4\n");
+}
+
+// A `ref` formal bound to a signal container is a raw aliased pointer the callee
+// mutates without a copy-back, so the notify can only land at the call's return
+// -- the same after-return bracket a waited-on container PROPERTY uses, now also
+// taken when the actual is a signal (or a signal-map element).
+TEST_CASE("a signal container mutated through a ref formal wakes its waiter") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$];
+            int a[int];
+            task automatic fill_q(ref int qq[$]);   qq.push_back(1); endtask
+            task automatic fill_a(ref int aa[int]); aa[5] = 9;       endtask
+            initial begin
+                fork begin wait (q.size() != 0); $display("refq %0t", $time); end join_none
+                fork begin wait (a.size() != 0); $display("refa %0t", $time); end join_none
+                #10 fill_q(q);
+                #10 fill_a(a);
+                #1 $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "refq 10\nrefa 20\n");
+}
+
+// Defect 1's inferred-sensitivity siblings: an `always @*` body and a continuous
+// assign RHS reading a static class property collected the same empty read set,
+// so the process ran once at time zero and never re-fired. The walk's lazy
+// declaration covers every SensitivityCollector user -- `wait`, `@*` /
+// always_comb, a continuous assign, an SVA sample -- because they all resolve
+// through the same lookup. The assign half matches Verilator 5.050; the `@*`
+// half is LRM 9.4.2.2 ("sensitive to every operand"; a static property is a
+// variable with module-storage semantics, 6.21/8.9) -- Verilator omits class
+// statics from `@*` sensitivity and does not re-fire there.
+TEST_CASE("inferred sensitivity re-fires when a static class property changes") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                static int m_val = 0;
+                function void bump(); m_val = 5; endfunction
+            endclass
+            int y, z;
+            always @* begin
+                y = C::m_val;
+                if (y == 5) $display("comb %0t", $time);
+            end
+            assign z = C::m_val;
+            C c;
+            initial begin
+                c = new;
+                #10 c.bump();
+                #1 $display("assign z=%0d at %0t", z, $time);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "comb 10\nassign z=5 at 11\n");
+}
