@@ -184,6 +184,39 @@ member, handle or direct, routes to records and execution order still decides th
 winner. The cost is confined to members of vif-bound interfaces that anyone
 nonblocking-writes; every other signal's layout is untouched.
 
+Two rules the record path fixes in place. **Retargeting**: LRM 10.4.2 evaluates
+the RHS when the statement executes and defers only the update, and 25.9 says the
+member access designates the instance the handle names *then* — so the record
+bakes both in at staging time, and reassigning the handle between the write's
+execution and the NBA region moves nothing. **Ordering against a blocking write**
+in the same time step: the blocking store lands immediately, the record commits in
+the NBA region, so the nonblocking value wins the step regardless of statement
+order — exactly the per-signal shadow's semantics, kept by replaying records in
+push order.
+
+**Inside a class task** — the UVM driver shape (`input_vif vif;` a class property,
+`vif.valid <= '0` in a `forever`) — the write is the same construct and takes the
+same path; what stood in its way was a guard, not machinery.
+`check_subroutine_nba_target` walked the lvalue chain PAST the handle access to the
+chain's root symbol and refused by the root's storage class: "nonblocking
+assignment to a class property" for the property-held handle — naming a construct
+the statement never wrote, since the handle is only READ to choose the instance,
+and the written storage is the interface signal. The walk now stops at a member
+access whose base is a virtual interface: the target is signal storage in some
+instance, which is exactly what the record path stages. A genuine class-property
+NBA (`obj.prop <= x`) is a DIFFERENT construct — legal SV (LRM 6.21 bans only the
+continuous forms on a non-static property) but unimplementable on signal-keyed
+staging, since an object body is a heap block with no per-object shadow — and
+keeps its own accurately-worded refusal.
+
+**Intra-assignment timing through a handle** (`vif.d <= #5 x`, `<= @e x`) is
+refused loudly and by name: the intra-assignment record pool has no instance
+context field (`intra_rec_ty`, unlike the plain vif record's `arr_rec_ctx`) and
+`emit_intra_commit` resolves a non-array destination with a static `storage_ptr`,
+so the delayed update would commit into the representative instance — silently the
+wrong interface. The refusal is tested ahead of the generic intra-NBA target
+check, whose "whole integral or real scalar" wording `vif.d` satisfies.
+
 **Clocking blocks.** `vif.cb.sig` reads the sampled storage of the instance the
 handle names: the clockvar's sampled temp lives in that instance's own scope, so it
 is one more def-relative base. A synchronous drive (`vif.cb.d <= x`) writes the
@@ -275,6 +308,9 @@ object. Routing it to the waiter list instead never wakes at all.
   and **`bind`** of an interface — Phase 4.
 - **`$typename` of an interface type** — lands with the shared `$typename`
   aggregate-type gap.
+- **Intra-assignment timing on a handle NBA** (`vif.d <= #5 x`) — see the
+  virtual-interface section; the intra record pool needs an instance-context
+  field before the deferred update can land in the bound instance.
 
 ## Oracle
 

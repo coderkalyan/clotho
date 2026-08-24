@@ -1773,12 +1773,17 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   property NBA inside a method (`p <= v`) reached the backend as an unaddressable
   root and failed with no source location, for every type — now a located refusal
   in `check_subroutine_nba_target`.
-- [ ] **NBA to a class property** (`c.x <= v`) — legal SV, refused loudly. Every
+- [ ] **NBA to a class property** (`c.x <= v`) — legal SV (LRM 6.21 bans only the
+  continuous forms on a non-static property), refused loudly. Every
   NBA staging buffer (the scalar shadow slot, the aggregate image, the container
   handle record) is indexed by `Signal`; an object body is a heap block with no
   signal, so a property reaches none of them. Needs staging keyed by destination
   ADDRESS rather than by signal, with last-write-wins resolved by comparing
-  addresses at commit. See docs/design/classes.md §8.
+  addresses at commit. See docs/design/classes.md §8. The refusal fires only for a
+  property TARGET now: `vif.sig <= x` with the handle held in a property is a write
+  to interface signal storage (the property is only read to pick the instance) and
+  used to be caught in the same net inside a subroutine — the vif-in-class-task
+  entry under UVM enablers.
 - [ ] **Intra-assignment delay on a container NBA** (`q <= #2 r`) — refused loudly.
   The intra-assignment path stages an integral or real value, an unpacked-array
   element or a struct field; a container handle needs the HandleCopyNb record to
@@ -2902,21 +2907,25 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   on the globals Lowerer BEFORE any top lowers, so `vif_defs_->insts` is empty
   at that point and a virtual-interface member access in such a body warns
   `virtual-interface-never-bound` and lowers to the run-time fatal even when a
-  top does instantiate the interface. Today every such body is also stubbed
-  (vif NBA / vif edge waits are unimplemented), so behavior is dominated by the
-  stubs; the vif-in-class-task work must revisit the globals-drain boundary.
+  top does instantiate the interface. The vif NBA half of what those bodies do
+  is implemented now (the vif-in-class-task entry under UVM enablers), so the
+  ordering is load-bearing: under it, a class-task NBA through a handle defers
+  to the never-bound run-time fatal instead of landing. The globals-drain
+  boundary must be revisited.
 
   Outcome: both measured programs match Verilator (`count=1`, `count=2`);
   easyUVM now boots, prints the 1800.2-2020 banner, POPULATES THE FACTORY,
   finds the test — `UVM_INFO @ 0: reporter [RNTST] Running test simple_test...`,
   INVTST gone — builds and connects the component hierarchy
   (uvm_test_top.env_h.slv.drv_out), starts the run phases, and stops at time 0
-  where the driver's run_phase executes its first stubbed body: `FATAL:
+  where the driver's run_phase executes its first refused body: `FATAL:
   driver.sv:26: nonblocking assignment to a class property is not supported`
-  and `FATAL: driver.sv:36: intra-body event wait has no signal events`. The
-  next wall between clotho and a passing UVM test is therefore virtual
-  interface traffic inside class tasks: NBA through a vif member and
-  edge/event waits on one.
+  (a MISNAMED refusal, since fixed — the target was a vif member, not a
+  property; the vif-in-class-task entry) and `FATAL: driver.sv:36: intra-body
+  event wait has no signal events`. The next wall between clotho and a passing
+  UVM test is therefore virtual interface traffic inside class tasks:
+  edge/event waits on a vif member, and the registry-ordering consequence
+  above.
 
 - [x] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
   landed. Every class carries a descriptor pointer at object-body field 0
@@ -3503,7 +3512,22 @@ project with its own algorithm, not tail cleanup on the property layer:
   separate instance, and the representative is found by ordinal path rather than by
   name. An `event` member is waited on through its own object, the mechanism its
   trigger fires. An NBA inside a subroutine reached through a handle takes the
-  record path like any other handle write. The LRM 25.9 `SBusTransactor` example
+  record path like any other handle write — including the UVM driver shape, an NBA
+  in a CLASS TASK through a property-held handle (`input_vif vif; … vif.valid <=
+  '0`), which the subroutine NBA guard used to refuse as "a class property": it
+  walked the lvalue chain past the handle access to the chain's root and named the
+  handle's storage class, a construct the statement never wrote. The walk now stops
+  at a member access whose base is a virtual interface — the target is signal
+  storage in the instance the handle names. Retargeting the handle between the
+  write's execution and the NBA region moves nothing (the record bakes destination
+  and context in at staging, LRM 10.4.2's evaluate-now-defer-the-update composed
+  with 25.9), and a blocking write to the same member in the same step loses to the
+  staged one, per-signal-shadow semantics kept. Scalar and vector members, bit and
+  part selects, an unpacked-array-member element and a modport-typed handle all
+  stage; `vif.d <= #5 x` / `<= @e x` is refused BY NAME (the intra record pool has
+  no instance-context field, so the delayed update would land in the
+  representative — see interfaces.md), no longer misdescribed by the generic
+  intra-NBA wording. The LRM 25.9 `SBusTransactor` example
   runs verbatim. Remaining, guarded loud:
   - [ ] A member of an interface **instantiated inside** the interface a handle
     names (`vif.i.d`) — a separate instance with a separate context record; needs

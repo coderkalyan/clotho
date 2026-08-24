@@ -740,3 +740,231 @@ TEST_CASE("virtual interface: a null handle reports as an interface, not a class
     CHECK(run.err.find("class handle") == std::string::npos);
     CHECK(run.out == "before\n");
 }
+
+// The UVM driver shape (easyUVM driver.sv:26): the handle is a CLASS PROPERTY and
+// the nonblocking write executes inside a class task. The target is the interface
+// SIGNAL the handle names (LRM 25.9), not the property, so the write stages like
+// any other NBA -- the guard used to walk past the handle access to the handle's
+// own storage class and refuse this as "a class property".
+//
+// The timing is the point (LRM 10.4.2): a reader in the same time step, after the
+// task returned, still sees the old values; the update commits in that instant's
+// NBA region, which is what wakes the negedge watcher at time 0.
+TEST_CASE("virtual interface: a nonblocking write in a class task lands in the NBA region") {
+    const std::string out = run_capture(R"(
+        interface ibus; logic valid; logic [31:0] A; endinterface
+        class drv;
+            virtual ibus vif;
+            task put();
+                vif.valid <= 1'b0;
+                vif.A <= 'x;
+            endtask
+        endclass
+        module top;
+            ibus bus();
+            drv d;
+            initial begin
+                bus.valid = 1'b1; bus.A = 32'd5;
+                d = new; d.vif = bus;
+                d.put();
+                $display("same-step %b %h", bus.valid, bus.A);
+            end
+            // 1 -> 0 is the only negedge here (x -> 1 above is a posedge), so this
+            // wakes exactly when the staged write commits -- still time 0.
+            initial @(negedge bus.valid) $display("committed %b %h %0t", bus.valid, bus.A, $time);
+        endmodule
+    )");
+    CHECK(out == "same-step 1 00000005\ncommitted 0 xxxxxxxx 0\n");
+}
+
+// The full easyUVM reset loop: forever { clear; @(posedge vif.rst); } forked from
+// the module. Each pass stages its writes in the instant it executes, so the
+// values dirtied between reset edges are clean again one step after the edge.
+TEST_CASE("virtual interface: the UVM reset loop clears signals on each reset edge") {
+    const std::string out = run_capture(R"(
+        interface ibus; logic rst; logic valid; logic [31:0] A; endinterface
+        class drv;
+            virtual ibus vif;
+            task reset_signals();
+                forever begin
+                    vif.valid <= '0;
+                    vif.A <= 'x;
+                    @(posedge vif.rst);
+                end
+            endtask
+        endclass
+        module top;
+            ibus bus();
+            drv d;
+            initial begin
+                bus.rst = 0; bus.valid = 1'b1; bus.A = 32'hdeadbeef;
+                d = new; d.vif = bus;
+                fork d.reset_signals(); join_none
+                #1 $display("t1 %b %h", bus.valid, bus.A);
+                bus.valid = 1'b1; bus.A = 32'h55;
+                #1 bus.rst = 1;
+                #1 $display("t3 %b %h", bus.valid, bus.A);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "t1 0 xxxxxxxx\nt3 0 xxxxxxxx\n");
+}
+
+// One handle, retargeted between the write's execution and the NBA region: the
+// update lands on the instance the handle named WHEN THE STATEMENT EXECUTED
+// (LRM 10.4.2 evaluates now, defers only the update; 25.9 says which instance),
+// exactly as the record path bakes the destination in at staging time.
+TEST_CASE("virtual interface: a retargeted handle does not move a staged write") {
+    const std::string out = run_capture(R"(
+        interface ibus; logic [7:0] d; endinterface
+        class drv;
+            virtual ibus vif;
+            task put(input logic [7:0] x); vif.d <= x; endtask
+        endclass
+        module top;
+            ibus a(), b();
+            drv m;
+            initial begin
+                a.d = 8'h05; b.d = 8'h06;
+                m = new; m.vif = a;
+                m.put(8'h11);
+                m.vif = b;
+                m.put(8'h22);
+                #1 $display("a=%h b=%h", a.d, b.d);
+            end
+        endmodule
+    )");
+    CHECK(out == "a=11 b=22\n");
+}
+
+// Select forms through the handle in a class task: a whole vector member, a bit
+// select and a part select of one, and an element of an unpacked-array member.
+// Each stages its own record with the positioned value and write mask, so the
+// two selects of `v` merge and the untouched bits keep their old value.
+TEST_CASE("virtual interface: nonblocking selects through a handle in a class task") {
+    const std::string out = run_capture(R"(
+        interface ibus;
+            logic [15:0] v, w;
+            logic [7:0] arr[4];
+        endinterface
+        class drv;
+            virtual ibus vif;
+            task go();
+                vif.w <= 16'habcd;
+                vif.v[0] <= 1'b1;
+                vif.v[11:8] <= 4'h7;
+                vif.arr[2] <= 8'h9a;
+            endtask
+        endclass
+        module top;
+            ibus bus();
+            drv d;
+            initial begin
+                bus.v = 16'h0; bus.arr[2] = 8'h00;
+                d = new; d.vif = bus;
+                d.go();
+                #1 $display("%h %h %h", bus.v, bus.w, bus.arr[2]);
+            end
+        endmodule
+    )");
+    CHECK(out == "0701 abcd 9a\n");
+}
+
+// A modport-typed handle nonblocking-writes like the plain-typed one: the modport
+// symbol canonicalizes to the same interface signal.
+TEST_CASE("virtual interface: a nonblocking write through a modport-typed handle") {
+    const std::string out = run_capture(R"(
+        interface ibus;
+            logic [7:0] d;
+            modport mp(output d);
+        endinterface
+        class drv;
+            virtual ibus.mp vif;
+            task put(); vif.d <= 8'h5a; endtask
+        endclass
+        module top;
+            ibus bus();
+            drv m;
+            initial begin
+                m = new; m.vif = bus;
+                m.put();
+                #1 $display("%h", bus.d);
+            end
+        endmodule
+    )");
+    CHECK(out == "5a\n");
+}
+
+// A blocking and a nonblocking write to the same member in one time step
+// (LRM 10.4.2): the blocking one lands immediately, the nonblocking one was
+// scheduled at ITS execution and commits in the NBA region, so it wins the step.
+TEST_CASE("virtual interface: blocking and nonblocking writes to one member in one step") {
+    const std::string out = run_capture(R"(
+        interface ibus; logic [7:0] d; endinterface
+        class drv;
+            virtual ibus vif;
+            task mix();
+                vif.d <= 8'h42;
+                vif.d = 8'h13;
+            endtask
+        endclass
+        module top;
+            ibus bus();
+            drv m;
+            initial begin
+                m = new; m.vif = bus;
+                m.mix();
+                $display("active %h", bus.d);
+                #1 $display("after %h", bus.d);
+            end
+        endmodule
+    )");
+    CHECK(out == "active 13\nafter 42\n");
+}
+
+// The split the misnamed diagnostic hid: a nonblocking write THROUGH the handle
+// targets an interface signal and works (above); a nonblocking write TO the
+// handle property targets class storage and is the real class-property NBA gap
+// (legal SV -- LRM 6.21 bans only continuous forms on a non-static property --
+// but an object body has no per-object NBA shadow). The refusal must name the
+// property, and only fire for it.
+TEST_CASE("virtual interface: NBA to the handle property itself is the class-property gap") {
+    const std::string diag = reject(R"(
+        interface ibus; logic [7:0] d; endinterface
+        class drv;
+            virtual ibus vif;
+        endclass
+        module top;
+            ibus bus();
+            drv m;
+            initial begin
+                m = new;
+                m.vif <= bus;
+            end
+        endmodule
+    )");
+    CHECK(diag.find("nonblocking assignment to a class property is not supported") !=
+          std::string::npos);
+}
+
+// Intra-assignment timing on a nonblocking write through a handle: the deferred
+// intra record carries no instance context (unlike the plain vif NBA record), so
+// the delayed update would commit into the representative instance -- refused
+// with the construct named, not misdescribed by the generic scalar-target check
+// (which `vif.d` satisfies).
+TEST_CASE("virtual interface: intra-assignment delay on a handle write is refused") {
+    const std::string diag = reject(R"(
+        interface ibus; logic [7:0] d; endinterface
+        module top;
+            ibus bus();
+            virtual ibus vif;
+            initial begin
+                vif = bus;
+                vif.d <= #5 8'h1;
+            end
+        endmodule
+    )");
+    CHECK(diag.find("intra-assignment timing on a nonblocking write through a virtual "
+                    "interface handle is not supported") != std::string::npos);
+}

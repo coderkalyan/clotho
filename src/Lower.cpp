@@ -21181,6 +21181,29 @@ private:
         return b.binary(ir::Inst::Tag::Mul, w, mul, l);
     }
 
+    // Whether an lvalue select chain reaches its target THROUGH a virtual interface
+    // handle (LRM 25.9). The written storage is then a signal in whichever instance
+    // the handle names, not one this body addresses statically, so the handle access
+    // is the deepest member access in the chain and the walk stops there. A
+    // bit/part-select or an array-element select above it does not change the answer.
+    static bool is_vif_member_lvalue(const Expression& e) {
+        switch (e.kind) {
+            case ExpressionKind::ElementSelect:
+                return is_vif_member_lvalue(e.as<ElementSelectExpression>().value());
+            case ExpressionKind::RangeSelect:
+                return is_vif_member_lvalue(e.as<RangeSelectExpression>().value());
+            case ExpressionKind::Conversion:
+                return is_vif_member_lvalue(e.as<ConversionExpression>().operand());
+            case ExpressionKind::MemberAccess: {
+                const MemberAccessExpression& ma = e.as<MemberAccessExpression>();
+                return ma.value().type->getCanonicalType().isVirtualInterface() ||
+                       is_vif_member_lvalue(ma.value());
+            }
+            default:
+                return false;
+        }
+    }
+
     // Whether a nonblocking intra-assignment target's select chain resolves
     // through storage the deferred record can address. The record reuses plain
     // NBA's lvalue encoding, so the supported chain is exactly what that
@@ -21253,9 +21276,24 @@ private:
             case ExpressionKind::RangeSelect:
                 check_subroutine_nba_target(lhs.as<RangeSelectExpression>().value());
                 return;
-            case ExpressionKind::MemberAccess:
-                check_subroutine_nba_target(lhs.as<MemberAccessExpression>().value());
+            case ExpressionKind::MemberAccess: {
+                const MemberAccessExpression& ma = lhs.as<MemberAccessExpression>();
+                if (ma.value().type->getCanonicalType().isVirtualInterface()) {
+                    // `vif.sig <= x` (LRM 25.9 with 10.4.2): the target is the SIGNAL in
+                    // whichever instance the handle names. That signal has ordinary
+                    // module storage and stages through the deferred-record path like
+                    // every other nonblocking write through a handle (collect_vif_nba
+                    // marks the member, emit_array_nba stages it with the instance
+                    // resolved now). The handle is only READ here, to choose the
+                    // instance, so ITS storage class is not the assignment's target --
+                    // walking past it reported whatever the handle happened to live in
+                    // (a class property, which is the UVM driver shape `input_vif vif;`,
+                    // or a frame local) and named a construct the statement never wrote.
+                    return;
+                }
+                check_subroutine_nba_target(ma.value());
                 return;
+            }
             case ExpressionKind::NamedValue: {
                 const ValueSymbol& vs = lhs.as<NamedValueExpression>().symbol;
                 if (fn_ctx_->localmap.contains(&vs)) {
@@ -21327,9 +21365,14 @@ private:
         }
         if (a.isNonBlocking() && a.left().kind == ExpressionKind::MemberAccess &&
             a.left().as<MemberAccessExpression>().member.kind == SymbolKind::ClassProperty) {
-            // TODO: nonblocking assignment to a class property. The aggregate NBA
-            // staging path shadows a signal's storage, but an object body is a heap
-            // block with no per-object shadow (docs/design/classes.md §8).
+            // TODO: nonblocking assignment to a class property — legal SV (LRM 6.21
+            // bans only continuous / procedural continuous assignments to a
+            // non-static property; 10.4.2 bans NBA to automatics and dynamic-array
+            // elements, and a property is neither). The aggregate NBA staging path
+            // shadows a signal's storage, but an object body is a heap block with
+            // no per-object shadow (docs/design/classes.md §8). Distinct from
+            // `vif.sig <= x`, whose target is an interface SIGNAL, not a property;
+            // that form is supported and never reaches this guard.
             fail("nonblocking assignment to a class property is not supported");
         }
         if (const auto* pat = as_assignment_pattern(a.left())) {
@@ -21401,6 +21444,20 @@ private:
                 // (constant or variable), an unpacked-array element, and a packed
                 // or unpacked struct field. A real rides its IEEE pattern through
                 // the same narrow record (intra_pack_mm).
+                if (is_vif_member_lvalue(a.left())) {
+                    // TODO: intra-assignment timing on a nonblocking write through a
+                    // virtual interface handle. Plain `vif.sig <= x` works because its
+                    // record carries the resolved instance (arr_rec_ctx), but the
+                    // intra-timing record has no such field (intra_rec_ty) and
+                    // emit_intra_commit resolves a non-array destination with a static
+                    // storage_ptr, so the deferred update would land in the
+                    // representative instance instead of the one the handle named --
+                    // silently the wrong interface. Reported ahead of the generic target
+                    // check below, whose wording ("a whole integral or real scalar")
+                    // describes `vif.sig` and so would deny what it just admitted.
+                    fail("intra-assignment timing on a nonblocking write through a "
+                         "virtual interface handle is not supported");
+                }
                 if (!intra_nb_target_supported(a.left())) {
                     fail("nonblocking intra-assignment timing is only supported for a whole "
                          "integral or real scalar, a bit/part-select of one, an "
