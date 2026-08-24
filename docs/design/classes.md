@@ -36,7 +36,28 @@ initializer stores whole, bypassing `coerce` (whose `Resize` rejects a string
 value). The initializer is lowered with `fn_ctx_` and `ctor_this_` cleared: it is
 class scope, and LRM 8.11 allows `this` only inside a non-static method, so a
 stray non-static reference must fail loudly rather than bind to whichever frame or
-object happened to be mid-lowering when first access triggered registration.
+object happened to be mid-lowering when registration triggered.
+
+**Initialization is EAGER** (LRM 6.21: "only once at the beginning of
+simulation"; LRM 8.9: usable "without creating an object of that type"). A
+design-wide pre-pass (`collect_class_types` + `init_static_class_props`, modelled
+on WaitPropScan) forces `declare_static_prop` for every static property with an
+initializer of every elaborated class: packages and `$unit` on the globals
+Lowerer — once per design, however many tops import them — and each top's
+instance tree on that top's Lowerer, where a module-scope class's initializer can
+see the module's signals. Generic specializations are enumerated from each
+`GenericClassDefSymbol`'s specialization map (a `C#(args)` ClassType is a member
+of no scope), sorted by rendered name, which is what catches a specialization
+named only in a typedef — UVM's `uvm_component_utils` registration shape, whose
+`local static bit m__initialized = __deferred_init()` has no reader at all.
+Access sites still call `declare_static_prop` and meet the pre-pass at one signal
+through `sigmap_`, so the initializer is queued exactly once. Order is
+implementation-defined (declaration order within and across classes;
+specializations of one generic by rendered name); an initializer reading another
+class's static forces that property's initialization ahead of the read. A class
+with no initialized statics contributes no PreInit work. See the TODO.md ledger
+entry for the randomization-guard relocation and body-stub policy this
+unlocked.
 
 **Virtual functions / dynamic dispatch** (LRM 8.20) now work (Phase 3, part 1). A
 class is *polymorphic* iff it or a base declares a virtual method; virtual

@@ -492,6 +492,80 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
     }
 };
 
+// Every class declared under `scope`, appended to `out`. This is what makes static
+// property initialization eager (LRM 6.21 / 8.9): the initializers must run once at
+// the beginning of simulation whether or not anything ever names the property, so
+// the set of classes cannot be "the ones some access site happened to reach".
+//
+// A generic class is the reason this is a walk of its own rather than a member walk
+// or an ASTVisitor. slang monomorphizes each `C#(args)` into its own ClassType which
+// is a member of NO scope -- it lives only in the generic definition's
+// specialization map -- so `R#(Foo)` named by nothing but a typedef is unreachable
+// from `Scope::members()`. That map is a hash map, so specializations are emitted
+// sorted by their rendered `C#(args)` name (ClassType::toString, which unlike
+// ClassType::name carries the arguments), which is what makes the initialization
+// order reproducible rather than hash-dependent.
+//
+// A package member is deliberately NOT descended into: the caller enumerates
+// packages itself (lower_globals), so that a package's classes are initialized once
+// on the globals Lowerer rather than once per top that imports it.
+void collect_class_types(const Scope& scope, std::vector<const ClassType*>& out) {
+    for (const Symbol& m : scope.members()) {
+        switch (m.kind) {
+            case SymbolKind::ClassType: {
+                const auto& cls = m.as<ClassType>();
+                out.push_back(&cls);
+                collect_class_types(cls, out); // a nested class
+                break;
+            }
+            case SymbolKind::GenericClassDef: {
+                std::vector<std::pair<std::string, const ClassType*>> specs;
+                for (const Type& spec : m.as<GenericClassDefSymbol>().specializations()) {
+                    // A specialization whose arguments failed to elaborate is an
+                    // ErrorType, and has no members to initialize.
+                    if (const auto* cls = spec.as_if<ClassType>()) {
+                        specs.emplace_back(cls->toString(), cls);
+                    }
+                }
+                std::ranges::stable_sort(specs, [](const auto& a, const auto& b) {
+                    return a.first < b.first;
+                });
+                for (const auto& [name, cls] : specs) {
+                    out.push_back(cls);
+                    collect_class_types(*cls, out);
+                }
+                break;
+            }
+            case SymbolKind::Instance:
+                // Not opaque, unlike the timescale walk below: a class declared in a
+                // child module is still a class this design must initialize.
+                collect_class_types(m.as<InstanceSymbol>().body, out);
+                break;
+            case SymbolKind::InstanceArray:
+                // The elements are members of the array scope, one nested array per
+                // extra unpacked dimension, so this bottoms out at the instances.
+                collect_class_types(m.as<InstanceArraySymbol>(), out);
+                break;
+            case SymbolKind::GenerateBlock: {
+                const auto& gb = m.as<GenerateBlockSymbol>();
+                if (!gb.isUninstantiated) {
+                    collect_class_types(gb, out);
+                }
+                break;
+            }
+            case SymbolKind::GenerateBlockArray:
+                for (const GenerateBlockSymbol* e : m.as<GenerateBlockArraySymbol>().entries) {
+                    if (!e->isUninstantiated) {
+                        collect_class_types(*e, out);
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 // True iff this scope (an instance body or one of its generate blocks — sharing
 // the enclosing instance's timescale — or a package / `$unit` compilation unit)
 // textually contains a real delay, in a procedural block, a subroutine body, an
@@ -2184,6 +2258,17 @@ public:
         lower_instance(top, prefix, Pass::Classify, &top_scope_, top.name);
         lower_instance(top, prefix, Pass::Emit, &top_scope_, top.name);
         emit_wire_resolvers();
+        // Static class property initializers of classes declared under this top; a
+        // package / $unit class already ran on the globals Lowerer, whose sigmap_
+        // seed makes the redeclaration here a cache hit. After Emit so the module
+        // signals a module-scope class's initializer may read exist and are
+        // initialized; before drain_pending_bodies, which builds any method body an
+        // initializer's call pulled in. The signals land in this top's root scope
+        // node so the VCD representability check still sees them.
+        prefix_ = prefix;
+        scope_stack_.push_back(&top_scope_);
+        init_static_class_props(top.body);
+        scope_stack_.pop_back();
         // Every body compute_vtable reserved while lowering this top's types, now
         // that the top's signals and scope tree are complete. Before the finalizers,
         // which close the processes a body's own lowering can still contribute to.
@@ -2204,14 +2289,15 @@ public:
     // in this Lowerer's PreInit process, so a package variable initializes
     // exactly once regardless of how many tops import it.
     void lower_globals(const Compilation& comp, const RootSymbol& root) {
-        // Three phases, in this order, because each one lowers code that may read
+        // Four phases, in this order, because each one lowers code that may read
         // whatever the previous one produced. Registration only needs types, so it
         // cannot observe a half-built anything; an initializer can call a function
-        // that reads any global, so every global has to exist first; and a deferred
-        // body can read a global AND run an initializer's side effects, so it goes
-        // last. Doing all three per-variable, as one loop, is what left
-        // `uvm_object::m_set_local_rsrc` unregistered when a variable declared above
-        // it pulled its class's vtable in.
+        // that reads any global, so every global has to exist first; a class
+        // static's initializer may read any of those, so classes follow the
+        // variables; and a deferred body can read a global AND run an initializer's
+        // side effects, so it goes last. Doing these per-variable, as one loop, is
+        // what left `uvm_object::m_set_local_rsrc` unregistered when a variable
+        // declared above it pulled its class's vtable in.
         for (const PackageSymbol* pkg : comp.getPackages()) {
             register_global_scope_signals(*pkg);
         }
@@ -2224,8 +2310,52 @@ public:
         for (const CompilationUnitSymbol* unit : root.compilationUnits) {
             init_global_scope_signals(*unit);
         }
+        // Every static class property initializer of every package / $unit class,
+        // including a parameterized specialization named only in a typedef: LRM 6.21
+        // requires the initialization "only once at the beginning of simulation",
+        // and LRM 8.9 lets a static property be used without any object existing,
+        // so waiting for an access site (declare_static_prop's other callers) would
+        // silently skip a property nobody reads. UVM's factory registration is
+        // exactly that shape: uvm_registry.svh's `local static bit m__initialized =
+        // __deferred_init()` has no reader at all. After the variable loops for the
+        // same reason those are sequenced: an initializer here may call a function
+        // reading any package variable.
+        for (const PackageSymbol* pkg : comp.getPackages()) {
+            init_static_class_props(*pkg);
+        }
+        for (const CompilationUnitSymbol* unit : root.compilationUnits) {
+            init_static_class_props(*unit);
+        }
         drain_pending_bodies();
         finalize_preinit();
+    }
+
+    // Force declaration -- and thereby time-zero initialization -- of every static
+    // class property with an initializer declared under `scope`. declare_static_prop
+    // is idempotent through sigmap_, so an access site reaching the same property
+    // (before or after this) never queues the initializer twice; a class with no
+    // initialized statics contributes nothing. Initializers run in declaration order
+    // within a class; across classes the order is collect_class_types's walk
+    // (declaration order, specializations by rendered name), which the LRM leaves
+    // implementation-defined. An initializer that READS another class's static
+    // forces that property's declaration mid-emission (value_lvalue ->
+    // declare_static_prop appends the whole nested store first), so it observes the
+    // initialized value, not the power-up one.
+    void init_static_class_props(const Scope& scope) {
+        std::vector<const ClassType*> classes;
+        collect_class_types(scope, classes);
+        for (const ClassType* cls : classes) {
+            scope_ = cls;
+            for (const Symbol& m : cls->members()) {
+                const auto* prop = m.as_if<ClassPropertySymbol>();
+                if (prop == nullptr || prop->lifetime != slang::ast::VariableLifetime::Static ||
+                    prop->getInitializer() == nullptr) {
+                    continue;
+                }
+                cur_range_ = slang::SourceRange{ prop->location, prop->location };
+                recover([&] { declare_static_prop(*prop); });
+            }
+        }
     }
 
     const ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>& sigmap() const {
@@ -3215,6 +3345,16 @@ private:
         uint32_t              rng_field  = 0;
         uint32_t              mode_field = 0;
         std::vector<RandProp> props;
+        // Non-empty when the chain carries a randomization surface step 1 cannot
+        // honour (a constraint block, a rand property of an undrawable type): the
+        // reason, verbatim. Such a class lowers -- eager static initialization
+        // (LRM 6.21) lowers every factory-registered type whether or not anything
+        // randomizes it, and UVM's register layer carries constraints in classes
+        // most designs never randomize -- but its generated $randomize body is a
+        // run-time fatal carrying this message, never a silent unconstrained draw.
+        // The body is the one point every randomize() of the class must reach
+        // (dispatch is virtual), so a base-typed handle is caught too.
+        std::string unsupported;
     };
 
     // Publish a lowered class: cache it against its ClassType and record its declared
@@ -3378,17 +3518,24 @@ private:
         uint32_t                idx = 0;
         ClassRand               rand;
         for (const slang::ast::ClassType* k : chain) {
-            guard_constraint_blocks(*k);
+            if (rand.unsupported.empty() && has_constraint_blocks(*k)) {
+                rand.unsupported = "constraint blocks are not supported";
+            }
             for (const auto& prop : k->membersOfType<slang::ast::ClassPropertySymbol>()) {
                 if (prop.lifetime == slang::ast::VariableLifetime::Static) {
                     // A static property (LRM 8.9) is ONE slot shared across all
                     // instances, not part of the per-object body — it gets persistent
-                    // module-signal storage (declare_static_prop), registered lazily on
-                    // first access. Skip it here.
+                    // module-signal storage (declare_static_prop), declared eagerly at
+                    // time zero (init_static_class_props) and on first access. Skip it
+                    // here.
                     continue;
                 }
-                if (prop.randMode != slang::ast::RandMode::None) {
-                    rand.props.push_back(admit_rand_prop(prop, idx, static_cast<uint32_t>(rand.props.size())));
+                if (prop.randMode != slang::ast::RandMode::None && rand.unsupported.empty()) {
+                    if (const char* why = rand_type_unsupported(prop.getType()); why != nullptr) {
+                        rand.unsupported = why;
+                    } else {
+                        rand.props.push_back(admit_rand_prop(prop, idx, static_cast<uint32_t>(rand.props.size())));
+                    }
                 }
                 class_prop_index_.emplace(&prop, idx);
                 const uint32_t prop_idx = idx;
@@ -3422,6 +3569,12 @@ private:
         // reason the property indices are: lowering a property's type can reach a
         // method body that constructs an object of this very class, and the seeding
         // at that `new` needs the block it is about to get.
+        // A reason found in a LATER chain class invalidates the earlier admissions:
+        // the whole chain's randomize is refused, so no rand block is laid out and
+        // the class pays nothing for the rand machinery it cannot use.
+        if (!rand.unsupported.empty()) {
+            rand.props.clear();
+        }
         uint32_t block = idx;
         if (!rand.props.empty()) {
             rand.present    = true;
@@ -3561,30 +3714,30 @@ private:
             p.randc_vals = 1u << w;
             return p;
         }
-        guard_rand_type(ty);
         return p;
     }
 
-    // Refuse a `rand` property type step 1 cannot draw a value for. Every one of
-    // these is legal SystemVerilog and every one is a TODO, not a limitation.
-    void guard_rand_type(const slang::ast::Type& ty) {
-        const slang::ast::Type& ct = ty.getCanonicalType();
-        if (ct.isIntegral() || ct.isClass()) {
-            return;
+    // Why step 1 cannot draw a value for a `rand` property of this type, or null
+    // when it can. Every named shape is legal SystemVerilog and a TODO, not a
+    // limitation: `rand real` (LRM 1800-2023 18.3) has no uniform distribution over
+    // its range to draw from; a rand dynamic array / queue / associative array /
+    // unpacked struct (LRM 18.4) needs an element walk the fixed-array case does
+    // statically. A class-property caller records the reason in
+    // ClassRand::unsupported, which turns the class's generated $randomize body
+    // into a run-time fatal; std::randomize (a direct call site) fails at compile
+    // time.
+    static const char* rand_type_unsupported(const slang::ast::Type& ty) {
+        const slang::ast::Type* ct = &ty.getCanonicalType();
+        while (const auto* arr = ct->as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
+            ct = &arr->elementType.getCanonicalType();
         }
-        if (ct.isFloating()) {
-            // TODO: `rand real` (LRM 1800-2023 18.3) — an unconstrained real has no
-            // uniform distribution over its range to draw from.
-            fail("rand real properties are not supported");
+        if (ct->isIntegral() || ct->isClass()) {
+            return nullptr;
         }
-        if (const auto* arr = ct.as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
-            guard_rand_type(arr->elementType);
-            return;
+        if (ct->isFloating()) {
+            return "rand real properties are not supported";
         }
-        // TODO: rand dynamic arrays, queues, associative arrays and unpacked structs
-        // (LRM 18.4). Each needs an element walk the fixed-array case above does
-        // statically; a dynamic one needs a runtime loop in the generated body.
-        fail("rand properties of this type are not supported");
+        return "rand properties of this type are not supported";
     }
 
     // The type of one 256-bit RNG / cyclic-history slot: four 64-bit words, laid out
@@ -3599,23 +3752,26 @@ private:
         return module_.pool.put(ir::Item{ t });
     }
 
-    // A `constraint` block is declarative and step 1 solves nothing, so a class
-    // carrying one is refused rather than silently randomized as if unconstrained.
-    // Enumerating them needs slang's own walk: an inherited member is wrapped in a
-    // TransparentMemberSymbol and membersOfType does not unwrap, so the chain is
-    // walked by the caller and only this class's own members are examined here.
+    // True if `clt`'s own member list carries a `constraint` block (LRM 18.5).
+    // A constraint is declarative and step 1 solves nothing, so a chain carrying one
+    // must never be silently randomized as if unconstrained -- the caller records it
+    // in ClassRand::unsupported and the generated $randomize body refuses at run
+    // time. Enumerating them needs slang's own walk: an inherited member is wrapped
+    // in a TransparentMemberSymbol and membersOfType does not unwrap, so the chain
+    // is walked by the caller and only this class's own members are examined here.
     //
     // TODO: constraint blocks (LRM 18.5) — step 2, the solver.
-    void guard_constraint_blocks(const slang::ast::ClassType& clt) {
+    static bool has_constraint_blocks(const slang::ast::ClassType& clt) {
         for (const slang::ast::Symbol& member : clt.members()) {
             const slang::ast::Symbol* sym = &member;
             while (sym->kind == SymbolKind::TransparentMember) {
                 sym = &sym->as<slang::ast::TransparentMemberSymbol>().wrapped;
             }
             if (sym->kind == SymbolKind::ConstraintBlock) {
-                fail("constraint blocks are not supported");
+                return true;
             }
         }
+        return false;
     }
 
     // Lower the built-in `process` class (LRM 9.7). Unlike a user class, its body is
@@ -6462,8 +6618,9 @@ private:
         if (csym.kind == SymbolKind::ClassProperty &&
             csym.as<slang::ast::ClassPropertySymbol>().lifetime == slang::ast::VariableLifetime::Static) {
             // A static class property gets persistent module-signal storage
-            // registered LAZILY on first access (declare_static_prop), and the value
-            // paths do that themselves. A reference that arrives here instead --
+            // (declare_static_prop): eagerly for an initialized property, on first
+            // access otherwise, and the value paths do that themselves. A reference
+            // that arrives here instead --
             // `@(C::e)` on a static event property, which resolves through
             // event_signal -- must trigger the same registration rather than report
             // the property as unknown.
@@ -19797,6 +19954,25 @@ private:
     // per defining instance.
     std::string hier_name() const {
         std::string path = instance_path();
+        if (path.empty() && scope_ != nullptr) {
+            // A package / $unit subroutine sits under no instance, so the instance
+            // path is empty; %m still owes the scope chain (LRM 21.2.1.3, Verilator
+            // renders `pkg.fn`). UVM's uvm_instance_scope (base/uvm_misc.svh) scans
+            // %m backwards for a '.' / ':' separated prefix and reports SCPSTR --
+            // 128 times, then a BUILDERR fatal -- when there is none, so the
+            // package segment is load-bearing, not cosmetic.
+            for (const Scope* s = scope_; s != nullptr; s = s->asSymbol().getParentScope()) {
+                const Symbol& sym = s->asSymbol();
+                if (sym.kind == SymbolKind::Package) {
+                    path = std::string(sym.name);
+                    break;
+                }
+                if (sym.kind == SymbolKind::CompilationUnit) {
+                    path = "$unit";
+                    break;
+                }
+            }
+        }
         if (fn_ctx_ != nullptr && !fn_ctx_->name_prefix.empty()) {
             path += '.';
             path.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
@@ -22776,7 +22952,8 @@ private:
         // runs away). An empty source clears the queue to size 0.
         const Expression& rhs = unwrap_conversion(a.right());
         if (is_dyn_array(rhs)) {
-            if (rhs.kind != ExpressionKind::NamedValue && rhs.kind != ExpressionKind::HierarchicalValue) {
+            if (rhs.kind != ExpressionKind::NamedValue && rhs.kind != ExpressionKind::HierarchicalValue &&
+                rhs.kind != ExpressionKind::MemberAccess) {
                 // TODO: queue = <dynamic-array rvalue> where the source is not a
                 // plain variable (a call result, slice, etc.) — needs the source
                 // materialized into a temp dynarray handle first.
@@ -24843,9 +25020,42 @@ private:
         using T               = ir::Inst::Tag;
         const ir::SourceLoc l = loc(e);
         if (is_string_expr(e.left())) {
-            // TODO: string-typed `inside` — members would need string comparison,
-            // not the integral WildEq / relational ops used here.
-            fail("inside operator over string operands is not supported");
+            // A string set (LRM 11.4.13; uvm_reg_field::needs_update is
+            // `get_access() inside {"RO","RC","RS"}`): per-member equality and, for
+            // a range, the two lexicographic relationals, folded with Lor. The
+            // backend's Eq / Ge / Le over string operands are already the content
+            // compares `==` and `<=` lower to (LRM 6.16.9), so no new instruction.
+            const ir::Index sel = lower_expr(e.left(), b);
+            ir::Index       acc{};
+            bool            have = false;
+            const auto      fold = [&](ir::Index p) {
+                acc  = have ? b.binary(T::Lor, acc, p, l) : p;
+                have = true;
+            };
+            for (const Expression* m : e.rangeList()) {
+                if (m->kind == ExpressionKind::ValueRange) {
+                    const auto& vr = m->as<ValueRangeExpression>();
+                    if (vr.rangeKind != ValueRangeKind::Simple) {
+                        // A tolerance range needs arithmetic, which a string has none of.
+                        fail("inside operator tolerance ranges are not supported");
+                    }
+                    fold(b.binary(T::Land,
+                                  b.binary(T::Ge, sel, lower_expr(vr.left(), b), l),
+                                  b.binary(T::Le, sel, lower_expr(vr.right(), b), l),
+                                  l));
+                    continue;
+                }
+                if (m->type->getCanonicalType().isUnpackedArray()) {
+                    // TODO: a container of strings as a set member — the element
+                    // walk above compares through resize, which rejects strings.
+                    fail("inside operator with a container of strings is not supported");
+                }
+                fold(b.binary(T::Eq, sel, lower_expr(*m, b), l));
+            }
+            if (!have) {
+                fail("internal: an inside set with no members");
+            }
+            return acc;
         }
         // A real set compares at `real`: a shortreal widens exactly (LRM 6.12.2),
         // and 11.4.13's relational range test is defined for reals (Table 11-1).
@@ -26254,9 +26464,15 @@ private:
     // the class (and its derived classes), not part of the per-object body. Like a
     // static function local — persistent module-signal storage, keyed by the
     // property symbol, class-qualified name — but resolved wherever the property is
-    // referenced (`obj.p`, `C::p`, or a bare `p` in a method). Registered lazily on
-    // first access; its initializer (if any) runs once at time zero via the PreInit
-    // process (LRM 8.9.2), like a module-level static variable.
+    // referenced (`obj.p`, `C::p`, or a bare `p` in a method). Declared EAGERLY for
+    // every class the design elaborates (init_static_class_props): LRM 6.21 runs a
+    // static's initializer "only once at the beginning of simulation", reader or
+    // no reader, so waiting for an access site would silently skip a write-only
+    // property (UVM's whole factory registration). Access sites still land here
+    // first when they precede the eager pass (a package variable's initializer
+    // reading `C::x`); the sigmap_ cache is what makes the two paths meet at one
+    // signal and ONE queued initializer. The initializer runs at time zero via the
+    // PreInit process (LRM 8.9.2), like a module-level static variable.
     ir::Signal declare_static_prop(const slang::ast::ClassPropertySymbol& prop) {
         const auto it = sigmap_.find(&prop);
         if (it != sigmap_.end()) {
@@ -27009,6 +27225,14 @@ private:
     // Lowerer owns. Hence the loop rather than two calls.
     void drain_pending_bodies() {
         const Restore<bool> immediate(defer_bodies_, false);
+        // A body built from here was forced into existence by vtable completeness,
+        // not by a call the design executes -- so an unsupported construct inside
+        // one becomes a warning plus a run-time fatal stub (build_function /
+        // build_task) instead of a whole-design refusal. Eager static class
+        // property initialization (LRM 6.21) is what makes this reachable at
+        // scale: every factory-registered UVM class now lowers, register layer
+        // included, whether or not the design ever calls into it.
+        const Restore<bool> stub(stub_unsupported_bodies_, true);
         while (true) {
             if (!body_pending_.empty()) {
                 const auto [sub, id] = body_pending_.back();
@@ -27145,6 +27369,36 @@ private:
         return b.member_select(body, it->second, class_ref, l);
     }
 
+    // Whether a body-build failure in `sub` may compile to a run-time fatal stub:
+    // only a CLASS METHOD built on the vtable-forced path (drain_pending_bodies).
+    // A module/package subroutine reaches lowering only from a real call site, so
+    // its compile diagnostic stands.
+    bool stub_eligible(const SubroutineSymbol& sub) const {
+        return stub_unsupported_bodies_ && sub.getParentScope() != nullptr &&
+               sub.getParentScope()->asSymbol().kind == SymbolKind::ClassType;
+    }
+
+    // Turn an abandoned body into the stub: roll the half-emitted statements back
+    // to the (empty) pre-body mark, record a compile-time warning naming the
+    // construct, and emit report + terminate so an EXECUTION of the body dies
+    // loudly with the same message. The caller's fall-through return and
+    // set_function tail then complete the record with the real signature, which is
+    // what keeps every call site ABI-correct without rebuilding it here.
+    void emit_unsupported_body_stub(const SubroutineSymbol& sub,
+                                    const LowerError&       e,
+                                    ir::Builder&            b,
+                                    ir::Builder::Mark       body_mark) {
+        b.rollback(body_mark);
+        report(Severity::Warning,
+               "unsupported-construct",
+               e.message + "; '" + std::string(sub.name) + "' compiles to a run-time fatal stub",
+               e.span);
+        const ir::SourceLoc el     = to_source_loc(sub.location);
+        const std::string   banner = banner_at(sub.location);
+        b.severity(static_cast<uint32_t>(ir::Severity::Fatal), banner, e.message, {}, el);
+        b.finish(banner + "$fatal", 1, el);
+    }
+
     // Lower one task body into the reserved slot. Like build_function, but the task
     // is void and becomes a coroutine: the backend emits the parameter copy-in /
     // copy-out (output / inout pass by pointer) and the completion handshake, so
@@ -27186,8 +27440,16 @@ private:
             fn_local(*fa);
         }
 
-        install_capture_boxes(sub, sub.getBody(), b);
-        lower_stmt(sub.getBody(), b);
+        const ir::Builder::Mark body_mark = b.mark();
+        try {
+            install_capture_boxes(sub, sub.getBody(), b);
+            lower_stmt(sub.getBody(), b);
+        } catch (const LowerError& e) {
+            if (!stub_eligible(sub)) {
+                throw;
+            }
+            emit_unsupported_body_stub(sub, e, b, body_mark);
+        }
 
         // Fall-through return: the void Ret drives the backend's copy-out epilogue.
         const ir::SourceLoc el = to_source_loc(sub.location);
@@ -27410,23 +27672,32 @@ private:
             ctx.ret_local = fn_local(*sub.returnValVar);
         }
 
-        install_capture_boxes(sub, sub.getBody(), b);
+        const ir::Builder::Mark body_mark = b.mark();
+        try {
+            install_capture_boxes(sub, sub.getBody(), b);
 
-        // A constructor constructs its base part first (LRM 8.15), before the body:
-        // implicitly (no-arg), via `extends B(args)`, or via an explicit `super.new`
-        // (all three surface through getBaseConstructorCall()). Emit it here, in the
-        // constructor's own frame, where any base-arg that references a ctor formal
-        // is in scope. slang requires super.new to be the first statement, so
-        // entry-emission is order-equivalent; the body's super.new is a no-op.
-        if (sub.flags.has(slang::ast::MethodFlags::Constructor) && sub.thisVar != nullptr) {
-            const auto& clt = sub.thisVar->getType().getCanonicalType().as<slang::ast::ClassType>();
-            if (clt.getBaseClass() != nullptr) {
-                const ir::SourceLoc bl = to_source_loc(sub.location);
-                emit_base_construction(clt, this_handle(b, bl), b, bl);
+            // A constructor constructs its base part first (LRM 8.15), before the
+            // body: implicitly (no-arg), via `extends B(args)`, or via an explicit
+            // `super.new` (all three surface through getBaseConstructorCall()). Emit
+            // it here, in the constructor's own frame, where any base-arg that
+            // references a ctor formal is in scope. slang requires super.new to be
+            // the first statement, so entry-emission is order-equivalent; the body's
+            // super.new is a no-op.
+            if (sub.flags.has(slang::ast::MethodFlags::Constructor) && sub.thisVar != nullptr) {
+                const auto& clt = sub.thisVar->getType().getCanonicalType().as<slang::ast::ClassType>();
+                if (clt.getBaseClass() != nullptr) {
+                    const ir::SourceLoc bl = to_source_loc(sub.location);
+                    emit_base_construction(clt, this_handle(b, bl), b, bl);
+                }
             }
-        }
 
-        lower_stmt(sub.getBody(), b);
+            lower_stmt(sub.getBody(), b);
+        } catch (const LowerError& e) {
+            if (!stub_eligible(sub)) {
+                throw;
+            }
+            emit_unsupported_body_stub(sub, e, b, body_mark);
+        }
 
         // Fall-through return: yields the function variable (X if never assigned).
         // An aggregate result's Ret operand is its lvalue (the backend copies its
@@ -27750,6 +28021,30 @@ private:
         const ir::Ref       i32 = make_int_type(32, false, true);
         ir::Builder         b(module_.pool);
         const ClassRand&    rd   = class_rand_.at(&clt);
+        if (!rd.unsupported.empty()) {
+            // The chain carries a randomization surface step 1 cannot honour (see
+            // ClassRand::unsupported). The refusal lives here, in the one body every
+            // randomize() of this class must reach -- the dispatch is virtual, so a
+            // base-typed handle over a constrained derived object lands here too --
+            // rather than at the type or the call site: eager static initialization
+            // lowers every factory-registered class and builds every vtable body,
+            // so a compile-time fail would refuse a design for merely CONTAINING
+            // such a class (all of UVM's register layer). Loud:
+            // report + terminate, never a silent unconstrained draw.
+            const std::string banner = banner_at(clt.location);
+            b.severity(static_cast<uint32_t>(ir::Severity::Fatal), banner, rd.unsupported, {}, l);
+            b.finish(banner + "$fatal", 1, l);
+            b.unary(ir::Inst::Tag::Ret, b.constant(module_.pool.put_int(i32, 0), l), l);
+            module_.set_function(id,
+                                 ir::Function{ .name        = std::string(clt.name) + ".randomize",
+                                               .return_type = i32,
+                                               .param_types = std::vector<ir::Ref>{ class_ref, u64 },
+                                               .arg_dirs = std::vector<ir::ArgDir>{ ir::ArgDir::In, ir::ArgDir::In },
+                                               .local_types = std::vector<ir::Ref>{ class_ref, u64 },
+                                               .span        = span_of(clt),
+                                               .ir          = b.finish() });
+            return;
+        }
         const ir::Index     self = b.unary(ir::Inst::Tag::Load, b.local(0, class_ref, l), l);
         emit_rand_hook(clt, "pre_randomize", self, b, l);
         if (rd.present) {
@@ -28829,7 +29124,9 @@ private:
                                          ? arg->as<slang::ast::AssignmentExpression>().left()
                                          : *arg;
             const slang::ast::Type& ty = target.type->getCanonicalType();
-            guard_rand_type(ty);
+            if (const char* why = rand_type_unsupported(ty); why != nullptr) {
+                fail(why);
+            }
             if (ty.isClass()) {
                 // TODO: std::randomize of a class handle (LRM 18.12) — the recursion
                 // needs the handle's own randomize, which is a virtual dispatch here.
@@ -28853,6 +29150,24 @@ private:
         const slang::ast::Symbol* sym    = target.getSymbolReference();
         const auto                it     = sym != nullptr ? rand_ordinal_.find(sym) : rand_ordinal_.end();
         if (it == rand_ordinal_.end()) {
+            if (const auto* prop = sym != nullptr ? sym->as_if<slang::ast::ClassPropertySymbol>() : nullptr;
+                prop != nullptr && prop->randMode != slang::ast::RandMode::None) {
+                // A WHOLE rand property with no ordinal: its declaring class's rand
+                // surface is unsupported (ClassRand::unsupported), so no rand block
+                // -- and no mode mask -- was ever laid out. Same run-time refusal as
+                // that class's generated $randomize body, and for the same reason:
+                // uvm_reg_field::get_rand_mode is `value.rand_mode()` in a class the
+                // factory registers whether or not the design ever randomizes it.
+                if (const auto* declaring = prop->getParentScope()->asSymbol().as_if<slang::ast::ClassType>()) {
+                    if (const auto rit = class_rand_.find(declaring);
+                        rit != class_rand_.end() && !rit->second.unsupported.empty()) {
+                        const std::string banner = banner_at(target.sourceRange.start());
+                        b.severity(static_cast<uint32_t>(ir::Severity::Fatal), banner, rit->second.unsupported, {}, l);
+                        b.finish(banner + "$fatal", 1, l);
+                        return b.constant(module_.pool.put_int(lower_type(*call.type), 0), l);
+                    }
+                }
+            }
             // TODO: rand_mode on a SUBELEMENT of a rand property (LRM 18.8) — it
             // needs a per-element enable, not one bit per property.
             fail("rand_mode is supported on a whole rand property only");
@@ -29499,6 +29814,11 @@ private:
     // Drained at a phase boundary by drain_pending_bodies.
     bool                                                                     defer_bodies_ = false;
     std::vector<std::pair<const SubroutineSymbol*, ir::FunctionId>>          body_pending_;
+    // Body-build failure policy (see drain_pending_bodies): true while building
+    // vtable-forced bodies, where an unsupported construct in a CLASS METHOD
+    // compiles to a warning plus a run-time fatal stub instead of refusing the
+    // design. False on the direct-call path, whose compile diagnostics stand.
+    bool stub_unsupported_bodies_ = false;
     // Canonical slang struct/union type -> its lowered ir::Ref, so a type used by
     // many variables (e.g. a bus of the same struct) interns its field table
     // once. The pool's own structural dedup can't do this: two independently

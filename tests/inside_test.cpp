@@ -222,15 +222,25 @@ TEST_CASE("inside: a real left operand against a real array member") {
     CHECK(out == "1 0\n");
 }
 
-// Unsupported forms fail loudly (never silently accept).
-TEST_CASE("inside: unsupported forms are rejected") {
-    check_rejected(R"(
+// A string left operand: per-member equality, and lexicographic relationals for
+// a range (LRM 11.4.13 / 6.16.9). The UVM shape is uvm_reg_field::needs_update,
+// `get_access() inside {"RO","RC","RS"}`, reached by every factory-registered
+// register field once static initialization is eager. Verified vs Verilator 5.050.
+TEST_CASE("inside: a string left operand against string members and a range") {
+    const std::string out = run_capture(R"(
         module m;
           string s;
-          initial begin s = "hi"; $display("%b", s inside {"hi", "bye"}); end
+          initial begin
+            s = "RC";
+            $display("%0d %0d %0d", s inside {"RO","RC","RS"}, "zz" inside {"RO","RC"}, s inside {["RA":"RD"]});
+          end
         endmodule
-    )",
-                   "string operands");
+    )");
+    CHECK(out == "1 0 1\n");
+}
+
+// Unsupported forms fail loudly (never silently accept).
+TEST_CASE("inside: unsupported forms are rejected") {
 
     // An associative array has no index walk to share with the ordered
     // containers; its traversal is the first/next key pair (LRM 7.9.4).

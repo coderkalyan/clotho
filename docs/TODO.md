@@ -2821,19 +2821,102 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   (the memcpy shape). With the fix the easyUVM invocation boots UVM, prints the
   1800.2-2020 banner and the report summary, and exits 0.
 
-- [ ] **Static initializers of unreferenced parameterized-class specializations**
-  (LRM 8.19 / 6.21) — a static property initializer must run before time zero
-  whether or not anything references the property. Clotho lowers a
-  specialization's statics only when the specialization is otherwise reachable,
-  so `uvm_component_registry#(simple_test)::me = get()` — the registration
-  pattern behind every `uvm_component_utils` — never runs, the emitted design
-  contains no `uvm_component_registry` body at all, and the factory stays empty.
-  Observable consequence, now that the alignment fix above lets UVM boot: the
-  easyUVM run reaches `UVM_WARNING [BDTYP] Cannot create a component of type
-  'simple_test'` then `UVM_FATAL [INVTST]` at time 0. This is the next wall
-  between clotho and a passing UVM test. It cannot wear a loud guard without
-  refusing all of UVM, so it is the documented exception to the guard rule until
-  it lands: the failure mode is UVM's own located fatal, not silence.
+- [x] **Eager static class property initialization** (LRM 6.21 / 8.9) — a static
+  property's initializer now runs once at the beginning of simulation, reader or
+  no reader, object or no object. It used to run LAZILY: `declare_static_prop`
+  registered storage and queued the initializer into PreInit, but was only
+  reached from ACCESS sites, so a property nobody names never initialized at
+  all — `count=0` where Verilator says 1. LRM 6.21 is explicit that the
+  `static` keyword marks "executing that initialization only once at the
+  beginning of simulation", and 8.9's own example (`static integer fileID =
+  $fopen("data","r")`) is used "without creating an object of that type". The
+  UVM consequence was terminal: `uvm_registry.svh`'s `local static bit
+  m__initialized = __deferred_init()` is read by NOBODY — its only purpose is
+  the factory-registration side effect — so the factory stayed empty and
+  easyUVM died at `UVM_FATAL [INVTST]` at time 0. Fix: a design-wide pre-pass
+  (`collect_class_types` + `init_static_class_props`), same shape as
+  WaitPropScan and for the same reason — a specialization named only in a
+  typedef may never be lowered on demand at all. Enumeration walks packages and
+  `$unit` on the globals Lowerer (so a package class initializes ONCE per
+  design, not once per top that imports it — each top's sigmap seed makes its
+  accesses cache hits; pinned by the two-top test in package_test.cpp) and each
+  top's instance tree on that top's Lowerer (a module-scope class's initializer
+  may read module signals). Generic classes are the load-bearing part: slang
+  monomorphizes each `C#(args)` into a ClassType that is a member of NO scope,
+  living only in the GenericClassDefSymbol's specialization hash map, so the
+  walk visits `specializations()` explicitly — which is exactly how a
+  typedef-only `uvm_component_registry#(T,"T")` is found. Exactly-once falls
+  out of the sigmap_ cache (access sites and the pre-pass meet at one signal
+  and one queued initializer). Order, which the LRM leaves undefined across
+  classes: declaration order within a class, declaration order across classes,
+  a generic's specializations sorted by their rendered `C#(args)` name (the
+  hash map's own order would be run-to-run stable but layout-dependent);
+  implementation-defined and deliberately so — UVM's `__deferred_init` checks
+  `get_core_state()` and defers precisely because the LRM promises no
+  order. An initializer reading ANOTHER class's static forces that property's
+  declaration mid-emission (the shared PreInit builder is append-only, so the
+  nested store lands before the read) and observes the initialized value;
+  verified against Verilator both directions, forward reference via `typedef
+  class`. Cost, which 6.21 simply requires: a design now pays every elaborated
+  specialization's initializers at time zero whether it uses them or not — all
+  of uvm_pkg's registries run for easyUVM — and a failure inside one (a null
+  deref, a `$fatal`) now kills the design before time zero on a type it never
+  "used"; that is the clause's own semantics, not a clotho choice. A class
+  with no initialized statics contributes nothing (pinned structurally: no
+  PreInit process exists at all).
+
+  Eagerly lowering every factory-registered class tore down four more walls
+  that were never reachable before, each relocated or implemented rather than
+  left refusing all of UVM:
+  - **Randomization guards moved from the TYPE to the act** — refusing a class
+    that merely CARRIES a `constraint` block (or a rand property of an
+    undrawable type, `uvm_reg_item`'s `rand uvm_reg_data_t value[]`) at
+    lower_class_type refused every design that NAMES the register layer. The
+    reason now travels in `ClassRand::unsupported`; the class lowers, lays out
+    no rand block, and its generated `$randomize` body is a located run-time
+    fatal — the one point every randomize() of the class must reach, virtual
+    dispatch included, so a base-typed handle over a constrained derived object
+    still dies loudly instead of drawing unconstrained. `value.rand_mode()` on
+    such a class (uvm_reg_field::get_rand_mode) takes the same run-time fatal;
+    std::randomize keeps its compile-time refusal (a direct call site).
+  - **Vtable-forced method bodies that fail to lower become stubs** — a body
+    built from drain_pending_bodies exists because vtable completeness demands
+    it, not because the design calls it (uvm_reg_map::do_bus_access needs
+    dynamic streaming slices no easyUVM run executes). Such a CLASS-METHOD
+    body now compiles to a warning (`unsupported-construct`, original message
+    and span) plus a run-time fatal stub with the same message; the signature
+    is the real one, so every call site stays ABI-correct. A subroutine built
+    from a direct call site keeps its compile-time diagnostic.
+  - **`inside` over strings** (LRM 11.4.13) — `get_access() inside
+    {"RO","RC","RS"}` is uvm_reg_field::needs_update; per-member string
+    equality and lexicographic range compares folded with Lor, no new
+    instruction. Verified vs Verilator.
+  - **`%m` in a package/$unit subroutine** rendered `.f` (empty instance path);
+    uvm_misc.svh's uvm_instance_scope scans %m for a separator and reported 128
+    `UVM_ERROR [SCPSTR]` then `UVM_FATAL [BUILDERR]`. It now renders `pkg.f` /
+    `$unit.f` (Verilator: `p.f`). Also: queue assignment from a member-access
+    dynamic array (`addrs = map_info.addr`, uvm_reg_map) — the guard demanded a
+    NamedValue where lower_lvalue already handles a MemberAccess slot.
+
+  Known consequence, documented not fixed: package/$unit class bodies now build
+  on the globals Lowerer BEFORE any top lowers, so `vif_defs_->insts` is empty
+  at that point and a virtual-interface member access in such a body warns
+  `virtual-interface-never-bound` and lowers to the run-time fatal even when a
+  top does instantiate the interface. Today every such body is also stubbed
+  (vif NBA / vif edge waits are unimplemented), so behavior is dominated by the
+  stubs; the vif-in-class-task work must revisit the globals-drain boundary.
+
+  Outcome: both measured programs match Verilator (`count=1`, `count=2`);
+  easyUVM now boots, prints the 1800.2-2020 banner, POPULATES THE FACTORY,
+  finds the test — `UVM_INFO @ 0: reporter [RNTST] Running test simple_test...`,
+  INVTST gone — builds and connects the component hierarchy
+  (uvm_test_top.env_h.slv.drv_out), starts the run phases, and stops at time 0
+  where the driver's run_phase executes its first stubbed body: `FATAL:
+  driver.sv:26: nonblocking assignment to a class property is not supported`
+  and `FATAL: driver.sv:36: intra-body event wait has no signal events`. The
+  next wall between clotho and a passing UVM test is therefore virtual
+  interface traffic inside class tasks: NBA through a vif member and
+  edge/event waits on one.
 
 - [x] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
   landed. Every class carries a descriptor pointer at object-body field 0

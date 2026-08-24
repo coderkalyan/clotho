@@ -399,6 +399,35 @@ TEST_CASE("package function's static local is shared across top-level modules") 
     CHECK(out == "m1 counter=1 counter=2\nm2 counter=3\n");
 }
 
+// The class-static analogue of the case above, plus eagerness (LRM 6.21 / 8.9):
+// a package class's static property is per-DESIGN, not per-top. The eager
+// initialization pass runs once, on the globals Lowerer, before any top's own
+// Lowerer starts; each top's sigmap is seeded with the property's signal, so m1
+// and m2 read ONE storage initialized ONE time -- not one copy per top and not
+// two initializations. n=1 in both prints is the exactly-once proof; the shared
+// mutation (99) crossing from m1 to m2 is the shared-storage proof.
+TEST_CASE("package class static property is shared and initialized once across top-level modules") {
+    const std::string out = run_capture(R"(
+        package p;
+            int log[$];
+            function int bump(); log.push_back(0); return 41; endfunction
+            class C; static int x = bump(); endclass
+        endpackage
+        module m1;
+            import p::*;
+            initial begin
+                $display("m1 x=%0d n=%0d", C::x, log.size());
+                C::x = 99;
+            end
+        endmodule
+        module m2;
+            import p::*;
+            initial #1 $display("m2 x=%0d n=%0d", C::x, log.size());
+        endmodule
+    )");
+    CHECK(out == "m1 x=41 n=1\nm2 x=99 n=1\n");
+}
+
 // A package variable's TYPE pulls its class in, and the class's vtable used to build
 // every virtual body right there -- from inside lowering a type, i.e. from inside the
 // loop still registering this scope's signals. A body that read a variable declared

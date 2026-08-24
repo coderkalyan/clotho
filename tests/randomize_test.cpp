@@ -61,6 +61,58 @@ std::string lower_error(std::string_view source) {
     return r.diagnostic_text();
 }
 
+// JIT-run a module and capture stdout and stderr separately (mirrors
+// severity_test.cpp): a run-time randomization refusal is a severity report on
+// stderr, while the design's own output stays on stdout.
+struct Streams {
+    std::string out;
+    std::string err;
+};
+
+std::string drain_stream(std::FILE* f) {
+    std::fflush(f);
+    std::rewind(f);
+    std::string s;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        s.append(buf, n);
+    }
+    return s;
+}
+
+Streams run_streams(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* out_tmp = std::tmpfile();
+    std::FILE* err_tmp = std::tmpfile();
+    REQUIRE(out_tmp != nullptr);
+    REQUIRE(err_tmp != nullptr);
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const int saved_out = dup(fileno(stdout));
+    const int saved_err = dup(fileno(stderr));
+    dup2(fileno(out_tmp), fileno(stdout));
+    dup2(fileno(err_tmp), fileno(stderr));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    dup2(saved_out, fileno(stdout));
+    dup2(saved_err, fileno(stderr));
+    close(saved_out);
+    close(saved_err);
+
+    Streams s{ drain_stream(out_tmp), drain_stream(err_tmp) };
+    std::fclose(out_tmp);
+    std::fclose(err_tmp);
+    return s;
+}
+
 } // namespace
 
 // -- 1. The value rules (LRM 18.4) ------------------------------------------
@@ -654,18 +706,34 @@ TEST_CASE("a shallow copy carries the randomization state (LRM 8.12)") {
 // Every constraint form is refused by its own name (never silently
 // accept). A constraint block used to compile silently, which is worse than a
 // crash: the class randomized as if the constraint were not there.
+//
+// The constraint-block refusal is a RUN-TIME fatal in the class's generated
+// $randomize body, not a compile-time one: eager static initialization (LRM 6.21)
+// lowers every factory-registered class and builds every vtable body -- UVM's
+// register layer carries constraints in classes most designs never randomize --
+// so a design must lower for merely CONTAINING such a class, and only an actual
+// randomize() of it may die. The dispatch is virtual, so the body catches a
+// randomize through a base-typed handle too (tested below).
 TEST_CASE("constraints are refused, each by its own message") {
-    CHECK(lower_error(R"(
+    {
+        const Streams s = run_streams(R"(
         module m;
             class C;
                 rand bit [3:0] x;
                 constraint q { x > 4; }
             endclass
-            initial begin automatic C c = new(); void'(c.randomize()); end
+            initial begin
+                automatic C c = new();
+                void'(c.randomize());
+                $display("unreachable");
+            end
         endmodule
-    )")
-            .find("constraint blocks are not supported")
-          != std::string::npos);
+    )");
+        CHECK(s.err.find("constraint blocks are not supported") != std::string::npos);
+        CHECK(s.err.find("FATAL: ") != std::string::npos);
+        // The fatal terminates the run; the statement after never executes.
+        CHECK(s.out.find("unreachable") == std::string::npos);
+    }
 
     CHECK(lower_error(R"(
         module m;
@@ -690,8 +758,59 @@ TEST_CASE("constraints are refused, each by its own message") {
           != std::string::npos);
 }
 
+// A design that merely CONTAINS a constrained class runs: the refusal moved into
+// the generated $randomize body, so nothing fires until something randomizes the
+// object. This is UVM's register layer in miniature -- uvm_reg_item carries
+// constraints and a rand dynamic array, is factory-registered by uvm_pkg itself,
+// and easyUVM never randomizes one.
+TEST_CASE("a constrained class that is never randomized lowers and runs") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                rand bit [3:0] x;
+                rand int       q[];
+                constraint k { x > 4; }
+            endclass
+            initial begin
+                automatic C c = new();
+                c.x = 3;
+                $display("x=%0d", c.x);
+            end
+        endmodule
+    )");
+    CHECK(out == "x=3\n");
+}
+
+// The hole a call-site check could not close: randomize() through a BASE-typed
+// handle over a constrained derived object. The dispatch is virtual, so it lands
+// in the derived class's generated body -- the run-time fatal -- and never draws
+// the derived object unconstrained.
+TEST_CASE("randomize of a constrained derived through a base handle is a run-time fatal") {
+    const Streams s = run_streams(R"(
+        module m;
+            class B;
+                rand bit [3:0] x;
+            endclass
+            class D extends B;
+                constraint k { x > 4; }
+            endclass
+            initial begin
+                automatic D d = new();
+                automatic B b = d;
+                void'(b.randomize());
+                $display("unreachable");
+            end
+        endmodule
+    )");
+    CHECK(s.err.find("constraint blocks are not supported") != std::string::npos);
+    CHECK(s.out.find("unreachable") == std::string::npos);
+}
+
 // The remaining legal-but-unimplemented rand surface, each loud and each carrying
-// a TODO at its guard.
+// a TODO at its guard. An undrawable rand property TYPE is refused at run time in
+// the generated $randomize body, like a constraint block and for the same reason
+// (uvm_reg_item carries `rand uvm_reg_data_t value[]`); the randc and randstate
+// shapes stay compile-time refusals.
 TEST_CASE("unimplemented rand forms are refused, each by its own message") {
     CHECK(lower_error(R"(
         module m;
@@ -704,16 +823,22 @@ TEST_CASE("unimplemented rand forms are refused, each by its own message") {
             .find("randc wider than 8 bits is not supported")
           != std::string::npos);
 
-    CHECK(lower_error(R"(
+    {
+        const Streams s = run_streams(R"(
         module m;
             class C;
                 rand int q[];
             endclass
-            initial begin automatic C c = new(); void'(c.randomize()); end
+            initial begin
+                automatic C c = new();
+                void'(c.randomize());
+                $display("unreachable");
+            end
         endmodule
-    )")
-            .find("rand properties of this type are not supported")
-          != std::string::npos);
+    )");
+        CHECK(s.err.find("rand properties of this type are not supported") != std::string::npos);
+        CHECK(s.out.find("unreachable") == std::string::npos);
+    }
 
     CHECK(lower_error(R"(
         module m;

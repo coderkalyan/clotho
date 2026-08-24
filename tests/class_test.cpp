@@ -472,7 +472,7 @@ TEST_CASE("class static property: shared slot, inherited, all access forms") {
 }
 
 // A static property of a class that is never instantiated still initializes once
-// (lazily, in PreInit); `local`/`static const` carry no runtime obligation.
+// (eagerly, in PreInit); `local`/`static const` carry no runtime obligation.
 TEST_CASE("class static property: no instance, const, local") {
     constexpr std::string_view src = R"(
         module m;
@@ -518,6 +518,200 @@ TEST_CASE("class static property: aggregate and container initializers") {
         endmodule
     )";
     CHECK(run_capture(src) == "1 2 3 4 hi\n11 22 5 6 7 8 9\n");
+}
+
+// -- Eager static property initialization (LRM 6.21 / 8.9) --
+// LRM 6.21: the explicit `static` keyword marks "the user's intent of executing
+// that initialization only once at the beginning of simulation"; LRM 8.9 lets a
+// static property be used "without creating an object of that type". Together:
+// the initializer runs at time zero whether or not anything ever reads the
+// property or constructs the class. Every expectation below is Verilator 5.050's
+// (iverilog cannot parse the package form).
+
+// The measured program: an initializer whose only purpose is its side effect, on
+// a property NOTHING reads. Lazily-on-access this printed count=0.
+TEST_CASE("class static property: side-effect initializer runs with no reader") {
+    constexpr std::string_view src = R"(
+        package p;
+            int log[$];
+            function bit reg_it(); log.push_back(1); return 1; endfunction
+            class C; static bit done = reg_it(); endclass
+        endpackage
+        module top; import p::*; initial $display("count=%0d", log.size()); endmodule
+    )";
+    CHECK(run_capture(src) == "count=1\n");
+}
+
+// The UVM factory shape (uvm_registry.svh's `local static bit m__initialized =
+// __deferred_init()`): the property is `local` and read by NOBODY; its
+// initializer must still run. Distinct from the case above in that visibility
+// must not gate the initialization.
+TEST_CASE("class static property: local static with no reader still initializes") {
+    constexpr std::string_view src = R"(
+        package p;
+            int registered = 0;
+            function bit reg_it(); registered++; return 1; endfunction
+            class C; local static bit done = reg_it(); endclass
+        endpackage
+        module top; import p::*; initial $display("registered=%0d", registered); endmodule
+    )";
+    CHECK(run_capture(src) == "registered=1\n");
+}
+
+// The decisive UVM shape, measured against Verilator (count=2): each
+// specialization of a parameterized class has its own statics (LRM 8.25), a
+// specialization named ONLY in a typedef is still a specialization, and neither
+// is ever instantiated or read. This is exactly `uvm_component_utils(T)`:
+// `typedef uvm_component_registry#(T,"T") type_id` registers T by being named.
+TEST_CASE("class static property: typedef-only specializations each initialize") {
+    constexpr std::string_view src = R"(
+        package p;
+            int log[$];
+            function bit reg_it(); log.push_back(1); return 1; endfunction
+            class R #(type T=int); local static bit done = reg_it(); endclass
+            class Foo; typedef R#(Foo) type_id; endclass
+            class Bar; typedef R#(Bar) type_id; endclass
+        endpackage
+        module top; import p::*; initial begin Foo f = new; $display("count=%0d", log.size()); end endmodule
+    )";
+    CHECK(run_capture(src) == "count=2\n");
+}
+
+// Exactly once: the eager pass declares the property first, and every later
+// access is a sigmap cache hit, so the initializer is queued a single time no
+// matter how many reads follow. A double-queue would print n=2.
+TEST_CASE("class static property: initializer runs once under multiple reads") {
+    constexpr std::string_view src = R"(
+        package p;
+            int log[$];
+            function int bump(); log.push_back(0); return log.size(); endfunction
+            class C; static int x = bump(); endclass
+        endpackage
+        module top;
+            import p::*;
+            initial $display("x=%0d x=%0d n=%0d", C::x, C::x, log.size());
+        endmodule
+    )";
+    CHECK(run_capture(src) == "x=1 x=1 n=1\n");
+}
+
+// Two specializations, each with its own static STORAGE, not just its own
+// initialization: the stamps differ per specialization, so a shared slot would
+// print the same value twice, and a double initialization n=3 or 4.
+TEST_CASE("parameterized class: each specialization's static initializes into its own slot") {
+    constexpr std::string_view src = R"(
+        package p;
+            int log[$];
+            function int stamp(int k); log.push_back(k); return k * 100; endfunction
+            class R #(int K=0); static int v = stamp(K); endclass
+            class U1; typedef R#(1) t; endclass
+            class U2; typedef R#(2) t; endclass
+        endpackage
+        module top;
+            import p::*;
+            initial $display("v1=%0d v2=%0d n=%0d", R#(1)::v, R#(2)::v, log.size());
+        endmodule
+    )";
+    CHECK(run_capture(src) == "v1=100 v2=200 n=2\n");
+}
+
+// LRM 8.9's own example is `static integer fileID = $fopen("data","r")`: a
+// side-effecting SYSTEM call in the initializer, run once at time zero. The
+// wrapper counts the executions; the fd is nonzero because /dev/null opens.
+TEST_CASE("class static property: the LRM 8.9 $fopen shape runs once") {
+    constexpr std::string_view src = R"(
+        package p;
+            int n_opens = 0;
+            function int open_it(); n_opens++; return $fopen("/dev/null", "r"); endfunction
+            class Packet; static int fileID = open_it(); endclass
+        endpackage
+        module top;
+            import p::*;
+            initial $display("opens=%0d ok=%0d ok=%0d", n_opens, Packet::fileID != 0, Packet::fileID != 0);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "opens=1 ok=1 ok=1\n");
+}
+
+// Within one class, initializers run in declaration order. Across classes the
+// LRM defines no order; clotho runs classes in declaration order (specializations
+// of one generic sorted by rendered name), recorded as implementation-defined in
+// docs/TODO.md.
+TEST_CASE("class static property: initializers run in declaration order") {
+    constexpr std::string_view src = R"(
+        package p;
+            int order[$];
+            function bit note(int k); order.push_back(k); return 1; endfunction
+            class C;
+                static bit first  = note(1);
+                static bit second = note(2);
+                static bit third  = note(3);
+            endclass
+        endpackage
+        module top;
+            import p::*;
+            initial $display("%0d %0d %0d n=%0d", order[0], order[1], order[2], order.size());
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 2 3 n=3\n");
+}
+
+// An initializer that reads ANOTHER class's static forces that property's
+// declaration mid-emission (value_lvalue -> declare_static_prop appends the whole
+// nested store ahead of the read), so it observes the initialized value whichever
+// declaration order the classes have. The forward reference needs the typedef
+// (LRM 8.6: a class must be declared before use). Verilator agrees: a=8 b=7.
+TEST_CASE("class static property: initializer reading another class's static") {
+    constexpr std::string_view src = R"(
+        package p;
+            typedef class B;
+            class A; static int a = B::b + 1; endclass
+            class B; static int b = 7; endclass
+        endpackage
+        module top;
+            import p::*;
+            initial $display("a=%0d b=%0d", A::a, B::b);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "a=8 b=7\n");
+}
+
+// A module-scope class initializes eagerly too, on the top's own Lowerer, where
+// the module's signals are visible: the initializer reads `g` after g's own
+// declaration initializer has run (class statics are queued after the module's
+// variable initializers in the same PreInit process).
+TEST_CASE("class static property: module-scope class initializes eagerly") {
+    constexpr std::string_view src = R"(
+        module m;
+            int g = 5;
+            int n_runs = 0;
+            function int derive(); n_runs++; return g + 1; endfunction
+            class C; local static int x = derive(); endclass
+            initial $display("runs=%0d", n_runs);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "runs=1\n");
+}
+
+// Zero cost: a class with NO initialized static contributes nothing to PreInit.
+// The design below has no variable initializer and no static-property
+// initializer anywhere, so no PreInit process may exist at all (the way "lower: event control and `wait` on a class property"
+// proved a class nothing waits on stays byte-identical).
+TEST_CASE("class static property: a class with no initialized statics emits no preinit work") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            class C;
+                static int x;
+                int y;
+                function int get(); return x; endfunction
+            endclass
+            initial begin C c; c = new(); $display("%0d", c.get()); end
+        endmodule
+    )");
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    for (const ir::Process& p : r.module->processes()) {
+        CHECK(p.activation != ir::Activation::PreInit);
+    }
 }
 
 // A STATIC method may be called through an object handle as well as through the
