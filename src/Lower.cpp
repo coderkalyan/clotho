@@ -405,6 +405,34 @@ struct ClassPropReadScan : slang::ast::ASTVisitor<ClassPropReadScan, VisitFlags:
     }
 };
 
+// Whether a fork-captured automatic of this type can carry a change notifier, i.e.
+// whether a `wait` reading one can ever be woken. Exactly the class-property
+// partition, because a capture box IS a one-field class object
+// (docs/design/fork-join.md V4) and its field takes the same notifier machinery:
+// one classified word, a string's content, or a container's mutation surface. An
+// unpacked struct / union / fixed unpacked array carries none, and the wait
+// lowering refuses it by name rather than parking on nothing.
+bool box_can_notify(const slang::ast::Type& ty) {
+    const slang::ast::Type& ct = ty.getCanonicalType();
+    return prop_notify_kind(ct) != PropNotify::None || is_notified_container(ct);
+}
+
+// Every value symbol a `wait` condition names. The design-wide pre-pass uses it to
+// decide which capture boxes are minted WITH a notifier; a symbol that turns out to
+// be a signal or a class property is simply never asked about again.
+struct WaitLocalScan : slang::ast::ASTVisitor<WaitLocalScan, VisitFlags::AllGood> {
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*>* out = nullptr;
+
+    void handle(const slang::ast::NamedValueExpression& e) {
+        out->insert(&e.symbol);
+        visitDefault(e);
+    }
+    void handle(const slang::ast::HierarchicalValueExpression& e) {
+        out->insert(&e.symbol);
+        visitDefault(e);
+    }
+};
+
 // Which (class property, edge) pairs the whole design waits on. Design-wide because
 // a class's object body must carry the notifiers BEFORE it is laid out, and
 // lower_class_type runs on demand from the first reference under any top -- which
@@ -419,6 +447,16 @@ struct WaitedProps {
         bool container = false;
     };
     ankerl::unordered_dense::map<const slang::ast::ClassPropertySymbol*, Waited> props;
+    // Every value symbol some `wait` condition in the design names. Consulted when a
+    // capture box is minted (box_one_capture / install_fork_decl_box): a box whose
+    // symbol is here carries a change notifier so the wait can be woken. A superset
+    // of the symbols that end up boxed -- signals and class properties land here too
+    // and are simply never asked about.
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> locals;
+
+    bool waits_local(const slang::ast::ValueSymbol& vs) const {
+        return locals.contains(&vs);
+    }
 
     void add(const slang::ast::ClassPropertySymbol& prop, ir::Edge edge) {
         props[&prop].edges |= static_cast<uint8_t>(1u << static_cast<uint32_t>(edge));
@@ -494,6 +532,12 @@ struct WaitPropScan : slang::ast::ASTVisitor<WaitPropScan, VisitFlags::AllGood> 
         // property the condition reads is enough: the any-change notifier only.
         ClassPropReadScan scan;
         w.cond.visit(scan);
+        // Every value symbol the condition names, for the capture-box notifiers: a
+        // fork-captured automatic in a wait condition is heap storage like a class
+        // property, and its box needs a notifier minted before the box class exists.
+        WaitLocalScan locals;
+        locals.out = &out->locals;
+        w.cond.visit(locals);
         for (const Expression* e : scan.notifiable) {
             const slang::ast::ClassPropertySymbol& prop = *level_waited_prop(*e);
             if (is_notified_container(prop.getType().getCanonicalType())) {
@@ -16517,8 +16561,42 @@ private:
         // on every pass.
         ClassPropReadScan prop_reads;
         w.cond.visit(prop_reads);
+        // Fork-captured automatics the condition reads. Each lives in a GC box (a
+        // one-field synthetic class, docs/design/fork-join.md V4), not a signal, so
+        // the signal collector above sees none of them; each parks on its box's
+        // hidden change notifier instead, minted by box_class_for because the
+        // design-wide pre-pass (WaitPropScan) saw this very statement. A boxed read
+        // whose type can carry no notifier is refused loudly below, exactly like
+        // the class-property case.
+        std::vector<const ValueSymbol*> boxed_reads;
+        {
+            ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> named;
+            WaitLocalScan                                                scan;
+            scan.out = &named;
+            w.cond.visit(scan);
+            for (const ValueSymbol* vs : named) {
+                if (!is_boxed_symbol(*vs)) {
+                    continue;
+                }
+                if (!box_can_notify(vs->getType().getCanonicalType())) {
+                    // TODO: same aggregate shapes as the property arm below.
+                    fail("wait on a fork-captured automatic of a type with no change "
+                         "notifier is not supported (an unpacked struct, union or fixed "
+                         "unpacked array cannot be waited on)");
+                }
+                boxed_reads.push_back(vs);
+            }
+            // Set iteration order is hash-dependent; sort by name then location so
+            // the emitted IR is deterministic.
+            std::ranges::sort(boxed_reads, [](const ValueSymbol* a, const ValueSymbol* c) {
+                if (a->name != c->name) {
+                    return a->name < c->name;
+                }
+                return a->location < c->location;
+            });
+        }
         if (reads.empty() && vif_reads.empty() && prop_reads.notifiable.empty() &&
-            prop_reads.event_props.empty() && prop_reads.any_prop) {
+            prop_reads.event_props.empty() && boxed_reads.empty() && prop_reads.any_prop) {
             // The condition reads a class property that can carry no notifier -- an
             // unpacked struct or union, or a FIXED unpacked array -- and nothing else
             // that can wake this process. Lowering it anyway is what used to happen,
@@ -16581,6 +16659,15 @@ private:
                 edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
                                               static_cast<uint32_t>(ir::Edge::Any),
                                               lower_expr(*pe, b) });
+            }
+            for (const ValueSymbol* vs : boxed_reads) {
+                // Park on the box's notifier event, dereferencing the box handle AT
+                // THIS POINT in the body: a fresh iteration of an enclosing loop can
+                // re-box (install_fork_decl_box allocates per entry), so the handle
+                // is re-read on every pass, like a vif handle above.
+                edges.push_back(ir::WaitEdge{ ir::Signal{ 0 },
+                                              static_cast<uint32_t>(ir::Edge::Any),
+                                              boxed_notifier_handle(*vs, b, l) });
             }
             // An empty list is legal and meaningful: `wait(0)` reads nothing and
             // parks the process for the rest of the run.
@@ -26309,10 +26396,16 @@ private:
         ankerl::unordered_dense::map<const ValueSymbol*, Boxed> boxed;
     };
 
-    // Inner storage type -> its capture-box class (box_class_type). The field name is
-    // not a legal SV identifier, so it cannot collide with a property.
+    // Inner storage type -> its capture-box class (box_class_type). Keyed
+    // separately for the notified variant: a box whose symbol some `wait` reads
+    // carries a hidden `$chg.$capture` event field (its change notifier), and the
+    // two layouts must not share a Ref. The field names are not legal SV
+    // identifiers, so they cannot collide with a property.
     static constexpr std::string_view                          kCaptureBoxField = "$capture";
+    static constexpr std::string_view                          kCaptureBoxChg   = "$chg.$capture";
     ankerl::unordered_dense::map<ir::Ref, ir::Ref>             box_class_;
+    ankerl::unordered_dense::map<ir::Ref, ir::Ref>             box_class_notified_;
+    ankerl::unordered_dense::set<uint32_t>                     notified_box_refs_;
 
     // The per-entry box of a fork-scope declaration in a PROCESS body, where there is
     // no frame to hold the handle (an initial/always block's own variables are design
@@ -26342,7 +26435,21 @@ private:
     // id is minted straight off the counter without joining the symbol map. A box has
     // no methods, is never a base and is never `$cast` to, so its slot table is empty.
     ir::Ref box_class_type(ir::Ref inner) {
-        if (const auto it = box_class_.find(inner); it != box_class_.end()) {
+        return box_class_impl(inner, /*notified=*/false, /*container=*/false);
+    }
+
+    // The notified variant: field 1 is the box's change-notifier event, registered
+    // with the backend's store path (set_change_notify) exactly like a waited class
+    // property's notifier, so every store / mutation of the boxed value fires it.
+    // `container` selects the mutation-fired flavour (a queue / dynamic / assoc
+    // array's value is its contents, so there is no old -> new word to classify).
+    ir::Ref box_class_type_notified(ir::Ref inner, bool container) {
+        return box_class_impl(inner, /*notified=*/true, container);
+    }
+
+    ir::Ref box_class_impl(ir::Ref inner, bool notified, bool container) {
+        auto& interned = notified ? box_class_notified_ : box_class_;
+        if (const auto it = interned.find(inner); it != interned.end()) {
             return it->second;
         }
         const uint32_t fid = module_.pool.reserve_struct_fields();
@@ -26358,10 +26465,39 @@ private:
         module_.pool.set_class_name(ref, kCaptureBoxField);
         std::vector<ir::FieldRow> fields;
         fields.push_back({ kCaptureBoxField, inner, 0 });
+        if (notified) {
+            fields.push_back({ kCaptureBoxChg, module_.pool.event_type, 1 });
+            // Any-change only: `wait` re-tests its condition on every wake (LRM
+            // 9.4.3), and `@` on a captured automatic is not routed here.
+            module_.set_change_notify(ref, 0, ir::Edge::Any, 1, container);
+            notified_box_refs_.insert(static_cast<uint32_t>(ref));
+        }
         module_.pool.set_struct_fields(fid, std::move(fields));
         module_.set_class_desc(ref, std::vector<ir::FunctionId>{}, class_ids_->next++);
-        box_class_.emplace(inner, ref);
+        interned.emplace(inner, ref);
         return ref;
+    }
+
+    // The box class for one captured symbol: the notified variant iff some `wait`
+    // condition in the design reads the symbol AND its type can carry a notifier.
+    // The design-wide pre-pass and the wait lowering MUST agree on notifiability,
+    // so both go through box_can_notify; a waited symbol of a type that cannot
+    // notify gets the plain box here and lower_wait_stmt refuses it by name.
+    ir::Ref box_class_for(const ValueSymbol& vs, ir::Ref inner) {
+        if (waited_props_ == nullptr || !waited_props_->waits_local(vs)) {
+            return box_class_type(inner);
+        }
+        const slang::ast::Type& ct = vs.getType().getCanonicalType();
+        if (!box_can_notify(ct)) {
+            return box_class_type(inner);
+        }
+        return box_class_type_notified(inner, is_notified_container(ct));
+    }
+
+    // Whether `cls` is a notified box class, i.e. carries the `$chg.$capture`
+    // field at index 1. Read by the wait lowering to build the park edge.
+    bool box_is_notified(ir::Ref cls) const {
+        return notified_box_refs_.contains(static_cast<uint32_t>(cls));
     }
 
     // The lvalue of a box's single field, given the box HANDLE as a value. Split out
@@ -26375,6 +26511,47 @@ private:
     // the single field. Re-emitted per access, like every other place.
     ir::Index boxed_lvalue(const FnCtx::Boxed& bx, ir::Builder& b, ir::SourceLoc l) {
         return box_field_lvalue(b.unary(ir::Inst::Tag::Load, b.local(bx.local, bx.cls, l), l), bx.cls, b, l);
+    }
+
+    // Whether `vs` resolves through a capture box at this point in lowering: a
+    // boxed automatic of the current frame (a fork child's capture formal included)
+    // or a fork-scope declaration of a fork in a PROCESS body. Same precedence as
+    // value_lvalue's, so the wait lowering and the access path answer identically.
+    bool is_boxed_symbol(const ValueSymbol& vs) const {
+        if (fn_ctx_ != nullptr && fn_ctx_->boxed.contains(&vs)) {
+            return true;
+        }
+        return proc_fork_boxes_.contains(&vs);
+    }
+
+    // The loaded event handle of a boxed local's change notifier (box field 1),
+    // for a `wait` edge. The box handle is loaded HERE, inside the wait loop's
+    // body, so a re-entered fork that re-boxes is re-read on every pass.
+    ir::Index boxed_notifier_handle(const ValueSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
+        ir::Index handle{};
+        ir::Ref   cls = ir::Ref::Invalid;
+        if (fn_ctx_ != nullptr) {
+            if (const auto bx = fn_ctx_->boxed.find(&vs); bx != fn_ctx_->boxed.end()) {
+                handle = b.unary(ir::Inst::Tag::Load, b.local(bx->second.local, bx->second.cls, l), l);
+                cls    = bx->second.cls;
+            }
+        }
+        if (cls == ir::Ref::Invalid) {
+            const auto fb = proc_fork_boxes_.find(&vs);
+            if (fb == proc_fork_boxes_.end()) {
+                fail("internal: no capture box for waited automatic '" + std::string(vs.name) + "'");
+            }
+            handle = b.unary(ir::Inst::Tag::Load, b.signal(fb->second.sig, l), l);
+            cls    = fb->second.cls;
+        }
+        if (!box_is_notified(cls)) {
+            // The pre-pass and box_class_for read the same resolver, so a plain box
+            // here means the two disagreed -- a lowering bug, not a design refusal.
+            fail("internal: waited automatic '" + std::string(vs.name) +
+                 "' was boxed without a change notifier");
+        }
+        return b.unary(ir::Inst::Tag::Load,
+                       b.member_select(b.handle_deref(handle, cls, l), 1, cls, l), l);
     }
 
     // The enclosing method's `this` handle, as a value. One helper rather than four
@@ -26459,7 +26636,7 @@ private:
             return;
         }
         const ir::Ref  inner = lower_type(vs.getType());
-        const ir::Ref  cls   = box_class_type(inner);
+        const ir::Ref  cls   = box_class_for(vs, inner);
         const uint32_t slot  = static_cast<uint32_t>(fn_ctx_->local_types.size());
         fn_ctx_->local_types.push_back(cls);
         b.binary(ir::Inst::Tag::Store, b.local(slot, cls, l), b.class_new(cls, l), l);
@@ -26496,7 +26673,7 @@ private:
     // process body, where there is no frame (a precise root -- an `initial` block's
     // storage is design state, docs/design/garbage-collection.md 5.4).
     void install_fork_decl_box(const VariableSymbol& vs, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Ref cls = box_class_type(lower_type(vs.getType()));
+        const ir::Ref cls = box_class_for(vs, lower_type(vs.getType()));
         if (fn_ctx_ != nullptr) {
             // Reuse the ordinary capture-box home so value_lvalue, ForkCaptureDetector
             // and a nested fork's own capture of this variable all need nothing new.
@@ -27719,8 +27896,11 @@ private:
         for (const ValueSymbol* sym : captures) {
             // The box handle, by value. Reference semantics come from the box, not
             // from the ABI, so nothing points into the parent's frame and the child
-            // may outlive it (docs/design/fork-join.md V4).
-            const ir::Ref cls = box_class_type(lower_type(sym->getType()));
+            // may outlive it (docs/design/fork-join.md V4). box_class_for, not
+            // box_class_type: the parent minted the NOTIFIED variant for a symbol
+            // some `wait` reads, and the child's stores must resolve the same
+            // (class, field) change-notify entry or they would fire nothing.
+            const ir::Ref cls = box_class_for(*sym, lower_type(sym->getType()));
             param_types.push_back(cls);
             arg_dirs.push_back(ir::ArgDir::In);
             const uint32_t k   = fn_local(*sym);

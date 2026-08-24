@@ -1045,3 +1045,223 @@ TEST_CASE("inferred sensitivity re-fires when a static class property changes") 
     )";
     CHECK(run_capture_finish(src) == "comb 10\nassign z=5 at 11\n");
 }
+
+// -- Waits on fork-captured automatics (LRM 9.3.2 over 9.4.3) -----------------
+//
+// A fork-captured automatic is ONE variable shared by parent and children
+// (9.3.2), and it lives in a GC capture box -- a one-field synthetic class --
+// not in a signal (docs/design/fork-join.md V4). A `wait` reading one therefore
+// collected no signal at all and parked on an empty event list: a silent
+// permanent park, exactly the shape "lower: waits on static class properties and signal-resident containers" fixed for static properties. This
+// is the defect that hung the UVM sequencer/driver rendezvous: the driver's
+// m_safe_select_item parks on `wait (select_process != null)` where
+// select_process is a task automatic a join_none watchdog writes
+// (uvm_sequencer_param_base.svh:535), so `finish_item` never returned.
+//
+// The fix mints the box WITH a hidden change-notifier event (`$chg.$capture`)
+// whenever some `wait` in the design reads the symbol, registered on the same
+// store-path machinery a waited class property uses, and the wait parks on it.
+// Each test asserts the rendezvous COMPLETES at the exact simulated time.
+
+// The minimal easyUVM shape: the parent waits, a join_none child writes.
+TEST_CASE("wait on a fork-captured automatic wakes when the child writes it") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t;
+                int flag = 0;
+                fork begin #5 flag = 7; end join_none
+                wait (flag != 0);
+                $display("woke %0d at %0t", flag, $time);
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "woke 7 at 5\n");
+}
+
+// The literal UVM watchdog shape (uvm_sequencer_param_base::m_safe_select_item):
+// a process-typed automatic the child fills with process::self(); the parent's
+// wait must see the write in the SAME time step (the child runs when the parent
+// parks, LRM 9.3.2), so the wake is at 0.
+TEST_CASE("wait on a captured process handle sees the child's self() at time zero") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t;
+                process select_process;
+                fork
+                    begin
+                        select_process = process::self();
+                        #100; // stays alive past the wait
+                    end
+                join_none
+                wait (select_process != null);
+                $display("granted at %0t", $time);
+                select_process.kill();
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "granted at 0\n");
+}
+
+// The inverse direction: the CHILD waits, the parent writes after the fork.
+TEST_CASE("a fork child's wait on a captured automatic wakes on the parent's write") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t;
+                int flag = 0;
+                fork begin wait (flag != 0); $display("child woke %0d at %0t", flag, $time); end join_none
+                #7 flag = 5;
+                #1; // let the child report before returning
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "child woke 5 at 7\n");
+}
+
+// Sibling children of one fork: one waits, the other writes.
+TEST_CASE("a fork child's wait wakes on a sibling child's write") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t;
+                int flag = 0;
+                fork
+                    begin #6 flag = 2; end
+                    begin wait (flag == 2); $display("sibling woke at %0t", $time); end
+                join
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "sibling woke at 6\n");
+}
+
+// A fork-scope declaration in a PROCESS body boxes per entry
+// (install_fork_decl_box, design-state home): same hole, same fix.
+TEST_CASE("wait on a fork-scope declaration wakes across sibling children") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial begin
+                fork
+                    automatic int k = 0;
+                    begin #5 k = 3; end
+                    begin wait (k != 0); $display("woke k=%0d at %0t", k, $time); end
+                join
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "woke k=3 at 5\n");
+}
+
+// A captured CONTAINER takes the mutation-fired notifier flavour, like a waited
+// container property: `q.size()` is computed, not stored, so the push itself
+// must fire.
+TEST_CASE("wait on a captured queue wakes when the child pushes") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t;
+                int q[$];
+                fork begin #9 q.push_back(42); end join_none
+                wait (q.size() != 0);
+                $display("woke size=%0d head=%0d at %0t", q.size(), q[0], $time);
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "woke size=1 head=42 at 9\n");
+}
+
+// A captured string's value is its CONTENT (LRM 6.16): the store compares
+// content, so a same-content rewrite fires nothing and a real change wakes.
+TEST_CASE("wait on a captured string wakes when the content changes") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t;
+                string s = "";
+                fork begin #4 s = "go"; end join_none
+                wait (s == "go");
+                $display("woke %s at %0t", s, $time);
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "woke go at 4\n");
+}
+
+// join_any detaches like join_none for the un-joined remainder; the box and its
+// notifier outlive the parent's continuation.
+TEST_CASE("wait in a join_any child wakes on the sibling's write") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t;
+                int flag = 0;
+                fork
+                    begin wait (flag != 0); $display("woke at %0t", $time); end
+                    begin #3 flag = 1; #1; end
+                join_any
+            endtask
+            initial begin t(); #10 $finish; end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "woke at 3\n");
+}
+
+// A write through a `ref` formal reaches the box by the aliased-pointer bracket,
+// so the notify lands at the call's return -- the same after-return arm a
+// signal / property actual takes.
+TEST_CASE("a captured automatic written through a ref formal wakes its waiter") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic bump(ref int x); #5 x = 9; endtask
+            task automatic t;
+                int flag = 0;
+                fork begin bump(flag); end join_none
+                wait (flag == 9);
+                $display("woke %0d at %0t", flag, $time);
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "woke 9 at 5\n");
+}
+
+// A compound condition over two captured locals: the first write wakes and
+// re-tests false (LRM 9.4.3), the second completes it.
+TEST_CASE("wait over two captured automatics re-tests until both are written") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t;
+                int a = 0; int b = 0;
+                fork
+                    begin #3 a = 1; end
+                    begin #8 b = 1; end
+                join_none
+                wait (a == 1 && b == 1);
+                $display("woke at %0t", $time);
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(run_capture_finish(src) == "woke at 8\n");
+}
+
+// A captured automatic of a type with no change notifier (an unpacked struct)
+// is refused loudly, like the class-property arm: a silent permanent park is
+// the defect this whole section exists to prevent.
+TEST_CASE("wait on a captured unpacked struct fails loudly") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a; } st;
+            task automatic t;
+                st x;
+                fork begin #2 x.a = 1; end join_none
+                wait (x.a != 0);
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(lower_error(src).find("fork-captured automatic of a type with no change notifier") !=
+          std::string::npos);
+}

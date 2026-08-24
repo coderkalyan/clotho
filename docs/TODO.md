@@ -1165,10 +1165,9 @@ professional parity; M5 makes it complete.
   all four bucket checks are compile-time nulls — so a design that never waits
   on signal-resident storage pays nothing.
   **Result**: the reproducer prints `[TB] report_phase at 10` and finishes with
-  no PH_TIMEOUT; the full suite is green. easyUVM is NOT this defect: its
-  sequencer/driver rendezvous still pins a core at ~99.7% with `finish_item`
-  never returning after `start_item` returns at 25 (traced), unchanged by these
-  fixes — a separate zero-delay-loop defect, still open.
+  no PH_TIMEOUT; the full suite is green. easyUVM was NOT this defect: its
+  sequencer/driver rendezvous was the sixth rung, the fork-captured-automatic
+  entry below.
   **One reference divergence, argued**: Verilator 5.050 omits class statics from
   `@*` inferred sensitivity and does not re-fire; 9.4.2.2 says "sensitive to
   every operand", and a static property is a variable with module-storage
@@ -1183,6 +1182,71 @@ professional parity; M5 makes it complete.
   orders in one design), one waiter per module-level mutation family (push_back /
   assoc element create / `new[n]` / `delete()`), the `ref`-formal signal queue
   and map, and the `@*` + continuous-assign siblings.
+- [x] **`wait` on a FORK-CAPTURED AUTOMATIC: the capture-box change notifier**
+  (LRM 9.4.3 over 9.3.2) — the sixth rung, and the one that hung the easyUVM
+  sequencer/driver rendezvous: `finish_item` never returned after `start_item`
+  returned at 25, the process pinned a core at ~99.7% (the free-running clock
+  and the always-comb adder kept the scheduler busy while every UVM process sat
+  parked), and the run never advanced past the first transaction. The site is
+  `uvm_sequencer_param_base.svh:535` (`m_safe_select_item`): the driver's `get`
+  forks a join_none watchdog that writes `select_process = process::self()`,
+  then the parent parks on `wait (select_process != null)` before
+  `m_req_fifo.peek` — and `select_process` is a TASK AUTOMATIC the fork
+  captured. The instrumented source trace showed the watchdog reaching its
+  await (`ssi_wd_await_pre`) and the parent never printing `ssi_waitproc_post`:
+  the write landed in the box, nobody woke, `peek` was never called, `item_done`
+  never ran, and the sequence's `wait_for_item_done` waited forever.
+  **The defect.** A fork-captured automatic is ONE variable shared by parent and
+  children (9.3.2), and it lives in a GC capture box — a one-field synthetic
+  class (`$capture`, docs/design/fork-join.md V4) — not in a signal and not in a
+  class property. A `wait` whose condition read one therefore collected NO
+  sensitivity at all: SensitivityCollector::lookup answers nullopt for a
+  frame-resident local (correctly — a plain local is unshared), ClassPropReadScan
+  sees no property, and the wait parked on an EMPTY event list. The fifth rung's
+  silent-permanent-park shape exactly, one storage class over.
+  **The fix, at the primitive.** The box now carries the same hidden
+  change-notifier machinery a waited class property carries. The design-wide
+  pre-pass (WaitPropScan) records every value symbol any `wait` condition names
+  (WaitedProps::locals); box_class_for mints the NOTIFIED box variant for a
+  captured symbol in that set — field 1 an event (`$chg.$capture`), registered
+  with set_change_notify(box, field 0, Any) — so every store and every container
+  mutation of the boxed value fires it through the very lv.chg path property
+  stores already take (service_snapshot / service_after_write / the string
+  content compare / notify_container_mutation: NO new backend code). The wait
+  lowering parks on the box's notifier (boxed_notifier_handle), loading the box
+  handle inside the re-test loop so a re-entered fork that re-boxes is re-read
+  per pass. build_fork_child types the child's capture formal through
+  box_class_for too — the child's stores must resolve the same (class, field)
+  change-notify entry or they would fire nothing, and the CHILD is the writer in
+  the UVM shape. Both homes take it: a frame-slot box (install_capture_boxes)
+  and a fork-scope declaration's design-state box (install_fork_decl_box).
+  **Cost**: a box whose symbol no `wait` reads is minted exactly as before
+  (plain one-field class, byte-identical); the notified variant is a second
+  interned class per inner type, one extra event word per box, and the standard
+  notifier fire per store. A design with no fork, or no wait on a capture, pays
+  nothing.
+  **Sibling audit** (all pinned in tests/wait_test.cpp, resume TIME asserted):
+  parent-waits/child-writes (the easyUVM shape, plus the literal process-typed
+  watchdog with process::self() and kill), child-waits/parent-writes,
+  child-waits/sibling-writes, join_any, a fork-scope declaration in a process
+  body, a captured queue (mutation-fired flavour), a captured string (content
+  compare), two captured locals in one condition (re-test), and a write through
+  a `ref` formal (the after-return bracket resolves the box's lv.chg). A
+  captured automatic of a type with NO notifier surface (unpacked struct /
+  union / fixed unpacked array) is refused loudly at the wait, same rule and
+  same reason as the property arm.
+  **Still refused loudly, unchanged**: `@` on a captured automatic ("reference
+  to unknown signal") — an event CONTROL needs a value-change classification
+  per 9.4.2 that the wait's unconditional any-change notifier deliberately does
+  not provide for containers, and the signal resolver never sees a boxed local.
+  It fails loudly, not silently, so it stays a gap, not a hazard.
+  **Result**: easyUVM's rendezvous completes — `start_item` returns at 25,
+  `finish_item` returns at 25, the driver's `get` returns at 25 and iteration 1
+  begins; the run then advances to 35 where it hits the NEXT wall,
+  `FATAL: packet_out.sv:4: aggregate argument must be a variable` (the
+  `__m_uvm_execute_field_op` aggregate-formal stub, a known M4 gap: the field
+  macros hand `'{...}`-shaped actuals to a function taking an aggregate by
+  value). The full suite is green.
 - [x] **Named events** (LRM 15.5) — `event e;`, `-> e`, `->> e`, `->> #d e`,
   `@(e)` / `always @(e)`, `wait(e.triggered)`, at module, package, generate,
   procedural-block and `static`-local scope. An event is an OBJECT (trigger tick +
