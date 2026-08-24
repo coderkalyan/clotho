@@ -1545,3 +1545,252 @@ TEST_CASE("an edge event control on a non-integral class property is rejected") 
         CHECK(err.find("is not integral") != std::string::npos);
     }
 }
+
+// -- Event-typed class properties: the wait side (LRM 9.4.2 over 15.5.1) --------
+//
+// An event property needs no change notifier: the property IS an object with a
+// waiter list, the very one `-> e` fires. What was missing was the RESOLUTION of
+// a bare `@e` inside a method to `this`'s property: event_signal reported
+// "reference to unknown signal", because a property is heap storage, not a
+// signal. The wait now parks on the handle the property holds when the wait
+// executes (event_wait_needs_handle), the path `@(obj.e)` always took.
+
+// The easyUVM driver shape (driver.sv:64's record_tr): two virtual protected
+// tasks forked from a virtual task, over a virtual interface for clocking; one
+// triggers event properties between clock edges, the other waits on them bare.
+// The wake TIMES are the assertion -- byte-identical to Verilator 5.050
+// ("begin at 5\nend at 15\n").
+TEST_CASE("an event property triggered in one method wakes a bare wait in a forked sibling") {
+    const std::string out = run_capture(R"(
+        interface input_if;
+            logic clk;
+        endinterface
+        class driver;
+            typedef virtual input_if input_vif;
+            input_vif vif;
+            event begin_record, end_record;
+            virtual task run_phase();
+                fork
+                    get_and_drive();
+                    record_tr();
+                join
+            endtask
+            virtual protected task get_and_drive();
+                @(posedge vif.clk);
+                -> begin_record;
+                @(posedge vif.clk);
+                -> end_record;
+            endtask
+            virtual protected task record_tr();
+                @(begin_record);
+                $display("begin at %0t", $time);
+                @(end_record);
+                $display("end at %0t", $time);
+            endtask
+        endclass
+        module top;
+            input_if intf();
+            driver d;
+            initial begin
+                intf.clk = 0;
+                forever #5 intf.clk = ~intf.clk;
+            end
+            initial begin
+                d = new;
+                d.vif = intf;
+                d.run_phase();
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "begin at 5\nend at 15\n");
+}
+
+// Every spelling of the same wait: bare `@e`, parenthesized `@(e)`, an explicit
+// `@(this.e)`, another object's property `@(o.e)` from inside a method, and an
+// element of an event ARRAY property. All park on the same object `-> e` fires.
+TEST_CASE("bare, parenthesized, this-qualified and other-object event property waits all wake") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                event e;
+                event arr[2];
+                task w_bare(); @e; $display("bare woke at %0t", $time); endtask
+                task w_paren(); @(e); $display("paren woke at %0t", $time); endtask
+                task w_this(); @(this.e); $display("this woke at %0t", $time); endtask
+                task w_other(C o); @(o.e); $display("other woke at %0t", $time); endtask
+                task w_arr(int i); @(arr[i]); $display("arr woke at %0t", $time); endtask
+                task t_arr(int i); #2 -> arr[i]; endtask
+            endclass
+            C c, d;
+            initial begin
+                c = new; d = new;
+                fork c.w_bare(); join_none
+                fork c.w_paren(); join_none
+                fork c.w_this(); join_none
+                fork d.w_other(c); join_none
+                fork c.w_arr(1); join_none
+                c.t_arr(1);
+                #3 -> c.e;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out.find("arr woke at 2\n") != std::string::npos);
+    CHECK(out.find("bare woke at 5\n") != std::string::npos);
+    CHECK(out.find("paren woke at 5\n") != std::string::npos);
+    CHECK(out.find("this woke at 5\n") != std::string::npos);
+    CHECK(out.find("other woke at 5\n") != std::string::npos);
+}
+
+// `->>` triggers in the NBA region of the same time step (LRM 15.5.2), so the
+// waiter still wakes in that step. A queue element holding the property's
+// object (push_back copies the handle, LRM 15.5.5) parks on the same object.
+TEST_CASE("a nonblocking trigger wakes a bare event property wait in the same step") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                event e;
+                event q[$];
+                function new(); q.push_back(e); endfunction
+                task w(); @e; $display("woke at %0t", $time); endtask
+                task wq(); @(q[0]); $display("q woke at %0t", $time); endtask
+            endclass
+            C c;
+            initial begin
+                c = new;
+                fork c.w(); join_none
+                fork c.wq(); join_none
+                #5 ->> c.e;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out.find("woke at 5\n") != std::string::npos);
+    CHECK(out.find("q woke at 5\n") != std::string::npos);
+}
+
+// The negative space: a trigger of a DIFFERENT event property of the same
+// object, and of the SAME-NAMED property of a different object, must wake
+// nothing -- each property is its own object with its own waiter list.
+TEST_CASE("an event property waiter ignores other properties and other objects") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                event e, f;
+                task w(); @e; $display("woke at %0t", $time); endtask
+            endclass
+            C c, d;
+            initial begin
+                c = new; d = new;
+                fork c.w(); join_none
+                #1 -> c.f;
+                #1 -> d.e;
+                #1 -> c.e;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "woke at 3\n");
+}
+
+// One trigger wakes every waiter parked on that property's object. Wake ORDER
+// within an instant is unspecified (LRM 4.7), so the set and time are asserted.
+TEST_CASE("two waiters on one event property both wake") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                event e;
+                task w(string n); @e; $display("%s woke at %0t", n, $time); endtask
+            endclass
+            C c;
+            initial begin
+                c = new;
+                fork c.w("p"); join_none
+                fork c.w("q"); join_none
+                #1 -> c.e;
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out.find("p woke at 1\n") != std::string::npos);
+    CHECK(out.find("q woke at 1\n") != std::string::npos);
+    CHECK(out.size() == std::string_view("p woke at 1\nq woke at 1\n").size());
+}
+
+// An inherited event property: the BASE method triggers at the base-relative
+// field index, the DERIVED method waits -- the flattened-field-table prefix
+// invariant (a base's table is a prefix of every derived class's, see
+// docs/design/classes.md) is what makes both address the same slot.
+TEST_CASE("an inherited event property triggered by a base method wakes a derived waiter") {
+    const std::string out = run_capture(R"(
+        module m;
+            class B;
+                event go;
+                task fire(); #2 -> go; endtask
+            endclass
+            class D extends B;
+                int pad;
+                task w(); @go; $display("woke at %0t", $time); endtask
+            endclass
+            D d;
+            initial begin
+                d = new;
+                fork d.w(); join_none
+                d.fire();
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "woke at 2\n");
+}
+
+// `wait(e.triggered)` on an event property (LRM 15.5.3 under 9.4.3): the wait
+// parks on the event OBJECT -- the only thing whose trigger changes the
+// condition -- and the persistent within-timestep `triggered` state satisfies a
+// wait that starts AFTER the trigger in the same instant, which `@e` would miss.
+TEST_CASE("wait on an event property's triggered state parks on the object") {
+    const std::string out = run_capture(R"(
+        module m;
+            class C;
+                event e;
+                task w(string n); wait(e.triggered); $display("%s woke at %0t", n, $time); endtask
+            endclass
+            C c;
+            initial begin
+                c = new;
+                fork c.w("early"); join_none
+                #5 -> c.e;
+                #1;
+                -> c.e;
+                c.w("late");
+                #1;
+            end
+        endmodule
+    )");
+    CHECK(out == "early woke at 5\nlate woke at 6\n");
+}
+
+// A wait on a member of a virtual interface NO instance of which exists is the
+// located LRM 25.9 run-time fatal the access paths already emit -- not a
+// compile-time refusal of the whole method. The old path left the event list
+// empty and refused with an internal invariant's wording ("intra-body event
+// wait has no signal events").
+TEST_CASE("an event wait through a never-bound virtual interface is a located run-time fatal") {
+    constexpr std::string_view src = R"(
+        interface never_if; logic clk; endinterface
+        module m;
+            class C;
+                virtual never_if vif;
+                task w(); @(posedge vif.clk); $display("UNREACHABLE"); endtask
+            endclass
+            C c;
+            initial begin c = new; c.w(); end
+        endmodule
+    )";
+    const LowerResult r = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    const test::DesignRun run = test::run_design_captured(src);
+    CHECK(run.out.find("UNREACHABLE") == std::string::npos);
+    CHECK(run.err.find("use of a null virtual interface") != std::string::npos);
+}
