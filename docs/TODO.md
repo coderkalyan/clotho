@@ -2723,12 +2723,13 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 - [ ] **Streaming operators, what still needs a bit-level buffer** — `with`
   clause; an operand or destination whose width does not divide into whole
   destination granules (`bit [5:0] q[$]` into a string, a 12-bit value into a byte
-  queue); `{<<S{...}}` over a dynamically sized stream (which block a bit lands in
-  depends on the total width, so the whole stream has to exist first); a
-  dynamically sized SOURCE in an unpack (`{>>{q}} = s`); a dynamically sized
-  stream into a FIXED packed target (`int v = {>>{q}}`, where LRM 11.4.14.3's
-  overflow answer is still open — verilator's is not derivable from the text).
-  Each is refused loudly with the width in the message.
+  queue); `{<<S{...}}` over a dynamically sized stream feeding a string / queue /
+  dynamic-array destination (which block a bit lands in depends on the total
+  width, so the whole stream has to exist first, and each of those three
+  destinations consumes one granule at a time — a **fixed** packed target does
+  not have this problem and is implemented, see below); a dynamically sized
+  SOURCE in an unpack (`{>>{q}} = s`). Each is refused loudly with the width in
+  the message.
 - [x] **Logical implication / equivalence** (`->`, `<->`) in expressions
   (LRM 11.4.7) — dedicated `Limplies`/`Lequiv` IR ops with direct 3-valued
   truth tables. `->` short-circuits (skips lowering the right operand
@@ -2757,20 +2758,50 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   are themselves non-singular, tolerance ranges and `$` bounds.
 - [x] **Indexed part-select** (`sig[base +: width]`, `sig[base -: width]`).
 - [x] **Streaming operators** (`{<<{...}}`, `{>>{...}}`, LRM 11.4.14) — pack and
-  unpack. A fixed-size stream is one packed value (reversal included); a stream
-  with a queue / dynamic-array / string operand keeps its operands apart as chunks
-  and the destination consumes them granule by granule: bytes for a string
-  (`StrAppendPacked` / whole-string concat, which makes `s = {>>{string_q}}` the
-  join UVM's `m_uvm_string_queue_join` wants, one runtime call per element),
-  elements for a queue (pushed) or dynamic array (counted, then sized and stored).
-  Unpack takes the source's leftmost bits, LRM 11.4.14.3's greedy rule giving the
-  first dynamically sized destination everything the fixed ones leave; a fixed
-  unpacked array / struct destination walks leaves in declared order
-  (`unpack_stream_agg`, the inverse of `serialize_agg_lvalue`). A packed operand
-  reaching a string converts through LRM 6.16's 8-bit-chunk rule, dropped 0x00
-  chunk included, so a folded `localparam` and the runtime path agree. Oracle:
-  verilator for every shape it supports (fixed unpack, `<<` reversal, unpacked
-  struct, string join), slang's constant evaluator otherwise.
+  unpack, fixed-size and dynamically-sized operands, into a fixed packed target,
+  a string, a queue, or a dynamic array. A fixed-size stream is one packed value
+  (reversal included, `lower_streaming_concat`); a stream with a queue /
+  dynamic-array / string operand keeps its operands apart as chunks
+  (`collect_stream_chunks` / `StreamChunk`) and the destination consumes them
+  granule by granule: bytes for a string (`StrAppendPacked` / whole-string
+  concat, which makes `s = {>>{string_q}}` the join UVM's
+  `m_uvm_string_queue_join` wants, one runtime call per element), elements for a
+  queue (pushed) or dynamic array (counted, then sized and stored), or — for a
+  **fixed** packed target (UVM's `uvm_unpack_intN`: `VAR = {<<bit{__array}}`) —
+  one bit at a time into a run-time-computed shift position (`stream_to_fixed`),
+  which is also where `{<<S{...}}` over a dynamically sized stream is
+  implemented (`stream_reorder_pos`, a per-bit LRM 11.4.14.2 block-reversal
+  position map — the only one of the four destinations that has this, since a
+  fixed target's width is known at lower time). A dynamically sized stream
+  narrower than its fixed target is left-aligned and zero-padded on the right
+  (LRM 11.4.14), for both `<<` and `>>`; wider is a run-time fatal (LRM
+  11.4.14: "an error shall be generated"). Verilator 5.050 disagrees with the
+  LRM on both points for this shape: it truncates silently (no diagnostic) on
+  overflow instead of erroring, and right-justifies (zero-pads on the left)
+  rather than left-aligning a narrower `>>` stream specifically — `<<`
+  matches the LRM already, only the no-reorder `>>` case is off — so Clotho
+  follows the LRM text over the oracle for both deviations. An operand shape
+  can be a dynamic array, a queue, a string, a dynamic array of a packed struct,
+  or a dynamic array
+  nested inside an otherwise-fixed aggregate (`collect_agg_stream_chunks`, the
+  dynamic analogue of `serialize_agg_lvalue`); an associative-array operand is
+  refused (LRM 6.24.1 excludes it from the bit-stream types) at the top level
+  or as an aggregate member. Unpack takes the source's leftmost bits, LRM
+  11.4.14.3's greedy rule giving the first dynamically sized destination
+  everything the fixed ones leave; a fixed unpacked array / struct destination
+  walks leaves in declared order (`unpack_stream_agg`, the inverse of
+  `serialize_agg_lvalue`). A packed operand reaching a string converts through
+  LRM 6.16's 8-bit-chunk rule, dropped 0x00 chunk included, so a folded
+  `localparam` and the runtime path agree. Oracle: Verilator for every shape it
+  supports and agrees with the LRM on (fixed unpack, `<<` reversal, unpacked
+  struct, string join, dynamic-operand-into-fixed narrower/exact/empty `<<`),
+  slang's constant evaluator otherwise, and the LRM text directly (with the own
+  derivation pinned in a test comment) for the handful of cases above where
+  Verilator disagrees with it. `uvm_reg_map::do_bus_access` (register layer,
+  never reached by easyUVM) needs `{<<S{...}}` over a dynamically sized stream
+  into a QUEUE destination, which stays refused (see above) — a fixed target's
+  mechanism does not extend to it, since the destination-side reordering it
+  would need is a separate, comparably-sized change.
 
 ### Procedural control
 

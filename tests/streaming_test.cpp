@@ -52,6 +52,55 @@ void check_rejected(std::string_view source, std::string_view needle) {
     CHECK_MESSAGE(r.diagnostic_text().find(needle) != std::string::npos, r.diagnostic_text());
 }
 
+// Captures stdout and stderr separately: severity reports ($fatal and friends)
+// go to stderr, like $display's own banner, so a runtime (not lowering-time)
+// LRM violation -- e.g. a dynamically-sized stream too wide for its fixed
+// target (LRM 11.4.14) -- shows up there rather than in `out`.
+struct Captured {
+    std::string out;
+    std::string err;
+};
+
+Captured run_capture_err(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+
+    std::FILE* out_tmp = std::tmpfile();
+    std::FILE* err_tmp = std::tmpfile();
+    REQUIRE(out_tmp != nullptr);
+    REQUIRE(err_tmp != nullptr);
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const int saved_out = dup(fileno(stdout));
+    const int saved_err = dup(fileno(stderr));
+    dup2(fileno(out_tmp), fileno(stdout));
+    dup2(fileno(err_tmp), fileno(stderr));
+
+    ir::run_jit(*r.module);
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+    dup2(saved_out, fileno(stdout));
+    dup2(saved_err, fileno(stderr));
+    close(saved_out);
+    close(saved_err);
+
+    std::rewind(out_tmp);
+    std::rewind(err_tmp);
+    const auto drain = [](std::FILE* f) {
+        std::string s;
+        char        buf[256];
+        size_t      n;
+        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+            s.append(buf, n);
+        std::fclose(f);
+        return s;
+    };
+    return { drain(out_tmp), drain(err_tmp) };
+}
+
 } // namespace
 
 // `>>` (sliceSize==0): no reorder — same as plain concatenation.
@@ -240,18 +289,22 @@ TEST_CASE("stream << x propagation") {
     CHECK(out == "10xx\n");
 }
 
-// A dynamically sized stream reaching a FIXED packed target: the runtime bit
-// count decides whether it fits, and LRM 11.4.14.3's answer for the overflow is
-// still open, so this stays refused rather than guessed. (A string / queue /
-// dynamic-array target has no such question and works -- see the cases below.)
-TEST_CASE("stream dynamic operand into a packed target rejected") {
-    check_rejected(R"(
+// A dynamically sized stream reaching a FIXED packed target (LRM 11.4.14):
+// the runtime bit count decides fit/pad/overflow, so the stream is walked bit
+// by bit (stream_to_fixed in Lower.cpp) rather than concatenated at compile
+// time. `s` is 5 bytes = 40 bits, exactly filling the 40-bit target, so this
+// case does not exercise padding -- see "narrower/wider/exact" below for that.
+TEST_CASE("stream a dynamically-sized string operand into a packed target (LRM 11.4.14)") {
+    CHECK(run_capture(R"(
         module t;
             string s = "hello";
             logic [39:0] r;
-            initial r = {>> {s}};
+            initial begin
+                r = {>> {s}};
+                $display("%h", r);
+            end
         endmodule
-    )", "dynamically-sized");
+    )") == "68656c6c6f\n");
 }
 
 TEST_CASE("whole unpacked array as a streaming-concat operand (LRM 11.4.14)") {
@@ -478,4 +531,265 @@ TEST_CASE("streaming shapes that need bit-level realignment are rejected") {
             endmodule
         )", "not integral or string");
     }
+}
+
+// -- A dynamically sized stream reaching a fixed packed target (LRM 11.4.14,
+// 11.4.14.2, 11.4.14.3): stream_to_fixed walks the stream bit by bit since the
+// width is a run-time value, folding in both `<<` block reversal and the
+// left-align-into-target placement per bit. --
+
+// The ticket repro, cross-checked against Verilator 5.050 for `rev` only.
+// `a` is 8 bits `0,1,0,1,0,1,0,1` (a[i] = i[0]); the generic stream (LRM
+// 11.4.14.1, foreach order, a[0] first/MSB) is 8'b0101_0101 = 0x55 either way
+// -- `>>` never reorders (11.4.14.2), and `<<`'s default 1-bit slice is a full
+// bit reversal, 8'b1010_1010 = 0xAA.
+//
+// LRM 11.4.14 (assignment target, non-streaming-concat case): "the stream ...
+// shall first be widened ... to left-align it in the target ... filling with
+// zero bits on the right" -- unconditionally, not just for `<<`. Clotho's own
+// already-tested FIXED-size lower_streaming_concat (Lower.cpp) implements
+// exactly that (concat the stream with a zero pad, then resize), regardless of
+// direction, and `rev` below matches it: 0xAA -> 0xAA000000.
+//
+// Verilator matches that for `rev` (0xaa000000) but NOT for `fwd`: it prints
+// `55` (0x00000055, right-justified) instead of the LRM's 0x55000000. The
+// `>>` case is the only difference from `rev` -- Verilator does not reorder
+// either way, so this looks like Verilator specifically treating a `>>`
+// (no-op reorder) stream as an ordinary numeric RHS instead of running it
+// through the streaming assignment's own left-align rule. Clotho follows the
+// LRM text and its own precedent instead of Verilator here.
+TEST_CASE("stream a dynamically-sized bit array and byte queue into a packed target (LRM 11.4.14)") {
+    CHECK(run_capture(R"(
+        module t;
+            bit a[]; int v; byte q[$];
+            initial begin
+                a = new [8]; for (int i=0;i<8;i++) a[i] = i[0];
+                v = { << bit { a }};                 $display("rev=%0h", v);
+                v = { >> bit { a }};                 $display("fwd=%0h", v);
+                q = {8'h12, 8'h34};
+                v = { >> byte { q }};                $display("q=%0h", v);
+            end
+        endmodule
+    )") == "rev=aa000000\nfwd=55000000\nq=12340000\n");
+}
+
+// Narrower (padded, above), exact fit (no padding), and wider (run-time error,
+// below) -- the three width relations LRM 11.4.14 distinguishes.
+TEST_CASE("stream a dynamically-sized queue that exactly fills its fixed target") {
+    CHECK(run_capture(R"(
+        module t;
+            byte q[$]; int v;
+            initial begin
+                q = {8'h11, 8'h22, 8'h33, 8'h44};
+                v = { >> { q }};
+                $display("%h", v);
+            end
+        endmodule
+    )") == "11223344\n");
+}
+
+// LRM 11.4.14: "If the target represents a fixed-size variable that is
+// narrower [...] than the stream, an error shall be generated" -- the width is
+// a run-time value here, so the check (and the report) happen at run time
+// (stream_to_fixed's check_stream_fits_fixed) rather than as a lowering
+// rejection. Verilator instead truncates silently to the low 32 bits (no
+// diagnostic at all) for this exact case; the LRM's own worked example (`int j
+// = {>>{a,b,c}};` with a,b,c a 32-bit `int` each, "error: j is 32 bits < 96
+// bits") is unambiguous, so Clotho reports rather than matching Verilator.
+TEST_CASE("stream a dynamically-sized bit array wider than its fixed target fatals (LRM 11.4.14)") {
+    const Captured c = run_capture_err(R"(
+        module t;
+            bit a[]; int v;
+            initial begin
+                a = new [40]; for (int i=0;i<40;i++) a[i] = i[0];
+                v = { >> bit { a }};
+                $display("unreachable: %0h", v);
+            end
+        endmodule
+    )");
+    CHECK(c.err.find("wider than its fixed-size target (LRM 11.4.14)") != std::string::npos);
+    CHECK(c.out.find("unreachable") == std::string::npos);
+}
+
+// LRM 11.4.14 gives no special case for a zero-length operand: a 0-bit stream
+// is simply narrower than any non-zero fixed target, so it is padded with
+// zero on the right the same as any other narrower stream -- an all-zero
+// result either direction. Cross-checked against Verilator.
+TEST_CASE("stream an empty dynamically-sized array into a fixed target") {
+    CHECK(run_capture(R"(
+        module t;
+            bit a[]; int v;
+            initial begin
+                a = new [0];
+                v = { << bit { a }};   $display("rev=%0h", v);
+                v = { >> bit { a }};   $display("fwd=%0h", v);
+            end
+        endmodule
+    )") == "rev=0\nfwd=0\n");
+}
+
+// `{<<3{a}}` over the same 8-bit `a`: slice size 3 does not divide 8, so the
+// last (leftmost) block is the 2-bit remainder (LRM 11.4.14.2, "no padding or
+// truncation"). Derived independently three ways -- Clotho's own position
+// formula, a bit-index re-derivation cross-checked against the LRM's own
+// {<<4{6'b110101}}->6'b010111 example (also one of this file's existing fixed-
+// size tests, "stream << non-power-of-two slice"), and direct string
+// manipulation of the blocks -- all agreeing on 0xA9 (0xA9000000 padded).
+// Verilator 5.050 instead gives 0xa8800000 for this case; since three
+// independent derivations agree with each other and with Clotho's own
+// existing, already-tested fixed-size block-reversal behavior for an
+// analogous (W=6, S=4) partial-block case, Verilator looks wrong here rather
+// than Clotho, so this is pinned to the derived value, not the oracle.
+TEST_CASE("stream << with a slice size over a dynamically-sized array, partial final block (LRM 11.4.14.2)") {
+    CHECK(run_capture(R"(
+        module t;
+            bit a[]; int v;
+            initial begin
+                a = new [8]; for (int i=0;i<8;i++) a[i] = i[0];
+                v = { << 3 { a }};
+                $display("%0h", v);
+            end
+        endmodule
+    )") == "a9000000\n");
+}
+
+// A slice size equal to the whole (dynamic) stream width is exactly one
+// block, so `<<` cannot reorder anything -- same value as the no-reorder `>>`
+// case above.
+TEST_CASE("stream << with a slice size equal to the whole dynamically-sized stream is a no-op reorder") {
+    CHECK(run_capture(R"(
+        module t;
+            bit a[]; int v;
+            initial begin
+                a = new [8]; for (int i=0;i<8;i++) a[i] = i[0];
+                v = { << 8 { a }};
+                $display("%0h", v);
+            end
+        endmodule
+    )") == "55000000\n");
+}
+
+// -- Operand shapes a dynamically-sized stream can be built from (LRM 11.4.14
+// / 11.4.14.1) --
+
+// A dynamic array of a packed struct: each element serializes to its own
+// packed bits (LRM 11.4.14.1's bit-stream-cast case, not the unpacked-array
+// recursion), so the two elements contribute 0x1122 and 0x3344 whole.
+TEST_CASE("stream a dynamic array of a packed struct into a fixed target") {
+    CHECK(run_capture(R"(
+        typedef struct packed { byte hi; byte lo; } pair_t;
+        module t;
+            pair_t p[]; longint v;
+            initial begin
+                p = new[2];
+                p[0] = '{hi:8'h11, lo:8'h22};
+                p[1] = '{hi:8'h33, lo:8'h44};
+                v = { >> { p }};
+                $display("%h", v);
+            end
+        endmodule
+    )") == "1122334400000000\n");
+}
+
+// A dynamic array nested inside an otherwise-fixed struct: the struct itself
+// is not fixed size (its `payload` member is dynamic), so the whole operand
+// takes collect_agg_stream_chunks's recursive leaf walk instead of the single-
+// chunk serialize_agg_lvalue path a truly fixed aggregate operand uses (see
+// "stream a dynamic array of a packed struct" above, and the pre-existing
+// "whole unpacked array as a streaming-concat operand" test, for that path).
+// `hdr` (8 bits, 0xAB) then `payload` (4 bits, 0,1,0,1 -> 0x5) = 12 bits =
+// 0xAB5, left-aligned into the 64-bit target.
+TEST_CASE("stream a dynamic array nested inside a fixed aggregate into a fixed target") {
+    CHECK(run_capture(R"(
+        typedef struct { byte hdr; bit payload[]; } pkt_t;
+        module t;
+            pkt_t pkt; longint v;
+            initial begin
+                pkt.hdr = 8'hAB;
+                pkt.payload = new[4];
+                foreach (pkt.payload[i]) pkt.payload[i] = i[0];
+                v = { >> { pkt }};
+                $display("%h", v);
+            end
+        endmodule
+    )") == "ab50000000000000\n");
+}
+
+// Two dynamically-sized operands concatenated: `a` (4 bits, 0101) then `q`
+// (16 bits, 0xABCD) = 20 bits = 0x5ABCD, left-aligned into the 32-bit target.
+TEST_CASE("stream two dynamically-sized operands into one fixed target") {
+    CHECK(run_capture(R"(
+        module t;
+            bit a[]; byte q[$]; int v;
+            initial begin
+                a = new[4]; foreach (a[i]) a[i] = i[0];
+                q = {8'hAB, 8'hCD};
+                v = { >> { a, q }};
+                $display("%h", v);
+            end
+        endmodule
+    )") == "5abcd000\n");
+}
+
+// A dynamically-sized operand mixed with a fixed one: `fx` (8 bits, 0xCD) then
+// `a` (4 bits, 0101) = 12 bits = 0xCD5, left-aligned into the 32-bit target.
+TEST_CASE("stream a dynamically-sized operand mixed with a fixed operand into a fixed target") {
+    CHECK(run_capture(R"(
+        module t;
+            bit a[]; logic [7:0] fx; int v;
+            initial begin
+                a = new[4]; foreach (a[i]) a[i] = i[0];
+                fx = 8'hCD;
+                v = { >> { fx, a }};
+                $display("%h", v);
+            end
+        endmodule
+    )") == "cd500000\n");
+}
+
+// LRM 6.24.1 lists what a bit-stream type is (integral, packed, or an
+// unpacked array/struct of bit-stream types) and does not include an
+// associative array -- an unbounded key -> value map has no ordered bit
+// representation at all -- so it is illegal as a stream operand, at the top
+// level or buried in an aggregate, independent of size.
+TEST_CASE("associative-array operand is rejected as not a bit-stream type (LRM 6.24.1)") {
+    SUBCASE("top-level operand") {
+        check_rejected(R"(
+            module t;
+                int a[string]; longint v;
+                initial v = { >> { a }};
+            endmodule
+        )", "not a bit-stream type");
+    }
+    SUBCASE("aggregate member") {
+        check_rejected(R"(
+            typedef struct { int a[string]; byte b; } bad_t;
+            module t;
+                bad_t x; longint v;
+                initial v = { >> { x }};
+            endmodule
+        )", "not a bit-stream type");
+    }
+}
+
+// The `do_bus_access` shape (uvm_reg_map.svh: `{<<8{ bit_q_t'({<<{p}}) }}`
+// where `p` is a byte queue, assigned to another queue) is slice size on a
+// dynamically-sized stream feeding a QUEUE destination, not a fixed one --
+// stream_to_fixed's per-bit position map (above) does not reach this path,
+// since collect_stream_chunks only passes dyn_slice_ok for the fixed-target
+// caller. Reordering into a growable string/queue/dynamic-array destination
+// would need its own materialize-and-reindex mechanism (each of those three
+// consumes the stream one granule at a time, never holding the whole thing),
+// which is a separate, comparably-sized change this ticket does not make;
+// do_bus_access is UVM's register layer, never reached by easyUVM. This is
+// the pre-existing "slice size over a dynamically-sized stream" SUBCASE below
+// with a queue destination in place of a string one, confirming the same
+// refusal covers it.
+TEST_CASE("slice size on a dynamically-sized stream into a queue destination stays refused (do_bus_access's shape)") {
+    check_rejected(R"(
+        module m;
+            byte p[$]; byte bits[$];
+            initial bits = {<<8{p}};
+        endmodule
+    )", "slice size on a dynamically-sized streaming concatenation");
 }

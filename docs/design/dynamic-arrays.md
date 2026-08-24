@@ -80,18 +80,44 @@ First cut restrictions, each keeping a guard and a documented TODO:
   7.8.3) and **unpacked struct / fixed array** (LRM 7.8.5). All unified under the
   normalized byte-span key model (§4a); the only remaining exclusion is a string
   or dynamically-sized member *inside* a struct key (variable-length span).
-- **Streaming operators — granule-aligned only** (LRM 11.4.14, added with
-  pack/unpack into containers). A queue, dynamic array or string on either side of
-  `{>>{...}}` has no lower-time width, so the stream stays a list of chunks
-  (`StreamChunk` in `Lower.cpp`) and the destination consumes it granule by
-  granule: one element per element width, one byte per byte. Everything whose
-  chunk boundaries do not line up with the destination's granule is refused with
-  the offending width in the message and needs a bit-level buffer instead: a
-  6-bit-element queue into a string, a 12-bit value into a byte queue, `{<<S{...}}`
-  over a dynamically sized stream, a dynamically sized source in an unpack. Only
-  the dynamic-array destination needs the element count up front (it is allocated,
-  not pushed onto), and `stream_granule_count` computes it — with a runtime
-  accumulation loop when the count depends on string lengths.
+- **Streaming operators — granule-aligned for a string/queue/dynamic-array
+  destination, per-bit for a fixed one** (LRM 11.4.14, added with pack/unpack
+  into containers; the fixed-target pack direction added later). A queue,
+  dynamic array or string on either side of `{>>{...}}` has no lower-time
+  width, so the stream stays a list of chunks (`StreamChunk` in `Lower.cpp`).
+  Three of the four destinations consume it granule by granule: one element
+  per element width for a queue/dynamic array, one byte per byte for a string.
+  Everything whose chunk boundaries do not line up with the destination's
+  granule is refused with the offending width in the message and needs a
+  bit-level buffer instead: a 6-bit-element queue into a string, a 12-bit
+  value into a byte queue, `{<<S{...}}` over a dynamically sized stream
+  feeding one of these three, a dynamically sized source in an unpack. Only
+  the dynamic-array destination needs the element count up front (it is
+  allocated, not pushed onto), and `stream_granule_count` computes it — with a
+  runtime accumulation loop when the count depends on string lengths.
+  The fourth destination, a **fixed** packed target (UVM's `uvm_unpack_intN`:
+  `VAR = {<<bit{__array}}`) — needs exactly this because the width is known
+  at lower time, so `stream_to_fixed` walks the stream at bit granularity
+  (`walk_stream_granules` with `g=1`) and computes each bit's final position
+  directly — folding in both the `<<` block reversal (`stream_reorder_pos`, a
+  per-bit LRM 11.4.14.2 position map) and the left-align-into-target placement
+  — into one run-time shift amount, so no intermediate stream buffer is
+  needed and `{<<S{...}}` is supported for this one destination
+  (`collect_stream_chunks`'s `dyn_slice_ok` parameter). A narrower stream is
+  zero-padded on the right (LRM 11.4.14); a wider one is a run-time fatal
+  (LRM 11.4.14: "an error shall be generated" — checked at run time since the
+  width is a run-time value here, unlike the fixed-size case slang itself
+  rejects at compile time). A dynamic array of a packed struct, and a dynamic
+  array nested inside an otherwise-fixed aggregate, both work
+  (`collect_agg_stream_chunks`, the dynamic analogue of the fixed path's
+  `serialize_agg_lvalue`); an associative-array operand is refused (LRM 6.24.1
+  excludes it from the bit-stream types) at the top level or as an aggregate
+  member. `uvm_reg_map::do_bus_access` (register layer, never reached by
+  easyUVM) needs `{<<S{...}}` into a QUEUE destination, which is the
+  three-destination case above and stays refused — the fixed-target mechanism
+  does not extend there, since reordering into a growable destination that is
+  consumed one granule at a time would need its own materialize-and-reindex
+  approach, a separate change of comparable size this did not make.
 
 ## 3. Element value model
 
