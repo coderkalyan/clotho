@@ -462,6 +462,25 @@ TEST_CASE("dynamic array from an assignment-pattern literal") {
     CHECK(run_capture(src) == "3 10 20 30\n4 1 2 3 4\n");
 }
 
+// === / !== over a dynamic array shares the queue's aggregate-equality
+// reduction (both are Kind::DynArray/Kind::Queue handles with no plane
+// value); a string leaf never carries x/z (LRM 6.16.9) so the X-propagating
+// == walk is exact for === too.
+TEST_CASE("dynamic array case-equality with a string element (LRM 11.2.2, 11.4.5)") {
+    CHECK(run_capture(R"(
+        module m;
+            string a[], b[];
+            initial begin
+                a = new[2]; a[0] = "x"; a[1] = "y";
+                b = new[2]; b[0] = "x"; b[1] = "y";
+                $display("ceq=%b", a === b);
+                b = new[3]; b[0] = "x"; b[1] = "y"; b[2] = "z";
+                $display("ceq=%b cne=%b", a === b, a !== b);
+            end
+        endmodule
+    )") == "ceq=1\nceq=0 cne=1\n");
+}
+
 // LRM 7.5.1 sizes a dynamic array with an `int`, and gives no meaning to a
 // negative one. The count used to cross the runtime ABI zero-extended, so
 // `new[-1]` asked for 4294967295 elements and the element-count-times-stride

@@ -946,6 +946,73 @@ TEST_CASE("unpacked struct equality is field-wise; X makes it ambiguous (LRM 11.
     )") == "eq=1 ne=1\nxeq=x\n");
 }
 
+// Case equality (===/!==) over an unpacked struct / queue / dynamic array
+// (LRM 11.4.5, Table 11-1) used to fall through past the == / != aggregate
+// reduction entirely: the frontend only special-cased Equality/Inequality,
+// so === on an aggregate/container operand reached the generic bitstream-
+// cast lowering, which tries to LOAD the whole aggregate as a scalar. For a
+// struct that miscompiled silently; for a queue/dynamic-array (no plane
+// value at all) the backend's defense-in-depth check caught it and aborted
+// with an unlocated "plane load of a container handle" -- found via UVM's
+// `uvm_field_queue_string` field-automation macro. Reusing the X-propagating
+// == walk for === is exact whenever no leaf can ever carry x/z (a string
+// leaf never does, LRM 6.16.9): case equality's only behavioral difference
+// from logical equality is how x/z compare, so with no x/z possible the two
+// operators agree by construction.
+TEST_CASE("unpacked struct case-equality with a string member reuses the "
+          "X-propagating walk (LRM 11.4.5)") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef struct { string s; bit [3:0] b; } s_t;
+            s_t x, y;
+            initial begin
+                x.s = "hi"; x.b = 4'h2;
+                y.s = "hi"; y.b = 4'h2;
+                $display("ceq=%b cne=%b", x === y, x !== y);
+                y.s = "ho";
+                $display("ceq=%b cne=%b", x === y, x !== y);
+            end
+        endmodule
+    )") == "ceq=1 cne=0\nceq=0 cne=1\n");
+}
+
+// A class-handle leaf is a definite pointer or null, never x/z, so it is
+// case-equality-safe by the same reasoning as a string leaf.
+TEST_CASE("unpacked struct case-equality with a class-handle member") {
+    CHECK(run_capture(R"(
+        module m;
+            class c; int v; endclass
+            typedef struct { c h; int i; } s_t;
+            s_t x, y;
+            c o;
+            initial begin
+                o = new; x.h = o; y.h = o; x.i = 5; y.i = 5;
+                $display("ceq=%b", x === y);
+                y.h = null;
+                $display("ceq=%b cne=%b", x === y, x !== y);
+            end
+        endmodule
+    )") == "ceq=1\nceq=0 cne=1\n");
+}
+
+// A 4-state leaf CAN carry x/z, where case and logical equality genuinely
+// disagree (case compares the bits directly, 12.5; logical X-propagates,
+// 11.4.5): reusing the == walk would be wrong, so this stays a located
+// refusal rather than a silent wrong answer.
+TEST_CASE("struct case-equality with a 4-state leaf is refused, not "
+          "silently approximated (LRM 11.4.5)") {
+    const LowerResult r = lower_text(R"(
+        module m;
+            typedef struct { logic [7:0] a; } s_t;
+            s_t x, y;
+            initial $display("%b", x === y);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("case equality of an aggregate or container "
+                                    "with a 4-state or real leaf is not supported") != std::string::npos);
+}
+
 TEST_CASE("unpacked struct equality with a string member") {
     // The string leaf compares by content (strcmp == 0), reduced with the
     // scalar members like any other leaf.

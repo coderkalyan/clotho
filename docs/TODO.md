@@ -2652,14 +2652,29 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   then a deep copy into the target; splices whole-queue operands, pushes scalars.
   A queue that IS an element or a member of something (`q = qq[i]`, `q = s.inner`)
   needs no temp: it already has a handle lvalue.
-- [x] **Queue / dynamic-array equality** (`==` / `!=`, LRM 11.2.2/11.4.5) — direct
-  and as an aggregate member, reached from the AggEq leaf walk: size mismatch is a
-  definite 0, else per-element 4-state compare with x-propagation. Fixed a prior
-  silent miscompile (handle compared as a value). A single-word integral / real /
-  string element goes through `rt_container_eq`; an aggregate, a nested container
-  or an element wider than one word walks element-wise in the backend
-  (`emit_container_eq_loop`), recursing through the same aggregate compare — which
-  is also what gives a queue of queues (and a struct holding a queue) a compare.
+- [x] **Queue / dynamic-array equality** (`==` / `!=` / `===` / `!==`, LRM
+  11.2.2/11.4.5) — direct and as an aggregate member, reached from the AggEq
+  leaf walk: size mismatch is a definite 0, else per-element 4-state compare
+  with x-propagation. Fixed a prior silent miscompile (handle compared as a
+  value). A single-word integral / real / string element goes through
+  `rt_container_eq`; an aggregate, a nested container or an element wider than
+  one word walks element-wise in the backend (`emit_container_eq_loop`),
+  recursing through the same aggregate compare — which is also what gives a
+  queue of queues (and a struct holding a queue) a compare. `===`/`!==` used to
+  fall through this reduction entirely (only `Equality`/`Inequality` were
+  special-cased), reaching a generic bitstream-cast lowering that tried to Load
+  the whole struct/container as a scalar — silently wrong for a struct (no
+  invariant to catch it) and an unlocated backend abort for a queue/dynamic
+  array (`"plane load of a container handle"`, the backend's defense-in-depth
+  check for exactly this shape). Found via UVM's `uvm_field_queue_string`
+  field-automation macro comparing a `string q[$]` field with `===`. Reusing
+  the X-propagating `==` walk for `===` is exact whenever no leaf can ever
+  carry x/z (`case_eq_matches_logical`: true for a string, class-handle or
+  chandle leaf, per 6.16.9/6.14 — none of those can be x/z); a leaf that CAN
+  (4-state integral, real, or an associative-array leaf with no case-compare
+  implementation) stays a located refusal citing 11.4.5/12.5, since case and
+  logical equality genuinely disagree on how x/z compares once that is
+  possible.
 - [ ] **Associative arrays** — `[*]`/typed keys, `.exists`, `.first`/`.next`,
   `.num`, `.delete`.
 - [ ] **Bit-stream casting** (`{<<{}}` / `{>>{}}` cast operands, LRM 6.24.3).

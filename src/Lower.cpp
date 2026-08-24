@@ -5923,6 +5923,41 @@ private:
         }
     }
 
+    // Whether case equality (===/!==) on `type` is provably identical to
+    // logical equality (==/!=): true when no leaf can ever carry x/z, the one
+    // condition under which LRM 11.4.5's two rules (case: x/z compare
+    // directly, like a procedural case statement, 12.5; logical: x/z
+    // propagate to an unknown result) can disagree. A string leaf carries no
+    // x/z at all (LRM 6.16.9); a class handle or chandle is a definite
+    // pointer or null, never x/z. A 4-state integral leaf is not provably
+    // safe, and neither is a real/shortreal leaf (=== is outright illegal on
+    // one, Table 11-1) or an associative-array leaf (no case-compare
+    // implementation) -- the caller refuses case equality for any of those
+    // rather than silently reusing the X-propagating AggEq / container-
+    // compare result.
+    bool case_eq_matches_logical(ir::Ref type) const {
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
+                if (!case_eq_matches_logical(f.type)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (t.kind == ir::Type::Kind::UnpackedArray || t.kind == ir::Type::Kind::Queue ||
+            t.kind == ir::Type::Kind::DynArray) {
+            return case_eq_matches_logical(t.element);
+        }
+        if (t.kind == ir::Type::Kind::String) {
+            return true;
+        }
+        if (module_.pool.is_float(type) || value_cat(type) == ValueCat::handle) {
+            return false;
+        }
+        return module_.pool.layout(type).domain != ir::Domain::Four;
+    }
+
     // Strip an outer identity/struct Conversion wrapper slang may insert on a
     // struct-typed rvalue, exposing the underlying lvalue-shaped expression.
     static const Expression& unwrap_conversion(const Expression& e) {
@@ -25402,23 +25437,48 @@ private:
             return lower_short_circuit(bin, b);
         }
 
-        // Unpacked aggregate equality (LRM 7.2, 11.2.2, 11.4.5): a whole struct /
-        // fixed unpacked array value cannot be loaded, so `==` / `!=` reduce to a
-        // per-leaf comparison. The leaf Eq results fold with Land (X propagates:
-        // any definite mismatch is 0, else X if any leaf is X, else 1); `!=`
-        // negates that reduction. slang wraps each operand in a bitstream
+        // Unpacked aggregate equality (LRM 7.2, 11.2.2, 11.4.5, Table 11-1): a
+        // whole struct / fixed unpacked array / queue / dynamic array value
+        // cannot be loaded, so every equality-family operator reduces to a
+        // per-leaf comparison instead. slang wraps each operand in a bitstream
         // Conversion, so the aggregate type is on the unwrapped operand.
-        if ((bin.op == B::Equality || bin.op == B::Inequality) &&
-            (is_unpacked_struct(*unwrap_conversion(bin.left()).type) ||
-             unwrap_conversion(bin.left()).type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() !=
-               nullptr ||
-             is_queue(unwrap_conversion(bin.left())) || is_dyn_array(unwrap_conversion(bin.left())))) {
-            // A whole queue / dynamic-array compare (LRM 11.2.2) also reduces to a
-            // per-element walk with §11.4.5 x-propagation; the AggEq expansion
-            // dispatches the handle leaf to the runtime element compare.
-            const ir::SourceLoc l = loc(bin);
-            const ir::Index acc = lower_struct_eq(unwrap_conversion(bin.left()), unwrap_conversion(bin.right()), b, l);
-            return bin.op == B::Equality ? acc : b.unary(ir::Inst::Tag::Lnot, acc, l);
+        if (bin.op == B::Equality || bin.op == B::Inequality || bin.op == B::CaseEquality ||
+            bin.op == B::CaseInequality) {
+            const Expression& ule         = unwrap_conversion(bin.left());
+            const bool        agg_operand =
+              is_unpacked_struct(*ule.type) ||
+              ule.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() !=
+                nullptr ||
+              is_queue(ule) || is_dyn_array(ule);
+            if (agg_operand) {
+                const bool is_case = bin.op == B::CaseEquality || bin.op == B::CaseInequality;
+                if (is_case && !case_eq_matches_logical(lower_type(*ule.type))) {
+                    // Case equality compares x/z bits directly instead of
+                    // X-propagating them like logical equality does (11.4.5,
+                    // "just as ... the procedural case statement", 12.5); the
+                    // AggEq / runtime container comparator below implements
+                    // only the X-propagating rule. Reusing it is exact when no
+                    // leaf can ever carry x/z (case_eq_matches_logical); a leaf
+                    // that could carry x/z has no dedicated case-equality
+                    // comparator yet.
+                    // TODO: a bit-for-bit (x/z-inclusive) case-equality member
+                    // walk for a struct / queue / dynamic array with a 4-state
+                    // or real leaf (LRM 11.4.5, 12.5).
+                    fail("case equality of an aggregate or container with a "
+                         "4-state or real leaf is not supported (LRM 11.4.5)");
+                }
+                // A whole queue / dynamic-array compare (LRM 11.2.2) reduces to
+                // a per-element walk with the same X-propagation (Land-reduced
+                // Eq leaves) a struct / fixed-array compare uses; the AggEq
+                // expansion dispatches the handle leaf to the runtime element
+                // compare. Proven leaf-safe above, that walk is exact for a
+                // case (in)equality operand too, not merely an approximation.
+                const ir::SourceLoc l   = loc(bin);
+                const ir::Index     acc = lower_struct_eq(ule, unwrap_conversion(bin.right()), b, l);
+                return (bin.op == B::Equality || bin.op == B::CaseEquality)
+                       ? acc
+                       : b.unary(ir::Inst::Tag::Lnot, acc, l);
+            }
         }
 
         if (bin.left().kind == ExpressionKind::TypeReference || bin.right().kind == ExpressionKind::TypeReference) {

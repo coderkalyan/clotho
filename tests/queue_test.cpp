@@ -710,6 +710,29 @@ TEST_CASE("queue equality with x-propagation") {
     CHECK(run_capture(src) == "10\n0\n0\nx\n0\n1\n0\n");
 }
 
+// === / !== over a queue used to reach a generic scalar-Load lowering
+// instead of the aggregate-equality reduction above (the frontend only
+// special-cased Equality/Inequality): the backend's defense-in-depth check
+// caught the resulting bad IR shape and aborted with an unlocated "plane
+// load of a container handle". Found via UVM's `uvm_field_queue_string`
+// field-automation macro, whose generated body compares a `string q[$]`
+// field with `===`. A string leaf never carries x/z (LRM 6.16.9), so the
+// X-propagating == walk is exact for === here too.
+TEST_CASE("queue case-equality with a string element (LRM 11.2.2, 11.4.5)") {
+    CHECK(run_capture(R"(
+        module m;
+            string q1[$], q2[$];
+            initial begin
+                q1.push_back("a"); q1.push_back("b");
+                q2.push_back("a"); q2.push_back("b");
+                $display("ceq=%b cne=%b", q1 === q2, q1 !== q2);
+                q2[1] = "c";
+                $display("ceq=%b cne=%b", q1 === q2, q1 !== q2);
+            end
+        endmodule
+    )") == "ceq=1 cne=0\nceq=0 cne=1\n");
+}
+
 // == of an unpacked struct with a queue member walks the member element-wise
 // (the AggEq leaf dispatch reaches rt_container_eq). Verified against verilator.
 TEST_CASE("struct-with-queue-member equality") {
