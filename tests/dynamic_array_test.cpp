@@ -917,6 +917,7 @@ TEST_CASE("dynamic array new[] declaration initializer size expression forms") {
     // iverilog 13 cannot parse an unpacked-struct $bits operand ("Unpacked
     // structs not supported") -- verilator 5.050 only.
     CHECK(run_capture(src) == "3 64 5 2 14\n");
+}
 // A chandle element (LRM 6.14): a plain 64-bit POD word, admitted by the same
 // guard_container_element gate a class handle uses. libc malloc/free is the
 // no-.so probe (no way to make a non-null chandle otherwise).
