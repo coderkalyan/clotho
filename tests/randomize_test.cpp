@@ -758,6 +758,36 @@ TEST_CASE("constraints are refused, each by its own message") {
           != std::string::npos);
 }
 
+// Regression: a constraint block used to be name-resolution-order-sensitive,
+// contradicting LRM 8.6 / 18.5 ("A class's properties are freely and broadly
+// available to the methods of the class" applies equally to a constraint
+// block, which is bound the same way a method body is). `x` is declared
+// AFTER the constraint that reads it; before the fix that failed to even
+// COMPILE with "identifier 'x' used before its declaration", a frontend
+// name-resolution bug, not the (separate, pre-existing) backend refusal
+// below -- the two are distinguished here by checking which message shows
+// up. The compile must now succeed and reach the ordinary, unrelated
+// constraint-block runtime refusal, exactly like the properly-ordered case
+// above.
+TEST_CASE("a constraint block may reference a property declared later in the class") {
+    const Streams s = run_streams(R"(
+        module m;
+            class C;
+                constraint q { x > 4; }
+                rand bit [3:0] x;
+            endclass
+            initial begin
+                automatic C c = new();
+                void'(c.randomize());
+                $display("unreachable");
+            end
+        endmodule
+    )");
+    CHECK(s.err.find("used before its declaration") == std::string::npos);
+    CHECK(s.err.find("constraint blocks are not supported") != std::string::npos);
+    CHECK(s.out.find("unreachable") == std::string::npos);
+}
+
 // A design that merely CONTAINS a constrained class runs: the refusal moved into
 // the generated $randomize body, so nothing fires until something randomizes the
 // object. This is UVM's register layer in miniature -- uvm_reg_item carries

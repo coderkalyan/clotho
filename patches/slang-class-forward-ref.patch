@@ -1,0 +1,37 @@
+diff --git a/source/ast/Lookup.cpp b/source/ast/Lookup.cpp
+index f2090c85b..aecaa4110 100644
+--- a/source/ast/Lookup.cpp
++++ b/source/ast/Lookup.cpp
+@@ -2120,8 +2120,30 @@ void Lookup::unqualifiedImpl(const Scope& scope, std::string_view name, LookupLo
+         }
+     }
+ 
+-    // Continue up the scope chain via our parent.
+-    location = LookupLocation::after(scope.asSymbol());
++    // Continue up the scope chain via our parent. Normally that means
++    // anchoring the search to right after our own declaration position, so
++    // that a parent-scope symbol declared later than us stays invisible
++    // (SV's general declare-before-use default, LRM 3.13 / 6.21).
++    //
++    // A class is an explicit, LRM-stated exception to that default: "A
++    // class's properties are freely and broadly available to the methods
++    // of the class" (LRM 8.6), and the same freedom extends to constraint
++    // blocks (LRM 18.5) and to a covergroup's coverpoint / cross / iff /
++    // event expressions embedded in a class (LRM 19.4, 19.5, and 8.11's
++    // grouping of covergroups with methods/constraints for `this`
++    // visibility). So when the scope we're about to search *is* the class
++    // itself, drop the positional bound instead of anchoring it to
++    // wherever the construct we're escaping from (a method body,
++    // constraint block, or covergroup's body/type scope, or a statement
++    // block nested inside any of those) happens to sit textually. Escaping
++    // the class scope itself (to its enclosing package/module/$unit) is a
++    // separate, later hop that is untouched by this and stays positional.
++    auto& enclosingSymbol = scope.asSymbol();
++    auto parentScope = enclosingSymbol.getParentScope();
++    if (parentScope && parentScope->asSymbol().kind == SymbolKind::ClassType)
++        location = LookupLocation(parentScope, UINT_MAX);
++    else
++        location = LookupLocation::after(enclosingSymbol);
+     if (!location.getScope())
+         return;
+ 

@@ -3423,3 +3423,106 @@ TEST_CASE("default argument of a constructor and of a bare same-object call") {
     )";
     CHECK(run_capture(src) == "33 33\n");
 }
+
+// Regression (LRM 8.6): "A class's properties are freely and broadly
+// available to the methods of the class", with no declaration-order
+// caveat -- an explicit exception to SV's general declare-before-use default
+// (LRM 3.13 / 6.21). `show()` reads `x` before `x`'s own declaration
+// textually; this used to fail to even compile, with "identifier 'x' used
+// before its declaration", because slang's scope-chain walk-up anchored the
+// search to `show()`'s own declaration position instead of the class's.
+TEST_CASE("class method: a property declared later in the class stays visible") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                function void show(); $display("%0d", x); endfunction
+                int x;
+                function new(); x = 5; endfunction
+            endclass
+            initial begin C c = new(); c.show(); end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "5\n");
+}
+
+// The paired control: the ordinary, already-working shape (property declared
+// BEFORE the method that reads it) stays unaffected by the fix above.
+TEST_CASE("class method: a property declared earlier in the class stays visible") {
+    constexpr std::string_view src = R"(
+        module m;
+            class C;
+                int x;
+                function void show(); $display("%0d", x); endfunction
+                function new(); x = 5; endfunction
+            endclass
+            initial begin C c = new(); c.show(); end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "5\n");
+}
+
+// Scope guard: LRM 8.6's exception is specific to a CLASS's own members. An
+// ordinary procedural block at module scope must still enforce the general
+// declare-before-use default -- the fix must not have widened the walk-up
+// past class boundaries.
+TEST_CASE("class method: general declare-before-use still applies outside a class") {
+    constexpr std::string_view src = R"(
+        module m;
+            initial $display("%0d", y);
+            int y;
+        endmodule
+    )";
+    CHECK(fails(src).find("used before its declaration") != std::string::npos);
+}
+
+// Scope guard: the exception is per-class, not global. A method of `c1` must
+// not resolve an unqualified name that only exists as a later-declared member
+// of an unrelated sibling class `c2` -- that would be the walk-up leaking
+// across a class boundary rather than stopping at its own class's scope.
+TEST_CASE("class method: cannot forward-reference a member of an unrelated, later-declared class") {
+    constexpr std::string_view src = R"(
+        module m;
+            class c1;
+                function int f(); return z; endfunction
+            endclass
+            class c2;
+                int z = 42;
+            endclass
+            initial begin c1 i = new(); $display("%0d", i.f()); end
+        endmodule
+    )";
+    CHECK(fails(src).find("use of undeclared identifier 'z'") != std::string::npos);
+}
+
+// Regression (LRM 19.4/19.5, 8.11): the same forward-reference freedom
+// extends to a covergroup's coverpoint/cross/iff/event expressions embedded
+// in a class -- "Class members can be used in coverpoint expressions". The
+// coverpoint here reads `analysis_txn`, a property declared textually AFTER
+// the covergroup (the shape of a real corpus hit,
+// uvm-examples/apb_coverage_monitor.svh's `OPCODE: coverpoint
+// analysis_txn.we` preceding `apb_seq_item analysis_txn;`). This only pins
+// the FRONTEND fix: clotho's backend does not lower covergroups at all yet
+// (no class property may have a CovergroupType, so `mon`'s layout refuses
+// with "unsupported non-integral type" regardless of order -- a separate,
+// pre-existing gap, not a symptom of the bug this fixes), so the class still
+// fails to lower; what changed is *which* diagnostic fires. Before the fix
+// this failed to even resolve the name, with "identifier 'analysis_txn' used
+// before its declaration".
+TEST_CASE("covergroup: a coverpoint may reference a property declared later in the class") {
+    constexpr std::string_view src = R"(
+        module m;
+            class txn; bit [3:0] we; endclass
+            class mon;
+                covergroup cg;
+                    OPCODE: coverpoint analysis_txn.we;
+                endgroup
+                txn analysis_txn;
+                function new(); analysis_txn = new(); cg = new(); endfunction
+            endclass
+            initial begin mon m = new(); m.cg.sample(); end
+        endmodule
+    )";
+    const std::string diag = fails(src);
+    CHECK(diag.find("used before its declaration") == std::string::npos);
+    CHECK(diag.find("unsupported-construct") != std::string::npos);
+}
