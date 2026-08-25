@@ -23386,21 +23386,55 @@ private:
         if (e.kind == ExpressionKind::RangeSelect) {
             const auto& rs = e.as<RangeSelectExpression>();
             if (!is_queue(rs.value())) {
-                // TODO: slice of a dynamic array yields a queue (LRM 7.10.4); its
-                // source handle is an rt_dynarr, not the rt_queue that
-                // rt_queue_append_range walks. Guarded here because the assignment
-                // path reaches this before lower_range_select's own guard.
-                fail("slice of a dynamic array is not supported");
-            }
-            if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
-                // TODO: indexed part-select slice q[i +: n] of a queue (runtime
-                // base makes the first index non-constant, but the range op takes
-                // runtime bounds already — only the width/direction plumbing is
-                // missing).
-                fail("indexed part-select slice of a queue is not supported");
+                // Structurally unreachable: slang types a RangeSelectExpression as
+                // a queue only when its OWN base already is one
+                // (SelectExpressions.cpp: `if (isQueue) result->type = Queue...`,
+                // decided before any dynamic-array-specific path runs). A
+                // dynamic-array slice `da[a:b]` (LRM 7.10.4) instead types as a
+                // FixedSizeUnpackedArrayType with constant bounds, so it never
+                // reaches a queue-typed consumer at all (see is_unpacked_array /
+                // is_dyn_array in lower_range_select for that separate, still
+                // unimplemented shape). Kept as defense in depth against that
+                // binder guarantee changing.
+                fail("internal: slice of a non-queue base flowed into queue lowering");
             }
             const ir::Index src = materialize_queue_rvalue(rs.value(), b);
-            b.queue_append_range(dst, src, lower_expr(rs.left(), b), lower_expr(rs.right(), b), qty, l);
+            // `$` in any bound (LRM 7.10.4, e.g. `q[1:$]`, `q[0:$-1]`) resolves
+            // against THIS slice's source queue -- see the UnboundedLiteral case
+            // in lower_expr. Scoped around both forms below: the Simple bounds
+            // AND an indexed form's base index can equally spell `$`.
+            const Restore<std::optional<QueueDollarCtx>> dollar_guard(queue_dollar_, QueueDollarCtx{ src, qty });
+            ir::Index lo, hi;
+            if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
+                lo = lower_expr(rs.left(), b);
+                hi = lower_expr(rs.right(), b);
+            } else {
+                // Indexed part-select `q[i +: n]` / `q[i -: n]` (LRM 11.5.1,
+                // extended to queues by 7.10.4). Unlike the fixed/packed-array
+                // form, a queue's width `n` need NOT be a compile-time constant
+                // (confirmed against slang: it applies no such check when the
+                // base is a queue) -- both `i` and `n` are ordinary runtime
+                // expressions. Translated to the same inclusive [lo:hi] shape the
+                // Simple form already feeds rt_queue_append_range, which clamps
+                // both ends against the source's actual length, so no separate
+                // bounds handling is needed here.
+                // A canonical `int` (LRM's own type for an index/width, and what
+                // `q[$]`'s size()-1 resolution already produces below), not
+                // `rs.left().type`: the base may itself be bare `$`
+                // (UnboundedType), which lower_type rejects outright.
+                const ir::Ref   i32  = make_int_type(32, false, true);
+                const ir::Index base = b.resize(lower_expr(rs.left(), b), i32, l);
+                const ir::Index nm1  = b.binary(ir::Inst::Tag::Sub, b.resize(lower_expr(rs.right(), b), i32, l),
+                                                b.constant(module_.pool.put_int(i32, 1), l), l);
+                if (rs.getSelectionKind() == RangeSelectionKind::IndexedUp) {
+                    lo = base;
+                    hi = b.binary(ir::Inst::Tag::Add, base, nm1, l);
+                } else {
+                    hi = base;
+                    lo = b.binary(ir::Inst::Tag::Sub, base, nm1, l);
+                }
+            }
+            b.queue_append_range(dst, src, lo, hi, qty, l);
             return;
         }
         if (e.kind == ExpressionKind::Streaming) {
@@ -25185,6 +25219,24 @@ private:
             case ExpressionKind::StructuredAssignmentPattern:
             case ExpressionKind::ReplicatedAssignmentPattern:
                 return lower_packed_pattern(expr, b);
+            case ExpressionKind::UnboundedLiteral: {
+                // `$` (LRM 7.10.4/11.5.1): legal here only inside a queue
+                // range-select's bounds (`q[a:$]`, `q[$:a]`, arithmetic on it
+                // like `q[0:$-1]`), where it denotes the queue's last valid
+                // index -- size() - 1, a RUNTIME value (unlike a fixed/packed
+                // array's `$`, its declared high bound, which slang folds to a
+                // constant long before lowering and so never reaches here).
+                // append_queue_pieces installs queue_dollar_ around lowering
+                // the two bound expressions, against the SAME materialized
+                // queue handle the slice reads from, so `$` and the receiver
+                // agree on one length.
+                if (!queue_dollar_.has_value()) {
+                    fail("'$' is not supported in this context");
+                }
+                const ir::Ref   i32  = make_int_type(32, false, true);
+                const ir::Index size = b.queue_size(queue_dollar_->src, queue_dollar_->qty, l);
+                return b.binary(ir::Inst::Tag::Sub, size, b.constant(module_.pool.put_int(i32, 1), l), l);
+            }
             default:
                 fail("unsupported expression kind=" + std::string(slang::ast::toString(expr.kind)));
         }
@@ -27233,6 +27285,17 @@ private:
     struct CtorThis {
         ir::Index handle;
         ir::Ref   cls;
+    };
+
+    // The queue handle / type `$` resolves against while lowering the bounds of
+    // a queue range-select (`q[a:$]`, `q[$:a]`, `q[$-1:$]` -- LRM 7.10.4/11.5.1).
+    // `$` there stands for the queue's last valid index (size - 1), a RUNTIME
+    // value, unlike a fixed/packed array's `$` (its declared high bound, a
+    // constant folded earlier by slang). Nullopt outside such a slice's bounds;
+    // scoped by Restore, never assigned bare.
+    struct QueueDollarCtx {
+        ir::Index src;
+        ir::Ref   qty;
     };
 
     // Restore a saved piece of Lowerer state when the scope exits — on the throwing
@@ -30948,6 +31011,10 @@ private:
     // the LValueReferenceExpression slang embeds in its rewritten RHS. Null
     // outside a compound assignment.
     std::optional<ir::Index> compound_lv_;
+    // The queue `$` resolves against inside a queue range-select's bounds (see
+    // QueueDollarCtx). Nullopt outside one; scoped by Restore, never assigned
+    // bare.
+    std::optional<QueueDollarCtx> queue_dollar_;
     // The object under construction while a non-static property's DECLARATION
     // initializer is lowered, plus the allocated class type that selects its vtable
     // layout. LRM 8.7 runs those initializers as part of construction ("each

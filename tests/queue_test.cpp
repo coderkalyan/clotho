@@ -630,6 +630,100 @@ TEST_CASE("queue slice") {
           "self s=3 20 30 40\n");
 }
 
+// `$` in a queue range-select bound (LRM 7.10.4) is the queue's runtime
+// size() - 1, not a fixed/packed array's declared high bound: `q = q[1:$]`
+// == `q.delete(0)`, `q = q[0:$-1]` drops the tail, `q[$:$]` is the last
+// element alone, and arithmetic on it (`$-1`) is ordinary int math. `q = {}`
+// (an empty concatenation) clears a queue exactly like `q.delete()` (7.10.2).
+// No iverilog oracle: it rejects `$` in a queue range-select as a syntax
+// error outright. Hand-checked against the LRM.
+TEST_CASE("queue $ slice bound and empty-literal clear") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$], s[$];
+            initial begin
+                q = '{1, 2, 3, 4, 5};
+                q = {};
+                $display("clear s=%0d", q.size());
+
+                q = '{1, 2, 3, 4, 5};
+                q = q[1:$];
+                $display("popfront s=%0d %0d", q.size(), q[0]);
+
+                q = '{1, 2, 3, 4, 5};
+                q = q[0:$-1];
+                $display("popback s=%0d %0d", q.size(), q[q.size()-1]);
+
+                q = '{7, 8, 9};
+                s = q[$:$];
+                $display("lastonly s=%0d %0d", s.size(), s[0]);
+
+                q = '{1, 2, 3, 4, 5, 6};
+                q = q[1:$-1];
+                $display("middle s=%0d %0d %0d", q.size(), q[0], q[q.size()-1]);
+
+                q = {};
+                s = q[1:$];
+                $display("emptysrc s=%0d", s.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "clear s=0\n"
+          "popfront s=4 2\n"
+          "popback s=4 4\n"
+          "lastonly s=1 9\n"
+          "middle s=4 2 5\n"
+          "emptysrc s=0\n");
+}
+
+// Indexed part-select `q[i +: n]` / `q[i -: n]` (LRM 11.5.1, extended to
+// queues by 7.10.4). Unlike a fixed/packed array, a queue's width `n` need
+// not be a compile-time constant. Both bounds clamp against the queue's
+// actual length exactly like the `a:b` form (`queue slice`, above), and the
+// base index may itself spell `$` (the last valid index). No iverilog
+// oracle: it crashes (an internal assertion) compiling ANY indexed
+// part-select of a queue, constant width included. Hand-checked against the
+// LRM.
+TEST_CASE("queue indexed part-select slice") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$], s[$];
+            int n, i;
+            initial begin
+                q = '{1, 2, 3, 4, 5, 6, 7, 8};
+                s = q[2 +: 3];
+                $display("up-const s=%0d %0d %0d %0d", s.size(), s[0], s[1], s[2]);
+                s = q[5 -: 3];
+                $display("down-const s=%0d %0d %0d %0d", s.size(), s[0], s[1], s[2]);
+                n = 3;
+                s = q[2 +: n];
+                $display("up-runtime-n s=%0d %0d %0d %0d", s.size(), s[0], s[1], s[2]);
+                i = 4;
+                s = q[i +: 2];
+                $display("up-runtime-i s=%0d %0d", s.size(), s[0]);
+                s = q[$ -: 3];
+                $display("down-from-end s=%0d %0d %0d %0d", s.size(), s[0], s[1], s[2]);
+                s = q[6 +: 5];
+                $display("up-oob s=%0d %0d", s.size(), s[0]);
+                s = q[1 -: 5];
+                $display("down-oob s=%0d %0d", s.size(), s[0]);
+                s = q[100 +: 3];
+                $display("fully-oob s=%0d", s.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "up-const s=3 3 4 5\n"
+          "down-const s=3 4 5 6\n"
+          "up-runtime-n s=3 3 4 5\n"
+          "up-runtime-i s=2 5\n"
+          "down-from-end s=3 6 7 8\n"
+          "up-oob s=2 7\n"
+          "down-oob s=2 1\n"
+          "fully-oob s=0\n");
+}
+
 // A bounded queue built from a too-long concatenation keeps the first N+1
 // elements (LRM 7.10.4). No verilator oracle (it miscompiles bounded-queue
 // concat); hand-checked against the LRM.

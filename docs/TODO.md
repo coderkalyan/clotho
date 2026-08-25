@@ -2752,6 +2752,33 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   nested-dynamic dimension already fold or hard-fail above), and a
   multidimensional dynamic collection (matches `$size`'s pre-existing
   boundary).
+- [ ] **Dynamic-array slice** `da[a:b]` / `da[i +: n]` / `da[i -: n]` (LRM
+  7.4.5/11.5.1) — refused (`fail("slice of a dynamic array is not
+  supported")` in `lower_range_select`). NOT the queue-slice work above: slang
+  types this a `FixedSizeUnpackedArrayType`, never a queue (confirmed against
+  `RangeSelectExpression::fromSyntax`, SelectExpressions.cpp — it only forces
+  `QueueType` when the value being sliced is ALREADY a queue), so `$` and a
+  runtime BASE never appear in the `a:b` form (slang requires both bounds
+  literal-constant there) and `n` must still be constant in the indexed form
+  (fixes the result's element count at compile time) — but `i` in the indexed
+  form CAN be a runtime value, unlike `a:b`. The real blocker is the backend,
+  not the frontend: the existing `ArrSlice` op (used for a FIXED unpacked
+  array's `a[a:b]`) advances an already-flat, address-indexed `LValue` by a
+  constant `elem_idx` offset (LlvmBackend.cpp, `Inst::Tag::ArrSlice`'s lvalue
+  case, "Flat-storage arrays only") — a dynamic array's storage is instead
+  (`rt_dynarr{data,len,epoch}`, heap-allocated, relocatable), so reaching an
+  element needs one more pointer hop through `data` that the current lvalue
+  chain has nowhere to encode, and a RUNTIME base additionally needs the hop
+  itself to carry a variable offset (a new op, not a reachable extension of
+  `ArrSlice`). Two more open questions before this can be attempted: whether a
+  slice is legal on the LHS too (7.4.5's "a slice name... is an unpacked
+  array" implies yes for a fixed array; unconfirmed for a dynamic-array
+  source), and the OOB rule when the constant bounds (or a runtime `i`)
+  exceed the array's ACTUAL runtime `size()` — clamp like a queue slice,
+  X-fill like a packed indexed part-select, or a located fatal; iverilog gives no
+  answer (it crashes an internal assertion compiling ANY indexed
+  part-select of a 2-state queue, AND any `a:b` slice of a dynamic array,
+  `elab_expr.cc:5902: prefix_indices.size()+1 == ...packed_dims().size()`).
 - [x] **Dynamic arrays** — `[]`, `new[n]` / `new[n](src)`, `.size()`, `.delete()`,
   element r/w, whole-array deep-copy, `foreach`, full subroutine ABI.
 - [x] **Checked container allocation** — every heap buffer a design's containers
@@ -2768,7 +2795,19 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   queues, strings (including the `{N{s}}` replication product) and associative
   arrays; coroutine frames (`rt_alloc`) keep their own path.
 - [x] **Queues** — `.size()`, push/pop/insert/delete, `q[i]` / `q[$]`, `foreach`,
-  whole-queue deep-copy, bounded `q[$:N]`, full subroutine ABI.
+  whole-queue deep-copy, bounded `q[$:N]`, full subroutine ABI, `q = {}` (empty
+  concatenation clears, LRM 7.10.2), a slice bound spelled `$` (LRM 7.10.4:
+  `q = q[1:$]` == `q.delete(0)`, `q = q[0:$-1]` pops the tail, `q[$:$]` the last
+  element alone) — `$` there is the queue's runtime `size() - 1`, not a
+  constant, unlike a fixed/packed array's declared high bound — and the
+  indexed part-select form `q[i +: n]` / `q[i -: n]` (LRM 11.5.1, extended to
+  queues by 7.10.4): `i` and (unlike a fixed/packed array) `n` are both
+  ordinary runtime expressions, `i` may itself spell `$`, and both ends clamp
+  against the queue's actual length exactly like the `a:b` form. A queue
+  slice of a DYNAMIC ARRAY is a different, still-unimplemented shape — see the
+  dynamic arrays entry below; it is not queue-typed at all (`da[a:b]` binds as
+  a `FixedSizeUnpackedArrayType` with constant bounds, LRM 7.4.5/11.5.1), so it
+  never reaches this lowering.
 - [x] **Associative arrays** (LRM 7.8/7.9) — all key kinds (integral of any
   width / enum / packed / `string` / `[*]`-wildcard / **class handle** (7.8.3) /
   **unpacked struct or fixed array** (7.8.5), unified as normalized
