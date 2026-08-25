@@ -527,6 +527,139 @@ diagnoses the unclocked disable-condition half itself
 (`analysis/ClockInference.cpp`); the abort half clotho refuses. Each has a unit
 test.
 
+### 4.2 Cross-scope sampling
+
+**Landed.** A shadow used to be forced into the scope lowering the assertion:
+`sampled_shadow_of` refused a live signal that was not itself in
+`scope_stack_.back()->signals`, so a hierarchical reference through a
+directly-instantiated interface (`dif.sig`, one hop from the asserting
+scope, or any deeper instance path) or a package / `$unit` variable was
+refused outright — "a concurrent assertion may only sample variables of the
+instance that declares it". This was the single highest-impact SVA gap
+against real UVM-flavoured SystemVerilog: 16 of 16 sv-tests chapter-16
+concurrent-assertion fixtures share exactly this shape, sampling through a
+directly-instantiated interface handed to the DUT and to the checker as a
+plain port connection.
+
+**The fix moves where the shadow's storage is registered, not how it is
+read.** A shadow is per-instance state and belongs beside the variable it
+shadows — the scope that DECLARES `live`, which need not be the scope
+lowering the assertion. That was always the intended fix (the guard's own
+`TODO` said so); what had not been established was whether reading a
+relocated shadow from a different asserting scope needed new addressing
+machinery. It does not, for a structural reason worth stating precisely:
+
+- **Signal handles are flat and globally unique** across the whole design
+  (`ir::InstanceScope`'s own doc comment, `src/ir/Module.h:75-78`). The scope
+  tree exists so the backend can group signals into per-instance state, not
+  to make a signal's *identity* scope-relative.
+- **Every `InstanceScope` occurrence gets its own LLVM global**
+  (`Anchor::state_gv`, `@clotho.inst.<hier>.state`,
+  `src/ir/LlvmBackend.cpp:710-713`, built by `emit_state_global`). A `Load`/
+  `Store` of a signal addresses it through ITS OWN declaring scope's anchor,
+  looked up from the signal's own recorded home
+  (`build_state_types`/`scope_type`), never from "the scope of the process
+  currently executing". `Process::scope` exists for a different reason
+  entirely — it is the key the state-type-deduplication work uses to decide
+  whether two structurally-identical processes across sibling instances can
+  share one compiled function body, addressed through a runtime anchor
+  parameter instead of a baked-in global (`Anchor::indirect`,
+  `src/ir/LlvmBackend.cpp:3833-3841`) — and an ordinary hierarchical read
+  already exercises exactly this path when the reading process is deduped,
+  since `dif.sig` read from a deduped `always` block already had to work.
+
+So the ONLY thing standing in the way was a frontend bookkeeping choice: the
+shadow's `ir::SignalInfo` was always registered while `scope_stack_` pointed
+at the asserting instance, attaching it to the wrong `InstanceScope::signals`
+list. The fix:
+
+1. `register_signal` now also fills `signal_scope_`, its own inverse (Signal
+   id -> declaring `InstanceScope::id`), alongside the forward attachment it
+   already did.
+2. `sampled_shadow_of` looks `live` up in `signal_scope_`. Found: the
+   declaring scope is `find_scope_node(top_scope_, id)` — the SAME lookup
+   `alloc_assert_control` already used to attach a different piece of
+   per-assertion state (LRM 20.12 control masks) to an arbitrary scope, safe
+   for the same reason: Collect has already finished and frozen the scope
+   tree by the time either pass runs (`alloc_assert_control`'s own comment;
+   `sampled_shadow_of` runs later still, during Emit). Not found: `live` was
+   registered with `scope_stack_` empty, which only the standalone globals
+   Lowerer does — a package / `$unit` variable.
+3. The shadow is registered by temporarily pushing the declaring scope (or,
+   for the package / `$unit` case, calling `module_.add_signal` directly, so
+   it stays unscoped exactly as `live` itself is). A null declaring scope
+   therefore does not need a synthetic home: `build_state_types` already
+   treats a signal claimed by no `InstanceScope` as a flat root-level field,
+   which is exactly where a package / `$unit` live signal already lives.
+
+No change was needed to how a shadow is READ. Atom lowering, `$sampled`, and
+the `$past` ring all resolve a shadow through `sva_shadow_of` and then emit an
+ordinary `Load`, exactly as before; the relocation is invisible to them
+because addressing was never about the reader's scope to begin with.
+
+**Both invariants from §4's design hold, and neither needed new machinery to
+keep holding:**
+
+- **One shadow per live signal, shared across every asserting scope.** The
+  `sva_shadows_` memoization at the top of `sampled_shadow_of` was always
+  keyed on `live` alone, never on the asserting scope — it simply could not
+  be exercised across scopes before, because a second asserting scope could
+  never get past the guard to ask a second time. Pinned by a fixture with two
+  different instances of one module (so this also exercises the shadow
+  surviving state-type deduplication, since both instances have structurally
+  identical monitors), both sampling one interface's `sig`: `shadow_count`
+  reads 1, not 2.
+- **The Preponed copy still runs exactly once per timestep.** No declaring
+  scope needed a Preponed process of its own to attach a copy to, because
+  there is only ever ONE — `finalize_preponed` builds a single,
+  per-top process tagged `Activation::Preponed` with `scope = Process::no_scope`
+  (never a specific instance), iterating `sva_shadow_pairs_` and emitting one
+  `Store(shadow, Load(live))` per PAIR, in creation order — which the
+  `sva_shadows_` memoization already keeps to one entry per live signal. The
+  interface-instance and package/`$unit` cases needed no new Preponed
+  process because the existing one was already unscoped and already
+  addressed arbitrary signals directly, never relative to "the asserting
+  scope". The same two-instance fixture above counts exactly one `Store` in
+  the whole module's one Preponed process.
+
+**Depth is not narrowed.** `find_scope_node` walks the whole scope tree from
+`top_scope_`, not one level from the asserting scope, so a second hierarchy
+hop (`assert` in `A` sampling a signal inside `A.b.c`, where `b` instantiates
+`c`) costs nothing extra — verified with exactly that fixture.
+
+**One more, narrower gap sat behind this one.** `$past`/`$rose`/`$fell`/
+`$stable`/`$changed`'s own "plain variable" operand check (§4.1) tested only
+`operand.kind == ExpressionKind::NamedValue`, never
+`ExpressionKind::HierarchicalValue` — the kind slang gives a dotted path like
+`dif.sig`, distinct from a bare name, everywhere else in `Lower.cpp` checked
+alongside `NamedValue` wherever a hierarchical reference is legal. Sampled-
+value functions had never needed the distinction before, because
+`sampled_shadow_of` refused any hierarchical `live` upstream regardless.
+Widened to accept both kinds, cast through the common `ValueExpressionBase`
+rather than `NamedValueExpression` specifically, matching the pattern every
+other hierarchical-reference site already uses.
+
+**`sampled_shadow_of`'s other caller is unaffected.** A clocking block
+input's `#1step` skew copy (LRM 14.4, §14.4 note in the function's own
+comment) shares the same relocation fix by construction — it is the same
+function — but no cross-scope clockvar-input fixture exists in
+`tests/clocking_test.cpp` and none was added here, so that caller's
+supported scope is unchanged pending its own coverage rather than assumed
+correct.
+
+**Still refused, loudly, with its own message and its own `TODO`:** a
+sampled variable without a packed scalar value — a string, an event, an
+unpacked aggregate, or a dynamic array / queue / associative array — LRM
+16.6's "sample the element value" clause, unrelated to scope and untouched by
+this work.
+
+Verified against Verilator 5.050 for the interface-hierarchical case's report
+timing, and against sv-tests: all 16 chapter-16 fixtures of the refused shape
+now compile and simulate; every other chapter-16 refusal left is an unrelated
+pre-existing gap (LRM 16.10 local variables in a sequence / property, LRM
+16.13 multiclock sequences, LRM 16.4 a deferred assertion inside a function /
+task). Tests: `tests/sva_test.cpp`.
+
 ---
 
 ## 5. Booleans, X/Z, and atoms

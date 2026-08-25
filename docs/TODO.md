@@ -3925,8 +3925,10 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `disable iff` inside a named property, local variables and sequence match
   items, recursive properties, a repetition with a zero lower bound (it admits
   the empty sequence, which libsva bans), goto/non-consecutive repetition over a
-  compound sequence, multiclock, hierarchical or non-packed sampled variables,
-  and an action block containing a nonzero delay / event control. A plain nonblocking
+  compound sequence, multiclock or non-packed sampled variables, and an action
+  block containing a nonzero delay / event control. (A hierarchical or package
+  / `$unit` sampled variable is no longer on this list — see "Cross-scope
+  assertion sampling" below.) A plain nonblocking
   assignment in an action block now works, committing in Re-NBA (LRM 4.4.2.8).
   An `and` in a consequent is refused where an `intersect` is accepted, because
   `and` runs to the later of its two ends and so needs both operands bounded;
@@ -3955,6 +3957,61 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   clocking event in that position and 16.12.14 requires an explicit clock argument
   for them, which is the gap above; slang diagnoses the unclocked
   disable-condition spelling itself. See docs/design/concurrent-assertions.md §4.1.
+- [x] **Cross-scope assertion sampling** (LRM 16.5, 16.6) —
+  `sampled_shadow_of` used to require a shadow's own storage to live in the
+  scope LOWERING the assertion, so a hierarchical reference through a
+  directly-instantiated interface (or any deeper instance path) or a
+  package / `$unit` variable sampled by a DIFFERENT scope's assertion was
+  refused outright ("a concurrent assertion may only sample variables of
+  the instance that declares it"). This was the single highest-impact SVA
+  gap in the sv-tests regression corpus: 16/16 chapter-16 concurrent-
+  assertion hits share one shape, `assert property (@(posedge dif.clk)
+  dif.read ##1 dif.write)`, sampling through a directly-instantiated
+  interface. Fixed at the root: the shadow (and its Preponed copy) is now
+  registered in the DECLARING scope of the live signal instead, found via a
+  new `register_signal`-populated reverse map (Signal id -> declaring
+  `InstanceScope::id`) and `find_scope_node` — the same lookup
+  `alloc_assert_control` already used to attach a different piece of
+  per-assertion state to an arbitrary scope once the Collect pass has
+  frozen the scope tree. Reading the relocated shadow from the (possibly
+  different) asserting scope needed no new addressing mechanism: Signal
+  handles are flat and globally unique and every `InstanceScope` owns its
+  own LLVM global (`Anchor::state_gv`), so the backend already addresses a
+  signal by ITS OWN declaring scope regardless of which process's body
+  references it — the same machinery an ordinary hierarchical read
+  (`dif.sig` in a plain `always` block) already used. A package / `$unit`
+  live signal (itself unscoped, per `register_signal`) leaves its shadow
+  unscoped too, which is what makes it a flat root-level field
+  (`build_state_types`) instead of pulling it into whichever instance
+  happens to assert. One shadow per live signal stays shared across every
+  asserting scope (the existing `sva_shadows_` memoization, now reachable
+  for a cross-scope live signal too — pinned by a test with two different
+  asserting instances of one definition sampling one interface signal,
+  checking both the shadow count and the single Preponed process's own
+  store count), and the single per-top Preponed copy process needed no
+  change: it was already `scope = no_scope` and already copied arbitrary
+  signals directly, never relative to "the asserting scope". Depth is not
+  narrowed: `find_scope_node` walks the whole scope tree, so a second
+  hierarchy hop costs nothing extra (`module A; module B; module C;`,
+  tested). `$past`/`$rose`/`$fell`/`$stable`/`$changed` needed one more,
+  narrower fix alongside this: their "plain variable" operand check tested
+  only `ExpressionKind::NamedValue`, never `HierarchicalValue` (what slang
+  gives a dotted path like `dif.sig`), so a hierarchical reference was
+  refused a SECOND time by an unrelated guard even once `sampled_shadow_of`
+  allowed it — widened to accept both kinds, matching every other
+  hierarchical-reference site in `Lower.cpp`. `sampled_shadow_of`'s other
+  caller, a clocking block input's `#1step` skew copy (LRM 14.4), is
+  unaffected by construction (same code path, no cross-scope test exercises
+  it, so its supported scope is unchanged) — `tests/clocking_test.cpp`
+  passes unmodified. Verified against Verilator 5.050 (interface-
+  hierarchical report timing) and against sv-tests chapter-16: all 16
+  corpus hits of this shape now compile and simulate; the chapter-16 files
+  still refused hit unrelated pre-existing gaps (LRM 16.10 local variables
+  in a sequence / property, LRM 16.13 multiclock sequences, LRM 16.4 a
+  deferred assertion inside a function / task). Tests: `tests/sva_test.cpp`.
+  Still refused, loud, its own message and its own TODO: a non-packed
+  (aggregate / container / string / event) sampled variable, unchanged by
+  this work. See docs/design/concurrent-assertions.md §4.
 - [~] **Property layer phase 3** — DONE. Unbounded `always p`, `s_eventually p`
   and all four `until` forms lower and simulate, tracked by a new COUNTED mode:
   the obligation is determinised totally and each of its states carries a
