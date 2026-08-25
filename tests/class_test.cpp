@@ -2317,6 +2317,71 @@ TEST_CASE("class vtable: a virtual call reached before its class is numbered") {
     CHECK(run_capture(src) == "1 2 2\n");
 }
 
+// A base class's own property can hold a forward-declared handle to a class that
+// EXTENDS it (UVM's uvm_sequence_item::m_parent_sequence : uvm_sequence_base,
+// where uvm_sequence_base extends uvm_sequence_item -- see docs/TODO.md and
+// docs/design/classes.md). Lowering the derived class recurses into its base
+// FIRST; if the base's own property layout reaches back into the derived class
+// before the base itself is interned, that reentrant lowering mints and fully
+// registers the derived class under its OWN Ref -- correctly, matching
+// ensure_vtable's reentrancy contract. The outer, still-in-flight call used to be
+// unaware of this: it minted a SECOND Ref for the same class and registered it as
+// "done" via compute_vtable's idempotency guard (keyed on the AST node, not the
+// Ref), without ever calling set_class_desc on it. That second Ref was
+// structurally valid but permanently undescribed -- exactly what crashed a real
+// UVM sequence testbench with "internal: class without a descriptor"
+// (uvm_sequence.svh:47), reachable from nothing more than `class C extends
+// uvm_sequence;`. Checked here at the IR level (no JIT): every class the design
+// registered must have every ancestor in its own display chain ALSO registered,
+// which is exactly what LlvmBackend.cpp's class_desc_global assumes when it walks
+// that chain.
+void check_every_class_desc_complete(const ir::Module& m) {
+    const auto check_chain = [&](ir::Ref start) {
+        for (ir::Ref k = start; k != ir::Ref::Invalid; k = std::get<ir::Type>(m.pool.get(k)).element) {
+            CAPTURE(static_cast<uint32_t>(k));
+            CHECK(m.class_desc(k) != nullptr);
+        }
+    };
+    // Every class-typed signal's OWN class -- and its whole ancestor chain -- must
+    // be registered: this is what catches the orphaned Ref itself, which (having
+    // never reached set_class_desc) never appears as anyone's registered
+    // ClassDesc::class_ref and so is invisible to a check that only walks
+    // ALREADY-registered classes.
+    for (const ir::SignalInfo& s : m.signals()) {
+        if (std::get<ir::Type>(m.pool.get(s.type)).kind == ir::Type::Kind::Class) {
+            check_chain(s.type);
+        }
+    }
+    // And every ancestor of every registered class, matching class_desc_global's
+    // (LlvmBackend.cpp) own display-building walk.
+    for (const ir::ClassDesc& cd : m.class_descs()) {
+        check_chain(cd.class_ref);
+    }
+}
+
+TEST_CASE("class registration: a base's property cycling back to its own derived "
+          "class must not orphan a Ref") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef class Derived;
+            class Base;
+                Derived d_link;
+                virtual function int tag(); return 1; endfunction
+            endclass
+            class Derived extends Base;
+                virtual function int tag2(); return 2; endfunction
+            endclass
+            initial begin
+                static Derived x = new;
+            end
+        endmodule
+    )";
+    const LowerResult r = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+    check_every_class_desc_complete(*r.module);
+}
+
 // -- Interface classes (LRM 8.26) --
 //
 // Oracle situation, measured on this workstation (docs/design/interface-classes.md

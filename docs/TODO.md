@@ -3476,6 +3476,49 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   overriding an inherited extern with an inline body, functions and tasks.
   A pure virtual returning a by-value aggregate that owns heap (a string member)
   works too, now that the return ABI's copy is per-leaf.
+- [x] **Class registration reentrancy/exception-safety** — a base class's own
+  property can legally hold a forward-declared handle to a class that EXTENDS
+  it (UVM's `uvm_sequence_item::m_parent_sequence : uvm_sequence_base`, where
+  `uvm_sequence_base extends uvm_sequence_item`). `lower_class_type` interns a
+  class only after its own base is fully resolved; if resolving the base
+  recurses back into the derived class before the derived class is interned,
+  that reentrant call correctly mints and fully registers it. The outer,
+  still-in-flight `lower_class_type` frame used to be unaware of this: on
+  resuming it minted a SECOND `ir::Ref` for the same class and (via
+  `compute_vtable`'s idempotency guard, keyed on the AST node rather than the
+  Ref) silently treated it as already numbered without ever calling
+  `set_class_desc` — a structurally valid but permanently undescribed Ref,
+  which crashed the LLVM backend as an unlocated `internal: class without a
+  descriptor` the first time codegen needed it. Reproduced by a real UVM
+  sequence testbench (`class C extends uvm_sequence;`, no parameterization
+  needed) against `uvm_pkg.sv`; not by every UVM design using the same
+  `uvm_sequence#(item)` shape, since the race only fires when
+  `uvm_sequence_base` (rather than `uvm_sequence_item`) is the first of the
+  pair reached by top-level lowering. Fixed at the root: `lower_class_type`
+  re-checks the class-type cache immediately after its base-class recursion
+  returns, adopting a reentrant registration instead of minting a second one.
+  `compute_vtable` separately guards the exception-safety half of the same
+  "done but undescribed" state with an RAII un-number-on-throw guard, so a
+  recoverable `LowerError` between numbering and `set_class_desc` (today
+  unreachable from any known legal construct, but structurally possible if a
+  future copy-thunk/interface/randomization guard grows one) propagates as a
+  located refusal instead of leaving a half-registered class behind.
+- [ ] **Backend crash on a class field whose type is (transitively) its own
+  descendant** — found while constructing a standalone repro for the
+  registration-reentrancy fix above. `class Base; Helper h; ... endclass class
+  Helper; Derived d; ... endclass class Derived extends Base; ... endclass`
+  (Base's field graph eventually reaches Derived, which extends Base) lowers
+  to valid `ir::Module` IR (`--emit ir` succeeds) but SIGSEGVs in
+  `--emit llvm` / `run` — LlvmBackend.cpp, not Lower.cpp; a plain
+  self-reference (`class Node; Node next; endclass`) is unaffected, so this is
+  specific to an ANCESTOR/DESCENDANT field cycle, not self-reference in
+  general. Does not reproduce against the real UVM library (`uvm_sequence_item`
+  holding a `uvm_sequence_base` field, the shape that motivated the entry
+  above, lowers and runs fine end to end), so something about a minimal
+  from-scratch construction differs from UVM's actual class bodies in a way
+  not yet root-caused. Unrelated to the registration fix above (verified: the
+  crash reproduces identically with that fix applied or reverted). Needs its
+  own investigation before a location + diagnostic (or a real fix) can land.
 - [x] **Parameterized classes** (`class C #(...)`, LRM 8.25) — type and value
   parameters, param-sized members, methods over the type parameter, inheritance
   from a specialization (`extends base#(5)`), per-specialization static members,
