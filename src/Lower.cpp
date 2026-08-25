@@ -22018,7 +22018,7 @@ private:
             const Expression&   src       = unwrap_conversion(a.right());
             const ir::Inst::Tag tag       = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
             const bool          whole_lhs = is_whole_array_lvalue(a.left());
-            if (is_indexed_array_slice(a.left())) {
+            if (is_positional_array_slice(a.left())) {
                 // `a[i +: n] = rhs` / `<= rhs`: the target positions are runtime
                 // indices, so there is no anchored slice lvalue to store through.
                 // Resolve the RHS to an array lvalue of the slice's type and copy it
@@ -25941,10 +25941,18 @@ private:
             return materialize_queue_rvalue(rs, b);
         }
         if (is_dyn_array(rs.value())) {
-            // TODO: dynamic-array slice `a[a:b]` (LRM 7.10.4) also yields a queue;
-            // the source handle is an rt_dynarr, not an rt_queue, so it needs a
-            // dynarr-source variant of the element-range append.
-            fail("slice of a dynamic array is not supported");
+            // A dynamic-array slice (LRM 7.4.5/7.5.1 -- `da[a:b]`, `da[i +: n]`,
+            // `da[i -: n]`) types as a FixedSizeUnpackedArrayType, never a queue
+            // (slang forces QueueType only when the base being sliced already is
+            // one); `$` and a runtime BASE in the `a:b` form are queue-only (slang
+            // requires both bounds literal-constant there), but the indexed forms'
+            // base index may be runtime, matching a fixed array. Its storage is
+            // handle-indirect (rt_dynarr{data,len}, heap, relocatable) rather than
+            // flat/address-indexed, so even the constant-bounds form has no
+            // storage-anchored sub-array to point at -- it can never become an
+            // ArrSlice, and is materialized position-wise like the fixed array's
+            // runtime-indexed form (emit_indexed_slice_copy handles both shapes).
+            return materialize_indexed_slice(rs, b, l);
         }
         if (is_unpacked_array(rs.value())) {
             // Fixed-size unpacked array slice (LRM 7.4.5 `busB = busA[7:6]`, "a
@@ -26031,6 +26039,23 @@ private:
                e.as<RangeSelectExpression>().getSelectionKind() != RangeSelectionKind::Simple;
     }
 
+    // Whether a range-select's BASE is a dynamic array (LRM 7.4.5/7.5.1): unlike a
+    // fixed unpacked array, a dynamic array's storage is handle-indirect
+    // (rt_dynarr{data,len}, heap, relocatable), so even its CONSTANT-bounds
+    // (`Simple`) form has no storage-anchored sub-array to point at -- every
+    // selection kind expands position-wise (emit_indexed_slice_copy), never
+    // becomes an ArrSlice.
+    static bool is_dynarr_slice(const Expression& e) {
+        return e.kind == ExpressionKind::RangeSelect && is_dyn_array(e.as<RangeSelectExpression>().value());
+    }
+
+    // Whether a range-select has no anchored sub-array lvalue and must instead be
+    // read/written position-wise: an indexed part-select of a fixed array (runtime
+    // base), or ANY slice of a dynamic array (constant-bounds included).
+    static bool is_positional_array_slice(const Expression& e) {
+        return is_indexed_array_slice(e) || is_dynarr_slice(e);
+    }
+
     // The parity guards the constant-bounds slice applies, for the indexed form: an
     // unpacked-struct / heap-handle element needs the recursive aggregate element
     // copy, and a string element needs a deep copy per element.
@@ -26052,14 +26077,26 @@ private:
           module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(coord))), l);
     }
 
-    // Copy between an indexed part-select slice `rs` and an array lvalue `other` of
-    // the slice's own type, one position at a time; `into_slice` picks the
-    // direction (a write to the slice, or a read out of it).
+    // Copy between a positional array slice `rs` (see is_positional_array_slice)
+    // and an array lvalue `other` of the slice's own type, one position at a time;
+    // `into_slice` picks the direction (a write to the slice, or a read out of it).
+    // Two shapes reach here:
+    //  - An indexed part-select `a[i +: n]` / `a[i -: n]` of EITHER a fixed or a
+    //    dynamic array (LRM 11.5.1, extended to a dynamic array by 7.5.1): `i` may
+    //    be a runtime value, `n` a compile-time constant.
+    //  - A dynamic array's CONSTANT-bounds `a[a:b]` (LRM 7.4.5) -- only reachable
+    //    when the base is a dynamic array; a fixed array's own constant-bounds
+    //    form is a live, zero-copy ArrSlice view instead and never reaches here.
+    //    Both bounds are already constant (slang requires it off a non-queue
+    //    base -- `$` and a runtime bound there are queue-only), so no runtime
+    //    index arithmetic is needed at all: position `pos` is simply `lo + pos`.
     //
-    // Positions run in the base array's declaration order (its left bound first),
-    // so position `pos` selects the base coordinate plus a compile-time delta: an
-    // ascending range walks up and a descending one down, and the `-:` form starts
-    // n-1 positions before the base. The base expression is lowered ONCE (LRM
+    // For the indexed form, positions run in the base array's declaration order
+    // (its left bound first), so position `pos` selects the base coordinate plus a
+    // compile-time delta: an ascending range walks up and a descending one down,
+    // and the `-:` form starts n-1 positions before the base. A dynamic array has
+    // no declared range to be descending IN (LRM 7.5.1: always 0-based ascending),
+    // so `asc` is forced true there. The base expression is lowered ONCE (LRM
     // 11.5.1 evaluates it in a self-determined context, so a call in the index runs
     // once), widened to 32 bits in its own signedness and 4-state-ness the way
     // lower_packed_offset does: an x/z base then poisons every position's index,
@@ -26068,10 +26105,15 @@ private:
     // unsigned bound compare (or back in range for a negative-bound array, which is
     // also correct).
     //
-    // Each position is an ordinary ElemSelect, so the LRM 7.4.5 out-of-range rule
-    // applies per position: a read past the bound yields the element default (x for
-    // 4-state, 0 for 2-state, Table 7-1) and a write there is dropped, leaving a
-    // partially out-of-range slice positionally correct rather than shifted.
+    // Each position is an ordinary ElemSelect, so the LRM 7.4.5/7.5 out-of-range
+    // rule applies per position: a read past the bound yields the element default
+    // (x for 4-state, 0 for 2-state, Table 7-1) and a write there is dropped,
+    // leaving a partially out-of-range slice positionally correct rather than
+    // shifted. `for_write` on the base-container side threads only for a dynamic
+    // array: `d[i] = v` (LRM 7.5) notifies a waited-on dynamic array's mutation on
+    // a for-write element select (ElemSelect::for_write, LlvmBackend.cpp); a fixed
+    // array has no handle to notify through, so the flag stays off there exactly
+    // as it always has.
     void emit_indexed_slice_copy(const RangeSelectExpression& rs,
                                  ir::Index                    other,
                                  bool                         into_slice,
@@ -26079,24 +26121,46 @@ private:
                                  ir::Builder&                 b,
                                  ir::SourceLoc                l) {
         guard_indexed_array_slice(rs);
+        const bool     simple   = rs.getSelectionKind() == RangeSelectionKind::Simple;
+        const bool     dynarr   = is_dyn_array(rs.value());
+        if (simple && !dynarr) {
+            fail("internal: a fixed array's constant-bounds slice has a live ArrSlice "
+                 "view and should never reach position-wise copy");
+        }
         const ir::Ref  arr_ty   = lower_type(*rs.value().type);
         const ir::Ref  slice_ty = lower_type(*rs.type);
         const ir::Type at       = std::get<ir::Type>(module_.pool.get(arr_ty));
         const ir::Type st       = std::get<ir::Type>(module_.pool.get(slice_ty));
-        const auto     n        = static_cast<uint32_t>(
-          const_uint(rs.right(), "an indexed part-select width (LRM 11.5.1)"));
-        const bool     down     = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
-        const bool     asc      = at.left <= at.right;
+        const ir::Index arr_lv  = lower_lvalue(rs.value(), b);
+        const ir::SourceLoc il  = loc(rs.left());
 
-        const ir::Index     arr_lv = lower_lvalue(rs.value(), b);
-        const ir::SourceLoc il     = loc(rs.left());
-        const ir::Ref       idx_ty = make_int_type(32, rs.left().type->isFourState(), rs.left().type->isSigned());
-        const ir::Index     base   = b.resize(lower_expr(rs.left(), b), idx_ty, il);
+        uint32_t  n;
+        ir::Ref   idx_ty;
+        ir::Index base;
+        if (simple) {
+            const std::optional<int32_t> lo = try_const_int(rs.left());
+            const std::optional<int32_t> hi = try_const_int(rs.right());
+            if (!lo || !hi) {
+                fail("expected constant dynamic-array slice bounds (LRM 7.5.1: `$` and a "
+                     "runtime bound there are queue-only)");
+            }
+            n      = static_cast<uint32_t>(*hi - *lo + 1);
+            idx_ty = make_int_type(32, false, true);
+            base   = b.constant(module_.pool.put_int(idx_ty, static_cast<uint64_t>(static_cast<int64_t>(*lo))), il);
+        } else {
+            n      = static_cast<uint32_t>(const_uint(rs.right(), "an indexed part-select width (LRM 11.5.1)"));
+            idx_ty = make_int_type(32, rs.left().type->isFourState(), rs.left().type->isSigned());
+            base   = b.resize(lower_expr(rs.left(), b), idx_ty, il);
+        }
+        const bool down = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
+        const bool asc  = dynarr || at.left <= at.right;
         for (uint32_t pos = 0; pos < n; ++pos) {
-            const auto    p     = static_cast<int32_t>(pos);
-            const auto    last  = static_cast<int32_t>(n - 1);
-            const int32_t delta = asc ? (down ? p - last : p) : (down ? -p : last - p);
             ir::Index     idx   = base;
+            int32_t       delta = static_cast<int32_t>(pos);
+            if (!simple) {
+                const auto last = static_cast<int32_t>(n - 1);
+                delta            = asc ? (down ? delta - last : delta) : (down ? -delta : last - delta);
+            }
             if (delta != 0) {
                 idx = b.binary(
                   ir::Inst::Tag::Add,
@@ -26105,7 +26169,7 @@ private:
                   il);
             }
             b.set_end(idx, to_source_loc(rs.left().sourceRange.end()));
-            const ir::Index sel = b.elem_select(arr_lv, idx, arr_ty, l);
+            const ir::Index sel = b.elem_select(arr_lv, idx, arr_ty, l, /*for_write=*/dynarr && into_slice);
             b.set_end(sel, to_source_loc(rs.value().sourceRange.end()));
             const ir::Index oth = b.elem_select(other, elem_coord_const(st, pos, b, l), slice_ty, l);
             if (into_slice) {
@@ -26116,24 +26180,26 @@ private:
         }
     }
 
-    // An indexed part-select slice read as a whole: copy it position-wise into a
-    // fresh temp array of the slice's own type and hand back the temp's lvalue, so
-    // every whole-slice consumer (copy source, equality operand, by-value argument)
-    // sees an ordinary array lvalue. The temp is a per-call frame Local inside a
-    // subroutine and a module signal in a process (make_canonical_agg_temp), which
-    // also makes it memcpy-compatible with a canonical aggregate formal.
+    // A positional array slice (see is_positional_array_slice) read as a whole:
+    // copy it position-wise into a fresh temp array of the slice's own type and
+    // hand back the temp's lvalue, so every whole-slice consumer (copy source,
+    // equality operand, by-value argument) sees an ordinary array lvalue. The
+    // temp is a per-call frame Local inside a subroutine and a module signal in
+    // a process (make_canonical_agg_temp), which also makes it memcpy-compatible
+    // with a canonical aggregate formal.
     ir::Index materialize_indexed_slice(const RangeSelectExpression& rs, ir::Builder& b, ir::SourceLoc l) {
         const ir::Index temp = make_canonical_agg_temp(lower_type(*rs.type), b, l);
         emit_indexed_slice_copy(rs, temp, /*into_slice=*/false, ir::Inst::Tag::Store, b, l);
         return temp;
     }
 
-    // An unpacked-array operand as an array lvalue: a variable / member / element or
-    // a constant-bounds slice already is one; an indexed part-select slice is
-    // materialized into a temp first. Read contexts only — a write target must go
-    // through emit_indexed_slice_copy, or it would land in the temp.
+    // An unpacked-array operand as an array lvalue: a variable / member / element
+    // or a fixed array's own constant-bounds slice already is one; a positional
+    // slice (a fixed array's indexed part-select, or any slice of a dynamic
+    // array) is materialized into a temp first. Read contexts only — a write
+    // target must go through emit_indexed_slice_copy, or it would land in the temp.
     ir::Index lower_array_operand(const Expression& e, ir::Builder& b) {
-        if (is_indexed_array_slice(e)) {
+        if (is_positional_array_slice(e)) {
             return materialize_indexed_slice(e.as<RangeSelectExpression>(), b, loc(e));
         }
         return lower_lvalue(e, b);
@@ -26147,7 +26213,7 @@ private:
     // holding the value as evaluated now, and it is the copy OUT of it that the
     // caller may defer (LRM 10.4.2 evaluates a nonblocking RHS at execution time).
     ir::Index array_rvalue_lvalue(const Expression& src, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
-        if (is_indexed_array_slice(src)) {
+        if (is_positional_array_slice(src)) {
             return materialize_indexed_slice(src.as<RangeSelectExpression>(), b, l);
         }
         if (is_whole_array_lvalue(src) || (src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src))) {
@@ -26202,7 +26268,7 @@ private:
                                 ir::Builder&      b,
                                 ir::SourceLoc     l) {
         const ir::Index lv = array_rvalue_lvalue(src, ty, b, l);
-        if (is_indexed_array_slice(src) || !is_array_lvalue_shape(src) || !array_copy_may_overlap(dst, src)) {
+        if (is_positional_array_slice(src) || !is_array_lvalue_shape(src) || !array_copy_may_overlap(dst, src)) {
             return lv;
         }
         const ir::Index temp = make_canonical_agg_temp(ty, b, l);
@@ -30454,7 +30520,7 @@ private:
                 if (dir != slang::ast::ArgumentDirection::Out) {
                     // An indexed slice fills the temp position-wise (it has no
                     // anchored lvalue to copy from); anything else copies whole.
-                    if (is_indexed_array_slice(src)) {
+                    if (is_positional_array_slice(src)) {
                         emit_indexed_slice_copy(src.as<RangeSelectExpression>(), temp,
                                                 /*into_slice=*/false, ir::Inst::Tag::Store, b, l);
                     } else {
@@ -30556,7 +30622,7 @@ private:
     // complex actual lvalues (bit / part selects) work.
     void emit_call_copyouts(const std::vector<CopyOutArg>& outs, ir::Builder& b, ir::SourceLoc l) {
         for (const CopyOutArg& oc : outs) {
-            if (oc.is_agg && is_indexed_array_slice(*oc.actual)) {
+            if (oc.is_agg && is_positional_array_slice(*oc.actual)) {
                 // An indexed-slice output / inout actual: write the callee-written
                 // temp back position-wise, since the actual has no anchored lvalue.
                 // An out-of-range position drops its write (LRM 7.4.5).

@@ -2752,35 +2752,47 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   nested-dynamic dimension already fold or hard-fail above), and a
   multidimensional dynamic collection (matches `$size`'s pre-existing
   boundary).
-- [ ] **Dynamic-array slice** `da[a:b]` / `da[i +: n]` / `da[i -: n]` (LRM
-  7.4.5/11.5.1) — refused (`fail("slice of a dynamic array is not
-  supported")` in `lower_range_select`). NOT the queue-slice work above: slang
-  types this a `FixedSizeUnpackedArrayType`, never a queue (confirmed against
-  `RangeSelectExpression::fromSyntax`, SelectExpressions.cpp — it only forces
-  `QueueType` when the value being sliced is ALREADY a queue), so `$` and a
-  runtime BASE never appear in the `a:b` form (slang requires both bounds
-  literal-constant there) and `n` must still be constant in the indexed form
-  (fixes the result's element count at compile time) — but `i` in the indexed
-  form CAN be a runtime value, unlike `a:b`. The real blocker is the backend,
-  not the frontend: the existing `ArrSlice` op (used for a FIXED unpacked
-  array's `a[a:b]`) advances an already-flat, address-indexed `LValue` by a
-  constant `elem_idx` offset (LlvmBackend.cpp, `Inst::Tag::ArrSlice`'s lvalue
-  case, "Flat-storage arrays only") — a dynamic array's storage is instead
-  (`rt_dynarr{data,len,epoch}`, heap-allocated, relocatable), so reaching an
-  element needs one more pointer hop through `data` that the current lvalue
-  chain has nowhere to encode, and a RUNTIME base additionally needs the hop
-  itself to carry a variable offset (a new op, not a reachable extension of
-  `ArrSlice`). Two more open questions before this can be attempted: whether a
-  slice is legal on the LHS too (7.4.5's "a slice name... is an unpacked
-  array" implies yes for a fixed array; unconfirmed for a dynamic-array
-  source), and the OOB rule when the constant bounds (or a runtime `i`)
-  exceed the array's ACTUAL runtime `size()` — clamp like a queue slice,
-  X-fill like a packed indexed part-select, or a located fatal; iverilog gives no
-  answer (it crashes an internal assertion compiling ANY indexed
-  part-select of a 2-state queue, AND any `a:b` slice of a dynamic array,
-  `elab_expr.cc:5902: prefix_indices.size()+1 == ...packed_dims().size()`).
+- [ ] **Assigning a fixed-size or queue array INTO a dynamic array target**
+  (LRM 7.5.1's "resizeable" assignment, e.g. `int f[5]; int d[]; d = f;`) —
+  `lower_dyn_array_assign`'s fallback (`d = other: deep copy the source
+  handle`) calls `lower_lvalue` on the RHS unconditionally, assuming it is
+  already an `rt_dynarr` handle; a fixed-size-array-typed RHS (a plain
+  variable, NOT only a slice) reaches slang's implicit Conversion node instead
+  and hits `lower_lvalue`'s default case (`fail("unsupported assignment
+  target kind=Conversion")`). Found while scoping the dynamic-array-slice
+  work below (`s = da[2:4]` where `s` is itself a dynamic array hits this),
+  but it is a pre-existing, unrelated gap — reproduces with no slice
+  involved at all. The fix wants an allocate-to-source-size-then-copy path
+  parallel to `emit_dyn_array_new_expr`'s `new[n](src)` form, not more slice
+  plumbing.
 - [x] **Dynamic arrays** — `[]`, `new[n]` / `new[n](src)`, `.size()`, `.delete()`,
-  element r/w, whole-array deep-copy, `foreach`, full subroutine ABI.
+  element r/w, whole-array deep-copy, `foreach`, full subroutine ABI, and a
+  slice `da[a:b]` / `da[i +: n]` / `da[i -: n]` (LRM 7.4.5/11.5.1, extended to
+  a dynamic array by 7.5.1). Unlike a queue slice, this types as a
+  `FixedSizeUnpackedArrayType`, never a queue, so `$` and a runtime bound in
+  the `a:b` form stay queue-only (both bounds must be compile-time constant);
+  the indexed form's base `i` MAY be runtime, only its width `n` must stay
+  constant. Storage is handle-indirect (`rt_dynarr{data,len}`, heap,
+  relocatable) rather than flat/address-indexed, so unlike a fixed array's own
+  constant-bounds slice (a live, zero-copy `ArrSlice` view) it is ALWAYS
+  materialized position-wise (`emit_indexed_slice_copy`, generalized from the
+  fixed array's indexed-only form to cover both selection kinds and either
+  base): a plain `ElemSelect` per position, so out-of-range clamping (read ->
+  default, write -> no-op) and, on a write, `HandleUse::Mutate`'s waited-on
+  notification (LRM 9.4.3) come for free from the SAME already-proven
+  single-element path an ordinary `da[i]` uses. Covers: read/write, an
+  equality operand, a by-value / output / inout subroutine argument (the
+  output case is what needs the write's `for_write` threaded through — a
+  by-value read does not touch the flag), and overlap-safe self-assignment
+  (`da[0:2] = da[1:3]`, inherently safe: the RHS is always independently
+  materialized first, never a live view of the same storage). NOT covered: an
+  aggregate (struct / heap-handle) element, matching the fixed array's own
+  indexed-slice gap; a `ref` argument (already refused generically — no slice
+  of any kind has an anchored lvalue a pointer can name, LRM 13.5.2). No
+  oracle: verilator 5.050 rejects `da[a:b]` outright ("Illegal range select");
+  iverilog 13 crashes an internal assertion on it. Hand-checked against the
+  LRM: the open `$` bound and a runtime bound in the `a:b` form are
+  queue-only, and a constant-bounds dynamic-array slice is legal (7.4.5).
 - [x] **Checked container allocation** — every heap buffer a design's containers
   need routes through `rt_alloc_checked` / `rt_alloc_elems_size` (Runtime.h).
   Three silent failures are now located fatals instead of a corrupt heap: a

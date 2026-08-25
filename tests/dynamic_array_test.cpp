@@ -962,3 +962,151 @@ TEST_CASE("dynamic array of chandles") {
     CHECK(run_capture(src) == "null0=1 null1=1\n"
                               "n=2 same=1\n");
 }
+
+// A dynamic-array slice (LRM 7.4.5/7.5.1) types as a FixedSizeUnpackedArrayType,
+// never a queue -- unlike a queue slice, both bounds must be compile-time
+// constant (no `$`, no runtime bound). Its storage is handle-indirect
+// (rt_dynarr{data,len}, heap, relocatable) rather than flat/address-indexed, so
+// -- unlike a fixed array's own constant-bounds slice, a live zero-copy
+// ArrSlice view -- it materializes position-wise into a temp. Each position is
+// an ordinary ElemSelect, so out-of-range reads/writes follow the same LRM
+// 7.5.1 rule an ordinary `da[i]` already has: a read past `size()` yields the
+// element default (0 for a 2-state `int`), a write there is silently dropped.
+// No oracle: verilator 5.050 rejects `da[a:b]` outright ("Illegal range
+// select"), and iverilog 13 crashes an internal assertion on it
+// (`elab_expr.cc:5902`). Hand-checked against the LRM: the open `$` bound
+// and a runtime bound in the `a:b` form are queue-only, and a constant-bounds
+// slice of a dynamic array is legal (7.4.5, 7.5.1).
+TEST_CASE("dynamic array constant-bounds slice read/write") {
+    constexpr std::string_view src = R"(
+        module m;
+            int da[];
+            int f3[3];
+            initial begin
+                da = new[8];
+                foreach (da[k]) da[k] = k + 1;
+                f3 = da[2:4];
+                $display("read %0d %0d %0d", f3[0], f3[1], f3[2]);
+
+                f3 = '{100, 200, 300};
+                da[1:3] = f3;
+                $display("write %0d %0d %0d %0d %0d", da[0], da[1], da[2], da[3], da[4]);
+
+                // OOB: da has indices 0..7. A read past the end defaults; a
+                // write there is dropped and the array does not resize.
+                f3 = da[6:8];
+                $display("oob-read %0d %0d %0d", f3[0], f3[1], f3[2]);
+                da = new[8];
+                foreach (da[k]) da[k] = k + 1;
+                f3 = '{111, 222, 333};
+                da[6:8] = f3;
+                $display("oob-write %0d %0d size=%0d", da[6], da[7], da.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "read 3 4 5\n"
+                              "write 1 100 200 300 5\n"
+                              "oob-read 7 8 0\n"
+                              "oob-write 111 222 size=8\n");
+}
+
+// Indexed part-select `da[i +: n]` / `da[i -: n]` (LRM 11.5.1, extended to a
+// dynamic array by 7.5.1): unlike the constant-bounds form, `i` may be a
+// runtime value (only `n`, the result's element count, must stay constant).
+TEST_CASE("dynamic array indexed part-select slice") {
+    constexpr std::string_view src = R"(
+        module m;
+            int da[];
+            int f3[3];
+            int i;
+            initial begin
+                da = new[8];
+                foreach (da[k]) da[k] = k + 1;
+
+                f3 = da[2 +: 3];
+                $display("up-const %0d %0d %0d", f3[0], f3[1], f3[2]);
+                f3 = da[5 -: 3];
+                $display("down-const %0d %0d %0d", f3[0], f3[1], f3[2]);
+                i = 3;
+                f3 = da[i +: 3];
+                $display("up-runtime %0d %0d %0d", f3[0], f3[1], f3[2]);
+
+                // OOB via a runtime base past the end: in-range positions
+                // apply, the rest are dropped.
+                i = 7;
+                f3 = '{11, 22, 33};
+                da[i +: 3] = f3;
+                $display("oob-write %0d size=%0d", da[7], da.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "up-const 3 4 5\n"
+                              "down-const 4 5 6\n"
+                              "up-runtime 4 5 6\n"
+                              "oob-write 11 size=8\n");
+}
+
+// A dynamic-array slice as an equality operand, a by-value function argument,
+// and an output-argument write-back target -- the contexts a slice with no
+// anchored lvalue must reach through materialize_indexed_slice /
+// emit_indexed_slice_copy rather than a live view. The output case is the one
+// that needs `for_write` threaded to the container-side element select (a
+// dynamic array is a heap handle, unlike a fixed array): without it a write
+// through the slice would resolve the wrong HandleUse and, for a waited-on
+// container, never notify a mutation waiter (LRM 9.4.3).
+TEST_CASE("dynamic array slice as an equality operand and a subroutine argument") {
+    constexpr std::string_view src = R"(
+        module m;
+            int da[];
+            int f3[3];
+
+            function automatic void takes_slice(input int s[3]);
+                $display("arg %0d %0d %0d", s[0], s[1], s[2]);
+            endfunction
+
+            task automatic writes_out(output int s[3]);
+                s = '{7, 8, 9};
+            endtask
+
+            initial begin
+                da = new[8];
+                foreach (da[k]) da[k] = k + 1;
+                f3 = '{3, 4, 5};
+                $display("eq %0d", da[2:4] == f3);
+                f3 = '{3, 4, 6};
+                $display("neq %0d", da[2:4] == f3);
+
+                takes_slice(da[1:3]);
+
+                writes_out(da[2:4]);
+                $display("outarg %0d %0d %0d %0d %0d", da[0], da[1], da[2], da[3], da[4]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "eq 1\n"
+                              "neq 0\n"
+                              "arg 2 3 4\n"
+                              "outarg 1 2 7 8 9\n");
+}
+
+// `da[0:2] = da[1:3]` (both sides slices of the SAME array, overlapping
+// ranges): LRM 10.4.1 evaluates the whole RHS before any assignment happens,
+// so the write must see the pre-assignment values throughout, not a value
+// some earlier position of the same statement already overwrote. A dynamic
+// array's slice is always independently materialized first (never a live
+// view), so this falls out for free -- unlike the fixed-array live-ArrSlice
+// case, which needs an explicit overlap-staging check (array_copy_may_overlap).
+TEST_CASE("dynamic array overlapping slice-to-slice assignment reads pre-assignment values") {
+    constexpr std::string_view src = R"(
+        module m;
+            int da[];
+            initial begin
+                da = new[8];
+                foreach (da[k]) da[k] = k + 1;
+                da[0:2] = da[1:3];
+                $display("%0d %0d %0d %0d", da[0], da[1], da[2], da[3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "2 3 4 4\n");
+}
