@@ -30,6 +30,13 @@ env:
   LLVM_RELEASE: "22.1.8"
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 1G
+  # libsva is a Zig static library clotho's frontend links at build time
+  # (docs/design/concurrent-assertions.md §1); pin the commit CI builds
+  # against rather than floating on whatever main happens to be, since
+  # nothing else records this today (§8's delivery-mechanism decision is
+  # still open — this is the minimal fix, not that one).
+  ZIG_VERSION: "0.16.0"
+  LIBSVA_REF: "51dbffa09b924ac3ce2e6c343c149ba59dd3a7d5"
 
 jobs:
   plan:
@@ -90,6 +97,16 @@ jobs:
         shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v4
+
+      # Zig builds libsva (CMakeLists.txt:237-244). Windows gets it from
+      # MSYS2's own package below instead of this action, since a JS action's
+      # PATH addition is not guaranteed to reach the msys2 shell every later
+      # step runs in.
+      - name: Install Zig (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
 
       # -- toolchain --------------------------------------------------------
       # LLVM is never built here: a source build is tens of minutes and the
@@ -163,8 +180,25 @@ jobs:
           # pacboy's `:p` suffix picks the environment's package prefix, so one
           # list serves both CLANG64 and CLANGARM64. Python is slang's — its
           # CMakeLists requires an interpreter for its generated sources.
+          # zig builds libsva (CMakeLists.txt:237-244); a MSYS2 package rather
+          # than mlugg/setup-zig, since that action's PATH addition is not
+          # guaranteed to reach the msys2 shell every later step runs in. git
+          # is unprefixed (an msys package, not an arch-specific mingw one):
+          # path-type stays the default `minimal`, which does not inherit
+          # Git for Windows' own PATH entry, and the libsva checkout step
+          # below needs `git` inside this shell.
           pacboy: >-
-            llvm:p clang:p cmake:p ninja:p ccache:p python:p
+            llvm:p clang:p cmake:p ninja:p ccache:p python:p zig:p git
+
+      # libsva is a build-only, sibling-checkout dependency
+      # (CLOTHO_LIBSVA_DIR defaults to ../libsva relative to this repo); not
+      # a submodule, so clone it explicitly rather than relying on whatever
+      # a runner image happens to have lying around.
+      - name: Check out libsva
+        run: |
+          set -eux
+          git clone https://github.com/coderkalyan/libsva ../libsva
+          git -C ../libsva checkout "$LIBSVA_REF"
 
       # -- caches -----------------------------------------------------------
       # slang is pinned to a SHA, so FetchContent does a full (non-shallow)
