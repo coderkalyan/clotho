@@ -94,6 +94,34 @@ propagates down, so polymorphism is uniform across a hierarchy. Design:
 Unit-tested over override, inherited body, non-virtual method calling a virtual
 internally, `super`, and a derived-introduced slot.
 
+**Registration is reentrancy-safe and exception-safe.** `lower_class_type` interns
+a class (`class_type_cache_`) only after its OWN base class is fully resolved, and
+`compute_vtable` treats `class_vslot_` membership as "this class is done, further
+calls are no-ops" (`ensure_vtable`'s reentrancy contract). A base class's own
+property can legally hold a forward-declared handle to a class that EXTENDS it
+(UVM's `uvm_sequence_item::m_parent_sequence : uvm_sequence_base`, where
+`uvm_sequence_base extends uvm_sequence_item`); lowering the derived class
+recurses into its base first, and if the base's own property layout reaches back
+into the derived class before the base itself is interned, that reentrant call
+mints and fully registers the derived class under its own Ref — correctly. The
+outer, still-in-flight `lower_class_type` frame used to be unaware of this: on
+resuming, it minted a SECOND Ref for the same class and (via `compute_vtable`'s
+idempotency guard, keyed on the AST node rather than the Ref) silently treated it
+as already numbered, without ever calling `set_class_desc` on it — a structurally
+valid `ir::Type` with no descriptor, which crashed the backend as an unlocated
+`internal: class without a descriptor` the first time codegen needed it (a real
+UVM sequence testbench, `class C extends uvm_sequence;`, hit this on
+`uvm_sequence_base` — see docs/TODO.md). Fixed by re-checking `class_type_cache_`
+immediately after the base-class recursion returns: if a reentrant call already
+registered `clt`, adopt its Ref instead of minting a second one. `compute_vtable`
+separately guards the exception-safety half of the same invariant: once
+`class_vslot_[&clt]` is set, an RAII guard un-numbers the class again if anything
+before `set_class_desc` throws (`build_copy_thunk`, `rand_body_id`, the pure-stub
+fill loop, `build_iface_table`), so a recoverable `LowerError` there propagates as
+the located refusal it already is rather than leaving a half-registered ghost —
+defense in depth for that same "done but undescribed" state, though no currently
+reachable legal construct throws from that specific window today.
+
 **Abstract classes** (`virtual class`, LRM 8.21) with concrete virtual methods
 lower normally — a valid handle type and base whose virtuals dispatch through the
 base; a direct `new` on one is rejected (slang, plus a defense guard in

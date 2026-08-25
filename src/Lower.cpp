@@ -3608,6 +3608,22 @@ private:
         ir::Ref base_ref = ir::Ref::Invalid;
         if (const slang::ast::Type* base = clt.getBaseClass()) {
             base_ref = lower_class_type(base->getCanonicalType().as<slang::ast::ClassType>());
+            // Lowering the base can recurse back into `clt` itself before this frame
+            // ever interns it: a base's own property can hold a forward-declared
+            // handle to the derived class being laid out right now (UVM's
+            // uvm_sequence_item::m_parent_sequence : uvm_sequence_base, where
+            // uvm_sequence_base extends uvm_sequence_item). That nested call finds
+            // `clt` uncached -- this frame has not reached bind_class_type yet -- so
+            // it mints and fully registers its own Ref for `clt`, correctly: this is
+            // exactly the shape ensure_vtable's reentrancy contract exists for.
+            // Without this re-check, this frame would go on to mint a SECOND Ref for
+            // the same class, and compute_vtable's own early-return (keyed on the
+            // AST pointer, not the Ref) would treat it as already numbered and skip
+            // set_class_desc -- leaving a structurally valid but never-registered Ref
+            // that crashes the backend the first time codegen needs its descriptor.
+            if (const auto cached = class_type_cache_.find(&clt); cached != class_type_cache_.end()) {
+                return cached->second;
+            }
         }
         t.element         = base_ref;
         const ir::Ref ref = module_.pool.put(ir::Item{ t });
@@ -4284,6 +4300,25 @@ private:
             slots.emplace(kRandOpsSlot, size++);
         }
         class_vslot_[&clt] = slots;
+        // If anything from here throws (a LowerError from build_copy_thunk,
+        // rand_body_id, the pure-stub loop below, or build_iface_table) before
+        // set_class_desc runs, this entry must not survive: ensure_vtable's
+        // reentrancy check above treats class_vslot_ membership as "descriptor
+        // fully registered", so a half-registered class left behind here would be
+        // permanently unreachable by any later retry -- exactly what the backend
+        // would otherwise report as an unlocated "internal: class without a
+        // descriptor" crash. Un-number on the way out so the LowerError propagates
+        // as the located refusal it already is, instead of a silent ghost entry.
+        struct VslotGuard {
+            ankerl::unordered_dense::map<const slang::ast::ClassType*, VtableSlots>& table;
+            const slang::ast::ClassType*                                            key;
+            bool                                                                    committed = false;
+            ~VslotGuard() {
+                if (!committed) {
+                    table.erase(key);
+                }
+            }
+        } vslot_guard{ class_vslot_, &clt };
         // Fill each slot with the most-derived body of that name (an override is an
         // override regardless of its own `virtual` keyword — match by name).
         //
@@ -4354,6 +4389,7 @@ private:
         auto [iface_slots, iface_ids] = build_iface_table(clt, slots, table);
         module_.set_class_desc(
           class_ref, std::move(table), class_type_id(clt), std::move(iface_slots), std::move(iface_ids));
+        vslot_guard.committed = true;
     }
 
     // The interface-dispatch half of a class's descriptor (LRM 8.26): the bodies it
