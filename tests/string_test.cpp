@@ -2052,6 +2052,21 @@ TEST_CASE("$sformatf formats into a string value") {
     )") == "[v=42 h=ab s=hi] len=14\n");
 }
 
+// $psprintf (a nonstandard tool alias for $sformatf, LRM 21.3.3) dispatches
+// through the identical lowering -- slang models both via the same
+// SFormatFunction class, differing only by the nonstandard-extension warning.
+TEST_CASE("$psprintf is an alias for $sformatf") {
+    CHECK(run_capture(R"(
+        module m;
+            string s;
+            initial begin
+                s = $psprintf("v=%0d h=%h s=%s", 42, 8'hab, "hi");
+                $display("[%s] len=%0d", s, s.len());
+            end
+        endmodule
+    )") == "[v=42 h=ab s=hi] len=14\n");
+}
+
 // A dynamic `string` value is accepted as a $fopen filename / mode and a $sscanf
 // source (LRM 21.3/21.4 allow a string-typed expression). The backend reads its
 // rt_string bytes in natural order (spill_ascii_arg forward=1), so the filename

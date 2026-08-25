@@ -1794,6 +1794,14 @@ professional parity; M5 makes it complete.
   the shared `build_format` can leak `$sformat`'s exception into the family.
   iverilog 13 and Verilator 5.050 do agree with each other, and with Clotho, on
   every `$sformat` shape above.
+- [x] **`$psprintf`** — a nonstandard tool extension some simulators (VCS,
+  Questa) accept as an alias for `$sformatf`; found via UVM examples using it
+  in `convert2string`/`do_print` overrides. slang itself models the two
+  identically, registering both through the same `SFormatFunction` class
+  (`build/_deps/slang-src/source/ast/builtins/MiscSystemFuncs.cpp:453-454`),
+  differing only by a nonstandard-extension warning flag — same argument
+  validation, same return type, same eval. Dispatches to `lower_sformatf`
+  alongside `$sformatf`.
 - [ ] **`%m` / `%l` in a runtime `$sformat` format** — they name the invoking
   scope, which only the compiler knows; `append_format_literal` splices the text
   in for a constant format and the renderer never learns either name. Would need

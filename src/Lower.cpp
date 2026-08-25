@@ -20114,7 +20114,13 @@ private:
         }
 
         // $sformatf(fmt, args) (LRM §21.3.3): format into a new string value.
-        if (name == "$sformatf") {
+        // $psprintf is a nonstandard tool alias for the identical operation --
+        // slang itself models both through the same SFormatFunction class
+        // (build/_deps/slang-src/source/ast/builtins/MiscSystemFuncs.cpp:453-454),
+        // differing only by the nonstandard-extension warning it emits at bind
+        // time; the argument validation, return type and eval semantics are
+        // shared, so the two names dispatch to the same lowering.
+        if (name == "$sformatf" || name == "$psprintf") {
             return lower_sformatf(call, b);
         }
 
