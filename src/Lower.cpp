@@ -6796,17 +6796,22 @@ private:
     }
 
     // Append a signal to the module and record it in the currently open
-    // hierarchy scope. Every signal-creating path funnels through here so the
-    // scope tree covers the signal table exactly. scope_stack_ is empty only on
-    // the standalone Lowerer that registers package/$unit-scope state (globals;
-    // see lower_globals) and package-scope function statics reached through it
-    // (see function_id's is_global_subroutine delegation) — those signals
-    // belong to no top's InstanceScope tree, and the backend already treats an
-    // unclaimed signal as a flat root-level field (build_state_types).
+    // hierarchy scope, and in signal_scope_, its own inverse: Signal ->
+    // declaring InstanceScope::id, which sampled_shadow_of uses to find a
+    // sampled variable's home scope regardless of which scope is currently
+    // open. Every signal-creating path funnels through here so the scope tree
+    // (and signal_scope_) cover the signal table exactly. scope_stack_ is
+    // empty only on the standalone Lowerer that registers package/$unit-scope
+    // state (globals; see lower_globals) and package-scope function statics
+    // reached through it (see function_id's is_global_subroutine delegation)
+    // — those signals belong to no top's InstanceScope tree (no signal_scope_
+    // entry either), and the backend already treats an unclaimed signal as a
+    // flat root-level field (build_state_types).
     ir::Signal register_signal(ir::SignalInfo info) {
         const ir::Signal sig = module_.add_signal(std::move(info));
         if (!scope_stack_.empty()) {
             scope_stack_.back()->signals.push_back(sig);
+            signal_scope_[static_cast<uint32_t>(sig)] = scope_stack_.back()->id;
         }
 
         return sig;
@@ -13692,24 +13697,29 @@ private:
             }
         }
 
-        // The operand has to be a plain variable. Sampling is keyed by variable --
-        // LRM 16.6 captures operands, not expressions -- so the shadow and the ring
+        // The operand has to be a plain variable -- a NamedValueExpression for a
+        // local name, or a HierarchicalValueExpression for a dotted path (LRM
+        // 23.6, `dif.sig`, now reachable here because sampled_shadow_of no
+        // longer requires the asserting scope to declare it); slang binds both
+        // to the target ValueSymbol the same way, through
+        // ValueExpressionBase::symbol. Sampling is keyed by variable -- LRM
+        // 16.6 captures operands, not expressions -- so the shadow and the ring
         // are both per-signal, and an expression has nothing to hang history on.
         // The width guard is what makes the unwrap safe: only a width-preserving
         // wrapper leaves the shadow's value interchangeable with the call's.
         const Expression& operand = unwrap_conversions(*args[0]);
         const bool        plain =
-          operand.kind == ExpressionKind::NamedValue &&
+          (operand.kind == ExpressionKind::NamedValue || operand.kind == ExpressionKind::HierarchicalValue) &&
           operand.type->getCanonicalType().getBitWidth() == args[0]->type->getCanonicalType().getBitWidth() &&
-          operand.as<NamedValueExpression>().symbol.kind != SymbolKind::Parameter &&
-          sigmap_.contains(&operand.as<NamedValueExpression>().symbol);
+          operand.as<ValueExpressionBase>().symbol.kind != SymbolKind::Parameter &&
+          sigmap_.contains(&operand.as<ValueExpressionBase>().symbol);
         if (!plain) {
             // TODO: a sampled value function over an expression, which needs a
             // history entry per EXPRESSION, evaluated at the tick it belongs to
             // rather than resolved back to a variable.
             fail(std::string(name) + " is only supported on a plain variable reference");
         }
-        const ir::Signal live   = signal_of(operand.as<NamedValueExpression>().symbol);
+        const ir::Signal live   = signal_of(operand.as<ValueExpressionBase>().symbol);
         const ir::Signal shadow = sva_shadow_of(live);
 
         // $sampled is the shadow itself: the value this variable had when the
@@ -15837,8 +15847,9 @@ private:
     // An assertion expression reads SAMPLED values, and what is sampled is the
     // VARIABLE, not the expression: LRM 16.6 has an operand captured before the
     // expression is evaluated, so a capture is a plain copy with no operator in
-    // it. One shadow per variable, shared by every assertion mentioning it and
-    // copied by the single Preponed process finalize_sva_sampling emits.
+    // it. One shadow per variable, shared by every assertion mentioning it --
+    // including two assertions in different asserting scopes -- and copied by
+    // the single Preponed process finalize_preponed emits.
     //
     // The shadow keeps the live signal's exact type -- full width, full 4-state.
     // Narrowing it to the one bit a boolean root needs would move operators into
@@ -15850,28 +15861,35 @@ private:
     }
 
     // The Preponed shadow of `live`, allocated once per live signal and shared by
-    // every reader. `what` names the construct doing the sampling, for the two
-    // refusals below: an assertion (LRM 16.5) and a clocking block input whose
-    // skew is `#1step` (LRM 14.4) want the identical value and so share one copy.
+    // every reader. `what` names the construct doing the sampling, for the
+    // packed-value refusal below: an assertion (LRM 16.5) and a clocking block
+    // input whose skew is `#1step` (LRM 14.4) want the identical value and so
+    // share one copy.
     ir::Signal sampled_shadow_of(ir::Signal live, std::string_view what) {
         const auto key = static_cast<uint32_t>(live);
         if (const auto it = sva_shadows_.find(key); it != sva_shadows_.end()) {
             return it->second;
         }
 
-        // A shadow is per-instance state, so it belongs to the scope declaring the
-        // variable -- which must be the scope lowering the assertion, because the
-        // monitor process that reads the shadow is addressed through one scope
-        // anchor and cannot reach across instances (the constraint
-        // register_resolved_slot already enforces on a net driven from two scopes).
-        // TODO: sample a variable declared outside the asserting instance (a
-        // hierarchical reference, or a package / $unit variable). Needs the shadow
-        // and its copy placed in the declaring scope and read across the boundary.
-        if (scope_stack_.empty() ||
-            std::ranges::find(scope_stack_.back()->signals, live) == scope_stack_.back()->signals.end()) {
-            fail(std::string(what) + " may only sample variables of the instance "
-                                     "that declares it; a hierarchical or package reference is not "
-                                     "supported");
+        // A shadow is per-instance state, so it belongs to the scope that
+        // declares `live` -- which need not be the scope lowering the
+        // assertion. A hierarchical reference through a directly-instantiated
+        // interface (or any deeper instance path) samples a variable one or
+        // more hops away, and a package / $unit variable belongs to no
+        // instance at all. signal_scope_ (register_signal's own inverse) names
+        // `live`'s declaring scope id regardless of which scope is currently
+        // open; find_scope_node walks the scope tree to the node itself,
+        // which by now is frozen (alloc_assert_control's comment). A miss in
+        // signal_scope_ means `live` was never registered by THIS top's
+        // Lowerer -- a package / $unit-scope variable, always registered by
+        // the standalone globals Lowerer, whose scope_stack_ is always empty.
+        ir::InstanceScope* declaring_scope = nullptr;
+        if (const auto sit = signal_scope_.find(key); sit != signal_scope_.end()) {
+            declaring_scope = find_scope_node(top_scope_, sit->second);
+            if (declaring_scope == nullptr) {
+                fail("internal: a sampled variable's declaring scope is missing "
+                     "from the scope tree");
+            }
         }
 
         const ir::SignalInfo& live_info = module_.signal(live);
@@ -15894,7 +15912,26 @@ private:
         // sampling process, so it must neither take a net's undriven-z power-up nor
         // join net resolution.
 
-        const ir::Signal shadow = register_signal(std::move(info));
+        // Registered in `live`'s OWN declaring scope, not scope_stack_.back()
+        // (the asserting scope): the two coincide for the common same-scope
+        // case, but a hierarchical or package live signal needs its shadow
+        // where the backend already knows how to address it relative to
+        // `live` itself -- the same per-instance state addressing an ordinary
+        // hierarchical read of `live` already uses (Anchor,
+        // src/ir/LlvmBackend.cpp), unlocked here simply by asking
+        // register_signal to attach the shadow to the right scope rather than
+        // whichever one happens to be open. A null declaring_scope (package /
+        // $unit) leaves the shadow unscoped too, so it becomes a flat
+        // root-level field beside the live signal it shadows (build_state_types)
+        // instead of being pulled into whichever instance is asserting.
+        ir::Signal shadow;
+        if (declaring_scope != nullptr) {
+            scope_stack_.push_back(declaring_scope);
+            shadow = register_signal(std::move(info));
+            scope_stack_.pop_back();
+        } else {
+            shadow = module_.add_signal(std::move(info));
+        }
         sva_shadows_.emplace(key, shadow);
         sva_shadow_pairs_.emplace_back(live, shadow);
 
@@ -30752,6 +30789,14 @@ private:
     // currently being lowered; register_signal records into its back().
     ir::InstanceScope               top_scope_;
     std::vector<ir::InstanceScope*> scope_stack_;
+
+    // register_signal's own inverse: Signal -> InstanceScope::id of the scope
+    // that declared it. Absent for a package / $unit-scope signal (registered
+    // by the standalone globals Lowerer, whose scope_stack_ is always empty --
+    // see register_signal). sampled_shadow_of uses this to attach a shadow
+    // beside the live signal it shadows, wherever that actually is, rather
+    // than wherever the asserting scope happens to be.
+    ankerl::unordered_dense::map<uint32_t, uint32_t> signal_scope_;
 
     // Scope id of the instance currently being lowered, for Process::scope;
     // no_scope outside any instance (the package/$unit Lowerer).

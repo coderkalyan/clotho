@@ -1824,10 +1824,14 @@ endmodule
     CHECK(stores == 2);
 }
 
-TEST_CASE("sampling a variable of another instance is refused") {
-    // The shadow is per-instance state addressed through one scope anchor, so a
-    // variable the asserting instance does not declare cannot be sampled yet.
-    refuses(R"(
+TEST_CASE("sampling a variable of another instance now works") {
+    // Once refused: a shadow is no longer required to live in the asserting
+    // instance's own scope. sampled_shadow_of attaches it beside `s.a` in `s`'s
+    // OWN declaring scope instead, and `t`'s monitor reads it through the same
+    // per-instance addressing an ordinary hierarchical read of `s.a` already
+    // used (docs/design/concurrent-assertions.md 4).
+    LowerResult        r;
+    const ir::Module&  m = lower_for_monitor(R"(
 module sub;
   bit a;
 endmodule
@@ -1836,7 +1840,137 @@ module t;
   sub s();
   ap: assert property (@(posedge clk) s.a |=> s.a);
 endmodule
-)", "may only sample variables of the instance that declares it");
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(shadow_count(m) == 1);
+    CHECK(has_shadow(m, "s.a"));
+}
+
+TEST_CASE("sampling a directly-instantiated interface's own variable works") {
+    // The confirmed real-world shape (sv-tests chapter-16, 16/16 concurrent-
+    // assertion hits): `dif` is a directly-instantiated interface one
+    // hierarchy hop from the asserting scope, and the clock itself is also
+    // read through it.
+    LowerResult        r;
+    const ir::Module&  m = lower_for_monitor(R"(
+interface dif_bus(input bit clk);
+  logic sig, sig2;
+endinterface
+module t;
+  bit clk;
+  dif_bus dif(clk);
+  ap: assert property (@(posedge dif.clk) dif.sig ##1 dif.sig2);
+endmodule
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(shadow_count(m) == 2);
+    CHECK(has_shadow(m, "dif.sig"));
+    CHECK(has_shadow(m, "dif.sig2"));
+    // dif.clk delimits cycles; it is read live, never sampled -- same as the
+    // same-scope case above.
+    CHECK_FALSE(has_shadow(m, "dif.clk"));
+}
+
+TEST_CASE("sampling through two hierarchy hops works") {
+    // Not narrowed by depth: the shadow is attached beside the live signal
+    // wherever it is actually declared, so a second hop costs nothing extra --
+    // find_scope_node walks the whole scope tree, not just one level.
+    LowerResult        r;
+    const ir::Module&  m = lower_for_monitor(R"(
+module leaf;
+  logic sig;
+endmodule
+module mid;
+  leaf lf();
+endmodule
+module t;
+  bit clk;
+  mid mi();
+  ap: assert property (@(posedge clk) mi.lf.sig);
+endmodule
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(shadow_count(m) == 1);
+    CHECK(has_shadow(m, "mi.lf.sig"));
+}
+
+TEST_CASE("sampling a package-scope variable works") {
+    LowerResult        r;
+    const ir::Module&  m = lower_for_monitor(R"(
+package p;
+  bit sig;
+endpackage
+module t;
+  import p::*;
+  bit clk;
+  ap: assert property (@(posedge clk) sig);
+endmodule
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(shadow_count(m) == 1);
+    CHECK(has_shadow(m, "sig"));
+}
+
+TEST_CASE("sampling a $unit-scope variable works") {
+    LowerResult        r;
+    const ir::Module&  m = lower_for_monitor(R"(
+bit unit_sig;
+module t;
+  bit clk;
+  ap: assert property (@(posedge clk) unit_sig);
+endmodule
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(m.monitors.size() == 1);
+    CHECK(shadow_count(m) == 1);
+    CHECK(has_shadow(m, "unit_sig"));
+}
+
+TEST_CASE("two asserting instances sampling one interface signal share one shadow") {
+    // The sharing invariant concurrent-assertions.md 4 states for the
+    // same-scope case extends across scopes: c1 and c2 are two DIFFERENT
+    // asserting instances of one definition (so this also exercises the
+    // shadow surviving state-type dedup), both sampling dif's own sig --
+    // one shadow, one copy, not two.
+    LowerResult        r;
+    const ir::Module&  m = lower_for_monitor(R"(
+interface dif_bus(input bit clk);
+  logic sig;
+endinterface
+module watcher(dif_bus b);
+  ap: assert property (@(posedge b.clk) b.sig |=> 1);
+endmodule
+module t;
+  bit clk;
+  dif_bus dif(clk);
+  watcher c1(dif);
+  watcher c2(dif);
+endmodule
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(m.monitors.size() == 2);
+    CHECK(shadow_count(m) == 1);
+    CHECK(has_shadow(m, "dif.sig"));
+
+    // The single Preponed process still copies it exactly once per timestep --
+    // not once per asserting instance.
+    const ir::Process* preponed = nullptr;
+    for (const ir::Process& proc : m.processes()) {
+        if (proc.activation == ir::Activation::Preponed) {
+            REQUIRE(preponed == nullptr); // one process for the whole top
+            preponed = &proc;
+        }
+    }
+    REQUIRE(preponed != nullptr);
+    size_t stores = 0;
+    for (size_t i = 0; i < preponed->ir.inst_count(); i++) {
+        stores += preponed->ir.tag(static_cast<ir::Index>(i)) == ir::Inst::Tag::Store ? 1 : 0;
+    }
+    CHECK(stores == 1);
 }
 
 TEST_CASE("sampling a variable with no packed value is refused") {
@@ -2685,6 +2819,99 @@ module t;
     @(posedge clk);
     @(posedge clk);
     @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 35");
+}
+
+// -- Cross-scope sampling: hierarchical and package/$unit references --------
+//
+// sampled_shadow_of used to require the shadow's own storage to live in the
+// asserting scope's own signal list, which refused a shadow of a variable
+// declared anywhere else -- through a directly-instantiated interface, a
+// deeper instance path, or a package / $unit variable -- outright. The
+// shadow is now attached beside the live signal in ITS OWN declaring scope
+// instead (docs/design/concurrent-assertions.md 4), read cross-scope through
+// the same per-instance addressing an ordinary hierarchical read already
+// used. The structural tests earlier in this file pin the shadow/monitor
+// shape; these pin the OBSERVABLE behaviour -- report timing -- against a
+// same-scope fixture and, where noted, Verilator.
+
+TEST_CASE("sampling through a directly-instantiated interface reports at the right ticks") {
+    // Verified against Verilator 5.050: its one report (it stops on the first
+    // failure by default) is also at t=25.
+    //
+    // sig sampled per tick: t5=0 (time-zero), t15=1 (end of t5's NBA), t25=0
+    // (end of t15's NBA). sig2 stays 0 throughout. `sig |=> sig2` seeds an
+    // obligation at t=15 (sig sampled 1) that is checked at t=25 against sig2
+    // sampled 0 -- the only failure.
+    CHECK(report_times(R"(
+interface dif_bus(input bit clk);
+  logic sig, sig2;
+endinterface
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  dif_bus dif(clk);
+  always @(posedge dif.clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge dif.clk) dif.sig |=> dif.sig2);
+  initial begin
+    dif.sig = 0; dif.sig2 = 0;
+    @(posedge dif.clk); dif.sig <= 1;
+    @(posedge dif.clk); dif.sig <= 0;
+    @(posedge dif.clk);
+    @(posedge dif.clk); $finish;
+  end
+endmodule
+)") == "25");
+}
+
+TEST_CASE("sampling a package-scope variable reports at the right ticks") {
+    // sig sampled per tick: t5=0, t15=0 (end of t5, unchanged), t25=1 (end of
+    // t15's NBA), t35=1. A bare boolean property fails wherever the sample is
+    // false.
+    CHECK(report_times(R"(
+package p;
+  bit sig;
+endpackage
+module t;
+  import p::*;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) sig);
+  initial begin
+    sig = 0;
+    @(posedge clk);
+    @(posedge clk); sig <= 1;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)") == "5 15");
+}
+
+TEST_CASE("$past on a hierarchically-referenced signal is the previous tick, cross-scope") {
+    // Identical fixture to "the ring is read before it is shifted" above, with
+    // v and the clock both read through a directly-instantiated interface --
+    // same trace, same "5 35" report set, because the shadow and its history
+    // ring live beside dif's own v regardless of who is asserting.
+    CHECK(report_times(R"(
+interface dif_bus(input bit clk);
+  bit [3:0] v = 0;
+endinterface
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  dif_bus dif(clk);
+  always @(posedge dif.clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge dif.clk) $past(dif.v) != dif.v);
+  initial begin
+    @(posedge dif.clk); dif.v <= 1;
+    @(posedge dif.clk); dif.v <= 2;
+    @(posedge dif.clk);
+    @(posedge dif.clk);
+    @(posedge dif.clk); $finish;
   end
 endmodule
 )") == "5 35");
