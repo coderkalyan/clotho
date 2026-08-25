@@ -272,6 +272,98 @@ dereference that skips the guard is the one rooted directly at `ClassNew` — th
 property default-initializer stores every `new` emits — since that handle is the
 address `rt_alloc` just returned.
 
+## Name resolution: class-member visibility (LRM 8.6, 18.5, 19.4/19.5)
+
+A class method body, a constraint block, and a covergroup's embedded
+coverpoint/cross/iff/event expressions may all reference ANY member of that
+same class regardless of textual declaration order — LRM 8.6: "A class's
+properties are freely and broadly available to the methods of the class",
+no order caveat; 8.11 groups covergroups with methods and constraints for
+the same `this`-visibility; 19.4/19.5 restate it for coverpoint expressions
+specifically. This is an explicit, LRM-stated EXCEPTION to SV's general
+declare-before-use default (LRM 3.13 / 6.21), which clotho correctly
+enforces everywhere else it applies: module scope, `$unit`, and — because
+the exception is about methods/constraints/covergroups and not about
+initializer expressions — a class's OWN property-initializer expressions
+stay positional too (`int b = a + 1; int a = 5;` is still illegal, same as
+outside a class).
+
+All three shapes used to fail to even compile, misdiagnosed with
+`identifier 'X' used before its declaration`, whenever the reference
+textually preceded the member. Real-world hit: 7 copies of one shared
+header in the uvm-examples corpus,
+`apb_agent/apb_coverage_monitor.svh:37`'s `OPCODE: coverpoint
+analysis_txn.we { ... }` declared before `apb_seq_item analysis_txn;`.
+
+**The defect was entirely in vendored slang, not in clotho.** Slang's own
+intent is already right at the seams that build a method/constraint body's
+root `ASTContext`: `SubroutineSymbols.cpp`'s `getBody()` and
+`ClassSymbols.cpp`'s `ConstraintBlockSymbol::getConstraints` both seed it
+with `LookupLocation::max` — the sentinel that is supposed to mean "no
+order restriction" (`Lookup.cpp:39`: `{nullptr, UINT_MAX}`). But
+`Lookup::unqualifiedImpl` — the scope-chain walk-up run whenever a name
+isn't found in the immediately-searched scope — discards whatever location
+it was carrying and unconditionally re-anchors to
+`LookupLocation::after(scope.asSymbol())` on EVERY hop up to the parent
+scope, `scope` here being whatever construct is being escaped (the method's
+own `SubroutineSymbol`, the `ConstraintBlockSymbol`, or a statement block
+nested inside either). That re-anchoring is exactly right in general — it's
+what makes `LookupLocation::max`'s "unbounded-ness" evaporate the moment a
+lookup has to leave its starting scope, correctly restoring
+declare-before-use for, say, a package-scope function referencing a
+not-yet-declared package variable — but it applies with no exception for
+the ONE hop that lands on the class scope itself, where LRM 8.6 says order
+should not matter at all.
+
+A covergroup coverpoint reaches the SAME walk-up code two hops deeper
+(`CoverpointSymbol`'s own scope is a `CovergroupBodySymbol`, whose own
+parent scope is the `CovergroupType`, whose own parent scope — for an
+embedded covergroup — is the class scope directly, per `Scope.cpp`'s
+`addMember(CovergroupType::fromSyntax(*this, ...))`), seeded from an
+already-positional `LookupLocation::after(parent)`
+(`DeclaredType::getASTContext<IsInitializer=true>`) rather than `max` — but
+the walk-up bug is what actually decides the outcome regardless of the
+seed, since the seed only matters for a name found directly in the
+FIRST-searched scope, and `analysis_txn` is never a member of the
+coverpoint's, the body's, or even (before escaping once more) the
+covergroup type's own scope.
+
+**Fixed at that one choke point.** In `Lookup::unqualifiedImpl`, the hop
+that walks up to a parent now checks whether the scope it is about to
+search next is the class itself (`SymbolKind::ClassType`): if so, it uses
+an unbounded location for that hop instead of anchoring to wherever the
+escaping construct sits; otherwise the walk-up is unchanged. This is a
+single, minimal, precisely-scoped patch that transparently covers all three
+constructs (and any depth of statement-block nesting inside any of them),
+because they all bottom out in this one function, and it does NOT need (or
+touch) anything in clotho's own `src/Lower.cpp` — the defect and the fix
+are both entirely in name resolution, upstream of anything clotho lowers.
+Two boundaries fall out of the fix by construction, not by a separate
+special case: escaping the class scope itself, to its enclosing
+package/module/`$unit`, is a different, later hop that the fix does not
+touch and that stays positional (so a method still cannot forward-reference
+a MODULE variable declared after the class); and an unqualified lookup from
+inside class `c1` never walks into an unrelated sibling class `c2`'s scope
+at all regardless of location bounds, since `c2`'s members were never part
+of `c1`'s scope chain to begin with — the widened hop only ever searches
+the ONE class actually enclosing the construct doing the looking up.
+
+**Patch mechanism.** slang is vendored via CMake `FetchContent` pinned to a
+`GIT_TAG` (`CMakeLists.txt`), so a hand-edit of the populated
+`build/_deps/slang-src` checkout would be silently lost on the next clean
+`FetchContent` re-populate. The fix instead lives at
+`patches/slang-class-forward-ref.patch` (a plain `git diff` against the
+pinned slang commit) and is wired into the `slang` `FetchContent_Declare`'s
+`PATCH_COMMAND`, which runs `cmake/ApplySlangPatch.cmake`. That script
+applies the patch with `git apply`, guarded by a `git apply --reverse
+--check` probe so it is a no-op on a checkout that already carries it —
+CMake reruns a FetchContent dependency's patch step whenever the step's
+recorded command hash changes (editing the patch file or the script), not
+only on a truly clean fetch, so the checkout on that rerun may already be
+patched from a previous run. Verified to survive a genuine `rm -rf build &&
+cmake -B build`: slang re-clones fresh at the pinned commit and the patch
+auto-applies with no manual step.
+
 ## Waiting on a property (LRM 9.4.2 / 9.4.3)
 
 `@p`, `@(obj.p)`, `@(posedge obj.p)` and `wait(<cond reading p>)` work for an

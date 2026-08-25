@@ -3132,6 +3132,57 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   so a `$unit`/package-scope class referenced by two modules interns two distinct
   (nominal) Refs; V1 exercises classes only within one module. Route
   `lower_class_type` through `globals_` like subroutines when this matters.
+- [x] **A class method, constraint block, or embedded covergroup expression may
+  reference a member declared later in the same class** (LRM 8.6, 18.5,
+  19.4/19.5) — "A class's properties are freely and broadly available to the
+  methods of the class" carries no declaration-order caveat, and 8.11 groups
+  covergroups with methods/constraints for the same `this`-visibility; this is
+  an explicit, LRM-stated exception to SV's general declare-before-use default
+  (LRM 3.13 / 6.21), which clotho correctly enforces everywhere else (module
+  scope, `$unit`, a class's own property-initializer expressions, which stay
+  positional — LRM 8.6 exempts methods, not initializers). All three shapes
+  used to fail to even compile, with `identifier 'X' used before its
+  declaration`, whenever the reference textually preceded the member —
+  `function void show(); $display("%0d", x); endfunction int x;` inside one
+  class, a `constraint c { x < 10; } rand int x;`, and a
+  `covergroup cg; coverpoint analysis_txn.we; endgroup apb_seq_item
+  analysis_txn;` (the real shape hit by 7 copies of one shared header in the
+  uvm-examples corpus, `apb_coverage_monitor.svh:37`). The bug was entirely in
+  vendored **slang**, not clotho: `SubroutineSymbols.cpp` and
+  `ClassSymbols.cpp`'s `ConstraintBlockSymbol::getConstraints` already seed a
+  method/constraint body's root `ASTContext` with `LookupLocation::max` (the
+  "no order restriction" sentinel) as if this were already handled, but
+  `Lookup.cpp`'s `unqualifiedImpl` — the scope-chain walk-up run when a name
+  isn't found in the immediate scope — unconditionally discards whatever
+  location it was given and re-anchors to `LookupLocation::after(scope's own
+  declaration position)` on every hop up to the parent, including the hop that
+  lands on the class scope itself. A covergroup coverpoint reaches the same
+  walk-up two hops deeper (coverpoint → `CovergroupBodySymbol` →
+  `CovergroupType` → class), seeded from an already-positional
+  `DeclaredType::getASTContext` location rather than `max`, but the SAME
+  walk-up bug is what actually decides the outcome regardless of the seed.
+  Fixed at that one choke point (`patches/slang-class-forward-ref.patch`,
+  applied via the `slang` `FetchContent_Declare`'s `PATCH_COMMAND` in
+  CMakeLists.txt, `cmake/ApplySlangPatch.cmake`): when the scope about to be
+  searched next is a `SymbolKind::ClassType`, the walk-up now uses an
+  unbounded location for that one hop instead of anchoring to the escaping
+  construct's own position; escaping the class scope itself (to its
+  enclosing package/module/`$unit`) is a separate, later hop, untouched and
+  still positional. This is why the fix does not need to (and does not) touch
+  clotho's own `src/Lower.cpp` — the defect and the fix are both entirely in
+  name resolution, upstream of anything clotho lowers. Verified: both
+  ordering shapes for a method, a constraint block, and a covergroup
+  coverpoint (tests/class_test.cpp, tests/randomize_test.cpp); a module-level
+  `initial` block referencing a not-yet-declared module variable still
+  correctly fails (the general default is untouched outside classes); a
+  method of one class still cannot forward-reference an unrelated sibling
+  class's later-declared member (the exception does not leak across class
+  boundaries); a property initializer forward-referencing a later property of
+  the same class still correctly fails (LRM 8.6 exempts methods/constraints/
+  covergroups, not initializers, and initializers never reach this walk-up —
+  they bind directly against the class scope with a positional location
+  derived from their own declaration point). See docs/design/classes.md for
+  the patch mechanism and the slang-side trace.
 
 ### Assertions (immediate)
 
