@@ -1909,6 +1909,11 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   concatenation-operand drivers (split into per-net stores), and cross-scope drivers
   (e.g. a shared interface net — the slots would span scopes). Non-overlapping
   constant bit/part-select drivers stay on the single-driver fast path.
+  Confirmed as the exact refusal on a real design's composition: an interface
+  signal (`apb_if.sv`'s `PSEL`) bound as an output port of one BFM and
+  separately continuous-assigned in a sub-system-level prober module when the
+  interface is composed into a larger testbench (`uvm_tb_build_ss_tb`) —
+  the shared-interface-net shape this bullet already names, not a new gap.
 - [~] **Drive strengths** — `(strong0, weak1)` etc. on continuous assigns, net
   declarations, and gates lower and resolve. Each driver slot carries a
   compile-time packed `(strength0, strength1)`; a net with any non-default
@@ -2396,7 +2401,11 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   stages a deep copy in the Active region and MOVES it into the live handle in the
   NBA region, generalizing the queue's path to all three container kinds. A
   literal / `new[n]` right-hand side is still refused (it builds in place rather
-  than deep-copying a handle the commit can move).
+  than deep-copying a handle the commit can move). Confirmed via a real
+  design (`uvm_id_register`, `reg_dut.sv`: `id_register_value <= '{'ha0,
+  'ha1, ...};` nonblocking-assigning an assignment-pattern literal directly
+  into a dynamic array inside an `always @(posedge clk)`) — the exact
+  already-known "literal RHS" gap above, not a new one.
 - [x] **Array ordering methods** (LRM 7.12.2) — `reverse` / `sort` / `rsort` /
   `shuffle` on a dynamic array or queue (`rt_dynarr_*` / `rt_queue_*` helpers),
   and on a fixed-size unpacked array through a mirror of one (see the fixed-size
@@ -3637,6 +3646,19 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   unreachable from any known legal construct, but structurally possible if a
   future copy-thunk/interface/randomization guard grows one) propagates as a
   located refusal instead of leaving a half-registered class behind.
+- [ ] **"class without a descriptor" recurrence through the generic component
+  registry** — the same internal-error class the reentrancy/exception-safety
+  fix above closed for `uvm_sequence#(item)`'s base-recursion shape recurs
+  through a DIFFERENT path: `uvm_component_registry#(T,Tname)::create_component`
+  (uvm-1.2's `uvm_registry.svh:116`). The fix above closed one specific
+  manifestation (a base class's own property forward-referencing a class that
+  extends it, reached from `lower_class_type`'s base recursion); it was never
+  meant to be a universal fix for every path that can leave a class
+  numbered-but-undescribed, and this is a different one, through the
+  parameterized/generic factory-registry machinery rather than field-type
+  recursion. Confirmed via a real design (`biquad_example`) on the uvm-1.2
+  tree. Not yet root-caused against this specific call path; needs its own
+  investigation before a location + diagnostic (or a real fix) can land.
 - [ ] **Backend crash on a class field whose type is (transitively) its own
   descendant** — found while constructing a standalone repro for the
   registration-reentrancy fix above. `class Base; Helper h; ... endclass class
@@ -4048,6 +4070,20 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   Still refused, loud, its own message and its own TODO: a non-packed
   (aggregate / container / string / event) sampled variable, unchanged by
   this work. See docs/design/concurrent-assertions.md §4.
+- [ ] **Sampled-value semantics for a system function call inside a
+  property/sequence expression** (LRM 16.9.1 / 4.4.2) — narrower than
+  cross-scope sampling above: an ordinary system function call
+  (`$isunknown(sig)`, `$countones(sig)`, etc.) used directly as a
+  boolean/expression operand of a property or sequence (`@(posedge PCLK)
+  disable iff (rst) !$isunknown(sig)`) is refused outright ("a function call
+  in a concurrent assertion expression is not supported: what it reads would
+  not be sampled") rather than evaluated at the Preponed (pre-clock-edge)
+  sample point the LRM requires for every assertion-expression operand. Not
+  implemented at all yet — no system function has any coverage in this
+  position, unlike the sampled-value FUNCTIONS ($rose/$past/etc.) above,
+  which are a different, already-covered mechanism. Confirmed via a real
+  design (`apb_if.sv`'s `psel_valid` property, uvm-examples
+  `apb_protocol_monitor` and `uvm_alu_config_analysis`).
 - [~] **Property layer phase 3** — DONE. Unbounded `always p`, `s_eventually p`
   and all four `until` forms lower and simulate, tracked by a new COUNTED mode:
   the obligation is determinised totally and each of its states carries a
@@ -4404,6 +4440,18 @@ project with its own algorithm, not tail cleanup on the property layer:
     aggregate `==` refusal wearing `%p` wording.
 - [ ] **Containers of handles** — queues/dynamic/associative arrays of class
   objects, and class objects holding them.
+- [ ] **Class static member initializer calling a virtual/static factory
+  method on a generic (parameterized) class, where the type parameter is
+  non-integral** — `class uvm_resource #(type T=int) extends
+  uvm_resource_base; static this_type my_type = get_type(); ... endclass`
+  (`uvm_resource.svh:57`). `uvm_resource#(T)` is the generic container
+  underneath UVM's entire `config_db`/`resource_db` mechanism, instantiated
+  with `T` = class handles, virtual-interface handles, queues, etc.
+  throughout any real testbench — the load-bearing template of UVM's config
+  mechanism, not a corner case. Confirmed via two real designs
+  (`uvm_register_spi_bl_tb`, `uvm_tb_build_bl_tb`); not yet root-caused to a
+  specific lowering site — needs its own investigation before a location +
+  diagnostic (or a real fix) can land.
 
 ---
 
