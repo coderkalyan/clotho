@@ -23669,12 +23669,25 @@ private:
         const ir::Ref   i64   = make_int_type(64, false, true);
         const ir::Index lo0   = b.constant(module_.pool.put_int(i64, 0), l);
         const ir::Index hiEnd = b.constant(module_.pool.put_int(i64, static_cast<uint64_t>(INT64_MAX)), l);
+        // A CONCATENATION operand that is itself a queue splices its elements
+        // (LRM 11.4.12): `{q, e}` flattens q's own elements in, one queue-typed
+        // operand contributing many. A PATTERN element never does this,
+        // regardless of its own type: `'{a, b}` specifies exactly one value per
+        // outer element (LRM 5.11 / 7.10.2), so when the outer queue's OWN
+        // element type happens to itself be a queue (`int qq[$][$]`), a
+        // queue-typed PATTERN piece like `'{1,2}` is one element to push, not a
+        // source to splice. Treating it as a splice source read it through the
+        // OUTER container's element stride (a queue-handle-sized stride) instead
+        // of its own -- silent memory corruption, not a refusal, since both
+        // ops tables are well-formed on their own.
+        const bool splices_queues = pat == nullptr;
         for (const Expression* op : pieces) {
-            if (is_queue(*op)) {
+            if (splices_queues && is_queue(*op)) {
                 b.queue_append_range(dst, materialize_queue_rvalue(*op, b), lo0, hiEnd, qty, l);
                 continue;
             }
-            if (is_dyn_array(*op) || op->type->getCanonicalType().isUnpackedArray()) {
+            if (splices_queues &&
+                (is_dyn_array(*op) || op->type->getCanonicalType().isUnpackedArray())) {
                 // A dynamic-array / unpacked-array operand splices its elements
                 // (LRM 11.4.12), but rt_queue_append_range only walks an rt_queue
                 // source; the frontend would otherwise push the whole aggregate as

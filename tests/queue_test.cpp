@@ -1621,6 +1621,48 @@ TEST_CASE("queue of queues: copy semantics, nested access, nested foreach") {
                               "clr 0\n");
 }
 
+TEST_CASE("queue of queues: assignment-pattern literal, whole assignment, and self-slice") {
+    // A pattern element is one outer element regardless of its OWN type (LRM
+    // 5.11 / 7.10.2): `'{'{1,2}, '{3,4}}`'s two pieces are each a whole INNER
+    // queue to push, never spliced -- unlike a CONCATENATION operand, which
+    // splices when it is itself a queue (LRM 11.4.12). append_queue_pieces
+    // used to test `is_queue(*op)` for a pattern piece the same way it does
+    // for a concatenation operand, so `'{1,2}` (whose static type is `int[$]`,
+    // matching the OUTER queue's own element type) was read as a source to
+    // splice through the OUTER container's element stride instead of pushed
+    // as one element through its own -- silent corruption (a queue-handle-sized
+    // stride walk over a 2-int buffer) that hung or SIGFPE'd at run time
+    // rather than refusing at compile time.
+    constexpr std::string_view src = R"(
+        module m;
+            int qq[$][$];
+            int rr[$][$];
+            initial begin
+                qq = '{ '{1,2}, '{3,4}, '{5,6} };
+                $display("lit %0d %0d %0d %0d", qq.size(), qq[0].size(), qq[1][1], qq[2][0]);
+                // Whole assignment between two distinct queue-of-queue handles.
+                rr = qq;
+                rr[0].push_back(99);
+                $display("whole %0d %0d %0d", rr.size(), rr[0].size(), qq[0].size());
+                // Self-slice (LRM 7.10.4's delete(0) equivalent), one level up:
+                // the source read (qq's own elements) and the destination build
+                // (a fresh temp) never alias, same as the scalar-element case.
+                qq = qq[1:$];
+                $display("self-slice %0d %0d %0d", qq.size(), qq[0][0], qq[1][0]);
+                // Unsized literal clears a queue-of-queues exactly as it does a
+                // queue of scalars.
+                qq = {};
+                $display("clear %0d", qq.size());
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "lit 3 2 4 5\n"
+                              "whole 3 3 2\n"
+                              "self-slice 2 3 5\n"
+                              "clear 0\n");
+}
+
 TEST_CASE("an out-of-range nested container element is empty, and writes to it vanish") {
     // LRM 7.4.5 through a container-valued element: the read is the type's default
     // (an EMPTY container), and a mutating method on it must not touch the heap
