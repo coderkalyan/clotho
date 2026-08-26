@@ -1,0 +1,46 @@
+diff --git a/source/ast/symbols/BlockSymbols.cpp b/source/ast/symbols/BlockSymbols.cpp
+index 96c7d80da..a58b2c690 100644
+--- a/source/ast/symbols/BlockSymbols.cpp
++++ b/source/ast/symbols/BlockSymbols.cpp
+@@ -262,11 +262,15 @@ StatementBlockSymbol& StatementBlockSymbol::fromSyntax(const Scope& scope,
+             result->addMember(
+                 StatementBlockSymbol::fromSyntax(scope, prod->as<RsCodeBlockSyntax>()));
+         }
++    }
+ 
+-        if (syntax.weightClause && syntax.weightClause->codeBlock) {
+-            result->addMember(StatementBlockSymbol::fromSyntax(
+-                scope, syntax.weightClause->codeBlock->as<RsCodeBlockSyntax>()));
+-        }
++    // The weight clause's block belongs to the rule, not to each prod. Creating
++    // it inside the loop bound its statements once per prod and, for a rule with
++    // two or more code-block prods, desynchronized createRule's positional walk
++    // over these members.
++    if (syntax.weightClause && syntax.weightClause->codeBlock) {
++        result->addMember(StatementBlockSymbol::fromSyntax(
++            scope, syntax.weightClause->codeBlock->as<RsCodeBlockSyntax>()));
+     }
+ 
+     return *result;
+diff --git a/source/ast/symbols/MemberSymbols.cpp b/source/ast/symbols/MemberSymbols.cpp
+index 41ac6ce23..64eeb4b61 100644
+--- a/source/ast/symbols/MemberSymbols.cpp
++++ b/source/ast/symbols/MemberSymbols.cpp
+@@ -2011,11 +2011,13 @@ const RandSeqProductionSymbol::CaseProd& RandSeqProductionSymbol::createCaseProd
+         switch (item->kind) {
+             case SyntaxKind::StandardRsCaseItem: {
+                 auto& sci = item->as<StandardRsCaseItemSyntax>();
+-                auto pi = createProdItem(*sci.item, context);
+-                for (auto es : sci.expressions) {
++                // One ProdItem per case ITEM, not per label expression: the
++                // second loop below advances prodIt once per item, so pushing a
++                // copy per label made every item after a multi-label one pick up
++                // the previous item's production.
++                prods.push_back(createProdItem(*sci.item, context));
++                for (auto es : sci.expressions)
+                     expressions.push_back(es);
+-                    prods.push_back(pi);
+-                }
+                 break;
+             }
+             case SyntaxKind::DefaultRsCaseItem:
