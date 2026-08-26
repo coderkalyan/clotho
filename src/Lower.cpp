@@ -10877,6 +10877,9 @@ private:
             case StatementKind::RandCase:
                 lower_randcase(stmt.as<slang::ast::RandCaseStatement>(), b);
                 break;
+            case StatementKind::RandSequence:
+                lower_randsequence(stmt.as<RandSequenceStatement>(), b);
+                break;
             case StatementKind::ForLoop:
                 lower_for(stmt.as<ForLoopStatement>(), b);
                 break;
@@ -10899,7 +10902,7 @@ private:
                 lower_immediate_assertion(stmt.as<ImmediateAssertionStatement>(), b);
                 break;
             case StatementKind::Break:
-                b.break_(loc(stmt));
+                lower_break(stmt, b);
                 break;
             case StatementKind::Continue:
                 b.continue_(loc(stmt));
@@ -16818,6 +16821,9 @@ private:
     // condition is a constant true (12.7.1); an X/Z condition exits (handled in
     // the backend via the definite-1 rule).
     void lower_for(const ForLoopStatement& f, ir::Builder& b) {
+        // A `break` anywhere below binds to this loop (LRM 12.8), not to an
+        // enclosing randsequence (18.17.6). Same note at every other loop.
+        const Restore<uint32_t> depth(loop_depth_, loop_depth_ + 1);
         // Init: declared loop vars and assignment initializers are mutually
         // exclusive. Either is lowered in source order so a later init may read
         // an earlier one (12.7.1).
@@ -16847,6 +16853,7 @@ private:
 
     // while-loop: a for-loop with no init and no step.
     void lower_while(const WhileLoopStatement& w, ir::Builder& b) {
+        const Restore<uint32_t> depth(loop_depth_, loop_depth_ + 1);
         b.open_region();
         const ir::Index      pred = lower_loop_cond(w.cond, b);
         const ir::ExtraSlice cond = b.close_region();
@@ -16866,6 +16873,7 @@ private:
     // body; `continue` still lands on the step block, which re-evaluates the
     // condition (empty step -> header).
     void lower_do_while(const DoWhileLoopStatement& d, ir::Builder& b) {
+        const Restore<uint32_t> depth(loop_depth_, loop_depth_ + 1);
         b.open_region();
         const ir::Index      pred = lower_loop_cond(d.cond, b);
         const ir::ExtraSlice cond = b.close_region();
@@ -17046,6 +17054,7 @@ private:
     // without one this is the legal zero-delay infinite loop noted in
     // lower_procedural_block.
     void lower_forever(const Statement& body, ir::Builder& b) {
+        const Restore<uint32_t> depth(loop_depth_, loop_depth_ + 1);
         b.open_region();
         const ir::Index      pred = true_const(b, loc(body));
         const ir::ExtraSlice cond = b.close_region();
@@ -17074,6 +17083,7 @@ private:
     // (-0.6)` rounds to -1 and runs the body zero times), and 64 bits is where
     // FtoI saturates, so a huge real cannot wrap into a small positive count.
     void lower_repeat(const RepeatLoopStatement& r, ir::Builder& b) {
+        const Restore<uint32_t> depth(loop_depth_, loop_depth_ + 1);
         const ir::SourceLoc l = loc(r);
         const ir::Ref ty      = r.count.type->isFloating() ? make_int_type(64, false, true) : lower_type(*r.count.type);
 
@@ -17118,6 +17128,7 @@ private:
     // whatever indexing the body performs on the result is ordinary,
     // pre-existing ElemSelect/BitSelect lowering, untouched by this loop nest.
     void lower_foreach(const ForeachLoopStatement& f, ir::Builder& b) {
+        const Restore<uint32_t> depth(loop_depth_, loop_depth_ + 1);
         lower_foreach_dim(f, 0, b);
     }
 
@@ -18867,6 +18878,1373 @@ private:
         const ir::ExtraSlice else_region = b.close_region();
 
         b.cond(pred, then_region, else_region, l);
+    }
+
+    // -- randsequence (LRM 18.17) --
+    //
+    // Each production becomes its own ir::Function; the grammar is NOT inlined,
+    // because LRM 18.17.7's own GenQueue example is left-recursive and a recursive
+    // production is the clause's stated way to loop. Every production of one
+    // randsequence shares one signature, so any may call any other
+    // (docs/design/randsequence.md §6):
+    //
+    //   randseq.<name>( <this>, output bit $abort, <output T $result>,
+    //                   <declared formals>, <captures...> )
+    //
+    // `$abort` carries `break` (18.17.6) up the call chain: the production that
+    // raises it returns at once, and every caller tests it after every production
+    // call and returns in turn, so the whole block unwinds to the statement after
+    // `endsequence`. `$result` carries a non-void production's `return expr`
+    // (18.17.7) into the rule variable of the rule that generated it. Both are
+    // `output` formals, so the backend's own copy-out epilogue delivers them and a
+    // production that consumes time (a task) needs nothing extra. `return` itself
+    // is just the production function's RetVoid, which is exactly 18.17.6's
+    // "aborts the generation of the current production". `<captures>` are the
+    // enclosing subroutine frame's symbols the block reads, passed by reference; a
+    // process body has no frame and the list is empty, since a module signal
+    // resolves directly from any body.
+    using RsProd     = RandSeqProductionSymbol;
+    using RsProdBase = RandSeqProductionSymbol::ProdBase;
+    using RsProdItem = RandSeqProductionSymbol::ProdItem;
+    using RsProdKind = RandSeqProductionSymbol::ProdKind;
+
+    struct RandSeqCtx {
+        // Production -> the ir::Function it lowered to.
+        ankerl::unordered_dense::map<const RsProd*, ir::FunctionId> ids;
+        // Enclosing-frame symbols every production takes as a trailing ref formal,
+        // in first-reference order -- that order IS the formal order.
+        std::vector<const ValueSymbol*> captures;
+        // The enclosing method's `this` automatic, spliced as formal 0 when the
+        // block reads a class member.
+        const ValueSymbol* this_var   = nullptr;
+        ir::Ref            this_class = ir::Ref::Invalid;
+        // Productions are coroutines exactly when the randsequence sits in one.
+        bool is_task = false;
+        // A production named as a `rand join` operand (LRM 18.17.5) additionally
+        // gets two entry points, because interleaving has to advance a sequence one
+        // depth-1 unit at a time and a plain call runs it to completion: `plan`
+        // performs its rule draw and reports the chosen rule and that rule's unit
+        // count, `step` generates one numbered unit of one numbered rule.
+        struct Steps {
+            ir::FunctionId plan;
+            ir::FunctionId step;
+        };
+        ankerl::unordered_dense::map<const RsProd*, Steps> steps;
+    };
+
+    // Per-rule bookkeeping for LRM 18.17.7's implicit result variables.
+    struct RandSeqRuleVars {
+        // slang's synthesized variable for each non-void production the rule names.
+        ankerl::unordered_dense::map<std::string_view, const VariableSymbol*> byname;
+        // 1-based index of each syntactic production reference among the references
+        // to the same production within this rule.
+        ankerl::unordered_dense::map<const RsProdItem*, uint32_t> occ;
+        // How many times each production is named -- one means the variable is a
+        // scalar, more means it is a `[1:N]` array.
+        ankerl::unordered_dense::map<const RsProd*, uint32_t> total;
+    };
+
+    // Walk everything a randsequence block can read. slang's generic ASTVisitor
+    // stops dead at RandSequenceStatement (it has neither visitExprs nor
+    // visitStmts) and RandSeqProductionSymbol::visitExprs deliberately skips code
+    // blocks, so the walk has to be spelled out.
+    template<typename V>
+    static void visit_randseq(const RandSequenceStatement& rs, V& v) {
+        for (const RsProd* p : rs.productions) {
+            if (p == nullptr) {
+                continue;
+            }
+            for (const FormalArgumentSymbol* fa : p->arguments) {
+                if (const Expression* dv = fa->getDefaultValue()) {
+                    dv->visit(v);
+                }
+            }
+            p->visitExprs(v);
+            for (const RsProd::Rule& rule : p->getRules()) {
+                for (const RsProdBase* prod : rule.prods) {
+                    if (prod->kind != RsProdKind::CodeBlock) {
+                        continue;
+                    }
+                    if (const Statement* s = prod->as<RsProd::CodeBlockProd>().block->tryGetStatement()) {
+                        s->visit(v);
+                    }
+                }
+                if (rule.codeBlock) {
+                    if (const Statement* s = rule.codeBlock->block->tryGetStatement()) {
+                        s->visit(v);
+                    }
+                }
+            }
+        }
+    }
+
+    void lower_randsequence(const RandSequenceStatement& rs, ir::Builder& b) {
+        if (rs.firstProduction == nullptr) {
+            // An empty randsequence, or a top-production lookup slang already
+            // diagnosed. Nothing to generate either way.
+            return;
+        }
+        const RandSeqCtx&   ctx = randseq_block(rs);
+        const ir::SourceLoc l   = loc(rs);
+        const auto          it  = ctx.ids.find(rs.firstProduction);
+        if (it == ctx.ids.end()) {
+            fail("internal: randsequence top production has no lowered body");
+        }
+        // The entry call. slang has already required the top production to take no
+        // arguments (RandSequenceStatement::fromSyntax), and its result -- if it
+        // declares one -- is discarded, so both output slots here are write-only
+        // temps: there is no frame above to unwind to, and a `break` reaching this
+        // point has already ended the block.
+        std::vector<ir::Index> args;
+        if (ctx.this_var != nullptr) {
+            args.push_back(this_handle(b, l));
+        }
+        args.push_back(abort_lvalue(b, l));
+        if (!rs.firstProduction->getReturnType().isVoid()) {
+            args.push_back(make_arg_temp(lower_type(rs.firstProduction->getReturnType()), b, l));
+        }
+        for (const ValueSymbol* cap : ctx.captures) {
+            args.push_back(value_lvalue(*cap, b, l));
+        }
+        if (ctx.is_task) {
+            b.task_call(it->second, args, l);
+        } else {
+            b.call(it->second, args, l);
+        }
+    }
+
+    // Build, once per randsequence statement, the function set it lowers to. Ids
+    // are reserved for the whole set before any body is built, so a production may
+    // call itself or one declared later (slang resolves production names with
+    // LookupFlags::AllowDeclaredAfter).
+    //
+    // Keyed on the statement alone: the production functions take everything they
+    // read as formals, so they do not depend on which enclosing body is lowering
+    // the block -- only the call-site actuals do.
+    const RandSeqCtx& randseq_block(const RandSequenceStatement& rs) {
+        if (const auto it = randseq_.find(&rs); it != randseq_.end()) {
+            return it->second;
+        }
+        RandSeqCtx ctx;
+        // A production body is a coroutine exactly when the randsequence sits in
+        // one, because a code block may consume time only there (LRM 13.4 forbids
+        // it in a function, and the function body's own timing guards report it).
+        ctx.is_task = fn_ctx_ == nullptr || fn_ctx_->is_task;
+
+        if (fn_ctx_ != nullptr) {
+            // Everything the block reads out of the ENCLOSING frame has to travel:
+            // a production is its own function with its own frame. Same detector,
+            // and the same first-reference formal order, as a fork child's captures.
+            ForkCaptureDetector d;
+            d.locals = &fn_ctx_->localmap;
+            ankerl::unordered_dense::set<const ValueSymbol*> boxed_syms;
+            for (const auto& [sym, bx] : fn_ctx_->boxed) {
+                boxed_syms.insert(sym);
+            }
+            d.boxed    = &boxed_syms;
+            d.this_var = fn_ctx_->this_var;
+            visit_randseq(rs, d);
+            for (const ValueSymbol* sym : d.captured) {
+                if (sym == fn_ctx_->this_var) {
+                    // A handle carries its own reference semantics, so `this` goes by
+                    // value as formal 0, exactly as splice_this passes it to a method.
+                    ctx.this_var   = sym;
+                    ctx.this_class = fn_ctx_->this_class;
+                    continue;
+                }
+                if (fn_ctx_->boxed.contains(sym)) {
+                    // TODO: a randsequence sharing an automatic with a DETACHING fork
+                    // (docs/design/fork-join.md V4). The variable lives in a GC box, so
+                    // the ref formal would alias the box's field rather than a frame
+                    // slot -- believed correct, but wholly unexercised, so guarded
+                    // rather than assumed.
+                    fail("a randsequence reading a variable captured by a detached fork "
+                         "is not supported");
+                }
+                ctx.captures.push_back(sym);
+            }
+        }
+
+        for (const RsProd* p : rs.productions) {
+            ctx.ids[p] = module_.reserve_function();
+        }
+        // A `rand join` operand needs its own plan / step pair. Collected across
+        // the whole block first, because the operand may be declared after the rule
+        // that names it.
+        for (const RsProd* p : rs.productions) {
+            for (const RsProd::Rule& rule : p->getRules()) {
+                if (!rule.isRandJoin) {
+                    continue;
+                }
+                for (const RsProdBase* prod : rule.prods) {
+                    // The parser guarantees every rand join operand is a plain
+                    // production reference (RandJoinProdItem).
+                    const RsProd* target = prod->kind == RsProdKind::Item ? prod->as<RsProdItem>().target : nullptr;
+                    if (target == nullptr || ctx.steps.contains(target)) {
+                        continue;
+                    }
+                    check_rand_join_operand(*target);
+                    ctx.steps[target] = { module_.reserve_function(), module_.reserve_function() };
+                }
+            }
+        }
+        const RandSeqCtx& stored = randseq_.emplace(&rs, std::move(ctx)).first->second;
+
+        // Every reserved slot must be filled even when a body fails, or the
+        // backend's unconditional declare_function pass reads an unset one
+        // (build_fork_child documents the same hazard). Each builder completes its
+        // own slot before rethrowing; this loop keeps going so the SIBLINGS' slots
+        // are completed too, and reports the first failure.
+        std::optional<LowerError> failure;
+        const auto                build = [&](auto&& fn) {
+            try {
+                fn();
+            } catch (const LowerError& e) {
+                if (!failure) {
+                    failure = e;
+                }
+            }
+        };
+        for (const RsProd* p : rs.productions) {
+            build([&] { build_production(*p, stored, stored.ids.at(p)); });
+            if (const auto it = stored.steps.find(p); it != stored.steps.end()) {
+                build([&] { build_production_plan(*p, stored, it->second.plan); });
+                build([&] { build_production_step(*p, stored, it->second.step); });
+            }
+        }
+        if (failure) {
+            throw *failure;
+        }
+        return stored;
+    }
+
+    // What an interleaved production may not do (LRM 18.17.5). Both limits come
+    // from the same place: `step` is a function of its own, entered once per unit,
+    // so nothing a rule holds ACROSS its units can live in its frame.
+    void check_rand_join_operand(const RsProd& p) {
+        for (const RsProd::Rule& rule : p.getRules()) {
+            if (rule.isRandJoin) {
+                // TODO: an operand of a `rand join` that is itself a `rand join`.
+                // Its units would have to be interleaved by the outer driver AND by
+                // its own, which needs a resumable inner driver, not a step index.
+                fail("a randsequence rand join operand that is itself a rand join is "
+                     "not supported");
+            }
+            for (const Symbol& m : rule.ruleBlock->members()) {
+                if (m.as_if<VariableSymbol>() != nullptr) {
+                    // TODO: LRM 18.17.7 value passing inside an interleaved
+                    // production. The rule's implicit result variables would have to
+                    // survive from the unit that writes one to the code block that
+                    // reads it, with other operands' units in between -- so they
+                    // cannot be frame locals of a per-unit `step`.
+                    fail("a randsequence rand join operand whose rule reads the result "
+                         "of another production is not supported");
+                }
+            }
+        }
+        for (const FormalArgumentSymbol* fa : p.arguments) {
+            if (fa->direction != slang::ast::ArgumentDirection::In) {
+                // TODO: an output / inout / ref formal on an interleaved production.
+                // Its arguments are evaluated once, before the first unit, and each
+                // unit is a separate call, so a copy-out would land N times at
+                // unspecified points in the interleaving.
+                fail("a randsequence rand join operand with a non-input argument is "
+                     "not supported");
+            }
+        }
+    }
+
+    // How many depth-1 units one rule contributes to an interleaving: its prods,
+    // plus the weight clause's trailing code block when it has one.
+    static uint32_t rand_join_units(const RsProd::Rule& rule) {
+        return static_cast<uint32_t>(rule.prods.size()) + (rule.codeBlock ? 1u : 0u);
+    }
+
+    void build_production(const RsProd& p, const RandSeqCtx& rs, ir::FunctionId id) {
+        const ir::SourceLoc l    = to_source_loc(p.location);
+        const ir::Ref       bit1 = make_int_type(1, false, false);
+        const Type&         rty  = p.getReturnType();
+
+        FnCtx ctx;
+        ctx.name_prefix = "randseq." + std::string(p.name) + ".";
+        ctx.is_task     = rs.is_task;
+        ctx.in_randseq  = true;
+        // As build_function / build_task: an enclosing construction's or default
+        // argument's `this` is another builder's Index and stops at this boundary.
+        const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
+        const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
+        const FnScope                          fn_scope(*this, &ctx);
+        ir::Builder                            b(module_.pool);
+        std::vector<ir::Ref>                   param_types;
+        std::vector<ir::ArgDir>                arg_dirs;
+
+        // Formal order -- and therefore frame Local order, which the backend's
+        // prologue relies on: `this`, the abort flag, the result slot, the declared
+        // formals, the captures. Every production of one block agrees on it.
+        if (rs.this_var != nullptr) {
+            param_types.push_back(rs.this_class);
+            arg_dirs.push_back(ir::ArgDir::In);
+            ctx.this_local = fn_local(*rs.this_var);
+            ctx.has_this   = true;
+            ctx.this_class = rs.this_class;
+            ctx.this_var   = rs.this_var;
+        }
+        param_types.push_back(bit1);
+        arg_dirs.push_back(ir::ArgDir::Out);
+        ctx.randseq_abort = anon_local(bit1);
+        if (!rty.isVoid()) {
+            const ir::Ref rref = lower_type(rty);
+            if (is_handle_ref(rref)) {
+                // TODO: a production returning a queue, dynamic array or associative
+                // array (LRM 18.17.7). The result slot is an output formal, and a
+                // container result needs the deep-copy assignment path lower_assign
+                // reaches through lower_queue_assign and friends -- all shaped around
+                // an AssignmentExpression, of which there is none here.
+                fail("a randsequence production returning a queue, dynamic array or "
+                     "associative array is not supported");
+            }
+            param_types.push_back(rref);
+            arg_dirs.push_back(ir::ArgDir::Out);
+            ctx.randseq_result     = anon_local(rref);
+            ctx.randseq_result_ty  = rref;
+            ctx.randseq_has_result = true;
+        }
+        for (const FormalArgumentSymbol* fa : p.arguments) {
+            param_types.push_back(lower_type(fa->getType()));
+            arg_dirs.push_back(to_arg_dir(fa->direction));
+            fn_local(*fa);
+        }
+        for (const ValueSymbol* cap : rs.captures) {
+            param_types.push_back(lower_type(cap->getType()));
+            arg_dirs.push_back(ir::ArgDir::Ref);
+            fn_local(*cap);
+        }
+
+        const ir::Builder::Mark   body_mark = b.mark();
+        std::optional<LowerError> failure;
+        try {
+            // An output formal is not seeded from the caller, so the flag starts at
+            // the frame's X fill. Clear it before any call can read it back.
+            b.binary(ir::Inst::Tag::Store,
+                     b.local(ctx.randseq_abort, bit1, l),
+                     b.constant(module_.pool.put_int(bit1, 0), l),
+                     l);
+            gen_production(p, rs, b);
+        } catch (const LowerError& e) {
+            b.rollback(body_mark);
+            failure = e;
+        }
+        b.ret_void(l);
+        module_.set_function(id,
+                             ir::Function{ .name        = "randseq." + std::string(p.name),
+                                           .return_type = module_.pool.void_type,
+                                           .param_types = std::move(param_types),
+                                           .arg_dirs    = std::move(arg_dirs),
+                                           .local_types = std::move(ctx.local_types),
+                                           .is_task     = rs.is_task,
+                                           .ir          = b.finish() });
+        if (failure) {
+            throw *failure;
+        }
+    }
+
+    // The `plan` entry point of a `rand join` operand (LRM 18.17.5): perform the
+    // production's rule draw and report which rule was chosen and how many depth-1
+    // units it contributes. Everything the weights may read -- `this`, the declared
+    // formals, the enclosing frame captures -- is passed exactly as to the
+    // production itself, so a weight tracks design state here as it does there.
+    //
+    //   randseq.<name>.plan( <this>, output int $rule, output int $len,
+    //                        <declared formals>, <captures...> )
+    //
+    // `$rule` is -1 when the weights summed to zero, which generates nothing.
+    void build_production_plan(const RsProd& p, const RandSeqCtx& rs, ir::FunctionId id) {
+        const ir::SourceLoc l   = to_source_loc(p.location);
+        const ir::Ref       i32 = make_int_type(32, false, true);
+
+        FnCtx ctx;
+        ctx.name_prefix = "randseq." + std::string(p.name) + ".plan.";
+        ctx.is_task     = rs.is_task;
+        ctx.in_randseq  = true;
+        const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
+        const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
+        const FnScope                          fn_scope(*this, &ctx);
+        ir::Builder                            b(module_.pool);
+        std::vector<ir::Ref>                   param_types;
+        std::vector<ir::ArgDir>                arg_dirs;
+
+        if (rs.this_var != nullptr) {
+            param_types.push_back(rs.this_class);
+            arg_dirs.push_back(ir::ArgDir::In);
+            ctx.this_local = fn_local(*rs.this_var);
+            ctx.has_this   = true;
+            ctx.this_class = rs.this_class;
+            ctx.this_var   = rs.this_var;
+        }
+        param_types.push_back(i32);
+        arg_dirs.push_back(ir::ArgDir::Out);
+        const uint32_t rule_out = anon_local(i32);
+        param_types.push_back(i32);
+        arg_dirs.push_back(ir::ArgDir::Out);
+        const uint32_t len_out = anon_local(i32);
+        // A plan body raises no abort of its own -- a weight expression is an
+        // ordinary expression -- but in_randseq is set for the shared helpers, so
+        // give the flag a slot nothing writes.
+        ctx.randseq_abort = anon_local(make_int_type(1, false, false));
+        for (const FormalArgumentSymbol* fa : p.arguments) {
+            param_types.push_back(lower_type(fa->getType()));
+            arg_dirs.push_back(to_arg_dir(fa->direction));
+            fn_local(*fa);
+        }
+        for (const ValueSymbol* cap : rs.captures) {
+            param_types.push_back(lower_type(cap->getType()));
+            arg_dirs.push_back(ir::ArgDir::Ref);
+            fn_local(*cap);
+        }
+
+        const ir::Builder::Mark   body_mark = b.mark();
+        std::optional<LowerError> failure;
+        try {
+            const auto store_plan = [&](int64_t rule_idx, uint32_t units) {
+                b.binary(ir::Inst::Tag::Store,
+                         b.local(rule_out, i32, l),
+                         b.constant(module_.pool.put_int(i32, rule_idx), l),
+                         l);
+                b.binary(
+                  ir::Inst::Tag::Store, b.local(len_out, i32, l), b.constant(module_.pool.put_int(i32, units), l), l);
+            };
+            store_plan(-1, 0);
+            const std::span<const RsProd::Rule> rules = p.getRules();
+            if (rules.size() == 1) {
+                store_plan(0, rand_join_units(rules[0]));
+            } else if (rules.size() > 1) {
+                gen_weighted_rules(p, rules, b, [&](size_t k, ir::Builder& bb) {
+                    (void)bb;
+                    store_plan(static_cast<int64_t>(k), rand_join_units(rules[k]));
+                });
+            }
+        } catch (const LowerError& e) {
+            b.rollback(body_mark);
+            failure = e;
+        }
+        b.ret_void(l);
+        module_.set_function(id,
+                             ir::Function{ .name        = "randseq." + std::string(p.name) + ".plan",
+                                           .return_type = module_.pool.void_type,
+                                           .param_types = std::move(param_types),
+                                           .arg_dirs    = std::move(arg_dirs),
+                                           .local_types = std::move(ctx.local_types),
+                                           .is_task     = rs.is_task,
+                                           .ir          = b.finish() });
+        if (failure) {
+            throw *failure;
+        }
+    }
+
+    // The `step` entry point of a `rand join` operand: generate unit `$pos` of rule
+    // `$rule`, one depth-1 item of the sequence the driver is interleaving.
+    //
+    //   randseq.<name>.step( <this>, output bit $abort, <output T $result>,
+    //                        input int $rule, input int $pos, output bit $stop,
+    //                        <declared formals>, <captures...> )
+    void build_production_step(const RsProd& p, const RandSeqCtx& rs, ir::FunctionId id) {
+        const ir::SourceLoc l    = to_source_loc(p.location);
+        const ir::Ref       bit1 = make_int_type(1, false, false);
+        const ir::Ref       i32  = make_int_type(32, false, true);
+        const Type&         rty  = p.getReturnType();
+
+        FnCtx ctx;
+        ctx.name_prefix = "randseq." + std::string(p.name) + ".step.";
+        ctx.is_task     = rs.is_task;
+        ctx.in_randseq  = true;
+        const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
+        const Restore<std::optional<CtorThis>> no_dflt_this(default_arg_this_, std::nullopt);
+        const FnScope                          fn_scope(*this, &ctx);
+        ir::Builder                            b(module_.pool);
+        std::vector<ir::Ref>                   param_types;
+        std::vector<ir::ArgDir>                arg_dirs;
+
+        if (rs.this_var != nullptr) {
+            param_types.push_back(rs.this_class);
+            arg_dirs.push_back(ir::ArgDir::In);
+            ctx.this_local = fn_local(*rs.this_var);
+            ctx.has_this   = true;
+            ctx.this_class = rs.this_class;
+            ctx.this_var   = rs.this_var;
+        }
+        param_types.push_back(bit1);
+        arg_dirs.push_back(ir::ArgDir::Out);
+        ctx.randseq_abort = anon_local(bit1);
+        if (!rty.isVoid()) {
+            const ir::Ref rref = lower_type(rty);
+            if (is_handle_ref(rref)) {
+                fail("a randsequence production returning a queue, dynamic array or "
+                     "associative array is not supported");
+            }
+            param_types.push_back(rref);
+            arg_dirs.push_back(ir::ArgDir::Out);
+            ctx.randseq_result     = anon_local(rref);
+            ctx.randseq_result_ty  = rref;
+            ctx.randseq_has_result = true;
+        }
+        param_types.push_back(i32);
+        arg_dirs.push_back(ir::ArgDir::In);
+        const uint32_t rule_in = anon_local(i32);
+        param_types.push_back(i32);
+        arg_dirs.push_back(ir::ArgDir::In);
+        const uint32_t pos_in = anon_local(i32);
+        param_types.push_back(bit1);
+        arg_dirs.push_back(ir::ArgDir::Out);
+        ctx.randseq_stop     = anon_local(bit1);
+        ctx.randseq_has_stop = true;
+        for (const FormalArgumentSymbol* fa : p.arguments) {
+            param_types.push_back(lower_type(fa->getType()));
+            arg_dirs.push_back(to_arg_dir(fa->direction));
+            fn_local(*fa);
+        }
+        for (const ValueSymbol* cap : rs.captures) {
+            param_types.push_back(lower_type(cap->getType()));
+            arg_dirs.push_back(ir::ArgDir::Ref);
+            fn_local(*cap);
+        }
+
+        const ir::Builder::Mark   body_mark = b.mark();
+        std::optional<LowerError> failure;
+        try {
+            const ir::Index zero = b.constant(module_.pool.put_int(bit1, 0), l);
+            b.binary(ir::Inst::Tag::Store, b.local(ctx.randseq_abort, bit1, l), zero, l);
+            b.binary(ir::Inst::Tag::Store, b.local(ctx.randseq_stop, bit1, l), zero, l);
+            gen_step_rules(rs,
+                           p.getRules(),
+                           0,
+                           b.unary(ir::Inst::Tag::Load, b.local(rule_in, i32, l), l),
+                           b.local(pos_in, i32, l),
+                           i32,
+                           b);
+        } catch (const LowerError& e) {
+            b.rollback(body_mark);
+            failure = e;
+        }
+        b.ret_void(l);
+        module_.set_function(id,
+                             ir::Function{ .name        = "randseq." + std::string(p.name) + ".step",
+                                           .return_type = module_.pool.void_type,
+                                           .param_types = std::move(param_types),
+                                           .arg_dirs    = std::move(arg_dirs),
+                                           .local_types = std::move(ctx.local_types),
+                                           .is_task     = rs.is_task,
+                                           .ir          = b.finish() });
+        if (failure) {
+            throw *failure;
+        }
+    }
+
+    // `switch ($rule)` as a Cond chain: both indices are small syntactic counts, so
+    // a chain costs less than a jump table's key packing.
+    void gen_step_rules(const RandSeqCtx&             rs,
+                        std::span<const RsProd::Rule> rules,
+                        size_t                        r,
+                        ir::Index                     rule_val,
+                        ir::Index                     pos_lv,
+                        ir::Ref                       i32,
+                        ir::Builder&                  b) {
+        if (r == rules.size()) {
+            return;
+        }
+        const ir::SourceLoc l = to_source_loc(rules[r].ruleBlock->location);
+        const ir::Index     pred =
+          b.binary(ir::Inst::Tag::Eq, rule_val, b.constant(module_.pool.put_int(i32, static_cast<int64_t>(r)), l), l);
+        b.open_region();
+        gen_step_units(rs, rules[r], 0, pos_lv, i32, b);
+        const ir::ExtraSlice then_region = b.close_region();
+        b.open_region();
+        gen_step_rules(rs, rules, r + 1, rule_val, pos_lv, i32, b);
+        const ir::ExtraSlice else_region = b.close_region();
+        b.cond(pred, then_region, else_region, l);
+    }
+
+    void gen_step_units(const RandSeqCtx&   rs,
+                        const RsProd::Rule& rule,
+                        uint32_t            u,
+                        ir::Index           pos_lv,
+                        ir::Ref             i32,
+                        ir::Builder&        b) {
+        if (u == rand_join_units(rule)) {
+            return;
+        }
+        const ir::SourceLoc l    = to_source_loc(rule.ruleBlock->location);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::Eq,
+                                            b.unary(ir::Inst::Tag::Load, pos_lv, l),
+                                            b.constant(module_.pool.put_int(i32, static_cast<int64_t>(u)), l),
+                                            l);
+        b.open_region();
+        // check_rand_join_operand has already refused a rule with result variables,
+        // so no unit of an interleaved rule can name a non-void production.
+        const RandSeqRuleVars vars;
+        if (u < rule.prods.size()) {
+            gen_prod(*rule.prods[u], rs, vars, b);
+        } else {
+            gen_code_block(*rule.codeBlock, b);
+        }
+        const ir::ExtraSlice then_region = b.close_region();
+        b.open_region();
+        gen_step_units(rs, rule, u + 1, pos_lv, i32, b);
+        const ir::ExtraSlice else_region = b.close_region();
+        b.cond(pred, then_region, else_region, l);
+    }
+
+    // One activation of a production: pick a rule, then generate it.
+    void gen_production(const RsProd& p, const RandSeqCtx& rs, ir::Builder& b) {
+        const std::span<const RsProd::Rule> rules = p.getRules();
+        if (rules.empty()) {
+            return;
+        }
+        if (rules.size() == 1) {
+            // No alternative to weigh, so no weight expression is evaluated and no
+            // random value is drawn: LRM 18.17.1 makes a weight meaningful only
+            // between alternatives, and draw counts are observable (they shift every
+            // later value in the process's stream).
+            gen_rule(rules[0], rs, b);
+            return;
+        }
+        gen_weighted_rules(p, rules, b, [&](size_t k, ir::Builder& bb) { gen_rule(rules[k], rs, bb); });
+    }
+
+    // LRM 18.17.1's weighted choice among a production's alternative rules, with
+    // `emit(k, b)` producing whatever the k-th rule means to the caller: generating
+    // it (gen_production) or just recording its index (build_production_plan, which
+    // must draw at the same point so an interleaved production's stream matches a
+    // plain one's).
+    //
+    // Same weight domain, sum precision and zero-total rule as randcase (18.16):
+    // unsigned summands at the widest weight's self-determined precision, one draw
+    // over the total, and no draw at all when the total is zero -- there is then no
+    // rule to pick, and drawing would shift the stream.
+    template<typename F>
+    void gen_weighted_rules(const RsProd& p, std::span<const RsProd::Rule> rules, ir::Builder& b, F&& emit) {
+        const ir::SourceLoc l = to_source_loc(p.location);
+
+        // An omitted weight is the integer literal 1 (LRM 18.17.1), whose
+        // self-determined precision is an integer's -- 32 bits. It has to fold into
+        // the common width like any other summand: at the literal 1-bit minimum,
+        // two default weights would sum to 0 and the production would generate
+        // nothing.
+        uint32_t width = 1;
+        for (const RsProd::Rule& r : rules) {
+            width = std::max(width, r.weightExpr != nullptr ? r.weightExpr->type->getBitWidth() : 32u);
+        }
+        if (width > 32) {
+            // TODO: a wider sum needs the LRM's several-draw scheme, stitching
+            // multiple $urandom_range results into one number (LRM 18.16, whose
+            // weight rules 18.17.1 shares). Same guard, same reason, as randcase.
+            fail("randsequence production weight wider than 32 bits is not supported");
+        }
+        const ir::Ref          wty = make_int_type(width, false, false);
+        std::vector<ir::Index> weights;
+        weights.reserve(rules.size());
+        for (const RsProd::Rule& r : rules) {
+            // "If no weight is specified, a production shall use a weight of 1"
+            // (18.17.1). A written weight is evaluated on every activation, in rule
+            // order, which is what lets it track design state.
+            weights.push_back(r.weightExpr != nullptr ? b.resize(lower_expr(*r.weightExpr, b), wty, loc(*r.weightExpr))
+                                                      : b.constant(module_.pool.put_int(wty, 1), l));
+        }
+        ir::Index sum = weights[0];
+        for (size_t k = 1; k < weights.size(); k++) {
+            sum = b.binary(ir::Inst::Tag::Add, sum, weights[k], l);
+        }
+
+        const ir::Ref   u32  = make_int_type(32, false, false);
+        const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
+        b.open_region();
+        const ir::Index draw = b.urandom_range(
+          b.binary(ir::Inst::Tag::Sub, b.resize(sum, u32, l), b.constant(module_.pool.put_int(u32, 1), l), l),
+          b.constant(module_.pool.put_int(u32, 0), l),
+          l);
+        gen_rule_arm(rules, 0, zero, draw, weights, u32, b, emit);
+        const ir::ExtraSlice pick_region = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice none_region = b.close_region();
+        b.cond(b.binary(ir::Inst::Tag::Ne, sum, zero, l), pick_region, none_region, l);
+    }
+
+    // One arm of the rule-selection ladder, shaped exactly like randcase's.
+    template<typename F>
+    void gen_rule_arm(std::span<const RsProd::Rule> rules,
+                      size_t                        k,
+                      ir::Index                     acc,
+                      ir::Index                     draw,
+                      const std::vector<ir::Index>& weights,
+                      ir::Ref                       u32,
+                      ir::Builder&                  b,
+                      F&                            emit) {
+        if (k == weights.size()) {
+            return;
+        }
+        const ir::SourceLoc l    = to_source_loc(rules[k].ruleBlock->location);
+        const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::Lt, draw, b.resize(next, u32, l), l);
+
+        b.open_region();
+        emit(k, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        gen_rule_arm(rules, k + 1, next, draw, weights, u32, b, emit);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, l);
+    }
+
+    // Everything one rule generates, in order: its prods left to right, then the
+    // weight clause's trailing code block. That order is forced by LRM 18.17.7's
+    // GenQueue example, whose weight-clause block reads the result of a production
+    // in the same rule's list.
+    void gen_rule(const RsProd::Rule& rule, const RandSeqCtx& rs, ir::Builder& b) {
+        // slang synthesizes one const variable per non-void production this rule
+        // names and puts it in the rule block's scope (LRM 18.17.7). They arrive as
+        // scope members, never as VariableDeclStatements, so nothing else would ever
+        // declare them -- lower_var_decl, not bare declare_storage, because the
+        // type default it writes is what a slot for a production the rule did NOT
+        // generate reads back. 18.17.7 calls that value "undefined"; Table 6-7's
+        // default is a defined choice, and the alternative here is the frame's
+        // previous contents.
+        RandSeqRuleVars vars;
+        for (const Symbol& m : rule.ruleBlock->members()) {
+            const auto* vs = m.as_if<VariableSymbol>();
+            if (vs == nullptr) {
+                continue;
+            }
+            lower_var_decl(*vs, b, /*force_frame=*/true);
+            vars.byname[vs->name] = vs;
+        }
+        count_rule_items(rule, vars);
+
+        if (rule.isRandJoin) {
+            gen_rand_join(rule, rs, vars, b);
+        } else {
+            for (const RsProdBase* prod : rule.prods) {
+                gen_prod(*prod, rs, vars, b);
+            }
+        }
+        if (rule.codeBlock) {
+            gen_code_block(*rule.codeBlock, b);
+        }
+    }
+
+    // `rand join [ (expr) ] S1 S2 ...` (LRM 18.17.5): interleave the operands'
+    // sequences at random while preserving each one's own order.
+    //
+    // Each operand is planned once -- one call that draws its rule and reports that
+    // rule's depth-1 unit count -- and then advanced one unit at a time by its
+    // `step` entry point. The parser guarantees every operand is a plain production
+    // reference and that there are at least two.
+    //
+    // The optional expression is "a real number in the range of 0.0 to 1.0" fixing
+    // "the degree to which the length of the sequences to be interleaved affects
+    // the probability of selecting a sequence": 0.0 favours the shortest remaining
+    // sequence, 1.0 the longest, and 0.5 "does not prioritize any sequence length".
+    // The clause pins those three points and nothing between them, so the weight is
+    //
+    //     w_i = (K - X) * (Lmax + 1 - L_i) + X * L_i
+    //
+    // with X the expression quantized to K = 1024ths and L_i the operand's
+    // remaining unit count. At X = 0 that is proportional to Lmax + 1 - L_i
+    // (shortest first), at X = K to L_i (longest first), and at X = K/2 it collapses
+    // to the constant K/2 * (Lmax + 1), i.e. uniform over the eligible operands --
+    // exactly the three anchors, monotone in X between them, and integer-only, so
+    // the pick reuses the same cumulative ladder every other weighted choice here
+    // uses. w_i is at least 1 for an eligible operand at every X, so the total can
+    // only be zero when none is eligible, which the loop condition already tests.
+    void gen_rand_join(const RsProd::Rule& rule, const RandSeqCtx& rs, const RandSeqRuleVars& vars, ir::Builder& b) {
+        const ir::SourceLoc l      = to_source_loc(rule.ruleBlock->location);
+        const ir::Ref       i32    = make_int_type(32, false, true);
+        const ir::Ref       u32    = make_int_type(32, false, false);
+        const ir::Ref       bit1   = make_int_type(1, false, false);
+        const auto          kconst = [&](int64_t v) { return b.constant(module_.pool.put_int(i32, v), l); };
+
+        // One operand's live interleaving state.
+        struct Operand {
+            const RsProdItem*       item = nullptr;
+            const RsProd*           prod = nullptr;
+            TempCell                rule_idx; // the rule `plan` drew
+            TempCell                nleft;    // units not yet generated
+            TempCell                pos;      // next unit index
+            TempCell                stop;     // the production returned; drop the rest
+            std::vector<TempCell>   args;     // the declared arguments, evaluated once
+            std::optional<TempCell> result;
+        };
+        std::vector<Operand> ops;
+        ops.reserve(rule.prods.size());
+        for (const RsProdBase* prod : rule.prods) {
+            if (prod->kind != RsProdKind::Item) {
+                fail("internal: a randsequence rand join operand is not a production reference");
+            }
+            const RsProdItem& item = prod->as<RsProdItem>();
+            if (item.target == nullptr) {
+                return; // an unresolved operand; slang already diagnosed it
+            }
+            Operand op;
+            op.item     = &item;
+            op.prod     = item.target;
+            op.rule_idx = make_temp_cell(i32, "rj_rule");
+            op.nleft    = make_temp_cell(i32, "rj_left");
+            op.pos      = make_temp_cell(i32, "rj_pos");
+            op.stop     = make_temp_cell(bit1, "rj_stop");
+            if (!op.prod->getReturnType().isVoid()) {
+                op.result = make_temp_cell(lower_type(op.prod->getReturnType()), "rj_res");
+            }
+            ops.push_back(std::move(op));
+        }
+
+        // "Passing data to a production is similar to a task call" (18.17.7), so each
+        // operand's arguments are evaluated exactly once -- here, before any unit --
+        // and replayed from temps at every step call. check_rand_join_operand has
+        // already refused a non-input formal, so there is no copy-out to place.
+        for (Operand& op : ops) {
+            std::vector<CopyOutArg>      outs;
+            const std::vector<ir::Index> vals = build_call_args(op.prod->arguments, op.item->args, outs, b, l);
+            for (size_t k = 0; k < vals.size(); k++) {
+                const TempCell cell = make_temp_cell(lower_type(op.prod->arguments[k]->getType()), "rj_arg");
+                b.binary(ir::Inst::Tag::Store, cell.lv(b, l), vals[k], l);
+                op.args.push_back(cell);
+            }
+        }
+
+        // Plan every operand up front, left to right.
+        for (const Operand& op : ops) {
+            const RandSeqCtx::Steps& st = rs.steps.at(op.prod);
+            std::vector<ir::Index>   args;
+            if (rs.this_var != nullptr) {
+                args.push_back(this_handle(b, l));
+            }
+            args.push_back(op.rule_idx.lv(b, l));
+            args.push_back(op.nleft.lv(b, l));
+            for (const TempCell& a : op.args) {
+                args.push_back(b.unary(ir::Inst::Tag::Load, a.lv(b, l), l));
+            }
+            for (const ValueSymbol* cap : rs.captures) {
+                args.push_back(value_lvalue(*cap, b, l));
+            }
+            if (rs.is_task) {
+                b.task_call(st.plan, args, l);
+            } else {
+                b.call(st.plan, args, l);
+            }
+            b.binary(ir::Inst::Tag::Store, op.pos.lv(b, l), kconst(0), l);
+            b.binary(ir::Inst::Tag::Store, op.stop.lv(b, l), b.constant(module_.pool.put_int(bit1, 0), l), l);
+        }
+
+        const ir::Index bias = rand_join_bias(rule, i32, b, l);
+
+        // while (any operand has units left)
+        b.open_region();
+        ir::Index any =
+          b.binary(ir::Inst::Tag::Gt, b.unary(ir::Inst::Tag::Load, ops[0].nleft.lv(b, l), l), kconst(0), l);
+        for (size_t i = 1; i < ops.size(); i++) {
+            any = b.binary(
+              ir::Inst::Tag::Bor,
+              any,
+              b.binary(ir::Inst::Tag::Gt, b.unary(ir::Inst::Tag::Load, ops[i].nleft.lv(b, l), l), kconst(0), l),
+              l);
+        }
+        const ir::ExtraSlice cond_region = b.close_region();
+
+        b.open_region();
+        // Lmax over the remaining lengths, then the per-operand weight above.
+        ir::Index lmax = b.unary(ir::Inst::Tag::Load, ops[0].nleft.lv(b, l), l);
+        for (size_t i = 1; i < ops.size(); i++) {
+            const ir::Index cur = b.unary(ir::Inst::Tag::Load, ops[i].nleft.lv(b, l), l);
+            lmax                = b.select(b.binary(ir::Inst::Tag::Gt, cur, lmax, l), cur, lmax, l);
+        }
+        const ir::Index        span = b.binary(ir::Inst::Tag::Add, lmax, kconst(1), l);
+        const ir::Index        kmx  = kconst(kRandJoinScale);
+        std::vector<ir::Index> weights;
+        weights.reserve(ops.size());
+        for (const Operand& op : ops) {
+            const ir::Index left   = b.unary(ir::Inst::Tag::Load, op.nleft.lv(b, l), l);
+            const ir::Index shortw = b.binary(ir::Inst::Tag::Mul,
+                                              b.binary(ir::Inst::Tag::Sub, kmx, bias, l),
+                                              b.binary(ir::Inst::Tag::Sub, span, left, l),
+                                              l);
+            const ir::Index longw  = b.binary(ir::Inst::Tag::Mul, bias, left, l);
+            const ir::Index w      = b.binary(ir::Inst::Tag::Add, shortw, longw, l);
+            weights.push_back(
+              b.resize(b.select(b.binary(ir::Inst::Tag::Gt, left, kconst(0), l), w, kconst(0), l), u32, l));
+        }
+        ir::Index sum = weights[0];
+        for (size_t i = 1; i < weights.size(); i++) {
+            sum = b.binary(ir::Inst::Tag::Add, sum, weights[i], l);
+        }
+        const ir::Index draw =
+          b.urandom_range(b.binary(ir::Inst::Tag::Sub, sum, b.constant(module_.pool.put_int(u32, 1), l), l),
+                          b.constant(module_.pool.put_int(u32, 0), l),
+                          l);
+        gen_rand_join_arm(ops, 0, b.constant(module_.pool.put_int(u32, 0), l), draw, weights, u32, rs, vars, b, l);
+        const ir::ExtraSlice body_region = b.close_region();
+
+        b.open_region();
+        const ir::ExtraSlice step_region = b.close_region();
+        b.loop(cond_region, any, body_region, step_region, /*bottom_test*/ false, l);
+    }
+
+    // The `rand join` length-bias expression, quantized to kRandJoinScale-ths and
+    // clamped: LRM 18.17.5 constrains it to [0.0, 1.0] and defaults it to 0.5.
+    static constexpr int64_t kRandJoinScale = 1024;
+
+    ir::Index rand_join_bias(const RsProd::Rule& rule, ir::Ref i32, ir::Builder& b, ir::SourceLoc l) {
+        if (rule.randJoinExpr == nullptr) {
+            return b.constant(module_.pool.put_int(i32, kRandJoinScale / 2), l);
+        }
+        const ir::SourceLoc el = loc(*rule.randJoinExpr);
+        const ir::Index     rv =
+          coerce(lower_expr(*rule.randJoinExpr, b), *rule.randJoinExpr->type, module_.pool.real_type, b, el);
+        const ir::Index scaled =
+          b.binary(ir::Inst::Tag::FMul,
+                   rv,
+                   b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(kRandJoinScale)), el),
+                   el);
+        const ir::Index q  = b.float_cvt(ir::Inst::Tag::FtoITrunc, scaled, i32, el);
+        const ir::Index lo = b.constant(module_.pool.put_int(i32, 0), el);
+        const ir::Index hi = b.constant(module_.pool.put_int(i32, kRandJoinScale), el);
+        // An out-of-range expression is not diagnosed by slang (it only requires a
+        // numeric type), and 18.17.5 gives no behaviour for one; clamping keeps the
+        // weights non-negative, which the ladder needs.
+        const ir::Index c1 = b.select(b.binary(ir::Inst::Tag::Lt, q, lo, el), lo, q, el);
+        return b.select(b.binary(ir::Inst::Tag::Gt, c1, hi, el), hi, c1, el);
+    }
+
+    // One arm of the interleaving pick: advance operand k by a single unit.
+    template<typename OpVec>
+    void gen_rand_join_arm(const OpVec&                  ops,
+                           size_t                        k,
+                           ir::Index                     acc,
+                           ir::Index                     draw,
+                           const std::vector<ir::Index>& weights,
+                           ir::Ref                       u32,
+                           const RandSeqCtx&             rs,
+                           const RandSeqRuleVars&        vars,
+                           ir::Builder&                  b,
+                           ir::SourceLoc                 l) {
+        if (k == ops.size()) {
+            return;
+        }
+        const ir::Index next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
+        const ir::Index pred = b.binary(ir::Inst::Tag::Lt, draw, next, l);
+
+        b.open_region();
+        gen_rand_join_step(ops[k], rs, vars, b, l);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        gen_rand_join_arm(ops, k + 1, next, draw, weights, u32, rs, vars, b, l);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, l);
+    }
+
+    template<typename Op>
+    void gen_rand_join_step(const Op&              op,
+                            const RandSeqCtx&      rs,
+                            const RandSeqRuleVars& vars,
+                            ir::Builder&           b,
+                            ir::SourceLoc          l) {
+        const ir::Ref i32    = make_int_type(32, false, true);
+        const auto    kconst = [&](int64_t v) { return b.constant(module_.pool.put_int(i32, v), l); };
+
+        const RandSeqCtx::Steps& st = rs.steps.at(op.prod);
+        std::vector<ir::Index>   args;
+        if (rs.this_var != nullptr) {
+            args.push_back(this_handle(b, l));
+        }
+        args.push_back(abort_lvalue(b, l));
+        if (op.result) {
+            args.push_back(op.result->lv(b, l));
+        }
+        args.push_back(b.unary(ir::Inst::Tag::Load, op.rule_idx.lv(b, l), l));
+        args.push_back(b.unary(ir::Inst::Tag::Load, op.pos.lv(b, l), l));
+        args.push_back(op.stop.lv(b, l));
+        for (const TempCell& a : op.args) {
+            args.push_back(b.unary(ir::Inst::Tag::Load, a.lv(b, l), l));
+        }
+        for (const ValueSymbol* cap : rs.captures) {
+            args.push_back(value_lvalue(*cap, b, l));
+        }
+        if (rs.is_task) {
+            b.task_call(st.step, args, l);
+        } else {
+            b.call(st.step, args, l);
+        }
+
+        // Advance this sequence: one unit consumed, unless the production aborted
+        // (LRM 18.17.6's `return`), in which case its remaining units are dropped
+        // and the other sequences carry on.
+        b.binary(ir::Inst::Tag::Store,
+                 op.pos.lv(b, l),
+                 b.binary(ir::Inst::Tag::Add, b.unary(ir::Inst::Tag::Load, op.pos.lv(b, l), l), kconst(1), l),
+                 l);
+        const ir::Index left = b.unary(ir::Inst::Tag::Load, op.nleft.lv(b, l), l);
+        const ir::Index dec  = b.binary(ir::Inst::Tag::Sub, left, kconst(1), l);
+        b.binary(
+          ir::Inst::Tag::Store,
+          op.nleft.lv(b, l),
+          b.select(
+            b.unary(ir::Inst::Tag::RedOr, b.unary(ir::Inst::Tag::Load, op.stop.lv(b, l), l), l), kconst(0), dec, l),
+          l);
+        if (op.result) {
+            // Only a production that actually returned a value wrote the slot, so
+            // the rule variable is written exactly then; otherwise it keeps the type
+            // default lower_var_decl gave it (LRM 18.17.7's "undefined value").
+            b.open_region();
+            const ir::Index place = result_slot(*op.item, *op.prod, vars, b, l);
+            b.binary(ir::Inst::Tag::Store, place, b.unary(ir::Inst::Tag::Load, op.result->lv(b, l), l), l);
+            const ir::ExtraSlice then_region = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_region = b.close_region();
+            b.cond(b.unary(ir::Inst::Tag::RedOr, b.unary(ir::Inst::Tag::Load, op.stop.lv(b, l), l), l),
+                   then_region,
+                   else_region,
+                   l);
+        }
+        emit_abort_check(b, l);
+    }
+
+    // Replays createRuleVariables' counting walk (slang's MemberSymbols.cpp) to
+    // number each syntactic production reference within its rule: the k-th
+    // reference to a non-void production P writes P[k], 1-based, or the scalar P
+    // when the rule names P once (LRM 18.17.7). slang records no such mapping.
+    //
+    // Walks the SYNTAX for a case production, because a `default` item's position
+    // among the standard ones is not recoverable from CaseProd -- it is held apart,
+    // in `defaultItem`, while createRuleVariables counts it where it was written.
+    static void count_rule_items(const RsProd::Rule& rule, RandSeqRuleVars& vars) {
+        const auto bump = [&](const RsProdItem& it) {
+            if (it.target == nullptr || it.target->getReturnType().isVoid()) {
+                return;
+            }
+            vars.occ[&it] = ++vars.total[it.target];
+        };
+        const slang::syntax::SyntaxNode* syn  = rule.ruleBlock->getSyntax();
+        const auto*                      rsyn = syn != nullptr ? syn->as_if<slang::syntax::RsRuleSyntax>() : nullptr;
+        size_t                           k    = 0;
+        for (const RsProdBase* prod : rule.prods) {
+            const slang::syntax::SyntaxNode* psyn =
+              (rsyn != nullptr && k < rsyn->prods.size()) ? rsyn->prods[k] : nullptr;
+            k++;
+            switch (prod->kind) {
+                case RsProdKind::Item:
+                    bump(prod->as<RsProdItem>());
+                    break;
+                case RsProdKind::CodeBlock:
+                    break;
+                case RsProdKind::IfElse: {
+                    const auto& ie = prod->as<RsProd::IfElseProd>();
+                    bump(ie.ifItem);
+                    if (ie.elseItem) {
+                        bump(*ie.elseItem);
+                    }
+                    break;
+                }
+                case RsProdKind::Repeat:
+                    // Counted once however many times it runs: LRM 18.17.7 Example 2
+                    // declares `int C;` scalar for `repeat(5) C`, so every iteration
+                    // overwrites one slot and the readable value is the last.
+                    bump(prod->as<RsProd::RepeatProd>().item);
+                    break;
+                case RsProdKind::Case: {
+                    const auto& cp = prod->as<RsProd::CaseProd>();
+                    const auto* cs = psyn != nullptr ? psyn->as_if<slang::syntax::RsCaseSyntax>() : nullptr;
+                    if (cs == nullptr) {
+                        for (const RsProd::CaseItem& ci : cp.items) {
+                            bump(ci.item);
+                        }
+                        if (cp.defaultItem) {
+                            bump(*cp.defaultItem);
+                        }
+                        break;
+                    }
+                    size_t si          = 0;
+                    bool   did_default = false;
+                    for (const slang::syntax::RsCaseItemSyntax* ci : cs->items) {
+                        if (ci->kind == slang::syntax::SyntaxKind::DefaultRsCaseItem) {
+                            // slang keeps only the first default; the parser already
+                            // reported the rest (MultipleDefaultCases).
+                            if (!did_default && cp.defaultItem) {
+                                bump(*cp.defaultItem);
+                                did_default = true;
+                            }
+                            continue;
+                        }
+                        if (si < cp.items.size()) {
+                            bump(cp.items[si++].item);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    void gen_prod(const RsProdBase& prod, const RandSeqCtx& rs, const RandSeqRuleVars& vars, ir::Builder& b) {
+        switch (prod.kind) {
+            case RsProdKind::Item:
+                gen_prod_item(prod.as<RsProdItem>(), rs, vars, b);
+                return;
+            case RsProdKind::CodeBlock:
+                gen_code_block(prod.as<RsProd::CodeBlockProd>(), b);
+                return;
+            case RsProdKind::IfElse: {
+                // LRM 18.17.2. The condition is an ordinary boolean, evaluated once.
+                const auto&         ie = prod.as<RsProd::IfElseProd>();
+                const ir::SourceLoc el = loc(*ie.expr);
+                const ir::Index     c  = lower_predicate(*ie.expr, b);
+                b.open_region();
+                gen_prod_item(ie.ifItem, rs, vars, b);
+                const ir::ExtraSlice then_region = b.close_region();
+                b.open_region();
+                if (ie.elseItem) {
+                    gen_prod_item(*ie.elseItem, rs, vars, b);
+                }
+                const ir::ExtraSlice else_region = b.close_region();
+                b.cond(c, then_region, else_region, el);
+                return;
+            }
+            case RsProdKind::Repeat: {
+                // LRM 18.17.4: the count is evaluated once, then the production is
+                // generated that many times. The loop is synthesized here, so
+                // loop_depth_ is deliberately NOT raised -- "the repeat production
+                // statement itself cannot be terminated prematurely. A break statement
+                // will terminate the entire randsequence block." A negative count runs
+                // zero times; 18.17.4 requires a non-negative one.
+                const auto&         rp      = prod.as<RsProd::RepeatProd>();
+                const ir::SourceLoc el      = loc(*rp.expr);
+                const ir::Ref       ty      = lower_type(*rp.expr->type);
+                const TempCell      bound   = make_temp_cell(ty, "rs_repeat_bound");
+                const TempCell      counter = make_temp_cell(ty, "rs_repeat_count");
+                b.binary(ir::Inst::Tag::Store, bound.lv(b, el), lower_expr(*rp.expr, b), el);
+                b.binary(ir::Inst::Tag::Store, counter.lv(b, el), b.constant(module_.pool.put_int(ty, 0), el), el);
+
+                b.open_region();
+                const ir::Index      pred = b.binary(ir::Inst::Tag::Lt,
+                                                     b.unary(ir::Inst::Tag::Load, counter.lv(b, el), el),
+                                                     b.unary(ir::Inst::Tag::Load, bound.lv(b, el), el),
+                                                     el);
+                const ir::ExtraSlice cond = b.close_region();
+
+                b.open_region();
+                gen_prod_item(rp.item, rs, vars, b);
+                const ir::ExtraSlice body = b.close_region();
+
+                b.open_region();
+                b.binary(ir::Inst::Tag::Store,
+                         counter.lv(b, el),
+                         b.binary(ir::Inst::Tag::Add,
+                                  b.unary(ir::Inst::Tag::Load, counter.lv(b, el), el),
+                                  b.constant(module_.pool.put_int(ty, 1), el),
+                                  el),
+                         el);
+                const ir::ExtraSlice step = b.close_region();
+
+                b.loop(cond, pred, body, step, /*bottom_test*/ false, el);
+                return;
+            }
+            case RsProdKind::Case:
+                gen_case_prod(prod.as<RsProd::CaseProd>(), rs, vars, b);
+                return;
+        }
+    }
+
+    // A production code block: LRM 18.17 makes each one "an anonymous automatic
+    // scope", which is what its statements' ordinary declare_storage path already
+    // gives them inside the production's frame. slang bound the body during
+    // createRule, so tryGetStatement is enough.
+    void gen_code_block(const RsProd::CodeBlockProd& cb, ir::Builder& b) {
+        if (const Statement* s = cb.block->tryGetStatement()) {
+            lower_stmt(*s, b);
+        }
+    }
+
+    // LRM 18.17.3: the selector is evaluated once and compared, in order, against
+    // each item's labels; the first match generates that item's production, and no
+    // match generates the default item's, or nothing. The same first-match rule as
+    // a procedural `case` -- lower_case itself cannot be reused because its arm
+    // body is a Statement, not a production.
+    void gen_case_prod(const RsProd::CaseProd& cp, const RandSeqCtx& rs, const RandSeqRuleVars& vars, ir::Builder& b) {
+        const ir::SourceLoc l = loc(*cp.expr);
+        // One common compare type for the selector and every label, as
+        // common_case_type computes for a procedural case (LRM 12.5).
+        uint32_t width = cp.expr->type->getBitWidth();
+        bool     four  = cp.expr->type->isFourState();
+        bool     signd = cp.expr->type->isSigned();
+        for (const RsProd::CaseItem& ci : cp.items) {
+            for (const Expression* e : ci.expressions) {
+                width = std::max(width, e->type->getBitWidth());
+                four  = four || e->type->isFourState();
+                signd = signd && e->type->isSigned();
+            }
+        }
+        const ir::Ref   ty  = make_int_type(width, four, signd);
+        const ir::Index sel = b.resize(lower_expr(*cp.expr, b), ty, l);
+        gen_case_arm(cp, 0, sel, ty, rs, vars, b);
+    }
+
+    void gen_case_arm(const RsProd::CaseProd& cp,
+                      size_t                  k,
+                      ir::Index               sel,
+                      ir::Ref                 ty,
+                      const RandSeqCtx&       rs,
+                      const RandSeqRuleVars&  vars,
+                      ir::Builder&            b) {
+        if (k == cp.items.size()) {
+            if (cp.defaultItem) {
+                gen_prod_item(*cp.defaultItem, rs, vars, b);
+            }
+            return;
+        }
+        const RsProd::CaseItem& ci = cp.items[k];
+        const ir::SourceLoc     l  = loc(*ci.expressions[0]);
+        ir::Index pred = b.binary(ir::Inst::Tag::CaseEq, sel, b.resize(lower_expr(*ci.expressions[0], b), ty, l), l);
+        for (size_t j = 1; j < ci.expressions.size(); j++) {
+            // Labels sharing one production (`1, 2 : DISK`) match as a set.
+            const ir::SourceLoc el = loc(*ci.expressions[j]);
+            pred =
+              b.binary(ir::Inst::Tag::Bor,
+                       pred,
+                       b.binary(ir::Inst::Tag::CaseEq, sel, b.resize(lower_expr(*ci.expressions[j], b), ty, el), el),
+                       el);
+        }
+
+        b.open_region();
+        gen_prod_item(ci.item, rs, vars, b);
+        const ir::ExtraSlice then_region = b.close_region();
+
+        b.open_region();
+        gen_case_arm(cp, k + 1, sel, ty, rs, vars, b);
+        const ir::ExtraSlice else_region = b.close_region();
+
+        b.cond(pred, then_region, else_region, l);
+    }
+
+    // Generate one production reference: evaluate its arguments, call it, then test
+    // the abort flag it may have raised.
+    void gen_prod_item(const RsProdItem& item, const RandSeqCtx& rs, const RandSeqRuleVars& vars, ir::Builder& b) {
+        if (item.target == nullptr) {
+            return; // an unresolved production name; slang already diagnosed it
+        }
+        const RsProd&       target = *item.target;
+        const ir::SourceLoc l      = to_source_loc(target.location);
+        const auto          idit   = rs.ids.find(&target);
+        if (idit == rs.ids.end()) {
+            fail("internal: randsequence production '" + std::string(target.name) + "' has no lowered body");
+        }
+        if (item.args.size() != target.arguments.size()) {
+            fail("randsequence production argument count mismatch");
+        }
+
+        std::vector<ir::Index> args;
+        if (rs.this_var != nullptr) {
+            args.push_back(this_handle(b, l));
+        }
+        args.push_back(abort_lvalue(b, l));
+        // The result rides a caller temp, not the rule variable's place directly:
+        // an `output` actual is a raw slot the callee writes through, and the rule
+        // variable may be an element of a `[1:N]` array, which is a composed lvalue
+        // rather than a slot. Same temp-then-copy-back shape build_call_args uses
+        // for every ordinary output argument.
+        std::optional<ir::Index> res_temp;
+        ir::Ref                  res_ty = ir::Ref::Invalid;
+        if (!target.getReturnType().isVoid()) {
+            res_ty   = lower_type(target.getReturnType());
+            res_temp = make_arg_temp(res_ty, b, l);
+            args.push_back(*res_temp);
+        }
+        std::vector<CopyOutArg>      outs;
+        const std::vector<ir::Index> declared = build_call_args(target.arguments, item.args, outs, b, l);
+        args.insert(args.end(), declared.begin(), declared.end());
+        for (const ValueSymbol* cap : rs.captures) {
+            args.push_back(value_lvalue(*cap, b, l));
+        }
+
+        if (rs.is_task) {
+            b.task_call(idit->second, args, l);
+        } else {
+            b.call(idit->second, args, l);
+        }
+        emit_call_copyouts(outs, b, l);
+        if (res_temp) {
+            // The value is the production's own return type on both sides, so
+            // nothing is coerced -- a string Store deep-copies the handle.
+            const ir::Index place = result_slot(item, target, vars, b, l);
+            if (is_agg_abi_ref(res_ty)) {
+                emit_agg_copy(place, *res_temp, res_ty, ir::Inst::Tag::Store, b, l);
+            } else {
+                b.binary(ir::Inst::Tag::Store, place, b.unary(ir::Inst::Tag::Load, *res_temp, l), l);
+            }
+        }
+        emit_abort_check(b, l);
+    }
+
+    // The lvalue this body passes as a production call's `$abort` output. Inside a
+    // production it is that production's own flag, which its own caller receives at
+    // return; at the randsequence statement there is nothing above to unwind, so it
+    // is a write-only temp.
+    ir::Index abort_lvalue(ir::Builder& b, ir::SourceLoc l) {
+        const ir::Ref bit1 = make_int_type(1, false, false);
+        if (fn_ctx_ != nullptr && fn_ctx_->in_randseq) {
+            return b.local(fn_ctx_->randseq_abort, bit1, l);
+        }
+        return make_arg_temp(bit1, b, l);
+    }
+
+    // After every production call: a `break` executed anywhere below raised the
+    // flag, and LRM 18.17.6 ends the whole randsequence, so unwind one frame. At
+    // the randsequence statement itself there is nothing left to unwind and
+    // execution simply continues after the block.
+    void emit_abort_check(ir::Builder& b, ir::SourceLoc l) {
+        if (fn_ctx_ == nullptr || !fn_ctx_->in_randseq) {
+            return;
+        }
+        const ir::Ref bit1 = make_int_type(1, false, false);
+        b.open_region();
+        b.ret_void(l);
+        const ir::ExtraSlice abort_region = b.close_region();
+        b.open_region();
+        const ir::ExtraSlice cont_region = b.close_region();
+        b.cond(b.unary(ir::Inst::Tag::Load, b.local(fn_ctx_->randseq_abort, bit1, l), l),
+               abort_region,
+               cont_region,
+               l,
+               /*unlikely=*/true);
+    }
+
+    // Where a non-void production's returned value lands: the rule variable slang
+    // synthesized for it, indexed from 1 in syntactic order of appearance when the
+    // rule names the production more than once (LRM 18.17.7).
+    ir::Index result_slot(const RsProdItem&      item,
+                          const RsProd&          target,
+                          const RandSeqRuleVars& vars,
+                          ir::Builder&           b,
+                          ir::SourceLoc          l) {
+        const auto vit = vars.byname.find(target.name);
+        const auto oit = vars.occ.find(&item);
+        const auto tit = vars.total.find(&target);
+        if (vit == vars.byname.end() || oit == vars.occ.end() || tit == vars.total.end()) {
+            // createRuleVariables makes one variable for every non-void production a
+            // rule names, so a miss is a lowering bug, not an unimplemented construct.
+            fail("internal: randsequence production '" + std::string(target.name) +
+                 "' has no result variable in its rule");
+        }
+        const ir::Index base = value_lvalue(*vit->second, b, l);
+        if (tit->second == 1) {
+            return base;
+        }
+        // The array is `[1:N]`, and ElemSelect indexes in declared-range coordinates.
+        const ir::Ref idx_ty = make_int_type(32, false, true);
+        return b.elem_select(base,
+                             b.constant(module_.pool.put_int(idx_ty, oit->second), l),
+                             lower_type(vit->second->getType()),
+                             l,
+                             /*for_write=*/true);
     }
 
     // -- System tasks --
@@ -27378,6 +28756,22 @@ private:
             ir::Ref  cls;   // the box's one-field synthetic class
         };
         ankerl::unordered_dense::map<const ValueSymbol*, Boxed> boxed;
+        // Set while lowering a randsequence production body (LRM 18.17). The two
+        // synthesized `output` formals: `$abort`, which a `break` with no enclosing
+        // loop raises and every caller tests (18.17.6), and `$result`, which a
+        // non-void production's `return expr` writes (18.17.7). See
+        // docs/design/randsequence.md §6.
+        bool     in_randseq         = false;
+        uint32_t randseq_abort      = 0;
+        bool     randseq_has_result = false;
+        uint32_t randseq_result     = 0;
+        ir::Ref  randseq_result_ty  = ir::Ref::Invalid;
+        // Inside a `rand join` operand's `step` body only (LRM 18.17.5): the output
+        // formal that reports "this production returned", so the driver stops
+        // advancing it. `return` in a plain production body just ends the function;
+        // in a step body it also has to end the production's remaining units.
+        bool     randseq_has_stop = false;
+        uint32_t randseq_stop     = 0;
     };
 
     // Inner storage type -> its capture-box class (box_class_type). Keyed
@@ -27780,20 +29174,25 @@ private:
     // full further down, next to the statement lowering that pushes it).
     struct OpenBlock;
 
-    // The three pieces of state every subroutine / action / fork-child body swaps:
+    // The four pieces of state every subroutine / action / fork-child body swaps:
     // its own frame context, a fresh named-block stack (a `disable` inside the body
-    // may only name blocks the body itself opened), and no procedure root — a body
-    // is built at its first call site, whose enclosing procedure is not its own, so
-    // the 16.4.4 outermost-scope question has no answer here.
+    // may only name blocks the body itself opened), no procedure root — a body is
+    // built at its first call site, whose enclosing procedure is not its own, so
+    // the 16.4.4 outermost-scope question has no answer here — and a loop nesting
+    // depth of zero, since a `break` in this body cannot bind to a loop outside it.
     class FnScope {
     public:
         FnScope(Lowerer& l, FnCtx* ctx)
-            : ctx_(l.fn_ctx_, ctx), blocks_(l.named_blocks_, {}), root_(l.proc_root_block_, nullptr) {}
+          : ctx_(l.fn_ctx_, ctx)
+          , blocks_(l.named_blocks_, {})
+          , root_(l.proc_root_block_, nullptr)
+          , depth_(l.loop_depth_, 0) {}
 
     private:
         Restore<FnCtx*>                 ctx_;
         Restore<std::vector<OpenBlock>> blocks_;
         Restore<const Symbol*>          root_;
+        Restore<uint32_t>               depth_;
     };
 
     // Get (creating if needed) the frame Local index for a function-local symbol.
@@ -28074,11 +29473,70 @@ private:
         return rv;
     }
 
+    // `break` terminates the innermost enclosing loop (LRM 12.8). Inside a
+    // randsequence production code block with no loop around it, 18.17.6 makes it
+    // terminate the whole randsequence instead: raise the production's abort flag
+    // and return, which the caller observes after its call and repeats, all the
+    // way out of the block. The backend's Break arm assumes an enclosing loop and
+    // indexes loop_targets_.back() unconditionally, so this must never reach it.
+    void lower_break(const Statement& stmt, ir::Builder& b) {
+        const ir::SourceLoc l = loc(stmt);
+        if (loop_depth_ == 0 && fn_ctx_ != nullptr && fn_ctx_->in_randseq) {
+            const ir::Ref bit1 = make_int_type(1, false, false);
+            b.binary(ir::Inst::Tag::Store,
+                     b.local(fn_ctx_->randseq_abort, bit1, l),
+                     b.constant(module_.pool.put_int(bit1, 1), l),
+                     l);
+            b.ret_void(l);
+            return;
+        }
+        b.break_(l);
+    }
+
     void lower_return(const ReturnStatement& r, ir::Builder& b) {
         if (fn_ctx_ == nullptr) {
             fail("return statement outside of a function");
         }
         const ir::SourceLoc l = loc(r);
+        if (fn_ctx_->in_randseq) {
+            // Inside a production, `return` aborts THIS production and generation
+            // continues with the next (LRM 18.17.6) -- which is exactly returning
+            // from the production's own function. `return expr` first stores the
+            // value into the result output formal (18.17.7); slang bound the
+            // expression against the production's declared return type, so no
+            // further conversion is implied beyond the width coercion below.
+            if (r.expr != nullptr) {
+                if (!fn_ctx_->randseq_has_result) {
+                    // slang emits MissingReturnValueProd for the converse; this
+                    // direction it leaves to the return type, which is void here.
+                    fail("return with a value in a void randsequence production");
+                }
+                const ir::Index slot = b.local(fn_ctx_->randseq_result, fn_ctx_->randseq_result_ty, l);
+                if (is_agg_abi_ref(fn_ctx_->randseq_result_ty)) {
+                    emit_agg_store(
+                      slot, fn_ctx_->randseq_result_ty, unwrap_conversion(*r.expr), ir::Inst::Tag::Store, b, l);
+                } else if (is_string_ref(fn_ctx_->randseq_result_ty)) {
+                    b.binary(ir::Inst::Tag::Store, slot, lower_expr(*r.expr, b), l);
+                } else {
+                    b.binary(ir::Inst::Tag::Store,
+                             slot,
+                             coerce(lower_expr(*r.expr, b), *r.expr->type, fn_ctx_->randseq_result_ty, b, l),
+                             l);
+                }
+            }
+            if (fn_ctx_->randseq_has_stop) {
+                // In a `rand join` operand's step body the function IS one unit, so
+                // returning from it only ends that unit. Tell the driver the whole
+                // production aborted, so it stops advancing this sequence.
+                const ir::Ref bit1 = make_int_type(1, false, false);
+                b.binary(ir::Inst::Tag::Store,
+                         b.local(fn_ctx_->randseq_stop, bit1, l),
+                         b.constant(module_.pool.put_int(bit1, 1), l),
+                         l);
+            }
+            b.ret_void(l);
+            return;
+        }
         if (r.expr != nullptr) {
             if (!fn_ctx_->has_ret_local) {
                 fail("return with a value in a void function");
@@ -31337,6 +32795,15 @@ private:
     };
     static constexpr uint32_t kNoBlockLabel = UINT32_MAX;
     std::vector<OpenBlock>    named_blocks_;
+    // How many user loops enclose the statement being lowered, within this body
+    // (FnScope resets it: a `break` cannot bind to a loop outside its own body).
+    // Read only by lower_break, to tell LRM 12.8's "innermost enclosing loop" from
+    // 18.17.6's "otherwise, it terminates the randsequence block".
+    uint32_t loop_depth_ = 0;
+    // The lowered function set of each randsequence statement (LRM 18.17). Keyed on
+    // the statement: a production takes everything it reads as a formal, so its
+    // body does not depend on which enclosing body generated the block.
+    ankerl::unordered_dense::map<const RandSequenceStatement*, RandSeqCtx> randseq_;
     // Femtoseconds per wheel tick (design-wide smallest time unit); 0 == unitless.
     uint64_t tick_fs_ = 0;
     // $system shell-exec access tier (LRM §20.17.1). Off rejects $system at
