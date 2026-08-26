@@ -4604,18 +4604,46 @@ project with its own algorithm, not tail cleanup on the property layer:
   binding, `liblist`/`use`.
 - [ ] **Checkers** (`checker`/`endchecker`) — assertions, free variables,
   instantiation.
-- [ ] **`randsequence`** (LRM 18.17) — grammar-based stimulus generation. Scoped in
-  docs/design/randsequence.md: one `ir::Function` per production (recursion is
-  required by the LRM's own `GenQueue` example, so verilator's inline-the-grammar
-  model is out), ABI `prod(<this>, ref bit $abort[, ref T $result], formals…)`,
-  rule selection reusing `lower_randcase`'s ladder verbatim, `break` as the
-  `$abort` flag and `return` as the production function's own `Ret`. Four phases:
-  P0 the named refusal (today it hits the anonymous `fail("unsupported
-  statement")` at src/Lower.cpp:10915), P1 the core, P2 value passing (18.17.7),
-  P3 `rand join`. Blocked on two vendored-slang defects the design records
-  (`createCaseProd` mis-pairs case items after a multi-label item; the
-  weight-clause code block is created once per prod and desynchronizes
-  `createRule`'s positional block pairing), both to be patched under `patches/`.
+- [x] **`randsequence`** (LRM 18.17) — grammar-based stimulus generation, complete
+  (docs/design/randsequence.md). Each production lowers to its own `ir::Function`
+  rather than being inlined, because the clause's own `GenQueue` example is
+  left-recursive — which is exactly what verilator, whose model is to inline the
+  grammar, cannot compile. One shared signature lets any production call any
+  other: `randseq.<name>(<this>, output bit $abort[, output T $result],
+  <declared formals>, <captures>)`. `$abort` carries `break` (18.17.6) up the call
+  chain one frame per return through the backend's ordinary output copy-out;
+  `return` is the production function's own `RetVoid`; `<captures>` are the
+  enclosing subroutine frame's symbols the block reads, found with the same
+  `ForkCaptureDetector` a fork child uses and passed by reference. Rule selection
+  (18.17.1) is `lower_randcase`'s weighted ladder verbatim — one draw, unsigned
+  wrapping sum, no draw at all on a zero total — with the omitted weight folding in
+  as a 32-bit literal 1 (at the 1-bit minimum two defaults sum to zero and neither
+  alternative is ever generated). Value passing (18.17.7) writes slang's synthesized
+  rule variables at an occurrence index re-derived from `createRuleVariables`'
+  counting walk, which slang records nowhere; a slot for a production the rule did
+  not generate reads the type default rather than stale frame contents. `rand join`
+  (18.17.5) gives each interleaved production two more entry points — `plan` draws
+  its rule and reports that rule's unit count, `step` generates one numbered unit —
+  and picks between sequences with the integer weight
+  `(1024-X)*(Lmax+1-L_i) + X*L_i`, which hits the clause's three bias anchors
+  exactly (X=0 shortest-first, X=1024 longest-first, X=512 uniform) with no libm.
+  `break` now needs a real `loop_depth_` on the lowerer to tell 12.8's innermost
+  loop from 18.17.6's whole block, which also closes a latent hazard: the backend's
+  Break arm indexes `loop_targets_.back()` on the assumption slang guarantees an
+  enclosing loop, and a randsequence `break` is the counter-example. Refused by
+  name: a production returning a container, and the three things an interleaved
+  production cannot do (be a `rand join` itself, read another production's result,
+  take a non-input argument) — all because `step` is entered once per unit, so
+  nothing may live across units. Landed with
+  `patches/slang-randseq-rule-pairing.patch`, which fixes two vendored-slang
+  defects that silently hand the frontend the wrong AST: `createCaseProd` pushed one
+  `ProdItem` per case LABEL but consumed one per case ITEM, so every `rs_case` item
+  after a multi-label one picked up the previous item's production (the LRM 18.17.3
+  example is exactly that shape); and the rule block created the weight clause's
+  code block once per prod, binding its statements N times and desynchronizing
+  `createRule`'s positional pairing for a rule with two or more code-block prods.
+  `cmake/ApplySlangPatch.cmake` now applies every `patches/slang-*.patch` in name
+  order. 27 cases in tests/randsequence_test.cpp.
 
 ### Language corners
 
