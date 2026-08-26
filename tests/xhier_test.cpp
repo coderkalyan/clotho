@@ -219,3 +219,81 @@ TEST_CASE("bit-select inout connection fails loudly") {
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("non-whole-signal connection") != std::string::npos);
 }
+
+// A `logic` interface member (a VARIABLE, not a net -- LRM 6.6 resolution is
+// net-kind only) driven from a single cross-scope source: a `bind`-inserted
+// module reaching the interface instance via LRM 23.8 upward name
+// referencing. This is the exact shape confirmed on a real design: uvm-
+// examples' uvm_tb_build_ss_tb/sub_system_tbs/pss_tb binds an `apb_prober`
+// module into its DUT, and the prober does `assign APB.PSEL = ...;` with
+// `APB` unresolved locally, so it searches upward through the bind target's
+// enclosing scopes and lands on the interface instantiated in the testbench
+// top. One driver reaches the net, so there is nothing to resolve -- this is
+// an ordinary (if unusually reached) hierarchical write, not multi-driver
+// resolution, and it lowers on the plain single-driver path like any other
+// xhier write above.
+TEST_CASE("xhier: bind-inserted module drives an interface member via upward name") {
+    const std::string out = run_capture(R"(
+        interface my_if(input clk);
+          logic [3:0] sig;
+        endinterface
+        module dut;
+          logic [3:0] internal_sig = 4'b0101;
+        endmodule
+        module prober(input logic [3:0] sig_in);
+          assign MY.sig = sig_in;
+        endmodule
+        bind dut prober probe(.sig_in(internal_sig));
+        module top;
+          logic clk = 0;
+          my_if MY(clk);
+          dut d();
+          initial #1 $display("sig=%b", MY.sig);
+        endmodule
+    )");
+    CHECK(out == "sig=0101\n");
+}
+
+// The SAME interface member also connected as an output port elsewhere is a
+// different matter, and it is illegal SystemVerilog rather than an
+// unimplemented gap: `logic` is a variable, and LRM 23.3.3 treats a port
+// connection as an implicit continuous assignment, so a variable output port
+// PLUS the bind-inserted `assign` above are two continuous assignments to one
+// variable -- LRM 6.5 / 10.3.2 make that a flat error regardless of scope,
+// with no wired resolution to fall back on the way a `wire`/`tri` net has
+// (LRM 6.6). slang raises MultipleContAssigns for exactly this (promoted to
+// Error in apply_severity_policy, Lower.cpp), before Lower.cpp's own
+// net-driver tracking -- which is net-kind-only via canonical_value_symbol's
+// `SymbolKind::Net` gate and never sees a `logic` symbol -- is even reached.
+// Confirmed against the real design this mirrors: uvm_tb_build_ss_tb's
+// hdl_top.sv keeps its `apb_driver_bfm` instance's connection to the shared
+// `APB` interface commented out specifically in the composition where
+// `apb_prober` is also bound onto the same net (both live at once would hit
+// this exact rule); with only the prober's driver connected, as the design
+// ships, the case above is what actually reaches clotho, not this one.
+TEST_CASE("a bind-inserted assign and an output port both driving a logic interface member fails loudly") {
+    const LowerResult r = lower_text(R"(
+        interface my_if(input clk);
+          logic [3:0] sig;
+        endinterface
+        module drv_bfm(output logic [3:0] sig);
+          assign sig = 4'b1010;
+        endmodule
+        module dut;
+          logic [3:0] internal_sig = 4'b0101;
+        endmodule
+        module prober(input logic [3:0] sig_in);
+          assign MY.sig = sig_in;
+        endmodule
+        bind dut prober probe(.sig_in(internal_sig));
+        module top;
+          logic clk = 0;
+          my_if MY(clk);
+          drv_bfm b(.sig(MY.sig));
+          dut d();
+          initial #1 $display("sig=%b", MY.sig);
+        endmodule
+    )");
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("multiple continuous assignments") != std::string::npos);
+}

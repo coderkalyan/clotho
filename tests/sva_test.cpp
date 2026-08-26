@@ -1220,6 +1220,72 @@ endmodule
 )", "function call in a concurrent assertion expression");
 }
 
+TEST_CASE("LRM 20.9's bit vector system functions sample their operand in an assertion expression") {
+    // Unlike a general call (the refusal just above), $isunknown / $countones /
+    // $countbits / $onehot / $onehot0 read nothing beyond their own operand --
+    // LRM 20.9's whole family is a pure combinational reduction, with no body to
+    // trace -- so reject_unsampled_call lets them through, and lower_bit_query
+    // lowers each as an ordinary expression over that operand. That expression
+    // reaches value_lvalue exactly the way a bare (non-call) atom already does,
+    // and value_lvalue is what redirects a read to the Preponed shadow while
+    // sva_sampled_ is set -- so the operand samples for free, one fewer call
+    // shape refused ahead of machinery that was already correct.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+module t;
+  bit clk;
+  bit [3:0] v;
+  ap: assert property (@(posedge clk)
+      !$isunknown(v) && !$onehot(v) && $onehot0(v) && $countones(v) == 0 &&
+      $countbits(v, 1'b1) == 0);
+endmodule
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    const ir::Process& p = monitor_process(m);
+    CHECK(touches(m, p, "sva.shadow.v"));
+    CHECK_FALSE(touches(m, p, "v"));
+}
+
+TEST_CASE("a bit-vector system function samples a bit-select of a hierarchical operand") {
+    // A sampled value function's own operand is checked elsewhere to be a
+    // plain variable (lower_sampled_value); LRM 20.9 imposes no such limit on
+    // this family; its operand is an arbitrary bit-vector expression, so a
+    // bit-select through a directly-instantiated interface has to keep
+    // sampling exactly as it already does for a bare (non-call) atom.
+    LowerResult       r;
+    const ir::Module& m = lower_for_monitor(R"(
+interface dif_bus(input bit clk);
+  bit [3:0] v;
+endinterface
+module t;
+  bit clk;
+  dif_bus dif(clk);
+  ap: assert property (@(posedge dif.clk) !$isunknown(dif.v[1:0]));
+endmodule
+)", r);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    const ir::Process& p = monitor_process(m);
+    CHECK(touches(m, p, "sva.shadow.dif.v"));
+    CHECK_FALSE(touches(m, p, "dif.v"));
+}
+
+TEST_CASE("a user function call nested inside a sampled bit-vector system function is still refused") {
+    // The exemption above is for the OUTER call alone -- $isunknown's operand
+    // may be an arbitrary expression, and a user call still hiding inside it is
+    // exactly as unsampleable as a bare one, so reject_unsampled_call has to
+    // keep walking into the exempted call's own operand (visitDefault) rather
+    // than stopping at it the way it does for a sampled value function's
+    // (whose operand is independently pinned to a plain variable and so could
+    // never hide a call in the first place).
+    refuses(R"(
+module t;
+  bit clk, a, b;
+  function automatic bit f(); return 1; endfunction
+  ap: assert property (@(posedge clk) $isunknown(f()) |=> b);
+endmodule
+)", "function call in a concurrent assertion expression");
+}
+
 TEST_CASE("a sequence method is refused by name, not as a stray function call") {
     // `.triggered` and `.matched` are calls only syntactically. Both report on the
     // attempts of the NAMED SEQUENCE they are called on, which would need that
@@ -3485,6 +3551,40 @@ endmodule
 )";
     CHECK(report_times(substituted(early, "COND", "")) == "25");
     CHECK(report_times(substituted(early, "COND", "disable iff ($sampled(rst))")).empty());
+}
+
+TEST_CASE("$isunknown reads the pre-edge sampled value, not the live one") {
+    // Same shape as "a disable iff on $sampled disables on the sampled value,
+    // not the live one" above, with the sampled read moved from the disable
+    // condition into the property's own boolean operand, through a call this
+    // time rather than a bare variable: v <= 1 at t=5 commits in that tick's
+    // NBA region, which is AFTER the Preponed sample (LRM 16.5.1 samples
+    // before any body of the time step runs) and BEFORE the monitor's Observed
+    // step. So AT t=5, v is live 1 but sampled x -- v's power-up default, since
+    // `logic` is 4-state -- and a correctly sampled $isunknown has to see the
+    // x a live read at that same Observed step would already have missed.
+    //
+    // `v !== 1'bx` is the same test spelled without a call: an ordinary boolean
+    // atom, sampled by machinery this gap never touches, so already known
+    // correct. Matching it tick for tick is the proof -- were $isunknown
+    // reading live instead of through value_lvalue's shadow redirect, its
+    // report set would drop t=5 while the plain form kept it.
+    constexpr std::string_view trace = R"(
+module t;
+  bit clk = 0;
+  always #5 clk = ~clk;
+  logic v;
+  always @(posedge clk) $display("[%0t]", $time);
+  ap: assert property (@(posedge clk) COND);
+  initial begin
+    @(posedge clk); v <= 1;
+    @(posedge clk);
+    @(posedge clk); $finish;
+  end
+endmodule
+)";
+    CHECK(report_times(substituted(trace, "COND", "v !== 1'bx")) == "5");
+    CHECK(report_times(substituted(trace, "COND", "!$isunknown(v)")) == "5");
 }
 
 TEST_CASE("an asynchronous abort condition may read $sampled") {

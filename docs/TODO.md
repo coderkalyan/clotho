@@ -1909,11 +1909,37 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   concatenation-operand drivers (split into per-net stores), and cross-scope drivers
   (e.g. a shared interface net — the slots would span scopes). Non-overlapping
   constant bit/part-select drivers stay on the single-driver fast path.
-  Confirmed as the exact refusal on a real design's composition: an interface
-  signal (`apb_if.sv`'s `PSEL`) bound as an output port of one BFM and
-  separately continuous-assigned in a sub-system-level prober module when the
-  interface is composed into a larger testbench (`uvm_tb_build_ss_tb`) —
-  the shared-interface-net shape this bullet already names, not a new gap.
+  TRIAGED against the real design this was raised from
+  (uvm-examples' `uvm_tb_build_ss_tb/sub_system_tbs/pss_tb`, `apb_if.sv`'s
+  `PSEL` bound as an output port of `apb_driver_bfm` and separately
+  continuous-assigned in the `apb_prober` module bound onto the DUT) and this
+  is NOT that shared-interface-net shape: `PSEL` is declared `logic[15:0]`, a
+  VARIABLE (LRM 6.6 resolution is net-kind only, `wire`/`tri`/`wand`/`wor`),
+  and `apb_prober` reaches it through an ordinary single driver, `assign
+  APB.PSEL = ...`, `APB` resolved by LRM 23.8 upward name referencing from
+  the `bind`-inserted instance's enclosing scopes up to where the testbench
+  top instantiates it — cross-checked with a standalone repro (`xhier_test.cpp`,
+  "bind-inserted module drives an interface member via upward name"): one
+  driver, nothing to resolve, lowers and runs on the plain single-driver path.
+  hdl_top.sv keeps `apb_driver_bfm`'s connection to the shared `APB` commented
+  out everywhere `apb_prober` is also bound onto it, so the shipped design
+  never puts a second driver on `PSEL` at all. WOULD a second driver land
+  there anyway (the commented-out port connection restored), it is a
+  DIFFERENT, ALREADY-CORRECT refusal: a variable output port is an implicit
+  continuous assignment (LRM 23.3.3), so a port plus the prober's `assign`
+  is two continuous assignments to one variable, which LRM 6.5 / 10.3.2 make
+  a flat error with no wired resolution to fall back on — slang raises
+  `MultipleContAssigns` for exactly this, promoted to Error in
+  `apply_severity_policy`, before Lower.cpp's own net-driver tracking (gated
+  on `SymbolKind::Net`, so a `logic` variable never reaches it) is even in
+  play. Pinned in `xhier_test.cpp` ("a bind-inserted assign and an output
+  port both driving a logic interface member fails loudly"). So this real
+  design motivates nothing further here: no bug, and the genuine cross-scope
+  NET case above stays exactly as tracked, unelevated — a `wire`/`tri`
+  interface member double-driven this way still hits "multiple drivers of a
+  net across different scopes are not supported" and still needs the
+  scope-spanning slot/resolver work described above, which this triage did
+  not attempt.
 - [~] **Drive strengths** — `(strong0, weak1)` etc. on continuous assigns, net
   declarations, and gates lower and resolve. Each driver slot carries a
   compile-time packed `(strength0, strength1)`; a net with any non-default
@@ -2400,12 +2426,22 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 - [x] **NBA to a dynamic array** — and to an associative array. `HandleCopyNb`
   stages a deep copy in the Active region and MOVES it into the live handle in the
   NBA region, generalizing the queue's path to all three container kinds. A
-  literal / `new[n]` right-hand side is still refused (it builds in place rather
-  than deep-copying a handle the commit can move). Confirmed via a real
-  design (`uvm_id_register`, `reg_dut.sv`: `id_register_value <= '{'ha0,
-  'ha1, ...};` nonblocking-assigning an assignment-pattern literal directly
-  into a dynamic array inside an `always @(posedge clk)`) — the exact
-  already-known "literal RHS" gap above, not a new one.
+  `'{...}` literal / `new[n]` right-hand side on a dynamic array now works too:
+  neither is a copyable handle (a literal fills element-by-element, `new[n]`
+  allocates), so `lower_dyn_array_assign`'s NBA branch materializes it into a
+  FRESH temp handle at Active-region time (the same blocking-assignment
+  machinery — `emit_agg_store` / `emit_dyn_array_new_expr` — redirected at a
+  scratch handle instead of the live one), then feeds that temp through the
+  same `HandleCopyNb` the plain-variable case already used, mirroring
+  `materialize_queue_rvalue`'s "materialize into a temp, then move" shape for
+  a queue. Confirmed via a real design (`uvm_id_register`, `reg_dut.sv`:
+  `id_register_value <= '{'ha0, 'ha1, ...};` nonblocking-assigning an
+  assignment-pattern literal directly into a `int id_register_value[];`
+  dynamic array inside an `always @(posedge PCLK)`). A keyed `'{key:value}`
+  literal on the right of an associative array's NBA is still refused
+  (`emit_assoc_literal_init`'s own guard) — an associative array literal has
+  no upfront size to allocate the way a dynamic array's does, so staging it
+  into a temp handle needs its own follow-up, not this one.
 - [x] **Array ordering methods** (LRM 7.12.2) — `reverse` / `sort` / `rsort` /
   `shuffle` on a dynamic array or queue (`rt_dynarr_*` / `rt_queue_*` helpers),
   and on a fixed-size unpacked array through a mirror of one (see the fixed-size
@@ -3646,19 +3682,59 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   unreachable from any known legal construct, but structurally possible if a
   future copy-thunk/interface/randomization guard grows one) propagates as a
   located refusal instead of leaving a half-registered class behind.
-- [ ] **"class without a descriptor" recurrence through the generic component
-  registry** — the same internal-error class the reentrancy/exception-safety
-  fix above closed for `uvm_sequence#(item)`'s base-recursion shape recurs
-  through a DIFFERENT path: `uvm_component_registry#(T,Tname)::create_component`
-  (uvm-1.2's `uvm_registry.svh:116`). The fix above closed one specific
-  manifestation (a base class's own property forward-referencing a class that
-  extends it, reached from `lower_class_type`'s base recursion); it was never
-  meant to be a universal fix for every path that can leave a class
-  numbered-but-undescribed, and this is a different one, through the
-  parameterized/generic factory-registry machinery rather than field-type
-  recursion. Confirmed via a real design (`biquad_example`) on the uvm-1.2
-  tree. Not yet root-caused against this specific call path; needs its own
-  investigation before a location + diagnostic (or a real fix) can land.
+- [x] **"class without a descriptor" recurrence through the generic component
+  registry** — the same internal-error class the reentrancy/exception-safety fix
+  above closed for `uvm_sequence#(item)`'s base-recursion shape recurred through a
+  DIFFERENT path, root-caused against the real `biquad_example` design:
+  `apb_coverage_monitor extends uvm_subscriber#(apb_seq_item)` embeds a
+  `covergroup`, a property type `lower_type` refuses outright (LRM 19, not
+  implemented — see M4 "Functional coverage"). `lower_class_type` interns a class
+  (`class_type_cache_`) BEFORE laying out its own properties, so that refusal
+  throws AFTER `apb_coverage_monitor` is interned but BEFORE `compute_vtable` ever
+  runs — and `` `uvm_component_utils`` forces every registered class's
+  factory-registry proxy (`uvm_component_registry#(T,Tname)`) through here
+  eagerly, via its `local static this_type me = get();` singleton (LRM 6.21),
+  whether or not the design ever constructs one. The `LowerError` unwinds out of
+  `lower_class_type` with no try/catch of its own; the first caller to catch it
+  (`build_function`'s `stub_eligible` degrade, reached from
+  `apb_coverage_monitor`'s own `create_component`'s `T obj;`) left
+  `class_type_cache_` still pointing at the abandoned Ref — the fix above's
+  mid-function re-check only guards the base-class-recursion window, not this
+  one. A LATER, unrelated reference to the same class — `apb_coverage_monitor`'s
+  own registry `create`'s `$cast(create, obj)` (`uvm_registry.svh:116`) — hit
+  that stale cache entry and silently reused it as if valid: a structurally
+  well-typed class with an intact (empty) field table but no vtable and no
+  descriptor, crashing the LLVM backend as an unlocated `internal: class without
+  a descriptor` in `ClassIsA` codegen the first time `$cast`'s runtime check
+  needed it. Fixed at the root, the same way as the base-recursion case but one
+  step earlier: `lower_class_type` now un-interns `class_type_cache_[&clt]` on
+  the way out if anything after `bind_class_type` throws (mirroring
+  `compute_vtable`'s own `VslotGuard`), so a later reference gets its own honest,
+  located `LowerError` instead of inheriting a landmine. Functional coverage
+  itself stays unimplemented (unchanged, tracked separately under M4); the fix is
+  that failing to lower one no longer corrupts an unrelated, later lowering
+  attempt of the same class.
+- [ ] **A vtable-forced method's own SIGNATURE (return type / formal types)
+  failing to lower is not stub-eligible, only a body STATEMENT failing is** —
+  found writing the regression test for the entry above. `build_function`
+  lowers the return type (`lower_type(sub.returnValVar->getType())`) and every
+  formal's type BEFORE its `try { lower_stmt(sub.getBody(), b); } catch
+  (LowerError&) { if (stub_eligible(sub)) emit_unsupported_body_stub(...); }`
+  even starts, so a `LowerError` from the SIGNATURE itself (e.g. a virtual
+  method returning a class whose own field layout is unsupported, such as one
+  embedding a covergroup) is never eligible for the graceful degrade
+  `drain_pending_bodies`'s `stub_unsupported_bodies_` otherwise gives every
+  vtable-forced (never directly called) body — it crashes the whole
+  compilation instead of the single method. Distinct from the body-statement
+  case (which already degrades correctly, per the entry above): there is no
+  obvious sound fallback return/formal type to build a stub AROUND, since a
+  real caller elsewhere in the design may depend on the true ABI. Not yet hit
+  by a real design (both known real triggers, `uvm_registry.svh`'s
+  `create_object`/`create_component`, return `uvm_object`/`uvm_component` —
+  ordinary, always-lowerable types — and fail from a STATEMENT inside their
+  body instead, which already degrades correctly); reproduced only by a
+  from-scratch minimal case (`virtual function Broken get(); return
+  cached; endfunction` where `Broken` itself fails to lower).
 - [ ] **Backend crash on a class field whose type is (transitively) its own
   descendant** — found while constructing a standalone repro for the
   registration-reentrancy fix above. `class Base; Helper h; ... endclass class
@@ -4070,20 +4146,37 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   Still refused, loud, its own message and its own TODO: a non-packed
   (aggregate / container / string / event) sampled variable, unchanged by
   this work. See docs/design/concurrent-assertions.md §4.
-- [ ] **Sampled-value semantics for a system function call inside a
-  property/sequence expression** (LRM 16.9.1 / 4.4.2) — narrower than
-  cross-scope sampling above: an ordinary system function call
-  (`$isunknown(sig)`, `$countones(sig)`, etc.) used directly as a
-  boolean/expression operand of a property or sequence (`@(posedge PCLK)
-  disable iff (rst) !$isunknown(sig)`) is refused outright ("a function call
-  in a concurrent assertion expression is not supported: what it reads would
-  not be sampled") rather than evaluated at the Preponed (pre-clock-edge)
-  sample point the LRM requires for every assertion-expression operand. Not
-  implemented at all yet — no system function has any coverage in this
-  position, unlike the sampled-value FUNCTIONS ($rose/$past/etc.) above,
-  which are a different, already-covered mechanism. Confirmed via a real
-  design (`apb_if.sv`'s `psel_valid` property, uvm-examples
-  `apb_protocol_monitor` and `uvm_alu_config_analysis`).
+- [x] **Sampled-value semantics for a system function call inside a
+  property/sequence expression** (LRM 16.9.1 / 4.4.2) — fixed for LRM 20.9's
+  bit vector system functions (`$isunknown`, `$countones`, `$countbits`,
+  `$onehot`, `$onehot0`): each is a pure combinational reduction over one
+  bit-vector operand and nothing else, and clotho already lowered the
+  non-constant case of each (`lower_bit_query`) as nothing more than
+  `lower_expr` on that operand plus the reduction op — the SAME `lower_expr`
+  every plain (non-call) assertion-expression atom already goes through to
+  reach `value_lvalue`, which is what redirects a read to the Preponed shadow
+  while an atom is being lowered (`SampledScope` / `sva_sampled_`). So
+  `reject_unsampled_call`'s blanket refusal was blocking a call this
+  machinery could already sample correctly; the fix (`is_pure_bitvec_sysfn`)
+  is a narrow exemption from that refusal, not new sampling logic, and unlike
+  a sampled value FUNCTION's operand (pinned to a plain variable,
+  `lower_sampled_value`) it costs no restriction on the operand's shape — LRM
+  20.9 leaves it an arbitrary expression, so a bit-select or a hierarchical
+  reference through it samples exactly as a bare (non-call) atom already
+  does. A call still hiding inside that operand (`$isunknown(f())`) is
+  exactly as unsampleable as a bare one, so the exemption still descends into
+  it (`visitDefault`) rather than stopping the walk the way the sampled value
+  function exemption does. Confirmed against the real design this gap names
+  (`apb_if.sv`'s `psel_valid` property) and by a differential test forcing
+  the operand's live and Preponed values to disagree within one time step
+  (an NBA landing between the Preponed sample and the monitor's Observed
+  read) so a live-reading bug would visibly drop a report. Tests:
+  `tests/sva_test.cpp`. Still refused, its own message, unchanged by this
+  work: a USER function/task call (its body may read state beyond what its
+  arguments name, and clotho does not trace subroutine bodies to add that to
+  the shadow set) and every OTHER system function outside the LRM 20.9 family
+  (e.g. `$time`, which names no operand to sample at all) — narrower TODOs of
+  their own, not covered here.
 - [~] **Property layer phase 3** — DONE. Unbounded `always p`, `s_eventually p`
   and all four `until` forms lower and simulate, tracked by a new COUNTED mode:
   the obligation is determinised totally and each of its states carries a
@@ -4440,18 +4533,34 @@ project with its own algorithm, not tail cleanup on the property layer:
     aggregate `==` refusal wearing `%p` wording.
 - [ ] **Containers of handles** — queues/dynamic/associative arrays of class
   objects, and class objects holding them.
-- [ ] **Class static member initializer calling a virtual/static factory
+- [x] **Class static member initializer calling a virtual/static factory
   method on a generic (parameterized) class, where the type parameter is
-  non-integral** — `class uvm_resource #(type T=int) extends
-  uvm_resource_base; static this_type my_type = get_type(); ... endclass`
-  (`uvm_resource.svh:57`). `uvm_resource#(T)` is the generic container
-  underneath UVM's entire `config_db`/`resource_db` mechanism, instantiated
-  with `T` = class handles, virtual-interface handles, queues, etc.
-  throughout any real testbench — the load-bearing template of UVM's config
-  mechanism, not a corner case. Confirmed via two real designs
-  (`uvm_register_spi_bl_tb`, `uvm_tb_build_bl_tb`); not yet root-caused to a
-  specific lowering site — needs its own investigation before a location +
-  diagnostic (or a real fix) can land.
+  non-integral** — MISDIAGNOSED: `uvm_resource#(T)` itself was never the
+  problem. `class uvm_resource #(type T=int) extends uvm_resource_base;
+  static this_type my_type = get_type(); ... endclass` (`uvm_resource.svh:57`)
+  works for every real non-integral `T` a testbench actually uses — class
+  handle, virtual interface, queue, dynamic array, associative array, string
+  — confirmed by a standalone repro exercising all five as the type
+  parameter of a self-referential singleton-static generic class (the exact
+  `uvm_resource#(T)` shape), all constructing and dispatching correctly.
+  The real trigger, root-caused against the two failing designs
+  (`uvm_register_spi_bl_tb`, `uvm_tb_build_bl_tb`): a UVM register-model
+  class embeds a `covergroup cg; ... endgroup` and is itself reachable as a
+  generic-class type parameter (`uvm_resource#(T)` / `uvm_config_db#(T)`),
+  which eager static initialization (LRM 6.21) lowers whether or not
+  anything ever samples the coverage. `lower_type` had no
+  `ct.isCovergroup()` case — covergroups are simply not implemented yet (see
+  "Functional coverage" below) — so it fell through to the generic
+  `!ct.isIntegral()` refusal with the message "unsupported non-integral
+  type", which named neither covergroups nor `uvm_resource#(T)` and sent
+  investigation chasing the wrong class entirely. Fixed: `lower_type` now
+  has an explicit `ct.isCovergroup()` case reporting "covergroup type is not
+  supported" — an accurate, correctly-scoped refusal — ahead of the generic
+  fallback, which itself is annotated as unreachable for any type kind slang
+  currently defines. The underlying gap (no covergroup lowering at all) is
+  tracked once, correctly, under "Functional coverage"; this entry is
+  closed as "misdiagnosed, now accurately diagnosed", not as "covergroups
+  implemented".
 
 ---
 

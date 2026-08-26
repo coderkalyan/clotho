@@ -1360,6 +1360,87 @@ TEST_CASE("parameterized class: value parameter access") {
     CHECK(run_capture(src) == "34 16\n");
 }
 
+// UVM's `uvm_resource#(T)` shape (uvm_resource.svh:57): a self-referential
+// singleton static (`static this_type my_type = get_type();`, where
+// `get_type()` reads `my_type`, null on first call, and assigns it) inside a
+// generic class, instantiated with every non-integral T a real testbench
+// throws at `uvm_config_db#(T)` / `uvm_resource_db#(T)`. A prior investigation
+// (docs/TODO.md, "Class static member initializer calling a virtual/static
+// factory method...") misattributed a real-design failure to this shape being
+// broken for SOME non-integral T; it root-caused instead to an unrelated,
+// already-tracked gap (covergroups, not implemented at all -- see the
+// covergroup test below). This pins that the shape itself is sound for every
+// non-integral T that has an IR representation: a class handle, a virtual
+// interface, a queue, and an associative array (dynamic array and string are
+// exercised elsewhere; T=int is the class's own default and covered by every
+// other parameterized-class test above).
+TEST_CASE("parameterized class: self-referential singleton static over class/vif/queue/assoc T") {
+    constexpr std::string_view src = R"(
+        interface IF; logic clk; endinterface
+        class Payload; int v; endclass
+        class C #(type T = int);
+            typedef C#(T) this_type;
+            static this_type my_type = get_type();
+            T val;
+            static function this_type get_type();
+                if (my_type == null) my_type = new();
+                return my_type;
+            endfunction
+        endclass
+        module m;
+            IF ifc();
+            initial begin
+                C#(Payload)          cc;
+                C#(virtual IF)       cv;
+                typedef int intq_t[$];
+                typedef int assoc_t[string];
+                C#(intq_t)           cq;
+                C#(assoc_t)          ca;
+                cc = C#(Payload)::get_type();
+                cv = C#(virtual IF)::get_type();
+                cq = C#(intq_t)::get_type();
+                ca = C#(assoc_t)::get_type();
+                // Idempotent: a second get_type() through the same
+                // specialization returns the SAME singleton, never a new one.
+                $display("%b %b %b %b", cc == C#(Payload)::get_type(),
+                          cv == C#(virtual IF)::get_type(),
+                          cq == C#(intq_t)::get_type(),
+                          ca == C#(assoc_t)::get_type());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 1 1 1\n");
+}
+
+// The actual root cause the misattribution above named: a covergroup type has
+// no IR representation at all (functional coverage is unimplemented, see
+// docs/TODO.md "Functional coverage"). Reaching one through `lower_type` --
+// here, directly as a class property's type, the same way a UVM register
+// model class embeds one and gets pulled through a generic-class type
+// parameter under eager static init (LRM 6.21) -- must name covergroups
+// specifically, not the generic (and misleading) "unsupported non-integral
+// type" every OTHER admitted non-integral kind used to share this refusal
+// with.
+TEST_CASE("a covergroup-typed property is refused by name, not the generic non-integral message") {
+    // `covergroup cg; endgroup` inside a class implicitly declares `cg` as
+    // BOTH the embedded covergroup type and a property of that type (LRM 19.3
+    // -- `cg = new()` in the constructor addresses it directly, no separate
+    // property declaration). A bare module-scope `covergroup` is a different,
+    // unrelated gap (an unsupported module member kind), so the property has
+    // to be reached the way real UVM code reaches it: embedded in a class.
+    const std::string d = fails(R"(
+        module m;
+            class C;
+                covergroup cg;
+                endgroup
+                function new(); endfunction
+            endclass
+            initial begin C o = new(); end
+        endmodule
+    )");
+    CHECK(d.find("covergroup") != std::string::npos);
+}
+
 // -- Forward typedef classes (`typedef class C;`, LRM 6.18 / 8.27) --
 // Class resolution itself needed no work: lower_class_type's intern-first
 // cache keys on the ClassType symbol pointer, which slang resolves a forward
@@ -2373,6 +2454,86 @@ TEST_CASE("class registration: a base's property cycling back to its own derived
             endclass
             initial begin
                 static Derived x = new;
+            end
+        endmodule
+    )";
+    const LowerResult r = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+    check_every_class_desc_complete(*r.module);
+}
+
+// A SECOND, unrelated way to orphan a class Ref -- the same internal-error class
+// the fix above closed for base-class recursion recurs through a completely
+// different trigger (docs/TODO.md, "'class without a descriptor' recurrence
+// through the generic component registry"): lower_class_type interns a class
+// (class_type_cache_) BEFORE laying out its own properties, so a property whose
+// TYPE is fundamentally unsupported -- a covergroup (LRM 19) is the one real
+// design hits, UVM's `apb_coverage_monitor extends uvm_subscriber#(...)` embeds
+// one, forced through here by `` `uvm_component_utils`` 's eager factory-registry
+// singleton (LRM 6.21) whether or not the design ever builds one -- throws AFTER
+// the class is interned but BEFORE compute_vtable ever runs. That LowerError
+// unwinds out of lower_class_type with no try/catch of its own; whatever caller
+// eventually catches it (build_function's stub_eligible degrade, here) leaves
+// class_type_cache_ still pointing at the abandoned Ref. A later, UNRELATED
+// reference to the same class -- reached through a different call chain than the
+// one that failed -- used to hit that cache and silently reuse the Ref as if it
+// were valid: structurally well-typed, with an intact (empty) field table, but no
+// vtable and no descriptor. That is exactly the shape that crashed a real
+// `uvm_component_registry#(T,Tname)::create`'s `$cast(create, obj)`
+// (uvm_registry.svh:116) as an unlocated "internal: class without a descriptor"
+// in LlvmBackend.cpp's ClassIsA case. Fixed the same way as the base-recursion
+// case: lower_class_type now un-interns on the way out if anything after
+// bind_class_type throws, so the SECOND reference gets its own honest,
+// stub-eligible LowerError instead of silently inheriting a landmine.
+//
+// `body_pending_` (function_id) drains LIFO (drain_pending_bodies pops from the
+// back), so the LAST vtable-forced body reserved is built FIRST. The initial
+// block below declares `w` before `h`, so Wrapper's class -- and its `get`
+// slot -- lowers and reserves first; Holder's class -- and its `touch` slot --
+// lowers and reserves second. Draining then builds Holder::touch FIRST:
+// Wrapper::get is built second and re-touches Broken's type through
+// declare_static_prop for its own static property `cached`. Without the fix,
+// that second attempt silently succeeds and registers `cached` as a class-typed
+// signal pointing at the undescribed Ref, which check_every_class_desc_complete
+// catches; with the fix, it re-throws its own LowerError before ever registering
+// the signal, so `cached` never appears in the design at all and there is
+// nothing left to check. `get`'s reference to `Broken` is a LOCAL VARIABLE
+// inside its body, deliberately not its return type: a body-statement
+// failure is what stub_eligible's degrade covers (build_function's own
+// try/catch wraps `lower_stmt(sub.getBody(), b)`) -- a failure while
+// lowering the RETURN TYPE itself happens earlier, outside that try/catch,
+// and is a separate, still-open gap (found while writing this test; not
+// this bullet's scope, since nothing here needs a stub with a poisoned
+// return type to exist).
+TEST_CASE("class registration: a property whose type fails after interning must "
+          "not orphan a Ref for a later, unrelated reference") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Broken;
+                bit sel;
+                covergroup cg;
+                    cp: coverpoint sel;
+                endgroup
+                function new();
+                    cg = new();
+                endfunction
+            endclass
+            class Wrapper;
+                static Broken cached;
+                virtual function void get();
+                    Broken x;
+                    x = cached;
+                endfunction
+            endclass
+            class Holder;
+                virtual function void touch();
+                    Broken b;
+                endfunction
+            endclass
+            initial begin
+                static Wrapper w = new;
+                static Holder h = new;
             end
         endmodule
     )";

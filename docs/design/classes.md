@@ -122,6 +122,25 @@ the located refusal it already is rather than leaving a half-registered ghost �
 defense in depth for that same "done but undescribed" state, though no currently
 reachable legal construct throws from that specific window today.
 
+A THIRD, unrelated way to reach the same "done but undescribed" state: a
+property whose TYPE is fundamentally unsupported (a `covergroup`, LRM 19, is the
+one real design hits — UVM's `apb_coverage_monitor extends
+uvm_subscriber#(apb_seq_item)` embeds one, forced through here by
+`` `uvm_component_utils`` 's eager `local static this_type me = get();` factory
+singleton, LRM 6.21) throws AFTER `lower_class_type` interns the class but
+BEFORE `compute_vtable` ever runs. That `LowerError` unwinds out of
+`lower_class_type` with no try/catch of its own, and once some ancestor frame
+catches it (`build_function`'s `stub_eligible` degrade, typically), the earlier
+fix's mid-function re-check does not help — it only guards the specific window
+opened by base-class recursion, not this one — so `class_type_cache_` was left
+pointing at the abandoned Ref. A later, unrelated reference (a DIFFERENT call
+chain than the one that failed — the same class's own factory `create`'s
+`$cast`, in the real design) hit that cache and reused the Ref as if valid,
+crashing the backend the same way. Fixed the same way, one step earlier:
+`lower_class_type` un-interns `class_type_cache_[&clt]` on the way out if
+anything after `bind_class_type` throws, so every later reference gets its own
+honest, located refusal instead of a landmine.
+
 **Abstract classes** (`virtual class`, LRM 8.21) with concrete virtual methods
 lower normally — a valid handle type and base whose virtuals dispatch through the
 base; a direct `new` on one is rejected (slang, plus a defense guard in

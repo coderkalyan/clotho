@@ -534,6 +534,74 @@ TEST_CASE("dynamic array from an assignment-pattern literal") {
     CHECK(run_capture(src) == "3 10 20 30\n4 1 2 3 4\n");
 }
 
+// Whole-dynamic-array nonblocking assignment from a `'{...}` literal or a
+// `new[n]` expression (LRM 10.4.2, 7.5): neither RHS is a copyable handle --
+// a pattern literal fills element-by-element and `new[n]` allocates -- so the
+// Active region builds it into a fresh temp handle and the NBA region moves
+// that temp into the target, the same HandleCopyNb the plain dynamic-array
+// / queue / associative-array variable case already used. `d.delete()`
+// between the `<=` and the `#1` shows the NBA commit overwrites whatever the
+// target held at NBA-region time, not what it held when the RHS was
+// evaluated -- mirrors "nonblocking whole-queue assignment" (queue_test.cpp).
+TEST_CASE("nonblocking dynamic array assignment from a literal or new[n]") {
+    constexpr std::string_view src = R"(
+        module m;
+            int d[];
+            int e[];
+            initial begin
+                d = '{9, 8};
+                d <= '{5, 5, 5};
+                d.delete();
+                $display("dimm=%0d", d.size());
+                #1;
+                $display("dpost=%0d %0d %0d %0d", d.size(), d[0], d[1], d[2]);
+                e = new[2];
+                e[0] = 1; e[1] = 2;
+                e <= new[4];
+                $display("eimm=%0d %0d %0d", e.size(), e[0], e[1]);
+                #1;
+                $display("epost=%0d %0d %0d %0d %0d", e.size(), e[0], e[1], e[2], e[3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "dimm=0\n"
+          "dpost=3 5 5 5\n"
+          "eimm=2 1 2\n"
+          "epost=4 0 0 0 0\n");
+}
+
+// A clocked dynamic-array register `d <= '{...}` samples the pattern literal
+// each posedge (LRM 10.4.2). Confirmed against a real design: UVM 1.2's
+// `uvm_id_register` (reg_dut.sv) nonblocking-assigns an assignment-pattern
+// literal straight into a `int id_register_value[];` dynamic array inside
+// `always @(posedge PCLK)` -- this was refused outright before (docs/TODO.md's
+// "NBA to a dynamic array" entry): the literal builds its value in place
+// rather than deep-copying a handle the commit can move, so it could not
+// stage into HandleCopyNb without first materializing a temp handle.
+TEST_CASE("nonblocking dynamic array register clocked from a pattern literal (LRM 10.4.2)") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0;
+            int cnt = 0;
+            int d[];
+            always #5 clk = ~clk;
+            always @(posedge clk) d <= '{cnt, cnt + 1, cnt + 2};
+            initial begin
+                @(posedge clk); #1;
+                $display("c1 %0d %0d %0d %0d", d.size(), d[0], d[1], d[2]);
+                cnt = 10;
+                @(posedge clk); #1;
+                $display("c2 %0d %0d %0d %0d", d.size(), d[0], d[1], d[2]);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "c1 3 0 1 2\n"
+          "c2 3 10 11 12\n");
+}
+
 // === / !== over a dynamic array shares the queue's aggregate-equality
 // reduction (both are Kind::DynArray/Kind::Queue handles with no plane
 // value); a string leaf never carries x/z (LRM 6.16.9) so the X-propagating

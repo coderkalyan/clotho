@@ -3459,8 +3459,30 @@ private:
             }
             return module_.pool.viface_type;
         }
+        if (ct.isCovergroup()) {
+            // A covergroup type (LRM 19) reached as an ordinary value type -- a
+            // class property, a generic-class type parameter, a variable
+            // declaration. Functional coverage (`covergroup`/`coverpoint`/`bins`)
+            // is not implemented at all yet (see M4 "Functional coverage" in
+            // docs/TODO.md), so there is no IR representation for one. Named
+            // separately from the generic fallback below: this is the single most
+            // common way that fallback was reached in practice (a UVM register
+            // model class embeds a `covergroup cg; ... endgroup` and is itself used
+            // as a generic-class type parameter -- e.g. `uvm_resource#(T)` /
+            // `uvm_config_db#(T)` -- which eager static initialization, LRM 6.21,
+            // lowers whether or not anything actually samples the coverage), and
+            // the OLD generic message ("unsupported non-integral type") gave no
+            // hint that covergroups specifically were the reason, sending every
+            // report of this shape chasing the wrong class (uvm_resource#(T) itself
+            // works for every OTHER non-integral T: class handle, virtual
+            // interface, queue, dynamic array, associative array, string -- all
+            // covered by the branches above).
+            fail("covergroup type is not supported");
+        }
         if (!ct.isIntegral()) {
-            // TODO: string / class types.
+            // TODO: any OTHER type kind reaching here is a genuine gap; every kind
+            // slang currently defines is handled by a branch above or by
+            // isCovergroup() just above, so this should be unreachable in practice.
             fail("unsupported non-integral type");
         }
 
@@ -3661,6 +3683,37 @@ private:
         t.element         = base_ref;
         const ir::Ref ref = module_.pool.put(ir::Item{ t });
         bind_class_type(clt, ref);
+        // If anything from here throws before this function returns -- a property
+        // whose type is fundamentally unsupported, most concretely a covergroup
+        // (LRM 19: UVM's `apb_coverage_monitor extends uvm_subscriber#(...)` embeds
+        // one, and `` `uvm_component_utils`` forces every registered class's
+        // factory proxy through here via its eager `local static this_type me =
+        // get();` singleton, LRM 6.21, whether or not the design ever constructs
+        // one) -- this entry must not survive: the cache check at the top of this
+        // function treats class_type_cache_ membership as "this class is fully
+        // registered, reuse its Ref", with no notion of an abandoned attempt. Left
+        // in place, a LATER, unrelated reference to the same class -- reached
+        // through a completely different call chain than the one that failed, e.g.
+        // the registry's own `create()` casting to it, uvm_registry.svh:116's
+        // `$cast(create, obj)` -- would silently reuse this Ref as if it were
+        // valid: a structurally well-typed class with an intact field table but no
+        // vtable and no descriptor, which crashes the LLVM backend as an unlocated
+        // "internal: class without a descriptor" the first time codegen needs it
+        // (LlvmBackend.cpp's ClassIsA case, mod_.class_desc(dest) == nullptr).
+        // Erase on the way out so every later reference gets its own honest,
+        // located LowerError instead of inheriting a landmine planted one
+        // class-lowering attempt ago. Mirrors compute_vtable's own VslotGuard for
+        // the exact same "done but undescribed" hazard, one step earlier.
+        struct InternGuard {
+            ankerl::unordered_dense::map<const slang::ast::ClassType*, ir::Ref>& table;
+            const slang::ast::ClassType*                                        key;
+            bool                                                                committed = false;
+            ~InternGuard() {
+                if (!committed) {
+                    table.erase(key);
+                }
+            }
+        } intern_guard{ class_type_cache_, &clt };
 
         // The chain, deepest base first — the field order of the object body.
         std::vector<const slang::ast::ClassType*> chain;
@@ -3791,6 +3844,7 @@ private:
         if (class_depth_ == 1) {
             drain_rand_bodies();
         }
+        intern_guard.committed = true;
         return ref;
     }
 
@@ -13566,6 +13620,21 @@ private:
                name == "$changed";
     }
 
+    // LRM 20.9's bit vector system functions: pure combinational reductions
+    // over one bit-vector operand (plus, for `$countbits`, its control
+    // arguments -- count_control_class requires each of those to be a
+    // constant 0/1/x/z, so they carry no runtime state of their own to
+    // sample). Used by reject_unsampled_call to let these through a sampled
+    // assertion expression: lower_bit_query, which already lowers the
+    // non-constant case of each in a plain (non-assertion) expression, is
+    // nothing but lower_expr on the operand plus the reduction op, so it
+    // needs no sampling logic of its own -- see the comment on
+    // reject_unsampled_call.
+    static bool is_pure_bitvec_sysfn(std::string_view name) {
+        return name == "$isunknown" || name == "$countones" || name == "$countbits" || name == "$onehot" ||
+               name == "$onehot0";
+    }
+
     // entries[n - 1] of the ring `live` keeps for `gate`: the value its shadow held
     // n advances of that ring ago. A null `gate` names the ungated ring, which is
     // what every $past without a third argument -- and every value change function,
@@ -13849,18 +13918,39 @@ private:
           b.resize(then, module_.pool.logic_type, l), b.resize(now, module_.pool.logic_type, l), name == "$rose", b, l);
     }
 
-    // A call in a sampled assertion expression would read live state: sampling
-    // captures the variables an expression names (LRM 16.6), and clotho does not
-    // trace a subroutine body to add what that body reads to the shadow set.
+    // Two families are exceptions, and neither is a grudging one, because
+    // neither has a body to trace: both bottom out in operand lowering that
+    // already reaches value_lvalue, which already redirects every variable to
+    // its Preponed shadow whenever sva_sampled_ is set -- set for the whole of
+    // this atom by eval_atom's SampledScope, so it is still set when either
+    // family's own operand gets lowered below.
     //
-    // The sampled value functions are the exception, and not a grudging one: they
-    // are DEFINED over sampled values, and lower_sampled_value builds each from the
-    // shadow and the history ring without reading live state at all. Their own
-    // operand must be a plain variable reference -- rejected there when it is not
-    // -- so declining to descend loses no call this would otherwise have caught.
-    // TODO: trace called bodies so their reads are sampled too, which is also what
-    // LRM 16.6's side-effect-freedom rule needs checking against
-    // (concurrent-assertions.md 4).
+    // The sampled value functions are the first: they are DEFINED over sampled
+    // values, and lower_sampled_value builds each from the shadow and the
+    // history ring without reading live state at all. Their own operand must
+    // already be a plain variable reference -- rejected there when it is not --
+    // so declining to descend into one loses no call this would otherwise have
+    // caught.
+    //
+    // LRM 20.9's bit vector system functions are the second
+    // (is_pure_bitvec_sysfn: `$isunknown`, `$countones`, `$countbits`,
+    // `$onehot`, `$onehot0`): pure combinational reductions over one
+    // bit-vector operand and nothing else, lowered by lower_bit_query as
+    // nothing more than lower_expr on that operand plus the reduction op --
+    // the same lower_expr every plain (non-call) assertion atom already goes
+    // through to reach value_lvalue. Unlike the family above, LRM 20.9 leaves
+    // the operand an arbitrary expression rather than requiring a plain
+    // variable, so a call nested inside it (`$isunknown(f())`) is exactly as
+    // unsampleable as a bare one -- which is why this case descends into the
+    // call below instead of returning, the one difference from the family
+    // above.
+    //
+    // TODO: trace called bodies so their reads are sampled too, which is also
+    // what LRM 16.6's side-effect-freedom rule needs checking against
+    // (concurrent-assertions.md 4) -- still the gap for every remaining system
+    // function (e.g. `$time`, which names no operand to sample in the first
+    // place) and for a user function/task call, either of which may read state
+    // its own arguments never name.
     //
     // A sequence method reaches here too, and is called out by name: `.triggered`
     // is a call syntactically, but "what it reads would not be sampled" describes
@@ -13872,6 +13962,14 @@ private:
 
             void handle(const CallExpression& call) {
                 if (call.isSystemCall() && is_sampled_value_fn(call.getSubroutineName())) {
+                    return;
+                }
+                if (call.isSystemCall() && is_pure_bitvec_sysfn(call.getSubroutineName())) {
+                    // Keep walking (unlike the case above) so a call nested in
+                    // THIS one's own operand -- not constrained to a plain
+                    // variable the way a sampled value function's is -- still
+                    // gets caught by a later visit of this same handler.
+                    visitDefault(call);
                     return;
                 }
                 if (method == nullptr && !sequence_method(call).empty()) {
@@ -22381,16 +22479,38 @@ private:
             // deep-copies the source into a staging handle and the NBA region moves
             // that into the live one -- HandleCopyNb, shared with queues and
             // associative arrays.
-            if (!is_dyn_array(a.right()) || !is_struct_lvalue_shape(unwrap_conversion(a.right()))) {
-                // TODO: a `'{...}` literal or a `new[n]` on the right of a
-                // nonblocking assignment. Both build their value in place rather
-                // than deep-copying a handle, so neither can stage into the record
-                // buffer without first materializing a temp handle.
-                fail("nonblocking assignment to a dynamic array is only supported from "
-                     "another dynamic-array variable");
+            if (is_dyn_array(a.right()) && is_struct_lvalue_shape(unwrap_conversion(a.right()))) {
+                b.handle_copy_nb(dst, lower_lvalue(unwrap_conversion(a.right()), b), aty, l);
+                return dst;
             }
-            b.handle_copy_nb(dst, lower_lvalue(unwrap_conversion(a.right()), b), aty, l);
-            return dst;
+            if (as_assignment_pattern(a.right()) != nullptr || a.right().kind == ExpressionKind::NewArray) {
+                // `d <= '{e0, e1, ...}` / `d <= new[n]` / `d <= new[n](src)`
+                // (confirmed against a real design: uvm_id_register's
+                // `id_register_value <= '{'ha0, 'ha1, ...}` in reg_dut.sv,
+                // nonblocking-assigning a pattern literal straight into a
+                // dynamic array). Neither shape is a copyable handle -- a
+                // pattern literal fills element-by-element and `new[n]`
+                // allocates -- so, unlike the plain-variable case above,
+                // there is no existing handle to stage. Build the value into
+                // a FRESH temp handle at Active-region time (the exact
+                // blocking-assignment machinery below, redirected at the
+                // scratch handle instead of `dst`), then feed that temp
+                // through the same HandleCopyNb the plain-variable case
+                // uses: the NBA-region commit is a cheap handle move either
+                // way, whether the Active-region side built it in place or
+                // deep-copied it. Mirrors materialize_queue_rvalue's
+                // "materialize into a temp, then move" shape for a queue.
+                const ir::Index tmp = make_arg_temp(aty, b, l);
+                if (as_assignment_pattern(a.right()) != nullptr) {
+                    emit_agg_store(tmp, aty, a.right(), ir::Inst::Tag::Store, b, l);
+                } else {
+                    emit_dyn_array_new_expr(tmp, a.right().as<slang::ast::NewArrayExpression>(), aty, b, l);
+                }
+                b.handle_copy_nb(dst, tmp, aty, l);
+                return dst;
+            }
+            fail("nonblocking assignment to a dynamic array is only supported from another "
+                 "dynamic-array variable, a `'{...}` literal, or `new[n]`");
         }
         // `d = '{e0, e1, ...}` (LRM 10.9): the source is an assignment-pattern
         // literal, not another handle — materialize it element-wise rather than
