@@ -375,6 +375,21 @@ twice would make `llvm::Function::Create` silently rename the second thunk
 `<name>.1` and bind C to an arbitrary instance, so the collector `fail`s on a
 duplicate `extern_name`.
 
+**A design with NO top module** (an interface bound into a package, no `module`
+anywhere — a real shape, not a degenerate one: uvm-examples/apb_protocol_monitor
+and uvm_alu_config_analysis, both `sv-tests` UVM fixtures pairing `uvm_pkg.sv` with
+a top-less interface) used to drop its `$unit`/package exports silently: "exactly
+one top admits them" had no top to be that one, so `uvm_pkg.sv`'s
+`export "DPI-C" function m__uvm_report_dpi` — the report-forwarding hook
+`uvm_dpi.o`'s own C calls back into — never collected, and the JIT failed at
+`--dpi-lib` link time with `Symbols not found: [ m__uvm_report_dpi ]`, not a
+compile-time diagnostic (`lower_top`'s per-top loop simply never ran, so nothing
+was there to refuse). `collect_dpi_exports` now takes a nullable top; the caller
+collects globals once against `nullptr` when `root.topInstances` is empty, which
+`function_id` needs no special-casing for (a null top can only ever match a
+module-scope export, which a topless design has none of by construction, so it
+takes the same "wrong top" `continue` an ordinary mismatch already does).
+
 The rest of this section is the original scoping; it matches what landed.
 
 ### Part 1 — symbol resolution: needs the relocatable-object loader

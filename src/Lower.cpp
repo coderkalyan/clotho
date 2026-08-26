@@ -28156,11 +28156,20 @@ private:
     // backend addresses each signal absolutely off that instance's own state global).
     // So an export must be collected by the Lowerer of the top containing it: `top`
     // admits this top's module-scope exports, and `collect_globals` — true on exactly
-    // one top — admits the $unit/package exports, which have no instance multiplicity
+    // one call — admits the $unit/package exports, which have no instance multiplicity
     // (LRM 6.8) and lower once through the shared globals Lowerer function_id
-    // delegates to.
+    // delegates to. `top` is nullable: a design with no elaborated top module at all
+    // (e.g. an interface-only file bound into a package, LRM 23.4 -- a real shape,
+    // not a degenerate one: uvm-examples/apb_protocol_monitor pairs uvm_pkg.sv with a
+    // single top-less interface) still has $unit/package exports to collect, and the
+    // caller passes null with collect_globals=true exactly once for it, since there is
+    // no "first top" to piggyback the one-time collection on. A null top can never
+    // equal a module-scope export's real owning instance, so the module-scope branch
+    // below just skips every such export via the same `continue` an ordinary
+    // wrong-top mismatch already takes -- correctly, since a design with no top module
+    // has no module-scope subroutine any export could belong to either.
 public:
-    void collect_dpi_exports(const slang::ast::Compilation& comp, const InstanceSymbol& top,
+    void collect_dpi_exports(const slang::ast::Compilation& comp, const InstanceSymbol* top,
                              bool collect_globals) {
         for (const auto& ex : comp.getDPIExports()) {
             const SubroutineSymbol& sub = *ex.subroutine;
@@ -28168,7 +28177,7 @@ public:
                 if (!collect_globals) {
                     continue; // collected once for the design, not once per top
                 }
-            } else if (owning_top(sub) != &top) {
+            } else if (top == nullptr || owning_top(sub) != top) {
                 continue; // another top's export (or no elaborated instance at all)
             }
             if (sub.subroutineKind == SubroutineKind::Task) {
@@ -32054,11 +32063,22 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             // own instance state), $unit/package ones through the shared `globals`
             // delegation in function_id — those have no instance multiplicity, so
             // only the first top admits them.
-            lw.collect_dpi_exports(comp, *top, /*collect_globals=*/top == root.topInstances.front());
+            lw.collect_dpi_exports(comp, top, /*collect_globals=*/top == root.topInstances.front());
             const std::span<const Diagnostic> recovered = lw.recovered_diags();
             result.diagnostics.insert(result.diagnostics.end(), recovered.begin(), recovered.end());
             poisoned  = poisoned || lw.poisoned();
             dumps_vcd = dumps_vcd || lw.dumps_vcd();
+        }
+        if (root.topInstances.empty()) {
+            // No top module at all (an interface-only file bound into a package,
+            // e.g. uvm-examples/apb_protocol_monitor): the loop above never runs, so
+            // nothing would otherwise collect the design's $unit/package DPI exports
+            // -- collect_dpi_exports's own "only the first top admits globals" rule
+            // has no top to piggyback on. globals.function_id needs no delegation
+            // here (globals_ is never set on the globals Lowerer itself), so this
+            // reaches build_reserved_body directly, exactly as the per-top delegation
+            // path above does.
+            globals.collect_dpi_exports(comp, nullptr, /*collect_globals=*/true);
         }
         // Any package/$unit class-method body still queued (a design with no top
         // instance, or a body the last top's own drain queued) builds now, and the

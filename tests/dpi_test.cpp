@@ -656,3 +656,25 @@ TEST_CASE("DPI export: a $unit-scope export is collected once in a multi-top des
     // The one $unit thunk belongs to no instance, so it reaches no instance state.
     CHECK(llvm_definition(ir_text, "u_get").find("clotho.inst.") == std::string::npos);
 }
+
+// A design with NO top module at all (a bare package, or -- the real-world
+// trigger -- an interface-only source paired with a package,
+// uvm-examples/apb_protocol_monitor and uvm_alu_config_analysis) still
+// collects its package-scope export. lower_compilation's per-top loop is what
+// normally admits the one-time $unit/package collection ("collect_globals=true
+// on the first top"); with zero tops that loop never runs at all, so nothing
+// collected it -- a JIT-time "Symbols not found" for any native code that calls
+// back into the export (uvm_dpi.o calling m__uvm_report_dpi is the real-world
+// trigger). No process reaches the export from the SV side either (there is
+// nothing to run), so this checks the thunk emits, not a runtime result.
+TEST_CASE("DPI export: a package-scope export is collected in a design with no top module") {
+    constexpr std::string_view src = R"(
+        package p;
+          export "DPI-C" function f;
+          function int f(input int x);
+            return x * 2;
+          endfunction
+        endpackage)";
+    const std::string ir_text = emit_llvm_text(src);
+    CHECK(llvm_definition(ir_text, "f").find("clotho.inst.") == std::string::npos);
+}
