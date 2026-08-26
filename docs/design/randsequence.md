@@ -6,14 +6,19 @@ statements, `rand join` interleaving, `break` / `return` abort semantics, and th
 value passing of 18.17.7 (production arguments, non-void productions, and the
 implicit per-rule result variables).
 
-Status: **landed** (P0-P3). Four things came out differently from the plan below
+Status: **landed** (P0-P4). Four things came out differently from the plan below
 and the text is corrected in place: the abort flag and the result slot are
 `output` formals rather than `ref` ones, which removed the entry wrapper the plan
 called for (§6); the result travels through a caller temp and is copied into the
 rule variable after the call (§10); the rule variables are default-initialized
 rather than left at the frame's raw contents (§10); and `rand join` needed two
-extra entry points per interleaved production plus three named refusals for what
-cannot cross a unit boundary (§11).
+extra entry points per interleaved production (§11).
+
+P4 then lifted four of the six refusals the first pass left behind — a container
+return type, the two things an interleaved production could not hold across a unit
+boundary, and a block sharing an automatic with a detached fork. Two refusals
+remain, each recorded at its guard as a deliberate deferral rather than an
+oversight (§14).
 
 This document owns the production-to-`ir::Function` lowering, the production ABI,
 the rule-selection and weight rules, the abort model, the value-passing model, and
@@ -34,9 +39,10 @@ optional sub-features.
 random stability (already built, §12), and the constraint solver (unrelated —
 18.17 has weights, not constraints).
 
-**Refused, each by name (§14):** four shapes, all of them consequences of one
-mechanism rather than of the clause — a production returning a container, and the
-three things an interleaved production may not do.
+**Refused, each by name (§14):** two constructs, both deferred deliberately — a
+rule weight wider than 32 bits, which `randcase` shares and must change with, and a
+`rand join` operand that is itself a `rand join`, which LRM 18.17.5's "to depth of
+1" does not describe.
 
 ---
 
@@ -120,7 +126,7 @@ unconditionally emits `ConstEvalRandValue` and fails.
 | weight wider than 32 bits | loud refusal, same message shape as randcase | the LRM's multi-draw stitching scheme is not built for randcase either |
 | result variables (18.17.7) | frame locals of the production, **default-initialized**, written from a caller temp after each call, at a slot index re-derived from `createRuleVariables`' counting order | slang synthesizes the variables but records **no** occurrence→index map. The temp is needed because an `output` actual is a raw slot and an array element is a composed lvalue |
 | unwritten result variable | the type default (Table 6-7) | 18.17.7 says "undefined value"; the frame's previous contents is the only alternative and is not reproducible |
-| production returning a container | refused by name | the deep-copy assignment path is shaped around an `AssignmentExpression` there is none of here |
+| production returning a container | the blocking half of `lower_*_assign`, split out as `emit_container_store` and shared | the deep-copy rules belong in one place; a `return` has an expression and a slot but no `AssignmentExpression` to hand them |
 | `rand join` mechanism | two extra entry points on each interleaved production: `plan` (draw the rule, report its unit count) and `step` (generate one numbered unit) | interleaving must advance a sequence one unit at a time; a plain call runs it to completion |
 | `rand join` bias expression | evaluate the real once, clamp to [0,1], quantize to 1024ths, then integer weight `w_i = (1024−X)·(Lmax+1−L_i) + X·L_i` | hits all three LRM anchors (X=0 favours short, X=1024 favours long, X=512 exactly uniform) with no libm and no real IR; feeds the existing integer ladder |
 | recursion depth cap | none | Clotho caps no other SV recursion; native stack is the limit |
@@ -350,6 +356,21 @@ the call — the same temp-then-copy-back shape `build_call_args` uses for every
 ordinary output argument. `elem_select` indexes in declared-range coordinates, which
 `[1:N]` matches directly.
 
+**The return type is unrestricted.** A scalar, string, enum, real or class handle is
+a `Store` with a `coerce`; an unpacked aggregate is `emit_agg_store`; a queue,
+dynamic array or associative array is `emit_container_store`, the blocking half of
+`lower_dyn_array_assign` / `lower_queue_assign` / `lower_assoc_assign` split out for
+exactly this. Splitting rather than re-deriving matters: those functions dispatch on
+the RHS *expression* shape (`new[n]`, `'{…}` patterns, a dynarr source into a queue,
+a streaming concatenation), and a second partial copy of that table beside the real
+one is the thing that rots. The copy back out of the caller temp is place-to-place
+and needs no dispatch at all (`emit_result_copy`).
+
+(`emit_handle_member_copy`, the neighbouring DECLARATION-INITIALIZER path, is
+deliberately left alone: it treats `new[N]` as construction rather than assignment
+and refuses the pattern and conditional sources these accept, so the two are not
+interchangeable. Folding them together is a separate change.)
+
 ---
 
 ## 11. `rand join` (LRM 18.17.5)
@@ -415,18 +436,31 @@ blocked orders `ABCD` / `CDAB`, `(1.0)` puts 68% on the four interleaved ones, `
 sits between. **Do not copy verilator here**: its driver re-picks the current operand
 with fixed probability ½ per step and ignores the expression entirely.
 
-**What an interleaved production may not do** — all three because `step` is a
-function of its own, entered once per unit, so nothing a rule holds *across* its
-units can live in its frame:
+**The activation record.** `step` is a function of its own, entered once per unit,
+so *nothing a production holds across its units may live in its frame*. Everything
+that does is hoisted into the driver's frame — which spans the whole interleaving —
+and handed back in as `ArgDir::Ref` formals of both `plan` and `step`:
 
-- be itself a `rand join`;
-- have a rule that names a non-void production (18.17.7's result variables would
-  have to survive from the unit that writes one to the code block that reads it,
-  with other operands' units in between);
-- have a non-input formal (the arguments are evaluated once, before the first unit,
-  so a copy-out would land N times at unspecified points in the interleaving).
+- **the declared formals.** One cell each, set up once by `bind_rand_join_formal`:
+  `input` and `inout` copy the actual in, `output` takes the type default, and a
+  `ref` formal aliases the actual itself (its lvalue materialized once here, so an
+  index expression inside it is evaluated once). One copy-out per `output` / `inout`
+  runs after the last unit, through the ordinary `emit_call_copyouts`. That is what
+  "similar to a task call" means for a production whose activation spans an
+  interleaving: the copies happen at its ends, not at every unit — and an `input`
+  the body mutates keeps the mutation between units, exactly as it would in a plain
+  production's single call.
+- **the rule variables.** One cell per (rule, variable) over every rule of the
+  production, in `rand_join_rule_vars` order, default-initialized once before the
+  first unit. `build_production_step` registers each symbol against its ref formal
+  with `fn_local`, so `value_lvalue` resolves a reference to one straight to the
+  driver's cell and `gen_rule`'s ordinary machinery needs no special case at all.
 
-Each is refused by its own message (§14).
+**The one thing that cannot be hoisted** is an operand that is itself a `rand join`:
+its state is not a fixed set of variables but an interleaving cursor per inner
+operand, chosen at its own plan time, so the outer `step` would have to be a
+resumable driver rather than an indexed one. Refused by name (§14), and 18.17.5's
+"interleaves nonterminal symbols to depth of 1" does not describe nesting.
 
 ---
 
@@ -494,18 +528,15 @@ inside a `fork` escapes the `ReturnInParallel` check.
 
 ## 14. The refusal surface
 
-| construct | message | site |
-|---|---|---|
-| a production returning a queue / dynamic array / associative array | `a randsequence production returning a queue, dynamic array or associative array is not supported` | `build_production`, `build_production_step` |
-| a rule weight wider than 32 bits | `randsequence production weight wider than 32 bits is not supported` | `gen_weighted_rules` |
-| a `rand join` operand that is itself a `rand join` | `a randsequence rand join operand that is itself a rand join is not supported` | `check_rand_join_operand` |
-| a `rand join` operand whose rule names a non-void production | `a randsequence rand join operand whose rule reads the result of another production is not supported` | `check_rand_join_operand` |
-| a `rand join` operand with an output / inout / ref formal | `a randsequence rand join operand with a non-input argument is not supported` | `check_rand_join_operand` |
-| a block reading an automatic that a *detached fork* also captured | `a randsequence reading a variable captured by a detached fork is not supported` | `randseq_block` |
+| construct | message | site | why still refused |
+|---|---|---|---|
+| a rule weight wider than 32 bits | `randsequence production weight wider than 32 bits is not supported` | `gen_weighted_rules` | `$urandom_range` is one 32-bit draw; LRM 18.16 wants several stitched together. `randcase` carries the identical guard under the same clause, so the two must change together — and stitching shifts how many values a selection takes from the process stream, which §12 makes a contract |
+| a `rand join` operand that is itself a `rand join` | `a randsequence rand join operand that is itself a rand join is not supported` | `check_rand_join_operand` | every other thing an interleaved production holds across its units is a fixed set of variables the driver hoists (§11); an inner `rand join`'s state is an interleaving cursor per inner operand, chosen at its own plan time, so the outer `step` would have to be a resumable driver rather than an indexed one. 18.17.5 interleaves "to depth of 1", which does not describe nesting |
 
-The last is defence, not a known gap: the variable lives in a GC box, so the ref
-formal would alias the box's field rather than a frame slot. Believed correct, wholly
-unexercised, so guarded rather than assumed.
+Both are deferrals recorded at the guard, not gaps found later. Everything else in
+18.17 is implemented: a production may return any type including a container, an
+interleaved production may pass values within its own rules and take arguments of
+any direction, and a block may share an automatic with a detached fork.
 
 ---
 
@@ -574,10 +605,22 @@ output formal, the implicit rule variables and the occurrence-index re-derivatio
 `GenQueue`, and the default-on-unwritten-slot rule for the `if/else` shape. All met.
 
 **P3 — `rand join` (18.17.5).** *(landed.)* The `plan` / `step` split, the driver,
-the bias weighting, and the three operand refusals. *Acceptance:* the six legal
-interleavings of the LRM example all occur and nothing else does; the bias anchors
-are measurably distinct; `return` and `break` inside an interleaved operand behave;
-three operands work. All met.
+and the bias weighting. *Acceptance:* the six legal interleavings of the LRM example
+all occur and nothing else does; the bias anchors are measurably distinct; `return`
+and `break` inside an interleaved operand behave; three operands work. All met.
+
+**P4 — the remaining refusals.** *(landed.)* P0-P3 left six named refusals; four
+were mechanism gaps rather than semantics and are now implemented. A production may
+return a container (`emit_container_store`, split out of the three whole-container
+assignment paths, §10); an interleaved production may pass values within its own
+rules and take arguments of any direction (the activation record, §11); and a block
+may share an automatic with a detached fork (the box handle travels by value, §6).
+The two that remain are recorded as deliberate deferrals at their guards (§14).
+*Acceptance:* queue / dynamic-array / associative-array return types including a
+`[1:N]` result array; result variables inside an interleaved operand's rule;
+`output`, `inout`, `ref` and mutated-`input` formals on interleaved operands, each
+with its copy landing exactly once; a randsequence and a `join_none` child sharing
+one automatic. All met.
 
 **Prerequisite, landed first:** `patches/slang-randseq-rule-pairing.patch` (§13).
 
@@ -585,7 +628,7 @@ three operands work. All met.
 
 ## 17. Verification
 
-`tests/randsequence_test.cpp` — 27 `TEST_CASE`s, registered by one line in the
+`tests/randsequence_test.cpp` — 30 `TEST_CASE`s, registered by one line in the
 explicit TU list in `CMakeLists.txt` beside `tests/randcase_test.cpp`;
 `doctest_discover_tests` needs no change. The two anonymous-namespace helpers every
 random-adjacent TU carries (`run_capture`, `lower_error`) are copied from
@@ -595,20 +638,22 @@ Determinism without a `--seed` flag uses the three instruments named in
 `docs/design/constrained-randomization.md:660-670`:
 
 1. **Grammars with one outcome.** The 18.17.6 `break` and `return` examples, the
-   18.17.2 if-else example, `repeat`, the case example, and both value-passing
-   examples are fully determined; their expected stdout is the LRM's own text.
+   18.17.2 if-else example, `repeat`, the case example, both value-passing examples,
+   and every P4 case are fully determined; their expected stdout is the LRM's own
+   text, or arithmetic the bias pins.
 2. **Compute the property in the design.** The weight ratios, the interleaving set,
    and the bias anchors run thousands of trials and `$display` a boolean bound.
 3. **Membership, not equality**, where the grammar admits several utterances (the
    opening example, the argument-default example): the design checks `inside` a set
    and prints `ok`.
 
-Suite result: **2574 passing, 0 failing** (2547 before; 2 skipped), including the
-existing `tests/randcase_test.cpp` unchanged, which is what confirms the shared
-weighted-pick refactor into `gen_weighted_rules` did not move randcase's draws.
+Suite result: **2577 passing, 0 failing** (2547 before this work; 2 skipped),
+including `tests/randcase_test.cpp` unchanged — which is what confirms both the
+shared weighted-pick refactor into `gen_weighted_rules` and P4's split of the
+container-assignment paths left the existing behaviour byte-identical.
 
-Still owed: nothing in 18.17. The six refusals of §14 are each covered by a
-`lower_error` case asserting the message by substring.
+Still owed: nothing in 18.17. Both refusals of §14 are covered by a `lower_error`
+case asserting the message by substring.
 
 ---
 
@@ -649,6 +694,13 @@ Still owed: nothing in 18.17. The six refusals of §14 are each covered by a
 - **An out-of-range `rand join` bias expression is clamped.** slang only requires a
   numeric type and 18.17.5 gives no behaviour for one outside [0.0, 1.0]; clamping
   keeps the weights non-negative, which the ladder needs.
+- **An interleaved production's arguments copy at the ends of its ACTIVATION, not at
+  each unit.** 18.17.7 makes passing data to a production "similar to a task call"
+  and 18.17.5 says nothing about where a copy-out lands in an interleaving; the
+  activation is the natural unit, so an `input` is copied in once and keeps what the
+  body did to it between units, and an `output` / `inout` copies back exactly once
+  after the last unit — identical to what the same production does when called
+  plainly.
 - **No recursion-depth cap.** 18.17's own `GenQueue` example recurses; Clotho caps no
   other SV recursion and the native stack is the limit, as it is for a recursive
   `function`.

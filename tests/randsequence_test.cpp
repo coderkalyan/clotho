@@ -663,31 +663,129 @@ TEST_CASE("randsequence with a 64-bit weight fails loudly") {
             .find("weight wider than 32 bits") != std::string::npos);
 }
 
-// The three shapes a `rand join` operand may not take, each by its own message.
-// All three come from the same place: an interleaved production is entered once
-// per unit, so nothing may live across its units.
-TEST_CASE("unsupported randsequence rand join operands are refused by name") {
+// LRM 18.17.7 over 18.17.5: an interleaved production's rule holds its implicit
+// result variables from the unit that writes one to the unit that reads it, with
+// the other sequence's units in between. They live in the driver's frame and reach
+// `step` by reference, since `step` is entered once per unit.
+TEST_CASE("randsequence rand join operands may pass values within their own rules") {
+    constexpr std::string_view src = R"(
+        module m;
+            string s;
+            initial begin
+                randsequence( T )
+                    T : rand join (1.0) P Q ;
+                    P : V V { s = {s, $sformatf("P%0d%0d ", V[1], V[2])}; } ;
+                    Q : W { s = {s, $sformatf("Q%0d ", W)}; } ;
+                    int V : { return 3; } ;
+                    int W : { return 9; } ;
+                endsequence
+                $display("%s", s);
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "P33 Q9 \n");
+}
+
+// An interleaved production's arguments are evaluated once, before its first unit,
+// and its activation spans the whole interleaving (LRM 18.17.7's "similar to a task
+// call"): an `input` keeps whatever the body did to it between units, an `output` /
+// `inout` copies back exactly once at the end, and a `ref` aliases the actual
+// throughout. Bias 0.0 keeps a picked sequence running, which makes the order --
+// and so the arithmetic -- deterministic.
+TEST_CASE("randsequence rand join operand arguments span the whole activation") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef int q_t[$];
+            string s;
+            int    got, seen, io = 5, base = 10;
+            q_t    src = {1, 2, 3};
+            initial begin
+                randsequence( T )
+                    T : rand join (0.0) P(got) Q(seen) ;
+                    P(output int o) : { o = 41; } { o = o + 1; } ;
+                    Q(ref int r)    : { r = 7; } { r = r * 3; } ;
+                endsequence
+                randsequence( U )
+                    U : rand join (0.0) R(io) S ;
+                    R(inout int v) : { v = v + 1; } { v = v * 10; } ;
+                    S : { } ;
+                endsequence
+                randsequence( V2 )
+                    V2 : rand join (0.0) A(base) B(src) ;
+                    A(int v)  : { v = v + 1; } { s = {s, $sformatf("A%0d ", v)}; } ;
+                    B(q_t z)  : { z = {z, 99}; } { s = {s, $sformatf("B%0d ", z.size())}; } ;
+                endsequence
+                $display("%0d %0d %0d %s%0d %0d", got, seen, io, s, base, src.size());
+                $finish;
+            end
+        endmodule
+    )";
+    // out=42, ref=21, inout=(5+1)*10; the input copies keep their mutations between
+    // units (A11, B4) without either escaping to the actual (base=10, size=3).
+    CHECK(run_capture(src) == "42 21 60 A11 B4 10 3\n");
+}
+
+// LRM 18.17.7 puts no restriction on a production's return type. A container result
+// reaches its rule variable through the same whole-container deep copy an ordinary
+// assignment applies.
+TEST_CASE("randsequence productions may return containers (LRM 18.17.7)") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef int q_t[$];
+            typedef int d_t[];
+            typedef int a_t[string];
+            int n;
+            initial begin
+                randsequence( T )
+                    void T : P D A { $display("%p %p %p", P, D, A); } ;
+                    q_t P : { q_t z = {1, 2, 3}; return z; } ;
+                    d_t D : { d_t z = new[2]; z[0] = 7; z[1] = 8; return z; } ;
+                    a_t A : { a_t z; z["k"] = 9; return z; } ;
+                endsequence
+                randsequence( U )
+                    void U : Q Q { $display("%p %p", Q[1], Q[2]); } ;
+                    q_t Q : { q_t z; n++; z = {n, n * 10}; return z; } ;
+                endsequence
+                $finish;
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "'{1, 2, 3} '{7, 8} '{\"k\":9}\n'{1, 10} '{2, 20}\n");
+}
+
+// A local a DETACHING fork also captured lives in a GC box rather than in the
+// frame (docs/design/fork-join.md V4), so the production takes the box HANDLE by
+// value -- a first-class GC root -- and both the randsequence and the fork child
+// see LRM 9.3.2's one variable.
+TEST_CASE("randsequence shares a boxed automatic with a detached fork") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t();
+                automatic int acc = 0;
+                fork
+                    begin #10 $display("fork %0d", acc); end
+                join_none
+                randsequence( A )
+                    A : B B B ;
+                    B : { acc = acc * 2 + 1; } ;
+                endsequence
+                $display("seq %0d", acc);
+                #20;
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "seq 7\nfork 7\n");
+}
+
+// The one interleaving shape that is deferred rather than built: an operand's own
+// state would be an inner interleaving cursor chosen at its own plan time, not a
+// fixed set of variables the driver can hoist. LRM 18.17.5 interleaves "to depth of
+// 1", which does not describe nesting.
+TEST_CASE("a nested randsequence rand join operand is refused by name") {
     CHECK(lower_error("module m; initial begin randsequence(T)\n"
                       " T : rand join P Q ; P : rand join R S ; Q : {} ; R : {} ; S : {} ;\n"
                       "endsequence end endmodule")
             .find("operand that is itself a rand join") != std::string::npos);
-    CHECK(lower_error("module m; initial begin randsequence(T)\n"
-                      " T : rand join P Q ; P : R { } ; int R : { return 1; } ; Q : {} ;\n"
-                      "endsequence end endmodule")
-            .find("reads the result of another production") != std::string::npos);
-    CHECK(lower_error("module m; int g; initial begin randsequence(T)\n"
-                      " T : rand join P(g) Q ; P(output int o) : { o = 1; } ; Q : {} ;\n"
-                      "endsequence end endmodule")
-            .find("with a non-input argument") != std::string::npos);
-}
-
-// A container result would need the deep-copy assignment path lower_assign reaches
-// through lower_queue_assign and friends, all shaped around an AssignmentExpression
-// the synthesized result store does not have.
-TEST_CASE("a randsequence production returning a container fails loudly") {
-    CHECK(lower_error("module m; typedef int q_t[$];\n"
-                      " initial begin randsequence(T) T : P { } ;\n"
-                      "  q_t P : { q_t z = {1, 2}; return z; } ; endsequence end\n"
-                      "endmodule")
-            .find("returning a queue, dynamic array or associative array") != std::string::npos);
 }

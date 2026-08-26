@@ -4630,11 +4630,23 @@ project with its own algorithm, not tail cleanup on the property layer:
   `break` now needs a real `loop_depth_` on the lowerer to tell 12.8's innermost
   loop from 18.17.6's whole block, which also closes a latent hazard: the backend's
   Break arm indexes `loop_targets_.back()` on the assumption slang guarantees an
-  enclosing loop, and a randsequence `break` is the counter-example. Refused by
-  name: a production returning a container, and the three things an interleaved
-  production cannot do (be a `rand join` itself, read another production's result,
-  take a non-input argument) — all because `step` is entered once per unit, so
-  nothing may live across units. Landed with
+  enclosing loop, and a randsequence `break` is the counter-example. A production
+  may return any type: a container result reuses `emit_container_store`, the
+  blocking half of the three whole-container assignment paths split out so a
+  synthesized store reaches the same deep-copy rules with no AssignmentExpression to
+  hand them. An interleaved production's activation state — its declared formals and
+  its rules' implicit result variables — is hoisted into the driver's frame and
+  handed back in by reference, since `step` is entered once per unit; its arguments
+  therefore copy in and out at the ends of the ACTIVATION, so an `input` keeps what
+  the body did to it between units and an `output`/`inout` copies back exactly once.
+  A block sharing an automatic with a DETACHED fork takes the GC box handle by
+  value, a first-class root, rather than a bare interior pointer held across a
+  suspend. Two constructs stay refused, each recorded at its guard as a deliberate
+  deferral: a weight wider than 32 bits (`$urandom_range` is one 32-bit draw; LRM
+  18.16 wants several stitched, `randcase` shares the guard, and stitching shifts
+  the process stream) and a `rand join` operand that is itself a `rand join` (its
+  state is an inner interleaving cursor, not a fixed variable set the driver can
+  hoist; 18.17.5 interleaves "to depth of 1"). Landed with
   `patches/slang-randseq-rule-pairing.patch`, which fixes two vendored-slang
   defects that silently hand the frontend the wrong AST: `createCaseProd` pushed one
   `ProdItem` per case LABEL but consumed one per case ITEM, so every `rs_case` item
@@ -4643,7 +4655,7 @@ project with its own algorithm, not tail cleanup on the property layer:
   code block once per prod, binding its statements N times and desynchronizing
   `createRule`'s positional pairing for a rule with two or more code-block prods.
   `cmake/ApplySlangPatch.cmake` now applies every `patches/slang-*.patch` in name
-  order. 27 cases in tests/randsequence_test.cpp.
+  order. 30 cases in tests/randsequence_test.cpp.
 
 ### Language corners
 
