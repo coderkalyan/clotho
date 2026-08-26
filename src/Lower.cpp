@@ -2458,6 +2458,24 @@ public:
     // declare_static_prop appends the whole nested store first), so it observes the
     // initialized value, not the power-up one.
     void init_static_class_props(const Scope& scope) {
+        // A static initializer's own call graph reserves class-method FunctionIds
+        // the same way compute_vtable does (function_id / rand_body_id /
+        // copy_thunk_id / pure_stub_id all grow module_'s function table with no
+        // rollback): the id is recorded in fnmap_ / copy_thunk_ / randomize_fn_ /
+        // pure_stub_ BEFORE the callee's body is built. recover() below undoes
+        // preinit_ and named_blocks_ on an "unsupported construct" LowerError, but
+        // has no notion of a reserved-and-cached-but-never-built FunctionId: that
+        // id survives the catch, permanently unset, and the backend's unconditional
+        // declare_function pass over every id segfaults on its Ref::Invalid return
+        // type the first time codegen reaches it. drain_pending_bodies already
+        // solves exactly this for its own vtable-forced bodies by making
+        // build_function/build_task degrade an unsupported construct to a run-time
+        // fatal stub instead of throwing (stub_eligible); this eager path reaches
+        // the very same class-method bodies (LRM 6.21 forces every
+        // factory-registered class's statics, whether or not the design ever
+        // calls into it) through a DIFFERENT, synchronous route that never turns
+        // the flag on, so it needs the identical treatment.
+        const Restore<bool> stub(stub_unsupported_bodies_, true);
         std::vector<const ClassType*> classes;
         collect_class_types(scope, classes);
         for (const ClassType* cls : classes) {
@@ -3622,6 +3640,21 @@ private:
             // set_class_desc -- leaving a structurally valid but never-registered Ref
             // that crashes the backend the first time codegen needs its descriptor.
             if (const auto cached = class_type_cache_.find(&clt); cached != class_type_cache_.end()) {
+                // The reentrant frame that fully registered `clt` ran its OWN
+                // compute_vtable (as part of completing before it could return),
+                // which may have reserved -- via rand_body_id -- randomize/randops
+                // FunctionIds now sitting undrained in rand_pending_: it was not at
+                // class_depth_ == 1, so it correctly deferred draining to the
+                // outermost frame. That outermost frame IS this one whenever
+                // class_depth_ == 1 here, so it must drain before returning early,
+                // exactly like the ordinary (non-reentrant) return points below --
+                // otherwise those ids are reserved but never module_.set_function'd,
+                // and the backend segfaults on their Ref::Invalid return type the
+                // first time codegen reaches them (LlvmBackend.cpp declare_function
+                // -> fn_return_ty -> width_of -> an invalid-Ref layout lookup).
+                if (class_depth_ == 1) {
+                    drain_rand_bodies();
+                }
                 return cached->second;
             }
         }
@@ -4585,7 +4618,26 @@ private:
             // us on the stack, still walking properties (lowering a property's type
             // recurses into bodies). Number it here; compute_vtable is idempotent, so
             // that frame's own call becomes a no-op.
+            //
+            // This call bypasses lower_class_type entirely, so it needs the SAME
+            // class_depth_ bookkeeping that function tracks around its own
+            // compute_vtable call -- otherwise a randomize/randops FunctionId
+            // compute_vtable reserves here (via rand_body_id) sits in rand_pending_
+            // with no lower_class_type frame above us ever reaching class_depth_==1
+            // to drain it: reserved but never module_.set_function'd, which
+            // segfaults the backend on its Ref::Invalid return type the first time
+            // codegen reaches it. Most calls here land at class_depth_ 0 (this runs
+            // from body lowering, on demand, well after any lower_class_type
+            // recursion that reached `clt` has already returned) -- this frame IS
+            // then the outermost one and must drain itself; a genuinely nested call
+            // (a class's own field layout virtual-dispatching into a sibling
+            // method's vtable) leaves the draining to whichever frame is actually
+            // at depth 1, exactly as it already does for lower_class_type's callers.
+            const Restore<uint32_t> depth(class_depth_, class_depth_ + 1);
             compute_vtable(clt, cached->second);
+            if (class_depth_ == 1) {
+                drain_rand_bodies();
+            }
         } else {
             lower_class_type(clt);
         }
@@ -12636,8 +12688,17 @@ private:
         ctx.is_task     = true;
         const FnScope fn_scope(*this, &ctx);
 
-        ir::Builder b(module_.pool);
-        lower_stmt(body, b);
+        ir::Builder                b(module_.pool);
+        const ir::Builder::Mark    body_mark = b.mark();
+        std::optional<LowerError>  failure;
+        try {
+            lower_stmt(body, b);
+        } catch (const LowerError& e) {
+            // See build_fork_child: `id` is already committed with no rollback;
+            // complete the reservation with a dead body before propagating.
+            b.rollback(body_mark);
+            failure = e;
+        }
         const ir::SourceLoc el = loc(body);
         b.ret_void(el);
 
@@ -12649,6 +12710,9 @@ private:
                                            .local_types = std::move(ctx.local_types),
                                            .is_task     = true,
                                            .ir          = b.finish() });
+        if (failure) {
+            throw *failure;
+        }
         return id;
     }
 
@@ -28693,8 +28757,29 @@ private:
             }
         }
 
-        ir::Builder b(module_.pool);
-        lower_stmt(body, b);
+        ir::Builder                b(module_.pool);
+        const ir::Builder::Mark    body_mark = b.mark();
+        std::optional<LowerError>  failure;
+        try {
+            lower_stmt(body, b);
+        } catch (const LowerError& e) {
+            // `id` is already committed to module_'s function table --
+            // reserve_function has no rollback -- and the caller (lower_fork,
+            // which built `ids` from this call's return value) never gets `id`
+            // back once this throws: nothing downstream will ever call
+            // module_.set_function(id, ...) for it. Left unset, the backend's
+            // unconditional declare_function pass over every reserved id
+            // segfaults on this one's Ref::Invalid return type the first time
+            // codegen reaches it, regardless of whether an OUTER stub_eligible
+            // catch later downgrades the enclosing method to a stub of its own
+            // (that stub never references this dead id either). The body is
+            // unreachable either way -- rethrowing after completing the
+            // reservation preserves the existing "whole enclosing method becomes
+            // a fatal stub" behavior the sibling capture-box check above already
+            // gets for the same construct.
+            b.rollback(body_mark);
+            failure = e;
+        }
         const ir::SourceLoc el = loc(body);
         b.ret_void(el);
 
@@ -28708,6 +28793,9 @@ private:
                                            .is_fork_child = true,
                                            .fork_kind     = kind,
                                            .ir            = b.finish() });
+        if (failure) {
+            throw *failure;
+        }
         return id;
     }
 
@@ -28740,26 +28828,38 @@ private:
         ctx.is_task     = true;
         const FnScope fn_scope(*this, &ctx);
 
-        ir::Builder b(module_.pool);
-        // $display / $strobe target the standard-output MCD (descriptor 1); the $f*
-        // forms carry an explicit descriptor as the first argument.
-        ir::Index desc = b.constant(svint_to_ref(slang::SVInt(32, 1, true), make_int_type(32, false, true)), l);
-        if (fd_arg) {
-            if (args.empty()) {
-                fail("$fstrobe / $fmonitor requires a file-descriptor argument");
+        ir::Builder                b(module_.pool);
+        const ir::Builder::Mark    body_mark = b.mark();
+        std::optional<LowerError>  failure;
+        try {
+            // $display / $strobe target the standard-output MCD (descriptor 1); the
+            // $f* forms carry an explicit descriptor as the first argument.
+            ir::Index desc =
+              b.constant(svint_to_ref(slang::SVInt(32, 1, true), make_int_type(32, false, true)), l);
+            if (fd_arg) {
+                if (args.empty()) {
+                    fail("$fstrobe / $fmonitor requires a file-descriptor argument");
+                }
+                desc = lower_expr(*args[0], b);
+                args = args.subspan(1);
             }
-            desc = lower_expr(*args[0], b);
-            args = args.subspan(1);
-        }
-        std::string            fmt;
-        std::vector<ir::Index> fargs;
-        build_format(args, fmt, fargs, b, default_conv);
-        if (monitor) {
-            b.monitor_emit(desc, fmt, fargs, l);
-        } else if (fd_arg) {
-            b.fdisplay(desc, fmt, /*newline=*/true, fargs, l);
-        } else {
-            b.display(fmt, /*newline=*/true, fargs, l);
+            std::string            fmt;
+            std::vector<ir::Index> fargs;
+            build_format(args, fmt, fargs, b, default_conv);
+            if (monitor) {
+                b.monitor_emit(desc, fmt, fargs, l);
+            } else if (fd_arg) {
+                b.fdisplay(desc, fmt, /*newline=*/true, fargs, l);
+            } else {
+                b.display(fmt, /*newline=*/true, fargs, l);
+            }
+        } catch (const LowerError& e) {
+            // See build_fork_child: `id` is already committed with no rollback, and
+            // this call's return value is what the pending-print call site would
+            // have used to reference it -- once this throws, nothing else ever
+            // will. Complete the reservation with a dead body before propagating.
+            b.rollback(body_mark);
+            failure = e;
         }
         b.ret_void(l);
 
@@ -28771,6 +28871,9 @@ private:
                                            .local_types = std::move(ctx.local_types),
                                            .is_task     = true,
                                            .ir          = b.finish() });
+        if (failure) {
+            throw *failure;
+        }
         return id;
     }
 

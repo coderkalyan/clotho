@@ -776,7 +776,6 @@ public:
     FunctionId reserve_function() {
         const auto index = static_cast<uint32_t>(functions_.size());
         functions_.emplace_back();
-
         return static_cast<FunctionId>(index);
     }
 
