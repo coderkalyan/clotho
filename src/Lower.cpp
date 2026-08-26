@@ -7558,16 +7558,26 @@ private:
     }
 
     ir::Signal alloc_driver_slot(ir::Signal net, ir::SourceLoc l, uint16_t strength = 0x0303) {
-        const auto net_u = static_cast<uint32_t>(net);
-        const auto it    = resolved_scope_.find(net_u);
-        if (it != resolved_scope_.end() && it->second != cur_scope_id()) {
-            // The drivers of this net live in different instance scopes (e.g. a
-            // shared interface net driven from two modules): the slots would span
-            // scopes and the resolver could not address them uniformly.
-            // TODO: cross-scope multiple drivers (LRM 6.6.1) — the slots and
-            // resolver would need a shared home scope.
-            fail("multiple drivers of a net across different scopes are not supported");
-        }
+        const auto net_u        = static_cast<uint32_t>(net);
+        const auto existing     = resolved_scope_.find(net_u);
+        const bool first_driver = existing == resolved_scope_.end();
+        // The drivers of this net can live in different instance scopes (e.g. a
+        // shared interface net whose header port is bound from the parent AND
+        // separately driven by a bind-inserted module reaching it through an
+        // upward hierarchical reference). Every driver SLOT is a design-wide
+        // ir::Signal regardless of which scope discovers it (register_signal
+        // only records it under scope_stack_ for VCD grouping of that ONE slot;
+        // the slot's storage and every load/store of it address it by its flat
+        // signal id, unaffected by scope) -- so the fold in emit_wire_resolvers
+        // needs nothing new to reach a cross-scope slot. What genuinely has no
+        // single right answer is which ONE scope the RESOLVER process (the
+        // thing that reads every slot and writes the net) should be attributed
+        // to for VCD grouping, once it folds slots contributed by more than one
+        // scope: no_scope is the existing, already-supported answer for exactly
+        // this shape (a process belonging to no single instance, like a per-top
+        // PreInit pass) rather than an arbitrary pick of one driver's scope.
+        const bool cross_scope =
+          !first_driver && existing->second != ir::Process::no_scope && existing->second != cur_scope_id();
         auto&          slots = resolved_slots_[net_u];
         ir::SignalInfo info;
         info.name             = std::string(module_.signal(net).name) + "$drv" + std::to_string(slots.size());
@@ -7576,8 +7586,12 @@ private:
         const ir::Signal slot = register_signal(std::move(info));
         slots.push_back(slot);
         resolved_strengths_[net_u].push_back(strength); // parallel to slots
-        resolved_scope_[net_u] = cur_scope_id();
-        resolved_loc_[net_u]   = l;
+        if (cross_scope) {
+            resolved_scope_[net_u] = ir::Process::no_scope;
+        } else if (first_driver) {
+            resolved_scope_[net_u] = cur_scope_id();
+        } // else: same scope as before, or already no_scope -- leave it.
+        resolved_loc_[net_u] = l;
         return slot;
     }
 
@@ -9439,16 +9453,33 @@ private:
                 // Input: drive the child net from the source rvalue, resized to the
                 // port width; wakes on the source's reads. The copy is a continuous
                 // driver of the whole child-side net.
-                if (resolved_nets_.contains(static_cast<uint32_t>(child_sig))) {
-                    // The child net is driven both by this input copy (parent
-                    // scope) and internally (child scope). Cross-scope resolution
-                    // is not yet supported: the driver slots would span two scopes.
-                    // TODO: cross-scope multi-driver resolution (input port + an
-                    // internal driver of the same net).
-                    fail("a net driven by both an input port and an internal driver is not supported");
-                }
                 const slang::ast::Type& itype = p.internalSymbol->as<ValueSymbol>().getType();
-                const ir::Ref           ty    = lower_type(itype);
+                if (resolved_nets_.contains(static_cast<uint32_t>(child_sig))) {
+                    // The child net has more than one driver total: this input
+                    // copy plus at least one other, possibly reached from a
+                    // DIFFERENT instance scope (e.g. a `bind`-inserted module
+                    // driving a shared interface net through an upward
+                    // hierarchical reference, LRM 23.8's own example shape).
+                    // Stage this copy as an ordinary driver slot instead of a
+                    // direct store -- the same way a resolved OUTPUT port
+                    // connection already does above -- so emit_wire_resolvers
+                    // folds it together with every other driver regardless of
+                    // which scope discovered each one (alloc_driver_slot no
+                    // longer requires every driver of one net to share a scope).
+                    if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
+                        // TODO: aggregate driver of a multiply-driven net (matches
+                        // the OUTPUT port and continuous-assign refusals above).
+                        fail("aggregate driver of a multiply-driven net is not supported");
+                    }
+                    const ir::Ref    ty   = lower_type(itype);
+                    const ir::Index  val  = coerce(lower_expr(*expr, b), *expr->type, ty, b, l);
+                    const ir::Signal slot = alloc_driver_slot(child_sig, l);
+                    b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
+                    collect_expr_reads(*expr, sens);
+                    add_continuous_process(std::move(sens), l, b);
+                    continue;
+                }
+                const ir::Ref ty = lower_type(itype);
                 if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
                     // A whole unpacked-struct / unpacked-array / aggregate input
                     // port: whole-object copy of the source into the child net (a

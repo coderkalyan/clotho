@@ -1904,42 +1904,49 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   background (LRM 6.7.1 admits no 2-state net; a 2-state MEMBER of a 4-state packed
   net converts per LRM 6.11.2 and resolves normally, so what used to be a guard is
   now the invariant `internal: resolved net storage is not 4-state`). Gate-primitive
-  outputs stage into slots like any other driver. Remaining, all still loud-failing:
-  unpacked-array / unpacked-struct nets (per-element slots + per-element resolver),
-  concatenation-operand drivers (split into per-net stores), and cross-scope drivers
-  (e.g. a shared interface net — the slots would span scopes). Non-overlapping
-  constant bit/part-select drivers stay on the single-driver fast path.
-  TRIAGED against the real design this was raised from
-  (uvm-examples' `uvm_tb_build_ss_tb/sub_system_tbs/pss_tb`, `apb_if.sv`'s
-  `PSEL` bound as an output port of `apb_driver_bfm` and separately
-  continuous-assigned in the `apb_prober` module bound onto the DUT) and this
-  is NOT that shared-interface-net shape: `PSEL` is declared `logic[15:0]`, a
-  VARIABLE (LRM 6.6 resolution is net-kind only, `wire`/`tri`/`wand`/`wor`),
-  and `apb_prober` reaches it through an ordinary single driver, `assign
-  APB.PSEL = ...`, `APB` resolved by LRM 23.8 upward name referencing from
-  the `bind`-inserted instance's enclosing scopes up to where the testbench
-  top instantiates it — cross-checked with a standalone repro (`xhier_test.cpp`,
-  "bind-inserted module drives an interface member via upward name"): one
-  driver, nothing to resolve, lowers and runs on the plain single-driver path.
-  hdl_top.sv keeps `apb_driver_bfm`'s connection to the shared `APB` commented
-  out everywhere `apb_prober` is also bound onto it, so the shipped design
-  never puts a second driver on `PSEL` at all. WOULD a second driver land
-  there anyway (the commented-out port connection restored), it is a
-  DIFFERENT, ALREADY-CORRECT refusal: a variable output port is an implicit
-  continuous assignment (LRM 23.3.3), so a port plus the prober's `assign`
-  is two continuous assignments to one variable, which LRM 6.5 / 10.3.2 make
-  a flat error with no wired resolution to fall back on — slang raises
-  `MultipleContAssigns` for exactly this, promoted to Error in
-  `apply_severity_policy`, before Lower.cpp's own net-driver tracking (gated
-  on `SymbolKind::Net`, so a `logic` variable never reaches it) is even in
-  play. Pinned in `xhier_test.cpp` ("a bind-inserted assign and an output
-  port both driving a logic interface member fails loudly"). So this real
-  design motivates nothing further here: no bug, and the genuine cross-scope
-  NET case above stays exactly as tracked, unelevated — a `wire`/`tri`
-  interface member double-driven this way still hits "multiple drivers of a
-  net across different scopes are not supported" and still needs the
-  scope-spanning slot/resolver work described above, which this triage did
-  not attempt.
+  outputs stage into slots like any other driver. Non-overlapping constant
+  bit/part-select drivers stay on the single-driver fast path.
+  **Cross-scope WHOLE-net drivers now resolve too** (previously the one
+  remaining item here), found blocking a real design
+  (`uvm_tb_build_ss_tb/sub_system_tbs/pss_tb`'s `apb_if.sv`: `APB.PCLK`, the
+  interface's own header net, bound as an input port from `hdl_top`'s `HCLK`
+  AND separately driven by a `bind`-inserted `apb_prober`'s `assign APB.PCLK =
+  PCLK;` reaching it through LRM 23.8 upward name referencing — TWO drivers in
+  two unrelated instance scopes on a genuine `wire`, not the `PSEL` variable
+  the report first suspected). `alloc_driver_slot` used to refuse outright the
+  moment a net's second driver was discovered in a DIFFERENT scope than its
+  first ("the slots would span scopes"), on the assumption that a driver slot
+  could only be addressed from the scope that allocated it. False:
+  `register_signal` already gives every slot a design-wide, flat `ir::Signal`
+  id regardless of which scope's Classify/Emit pass allocates it (the scope it
+  records a slot under is purely for VCD grouping of that ONE slot), so
+  `emit_wire_resolvers`'s fold already reaches a cross-scope slot with zero
+  change. The only real question was which ONE scope the RESOLVER process
+  itself — the thing that reads every slot and writes the net, one per net —
+  should be attributed to once its slots span more than one: answered with
+  `ir::Process::no_scope`, the existing "belongs to no single instance" marker
+  a per-top PreInit process already uses, rather than an arbitrary pick of one
+  driver's scope. `wire_ports`'s INPUT-port branch separately needed its own
+  fix: it never staged the port's own copy as a driver slot at all (an
+  ordinary, common single-driver input port has no need to), so it hit the
+  refusal above unconditionally whenever `resolved_nets_` already knew the
+  net had another driver — now it stages through `alloc_driver_slot` exactly
+  as a resolved OUTPUT port connection already did. Verified behaviorally, not
+  just "does not crash": a synthetic two-instance tri-state bus
+  (`tests/xhier_test.cpp`, "a tri-state bus driven from two different
+  instance scopes resolves correctly") reproduces the ordinary WireRes
+  lattice — undriven is z, either driver alone wins, two disagreeing drivers
+  fold to x — identically whether or not the drivers share a scope. Remaining,
+  all still loud-failing, all now genuinely narrower than "cross-scope" alone:
+  unpacked-array / unpacked-struct nets (per-element slots + per-element
+  resolver), concatenation-operand drivers (split into per-net stores), and a
+  cross-scope PARTIAL (bit/part-select) driver (the whole-net case above
+  covers only `is_whole_net_lvalue`; a constant packed sub-range driver from a
+  different scope than the net's other drivers still has no code path routing
+  it through `alloc_driver_slot` at the input-port site above, only at the
+  continuous-assign / gate-output sites, which were already scope-agnostic
+  before this fix took effect since they always routed through
+  `alloc_driver_slot`).
 - [~] **Drive strengths** — `(strong0, weak1)` etc. on continuous assigns, net
   declarations, and gates lower and resolve. Each driver slot carries a
   compile-time packed `(strength0, strength1)`; a net with any non-default
@@ -1973,9 +1980,11 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   net resolution folds any drivers. Whole-signal connection with a single-scope
   effective driver works (either direction). Deferred, loud: a bit-select /
   part-select / concat connection (needs sub-signal aliasing the whole-signal
-  collapse cannot express), and a bidirectional bus with drivers in two instance
-  scopes (the general cross-scope multi-driver limitation below, not
-  inout-specific).
+  collapse cannot express). A bidirectional bus with drivers in two instance
+  scopes now resolves too (the general cross-scope multi-driver limitation,
+  see the entry below) — a same-scope OR cross-scope tri-state bus is one path
+  either way, `inout` having nothing special about it beyond the storage
+  collapse itself.
 - [x] **Cross-hierarchy references** (`top.u1.sig`, LRM 23.6) — reads and writes
   any direction, bit/part-select, `@(edge)`, blocking and nonblocking assign.
 - [x] **Unconnected ports** — unconnected input reads `z` (LRM 6.6).
@@ -4595,7 +4604,18 @@ project with its own algorithm, not tail cleanup on the property layer:
   binding, `liblist`/`use`.
 - [ ] **Checkers** (`checker`/`endchecker`) — assertions, free variables,
   instantiation.
-- [ ] **`randsequence`** — grammar-based stimulus generation.
+- [ ] **`randsequence`** (LRM 18.17) — grammar-based stimulus generation. Scoped in
+  docs/design/randsequence.md: one `ir::Function` per production (recursion is
+  required by the LRM's own `GenQueue` example, so verilator's inline-the-grammar
+  model is out), ABI `prod(<this>, ref bit $abort[, ref T $result], formals…)`,
+  rule selection reusing `lower_randcase`'s ladder verbatim, `break` as the
+  `$abort` flag and `return` as the production function's own `Ret`. Four phases:
+  P0 the named refusal (today it hits the anonymous `fail("unsupported
+  statement")` at src/Lower.cpp:10915), P1 the core, P2 value passing (18.17.7),
+  P3 `rand join`. Blocked on two vendored-slang defects the design records
+  (`createCaseProd` mis-pairs case items after a multi-label item; the
+  weight-clause code block is created once per prod and desynchronizes
+  `createRule`'s positional block pairing), both to be patched under `patches/`.
 
 ### Language corners
 

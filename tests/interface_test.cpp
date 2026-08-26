@@ -156,13 +156,15 @@ TEST_CASE("unrestricted interface port") {
     CHECK(out == "data=7 valid=1\n");
 }
 
-// Two modules driving one interface net is a genuine multiple-driver conflict
-// on shared storage (the canonicalized driver tracking sees both as drivers of
-// the same underlying net). Whole-net resolution exists (LRM 6.6.1), but the
-// drivers here live in different instance scopes (drv1 / drv2), which V1
-// resolution does not yet support, so it must still fail loudly.
-TEST_CASE("multiple continuous drivers on an interface net fail loudly") {
-    const std::string diag = reject(R"(
+// Two modules driving one interface net from different instance scopes is an
+// ordinary multi-driver WHOLE-NET conflict (LRM 6.6.1): each `assign` stages
+// its value into its own driver slot regardless of which scope discovered
+// it, and a resolver process (attributed to no single scope, since its slots
+// now come from more than one) folds them exactly as it would for two
+// same-scope drivers -- a definite winner when only one drives, X where two
+// disagree.
+TEST_CASE("multiple continuous drivers on an interface net resolve across scopes") {
+    const std::string out = run_capture(R"(
         interface nbus; wire [7:0] d; endinterface
         module drv1(nbus b); assign b.d = 8'd1; endmodule
         module drv2(nbus b); assign b.d = 8'd2; endmodule
@@ -170,10 +172,12 @@ TEST_CASE("multiple continuous drivers on an interface net fail loudly") {
           nbus bus();
           drv1 u1(bus);
           drv2 u2(bus);
-          initial #1 $finish;
+          initial #1 begin $display("d=%b", bus.d); $finish; end
         endmodule
     )");
-    CHECK(diag.find("multiple drivers") != std::string::npos);
+    // 8'd1 = 0000_0001, 8'd2 = 0000_0010: bits 0 and 1 disagree (fold to x),
+    // every other bit agrees at 0.
+    CHECK(out == "d=000000xx\n");
 }
 
 // A modport expression port that renames a whole interface signal

@@ -186,12 +186,27 @@ TEST_CASE("inout port: child drives, parent (and a sibling) read") {
     CHECK(out == "1010 0101\n");
 }
 
-// A bidirectional bus with drivers in two separate instance scopes is the
-// pre-existing cross-scope multi-driver limitation (not inout-specific), and a
-// bit-select / concat inout connection needs sub-signal aliasing the whole-signal
-// collapse cannot express. Both stay loud.
-TEST_CASE("cross-scope inout bus driver fails loudly") {
-    const LowerResult r = lower_text(R"(
+// A bidirectional bus with drivers in two separate instance scopes (the
+// classic tri-state-bus-of-multiple-drivers shape) used to be refused
+// outright: alloc_driver_slot required every driver of one net to share the
+// SAME instance scope, since only the scope that discovered the FIRST driver
+// was ever recorded, and a second driver from elsewhere failed loudly rather
+// than risk a resolver that could not address a slot from another scope.
+// That address concern turned out not to apply: register_signal already
+// gives every driver slot a design-wide, flat ir::Signal id regardless of
+// which scope's Classify/Emit pass allocated it (the scope it records a slot
+// under is purely for VCD grouping of that ONE slot), so emit_wire_resolvers'
+// fold already reaches a cross-scope slot with no change. The one real
+// question -- which scope should the RESOLVER process itself (the thing that
+// reads every slot and writes the net) be attributed to, once its slots come
+// from more than one scope -- has an existing answer: no_scope, the same
+// "belongs to no single instance" marker a per-top PreInit process already
+// uses. Verified against the WireRes conflict-resolution semantics a
+// same-scope multi-driver net already has: undriven is z, either driver
+// alone wins outright, and two drivers disagreeing on a bit folds to x --
+// identical whether or not the drivers share an instance scope.
+TEST_CASE("a tri-state bus driven from two different instance scopes resolves correctly") {
+    constexpr std::string_view src = R"(
         module tsdrv(inout wire bus, input drive, input val);
           assign bus = drive ? val : 1'bz;
         endmodule
@@ -200,10 +215,23 @@ TEST_CASE("cross-scope inout bus driver fails loudly") {
           logic d1, v1, d2, v2;
           tsdrv a(bus, d1, v1);
           tsdrv b(bus, d2, v2);
+          initial begin
+            d1 = 0; v1 = 0; d2 = 0; v2 = 0;
+            #1 $display("undriven=%b", bus);
+            d1 = 1; v1 = 1;
+            #1 $display("a_drives_1=%b", bus);
+            d1 = 0;
+            d2 = 1; v2 = 0;
+            #1 $display("b_drives_0=%b", bus);
+            d1 = 1; v1 = 1;
+            #1 $display("conflict=%b", bus);
+          end
         endmodule
-    )");
-    CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("across different scopes") != std::string::npos);
+    )";
+    CHECK(run_capture(src) == "undriven=z\n"
+                              "a_drives_1=1\n"
+                              "b_drives_0=0\n"
+                              "conflict=x\n");
 }
 
 TEST_CASE("bit-select inout connection fails loudly") {
