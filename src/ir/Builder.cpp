@@ -281,6 +281,12 @@ Index Builder::dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc lo
     return emit({ Inst::Tag::DynArrayCopy, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
 }
 
+Index Builder::dyn_array_copy_queue(Index dst, Index src, Ref array_type, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(DynArrayArg{ src, array_type });
+
+    return emit({ Inst::Tag::DynArrayCopyQueue, Inst::Payload{ .op_extra = { dst, extra } } }, loc);
+}
+
 Index Builder::dyn_array_reverse(Index arr, Ref array_type, SourceLoc loc) {
     return emit({ Inst::Tag::DynArrayReverse, Inst::Payload{ .op_type = { arr, array_type } } }, loc);
 }

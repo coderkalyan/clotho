@@ -153,6 +153,9 @@ public:
     Index dyn_array_delete(Index arr, Ref array_type, SourceLoc loc);
     // dst = src: deep copy of another dynamic array (value semantics).
     Index dyn_array_copy(Index dst, Index src, Ref array_type, SourceLoc loc);
+    // dst = src: deep copy of a QUEUE into a dynamic array (LRM 7.5.1's
+    // resizeable assignment; src is a queue handle lvalue).
+    Index dyn_array_copy_queue(Index dst, Index src, Ref array_type, SourceLoc loc);
     // arr.reverse() (LRM 7.12.2): reverse element order in place.
     Index dyn_array_reverse(Index arr, Ref array_type, SourceLoc loc);
     // arr.sort() (`reversed` false) / arr.rsort() (`reversed` true): value order.

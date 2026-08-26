@@ -5735,13 +5735,44 @@ private:
             fail("queue / dynamic array member assignment from a non-variable "
                  "value is not supported");
         }
-        const ir::Index src_lv = lower_lvalue(src, b);
+        if (t.kind == ir::Type::Kind::Assoc) {
+            // LRM 7.9 admits no other source kind for an associative array
+            // (slang's own type-check rejects anything else at the binding
+            // level), so no source-kind dispatch is needed here.
+            b.assoc_copy(lhs, lower_lvalue(src, b), type, l);
+            return;
+        }
         if (t.kind == ir::Type::Kind::Queue) {
-            b.queue_copy(lhs, src_lv, type, l);
-        } else if (t.kind == ir::Type::Kind::Assoc) {
-            b.assoc_copy(lhs, src_lv, type, l);
+            // LRM 7.10.2: a queue can be assigned from another queue, a
+            // dynamic array, or a fixed-size unpacked array. Each source
+            // shape needs its OWN runtime path -- feeding a mismatched
+            // handle's bytes to the wrong rt_queue_* call reads past the
+            // struct (an rt_dynarr has no ring fields at all) or reads
+            // garbage reinterpreted as one (a fixed array has no handle
+            // whatsoever, just flat storage) -- so the source's ACTUAL type,
+            // not just its lvalue shape, decides the call.
+            if (is_dyn_array(src)) {
+                b.queue_copy_dynarr(lhs, lower_lvalue(src, b), type, l);
+            } else if (is_unpacked_array(src)) {
+                emit_fixed_array_into_queue(lhs, src, type, b, l);
+            } else {
+                b.queue_copy(lhs, lower_lvalue(src, b), type, l);
+            }
+            return;
+        }
+        // t.kind == DynArray (LRM 7.5.1): symmetric to the queue case above --
+        // a queue or a fixed-size unpacked array source each need their own
+        // runtime path, not dyn_array_copy's rt_dynarr-shaped one.
+        if (is_queue(src)) {
+            b.dyn_array_copy_queue(lhs, lower_lvalue(src, b), type, l);
+        } else if (is_unpacked_array(src)) {
+            const auto&   fty = src.type->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>();
+            const auto    n   = static_cast<uint32_t>(fty.range.width());
+            const ir::Ref i32 = make_int_type(32, false, true);
+            b.dyn_array_new(lhs, b.constant(module_.pool.put_int(i32, n), l), lhs, /*has_init=*/false, type, l);
+            emit_fixed_array_into_dynarr(lhs, src, type, n, b, l);
         } else {
-            b.dyn_array_copy(lhs, src_lv, type, l);
+            b.dyn_array_copy(lhs, lower_lvalue(src, b), type, l);
         }
     }
 
@@ -22217,6 +22248,61 @@ private:
         }
     }
 
+    // Copy a FIXED-size unpacked array's `n` elements, in order, position-wise
+    // into an already-ALLOCATED (size >= n) dynamic-array handle `dst` (LRM
+    // 7.5.1's resizeable assignment `d = f`, both the statement-assignment
+    // and the declaration-initializer / handle-member-store form). The
+    // caller allocates first (dyn_array_new for a whole assign, an
+    // already-sized `new[N]` frame for a decl-init) -- this only fills.
+    // `src` may be ANY supported fixed-array rvalue shape (a variable, a
+    // constant-bounds or indexed slice); lower_array_operand resolves all
+    // three to an array lvalue.
+    void emit_fixed_array_into_dynarr(ir::Index     dst,
+                                      const Expression& src,
+                                      ir::Ref       dst_ty,
+                                      uint32_t      n,
+                                      ir::Builder&  b,
+                                      ir::SourceLoc l) {
+        const ir::Index src_lv = lower_array_operand(src, b);
+        const ir::Ref   src_ty = lower_type(*src.type);
+        const ir::Type  st     = std::get<ir::Type>(module_.pool.get(src_ty));
+        const ir::Type  dt     = std::get<ir::Type>(module_.pool.get(dst_ty));
+        const ir::Ref   i32    = make_int_type(32, false, true);
+        for (uint32_t k = 0; k < n; ++k) {
+            const ir::Index dst_el =
+              b.elem_select(dst, b.constant(module_.pool.put_int(i32, k), l), dst_ty, l, /*for_write=*/true);
+            const ir::Index src_el = b.elem_select(src_lv, elem_coord_const(st, k, b, l), src_ty, l);
+            emit_agg_copy(dst_el, src_el, dt.element, ir::Inst::Tag::Store, b, l);
+        }
+    }
+
+    // Copy a FIXED-size unpacked array's elements, in order, into a queue
+    // handle `dst` (LRM 7.10.2's whole assignment from a fixed array). No
+    // direct runtime path exists (rt_queue_append_range only walks an
+    // rt_queue source); stage through a temp dynamic array of the same
+    // element type/size -- emit_fixed_array_into_dynarr, the exact fill the
+    // dynamic-array-target case uses -- and reuse queue_copy_dynarr, the
+    // already-proven dynarr -> queue path. `dst` is cleared inside
+    // queue_copy_dynarr's runtime call, matching every other whole-queue
+    // assignment source.
+    void emit_fixed_array_into_queue(ir::Index         dst,
+                                     const Expression& src,
+                                     ir::Ref           queue_ty,
+                                     ir::Builder&       b,
+                                     ir::SourceLoc      l) {
+        const auto&   fty = src.type->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>();
+        const auto    n   = static_cast<uint32_t>(fty.range.width());
+        ir::Type      dat;
+        dat.kind             = ir::Type::Kind::DynArray;
+        dat.element          = std::get<ir::Type>(module_.pool.get(queue_ty)).element;
+        const ir::Ref   daty = module_.pool.put(ir::Item{ dat });
+        const ir::Index tmp  = make_arg_temp(daty, b, l);
+        const ir::Ref   i32  = make_int_type(32, false, true);
+        b.dyn_array_new(tmp, b.constant(module_.pool.put_int(i32, n), l), tmp, /*has_init=*/false, daty, l);
+        emit_fixed_array_into_dynarr(tmp, src, daty, n, b, l);
+        b.queue_copy_dynarr(dst, tmp, queue_ty, l);
+    }
+
     // Whole dynamic-array assignment (LRM 7.5): `arr = new[n]` / `arr = new[n](src)`
     // (allocate + optional element copy) or `arr = other` (deep copy). Element
     // writes (`arr[i] = x`) are ordinary Stores over an ElemSelect and do not
@@ -22260,6 +22346,31 @@ private:
             collect_stream_chunks(
               unwrap_conversion(a.right()).as<StreamingConcatenationExpression>(), chunks, b, l);
             stream_fill_dynarr(dst, chunks, aty, b, l);
+            return dst;
+        }
+        const Expression& rhs = unwrap_conversion(a.right());
+        if (is_queue(rhs)) {
+            // `d = q` (LRM 7.5.1's resizeable assignment): allocate to the
+            // queue's RUNTIME size() and deep-copy, ring-indexed source into
+            // linear destination -- rt_dynarr_assign_queue, the mirror of
+            // rt_queue_assign_dynarr (queue = dynamic array). materialize_queue_rvalue
+            // resolves ANY queue rvalue shape (a variable, a slice, a
+            // concatenation) to a handle lvalue, matching the plain-dynarr
+            // fallback below.
+            b.dyn_array_copy_queue(dst, materialize_queue_rvalue(rhs, b), aty, l);
+            return dst;
+        }
+        if (is_unpacked_array(rhs)) {
+            // `d = f` (LRM 7.5.1's resizeable assignment): a FIXED-size
+            // unpacked array's element count is a COMPILE-TIME constant,
+            // unlike a queue's runtime size() -- allocate to that count bare
+            // (default-filled, like `new[n]` with no init source), then copy
+            // position-wise.
+            const auto&   fty = rhs.type->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>();
+            const auto    n   = static_cast<uint32_t>(fty.range.width());
+            const ir::Ref i32 = make_int_type(32, false, true);
+            b.dyn_array_new(dst, b.constant(module_.pool.put_int(i32, n), l), dst, /*has_init=*/false, aty, l);
+            emit_fixed_array_into_dynarr(dst, rhs, aty, n, b, l);
             return dst;
         }
         // arr = other: deep copy the source handle (value semantics).
@@ -23540,6 +23651,19 @@ private:
                 fail("nonblocking queue assignment from a dynamic array is not supported");
             }
             b.queue_copy_dynarr(dst, lower_lvalue(rhs, b), qty, l);
+            return dst;
+        }
+        if (is_unpacked_array(rhs)) {
+            // q = f: whole fixed-array-into-queue copy (LRM 7.10.2). `f`'s
+            // element count is a compile-time constant, unlike a dynamic
+            // array or another queue's runtime size().
+            if (a.isNonBlocking()) {
+                // TODO: nonblocking q <= f whole copy from a fixed array (needs
+                // a fixed-array-source staging path in the NBA region, same gap
+                // as the dynamic-array source above).
+                fail("nonblocking queue assignment from a fixed-size array is not supported");
+            }
+            emit_fixed_array_into_queue(dst, rhs, qty, b, l);
             return dst;
         }
         const ir::Index src = materialize_queue_rvalue(a.right(), b);

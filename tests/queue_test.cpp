@@ -600,6 +600,54 @@ TEST_CASE("queue assignment from a concatenation") {
           "self s=4 last=4\n");
 }
 
+// `q = f` (LRM 7.10.2): a queue can be assigned from a fixed-size unpacked
+// array too, not just another queue or a dynamic array. No direct runtime
+// path exists for this shape (rt_queue_append_range only walks an rt_queue
+// source, and a fixed array has no handle at all -- just flat storage), so
+// it stages through a temp dynamic array (the same fill a dynamic-array
+// TARGET uses) and reuses queue_copy_dynarr. Previously this silently
+// misread the fixed array's flat bytes as an rt_queue{base,head,len,cap}
+// handle instead of refusing or working -- a genuine data-corrupting bug, not
+// merely an unsupported construct. No oracle: iverilog crashes an internal
+// assertion compiling ANY queue in this file's shape. Hand-checked against
+// the LRM.
+TEST_CASE("queue assignment from a fixed-size array") {
+    constexpr std::string_view src = R"(
+        module m;
+            int f[5];
+            int q[$];
+            initial begin
+                f = '{1, 2, 3, 4, 5};
+                q = f;
+                $display("s=%0d %0d %0d %0d %0d %0d", q.size(), q[0], q[1], q[2], q[3], q[4]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "s=5 1 2 3 4 5\n");
+}
+
+// The declaration-initializer form (`int q[$] = f;` / `int q[$] = d;`) shares
+// emit_handle_member_copy with every other handle-typed member initializer
+// and had the identical bug independently: a fixed-array source produced a
+// silently WRONG result (garbage bytes happened to decode as an empty queue
+// rather than crashing), and a dynamic-array source was a genuine crash.
+TEST_CASE("queue declaration initializer from a fixed-size array or a dynamic array") {
+    constexpr std::string_view src = R"(
+        module m;
+            int f[3] = '{1, 2, 3};
+            int q[$] = f;
+            int d[] = '{4, 5, 6, 7};
+            int qd[$] = d;
+            initial begin
+                $display("fixed s=%0d %0d %0d", q.size(), q[0], q[2]);
+                $display("dynarr s=%0d %0d %0d", qd.size(), qd[0], qd[3]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "fixed s=3 1 3\n"
+                              "dynarr s=4 4 7\n");
+}
+
 // A queue slice `q[a:b]` (LRM 7.10.4) yields a new queue. Bounds clamp to
 // [0, size-1]; a>b is empty. A self-slice `q = q[a:b]` is alias-safe. Verified
 // against verilator.

@@ -325,6 +325,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_dynarr_new_copy", &rt_dynarr_new_copy);
     expose("rt_dynarr_delete", &rt_dynarr_delete);
     expose("rt_dynarr_assign", &rt_dynarr_assign);
+    expose("rt_dynarr_assign_queue", &rt_dynarr_assign_queue);
     expose("rt_dynarr_move", &rt_dynarr_move);
     expose("rt_dynarr_reverse", &rt_dynarr_reverse);
     expose("rt_dynarr_sort", &rt_dynarr_sort);

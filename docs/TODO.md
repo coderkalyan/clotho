@@ -2752,19 +2752,19 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   nested-dynamic dimension already fold or hard-fail above), and a
   multidimensional dynamic collection (matches `$size`'s pre-existing
   boundary).
-- [ ] **Assigning a fixed-size or queue array INTO a dynamic array target**
-  (LRM 7.5.1's "resizeable" assignment, e.g. `int f[5]; int d[]; d = f;`) —
-  `lower_dyn_array_assign`'s fallback (`d = other: deep copy the source
-  handle`) calls `lower_lvalue` on the RHS unconditionally, assuming it is
-  already an `rt_dynarr` handle; a fixed-size-array-typed RHS (a plain
-  variable, NOT only a slice) reaches slang's implicit Conversion node instead
-  and hits `lower_lvalue`'s default case (`fail("unsupported assignment
-  target kind=Conversion")`). Found while scoping the dynamic-array-slice
-  work below (`s = da[2:4]` where `s` is itself a dynamic array hits this),
-  but it is a pre-existing, unrelated gap — reproduces with no slice
-  involved at all. The fix wants an allocate-to-source-size-then-copy path
-  parallel to `emit_dyn_array_new_expr`'s `new[n](src)` form, not more slice
-  plumbing.
+- [ ] **A bounded queue's `[$:N]` bound is not respected by WHOLE assignment**
+  (`qb = other` for any source kind — queue, dynamic array, or fixed array;
+  found while verifying the resizeable-assignment fixes below, reproduces
+  queue-to-queue with neither involved, so it predates and is unrelated to
+  them). `rt_queue_assign` / `rt_queue_assign_dynarr` (the mirrored
+  `rt_dynarr_assign_queue` inherits it too) just set `dst->len = src->len`
+  unconditionally — unlike `q_push_back_raw` (Runtime.h's per-element push /
+  insert path), which already clamps correctly against `bound`, WHOLE
+  assignment has no clamp at all, so `int qb[$:2]; qb = '{1,2,3,4,5};` keeps
+  all 5 elements instead of truncating to 3. Needs the assign functions to
+  take the queue's `bound` (already computed elsewhere as
+  `std::get<Type>(pool.get(queue_type)).left`, see `lower_queue_append_range`)
+  and clamp `len` the same way push does, not just copy `src->len` through.
 - [x] **Dynamic arrays** — `[]`, `new[n]` / `new[n](src)`, `.size()`, `.delete()`,
   element r/w, whole-array deep-copy, `foreach`, full subroutine ABI, and a
   slice `da[a:b]` / `da[i +: n]` / `da[i -: n]` (LRM 7.4.5/11.5.1, extended to
@@ -2793,6 +2793,21 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   iverilog 13 crashes an internal assertion on it. Hand-checked against the
   LRM: the open `$` bound and a runtime bound in the `a:b` form are
   queue-only, and a constant-bounds dynamic-array slice is legal (7.4.5).
+  Resizeable assignment INTO a dynamic array (LRM 7.5.1: `d = f` / `d = q`,
+  a fixed-size array or a queue source, both the statement-assignment and the
+  declaration-initializer / handle-member-store / class-property form) was a
+  genuine data-corrupting bug, not merely unsupported: the fallback fed the
+  mismatched source's lvalue straight to `dyn_array_copy`, which either hit
+  an unrelated refusal (a fixed-array source arrives wrapped in slang's
+  implicit Conversion node, so `lower_lvalue`'s default case fired) or, worse,
+  silently reinterpreted another container's handle bytes as an
+  `rt_dynarr{data,len}` (a queue source has no Conversion node to catch it) —
+  a garbage `data` pointer read through a garbage `len`. Fixed by checking the
+  source's ACTUAL kind before dispatching: `dyn_array_copy_queue` (new,
+  mirrors `rt_queue_assign_dynarr`) for a queue source, and a compile-time-
+  constant-count allocate-then-position-wise-copy loop
+  (`emit_fixed_array_into_dynarr`) for a fixed-array source — reused by both
+  entry points, and by the symmetric queue-target fix below.
 - [x] **Checked container allocation** — every heap buffer a design's containers
   need routes through `rt_alloc_checked` / `rt_alloc_elems_size` (Runtime.h).
   Three silent failures are now located fatals instead of a corrupt heap: a
@@ -2815,11 +2830,20 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   indexed part-select form `q[i +: n]` / `q[i -: n]` (LRM 11.5.1, extended to
   queues by 7.10.4): `i` and (unlike a fixed/packed array) `n` are both
   ordinary runtime expressions, `i` may itself spell `$`, and both ends clamp
-  against the queue's actual length exactly like the `a:b` form. A queue
-  slice of a DYNAMIC ARRAY is a different, still-unimplemented shape — see the
-  dynamic arrays entry below; it is not queue-typed at all (`da[a:b]` binds as
-  a `FixedSizeUnpackedArrayType` with constant bounds, LRM 7.4.5/11.5.1), so it
-  never reaches this lowering.
+  against the queue's actual length exactly like the `a:b` form. A slice of a
+  DYNAMIC ARRAY is a different shape entirely (not queue-typed at all --
+  `da[a:b]` binds as a `FixedSizeUnpackedArrayType` with constant bounds, LRM
+  7.4.5/11.5.1) — see the dynamic arrays entry above, which covers it.
+  Resizeable assignment FROM a fixed-size array (`q = f`, LRM 7.10.2) had the
+  identical data-corrupting bug the dynamic-array-target fix above describes
+  (a fixed array's flat storage read as an `rt_queue{base,head,len,cap}`
+  handle) — fixed the same way: stage through a temp dynamic array
+  (`emit_fixed_array_into_dynarr`, the exact fill the dynamic-array-target
+  case uses) and reuse the already-proven `queue_copy_dynarr`
+  (`emit_fixed_array_into_queue`), rather than build a parallel fixed-array
+  ring-push path. NOT covered: a bounded queue target's `[$:N]` bound is not
+  respected by whole assignment from any source — see the dedicated entry
+  below (found while verifying this fix, a pre-existing gap unrelated to it).
 - [x] **Associative arrays** (LRM 7.8/7.9) — all key kinds (integral of any
   width / enum / packed / `string` / `[*]`-wildcard / **class handle** (7.8.3) /
   **unpacked struct or fixed array** (7.8.5), unified as normalized

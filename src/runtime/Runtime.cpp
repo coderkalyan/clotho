@@ -2094,6 +2094,40 @@ extern "C" void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src,
     dst->cap  = src->len;
 }
 
+// Deep-copy a queue into a dynamic array (LRM 7.5.1 resizeable assignment):
+// `d = q`. The source is an rt_queue (ring-indexed {base,head,len,cap}), NOT
+// an rt_dynarr, so it cannot go through rt_dynarr_assign, whose struct layout
+// differs -- the mirror of rt_queue_assign_dynarr above. An empty source
+// clears the array to size 0. Always copies element-by-element (even for an
+// unmanaged/POD element): the source ring can wrap, so it has no single
+// contiguous run to bulk memcpy the way rt_dynarr_assign's dynarr source does.
+extern "C" void rt_dynarr_assign_queue(rt_dynarr* dst, const rt_queue* src,
+                                       const rt_elem_ops* ops, const rt_alloc_site* site) {
+    // No dst == src guard, unlike every sibling assign: the operands are an
+    // rt_dynarr and an rt_queue: distinct handle types that can never name the
+    // same object, so the comparison could only ever be false. A comment costs
+    // less than a check that is dead by construction.
+    rt_dynarr_delete(dst, ops);
+    if (src->len == 0) {
+        return;
+    }
+    const uint64_t stride = ops->stride;
+    auto* buf = static_cast<uint8_t*>(
+        rt_alloc_elems_checked(src->len, stride, site, rt_diag_now()));
+    if (!elem_managed(ops)) {
+        for (uint64_t i = 0; i < src->len; ++i) {
+            std::memcpy(buf + i * stride, q_elem(src, stride, i), stride);
+        }
+    } else {
+        for (uint64_t i = 0; i < src->len; ++i) {
+            rt_elem_init(ops, buf + i * stride);
+            rt_elem_copy(ops, buf + i * stride, q_elem(src, stride, i), site);
+        }
+    }
+    dst->data = buf;
+    dst->len  = src->len;
+}
+
 extern "C" void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
                                       const rt_elem_ops* ops, uint64_t bound, int64_t lo,
                                       int64_t hi, const rt_alloc_site* site) {

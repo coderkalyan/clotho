@@ -221,6 +221,7 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::DynArraySize:
         case Inst::Tag::DynArrayDelete:
         case Inst::Tag::DynArrayCopy:
+        case Inst::Tag::DynArrayCopyQueue:
         case Inst::Tag::QueueSize:
         case Inst::Tag::QueuePushBack:
         case Inst::Tag::QueuePushFront:
@@ -1159,6 +1160,7 @@ struct ValueSweep {
                 case Inst::Tag::DynArraySize:
                 case Inst::Tag::DynArrayDelete:
                 case Inst::Tag::DynArrayCopy:
+                case Inst::Tag::DynArrayCopyQueue:
                     // size() is a definite int; new / delete / copy write the
                     // handle, not a plane slot.
                     val_z[raw] = 0;

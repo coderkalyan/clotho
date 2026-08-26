@@ -289,9 +289,11 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                 scratch[1]      = info.rhs;
                 return { scratch.data(), 2 };
             }
-            // dyn_array_new / dyn_array_copy expose the handle lvalue plus
-            // their DynArrayArg operand (element count / copy source).
-            if (tag == Inst::Tag::DynArrayNew || tag == Inst::Tag::DynArrayCopy) {
+            // dyn_array_new / dyn_array_copy / dyn_array_copy_queue expose the
+            // handle lvalue plus their DynArrayArg operand (element count /
+            // copy source).
+            if (tag == Inst::Tag::DynArrayNew || tag == Inst::Tag::DynArrayCopy ||
+                tag == Inst::Tag::DynArrayCopyQueue) {
                 const auto da = extra_data<DynArrayArg>(p.op_extra.extra);
                 scratch[0]    = p.op_extra.op;
                 scratch[1]    = da.arg;

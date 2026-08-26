@@ -1344,6 +1344,13 @@ struct Inst {
         // semantics; payload: op_extra -> DynArrayArg, whose arg is the source
         // handle lvalue; op is the destination handle lvalue).
         DynArrayCopy,
+        // arr = q: deep copy of a QUEUE into a dynamic array (LRM 7.5.1's
+        // resizeable assignment; payload: op_extra -> DynArrayArg, whose arg is
+        // the SOURCE queue handle lvalue, op is the destination dynarray handle
+        // lvalue). Distinct from DynArrayCopy because the source is an
+        // rt_queue (ring-indexed), not an rt_dynarr (linear) -- the mirror of
+        // QueueCopyDyn below.
+        DynArrayCopyQueue,
 
         // -- Queue operations on a handle lvalue (LRM 7.10.2) --
         // Each lowers to its rt_queue_* runtime call; indexed element access
@@ -2620,6 +2627,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::DynArrayNew:
         case T::DynArrayNewInit:
         case T::DynArrayCopy:
+        case T::DynArrayCopyQueue:
         case T::QueuePushBack:
         case T::QueuePushFront:
         case T::QueueInsert:

@@ -182,6 +182,8 @@ const char* tag_name(Inst::Tag tag) {
             return "dyn_array_delete";
         case T::DynArrayCopy:
             return "dyn_array_copy";
+        case T::DynArrayCopyQueue:
+            return "dyn_array_copy_queue";
         case T::QueueSize:
             return "queue_size";
         case T::QueuePushBack:

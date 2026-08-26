@@ -13412,6 +13412,11 @@ private:
         return rt_fn("rt_dynarr_assign", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
+    // void rt_dynarr_assign_queue(rt_dynarr*, const rt_queue*, const rt_elem_ops*, const rt_alloc_site*)
+    llvm::FunctionCallee dynarr_assign_queue_fn() {
+        return rt_fn("rt_dynarr_assign_queue", b_.getVoidTy(),
+                     { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
     // void rt_dynarr_move(rt_dynarr* dst, rt_dynarr* src, const rt_elem_ops*)
     llvm::FunctionCallee dynarr_move_fn() {
         return rt_fn("rt_dynarr_move", b_.getVoidTy(),
@@ -14931,6 +14936,7 @@ private:
             case Inst::Tag::DynArraySize:
             case Inst::Tag::DynArrayDelete:
             case Inst::Tag::DynArrayCopy:
+            case Inst::Tag::DynArrayCopyQueue:
                 // Only size() is a value (a definite 2-state int); new / delete /
                 // copy are statements whose type is never queried.
                 return { 32, false, true };
@@ -16497,6 +16503,9 @@ private:
             case Inst::Tag::DynArrayCopy:
                 lower_dyn_array_copy(i);
                 return;
+            case Inst::Tag::DynArrayCopyQueue:
+                lower_dyn_array_copy_queue(i);
+                return;
 
             case Inst::Tag::QueueSize:
                 lower_queue_size(i);
@@ -18014,6 +18023,19 @@ private:
         // See lower_queue_push.
         emit_gc_barrier_for(lvalue_of(p.op));
         b_.CreateCall(dynarr_assign_fn(),
+                      { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
+                        lv_handle_ptr(lvalue_of(da.arg), HandleUse::Read),
+                        elem_ops_global(da.array_type),
+                        alloc_site_global(loc_text(i), "dynamic array") });
+    }
+
+    void lower_dyn_array_copy_queue(Index i) {
+        const auto& p  = ir_->payload(i).op_extra;
+        const auto  da = ir_->extra_data<DynArrayArg>(p.extra);
+        // Whole-array assign from a queue (LRM 7.5.1's resizeable assignment).
+        // See lower_queue_push.
+        emit_gc_barrier_for(lvalue_of(p.op));
+        b_.CreateCall(dynarr_assign_queue_fn(),
                       { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                         lv_handle_ptr(lvalue_of(da.arg), HandleUse::Read),
                         elem_ops_global(da.array_type),

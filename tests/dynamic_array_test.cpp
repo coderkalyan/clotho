@@ -418,6 +418,78 @@ TEST_CASE("dynamic array decl initializer copied from another dynamic array is a
     CHECK(run_capture(src) == "3 7 8 9 7\n");
 }
 
+// LRM 7.5.1's "resizeable assignment": a dynamic array can be assigned from
+// another dynamic array (above), a fixed-size unpacked array, or a queue --
+// each of the latter two needs its own runtime path (a fixed array has no
+// handle at all, just flat storage; a queue's is ring-indexed, not linear),
+// previously missing: `lower_dyn_array_assign`'s fallback fed the mismatched
+// source straight to `lower_lvalue`/`dyn_array_copy`, which either hit an
+// unrelated "unsupported assignment target" refusal (a fixed-array source,
+// wrapped in slang's implicit Conversion node) or silently misread another
+// container's handle bytes as an rt_dynarr (a queue source -- no Conversion
+// node to catch it, so nothing refused it at all). No working oracle: iverilog
+// 13 crashes an internal assertion on this file entirely; verilator 5.050's
+// lint accepts it but its generated C++ fails to build in this environment
+// (an unrelated local toolchain issue, not a rejection). Hand-checked against
+// the LRM.
+TEST_CASE("dynamic array assignment from a fixed-size array or a queue (LRM 7.5.1)") {
+    constexpr std::string_view src = R"(
+        module m;
+            int f[5];
+            int d[];
+            int qsrc[$];
+            initial begin
+                f = '{1, 2, 3, 4, 5};
+                d = f;
+                $display("fixed s=%0d %0d %0d %0d %0d %0d", d.size(), d[0], d[1], d[2], d[3], d[4]);
+
+                qsrc = '{10, 20, 30};
+                d = qsrc;
+                $display("queue s=%0d %0d %0d %0d", d.size(), d[0], d[1], d[2]);
+
+                qsrc.delete();
+                d = qsrc;
+                $display("empty queue s=%0d", d.size());
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "fixed s=5 1 2 3 4 5\n"
+                              "queue s=3 10 20 30\n"
+                              "empty queue s=0\n");
+}
+
+// The declaration-initializer / handle-member-store form (emit_handle_member_copy)
+// had the identical bug independently: `int d[] = f;` (fixed-array source) hit a
+// genuine SEGFAULT (a fixed array's flat storage read as an rt_dynarr{data,len}
+// handle -- a garbage data pointer dereferenced through a garbage length), and
+// `int d[] = q;` a garbage-comparison crash (a queue's ring fields read as
+// rt_dynarr's two). A class-property initializer shares the same lowering.
+TEST_CASE("dynamic array declaration initializer from a fixed-size array or a queue") {
+    constexpr std::string_view src = R"(
+        module m;
+            class c;
+                int fld[3] = '{1, 2, 3};
+                int fromfixed[] = fld;
+            endclass
+            int f[3] = '{4, 5, 6};
+            int fromfixed[] = f;
+            int qsrc[$] = '{7, 8, 9};
+            int fromqueue[] = qsrc;
+            c obj;
+            initial begin
+                $display("fixed s=%0d %0d %0d %0d", fromfixed.size(), fromfixed[0], fromfixed[1], fromfixed[2]);
+                $display("queue s=%0d %0d %0d %0d", fromqueue.size(), fromqueue[0], fromqueue[1], fromqueue[2]);
+                obj = new;
+                $display("class prop s=%0d %0d %0d %0d",
+                         obj.fromfixed.size(), obj.fromfixed[0], obj.fromfixed[1], obj.fromfixed[2]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "fixed s=3 4 5 6\n"
+                              "queue s=3 7 8 9\n"
+                              "class prop s=3 1 2 3\n");
+}
+
 TEST_CASE("queue decl initializer from a bare concatenation literal") {
     constexpr std::string_view src = R"(
         module m;

@@ -1189,6 +1189,14 @@ void rt_queue_assign(rt_queue* dst, const rt_queue* src, const rt_elem_ops* ops,
 void rt_queue_assign_dynarr(rt_queue* dst, const rt_dynarr* src, const rt_elem_ops* ops,
                             const rt_alloc_site* site);
 
+// dst = src: deep copy a QUEUE's elements into a dynamic array (LRM 7.5.1's
+// resizeable assignment). `src` is ring-indexed (rt_queue), `dst` linear
+// (rt_dynarr); the mirror of rt_queue_assign_dynarr above. `site` is the
+// assignment's source location, for the report if the copy cannot be
+// allocated.
+void rt_dynarr_assign_queue(rt_dynarr* dst, const rt_queue* src, const rt_elem_ops* ops,
+                            const rt_alloc_site* site);
+
 // Move `src`'s buffer into `dst` (ownership transfer, LRM 7.10): destroy `dst`'s
 // elements + buffer, take `src`'s, leave `src` empty. The nonblocking-assignment
 // commit path (RHS deep-copied into `src` in the Active region). No-op if equal.
