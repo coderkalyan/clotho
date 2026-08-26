@@ -18908,12 +18908,25 @@ private:
     using RsProdItem = RandSeqProductionSymbol::ProdItem;
     using RsProdKind = RandSeqProductionSymbol::ProdKind;
 
+    // Declared in full further down, next to the function lowering and the call
+    // marshalling that fill them; named here because the randsequence helpers below
+    // take them by reference.
+    struct FnCtx;
+    struct CopyOutArg;
+
     struct RandSeqCtx {
         // Production -> the ir::Function it lowered to.
         ankerl::unordered_dense::map<const RsProd*, ir::FunctionId> ids;
-        // Enclosing-frame symbols every production takes as a trailing ref formal,
-        // in first-reference order -- that order IS the formal order.
-        std::vector<const ValueSymbol*> captures;
+        // Enclosing-frame symbols every production takes as a trailing formal, in
+        // first-reference order -- that order IS the formal order. An ordinary frame
+        // symbol goes by reference; one already living in a GC box (a detaching
+        // fork captured it too) goes as its box HANDLE by value, exactly as a fork
+        // child takes it.
+        struct Capture {
+            const ValueSymbol* sym;
+            bool               boxed;
+        };
+        std::vector<Capture> captures;
         // The enclosing method's `this` automatic, spliced as formal 0 when the
         // block reads a class member.
         const ValueSymbol* this_var   = nullptr;
@@ -19003,13 +19016,47 @@ private:
         if (!rs.firstProduction->getReturnType().isVoid()) {
             args.push_back(make_arg_temp(lower_type(rs.firstProduction->getReturnType()), b, l));
         }
-        for (const ValueSymbol* cap : ctx.captures) {
-            args.push_back(value_lvalue(*cap, b, l));
-        }
+        push_capture_args(ctx, args, b, l);
         if (ctx.is_task) {
             b.task_call(it->second, args, l);
         } else {
             b.call(it->second, args, l);
+        }
+    }
+
+    // Declare the trailing capture formals of one production entry point, in the
+    // single order every entry point of the block agrees on.
+    void declare_capture_formals(const RandSeqCtx&        rs,
+                                 FnCtx&                   ctx,
+                                 std::vector<ir::Ref>&    param_types,
+                                 std::vector<ir::ArgDir>& arg_dirs) {
+        for (const RandSeqCtx::Capture& cap : rs.captures) {
+            if (cap.boxed) {
+                // box_class_for, not box_class_type: the enclosing frame may have
+                // minted the NOTIFIED variant for a symbol some `wait` reads, and a
+                // store resolving the other (class, field) pair would fire nothing.
+                const ir::Ref cls = box_class_for(*cap.sym, lower_type(cap.sym->getType()));
+                param_types.push_back(cls);
+                arg_dirs.push_back(ir::ArgDir::In);
+                const uint32_t k   = fn_local(*cap.sym);
+                ctx.local_types[k] = cls;
+                ctx.boxed[cap.sym] = { k, cls };
+                continue;
+            }
+            param_types.push_back(lower_type(cap.sym->getType()));
+            arg_dirs.push_back(ir::ArgDir::Ref);
+            fn_local(*cap.sym);
+        }
+    }
+
+    // The matching actuals, resolved in whichever body is making the call: the
+    // enclosing procedural body at the randsequence statement, or a production's own
+    // frame when one production calls another. value_lvalue and capture_handle both
+    // route through the callee-side registrations above, so a nested call re-passes
+    // exactly what it was given.
+    void push_capture_args(const RandSeqCtx& rs, std::vector<ir::Index>& args, ir::Builder& b, ir::SourceLoc l) {
+        for (const RandSeqCtx::Capture& cap : rs.captures) {
+            args.push_back(cap.boxed ? capture_handle(*cap.sym, b, l) : value_lvalue(*cap.sym, b, l));
         }
     }
 
@@ -19052,16 +19099,15 @@ private:
                     ctx.this_class = fn_ctx_->this_class;
                     continue;
                 }
-                if (fn_ctx_->boxed.contains(sym)) {
-                    // TODO: a randsequence sharing an automatic with a DETACHING fork
-                    // (docs/design/fork-join.md V4). The variable lives in a GC box, so
-                    // the ref formal would alias the box's field rather than a frame
-                    // slot -- believed correct, but wholly unexercised, so guarded
-                    // rather than assumed.
-                    fail("a randsequence reading a variable captured by a detached fork "
-                         "is not supported");
-                }
-                ctx.captures.push_back(sym);
+                // A variable a DETACHING fork also captured lives in a GC box rather
+                // than in the frame (docs/design/fork-join.md V4), so there is no
+                // frame slot to alias. Its box HANDLE travels by value instead --
+                // reference semantics come from the box, and a first-class handle is
+                // a GC root, where a `ref` into the box's body would be a bare
+                // interior pointer held across a suspend (a production is a task) and
+                // would break the moment evacuation is switched on
+                // (docs/design/garbage-collection.md §8).
+                ctx.captures.push_back({ sym, fn_ctx_->boxed.contains(sym) });
             }
         }
 
@@ -19118,37 +19164,26 @@ private:
         return stored;
     }
 
-    // What an interleaved production may not do (LRM 18.17.5). Both limits come
-    // from the same place: `step` is a function of its own, entered once per unit,
-    // so nothing a rule holds ACROSS its units can live in its frame.
+    // The one thing an interleaved production may not be (LRM 18.17.5).
+    //
+    // Everything else a production holds across its units -- its declared formals
+    // and its rules' implicit result variables -- is hoisted into the driver's frame
+    // and passed back in by reference (bind_rand_join_formal, rand_join_rule_vars),
+    // because `step` is a function of its own and is entered once per unit. An inner
+    // `rand join` cannot be hoisted the same way: its state is not a fixed set of
+    // variables but an interleaving cursor per inner operand, chosen at ITS plan
+    // time, so the outer `step` would have to be a resumable driver rather than an
+    // indexed one.
+    //
+    // Deliberately deferred rather than unnoticed: 18.17.5 says the generator
+    // "interleaves nonterminal symbols to depth of 1", which does not describe
+    // nesting at all; verilator ignores the bias expression entirely and cannot
+    // compile a recursive production.
     void check_rand_join_operand(const RsProd& p) {
         for (const RsProd::Rule& rule : p.getRules()) {
             if (rule.isRandJoin) {
                 // TODO: an operand of a `rand join` that is itself a `rand join`.
-                // Its units would have to be interleaved by the outer driver AND by
-                // its own, which needs a resumable inner driver, not a step index.
                 fail("a randsequence rand join operand that is itself a rand join is "
-                     "not supported");
-            }
-            for (const Symbol& m : rule.ruleBlock->members()) {
-                if (m.as_if<VariableSymbol>() != nullptr) {
-                    // TODO: LRM 18.17.7 value passing inside an interleaved
-                    // production. The rule's implicit result variables would have to
-                    // survive from the unit that writes one to the code block that
-                    // reads it, with other operands' units in between -- so they
-                    // cannot be frame locals of a per-unit `step`.
-                    fail("a randsequence rand join operand whose rule reads the result "
-                         "of another production is not supported");
-                }
-            }
-        }
-        for (const FormalArgumentSymbol* fa : p.arguments) {
-            if (fa->direction != slang::ast::ArgumentDirection::In) {
-                // TODO: an output / inout / ref formal on an interleaved production.
-                // Its arguments are evaluated once, before the first unit, and each
-                // unit is a separate call, so a copy-out would land N times at
-                // unspecified points in the interleaving.
-                fail("a randsequence rand join operand with a non-input argument is "
                      "not supported");
             }
         }
@@ -19194,15 +19229,6 @@ private:
         ctx.randseq_abort = anon_local(bit1);
         if (!rty.isVoid()) {
             const ir::Ref rref = lower_type(rty);
-            if (is_handle_ref(rref)) {
-                // TODO: a production returning a queue, dynamic array or associative
-                // array (LRM 18.17.7). The result slot is an output formal, and a
-                // container result needs the deep-copy assignment path lower_assign
-                // reaches through lower_queue_assign and friends -- all shaped around
-                // an AssignmentExpression, of which there is none here.
-                fail("a randsequence production returning a queue, dynamic array or "
-                     "associative array is not supported");
-            }
             param_types.push_back(rref);
             arg_dirs.push_back(ir::ArgDir::Out);
             ctx.randseq_result     = anon_local(rref);
@@ -19214,11 +19240,7 @@ private:
             arg_dirs.push_back(to_arg_dir(fa->direction));
             fn_local(*fa);
         }
-        for (const ValueSymbol* cap : rs.captures) {
-            param_types.push_back(lower_type(cap->getType()));
-            arg_dirs.push_back(ir::ArgDir::Ref);
-            fn_local(*cap);
-        }
+        declare_capture_formals(rs, ctx, param_types, arg_dirs);
 
         const ir::Builder::Mark   body_mark = b.mark();
         std::optional<LowerError> failure;
@@ -19291,16 +19313,14 @@ private:
         // ordinary expression -- but in_randseq is set for the shared helpers, so
         // give the flag a slot nothing writes.
         ctx.randseq_abort = anon_local(make_int_type(1, false, false));
+        // As `step`: a reference to the driver's activation cell, so `plan`'s weight
+        // expressions read exactly what the units will.
         for (const FormalArgumentSymbol* fa : p.arguments) {
             param_types.push_back(lower_type(fa->getType()));
-            arg_dirs.push_back(to_arg_dir(fa->direction));
+            arg_dirs.push_back(ir::ArgDir::Ref);
             fn_local(*fa);
         }
-        for (const ValueSymbol* cap : rs.captures) {
-            param_types.push_back(lower_type(cap->getType()));
-            arg_dirs.push_back(ir::ArgDir::Ref);
-            fn_local(*cap);
-        }
+        declare_capture_formals(rs, ctx, param_types, arg_dirs);
 
         const ir::Builder::Mark   body_mark = b.mark();
         std::optional<LowerError> failure;
@@ -19377,10 +19397,9 @@ private:
         ctx.randseq_abort = anon_local(bit1);
         if (!rty.isVoid()) {
             const ir::Ref rref = lower_type(rty);
-            if (is_handle_ref(rref)) {
-                fail("a randsequence production returning a queue, dynamic array or "
-                     "associative array is not supported");
-            }
+            // A container result rides the same output formal as any other: the
+            // backend passes the handle pointer and deep-copies the callee's frame
+            // handle back out.
             param_types.push_back(rref);
             arg_dirs.push_back(ir::ArgDir::Out);
             ctx.randseq_result     = anon_local(rref);
@@ -19397,16 +19416,27 @@ private:
         arg_dirs.push_back(ir::ArgDir::Out);
         ctx.randseq_stop     = anon_local(bit1);
         ctx.randseq_has_stop = true;
+        // Every declared formal is a REFERENCE to the driver's activation cell, not
+        // a per-call copy: `step` is entered once per unit, so a copy would lose an
+        // `input` the body mutated and would repeat an `output` copy-out at every
+        // unit. bind_rand_join_formal set the cells up.
         for (const FormalArgumentSymbol* fa : p.arguments) {
             param_types.push_back(lower_type(fa->getType()));
-            arg_dirs.push_back(to_arg_dir(fa->direction));
+            arg_dirs.push_back(ir::ArgDir::Ref);
             fn_local(*fa);
         }
-        for (const ValueSymbol* cap : rs.captures) {
-            param_types.push_back(lower_type(cap->getType()));
+        // Then the rule variables, in rand_join_rule_vars' order. Registering each
+        // symbol against its ref formal is all it takes: value_lvalue resolves a
+        // reference to one straight to the formal's slot, so gen_rule's ordinary
+        // machinery below reads and writes the driver's cell with no special case.
+        std::vector<const VariableSymbol*> rule_var_syms;
+        rand_join_rule_vars(p, rule_var_syms);
+        for (const VariableSymbol* vs : rule_var_syms) {
+            param_types.push_back(lower_type(vs->getType()));
             arg_dirs.push_back(ir::ArgDir::Ref);
-            fn_local(*cap);
+            fn_local(*vs);
         }
+        declare_capture_formals(rs, ctx, param_types, arg_dirs);
 
         const ir::Builder::Mark   body_mark = b.mark();
         std::optional<LowerError> failure;
@@ -19478,9 +19508,10 @@ private:
                                             b.constant(module_.pool.put_int(i32, static_cast<int64_t>(u)), l),
                                             l);
         b.open_region();
-        // check_rand_join_operand has already refused a rule with result variables,
-        // so no unit of an interleaved rule can name a non-void production.
-        const RandSeqRuleVars vars;
+        // The rule's result variables are ref formals over the driver's cells, so
+        // they are already declared and already initialized: map the names without
+        // giving them storage of their own.
+        const RandSeqRuleVars vars = rule_vars(rule, /*declare=*/false, b);
         if (u < rule.prods.size()) {
             gen_prod(*rule.prods[u], rs, vars, b);
         } else {
@@ -19535,8 +19566,16 @@ private:
         }
         if (width > 32) {
             // TODO: a wider sum needs the LRM's several-draw scheme, stitching
-            // multiple $urandom_range results into one number (LRM 18.16, whose
-            // weight rules 18.17.1 shares). Same guard, same reason, as randcase.
+            // multiple $urandom_range results into one number ("This can result in
+            // multiple calls to $urandom_range() to handle numbers greater than 32
+            // bits", LRM 18.16, whose weight rules 18.17.1 shares).
+            //
+            // Deliberately shared with randcase's identical guard rather than lifted
+            // here alone: the two constructs weigh alternatives by the same clause,
+            // so they must agree, and stitching changes how many values a selection
+            // draws from the process stream -- a documented contract
+            // (docs/design/randsequence.md §12), not an implementation detail. One
+            // change, both sites, one recorded stream shift.
             fail("randsequence production weight wider than 32 bits is not supported");
         }
         const ir::Ref          wty = make_int_type(width, false, false);
@@ -19601,25 +19640,7 @@ private:
     // GenQueue example, whose weight-clause block reads the result of a production
     // in the same rule's list.
     void gen_rule(const RsProd::Rule& rule, const RandSeqCtx& rs, ir::Builder& b) {
-        // slang synthesizes one const variable per non-void production this rule
-        // names and puts it in the rule block's scope (LRM 18.17.7). They arrive as
-        // scope members, never as VariableDeclStatements, so nothing else would ever
-        // declare them -- lower_var_decl, not bare declare_storage, because the
-        // type default it writes is what a slot for a production the rule did NOT
-        // generate reads back. 18.17.7 calls that value "undefined"; Table 6-7's
-        // default is a defined choice, and the alternative here is the frame's
-        // previous contents.
-        RandSeqRuleVars vars;
-        for (const Symbol& m : rule.ruleBlock->members()) {
-            const auto* vs = m.as_if<VariableSymbol>();
-            if (vs == nullptr) {
-                continue;
-            }
-            lower_var_decl(*vs, b, /*force_frame=*/true);
-            vars.byname[vs->name] = vs;
-        }
-        count_rule_items(rule, vars);
-
+        const RandSeqRuleVars vars = rule_vars(rule, /*declare=*/true, b);
         if (rule.isRandJoin) {
             gen_rand_join(rule, rs, vars, b);
         } else {
@@ -19630,6 +19651,36 @@ private:
         if (rule.codeBlock) {
             gen_code_block(*rule.codeBlock, b);
         }
+    }
+
+    // A rule's implicit result variables (LRM 18.17.7) and the occurrence index of
+    // each production reference within it.
+    //
+    // slang synthesizes one const variable per non-void production the rule names
+    // and puts it in the rule block's scope. They arrive as scope members, never as
+    // VariableDeclStatements, so nothing else would ever declare them --
+    // lower_var_decl, not bare declare_storage, because the type default it writes
+    // is what a slot for a production the rule did NOT generate reads back. 18.17.7
+    // calls that value "undefined"; Table 6-7's default is a defined choice, and the
+    // alternative here is the frame's previous contents.
+    //
+    // `declare` is false inside a `rand join` operand's `step` body, where the
+    // variables are ref formals over the driver's cells and were initialized once,
+    // before the first unit.
+    RandSeqRuleVars rule_vars(const RsProd::Rule& rule, bool declare, ir::Builder& b) {
+        RandSeqRuleVars vars;
+        for (const Symbol& m : rule.ruleBlock->members()) {
+            const auto* vs = m.as_if<VariableSymbol>();
+            if (vs == nullptr) {
+                continue;
+            }
+            if (declare) {
+                lower_var_decl(*vs, b, /*force_frame=*/true);
+            }
+            vars.byname[vs->name] = vs;
+        }
+        count_rule_items(rule, vars);
+        return vars;
     }
 
     // `rand join [ (expr) ] S1 S2 ...` (LRM 18.17.5): interleave the operands'
@@ -19663,7 +19714,11 @@ private:
         const ir::Ref       bit1   = make_int_type(1, false, false);
         const auto          kconst = [&](int64_t v) { return b.constant(module_.pool.put_int(i32, v), l); };
 
-        // One operand's live interleaving state.
+        // One operand's live interleaving state. Everything the production holds
+        // ACROSS its units lives here, in the driver's frame, because `step` is
+        // entered once per unit and its own frame does not survive between them:
+        // the declared formals (one activation's copies, LRM 18.17.7's "similar to
+        // a task call") and the rule's implicit result variables.
         struct Operand {
             const RsProdItem*       item = nullptr;
             const RsProd*           prod = nullptr;
@@ -19671,8 +19726,10 @@ private:
             TempCell                nleft;    // units not yet generated
             TempCell                pos;      // next unit index
             TempCell                stop;     // the production returned; drop the rest
-            std::vector<TempCell>   args;     // the declared arguments, evaluated once
             std::optional<TempCell> result;
+            std::vector<ir::Index>  formals;  // one lvalue per declared formal
+            std::vector<ir::Index>  rulevars; // one lvalue per (rule, result variable)
+            std::vector<CopyOutArg> outs;     // output / inout copy-backs, run once at the end
         };
         std::vector<Operand> ops;
         ops.reserve(rule.prods.size());
@@ -19697,17 +19754,26 @@ private:
             ops.push_back(std::move(op));
         }
 
-        // "Passing data to a production is similar to a task call" (18.17.7), so each
-        // operand's arguments are evaluated exactly once -- here, before any unit --
-        // and replayed from temps at every step call. check_rand_join_operand has
-        // already refused a non-input formal, so there is no copy-out to place.
+        // The activation state, set up once, before any unit runs.
         for (Operand& op : ops) {
-            std::vector<CopyOutArg>      outs;
-            const std::vector<ir::Index> vals = build_call_args(op.prod->arguments, op.item->args, outs, b, l);
-            for (size_t k = 0; k < vals.size(); k++) {
-                const TempCell cell = make_temp_cell(lower_type(op.prod->arguments[k]->getType()), "rj_arg");
-                b.binary(ir::Inst::Tag::Store, cell.lv(b, l), vals[k], l);
-                op.args.push_back(cell);
+            if (op.item->args.size() != op.prod->arguments.size()) {
+                fail("randsequence production argument count mismatch");
+            }
+            for (size_t k = 0; k < op.prod->arguments.size(); k++) {
+                op.formals.push_back(bind_rand_join_formal(*op.prod->arguments[k], *op.item->args[k], op.outs, b, l));
+            }
+            // LRM 18.17.7's implicit result variables. Default-initialized here and
+            // not per unit: a slot written by one unit is read by a later one, and a
+            // slot for a production the rule did not generate keeps the type default
+            // (18.17.7's "undefined value").
+            std::vector<const VariableSymbol*> rvs;
+            rand_join_rule_vars(*op.prod, rvs);
+            for (const VariableSymbol* vs : rvs) {
+                const ir::Ref   vty = lower_type(vs->getType());
+                const ir::Index cell =
+                  is_agg_abi_ref(vty) ? make_canonical_agg_temp(vty, b, l) : make_arg_temp(vty, b, l);
+                emit_default_init(cell, vty, b, l);
+                op.rulevars.push_back(cell);
             }
         }
 
@@ -19720,12 +19786,8 @@ private:
             }
             args.push_back(op.rule_idx.lv(b, l));
             args.push_back(op.nleft.lv(b, l));
-            for (const TempCell& a : op.args) {
-                args.push_back(b.unary(ir::Inst::Tag::Load, a.lv(b, l), l));
-            }
-            for (const ValueSymbol* cap : rs.captures) {
-                args.push_back(value_lvalue(*cap, b, l));
-            }
+            args.insert(args.end(), op.formals.begin(), op.formals.end());
+            push_capture_args(rs, args, b, l);
             if (rs.is_task) {
                 b.task_call(st.plan, args, l);
             } else {
@@ -19786,6 +19848,82 @@ private:
         b.open_region();
         const ir::ExtraSlice step_region = b.close_region();
         b.loop(cond_region, any, body_region, step_region, /*bottom_test*/ false, l);
+
+        // One copy-out per output / inout formal, after the last unit: the
+        // production's activation spans the whole interleaving, so LRM 18.17.7's
+        // "similar to a task call" puts its completion here and not at each unit.
+        for (const Operand& op : ops) {
+            emit_call_copyouts(op.outs, b, l);
+        }
+    }
+
+    // One declared formal of an interleaved production, bound to storage that
+    // outlives a single unit (LRM 18.17.5 with 18.17.7). Returns the lvalue the
+    // `plan` and `step` calls pass, which is why every declared formal of those two
+    // entry points is an ArgDir::Ref: the callee reads and writes the one copy the
+    // whole activation shares, exactly as a plain production's frame slot does.
+    //
+    // A `ref` formal aliases the actual itself, materialized once here so an index
+    // expression inside it is evaluated once (13.5.2 with 18.17.7's once-only rule).
+    // Everything else takes a driver-frame cell: copied in for `input` / `inout`,
+    // default-initialized for `output`, and recorded in `outs` for the single
+    // copy-back the caller runs after the interleaving finishes.
+    ir::Index bind_rand_join_formal(const FormalArgumentSymbol& fa,
+                                    const Expression&           actual_expr,
+                                    std::vector<CopyOutArg>&    outs,
+                                    ir::Builder&                b,
+                                    ir::SourceLoc               l) {
+        const auto dir = fa.direction;
+        if (dir == slang::ast::ArgumentDirection::Ref) {
+            return lower_ref_actual(actual_expr, b);
+        }
+        const ir::Ref pty = lower_type(fa.getType());
+        const bool    agg = is_agg_abi_ref(pty);
+        // slang models an output / inout actual as an AssignmentExpression whose
+        // left side is the caller lvalue; unwrap it to the bound expression.
+        const Expression* actual = &actual_expr;
+        if (actual->kind == ExpressionKind::Assignment) {
+            actual = &actual->as<AssignmentExpression>().left();
+        }
+        const ir::Index cell = agg ? make_canonical_agg_temp(pty, b, l) : make_arg_temp(pty, b, l);
+        if (dir == slang::ast::ArgumentDirection::Out) {
+            // Not seeded from the caller (LRM 13.5.1); the type default is what an
+            // ordinary callee's frame slot would hold at entry.
+            emit_default_init(cell, pty, b, l);
+        } else if (agg) {
+            const Expression& src = unwrap_conversion(*actual);
+            if (is_struct_lvalue_shape(src)) {
+                emit_agg_copy(cell, lower_lvalue(src, b), pty, ir::Inst::Tag::Store, b, l);
+            } else {
+                emit_agg_store(cell, pty, src, ir::Inst::Tag::Store, b, l);
+            }
+        } else if (is_handle_ref(pty)) {
+            emit_container_store(cell, pty, *actual, b, l);
+        } else if (is_string_ref(pty)) {
+            b.binary(ir::Inst::Tag::Store, cell, lower_expr(*actual, b), l);
+        } else {
+            b.binary(ir::Inst::Tag::Store, cell, coerce(lower_expr(*actual, b), *actual->type, pty, b, l), l);
+        }
+        if (dir != slang::ast::ArgumentDirection::In) {
+            outs.push_back(CopyOutArg{ cell, actual, lower_type(*actual->type), &fa.getType(), agg, pty });
+        }
+        return cell;
+    }
+
+    // Every implicit result variable of every rule of `p`, in rule order then
+    // declaration order (LRM 18.17.7). For an interleaved production these cannot be
+    // frame locals of `step`: one is written by the unit that generates the
+    // production and read by a later unit of the same rule, with other sequences'
+    // units in between. The driver owns them and passes each by reference, in this
+    // order, which build_production_step's formal list mirrors.
+    static void rand_join_rule_vars(const RsProd& p, std::vector<const VariableSymbol*>& out) {
+        for (const RsProd::Rule& rule : p.getRules()) {
+            for (const Symbol& m : rule.ruleBlock->members()) {
+                if (const auto* vs = m.as_if<VariableSymbol>()) {
+                    out.push_back(vs);
+                }
+            }
+        }
     }
 
     // The `rand join` length-bias expression, quantized to kRandJoinScale-ths and
@@ -19864,12 +20002,9 @@ private:
         args.push_back(b.unary(ir::Inst::Tag::Load, op.rule_idx.lv(b, l), l));
         args.push_back(b.unary(ir::Inst::Tag::Load, op.pos.lv(b, l), l));
         args.push_back(op.stop.lv(b, l));
-        for (const TempCell& a : op.args) {
-            args.push_back(b.unary(ir::Inst::Tag::Load, a.lv(b, l), l));
-        }
-        for (const ValueSymbol* cap : rs.captures) {
-            args.push_back(value_lvalue(*cap, b, l));
-        }
+        args.insert(args.end(), op.formals.begin(), op.formals.end());
+        args.insert(args.end(), op.rulevars.begin(), op.rulevars.end());
+        push_capture_args(rs, args, b, l);
         if (rs.is_task) {
             b.task_call(st.step, args, l);
         } else {
@@ -20161,9 +20296,7 @@ private:
         std::vector<CopyOutArg>      outs;
         const std::vector<ir::Index> declared = build_call_args(target.arguments, item.args, outs, b, l);
         args.insert(args.end(), declared.begin(), declared.end());
-        for (const ValueSymbol* cap : rs.captures) {
-            args.push_back(value_lvalue(*cap, b, l));
-        }
+        push_capture_args(rs, args, b, l);
 
         if (rs.is_task) {
             b.task_call(idit->second, args, l);
@@ -20175,13 +20308,33 @@ private:
             // The value is the production's own return type on both sides, so
             // nothing is coerced -- a string Store deep-copies the handle.
             const ir::Index place = result_slot(item, target, vars, b, l);
-            if (is_agg_abi_ref(res_ty)) {
-                emit_agg_copy(place, *res_temp, res_ty, ir::Inst::Tag::Store, b, l);
-            } else {
-                b.binary(ir::Inst::Tag::Store, place, b.unary(ir::Inst::Tag::Load, *res_temp, l), l);
-            }
+            emit_result_copy(place, *res_temp, res_ty, b, l);
         }
         emit_abort_check(b, l);
+    }
+
+    // Move a production's returned value out of the caller temp the output formal
+    // wrote and into the rule variable that names it (LRM 18.17.7). Place-to-place,
+    // so there is no expression to dispatch on: an aggregate copies element-wise, a
+    // container deep-copies its handle, everything else is a load and a store.
+    void emit_result_copy(ir::Index place, ir::Index temp, ir::Ref ty, ir::Builder& b, ir::SourceLoc l) {
+        if (is_agg_abi_ref(ty)) {
+            emit_agg_copy(place, temp, ty, ir::Inst::Tag::Store, b, l);
+            return;
+        }
+        switch (std::get<ir::Type>(module_.pool.get(ty)).kind) {
+            case ir::Type::Kind::DynArray:
+                b.dyn_array_copy(place, temp, ty, l);
+                return;
+            case ir::Type::Kind::Queue:
+                b.queue_copy(place, temp, ty, l);
+                return;
+            case ir::Type::Kind::Assoc:
+                b.assoc_copy(place, temp, ty, l);
+                return;
+            default:
+                b.binary(ir::Inst::Tag::Store, place, b.unary(ir::Inst::Tag::Load, temp, l), l);
+        }
     }
 
     // The lvalue this body passes as a production call's `$abort` output. Inside a
@@ -23921,27 +24074,61 @@ private:
             fail("nonblocking assignment to a dynamic array is only supported from another "
                  "dynamic-array variable, a `'{...}` literal, or `new[n]`");
         }
+        emit_dyn_array_store(dst, aty, a.right(), b, l);
+        return dst;
+    }
+
+    // The BLOCKING half of a whole-container store, `dst = rhs`, split out of the
+    // three lower_*_assign paths so a SYNTHESIZED store reaches exactly the same
+    // rules with no AssignmentExpression to hand them. Two callers need that: a
+    // randsequence production returning a container (LRM 18.17.7), whose `return`
+    // has an expression and a frame slot but no assignment node, and the once-only
+    // copy-in of a container argument to an interleaved production (18.17.5).
+    //
+    // The nonblocking halves stay with their statements: an NBA stages a handle and
+    // commits it in the NBA region, which no synthesized store wants.
+    //
+    // (`emit_handle_member_copy` covers the neighbouring DECLARATION-INITIALIZER
+    // form. It is deliberately not folded in here: it treats `new[N]` as
+    // construction rather than assignment and refuses the pattern / conditional
+    // sources these accept, so the two are not interchangeable.)
+    void emit_container_store(ir::Index dst, ir::Ref ty, const Expression& rhs, ir::Builder& b, ir::SourceLoc l) {
+        switch (std::get<ir::Type>(module_.pool.get(ty)).kind) {
+            case ir::Type::Kind::DynArray:
+                emit_dyn_array_store(dst, ty, rhs, b, l);
+                return;
+            case ir::Type::Kind::Queue:
+                emit_queue_store(dst, ty, rhs, b, l);
+                return;
+            case ir::Type::Kind::Assoc:
+                emit_assoc_store(dst, ty, rhs, b, l);
+                return;
+            default:
+                fail("internal: whole-container store on a non-container type");
+        }
+    }
+
+    void emit_dyn_array_store(ir::Index dst, ir::Ref aty, const Expression& rhs_expr, ir::Builder& b, ir::SourceLoc l) {
         // `d = '{e0, e1, ...}` (LRM 10.9): the source is an assignment-pattern
         // literal, not another handle — materialize it element-wise rather than
         // deep-copying a handle (emit_handle_literal_init allocates + stores).
-        if (as_assignment_pattern(a.right()) != nullptr) {
-            emit_agg_store(dst, aty, a.right(), ir::Inst::Tag::Store, b, l);
-            return dst;
+        if (as_assignment_pattern(rhs_expr) != nullptr) {
+            emit_agg_store(dst, aty, rhs_expr, ir::Inst::Tag::Store, b, l);
+            return;
         }
-        if (a.right().kind == ExpressionKind::NewArray) {
-            emit_dyn_array_new_expr(dst, a.right().as<slang::ast::NewArrayExpression>(), aty, b, l);
-            return dst;
+        if (rhs_expr.kind == ExpressionKind::NewArray) {
+            emit_dyn_array_new_expr(dst, rhs_expr.as<slang::ast::NewArrayExpression>(), aty, b, l);
+            return;
         }
-        if (unwrap_conversion(a.right()).kind == ExpressionKind::Streaming) {
+        if (unwrap_conversion(rhs_expr).kind == ExpressionKind::Streaming) {
             // `d = {>>{...}}` (LRM 11.4.14): sized to the stream's element count,
             // then filled in stream order.
             std::vector<StreamChunk> chunks;
-            collect_stream_chunks(
-              unwrap_conversion(a.right()).as<StreamingConcatenationExpression>(), chunks, b, l);
+            collect_stream_chunks(unwrap_conversion(rhs_expr).as<StreamingConcatenationExpression>(), chunks, b, l);
             stream_fill_dynarr(dst, chunks, aty, b, l);
-            return dst;
+            return;
         }
-        const Expression& rhs = unwrap_conversion(a.right());
+        const Expression& rhs = unwrap_conversion(rhs_expr);
         if (is_queue(rhs)) {
             // `d = q` (LRM 7.5.1's resizeable assignment): allocate to the
             // queue's RUNTIME size() and deep-copy, ring-indexed source into
@@ -23951,7 +24138,7 @@ private:
             // concatenation) to a handle lvalue, matching the plain-dynarr
             // fallback below.
             b.dyn_array_copy_queue(dst, materialize_queue_rvalue(rhs, b), aty, l);
-            return dst;
+            return;
         }
         if (is_unpacked_array(rhs)) {
             // `d = f` (LRM 7.5.1's resizeable assignment): a FIXED-size
@@ -23964,11 +24151,10 @@ private:
             const ir::Ref i32 = make_int_type(32, false, true);
             b.dyn_array_new(dst, b.constant(module_.pool.put_int(i32, n), l), dst, /*has_init=*/false, aty, l);
             emit_fixed_array_into_dynarr(dst, rhs, aty, n, b, l);
-            return dst;
+            return;
         }
         // arr = other: deep copy the source handle (value semantics).
-        b.dyn_array_copy(dst, lower_lvalue(a.right(), b), aty, l);
-        return dst;
+        b.dyn_array_copy(dst, lower_lvalue(rhs_expr, b), aty, l);
     }
 
     // Store each element of an assignment-pattern literal into an already-allocated
@@ -25238,50 +25424,67 @@ private:
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       qty = lower_type(*a.left().type);
-        // q = d: whole dynamic-array-into-queue copy (LRM 7.10). The source is an
-        // rt_dynarr handle, not an rt_queue, so it takes its own runtime path
-        // (feeding a dynarr handle to rt_queue_assign reads past the struct and
-        // runs away). An empty source clears the queue to size 0.
-        const Expression& rhs = unwrap_conversion(a.right());
-        if (is_dyn_array(rhs)) {
-            if (rhs.kind != ExpressionKind::NamedValue && rhs.kind != ExpressionKind::HierarchicalValue &&
-                rhs.kind != ExpressionKind::MemberAccess) {
-                // TODO: queue = <dynamic-array rvalue> where the source is not a
-                // plain variable (a call result, slice, etc.) — needs the source
-                // materialized into a temp dynarray handle first.
-                fail("queue assignment from this dynamic-array expression is not supported");
-            }
-            if (a.isNonBlocking()) {
+        const Expression&   rhs = unwrap_conversion(a.right());
+        if (a.isNonBlocking()) {
+            // Source-shape refusals come FIRST, as they do on the blocking path, so
+            // a nonblocking assignment from an unsupported source still names the
+            // source rather than the region.
+            if (is_dyn_array(rhs)) {
+                if (!is_plain_handle_place(rhs)) {
+                    fail("queue assignment from this dynamic-array expression is not supported");
+                }
                 // TODO: nonblocking q <= d whole copy from a dynamic array (needs
                 // a dynarr-source staging path in the NBA region).
                 fail("nonblocking queue assignment from a dynamic array is not supported");
             }
-            b.queue_copy_dynarr(dst, lower_lvalue(rhs, b), qty, l);
-            return dst;
-        }
-        if (is_unpacked_array(rhs)) {
-            // q = f: whole fixed-array-into-queue copy (LRM 7.10.2). `f`'s
-            // element count is a compile-time constant, unlike a dynamic
-            // array or another queue's runtime size().
-            if (a.isNonBlocking()) {
+            if (is_unpacked_array(rhs)) {
                 // TODO: nonblocking q <= f whole copy from a fixed array (needs
                 // a fixed-array-source staging path in the NBA region, same gap
                 // as the dynamic-array source above).
                 fail("nonblocking queue assignment from a fixed-size array is not supported");
             }
-            emit_fixed_array_into_queue(dst, rhs, qty, b, l);
-            return dst;
-        }
-        const ir::Index src = materialize_queue_rvalue(a.right(), b);
-        if (a.isNonBlocking()) {
             // Whole-queue NBA: stage a deep copy now, move it into dst in the NBA
             // region (LRM 10.4.2). The target is a module signal (task/process
             // NBA is module-signal-only; function NBA is rejected above).
-            b.handle_copy_nb(dst, src, qty, l);
+            b.handle_copy_nb(dst, materialize_queue_rvalue(a.right(), b), qty, l);
             return dst;
         }
-        b.queue_copy(dst, src, qty, l);
+        emit_queue_store(dst, qty, a.right(), b, l);
         return dst;
+    }
+
+    // A source shape a container deep copy can address directly: a named variable,
+    // a hierarchical reference, or a struct member. Not an element select or a call
+    // result, neither of which the dynarr-into-queue runtime path can take.
+    static bool is_plain_handle_place(const Expression& e) {
+        return e.kind == ExpressionKind::NamedValue || e.kind == ExpressionKind::HierarchicalValue ||
+               e.kind == ExpressionKind::MemberAccess;
+    }
+
+    void emit_queue_store(ir::Index dst, ir::Ref qty, const Expression& rhs_expr, ir::Builder& b, ir::SourceLoc l) {
+        // q = d: whole dynamic-array-into-queue copy (LRM 7.10). The source is an
+        // rt_dynarr handle, not an rt_queue, so it takes its own runtime path
+        // (feeding a dynarr handle to rt_queue_assign reads past the struct and
+        // runs away). An empty source clears the queue to size 0.
+        const Expression& rhs = unwrap_conversion(rhs_expr);
+        if (is_dyn_array(rhs)) {
+            if (!is_plain_handle_place(rhs)) {
+                // TODO: queue = <dynamic-array rvalue> where the source is not a
+                // plain variable (a call result, slice, etc.) — needs the source
+                // materialized into a temp dynarray handle first.
+                fail("queue assignment from this dynamic-array expression is not supported");
+            }
+            b.queue_copy_dynarr(dst, lower_lvalue(rhs, b), qty, l);
+            return;
+        }
+        if (is_unpacked_array(rhs)) {
+            // q = f: whole fixed-array-into-queue copy (LRM 7.10.2). `f`'s
+            // element count is a compile-time constant, unlike a dynamic
+            // array or another queue's runtime size().
+            emit_fixed_array_into_queue(dst, rhs, qty, b, l);
+            return;
+        }
+        b.queue_copy(dst, materialize_queue_rvalue(rhs_expr, b), qty, l);
     }
 
     // Whole-associative-array assignment (LRM 7.9): `a = other` deep-copies the
@@ -25292,44 +25495,50 @@ private:
         const ir::SourceLoc l   = loc(a);
         const ir::Index     dst = lower_lvalue(a.left(), b);
         const ir::Ref       aty = lower_type(*a.left().type);
-        if (a.isNonBlocking() && as_assignment_pattern(a.right()) != nullptr) {
-            // TODO: a `'{key:value}` / `'{default:v}` literal on the right of a
-            // nonblocking assignment. The literal builds its entries in place rather
-            // than deep-copying a handle, so staging it needs a temp map first. Must
-            // be refused BEFORE the pattern branch below, which would otherwise
-            // silently apply the literal as a BLOCKING assignment.
-            fail("nonblocking assignment of a literal into an associative array is "
-                 "not supported");
-        }
-        if (as_assignment_pattern(a.right()) != nullptr) {
-            emit_assoc_literal_init(dst, aty, unwrap_conversion(a.right()), ir::Inst::Tag::Store, b, l);
-            return dst;
-        }
-        // LRM 7.9 admits a variable, a call result or a literal as the source. A
-        // "variable" here is any PLACE holding an associative array, not just a
-        // named one: an assoc that lives in a struct member, an array element, a
-        // container element or a class property is equally a handle lvalue, and the
-        // deep copy below reaches it through the same resolver. Restricting this to
-        // NamedValue / HierarchicalValue refused `outer.m = inner`, `arr[i] = inner`
-        // and every other nested shape for no reason.
-        const bool src_is_place =
-          is_assoc(a.right()) &&
-          (is_struct_lvalue_shape(a.right()) || a.right().kind == ExpressionKind::Call);
-        if (!src_is_place) {
-            // TODO: an associative-array source that is none of those three shapes.
-            // LRM 7.9 defines no other whole-array value, so this is a defensive
-            // guard rather than a known gap.
-            fail("associative array assignment from a non-variable value is not supported");
-        }
         if (a.isNonBlocking()) {
+            if (as_assignment_pattern(a.right()) != nullptr) {
+                // TODO: a `'{key:value}` / `'{default:v}` literal on the right of a
+                // nonblocking assignment. The literal builds its entries in place
+                // rather than deep-copying a handle, so staging it needs a temp map
+                // first. Must be refused BEFORE the blocking path below, which would
+                // otherwise silently apply the literal as a BLOCKING assignment.
+                fail("nonblocking assignment of a literal into an associative array is "
+                     "not supported");
+            }
+            if (!is_assoc_source_place(a.right())) {
+                fail("associative array assignment from a non-variable value is not supported");
+            }
             // `a <= other` (LRM 7.9, 10.4.2): staged deep copy in the Active region,
             // moved into the live map in the NBA region -- the same HandleCopyNb a
             // queue and a dynamic array take.
             b.handle_copy_nb(dst, lower_lvalue(a.right(), b), aty, l);
             return dst;
         }
-        b.assoc_copy(dst, lower_lvalue(a.right(), b), aty, l);
+        emit_assoc_store(dst, aty, a.right(), b, l);
         return dst;
+    }
+
+    // LRM 7.9 admits a variable, a call result or a literal as an associative-array
+    // source. A "variable" here is any PLACE holding one, not just a named one: an
+    // assoc that lives in a struct member, an array element, a container element or
+    // a class property is equally a handle lvalue, and the deep copy reaches it
+    // through the same resolver.
+    bool is_assoc_source_place(const Expression& e) {
+        return is_assoc(e) && (is_struct_lvalue_shape(e) || e.kind == ExpressionKind::Call);
+    }
+
+    void emit_assoc_store(ir::Index dst, ir::Ref aty, const Expression& rhs_expr, ir::Builder& b, ir::SourceLoc l) {
+        if (as_assignment_pattern(rhs_expr) != nullptr) {
+            emit_assoc_literal_init(dst, aty, unwrap_conversion(rhs_expr), ir::Inst::Tag::Store, b, l);
+            return;
+        }
+        if (!is_assoc_source_place(rhs_expr)) {
+            // TODO: an associative-array source that is none of those three shapes.
+            // LRM 7.9 defines no other whole-array value, so this is a defensive
+            // guard rather than a known gap.
+            fail("associative array assignment from a non-variable value is not supported");
+        }
+        b.assoc_copy(dst, lower_lvalue(rhs_expr, b), aty, l);
     }
 
     // One element value on its way into a container, in the form the backend wants:
@@ -29512,7 +29721,12 @@ private:
                     fail("return with a value in a void randsequence production");
                 }
                 const ir::Index slot = b.local(fn_ctx_->randseq_result, fn_ctx_->randseq_result_ty, l);
-                if (is_agg_abi_ref(fn_ctx_->randseq_result_ty)) {
+                if (is_handle_ref(fn_ctx_->randseq_result_ty)) {
+                    // A queue / dynamic array / associative array result: the same
+                    // deep-copy rules a whole-container assignment applies, reached
+                    // without an AssignmentExpression.
+                    emit_container_store(slot, fn_ctx_->randseq_result_ty, *r.expr, b, l);
+                } else if (is_agg_abi_ref(fn_ctx_->randseq_result_ty)) {
                     emit_agg_store(
                       slot, fn_ctx_->randseq_result_ty, unwrap_conversion(*r.expr), ir::Inst::Tag::Store, b, l);
                 } else if (is_string_ref(fn_ctx_->randseq_result_ty)) {
