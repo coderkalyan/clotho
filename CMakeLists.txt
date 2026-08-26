@@ -174,17 +174,27 @@ FetchContent_Declare(
   # (AnalysisManager, dataflow diagnostics like inferred-latch), which the
   # frontend runs after elaboration.
   GIT_TAG        6933832c97c39976890e5f12b69245f061d60a9a # v10.0-360-g6933832c9
-  # LRM 8.6 (class methods), 18.5 (constraint blocks), and 19.4/19.5 (a
-  # covergroup's coverpoint/cross/iff/event expressions embedded in a class)
-  # all give a class's own members unordered visibility to those constructs
-  # -- unlike SV's general declare-before-use default (LRM 3.13/6.21) -- but
-  # slang's scope-chain walk-up (Lookup.cpp's unqualifiedImpl) unconditionally
-  # anchored the search to its own declaration position, so a method,
-  # constraint block, or coverpoint that textually preceded the class member
-  # it read was misdiagnosed as "used before its declaration". See
-  # docs/design/classes.md and docs/TODO.md for what this patch changes and
-  # what it was verified against.
-  PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/slang-class-forward-ref.patch"
+  # Every patches/slang-*.patch is applied, in name order:
+  #
+  # slang-class-forward-ref: LRM 8.6 (class methods), 18.5 (constraint blocks),
+  # and 19.4/19.5 (a covergroup's coverpoint/cross/iff/event expressions
+  # embedded in a class) all give a class's own members unordered visibility to
+  # those constructs -- unlike SV's general declare-before-use default (LRM
+  # 3.13/6.21) -- but slang's scope-chain walk-up (Lookup.cpp's
+  # unqualifiedImpl) unconditionally anchored the search to its own declaration
+  # position, so a method, constraint block, or coverpoint that textually
+  # preceded the class member it read was misdiagnosed as "used before its
+  # declaration". See docs/design/classes.md.
+  #
+  # slang-randseq-rule-pairing: two randsequence elaboration defects, both of
+  # which silently hand the frontend the wrong AST rather than diagnosing.
+  # createCaseProd pushed one ProdItem per case LABEL but consumed one per case
+  # ITEM, so every rs_case item after a multi-label one picked up the previous
+  # item's production; and the rule block symbol created the weight clause's
+  # code block once per prod, which bound its statements N times and
+  # desynchronized createRule's positional pairing for a rule with two or more
+  # code-block prods. See docs/design/randsequence.md §13.
+  PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
 )
 FetchContent_MakeAvailable(slang)
@@ -569,6 +579,7 @@ add_executable(clotho_test
   tests/enum_test.cpp
   tests/sysfunc_test.cpp
   tests/randcase_test.cpp
+  tests/randsequence_test.cpp
   tests/randomize_test.cpp
   tests/streaming_test.cpp
   tests/uwire_test.cpp
