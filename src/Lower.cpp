@@ -5800,7 +5800,7 @@ private:
             b.binary(ir::Inst::Tag::Store, b.assoc_default(lhs, type, l), dv, l);
         }
         for (const auto& setter : sap.indexSetters) {
-            const ir::Index key = lower_expr(*setter.index, b);
+            const ir::Index key = lower_assoc_key(*setter.index, type, b, l);
             const ir::Index val = lower_assoc_value(*setter.expr, elem, b, l);
             b.binary(ir::Inst::Tag::Store, b.assoc_select(lhs, key, type, l), val, l);
         }
@@ -6825,6 +6825,18 @@ private:
                          b.constant(lower_constant(dflt, at.elementType), l), l);
             }
             for (const auto& [key, val] : *cv.map()) {
+                // P4c (docs/design/assoc-keys.md): `lower_constant` cannot pool a
+                // queue / dynamic-array / associative-array / string-in-struct key
+                // as a compile-time constant (it has no static byte image -- that
+                // is exactly why the Queue/DynArray/Assoc branches above build
+                // those VALUES step by step instead of pooling them). Currently
+                // unreachable: a parameter whose type needs one of those key
+                // kinds is refused earlier by the general "only integral, real,
+                // string and null constant parameters" restriction, independent
+                // of this feature. Would need the same per-kind step-by-step
+                // construction this function already gives queue / dynarray /
+                // assoc VALUES, applied to the key instead, if that restriction
+                // is ever lifted.
                 const ir::Index k = b.constant(lower_constant(key, *at.indexType), l);
                 b.binary(ir::Inst::Tag::Store, b.assoc_select(lhs, k, ty, l),
                          b.constant(lower_constant(val, at.elementType), l), l);
@@ -23007,12 +23019,24 @@ private:
         std::string            efrag;
         std::vector<ir::Index> eargs;
         // The key prints by the same leaf rules as any other %p element, so an enum
-        // key prints its name and a string key prints quoted.
-        if (kst != nullptr) {
-            expand_p_scalar(b.unary(T::Load, key.lv(b, l), l), *kst, efrag, eargs, b, l);
-        } else {
+        // key prints its name and a string key prints quoted. An unpacked struct /
+        // fixed array key has no plane value to Load -- same split key_operand()
+        // makes for a[k] itself -- so it renders through the ordinary aggregate %p
+        // expansion instead: expand_p_scalar assumes a packed value and crashes (a
+        // slang assertion, casting an unpacked struct's type as packed) on
+        // anything else. A bare queue / dynamic-array / associative-array key (P2/
+        // P3) is left on the scalar path, which refuses it the same way a
+        // container-typed VALUE element already is -- expand_p_lvalue's container
+        // renderer works from a flat element descriptor a nested container has no
+        // image for (existing TODO, expand_p_scalar), a limitation orthogonal to
+        // which types are legal KEYS.
+        if (kst == nullptr) {
             efrag += "%0d";
             eargs.push_back(b.unary(T::Load, key.lv(b, l), l));
+        } else if (is_agg_abi_ref(kr)) {
+            expand_p_lvalue(key.lv(b, l), kr, kst, efrag, eargs, b, l);
+        } else {
+            expand_p_scalar(b.unary(T::Load, key.lv(b, l), l), *kst, efrag, eargs, b, l);
         }
         efrag += ':';
         expand_p_lvalue(b.assoc_select(lv, key_operand(), ty, l), t.element, est, efrag, eargs, b, l);

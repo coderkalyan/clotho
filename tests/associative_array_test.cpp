@@ -1813,3 +1813,117 @@ TEST_CASE("assoc whole-array equality (P4a)") {
         CHECK(r.diagnostic_text().find("4-state-capable value element") != std::string::npos);
     }
 }
+
+// P4c (docs/design/assoc-keys.md): a whole-array `'{key: value, ...}` literal
+// pattern used lower_expr for the key, bypassing lower_assoc_key -- wrong for
+// any key needing a PLACE rather than a plane value (an aggregate key, or a
+// bare queue / dynamic-array / associative-array key). Unreachable before
+// P1-P3 widened the admitted key kinds (only integral / string / class-handle
+// keys existed, all plane values); routed through lower_assoc_key now.
+TEST_CASE("assoc literal pattern with a non-scalar key (P4c)") {
+    SUBCASE("struct key, including default and overwrite via a second literal") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { byte b; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    a = '{ '{8'd1, 10} : 100, '{8'd2, 20} : 200, default: -1 };
+                    $display("num=%0d", a.num());
+                    k = '{8'd1, 10}; $display("v1=%0d", a[k]);
+                    k = '{8'd2, 20}; $display("v2=%0d", a[k]);
+                    k = '{8'd9, 90}; $display("vdef=%0d", a[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\n"
+                                  "v1=100\n"
+                                  "v2=200\n"
+                                  "vdef=-1\n");
+    }
+    SUBCASE("bare queue key") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int q_t[$];
+                int a [q_t];
+                q_t q;
+                initial begin
+                    a = '{ '{1, 2, 3} : 10, '{4, 5} : 20 };
+                    $display("num=%0d", a.num());
+                    q = '{1, 2, 3}; $display("v1=%0d", a[q]);
+                    q = '{4, 5};    $display("v2=%0d", a[q]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nv1=10\nv2=20\n");
+    }
+}
+
+// P4d (docs/design/assoc-keys.md): `%p` of an assoc renders each key by the
+// ordinary %p leaf rules (LRM 21.2.1.6), in sorted-key order. An unpacked
+// struct / fixed-array key has no plane value, and the pre-existing code
+// unconditionally tried to Load-and-format it through the SCALAR leaf path
+// (which assumes a packed value and crashed -- a slang assertion casting the
+// key's unpacked struct type as packed) instead of the aggregate lvalue path
+// `a[k]` itself already splits on (key_operand()). Fixed to make that same
+// split; a bare queue / dynamic-array / associative-array key (P2/P3) still
+// refuses %p cleanly, matching the pre-existing "container VALUE element"
+// limitation (expand_p_scalar's is_handle_ref guard) rather than crashing.
+TEST_CASE("assoc %p rendering (P4d)") {
+    SUBCASE("struct key: renders without crashing, in sorted-key order") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { byte b; int i; } k_t;
+                int a [k_t];
+                initial begin
+                    a['{8'd3, 30}] = 3;
+                    a['{8'd1, 10}] = 1;
+                    a['{8'd2, 20}] = 2;
+                    $display("%p", a);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "'{'{b:1, i:10}:1, '{b:2, i:20}:2, '{b:3, i:30}:3}\n");
+    }
+    SUBCASE("fixed-array key, class-handle key, and a nested-assoc struct member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef byte arr_t [0:1];
+                int c [arr_t];
+                arr_t ak;
+                class C; int x; endclass
+                int d [C];
+                C obj;
+                typedef int im_t [int];
+                typedef struct { byte b; im_t m; } k2_t;
+                int e [k2_t];
+                k2_t k2;
+                initial begin
+                    ak[0] = 1; ak[1] = 2; c[ak] = 3;
+                    $display("%p", c);
+                    obj = new; d[obj] = 4;
+                    $display("%p", d);
+                    k2.b = 1; k2.m.delete(); k2.m[10] = 20; e[k2] = 5;
+                    $display("%p", e);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "'{'{1, 2}:3}\n"
+                                  "'{C:4}\n"
+                                  "'{'{b:1, m:'{10:20}}:5}\n");
+    }
+    SUBCASE("a bare queue key refuses %p cleanly (no crash)") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef int q_t[$];
+                int a [q_t];
+                initial begin
+                    a['{1, 2, 3}] = 5;
+                    $display("%p", a);
+                end
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("container or aggregate element") != std::string::npos);
+    }
+}
