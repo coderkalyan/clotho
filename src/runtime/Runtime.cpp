@@ -6498,6 +6498,19 @@ extern "C" void* rt_proc_complete(void* pcb, void** fork_waiters_out) {
     return w;
 }
 
+extern "C" void rt_proc_adopt(void* to, void* from) {
+    auto*    np    = static_cast<rt_proc*>(to);
+    auto*    p     = static_cast<rt_proc*>(from);
+    rt_proc* child = p->first_child;
+    while (child != nullptr) {
+        // `next` before the re-link: proc_link_child rewrites child->next_sib.
+        rt_proc* next = child->next_sib;
+        proc_link_child(np, child);
+        child = next;
+    }
+    p->first_child = nullptr;
+}
+
 extern "C" void rt_proc_thread_done(void* pcb) {
     auto* p = static_cast<rt_proc*>(pcb);
     if (p->refs != 0) {

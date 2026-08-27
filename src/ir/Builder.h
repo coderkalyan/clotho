@@ -497,6 +497,11 @@ public:
     // prefix "<file>:<line>: <task>"; `arg` is the diagnostic level (0/1/2, LRM
     // Table 20-1). No SSA operands.
     Index finish(std::string_view banner, uint32_t arg, SourceLoc loc);
+    // $exit (LRM 24.7): terminate every `initial` procedure of the program instance
+    // the calling thread originates in, and all of their descendant threads. No SSA
+    // operands and no payload -- the owning instance is resolved in the backend, off
+    // the body this lands in (see Inst::Tag::ProgramExit).
+    Index program_exit(SourceLoc loc);
     // Unique/priority case violation report (LRM 12.5.3). `banner` is the
     // compile-time prefix "<file>:<line>: "; `kind` selects the message (0 = no
     // item matched, 1 = overlapping items). Non-fatal, warns and returns. No SSA

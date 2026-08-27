@@ -478,6 +478,8 @@ const char* tag_name(Inst::Tag tag) {
             return "disable_remote";
         case T::DisableAbort:
             return "disable_abort";
+        case T::ProgramExit:
+            return "program_exit";
         case T::DeferFlush:
             return "defer_flush";
         case T::Fflush:

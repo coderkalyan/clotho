@@ -1310,6 +1310,27 @@ declaration, which would have to be hoisted back out through the instantiation t
 reach `sva::Request`; `$global_clock`; end-of-simulation coverage reporting for
 `cover property` (already deferred at `docs/TODO.md:738-740`).
 
+One more, and it is a *region* refusal rather than a property-layer one, so it
+sits at the leading-clock resolution beside the posedge/negedge check: a leading
+clocking event that is a **program signal** (LRM 24.3 — a program port, or
+anything a program's own code writes). LRM 24.3.1 requires the scheduler to
+"iterate from the reactive region set back around the outer loop in Figure 4-1,
+through the Observed region, where the assertion is evaluated"; clotho's loop does
+not close that way — the reactive drain's re-settle reaches the active drain or
+Postponed, never the Observed block — so the monitor would step a full time slot
+late, silently, and only when no Active-region process happens to read the same
+clock. It is refused rather than repaired for a reason specific to §3.4's design:
+a monitor detects its clock edge from the **Preponed shadow**, which by
+construction does not change within a step, so the natural fix — re-entering
+Observed a second time in the slot — would step the automaton **twice for one
+clocking event**, a wrong verdict rather than a late one. A clocking block is safe
+under that same second pass, which is why the two constructs get two refusals. A
+real fix needs a per-monitor per-step latch (the monitor's analogue of a clocking
+block's `clocking_fired`, cleared by `finalize_preponed`) plus a termination
+argument for the extra pass. Full reasoning, with the three region-loop block
+names and the second candidate fix, in `docs/design/program-blocks.md` §10; a
+design-signal clock is unaffected, and LRM 24.4 asks for one anyway.
+
 Named `sequence` / `property` declarations and their instantiation work
 (`tests/sva/diff_namedseq.sv`). slang hands back an already-expanded
 `AssertionInstanceExpression::body`, so an instance is a recursion into that body

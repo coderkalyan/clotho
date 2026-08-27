@@ -221,6 +221,38 @@ struct Process {
     // false: it runs only when a wait event fires. Only meaningful with a non-empty
     // wait list (a sensitivity-less process already runs once via the seed loop).
     bool self_start = false;
+    // A continuously-active process whose home region is the reactive region set
+    // rather than the active one: a continuous construct declared inside a
+    // `program` (LRM 24.3.1 -- "The continuous assignment assign tclk = clk;
+    // would also be scheduled in the Reactive region"), and, once ports land, a
+    // program port copy. Such a body is seeded and woken onto the reactive ring
+    // and its parks are reactive-home; nothing else about it differs from an
+    // ordinary Activation::Always process.
+    //
+    // A flag rather than a new Activation, because the two questions are
+    // orthogonal. Activation says WHEN a body runs, and is dispatched on
+    // throughout the frontend, the analysis pass, the backend and the printer;
+    // this says only which ring runs it. Every Activation::Always path -- static
+    // subscription, the self_start time-zero settle, comb fusion, trigger masks,
+    // ProcessFacts -- applies verbatim to a program's continuous assign, and a
+    // new enumerator would fork all of them.
+    //
+    // Never set on an Activation::Reactive process: a program `initial` is
+    // one-shot and states its region in the activation itself. The backend relies
+    // on that to keep the LRM 24.3 implicit-finish countdown counting `initial`
+    // procedures only (build_program_fns). Costs nothing: it lands in the padding
+    // the flags around it already leave before `span`.
+    //
+    // This says "program code" for the REGION question only. It does NOT make the
+    // process a thread originating in an `initial` procedure, which is the
+    // separate test LRM 24.3's termination rule and 24.7's `$exit` are scoped by:
+    // 24.7 ignores a call "from a thread or its descendent thread that does not
+    // originate in an initial procedure in a program", and a continuously-active
+    // process never does. So the backend's per-program termination, its
+    // implicit-finish countdown and its `$exit` owner closure all key on
+    // Activation::Reactive and deliberately treat a reactive-home process as
+    // NON-originating -- correct on the clause, not conservative.
+    bool reactive_home = false;
     // Whether code this process runs may spawn a background process — a
     // `fork … join_none` inside a FUNCTION it calls (LRM 13.4.4). The LRM allows
     // that only when "the thread calling the function is created by an initial

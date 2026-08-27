@@ -1692,5 +1692,5 @@ TEST_CASE("a container port connection is refused at lowering") {
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK(r.diagnostic_text().find("module port connection is not supported") != std::string::npos);
+    CHECK(r.diagnostic_text().find("associative-array port connection is not supported") != std::string::npos);
 }

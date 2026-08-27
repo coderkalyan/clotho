@@ -218,7 +218,7 @@ close.
    **The constraint V2 inherits from this, and it is the sharpest one in the
    file:** the epilogue is reachable ONLY from structured returns —
    `emit_finish_exit:14583`, `lower_ret:16357`, and the structured fall-through
-   at `:3663`. No suspend point branches to it (`emit_suspend_raw:3898-3906`
+   at `:3663`. No suspend point branches to it (`emit_suspend:3898-3906`
    wires case 1 to `coro_cleanup_bb_` and case 0 to the resume block, nothing
    else). A force-woken activation therefore cannot be "unwound" by the
    disabler in any sense; it must re-enter at its own resume block and branch to
@@ -242,7 +242,7 @@ close.
    (`:832-838`) valid in any block. A `build_disable_epochs` /
    `disable_epoch_ptr` pair is a near-literal transcription of that with `i32`
    → `i64` and "process index" → "target index".
-3. **A destroy edge already exists at every suspend.** `emit_suspend_raw`
+3. **A destroy edge already exists at every suspend.** `emit_suspend`
    (`src/ir/LlvmBackend.cpp:3898-3906`) switches `coro.suspend` with case 1
    wired to `coro_cleanup_bb_`. It is unreachable in practice today.
 

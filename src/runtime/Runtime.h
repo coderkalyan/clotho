@@ -1682,6 +1682,17 @@ void* rt_proc_mark_kill(void* pcb, uint32_t with_self);
 // tested here -- after the unlink, while the parent is still reachable.
 void* rt_proc_complete(void* pcb, void** fork_waiters_out);
 
+// Move `from`'s live children under `to`, leaving `from` childless. LRM 24.3's
+// per-program termination: a program `initial` that reaches its end while a
+// SIBLING `initial` of the same program is still running must keep its
+// descendants reachable, because the clause terminates them only once EVERY
+// `initial` of that program has ended. rt_proc_complete would re-parent them onto
+// the ending thread's own parent, which is null for a statically created process,
+// dropping them out of the tree for good; so a program body hands them to its
+// program instance's termination root first -- a static block that is a tree node
+// and never a thread.
+void rt_proc_adopt(void* to, void* from);
+
 // Drop the reference the live thread held. Frees a pooled block whose last
 // reference this was.
 void rt_proc_thread_done(void* pcb);

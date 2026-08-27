@@ -430,7 +430,7 @@ RUNNING/WAITING for the whole run, which is correct: only `kill`, `disable`, or
 | transition | where |
 |---|---|
 | → RUNNING at creation | ramp, with the PCB store |
-| RUNNING → WAITING | `emit_suspend` / `emit_suspend_raw` (`:4861-4903`), immediately before the `coro.suspend` |
+| RUNNING → WAITING | `emit_suspend` (`:4861-4903`), immediately before the `coro.suspend` |
 | WAITING → RUNNING | the resume block of the same suspend |
 | → FINISHED / KILLED | the completion sequence (§5.3) |
 | → SUSPENDED | `suspend()` |
@@ -534,6 +534,81 @@ Four things must happen that a naive "mark and wake" gets wrong:
    be gated on `design_uses_process_` as well as `design_uses_disable_` (`:5116`).
 4. **Nothing is destroyed from outside.** The force-wake guarantees the killed
    thread runs its own poll once, so there is no need for a lazy-reap path (§12).
+5. **A thread marked before it has ever run must not run its head segment.** Found
+   landing LRM 24.3 (`program-blocks.md` §5.1), and it applies to `kill`,
+   `disable fork` and `$exit` alike. `pcb->acts` is linked in the BODY, after the
+   initial suspend, so a thread that has been ramped and queued but not yet resumed
+   has no activation for the mark walk to force-wake: it is marked, correctly
+   skipped by the walk, and then resumed by the drain anyway. Every other abort poll
+   sits AFTER a suspending op, so such a thread would run everything up to its first
+   park — printing, storing, even forking threads of its own — after having been
+   terminated.
+
+   Fixed by testing the mark once on body entry. **Two body kinds need it, and they
+   are the whole set:** a fork child (`lower_task`), reached by `kill` /
+   `disable fork` on a just-spawned `join_none` child; and a **program `initial`**
+   (`lower_group`), reached by `$exit`, which names every `initial` of its instance
+   by that procedure's STATIC control block — including one the seed loop has queued
+   but the reactive drain has not yet resumed. Nothing can name a design process
+   before it starts, so no other body kind is exposed. A program `initial` caught
+   this way leaves through `program.end`, which counts it down: 24.3 asks only that
+   a procedure have "reached its end", and one terminated by `$exit` has. Invariant
+   4's "runs its own poll once" now holds for a thread that had not started as well
+   as for one that had.
+
+   **Why those two are the whole set**, by enumeration of every way a mark can reach
+   a thread — re-check this if you add a `lower_proc_kill` caller:
+
+   | caller | target | can it name an unstarted thread? |
+   |---|---|---|
+   | `p.kill()` | a runtime `process` handle | **no** — the only producer of one is `process::self()`, so the thread has executed inside itself; `process` is abstract and cannot be constructed |
+   | `disable fork` | `pcb_`, `with_self=false` | **yes**, a just-spawned `join_none` child — the `lower_task` entry test |
+   | `$exit` (24.7) | each `initial`'s STATIC slot, `with_self=true` | **yes**, a seeded-but-unresumed `initial` — the `lower_group` entry test |
+   | `$exit` / 24.3 | the program instance's termination root | not a thread at all |
+
+   `proc_pcb_slot()` has exactly three callers — its own definition, the `pcb_`
+   assignment in `lower_group`, and `$exit` — so `$exit` is the only thing in the
+   tree that names a thread by static slot, which is what makes the third row the
+   only static-slot exposure.
+
+   Stated generally, because the table is the special case: `pcb->acts` is linked in
+   `start_bb`, i.e. only on a thread's FIRST RESUME, so **any** future way of naming
+   a thread before that reopens this — not merely a new `lower_proc_kill` caller.
+   Naming by handle cannot, since a `process` handle only exists once the ramp has
+   returned; naming by static slot can, which is what `$exit` does.
+
+6. **A force-wake must not push a thread that is RUNNING.** The walk skips only the
+   CALLING thread (`p == pcb_`), and the runtime cannot tell running from queued, so
+   the scheduled flag is what stands between a force-wake and a second queue entry
+   for a thread that is neither parked nor the caller. That invariant held for an
+   always loop (flag held set across the body) and for any woken thread (the waker
+   sets it), but **not** for a program `initial` in its FIRST activation: the seed
+   loop enqueued it without marking it scheduled. `$exit` from a `fork ... join`
+   child reaches exactly that state — `join` resumes a child inline, so the parent is
+   on the stack, its park record null, its flag clear — and the push would queue a
+   handle whose frame the resumer is about to destroy. Fixed by marking a Reactive
+   process scheduled as the seed loop enqueues it, which is what the `self_start` arm
+   beside it already did for the analogous double-push. "Set while running, clear
+   while parked" now holds for every body kind.
+
+Two operations were added to this machinery by clause 24 and belong here rather
+than in `program-blocks.md`, since both are general:
+
+- **`rt_proc_adopt(to, from)`** moves `from`'s live children under `to`. Needed
+  because `rt_proc_complete` re-parents an ending thread's children onto its own
+  parent, which is **null** for a statically created process — so a program with two
+  `initial`s would drop the first one's children out of the tree entirely before the
+  second ended. A program instance therefore owns a static block that is a tree node
+  and never a thread (`clotho.program_root`), and every program body hands its
+  children to it on the way out. Nothing else in the tree needs a non-thread node,
+  which is why this is a separate entry point rather than a change to
+  `rt_proc_complete` — that function is on the path of every thread completion in
+  every design.
+- **`lower_proc_kill(..., branch_on_self)`**, defaulted true. False for exactly one
+  caller, `$exit`, which kills several roots in a row: the existing `with_self`
+  self-branch fires immediately after the matching root's walk, which would leave the
+  walks after it unreachable. `$exit` marks every root first, then ends the calling
+  thread with one unconditional branch.
 
 ### 7.2 `await`
 
@@ -647,6 +722,25 @@ someone touches both.
 `DesignUses::process` (`src/ir/Analysis.h:164-182`) is set by any `ProcCtl` /
 `ProcWait` op, in processes **or** functions (like `disable`, unlike `defer`). With
 it clear, nothing below is emitted and `--emit llvm` must be byte-identical.
+
+**Two later sources turn the machinery on without the source naming `process`**, both
+from LRM clause 24, because a program's termination rules ARE this subtree abort and
+its tree is these control blocks (`docs/design/program-blocks.md` §5):
+
+- `Inst::Tag::ProgramExit` (`$exit`, 24.7) sets the fact directly. It has to: 24.7
+  terminates a program's `initial` procedures themselves, so the threads it marks are
+  the statically created ones, and a program with no `fork` anywhere still needs their
+  blocks.
+- 24.3's implicit descendant termination sets it in the backend rather than the
+  analysis, at the one site that already folds design-wide questions into the flag:
+  `design_uses_process_ = facts_.uses.process || (has_program_initial() && design_forks())`
+  (`src/ir/LlvmBackend.cpp`, `run()`). Narrowed by `design_forks()` deliberately —
+  with no fork in the design a program `initial` has no descendant thread, so the
+  walk is provably empty and a program-only design keeps paying nothing.
+
+So "no `process` in the source" no longer implies "no PCBs"; "no `process`, no
+`$exit`, and no `fork` alongside a program" does. A design with no program at all is
+unaffected either way.
 
 With it set, the design pays:
 

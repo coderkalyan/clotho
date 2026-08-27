@@ -581,14 +581,17 @@ function is LEGAL per 13.4.4, that is the right answer — no exclusion, no refu
 
 ### V5.4 Region: already handled, including the shared-body hazard
 
-Region is a compile-time property of the lowered body (`reactive_home()`) plus a tag
-on parked handles, and a function already gets the compile-time answer from
-`build_reactive_fns` / `build_program_fns`. The interesting case — a function reached
-both as reactive code and from ordinary code, which is lowered once and can record
-only one home region — is already refused: `reject_unsupported_reactive` runs over
-every reactive-reachable FUNCTION and its `Fork` arm calls
-`reject_shared_reactive_suspend`. A function is likelier than a task to be shared
-that way, so that guard stops being theoretical with V5; it needs no change.
+Region is a property of the calling THREAD, not of the lowered body (LRM 24.3.1),
+and `build_shared_home_fns` classifies every subroutine accordingly: reached only
+by reactive-home code it folds Reactive, only by ordinary code it folds Active, and
+by both it takes its caller's answer through a gated `i8 home` ramp parameter
+(`docs/design/program-blocks.md` §6.1). A FUNCTION is covered on the same terms as
+a task, which matters for V5 precisely because a function is likelier to be shared:
+it cannot suspend itself, but it passes its home on to a `join_none` child it
+spawns, and that child parks. This needs no change for V5.
+
+The refusal this section used to name — `reject_shared_reactive_suspend`, one
+lowering, one home region — is gone.
 
 ### V5.5 What V5 alone does not buy: the LRM's own example
 

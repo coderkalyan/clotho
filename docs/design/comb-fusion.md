@@ -94,9 +94,17 @@ is not overfit to the target benchmark.
 
 - Group = connected component of the writer→reader wake graph restricted to
   eligible singleton processes (`wake_adj_` retained from
-  `compute_subscription_order`, union-find, equal `self_start` required);
-  components > 256 chunk into rank-contiguous segments (a leftover chunk of
-  one stays a singleton).
+  `compute_subscription_order`, union-find, equal `self_start` **and equal
+  `reactive_home`** required); components > 256 chunk into rank-contiguous
+  segments (a leftover chunk of one stays a singleton).
+- Home-homogeneous because a group is one function pushed onto one ring: a
+  program's continuous assign is reactive-home (LRM 24.3.1,
+  docs/design/program-blocks.md §3) and fusing it with an Active-home process
+  would run half the group in the wrong region. The V1 identical-sensitivity
+  bucket key carries `reactive_home` for the same reason. A reactive-home group
+  is also kept off the thunk path: the thunk tag is pointer bit 0 and the
+  reactive-home tag is bit 1, and the scheduler's reactive test requires bit 0
+  clear, so a pointer carrying both reads as neither.
 - Members ordered by existing `sub_order_` rank (DAG by construction —
   nontrivial SCCs excluded via `scc_nontrivial_`).
 - **Interior guard**: only candidates whose entire sensitivity is

@@ -525,6 +525,10 @@ Index Builder::disable_abort(SourceLoc loc) {
     return emit({ Inst::Tag::DisableAbort, Inst::Payload{ .none = 0 } }, loc);
 }
 
+Index Builder::program_exit(SourceLoc loc) {
+    return emit({ Inst::Tag::ProgramExit, Inst::Payload{ .none = 0 } }, loc);
+}
+
 Index Builder::str_putc(Index str, Index index, Index ch, SourceLoc loc) {
     const ExtraIndex extra = add_extra(StrPutcInfo{ index, ch });
 

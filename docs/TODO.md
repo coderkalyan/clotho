@@ -3994,7 +3994,17 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   concatenations); a non-posedge/negedge or multi-signal **clocking event**; an
   **assertion item declared inside a block** (LRM 14.3 with 16.16(b)'s rules); and
   a **sampled value function in procedural code** (LRM 16.9.3), which needs
-  history rings keyed to the default clocking rather than to a monitor.
+  history rings keyed to the default clocking rather than to a monitor; and a
+  **clocking event that is a program signal** (LRM 24.3 — a program port, or
+  anything a program's own code writes), because the block samples in Observed
+  while such a clock changes in Reactive, one region later. LRM 24.3.1 requires
+  the scheduler to iterate from the reactive region set back around the outer
+  loop through Observed, and clotho's loop does not close that way, so the block
+  would sample a full time slot late — silently, until now. Refused rather than
+  fixed: pointing the reactive re-settle at the Observed block hangs (it bumps no
+  oscillation counter), and re-entering Observed conditionally would step an SVA
+  monitor's automaton twice for one clocking event. A **design**-signal clock is
+  unaffected and is what LRM 24.4 asks for; see docs/design/program-blocks.md §10.
 - [~] **Program blocks** — `program`/`endprogram` elaborate and simulate. A
   program instance goes through the ordinary instance path (own scope,
   variables, functions, non-suspending tasks), and its `initial` procedures run
@@ -4003,19 +4013,126 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   `@`, `wait` or a nonzero `#delay` and resumes back into Reactive — each
   suspend wakes in Active, re-queues onto the reactive ring and suspends again
   (`emit_suspend`), because a waker does not know its sleeper's region. The LRM
-  24.6 implicit `$finish` (simulation ends when the last program initial
+  24.3 implicit `$finish` (simulation ends when the last program initial
   completes) is implemented as a countdown of live program initials. The region
   order against an Active-region cascade is covered by
   `tests/sva/diff_program_ref.sv` and `tests/program_test.cpp`.
 
   Before this, `program` was accepted and silently lowered as a **module** —
   Active-region initials, no implicit finish — a silent miscompile that
-  predated the region set. Remaining gaps, all guarded loud: program **ports**
-  (24.3 clocking/skew semantics unimplemented), **`$exit`** (24.5, needs program
-  termination), **`#0`** inside a program (would resume through Inactive rather
-  than Re-Inactive, 4.4.2.7), and a **suspending task** called from a program
-  (the re-entry would push the task's handle, not the caller's). `always` in a
-  program, nested programs and anonymous-program members are rejected by slang.
+  predated the region set. `always` in a program, nested programs,
+  anonymous-program members, a module instance in a program, a design reference
+  to a program signal and a design call of a program subroutine are all
+  rejected by slang.
+
+  Every remaining gap is scoped, with LRM quotes and code sites, in
+  docs/design/program-blocks.md. A program driver of a **multiply-driven
+  (resolved) net** — a port copy, or a hierarchical `assign` — used to be
+  refused; it now works, because such a net's resolver is **reactive-home**
+  (24.3.2: "the driving and resolution of nets on the other side of a program
+  port connection also occurs in the reactive region set"). A net has one
+  resolver, hence one resolution region, so this deliberately moves the
+  resolution of that net's *design-side* drivers into Reactive as well; the
+  clause does not distinguish which driver changed, and the alternative —
+  per-driver resolution regions — is in no sentence of the LRM. A net with no
+  program driver keeps its Active-home resolver, which is pinned by a control
+  test. `#0` inside a program does park in Re-Inactive (4.4.2.7) and is covered
+  by `tests/program_test.cpp`.
+
+  **A clocking block or concurrent assertion clocked by a program signal is
+  refused, loudly, and not fixed** — the last known gap in clause 24, and the one
+  that was still a silent wrong answer. 24.3.1: "If an assertion is clocked by
+  activity on a program object (not recommended), the scheduler will iterate from
+  the reactive region set back around the outer loop in Figure 4-1, through the
+  Observed region, where the assertion is evaluated." Clotho's loop does not:
+  `wheel.check` runs the Observed bodies and re-settles to the active drain, and
+  the reactive drain's `reactive.done` re-settle reaches the active drain or falls
+  through to Postponed — never back to `wheel.check`. So a clock written only in
+  the reactive region set (a program `initial`, a program `assign`, or an `input`
+  port copy, all reactive-home per 24.3.1) is not seen until the next slot's
+  Observed pass. It bit only when no Active-region process read the same signal,
+  since any Active reader's wake re-enters the loop and catches the edge by
+  accident. Two candidate fixes, both rejected for now and both recorded so they
+  are not re-derived: pointing `reactive.done`'s else-edge at `wheel.check` HANGS
+  (that edge pops no ring entry, so it bumps no oscillation counter and the guard
+  never trips), and a conditional Observed re-entry re-runs every Observed body in
+  the slot — survivable for a clocking block, which detects its edge against a
+  one-slot latch, but not for an SVA monitor, which detects its clock edge from
+  the Preponed shadow and would step its automaton twice for one clocking event.
+  A real fix needs a per-monitor per-step latch (clause 16 work) plus a
+  termination argument for the extra pass. A **design**-signal clock — including
+  one reached hierarchically or through an interface port — is unaffected, which
+  is what LRM 24.4 asks for anyway. Analysis in docs/design/program-blocks.md
+  §10; refusals and positives in `tests/program_test.cpp`.
+
+  **The home region belongs to the THREAD, not the body** (LRM 24.3.1: "a
+  section of sequential code anywhere in the design or testbench inherits the
+  scheduling region of the thread that calls it"; 24.5: "when a task within a
+  design module is called from a program, it shall use the reactive region set
+  for its scheduling activities"). A **suspending task called from a program**
+  used to be refused because a body lowered once could record only one home;
+  `build_shared_home_fns` now intersects the reactive-home call closure with the
+  ordinary one, and a body in both takes its home from a gated `i8 home` ramp
+  parameter beside `proc` instead of folding one. Unshared bodies still fold —
+  Reactive if only program code reaches them, Active otherwise — and a design
+  with no shared body emits the signatures it always did. `expect` (16.17) is
+  now one user of that slot rather than a special case, and inheritance is
+  transitive because each call site passes its own CURRENT home rather than its
+  lexical one. 24.5's own `module … task T; #5; endtask` example, a waiting class
+  method, two-level inheritance, a task called from both a program and a module
+  in one design, and a module-only task pinned to Active are covered in
+  `tests/program_test.cpp`. The sibling backend refusal for an assertion action
+  block sharing a body (`reject_shared_reactive_suspend`) is gone with it, and
+  was unreachable anyway: the frontend refuses any user-task call in an action
+  block because it cannot trace the body, which is a separate limit that stands.
+
+  **Ports are done** (LRM 24.3, 24.3.2). A program port is an ordinary module
+  port — 24.3: "Program port declaration syntax and semantics are the same as
+  those of modules" — carrying one extra rule: 24.3.2 puts the copy process in
+  the reactive region set, in both directions, so `wire_ports` emits its copies
+  for a program child with `Process::reactive_home` set. An interface or modport
+  port needs no copy at all (both sides canonicalize onto the interface
+  instance's signal) and `inout`/`ref` needs none either (`build_inout_aliases`
+  collapses both sides onto one signal), so those two cost nothing but tests.
+  There is no such thing as port skew, which is what the old refusal claimed.
+  Value ports both directions, interface and modport, a clocking block sampling a
+  port, `inout`, 24.3's own declaration shape, unconnected, `.*`, non-ANSI,
+  `bind` and width coercion are covered in `tests/program_test.cpp`.
+
+  **Per-program termination (24.3) and `$exit` (24.7) are done.** A program
+  instance is `Process::scope` over its `Activation::Reactive` processes, with a
+  live-`initial` counter and a static termination-root control block each
+  (`clotho.program_inst_live`, `clotho.program_root`); when an instance's counter
+  reaches zero it terminates that instance's descendant threads through the
+  `process::kill` subtree abort, and the design-wide counter then fires the
+  implicit `$finish` exactly as before. `$exit` is the same abort over the
+  instance's `initial`s as well, and counts nothing itself — each terminated
+  `initial` still passes through the program-end path exactly once. An `initial`
+  killed by `disable` or `process::kill` counts too, since 24.3 asks only that it
+  have "reached its end". Two `$exit` refusals remain, both loud: inside a
+  subroutine that no single program instance owns (24.7 answers by the calling
+  thread, and a shared body cannot name it — the thread-carried home region is
+  the mechanism that would), and inside a **function**, which has no abort exit
+  for its caller to poll.
+
+  A **continuous construct inside a program** is reactive-home per 24.3.1 ("the
+  continuous assignment `assign tclk = clk;` would also be scheduled in the
+  Reactive region"). `ir::Process::reactive_home` marks a continuously-active
+  process whose body belongs to the reactive region set: it is seeded onto
+  `@clotho.reactive`, its static subscription records a home-tagged handle so
+  every waker routes it there, and its parks are reactive-home. A flag rather
+  than a new `Activation`, which answers the orthogonal question of *when* a body
+  runs and is dispatched on everywhere. Design readers of a program-driven signal
+  therefore wake into the Active region of 24.3.2's "next iteration", the
+  ordering that clause's own example asks for. A program driver of a *resolved*
+  (multiply-driven) net takes the same route one level down: 24.3.2 puts the
+  **resolution** in the reactive region set too, so `emit_wire_resolvers` marks
+  that net's resolver reactive-home (`program_driven_nets_`, recorded at
+  `alloc_driver_slot` — the choke point every driver slot passes through — and at
+  `register_net_force_site`, since a net `force` is a resolver overlay rather
+  than a slot). One net, one resolver, one resolution region: the net's
+  design-side drivers resolve in Reactive as well, which the clause's wording
+  supports and per-driver resolution regions do not.
 
 ### Concurrent assertions (SVA)
 
@@ -4718,8 +4835,9 @@ project with its own algorithm, not tail cleanup on the property layer:
   task and function forms. Refused by default; gated behind an explicit
   `--allow-system=const|full` operator opt-in with a compile-time gate plus a
   runtime backstop (a security-motivated deviation).
-- [ ] **`$random` family completeness** and command/severity tasks
-  (`$exit` semantics, `$stop` levels at `Lower.cpp:1021`).
+- [ ] **`$random` family completeness** and command/severity tasks (`$stop`
+  levels at `Lower.cpp:1021`). `$exit` semantics are done — LRM 24.7, see the
+  Program blocks entry above.
 - [x] **Conversion functions** — `$itor`, `$rtoi`, `$bitstoreal`, `$realtobits`,
   `$shortrealtobits`, `$bitstoshortreal`.
 

@@ -116,7 +116,7 @@ They are deliberately not on the CLI. §4.2.
 
 2. **Between two suspension points, a process body is straight-line native
    code with zero polls.** The only suspension mechanism is
-   `emit_suspend_raw` (`LlvmBackend.cpp:3796`) wrapping `llvm.coro.suspend`,
+   `emit_suspend` (`LlvmBackend.cpp:3796`) wrapping `llvm.coro.suspend`,
    and the complete set of sites is: initial suspend (`:2827`), the always-loop
    wait (`:2868`), `@`/`wait` (`:3980`), `#delay` and `#0` (`:3854`, `:6922`),
    a blocking task call (`:15576`), and `fork`/`join` (`:15476`). The one flag

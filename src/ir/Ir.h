@@ -2241,6 +2241,22 @@ struct Inst {
         // this enum deliberately: inserting mid-enum renumbers every later tag and
         // changes the monitor digests sva_test pins.
         ClassImplements,
+
+        // -- Program control tasks (LRM 24.7, docs/design/program-blocks.md §5.2) --
+        // `$exit()`: a statement with no payload and no result. It terminates every
+        // `initial` procedure of the program instance the CALLING THREAD originates
+        // in, plus all of their descendant threads.
+        //
+        // The instance is deliberately NOT carried here. 24.7 scopes the effect by
+        // the thread ("from a thread or its descendent thread originating in an
+        // initial procedure of a program block"), not by the lexical site, so the
+        // owner is a property of the body this op ends up in: the backend reads it
+        // off the program `initial` being lowered, or off a per-function owner
+        // closure for a fork child or a subroutine, and refuses loudly where no
+        // single owner exists. Appended at the end of this enum deliberately, like
+        // ClassImplements above: inserting mid-enum renumbers every later tag and
+        // changes the monitor digests sva_test pins.
+        ProgramExit,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2566,6 +2582,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Break:
         case T::Continue:
         case T::DisableAbort:
+        case T::ProgramExit:
         case T::RetVoid:
         case T::DumpVars:
         case T::DumpOff:

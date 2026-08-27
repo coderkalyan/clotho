@@ -916,7 +916,14 @@ public:
         // ring-overflow guard, which was fork-only until force-wake existed.
         design_uses_disable_  = facts_.uses.disable;
         // Gates every process-control site (docs/design/process-class.md §9).
-        design_uses_process_  = facts_.uses.process;
+        // LRM 24.3 turns it on with no mention of `process` in the source at all:
+        // when a program's `initial` procedures have all ended, that program
+        // terminates their descendant threads, and that IS the `kill` subtree walk,
+        // whose tree is the control blocks. Gated on the design being able to spawn
+        // a descendant at all -- with no fork anywhere a program `initial` has
+        // none, the walk is provably empty, and a program-only design keeps paying
+        // nothing for the blocks.
+        design_uses_process_ = facts_.uses.process || (has_program_initial() && design_forks());
         // The reactive region set (LRM 4.4.2.5 - 4.4.2.7): wanted when there is
         // pass/fail code to schedule, a process in Observed that could schedule
         // some, or a program block, whose `initial` procedures run in Reactive
@@ -924,10 +931,15 @@ public:
         design_uses_reactive_ = facts_.uses.reactive || has_observed() || has_program() || has_renba();
         if (design_uses_reactive_) {
             // Before any body lowers: the classification decides which region a #0
-            // inside reactive code parks in, and both queues have to exist ahead of
-            // lower_finish, which empties whichever of them were created.
+            // inside reactive code parks in, both queues have to exist ahead of
+            // lower_finish, which empties whichever of them were created, and
+            // build_shared_home_fns decides the SIGNATURE every subroutine ramp
+            // gets (see declare_task), so it has to precede declare_function.
             build_reactive_fns();
             build_program_fns();
+            build_shared_home_fns(); // after both: intersects their two closures
+            build_program_instances();
+            build_program_exit_owners(); // after build_program_instances: seeds from its partition
             ensure_reactive_queue();
             if (reactive_has_delay_) {
                 ensure_re_inactive_queue();
@@ -4855,6 +4867,18 @@ private:
         // wall-neutral. Groups past the cap keep the merged root body.
         constexpr size_t outline_max_members = 16;
         const uint32_t g_ = group_of_[proc_index];
+        // A thunk group is not a thread: no frame, no handle, no control block, and
+        // proc_arg's own contract already says such a body passes null. Reset here,
+        // ahead of both thunk paths, because they return before the coroutine path's
+        // reset at the ramp -- a leftover value is a constant GEP naming some
+        // PREVIOUSLY lowered process's block, so a function called from a thunk would
+        // be handed the wrong thread. Today nothing dereferences it (a thunk cannot
+        // suspend or park, so no poll or state store reads it, and a design with no
+        // process op has no `self()` to observe it), which is why it has never
+        // bitten; LRM 24.3's termination turning the blocks on for any program that
+        // forks widens the population it is latent in, so fix it rather than reason
+        // about it again.
+        pcb_ = nullptr;
         if (config_.split && config_.outline && thunk_group_[g_] &&
             members.size() > 1 && members.size() <= outline_max_members &&
             group_unit_anchor_[g_] == SignalSlot::no_anchor &&
@@ -5002,12 +5026,23 @@ private:
         silent_stores_ = proc.activation == Activation::PreInit ||
                          proc.activation == Activation::Preponed;
         // A program block's `initial` (LRM 24.3). Drives the region-restoring
-        // resume in emit_suspend and the 24.6 implicit finish below.
+        // resume in emit_suspend and the 24.3 implicit finish below.
         in_program_body_ = proc.activation == Activation::Reactive;
-        // An `expect` in this body moves the thread to Reactive for good, so its
-        // home has to be read at each park rather than folded (see home_ptr).
+        // A continuous process declared inside a program (LRM 24.3.1): reactive-
+        // home like a program `initial`, but NOT one -- it never reaches its end,
+        // so it must stay out of in_program_body_, which is what counts the
+        // implicit-finish countdown down. Fusion groups are home-homogeneous by
+        // group key (compute_fusion_groups), so the front member answers for the
+        // whole group.
+        in_reactive_home_body_ = proc.reactive_home;
+        // A process is a thread ROOT: it has no caller to inherit a home from, so
+        // its lexical answer above is the whole truth and home_ptr, if one is
+        // needed at all, seeds from it. The one thing that can still change it is
+        // an `expect` (LRM 16.17), which moves the thread to Reactive for good and
+        // so has to be read at each park rather than folded (see home_ptr).
         body_home_is_runtime_ = ir_has_expect_wait(proc.ir);
         home_ptr_             = nullptr;
+        home_arg_             = nullptr;
 
         auto* none     = llvm::ConstantTokenNone::get(ctx_);
         auto* null     = llvm::ConstantPointerNull::get(ptr_ty);
@@ -5101,6 +5136,19 @@ private:
         // once. Branching to coro.cleanup instead would free the frame underneath
         // the drain loop, which then reads it — a use-after-free.
         coro_final_bb_    = llvm::BasicBlock::Create(ctx_, "coro.final", fn_);
+        // Where a program `initial` counts itself down and terminates its program's
+        // descendant threads (LRM 24.3, emit_program_end). Its own block rather than
+        // the fallthrough because an `initial` aborted by `disable` or
+        // `process::kill` has "reached its end" for the clause and must count too,
+        // so proc_abort_exit sends a program body here instead of straight to
+        // coro.final. A $finish still branches straight there (emit_finish_exit) and
+        // is deliberately not counted -- it has already ended the simulation.
+        program_end_bb_ = in_program_body_ ? llvm::BasicBlock::Create(ctx_, "program.end", fn_) : nullptr;
+        // The program instance a `$exit` in this body names (LRM 24.7). For a
+        // program `initial` that is simply the instance it belongs to; a subroutine
+        // and a fork child get theirs from the owner closure instead (build_function
+        // / lower_task).
+        cur_program_inst_ = in_program_body_ ? program_inst_of(proc_index) : kNoProgramInst;
 
         b_.SetInsertPoint(coro_cleanup_bb_);
         if (gc_frame) {
@@ -5156,6 +5204,27 @@ private:
         emit_proc_publish_rng();
         acts_node_ = nullptr;
         emit_pcb_acts_link();
+        // A program `initial` can be terminated before it has ever run, and this is
+        // the only body kind that can: `$exit` (LRM 24.7) names every `initial` of
+        // its program instance by that procedure's STATIC control block, including
+        // one the seed loop has queued but the reactive drain has not yet resumed.
+        // Such a procedure has no activation for the mark walk to force-wake --
+        // pcb->acts is linked just above, AFTER the initial suspend, so it is still
+        // null while the process sits queued -- and every other abort poll sits after
+        // a suspending op, so without this test it would run everything up to its
+        // first park after having been terminated. The same hole as an unstarted fork
+        // child's (lower_task), reached by a different route; the two are the whole
+        // set, since nothing can name a design process before it starts.
+        //
+        // It leaves through program.end, which counts it down: 24.3 asks only that a
+        // procedure have "reached its end", and one terminated by $exit has.
+        if (in_program_body_ && pcb_ != nullptr) {
+            auto*        live = llvm::BasicBlock::Create(ctx_, "program.initial.live", fn_);
+            llvm::Value* ctl  = b_.CreateLoad(b_.getInt32Ty(), pcb_field(pcb_, kPcbCtl));
+            b_.CreateCondBr(
+              b_.CreateICmpNE(b_.CreateAnd(ctl, b_.getInt32(kProcAbort)), b_.getInt32(0)), program_end_bb_, live);
+            b_.SetInsertPoint(live);
+        }
         const bool always_loop = proc.activation == Activation::Always && !proc.wait_events.empty();
         if (always_loop) {
             // An always block with a sensitivity list. It is subscribed to its
@@ -5198,41 +5267,13 @@ private:
 
         // Final suspend: the default edge returns the (now-done) handle to the
         // resumer, which destroys it; case 1 is the destroy re-entry; resuming a
-        // finished coroutine (case 0) is undefined, so trap. The LRM 24.6 check
-        // below runs first, on the fallthrough from the body.
-        //
-        // LRM 24.6: when every program `initial` has completed, the simulation
-        // ends on its own, without waiting for the modules. Counted down here, at
-        // the natural end of the body -- an explicit $finish branches straight to
-        // coro_final_bb_ and skips this, having already ended things itself.
+        // finished coroutine (case 0) is undefined, so trap. The LRM 24.3 rules
+        // run first, in program.end, which every path by which a program `initial`
+        // reaches its end goes through (emit_program_end, proc_abort_exit).
         if (in_program_body_) {
-            auto*        i32  = b_.getInt32Ty();
-            auto*        live = program_live_ptr();
-            llvm::Value* n    = b_.CreateSub(b_.CreateLoad(i32, live), b_.getInt32(1));
-            b_.CreateStore(n, live);
-            auto* last = llvm::BasicBlock::Create(ctx_, "program.last", fn_);
-            auto* more = llvm::BasicBlock::Create(ctx_, "program.more", fn_);
-            b_.CreateCondBr(b_.CreateICmpEQ(n, b_.getInt32(0)), last, more);
-
-            b_.SetInsertPoint(last);
-            // Same cooperative stop $finish takes (lower_finish): report, then
-            // empty the rings so nothing else queued at this instant runs. The
-            // body still leaves through its own final suspend, so its frame is
-            // released by the resumer exactly as on a normal completion.
-            llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
-            b_.CreateCall(finish_coop_fn(),
-                          { b_.CreateGlobalString("implicit $finish from program"), now, b_.getInt32(0) });
-            if (active_head_gv_ != nullptr) {
-                b_.CreateStore(b_.CreateLoad(i32, sym(active_tail_gv_)), sym(active_head_gv_));
-            }
-            if (reactive_head_gv_ != nullptr) {
-                b_.CreateStore(b_.CreateLoad(i32, sym(reactive_tail_gv_)), sym(reactive_head_gv_));
-            }
-            if (re_inactive_top_gv_ != nullptr) {
-                b_.CreateStore(b_.getInt32(0), sym(re_inactive_top_gv_));
-            }
-            b_.CreateBr(more);
-            b_.SetInsertPoint(more);
+            b_.CreateBr(program_end_bb_);
+            b_.SetInsertPoint(program_end_bb_);
+            emit_program_end(proc_index);
         }
 
         b_.CreateBr(coro_final_bb_);
@@ -5254,8 +5295,13 @@ private:
         b_.SetInsertPoint(trap_bb);
         b_.CreateUnreachable();
         in_program_body_ = false;
+        in_reactive_home_body_ = false;
         body_home_is_runtime_ = false;
         home_ptr_             = nullptr;
+        // Blocks of a finished function must never be reachable from the next body's
+        // lowering, the event_wait_node hazard: proc_abort_exit reads this one.
+        program_end_bb_   = nullptr;
+        cur_program_inst_ = kNoProgramInst;
         return fn_;
     }
 
@@ -5390,6 +5436,18 @@ private:
         if (design_uses_process_) {
             params.push_back(ptr); // proc
         }
+        // The calling THREAD's scheduling home region (LRM 24.3.1): "a section of
+        // sequential code anywhere in the design or testbench inherits the
+        // scheduling region of the thread that calls it". A FUNCTION cannot suspend
+        // and so has no home of its own to answer for -- but LRM 13.4.4 lets one
+        // spawn a `fork ... join_none` child, and that child is a thread whose park
+        // sites need the answer. Sits beside `proc` because it is the same kind of
+        // thing: the second of the two facts a callee inherits from its caller's
+        // thread rather than from its own declaration. Gated design-wide, on the
+        // same uniformity argument as `proc` (see home_param_index).
+        if (design_uses_home_arg_) {
+            params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
+        }
         // TODO: pass a 2-state formal as a single iW param (and a 2-state result as
         // a bare iW) instead of the packed (mm, z) pair. The wire is packed today —
         // a 2-state arg lifts to must==may with a constant-0 z, which LLVM folds —
@@ -5450,7 +5508,7 @@ private:
 
     // A task is a switched-resume coroutine. Its signature is:
     //   ptr @<mod>.task.<name>(ptr noalias state, ptr rng, ptr wheel,
-    //                          <per formal>, ptr record)
+    //                          [ptr proc,] [i8 home,] <per formal>, ptr record)
     // where each input formal contributes (i(2W) mm, iW z) value planes, each
     // output / inout formal contributes (ptr mm_ptr, ptr z_ptr) into a caller temp,
     // and an unpacked aggregate formal contributes ONE storage pointer in every
@@ -5467,6 +5525,16 @@ private:
         params.push_back(ptr); // wheel
         if (design_uses_process_) {
             params.push_back(ptr); // proc — the calling thread's control block
+        }
+        // The calling thread's home region, LRM 24.3.1's "inherits the scheduling
+        // region of the thread that calls it". This is the load-bearing one: a task
+        // reached from both a program `initial` and an ordinary process is lowered
+        // ONCE, so its park sites cannot fold a home, and the only authority on
+        // which region the running thread belongs to is the caller. See
+        // build_shared_home_fns for who actually reads it, and home_param_index for
+        // why it is gated design-wide rather than per callee.
+        if (design_uses_home_arg_) {
+            params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
         }
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             if (f.arg_dirs[k] == ArgDir::Ref) {
@@ -5553,13 +5621,27 @@ private:
         return 2;
     }
 
+    // LLVM arg index of the gated `home` parameter (declare_function /
+    // declare_task): right after the gated `proc`, which is right after the fixed
+    // head -- `state, rng` for a function, `state, rng, wheel` for a task.
+    //
+    // Gated DESIGN-WIDE rather than per callee, exactly as `proc` is and for the
+    // same reason: a virtual call reaches its callee through one vtable slot, so
+    // every body that can occupy that slot must share one FunctionType, and no
+    // per-callee bit can vary it. The design-wide bit costs one i8 register on
+    // calls that ignore it, and only in a design that has a shared body at all.
+    uint32_t home_param_index(bool is_task) const {
+        return (is_task ? 3u : 2u) + (design_uses_process_ ? 1u : 0u);
+    }
+
     // LLVM arg index of each formal's first parameter for `f`'s signature shape:
     // functions start after `state, rng`, tasks after `state, rng, wheel`. The
     // record slot follows all formals.
     std::vector<uint32_t> param_indices(const Function& f) const {
         std::vector<uint32_t> idx(f.param_types.size());
-        // ... plus the gated `proc` parameter, which sits right after them.
-        uint32_t              cur = (f.is_task ? 3u : 2u) + (design_uses_process_ ? 1u : 0u);
+        // ... plus the gated `proc` and `home` parameters, which sit right after
+        // them, in that order.
+        uint32_t cur = home_param_index(f.is_task) + (design_uses_home_arg_ ? 1u : 0u);
         for (size_t k = 0; k < f.param_types.size(); ++k) {
             idx[k] = cur;
             cur += formal_param_count(f, k);
@@ -5571,7 +5653,7 @@ private:
     uint32_t task_record_param(const Function& f) const {
         const auto idx = param_indices(f);
         if (idx.empty()) {
-            return (design_uses_process_ ? 4u : 3u);
+            return home_param_index(/*is_task=*/true) + (design_uses_home_arg_ ? 1u : 0u);
         }
         return idx.back() + formal_param_count(f, f.param_types.size() - 1);
     }
@@ -5832,9 +5914,17 @@ private:
         }
         ir_ = &f.ir;
         cur_fn_           = &f;
-        in_reactive_body_ = is_reactive_fn(id);
-        in_program_fn_    = is_program_fn(id);
-        body_home_is_runtime_ = ir_has_expect_wait(f.ir);
+        // The body's LEXICAL home region (LRM 24.3.1): Reactive when reactive code
+        // -- a program block, an assertion action block -- is what reaches it. Only
+        // meaningful for a body one KIND of caller reaches; see reactive_home.
+        in_reactive_home_fn_ = is_reactive_home_fn(id);
+        cur_program_inst_    = program_exit_owner_of(id);
+        // Take the home from the calling THREAD instead of folding it when the body
+        // has no single lexical answer -- reached from both reactive and ordinary
+        // code, LRM 24.3.1's "inherits the scheduling region of the thread that
+        // calls it" -- or when an `expect` can move that thread's home mid-body
+        // (LRM 16.17). See home_ptr.
+        body_home_is_runtime_ = is_shared_home_fn(id) || ir_has_expect_wait(f.ir);
         home_ptr_         = nullptr;
         cur_is_task_      = false;
         param_llvm_index_ = param_indices(f);
@@ -5863,6 +5953,16 @@ private:
         if (design_uses_process_) {
             pcb_ = fn_->getArg(2);
             pcb_->setName("proc");
+        }
+        // Nor does it have a home region of its own: a function cannot suspend, so
+        // it only carries the calling thread's home onward -- to a `fork ...
+        // join_none` child it spawns (LRM 13.4.4), whose park sites do need it.
+        // Straight from the parameter, with no frame slot: there is no suspend for
+        // the value to have to survive.
+        home_arg_ = nullptr;
+        if (design_uses_home_arg_) {
+            home_arg_ = fn_->getArg(home_param_index(/*is_task=*/false));
+            home_arg_->setName("home");
         }
         // A function takes no wheel parameter, but the clock is a global, so event
         // ops and any other time read resolve here exactly as they do in a task.
@@ -5898,10 +5998,11 @@ private:
         }
 
         cur_fn_ = nullptr;
-        in_reactive_body_ = false;
-        in_program_fn_    = false;
+        in_reactive_home_fn_  = false;
+        cur_program_inst_     = kNoProgramInst;
         body_home_is_runtime_ = false;
         home_ptr_ = nullptr;
+        home_arg_             = nullptr;
         frame_  = nullptr;
     }
 
@@ -5986,9 +6087,13 @@ private:
         const BodyCtx   body_ctx(*this, f);
         ir_               = &f.ir;
         cur_fn_           = &f;
-        in_reactive_body_ = is_reactive_fn(id);
-        in_program_fn_    = is_program_fn(id);
-        body_home_is_runtime_ = ir_has_expect_wait(f.ir);
+        // Same two answers a function's prologue records, and here they are the ones
+        // that matter: a task suspends, so its park sites are where the home region
+        // is actually spent. LRM 24.5's `module ... task T; #5; endtask` called from
+        // a program is exactly the shared case body_home_is_runtime_ names.
+        in_reactive_home_fn_  = is_reactive_home_fn(id);
+        cur_program_inst_     = program_exit_owner_of(id);
+        body_home_is_runtime_ = is_shared_home_fn(id) || ir_has_expect_wait(f.ir);
         home_ptr_         = nullptr;
         cur_is_task_      = true;
         param_llvm_index_ = param_indices(f);
@@ -6110,6 +6215,18 @@ private:
                 emit_proc_publish_rng();
             }
         }
+        // The calling thread's home region (LRM 24.3.1). Read in the RAMP, where the
+        // caller's context is still live; home_ptr spills it into the frame at
+        // coro.begin so it survives every suspend, and lower_task_call_inst hands
+        // whatever is in that slot to the next callee down -- which is how "all
+        // subsequent blocking statements in that thread" stays true through a chain
+        // of task enables. A fork child inherits the same way: it is spawned with
+        // the spawning thread's current home (lower_fork), not with a lexical one.
+        home_arg_ = nullptr;
+        if (design_uses_home_arg_) {
+            home_arg_ = fn_->getArg(home_param_index(/*is_task=*/true));
+            home_arg_->setName("home");
+        }
         acts_node_ = nullptr;
         fork_live_ = nullptr;
 
@@ -6169,6 +6286,22 @@ private:
             emit_disable_link(f.disable_target, disable_node_);
         }
         emit_pcb_acts_link();
+        // A thread can be aborted before it has ever run: `kill`, `disable fork` and
+        // LRM 24.3's program termination all mark a just-ramped fork child whose body
+        // has not started, and the mark walk finds no activation to force-wake for it
+        // -- pcb->acts is linked immediately above, in the BODY, so it is still null
+        // while the child sits queued at its initial suspend. Without this test such a
+        // child would go on to run everything up to its first park (printing, storing,
+        // even forking threads of its own) after having been terminated, since every
+        // other abort poll sits AFTER a suspending op. One load, in a fork child of a
+        // process-control design only.
+        if (f.is_fork_child && pcb_ != nullptr) {
+            auto*        alive = llvm::BasicBlock::Create(ctx_, "fork.child.alive", fn_);
+            llvm::Value* ctl   = b_.CreateLoad(b_.getInt32Ty(), pcb_field(pcb_, kPcbCtl));
+            b_.CreateCondBr(
+              b_.CreateICmpNE(b_.CreateAnd(ctl, b_.getInt32(kProcAbort)), b_.getInt32(0)), epilogue_bb, alive);
+            b_.SetInsertPoint(alive);
+        }
         lower_region(ir_->root());
         branch_to(epilogue_bb);
 
@@ -6268,10 +6401,11 @@ private:
         b_.CreateUnreachable();
 
         cur_fn_           = nullptr;
-        in_reactive_body_ = false;
-        in_program_fn_    = false;
+        in_reactive_home_fn_  = false;
+        cur_program_inst_     = kNoProgramInst;
         body_home_is_runtime_ = false;
         home_ptr_         = nullptr;
+        home_arg_             = nullptr;
         cur_is_task_      = false;
         frame_            = nullptr;
         task_epilogue_bb_ = nullptr;
@@ -6539,8 +6673,24 @@ private:
     // The save token pairs the suspend with this resume point; the default edge
     // returns control to the resumer (coro.ret), case 0 resumes in the new block,
     // case 1 is a destroy while suspended. Shared by every suspend site (#delay,
-    // #0, event wait).
-    void emit_suspend_raw(const char* label) {
+    // #0, event wait, task enable, join, expect, wait fork).
+    //
+    // Coming back in the right region is the parked handle's business, not this
+    // function's: every site that records a handle for a later wake records it
+    // through parked_handle, and every site that wakes one reads the region back
+    // out through emit_wake_push.
+    //
+    // This used to refuse a suspend inside any program-reachable subroutine that
+    // was not a fork child, because a body lowered once could record only one home
+    // region. build_shared_home_fns removes the premise: a body two kinds of
+    // caller reach records no home at all and reads the calling thread's instead
+    // (LRM 24.3.1), so 24.5's `module ... task T; #5; endtask` called from a
+    // program now lowers. The fork-child exemption is gone with it, and was never
+    // the right argument anyway: it said a child body belongs to one fork SITE, but
+    // the home is a property of the spawning THREAD, and a child of a shared task
+    // is itself shared under the classification and inherits at spawn like any
+    // other callee.
+    void emit_suspend(const char* label) {
         // LRM 9.7's WAITING is "waiting in a blocking statement", which is exactly
         // this: every park goes through here, so the status word is maintained in one
         // place rather than at each parking construct. Two stores, in a design that
@@ -6554,40 +6704,6 @@ private:
         sw->addCase(b_.getInt8(1), coro_cleanup_bb_);
         b_.SetInsertPoint(resume);
         emit_proc_state(kProcWaiting, kProcRunning);
-    }
-
-    // Suspend. Coming back in the right region is the parked handle's business,
-    // not this function's: every site that records a handle for a later wake
-    // records it through parked_handle, and every site that wakes one reads the
-    // region back out through emit_wake_push.
-    //
-    // A program `initial` (LRM 24.3) used to correct its own region after the
-    // fact -- wake in Active, re-queue onto the reactive ring, suspend a second
-    // time, and let the reactive drain of the same time slot run the body. That
-    // cost a resume per suspend and, worse, put the body BEHIND whatever the
-    // instant had already queued reactively, because it only joined the ring
-    // once Active had already reached it. The tag puts it straight onto the
-    // reactive ring at wake time, in wake order, so the correction is gone.
-    void emit_suspend(const char* label) {
-        // A fork child is exempt: it is a piece of THIS body that the frontend
-        // split out, it has no caller to resume inline (it signals completion by
-        // decrementing the shared join record), and suspending is the entire
-        // point of forking. It is never shared either -- one child body per fork
-        // site -- so its home region is unambiguous.
-        if (in_program_fn_ && (cur_fn_ == nullptr || !cur_fn_->is_fork_child)) {
-            // TODO: a task called from a program block. The wake routing would
-            // now handle it -- the task's own handle would be tagged, and the
-            // caller's handle in the task record already is -- but build_program_fns
-            // computes no shared set, unlike build_reactive_fns: a task reachable
-            // from both a program `initial` and an ordinary process is lowered
-            // once, and one lowering can record only one home region. Refused
-            // until that classification exists, rather than resuming an ordinary
-            // caller's task in Reactive behind its back.
-            throw BackendError{ "suspending inside a task called from a `program` block is not "
-                                "supported: the task body is lowered once and cannot record two "
-                                "home regions" };
-        }
-        emit_suspend_raw(label);
     }
 
     // Lower a #delay, then suspend; execution continues in a fresh resume block.
@@ -6892,11 +7008,31 @@ private:
         return false;
     }
 
-    // Whether any process is a program block's `initial` (LRM 24.3). Those run in
-    // the Reactive region, so their presence alone means the design needs the
-    // reactive region set even with no concurrent assertion anywhere. A design
-    // with no program pays nothing, exactly like has_observed.
+    // Whether any process belongs to the reactive region set by being program
+    // code (LRM 24.3): a program block's `initial`, or a continuous construct
+    // declared inside a program, whose home is Reactive too (24.3.1). Either
+    // presence alone means the design needs the reactive region set even with no
+    // concurrent assertion anywhere -- and a program whose only member is an
+    // `assign` has no Activation::Reactive process at all, so both arms are
+    // load-bearing. A design with no program pays nothing, exactly like
+    // has_observed.
     bool has_program() const {
+        for (const Process& p : mod_.processes()) {
+            if (p.activation == Activation::Reactive || p.reactive_home) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether any process is a program block's `initial` PROCEDURE (LRM 24.3).
+    // Deliberately narrower than has_program(): the clause's two rules -- terminate
+    // a program's descendant threads when all its `initial`s have ended, then end
+    // the simulation when every program's have -- count `initial` procedures, and a
+    // program's reactive-home continuous code (24.3.1) is not one and never reaches
+    // an end. Keyed on the activation alone so it cannot start answering yes for
+    // one.
+    bool has_program_initial() const {
         for (const Process& p : mod_.processes()) {
             if (p.activation == Activation::Reactive) {
                 return true;
@@ -6970,13 +7106,12 @@ private:
         return k < reactive_fns_.size() && reactive_fns_[k];
     }
 
-    // Subroutines reachable from a program block's `initial` (LRM 24.3). A
-    // program body restores the Reactive region itself on every resume
-    // (emit_suspend), but a task it calls is a coroutine of its own whose handle
-    // that trampoline would push -- unverified, so a suspend inside one is
-    // rejected loud rather than silently resumed in the Active region. A function
-    // cannot suspend at all (LRM 13.4.4 bars timing controls in one), so in
-    // practice this only ever bites a task.
+    // Subroutines reachable from program code (LRM 24.3) -- a program block's
+    // `initial`, or a program's continuous assign / port copy. One of the two
+    // reactive-home closures build_shared_home_fns intersects against ordinary
+    // code to find the bodies whose home region has to travel with the thread;
+    // the other is build_reactive_fns'. Also counts the program `initial`
+    // procedures for the 24.3 implicit-finish countdown.
     void build_program_fns() {
         const size_t nfn = mod_.function_count();
         program_fns_.assign(nfn, false);
@@ -6987,8 +7122,19 @@ private:
             if (p.activation == Activation::Reactive) {
                 // One process per group: a sensitivity-less body is never fused
                 // (see lower_group), so this also counts the emitted bodies, which
-                // is what the 24.6 countdown needs.
+                // is what the 24.3 countdown needs.
                 ++program_proc_count_;
+                collect_callees(p.ir, work);
+            } else if (p.reactive_home) {
+                // Program code as well, so a function it calls is program-reachable
+                // and its suspends answer to the same refusal. Deliberately NOT
+                // counted: LRM 24.3 scopes the countdown to `initial` procedures --
+                // the simulation ends "immediately after all the threads and all
+                // their descendent threads originating from all initial procedures
+                // within all programs have ended" -- and a continuously-active
+                // process is not one and never ends, so counting it would hold the
+                // counter permanently above zero and the implicit $finish would
+                // never fire.
                 collect_callees(p.ir, work);
             }
         }
@@ -7009,9 +7155,186 @@ private:
         return k < program_fns_.size() && program_fns_[k];
     }
 
-    // The LRM 24.6 live-program counter: how many program `initial` procedures
-    // have not yet completed. Created on first use, so a design with no program
-    // never emits it.
+    // Every call edge of `ir`, with virtual dispatch expanded to EVERY body that
+    // can occupy the slot rather than only to the statically named target
+    // `ir::collect_callees` follows.
+    //
+    // The union is required here, and in both directions. LRM 24.3.1 makes the home
+    // region a property of the calling thread, so the question this walk answers is
+    // "which bodies can a reactive thread reach" -- and a virtual task call reaches
+    // whichever override the handle holds, which no static target names. Following
+    // the static target alone would leave an override reached only through a handle
+    // in NEITHER closure, and it would then fold the Active home and resume a
+    // program's thread in the wrong region, silently. Because the same union is
+    // taken from the ordinary roots too, an over-approximation cannot go wrong the
+    // other way either: a slot both kinds of code dispatch on puts all of its
+    // overrides in both closures, i.e. marks them shared, and a shared body asks
+    // the caller instead of folding anything.
+    //
+    // build_rng_fns builds the same two tables for the same reason (an override's
+    // $urandom draw); kept local to each because they are cheap and the two passes
+    // run at different points of run().
+    void collect_home_callees(const Ir&                                   ir,
+                              const std::vector<std::vector<FunctionId>>& slot_fns,
+                              const std::vector<std::vector<FunctionId>>& iface_fns,
+                              std::vector<FunctionId>&                    out) const {
+        collect_callees(ir, out);
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            const auto i = static_cast<Index>(k);
+            if (ir.tag(i) != Inst::Tag::CallVirtual && ir.tag(i) != Inst::Tag::TaskCallVirtual) {
+                continue;
+            }
+            const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(i).extra);
+            // Two numbering spaces: ordinary vtable slots, and the design-wide
+            // interface-method indices an interface-handle dispatch uses (LRM 8.26).
+            const std::vector<std::vector<FunctionId>>& table = vci.iface_index != kNoIface ? iface_fns : slot_fns;
+            const uint32_t                              idx = vci.iface_index != kNoIface ? vci.iface_index : vci.slot;
+            if (idx < table.size()) {
+                out.insert(out.end(), table[idx].begin(), table[idx].end());
+            }
+        }
+    }
+
+    // Which subroutines have a home region that must travel with the calling
+    // THREAD instead of being folded into the body -- LRM 24.3.1:
+    //
+    //   Once a program process starts a thread of execution, all subsequent
+    //   blocking statements in that thread are scheduled in the Reactive region.
+    //   This includes subroutine code called by the thread, even if the subroutine
+    //   code is declared in a module, package, or interface. Effectively, a section
+    //   of sequential code anywhere in the design or testbench inherits the
+    //   scheduling region of the thread that calls it.
+    //
+    // and 24.5, which states the same rule for the one shape it is easiest to hit:
+    // "When a task within a design module is called from a program, it shall use
+    // the reactive region set for its scheduling activities."
+    //
+    // That is exactly an INTERSECTION. A body only reactive-home code reaches is
+    // reactive-home for good, a body only ordinary code reaches is active-home for
+    // good, and each folds its answer at every park (reactive_home). A body BOTH
+    // reach has no lexical answer at all -- it is lowered once, and 24.5's own
+    // example is a `task T` a module declares, one program calling it and one
+    // module `initial` calling it in the same design -- so it reads its home from
+    // the calling thread instead (body_home_is_runtime_ / home_ptr), which is the
+    // clause's own wording made operational.
+    //
+    // The two closures:
+    //   R  reactive-home. Seeded from build_program_fns' and build_reactive_fns'
+    //      results (a program `initial`, a program's continuous assign / port copy,
+    //      an assertion action block, and everything they statically call) PLUS the
+    //      virtual-dispatch union out of every reactive-home PROCESS body, which
+    //      those two passes cannot see because they never walk a process with this
+    //      walker.
+    //   A  active-home. Every other process, plus the same catch-all
+    //      build_reactive_fns used: a function OUTSIDE R contributes its callees,
+    //      so a chain nothing else reaches still lands somewhere.
+    //
+    // A body in neither closure is unreachable -- nothing calls it and no dispatch
+    // site can land in it -- so its folded Active home can never be observed, and
+    // it deliberately does not turn the ramp parameter on.
+    void build_shared_home_fns() {
+        const size_t nfn = mod_.function_count();
+        shared_home_fns_.assign(nfn, false);
+        reactive_home_fns_.assign(nfn, false);
+        design_uses_home_arg_ = false;
+
+        std::vector<std::vector<FunctionId>> slot_fns;
+        std::vector<std::vector<FunctionId>> iface_fns;
+        const auto collect = [](std::vector<std::vector<FunctionId>>& into, const std::vector<FunctionId>& from) {
+            if (into.size() < from.size()) {
+                into.resize(from.size());
+            }
+            for (size_t s = 0; s < from.size(); ++s) {
+                into[s].push_back(from[s]);
+            }
+        };
+        for (const ClassDesc& vt : mod_.class_descs()) {
+            collect(slot_fns, vt.slots);
+            collect(iface_fns, vt.iface_slots);
+        }
+        // Drain `seeds` into `into`, walking each newly added body's own call edges.
+        const auto close = [&](std::vector<bool>& into, std::vector<FunctionId>& seeds) {
+            while (!seeds.empty()) {
+                const auto f = static_cast<uint32_t>(seeds.back());
+                seeds.pop_back();
+                if (into[f]) {
+                    continue;
+                }
+                into[f] = true;
+                collect_home_callees(mod_.function(static_cast<FunctionId>(f)).ir, slot_fns, iface_fns, seeds);
+            }
+        };
+
+        std::vector<FunctionId> work;
+        for (size_t k = 0; k < nfn; ++k) {
+            const auto id = static_cast<FunctionId>(k);
+            if (is_program_fn(id) || is_reactive_fn(id)) {
+                work.push_back(id);
+            }
+        }
+        for (const Process& p : mod_.processes()) {
+            if (p.activation == Activation::Reactive || p.reactive_home) {
+                collect_home_callees(p.ir, slot_fns, iface_fns, work);
+            }
+        }
+        close(reactive_home_fns_, work);
+
+        std::vector<bool> active(nfn, false);
+        for (const Process& p : mod_.processes()) {
+            if (p.activation != Activation::Reactive && !p.reactive_home) {
+                collect_home_callees(p.ir, slot_fns, iface_fns, work);
+            }
+        }
+        for (size_t k = 0; k < nfn; ++k) {
+            if (!reactive_home_fns_[k]) {
+                collect_home_callees(mod_.function(static_cast<FunctionId>(k)).ir, slot_fns, iface_fns, work);
+            }
+        }
+        close(active, work);
+
+        for (size_t k = 0; k < nfn; ++k) {
+            shared_home_fns_[k]   = reactive_home_fns_[k] && active[k];
+            design_uses_home_arg_ = design_uses_home_arg_ || shared_home_fns_[k];
+            // A reactive-home subroutine may now suspend, so its `#0` can park in
+            // the re-inactive batch (emit_zero_delay_push) -- for a shared body at
+            // run time, on the branch emit_by_home picks. Decided here because
+            // run() has to create the batch before any body lowers: lower_finish
+            // empties whichever queues exist, whatever order the bodies came in.
+            if (reactive_home_fns_[k] && ir_has_delay(mod_.function(static_cast<FunctionId>(k)).ir)) {
+                reactive_has_delay_ = true;
+            }
+        }
+    }
+
+    // Whether `id`'s LEXICAL home is Reactive, i.e. whether reactive-home code
+    // reaches it (build_shared_home_fns). Bounds-checked like is_program_fn: the
+    // table is only sized for a design that has reactive code at all.
+    bool is_reactive_home_fn(FunctionId id) const {
+        const auto k = static_cast<uint32_t>(id);
+        return k < reactive_home_fns_.size() && reactive_home_fns_[k];
+    }
+
+    // Whether `id` is reached from BOTH reactive-home and ordinary code, and so has
+    // no lexical home at all (build_shared_home_fns).
+    bool is_shared_home_fn(FunctionId id) const {
+        const auto k = static_cast<uint32_t>(id);
+        return k < shared_home_fns_.size() && shared_home_fns_[k];
+    }
+
+    // The LRM 24.3 live-program counter: how many program `initial` procedures
+    // have not yet completed, DESIGN-WIDE. Created on first use, so a design with
+    // no program never emits it.
+    //
+    // This is the clause's SECOND sentence: "the entire simulation shall terminate
+    // by means of an implicit call to the $finish system task immediately after all
+    // the threads and all their descendent threads originating from all initial
+    // procedures within all programs have ended". Counting only the `initial`
+    // procedures is enough for it precisely BECAUSE of the first sentence: each
+    // program instance terminates its own descendants the instant its own count
+    // reaches zero (program_end_bb_ in lower_group), so by the time the last
+    // `initial` in the design has ended there is provably no descendant of any of
+    // them left running, and "all their descendent threads have ended" reduces to
+    // "this counter is zero".
     llvm::Constant* program_live_ptr() {
         if (program_live_gv_ == nullptr) {
             auto* i32        = llvm::Type::getInt32Ty(ctx_);
@@ -7023,16 +7346,377 @@ private:
         return sym(program_live_gv_);
     }
 
+    // Partition the program `initial` procedures into program INSTANCES, which is
+    // the granularity LRM 24.3's FIRST sentence works at: "when all initial
+    // procedures within a program have reached their end, that program shall
+    // immediately terminate all descendent threads of initial procedures within
+    // that program". Process::scope is the InstanceScope::id of the instance whose
+    // definition declared the process, so two instances of one program definition
+    // partition apart for free and each gets its own countdown and its own
+    // termination root.
+    //
+    // The instance index is folded into each body as a COMPILE-TIME constant. That
+    // is sound because a program `initial` body is never shared between instances:
+    // the only body sharing in the backend is share_twin_groups, which takes only
+    // thunk groups, and thunk eligibility is is_simple_always, which requires
+    // Activation::Always (src/ir/Analysis.cpp) -- so an Activation::Reactive
+    // process is always a coroutine of its own, one per instance, exactly as
+    // lower_group's deferred-assertion note already relies on. No instance-context
+    // plumbing is needed, and docs/design/program-blocks.md §5 is wrong to say it
+    // is.
+    void build_program_instances() {
+        const auto   all   = mod_.processes();
+        const size_t nproc = all.size();
+        program_inst_procs_.clear();
+        program_inst_of_proc_.clear();
+        if (!has_program_initial()) {
+            return;
+        }
+        program_inst_of_proc_.assign(nproc, kNoProgramInst);
+        // Scope id per instance index. A linear scan because a design has a handful
+        // of program instances, never thousands.
+        std::vector<uint32_t> scope_of_inst;
+        for (uint32_t k = 0; k < nproc; ++k) {
+            if (all[k].activation != Activation::Reactive) {
+                continue;
+            }
+            uint32_t inst = kNoProgramInst;
+            for (uint32_t i = 0; i < scope_of_inst.size(); ++i) {
+                if (scope_of_inst[i] == all[k].scope) {
+                    inst = i;
+                    break;
+                }
+            }
+            if (inst == kNoProgramInst) {
+                inst = static_cast<uint32_t>(scope_of_inst.size());
+                scope_of_inst.push_back(all[k].scope);
+                program_inst_procs_.emplace_back();
+            }
+            program_inst_of_proc_[k] = inst;
+            program_inst_procs_[inst].push_back(k);
+        }
+    }
+
+    // Which program instance's `initial` procedures reach each subroutine, for LRM
+    // 24.7's `$exit`. The clause scopes `$exit` by the thread -- "from a thread or
+    // its descendent thread originating in an initial procedure of a program block"
+    // -- and a subroutine body is lowered once for every caller, so the only threads
+    // it can name are the ones that statically reach it:
+    //
+    //   kNoProgramInst        no program `initial` reaches it, so a `$exit` inside it
+    //                         is the clause's "shall be ignored" arm.
+    //   <inst>                exactly one program instance's `initial`s reach it, and
+    //                         nothing else does, so `$exit` names that instance.
+    //   kAmbiguousProgramInst two instances' `initial`s reach it, or an `initial` and
+    //                         some process that is not one. Refused in
+    //                         lower_program_exit.
+    //
+    // A fork child is covered by the same table: collect_callees follows a Fork's
+    // children like any other call edge, so a child of a program `initial` is
+    // reachable only from that `initial` and lands on its instance.
+    void build_program_exit_owners() {
+        const size_t nfn = mod_.function_count();
+        program_exit_owner_.assign(nfn, kNoProgramInst);
+        if (program_inst_procs_.empty()) {
+            return;
+        }
+        std::vector<FunctionId> work;
+        // Per-instance visit stamp, so each instance's walk descends through a
+        // function exactly once. A shared "already ambiguous, stop" test would be
+        // wrong: it would leave a function reached only THROUGH the ambiguous one
+        // owned by whichever instance got there first.
+        std::vector<uint32_t> stamp(nfn, kNoProgramInst);
+        for (uint32_t inst = 0; inst < program_inst_procs_.size(); ++inst) {
+            work.clear();
+            for (const uint32_t p : program_inst_procs_[inst]) {
+                collect_callees(mod_.processes()[p].ir, work);
+            }
+            while (!work.empty()) {
+                const auto f = static_cast<uint32_t>(work.back());
+                work.pop_back();
+                if (stamp[f] == inst) {
+                    continue;
+                }
+                stamp[f]               = inst;
+                program_exit_owner_[f] = program_exit_owner_[f] == kNoProgramInst ? inst : kAmbiguousProgramInst;
+                collect_callees(mod_.function(static_cast<FunctionId>(f)).ir, work);
+            }
+        }
+        // Now every process that is NOT a program `initial`. The seed is the clause's
+        // own test, not an approximation of it: 24.7 keys on where the calling thread
+        // ORIGINATES -- "a thread or its descendent thread that does not originate in
+        // an initial procedure in a program shall be ignored" -- so a design process
+        // and a program's own reactive-home continuous process (24.3.1) both land on
+        // the ignored arm, because neither is an `initial` procedure and nothing
+        // spawns either from one. `reactive_home` answers a different question (which
+        // REGION the body runs in) and deliberately does not appear here.
+        //
+        // A subroutine such a process shares with a program `initial` therefore has
+        // two answers -- terminate that program for the `initial` caller, ignore for
+        // the other -- even when both callers sit in the SAME program instance, so it
+        // is ambiguous for the same reason two instances are.
+        work.clear();
+        for (const Process& p : mod_.processes()) {
+            if (p.activation != Activation::Reactive) {
+                collect_callees(p.ir, work);
+            }
+        }
+        std::vector<bool> from_design(nfn, false);
+        while (!work.empty()) {
+            const auto f = static_cast<uint32_t>(work.back());
+            work.pop_back();
+            if (from_design[f]) {
+                continue;
+            }
+            from_design[f] = true;
+            if (program_exit_owner_[f] != kNoProgramInst) {
+                program_exit_owner_[f] = kAmbiguousProgramInst;
+            }
+            collect_callees(mod_.function(static_cast<FunctionId>(f)).ir, work);
+        }
+    }
+
+    // The program instance a `$exit` in function `id` names (build_program_exit_owners).
+    // Bounds-checked like is_program_fn: the table is only sized for a design that has
+    // a program.
+    uint32_t program_exit_owner_of(FunctionId id) const {
+        const auto k = static_cast<uint32_t>(id);
+        return k < program_exit_owner_.size() ? program_exit_owner_[k] : kNoProgramInst;
+    }
+
+    // `$exit()` (LRM 24.7): "Calling $exit from a thread or its descendent thread
+    // originating in an initial procedure of a program block shall terminate all
+    // initial procedures and their descendent threads within that originating program
+    // block. Calling $exit from a thread or its descendent thread that does not
+    // originate in an initial procedure in a program shall be ignored, and a warning
+    // may be issued to indicate that the call to $exit has been ignored."
+    //
+    // Which program instance the calling thread originates in is `cur_program_inst_`,
+    // decided per BODY (lower_group for a program `initial`, the owner closure for a
+    // subroutine or a fork child) because the op carries no payload.
+    //
+    // The two-sided part. `$exit` terminates the `initial`s AND every descendant, and
+    // the calling thread is itself one of those things -- so the set to mark is each
+    // of the instance's `initial` threads (subtree included, which is where a
+    // descendant of a still-running `initial` lives) plus the instance's termination
+    // root (where the descendants of `initial`s that ALREADY ended were handed on,
+    // see program_root_pcb). What this deliberately does NOT do is any counting: the
+    // per-instance and design-wide countdowns live in program.end (emit_program_end),
+    // every marked `initial` reaches program.end through its own abort exit
+    // (proc_abort_exit), and the abort protocol delivers it there exactly once --
+    // rt_proc_mark_kill skips a thread that is already FINISHED, KILLED or marked, and
+    // the force-wake is claim-or-flag. So each `initial` is counted once whether it
+    // ended normally, earlier, or by this `$exit`, and the design-wide implicit
+    // $finish still fires exactly once. Counting here instead would need a second
+    // "has this one been counted?" flag per procedure, which is precisely the
+    // double-decrement this avoids.
+    void lower_program_exit(Index i) {
+        (void)i; // no payload: the owner is a property of the body, not of the call
+        if (cur_program_inst_ == kNoProgramInst) {
+            // 24.7's second sentence. The frontend already warned where it could tell
+            // statically (a design process); here we are in a subroutine no program
+            // `initial` reaches, so the call is ignored and nothing is emitted.
+            return;
+        }
+        if (cur_program_inst_ == kAmbiguousProgramInst) {
+            // TODO: `$exit` from a subroutine reached by threads with different
+            // origins -- two program instances' `initial`s, or an `initial` and any
+            // process that is not one (a design process, or a program's own
+            // reactive-home continuous process). 24.7 answers by where the CALLING
+            // THREAD originates, and a shared body lowered once cannot name it: that
+            // needs per-thread program identity in the control block (the same thing
+            // the thread-carried home region needs, docs/design/program-blocks.md §6).
+            // Refused rather than guessing an instance or silently ignoring the call.
+            throw BackendError{ "`$exit` in a subroutine reachable from more than one program "
+                                "instance's `initial` procedures, or from an `initial` and from "
+                                "code that is not one, is not supported: LRM 24.7 answers by "
+                                "where the calling thread originates and this body is lowered "
+                                "once for every caller" };
+        }
+        llvm::BasicBlock* exit = proc_abort_exit();
+        if (exit == nullptr) {
+            // TODO: `$exit` inside a FUNCTION. A function is not a coroutine and has
+            // no abort exit; its caller would keep running, because the abort poll is
+            // emitted after a suspending op and a plain Call is not one. The shape that
+            // would carry it is may_finish_ / emit_finish_check, which does exactly
+            // this job for $finish.
+            throw BackendError{ "`$exit` inside a function is not supported: the function has no "
+                                "abort exit, so its caller would keep running past the point "
+                                "LRM 24.7 ends the thread" };
+        }
+        if (pcb_ == nullptr) {
+            // Unreachable: the ProgramExit tag sets DesignUses::process (Analysis.cpp),
+            // so every thread in the design has a control block. Checked because the
+            // marks below are the whole effect of the statement.
+            throw BackendError{ "internal: `$exit` with no thread control block" };
+        }
+        // Each `initial` of this instance, subtree included. with_self, because 24.7
+        // terminates the procedures themselves and not merely their descendants;
+        // branch_on_self suppressed so one matching root does not strand the walks
+        // after it.
+        for (const uint32_t p : program_inst_procs_[cur_program_inst_]) {
+            lower_proc_kill(proc_pcb_slot(p), /*with_self=*/true, /*branch_on_self=*/false);
+        }
+        // ... and the descendants that outlived an `initial` which already ended.
+        lower_proc_kill(program_root_pcb(cur_program_inst_),
+                        /*with_self=*/false,
+                        /*branch_on_self=*/false);
+        // The calling thread is in the marked set but is RUNNING, so no wake can reach
+        // it (lower_proc_kill skips its own block deliberately). It leaves here: an
+        // `initial` through program.end, which counts it down, a fork child or task
+        // through its epilogue, which wakes its caller so the caller polls and aborts
+        // in turn.
+        b_.CreateBr(exit);
+        // The rest of the region is dead but still gets lowered, exactly as after a
+        // $finish (lower_finish): park it in a block with no predecessors.
+        b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "exit.dead", fn_));
+    }
+
+    // The program instance `proc_index` belongs to, or kNoProgramInst for a process
+    // that is not a program `initial`. Bounds-checked like is_program_fn: the table
+    // is only sized for a design that has a program.
+    uint32_t program_inst_of(uint32_t proc_index) const {
+        return proc_index < program_inst_of_proc_.size() ? program_inst_of_proc_[proc_index] : kNoProgramInst;
+    }
+
+    // The per-program-instance live-`initial` counter (LRM 24.3, first sentence):
+    // how many `initial` procedures of instance `inst` have not yet reached their
+    // end. One i32 per program instance, initialized to that instance's count.
+    // Created on first use, so a design with no program never emits it.
+    llvm::Value* program_inst_live_ptr(uint32_t inst) {
+        if (program_inst_live_gv_ == nullptr) {
+            auto* i32 = llvm::Type::getInt32Ty(ctx_);
+            auto* ty  = llvm::ArrayType::get(i32, std::max<size_t>(program_inst_procs_.size(), 1));
+            std::vector<llvm::Constant*> init;
+            init.reserve(program_inst_procs_.size());
+            for (const std::vector<uint32_t>& procs : program_inst_procs_) {
+                init.push_back(llvm::ConstantInt::get(i32, procs.size()));
+            }
+            if (init.empty()) {
+                init.push_back(llvm::ConstantInt::get(i32, 0));
+            }
+            program_inst_live_arr_ty_ = ty;
+            program_inst_live_gv_     = new llvm::GlobalVariable(root_env_->llmod,
+                                                                 ty,
+                                                                 false,
+                                                                 llvm::GlobalValue::InternalLinkage,
+                                                                 llvm::ConstantArray::get(ty, init),
+                                                                 "clotho.program_inst_live");
+        }
+        return b_.CreateInBoundsGEP(
+          program_inst_live_arr_ty_, sym(program_inst_live_gv_), { b_.getInt32(0), b_.getInt32(inst) });
+    }
+
+    // Everything LRM 24.3 requires when ONE program `initial` procedure reaches its
+    // end, emitted into program.end -- the block every exit of a program body takes
+    // except the one that must not count (lower_group, proc_abort_exit,
+    // emit_finish_exit). `proc_index` is the procedure that is ending.
+    //
+    // The clause, in two sentences that work at two different granularities:
+    //
+    //   "When all initial procedures within a program have reached their end, that
+    //    program shall immediately terminate all descendent threads of initial
+    //    procedures within that program. If there is at least one initial procedure
+    //    within at least one program block, the entire simulation shall terminate by
+    //    means of an implicit call to the $finish system task immediately after all
+    //    the threads and all their descendent threads originating from all initial
+    //    procedures within all programs have ended."
+    //
+    // So: a per-INSTANCE countdown that terminates that instance's descendants, and
+    // a DESIGN-WIDE one that ends the run. Both are plain counters -- nothing here
+    // walks the process table at run time -- and the instance index is a compile-time
+    // constant (build_program_instances).
+    void emit_program_end(uint32_t proc_index) {
+        auto*          i32  = b_.getInt32Ty();
+        const uint32_t inst = program_inst_of(proc_index);
+        if (inst == kNoProgramInst) {
+            // in_program_body_ is exactly Activation::Reactive and
+            // build_program_instances partitions every one of those, so this is
+            // unreachable. Checked rather than assumed: silently skipping a
+            // program's termination is the failure mode this whole block exists to
+            // remove.
+            throw BackendError{ "internal: a program `initial` with no program instance" };
+        }
+
+        // FIRST SENTENCE, per program instance. Only when the design has control
+        // blocks at all: design_uses_process_ is false exactly when nothing in the
+        // design forks (see run()), and then an `initial` has no descendant thread
+        // to move or to terminate, so the whole per-instance counter is dead and is
+        // never even emitted.
+        if (pcb_ != nullptr) {
+            // Hand this procedure's live descendants to the instance's termination
+            // root BEFORE the count is tested. Two reasons, both load-bearing: it
+            // keeps them reachable when a sibling `initial` of the same program is
+            // still running (rt_proc_complete would otherwise re-parent them onto
+            // this static process's null parent and lose them -- see
+            // program_root_pcb), and it puts them under the single node the kill
+            // below is rooted at, so one subtree walk covers every descendant of
+            // every `initial` of this instance, transitively.
+            llvm::Value* root = program_root_pcb(inst);
+            b_.CreateCall(proc_adopt_fn(), { root, pcb_ });
+            llvm::Value* ilive = program_inst_live_ptr(inst);
+            llvm::Value* ni    = b_.CreateSub(b_.CreateLoad(i32, ilive), b_.getInt32(1));
+            b_.CreateStore(ni, ilive);
+            auto* term = llvm::BasicBlock::Create(ctx_, "program.inst.last", fn_);
+            auto* rest = llvm::BasicBlock::Create(ctx_, "program.inst.more", fn_);
+            b_.CreateCondBr(b_.CreateICmpEQ(ni, b_.getInt32(0)), term, rest);
+
+            b_.SetInsertPoint(term);
+            // "shall immediately terminate all descendent threads": the `kill` /
+            // `disable fork` subtree abort (LRM 9.7, 9.6.3), rooted at this
+            // instance's node and NOT including it, since the node is not a thread.
+            // Every marked thread is force-woken exactly once and leaves through its
+            // own abort exit, so nothing is destroyed from outside and there is no
+            // second termination protocol (docs/design/process-class.md §7.1).
+            // Before the implicit $finish below, which is the clause's own order.
+            lower_proc_kill(root, /*with_self=*/false);
+            b_.CreateBr(rest);
+            b_.SetInsertPoint(rest);
+        }
+
+        // SECOND SENTENCE, design-wide: when every program `initial` has ended the
+        // simulation ends on its own, without waiting for the modules.
+        llvm::Value* live = program_live_ptr();
+        llvm::Value* n    = b_.CreateSub(b_.CreateLoad(i32, live), b_.getInt32(1));
+        b_.CreateStore(n, live);
+        auto* last = llvm::BasicBlock::Create(ctx_, "program.last", fn_);
+        auto* more = llvm::BasicBlock::Create(ctx_, "program.more", fn_);
+        b_.CreateCondBr(b_.CreateICmpEQ(n, b_.getInt32(0)), last, more);
+
+        b_.SetInsertPoint(last);
+        // Same cooperative stop $finish takes (lower_finish): report, then empty the
+        // rings so nothing else queued at this instant runs. The body still leaves
+        // through its own final suspend, so its frame is released by the resumer
+        // exactly as on a normal completion.
+        llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
+        b_.CreateCall(finish_coop_fn(),
+                      { b_.CreateGlobalString("implicit $finish from program"), now, b_.getInt32(0) });
+        if (active_head_gv_ != nullptr) {
+            b_.CreateStore(b_.CreateLoad(i32, sym(active_tail_gv_)), sym(active_head_gv_));
+        }
+        if (reactive_head_gv_ != nullptr) {
+            b_.CreateStore(b_.CreateLoad(i32, sym(reactive_tail_gv_)), sym(reactive_head_gv_));
+        }
+        if (re_inactive_top_gv_ != nullptr) {
+            b_.CreateStore(b_.getInt32(0), sym(re_inactive_top_gv_));
+        }
+        b_.CreateBr(more);
+        b_.SetInsertPoint(more);
+    }
+
     // Classify every function reachable as reactive code -- the action-block
     // tasks a ReactivePend names, plus their transitive callees -- and reject
-    // what the reactive region set cannot yet run. The set decides which region a
-    // #0 inside one of them parks in (emit_zero_delay_push).
+    // what the reactive region set cannot yet run. The set is also one of
+    // build_shared_home_fns' two seeds, which is what actually decides the region
+    // a #0 inside one of them parks in (emit_zero_delay_push).
     //
     // Virtual dispatch is followed through its statically named target only. An
     // action block that reached an override through a class handle would have its
     // body missed here; the frontend cannot currently produce one (an action block
     // lowers to severity tasks and $display), so this is a documented bound rather
-    // than a silent one.
+    // than a silent one -- and it bounds only the REJECTIONS below, since
+    // build_shared_home_fns re-closes the same seed over the whole vtable slot
+    // before answering the home question.
     void build_reactive_fns() {
         const size_t nfn = mod_.function_count();
         reactive_fns_.assign(nfn, false);
@@ -7062,35 +7746,10 @@ private:
             collect_callees(mod_.function(static_cast<FunctionId>(f)).ir, work);
         }
 
-        // Which of them ordinary (non-reactive) code also reaches. Such a body
-        // would need one lowering per region -- only the call site knows whether
-        // its #0 parks in Inactive or Re-Inactive -- and it is emitted once.
-        std::vector<bool> shared(nfn, false);
-        std::vector<bool> seen(nfn, false);
-        std::vector<FunctionId> outside;
-        for (const Process& p : mod_.processes()) {
-            collect_callees(p.ir, outside);
-        }
-        for (size_t k = 0; k < nfn; ++k) {
-            if (!reactive_fns_[k]) {
-                collect_callees(mod_.function(static_cast<FunctionId>(k)).ir, outside);
-            }
-        }
-        while (!outside.empty()) {
-            const auto f = static_cast<uint32_t>(outside.back());
-            outside.pop_back();
-            if (seen[f]) {
-                continue;
-            }
-            seen[f]   = true;
-            shared[f] = reactive_fns_[f];
-            collect_callees(mod_.function(static_cast<FunctionId>(f)).ir, outside);
-        }
-
         for (size_t k = 0; k < nfn; ++k) {
             if (reactive_fns_[k]) {
                 const Function& f = mod_.function(static_cast<FunctionId>(k));
-                reject_unsupported_reactive(f.name, f.ir, shared[k]);
+                reject_unsupported_reactive(f.name, f.ir);
             }
         }
         for (const Process& p : mod_.processes()) {
@@ -7098,12 +7757,20 @@ private:
                 reject_resume_once(p.ir, "Observed", "property evaluation, LRM 4.4.2.5");
             } else if (p.activation == Activation::ReNba) {
                 reject_resume_once(p.ir, "Re-NBA", "clocking block drives, LRM 4.4.2.8");
-            } else if (p.activation == Activation::Reactive) {
+            } else if (p.activation == Activation::Reactive || p.reactive_home) {
                 // A program `initial` (LRM 24.3) is reactive-home too, and its #0
                 // parks in the re-inactive batch exactly as an action block's does.
                 // Noted here, before ensure_re_inactive_queue runs, so the batch
                 // exists whatever order the bodies lower in -- lower_finish empties
                 // whichever queues were created and must see this one.
+                //
+                // A reactive-home CONTINUOUS process (24.3.1) is scanned on the same
+                // terms. No such body can hold a Delay today -- a continuous assign
+                // lowers to a store, and `assign #d` to an inertial store, neither of
+                // which suspends -- so this is the local statement of the invariant
+                // emit_zero_delay_push depends on rather than a live case. The
+                // SUBROUTINE half of the same invariant is build_shared_home_fns',
+                // which scans every reactive-home body it classifies for a Delay.
                 for (uint32_t k = 0; k < p.ir.inst_count(); ++k) {
                     if (p.ir.tag(static_cast<Index>(k)) == Inst::Tag::Delay) {
                         reactive_has_delay_ = true;
@@ -7114,30 +7781,12 @@ private:
         }
     }
 
-    // A body reached both as reactive code and from ordinary code cannot
-    // suspend. The home region a parked handle carries is decided when the body
-    // is LOWERED (parked_handle reads in_reactive_body_), and a shared body is
-    // lowered exactly once, so one of its two callers would always get the wrong
-    // ring. Refused rather than resumed in a region the caller did not ask for.
-    //
-    // TODO: the fix is one lowering per region -- emit the body twice and let
-    // each call site pick -- which is a code-duplication policy decision, not a
-    // scheduler one, so it is not made here.
-    void reject_shared_reactive_suspend(const std::string& where, bool shared, const char* what) {
-        if (shared) {
-            throw BackendError{ std::string(what) + " in '" + where +
-                                "', which is reached both as reactive code (a concurrent assertion "
-                                "action block) and from ordinary code, is not supported: the body is "
-                                "lowered once and can record only one home region" };
-        }
-    }
-
     // What reactive code may not contain. Every rejection here is a hole in the
     // region set, not a source error, so each names what is missing. The
     // frontend's ReactiveSafetyChecker refuses the same shapes with a source
     // location; this is the backend's independent backstop and the two are kept
     // in agreement deliberately.
-    void reject_unsupported_reactive(const std::string& where, const Ir& ir, bool shared) {
+    void reject_unsupported_reactive(const std::string& where, const Ir& ir) {
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             switch (ir.tag(static_cast<Index>(k))) {
                 case Inst::Tag::StoreNbDelay:
@@ -7171,22 +7820,9 @@ private:
                                         "action block is a zero-time thunk the reactive drain "
                                         "resumes exactly once" };
                 case Inst::Tag::Delay:
-                    reject_shared_reactive_suspend(where, shared, "a delay");
                     // A #0 in reactive code parks in the re-inactive batch, which
                     // has to exist before any body lowers (see run()).
                     reactive_has_delay_ = true;
-                    break;
-                case Inst::Tag::Wait:
-                    reject_shared_reactive_suspend(where, shared, "an event control");
-                    break;
-                case Inst::Tag::Fork:
-                    reject_shared_reactive_suspend(where, shared, "a fork");
-                    break;
-                case Inst::Tag::TaskCall:
-                case Inst::Tag::TaskCallVirtual:
-                    // A task enable parks the CALLER's handle in the task record
-                    // whenever the task consumes time, so it is a suspend site too.
-                    reject_shared_reactive_suspend(where, shared, "a task enable");
                     break;
                 default:
                     break;
@@ -8352,6 +8988,16 @@ private:
     // the processes inside a loop keep declaration order among themselves;
     // everything downstream of the loop is still placed after it. Convergence
     // is unaffected either way — re-wake-on-change still iterates SCCs.
+    //
+    // Mixed home regions need nothing here. An edge whose endpoints sit in
+    // different rings (a program's reactive-home continuous assign feeding a
+    // design process, LRM 24.3.2) can never be a same-wave ordering constraint:
+    // the two rings drain in separate passes, and the reader is only reached by
+    // the active re-settle after the whole reactive drain (emit_active_run), which
+    // is exactly 24.3.2's "next iteration of the overall scheduling loop". So a
+    // cross-home edge costs at worst a conservative rank, never a lost wave. The
+    // other consumer of these edges, comb fusion, refuses to merge across homes
+    // outright (compute_fusion_groups).
     void compute_subscription_order() {
         const auto     all    = mod_.processes();
         const auto     nprocs = static_cast<uint32_t>(all.size());
@@ -9413,16 +10059,23 @@ private:
             return key;
         };
 
-        // Bucket fusable processes by (canonical events, self_start), preserving
-        // first-seen order; everything else is its own singleton group. Group
-        // size is capped so one fused coroutine cannot grow arbitrarily large
-        // (function size / frame size / compile time).
+        // Bucket fusable processes by (canonical events, self_start,
+        // reactive_home), preserving first-seen order; everything else is its own
+        // singleton group. Group size is capped so one fused coroutine cannot grow
+        // arbitrarily large (function size / frame size / compile time).
+        //
+        // reactive_home is part of the key because a group is ONE function pushed
+        // onto ONE ring: the seed loop makes a single push decision for it and its
+        // static subscription records a single home tag, so fusing a program's
+        // continuous assign (LRM 24.3.1, reactive-home) with a design one would
+        // run half the group in the wrong region. A reactive-only group is fine --
+        // both rings drain the same handle shapes.
         constexpr size_t group_cap = 256;
-        std::map<std::pair<std::vector<std::pair<uint32_t, uint32_t>>, bool>, uint32_t> by_key;
+        std::map<std::tuple<std::vector<std::pair<uint32_t, uint32_t>>, bool, bool>, uint32_t> by_key;
         for (uint32_t k = 0; k < nprocs; ++k) {
             const Process& p = all[k];
             if (config_.fuse && facts_.processes[k].simple_always) {
-                const auto key = std::make_pair(canonical(p.wait_events), p.self_start);
+                const auto key = std::make_tuple(canonical(p.wait_events), p.self_start, p.reactive_home);
                 const auto it  = by_key.find(key);
                 if (it != by_key.end() && groups_[it->second].size() < group_cap) {
                     groups_[it->second].push_back(k);
@@ -9499,9 +10152,11 @@ private:
                     }
                 }
             }
-            // Union-find over wake edges between candidates. self_start must
-            // match: the group makes one seed decision (comb populations are
-            // uniformly self_start in practice; a mismatch just splits).
+            // Union-find over wake edges between candidates. self_start and
+            // reactive_home must both match: the group makes one seed decision and
+            // has one home ring (see the bucket key above). Comb populations are
+            // uniformly self_start and Active-home in practice; a mismatch just
+            // splits.
             std::vector<uint32_t> uf(nprocs);
             for (uint32_t k = 0; k < nprocs; ++k) {
                 uf[k] = k;
@@ -9518,7 +10173,8 @@ private:
                     continue;
                 }
                 for (const uint32_t q : wake_adj_[k]) {
-                    if (cand[q] != 0 && all[q].self_start == all[k].self_start) {
+                    if (cand[q] != 0 && all[q].self_start == all[k].self_start &&
+                        all[q].reactive_home == all[k].reactive_home) {
                         uf[find(k)] = find(q);
                     }
                 }
@@ -9616,13 +10272,23 @@ private:
         // restart on every activation. is_simple_always already rejects a body
         // holding a draw ITSELF (tag_info().blocks_thunk); this covers the ones
         // that reach one through a call.
+        //
+        // A reactive-home group is excluded too, for a tagged-pointer reason: its
+        // static subscription has to carry kReactiveHomeTag (bit 1) so the wake
+        // path picks the reactive ring, and a thunk "handle" is a function pointer
+        // carrying the thunk tag (bit 0). The two tags are mutually exclusive by
+        // construction -- see kReactiveHomeTag -- so a pointer holding both would
+        // read as neither reactive (the test is bit 1 set AND bit 0 clear) nor as a
+        // maskable thunk, and the drain would call two bytes past the function.
+        // Costs a coroutine frame for each of a program's continuous assigns, a
+        // handful of processes in a testbench; the thunk path exists for wide
+        // combinational designs, which are Active-home by definition.
         thunk_group_.assign(groups_.size(), false);
         if (config_.thunk) {
             for (uint32_t g = 0; g < groups_.size(); ++g) {
                 thunk_group_[g] =
-                  facts_.processes[groups_[g].front()].simple_always &&
-                  std::none_of(groups_[g].begin(), groups_[g].end(),
-                               [&](uint32_t m) { return rng_procs_[m]; });
+                  facts_.processes[groups_[g].front()].simple_always && !all[groups_[g].front()].reactive_home &&
+                  std::none_of(groups_[g].begin(), groups_[g].end(), [&](uint32_t m) { return rng_procs_[m]; });
             }
         }
     }
@@ -11385,28 +12051,64 @@ private:
     // rt_alloc, whose low three bits are free.
     static constexpr uint64_t kReactiveHomeTag = 2;
 
-    // Whether the body being lowered must come back in Reactive when something
-    // wakes it: a concurrent assertion's action block, a program `initial` (LRM
-    // 24.3), or a subroutine / fork child of either. All live in the reactive
-    // region set.
+    // The body's LEXICAL home region: whether a wake of THIS body comes back in
+    // Reactive -- a concurrent assertion's action block, a program `initial` (LRM
+    // 24.3), a program's continuous assign or port copy (LRM 24.3.1), or a
+    // subroutine / fork child that only such code reaches. All live in the
+    // reactive region set.
     //
-    // in_program_fn_ is safe to include even though build_program_fns computes no
-    // shared set: the only program-reachable body that can reach a park site is a
-    // fork child (emit_suspend refuses every other one), and a fork child belongs
-    // to exactly one fork site, so it is never shared.
-    bool reactive_home() const { return in_reactive_body_ || in_program_body_ || in_program_fn_; }
+    // Valid only where the home is NOT thread-carried. A body reached from both
+    // reactive-home and ordinary code has no lexical home at all, and the answer
+    // here is not the one to use: every consumer (parked_handle, emit_by_home)
+    // tests body_home_is_runtime_ first, and home_ptr consults this only to seed a
+    // body that has no caller to inherit from.
+    bool reactive_home() const {
+        return in_program_body_ || in_reactive_home_body_ || in_reactive_home_fn_;
+    }
 
-    // The body's home region as a RUNTIME value: an i8 spilled into the
-    // coroutine frame, holding 0 for Active or kReactiveHomeTag for Reactive, so
-    // it can be OR'd straight into a handle with no select.
+    // OR the reactive-home tag onto a handle whose home is known from the PROCESS
+    // rather than from the body being lowered. One caller needs that: the static
+    // subscription of a reactive-home continuous process, recorded by the seed loop
+    // (emit_active_run) from outside any body. Everything else parks through
+    // parked_handle, which asks the body.
     //
-    // Almost every body's home is a lexical constant and parked_handle folds it.
-    // `expect` (LRM 16.17) is the exception: it resumes the executing process
-    // into Reactive, and LRM 24.3.1 makes the region a property of the THREAD
-    // from then on -- "all subsequent blocking statements in that thread are
-    // scheduled in the Reactive region" -- so a body that executes one has to
-    // carry a home that can change under it. Created only for such a body
-    // (body_home_is_runtime_), so no other design pays a load per park.
+    // Gated on design_uses_reactive_ so the tag can only be emitted where
+    // emit_wake_push's masking path is emitted too; see parked_handle.
+    llvm::Value* tag_reactive_home(llvm::IRBuilder<>& b, llvm::Value* handle, bool reactive) {
+        if (!reactive || !design_uses_reactive_) {
+            return handle;
+        }
+        auto* i64 = b.getInt64Ty();
+        return b.CreateIntToPtr(
+          b.CreateOr(b.CreatePtrToInt(handle, i64), llvm::ConstantInt::get(i64, kReactiveHomeTag)),
+          llvm::PointerType::getUnqual(ctx_));
+    }
+
+    // The running THREAD's home region as an i8 -- 0 for Active, kReactiveHomeTag
+    // for Reactive, so it can be OR'd straight into a handle with no select --
+    // spilled into the coroutine frame.
+    //
+    // This is LRM 24.3.1's rule made operational. The clause puts the region on the
+    // thread, not on the body: "Once a program process starts a thread of execution,
+    // all subsequent blocking statements in that thread are scheduled in the
+    // Reactive region. This includes subroutine code called by the thread, even if
+    // the subroutine code is declared in a module, package, or interface." Two
+    // things make a body need the slot rather than a folded constant, and they are
+    // the same phenomenon seen from two sides:
+    //
+    //   - it is SHARED (build_shared_home_fns): both a reactive-home thread and an
+    //     ordinary one can be executing it, so only the caller knows. Seeded from
+    //     home_arg_, which is the caller's answer, passed as a ramp parameter.
+    //   - it runs an `expect` (LRM 16.17), which moves the thread into Reactive
+    //     mid-body and leaves it there. That is a STORE to this slot
+    //     (lower_expect_wait), not a different mechanism.
+    //
+    // A shared body that also runs an `expect` needs no extra thought: it seeds
+    // from the caller and the expect overwrites it, later store wins, which is
+    // exactly "all subsequent blocking statements in that thread".
+    //
+    // Created only for such a body (body_home_is_runtime_), so no other design pays
+    // a load per park.
     //
     // In the frame rather than in a per-process global: a frame alloca is
     // per-instance for free, which a global indexed by process is not under
@@ -11418,39 +12120,75 @@ private:
         if (home_ptr_ == nullptr) {
             llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
             home_ptr_ = ab.CreateAlloca(ab.getInt8Ty(), nullptr, "home_region");
-            // Seeded with the lexical answer, so a body that never reaches its
-            // expect behaves exactly as the folded form would.
-            ab.CreateStore(ab.getInt8(reactive_home() ? kReactiveHomeTag : 0), home_ptr_);
+            // The caller's answer when there is a caller -- a task or fork-child
+            // ramp -- and the lexical one for a PROCESS, which is a thread root and
+            // has nobody to ask. A body that never migrates then behaves exactly as
+            // the folded form would.
+            ab.CreateStore(home_arg_ != nullptr
+                             ? home_arg_
+                             : static_cast<llvm::Value*>(ab.getInt8(reactive_home() ? kReactiveHomeTag : 0)),
+                           home_ptr_);
         }
         return home_ptr_;
     }
 
+    // This thread's home region right now, as an i8. Folded to a constant unless
+    // the body carries its home at run time; a coroutine reads the frame slot,
+    // which is where a value has to live to survive a suspend, and a plain FUNCTION
+    // -- which cannot suspend -- reads its incoming parameter directly.
+    //
+    // A shared body always HAS that parameter: design_uses_home_arg_ is exactly
+    // "some body in this design is shared", so wherever this can be reached with
+    // body_home_is_runtime_ set for sharing, the signature carries it. An `expect`
+    // body without the parameter is a coroutine by construction (16.17 blocks), so
+    // it took the frame path.
+    llvm::Value* current_home(llvm::IRBuilder<>& b) {
+        if (!body_home_is_runtime_) {
+            return b.getInt8(reactive_home() ? kReactiveHomeTag : 0);
+        }
+        return in_coroutine_body() ? b.CreateLoad(b.getInt8Ty(), home_ptr()) : home_arg_;
+    }
+
+    // Whether the body being lowered is a coroutine. Asked of coro_begin_ AND of
+    // whose function it belongs to, because the pointer is never cleared between
+    // bodies: a plain function lowered after a task would otherwise look like a
+    // coroutine and hoist its allocas into the task's entry block. The same
+    // comparison the mutator-pointer anchor asserts.
+    bool in_coroutine_body() const {
+        return coro_begin_ != nullptr && coro_begin_->getFunction() == fn_;
+    }
+
+    // The home region to hand a callee: whatever this thread's is at the call, so a
+    // task that calls a task passes its own CURRENT answer down rather than its
+    // lexical one. That is what makes 24.3.1's "inherits the scheduling region of
+    // the thread that calls it" transitive -- by induction over the call chain, and
+    // over an `expect` too, since the store lands before any later call reads it.
+    // Null when the parameter is not in the signature, which is every design with
+    // no shared body.
+    llvm::Value* callee_home() {
+        return design_uses_home_arg_ ? current_home(b_) : nullptr;
+    }
+
     // The value to record when parking this coroutine for a later wake. Folded at
-    // lowering time unless the body can migrate region under an `expect`, so
-    // ordinary code emits the bare handle and every wake of it reads Active with
-    // no tag ever materialized.
+    // lowering time unless the home travels with the thread (home_ptr), so ordinary
+    // code emits the bare handle and every wake of it reads Active with no tag ever
+    // materialized.
     llvm::Value* parked_handle(llvm::IRBuilder<>& b, llvm::Value* handle) {
-        auto* i64 = b.getInt64Ty();
         // Tie the tag to the exact flag emit_wake_push tests before masking it
         // off. A tag emitted while that path is compiled out would never be
         // stripped, and the ring would hold a handle two bytes past its frame --
         // a crash, not merely a wrong region. Both sides read design_uses_reactive_
-        // so the pair cannot drift; a body can only be reactive-home, or run an
-        // expect, in a design where this is already true.
+        // so the pair cannot drift; a body can only be reactive-home, or shared, or
+        // run an expect, in a design where this is already true.
         if (!design_uses_reactive_) {
             return handle;
         }
-        if (body_home_is_runtime_) {
-            llvm::Value* tag = b.CreateZExt(b.CreateLoad(b.getInt8Ty(), home_ptr()), i64);
-            return b.CreateIntToPtr(b.CreateOr(b.CreatePtrToInt(handle, i64), tag),
-                                    llvm::PointerType::getUnqual(ctx_));
+        if (!body_home_is_runtime_) {
+            return reactive_home() ? tag_reactive_home(b, handle, /*reactive=*/true) : handle;
         }
-        if (!reactive_home()) {
-            return handle;
-        }
-        return b.CreateIntToPtr(
-          b.CreateOr(b.CreatePtrToInt(handle, i64), llvm::ConstantInt::get(i64, kReactiveHomeTag)),
-          llvm::PointerType::getUnqual(ctx_));
+        auto*        i64 = b.getInt64Ty();
+        llvm::Value* tag = b.CreateZExt(current_home(b), i64);
+        return b.CreateIntToPtr(b.CreateOr(b.CreatePtrToInt(handle, i64), tag), llvm::PointerType::getUnqual(ctx_));
     }
 
     // Whether `ir` executes an `expect`, i.e. whether its home region can change
@@ -11460,6 +12198,19 @@ private:
     static bool ir_has_expect_wait(const Ir& ir) {
         for (uint32_t k = 0; k < ir.inst_count(); ++k) {
             if (ir.tag(static_cast<Index>(k)) == Inst::Tag::ExpectWait) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether `ir` holds a `#delay`. Asked of a reactive-home body so run() knows
+    // to create the re-inactive batch before anything lowers: a `#0` in reactive
+    // code parks there rather than in the inactive queue (emit_zero_delay_push),
+    // and lower_finish has to see the batch to empty it.
+    static bool ir_has_delay(const Ir& ir) {
+        for (uint32_t k = 0; k < ir.inst_count(); ++k) {
+            if (ir.tag(static_cast<Index>(k)) == Inst::Tag::Delay) {
                 return true;
             }
         }
@@ -11523,11 +12274,7 @@ private:
         if (park_claim_wanted() && sched_ptr_ != nullptr) {
             b.CreateStore(b.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
         }
-        if (reactive_home()) {
-            emit_re_inactive_push(b, handle);
-        } else {
-            emit_inactive_push(b, handle);
-        }
+        emit_by_home(b, [&] { emit_re_inactive_push(b, handle); }, [&] { emit_inactive_push(b, handle); });
     }
 
     // Make a freshly ramped coroutine ready in the region the body doing the
@@ -11537,11 +12284,45 @@ private:
     // child of a reactive body belongs in the reactive ring for the same reason its
     // parent's `#0` does.
     void emit_region_push(llvm::IRBuilder<>& b, llvm::Value* handle) {
-        if (reactive_home()) {
-            emit_reactive_push(b, handle);
-        } else {
-            emit_active_push(b, handle);
+        emit_by_home(b, [&] { emit_reactive_push(b, handle); }, [&] { emit_active_push(b, handle); });
+    }
+
+    // Run the reactive-region arm or the active one according to this body's home.
+    // Folded to whichever arm the lexical answer names, except for a body whose
+    // home travels with the thread (body_home_is_runtime_: a shared subroutine,
+    // LRM 24.3.1, or one that has run an `expect`, 16.17), where it is a branch.
+    //
+    // A branch and not a select, unlike parked_handle: that one ORs a bit onto a
+    // pointer, so both answers are the same instruction. These two destinations are
+    // different data structures -- a ring with head/tail versus a batch with a top
+    // -- with their own overflow guards, so there is nothing to merge.
+    //
+    // Each arm may open blocks of its own (the guards do), so the arm's own last
+    // block is what branches to the continuation rather than the block created here.
+    template<typename Reactive, typename Active>
+    void emit_by_home(llvm::IRBuilder<>& b, Reactive&& reactive, Active&& active) {
+        // No reactive region set in this design at all: nothing was ever tagged,
+        // neither reactive queue exists, and there is no choice to make.
+        if (!body_home_is_runtime_ || !design_uses_reactive_) {
+            if (reactive_home()) {
+                reactive();
+            } else {
+                active();
+            }
+            return;
         }
+        llvm::Function* fn   = b.GetInsertBlock()->getParent();
+        auto*           rbb  = llvm::BasicBlock::Create(ctx_, "home.reactive", fn);
+        auto*           abb  = llvm::BasicBlock::Create(ctx_, "home.active", fn);
+        auto*           cont = llvm::BasicBlock::Create(ctx_, "home.cont", fn);
+        b.CreateCondBr(b.CreateICmpNE(current_home(b), b.getInt8(0)), rbb, abb);
+        b.SetInsertPoint(rbb);
+        reactive();
+        b.CreateBr(cont);
+        b.SetInsertPoint(abb);
+        active();
+        b.CreateBr(cont);
+        b.SetInsertPoint(cont);
     }
 
     // -- NBA update region --
@@ -11983,12 +12764,40 @@ private:
                     llvm::Constant* flag = sched_flag_ptr(k);
                     // The time-zero settle run must evaluate every member.
                     b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), flag);
-                    emit_active_push(b_, hdl);
+                    // A reactive-home group -- a program's continuous assign (LRM
+                    // 24.3.1) -- settles in slot 0's REACTIVE region rather than its
+                    // Active one, so its stores land after the design has settled and
+                    // design readers of what it drives are woken into the Active
+                    // region of the next iteration of 4.4.2's loop. That is 24.3.2's
+                    // own sentence. A ring entry is a bare handle either way: the
+                    // home tag belongs to a PARKED handle, and the seed loop created
+                    // this one so it knows the ring without reading a tag back.
+                    if (p.reactive_home) {
+                        emit_reactive_push(b_, hdl);
+                    } else {
+                        emit_active_push(b_, hdl);
+                    }
                 }
             } else if (p.activation == Activation::Reactive) {
                 // A program `initial` (LRM 24.3) starts in the Reactive region, so
                 // it is seeded onto the reactive ring instead of the active one.
                 // Its body keeps itself there across every suspend (emit_suspend).
+                //
+                // Mark it scheduled as it is enqueued, for the reason the self_start
+                // arm above gives -- it is QUEUED from here, so anything that pushes
+                // it again before it runs double-queues it -- which for this arm is
+                // not a static subscription (a sensitivity-less body has none) but a
+                // FORCE-WAKE. `$exit` (LRM 24.7) names every `initial` of its program
+                // instance by static control block, so a `fork ... join` child that
+                // exits during its parent's FIRST activation force-wakes a parent that
+                // is running on the stack rather than parked: its park record is null,
+                // so emit_node_force_wake falls to the flag, and with the flag clear it
+                // would push the handle of a coroutine that is about to reach its final
+                // suspend and be destroyed by the resumer -- the drain would then resume
+                // a freed frame. The flag is cleared by the body itself before each
+                // park (lower_wait, emit_delay), so "set while running, clear while
+                // parked" holds for this arm exactly as it does for an always loop.
+                b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_flag_ptr(k));
                 emit_reactive_push(b_, hdl);
             } else {
                 emit_active_push(b_, hdl);
@@ -12013,8 +12822,19 @@ private:
             }
             subscribed[g]        = true;
             llvm::Constant* flag = sched_flag_ptr(f);
+            // A reactive-home group needs no separate subscription path: the
+            // predicate above selects it like any other Always group, and the ring
+            // is picked at WAKE time from the handle's home tag (emit_wake_push).
+            // What it does need is the tag ON the handle recorded here. A static
+            // subscription records a handle exactly once, from this loop, and the
+            // always-loop's park never re-records it (emit_wait_suspend only
+            // suspends) -- so unlike an intra-body wait, which parks through
+            // parked_handle at each `@`, this is the only place the home can be
+            // stated. Untagged, every wake of a program's continuous assign would
+            // push it onto the active ring, which is the bug this phase fixes.
+            llvm::Value* sub_hdl = tag_reactive_home(b_, hdls[g], all[f].reactive_home);
             for (const WaitEvent& w : group_events_[g]) {
-                emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), hdls[g], flag);
+                emit_static_subscribe(w.signal, static_cast<uint32_t>(w.edge), sub_hdl, flag);
             }
         }
 
@@ -12449,10 +13269,31 @@ private:
             b_.SetInsertPoint(run_bb);
             llvm::Value* record = b_.CreateAlloca(ptr_ty, nullptr, "monitor.record");
             b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), record);
-            auto* rampty = llvm::FunctionType::get(ptr_ty, { ptr_ty, ptr_ty, ptr_ty, ptr_ty }, false);
+            // Reconstructed rather than read off a declaration, because the callee
+            // arrives as an opaque pointer from the runtime -- so it MUST track
+            // declare_task's gated parameters exactly. It did not: `proc` was pushed
+            // into margv but never into this type, so a design with both $monitor
+            // and process control built a call whose argument count did not match
+            // its signature (an assert in a debug LLVM, malformed IR in a release
+            // one). Both gates are honoured below now.
+            std::vector<llvm::Type*> rampparams{ ptr_ty, ptr_ty, ptr_ty }; // state, rng, wheel
+            if (design_uses_process_) {
+                rampparams.push_back(ptr_ty); // proc
+            }
+            if (design_uses_home_arg_) {
+                rampparams.push_back(llvm::Type::getInt8Ty(ctx_)); // home
+            }
+            rampparams.push_back(ptr_ty); // record
+            auto*                     rampty = llvm::FunctionType::get(ptr_ty, rampparams, false);
             std::vector<llvm::Value*> margv{ state, sym(rng_global_), wheel };
             if (design_uses_process_) {
                 margv.push_back(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+            }
+            // No calling thread on this path either (the Postponed drain ramps the
+            // registered body from main), so the region it would inherit is the
+            // default Active one.
+            if (design_uses_home_arg_) {
+                margv.push_back(b_.getInt8(0));
             }
             margv.push_back(record);
             llvm::Value* hdl = b_.CreateCall(rampty, ramp, margv);
@@ -15202,6 +16043,7 @@ private:
             case Inst::Tag::MonitorOff:
             case Inst::Tag::TimeFormat:
             case Inst::Tag::Finish:
+            case Inst::Tag::ProgramExit:
             case Inst::Tag::CaseViol:
             case Inst::Tag::TaggedCheck:
             case Inst::Tag::Severity:
@@ -17311,6 +18153,12 @@ private:
                 // $finish / $stop: rt_finish prints the banner then exits, never
                 // returning (noreturn), so the optimizer prunes the region tail.
                 lower_finish(i);
+                return;
+
+            case Inst::Tag::ProgramExit:
+                // $exit (LRM 24.7): end this program's `initial` procedures and their
+                // descendants, then leave through this body's abort exit.
+                lower_program_exit(i);
                 return;
 
             case Inst::Tag::CaseViol:
@@ -20655,6 +21503,9 @@ private:
         if (design_uses_process_) {
             argv.push_back(proc_arg());
         }
+        if (design_uses_home_arg_) {
+            argv.push_back(callee_home());
+        }
         argv.push_back(record);
         llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
         b_.CreateCall(strobe_pend_fn(), { hdl });
@@ -20678,6 +21529,14 @@ private:
         std::vector<llvm::Value*> argv{ state_, rng_slot_, wheel_ };
         if (design_uses_process_) {
             argv.push_back(proc_arg());
+        }
+        // NOT the pending body's home. LRM 4.4.2.5 hands an action block to the
+        // Reactive region of this time slot no matter which region decided the
+        // verdict -- the pend below pushes straight onto the reactive ring -- so the
+        // thread this ramp starts is reactive-home by construction rather than by
+        // inheritance from the Observed process that pended it.
+        if (design_uses_home_arg_) {
+            argv.push_back(b_.getInt8(kReactiveHomeTag));
         }
         argv.push_back(reactive_record_slot());
         llvm::Value* hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
@@ -20715,12 +21574,12 @@ private:
     // waiter queue and suspend. The request store that asks the monitor for an
     // attempt is a separate Store the frontend already emitted above this.
     //
-    // emit_suspend_raw and not emit_suspend: the wake pushes straight onto the
-    // reactive ring (lower_expect_wake), so there is no region to correct on the
-    // way back in -- the handle is already where it belongs. For the same reason
-    // the handle is stored bare rather than through parked_handle: a home-region
-    // tag would have to be masked off again before the push, and an expect's
-    // destination is not its home region anyway. It is the verdict's region.
+    // The wake pushes straight onto the reactive ring (lower_expect_wake), so there
+    // is no region to decide on the way back in -- the handle is already where it
+    // belongs. That is also why the handle is stored bare rather than through
+    // parked_handle: a home-region tag would have to be masked off again before the
+    // push, and an expect's destination is not its home region anyway. It is the
+    // verdict's region.
     void lower_expect_wait(Index i) {
         if (cur_fn_ != nullptr) {
             // A task's epilogue resumes its caller through the caller's own wake
@@ -20748,7 +21607,7 @@ private:
         // sits in no other queue, so the flag must say "not scheduled" or a later
         // event wake would be dropped as a duplicate.
         b_.CreateStore(b_.getInt64(0), sched_ptr_);
-        emit_suspend_raw("expect.resume");
+        emit_suspend("expect.resume");
 
         // Past the resume point, so this thread is now running in the Reactive
         // region -- and by LRM 24.3.1 it stays there: "all subsequent blocking
@@ -22420,9 +23279,17 @@ private:
     llvm::FunctionCallee vcd_touch_fn() {
         return rt_fn("rt_vcd_touch", b_.getVoidTy(), { b_.getInt32Ty() });
     }
-    // Does any process or subroutine in the design contain a $finish / $stop?
-    // Gates the drain loop's finished test; memoized, since emit_active_run asks
-    // once per unit module.
+    // Does any process or subroutine in the design contain a $finish / $stop --
+    // or can the design end by LRM 24.3's implicit one? Gates the drain loop's
+    // finished test; memoized, since emit_active_run asks once per unit module.
+    //
+    // A program `initial` counts even though no body holds an Inst::Tag::Finish:
+    // 24.3's "the entire simulation shall terminate by means of an implicit call
+    // to the $finish system task" is emitted by emit_program_end, and it stops the
+    // run the same cooperative way an explicit $finish does -- set rt_finishing,
+    // empty the rings, and let each drain notice on its empty edge. Without this
+    // the drains never test the flag, so a design whose only way to end is the
+    // implicit finish (no explicit $finish anywhere) ran forever.
     bool design_has_finish() {
         if (!design_has_finish_.has_value()) {
             const auto scan = [](const Ir& ir) {
@@ -22433,7 +23300,7 @@ private:
                 }
                 return false;
             };
-            bool found = false;
+            bool found = has_program_initial();
             for (const Process& p : mod_.processes()) {
                 found = found || scan(p.ir);
             }
@@ -23105,6 +23972,12 @@ private:
         // names the caller (LRM 9.7).
         if (design_uses_process_) {
             argv.push_back(proc_arg());
+        }
+        // ... and its scheduling region, for the same reason (LRM 24.3.1). A
+        // function cannot suspend, so this only matters for a `fork ... join_none`
+        // child it spawns.
+        if (design_uses_home_arg_) {
+            argv.push_back(callee_home());
         }
         // A ref actual that is a signal with waiters: the callee writes it live, so
         // its wait queue must be serviced with the call's net old -> new transition.
@@ -23852,6 +24725,11 @@ private:
         if (design_uses_process_) {
             argv.push_back(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
         }
+        // Nor a home region: native C drove the call, so there is no calling thread
+        // whose scheduling region an exported subroutine could inherit (LRM 24.3.1).
+        if (design_uses_home_arg_) {
+            argv.push_back(b_.getInt8(0));
+        }
         for (size_t k = 0; k < ex.arg_ctypes.size(); ++k) {
             const DpiCType ct     = ex.arg_ctypes[k];
             const ArgDir   dir    = ex.arg_dirs[k];
@@ -24196,6 +25074,11 @@ private:
         if (design_uses_process_) {
             argv.push_back(proc_arg());
         }
+        // ... and its home region: a child inherits the spawning thread's, which is
+        // this body's CURRENT one, not its lexical one (LRM 24.3.1).
+        if (design_uses_home_arg_) {
+            argv.push_back(callee_home());
+        }
         // An `In` scalar formal is two params, must|may and z, exactly as an ordinary
         // call marshals one (lower_task_call_inst's last arm).
         for (const Index cap : caps) {
@@ -24347,6 +25230,14 @@ private:
         // A task runs in its caller's thread too, so it carries the caller's block.
         if (design_uses_process_) {
             argv.push_back(proc_arg());
+        }
+        // ... and its home region, which is the whole of LRM 24.5: "when a task
+        // within a design module is called from a program, it shall use the reactive
+        // region set for its scheduling activities". callee_home() is this thread's
+        // answer at this call, so a task calling a task passes on what it inherited
+        // rather than what its own declaration would say.
+        if (design_uses_home_arg_) {
+            argv.push_back(callee_home());
         }
         // Snapshot each ref-actual signal with waiters before the call; the wait
         // queue is serviced at the continuation with the net old -> new transition.
@@ -27050,6 +27941,55 @@ private:
                                     { b_.getInt32(0), b_.getInt32(proc_index) });
     }
 
+    // The per-program-instance TERMINATION ROOT (LRM 24.3): one static control block
+    // per program instance, which is a tree NODE and never a thread.
+    //
+    // It exists because the clause terminates a program's descendant threads only
+    // "when all initial procedures within a program have reached their end", while a
+    // thread's own completion hands its live children to its PARENT
+    // (rt_proc_complete) -- and a program `initial` is a statically created process,
+    // whose parent is null, so the first `initial` of a two-`initial` program would
+    // drop its children out of the tree before the second one ended. Every program
+    // body therefore hands its children here on its way out (rt_proc_adopt), which
+    // makes the subtree of root[i] exactly "every thread still live that descends
+    // from an `initial` of program instance i" -- the set the clause names, closed
+    // transitively because the tree is.
+    //
+    // Rooting the kill here also keeps the walk off the `initial`s themselves: they
+    // stay parentless, as today, so the thread running the LAST one is not marked
+    // KILLED on its way to an ordinary completion, and `wait fork` / `disable fork`
+    // inside an `initial` keep seeing that thread's own descendants and nothing else
+    // -- a live `initial` is never handed another one's orphans.
+    //
+    // FINISHED rather than RUNNING because it is not a thread and never runs;
+    // kProcStatic keeps it off the pool freelist (proc_maybe_free), like every block
+    // in clotho.proc_pcb. Created on first use, so a design with no program never
+    // emits it.
+    llvm::Value* program_root_pcb(uint32_t inst) {
+        if (program_root_gv_ == nullptr) {
+            const auto                   n    = std::max<size_t>(program_inst_procs_.size(), 1);
+            auto*                        ty   = llvm::ArrayType::get(pcb_ty(), n);
+            auto*                        i32  = b_.getInt32Ty();
+            auto*                        ptr  = llvm::PointerType::getUnqual(ctx_);
+            auto*                        null = llvm::ConstantPointerNull::get(ptr);
+            std::vector<llvm::Constant*> fields{ llvm::ConstantInt::get(i32, kProcFinished | kProcStatic),
+                                                 llvm::ConstantInt::get(i32, 1) };
+            for (uint32_t k = 2; k <= kPcbNextMarked; ++k) {
+                fields.push_back(null);
+            }
+            auto* one            = llvm::ConstantStruct::get(pcb_ty(), fields);
+            program_root_arr_ty_ = ty;
+            program_root_gv_ =
+              new llvm::GlobalVariable(root_env_->llmod,
+                                       ty,
+                                       false,
+                                       llvm::GlobalValue::InternalLinkage,
+                                       llvm::ConstantArray::get(ty, std::vector<llvm::Constant*>(n, one)),
+                                       "clotho.program_root");
+        }
+        return b_.CreateInBoundsGEP(program_root_arr_ty_, sym(program_root_gv_), { b_.getInt32(0), b_.getInt32(inst) });
+    }
+
     llvm::FunctionCallee proc_alloc_fn() {
         return rt_fn("rt_proc_alloc", raw_ptr_ty(), { raw_ptr_ty() });
     }
@@ -27058,6 +27998,9 @@ private:
     }
     llvm::FunctionCallee proc_mark_kill_fn() {
         return rt_fn("rt_proc_mark_kill", raw_ptr_ty(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee proc_adopt_fn() {
+        return rt_fn("rt_proc_adopt", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
     llvm::FunctionCallee proc_thread_done_fn() {
         return rt_fn("rt_proc_thread_done", b_.getVoidTy(), { raw_ptr_ty() });
@@ -27291,7 +28234,18 @@ private:
         if (cur_is_task_) {
             return task_epilogue_bb_;
         }
-        return hdl_ != nullptr ? coro_final_bb_ : nullptr;
+        if (hdl_ == nullptr) {
+            return nullptr;
+        }
+        // A program `initial` aborted while parked has "reached its end" for LRM
+        // 24.3: the clause counts procedures that have ended, not ones that ended
+        // normally, and an `initial` killed by `disable` or `process::kill` is never
+        // going to end any other way. So it leaves through program.end, which counts
+        // it down and terminates its program's descendants, and falls into the
+        // ordinary final suspend from there. Null for every other body -- and for a
+        // $finish, which branches straight to coro.final (emit_finish_exit) because
+        // it has already ended the simulation and must not be counted twice.
+        return program_end_bb_ != nullptr ? program_end_bb_ : coro_final_bb_;
     }
 
     // Back from a park: if `kill` (or `disable fork`) landed on this thread while it
@@ -27318,7 +28272,12 @@ private:
     // point; nothing is destroyed from outside. Killing the calling thread is the one
     // activation no wake can reach -- it is running, not parked -- so it takes its
     // abort exit directly, exactly as a self-`disable` does.
-    void lower_proc_kill(llvm::Value* target, bool with_self) {
+    //
+    // `branch_on_self` is false for exactly one caller, `$exit` (LRM 24.7,
+    // lower_program_exit): it kills SEVERAL roots in a row, and the self-branch would
+    // leave the walks after the matching one unreachable. It ends the calling thread
+    // with one unconditional branch once every root is marked instead.
+    void lower_proc_kill(llvm::Value* target, bool with_self, bool branch_on_self = true) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
         auto* nty  = disable_node_ty();
         auto* null = llvm::ConstantPointerNull::get(ptr);
@@ -27360,7 +28319,7 @@ private:
         b_.SetInsertPoint(done);
         // Did this kill name the calling thread? Then abort here: nothing else will
         // resume us to notice the mark.
-        if (with_self && pcb_ != nullptr && proc_abort_exit() != nullptr) {
+        if (with_self && branch_on_self && pcb_ != nullptr && proc_abort_exit() != nullptr) {
             auto* cont = llvm::BasicBlock::Create(ctx_, "kill.other", fn);
             b_.CreateCondBr(b_.CreateICmpEQ(target, pcb_), proc_abort_exit(), cont);
             b_.SetInsertPoint(cont);
@@ -27446,7 +28405,7 @@ private:
         // Record that the wake we were parked for has already been delivered, so
         // `resume` schedules instead of waiting for a source that will not fire twice.
         b_.CreateStore(b_.CreateOr(b_.CreateLoad(i32, ctlp), b_.getInt32(kProcWakePend)), ctlp);
-        emit_suspend_raw("susp.resume");
+        emit_suspend("susp.resume");
         b_.CreateBr(test);
 
         b_.SetInsertPoint(done);
@@ -27576,7 +28535,7 @@ private:
         b_.SetInsertPoint(armed);
         b_.CreateStore(node, headp);
         b_.CreateStore(b_.getInt64(0), sched_ptr_);
-        emit_suspend_raw("waitfork.resume");
+        emit_suspend("waitfork.resume");
         emit_proc_unlink_node(node);
         // Killed while parked (LRM 9.7): leave the barrier now. Re-testing instead
         // would re-park on a still-live child list and the force-wake would be lost;
@@ -27730,7 +28689,7 @@ private:
         // in no other queue, so the flag has to read "not scheduled" or the wake is
         // dropped as a duplicate.
         b_.CreateStore(b_.getInt64(0), sched_ptr_);
-        emit_suspend_raw("await.resume");
+        emit_suspend("await.resume");
         // Unlink on resume, whoever woke us: the waker only walks and pushes, it does
         // not unlink, which is what keeps a multi-waiter list correct without a
         // compaction pass.
@@ -28309,28 +29268,78 @@ private:
     // A design with neither emits none of it.
     bool design_uses_reactive_ = false;
     // Functions reachable as reactive code, indexed by FunctionId
-    // (build_reactive_fns). Decides which region a #0 inside one parks in.
+    // (build_reactive_fns). One of build_shared_home_fns' two seeds.
     std::vector<bool> reactive_fns_;
-    // Whether the body currently lowering is one of them; see lower_delay.
-    bool in_reactive_body_ = false;
     // Whether any reactive body contains a #delay, i.e. whether the re-inactive
     // batch can ever be pushed. Decides eagerly, so lower_finish always sees the
     // queue it has to empty, whatever order the bodies lower in.
     bool reactive_has_delay_ = false;
-    // Functions reachable from a program block's `initial`, indexed by FunctionId
-    // (build_program_fns). A suspend inside one is rejected: see the comment there.
+    // Functions reachable from program code -- a program block's `initial` or a
+    // program's continuous assign / port copy -- indexed by FunctionId
+    // (build_program_fns). The other of build_shared_home_fns' two seeds.
     std::vector<bool> program_fns_;
+    // The two answers build_shared_home_fns computes, indexed by FunctionId:
+    // whether reactive-home code reaches the body at all, and whether ORDINARY code
+    // reaches it too -- in which case it has no lexical home and reads the calling
+    // thread's instead (LRM 24.3.1).
+    std::vector<bool> reactive_home_fns_;
+    std::vector<bool> shared_home_fns_;
+    // Whether ANY body is shared, i.e. whether the `home` ramp parameter exists.
+    // Design-wide for the same reason `proc` is (home_param_index): one vtable slot,
+    // one FunctionType. False for every design with no shared body, which then emits
+    // exactly the signatures it did before this existed.
+    bool design_uses_home_arg_ = false;
     // Whether the body currently lowering is a program block's `initial`. Drives
-    // the region-restoring resume in emit_suspend and the LRM 24.6 implicit
-    // finish; false for everything else, so no other design pays for either.
+    // the LRM 24.3 implicit finish; false for everything else, so no other design
+    // pays for it.
     bool in_program_body_ = false;
-    // Whether the body currently lowering is a subroutine a program can reach.
-    bool in_program_fn_ = false;
+    // Whether the body currently lowering is a reactive-home CONTINUOUS process
+    // (ir::Process::reactive_home): a program's continuous assign or port copy,
+    // LRM 24.3.1. Reactive-home like a program `initial` but not one of them, so
+    // it is kept apart from in_program_body_, which also drives the implicit
+    // finish countdown that only `initial` procedures may count against.
+    bool in_reactive_home_body_ = false;
+    // Whether the SUBROUTINE body currently lowering has a Reactive lexical home,
+    // i.e. is in reactive_home_fns_. Says nothing about a shared body, whose home is
+    // body_home_is_runtime_'s business; see reactive_home.
+    bool in_reactive_home_fn_ = false;
     // Number of program `initial` processes, i.e. the initial value of the live
-    // counter the LRM 24.6 implicit finish counts down. Zero when the design has
+    // counter the LRM 24.3 implicit finish counts down. Zero when the design has
     // no program at all, which is what elides the whole mechanism.
     uint32_t program_proc_count_ = 0;
     llvm::GlobalVariable* program_live_gv_ = nullptr;
+    // The LRM 24.3 program-INSTANCE partition (build_program_instances): how many
+    // `initial` procedures each program instance declares, and which instance each
+    // process belongs to (kNoProgramInst for a process that is not a program
+    // `initial`). Both empty for a design with no program.
+    static constexpr uint32_t kNoProgramInst = ~0u;
+    // A subroutine no single program instance owns (build_program_exit_owners): two
+    // instances reach it, or a program instance and a design process both do. Only
+    // `$exit` cares, and it refuses rather than guess (LRM 24.7 answers by thread).
+    static constexpr uint32_t kAmbiguousProgramInst = ~1u;
+    // Per instance, the process indices of its `initial` procedures, in process
+    // order. Its size is the number of program instances, and each entry's size is
+    // that instance's live-`initial` count at time zero.
+    std::vector<std::vector<uint32_t>> program_inst_procs_;
+    std::vector<uint32_t>              program_inst_of_proc_;
+    // Per FunctionId: the program instance whose `initial`s reach that subroutine,
+    // kNoProgramInst for none, kAmbiguousProgramInst for more than one owner.
+    std::vector<uint32_t> program_exit_owner_;
+    // The program instance a `$exit` in the body currently lowering names. Set per
+    // body: the instance itself for a program `initial`, the owner-closure answer for
+    // a subroutine or fork child, kNoProgramInst for design code. Distinct from
+    // emit_program_end's own lookup, which asks a different question (which instance
+    // is the process that is ENDING part of) and happens to coincide for a process.
+    uint32_t cur_program_inst_ = kNoProgramInst;
+    // [ninst x i32] live-`initial` counters and [ninst x pcb] termination roots,
+    // both created on first use by a program body that can have descendants.
+    llvm::GlobalVariable* program_inst_live_gv_     = nullptr;
+    llvm::ArrayType*      program_inst_live_arr_ty_ = nullptr;
+    llvm::GlobalVariable* program_root_gv_          = nullptr;
+    llvm::ArrayType*      program_root_arr_ty_      = nullptr;
+    // Where the body currently lowering runs LRM 24.3's end-of-`initial` rules
+    // (emit_program_end). Non-null only while a program `initial` body lowers.
+    llvm::BasicBlock* program_end_bb_ = nullptr;
     // Current group's deferred-assertion generation-counter group id (-1 = none);
     // set per group in lower_group. Per-group generation globals, created lazily.
     int32_t                            cur_defer_group_ = -1;
@@ -28483,9 +29492,15 @@ private:
     // the coroutine frame. Null unless body_home_is_runtime_ -- almost every body
     // folds its home at lowering time instead.
     llvm::Value*        home_ptr_        = nullptr;
-    // Whether the body currently lowering executes an `expect`, whose resume
-    // moves the thread into the Reactive region for good (LRM 24.3.1). Such a
-    // body reads its home from home_ptr_ at every park instead of folding it.
+    // The gated `home` ramp parameter of the SUBROUTINE body currently lowering:
+    // the calling thread's home region (LRM 24.3.1). Null in a process body, which
+    // is a thread root and has no caller, and in a design with no shared body.
+    llvm::Value* home_arg_ = nullptr;
+    // Whether the body currently lowering must read its home from the running
+    // thread rather than fold it: it is SHARED between reactive-home and ordinary
+    // callers (LRM 24.3.1 / 24.5), or it executes an `expect`, whose resume moves
+    // the thread into the Reactive region for good (LRM 16.17 + 24.3.1). Such a
+    // body goes through home_ptr_ at every park instead of folding a constant.
     bool                body_home_is_runtime_ = false;
     // Deferred def-relative sched addressing chosen by lower_group (see
     // materialize_sched_ptr); no_anchor when the absolute constant is used.

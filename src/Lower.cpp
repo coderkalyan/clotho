@@ -1746,10 +1746,14 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
         // user task is not, and clotho does not trace the body -- so it cannot rule
         // out a construct this walk would have refused had the user written it in
         // the action block itself: a `forever`, an intra-assignment delay, a
-        // deferred immediate assertion. Suspending is no longer among them, so this
-        // is no longer "the call might consume time". Nor can it tell whether the
-        // same task is called from ordinary code as well, which the backend refuses
-        // separately: a body records one home region and is lowered once.
+        // deferred immediate assertion. Suspending is no longer among them.
+        //
+        // Sharing the task with ordinary code is no longer among them either. That
+        // used to be a second, independent reason -- a body records one home region
+        // and is lowered once -- and the backend refused it separately; LRM 24.3.1
+        // now puts the home on the THREAD, so a shared body reads its caller's
+        // (build_shared_home_fns in LlvmBackend.cpp) and the question is settled.
+        // What remains is only the untraced-body one.
         //
         // A user *function* needs no check at all: LRM 13.4.4 forbids a timing
         // control in one, so calling it cannot suspend, and a function that cannot
@@ -1757,8 +1761,7 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
         if (c.subroutine.index() == 0 && std::get<0>(c.subroutine)->subroutineKind == SubroutineKind::Task) {
             reject("a task call",
                    "clotho does not trace the body, so it cannot rule out a construct there that "
-                   "would be refused if it were written here, nor tell whether ordinary code calls "
-                   "the same task");
+                   "would be refused if it were written here");
         }
         // Arguments only, rather than visitDefault: a call's other child nodes are
         // the `with` constraint block of a randomize(), which is declarative and
@@ -1935,14 +1938,45 @@ public:
         // rejected as "member not allowed in program declaration", and
         // instantiating a program inside a program is rejected outright.
         const bool is_program = inst.getDefinition().definitionKind == slang::ast::DefinitionKind::Program;
-        if (is_program && !inst.getPortConnections().empty()) {
-            // TODO: program ports. They would elaborate through wire_ports like a
-            // module's, but a program's ports carry the clocking-block/skew
-            // semantics of LRM 24.3 that nothing here implements, and an unchecked
-            // port copy is an Active-region process feeding Reactive code. Refused
-            // rather than silently given module semantics.
-            fail("a `program` with ports is not supported (LRM 24.3)");
-        }
+        // Program PORTS are module ports plus exactly one region rule, and both
+        // halves are now in place, so nothing about a port is refused here.
+        //
+        // LRM 24.3: "Program port declaration syntax and semantics are the same as
+        // those of modules (see 23.2.2)", so a program's connections elaborate
+        // through build_inout_aliases and wire_ports unchanged. LRM 24.3.2 adds
+        // only WHERE the copy runs: "variables on the other side of a program port
+        // connection are updated in the reactive region set. Similarly, the driving
+        // and resolution of nets on the other side of a program port connection
+        // also occurs in the reactive region set. [...] Design processes sensitive
+        // to those cross-region variables and nets are scheduled for wake up in the
+        // active region set." wire_ports marks the copies it emits for a program
+        // child reactive-home for that sentence; the input direction is 24.3.1's
+        // own `assign tclk = clk;`, a construct inside the program sensitive to a
+        // design signal, which that clause puts in the Reactive region too.
+        //
+        // By port kind, all four shapes need no instance-level check:
+        //  - interface / modport: no copy process exists at all, since
+        //    canonical_value_symbol resolves both sides onto the interface
+        //    instance's own signal (docs/design/interfaces.md), so the program's
+        //    reactive code reads and writes it exactly as it does through a
+        //    hierarchical name -- which is already how the landed tests reach it;
+        //  - input / output value port: a reactive-home copy (wire_ports);
+        //  - inout / ref: build_inout_aliases collapses both sides onto one signal,
+        //    so again no copy -- the program writes the shared signal from Reactive
+        //    and design readers wake into Active by the ordinary wake path, which
+        //    is 24.3.2's last sentence verbatim;
+        //  - unconnected: no copy process either way, which is also why a
+        //    TOP-LEVEL program with ports needs no special case. A top instance has
+        //    no port connections at all, so there is nothing to copy and nothing to
+        //    classify. (The refusal this replaced keyed on connections and so let
+        //    that case through for the wrong reason.)
+        //
+        // A multiply-driven net on either side of the boundary is no longer a
+        // refusal: its resolver is reactive-home when any driver is program-side
+        // (alloc_driver_slot / emit_wire_resolvers, phase A5 of
+        // docs/design/program-blocks.md). What is still refused lives where the
+        // answer is known rather than here: the shape refusals wire_ports /
+        // build_inout_aliases already apply to any instance.
 
         // Collect builds the scope node; Emit reuses the node Collect built.
         // A parent's children vector only grows during Collect (before this
@@ -6759,6 +6793,13 @@ private:
     // parent connection to be a whole signal (a single canonical net/variable);
     // a bit-select / part-select / concat connection has no single collapse target
     // and is rejected loud. An unconnected inout leaves the child net standalone.
+    //
+    // A `program`'s inout/ref port takes this same collapse, and the collapse is
+    // what makes it correct under LRM 24.3.2 with no region work at all: with one
+    // shared signal there is no copy process to place, the program writes that
+    // signal from its Reactive code, and "design processes sensitive to those
+    // cross-region variables and nets are scheduled for wake up in the active
+    // region set" is then just the ordinary wake path.
     void build_inout_aliases(const InstanceSymbol& inst) {
         for (const PortConnection* pc : inst.getPortConnections()) {
             if (pc->port.kind != SymbolKind::Port) {
@@ -7557,10 +7598,25 @@ private:
         return static_cast<uint16_t>((strength_level(ds.first) << 8) | strength_level(ds.second));
     }
 
-    ir::Signal alloc_driver_slot(ir::Signal net, ir::SourceLoc l, uint16_t strength = 0x0303) {
+    // `program_driver` is for the caller that knows the answer without
+    // `in_program_`: a program's PORT copy is emitted by wire_ports while the
+    // PARENT instance's members lower, so the flag there is the parent's answer
+    // -- false, since a program can only be instantiated in a design scope. The
+    // same split, for the same reason, as add_continuous_process.
+    ir::Signal alloc_driver_slot(ir::Signal    net,
+                                 ir::SourceLoc l,
+                                 uint16_t      strength       = 0x0303,
+                                 bool          program_driver = false) {
         const auto net_u        = static_cast<uint32_t>(net);
         const auto existing     = resolved_scope_.find(net_u);
         const bool first_driver = existing == resolved_scope_.end();
+        // Every driver of a resolved net passes through here, so this is the one
+        // place that can see "some driver of this net is program-side" without
+        // each caller remembering to say so (LRM 24.3.2; emit_wire_resolvers
+        // turns it into a reactive-home resolver).
+        if (program_driver || in_program_) {
+            program_driven_nets_.insert(net_u);
+        }
         // The drivers of this net can live in different instance scopes (e.g. a
         // shared interface net whose header port is bound from the parent AND
         // separately driven by a bind-inserted module reaching it through an
@@ -7900,12 +7956,31 @@ private:
                 wait_events.push_back(ir::WaitEvent{ .signal = site.active, .edge = ir::Edge::Any });
                 wait_events.push_back(ir::WaitEvent{ .signal = site.val, .edge = ir::Edge::Any });
             }
-            module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
-                                             .wait_events = std::move(wait_events),
-                                             .self_start  = true,
-                                             .span        = ir::SourceSpan{ l, l },
-                                             .ir          = b.finish(),
-                                             .scope       = scope });
+            // LRM 24.3.2: "the driving and resolution of nets on the other side of
+            // a program port connection also occurs in the reactive region set."
+            // One program-side driver therefore makes the WHOLE resolver
+            // reactive-home, and that is a real semantic choice, not a local one:
+            // a net has exactly one resolution region, so the net's DESIGN-side
+            // drivers now resolve in Reactive too. A design cascade that runs
+            // through this net consequently sorts after the reactive code of the
+            // same slot, and its design readers wake in the next Active iteration
+            // -- which is precisely the ordering the clause's own example asks for
+            // on the program-driven edge, now applied to every edge of the net.
+            // The clause does not distinguish which driver changed; it puts the
+            // resolution of such a net in the reactive region set, full stop.
+            //
+            // The alternative would be per-driver resolution regions -- two
+            // resolvers folding one net, an Active one and a Reactive one -- which
+            // no sentence of the LRM asks for, and which has no defined answer for
+            // how the two partial folds combine into the net's single value.
+            const bool reactive_home = program_driven_nets_.contains(net_u);
+            module_.add_process(ir::Process{ .activation    = ir::Activation::Always,
+                                             .wait_events   = std::move(wait_events),
+                                             .self_start    = true,
+                                             .reactive_home = reactive_home,
+                                             .span          = ir::SourceSpan{ l, l },
+                                             .ir            = b.finish(),
+                                             .scope         = scope });
         }
     }
 
@@ -7944,6 +8019,11 @@ private:
             // An `assign #d` here is a PER-DRIVER inertial delay (LRM 10.3.3) — it
             // delays this driver's contribution, and the resolver re-runs when the
             // slot lands — so it rides the slot store, never the resolved net.
+            // Inside a program the slot store is reactive-home like every other
+            // continuous construct (LRM 24.3.1), and alloc_driver_slot records the
+            // net through `in_program_` so emit_wire_resolvers folds it from a
+            // reactive-home resolver as well (LRM 24.3.2). What that costs the
+            // net's design-side drivers is stated at that fold.
             emit_resolved_driver(
               *net, a, left, b, l, strength, delay != nullptr ? &delay->as<DelayControl>().expr : nullptr);
             return;
@@ -8022,13 +8102,26 @@ private:
     // copy) lowers to: it evaluates once at time zero so it settles from
     // declaration-initialized values, then re-evaluates whenever a wait event
     // fires (LRM 4.9.1, 23.3.3).
-    void add_continuous_process(std::vector<ir::WaitEvent> wait_events, ir::SourceLoc l, ir::Builder& b) {
-        module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
-                                         .wait_events = std::move(wait_events),
-                                         .self_start  = true,
-                                         .span        = ir::SourceSpan{ l, l },
-                                         .ir          = b.finish(),
-                                         .scope       = cur_scope_id() });
+    //
+    // Inside a `program` the same construct belongs to the reactive region set
+    // instead (LRM 24.3.1: "The continuous assignment assign tclk = clk; would
+    // also be scheduled in the Reactive region"), which is what `in_program_`
+    // contributes here. The parameter is for the caller that knows the answer
+    // without that flag: a program's PORT copy is emitted by wire_ports while the
+    // PARENT instance's members lower, so `in_program_` there is the parent's
+    // answer -- false, since a program can only be instantiated in a design scope
+    // -- rather than the program's.
+    void add_continuous_process(std::vector<ir::WaitEvent> wait_events,
+                                ir::SourceLoc              l,
+                                ir::Builder&               b,
+                                bool                       reactive_home = false) {
+        module_.add_process(ir::Process{ .activation    = ir::Activation::Always,
+                                         .wait_events   = std::move(wait_events),
+                                         .self_start    = true,
+                                         .reactive_home = reactive_home || in_program_,
+                                         .span          = ir::SourceSpan{ l, l },
+                                         .ir            = b.finish(),
+                                         .scope         = cur_scope_id() });
     }
 
     // -- Procedural continuous assignment: force / release (LRM 10.6.2) --
@@ -8189,6 +8282,18 @@ private:
         stmt_force_site_[&s] = { net_u, idx };
         if (resolved_nets_.insert(net_u).second) {
             net_resolve_op_[net_u] = net_resolve_tag(canonical_value_symbol(root).as<NetSymbol>().netType.netKind);
+        }
+        if (in_program_) {
+            // A `force` from program code drives this net as surely as a
+            // continuous assignment does -- the resolver overlays the site on the
+            // fold (LRM 10.6.2) -- and the site's `active` / `val` are written by
+            // the program's Reactive thread. Without this the resolver would
+            // re-fold them in the next Active, a region later than LRM 24.3.2
+            // allows, which is the same defect the driver slots would have.
+            // A `force` is the only procedural continuous assignment that can
+            // reach a net: `assign` on a net is illegal and slang rejects it
+            // (register_pca_site), so no other PCA path needs this.
+            program_driven_nets_.insert(net_u);
         }
     }
 
@@ -9330,6 +9435,23 @@ private:
     // AssignmentExpression (sink = source, with width conversions baked in), while
     // an input yields the bare source rvalue to drive the child net with.
     void wire_ports(const InstanceSymbol& child) {
+        // Every copy emitted below for a PROGRAM child is reactive-home. LRM
+        // 24.3.2: "variables on the other side of a program port connection are
+        // updated in the reactive region set. Similarly, the driving and resolution
+        // of nets on the other side of a program port connection also occurs in the
+        // reactive region set." That sentence is about the OUTPUT direction; the
+        // input direction is 24.3.1's own example -- "The continuous assignment
+        // assign tclk = clk; would also be scheduled in the Reactive region" -- an
+        // input copy being exactly that assignment, a construct inside the program
+        // sensitive to a design signal. So both directions, one flag.
+        //
+        // Asked of the child definition rather than of `in_program_`:
+        // add_continuous_process ORs `in_program_` in, but that is the PARENT's
+        // answer here (this runs after lower_instance(child) restored it) and is
+        // always false, because LRM 24.3.2 also says program ports "are always
+        // connected to design objects (nets and variables), since programs can only
+        // be instantiated in design scopes".
+        const bool child_is_program = child.getDefinition().definitionKind == slang::ast::DefinitionKind::Program;
         for (const PortConnection* pc : child.getPortConnections()) {
             if (pc->port.kind == SymbolKind::InterfacePort) {
                 // An interface port carries no value to copy: the interface
@@ -9396,10 +9518,11 @@ private:
             // away. Guarded at all because the plane-copy path below would otherwise
             // reach the backend as a plane load of a handle, which throws there —
             // a backend error with no source location instead of a diagnostic.
-            // TODO: container module ports (a handle-aware continuous copy).
+            // TODO: container ports (a handle-aware continuous copy). Reached by a
+            // `program` port too, hence no "module" in the message.
             if (ir::types::is_container(module_.pool, lower_type(p.internalSymbol->as<ValueSymbol>().getType()))) {
-                fail("a dynamic-array, queue or associative-array module port "
-                     "connection is not supported");
+                fail("a dynamic-array, queue or associative-array port connection "
+                     "is not supported");
             }
             if (expr->kind == ExpressionKind::Assignment) {
                 // Output: parent_target = child_net. slang gives an assignment whose
@@ -9411,6 +9534,15 @@ private:
                     // The parent net has multiple drivers: stage this child's
                     // output (whole net, or a constant sub-range with a Z
                     // background) into its own slot; the resolver folds them.
+                    // A program child's output copy is reactive-home, and so is
+                    // the resolver of the design net it drives: LRM 24.3.2, "the
+                    // driving and resolution of nets on the other side of a
+                    // program port connection also occurs in the reactive region
+                    // set". child_is_program records the net for
+                    // emit_wire_resolvers, which states what a reactive resolver
+                    // costs the net's design-side drivers. Identical question,
+                    // identical answer as a program's hierarchical `assign` to a
+                    // resolved net (lower_continuous_assign).
                     if (is_aggregate(*a.left().type)) {
                         // TODO: aggregate driver of a multiply-driven net.
                         fail("aggregate driver of a multiply-driven net is not supported");
@@ -9419,10 +9551,10 @@ private:
                     const ir::Index child_val =
                       coerce(b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
                     const ir::Index  val  = build_driver_slot_value(*net, a.left(), child_val, b, l);
-                    const ir::Signal slot = alloc_driver_slot(*net, l);
+                    const ir::Signal slot = alloc_driver_slot(*net, l, /*strength=*/0x0303, child_is_program);
                     b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
                     sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
-                    add_continuous_process(std::move(sens), l, b);
+                    add_continuous_process(std::move(sens), l, b, child_is_program);
                     continue;
                 }
                 if (is_aggregate(*a.left().type) || is_unpacked_array_type(*a.left().type)) {
@@ -9466,6 +9598,19 @@ private:
                     // folds it together with every other driver regardless of
                     // which scope discovered each one (alloc_driver_slot no
                     // longer requires every driver of one net to share a scope).
+                    // A program child's input copy is reactive-home, so the net
+                    // it drives resolves in the reactive region set too: LRM
+                    // 24.3.1 schedules constructs within a program block that are
+                    // sensitive to changes on design signals in the Reactive
+                    // region, and the reader that would otherwise see the fold a
+                    // region late is the program's OWN code. child_is_program
+                    // records the net for emit_wire_resolvers, which states what
+                    // a reactive resolver costs the net's other drivers.
+                    //
+                    // The second driver can only come from another program: LRM
+                    // 24.3 makes a design reference to a program signal an error
+                    // but explicitly allows "hierarchical references to extend
+                    // from one program scope to another program scope".
                     if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
                         // TODO: aggregate driver of a multiply-driven net (matches
                         // the OUTPUT port and continuous-assign refusals above).
@@ -9473,10 +9618,10 @@ private:
                     }
                     const ir::Ref    ty   = lower_type(itype);
                     const ir::Index  val  = coerce(lower_expr(*expr, b), *expr->type, ty, b, l);
-                    const ir::Signal slot = alloc_driver_slot(child_sig, l);
+                    const ir::Signal slot = alloc_driver_slot(child_sig, l, /*strength=*/0x0303, child_is_program);
                     b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
                     collect_expr_reads(*expr, sens);
-                    add_continuous_process(std::move(sens), l, b);
+                    add_continuous_process(std::move(sens), l, b, child_is_program);
                     continue;
                 }
                 const ir::Ref ty = lower_type(itype);
@@ -9502,7 +9647,7 @@ private:
             // A port connection is a continuous copy: evaluate at time zero so the
             // child sees the parent's declaration-initialized value even when the
             // parent signal never changes afterward (LRM 23.3.3).
-            add_continuous_process(std::move(sens), l, b);
+            add_continuous_process(std::move(sens), l, b, child_is_program);
         }
     }
 
@@ -12519,6 +12664,22 @@ private:
             // cycles the way the automaton assumes.
             // TODO: `edge` and level-sensitive assertion clocks.
             fail("an assertion clock must be a posedge or a negedge");
+        }
+        // A program signal as the leading clocking event: LRM 24.3.1 requires the
+        // scheduler to iterate from the reactive region set back around the outer
+        // loop, through the OBSERVED region where the assertion is evaluated, and
+        // clotho's loop never re-enters Observed once the reactive drain empties.
+        // The monitor would step one whole time slot late, silently. Reachable only
+        // for an assertion INSIDE a program: 24.3 makes a reference to a program
+        // signal "from outside any program block" an error and slang enforces it.
+        // Full analysis, and the two candidate fixes, on program_clock_signal.
+        if (const ValueSymbol* psig = program_clock_signal(event.expr)) {
+            fail("a concurrent assertion clocked by the program signal `" + std::string(psig->name) +
+                 "` is not supported: the assertion is evaluated in the Observed region, which "
+                 "Clotho does not re-enter after the reactive region set drains (LRM 24.3.1 "
+                 "requires the scheduler to iterate back around the outer loop through Observed), "
+                 "so it would step a full time slot late -- clock it from a design signal, which "
+                 "is what LRM 24.4 asks for anyway");
         }
 
         // Peel the disable condition. LRM 16.15: it is deliberately NOT sampled,
@@ -16367,6 +16528,117 @@ private:
         return ev;
     }
 
+    // Whether a signal is a PROGRAM signal, which LRM 24.3 defines by declaring
+    // scope and nothing else:
+    //
+    //   Variables declared within the scope of a program, including variables
+    //   declared as ports, are called program variables. Similarly, nets declared
+    //   within the scope of a program are called program nets. Program variables
+    //   and nets are collectively termed program signals.
+    //
+    // and whose dual the same subclause fixes just as tightly: "Any net or
+    // variable declared within a module, interface, package, or $unit is
+    // considered to be a design signal." So the test is the first enclosing
+    // instance body, and a program PORT is deliberately included however the
+    // design drives the other side of it.
+    //
+    // Canonicalized first, which is what keeps the recommended shape legal: a
+    // signal reached through an interface port or a modport collapses onto the
+    // INTERFACE instance's own storage (docs/design/interfaces.md), and the clause
+    // above calls that a design signal.
+    //
+    // The walk stops at the first InstanceBody because climbing past one reaches
+    // the DECLARATION site rather than the enclosing instance (see owning_top), so
+    // a program instantiated in a module must not read as a module signal's scope
+    // and a module instantiated -- illegally, but slang decides that -- in a
+    // program must not read as a program's.
+    static bool is_program_signal(const ValueSymbol& raw) {
+        const ValueSymbol& sym = canonical_value_symbol(raw);
+        for (const Scope* s = sym.getParentScope(); s != nullptr;) {
+            const Symbol& owner = s->asSymbol();
+            if (owner.kind == SymbolKind::InstanceBody) {
+                return owner.as<InstanceBodySymbol>().getDefinition().definitionKind ==
+                       slang::ast::DefinitionKind::Program;
+            }
+            s = owner.getParentScope();
+        }
+        return false;
+    }
+
+    // The first program signal an event expression references, or null. Shared by
+    // the clocking-block and concurrent-assertion clocks, which have one and the
+    // same defect for one and the same reason -- both are Observed-region bodies
+    // detecting their own edge -- and it is a silent wrong answer, not a crash, so
+    // it is refused at both sites.
+    //
+    // LRM 24.3.1:
+    //
+    //   If an assertion is clocked by activity on a program object (not
+    //   recommended), the scheduler will iterate from the reactive region set back
+    //   around the outer loop in Figure 4-1, through the Observed region, where the
+    //   assertion is evaluated.
+    //
+    // Clotho's loop does not close that way. In emit_active_run: `wheel.check` runs
+    // emit_observed_run and then re-settles to the active drain (`check`) when the
+    // ACTIVE ring is non-empty; the reactive drain's `reactive.done` re-settle
+    // branches to `check` on the same test and otherwise falls through to
+    // `reactive.settled` -> Postponed -> the wheel. Observed <-> Active is a closed
+    // loop, but nothing ever re-enters Observed from the reactive region set. So a
+    // clock written only in Reactive -- a program `initial`, a program's continuous
+    // assign, or an input port copy, all reactive-home per 24.3.1 -- is not seen
+    // until the NEXT time slot's Observed pass, one whole slot late. It bites only
+    // when no Active-region process reads the same signal, because any Active
+    // reader's wake leaves the ring non-empty at `reactive.done` and Observed is
+    // then re-entered by accident.
+    //
+    // TODO: two candidate fixes, both larger than clause 24, so neither is taken
+    // here. Recorded in full so the next person does not re-derive them
+    // (docs/design/program-blocks.md §10):
+    //   1. Point `reactive.done`'s else-edge at `wheel.check`. Rejected: it HANGS.
+    //      `wheel.check`'s own re-settle leaves only via `check`, and the
+    //      reactive->Observed edge pops no ring entry, so it bumps no oscillation
+    //      counter and would spin without ever tripping the guard that aborts a
+    //      non-converging slot. A hang is a worse failure than a refusal.
+    //   2. Re-enter Observed conditionally -- "did reactive code write something an
+    //      Observed process samples". Rejected for now: it re-runs every Observed
+    //      body a second time in the slot. A clocking block survives that (it
+    //      detects its edge against `clocking_clk`, a one-slot latch, and
+    //      finalize_preponed clears `clocking_fired` per step), but an SVA monitor
+    //      detects its clock edge from the Preponed shadow, which does not change
+    //      within a step, so it would step its automaton twice for one clocking
+    //      event. Making that safe needs a per-monitor per-step latch, which is
+    //      clause 16 work, plus a termination argument for the extra pass.
+    //
+    // Deliberately conservative in one place, and it is cheaper to over-refuse a
+    // construct LRM 24.4 tells a testbench not to write than to decide it: an
+    // `inout` / `ref` program port collapses onto the design's own storage
+    // (build_inout_aliases), so clocking off one is safe as long as no program code
+    // writes it -- which needs a driver analysis this site does not run. 24.3 calls
+    // it a program signal, so it is refused with the rest.
+    static const ValueSymbol* program_clock_signal(const Expression& e) {
+        struct Scan : slang::ast::ASTVisitor<Scan, slang::ast::VisitFlags::AllGood> {
+            const ValueSymbol* hit = nullptr;
+            void               take(const ValueSymbol& vs) {
+                if (hit == nullptr && is_program_signal(vs)) {
+                    hit = &vs;
+                }
+            }
+            void handle(const NamedValueExpression& nv) {
+                take(nv.symbol);
+            }
+            void handle(const HierarchicalValueExpression& hv) {
+                take(hv.symbol);
+            }
+        };
+        // A composite clock (`@(posedge (a & b))`) is refused when ANY operand is a
+        // program signal: every operand drives the synthesized event net
+        // (synth_event_net), so one reactive-home operand puts the whole edge one
+        // slot late.
+        Scan scan;
+        e.visit(scan);
+        return scan.hit;
+    }
+
     // Whether this input clockvar's effective skew is an explicit `#0`. LRM 14.4's
     // built-in default is `#1step`, a block-level `default input` item overrides
     // that, and the item's own skew overrides both; slang folds neither fallback
@@ -16432,7 +16704,22 @@ private:
         // Checked in Collect so an unsupported clock is reported before any reader
         // resolves a clockvar of this block. The signal itself resolves in Emit,
         // once every scope has been collected.
-        clocking_event(cb);
+        const SignalEventControl& cev = clocking_event(cb);
+        // Same defect as the assertion clock above, same region, same reason: the
+        // block's sampling process is an Observed body (LRM 14.13), and a clock
+        // written only in the reactive region set is not seen until the next slot's
+        // Observed pass. Checked here in Collect, with the event shape, so no reader
+        // of a clockvar of this block ever resolves against storage that is about to
+        // be refused. Full analysis, and the two candidate fixes, on
+        // program_clock_signal.
+        if (const ValueSymbol* psig = program_clock_signal(cev.expr)) {
+            fail("a clocking block clocked by the program signal `" + std::string(psig->name) +
+                 "` is not supported: the block samples in the Observed region, which Clotho does "
+                 "not re-enter after the reactive region set drains (LRM 24.3.1 requires the "
+                 "scheduler to iterate back around the outer loop through Observed), so it would "
+                 "sample a full time slot late -- clock it from a design signal, which is what LRM "
+                 "24.4 asks for anyway");
+        }
 
         ClockingBlockState st;
         st.event   = declare_temp(mask_type(1), "clocking_ev");
@@ -20630,6 +20917,34 @@ private:
             // LRM 20.12. slang registers all ten names on one AssertControlTask,
             // so the arity and the shape of every argument are already checked.
             lower_assert_control(name, call, b);
+            return;
+        }
+        if (name == "$exit") {
+            // LRM 24.7: "Calling $exit from a thread or its descendent thread
+            // originating in an initial procedure of a program block shall terminate
+            // all initial procedures and their descendent threads within that
+            // originating program block. Calling $exit from a thread or its
+            // descendent thread that does not originate in an initial procedure in a
+            // program shall be ignored, and a warning may be issued to indicate that
+            // the call to $exit has been ignored."
+            //
+            // The clause scopes the effect by the THREAD, not by the lexical site, so
+            // only one case is decidable here: a call lexically in a design PROCESS
+            // (not inside a program, not inside a subroutine) can only ever be
+            // reached by a design thread, so it is the "shall be ignored" arm and
+            // nothing is emitted. Every other site emits the op and the backend names
+            // the owning program instance from the body the op lands in -- which is
+            // what a fork child of a program `initial`, and a subroutine, need.
+            if (!in_program_ && fn_ctx_ == nullptr) {
+                report(Severity::Warning,
+                       "program-exit-ignored",
+                       "$exit outside a program block is ignored (LRM 24.7): it terminates the "
+                       "`initial` procedures of the program the calling thread originates in, and "
+                       "this thread originates in design code",
+                       to_source_span(call.sourceRange));
+                return;
+            }
+            b.program_exit(loc(call));
             return;
         }
         fail("unsupported system task '" + std::string(name) + "'");
@@ -32952,6 +33267,15 @@ private:
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;
+    // The subset of resolved_nets_ with at least one PROGRAM-side driver: a
+    // driver lowered while in_program_ (a program's hierarchical `assign`, a
+    // net declaration assignment, a `force`) or a wire_ports port copy for a
+    // program child. LRM 24.3.2 puts "the driving and resolution of nets on the
+    // other side of a program port connection" in the reactive region set, so
+    // emit_wire_resolvers gives such a net a reactive-home resolver. Recorded
+    // rather than derived because the resolver is built after every pass, long
+    // after the flag that answers the question has been restored.
+    ankerl::unordered_dense::set<uint32_t> program_driven_nets_;
     // Per resolved net: its per-driver slot signals (fold order), the scope id
     // the resolver process is attributed to, and a representative source loc.
     ankerl::unordered_dense::map<uint32_t, std::vector<ir::Signal>> resolved_slots_;

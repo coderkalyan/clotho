@@ -25,10 +25,37 @@ And it is the load-bearing testbench construct: LRM 24.4 is explicit that
 clocks that are design signals are insensitive to read-write races", and that
 nonzero input skews alone do *not* buy that.
 
-Still blocked, and NOT unblocked by this work: `program` **ports** (LRM 24.3,
-refused in `lower_instance`). Port skew needs the clockvar machinery *plus* a
-Reactive-safe port copy, and `require_reactive_safe` already rejects event
-controls and intra-assignment delays in reactive code.
+`program` **ports** are no longer blocked: they landed as phases A1/A3/A4 of
+docs/design/program-blocks.md §4, and needed nothing from the clockvar machinery.
+There is no such thing as port skew — LRM 24.3 makes program port semantics "the
+same as those of modules" — and skew belongs to a clocking *item* (14.4), never
+to a port. What a port actually carries is a region: LRM 24.3.2 puts its copy
+process in the reactive region set, which is now an `ir::Process::reactive_home`
+flag rather than a new `Activation`. So a clocking block inside a program may
+sample a port, which is the canonical testbench shape
+(`tests/program_test.cpp`, "a clocking block in a program samples an input
+port"); the port is just an ordinary program-scope signal to it.
+
+One caveat that is a scheduler property rather than a clocking-block one, and it
+is now a **loud refusal** (§5) rather than a silent wrong schedule: the clocking
+EVENT must be a design signal, which is what LRM 24.4 asks for anyway ("programs
+that read design values exclusively through clocking blocks with clocks that are
+design signals are insensitive to read-write races"). A block clocked by a
+*program* signal — a port, or anything a program's own code writes — samples in
+Observed, which precedes Reactive, so a clock updated only in Reactive is not seen
+until a later pass through Observed. LRM 24.3.1 says the scheduler "will iterate
+from the reactive region set back around the outer loop […] through the Observed
+region" for exactly this case; clotho's reactive drain re-settles back to the
+active drain only when the ACTIVE ring is non-empty, and an Observed process is in
+no ring. It only bites when NOTHING in the Active region is sensitive to that
+signal, because any Active reader's wake re-enters the loop and catches the edge by
+accident — which is why it went unnoticed. Pre-dates the port work (a program
+`initial` or `assign` writing the clock reaches it too), and the naive one-edge fix
+hangs; the clause text, the three region-loop block names, both candidate fixes and
+what a real one needs are in program-blocks.md **§10**, which is the only copy.
+A concurrent assertion clocked the same way is refused beside it, separately,
+because the two fixes differ: a clocking block survives a second Observed pass of
+one slot and a monitor does not.
 
 ## 2. The shape of it
 
@@ -115,6 +142,7 @@ value change anyway.
 | bit-select or slice as a drive target | the pending value is one whole-signal store (LRM 14.16 allows both forms) |
 | clocking item bound to an expression | LRM 14.5 slices and concatenations |
 | non-posedge/negedge or multi-signal clocking event | the Observed body detects its own edge from a one-slot history |
+| clocking event that is a **program signal** (LRM 24.3), i.e. a program port or anything a program's own code writes | the block samples in Observed and the clock changes in Reactive, one region later; LRM 24.3.1 requires the scheduler to iterate back around the outer loop through Observed and clotho's loop does not close that way, so it would sample a full time slot late. Refused rather than fixed because pointing the reactive re-settle at the Observed block hangs, and re-entering Observed conditionally would step an SVA monitor's automaton twice for one clocking event — program-blocks.md §10 |
 | clockvar of non-packed type | the sample is one whole-signal copy |
 | assertion item declared inside a block | LRM 14.3, under 16.16(b)'s three restrictions |
 | sampled value function in procedural code | LRM 16.9.3; needs history rings keyed to the default clocking, not to a monitor |

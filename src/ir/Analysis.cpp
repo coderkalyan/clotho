@@ -304,6 +304,11 @@ TagInfo tag_info(Inst::Tag tag) {
         case Inst::Tag::FreadMem:
         case Inst::Tag::TimeFormat:
         case Inst::Tag::Finish:
+        // `$exit` (LRM 24.7) ends threads, so it is simulation-only for the same
+        // reason $finish is, and it is not a value op. It does NOT block thunk
+        // elision: a thunk-elided body is an `always`, i.e. design code, where 24.7
+        // says the call is ignored and the backend emits nothing at all.
+        case Inst::Tag::ProgramExit:
         case Inst::Tag::Severity:
         case Inst::Tag::Fflush:
         case Inst::Tag::System:
@@ -770,6 +775,17 @@ struct Structural {
                     // branch, so it deliberately does NOT set the fact -- a design
                     // using only V1's form keeps paying nothing.
                     uses.disable = true;
+                    break;
+                case Inst::Tag::ProgramExit:
+                    // `$exit` (LRM 24.7) terminates a program's `initial` procedures
+                    // and every descendant thread of one, which IS the `kill` subtree
+                    // walk (LRM 9.7), so it needs the control blocks that walk's tree
+                    // is made of -- even in a program that never forks and never
+                    // mentions `process`, since the `initial`s themselves are the
+                    // threads it marks. Its own arm rather than a fallthrough into the
+                    // one below: this tag carries no payload, and that arm reads a
+                    // ProcCtlInfo out of `extra`.
+                    uses.process = true;
                     break;
                 case Inst::Tag::ProcQuery:
                 case Inst::Tag::ProcCtl:
@@ -1540,6 +1556,7 @@ struct ValueSweep {
                 case Inst::Tag::MonitorOff:
                 case Inst::Tag::TimeFormat:
                 case Inst::Tag::Finish:
+                case Inst::Tag::ProgramExit:
                 case Inst::Tag::CaseViol:
                 case Inst::Tag::TaggedCheck:
                 case Inst::Tag::Severity:

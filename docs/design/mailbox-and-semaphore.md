@@ -547,7 +547,7 @@ branch is `unlink` + `WakeHead`, the same pair `Leave` emits, and it is pinned b
 | `wait fork` over children blocked on a mailbox | unaffected | the PCB tree is orthogonal |
 | `$finish` while waiters are parked | waiters stay linked and are never resumed | rings are emptied, nothing is freed, no collection follows (`lower_finish`) |
 | a blocked `get` inside an assertion action block | **refused in the first cut**, loud | an action block runs on the monitor's thread and the reactive-safety checker already refuses `wait fork` / `disable fork` there on identity grounds (`src/Lower.cpp:889-897`, `:928-938`), with a backend backstop at `reject_unsupported_reactive`. The `try_*` forms stay legal. Lifting it is the same work as `expect`'s. |
-| a blocked `get` in a task called from a `program` block | inherits `emit_suspend`'s existing refusal | `"suspending inside a task called from a `program` block is not supported"` |
+| a blocked `get` in a task called from a `program` block | works, and blocks in the REACTIVE region set | LRM 24.3.1 / 24.5: the task inherits the calling thread's home, so its park is reactive-home (`build_shared_home_fns`, `docs/design/program-blocks.md` §6.1). `emit_suspend`'s old refusal for this shape is gone. |
 | deadlock (all threads blocked) | the drain quiesces and simulation ends | no event is left to run; no deadlock detection is in scope |
 
 ---
