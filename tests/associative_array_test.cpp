@@ -396,20 +396,232 @@ TEST_CASE("assoc struct-keyed deep copy independence") {
                               "a1=1 c1=111\n");
 }
 
-// The key-type gate that remains (LRM 7.8.5 allows a queue / dynamic-array /
-// associative-array member; P2/P3, docs/design/assoc-keys.md, land it later).
+// The key-type gate that remains (LRM 7.8.5 allows an associative-array member;
+// P3, docs/design/assoc-keys.md, lands it later), and the deliberate GC-safety
+// scope boundary a class handle combined with a variable component hits.
 TEST_CASE("assoc key types Clotho still refuses loudly") {
-    SUBCASE("struct key with a queue member") {
+    SUBCASE("struct key with an associative-array member") {
         const LowerResult r = lower_text(R"(
             module m;
-                typedef struct { int q[$]; int i; } k_t;
+                typedef struct { int m[string]; int i; } k_t;
                 int a [k_t];
                 k_t k;
                 initial a[k] = 1;
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("queue / dynamic-array member") != std::string::npos);
+        CHECK(r.diagnostic_text().find("associative-array member") != std::string::npos);
+    }
+    // A class handle's key-handle offset (for GC tracing) is a compile-time
+    // constant, correct only for a FIXED key; a variable key's byte offsets are
+    // runtime-dependent, so a handle anywhere inside one is refused rather than
+    // risking an untraced (or wrongly offset) reference.
+    SUBCASE("struct key combining a class handle with a string member") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                class C; int x; endclass
+                typedef struct { C h; string s; } k_t;
+                int a [k_t];
+                k_t k;
+                initial a[k] = 1;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("combining a class handle") != std::string::npos);
+    }
+    SUBCASE("dynamic-array key from a non-lvalue expression") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef int d_t[];
+                int a [d_t];
+                function d_t f(); f = '{1, 2}; endfunction
+                initial a[f()] = 1;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("non-variable dynamic-array key") != std::string::npos);
+    }
+}
+
+// P2 (docs/design/assoc-keys.md): a queue / dynamic-array leaf, or a bare queue /
+// dynamic array itself, as a key. Count-prefixed (u32 be count || each element
+// recursively normalized in the container's own order -- its identity per
+// LRM 11.4.5 / 7.10), so it composes with P1's string leaves and nests to any
+// depth (a queue of queues, a queue of structs holding strings, ...).
+TEST_CASE("assoc queue / dynamic-array keys") {
+    SUBCASE("struct key with a queue member: put/get/exists/num/overwrite") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { int q[$]; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.q = '{1, 2, 3}; k.i = 5; a[k] = 100;
+                    k.q = '{1, 2};    k.i = 5; a[k] = 200;
+                    $display("num=%0d", a.num());
+                    k.q = '{1, 2, 3}; k.i = 5;
+                    $display("get=%0d ex=%0d", a[k], a.exists(k));
+                    k.q = '{1, 2, 3}; k.i = 5; a[k] = 999;  // same key: overwrite
+                    $display("num2=%0d get2=%0d", a.num(), a[k]);
+                    k.q = '{9, 9};
+                    $display("absent=%0d ex=%0d", a[k], a.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\n"
+                                  "get=100 ex=1\n"
+                                  "num2=2 get2=999\n"
+                                  "absent=0 ex=0\n");
+    }
+    // Injectivity: a raw (unprefixed) concatenation of two queues' elements
+    // would let {1,2},{3} collide with {1},{2,3}; the count prefix keeps them
+    // two distinct entries the same way P1's string length prefix does.
+    SUBCASE("injectivity: {1,2},{3} and {1},{2,3} are distinct entries") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { int a[$]; int b[$]; } k_t;
+                int m1 [k_t];
+                k_t k;
+                initial begin
+                    k.a = '{1, 2}; k.b = '{3};
+                    m1[k] = 1;
+                    k.a = '{1}; k.b = '{2, 3};
+                    m1[k] = 2;
+                    $display("num=%0d", m1.num());
+                    k.a = '{1, 2}; k.b = '{3};
+                    $display("v1=%0d", m1[k]);
+                    k.a = '{1}; k.b = '{2, 3};
+                    $display("v2=%0d", m1[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nv1=1\nv2=2\n");
+    }
+    // foreach traversal and first/next readout MATERIALIZE a fresh queue handle
+    // per key variable write -- the denormalizer's biggest piece of new code.
+    SUBCASE("foreach and first/next traversal readout, including an empty queue") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { int q[$]; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.q = '{9};    k.i = 1; a[k] = 1;
+                    k.q = '{1,2,3}; k.i = 5; a[k] = 2;
+                    k.q = '{};      k.i = 0; a[k] = 3;
+                    foreach (a[kk]) begin
+                        $write("i=%0d q=", kk.i);
+                        foreach (kk.q[j]) $write("%0d,", kk.q[j]);
+                        $display(" v=%0d", a[kk]);
+                    end
+                    void'(a.first(k));
+                    $display("first i=%0d qlen=%0d", k.i, k.q.size());
+                    void'(a.last(k));
+                    $display("last  i=%0d qlen=%0d q0=%0d", k.i, k.q.size(), k.q[0]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "i=0 q= v=3\n"
+                                  "i=1 q=9, v=1\n"
+                                  "i=5 q=1,2,3, v=2\n"
+                                  "first i=0 qlen=0\n"
+                                  "last  i=5 qlen=3 q0=1\n");
+    }
+    // A queue itself is the key (not nested in a struct); the frontend routes it
+    // through materialize_queue_rvalue instead of the struct aggregate-temp path.
+    SUBCASE("a bare queue as the key itself") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int q_t[$];
+                int a [q_t];
+                q_t q1, q2;
+                initial begin
+                    q1 = '{1, 2, 3}; a[q1] = 10;
+                    q2 = '{4, 5};    a[q2] = 20;
+                    $display("num=%0d", a.num());
+                    q1 = '{1, 2, 3};
+                    $display("get=%0d", a[q1]);
+                    foreach (a[k]) begin
+                        $write("k=");
+                        foreach (k[j]) $write("%0d,", k[j]);
+                        $display("");
+                    end
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=10\nk=4,5,\nk=1,2,3,\n");
+    }
+    // A dynamic-array member (the other P2 container kind).
+    SUBCASE("struct key with a dynamic-array member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { int d[]; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.d = '{7, 8, 9}; a[k] = 1;
+                    k.d = '{7, 8};    a[k] = 2;
+                    $display("num=%0d", a.num());
+                    k.d = '{7, 8, 9};
+                    $display("get=%0d", a[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=1\n");
+    }
+    // Composability: a queue of strings (P1 + P2 together), and a queue of
+    // queues (P2 nested inside itself).
+    SUBCASE("nesting: queue of strings, queue of queues") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef string qs_t[$];
+                int a [qs_t];
+                qs_t q1;
+                typedef int qq_t[$][$];
+                int b [qq_t];
+                qq_t q2;
+                initial begin
+                    q1 = '{"foo", "bar"}; a[q1] = 1;
+                    q1 = '{"foo"};        a[q1] = 2;
+                    $display("num=%0d", a.num());
+                    q1 = '{"foo", "bar"};
+                    $display("get=%0d", a[q1]);
+
+                    q2 = '{ '{1, 2}, '{3} };
+                    b[q2] = 42;
+                    q2 = '{ '{1, 2}, '{3} };
+                    $display("qq num=%0d get=%0d", b.num(), b[q2]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=1\nqq num=1 get=42\n");
+    }
+    // A class handle nested only through FIXED (non-variable) struct members is
+    // unaffected by the variable-key GC-safety guard, and stays GC-traced
+    // (regression pin: heavy allocation churn around the live key).
+    SUBCASE("class handle in a fixed key survives GC churn") {
+        constexpr std::string_view src = R"(
+            module m;
+                class C; int x; endclass
+                typedef struct { C h; byte b; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    for (int i = 0; i < 200; i++) begin
+                        automatic C junk = new;
+                        junk.x = i;
+                    end
+                    k.h = new; k.h.x = 42; k.b = 1;
+                    a[k] = 100;
+                    for (int i = 0; i < 200; i++) begin
+                        automatic C junk = new;
+                        junk.x = i;
+                    end
+                    $display("num=%0d get=%0d x=%0d", a.num(), a[k], k.h.x);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=1 get=100 x=42\n");
     }
 }
 

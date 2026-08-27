@@ -1918,20 +1918,26 @@ private:
     }
 
     // rt_elem_ops::keyhandles for an ASSOCIATIVE ARRAY descriptor: where the class
-    // handles are in one normalized key span, ascending. Empty for a key that cannot
-    // contain one.
+    // handles are in one normalized key span, ascending. Empty for a key that
+    // cannot contain one.
     //
-    // A bare class-handle key is the ONE-ENTRY case, `{ 0 }`, rather than a separate
-    // path: assoc_key_info reduces it to the integral case at width 64, and
-    // emit_key_bytes writes it at offset 0. A wildcard `[*]` key is never a handle --
-    // Lower.cpp:2285-2290 interns its key type as a canonical unsigned integral
-    // placeholder -- and a `string` key holds no handle either.
+    // A bare class-handle key is the ONE-ENTRY case, `{ 0 }`, rather than a
+    // separate path: assoc_key_info reduces it to the integral case at width 64,
+    // and emit_key_bytes writes it at offset 0. A wildcard `[*]` key is never a
+    // handle -- its key type interns as a canonical unsigned integral placeholder
+    // -- and a `string` key holds no handle either.
+    //
+    // A VARIABLE key (info.is_variable) never reaches agg_key_handle_offsets: its
+    // offsets are compile-time constants only for a FIXED key, and the frontend
+    // refuses a class handle anywhere inside a variable one precisely so this
+    // table never has to describe a runtime-dependent offset (Lower.cpp
+    // guard_key_no_handle_in_variable).
     std::vector<uint32_t> assoc_key_handle_offsets(Ref assoc_type) {
         assert(std::get<Type>(mod_.pool.get(assoc_type)).kind == Type::Kind::Assoc &&
                "only an associative array has a key");
         std::vector<uint32_t> out;
         const AssocKeyInfo info = assoc_key_info(assoc_type);
-        if (info.wildcard || info.is_string) {
+        if (info.wildcard || info.is_string || info.is_variable) {
             return out;
         }
         if (info.is_agg) {
@@ -18514,9 +18520,14 @@ private:
             info.is_string = true;
             return info;
         }
-        if (is_agg_abi(key_ty)) {
-            // An unpacked struct / fixed unpacked array key: serialized leaf by
-            // leaf (never memcpy'd -- see normalize_agg_key / normalize_variable_agg_key).
+        const Type& kt = std::get<Type>(mod_.pool.get(key_ty));
+        if (is_agg_abi(key_ty) || kt.kind == Type::Kind::Queue || kt.kind == Type::Kind::DynArray) {
+            // An unpacked struct / fixed unpacked array key, or (P2) a queue /
+            // dynamic array key itself: serialized leaf by leaf / count-prefixed,
+            // never memcpy'd -- see normalize_agg_key / normalize_variable_agg_key.
+            // A queue/dynarray key is always classified variable (its element
+            // count has no compile-time bound), which key_type_is_variable already
+            // reports for Kind::Queue / Kind::DynArray.
             info.is_agg      = true;
             info.is_variable = key_type_is_variable(key_ty);
             return info;
@@ -18696,11 +18707,41 @@ private:
             b_.CreateCall(keybuf_append_fn(), { dat, len });
             return;
         }
-        // A queue / dynamic-array / associative-array leaf reaches here once
-        // P2/P3 widen the admit list; guard_agg_key_leaves refuses every other
-        // case today, so only a plain scalar leaf (integral / class handle /
-        // event / chandle / virtual interface / packed struct or union) is
-        // reachable.
+        if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
+            // P2: u32 be count || each element recursively normalized in its own
+            // (queue: logical, ring-unwrapped) order -- element order is the
+            // container's own identity (`==` on queues is element-wise, 11.4.5 /
+            // 7.10), so this is canonical without needing a sort.
+            llvm::Value*    handle    = lv_handle_ptr(lv, HandleUse::Read);
+            const auto [len, data]    = container_len_base(handle, type);
+            const DynElem   e         = dynarr_elem(type);
+            llvm::Value*    count32   = cast(len, 32, false);
+            auto*           cty       = llvm::ArrayType::get(b_.getInt8Ty(), 4);
+            auto*           csc       = entry_alloca(cty, "assoc.vkey.qcount");
+            emit_key_bytes(count32, 32, false, csc, cty, 0);
+            b_.CreateCall(keybuf_append_fn(), { csc, b_.getInt32(4) });
+            auto* idx_a = entry_alloca(b_.getInt64Ty(), "assoc.vkey.qidx");
+            b_.CreateStore(b_.getInt64(0), idx_a);
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* head = llvm::BasicBlock::Create(ctx_, "vkey.q.head", fn);
+            auto* body = llvm::BasicBlock::Create(ctx_, "vkey.q.body", fn);
+            auto* done = llvm::BasicBlock::Create(ctx_, "vkey.q.done", fn);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            llvm::Value* i = b_.CreateLoad(b_.getInt64Ty(), idx_a);
+            b_.CreateCondBr(b_.CreateICmpULT(i, len), body, done);
+            b_.SetInsertPoint(body);
+            LValue elem_lv = container_elem_lvalue(handle, data, type, e, i);
+            emit_variable_agg_key_bytes(t.element, elem_lv, any_x);
+            b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+            return;
+        }
+        // An associative-array leaf reaches here once P3 widens the admit list;
+        // guard_agg_key_leaves refuses it today, so only a plain scalar leaf
+        // (integral / class handle / event / chandle / virtual interface /
+        // packed struct or union) is reachable.
         LValue leaf = lv;
         if (leaf.is_agg) {
             fill_agg_leaf(leaf, type);
@@ -18917,8 +18958,61 @@ private:
             off = b_.CreateAdd(off, b_.CreateAdd(b_.getInt32(4), len32));
             return;
         }
-        // A queue / dynamic-array / associative-array leaf reaches here once
-        // P2/P3 widen the admit list; see emit_variable_agg_key_bytes.
+        if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
+            // P2: inverse of the count-prefixed emit_variable_agg_key_bytes
+            // branch. Materializes into a scratch LINEAR (dynarray-shaped)
+            // handle first -- `tmp_elem_lvalue` addresses it with no ring wrap,
+            // regardless of whether the destination is a queue or a dynamic
+            // array -- then moves (dynarray destination) or deep-copies (queue
+            // destination, which has no bulk "allocate n empty elements"
+            // primitive of its own) into the actual destination handle.
+            llvm::Value*    n64 = cast(denormalize_key_word(leafptr, 0, 32, false, 32), 64, false);
+            llvm::Constant* ops = elem_ops_global(type);
+            const DynElem   e   = dynarr_elem(type);
+            auto* tmp = entry_alloca(dynarr_slot_ty(), "assoc.vkey.qtmp");
+            b_.CreateStore(llvm::Constant::getNullValue(dynarr_slot_ty()), tmp);
+            b_.CreateCall(dynarr_new_fn(),
+                         { tmp, ops, n64, alloc_site_global(loc_text(at), "assoc key traversal") });
+            llvm::Value* tdata = b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), tmp, 0));
+
+            // The element bytes start right after the 4-byte count prefix; a
+            // running offset threaded through the loop, since a variable-shaped
+            // element (a nested string / container) has no fixed stride to skip.
+            auto* eoff_a = entry_alloca(b_.getInt32Ty(), "assoc.vkey.qeoff");
+            b_.CreateStore(b_.CreateAdd(off, b_.getInt32(4)), eoff_a);
+            auto* idx_a = entry_alloca(b_.getInt64Ty(), "assoc.vkey.qidx");
+            b_.CreateStore(b_.getInt64(0), idx_a);
+
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* head = llvm::BasicBlock::Create(ctx_, "vkeyd.q.head", fn);
+            auto* body = llvm::BasicBlock::Create(ctx_, "vkeyd.q.body", fn);
+            auto* done = llvm::BasicBlock::Create(ctx_, "vkeyd.q.done", fn);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            llvm::Value* i = b_.CreateLoad(b_.getInt64Ty(), idx_a);
+            b_.CreateCondBr(b_.CreateICmpULT(i, n64), body, done);
+            b_.SetInsertPoint(body);
+            llvm::Value* eoff     = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
+            LValue       elem_lv  = tmp_elem_lvalue(tdata, e, i);
+            denormalize_variable_agg_key(t.element, elem_lv, kbase, eoff, at);
+            b_.CreateStore(eoff, eoff_a);
+            b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+
+            llvm::Value* dst = lv_handle_ptr(lv, HandleUse::Mutate);
+            if (t.kind == Type::Kind::DynArray) {
+                b_.CreateCall(dynarr_move_fn(), { dst, tmp, ops });
+            } else {
+                b_.CreateCall(queue_assign_dynarr_fn(),
+                             { dst, tmp, ops, alloc_site_global(loc_text(at), "assoc key traversal") });
+                b_.CreateCall(dynarr_delete_fn(), { tmp, ops });
+            }
+            off = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
+            return;
+        }
+        // An associative-array leaf reaches here once P3 widens the admit list;
+        // see emit_variable_agg_key_bytes.
         LValue leaf = lv;
         if (leaf.is_agg) {
             fill_agg_leaf(leaf, type);
@@ -26084,6 +26178,29 @@ private:
         el.narrow      = e.narrow;
         el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
         el.elem_idx    = cast(phys, 32, false);
+        el.store_width = e.width;
+        el.bit_off     = b_.getInt32(0);
+        el.width       = e.width;
+        return el;
+    }
+
+    // Element `idx` of a plain LINEAR data buffer (no ring wrap): the same body
+    // as container_elem_lvalue's non-queue path, but callable with no `type` Ref
+    // at all -- for denormalize_variable_agg_key's scratch dynarray (P2), which
+    // is always linear regardless of whether the destination key leaf is a
+    // queue or a dynamic array, so it never needs the ring-wrap branch that
+    // container_elem_lvalue's `type` parameter exists only to select.
+    LValue tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value* idx) {
+        if (e.is_agg || e.is_handle) {
+            return dyn_agg_elem_lvalue(LValue{}, e, data, idx, /*inrange=*/nullptr);
+        }
+        LValue el;
+        el.base        = data;
+        el.slot_ty     = e.slot_ty;
+        el.has_z       = e.has_z;
+        el.narrow      = e.narrow;
+        el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
+        el.elem_idx    = cast(idx, 32, false);
         el.store_width = e.width;
         el.bit_off     = b_.getInt32(0);
         el.width       = e.width;
