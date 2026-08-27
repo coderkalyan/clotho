@@ -1,13 +1,32 @@
 # Associative-array keys: every legal index type
 
-**Status:** scoping. Nothing here is implemented; the phases at the end are the
-proposal. The current model is `dynamic-arrays.md` §4a, which this supersedes
-once (if) the phases land.
+**Status: landed.** Every LRM 7.8.5 index type works: integral (2-/4-state,
+enum, packed), `[*]` wildcard, string, class handle, chandle, event, virtual
+interface, unpacked union, unpacked struct / fixed unpacked array, queue,
+dynamic array, associative array, and any nesting of these through structs /
+fixed arrays to arbitrary depth -- including the LRM's own example
+(`struct { byte B; int I[*]; }`). Supersedes `dynamic-arrays.md` §4a, which
+described the pre-P0 six-kind subset.
 
-Goal: make every index type LRM 7.8.5 declares legal actually work, instead of
-the six-kind subset clotho admits today. The blocking case in the conformance
-suite is an unpacked struct with a queue member, which is nearly the LRM's own
-example.
+Landed across five commits (P0-P4, docs/TODO.md): P0 admitted chandle / event
+/ virtual-interface / unpacked-union keys (all already flat handle-shaped or
+is_packed values, no backend change needed); P1 built the variable-length key
+mechanism (`rt_keybuf_*`) and string leaves; P2 added queue / dynamic-array
+key components; P3 added associative-array key components (completing the
+LRM's example); P4 fixed four independent correctness debts found while
+scoping (§7).
+
+One scope boundary beyond the original plan: a class handle anywhere inside a
+VARIABLE key (a key containing a string / queue / dynamic-array / associative-
+array component) is refused loudly (`guard_key_no_handle_in_variable`,
+Lower.cpp). The collector's key-handle trace is a compile-time STATIC offset
+table, correct only for a FIXED key; a variable key's byte offsets depend on
+runtime data, so a handle inside one could land at a different offset per
+entry. A runtime decode walk the collector could use instead was not built.
+A handle in an otherwise-fixed key (P0's bare handle keys, or one nested only
+through fixed struct/array members) is unaffected -- its static offset already
+works, verified under `--gc-stress` with heavy allocation churn around a live
+keyed entry.
 
 ## 1. What the LRM requires
 
@@ -117,24 +136,24 @@ So the map layer needs **no change** for variable-length keys. Every restriction
 is in the backend's fixed-size span construction and the frontend guards that
 protect it.
 
-### Support matrix, verified
+### Support matrix, landed
 
-Each row was run through `build-perf/clotho` on `main`:
-
-| index type | today |
+| index type | status |
 | --- | --- |
 | integral 2-state / 4-state, enum, packed | works |
 | `[*]` wildcard | works |
 | string | works |
 | class handle | works |
-| unpacked struct of integrals (nested structs / fixed arrays included) | works |
-| fixed unpacked array of integrals | works |
-| unpacked struct or array containing a **string** | refused (`... with a string member`) |
-| unpacked struct or array containing a **queue / dynamic array** | refused (`... with a queue / dynamic-array member`) |
-| unpacked struct or array containing an **assoc** | refused (same walk) |
-| **queue**, **dynamic array**, **assoc** as the key itself | refused (admit list) |
-| **chandle**, **event**, **virtual interface** | refused (admit list) |
-| **unpacked union** | refused (admit list, via `is_agg_abi_type`) |
+| chandle, event, virtual interface (P0) | works |
+| unpacked union (P0) | works |
+| unpacked struct / fixed unpacked array of integrals | works |
+| unpacked struct or array containing a **string** (P1) | works |
+| unpacked struct or array containing a **queue / dynamic array** (P2) | works |
+| unpacked struct or array containing an **associative array** (P3) | works |
+| **queue**, **dynamic array**, **associative array** as the key itself (P2/P3) | works |
+| any nesting of the above to arbitrary depth (queue of queues, assoc of structs of strings, ...) | works |
+| a class handle combined with a string / queue / dynamic-array / associative-array component | refused (GC-safety scope boundary, see header) |
+| a non-lvalue dynamic-array / associative-array key expression (a literal, a slice, an in-place call result) | refused (needs the dynamic-array/assoc twin of `materialize_queue_rvalue`) |
 | real / real-containing | rejected by slang — correct, 7.8.5 |
 
 ## 3. Why the guards exist: prefix ambiguity
@@ -235,44 +254,62 @@ makes this safe.
 - Route `emit_assoc_literal_init` and `const_table_signal` through
   `lower_assoc_key` (§7).
 
-## 6. Phases
+## 6. Phases — all landed
 
-| phase | content | rough size |
+| phase | content | commit |
 | --- | --- | --- |
-| **P0** | chandle / event / virtual-interface keys (handle word, class-handle normalizer verbatim); decide unpacked-union keys (does slang define `==`? if not, keep a guard that says so) | small — admit-list edit + tests |
-| **P1** | `rt_keybuf_*` + the fixed/variable split + **string leaves** inside aggregate keys, including denormalization for traversal | medium — this is where the mechanism is built and paid for |
-| **P2** | **queue / dynamic-array** components, top-level and nested (count-prefixed), including materializing deserialization for traversal | medium |
-| **P3** | **assoc** components (canonical sorted-entry serialization), which completes the LRM 7.8.5 example | medium, mostly the nested-iteration case |
-| **P4** | the correctness debts in §7 | small each, but P4a is a silent miscompile |
+| **P0** | chandle / event / virtual-interface keys (already flat handle words); unpacked-union keys (already flat `is_packed` values, since it lowers identically to a packed union) | `assoc: admit chandle / event / virtual-interface / unpacked-union keys (P0)` |
+| **P1** | `rt_keybuf_*` + the fixed/variable split + **string leaves** inside aggregate keys, including denormalization for traversal | `assoc: variable-length key encoding for string leaves inside struct/array keys (P1)` |
+| **P2** | **queue / dynamic-array** components, top-level and nested (count-prefixed), including materializing deserialization for traversal | `assoc: queue / dynamic-array key components, nested or bare (P2)` |
+| **P3** | **assoc** components (canonical sorted-entry serialization), completing the LRM 7.8.5 example | `assoc: associative-array key components, nested or bare (P3)` |
+| **P4** | the four correctness debts below | `assoc: fix silently-wrong whole-array equality (P4a)`, `assoc: implement LRM 7.8.6 invalid-key handling (P4b)`, `assoc: route literal-pattern keys through lower_assoc_key; fix a %p crash (P4c, P4d)` |
 
-P1 is the gate: P2 and P3 are new emitters on machinery P1 builds. P0 is
-independent and could land tomorrow.
+P2/P3's runtime loops (materializing a queue/dynarray/assoc from decoded key
+bytes, and the sorted-entry walk) also surfaced a latent SSA-dominance bug:
+the encoder's unknown-bit accumulator was threaded as a plain SSA reference
+across a runtime loop of unbounded trip count, which the LLVM verifier
+rejects once a leaf's `any_unknown()` is a genuine runtime value rather than
+a compile-time constant (latent for every all-2-state key tested through
+P1-P3; surfaced by P4a's 4-state-value regression test). Fixed by making the
+accumulator memory-backed (an `i1*` alloca), safe regardless of loop trip
+count — folded in with the P4a commit.
 
-## 7. Correctness debts found while scoping
+## 7. Correctness debts found while scoping — all fixed
 
-These are pre-existing, independent of the feature, and two of them are worse
-than the missing feature:
+These were pre-existing, independent of the feature:
 
-- **P4a — associative-array `==` / `!=` is silently wrong.** `is_assoc` is absent
-  from the aggregate-equality dispatch (`Lower.cpp:19368`), so a whole-assoc
-  compare falls through to the scalar binary path. Verified on `main`: two maps
-  with different contents report `eq 1 ne 0`. Should be an element-wise compare
-  (or, until then, a loud guard).
-- **P4b — LRM 7.8.6 is not implemented.** No warning is ever emitted for an
-  invalid (x/z) index on read or write, and `integral_key_valid`
-  (`LlvmBackend.cpp:13576`) treats a *literal* x/z key as valid because its
-  unknown mask is an `llvm::Constant`. Verified: `a[8'hxx] = 7; a[8'hzz] = 8;`
-  creates **one** entry (x and z both normalize to the all-zero span) where the
-  LRM wants zero entries and two warnings.
-- **P4c — two key paths bypass `lower_assoc_key`** (`emit_assoc_literal_init`,
-  `const_table_signal`). Currently unreachable for aggregate keys because a
-  struct localparam is separately unsupported; it becomes reachable as soon as
-  key types widen.
-- **P4d — `%p` of an assoc renders** (`build_assoc_p_string`), keyed by
-  `assoc_traverse(First/Next)`, so a printable key type prints. The key goes through
-  the ordinary `%p` leaf rules, which means a key type those rules cannot render is
-  refused by the leaf and not by the walk — the same refusal a value of that type
-  would take. Ordering is asserted in tests only for integral and string keys, per §8.
+- **P4a — associative-array `==` / `!=` was silently wrong.** `is_assoc` was
+  absent from the aggregate-equality dispatch, so a whole-assoc compare fell
+  through to the scalar binary path (verified on `main`: two maps with
+  different contents reported `eq 1 ne 0`). Fixed: reuses the P3 canonical
+  byte serializer on each whole operand and compares bytes -- bit-exact, so
+  `===`/`!==` always work; plain `==`/`!=` are refused loudly for a
+  4-state-capable value element, where the LRM's X-propagating answer can
+  differ from a flat byte compare.
+- **P4b — LRM 7.8.6 was not implemented.** No warning was ever emitted for an
+  invalid (x/z) index on read or write, and `integral_key_valid` treated a
+  *literal* x/z key as valid because its unknown mask is an `llvm::Constant`
+  (checking "is a Constant" rather than "is the constant false"), so
+  `a[8'hxx] = 7; a[8'hzz] = 8;` created **one** entry instead of the LRM's zero.
+  Fixed: the constant-folding bug is corrected, and the mandated warning is
+  emitted under `--sanitize=bounds` (`RT_BOUNDS_ASSOC_KEY`), matching how
+  every other "shall issue a warning" bounds clause Clotho already implements.
+- **P4c — two key paths bypassed `lower_assoc_key`** (`emit_assoc_literal_init`,
+  `const_table_signal`). `emit_assoc_literal_init` (a `'{key: value}` literal
+  pattern) is fixed, now reachable and exercised by P1-P3's widened key kinds.
+  `const_table_signal`'s own bypass (seeding a parameter-typed assoc constant)
+  remains unreachable, gated by an independent, still-standing "only integral,
+  real, string and null constant parameters" restriction unrelated to this
+  feature; documented in place (`Lower.cpp`, `emit_const_seed`) for if that
+  restriction is ever lifted.
+- **P4d — `%p` of an assoc with an unpacked-struct / fixed-array key crashed**
+  (a slang assertion, casting the key's unpacked struct type as packed) --
+  pre-existing on `main`, found while verifying `%p` for the newly admitted
+  key kinds. The key rendering unconditionally used the scalar leaf `%p` path;
+  fixed to split on `is_agg_abi_ref` the same way `key_operand()` already does
+  for `a[k]` itself. A bare queue / dynamic-array / associative-array key
+  still refuses `%p` cleanly (no crash), matching the pre-existing,
+  independent "container VALUE element" `%p` limitation.
 
 ## 8. Test and oracle plan
 
@@ -303,25 +340,21 @@ per lookup. An assoc-bearing key additionally forces the source map's sorted
 index to be built — worth a note in the docs, since it turns an O(1) lookup into
 O(n log n) on first use of such a key.
 
-## 10. Open questions
+## 10. Open questions — resolved
 
 1. ~~Does slang define `==` for an unpacked union?~~ **Answered while scoping:
-   yes.** `typedef union { byte a; byte b; } u_t; u_t x, y; x == y` binds and
-   runs on `main` today (prints 1), so an unpacked union has the equality
-   operator 7.8.5 asks for and belongs in P0's admit list. The only work is that
-   `is_agg_abi_type` (`Lower.cpp:2497`) tests `isUnpackedStruct()` and misses it,
-   even though `lower_type` already gives a union `Kind::Struct` storage — so the
-   leaf walk needs the union's overlapping members thought about (two members at
-   offset 0 must not serialize twice).
-2. Should an **assoc-bearing key** be legal at all in clotho's first cut? It is
-   the LRM's own example, so yes eventually, but it is the only phase that makes
-   a lookup depend on another map's sorted index. Splitting it out (P3) keeps
-   that decision reversible.
-3. Ordering for **string keys inside an aggregate**: this proposal length-prefixes
-   them, so the aggregate's order is not lexicographic in that leaf. That is
-   legal (no `<` on a struct), but if we ever want "obvious" ordering for
-   debugging, an escaping encoding (`00 -> 00 FF`, terminator `00 00`) preserves
-   order at the cost of a second pass and up to 2x expansion.
-4. Is there a **key-size cap** worth enforcing (a queue key with a million
-   elements serializes a million times per lookup)? A loud failure past some
-   large bound is cheaper to explain than a mysterious hang.
+   yes**, and it turned out moot: `lower_type`'s `isUnpackedUnion` arm already
+   lowers it identically to a packed union (one flat `is_packed` value, LRM's
+   overlay left to Clotho since 7.3 does not fix one for the unpacked case) --
+   so it already fell into `assoc_key_info`'s integral-width branch with no
+   leaf walk, no overlap handling, and no new backend code at all (P0).
+2. Should an **assoc-bearing key** be legal at all in clotho's first cut?
+   **Yes** (P3) -- landed as its own phase, on top of the P1 mechanism, as
+   planned.
+3. Ordering for **string keys inside an aggregate**: **length-prefixed**
+   (P1), per the recommendation here -- simple, matches every other variable
+   leaf, no `<` guarantee needed (legal per 7.8.5, no relational operator
+   defined for an aggregate key). The escaping alternative was not built.
+4. Is there a **key-size cap** worth enforcing? **No** -- left unbounded, on
+   the same trust-the-user basis as every other unbounded container
+   operation in Clotho.

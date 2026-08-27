@@ -198,7 +198,12 @@ Revisit `flat_map` only if a fill-once-iterate-many workload ever dominates.
 
 ## 4a. Key model — normalized order-preserving byte span (all key kinds)
 
-**Status: implemented.** All key kinds below land in v1. There is no external
+**Status: implemented for the FIXED-width subset below (v1); superseded by
+`assoc-keys.md` for the full LRM 7.8.5 picture** — string / queue / dynamic-
+array / associative-array leaves inside a struct key, and a bare queue /
+dynamic-array / associative-array key, chandle / event / virtual-interface /
+unpacked-union keys, and any nesting of these, all landed there on top of the
+fixed-width mechanism this section describes unchanged. There is no external
 reference for assoc — iverilog 13 cannot parse an associative-array
 declaration, and verilator violates LRM 7.8 by creating an entry on a read of an
 absent key.
@@ -281,11 +286,14 @@ is a *probe* (7.9.4 allows an absent one) and the clause defines no invalid-prob
 behaviour, so it normalizes as its must bits. Before this, an x key normalized to
 its must plane, which silently aliased `a['x]` onto `a[0]`.
 
-Deferred: a **string or dynamically-sized member inside a struct key** (LRM 7.8.5
-allows it, but the span would be variable-length, so the fixed-width leaf layout —
-and the shorter-is-less order — does not model it); guarded loud. **String /
-nested-container VALUE elements** are guarded loud (the a[k] read/write would have
-to route a handle, not a plane) — keys of every kind are supported regardless.
+A **string or dynamically-sized member inside a struct key**, or a bare queue /
+dynamic-array / associative-array key (LRM 7.8.5 allows both; the span is
+variable-length, so the fixed-width leaf layout above does not model it) is
+landed in `assoc-keys.md` on a separate variable-length encoding, gated behind
+a fixed-vs-variable classification so this section's fixed path pays nothing
+extra. **String / nested-container VALUE elements** are still guarded loud
+(the a[k] read/write would have to route a handle, not a plane) — keys of
+every kind are supported regardless.
 
 ## 5. Handle ABI (follows `rt_string`)
 
