@@ -2226,6 +2226,18 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
     message. A streaming RVALUE actual on an input formal is refused by
     `emit_agg_store` ("unsupported unpacked struct rvalue"; verilator 5.050
     ICEs on the same cast).
+  **A non-lvalue aggregate actual bound to a module port** ("aggregate/array
+  port connection must be a variable") was the same refusal at a second call
+  site: LRM 23.3.3 makes a port connection a continuous copy exactly like a
+  value-typed call argument, so `wire_ports`'s input-port branch now stages a
+  non-`is_struct_lvalue_shape` source through `agg_input_actual` too, instead
+  of refusing it — a `'{...}` pattern, a struct-returning call, and a `?:`
+  actual all reach a whole-struct or whole-array `input` port. An lvalue
+  actual (the common case: a plain variable / member / element) still copies
+  straight through with no extra temp. The slice-of-a-struct-array gap above
+  is inherited unchanged (same helper, same guard). Covered in
+  tests/instance_array_test.cpp ("non-lvalue aggregate actual bound to an
+  input port": literal struct, literal array, and call-result subcases).
 - [ ] **String-containing aggregate by value** through a function.
 - [x] **Non-lvalue aggregate RETURN, and an aggregate call result in a read
   context** (LRM 13.4) — `return g();`, `return '{1,2};`,

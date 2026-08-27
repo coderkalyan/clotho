@@ -230,6 +230,70 @@ TEST_CASE("whole unpacked sub-array (arr[i][j]) as a module port, in and out") {
     CHECK(run_capture(src) == "11 22 31 42\n");
 }
 
+// A non-lvalue aggregate actual (a `'{...}` pattern, or a struct-returning
+// function call) bound to a whole-struct / whole-array INPUT port used to be
+// refused outright ("aggregate/array port connection must be a variable"):
+// wire_ports required an lvalue-shaped source to copy from directly. Fixed by
+// staging a non-lvalue source into a fresh canonical temp first
+// (agg_input_actual), the same machinery an aggregate function-call argument
+// already uses -- LRM 23.3.3 makes a port connection a continuous copy
+// exactly like a value-typed call argument, so the same staging applies. An
+// lvalue-shaped actual (the common case) still passes straight through with
+// no extra copy.
+TEST_CASE("non-lvalue aggregate actual bound to an input port") {
+    SUBCASE("a '{...} struct literal") {
+        constexpr std::string_view src = R"(
+            typedef struct { int a; int b; } struct_t;
+            module child(input struct_t s, output int sum);
+                assign sum = s.a + s.b;
+            endmodule
+            module m;
+                int r;
+                child c(.s('{1, 2}), .sum(r));
+                initial begin
+                    #1; $display("sum=%0d", r);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "sum=3\n");
+    }
+    SUBCASE("a '{...} unpacked-array literal") {
+        constexpr std::string_view src = R"(
+            module child(input logic [7:0] wv [0:1], output logic [7:0] rv [0:1]);
+                assign rv[0] = wv[0] + 8'd1;
+                assign rv[1] = wv[1] + 8'd2;
+            endmodule
+            module m;
+                logic [7:0] rv[0:1];
+                child c(.wv('{8'h10, 8'h20}), .rv(rv));
+                initial begin
+                    #1; $display("rv0=%h rv1=%h", rv[0], rv[1]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "rv0=11 rv1=22\n");
+    }
+    SUBCASE("a struct-returning function call") {
+        constexpr std::string_view src = R"(
+            typedef struct { int a; int b; } struct_t;
+            function struct_t make(int x, int y);
+                make.a = x; make.b = y;
+            endfunction
+            module child(input struct_t s, output int sum);
+                assign sum = s.a + s.b;
+            endmodule
+            module m;
+                int r;
+                child c(.s(make(3, 4)), .sum(r));
+                initial begin
+                    #1; $display("sum=%0d", r);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "sum=7\n");
+    }
+}
+
 // A whole-array copy between two same-typed arrays whose z-elided slot layouts
 // differ only in the z word's presence: the dest is may-z (assigned z elsewhere),
 // this source is proven never-z. memcpy strides differ, so the copy is

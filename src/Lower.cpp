@@ -9629,14 +9629,21 @@ private:
                 if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
                     // A whole unpacked-struct / unpacked-array / aggregate input
                     // port: whole-object copy of the source into the child net (a
-                    // plain unpacked array memcpy's via emit_port_agg_copy).
+                    // plain unpacked array memcpy's via emit_port_agg_copy). An
+                    // lvalue-shaped actual (the common case -- a plain variable /
+                    // member / element) passes straight through with no extra
+                    // copy beyond the port's own; anything else (a `'{...}`
+                    // pattern, an aggregate `?:`, a call, a concatenation) is
+                    // staged into a fresh canonical temp first, by the same
+                    // machinery an aggregate CALL actual already uses
+                    // (agg_input_actual) -- LRM 23.3.3 makes a port connection a
+                    // continuous copy exactly like a value-typed call argument,
+                    // so the same staging is correct here, not just reused for
+                    // convenience.
                     const Expression& src = unwrap_conversion(*expr);
-                    if (!is_struct_lvalue_shape(src)) {
-                        // TODO: an aggregate port driven by a `'{...}` pattern / call
-                        // (needs a materialized temp, like an aggregate call actual).
-                        fail("aggregate/array port connection must be a variable");
-                    }
-                    emit_port_agg_copy(b.signal(child_sig, l), lower_lvalue(src, b), ty, b, l);
+                    const ir::Index   av  = is_struct_lvalue_shape(src) ? lower_lvalue(src, b)
+                                                                       : agg_input_actual(src, ty, b, l);
+                    emit_port_agg_copy(b.signal(child_sig, l), av, ty, b, l);
                 } else {
                     b.binary(ir::Inst::Tag::Store,
                              b.signal(child_sig, l),
