@@ -7935,15 +7935,6 @@ private:
             // slot's power-up value with the Z background.
             fail("delay on a partial driver of a multiply-driven (resolved) net is not supported");
         }
-        // The inertial decide compares both value planes as i64 (emit_inertial_arm),
-        // so the mm plane must fit 64 bits; a 4-state slot packs must|may, halving
-        // the usable width to 32. The slot always carries the net's own type.
-        // TODO: inertial delay on a net wider than 64 value bits.
-        const auto     ly       = module_.pool.layout(module_.signal(net).type);
-        const uint32_t mm_width = ly.domain == ir::Domain::Four ? 2 * ly.width : ly.width;
-        if (mm_width > 64) {
-            fail("inertial delay on a net wider than 64 value bits is not supported");
-        }
         b.store_inertial_delay(lv, val, scaled_delay(*delay_expr, b), l);
     }
 
@@ -8190,15 +8181,6 @@ private:
             if (!whole_scalar) {
                 fail("continuous assignment delay is only supported for a whole integral "
                      "scalar target");
-            }
-            // The inertial decide compares both value planes as i64, so the net's
-            // mm plane must fit 64 bits (a 4-state net packs must|may, halving the
-            // usable width to 32).
-            // TODO: inertial delay on a net wider than 64 value bits.
-            const uint32_t width    = left.type->getBitWidth();
-            const uint32_t mm_width = left.type->isFourState() ? 2 * width : width;
-            if (mm_width > 64) {
-                fail("inertial delay on a net wider than 64 value bits is not supported");
             }
             const ir::Index rhs   = lower_expr(a.right(), b);
             const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);

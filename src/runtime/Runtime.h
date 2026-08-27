@@ -1899,20 +1899,36 @@ void rt_intra_reset(void);
 
 // -- Inertial continuous-assignment delay (`assign #d lhs = rhs`, LRM 10.3.3) --
 //
-// On each RHS change the backend evaluates the new RHS and asks rt_inertial_decide
-// whether (and with what epoch) to arm a detached store. Inertial (pulse-rejecting)
-// semantics: a change that supersedes a still-pending store cancels it (epoch bump),
-// so a pulse narrower than the delay never propagates.
+// On each RHS change the backend loads the site's persistent pending-value
+// buffer and the target net's current value, compares both against the fresh
+// RHS with its own `icmp eq` (arbitrary width, no size limit — the runtime
+// never interprets value bytes, only bookkeeps epoch/pending state), and asks
+// rt_inertial_decide whether (and with what epoch) to arm a detached store.
+// Inertial (pulse-rejecting) semantics: a change that supersedes a still-
+// pending store cancels it (epoch bump), so a pulse narrower than the delay
+// never propagates.
 
-// Decide the inertial action for site `idx` given the freshly-evaluated RHS planes
-// (`new_mm`/`new_z`) and the target net's current value planes (`cur_mm`/`cur_z`),
-// each packed into a 64-bit word (4-state: must | may<<W and the z plane; 2-state:
-// the value and 0). Returns 0 to arm nothing (either a store to the same value is
-// already pending — keep its timer — or the new value already equals the net), else
-// the non-zero epoch the caller must stamp on the armed record. A 4-state-exact
-// (`===`) compare on both planes.
-uint64_t rt_inertial_decide(uint32_t idx, uint64_t new_mm, uint64_t new_z, uint64_t cur_mm,
-                            uint64_t cur_z);
+// Return site `idx`'s persistent pending-value buffer, allocating it to
+// `nbytes` on the first call. A site's width is fixed after elaboration, so
+// every later call for the same `idx` passes the same `nbytes` and returns the
+// same pointer — one allocation per site, none after warm-up. The backend
+// stores the freshly-armed value's planes here (see rt_inertial_decide) and
+// loads them back next time to build `same_as_pending`.
+void* rt_inertial_buf(uint32_t idx, uint32_t nbytes);
+
+// Decide the inertial action for site `idx`. `same_as_pending` is the
+// backend's own 4-state-exact (`===`) compare of the fresh RHS against the
+// buffer rt_inertial_buf returned (mm && z planes, nonzero when equal); it is
+// only consulted when a store is already pending, so a stale/uninitialized
+// buffer before the first arm is never read here. `same_as_cur` is the same
+// compare against the target net's current value. Both are plain 0/1 flags,
+// not C++ `bool`, to keep the JIT call's LLVM parameter types an exact match
+// for the native ABI. Returns 0 to arm nothing (either a store to the same
+// value is already pending — keep its timer — or the new value already
+// equals the net), else the non-zero epoch the caller must stamp on the armed
+// record; the caller is then responsible for storing the new planes into the
+// rt_inertial_buf buffer before arming.
+uint64_t rt_inertial_decide(uint32_t idx, uint32_t same_as_pending, uint32_t same_as_cur);
 
 // Wheel expiry callback for an inertial record: commit it (rt_intra ready list) only
 // if its stamped epoch still matches the site's current epoch, else it was cancelled

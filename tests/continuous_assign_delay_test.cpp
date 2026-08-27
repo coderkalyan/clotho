@@ -117,12 +117,21 @@ TEST_CASE("inertial CA delay: concatenation target is rejected") {
     CHECK(err.find("whole integral scalar") != std::string::npos);
 }
 
-// Guard: a 4-state net wider than 32 bits packs to more than 64 mm-plane bits,
-// which the i64 decide compare cannot hold; fail loud.
-TEST_CASE("inertial CA delay: net wider than 64 value bits is rejected") {
-    const std::string err = lower_error(R"(
-        module m; logic [40:0] a, y; assign #5 y = a; endmodule)");
-    CHECK(err.find("wider than 64 value bits") != std::string::npos);
+// An 81-bit 4-state target (162 mm-plane bits) is supported: the backend's
+// inertial decide compares via `icmp` on loaded values, not a packed-scalar
+// runtime call, so it carries no width limit.
+TEST_CASE("inertial CA delay: a net wider than 64 value bits is supported") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [80:0] a, y;
+            assign #5 y = a;
+            initial begin
+                a = 81'h1_DEAD_BEEF_0000_0001_1234;
+                #6 $display("y=%h", y);
+                #1 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "y=1deadbeef000000011234\n");
 }
 
 // LRM 10.3.3: on a multiply-driven net the delay belongs to the DRIVER, ahead of
@@ -167,11 +176,21 @@ TEST_CASE("inertial CA delay: partial driver of a resolved net is rejected") {
     CHECK(err.find("partial driver of a multiply-driven") != std::string::npos);
 }
 
-// Guard: the width limit applies to a resolved net too — the slot carries the
-// net's type, so a 41-bit 4-state net packs to 82 mm-plane bits.
-TEST_CASE("inertial CA delay: wide multiply-driven net is rejected") {
-    const std::string err = lower_error(R"(
-        module m; logic [40:0] a, b; wire [40:0] y;
-        assign #5 y = a; assign y = b; endmodule)");
-    CHECK(err.find("wider than 64 value bits") != std::string::npos);
+// A delayed driver's slot on a resolved net also carries no width limit — a
+// 41-bit 4-state net packs to 82 mm-plane bits, past the old 64-bit cap.
+TEST_CASE("inertial CA delay: a wide multiply-driven net is supported") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [40:0] a, b;
+            wire  [40:0] y;
+            assign #5 y = a;
+            assign    y = b;
+            initial begin
+                a = 41'h1_FFFF_FFFF; b = 41'bz;
+                #1 $display("t=%0t y=%h", $time, y);
+                #6 $display("t=%0t y=%h", $time, y);
+                #1 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=1 y=xxxxxxxxxxx\nt=7 y=001ffffffff\n");
 }

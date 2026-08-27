@@ -374,6 +374,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_intra_reset", &rt_intra_reset);
     expose("rt_intra_event_register", &rt_intra_event_register);
     expose("rt_intra_event_fire", &rt_intra_event_fire);
+    expose("rt_inertial_buf", &rt_inertial_buf);
     expose("rt_inertial_decide", &rt_inertial_decide);
     expose("rt_inertial_cb", &rt_inertial_cb);
     expose("rt_dpi_pack_logicvec", &rt_dpi_pack_logicvec);

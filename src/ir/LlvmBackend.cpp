@@ -14119,11 +14119,16 @@ private:
     llvm::FunctionCallee intra_cb_fn() {
         return rt_fn("rt_intra_cb", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
-    // Inertial continuous-assignment delay (rt_inertial_*, LRM 10.3.3).
+    // Inertial continuous-assignment delay (rt_inertial_*, LRM 10.3.3). The
+    // decide call takes plain 0/1 flags (not the value planes themselves), so
+    // it is width-agnostic — the backend does the value compares in IR against
+    // the pointer rt_inertial_buf returns.
+    llvm::FunctionCallee inertial_buf_fn() {
+        return rt_fn("rt_inertial_buf", raw_ptr_ty(), { b_.getInt32Ty(), b_.getInt32Ty() });
+    }
     llvm::FunctionCallee inertial_decide_fn() {
         auto* i64 = b_.getInt64Ty();
-        return rt_fn("rt_inertial_decide", i64,
-                     { b_.getInt32Ty(), i64, i64, i64, i64 });
+        return rt_fn("rt_inertial_decide", i64, { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty() });
     }
     llvm::FunctionCallee inertial_cb_fn() {
         return rt_fn("rt_inertial_cb", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
@@ -21275,7 +21280,6 @@ private:
         llvm::StructType* rt     = intra_rec_ty(s);
         const uint32_t    stride = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(rt));
         llvm::Value*      idxv   = intra_id_value(lv.sig);
-        auto*             i64    = b_.getInt64Ty();
         const uint32_t    W      = s.width;
         auto*             mmty   = int_ty(s.narrow ? W : 2 * W);
         auto*             zty    = int_ty(W);
@@ -21291,17 +21295,44 @@ private:
         }
         llvm::Value* z_val = s.has_z ? rhs.z : nullptr;
 
-        // Current net value planes (the step-c "equals current LHS" compare). The
-        // mm/z fields have the same encoding as the record's, so the runtime's
-        // === compare on the i64-packed planes is exact.
+        // Current net value planes (the step-c "equals current LHS" compare).
         llvm::Value* cur_mm = b_.CreateLoad(mmty, lv_mm_ptr(lv));
         llvm::Value* cur_z  = s.has_z ? b_.CreateLoad(zty, lv_z_ptr(lv)) : nullptr;
 
-        auto to64 = [&](llvm::Value* v) -> llvm::Value* {
-            return v != nullptr ? b_.CreateZExt(v, i64) : b_.getInt64(0);
-        };
-        llvm::Value* ep = b_.CreateCall(
-          inertial_decide_fn(), { idxv, to64(mm_val), to64(z_val), to64(cur_mm), to64(cur_z) });
+        // The site's persistent pending-value buffer (rt_inertial_buf): holds
+        // whatever was armed last time, at any width. Every compare below is an
+        // ordinary `icmp eq` on values loaded into registers, never a runtime
+        // byte-memcmp of memory -- an odd (non-byte-multiple) width's padding
+        // bits are otherwise unspecified across two independently materialized
+        // buffers, so `icmp` is the only representation-independent way to
+        // compare an arbitrary-width iN for equality.
+        // NOTE: StructType::get(Context, {single_elem}) is genuinely ambiguous
+        // with StructType::get(Context, isPacked) -- a lone Type* argument binds
+        // to `bool isPacked` (a standard pointer-to-bool conversion) in
+        // preference to ArrayRef<Type*>'s initializer_list constructor (a
+        // user-defined conversion), silently building an EMPTY packed struct.
+        // An explicit SmallVector sidesteps the ambiguity entirely.
+        llvm::SmallVector<llvm::Type*, 2> buf_fields{ mmty };
+        if (s.has_z) {
+            buf_fields.push_back(zty);
+        }
+        llvm::StructType* buf_ty          = llvm::StructType::get(ctx_, buf_fields);
+        const uint32_t    buf_bytes       = static_cast<uint32_t>(env_->llmod.getDataLayout().getTypeAllocSize(buf_ty));
+        llvm::Value*      buf             = b_.CreateCall(inertial_buf_fn(), { idxv, b_.getInt32(buf_bytes) });
+        llvm::Value*      pend_mm_ptr     = b_.CreateStructGEP(buf_ty, buf, 0);
+        llvm::Value*      pend_mm         = b_.CreateLoad(mmty, pend_mm_ptr);
+        llvm::Value*      same_as_pending = b_.CreateICmpEQ(mm_val, pend_mm);
+        llvm::Value*      same_as_cur     = b_.CreateICmpEQ(mm_val, cur_mm);
+        llvm::Value*      pend_z_ptr      = nullptr;
+        if (s.has_z) {
+            pend_z_ptr          = b_.CreateStructGEP(buf_ty, buf, 1);
+            llvm::Value* pend_z = b_.CreateLoad(zty, pend_z_ptr);
+            same_as_pending     = b_.CreateAnd(same_as_pending, b_.CreateICmpEQ(z_val, pend_z));
+            same_as_cur         = b_.CreateAnd(same_as_cur, b_.CreateICmpEQ(z_val, cur_z));
+        }
+        auto*        i32 = b_.getInt32Ty();
+        llvm::Value* ep = b_.CreateCall(inertial_decide_fn(),
+                                        { idxv, b_.CreateZExt(same_as_pending, i32), b_.CreateZExt(same_as_cur, i32) });
 
         // ep == 0 -> arm nothing (kept timer / no change). Only the taken block
         // reserves a record; a spurious alloc on the not-taken path would leak.
@@ -21310,6 +21341,11 @@ private:
         b_.CreateCondBr(b_.CreateICmpNE(ep, b_.getInt64(0)), armbb, contb);
 
         b_.SetInsertPoint(armbb);
+        // Remember this arm's value for the next call's "same as pending" compare.
+        b_.CreateStore(mm_val, pend_mm_ptr);
+        if (s.has_z) {
+            b_.CreateStore(z_val, pend_z_ptr);
+        }
         llvm::Value* rec = b_.CreateCall(intra_alloc_fn(), { idxv, b_.getInt32(stride) });
         b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2)); // idx routes the fire
         b_.CreateAlignedStore(ep, b_.CreateStructGEP(rt, rec, 5), a1); // deschedule stamp

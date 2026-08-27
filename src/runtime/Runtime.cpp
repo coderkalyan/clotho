@@ -1857,16 +1857,23 @@ uint32_t               intra_total = 0; // ready records across all sites
 uint32_t               intra_seq   = 0; // monotonic arm-order stamp
 
 // Per inertial continuous-assignment site (LRM 10.3.3): the current deschedule
-// epoch and the value currently scheduled to propagate. Indexed by the same dense
-// intra-nba id as intra_sites. `pending` records whether a store is in flight (so a
-// same-value change keeps its timer, LRM 10.3.3 step b).
+// epoch and whether a store is currently in flight (so a same-value change
+// keeps its timer, LRM 10.3.3 step b). The pending VALUE itself lives in
+// `inertial_bufs` below, not here — this struct never sizes with the site's
+// width, so it stays fixed-size regardless of net width.
 struct InertialState {
     uint64_t epoch   = 0;
     bool     pending = false;
-    uint64_t pmm     = 0; // pending value's packed mm plane
-    uint64_t pz      = 0; // pending value's packed z plane
 };
 std::vector<InertialState> inertial_states; // indexed by dense intra-nba id
+
+// Per inertial site, the persistent byte buffer holding the last value armed
+// (rt_inertial_buf). Sized once, on the site's first call — a site's width is
+// fixed after elaboration, so this never resizes again. The backend owns the
+// byte layout (mm plane [+ z plane]) and does every value compare itself via
+// `icmp` on values loaded from this buffer; the runtime never interprets these
+// bytes, exactly like the general rt_intra_rec pool.
+std::vector<std::unique_ptr<unsigned char[]>> inertial_bufs; // indexed by dense intra-nba id
 
 // Per trigger id (dense (trigger-signal, edge)): records armed on `x <= @e y`
 // waiting for that edge. Growable — an unbounded number can arm between two edges.
@@ -2940,15 +2947,24 @@ extern "C" void rt_intra_cb(rt_timer* timer, void* /*ctx*/) {
     intra_ready_push(reinterpret_cast<rt_intra_rec*>(timer));
 }
 
-extern "C" uint64_t rt_inertial_decide(uint32_t idx, uint64_t new_mm, uint64_t new_z,
-                                       uint64_t cur_mm, uint64_t cur_z) {
+extern "C" void* rt_inertial_buf(uint32_t idx, uint32_t nbytes) {
+    if (idx >= inertial_bufs.size()) {
+        inertial_bufs.resize(idx + 1);
+    }
+    if (!inertial_bufs[idx]) {
+        inertial_bufs[idx] = std::make_unique<unsigned char[]>(nbytes);
+    }
+    return inertial_bufs[idx].get();
+}
+
+extern "C" uint64_t rt_inertial_decide(uint32_t idx, uint32_t same_as_pending, uint32_t same_as_cur) {
     if (idx >= inertial_states.size()) {
         inertial_states.resize(idx + 1);
     }
     InertialState& s = inertial_states[idx];
     // LRM 10.3.3 step b: if the new RHS equals the value already scheduled to
     // propagate, keep the existing timer running — do not reschedule.
-    if (s.pending && new_mm == s.pmm && new_z == s.pz) {
+    if (s.pending && same_as_pending) {
         return 0;
     }
     // Any other change deschedules the pending store: bump the epoch so a stale
@@ -2956,14 +2972,13 @@ extern "C" uint64_t rt_inertial_decide(uint32_t idx, uint64_t new_mm, uint64_t n
     s.epoch++;
     // LRM 10.3.3 step c: the new RHS already equals the current net value, so
     // schedule nothing (and there is no longer a pending store).
-    if (new_mm == cur_mm && new_z == cur_z) {
+    if (same_as_cur) {
         s.pending = false;
         return 0;
     }
-    // LRM 10.3.3 step d: arm a fresh store; the caller stamps this epoch.
+    // LRM 10.3.3 step d: arm a fresh store; the caller stamps this epoch and
+    // stores the new planes into rt_inertial_buf's buffer.
     s.pending = true;
-    s.pmm     = new_mm;
-    s.pz      = new_z;
     return s.epoch;
 }
 
