@@ -423,31 +423,76 @@ TEST_CASE("assoc key types Clotho still refuses loudly") {
         CHECK_FALSE(r.ok);
         CHECK(r.diagnostic_text().find("queue / dynamic-array member") != std::string::npos);
     }
-    SUBCASE("event key") {
-        const LowerResult r = lower_text(R"(
+}
+
+// P0 (docs/design/assoc-keys.md): chandle / event / virtual-interface / unpacked-
+// union keys. All four already lower to a flat handle-shaped or is_packed integral
+// value in the type pool, so admitting them needed no new backend machinery -- see
+// the widened admit-list guard in lower_type's AssociativeArrayType arm.
+TEST_CASE("assoc chandle/event/virtual-interface/unpacked-union keys") {
+    SUBCASE("event key: distinct handles are distinct entries") {
+        constexpr std::string_view src = R"(
             module m;
                 int a [event];
-                event e;
-                initial a[e] = 1;
+                event e1, e2;
+                initial begin
+                    a[e1] = 1;
+                    a[e2] = 2;
+                    $display("num=%0d e1=%0d e2=%0d ex=%0d", a.num(), a[e1], a[e2], a.exists(e1));
+                end
             endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("key type is not supported") != std::string::npos);
+        )";
+        CHECK(run_capture(src) == "num=2 e1=1 e2=2 ex=1\n");
     }
-    // A chandle VALUE now lowers (see the chandle-value test below); a chandle KEY
-    // is a separate, still-unimplemented admit-list widening tracked in
-    // docs/design/assoc-keys.md's P0 phase ("Status: scoping"), deliberately left
-    // alone here.
-    SUBCASE("chandle key") {
-        const LowerResult r = lower_text(R"(
+    SUBCASE("chandle key: null is a valid, distinct key") {
+        constexpr std::string_view src = R"(
+            import "DPI-C" function chandle mkptr();
             module m;
                 int a [chandle];
-                chandle c;
-                initial a[c] = 1;
+                chandle c1, c2;
+                initial begin
+                    c1 = mkptr();
+                    a[c1] = 5;
+                    a[null] = 9;
+                    $display("num=%0d c1v=%0d nullv=%0d exnull=%0d", a.num(), a[c1], a[null], a.exists(null));
+                end
             endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("key type is not supported") != std::string::npos);
+        )";
+        const LowerResult r = lower_text(src);
+        REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    }
+    SUBCASE("virtual interface key: distinct instances are distinct entries") {
+        constexpr std::string_view src = R"(
+            interface bus_if; logic clk; endinterface
+            module m;
+                bus_if b1();
+                bus_if b2();
+                int a [virtual bus_if];
+                virtual bus_if v1, v2;
+                initial begin
+                    v1 = b1; v2 = b2;
+                    a[v1] = 10;
+                    a[v2] = 20;
+                    $display("num=%0d v1=%0d v2=%0d", a.num(), a[v1], a[v2]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2 v1=10 v2=20\n");
+    }
+    SUBCASE("unpacked union key: distinct member writes over the same flat storage") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef union { byte b; shortint s; } key_t;
+                int a [key_t];
+                key_t k;
+                initial begin
+                    k.s = 16'h0102; a[k] = 1;
+                    k.s = 16'h0304; a[k] = 2;
+                    $display("num=%0d v1=%0d ex=%0d", a.num(), a[k], a.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2 v1=2 ex=1\n");
     }
 }
 

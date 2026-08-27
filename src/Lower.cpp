@@ -3240,13 +3240,19 @@ private:
                 // freed). An unpacked struct / fixed unpacked array key (7.8.5) is
                 // serialized leaf by leaf in the backend. Both fold into the same
                 // normalized byte span as an integral or string key.
-                if (!kt.isClass() && !kt.isIntegral() && !kt.isString() && !is_agg_abi_type(kt)) {
-                    // 7.8.5 makes a real (or real-containing) index type illegal;
-                    // everything else left here (chandle, event, virtual interface)
-                    // has no equality-defined byte form.
+                if (!kt.isClass() && !kt.isIntegral() && !kt.isString() && !is_agg_abi_type(kt) &&
+                    !kt.isCHandle() && !kt.isEvent() && !kt.isVirtualInterface() && !kt.isUnpackedUnion()) {
+                    // 7.8.5 makes a real (or real-containing) index type illegal; every
+                    // other type slang gives `==` normalizes straight to a byte span with
+                    // no new backend machinery (P0, docs/design/assoc-keys.md): a chandle /
+                    // event / virtual interface already lowers to a flat 64-bit handle word
+                    // (Kind::Int, same shape as a class handle minus GC tracing), and an
+                    // unpacked union already lowers identically to a packed union -- one
+                    // flat is_packed integral value, no leaf walk -- so all four fall
+                    // straight into assoc_key_info's integral-width branch below.
                     fail("associative array key type is not supported (integral, enum, "
-                         "packed, string, class handle, unpacked struct / array, or "
-                         "wildcard [*])");
+                         "packed, string, class handle, chandle, event, virtual interface, "
+                         "unpacked union, unpacked struct / array, or wildcard [*])");
                 }
                 if (is_agg_abi_type(kt)) {
                     guard_agg_key_leaves(*aa->indexType, kr);

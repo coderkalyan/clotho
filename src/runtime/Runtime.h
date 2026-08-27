@@ -1249,6 +1249,33 @@ void rt_queue_sort(rt_queue* h, const rt_elem_ops* ops, uint32_t kind, uint32_t 
                    uint32_t rev);
 void rt_queue_shuffle(rt_queue* h, const rt_elem_ops* ops, uint64_t* rng);
 
+// -- Associative-array key scratch buffer (docs/design/assoc-keys.md P1) --
+//
+// A FIXED key (every leaf integral / handle-shaped) normalizes into a
+// compile-time-sized entry-block alloca with no runtime call, unchanged from
+// before this existed. A VARIABLE key -- one containing a string / queue /
+// dynamic-array / associative-array leaf -- has no such bound, so the backend
+// builds it here instead: a growable buffer with mark/pop scoping, since key
+// construction nests (an assoc-bearing key iterates a map whose own entries
+// are themselves normalized spans). Process-global, like every other piece of
+// clotho's single-threaded simulation state.
+
+// Returns a mark: the buffer's current length, to `end` back to later.
+uint32_t rt_keybuf_begin(void);
+
+// Appends `len` bytes to the buffer's tail.
+void rt_keybuf_append(const void* bytes, uint32_t len);
+
+// The bytes appended since `mark`: a span into the buffer's storage, valid
+// until the next rt_keybuf_append (which may reallocate) or a `rt_keybuf_end`
+// that pops back over it.
+void rt_keybuf_span(uint32_t mark, const uint8_t** out_ptr, uint32_t* out_len);
+
+// Pops the buffer back to `mark`, discarding everything appended since. Does
+// not free the underlying storage, so a span already read via rt_keybuf_span
+// stays valid in memory (though logically popped) until the next append.
+void rt_keybuf_end(uint32_t mark);
+
 // -- SystemVerilog associative arrays --
 //
 // The associative-array type (LRM §7.8/7.9): a runtime-sized key->value map. The
