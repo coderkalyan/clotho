@@ -18521,13 +18521,15 @@ private:
             return info;
         }
         const Type& kt = std::get<Type>(mod_.pool.get(key_ty));
-        if (is_agg_abi(key_ty) || kt.kind == Type::Kind::Queue || kt.kind == Type::Kind::DynArray) {
-            // An unpacked struct / fixed unpacked array key, or (P2) a queue /
-            // dynamic array key itself: serialized leaf by leaf / count-prefixed,
-            // never memcpy'd -- see normalize_agg_key / normalize_variable_agg_key.
-            // A queue/dynarray key is always classified variable (its element
-            // count has no compile-time bound), which key_type_is_variable already
-            // reports for Kind::Queue / Kind::DynArray.
+        if (is_agg_abi(key_ty) || kt.kind == Type::Kind::Queue || kt.kind == Type::Kind::DynArray ||
+            kt.kind == Type::Kind::Assoc) {
+            // An unpacked struct / fixed unpacked array key, a queue / dynamic
+            // array key itself (P2), or an associative-array key itself (P3):
+            // serialized leaf by leaf / count-prefixed, never memcpy'd -- see
+            // normalize_agg_key / normalize_variable_agg_key. A queue / dynarray /
+            // assoc key is always classified variable (its element / entry count
+            // has no compile-time bound), which key_type_is_variable already
+            // reports for those three kinds.
             info.is_agg      = true;
             info.is_variable = key_type_is_variable(key_ty);
             return info;
@@ -18738,10 +18740,68 @@ private:
             b_.SetInsertPoint(done);
             return;
         }
-        // An associative-array leaf reaches here once P3 widens the admit list;
-        // guard_agg_key_leaves refuses it today, so only a plain scalar leaf
-        // (integral / class handle / event / chandle / virtual interface /
-        // packed struct or union) is reachable.
+        if (t.kind == Type::Kind::Assoc) {
+            // P3: u32 be count || (key, value) pairs in the nested map's own
+            // sorted-key order (rt_assoc_first/next), which is what makes this
+            // canonical -- two equal-content maps produce identical bytes
+            // regardless of insertion order, or key equality would break.
+            //
+            // Each pair is `u32 be klen || klen raw key bytes || value bytes`.
+            // The key bytes are copied VERBATIM from the source entry rather than
+            // re-normalized from a decoded value: the map already stores them in
+            // exactly this span's own format, and copying is what lets denormalize
+            // (P3's decode side) hand them straight to rt_assoc_put_ptr with no
+            // decode/re-encode round trip. They still need their own length
+            // prefix -- unlike every other leaf here, a BARE nested key of type
+            // `string` is the one shape with no self-delimiting encoding of its
+            // own (normalize_assoc_key_value's info.is_string arm keeps it raw and
+            // unprefixed, for LRM 6.16.8 ordering), so klen cannot be inferred by
+            // walking the copied bytes. The value bytes need no such prefix: its
+            // OWN type-directed walk (this same function, recursively) is already
+            // self-delimiting for every leaf kind, including a value-position
+            // string (whose length prefix lives in the String arm above).
+            llvm::Value*    handle  = lv_handle_ptr(lv, HandleUse::Read);
+            llvm::Value*    count64 = b_.CreateCall(assoc_num_fn(), { handle });
+            llvm::Value*    count32 = cast(count64, 32, false);
+            auto*           cty     = llvm::ArrayType::get(b_.getInt8Ty(), 4);
+            auto*           csc     = entry_alloca(cty, "assoc.vkey.acount");
+            emit_key_bytes(count32, 32, false, csc, cty, 0);
+            b_.CreateCall(keybuf_append_fn(), { csc, b_.getInt32(4) });
+
+            auto* kptr_a = entry_alloca(raw_ptr_ty(), "assoc.vkey.akptr");
+            auto* klen_a = entry_alloca(b_.getInt32Ty(), "assoc.vkey.aklen");
+            llvm::Value* got0 = b_.CreateCall(assoc_end_fn(/*last=*/false), { handle, kptr_a, klen_a });
+            auto*        have_a = entry_alloca(b_.getInt1Ty(), "assoc.vkey.ahave");
+            b_.CreateStore(b_.CreateTrunc(got0, b_.getInt1Ty()), have_a);
+
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* head = llvm::BasicBlock::Create(ctx_, "vkey.a.head", fn);
+            auto* body = llvm::BasicBlock::Create(ctx_, "vkey.a.body", fn);
+            auto* done = llvm::BasicBlock::Create(ctx_, "vkey.a.done", fn);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            b_.CreateCondBr(b_.CreateLoad(b_.getInt1Ty(), have_a), body, done);
+            b_.SetInsertPoint(body);
+            llvm::Value* kptr = b_.CreateLoad(raw_ptr_ty(), kptr_a);
+            llvm::Value* klen = b_.CreateLoad(b_.getInt32Ty(), klen_a);
+            auto*        lty2 = llvm::ArrayType::get(b_.getInt8Ty(), 4);
+            auto*        lsc2 = entry_alloca(lty2, "assoc.vkey.aklenpfx");
+            emit_key_bytes(klen, 32, false, lsc2, lty2, 0);
+            b_.CreateCall(keybuf_append_fn(), { lsc2, b_.getInt32(4) });
+            b_.CreateCall(keybuf_append_fn(), { kptr, klen });
+            llvm::Value*  vslot = b_.CreateCall(assoc_get_ptr_fn(), { handle, kptr, klen });
+            const DynElem ve    = dynarr_elem(type);
+            LValue        vlv   = tmp_elem_lvalue(vslot, ve, b_.getInt64(0));
+            emit_variable_agg_key_bytes(t.element, vlv, any_x);
+            llvm::Value* got = b_.CreateCall(assoc_step_fn(/*prev=*/false), { handle, kptr, klen, kptr_a, klen_a });
+            b_.CreateStore(b_.CreateTrunc(got, b_.getInt1Ty()), have_a);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+            return;
+        }
+        // Every non-scalar leaf kind is handled above; what remains is a plain
+        // scalar leaf (integral / class handle / event / chandle / virtual
+        // interface / packed struct or union).
         LValue leaf = lv;
         if (leaf.is_agg) {
             fill_agg_leaf(leaf, type);
@@ -19011,8 +19071,53 @@ private:
             off = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
             return;
         }
-        // An associative-array leaf reaches here once P3 widens the admit list;
-        // see emit_variable_agg_key_bytes.
+        if (t.kind == Type::Kind::Assoc) {
+            // P3: inverse of the count-prefixed `(key, value)` pair emitter.
+            // Materialization needs no decode-then-renormalize round trip for the
+            // key half: the copied bytes are already a valid normalized span for
+            // the nested map's OWN key type (that's what makes the encoder's
+            // verbatim copy correct in the first place), so they go straight to
+            // rt_assoc_put_ptr. Only the value half is decoded, directly into the
+            // slot that call returns.
+            llvm::Value*    count32 = denormalize_key_word(leafptr, 0, 32, false, 32);
+            llvm::Value*    count64 = cast(count32, 64, false);
+            llvm::Constant* ops     = elem_ops_global(type); // the nested map's VALUE ops
+            llvm::Value*    dst     = lv_handle_ptr(lv, HandleUse::Mutate);
+            b_.CreateCall(assoc_reset_fn(), { dst, ops }); // drop stale entries + default first
+
+            auto* eoff_a = entry_alloca(b_.getInt32Ty(), "assoc.vkey.aeoff");
+            b_.CreateStore(b_.CreateAdd(off, b_.getInt32(4)), eoff_a);
+            auto* idx_a = entry_alloca(b_.getInt64Ty(), "assoc.vkey.aidx");
+            b_.CreateStore(b_.getInt64(0), idx_a);
+
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* head = llvm::BasicBlock::Create(ctx_, "vkeyd.a.head", fn);
+            auto* body = llvm::BasicBlock::Create(ctx_, "vkeyd.a.body", fn);
+            auto* done = llvm::BasicBlock::Create(ctx_, "vkeyd.a.done", fn);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            llvm::Value* i = b_.CreateLoad(b_.getInt64Ty(), idx_a);
+            b_.CreateCondBr(b_.CreateICmpULT(i, count64), body, done);
+            b_.SetInsertPoint(body);
+            llvm::Value* eoff      = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
+            llvm::Value* klenptr   = b_.CreateInBoundsGEP(b_.getInt8Ty(), kbase, eoff);
+            llvm::Value* klen      = denormalize_key_word(klenptr, 0, 32, false, 32);
+            llvm::Value* kbytesptr = b_.CreateInBoundsGEP(b_.getInt8Ty(), klenptr, b_.getInt32(4));
+            llvm::Value* slot      = b_.CreateCall(assoc_put_ptr_fn(),
+                                                   { dst, ops, kbytesptr, klen,
+                                                     alloc_site_global(loc_text(at), "assoc key traversal") });
+            llvm::Value*  voff = b_.CreateAdd(b_.CreateAdd(eoff, b_.getInt32(4)), klen);
+            const DynElem ve   = dynarr_elem(type);
+            LValue        vlv  = tmp_elem_lvalue(slot, ve, b_.getInt64(0));
+            denormalize_variable_agg_key(t.element, vlv, kbase, voff, at);
+            b_.CreateStore(voff, eoff_a);
+            b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+            off = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
+            return;
+        }
+        // Every non-scalar leaf kind is handled above; see emit_variable_agg_key_bytes.
         LValue leaf = lv;
         if (leaf.is_agg) {
             fill_agg_leaf(leaf, type);

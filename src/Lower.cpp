@@ -3064,14 +3064,16 @@ private:
     // type (LRM 7.8.5) when equality is defined for it. Clotho's key model
     // (docs/design/assoc-keys.md) admits every leaf with a byte-serializable
     // value: an integral / handle-shaped leaf gets a fixed-width big-endian span,
-    // a `string` leaf (P1) gets a length-prefixed one, and a queue / dynamic-array
+    // a `string` leaf (P1) gets a length-prefixed one, a queue / dynamic-array
     // leaf (P2) gets a count-prefixed one of its own recursively-normalized
-    // elements -- all nested through structs and fixed arrays. The backend
-    // classifies the whole key type as fixed or variable and picks the matching
-    // encoder (LlvmBackend.cpp AssocKeyInfo::is_variable). A `real` leaf makes the
-    // index type illegal outright ("real or shortreal data types, or a type
-    // containing a real or shortreal, shall be an illegal index type"); an
-    // associative-array leaf is legal per the LRM but not yet implemented (P3).
+    // elements, and an associative-array leaf (P3) gets a count-prefixed
+    // `(key, value)` list in the nested map's own sorted-key order -- all nested
+    // through structs and fixed arrays to any depth, completing LRM 7.8.5's own
+    // example (`struct { byte B; int I[*]; }`). The backend classifies the whole
+    // key type as fixed or variable and picks the matching encoder
+    // (LlvmBackend.cpp AssocKeyInfo::is_variable). A `real` leaf makes the index
+    // type illegal outright ("real or shortreal data types, or a type containing
+    // a real or shortreal, shall be an illegal index type").
     void guard_agg_key_leaves(const slang::ast::Type& kt, ir::Ref kr) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(kr));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
@@ -3100,10 +3102,12 @@ private:
             return;
         }
         if (t.kind == ir::Type::Kind::Assoc) {
-            // TODO: an associative-array leaf inside a key (LRM 7.8.5's own
-            // example, `int I[*]` in a struct key); P3, docs/design/assoc-keys.md.
-            fail("associative array key type with an associative-array member is "
-                 "not supported");
+            // P3: count-prefixed leaf, `(key, value)` pairs in the nested map's own
+            // sorted-key order -- canonical because two equal-content maps then
+            // produce identical bytes (assoc-keys.md §4.5). The nested map's OWN
+            // key type was already fully validated when IT was declared (every
+            // legal-index-type check ran then); nothing further to check here.
+            return;
         }
     }
 
@@ -3327,22 +3331,26 @@ private:
                 if (!kt.isClass() && !kt.isIntegral() && !kt.isString() && !is_agg_abi_type(kt) &&
                     !kt.isCHandle() && !kt.isEvent() && !kt.isVirtualInterface() && !kt.isUnpackedUnion() &&
                     kt.as_if<slang::ast::QueueType>() == nullptr &&
-                    kt.as_if<slang::ast::DynamicArrayType>() == nullptr) {
+                    kt.as_if<slang::ast::DynamicArrayType>() == nullptr &&
+                    kt.as_if<slang::ast::AssociativeArrayType>() == nullptr) {
                     // 7.8.5 makes a real (or real-containing) index type illegal; every
                     // other type slang gives `==` normalizes to a byte span (assoc-keys.md):
                     // a chandle / event / virtual interface already lowers to a flat 64-bit
                     // handle word, an unpacked union already lowers identically to a packed
-                    // union (one flat is_packed integral value), and a queue / dynamic array
-                    // (P2) count-prefixes its normalized elements the same way a string
-                    // length-prefixes its bytes (P1) -- all fall into assoc_key_info's
-                    // integral-width branch or its variable-length walk below.
+                    // union (one flat is_packed integral value), a queue / dynamic array (P2)
+                    // count-prefixes its normalized elements the same way a string
+                    // length-prefixes its bytes (P1), and an associative array (P3)
+                    // count-prefixes its (key, value) pairs in sorted-key order -- all fall
+                    // into assoc_key_info's integral-width branch or its variable-length
+                    // walk below.
                     fail("associative array key type is not supported (integral, enum, "
                          "packed, string, class handle, chandle, event, virtual interface, "
-                         "unpacked union, unpacked struct / array, queue, dynamic array, or "
-                         "wildcard [*])");
+                         "unpacked union, unpacked struct / array, queue, dynamic array, "
+                         "associative array, or wildcard [*])");
                 }
                 if (is_agg_abi_type(kt) || kt.as_if<slang::ast::QueueType>() != nullptr ||
-                    kt.as_if<slang::ast::DynamicArrayType>() != nullptr) {
+                    kt.as_if<slang::ast::DynamicArrayType>() != nullptr ||
+                    kt.as_if<slang::ast::AssociativeArrayType>() != nullptr) {
                     guard_agg_key_leaves(*aa->indexType, kr);
                     guard_key_no_handle_in_variable(kr);
                 }
@@ -25341,12 +25349,12 @@ private:
 
     // A key operand of `a[k]` / `exists(k)` / `delete(k)`: an ordinary value for an
     // integral, class-handle or string key (the backend normalizes the plane), and an
-    // LVALUE for an unpacked struct / array key (P0/P1) or a bare queue / dynamic-array
-    // key itself (P2) — none of these has a plane value, so the backend walks its
-    // storage / handle directly. A non-lvalue aggregate key (a `'{...}` pattern) is
-    // staged into a canonical temp of the key type first; a non-lvalue queue key (a
-    // literal, a slice, a concatenation) reuses the same materializing handle temp
-    // any other queue-typed rvalue gets.
+    // LVALUE for an unpacked struct / array key (P0/P1), or a bare queue / dynamic
+    // array / associative array key itself (P2/P3) — none of these has a plane
+    // value, so the backend walks its storage / handle directly. A non-lvalue
+    // aggregate key (a `'{...}` pattern) is staged into a canonical temp of the
+    // key type first; a non-lvalue queue key (a literal, a slice, a concatenation)
+    // reuses the same materializing handle temp any other queue-typed rvalue gets.
     ir::Index lower_assoc_key(const Expression& key, ir::Ref assoc_ty, ir::Builder& b, ir::SourceLoc l) {
         const ir::Type at = std::get<ir::Type>(module_.pool.get(assoc_ty));
         if (at.right != 0) {
@@ -25357,16 +25365,18 @@ private:
         if (kt.kind == ir::Type::Kind::Queue) {
             return materialize_queue_rvalue(key, b);
         }
-        if (kt.kind == ir::Type::Kind::DynArray) {
+        if (kt.kind == ir::Type::Kind::DynArray || kt.kind == ir::Type::Kind::Assoc) {
             const Expression& src = unwrap_conversion(key);
             if (is_struct_lvalue_shape(src)) {
                 return lower_lvalue(src, b);
             }
-            // TODO: a non-lvalue dynamic-array key expression (a literal, a
-            // slice, an in-place call result) — needs the same materializing
-            // temp construction materialize_queue_rvalue gives a queue key,
-            // written for a dynamic-array handle instead of a queue's ring.
-            fail("a non-variable dynamic-array key expression is not supported");
+            // TODO: a non-lvalue dynamic-array / associative-array key expression
+            // (a literal, a slice, an in-place call result) — needs the same
+            // materializing temp construction materialize_queue_rvalue gives a
+            // queue key, written for a dynamic-array / assoc handle instead of a
+            // queue's ring.
+            fail("a non-variable dynamic-array / associative-array key expression "
+                 "is not supported");
         }
         if (!is_agg_abi_ref(kr)) {
             return lower_expr(key, b);

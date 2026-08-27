@@ -396,22 +396,10 @@ TEST_CASE("assoc struct-keyed deep copy independence") {
                               "a1=1 c1=111\n");
 }
 
-// The key-type gate that remains (LRM 7.8.5 allows an associative-array member;
-// P3, docs/design/assoc-keys.md, lands it later), and the deliberate GC-safety
-// scope boundary a class handle combined with a variable component hits.
+// docs/design/assoc-keys.md's P0-P3 phases admit every LRM 7.8.5 index type;
+// what remains here is a deliberate GC-safety scope boundary (a class handle
+// combined with a variable component) and one non-lvalue-expression corner.
 TEST_CASE("assoc key types Clotho still refuses loudly") {
-    SUBCASE("struct key with an associative-array member") {
-        const LowerResult r = lower_text(R"(
-            module m;
-                typedef struct { int m[string]; int i; } k_t;
-                int a [k_t];
-                k_t k;
-                initial a[k] = 1;
-            endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("associative-array member") != std::string::npos);
-    }
     // A class handle's key-handle offset (for GC tracing) is a compile-time
     // constant, correct only for a FIXED key; a variable key's byte offsets are
     // runtime-dependent, so a handle anywhere inside one is refused rather than
@@ -439,7 +427,137 @@ TEST_CASE("assoc key types Clotho still refuses loudly") {
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("non-variable dynamic-array key") != std::string::npos);
+        CHECK(r.diagnostic_text().find("non-variable dynamic-array") != std::string::npos);
+    }
+}
+
+// P3 (docs/design/assoc-keys.md): an associative-array leaf, or a bare
+// associative array itself, as a key -- completing LRM 7.8.5's own motivating
+// example. Count-prefixed `(key, value)` pairs in the nested map's own
+// sorted-key order, so two equal-content maps produce identical bytes
+// regardless of insertion order (canonical, or key equality would break).
+TEST_CASE("assoc associative-array keys") {
+    // The LRM 7.8.5 example verbatim: `typedef struct { byte B; int I[*]; }
+    // Unpkt; int array_name [Unpkt];` -- a wildcard-indexed nested assoc member.
+    SUBCASE("LRM 7.8.5's own example: struct with a wildcard-indexed assoc member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { byte B; int I[*]; } Unpkt;
+                int array_name [Unpkt];
+                Unpkt k;
+                initial begin
+                    k.B = 8'd1;
+                    k.I.delete(); k.I[10] = 100; k.I[20] = 200;
+                    array_name[k] = 999;
+                    $display("num=%0d get=%0d", array_name.num(), array_name[k]);
+                    k.I[20] = 201;  // different content: a different key
+                    $display("num2=%0d ex=%0d", array_name.num(), array_name.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=1 get=999\n"
+                                  "num2=1 ex=0\n");
+    }
+    SUBCASE("struct key with a non-wildcard nested assoc member: put/get/exists/num") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int im_t[int];
+                typedef struct { byte B; im_t I; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.B = 1; k.I.delete(); k.I[10] = 1; k.I[20] = 2;
+                    a[k] = 100;
+                    k.B = 2; k.I.delete(); k.I[5] = 9;
+                    a[k] = 200;
+                    $display("num=%0d", a.num());
+                    k.B = 1; k.I.delete(); k.I[10] = 1; k.I[20] = 2;
+                    $display("get=%0d ex=%0d", a[k], a.exists(k));
+                    k.I.delete(); k.I[10] = 1; k.I[20] = 999;  // one value differs
+                    $display("absent=%0d ex=%0d", a[k], a.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\n"
+                                  "get=100 ex=1\n"
+                                  "absent=0 ex=0\n");
+    }
+    // foreach traversal and first/next readout MATERIALIZE a fresh nested assoc
+    // handle per key variable write, put_ptr-ing each decoded (key, value) pair.
+    SUBCASE("foreach and first/next traversal readout, nested foreach into the assoc member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int im_t[int];
+                typedef struct { byte B; im_t I; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.B = 1; k.I.delete(); k.I[10] = 1; k.I[20] = 2;
+                    a[k] = 100;
+                    k.B = 2; k.I.delete(); k.I[5] = 9;
+                    a[k] = 200;
+                    foreach (a[kk]) begin
+                        $write("B=%0d I=", kk.B);
+                        foreach (kk.I[idx]) $write("%0d:%0d,", idx, kk.I[idx]);
+                        $display(" v=%0d", a[kk]);
+                    end
+                    void'(a.first(k));
+                    $write("first B=%0d I=", k.B);
+                    foreach (k.I[idx]) $write("%0d:%0d,", idx, k.I[idx]);
+                    $display("");
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "B=1 I=10:1,20:2, v=100\n"
+                                  "B=2 I=5:9, v=200\n"
+                                  "first B=1 I=10:1,20:2,\n");
+    }
+    // A string-keyed nested assoc member exercises P1+P3 composed together
+    // (the nested map's OWN key normalizes via the bare, unprefixed string
+    // encoding, copied verbatim -- the one leaf kind with no self-delimiting
+    // encoding of its own, which is why the pair wrapper always length-prefixes
+    // the key half regardless of the nested key's own shape).
+    SUBCASE("string-keyed nested assoc member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int sk_t[string];
+                int a [sk_t];
+                sk_t k;
+                initial begin
+                    k.delete(); k["x"] = 1; k["y"] = 2;
+                    a[k] = 42;
+                    k.delete(); k["x"] = 1;
+                    a[k] = 43;
+                    $display("num=%0d", a.num());
+                    foreach (a[kk]) begin
+                        $write("k=");
+                        foreach (kk[s]) $write("%s:%0d,", s, kk[s]);
+                        $display(" v=%0d", a[kk]);
+                    end
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nk=x:1, v=43\nk=x:1,y:2, v=42\n");
+    }
+    // A bare associative array as the key itself (not nested in a struct).
+    SUBCASE("a bare associative array as the key itself") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int am_t[int];
+                int a [am_t];
+                am_t m1, m2;
+                initial begin
+                    m1.delete(); m1[1] = 10; m1[2] = 20;
+                    a[m1] = 100;
+                    m2.delete(); m2[1] = 10;
+                    a[m2] = 200;
+                    $display("num=%0d", a.num());
+                    m1.delete(); m1[1] = 10; m1[2] = 20;
+                    $display("get=%0d", a[m1]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=100\n");
     }
 }
 
