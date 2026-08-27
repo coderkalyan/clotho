@@ -345,6 +345,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_queue_reverse", &rt_queue_reverse);
     expose("rt_queue_sort", &rt_queue_sort);
     expose("rt_queue_shuffle", &rt_queue_shuffle);
+    expose("rt_keybuf_begin", &rt_keybuf_begin);
+    expose("rt_keybuf_append", &rt_keybuf_append);
+    expose("rt_keybuf_span", &rt_keybuf_span);
+    expose("rt_keybuf_end", &rt_keybuf_end);
     expose("rt_assoc_get_ptr", &rt_assoc_get_ptr);
     expose("rt_assoc_put_ptr", &rt_assoc_put_ptr);
     expose("rt_assoc_exists", &rt_assoc_exists);

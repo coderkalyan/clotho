@@ -2458,6 +2458,30 @@ extern "C" void rt_queue_shuffle(rt_queue* h, const rt_elem_ops* ops, uint64_t* 
     ++h->epoch;
 }
 
+// -- Associative-array key scratch buffer (docs/design/assoc-keys.md P1) --
+// See the rationale at the declaration (Runtime.h).
+namespace {
+std::vector<uint8_t> g_keybuf;
+} // namespace
+
+extern "C" uint32_t rt_keybuf_begin(void) {
+    return static_cast<uint32_t>(g_keybuf.size());
+}
+
+extern "C" void rt_keybuf_append(const void* bytes, uint32_t len) {
+    const auto* p = static_cast<const uint8_t*>(bytes);
+    g_keybuf.insert(g_keybuf.end(), p, p + len);
+}
+
+extern "C" void rt_keybuf_span(uint32_t mark, const uint8_t** out_ptr, uint32_t* out_len) {
+    *out_ptr = g_keybuf.data() + mark;
+    *out_len = static_cast<uint32_t>(g_keybuf.size() - mark);
+}
+
+extern "C" void rt_keybuf_end(uint32_t mark) {
+    g_keybuf.resize(mark);
+}
+
 // -- Associative arrays (LRM 7.8/7.9) --
 //
 // The map is keyed by the backend's normalized order-preserving key bytes

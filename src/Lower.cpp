@@ -3061,13 +3061,16 @@ private:
     // -- Types --
 
     // An unpacked struct / fixed unpacked array is a legal associative-array index
-    // type (LRM 7.8.5) when equality is defined for it, which for Clotho's key model
-    // means every leaf must serialize to a fixed-width byte field: integral leaves
-    // only, nested through structs and fixed arrays. A `real` leaf makes the index
-    // type illegal outright ("real or shortreal data types, or a type containing a
-    // real or shortreal, shall be an illegal index type"); a `string` or
-    // dynamically-sized leaf is legal per the LRM but has no fixed width, so it is
-    // refused loudly rather than silently truncated.
+    // type (LRM 7.8.5) when equality is defined for it. Clotho's key model
+    // (docs/design/assoc-keys.md) admits every leaf with a byte-serializable
+    // value: an integral / handle-shaped leaf gets a fixed-width big-endian span,
+    // and (P1) a `string` leaf gets a length-prefixed one, both nested through
+    // structs and fixed arrays -- the backend classifies the whole key type as
+    // fixed or variable and picks the matching encoder (LlvmBackend.cpp
+    // AssocKeyInfo::is_variable). A `real` leaf makes the index type illegal
+    // outright ("real or shortreal data types, or a type containing a real or
+    // shortreal, shall be an illegal index type"); a queue / dynamic-array /
+    // associative-array leaf is legal per the LRM but not yet implemented (P2/P3).
     void guard_agg_key_leaves(const slang::ast::Type& kt, ir::Ref kr) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(kr));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
@@ -3084,14 +3087,11 @@ private:
             fail("associative array key type containing a real is illegal (LRM 7.8.5)");
         }
         if (t.kind == ir::Type::Kind::String) {
-            // TODO: a string leaf inside a struct key — the normalized span would be
-            // variable-length, which the fixed-width leaf layout (and the runtime's
-            // shorter-is-less order) does not model.
-            fail("associative array key type with a string member is not supported");
+            return; // P1: length-prefixed leaf, admitted.
         }
         if (value_cat(kr) != ValueCat::scalar) {
             // TODO: a queue / dynamic-array / associative-array leaf inside a struct
-            // key (LRM 7.8.5 allows it; the key bytes would be dynamically sized).
+            // key (LRM 7.8.5 allows it; P2/P3, docs/design/assoc-keys.md).
             fail("associative array key type with a queue / dynamic-array member is "
                  "not supported");
         }

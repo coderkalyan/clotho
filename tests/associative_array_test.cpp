@@ -396,21 +396,9 @@ TEST_CASE("assoc struct-keyed deep copy independence") {
                               "a1=1 c1=111\n");
 }
 
-// The key-type gates that remain (LRM 7.8.5 allows a string / dynamically sized
-// member; Clotho's fixed-width leaf span does not model one yet).
+// The key-type gate that remains (LRM 7.8.5 allows a queue / dynamic-array /
+// associative-array member; P2/P3, docs/design/assoc-keys.md, land it later).
 TEST_CASE("assoc key types Clotho still refuses loudly") {
-    SUBCASE("struct key with a string member") {
-        const LowerResult r = lower_text(R"(
-            module m;
-                typedef struct { string s; int i; } k_t;
-                int a [k_t];
-                k_t k;
-                initial a[k] = 1;
-            endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("key type with a string member") != std::string::npos);
-    }
     SUBCASE("struct key with a queue member") {
         const LowerResult r = lower_text(R"(
             module m;
@@ -422,6 +410,177 @@ TEST_CASE("assoc key types Clotho still refuses loudly") {
         )");
         CHECK_FALSE(r.ok);
         CHECK(r.diagnostic_text().find("queue / dynamic-array member") != std::string::npos);
+    }
+}
+
+// P1 (docs/design/assoc-keys.md): a string leaf inside a struct/array key. The
+// key type is classified fixed vs variable at lowering (AssocKeyInfo::is_variable);
+// a variable key's string leaf is length-prefixed (u32 be length || bytes) rather
+// than raw-concatenated, which is what makes it injective -- two leaves of
+// different lengths whose bytes happen to concatenate identically must still be
+// two distinct entries.
+TEST_CASE("assoc struct key with a string member") {
+    SUBCASE("put/get/exists/num, distinct entries, overwrite") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k = '{"ab", 1}; a[k] = 11;
+                    k = '{"c",  1}; a[k] = 12;
+                    $display("num=%0d", a.num());
+                    k = '{"ab", 1};
+                    $display("get=%0d ex=%0d", a[k], a.exists(k));
+                    k = '{"ab", 1}; a[k] = 99;      // same key: overwrite
+                    $display("num2=%0d get2=%0d", a.num(), a[k]);
+                    k = '{"zz", 9};
+                    $display("absent=%0d ex=%0d", a[k], a.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\n"
+                                  "get=11 ex=1\n"
+                                  "num2=2 get2=99\n"
+                                  "absent=0 ex=0\n");
+    }
+    // The design doc's motivating injectivity pin: raw concatenation of
+    // {"ab","c"} and {"a","bc"} collides ("abc" both ways); length-prefixing
+    // must keep them two distinct entries.
+    SUBCASE("injectivity: {ab,c} and {a,bc} are distinct entries") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string a; string b; } k_t;
+                int m1 [k_t];
+                k_t k;
+                initial begin
+                    k = '{"ab", "c"}; m1[k] = 1;
+                    k = '{"a", "bc"}; m1[k] = 2;
+                    $display("num=%0d", m1.num());
+                    k = '{"ab", "c"}; $display("v1=%0d", m1[k]);
+                    k = '{"a", "bc"}; $display("v2=%0d", m1[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nv1=1\nv2=2\n");
+    }
+    // foreach traversal, and first/next readout writing a whole struct key
+    // variable back (denormalize_variable_agg_key) -- LRM 7.9.3/7.9.4.
+    SUBCASE("foreach and first/next traversal readout") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k = '{"ab", 1}; a[k] = 1;
+                    k = '{"c",  1}; a[k] = 2;
+                    k = '{"",   9}; a[k] = 3;
+                    foreach (a[kk]) $display("s=%s i=%0d v=%0d", kk.s, kk.i, a[kk]);
+                    void'(a.first(k));
+                    $display("first s=%s i=%0d", k.s, k.i);
+                    void'(a.next(k));
+                    $display("next  s=%s i=%0d", k.s, k.i);
+                    void'(a.last(k));
+                    $display("last  s=%s i=%0d", k.s, k.i);
+                end
+            endmodule
+        )";
+        // Length-prefixed ordering: "" (len 0) < "c" (len 1) < "ab" (len 2).
+        CHECK(run_capture(src) == "s= i=9 v=3\n"
+                                  "s=c i=1 v=2\n"
+                                  "s=ab i=1 v=1\n"
+                                  "first s= i=9\n"
+                                  "next  s=c i=1\n"
+                                  "last  s=ab i=1\n");
+    }
+    // Stability rule (LRM 7.8.5's fourth bullet): traversing twice with no
+    // insert/delete between yields identical order.
+    SUBCASE("traversal order is stable across repeated traversals") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.s = "zzz"; a[k] = 1;
+                    k.s = "a";   a[k] = 2;
+                    k.s = "mm";  a[k] = 3;
+                    foreach (a[kk]) $display("%s", kk.s);
+                    foreach (a[kk]) $display("%s", kk.s);
+                end
+            endmodule
+        )";
+        // Length-prefixed ordering is deterministic ("a" len 1 < "mm"/"zzz" len 2,
+        // tied at length so insertion-independent byte order breaks the tie); the
+        // same order must repeat verbatim on the second, insert/delete-free pass.
+        const std::string out = run_capture(src);
+        REQUIRE(out.size() % 2 == 0);
+        CHECK(out.substr(0, out.size() / 2) == out.substr(out.size() / 2));
+    }
+    // Value semantics: the source struct's string member is copied INTO the key
+    // at insert time. Mutating the source afterward must not move the entry.
+    SUBCASE("key value is copied at insert; later source mutation does not move it") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k = '{"orig", 1};
+                    a[k] = 42;
+                    k.s = "mutated";
+                    $display("num=%0d origex=%0d mutex=%0d", a.num(), a.exists('{"orig", 1}), a.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=1 origex=1 mutex=0\n");
+    }
+    // A compound read-modify-write (`a[k] += ...`) resolves the SAME deferred
+    // key TWICE (get_ptr then put_ptr), with the RHS's own assoc access
+    // evaluated in between -- exactly the interleaving that would corrupt a key
+    // span cached across the two resolutions (assoc_elem_lvalue normalizes it
+    // fresh each time instead).
+    SUBCASE("compound assignment resolves the key twice, safely, around another key build") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                int b [k_t];
+                k_t k1, k2;
+                initial begin
+                    k1 = '{"foo", 1};
+                    k2 = '{"barbaz", 2};
+                    a[k1] = 10;
+                    b[k2] = 5;
+                    a[k1] += b[k2];
+                    $display("a=%0d", a[k1]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "a=15\n");
+    }
+    // The mark/pop scratch must not leak or corrupt across many sequential
+    // variable-key builds in a loop.
+    SUBCASE("many distinct variable keys built in a loop") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    for (int idx = 0; idx < 200; idx++) begin
+                        k.s = $sformatf("key%0d", idx);
+                        k.i = idx;
+                        a[k] = idx * 2;
+                    end
+                    $display("num=%0d", a.num());
+                    k.s = "key100"; k.i = 100;
+                    $display("get=%0d", a[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=200\nget=200\n");
     }
 }
 
