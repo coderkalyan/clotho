@@ -182,6 +182,11 @@ typedef enum rt_bounds_what {
     // pop_front / pop_back on an empty queue (LRM 7.10.2.4 - 7.10.2.5). No
     // index and no bound: the report is the fact itself.
     RT_BOUNDS_EMPTY_POP = 5,
+    // Associative-array index that is or contains x or z (LRM 7.8.4 / 7.8.5):
+    // invalid outright, not merely out of some range, so (like
+    // RT_BOUNDS_EMPTY_POP) there is no bound to report -- x/z is the whole
+    // finding.
+    RT_BOUNDS_ASSOC_KEY = 6,
 } rt_bounds_what;
 
 // One instrumented access, emitted by the backend as a constant global beside

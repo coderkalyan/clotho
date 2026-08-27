@@ -18866,8 +18866,13 @@ private:
             return nullptr; // 2-state (or a real, which the frontend rejects as a key)
         }
         llvm::Value* ux = any_unknown(pl);
-        if (llvm::isa<llvm::Constant>(ux)) {
-            return nullptr; // statically known-good
+        // A LITERAL x/z key (e.g. `a[8'hxx]`) folds any_unknown() to a compile-
+        // time constant TRUE, not false -- "it's a Constant" alone does not mean
+        // "statically valid" (P4b: this used to wrongly treat that as always-
+        // valid, so `a[8'hxx] = 7; a[8'hzz] = 8;` silently merged into ONE
+        // entry via the all-zero must-plane span instead of dropping both).
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ux)) {
+            return c->isZero() ? nullptr : b_.getInt1(false); // statically good / statically invalid
         }
         return b_.CreateNot(ux);
     }
@@ -19173,6 +19178,7 @@ private:
             kptr                    = span.ptr;
             klen                    = span.len;
             kvalid                  = span.valid;
+            emit_assoc_key_bounds_check(kvalid, lv, for_write);
         }
         // The resolved slot pointer. The pattern-default slot (LRM 7.9.11) always
         // exists once asked for, so it needs neither the read/write split nor a
@@ -21427,12 +21433,13 @@ private:
 
     // The rt_bounds_what enum (Runtime.h), which picks the report's wording.
     enum class BoundsWhat : int32_t {
-        Element  = 0,
-        Bit      = 1,
-        Part     = 2,
-        Char     = 3,
-        QueueOp  = 4,
-        EmptyPop = 5,
+        Element   = 0,
+        Bit       = 1,
+        Part      = 2,
+        Char      = 3,
+        QueueOp   = 4,
+        EmptyPop  = 5,
+        AssocKey  = 6,
     };
 
     // The rt_bounds_site record (Runtime.h): { ptr where, ptr line, ptr name,
@@ -21635,6 +21642,31 @@ private:
                                                            0, 0),
                            },
                            /*is_write=*/false);
+    }
+
+    // LRM 7.8.6 (P4b): an index that is or contains x or z is an invalid
+    // associative-array key. The read-yields-default / write-is-dropped
+    // behaviour is already implemented by the `kvalid` gate this wraps
+    // (assoc_elem_lvalue); only the WARNING the clause also asks for is new
+    // here, and only under --sanitize=bounds -- Clotho's existing, deliberate
+    // performance/compliance tradeoff for this whole category of runtime
+    // report (matches RT_BOUNDS_EMPTY_POP and friends). `kvalid` null means
+    // the key type is 2-state (or has no x/z concept at all -- string, queue,
+    // dynamic array, associative array): statically always valid, nothing to
+    // report.
+    void emit_assoc_key_bounds_check(llvm::Value* kvalid, const LValue& lv, bool for_write) {
+        if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds) || kvalid == nullptr) {
+            return;
+        }
+        emit_bounds_report(BoundsCheck{
+                             .inrange = kvalid,
+                             .index   = b_.getInt64(0),
+                             .unknown = b_.getInt1(true),
+                             .extent  = b_.getInt64(0),
+                             .site    = bounds_site_global(loc_text(lv.assoc_key_arg), loc_text(lv.assoc_key_arg),
+                                                           bounds_name(lv), BoundsWhat::AssocKey, 0, 0),
+                           },
+                           for_write);
     }
 
     // One --sanitize=bounds check: a branch on the in-range predicate the access

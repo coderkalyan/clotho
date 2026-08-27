@@ -373,6 +373,29 @@ TEST_CASE("assoc invalid (x/z) key: read defaults, write drops, exists is 0") {
                               "s del=1\n");
 }
 
+// P4b: a LITERAL x/z key (`a[8'hxx]`) reaches a separate code path from a
+// runtime x/z variable (the test above) -- slang/LLVM constant-fold its
+// unknown-bit plane to a compile-time TRUE, and the guard used to treat
+// "the unknown-ness is a compile-time Constant" as synonymous with
+// "statically valid" without checking WHICH constant, so
+// `a[8'hxx] = 7; a[8'hzz] = 8;` silently merged into one entry (both
+// normalize to the same all-zero must-plane span) instead of dropping both.
+TEST_CASE("assoc invalid (x/z) key: a literal key drops too, not just a runtime one") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a [integer];
+            initial begin
+                a[32'hxxxxxxxx] = 7;
+                a[32'hzzzzzzzz] = 8;
+                $display("num=%0d", a.num());
+                a[0] = 9;
+                $display("num2=%0d get=%0d", a.num(), a[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=0\nnum2=1 get=9\n");
+}
+
 // Keys are owned by the map, so a struct-keyed array deep-copies like any other.
 TEST_CASE("assoc struct-keyed deep copy independence") {
     constexpr std::string_view src = R"(

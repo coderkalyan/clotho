@@ -4221,10 +4221,13 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
         case RT_BOUNDS_CHAR: noun = "string index out of bounds"; break;
         case RT_BOUNDS_QUEUE_OP: noun = "queue index out of bounds"; break;
         case RT_BOUNDS_EMPTY_POP: noun = "pop from an empty queue"; break;
+        case RT_BOUNDS_ASSOC_KEY: noun = "associative array key is invalid (x or z)"; break;
         default: break;
     }
-    if (site->what == RT_BOUNDS_EMPTY_POP) {
-        // No index and no bound to name: the headline is the whole finding.
+    if (site->what == RT_BOUNDS_EMPTY_POP || site->what == RT_BOUNDS_ASSOC_KEY) {
+        // No index and no bound to name: x/z makes ANY key invalid, not just
+        // one outside some range (LRM 7.8.4 / 7.8.5), so the headline is the
+        // whole finding, same as an empty-queue pop.
         fmt::print(stderr, head, " {}", noun);
     } else {
         const std::string idx   = unknown ? std::string("x") : std::to_string(index);
