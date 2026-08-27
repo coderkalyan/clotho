@@ -7053,11 +7053,30 @@ private:
                                 fail("unsupported net type (only wire/tri/uwire/wand/wor/tri0/tri1/"
                                      "supply0/supply1 are modeled)");
                         }
-                        if (net.getDelay() != nullptr) {
-                            // TODO: net delay (`wire #5 w;`, LRM 28.16) — an
-                            // inertial delay on every driver of the net; dropped
-                            // today, so propagation would be instant.
-                            fail("net delay is not supported");
+                        // A delay3 on the net_declaration syntax is either a
+                        // true net delay (LRM 28.16, no net_decl_assignment) or,
+                        // when the declaration also carries an assignment
+                        // (`wire #5 w = expr;`), that ONE assignment's own
+                        // continuous-assign delay (LRM 10.3.3's last paragraph:
+                        // "shall not be added to the delay of other drivers on
+                        // the net") — lowered by lower_net_initializer instead,
+                        // exactly like a bare `assign #d`.
+                        if (net.getDelay() != nullptr && net.getInitializer() == nullptr) {
+                            if (net.getDelay()->kind != TimingControlKind::Delay) {
+                                // TODO: rise/fall/turn-off net delay
+                                // (`wire #(a,b,c) w;`), LRM 28.16 — same gap as
+                                // the continuous-assign / gate delay triple.
+                                fail("net delay rise/fall/turn-off triples (wire #(a,b,c)) are "
+                                     "not supported");
+                            }
+                            if (is_aggregate(vs.getType())) {
+                                // TODO: net delay on an unpacked-aggregate net —
+                                // needs a leaf-wise inertial replay (like the
+                                // intra-assignment aggregate commit), not the
+                                // flat packed-plane resolver fold this forces
+                                // every other net delay through.
+                                fail("net delay on an unpacked-aggregate net is not supported");
+                            }
                         }
                         info.is_net = true;
                     }
@@ -7086,14 +7105,28 @@ private:
                     const ir::Signal sig = register_signal(std::move(info));
                     sigmap_[&vs]         = sig;
                     if (m.kind == SymbolKind::Net) {
+                        const NetSymbol&       nsym = m.as<NetSymbol>();
+                        const NetType::NetKind nk   = nsym.netType.netKind;
                         // A tri0/tri1 / supply0/supply1 net always needs a resolver
                         // so its pull can fill undriven bits — even with zero or one
                         // driver. Record it here (its home scope) so a driverless one
                         // still emits.
-                        const NetType::NetKind nk = m.as<NetSymbol>().netType.netKind;
                         if (const std::optional<int> pull = net_pull_value(nk)) {
                             net_pull_[static_cast<uint32_t>(sig)] =
                               PullInfo{ *pull, cur_scope_id(), to_source_loc(vs.location), net_pull_strength(nk) };
+                        }
+                        // A true net delay (validated above) applies to every
+                        // driver's contribution to the net, after resolution —
+                        // force the net onto the per-driver-slot path even with
+                        // a single real driver (like `force`/cmos do), using
+                        // this net kind's own fold op rather than assuming
+                        // WireRes, so a delayed wand/wor net still resolves by
+                        // value instead of by the wrong reducer.
+                        if (nsym.getDelay() != nullptr && nsym.getInitializer() == nullptr) {
+                            net_delay_[static_cast<uint32_t>(sig)] = &nsym.getDelay()->as<DelayControl>().expr;
+                            if (resolved_nets_.insert(static_cast<uint32_t>(sig)).second) {
+                                net_resolve_op_[static_cast<uint32_t>(sig)] = net_resolve_tag(nk);
+                            }
                         }
                     }
                     break;
@@ -8071,7 +8104,18 @@ private:
             const std::span<const NetForceSite> sites = fs_it != net_force_sites_.end()
                                                           ? std::span<const NetForceSite>(fs_it->second)
                                                           : std::span<const NetForceSite>();
-            b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
+            // A net delay (LRM 28.16, `wire #5 w;`) delays the resolved fold
+            // itself, not any one driver's slot -- "the time it takes from any
+            // driver on the net changing value to the time when the net value
+            // is updated". It rides this store alone; the force overlay below
+            // stays immediate (force is an override, not a driver LRM 28.16
+            // times).
+            const auto nd_it = net_delay_.find(net_u);
+            if (nd_it != net_delay_.end()) {
+                b.store_inertial_delay(b.signal(net, l), acc, scaled_delay(*nd_it->second, b), l);
+            } else {
+                b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
+            }
             for (const NetForceSite& site : sites) {
                 const ir::Index net_lv = (site.lo == 0 && site.hi == net_w - 1)
                                            ? b.signal(net, l)
@@ -8777,6 +8821,13 @@ private:
                 // WireRes folds packed planes only.
                 fail("multiple drivers on an aggregate net are not supported");
             }
+            if (ns.getDelay() != nullptr) {
+                // TODO: net declaration assignment delay on an unpacked
+                // aggregate — emit_agg_store has no inertial-delay counterpart
+                // (that needs a leaf-wise replay, like the intra-assignment
+                // aggregate commit does for `<= #d`).
+                fail("a delay on an aggregate net declaration assignment is not supported");
+            }
             // A whole unpacked-struct / aggregate net initializer is a whole-object
             // continuous copy (one process on the source's sensitivity), the same
             // as a bare `assign n = ...` on a struct.
@@ -8786,14 +8837,37 @@ private:
             add_continuous_process(continuous_events(*init), to_source_loc(ns.location), ab);
             return;
         }
+        // `wire #d w = expr;` carries a per-driver continuous-assign delay (LRM
+        // 10.3.3's last paragraph: embedded in the declaration, so it belongs to
+        // THIS one driver and is not added to any other driver's delay), lowered
+        // exactly like a bare `assign #d`. The LHS is always the whole net here —
+        // a net_decl_assignment forbids any indexing (LRM 10.3.1) — so unlike
+        // lower_continuous_assign there is no "whole scalar" shape to check.
+        const TimingControl* delay = ns.getDelay();
+        if (delay != nullptr && delay->kind != TimingControlKind::Delay) {
+            // TODO: net declaration assignment rise/fall/turn-off delays
+            // (`wire #(a,b,c) w = ...;`) — same gap as `assign #(a,b,c)`.
+            fail("net declaration assignment rise/fall/turn-off delays (wire #(a,b,c) w = ...) "
+                 "are not supported");
+        }
         ir::Builder         b(module_.pool);
         const ir::SourceLoc l = loc(*init);
         if (resolved) {
             // A net-declaration assignment is a whole-net driver: stage the
             // initializer into this driver's slot (emit_wire_resolvers folds it).
             const ir::Signal slot = alloc_driver_slot(signal_of(ns), l, pack_strength(ns.getDriveStrength()));
-            b.binary(
-              ir::Inst::Tag::Store, b.signal(slot, l), b.resize(lower_expr(*init, b), lower_type(ns.getType()), l), l);
+            const ir::Index  val  = b.resize(lower_expr(*init, b), lower_type(ns.getType()), l);
+            if (delay != nullptr) {
+                b.store_inertial_delay(b.signal(slot, l), val, scaled_delay(delay->as<DelayControl>().expr, b), l);
+            } else {
+                b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
+            }
+            add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
+            return;
+        }
+        if (delay != nullptr) {
+            b.store_inertial_delay(
+              value_lvalue(ns, b, l), lower_expr(*init, b), scaled_delay(delay->as<DelayControl>().expr, b), l);
             add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
             return;
         }
@@ -33503,6 +33577,13 @@ private:
         uint8_t strength;
     };
     ankerl::unordered_dense::map<uint32_t, PullInfo> net_pull_;
+    // Nets declared with a plain net delay (`wire #5 w;`, no net_decl_assignment
+    // — LRM 28.16), keyed by signal id: the single delay-value expression,
+    // lowered lazily by emit_wire_resolvers once every driver has registered
+    // its slot. Distinct from a delay embedded in a net-declaration ASSIGNMENT
+    // (`wire #5 w = expr;`), which LRM 10.3.3 treats as that one driver's own
+    // continuous-assign delay instead and lowers through lower_net_initializer.
+    ankerl::unordered_dense::map<uint32_t, const Expression*> net_delay_;
     // Hierarchical name prefix of the instance currently being lowered (e.g.
     // "u_alu.u_sub."); empty for the top. Prepended to every signal name created
     // while this instance's body is processed so flattened signals stay unique.

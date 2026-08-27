@@ -1433,16 +1433,18 @@ TEST_CASE("drive strengths lower on continuous assigns and net declarations") {
     CHECK_MESSAGE(rs.ok, rs.diagnostic_text());
 }
 
-// -- Net delay (LRM 28.16) --
+// -- Net delay (LRM 28.16) -- full behavior coverage (timing, multi-driver
+// resolution, wide values, and the Delay3 / aggregate guards) lives in
+// net_delay_test.cpp; this is a lowering-only sanity check that both forms
+// compile.
 
-TEST_CASE("a net declaration delay fails loudly") {
+TEST_CASE("a net declaration delay lowers") {
     const LowerResult ri = lower_text(R"(
         module m(input a);
             wire #5 w = a;
         endmodule
     )");
-    CHECK_FALSE(ri.ok);
-    CHECK(ri.diagnostic_text().find("net delay") != std::string::npos);
+    CHECK_MESSAGE(ri.ok, ri.diagnostic_text());
 
     const LowerResult rd = lower_text(R"(
         module m(input a);
@@ -1450,8 +1452,7 @@ TEST_CASE("a net declaration delay fails loudly") {
             assign w = a;
         endmodule
     )");
-    CHECK_FALSE(rd.ok);
-    CHECK(rd.diagnostic_text().find("net delay") != std::string::npos);
+    CHECK_MESSAGE(rd.ok, rd.diagnostic_text());
 
     // No delay: a plain net declaration assignment still lowers.
     const LowerResult rp = lower_text(R"(

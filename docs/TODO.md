@@ -1277,21 +1277,54 @@ professional parity; M5 makes it complete.
   record on the timing wheel, committed in the active region ahead of the drain
   (`emit_inertial_arm` / `rt_inertial_decide`). A delay on a whole driver of a
   multiply-driven (resolved) net rides that driver's own slot store, ahead of
-  resolution (`store_driver_slot`). Gaps (guarded loud): rise/fall/turn-off delay
-  triples `#(a,b,c)`, a select / concat / aggregate target, a net wider than 64
-  value bits, and a delay on a PARTIAL driver of a resolved net (its slot powers
-  up all-x, so the undriven bits would fold as x instead of z until the first
-  store lands).
+  resolution (`store_driver_slot`). No width limit: `rt_inertial_decide` takes
+  0/1 compare-result flags rather than the value planes packed into a `uint64_t`,
+  so the backend does every equality compare as an ordinary `icmp` on values
+  loaded from a per-site persistent buffer (`rt_inertial_buf`) — arbitrary width,
+  including a 4-state mm plane that is not a multiple of 8 bits, where a
+  byte-level `memcmp` of two independently materialized buffers would have hit
+  an LLVM-unspecified padding-bit mismatch that `icmp` on the actual `iN` values
+  never can. Gaps (guarded loud): rise/fall/turn-off delay triples `#(a,b,c)`, a
+  select / concat / aggregate target, and a delay on a PARTIAL driver of a
+  resolved net (its slot powers up all-x, so the undriven bits would fold as x
+  instead of z until the first store lands).
 - [x] **Single-value gate delay** (`and #2 (...)`, LRM 28.16) — inertial, reusing
-  the continuous-assign delay record (`emit_gate_as_process` -> `store_inertial_delay`).
-  A gate driving a multiply-driven (resolved) net delays its own slot, and
-  `cmos #d` / `rcmos #d` delay each of the two halves LRM 28.9 decomposes them
-  into (identical waveforms to `nmos #d` + `pmos #d` under iverilog 13). Gaps
-  (guarded loud): rise/fall/turn-off triples `#(a,b,c)` (now also rejected on
-  cmos/rcmos), a bit-addressed output on a single-driver net, and a delay on a
-  partial driver of a resolved net.
-- [ ] **Net delays** (`wire #3 w;`) — delays every driver of the net (added to each
-  driver's own delay, LRM 10.3.3); distinct from a continuous/gate assign delay.
+  the continuous-assign delay record (`emit_gate_as_process` -> `store_inertial_delay`),
+  so it carries the same no-width-limit fix. A gate driving a multiply-driven
+  (resolved) net delays its own slot, and `cmos #d` / `rcmos #d` delay each of
+  the two halves LRM 28.9 decomposes them into (identical waveforms to `nmos #d`
+  + `pmos #d` under iverilog 13). Gaps (guarded loud): rise/fall/turn-off triples
+  `#(a,b,c)` (now also rejected on cmos/rcmos), a bit-addressed output on a
+  single-driver net, and a delay on a partial driver of a resolved net.
+- [x] **Net delays** (`wire #3 w;`, LRM 28.16) — distinct from a continuous/gate
+  assign delay, and lowered differently: the delay sits on the NET, "the time it
+  takes from any driver on the net changing value to the time when the net value
+  is updated," so it applies once to the resolved value regardless of driver
+  count, and stacks additively with any driver's OWN delay rather than replacing
+  it. Implemented by forcing the net onto the per-driver-slot/resolver path even
+  with a single real driver (`collect_scope_signals`, mirroring how `force` and
+  `cmos`/`rcmos` already force resolution) — using the net kind's own fold op
+  (`net_resolve_tag`), not the resolved-by-default `WireRes`, so a delayed
+  `wand`/`wor` net still folds by value instead of the wrong reducer — and then
+  making `emit_wire_resolvers`'s base fold-into-net store inertial
+  (`net_delay_` : signal -> delay expression) instead of plain, while the force
+  overlay stores stay immediate (force is an override, not a driver LRM 28.16
+  times). Every existing driver kind (assign, gate, net initializer, port
+  connection copy, cmos/mos switch) already routes through that same slot path
+  for any resolved net, so none of them needed a dedicated net-delay code path.
+  A delay embedded IN a net declaration's own assignment (`wire #5 w = expr;`)
+  is a DIFFERENT thing per LRM 10.3.3's closing paragraph — that ONE driver's own
+  continuous-assign delay, "not added to the delay of other drivers on the net"
+  — and lowers through `lower_net_initializer` exactly like a bare `assign #d`
+  (whole-net direct `store_inertial_delay`, or a slot store when the net is
+  otherwise resolved); `collect_scope_signals`'s net-delay guard keys off
+  `getInitializer() == nullptr` to route the two cases separately. Gaps (guarded
+  loud): rise/fall/turn-off triples `#(a,b,c)` on either form, and a net delay on
+  an unpacked-aggregate net (forcing resolution hits the pre-existing
+  packed-plane-only `WireRes` fold; a real fix needs a leaf-wise inertial replay
+  like the intra-assignment aggregate commit, not attempted here) on either form.
+  A net delay on a user-defined-nettype net is excluded pending nettype
+  resolution-function support generally. `tests/net_delay_test.cpp`.
 
 ### Procedural continuous assignment & force
 
