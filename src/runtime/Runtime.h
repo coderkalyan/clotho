@@ -1276,6 +1276,12 @@ void rt_keybuf_span(uint32_t mark, const uint8_t** out_ptr, uint32_t* out_len);
 // stays valid in memory (though logically popped) until the next append.
 void rt_keybuf_end(uint32_t mark);
 
+// Whole-associative-array equality (LRM 11.4.5 / 7.9, P4a): 1 if two spans are
+// byte-identical, else 0. The backend builds each side's span with the P3
+// assoc-key canonical serializer (count || sorted (key, value) pairs), so
+// byte identity here is exactly map-content equality.
+uint8_t rt_key_span_eq(const uint8_t* a, uint32_t alen, const uint8_t* b, uint32_t blen);
+
 // -- SystemVerilog associative arrays --
 //
 // The associative-array type (LRM §7.8/7.9): a runtime-sized key->value map. The

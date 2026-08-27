@@ -6234,6 +6234,37 @@ private:
         return module_.pool.layout(type).domain != ir::Domain::Four;
     }
 
+    // Whether a value of `type` could ever carry an x/z bit, recursing through
+    // every leaf kind the P3 assoc-key canonical serializer
+    // (emit_variable_agg_key_bytes, LlvmBackend.cpp) knows how to encode --
+    // struct / fixed array / queue / dynamic array / associative array nesting,
+    // down to a plain leaf. False for a leaf with no x/z state at all (string,
+    // class handle, chandle, event, virtual interface, real/shortreal, a
+    // 2-state integral); true for a genuinely 4-state-capable integral leaf.
+    // Used only to gate whole-associative-array logical equality (P4a): a flat
+    // byte compare on the canonical serialization is exact for a definite
+    // value, but cannot give the X-propagating answer LRM 11.4.5 wants when a
+    // value pair is unknown.
+    bool assoc_value_may_carry_xz(ir::Ref type) const {
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
+                if (assoc_value_may_carry_xz(f.type)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (t.kind == ir::Type::Kind::UnpackedArray || t.kind == ir::Type::Kind::Queue ||
+            t.kind == ir::Type::Kind::DynArray || t.kind == ir::Type::Kind::Assoc) {
+            return assoc_value_may_carry_xz(t.element);
+        }
+        if (t.kind == ir::Type::Kind::String || module_.pool.is_float(type)) {
+            return false;
+        }
+        return module_.pool.layout(type).domain == ir::Domain::Four;
+    }
+
     // Strip an outer identity/struct Conversion wrapper slang may insert on a
     // struct-typed rvalue, exposing the underlying lvalue-shaped expression.
     static const Expression& unwrap_conversion(const Expression& e) {
@@ -27631,14 +27662,49 @@ private:
         }
 
         // Unpacked aggregate equality (LRM 7.2, 11.2.2, 11.4.5, Table 11-1): a
-        // whole struct / fixed unpacked array / queue / dynamic array value
-        // cannot be loaded, so every equality-family operator reduces to a
-        // per-leaf comparison instead. slang wraps each operand in a bitstream
-        // Conversion, so the aggregate type is on the unwrapped operand.
+        // whole struct / fixed unpacked array / queue / dynamic array / associative
+        // array value cannot be loaded, so every equality-family operator reduces to
+        // a per-leaf (or, for an associative array, whole-map canonical byte)
+        // comparison instead. slang wraps each operand in a bitstream Conversion,
+        // so the aggregate type is on the unwrapped operand.
         if (bin.op == B::Equality || bin.op == B::Inequality || bin.op == B::CaseEquality ||
             bin.op == B::CaseInequality) {
-            const Expression& ule         = unwrap_conversion(bin.left());
-            const bool        agg_operand =
+            const Expression& ule = unwrap_conversion(bin.left());
+            if (is_assoc(ule)) {
+                // LRM 11.4.5 / 7.9 (P4a): two associative arrays are equal iff
+                // they hold the same set of (key, value) pairs -- no per-leaf
+                // walk here (a map has no positional "leaves" to Land-reduce
+                // over the way a struct/array/queue does); the backend compares
+                // each side's P3 canonical serialization byte for byte instead.
+                const Expression& re = unwrap_conversion(bin.right());
+                if (!is_struct_lvalue_shape(ule) || !is_struct_lvalue_shape(re)) {
+                    fail("associative array equality is only supported between "
+                         "array variables");
+                }
+                const ir::Ref  sty     = lower_type(*ule.type);
+                const bool     is_case = bin.op == B::CaseEquality || bin.op == B::CaseInequality;
+                if (!is_case) {
+                    const ir::Type t = std::get<ir::Type>(module_.pool.get(sty));
+                    if (assoc_value_may_carry_xz(t.element)) {
+                        // TODO: X-propagating logical equality for a
+                        // 4-state-capable value element (LRM 11.4.5) -- the
+                        // canonical byte serialization is bit-exact, which is
+                        // what case equality (===) wants, but logical equality
+                        // needs an unknown VALUE pair to propagate to an
+                        // ambiguous (x) result, and a flat byte compare cannot
+                        // give that.
+                        fail("logical equality of an associative array with a "
+                             "4-state-capable value element is not supported "
+                             "(LRM 11.4.5); use === instead");
+                    }
+                }
+                const ir::SourceLoc l   = loc(bin);
+                const ir::Index     acc = b.agg_eq(lower_lvalue(ule, b), lower_lvalue(re, b), sty, l);
+                return (bin.op == B::Equality || bin.op == B::CaseEquality)
+                       ? acc
+                       : b.unary(ir::Inst::Tag::Lnot, acc, l);
+            }
+            const bool agg_operand =
               is_unpacked_struct(*ule.type) ||
               ule.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() !=
                 nullptr ||

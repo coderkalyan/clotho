@@ -13600,6 +13600,11 @@ private:
     llvm::FunctionCallee keybuf_end_fn() {
         return rt_fn("rt_keybuf_end", b_.getVoidTy(), { b_.getInt32Ty() });
     }
+    // u8 rt_key_span_eq(const u8* a, u32 alen, const u8* b, u32 blen)
+    llvm::FunctionCallee key_span_eq_fn() {
+        return rt_fn("rt_key_span_eq", b_.getInt8Ty(),
+                     { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
 
     llvm::FunctionCallee str_init_fn() {
         return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
@@ -18681,12 +18686,22 @@ private:
     // §3) -- a bare top-level string key keeps its own unprefixed encoding
     // (normalize_assoc_key_value's info.is_string arm), since the two never mix
     // in one span.
-    void emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value*& any_x) {
+    // `any_x_slot`: an i1* alloca the caller owns, ORed with this leaf's (or
+    // subtree's) unknown-ness. Memory-backed rather than an SSA value threaded
+    // by reference: a Queue / DynArray / Assoc leaf recurses inside a RUNTIME
+    // loop of unknown trip count, so a leaf's unknown-bit value is defined
+    // inside the loop body, which does not dominate the code after the loop --
+    // an SSA any_x carried past the loop that way is a verifier-rejected
+    // dominance violation (only latent for a 2-state leaf, whose any_unknown()
+    // is a compile-time constant with no defining block to violate). A plain
+    // load/store through the slot is correct regardless of trip count or
+    // nesting depth.
+    void emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot) {
         const Type& t = std::get<Type>(mod_.pool.get(type));
         if (t.kind == Type::Kind::Struct && !t.is_packed) {
             uint32_t f = 0;
             for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
-                emit_variable_agg_key_bytes(fld.type, agg_member(lv, type, f), any_x);
+                emit_variable_agg_key_bytes(fld.type, agg_member(lv, type, f), any_x_slot);
                 ++f;
             }
             return;
@@ -18694,7 +18709,7 @@ private:
         if (t.kind == Type::Kind::UnpackedArray) {
             const uint32_t n = array_dim(t);
             for (uint32_t k = 0; k < n; ++k) {
-                emit_variable_agg_key_bytes(t.element, agg_elem(lv, type, k), any_x);
+                emit_variable_agg_key_bytes(t.element, agg_elem(lv, type, k), any_x_slot);
             }
             return;
         }
@@ -18734,7 +18749,7 @@ private:
             b_.CreateCondBr(b_.CreateICmpULT(i, len), body, done);
             b_.SetInsertPoint(body);
             LValue elem_lv = container_elem_lvalue(handle, data, type, e, i);
-            emit_variable_agg_key_bytes(t.element, elem_lv, any_x);
+            emit_variable_agg_key_bytes(t.element, elem_lv, any_x_slot);
             b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
             b_.CreateBr(head);
             b_.SetInsertPoint(done);
@@ -18792,7 +18807,7 @@ private:
             llvm::Value*  vslot = b_.CreateCall(assoc_get_ptr_fn(), { handle, kptr, klen });
             const DynElem ve    = dynarr_elem(type);
             LValue        vlv   = tmp_elem_lvalue(vslot, ve, b_.getInt64(0));
-            emit_variable_agg_key_bytes(t.element, vlv, any_x);
+            emit_variable_agg_key_bytes(t.element, vlv, any_x_slot);
             llvm::Value* got = b_.CreateCall(assoc_step_fn(/*prev=*/false), { handle, kptr, klen, kptr_a, klen_a });
             b_.CreateStore(b_.CreateTrunc(got, b_.getInt1Ty()), have_a);
             b_.CreateBr(head);
@@ -18809,7 +18824,7 @@ private:
         }
         const Plane  pl = lower_load(leaf);
         llvm::Value* ux = any_unknown(pl);
-        any_x           = any_x == nullptr ? ux : b_.CreateOr(any_x, ux);
+        b_.CreateStore(b_.CreateOr(b_.CreateLoad(b_.getInt1Ty(), any_x_slot), cast(ux, 1, false)), any_x_slot);
         const uint32_t w       = mod_.pool.layout(type).width;
         const uint32_t W       = w == 0 ? 1 : w;
         const uint32_t nbytes  = (W + 7) / 8;
@@ -18827,19 +18842,20 @@ private:
     // survives past it -- see the LValue field comment on assoc_key_arg for why
     // that matters (a deferred a[k] place can resolve its key twice).
     AssocKeySpan normalize_variable_agg_key(const LValue& key_lv, const AssocKeyInfo& info) {
-        llvm::Value* mark  = b_.CreateCall(keybuf_begin_fn(), {});
-        llvm::Value* any_x = nullptr;
-        emit_variable_agg_key_bytes(info.key_ty, key_lv, any_x);
+        llvm::Value* mark      = b_.CreateCall(keybuf_begin_fn(), {});
+        llvm::Value* any_x_slot = entry_alloca(b_.getInt1Ty(), "assoc.vkey.anyx");
+        b_.CreateStore(b_.getInt1(false), any_x_slot);
+        emit_variable_agg_key_bytes(info.key_ty, key_lv, any_x_slot);
         llvm::Value* ptr_slot = entry_alloca(raw_ptr_ty(), "assoc.vkey.ptr");
         llvm::Value* len_slot = entry_alloca(b_.getInt32Ty(), "assoc.vkey.len");
         b_.CreateCall(keybuf_span_fn(), { mark, ptr_slot, len_slot });
         llvm::Value* ptr = b_.CreateLoad(raw_ptr_ty(), ptr_slot);
         llvm::Value* len = b_.CreateLoad(b_.getInt32Ty(), len_slot);
         b_.CreateCall(keybuf_end_fn(), { mark });
-        llvm::Value* valid = any_x == nullptr ? nullptr : b_.CreateNot(any_x);
-        if (valid != nullptr && llvm::isa<llvm::Constant>(valid)) {
-            valid = nullptr; // every leaf 2-state: statically valid
-        }
+        // Not folded to null even when every leaf is provably 2-state (the
+        // memory-backed accumulator loses that compile-time fact) -- the JIT's
+        // own optimization pass folds the resulting always-false gate away.
+        llvm::Value* valid = b_.CreateNot(b_.CreateLoad(b_.getInt1Ty(), any_x_slot));
         return { ptr, len, valid };
     }
 
@@ -26426,6 +26442,40 @@ private:
             llvm::Value* may  = b_.CreateICmpNE(ts, b_.getInt8(0));
             llvm::Value* must = b_.CreateICmpEQ(ts, b_.getInt8(1));
             return bit_plane(must, may);
+        }
+        if (t.kind == Type::Kind::Assoc) {
+            // LRM 11.4.5 / 7.9 (P4a): equal iff the same set of (key, value)
+            // pairs. Reuses the P3 assoc-key-leaf canonical serializer (count ||
+            // sorted (key, value) pairs) on each whole operand -- the same
+            // property that makes that encoding "canonical" (two equal-content
+            // maps produce identical bytes) is exactly what a byte compare here
+            // needs. Bit-exact, so this answers === directly; the frontend
+            // refuses plain == for a 4-state-capable value element, where the
+            // X-propagating answer can differ from a flat byte compare.
+            //
+            // Both spans build into the SAME rt_keybuf_* region back to back, so
+            // only the FINAL span (after both are written) is read -- an
+            // intervening rt_keybuf_append can reallocate the buffer, which
+            // would dangle a pointer captured mid-build; the byte offsets
+            // (`mark0`/`mid`/`end`, plain u32s) stay valid regardless.
+            llvm::Value* mark0     = b_.CreateCall(keybuf_begin_fn(), {});
+            llvm::Value* xz_slot   = entry_alloca(b_.getInt1Ty(), "aeq.anyx");
+            b_.CreateStore(b_.getInt1(false), xz_slot);
+            emit_variable_agg_key_bytes(type, lhs, xz_slot);
+            llvm::Value* mid = b_.CreateCall(keybuf_begin_fn(), {});
+            emit_variable_agg_key_bytes(type, rhs, xz_slot);
+            llvm::Value* end = b_.CreateCall(keybuf_begin_fn(), {});
+            llvm::Value* ptr_slot = entry_alloca(raw_ptr_ty(), "aeq.ptr");
+            llvm::Value* len_slot = entry_alloca(b_.getInt32Ty(), "aeq.len");
+            b_.CreateCall(keybuf_span_fn(), { mark0, ptr_slot, len_slot });
+            llvm::Value* aptr = b_.CreateLoad(raw_ptr_ty(), ptr_slot);
+            llvm::Value* alen = b_.CreateSub(mid, mark0);
+            llvm::Value* blen = b_.CreateSub(end, mid);
+            llvm::Value* bptr = b_.CreateInBoundsGEP(b_.getInt8Ty(), aptr, alen);
+            llvm::Value* eqb  = b_.CreateCall(key_span_eq_fn(), { aptr, alen, bptr, blen });
+            b_.CreateCall(keybuf_end_fn(), { mark0 });
+            llvm::Value* bit = b_.CreateICmpNE(eqb, b_.getInt8(0));
+            return bit_plane(bit, bit);
         }
         const ValType vt = from_ref(type);
         // A leaf reached through a deferred associative-array element (`a[k] == x`

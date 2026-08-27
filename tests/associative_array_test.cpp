@@ -1684,3 +1684,109 @@ TEST_CASE("array query functions (LRM 20.7): a non-integral associative key is r
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("non-integral") != std::string::npos);
 }
+
+// P4a (docs/design/assoc-keys.md): whole-associative-array equality (LRM
+// 11.4.5 / 7.9) used to be silently wrong -- is_assoc was absent from the
+// aggregate-equality dispatch, so `a == b` fell through to the scalar plane
+// path and compared handle words instead of contents. Fixed by reusing the
+// P3 assoc-key canonical serializer (count || sorted (key, value) pairs) on
+// each whole operand and comparing bytes: two maps are equal iff they hold
+// the same set of entries.
+TEST_CASE("assoc whole-array equality (P4a)") {
+    SUBCASE("integral value: equal, then a value differs, then sizes differ") {
+        constexpr std::string_view src = R"(
+            module m;
+                int a[int];
+                int b[int];
+                initial begin
+                    a[1] = 5; a[2] = 6;
+                    b[1] = 5; b[2] = 6;
+                    $display("eq=%0d ne=%0d", a == b, a != b);
+                    b[2] = 999;
+                    $display("eq2=%0d ne2=%0d", a == b, a != b);
+                    b[2] = 6; b[3] = 7;
+                    $display("eq3=%0d ne3=%0d", a == b, a != b);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "eq=1 ne=0\n"
+                                  "eq2=0 ne2=1\n"
+                                  "eq3=0 ne3=1\n");
+    }
+    SUBCASE("string keys, case equality, empty maps") {
+        constexpr std::string_view src = R"(
+            module m;
+                int a[string];
+                int b[string];
+                int c[string];
+                initial begin
+                    a["x"] = 1; a["y"] = 2;
+                    b["x"] = 1; b["y"] = 2;
+                    c["x"] = 1;
+                    $display("eq=%0d ne=%0d ceq=%0d cne=%0d", a == b, a != b, a === b, a !== b);
+                    $display("eqc=%0d nec=%0d", a == c, a != c);
+                    b.delete();
+                    $display("eqempty=%0d", a == b);
+                    a.delete();
+                    $display("botempty=%0d", a == b);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "eq=1 ne=0 ceq=1 cne=0\n"
+                                  "eqc=0 nec=1\n"
+                                  "eqempty=0\n"
+                                  "botempty=1\n");
+    }
+    // Case equality (===) is bit-exact, so it works even for a 4-state value
+    // element -- the flat byte compare IS the case-equality answer.
+    SUBCASE("case equality with a 4-state value element, including x/z") {
+        constexpr std::string_view src = R"(
+            module m;
+                logic [3:0] a[int];
+                logic [3:0] b[int];
+                initial begin
+                    a[1] = 4'b0101;
+                    b[1] = 4'b0101;
+                    $display("ceq=%0d", a === b);
+                    b[1] = 4'bxxxx;
+                    $display("ceq2=%0d cne2=%0d", a === b, a !== b);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "ceq=1\nceq2=0 cne2=1\n");
+    }
+    // A queue of 4-state values as the KEY itself: the alloca-backed
+    // unknown-bit accumulator (fixing a latent SSA-dominance bug across the
+    // P2 container-key runtime loop) must not crash the JIT verifier.
+    SUBCASE("queue-of-4-state key regression: no SSA dominance crash") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef logic [3:0] q4_t[$];
+                int a[q4_t];
+                q4_t k;
+                initial begin
+                    k = '{4'b0101, 4'b1010}; a[k] = 1;
+                    k = '{4'b0101, 4'b1111}; a[k] = 2;
+                    $display("num=%0d", a.num());
+                    k = '{4'b0101, 4'b1010};
+                    $display("get=%0d", a[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=1\n");
+    }
+    // Logical equality with a 4-state-capable value element needs
+    // X-propagation a flat byte compare cannot give; refused loudly rather
+    // than silently answering wrong.
+    SUBCASE("logical equality with a 4-state value element is refused") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                logic [3:0] a[int];
+                logic [3:0] b[int];
+                initial $display("%0d", a == b);
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("4-state-capable value element") != std::string::npos);
+    }
+}

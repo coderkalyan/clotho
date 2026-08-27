@@ -349,6 +349,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_keybuf_append", &rt_keybuf_append);
     expose("rt_keybuf_span", &rt_keybuf_span);
     expose("rt_keybuf_end", &rt_keybuf_end);
+    expose("rt_key_span_eq", &rt_key_span_eq);
     expose("rt_assoc_get_ptr", &rt_assoc_get_ptr);
     expose("rt_assoc_put_ptr", &rt_assoc_put_ptr);
     expose("rt_assoc_exists", &rt_assoc_exists);

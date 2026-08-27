@@ -2482,6 +2482,14 @@ extern "C" void rt_keybuf_end(uint32_t mark) {
     g_keybuf.resize(mark);
 }
 
+// Whole-associative-array equality (LRM 11.4.5 / 7.9, P4a): 1 if two spans are
+// byte-identical, else 0. The backend builds each side's span with the P3
+// assoc-key canonical serializer (count || sorted (key, value) pairs), so
+// byte identity here is exactly map-content equality.
+extern "C" uint8_t rt_key_span_eq(const uint8_t* a, uint32_t alen, const uint8_t* b, uint32_t blen) {
+    return (alen == blen && std::memcmp(a, b, alen) == 0) ? 1 : 0;
+}
+
 // -- Associative arrays (LRM 7.8/7.9) --
 //
 // The map is keyed by the backend's normalized order-preserving key bytes
