@@ -2458,6 +2458,38 @@ extern "C" void rt_queue_shuffle(rt_queue* h, const rt_elem_ops* ops, uint64_t* 
     ++h->epoch;
 }
 
+// -- Associative-array key scratch buffer (docs/design/assoc-keys.md P1) --
+// See the rationale at the declaration (Runtime.h).
+namespace {
+std::vector<uint8_t> g_keybuf;
+} // namespace
+
+extern "C" uint32_t rt_keybuf_begin(void) {
+    return static_cast<uint32_t>(g_keybuf.size());
+}
+
+extern "C" void rt_keybuf_append(const void* bytes, uint32_t len) {
+    const auto* p = static_cast<const uint8_t*>(bytes);
+    g_keybuf.insert(g_keybuf.end(), p, p + len);
+}
+
+extern "C" void rt_keybuf_span(uint32_t mark, const uint8_t** out_ptr, uint32_t* out_len) {
+    *out_ptr = g_keybuf.data() + mark;
+    *out_len = static_cast<uint32_t>(g_keybuf.size() - mark);
+}
+
+extern "C" void rt_keybuf_end(uint32_t mark) {
+    g_keybuf.resize(mark);
+}
+
+// Whole-associative-array equality (LRM 11.4.5 / 7.9, P4a): 1 if two spans are
+// byte-identical, else 0. The backend builds each side's span with the P3
+// assoc-key canonical serializer (count || sorted (key, value) pairs), so
+// byte identity here is exactly map-content equality.
+extern "C" uint8_t rt_key_span_eq(const uint8_t* a, uint32_t alen, const uint8_t* b, uint32_t blen) {
+    return (alen == blen && std::memcmp(a, b, alen) == 0) ? 1 : 0;
+}
+
 // -- Associative arrays (LRM 7.8/7.9) --
 //
 // The map is keyed by the backend's normalized order-preserving key bytes
@@ -4189,10 +4221,13 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
         case RT_BOUNDS_CHAR: noun = "string index out of bounds"; break;
         case RT_BOUNDS_QUEUE_OP: noun = "queue index out of bounds"; break;
         case RT_BOUNDS_EMPTY_POP: noun = "pop from an empty queue"; break;
+        case RT_BOUNDS_ASSOC_KEY: noun = "associative array key is invalid (x or z)"; break;
         default: break;
     }
-    if (site->what == RT_BOUNDS_EMPTY_POP) {
-        // No index and no bound to name: the headline is the whole finding.
+    if (site->what == RT_BOUNDS_EMPTY_POP || site->what == RT_BOUNDS_ASSOC_KEY) {
+        // No index and no bound to name: x/z makes ANY key invalid, not just
+        // one outside some range (LRM 7.8.4 / 7.8.5), so the headline is the
+        // whole finding, same as an empty-queue pop.
         fmt::print(stderr, head, " {}", noun);
     } else {
         const std::string idx   = unknown ? std::string("x") : std::to_string(index);

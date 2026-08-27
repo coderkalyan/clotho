@@ -182,6 +182,11 @@ typedef enum rt_bounds_what {
     // pop_front / pop_back on an empty queue (LRM 7.10.2.4 - 7.10.2.5). No
     // index and no bound: the report is the fact itself.
     RT_BOUNDS_EMPTY_POP = 5,
+    // Associative-array index that is or contains x or z (LRM 7.8.4 / 7.8.5):
+    // invalid outright, not merely out of some range, so (like
+    // RT_BOUNDS_EMPTY_POP) there is no bound to report -- x/z is the whole
+    // finding.
+    RT_BOUNDS_ASSOC_KEY = 6,
 } rt_bounds_what;
 
 // One instrumented access, emitted by the backend as a constant global beside
@@ -1248,6 +1253,39 @@ void rt_queue_reverse(rt_queue* h, const rt_elem_ops* ops);
 void rt_queue_sort(rt_queue* h, const rt_elem_ops* ops, uint32_t kind, uint32_t width,
                    uint32_t rev);
 void rt_queue_shuffle(rt_queue* h, const rt_elem_ops* ops, uint64_t* rng);
+
+// -- Associative-array key scratch buffer (docs/design/assoc-keys.md P1) --
+//
+// A FIXED key (every leaf integral / handle-shaped) normalizes into a
+// compile-time-sized entry-block alloca with no runtime call, unchanged from
+// before this existed. A VARIABLE key -- one containing a string / queue /
+// dynamic-array / associative-array leaf -- has no such bound, so the backend
+// builds it here instead: a growable buffer with mark/pop scoping, since key
+// construction nests (an assoc-bearing key iterates a map whose own entries
+// are themselves normalized spans). Process-global, like every other piece of
+// clotho's single-threaded simulation state.
+
+// Returns a mark: the buffer's current length, to `end` back to later.
+uint32_t rt_keybuf_begin(void);
+
+// Appends `len` bytes to the buffer's tail.
+void rt_keybuf_append(const void* bytes, uint32_t len);
+
+// The bytes appended since `mark`: a span into the buffer's storage, valid
+// until the next rt_keybuf_append (which may reallocate) or a `rt_keybuf_end`
+// that pops back over it.
+void rt_keybuf_span(uint32_t mark, const uint8_t** out_ptr, uint32_t* out_len);
+
+// Pops the buffer back to `mark`, discarding everything appended since. Does
+// not free the underlying storage, so a span already read via rt_keybuf_span
+// stays valid in memory (though logically popped) until the next append.
+void rt_keybuf_end(uint32_t mark);
+
+// Whole-associative-array equality (LRM 11.4.5 / 7.9, P4a): 1 if two spans are
+// byte-identical, else 0. The backend builds each side's span with the P3
+// assoc-key canonical serializer (count || sorted (key, value) pairs), so
+// byte identity here is exactly map-content equality.
+uint8_t rt_key_span_eq(const uint8_t* a, uint32_t alen, const uint8_t* b, uint32_t blen);
 
 // -- SystemVerilog associative arrays --
 //

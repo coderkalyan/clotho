@@ -373,6 +373,29 @@ TEST_CASE("assoc invalid (x/z) key: read defaults, write drops, exists is 0") {
                               "s del=1\n");
 }
 
+// P4b: a LITERAL x/z key (`a[8'hxx]`) reaches a separate code path from a
+// runtime x/z variable (the test above) -- slang/LLVM constant-fold its
+// unknown-bit plane to a compile-time TRUE, and the guard used to treat
+// "the unknown-ness is a compile-time Constant" as synonymous with
+// "statically valid" without checking WHICH constant, so
+// `a[8'hxx] = 7; a[8'hzz] = 8;` silently merged into one entry (both
+// normalize to the same all-zero must-plane span) instead of dropping both.
+TEST_CASE("assoc invalid (x/z) key: a literal key drops too, not just a runtime one") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a [integer];
+            initial begin
+                a[32'hxxxxxxxx] = 7;
+                a[32'hzzzzzzzz] = 8;
+                $display("num=%0d", a.num());
+                a[0] = 9;
+                $display("num2=%0d get=%0d", a.num(), a[0]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "num=0\nnum2=1 get=9\n");
+}
+
 // Keys are owned by the map, so a struct-keyed array deep-copies like any other.
 TEST_CASE("assoc struct-keyed deep copy independence") {
     constexpr std::string_view src = R"(
@@ -396,58 +419,592 @@ TEST_CASE("assoc struct-keyed deep copy independence") {
                               "a1=1 c1=111\n");
 }
 
-// The key-type gates that remain (LRM 7.8.5 allows a string / dynamically sized
-// member; Clotho's fixed-width leaf span does not model one yet).
+// docs/design/assoc-keys.md's P0-P3 phases admit every LRM 7.8.5 index type;
+// what remains here is a deliberate GC-safety scope boundary (a class handle
+// combined with a variable component) and one non-lvalue-expression corner.
 TEST_CASE("assoc key types Clotho still refuses loudly") {
-    SUBCASE("struct key with a string member") {
+    // A class handle's key-handle offset (for GC tracing) is a compile-time
+    // constant, correct only for a FIXED key; a variable key's byte offsets are
+    // runtime-dependent, so a handle anywhere inside one is refused rather than
+    // risking an untraced (or wrongly offset) reference.
+    SUBCASE("struct key combining a class handle with a string member") {
         const LowerResult r = lower_text(R"(
             module m;
-                typedef struct { string s; int i; } k_t;
+                class C; int x; endclass
+                typedef struct { C h; string s; } k_t;
                 int a [k_t];
                 k_t k;
                 initial a[k] = 1;
             endmodule
         )");
         CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("key type with a string member") != std::string::npos);
+        CHECK(r.diagnostic_text().find("combining a class handle") != std::string::npos);
     }
-    SUBCASE("struct key with a queue member") {
+    SUBCASE("dynamic-array key from a non-lvalue expression") {
         const LowerResult r = lower_text(R"(
+            module m;
+                typedef int d_t[];
+                int a [d_t];
+                function d_t f(); f = '{1, 2}; endfunction
+                initial a[f()] = 1;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("non-variable dynamic-array") != std::string::npos);
+    }
+}
+
+// P3 (docs/design/assoc-keys.md): an associative-array leaf, or a bare
+// associative array itself, as a key -- completing LRM 7.8.5's own motivating
+// example. Count-prefixed `(key, value)` pairs in the nested map's own
+// sorted-key order, so two equal-content maps produce identical bytes
+// regardless of insertion order (canonical, or key equality would break).
+TEST_CASE("assoc associative-array keys") {
+    // The LRM 7.8.5 example verbatim: `typedef struct { byte B; int I[*]; }
+    // Unpkt; int array_name [Unpkt];` -- a wildcard-indexed nested assoc member.
+    SUBCASE("LRM 7.8.5's own example: struct with a wildcard-indexed assoc member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { byte B; int I[*]; } Unpkt;
+                int array_name [Unpkt];
+                Unpkt k;
+                initial begin
+                    k.B = 8'd1;
+                    k.I.delete(); k.I[10] = 100; k.I[20] = 200;
+                    array_name[k] = 999;
+                    $display("num=%0d get=%0d", array_name.num(), array_name[k]);
+                    k.I[20] = 201;  // different content: a different key
+                    $display("num2=%0d ex=%0d", array_name.num(), array_name.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=1 get=999\n"
+                                  "num2=1 ex=0\n");
+    }
+    SUBCASE("struct key with a non-wildcard nested assoc member: put/get/exists/num") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int im_t[int];
+                typedef struct { byte B; im_t I; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.B = 1; k.I.delete(); k.I[10] = 1; k.I[20] = 2;
+                    a[k] = 100;
+                    k.B = 2; k.I.delete(); k.I[5] = 9;
+                    a[k] = 200;
+                    $display("num=%0d", a.num());
+                    k.B = 1; k.I.delete(); k.I[10] = 1; k.I[20] = 2;
+                    $display("get=%0d ex=%0d", a[k], a.exists(k));
+                    k.I.delete(); k.I[10] = 1; k.I[20] = 999;  // one value differs
+                    $display("absent=%0d ex=%0d", a[k], a.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\n"
+                                  "get=100 ex=1\n"
+                                  "absent=0 ex=0\n");
+    }
+    // foreach traversal and first/next readout MATERIALIZE a fresh nested assoc
+    // handle per key variable write, put_ptr-ing each decoded (key, value) pair.
+    SUBCASE("foreach and first/next traversal readout, nested foreach into the assoc member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int im_t[int];
+                typedef struct { byte B; im_t I; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.B = 1; k.I.delete(); k.I[10] = 1; k.I[20] = 2;
+                    a[k] = 100;
+                    k.B = 2; k.I.delete(); k.I[5] = 9;
+                    a[k] = 200;
+                    foreach (a[kk]) begin
+                        $write("B=%0d I=", kk.B);
+                        foreach (kk.I[idx]) $write("%0d:%0d,", idx, kk.I[idx]);
+                        $display(" v=%0d", a[kk]);
+                    end
+                    void'(a.first(k));
+                    $write("first B=%0d I=", k.B);
+                    foreach (k.I[idx]) $write("%0d:%0d,", idx, k.I[idx]);
+                    $display("");
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "B=1 I=10:1,20:2, v=100\n"
+                                  "B=2 I=5:9, v=200\n"
+                                  "first B=1 I=10:1,20:2,\n");
+    }
+    // A string-keyed nested assoc member exercises P1+P3 composed together
+    // (the nested map's OWN key normalizes via the bare, unprefixed string
+    // encoding, copied verbatim -- the one leaf kind with no self-delimiting
+    // encoding of its own, which is why the pair wrapper always length-prefixes
+    // the key half regardless of the nested key's own shape).
+    SUBCASE("string-keyed nested assoc member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int sk_t[string];
+                int a [sk_t];
+                sk_t k;
+                initial begin
+                    k.delete(); k["x"] = 1; k["y"] = 2;
+                    a[k] = 42;
+                    k.delete(); k["x"] = 1;
+                    a[k] = 43;
+                    $display("num=%0d", a.num());
+                    foreach (a[kk]) begin
+                        $write("k=");
+                        foreach (kk[s]) $write("%s:%0d,", s, kk[s]);
+                        $display(" v=%0d", a[kk]);
+                    end
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nk=x:1, v=43\nk=x:1,y:2, v=42\n");
+    }
+    // A bare associative array as the key itself (not nested in a struct).
+    SUBCASE("a bare associative array as the key itself") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int am_t[int];
+                int a [am_t];
+                am_t m1, m2;
+                initial begin
+                    m1.delete(); m1[1] = 10; m1[2] = 20;
+                    a[m1] = 100;
+                    m2.delete(); m2[1] = 10;
+                    a[m2] = 200;
+                    $display("num=%0d", a.num());
+                    m1.delete(); m1[1] = 10; m1[2] = 20;
+                    $display("get=%0d", a[m1]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=100\n");
+    }
+}
+
+// P2 (docs/design/assoc-keys.md): a queue / dynamic-array leaf, or a bare queue /
+// dynamic array itself, as a key. Count-prefixed (u32 be count || each element
+// recursively normalized in the container's own order -- its identity per
+// LRM 11.4.5 / 7.10), so it composes with P1's string leaves and nests to any
+// depth (a queue of queues, a queue of structs holding strings, ...).
+TEST_CASE("assoc queue / dynamic-array keys") {
+    SUBCASE("struct key with a queue member: put/get/exists/num/overwrite") {
+        constexpr std::string_view src = R"(
             module m;
                 typedef struct { int q[$]; int i; } k_t;
                 int a [k_t];
                 k_t k;
-                initial a[k] = 1;
+                initial begin
+                    k.q = '{1, 2, 3}; k.i = 5; a[k] = 100;
+                    k.q = '{1, 2};    k.i = 5; a[k] = 200;
+                    $display("num=%0d", a.num());
+                    k.q = '{1, 2, 3}; k.i = 5;
+                    $display("get=%0d ex=%0d", a[k], a.exists(k));
+                    k.q = '{1, 2, 3}; k.i = 5; a[k] = 999;  // same key: overwrite
+                    $display("num2=%0d get2=%0d", a.num(), a[k]);
+                    k.q = '{9, 9};
+                    $display("absent=%0d ex=%0d", a[k], a.exists(k));
+                end
             endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("queue / dynamic-array member") != std::string::npos);
+        )";
+        CHECK(run_capture(src) == "num=2\n"
+                                  "get=100 ex=1\n"
+                                  "num2=2 get2=999\n"
+                                  "absent=0 ex=0\n");
     }
-    SUBCASE("event key") {
-        const LowerResult r = lower_text(R"(
+    // Injectivity: a raw (unprefixed) concatenation of two queues' elements
+    // would let {1,2},{3} collide with {1},{2,3}; the count prefix keeps them
+    // two distinct entries the same way P1's string length prefix does.
+    SUBCASE("injectivity: {1,2},{3} and {1},{2,3} are distinct entries") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { int a[$]; int b[$]; } k_t;
+                int m1 [k_t];
+                k_t k;
+                initial begin
+                    k.a = '{1, 2}; k.b = '{3};
+                    m1[k] = 1;
+                    k.a = '{1}; k.b = '{2, 3};
+                    m1[k] = 2;
+                    $display("num=%0d", m1.num());
+                    k.a = '{1, 2}; k.b = '{3};
+                    $display("v1=%0d", m1[k]);
+                    k.a = '{1}; k.b = '{2, 3};
+                    $display("v2=%0d", m1[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nv1=1\nv2=2\n");
+    }
+    // foreach traversal and first/next readout MATERIALIZE a fresh queue handle
+    // per key variable write -- the denormalizer's biggest piece of new code.
+    SUBCASE("foreach and first/next traversal readout, including an empty queue") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { int q[$]; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.q = '{9};    k.i = 1; a[k] = 1;
+                    k.q = '{1,2,3}; k.i = 5; a[k] = 2;
+                    k.q = '{};      k.i = 0; a[k] = 3;
+                    foreach (a[kk]) begin
+                        $write("i=%0d q=", kk.i);
+                        foreach (kk.q[j]) $write("%0d,", kk.q[j]);
+                        $display(" v=%0d", a[kk]);
+                    end
+                    void'(a.first(k));
+                    $display("first i=%0d qlen=%0d", k.i, k.q.size());
+                    void'(a.last(k));
+                    $display("last  i=%0d qlen=%0d q0=%0d", k.i, k.q.size(), k.q[0]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "i=0 q= v=3\n"
+                                  "i=1 q=9, v=1\n"
+                                  "i=5 q=1,2,3, v=2\n"
+                                  "first i=0 qlen=0\n"
+                                  "last  i=5 qlen=3 q0=1\n");
+    }
+    // A queue itself is the key (not nested in a struct); the frontend routes it
+    // through materialize_queue_rvalue instead of the struct aggregate-temp path.
+    SUBCASE("a bare queue as the key itself") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int q_t[$];
+                int a [q_t];
+                q_t q1, q2;
+                initial begin
+                    q1 = '{1, 2, 3}; a[q1] = 10;
+                    q2 = '{4, 5};    a[q2] = 20;
+                    $display("num=%0d", a.num());
+                    q1 = '{1, 2, 3};
+                    $display("get=%0d", a[q1]);
+                    foreach (a[k]) begin
+                        $write("k=");
+                        foreach (k[j]) $write("%0d,", k[j]);
+                        $display("");
+                    end
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=10\nk=4,5,\nk=1,2,3,\n");
+    }
+    // A dynamic-array member (the other P2 container kind).
+    SUBCASE("struct key with a dynamic-array member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { int d[]; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.d = '{7, 8, 9}; a[k] = 1;
+                    k.d = '{7, 8};    a[k] = 2;
+                    $display("num=%0d", a.num());
+                    k.d = '{7, 8, 9};
+                    $display("get=%0d", a[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=1\n");
+    }
+    // Composability: a queue of strings (P1 + P2 together), and a queue of
+    // queues (P2 nested inside itself).
+    SUBCASE("nesting: queue of strings, queue of queues") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef string qs_t[$];
+                int a [qs_t];
+                qs_t q1;
+                typedef int qq_t[$][$];
+                int b [qq_t];
+                qq_t q2;
+                initial begin
+                    q1 = '{"foo", "bar"}; a[q1] = 1;
+                    q1 = '{"foo"};        a[q1] = 2;
+                    $display("num=%0d", a.num());
+                    q1 = '{"foo", "bar"};
+                    $display("get=%0d", a[q1]);
+
+                    q2 = '{ '{1, 2}, '{3} };
+                    b[q2] = 42;
+                    q2 = '{ '{1, 2}, '{3} };
+                    $display("qq num=%0d get=%0d", b.num(), b[q2]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=1\nqq num=1 get=42\n");
+    }
+    // A class handle nested only through FIXED (non-variable) struct members is
+    // unaffected by the variable-key GC-safety guard, and stays GC-traced
+    // (regression pin: heavy allocation churn around the live key).
+    SUBCASE("class handle in a fixed key survives GC churn") {
+        constexpr std::string_view src = R"(
+            module m;
+                class C; int x; endclass
+                typedef struct { C h; byte b; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    for (int i = 0; i < 200; i++) begin
+                        automatic C junk = new;
+                        junk.x = i;
+                    end
+                    k.h = new; k.h.x = 42; k.b = 1;
+                    a[k] = 100;
+                    for (int i = 0; i < 200; i++) begin
+                        automatic C junk = new;
+                        junk.x = i;
+                    end
+                    $display("num=%0d get=%0d x=%0d", a.num(), a[k], k.h.x);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=1 get=100 x=42\n");
+    }
+}
+
+// P1 (docs/design/assoc-keys.md): a string leaf inside a struct/array key. The
+// key type is classified fixed vs variable at lowering (AssocKeyInfo::is_variable);
+// a variable key's string leaf is length-prefixed (u32 be length || bytes) rather
+// than raw-concatenated, which is what makes it injective -- two leaves of
+// different lengths whose bytes happen to concatenate identically must still be
+// two distinct entries.
+TEST_CASE("assoc struct key with a string member") {
+    SUBCASE("put/get/exists/num, distinct entries, overwrite") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k = '{"ab", 1}; a[k] = 11;
+                    k = '{"c",  1}; a[k] = 12;
+                    $display("num=%0d", a.num());
+                    k = '{"ab", 1};
+                    $display("get=%0d ex=%0d", a[k], a.exists(k));
+                    k = '{"ab", 1}; a[k] = 99;      // same key: overwrite
+                    $display("num2=%0d get2=%0d", a.num(), a[k]);
+                    k = '{"zz", 9};
+                    $display("absent=%0d ex=%0d", a[k], a.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\n"
+                                  "get=11 ex=1\n"
+                                  "num2=2 get2=99\n"
+                                  "absent=0 ex=0\n");
+    }
+    // The design doc's motivating injectivity pin: raw concatenation of
+    // {"ab","c"} and {"a","bc"} collides ("abc" both ways); length-prefixing
+    // must keep them two distinct entries.
+    SUBCASE("injectivity: {ab,c} and {a,bc} are distinct entries") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string a; string b; } k_t;
+                int m1 [k_t];
+                k_t k;
+                initial begin
+                    k = '{"ab", "c"}; m1[k] = 1;
+                    k = '{"a", "bc"}; m1[k] = 2;
+                    $display("num=%0d", m1.num());
+                    k = '{"ab", "c"}; $display("v1=%0d", m1[k]);
+                    k = '{"a", "bc"}; $display("v2=%0d", m1[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nv1=1\nv2=2\n");
+    }
+    // foreach traversal, and first/next readout writing a whole struct key
+    // variable back (denormalize_variable_agg_key) -- LRM 7.9.3/7.9.4.
+    SUBCASE("foreach and first/next traversal readout") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k = '{"ab", 1}; a[k] = 1;
+                    k = '{"c",  1}; a[k] = 2;
+                    k = '{"",   9}; a[k] = 3;
+                    foreach (a[kk]) $display("s=%s i=%0d v=%0d", kk.s, kk.i, a[kk]);
+                    void'(a.first(k));
+                    $display("first s=%s i=%0d", k.s, k.i);
+                    void'(a.next(k));
+                    $display("next  s=%s i=%0d", k.s, k.i);
+                    void'(a.last(k));
+                    $display("last  s=%s i=%0d", k.s, k.i);
+                end
+            endmodule
+        )";
+        // Length-prefixed ordering: "" (len 0) < "c" (len 1) < "ab" (len 2).
+        CHECK(run_capture(src) == "s= i=9 v=3\n"
+                                  "s=c i=1 v=2\n"
+                                  "s=ab i=1 v=1\n"
+                                  "first s= i=9\n"
+                                  "next  s=c i=1\n"
+                                  "last  s=ab i=1\n");
+    }
+    // Stability rule (LRM 7.8.5's fourth bullet): traversing twice with no
+    // insert/delete between yields identical order.
+    SUBCASE("traversal order is stable across repeated traversals") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k.s = "zzz"; a[k] = 1;
+                    k.s = "a";   a[k] = 2;
+                    k.s = "mm";  a[k] = 3;
+                    foreach (a[kk]) $display("%s", kk.s);
+                    foreach (a[kk]) $display("%s", kk.s);
+                end
+            endmodule
+        )";
+        // Length-prefixed ordering is deterministic ("a" len 1 < "mm"/"zzz" len 2,
+        // tied at length so insertion-independent byte order breaks the tie); the
+        // same order must repeat verbatim on the second, insert/delete-free pass.
+        const std::string out = run_capture(src);
+        REQUIRE(out.size() % 2 == 0);
+        CHECK(out.substr(0, out.size() / 2) == out.substr(out.size() / 2));
+    }
+    // Value semantics: the source struct's string member is copied INTO the key
+    // at insert time. Mutating the source afterward must not move the entry.
+    SUBCASE("key value is copied at insert; later source mutation does not move it") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    k = '{"orig", 1};
+                    a[k] = 42;
+                    k.s = "mutated";
+                    $display("num=%0d origex=%0d mutex=%0d", a.num(), a.exists('{"orig", 1}), a.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=1 origex=1 mutex=0\n");
+    }
+    // A compound read-modify-write (`a[k] += ...`) resolves the SAME deferred
+    // key TWICE (get_ptr then put_ptr), with the RHS's own assoc access
+    // evaluated in between -- exactly the interleaving that would corrupt a key
+    // span cached across the two resolutions (assoc_elem_lvalue normalizes it
+    // fresh each time instead).
+    SUBCASE("compound assignment resolves the key twice, safely, around another key build") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                int b [k_t];
+                k_t k1, k2;
+                initial begin
+                    k1 = '{"foo", 1};
+                    k2 = '{"barbaz", 2};
+                    a[k1] = 10;
+                    b[k2] = 5;
+                    a[k1] += b[k2];
+                    $display("a=%0d", a[k1]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "a=15\n");
+    }
+    // The mark/pop scratch must not leak or corrupt across many sequential
+    // variable-key builds in a loop.
+    SUBCASE("many distinct variable keys built in a loop") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { string s; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    for (int idx = 0; idx < 200; idx++) begin
+                        k.s = $sformatf("key%0d", idx);
+                        k.i = idx;
+                        a[k] = idx * 2;
+                    end
+                    $display("num=%0d", a.num());
+                    k.s = "key100"; k.i = 100;
+                    $display("get=%0d", a[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=200\nget=200\n");
+    }
+}
+
+// P0 (docs/design/assoc-keys.md): chandle / event / virtual-interface / unpacked-
+// union keys. All four already lower to a flat handle-shaped or is_packed integral
+// value in the type pool, so admitting them needed no new backend machinery -- see
+// the widened admit-list guard in lower_type's AssociativeArrayType arm.
+TEST_CASE("assoc chandle/event/virtual-interface/unpacked-union keys") {
+    SUBCASE("event key: distinct handles are distinct entries") {
+        constexpr std::string_view src = R"(
             module m;
                 int a [event];
-                event e;
-                initial a[e] = 1;
+                event e1, e2;
+                initial begin
+                    a[e1] = 1;
+                    a[e2] = 2;
+                    $display("num=%0d e1=%0d e2=%0d ex=%0d", a.num(), a[e1], a[e2], a.exists(e1));
+                end
             endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("key type is not supported") != std::string::npos);
+        )";
+        CHECK(run_capture(src) == "num=2 e1=1 e2=2 ex=1\n");
     }
-    // A chandle VALUE now lowers (see the chandle-value test below); a chandle KEY
-    // is a separate, still-unimplemented admit-list widening tracked in
-    // docs/design/assoc-keys.md's P0 phase ("Status: scoping"), deliberately left
-    // alone here.
-    SUBCASE("chandle key") {
-        const LowerResult r = lower_text(R"(
+    SUBCASE("chandle key: null is a valid, distinct key") {
+        constexpr std::string_view src = R"(
+            import "DPI-C" function chandle mkptr();
             module m;
                 int a [chandle];
-                chandle c;
-                initial a[c] = 1;
+                chandle c1, c2;
+                initial begin
+                    c1 = mkptr();
+                    a[c1] = 5;
+                    a[null] = 9;
+                    $display("num=%0d c1v=%0d nullv=%0d exnull=%0d", a.num(), a[c1], a[null], a.exists(null));
+                end
             endmodule
-        )");
-        CHECK_FALSE(r.ok);
-        CHECK(r.diagnostic_text().find("key type is not supported") != std::string::npos);
+        )";
+        const LowerResult r = lower_text(src);
+        REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    }
+    SUBCASE("virtual interface key: distinct instances are distinct entries") {
+        constexpr std::string_view src = R"(
+            interface bus_if; logic clk; endinterface
+            module m;
+                bus_if b1();
+                bus_if b2();
+                int a [virtual bus_if];
+                virtual bus_if v1, v2;
+                initial begin
+                    v1 = b1; v2 = b2;
+                    a[v1] = 10;
+                    a[v2] = 20;
+                    $display("num=%0d v1=%0d v2=%0d", a.num(), a[v1], a[v2]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2 v1=10 v2=20\n");
+    }
+    SUBCASE("unpacked union key: distinct member writes over the same flat storage") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef union { byte b; shortint s; } key_t;
+                int a [key_t];
+                key_t k;
+                initial begin
+                    k.s = 16'h0102; a[k] = 1;
+                    k.s = 16'h0304; a[k] = 2;
+                    $display("num=%0d v1=%0d ex=%0d", a.num(), a[k], a.exists(k));
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2 v1=2 ex=1\n");
     }
 }
 
@@ -1149,4 +1706,224 @@ TEST_CASE("array query functions (LRM 20.7): a non-integral associative key is r
     )");
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("non-integral") != std::string::npos);
+}
+
+// P4a (docs/design/assoc-keys.md): whole-associative-array equality (LRM
+// 11.4.5 / 7.9) used to be silently wrong -- is_assoc was absent from the
+// aggregate-equality dispatch, so `a == b` fell through to the scalar plane
+// path and compared handle words instead of contents. Fixed by reusing the
+// P3 assoc-key canonical serializer (count || sorted (key, value) pairs) on
+// each whole operand and comparing bytes: two maps are equal iff they hold
+// the same set of entries.
+TEST_CASE("assoc whole-array equality (P4a)") {
+    SUBCASE("integral value: equal, then a value differs, then sizes differ") {
+        constexpr std::string_view src = R"(
+            module m;
+                int a[int];
+                int b[int];
+                initial begin
+                    a[1] = 5; a[2] = 6;
+                    b[1] = 5; b[2] = 6;
+                    $display("eq=%0d ne=%0d", a == b, a != b);
+                    b[2] = 999;
+                    $display("eq2=%0d ne2=%0d", a == b, a != b);
+                    b[2] = 6; b[3] = 7;
+                    $display("eq3=%0d ne3=%0d", a == b, a != b);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "eq=1 ne=0\n"
+                                  "eq2=0 ne2=1\n"
+                                  "eq3=0 ne3=1\n");
+    }
+    SUBCASE("string keys, case equality, empty maps") {
+        constexpr std::string_view src = R"(
+            module m;
+                int a[string];
+                int b[string];
+                int c[string];
+                initial begin
+                    a["x"] = 1; a["y"] = 2;
+                    b["x"] = 1; b["y"] = 2;
+                    c["x"] = 1;
+                    $display("eq=%0d ne=%0d ceq=%0d cne=%0d", a == b, a != b, a === b, a !== b);
+                    $display("eqc=%0d nec=%0d", a == c, a != c);
+                    b.delete();
+                    $display("eqempty=%0d", a == b);
+                    a.delete();
+                    $display("botempty=%0d", a == b);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "eq=1 ne=0 ceq=1 cne=0\n"
+                                  "eqc=0 nec=1\n"
+                                  "eqempty=0\n"
+                                  "botempty=1\n");
+    }
+    // Case equality (===) is bit-exact, so it works even for a 4-state value
+    // element -- the flat byte compare IS the case-equality answer.
+    SUBCASE("case equality with a 4-state value element, including x/z") {
+        constexpr std::string_view src = R"(
+            module m;
+                logic [3:0] a[int];
+                logic [3:0] b[int];
+                initial begin
+                    a[1] = 4'b0101;
+                    b[1] = 4'b0101;
+                    $display("ceq=%0d", a === b);
+                    b[1] = 4'bxxxx;
+                    $display("ceq2=%0d cne2=%0d", a === b, a !== b);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "ceq=1\nceq2=0 cne2=1\n");
+    }
+    // A queue of 4-state values as the KEY itself: the alloca-backed
+    // unknown-bit accumulator (fixing a latent SSA-dominance bug across the
+    // P2 container-key runtime loop) must not crash the JIT verifier.
+    SUBCASE("queue-of-4-state key regression: no SSA dominance crash") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef logic [3:0] q4_t[$];
+                int a[q4_t];
+                q4_t k;
+                initial begin
+                    k = '{4'b0101, 4'b1010}; a[k] = 1;
+                    k = '{4'b0101, 4'b1111}; a[k] = 2;
+                    $display("num=%0d", a.num());
+                    k = '{4'b0101, 4'b1010};
+                    $display("get=%0d", a[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nget=1\n");
+    }
+    // Logical equality with a 4-state-capable value element needs
+    // X-propagation a flat byte compare cannot give; refused loudly rather
+    // than silently answering wrong.
+    SUBCASE("logical equality with a 4-state value element is refused") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                logic [3:0] a[int];
+                logic [3:0] b[int];
+                initial $display("%0d", a == b);
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("4-state-capable value element") != std::string::npos);
+    }
+}
+
+// P4c (docs/design/assoc-keys.md): a whole-array `'{key: value, ...}` literal
+// pattern used lower_expr for the key, bypassing lower_assoc_key -- wrong for
+// any key needing a PLACE rather than a plane value (an aggregate key, or a
+// bare queue / dynamic-array / associative-array key). Unreachable before
+// P1-P3 widened the admitted key kinds (only integral / string / class-handle
+// keys existed, all plane values); routed through lower_assoc_key now.
+TEST_CASE("assoc literal pattern with a non-scalar key (P4c)") {
+    SUBCASE("struct key, including default and overwrite via a second literal") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { byte b; int i; } k_t;
+                int a [k_t];
+                k_t k;
+                initial begin
+                    a = '{ '{8'd1, 10} : 100, '{8'd2, 20} : 200, default: -1 };
+                    $display("num=%0d", a.num());
+                    k = '{8'd1, 10}; $display("v1=%0d", a[k]);
+                    k = '{8'd2, 20}; $display("v2=%0d", a[k]);
+                    k = '{8'd9, 90}; $display("vdef=%0d", a[k]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\n"
+                                  "v1=100\n"
+                                  "v2=200\n"
+                                  "vdef=-1\n");
+    }
+    SUBCASE("bare queue key") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef int q_t[$];
+                int a [q_t];
+                q_t q;
+                initial begin
+                    a = '{ '{1, 2, 3} : 10, '{4, 5} : 20 };
+                    $display("num=%0d", a.num());
+                    q = '{1, 2, 3}; $display("v1=%0d", a[q]);
+                    q = '{4, 5};    $display("v2=%0d", a[q]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "num=2\nv1=10\nv2=20\n");
+    }
+}
+
+// P4d (docs/design/assoc-keys.md): `%p` of an assoc renders each key by the
+// ordinary %p leaf rules (LRM 21.2.1.6), in sorted-key order. An unpacked
+// struct / fixed-array key has no plane value, and the pre-existing code
+// unconditionally tried to Load-and-format it through the SCALAR leaf path
+// (which assumes a packed value and crashed -- a slang assertion casting the
+// key's unpacked struct type as packed) instead of the aggregate lvalue path
+// `a[k]` itself already splits on (key_operand()). Fixed to make that same
+// split; a bare queue / dynamic-array / associative-array key (P2/P3) still
+// refuses %p cleanly, matching the pre-existing "container VALUE element"
+// limitation (expand_p_scalar's is_handle_ref guard) rather than crashing.
+TEST_CASE("assoc %p rendering (P4d)") {
+    SUBCASE("struct key: renders without crashing, in sorted-key order") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef struct { byte b; int i; } k_t;
+                int a [k_t];
+                initial begin
+                    a['{8'd3, 30}] = 3;
+                    a['{8'd1, 10}] = 1;
+                    a['{8'd2, 20}] = 2;
+                    $display("%p", a);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "'{'{b:1, i:10}:1, '{b:2, i:20}:2, '{b:3, i:30}:3}\n");
+    }
+    SUBCASE("fixed-array key, class-handle key, and a nested-assoc struct member") {
+        constexpr std::string_view src = R"(
+            module m;
+                typedef byte arr_t [0:1];
+                int c [arr_t];
+                arr_t ak;
+                class C; int x; endclass
+                int d [C];
+                C obj;
+                typedef int im_t [int];
+                typedef struct { byte b; im_t m; } k2_t;
+                int e [k2_t];
+                k2_t k2;
+                initial begin
+                    ak[0] = 1; ak[1] = 2; c[ak] = 3;
+                    $display("%p", c);
+                    obj = new; d[obj] = 4;
+                    $display("%p", d);
+                    k2.b = 1; k2.m.delete(); k2.m[10] = 20; e[k2] = 5;
+                    $display("%p", e);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "'{'{1, 2}:3}\n"
+                                  "'{C:4}\n"
+                                  "'{'{b:1, m:'{10:20}}:5}\n");
+    }
+    SUBCASE("a bare queue key refuses %p cleanly (no crash)") {
+        const LowerResult r = lower_text(R"(
+            module m;
+                typedef int q_t[$];
+                int a [q_t];
+                initial begin
+                    a['{1, 2, 3}] = 5;
+                    $display("%p", a);
+                end
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("container or aggregate element") != std::string::npos);
+    }
 }

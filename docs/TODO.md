@@ -2226,6 +2226,18 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
     message. A streaming RVALUE actual on an input formal is refused by
     `emit_agg_store` ("unsupported unpacked struct rvalue"; verilator 5.050
     ICEs on the same cast).
+  **A non-lvalue aggregate actual bound to a module port** ("aggregate/array
+  port connection must be a variable") was the same refusal at a second call
+  site: LRM 23.3.3 makes a port connection a continuous copy exactly like a
+  value-typed call argument, so `wire_ports`'s input-port branch now stages a
+  non-`is_struct_lvalue_shape` source through `agg_input_actual` too, instead
+  of refusing it — a `'{...}` pattern, a struct-returning call, and a `?:`
+  actual all reach a whole-struct or whole-array `input` port. An lvalue
+  actual (the common case: a plain variable / member / element) still copies
+  straight through with no extra temp. The slice-of-a-struct-array gap above
+  is inherited unchanged (same helper, same guard). Covered in
+  tests/instance_array_test.cpp ("non-lvalue aggregate actual bound to an
+  input port": literal struct, literal array, and call-result subcases).
 - [ ] **String-containing aggregate by value** through a function.
 - [x] **Non-lvalue aggregate RETURN, and an aggregate call result in a read
   context** (LRM 13.4) — `return g();`, `return '{1,2};`,
@@ -2418,19 +2430,18 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   uvm_lru_cache#(string, chandle);`) is on UVM's DEFAULT (DPI-enabled) boot path and
   its base class's `typedef chandle optional_data[$];` used to fail lowering at
   `uvm_lru_cache.svh:193` with "queue element type is not supported".
-  Associative-array KEY admission is a separate question and is UNTOUCHED here --
+  Associative-array KEY admission was a separate question, left UNTOUCHED here --
   6.14's own text ("chandles can be inserted into associative arrays ... the relative
   ordering of any two entries ... can vary") reads, together with 7.8.5's
   equality-only legality rule, as though a chandle key should already be legal, which
-  is exactly what docs/design/assoc-keys.md's P0 phase already plans to admit later
-  with the class-handle key normalizer reused verbatim -- but that document's own
-  status is "scoping, nothing implemented", so admitting a chandle KEY stays a
-  separate, not-yet-landed change; `int q[chandle]` is still refused, now confirmed by
-  a dedicated test. Verilator's chandle/DPI support does not extend to a container of
-  them, so Verilator is no runtime oracle for the container shapes; behaviour is pinned to
-  the LRM 6.14 / 7.10 / 7.5 / 15.4 / 7.12.2 text directly, the same precedent already
-  used for associative-array tests. Covered in tests/queue_test.cpp,
-  tests/dynamic_array_test.cpp, tests/associative_array_test.cpp,
+  is exactly what docs/design/assoc-keys.md's P0 phase later admitted (now
+  **landed**, `assoc: admit chandle / event / virtual-interface / unpacked-union
+  keys (P0)`) with the class-handle key normalizer reused verbatim; `int q[chandle]`
+  now works, covered by a dedicated test. Verilator's chandle/DPI support does not
+  extend to a container of them, so Verilator is no runtime oracle for the container
+  shapes; behaviour is pinned to the LRM 6.14 / 7.10 / 7.5 / 15.4 / 7.12.2 text
+  directly, the same precedent already used for associative-array tests. Covered in
+  tests/queue_test.cpp, tests/dynamic_array_test.cpp, tests/associative_array_test.cpp,
   tests/array_ordering_test.cpp, tests/sync_test.cpp and tests/display_test.cpp.
 - [x] **NBA to a dynamic array** — and to an associative array. `HandleCopyNb`
   stages a deep copy in the Active region and MOVES it into the live handle in the
@@ -2737,8 +2748,6 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   implementation) stays a located refusal citing 11.4.5/12.5, since case and
   logical equality genuinely disagree on how x/z compares once that is
   possible.
-- [ ] **Associative arrays** — `[*]`/typed keys, `.exists`, `.first`/`.next`,
-  `.num`, `.delete`.
 - [ ] **Bit-stream casting** (`{<<{}}` / `{>>{}}` cast operands, LRM 6.24.3).
 - [ ] **Casts to/from enum / struct / union**. `$cast` is tracked under M4. Open
   question, low confidence that it is a real violation: `$cast` into a **packed
@@ -2898,13 +2907,23 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   ring-push path. NOT covered: a bounded queue target's `[$:N]` bound is not
   respected by whole assignment from any source — see the dedicated entry
   below (found while verifying this fix, a pre-existing gap unrelated to it).
-- [x] **Associative arrays** (LRM 7.8/7.9) — all key kinds (integral of any
-  width / enum / packed / `string` / `[*]`-wildcard / **class handle** (7.8.3) /
-  **unpacked struct or fixed array** (7.8.5), unified as normalized
-  order-preserving byte spans, see docs/design/dynamic-arrays.md §4a), index
-  r/w, `.num`/`.size`/`.exists`/`.delete(k)`/`.delete`/`.first`/`.last`/`.next`/
-  `.prev`, ascending-key `foreach`, whole-array deep-copy, `'{key:value,
-  default:v}` literals (7.9.11), full subroutine ABI.
+- [x] **Associative arrays** (LRM 7.8/7.9) — every legal key kind (integral of
+  any width / enum / packed / `string` / `[*]`-wildcard / class handle (7.8.3) /
+  chandle / event / virtual interface / unpacked union / unpacked struct or
+  fixed array (7.8.5) / queue / dynamic array / associative array, and any
+  nesting of these through structs and fixed arrays to arbitrary depth,
+  including the LRM's own example `struct { byte B; int I[*]; }`), unified as
+  normalized order-preserving byte spans — fixed-width for a leaf without a
+  string/queue/dynarray/assoc component, length/count-prefixed variable-width
+  otherwise (see docs/design/assoc-keys.md, which supersedes
+  docs/design/dynamic-arrays.md §4a). Index r/w,
+  `.num`/`.size`/`.exists`/`.delete(k)`/`.delete`/`.first`/`.last`/`.next`/
+  `.prev`, ascending-key `foreach`, whole-array deep-copy AND equality
+  (`==`/`!=`/`===`/`!==`, LRM 11.4.5, element-wise on the map's contents —
+  logical `==`/`!=` refuses a 4-state-capable value element, where X-propagation
+  differs from a byte compare; `===`/`!==` are bit-exact and always work),
+  `'{key:value,
+  default:v}` literals (7.9.11, including a non-scalar key), full subroutine ABI.
   Value element: every kind a queue / dynamic-array element takes (one shared
   rule, `guard_container_element`) — integral / real / `string` / class handle /
   unpacked struct or array including one with string or container leaves /
@@ -2919,13 +2938,15 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
   than deferred to the consumer, so a read resolves get_ptr and creates nothing (LRM
   7.8.6) while a write and a mutating receiver resolve put_ptr (7.8 / 7.10). A `ref`
   bound through one is checked at every level (docs/design/data-model.md §3.1).
-  Still guarded loud, for a stated reason (§7): a `string` or dynamically-sized
-  member inside a struct KEY needs
-  the order-preserving escaped encoding (the normalized span would otherwise be
-  variable-length). Whole-array NBA works (`HandleCopyNb`); a literal RHS under
-  NBA does not. An x/z index is invalid per 7.8.4 / 7.8.5: the read yields the
-  element default, the write is dropped without creating an entry, `exists`
-  answers 0 and `delete` is a no-op. iverilog cannot parse associative arrays at
+  Still guarded loud: a class handle combined with a string / queue / dynamic-array
+  / associative-array component in the SAME key (a variable key's byte offsets are
+  runtime-dependent, so the collector's key-handle trace -- a compile-time static
+  offset table -- cannot describe one; a handle in an otherwise-fixed key is
+  unaffected). Whole-array NBA works (`HandleCopyNb`); a literal RHS under NBA does
+  not. An x/z index is invalid per 7.8.4 / 7.8.5: the read yields the element
+  default, the write is dropped without creating an entry, `exists` answers 0 and
+  `delete` is a no-op, and a warning is issued under `--sanitize=bounds`
+  (`RT_BOUNDS_ASSOC_KEY`, LRM 7.8.6). iverilog cannot parse associative arrays at
   all, and verilator creates an entry on an absent read, violating LRM 7.8, so
   neither models this behaviour.
 - [x] **Casting (scalar/packed)** — static / size / sign / const cast,

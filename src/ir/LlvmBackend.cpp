@@ -415,17 +415,27 @@ struct LValue {
     // An associative-array element target (LRM 7.8/7.9). Unlike dyn/queue the
     // element pointer is not yet resolved: the get_ptr (read) vs put_ptr (write)
     // choice depends on Load/Store context, so it is deferred. `assoc_handle` is
-    // the rt_assoc handle pointer; `assoc_key_ptr` / `assoc_key_len` are the
-    // normalized key span (built into a scratch alloca by the AssocSelect
-    // lowering); `assoc_ops` is the value element's rt_elem_ops descriptor. The
-    // value element slot facts (slot_ty / has_z / narrow / width / store_width /
-    // bit_off / array_ty) are filled as for a dyn element. A Load resolves via
-    // rt_assoc_get_ptr (absent -> element default); a Store via rt_assoc_put_ptr.
-    bool            is_assoc      = false;
-    llvm::Value*    assoc_handle  = nullptr;
-    llvm::Value*    assoc_key_ptr = nullptr;
-    llvm::Value*    assoc_key_len = nullptr;
-    llvm::Constant* assoc_ops     = nullptr;
+    // the rt_assoc handle pointer. The key is normalized LAZILY, inside
+    // assoc_elem_lvalue, from `assoc_key_arg` / `assoc_key_type` (the un-normalized
+    // key expression and the assoc's own type) rather than eagerly here at
+    // AssocSelect-lowering time: a VARIABLE key (docs/design/assoc-keys.md P1)
+    // normalizes into the shared rt_keybuf_* scratch, and this deferred lvalue can
+    // be resolved TWICE for one AssocSelect (`a[k] += 1` reads via get_ptr, then
+    // writes via put_ptr) with unrelated code -- another assoc access, most
+    // plainly -- possibly running in between; a span built once and cached across
+    // that gap could be overwritten before the second resolution reads it. Building
+    // it fresh inside each resolution keeps every rt_keybuf_begin/append/span/end
+    // call self-contained, so no span the backend hands to the runtime ever
+    // outlives its one consuming call. `assoc_ops` is the value element's
+    // rt_elem_ops descriptor. The value element slot facts (slot_ty / has_z /
+    // narrow / width / store_width / bit_off / array_ty) are filled as for a dyn
+    // element. A Load resolves via rt_assoc_get_ptr (absent -> element default); a
+    // Store via rt_assoc_put_ptr.
+    bool            is_assoc       = false;
+    llvm::Value*    assoc_handle   = nullptr;
+    Index           assoc_key_arg  = Index{ 0 };
+    Ref             assoc_key_type = Ref::Invalid;
+    llvm::Constant* assoc_ops      = nullptr;
     // The assoc's VALUE element type, so the resolver can ask type-level questions
     // about it (an event element's Table 7-1 default is not a constant image).
     Ref             assoc_elem_type = Ref::Invalid;
@@ -1920,20 +1930,26 @@ private:
     }
 
     // rt_elem_ops::keyhandles for an ASSOCIATIVE ARRAY descriptor: where the class
-    // handles are in one normalized key span, ascending. Empty for a key that cannot
-    // contain one.
+    // handles are in one normalized key span, ascending. Empty for a key that
+    // cannot contain one.
     //
-    // A bare class-handle key is the ONE-ENTRY case, `{ 0 }`, rather than a separate
-    // path: assoc_key_info reduces it to the integral case at width 64, and
-    // emit_key_bytes writes it at offset 0. A wildcard `[*]` key is never a handle --
-    // Lower.cpp:2285-2290 interns its key type as a canonical unsigned integral
-    // placeholder -- and a `string` key holds no handle either.
+    // A bare class-handle key is the ONE-ENTRY case, `{ 0 }`, rather than a
+    // separate path: assoc_key_info reduces it to the integral case at width 64,
+    // and emit_key_bytes writes it at offset 0. A wildcard `[*]` key is never a
+    // handle -- its key type interns as a canonical unsigned integral placeholder
+    // -- and a `string` key holds no handle either.
+    //
+    // A VARIABLE key (info.is_variable) never reaches agg_key_handle_offsets: its
+    // offsets are compile-time constants only for a FIXED key, and the frontend
+    // refuses a class handle anywhere inside a variable one precisely so this
+    // table never has to describe a runtime-dependent offset (Lower.cpp
+    // guard_key_no_handle_in_variable).
     std::vector<uint32_t> assoc_key_handle_offsets(Ref assoc_type) {
         assert(std::get<Type>(mod_.pool.get(assoc_type)).kind == Type::Kind::Assoc &&
                "only an associative array has a key");
         std::vector<uint32_t> out;
         const AssocKeyInfo info = assoc_key_info(assoc_type);
-        if (info.wildcard || info.is_string) {
+        if (info.wildcard || info.is_string || info.is_variable) {
             return out;
         }
         if (info.is_agg) {
@@ -14409,6 +14425,28 @@ private:
                      { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
     }
 
+    // -- Variable-length associative-array key scratch (docs/design/
+    // assoc-keys.md P1). See Runtime.h for the mark/pop contract. --
+    // u32 rt_keybuf_begin(void)
+    llvm::FunctionCallee keybuf_begin_fn() { return rt_fn("rt_keybuf_begin", b_.getInt32Ty(), {}); }
+    // void rt_keybuf_append(const void* bytes, u32 len)
+    llvm::FunctionCallee keybuf_append_fn() {
+        return rt_fn("rt_keybuf_append", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
+    }
+    // void rt_keybuf_span(u32 mark, const u8** out_ptr, u32* out_len)
+    llvm::FunctionCallee keybuf_span_fn() {
+        return rt_fn("rt_keybuf_span", b_.getVoidTy(), { b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty() });
+    }
+    // void rt_keybuf_end(u32 mark)
+    llvm::FunctionCallee keybuf_end_fn() {
+        return rt_fn("rt_keybuf_end", b_.getVoidTy(), { b_.getInt32Ty() });
+    }
+    // u8 rt_key_span_eq(const u8* a, u32 alen, const u8* b, u32 blen)
+    llvm::FunctionCallee key_span_eq_fn() {
+        return rt_fn("rt_key_span_eq", b_.getInt8Ty(),
+                     { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty(), b_.getInt32Ty() });
+    }
+
     llvm::FunctionCallee str_init_fn() {
         return rt_fn("rt_string_init", b_.getVoidTy(), { raw_ptr_ty() });
     }
@@ -16719,9 +16757,10 @@ private:
             case Inst::Tag::AssocSelect: {
                 // a[key] (LRM 7.8/7.9): build a deferred assoc element lvalue.
                 // The get_ptr (read) vs put_ptr (write) resolution is left to the
-                // Load / Store consumer (see assoc_elem_lvalue). Here we resolve
-                // the handle, normalize the key into a scratch span, and record
-                // the value element slot facts.
+                // Load / Store consumer (see assoc_elem_lvalue), which is also
+                // where the key is normalized -- see the LValue field comment for
+                // why that has to happen lazily, at each resolution, rather than
+                // once here.
                 const auto    aa = ir_->extra_data<AssocArg>(p.op_extra.extra);
                 const DynElem e  = dynarr_elem(aa.assoc_type);
                 // A deferred base means `a[k1][k2]`: the outer entry must be
@@ -16731,7 +16770,6 @@ private:
                 const LValue raw_hlv = lvalue_of(p.op_extra.op);
                 const LValue hlv =
                   raw_hlv.is_assoc ? assoc_elem_lvalue(raw_hlv, aa.for_write != 0) : raw_hlv;
-                auto [kptr, klen, kvalid] = normalize_assoc_key_value(aa.arg, aa.assoc_type);
                 LValue el;
                 el.is_assoc          = true;
                 el.assoc_handle      = lv_handle_ptr(hlv, HandleUse::Place);
@@ -16755,13 +16793,10 @@ private:
                 el.epoch_chain       = hlv.epoch_chain;
                 el.epoch_chain.push_back(b_.CreateStructGEP(assoc_slot_ty(), el.assoc_handle,
                                                             handle_epoch_field(aa.assoc_type)));
-                el.assoc_key_ptr     = kptr;
-                el.assoc_key_len     = klen;
-                // An x/z key is an invalid index (LRM 7.8.4 / 7.8.5): gate the
-                // element the same way an out-of-range dynamic-array element is
-                // gated, so a read yields the element default and a write is
-                // dropped without creating an entry (7.8.6).
-                el.dyn_inrange       = kvalid;
+                el.assoc_key_arg     = aa.arg;
+                el.assoc_key_type    = aa.assoc_type;
+                // x/z-key validity (LRM 7.8.4 / 7.8.5) is computed alongside the
+                // normalized span, inside assoc_elem_lvalue -- not here.
                 el.assoc_ops         = elem_ops_global(aa.assoc_type);
                 el.assoc_elem_type   = std::get<Type>(mod_.pool.get(aa.assoc_type)).element;
                 el.assoc_val_string  = e.is_string;
@@ -19276,13 +19311,52 @@ private:
     // integral case via its layout width (a class handle is a 2-state 64-bit
     // pointer word, so its normalized key is its identity — LRM 7.8.3).
     struct AssocKeyInfo {
-        bool     wildcard  = false;
-        bool     is_string = false;
-        bool     is_agg    = false;
-        Ref      key_ty    = Ref::Invalid;
-        uint32_t W         = 0;
-        bool     is_signed = false;
+        bool     wildcard    = false;
+        bool     is_string   = false;
+        bool     is_agg      = false;
+        // True when `is_agg` and some leaf (through struct / fixed-array nesting)
+        // is a string / queue / dynamic array / associative array: the span has
+        // no compile-time bound, so it normalizes into the shared rt_keybuf_*
+        // scratch (normalize_variable_agg_key) instead of an entry-block alloca.
+        // False keeps today's fixed encoding byte for byte, with no runtime call
+        // (docs/design/assoc-keys.md P1).
+        bool     is_variable = false;
+        Ref      key_ty      = Ref::Invalid;
+        uint32_t W           = 0;
+        bool     is_signed   = false;
     };
+
+    // True when `type`'s normalized form needs the variable-length rt_keybuf_*
+    // path: itself a string, or (through struct / fixed-array nesting) any leaf
+    // is a string / queue / dynamic array / associative array. Only reachable
+    // through an is_agg key today (guard_agg_key_leaves refuses a bare queue /
+    // dynarray / assoc key and a nested one alike until P2/P3 widen the admit
+    // list); written to classify either shape uniformly once they do.
+    bool key_type_is_variable(Ref type) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        switch (t.kind) {
+            case Type::Kind::String:
+            case Type::Kind::Queue:
+            case Type::Kind::DynArray:
+            case Type::Kind::Assoc:
+                return true;
+            case Type::Kind::Struct:
+                if (t.is_packed) {
+                    return false;
+                }
+                for (const Field& f : mod_.pool.struct_fields(t.fields_id)) {
+                    if (key_type_is_variable(f.type)) {
+                        return true;
+                    }
+                }
+                return false;
+            case Type::Kind::UnpackedArray:
+                return key_type_is_variable(t.element);
+            default:
+                return false;
+        }
+    }
+
     AssocKeyInfo assoc_key_info(Ref assoc_type) {
         const Type&  at = std::get<Type>(mod_.pool.get(assoc_type));
         AssocKeyInfo info;
@@ -19299,10 +19373,18 @@ private:
             info.is_string = true;
             return info;
         }
-        if (is_agg_abi(key_ty)) {
-            // An unpacked struct / fixed unpacked array key: serialized leaf by
-            // leaf (never memcpy'd -- see normalize_agg_key).
-            info.is_agg = true;
+        const Type& kt = std::get<Type>(mod_.pool.get(key_ty));
+        if (is_agg_abi(key_ty) || kt.kind == Type::Kind::Queue || kt.kind == Type::Kind::DynArray ||
+            kt.kind == Type::Kind::Assoc) {
+            // An unpacked struct / fixed unpacked array key, a queue / dynamic
+            // array key itself (P2), or an associative-array key itself (P3):
+            // serialized leaf by leaf / count-prefixed, never memcpy'd -- see
+            // normalize_agg_key / normalize_variable_agg_key. A queue / dynarray /
+            // assoc key is always classified variable (its element / entry count
+            // has no compile-time bound), which key_type_is_variable already
+            // reports for those three kinds.
+            info.is_agg      = true;
+            info.is_variable = key_type_is_variable(key_ty);
             return info;
         }
         const uint32_t w = mod_.pool.layout(key_ty).width;
@@ -19443,6 +19525,188 @@ private:
         return { scratch, b_.getInt32(nbytes), valid };
     }
 
+    // Append one aggregate key's leaves to the shared rt_keybuf_* scratch, in
+    // declaration order (depth first) -- the VARIABLE-length twin of
+    // emit_agg_key_bytes. A plain scalar leaf still writes fixed big-endian bytes
+    // (through a tiny per-leaf alloca, since rt_keybuf_append takes a pointer); a
+    // STRING leaf is length-prefixed (u32 big-endian length || bytes), since raw
+    // concatenation of two variable-length leaves is not injective (assoc-keys.md
+    // §3) -- a bare top-level string key keeps its own unprefixed encoding
+    // (normalize_assoc_key_value's info.is_string arm), since the two never mix
+    // in one span.
+    // `any_x_slot`: an i1* alloca the caller owns, ORed with this leaf's (or
+    // subtree's) unknown-ness. Memory-backed rather than an SSA value threaded
+    // by reference: a Queue / DynArray / Assoc leaf recurses inside a RUNTIME
+    // loop of unknown trip count, so a leaf's unknown-bit value is defined
+    // inside the loop body, which does not dominate the code after the loop --
+    // an SSA any_x carried past the loop that way is a verifier-rejected
+    // dominance violation (only latent for a 2-state leaf, whose any_unknown()
+    // is a compile-time constant with no defining block to violate). A plain
+    // load/store through the slot is correct regardless of trip count or
+    // nesting depth.
+    void emit_variable_agg_key_bytes(Ref type, const LValue& lv, llvm::Value* any_x_slot) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            uint32_t f = 0;
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                emit_variable_agg_key_bytes(fld.type, agg_member(lv, type, f), any_x_slot);
+                ++f;
+            }
+            return;
+        }
+        if (t.kind == Type::Kind::UnpackedArray) {
+            const uint32_t n = array_dim(t);
+            for (uint32_t k = 0; k < n; ++k) {
+                emit_variable_agg_key_bytes(t.element, agg_elem(lv, type, k), any_x_slot);
+            }
+            return;
+        }
+        if (t.kind == Type::Kind::String) {
+            llvm::Value* sh  = lv_string_ptr(lv, StringUse::Read);
+            llvm::Value* dat = b_.CreateCall(str_data_fn(), { sh });
+            llvm::Value* len = cast(b_.CreateCall(str_len_fn(), { sh }), 32, false);
+            auto*        lty = llvm::ArrayType::get(b_.getInt8Ty(), 4);
+            auto*        lsc = entry_alloca(lty, "assoc.vkey.slen");
+            emit_key_bytes(len, 32, false, lsc, lty, 0);
+            b_.CreateCall(keybuf_append_fn(), { lsc, b_.getInt32(4) });
+            b_.CreateCall(keybuf_append_fn(), { dat, len });
+            return;
+        }
+        if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
+            // P2: u32 be count || each element recursively normalized in its own
+            // (queue: logical, ring-unwrapped) order -- element order is the
+            // container's own identity (`==` on queues is element-wise, 11.4.5 /
+            // 7.10), so this is canonical without needing a sort.
+            llvm::Value*    handle    = lv_handle_ptr(lv, HandleUse::Read);
+            const auto [len, data]    = container_len_base(handle, type);
+            const DynElem   e         = dynarr_elem(type);
+            llvm::Value*    count32   = cast(len, 32, false);
+            auto*           cty       = llvm::ArrayType::get(b_.getInt8Ty(), 4);
+            auto*           csc       = entry_alloca(cty, "assoc.vkey.qcount");
+            emit_key_bytes(count32, 32, false, csc, cty, 0);
+            b_.CreateCall(keybuf_append_fn(), { csc, b_.getInt32(4) });
+            auto* idx_a = entry_alloca(b_.getInt64Ty(), "assoc.vkey.qidx");
+            b_.CreateStore(b_.getInt64(0), idx_a);
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* head = llvm::BasicBlock::Create(ctx_, "vkey.q.head", fn);
+            auto* body = llvm::BasicBlock::Create(ctx_, "vkey.q.body", fn);
+            auto* done = llvm::BasicBlock::Create(ctx_, "vkey.q.done", fn);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            llvm::Value* i = b_.CreateLoad(b_.getInt64Ty(), idx_a);
+            b_.CreateCondBr(b_.CreateICmpULT(i, len), body, done);
+            b_.SetInsertPoint(body);
+            LValue elem_lv = container_elem_lvalue(handle, data, type, e, i);
+            emit_variable_agg_key_bytes(t.element, elem_lv, any_x_slot);
+            b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+            return;
+        }
+        if (t.kind == Type::Kind::Assoc) {
+            // P3: u32 be count || (key, value) pairs in the nested map's own
+            // sorted-key order (rt_assoc_first/next), which is what makes this
+            // canonical -- two equal-content maps produce identical bytes
+            // regardless of insertion order, or key equality would break.
+            //
+            // Each pair is `u32 be klen || klen raw key bytes || value bytes`.
+            // The key bytes are copied VERBATIM from the source entry rather than
+            // re-normalized from a decoded value: the map already stores them in
+            // exactly this span's own format, and copying is what lets denormalize
+            // (P3's decode side) hand them straight to rt_assoc_put_ptr with no
+            // decode/re-encode round trip. They still need their own length
+            // prefix -- unlike every other leaf here, a BARE nested key of type
+            // `string` is the one shape with no self-delimiting encoding of its
+            // own (normalize_assoc_key_value's info.is_string arm keeps it raw and
+            // unprefixed, for LRM 6.16.8 ordering), so klen cannot be inferred by
+            // walking the copied bytes. The value bytes need no such prefix: its
+            // OWN type-directed walk (this same function, recursively) is already
+            // self-delimiting for every leaf kind, including a value-position
+            // string (whose length prefix lives in the String arm above).
+            llvm::Value*    handle  = lv_handle_ptr(lv, HandleUse::Read);
+            llvm::Value*    count64 = b_.CreateCall(assoc_num_fn(), { handle });
+            llvm::Value*    count32 = cast(count64, 32, false);
+            auto*           cty     = llvm::ArrayType::get(b_.getInt8Ty(), 4);
+            auto*           csc     = entry_alloca(cty, "assoc.vkey.acount");
+            emit_key_bytes(count32, 32, false, csc, cty, 0);
+            b_.CreateCall(keybuf_append_fn(), { csc, b_.getInt32(4) });
+
+            auto* kptr_a = entry_alloca(raw_ptr_ty(), "assoc.vkey.akptr");
+            auto* klen_a = entry_alloca(b_.getInt32Ty(), "assoc.vkey.aklen");
+            llvm::Value* got0 = b_.CreateCall(assoc_end_fn(/*last=*/false), { handle, kptr_a, klen_a });
+            auto*        have_a = entry_alloca(b_.getInt1Ty(), "assoc.vkey.ahave");
+            b_.CreateStore(b_.CreateTrunc(got0, b_.getInt1Ty()), have_a);
+
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* head = llvm::BasicBlock::Create(ctx_, "vkey.a.head", fn);
+            auto* body = llvm::BasicBlock::Create(ctx_, "vkey.a.body", fn);
+            auto* done = llvm::BasicBlock::Create(ctx_, "vkey.a.done", fn);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            b_.CreateCondBr(b_.CreateLoad(b_.getInt1Ty(), have_a), body, done);
+            b_.SetInsertPoint(body);
+            llvm::Value* kptr = b_.CreateLoad(raw_ptr_ty(), kptr_a);
+            llvm::Value* klen = b_.CreateLoad(b_.getInt32Ty(), klen_a);
+            auto*        lty2 = llvm::ArrayType::get(b_.getInt8Ty(), 4);
+            auto*        lsc2 = entry_alloca(lty2, "assoc.vkey.aklenpfx");
+            emit_key_bytes(klen, 32, false, lsc2, lty2, 0);
+            b_.CreateCall(keybuf_append_fn(), { lsc2, b_.getInt32(4) });
+            b_.CreateCall(keybuf_append_fn(), { kptr, klen });
+            llvm::Value*  vslot = b_.CreateCall(assoc_get_ptr_fn(), { handle, kptr, klen });
+            const DynElem ve    = dynarr_elem(type);
+            LValue        vlv   = tmp_elem_lvalue(vslot, ve, b_.getInt64(0));
+            emit_variable_agg_key_bytes(t.element, vlv, any_x_slot);
+            llvm::Value* got = b_.CreateCall(assoc_step_fn(/*prev=*/false), { handle, kptr, klen, kptr_a, klen_a });
+            b_.CreateStore(b_.CreateTrunc(got, b_.getInt1Ty()), have_a);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+            return;
+        }
+        // Every non-scalar leaf kind is handled above; what remains is a plain
+        // scalar leaf (integral / class handle / event / chandle / virtual
+        // interface / packed struct or union).
+        LValue leaf = lv;
+        if (leaf.is_agg) {
+            fill_agg_leaf(leaf, type);
+            leaf.agg_leaf = true;
+        }
+        const Plane  pl = lower_load(leaf);
+        llvm::Value* ux = any_unknown(pl);
+        b_.CreateStore(b_.CreateOr(b_.CreateLoad(b_.getInt1Ty(), any_x_slot), cast(ux, 1, false)), any_x_slot);
+        const uint32_t w       = mod_.pool.layout(type).width;
+        const uint32_t W       = w == 0 ? 1 : w;
+        const uint32_t nbytes  = (W + 7) / 8;
+        auto*           arr_ty = llvm::ArrayType::get(b_.getInt8Ty(), nbytes);
+        auto*           scratch = entry_alloca(arr_ty, "assoc.vkey.leaf");
+        emit_key_bytes(must_of(pl), W, std::get<Type>(mod_.pool.get(type)).is_signed, scratch, arr_ty, 0);
+        b_.CreateCall(keybuf_append_fn(), { scratch, b_.getInt32(nbytes) });
+    }
+
+    // Normalized span of a VARIABLE aggregate key (docs/design/assoc-keys.md
+    // P1): built into the shared rt_keybuf_* scratch rather than a fixed alloca,
+    // since its length depends on runtime data (a string leaf's length, and --
+    // once P2/P3 land -- a container's element count). Self-contained: begin,
+    // build, read the span, pop, all in this one call, so the mark never
+    // survives past it -- see the LValue field comment on assoc_key_arg for why
+    // that matters (a deferred a[k] place can resolve its key twice).
+    AssocKeySpan normalize_variable_agg_key(const LValue& key_lv, const AssocKeyInfo& info) {
+        llvm::Value* mark      = b_.CreateCall(keybuf_begin_fn(), {});
+        llvm::Value* any_x_slot = entry_alloca(b_.getInt1Ty(), "assoc.vkey.anyx");
+        b_.CreateStore(b_.getInt1(false), any_x_slot);
+        emit_variable_agg_key_bytes(info.key_ty, key_lv, any_x_slot);
+        llvm::Value* ptr_slot = entry_alloca(raw_ptr_ty(), "assoc.vkey.ptr");
+        llvm::Value* len_slot = entry_alloca(b_.getInt32Ty(), "assoc.vkey.len");
+        b_.CreateCall(keybuf_span_fn(), { mark, ptr_slot, len_slot });
+        llvm::Value* ptr = b_.CreateLoad(raw_ptr_ty(), ptr_slot);
+        llvm::Value* len = b_.CreateLoad(b_.getInt32Ty(), len_slot);
+        b_.CreateCall(keybuf_end_fn(), { mark });
+        // Not folded to null even when every leaf is provably 2-state (the
+        // memory-backed accumulator loses that compile-time fact) -- the JIT's
+        // own optimization pass folds the resulting always-false gate away.
+        llvm::Value* valid = b_.CreateNot(b_.CreateLoad(b_.getInt1Ty(), any_x_slot));
+        return { ptr, len, valid };
+    }
+
     // The i1 validity of an integral key plane: false when it holds an x/z bit
     // (LRM 7.8.4). Null when the key is 2-state, so nothing is gated.
     llvm::Value* integral_key_valid(Plane pl) {
@@ -19450,8 +19714,13 @@ private:
             return nullptr; // 2-state (or a real, which the frontend rejects as a key)
         }
         llvm::Value* ux = any_unknown(pl);
-        if (llvm::isa<llvm::Constant>(ux)) {
-            return nullptr; // statically known-good
+        // A LITERAL x/z key (e.g. `a[8'hxx]`) folds any_unknown() to a compile-
+        // time constant TRUE, not false -- "it's a Constant" alone does not mean
+        // "statically valid" (P4b: this used to wrongly treat that as always-
+        // valid, so `a[8'hxx] = 7; a[8'hzz] = 8;` silently merged into ONE
+        // entry via the all-zero must-plane span instead of dropping both).
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(ux)) {
+            return c->isZero() ? nullptr : b_.getInt1(false); // statically good / statically invalid
         }
         return b_.CreateNot(ux);
     }
@@ -19468,7 +19737,8 @@ private:
                      nullptr };
         }
         if (info.is_agg) {
-            return normalize_agg_key(lvalue_of(key), info);
+            return info.is_variable ? normalize_variable_agg_key(lvalue_of(key), info)
+                                    : normalize_agg_key(lvalue_of(key), info);
         }
         const Plane pl    = value_of(key);
         auto [kptr, klen] = normalize_integral_key(must_of(pl), info);
@@ -19486,7 +19756,7 @@ private:
                      nullptr };
         }
         if (info.is_agg) {
-            return normalize_agg_key(key_lv, info);
+            return info.is_variable ? normalize_variable_agg_key(key_lv, info) : normalize_agg_key(key_lv, info);
         }
         const Plane pl    = lower_load(key_lv);
         auto [kptr, klen] = normalize_integral_key(must_of(pl), info);
@@ -19507,8 +19777,13 @@ private:
             return;
         }
         if (info.is_agg) {
-            uint32_t off = 0;
-            denormalize_agg_key(info.key_ty, key_lv, kptr, off);
+            if (info.is_variable) {
+                llvm::Value* off = b_.getInt32(0);
+                denormalize_variable_agg_key(info.key_ty, key_lv, kptr, off, at);
+            } else {
+                uint32_t off = 0;
+                denormalize_agg_key(info.key_ty, key_lv, kptr, off);
+            }
             return;
         }
         lower_store(key_lv, two_val(denormalize_key_word(kptr, 0, info.W, info.is_signed, key_lv.store_width)));
@@ -19571,6 +19846,159 @@ private:
         off += (W + 7) / 8;
     }
 
+    // Inverse of emit_variable_agg_key_bytes: the VARIABLE-length twin of
+    // denormalize_agg_key. `off` is a RUNTIME byte offset (a string leaf's
+    // encoded length is only known once decoded), so each leaf is read through a
+    // fresh GEP off `kbase` rather than the fixed helper's compile-time offset --
+    // `denormalize_key_word` still does the big-endian reassembly / sign-unflip,
+    // just relative to that GEP instead of `kbase` directly.
+    void denormalize_variable_agg_key(Ref type, const LValue& lv, llvm::Value* kbase, llvm::Value*& off,
+                                      Index at) {
+        const Type& t = std::get<Type>(mod_.pool.get(type));
+        if (t.kind == Type::Kind::Struct && !t.is_packed) {
+            uint32_t f = 0;
+            for (const Field& fld : mod_.pool.struct_fields(t.fields_id)) {
+                denormalize_variable_agg_key(fld.type, agg_member(lv, type, f), kbase, off, at);
+                ++f;
+            }
+            return;
+        }
+        if (t.kind == Type::Kind::UnpackedArray) {
+            const uint32_t n = array_dim(t);
+            for (uint32_t k = 0; k < n; ++k) {
+                denormalize_variable_agg_key(t.element, agg_elem(lv, type, k), kbase, off, at);
+            }
+            return;
+        }
+        llvm::Value* leafptr = b_.CreateInBoundsGEP(b_.getInt8Ty(), kbase, off);
+        if (t.kind == Type::Kind::String) {
+            llvm::Value* len32  = denormalize_key_word(leafptr, 0, 32, false, 32);
+            llvm::Value* datptr = b_.CreateInBoundsGEP(b_.getInt8Ty(), leafptr, b_.getInt32(4));
+            LValue       leaf   = lv;
+            if (leaf.is_agg) {
+                fill_agg_leaf(leaf, type);
+                leaf.agg_leaf = true;
+            }
+            llvm::Value* snap = str_chg_snapshot(leaf);
+            b_.CreateCall(str_assign_bytes_fn(), { lv_string_ptr(leaf, StringUse::Write), datptr,
+                                                   cast(len32, 64, false),
+                                                   alloc_site_global(loc_text(at), "string") });
+            str_chg_after(leaf, snap);
+            off = b_.CreateAdd(off, b_.CreateAdd(b_.getInt32(4), len32));
+            return;
+        }
+        if (t.kind == Type::Kind::Queue || t.kind == Type::Kind::DynArray) {
+            // P2: inverse of the count-prefixed emit_variable_agg_key_bytes
+            // branch. Materializes into a scratch LINEAR (dynarray-shaped)
+            // handle first -- `tmp_elem_lvalue` addresses it with no ring wrap,
+            // regardless of whether the destination is a queue or a dynamic
+            // array -- then moves (dynarray destination) or deep-copies (queue
+            // destination, which has no bulk "allocate n empty elements"
+            // primitive of its own) into the actual destination handle.
+            llvm::Value*    n64 = cast(denormalize_key_word(leafptr, 0, 32, false, 32), 64, false);
+            llvm::Constant* ops = elem_ops_global(type);
+            const DynElem   e   = dynarr_elem(type);
+            auto* tmp = entry_alloca(dynarr_slot_ty(), "assoc.vkey.qtmp");
+            b_.CreateStore(llvm::Constant::getNullValue(dynarr_slot_ty()), tmp);
+            b_.CreateCall(dynarr_new_fn(),
+                         { tmp, ops, n64, alloc_site_global(loc_text(at), "assoc key traversal") });
+            llvm::Value* tdata = b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), tmp, 0));
+
+            // The element bytes start right after the 4-byte count prefix; a
+            // running offset threaded through the loop, since a variable-shaped
+            // element (a nested string / container) has no fixed stride to skip.
+            auto* eoff_a = entry_alloca(b_.getInt32Ty(), "assoc.vkey.qeoff");
+            b_.CreateStore(b_.CreateAdd(off, b_.getInt32(4)), eoff_a);
+            auto* idx_a = entry_alloca(b_.getInt64Ty(), "assoc.vkey.qidx");
+            b_.CreateStore(b_.getInt64(0), idx_a);
+
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* head = llvm::BasicBlock::Create(ctx_, "vkeyd.q.head", fn);
+            auto* body = llvm::BasicBlock::Create(ctx_, "vkeyd.q.body", fn);
+            auto* done = llvm::BasicBlock::Create(ctx_, "vkeyd.q.done", fn);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            llvm::Value* i = b_.CreateLoad(b_.getInt64Ty(), idx_a);
+            b_.CreateCondBr(b_.CreateICmpULT(i, n64), body, done);
+            b_.SetInsertPoint(body);
+            llvm::Value* eoff     = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
+            LValue       elem_lv  = tmp_elem_lvalue(tdata, e, i);
+            denormalize_variable_agg_key(t.element, elem_lv, kbase, eoff, at);
+            b_.CreateStore(eoff, eoff_a);
+            b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+
+            llvm::Value* dst = lv_handle_ptr(lv, HandleUse::Mutate);
+            if (t.kind == Type::Kind::DynArray) {
+                b_.CreateCall(dynarr_move_fn(), { dst, tmp, ops });
+            } else {
+                b_.CreateCall(queue_assign_dynarr_fn(),
+                             { dst, tmp, ops, alloc_site_global(loc_text(at), "assoc key traversal") });
+                b_.CreateCall(dynarr_delete_fn(), { tmp, ops });
+            }
+            off = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
+            return;
+        }
+        if (t.kind == Type::Kind::Assoc) {
+            // P3: inverse of the count-prefixed `(key, value)` pair emitter.
+            // Materialization needs no decode-then-renormalize round trip for the
+            // key half: the copied bytes are already a valid normalized span for
+            // the nested map's OWN key type (that's what makes the encoder's
+            // verbatim copy correct in the first place), so they go straight to
+            // rt_assoc_put_ptr. Only the value half is decoded, directly into the
+            // slot that call returns.
+            llvm::Value*    count32 = denormalize_key_word(leafptr, 0, 32, false, 32);
+            llvm::Value*    count64 = cast(count32, 64, false);
+            llvm::Constant* ops     = elem_ops_global(type); // the nested map's VALUE ops
+            llvm::Value*    dst     = lv_handle_ptr(lv, HandleUse::Mutate);
+            b_.CreateCall(assoc_reset_fn(), { dst, ops }); // drop stale entries + default first
+
+            auto* eoff_a = entry_alloca(b_.getInt32Ty(), "assoc.vkey.aeoff");
+            b_.CreateStore(b_.CreateAdd(off, b_.getInt32(4)), eoff_a);
+            auto* idx_a = entry_alloca(b_.getInt64Ty(), "assoc.vkey.aidx");
+            b_.CreateStore(b_.getInt64(0), idx_a);
+
+            auto* fn   = b_.GetInsertBlock()->getParent();
+            auto* head = llvm::BasicBlock::Create(ctx_, "vkeyd.a.head", fn);
+            auto* body = llvm::BasicBlock::Create(ctx_, "vkeyd.a.body", fn);
+            auto* done = llvm::BasicBlock::Create(ctx_, "vkeyd.a.done", fn);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(head);
+            llvm::Value* i = b_.CreateLoad(b_.getInt64Ty(), idx_a);
+            b_.CreateCondBr(b_.CreateICmpULT(i, count64), body, done);
+            b_.SetInsertPoint(body);
+            llvm::Value* eoff      = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
+            llvm::Value* klenptr   = b_.CreateInBoundsGEP(b_.getInt8Ty(), kbase, eoff);
+            llvm::Value* klen      = denormalize_key_word(klenptr, 0, 32, false, 32);
+            llvm::Value* kbytesptr = b_.CreateInBoundsGEP(b_.getInt8Ty(), klenptr, b_.getInt32(4));
+            llvm::Value* slot      = b_.CreateCall(assoc_put_ptr_fn(),
+                                                   { dst, ops, kbytesptr, klen,
+                                                     alloc_site_global(loc_text(at), "assoc key traversal") });
+            llvm::Value*  voff = b_.CreateAdd(b_.CreateAdd(eoff, b_.getInt32(4)), klen);
+            const DynElem ve   = dynarr_elem(type);
+            LValue        vlv  = tmp_elem_lvalue(slot, ve, b_.getInt64(0));
+            denormalize_variable_agg_key(t.element, vlv, kbase, voff, at);
+            b_.CreateStore(voff, eoff_a);
+            b_.CreateStore(b_.CreateAdd(b_.CreateLoad(b_.getInt64Ty(), idx_a), b_.getInt64(1)), idx_a);
+            b_.CreateBr(head);
+            b_.SetInsertPoint(done);
+            off = b_.CreateLoad(b_.getInt32Ty(), eoff_a);
+            return;
+        }
+        // Every non-scalar leaf kind is handled above; see emit_variable_agg_key_bytes.
+        LValue leaf = lv;
+        if (leaf.is_agg) {
+            fill_agg_leaf(leaf, type);
+            leaf.agg_leaf = true;
+        }
+        const uint32_t w = mod_.pool.layout(type).width;
+        const uint32_t W = w == 0 ? 1 : w;
+        lower_store(leaf, two_val(denormalize_key_word(leafptr, 0, W,
+                    std::get<Type>(mod_.pool.get(type)).is_signed, leaf.store_width)));
+        off = b_.CreateAdd(off, b_.getInt32((W + 7) / 8));
+    }
+
     // Resolve an assoc element lvalue (deferred in AssocSelect) to a concrete
     // element lvalue over the heap slot: get_ptr for a read (absent -> the
     // dyn_inrange=false default path, no entry created), put_ptr for a write
@@ -19581,6 +20009,25 @@ private:
     // entry-creating allocation reports "<unknown>".
     LValue assoc_elem_lvalue(const LValue& lv, bool for_write) {
         const SourceText at{ .where = "<unknown>" };
+        // The key is normalized HERE, fresh for every resolution, rather than once
+        // at AssocSelect-lowering time -- see the LValue field comment for why: a
+        // span cached across two resolutions of one deferred place (`a[k] += 1`
+        // reads via get_ptr, then writes via put_ptr, with the read/store's own
+        // operand evaluation free to build and pop OTHER keys in between) could be
+        // overwritten before the second resolution reads it. Building it fresh
+        // keeps every rt_keybuf_begin/append/span/end call self-contained: the span
+        // it returns is consumed by exactly the one runtime call below and nothing
+        // else. The pattern-default slot has no key at all.
+        llvm::Value* kptr   = nullptr;
+        llvm::Value* klen   = nullptr;
+        llvm::Value* kvalid = nullptr;
+        if (!lv.assoc_default) {
+            const AssocKeySpan span = normalize_assoc_key_value(lv.assoc_key_arg, lv.assoc_key_type);
+            kptr                    = span.ptr;
+            klen                    = span.len;
+            kvalid                  = span.valid;
+            emit_assoc_key_bounds_check(kvalid, lv, for_write);
+        }
         // The resolved slot pointer. The pattern-default slot (LRM 7.9.11) always
         // exists once asked for, so it needs neither the read/write split nor a
         // found-check; a keyed entry resolves through put_ptr on a write (creates)
@@ -19611,10 +20058,9 @@ private:
                                        alloc_site_global(at, "associative array") });
             }
             if (for_write) {
-                if (lv.dyn_inrange == nullptr) {
+                if (kvalid == nullptr) {
                     return b_.CreateCall(assoc_put_ptr_fn(),
-                                         { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr,
-                                           lv.assoc_key_len,
+                                         { lv.assoc_handle, lv.assoc_ops, kptr, klen,
                                            alloc_site_global(at, "associative array") });
                 }
                 // An invalid (x/z) key must not even allocate the entry, or
@@ -19625,11 +20071,10 @@ private:
                 auto* putbb = llvm::BasicBlock::Create(ctx_, "assoc.key.ok", fn);
                 auto* cont  = llvm::BasicBlock::Create(ctx_, "assoc.key.cont", fn);
                 auto* from  = b_.GetInsertBlock();
-                b_.CreateCondBr(lv.dyn_inrange, putbb, cont);
+                b_.CreateCondBr(kvalid, putbb, cont);
                 b_.SetInsertPoint(putbb);
                 llvm::Value* p = b_.CreateCall(assoc_put_ptr_fn(),
-                                              { lv.assoc_handle, lv.assoc_ops, lv.assoc_key_ptr,
-                                                lv.assoc_key_len,
+                                              { lv.assoc_handle, lv.assoc_ops, kptr, klen,
                                                 alloc_site_global(at, "associative array") });
                 auto* putend = b_.GetInsertBlock();
                 b_.CreateBr(cont);
@@ -19657,8 +20102,7 @@ private:
                 auto* fn    = b_.GetInsertBlock()->getParent();
                 auto* miss  = llvm::BasicBlock::Create(ctx_, "assoc.absent", fn);
                 auto* cont  = llvm::BasicBlock::Create(ctx_, "assoc.found", fn);
-                llvm::Value* got = b_.CreateCall(assoc_get_ptr_fn(),
-                                                 { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
+                llvm::Value* got = b_.CreateCall(assoc_get_ptr_fn(), { lv.assoc_handle, kptr, klen });
                 auto* from = b_.GetInsertBlock();
                 b_.CreateCondBr(b_.CreateICmpEQ(got, llvm::Constant::getNullValue(raw_ptr_ty())),
                                 miss, cont);
@@ -19674,8 +20118,7 @@ private:
                 phi->addIncoming(def, missend);
                 return phi;
             }
-            return b_.CreateCall(assoc_get_ptr_fn(),
-                                 { lv.assoc_handle, lv.assoc_key_ptr, lv.assoc_key_len });
+            return b_.CreateCall(assoc_get_ptr_fn(), { lv.assoc_handle, kptr, klen });
         };
         // A found-check is only meaningful for a key read: everything else yields a
         // live slot.
@@ -19693,9 +20136,9 @@ private:
                                  : nullptr;
         const auto   gate    = [&](llvm::Value* base_gate) -> llvm::Value* {
             if (base_gate == nullptr) {
-                return lv.dyn_inrange;
+                return kvalid;
             }
-            return lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, base_gate) : base_gate;
+            return kvalid != nullptr ? b_.CreateAnd(kvalid, base_gate) : base_gate;
         };
         if (lv.is_agg) {
             LValue el      = lv;
@@ -21849,12 +22292,13 @@ private:
 
     // The rt_bounds_what enum (Runtime.h), which picks the report's wording.
     enum class BoundsWhat : int32_t {
-        Element  = 0,
-        Bit      = 1,
-        Part     = 2,
-        Char     = 3,
-        QueueOp  = 4,
-        EmptyPop = 5,
+        Element   = 0,
+        Bit       = 1,
+        Part      = 2,
+        Char      = 3,
+        QueueOp   = 4,
+        EmptyPop  = 5,
+        AssocKey  = 6,
     };
 
     // The rt_bounds_site record (Runtime.h): { ptr where, ptr line, ptr name,
@@ -22057,6 +22501,31 @@ private:
                                                            0, 0),
                            },
                            /*is_write=*/false);
+    }
+
+    // LRM 7.8.6 (P4b): an index that is or contains x or z is an invalid
+    // associative-array key. The read-yields-default / write-is-dropped
+    // behaviour is already implemented by the `kvalid` gate this wraps
+    // (assoc_elem_lvalue); only the WARNING the clause also asks for is new
+    // here, and only under --sanitize=bounds -- Clotho's existing, deliberate
+    // performance/compliance tradeoff for this whole category of runtime
+    // report (matches RT_BOUNDS_EMPTY_POP and friends). `kvalid` null means
+    // the key type is 2-state (or has no x/z concept at all -- string, queue,
+    // dynamic array, associative array): statically always valid, nothing to
+    // report.
+    void emit_assoc_key_bounds_check(llvm::Value* kvalid, const LValue& lv, bool for_write) {
+        if (!sanitizer_on(config_.sanitizers, Sanitizer::Bounds) || kvalid == nullptr) {
+            return;
+        }
+        emit_bounds_report(BoundsCheck{
+                             .inrange = kvalid,
+                             .index   = b_.getInt64(0),
+                             .unknown = b_.getInt1(true),
+                             .extent  = b_.getInt64(0),
+                             .site    = bounds_site_global(loc_text(lv.assoc_key_arg), loc_text(lv.assoc_key_arg),
+                                                           bounds_name(lv), BoundsWhat::AssocKey, 0, 0),
+                           },
+                           for_write);
     }
 
     // One --sanitize=bounds check: a branch on the in-range predicate the access
@@ -26759,6 +27228,29 @@ private:
         return el;
     }
 
+    // Element `idx` of a plain LINEAR data buffer (no ring wrap): the same body
+    // as container_elem_lvalue's non-queue path, but callable with no `type` Ref
+    // at all -- for denormalize_variable_agg_key's scratch dynarray (P2), which
+    // is always linear regardless of whether the destination key leaf is a
+    // queue or a dynamic array, so it never needs the ring-wrap branch that
+    // container_elem_lvalue's `type` parameter exists only to select.
+    LValue tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value* idx) {
+        if (e.is_agg || e.is_handle) {
+            return dyn_agg_elem_lvalue(LValue{}, e, data, idx, /*inrange=*/nullptr);
+        }
+        LValue el;
+        el.base        = data;
+        el.slot_ty     = e.slot_ty;
+        el.has_z       = e.has_z;
+        el.narrow      = e.narrow;
+        el.array_ty    = llvm::ArrayType::get(e.slot_ty, 0);
+        el.elem_idx    = cast(idx, 32, false);
+        el.store_width = e.width;
+        el.bit_off     = b_.getInt32(0);
+        el.width       = e.width;
+        return el;
+    }
+
     // `a == b` over a container whose elements are aggregates or nested containers
     // (LRM 11.4.5 / 7.10): equal sizes and every element pair equal, X-propagating
     // through the same Land reduction the struct / array cases use.
@@ -26873,6 +27365,40 @@ private:
             llvm::Value* may  = b_.CreateICmpNE(ts, b_.getInt8(0));
             llvm::Value* must = b_.CreateICmpEQ(ts, b_.getInt8(1));
             return bit_plane(must, may);
+        }
+        if (t.kind == Type::Kind::Assoc) {
+            // LRM 11.4.5 / 7.9 (P4a): equal iff the same set of (key, value)
+            // pairs. Reuses the P3 assoc-key-leaf canonical serializer (count ||
+            // sorted (key, value) pairs) on each whole operand -- the same
+            // property that makes that encoding "canonical" (two equal-content
+            // maps produce identical bytes) is exactly what a byte compare here
+            // needs. Bit-exact, so this answers === directly; the frontend
+            // refuses plain == for a 4-state-capable value element, where the
+            // X-propagating answer can differ from a flat byte compare.
+            //
+            // Both spans build into the SAME rt_keybuf_* region back to back, so
+            // only the FINAL span (after both are written) is read -- an
+            // intervening rt_keybuf_append can reallocate the buffer, which
+            // would dangle a pointer captured mid-build; the byte offsets
+            // (`mark0`/`mid`/`end`, plain u32s) stay valid regardless.
+            llvm::Value* mark0     = b_.CreateCall(keybuf_begin_fn(), {});
+            llvm::Value* xz_slot   = entry_alloca(b_.getInt1Ty(), "aeq.anyx");
+            b_.CreateStore(b_.getInt1(false), xz_slot);
+            emit_variable_agg_key_bytes(type, lhs, xz_slot);
+            llvm::Value* mid = b_.CreateCall(keybuf_begin_fn(), {});
+            emit_variable_agg_key_bytes(type, rhs, xz_slot);
+            llvm::Value* end = b_.CreateCall(keybuf_begin_fn(), {});
+            llvm::Value* ptr_slot = entry_alloca(raw_ptr_ty(), "aeq.ptr");
+            llvm::Value* len_slot = entry_alloca(b_.getInt32Ty(), "aeq.len");
+            b_.CreateCall(keybuf_span_fn(), { mark0, ptr_slot, len_slot });
+            llvm::Value* aptr = b_.CreateLoad(raw_ptr_ty(), ptr_slot);
+            llvm::Value* alen = b_.CreateSub(mid, mark0);
+            llvm::Value* blen = b_.CreateSub(end, mid);
+            llvm::Value* bptr = b_.CreateInBoundsGEP(b_.getInt8Ty(), aptr, alen);
+            llvm::Value* eqb  = b_.CreateCall(key_span_eq_fn(), { aptr, alen, bptr, blen });
+            b_.CreateCall(keybuf_end_fn(), { mark0 });
+            llvm::Value* bit = b_.CreateICmpNE(eqb, b_.getInt8(0));
+            return bit_plane(bit, bit);
         }
         const ValType vt = from_ref(type);
         // A leaf reached through a deferred associative-array element (`a[k] == x`

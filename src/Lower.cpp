@@ -3095,13 +3095,19 @@ private:
     // -- Types --
 
     // An unpacked struct / fixed unpacked array is a legal associative-array index
-    // type (LRM 7.8.5) when equality is defined for it, which for Clotho's key model
-    // means every leaf must serialize to a fixed-width byte field: integral leaves
-    // only, nested through structs and fixed arrays. A `real` leaf makes the index
-    // type illegal outright ("real or shortreal data types, or a type containing a
-    // real or shortreal, shall be an illegal index type"); a `string` or
-    // dynamically-sized leaf is legal per the LRM but has no fixed width, so it is
-    // refused loudly rather than silently truncated.
+    // type (LRM 7.8.5) when equality is defined for it. Clotho's key model
+    // (docs/design/assoc-keys.md) admits every leaf with a byte-serializable
+    // value: an integral / handle-shaped leaf gets a fixed-width big-endian span,
+    // a `string` leaf (P1) gets a length-prefixed one, a queue / dynamic-array
+    // leaf (P2) gets a count-prefixed one of its own recursively-normalized
+    // elements, and an associative-array leaf (P3) gets a count-prefixed
+    // `(key, value)` list in the nested map's own sorted-key order -- all nested
+    // through structs and fixed arrays to any depth, completing LRM 7.8.5's own
+    // example (`struct { byte B; int I[*]; }`). The backend classifies the whole
+    // key type as fixed or variable and picks the matching encoder
+    // (LlvmBackend.cpp AssocKeyInfo::is_variable). A `real` leaf makes the index
+    // type illegal outright ("real or shortreal data types, or a type containing
+    // a real or shortreal, shall be an illegal index type").
     void guard_agg_key_leaves(const slang::ast::Type& kt, ir::Ref kr) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(kr));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
@@ -3118,17 +3124,99 @@ private:
             fail("associative array key type containing a real is illegal (LRM 7.8.5)");
         }
         if (t.kind == ir::Type::Kind::String) {
-            // TODO: a string leaf inside a struct key — the normalized span would be
-            // variable-length, which the fixed-width leaf layout (and the runtime's
-            // shorter-is-less order) does not model.
-            fail("associative array key type with a string member is not supported");
+            return; // P1: length-prefixed leaf, admitted.
         }
-        if (value_cat(kr) != ValueCat::scalar) {
-            // TODO: a queue / dynamic-array / associative-array leaf inside a struct
-            // key (LRM 7.8.5 allows it; the key bytes would be dynamically sized).
-            fail("associative array key type with a queue / dynamic-array member is "
-                 "not supported");
+        if (t.kind == ir::Type::Kind::Queue || t.kind == ir::Type::Kind::DynArray) {
+            // P2: count-prefixed leaf, each element recursively normalized. The
+            // element's own admissibility was already checked by lower_type's
+            // Queue / DynArray arm (guard_container_element); recurse here so an
+            // Assoc leaf nested inside it is still refused (P3), not silently
+            // miscompiled.
+            guard_agg_key_leaves(kt, t.element);
+            return;
         }
+        if (t.kind == ir::Type::Kind::Assoc) {
+            // P3: count-prefixed leaf, `(key, value)` pairs in the nested map's own
+            // sorted-key order -- canonical because two equal-content maps then
+            // produce identical bytes (assoc-keys.md §4.5). The nested map's OWN
+            // key type was already fully validated when IT was declared (every
+            // legal-index-type check ran then); nothing further to check here.
+            return;
+        }
+    }
+
+    // True if `type`'s normalized key span has no compile-time bound: itself a
+    // string / queue / dynamic array / associative array, or (through struct /
+    // fixed-array nesting) any leaf is. Mirrors LlvmBackend.cpp's
+    // key_type_is_variable exactly -- kept as a second, independent walk (like
+    // agg_key_bytes / emit_agg_key_bytes / agg_key_handle_offsets already are)
+    // rather than exposed across the frontend/backend boundary.
+    bool key_type_is_variable(ir::Ref type) const {
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
+        switch (t.kind) {
+            case ir::Type::Kind::String:
+            case ir::Type::Kind::Queue:
+            case ir::Type::Kind::DynArray:
+            case ir::Type::Kind::Assoc:
+                return true;
+            case ir::Type::Kind::Struct:
+                if (t.is_packed) {
+                    return false;
+                }
+                for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
+                    if (key_type_is_variable(f.type)) {
+                        return true;
+                    }
+                }
+                return false;
+            case ir::Type::Kind::UnpackedArray:
+                return key_type_is_variable(t.element);
+            default:
+                return false;
+        }
+    }
+
+    // True if a class handle is reachable anywhere inside `type`.
+    bool key_type_has_class_handle(ir::Ref type) const {
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
+        switch (t.kind) {
+            case ir::Type::Kind::Class:
+                return true;
+            case ir::Type::Kind::Struct:
+                for (const ir::Field& f : module_.pool.struct_fields(t.fields_id)) {
+                    if (key_type_has_class_handle(f.type)) {
+                        return true;
+                    }
+                }
+                return false;
+            case ir::Type::Kind::UnpackedArray:
+            case ir::Type::Kind::Queue:
+            case ir::Type::Kind::DynArray:
+                return key_type_has_class_handle(t.element);
+            case ir::Type::Kind::Assoc:
+                return key_type_has_class_handle(t.element) ||
+                       (t.right == 0 && key_type_has_class_handle(static_cast<ir::Ref>(t.fields_id)));
+            default:
+                return false;
+        }
+    }
+
+    // A class handle anywhere inside a VARIABLE key is refused: the collector's
+    // key-handle trace (assoc_key_handle_offsets, LlvmBackend.cpp) is a
+    // compile-time STATIC offset table, correct only for a FIXED key -- a
+    // variable key's byte offsets depend on runtime data (a string's length, a
+    // container's element count), so a handle anywhere in one could land at a
+    // different offset on every entry, or after a sibling variable component
+    // that precedes it in declaration order. A runtime decode walk the collector
+    // could use instead is not yet built. A handle in an otherwise-FIXED key
+    // (P0's bare class-handle / chandle-shaped keys, or one nested only through
+    // fixed struct/array members) is unaffected: its static offset already works.
+    void guard_key_no_handle_in_variable(ir::Ref key_ty) {
+        if (!key_type_is_variable(key_ty) || !key_type_has_class_handle(key_ty)) {
+            return;
+        }
+        fail("associative array key type combining a class handle with a string / "
+             "queue / dynamic-array member is not supported");
     }
 
     // The element types a dynamic array / queue admits, with a loud refusal for the
@@ -3274,16 +3362,31 @@ private:
                 // freed). An unpacked struct / fixed unpacked array key (7.8.5) is
                 // serialized leaf by leaf in the backend. Both fold into the same
                 // normalized byte span as an integral or string key.
-                if (!kt.isClass() && !kt.isIntegral() && !kt.isString() && !is_agg_abi_type(kt)) {
-                    // 7.8.5 makes a real (or real-containing) index type illegal;
-                    // everything else left here (chandle, event, virtual interface)
-                    // has no equality-defined byte form.
+                if (!kt.isClass() && !kt.isIntegral() && !kt.isString() && !is_agg_abi_type(kt) &&
+                    !kt.isCHandle() && !kt.isEvent() && !kt.isVirtualInterface() && !kt.isUnpackedUnion() &&
+                    kt.as_if<slang::ast::QueueType>() == nullptr &&
+                    kt.as_if<slang::ast::DynamicArrayType>() == nullptr &&
+                    kt.as_if<slang::ast::AssociativeArrayType>() == nullptr) {
+                    // 7.8.5 makes a real (or real-containing) index type illegal; every
+                    // other type slang gives `==` normalizes to a byte span (assoc-keys.md):
+                    // a chandle / event / virtual interface already lowers to a flat 64-bit
+                    // handle word, an unpacked union already lowers identically to a packed
+                    // union (one flat is_packed integral value), a queue / dynamic array (P2)
+                    // count-prefixes its normalized elements the same way a string
+                    // length-prefixes its bytes (P1), and an associative array (P3)
+                    // count-prefixes its (key, value) pairs in sorted-key order -- all fall
+                    // into assoc_key_info's integral-width branch or its variable-length
+                    // walk below.
                     fail("associative array key type is not supported (integral, enum, "
-                         "packed, string, class handle, unpacked struct / array, or "
-                         "wildcard [*])");
+                         "packed, string, class handle, chandle, event, virtual interface, "
+                         "unpacked union, unpacked struct / array, queue, dynamic array, "
+                         "associative array, or wildcard [*])");
                 }
-                if (is_agg_abi_type(kt)) {
+                if (is_agg_abi_type(kt) || kt.as_if<slang::ast::QueueType>() != nullptr ||
+                    kt.as_if<slang::ast::DynamicArrayType>() != nullptr ||
+                    kt.as_if<slang::ast::AssociativeArrayType>() != nullptr) {
                     guard_agg_key_leaves(*aa->indexType, kr);
+                    guard_key_no_handle_in_variable(kr);
                 }
                 // Typed integral keys of any width normalize via the backend's
                 // per-byte big-endian emit (wide keys included). String keys pass
@@ -5731,7 +5834,7 @@ private:
             b.binary(ir::Inst::Tag::Store, b.assoc_default(lhs, type, l), dv, l);
         }
         for (const auto& setter : sap.indexSetters) {
-            const ir::Index key = lower_expr(*setter.index, b);
+            const ir::Index key = lower_assoc_key(*setter.index, type, b, l);
             const ir::Index val = lower_assoc_value(*setter.expr, elem, b, l);
             b.binary(ir::Inst::Tag::Store, b.assoc_select(lhs, key, type, l), val, l);
         }
@@ -6163,6 +6266,37 @@ private:
             return false;
         }
         return module_.pool.layout(type).domain != ir::Domain::Four;
+    }
+
+    // Whether a value of `type` could ever carry an x/z bit, recursing through
+    // every leaf kind the P3 assoc-key canonical serializer
+    // (emit_variable_agg_key_bytes, LlvmBackend.cpp) knows how to encode --
+    // struct / fixed array / queue / dynamic array / associative array nesting,
+    // down to a plain leaf. False for a leaf with no x/z state at all (string,
+    // class handle, chandle, event, virtual interface, real/shortreal, a
+    // 2-state integral); true for a genuinely 4-state-capable integral leaf.
+    // Used only to gate whole-associative-array logical equality (P4a): a flat
+    // byte compare on the canonical serialization is exact for a definite
+    // value, but cannot give the X-propagating answer LRM 11.4.5 wants when a
+    // value pair is unknown.
+    bool assoc_value_may_carry_xz(ir::Ref type) const {
+        const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
+        if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
+            for (const auto& f : module_.pool.struct_fields(t.fields_id)) {
+                if (assoc_value_may_carry_xz(f.type)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (t.kind == ir::Type::Kind::UnpackedArray || t.kind == ir::Type::Kind::Queue ||
+            t.kind == ir::Type::Kind::DynArray || t.kind == ir::Type::Kind::Assoc) {
+            return assoc_value_may_carry_xz(t.element);
+        }
+        if (t.kind == ir::Type::Kind::String || module_.pool.is_float(type)) {
+            return false;
+        }
+        return module_.pool.layout(type).domain == ir::Domain::Four;
     }
 
     // Strip an outer identity/struct Conversion wrapper slang may insert on a
@@ -6725,6 +6859,18 @@ private:
                          b.constant(lower_constant(dflt, at.elementType), l), l);
             }
             for (const auto& [key, val] : *cv.map()) {
+                // P4c (docs/design/assoc-keys.md): `lower_constant` cannot pool a
+                // queue / dynamic-array / associative-array / string-in-struct key
+                // as a compile-time constant (it has no static byte image -- that
+                // is exactly why the Queue/DynArray/Assoc branches above build
+                // those VALUES step by step instead of pooling them). Currently
+                // unreachable: a parameter whose type needs one of those key
+                // kinds is refused earlier by the general "only integral, real,
+                // string and null constant parameters" restriction, independent
+                // of this feature. Would need the same per-kind step-by-step
+                // construction this function already gives queue / dynarray /
+                // assoc VALUES, applied to the key instead, if that restriction
+                // is ever lifted.
                 const ir::Index k = b.constant(lower_constant(key, *at.indexType), l);
                 b.binary(ir::Inst::Tag::Store, b.assoc_select(lhs, k, ty, l),
                          b.constant(lower_constant(val, at.elementType), l), l);
@@ -9628,14 +9774,21 @@ private:
                 if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
                     // A whole unpacked-struct / unpacked-array / aggregate input
                     // port: whole-object copy of the source into the child net (a
-                    // plain unpacked array memcpy's via emit_port_agg_copy).
+                    // plain unpacked array memcpy's via emit_port_agg_copy). An
+                    // lvalue-shaped actual (the common case -- a plain variable /
+                    // member / element) passes straight through with no extra
+                    // copy beyond the port's own; anything else (a `'{...}`
+                    // pattern, an aggregate `?:`, a call, a concatenation) is
+                    // staged into a fresh canonical temp first, by the same
+                    // machinery an aggregate CALL actual already uses
+                    // (agg_input_actual) -- LRM 23.3.3 makes a port connection a
+                    // continuous copy exactly like a value-typed call argument,
+                    // so the same staging is correct here, not just reused for
+                    // convenience.
                     const Expression& src = unwrap_conversion(*expr);
-                    if (!is_struct_lvalue_shape(src)) {
-                        // TODO: an aggregate port driven by a `'{...}` pattern / call
-                        // (needs a materialized temp, like an aggregate call actual).
-                        fail("aggregate/array port connection must be a variable");
-                    }
-                    emit_port_agg_copy(b.signal(child_sig, l), lower_lvalue(src, b), ty, b, l);
+                    const ir::Index   av  = is_struct_lvalue_shape(src) ? lower_lvalue(src, b)
+                                                                       : agg_input_actual(src, ty, b, l);
+                    emit_port_agg_copy(b.signal(child_sig, l), av, ty, b, l);
                 } else {
                     b.binary(ir::Inst::Tag::Store,
                              b.signal(child_sig, l),
@@ -23188,12 +23341,24 @@ private:
         std::string            efrag;
         std::vector<ir::Index> eargs;
         // The key prints by the same leaf rules as any other %p element, so an enum
-        // key prints its name and a string key prints quoted.
-        if (kst != nullptr) {
-            expand_p_scalar(b.unary(T::Load, key.lv(b, l), l), *kst, efrag, eargs, b, l);
-        } else {
+        // key prints its name and a string key prints quoted. An unpacked struct /
+        // fixed array key has no plane value to Load -- same split key_operand()
+        // makes for a[k] itself -- so it renders through the ordinary aggregate %p
+        // expansion instead: expand_p_scalar assumes a packed value and crashes (a
+        // slang assertion, casting an unpacked struct's type as packed) on
+        // anything else. A bare queue / dynamic-array / associative-array key (P2/
+        // P3) is left on the scalar path, which refuses it the same way a
+        // container-typed VALUE element already is -- expand_p_lvalue's container
+        // renderer works from a flat element descriptor a nested container has no
+        // image for (existing TODO, expand_p_scalar), a limitation orthogonal to
+        // which types are legal KEYS.
+        if (kst == nullptr) {
             efrag += "%0d";
             eargs.push_back(b.unary(T::Load, key.lv(b, l), l));
+        } else if (is_agg_abi_ref(kr)) {
+            expand_p_lvalue(key.lv(b, l), kr, kst, efrag, eargs, b, l);
+        } else {
+            expand_p_scalar(b.unary(T::Load, key.lv(b, l), l), *kst, efrag, eargs, b, l);
         }
         efrag += ':';
         expand_p_lvalue(b.assoc_select(lv, key_operand(), ty, l), t.element, est, efrag, eargs, b, l);
@@ -25561,15 +25726,35 @@ private:
 
     // A key operand of `a[k]` / `exists(k)` / `delete(k)`: an ordinary value for an
     // integral, class-handle or string key (the backend normalizes the plane), and an
-    // LVALUE for an unpacked struct / array key — an aggregate has no plane value, so
-    // the backend serializes it leaf by leaf from its storage. A non-lvalue aggregate
-    // key (a `'{...}` pattern) is staged into a canonical temp of the key type first.
+    // LVALUE for an unpacked struct / array key (P0/P1), or a bare queue / dynamic
+    // array / associative array key itself (P2/P3) — none of these has a plane
+    // value, so the backend walks its storage / handle directly. A non-lvalue
+    // aggregate key (a `'{...}` pattern) is staged into a canonical temp of the
+    // key type first; a non-lvalue queue key (a literal, a slice, a concatenation)
+    // reuses the same materializing handle temp any other queue-typed rvalue gets.
     ir::Index lower_assoc_key(const Expression& key, ir::Ref assoc_ty, ir::Builder& b, ir::SourceLoc l) {
         const ir::Type at = std::get<ir::Type>(module_.pool.get(assoc_ty));
         if (at.right != 0) {
             return lower_expr(key, b); // wildcard [*]: any integral value
         }
-        const auto kr = static_cast<ir::Ref>(at.fields_id);
+        const auto     kr = static_cast<ir::Ref>(at.fields_id);
+        const ir::Type kt = std::get<ir::Type>(module_.pool.get(kr));
+        if (kt.kind == ir::Type::Kind::Queue) {
+            return materialize_queue_rvalue(key, b);
+        }
+        if (kt.kind == ir::Type::Kind::DynArray || kt.kind == ir::Type::Kind::Assoc) {
+            const Expression& src = unwrap_conversion(key);
+            if (is_struct_lvalue_shape(src)) {
+                return lower_lvalue(src, b);
+            }
+            // TODO: a non-lvalue dynamic-array / associative-array key expression
+            // (a literal, a slice, an in-place call result) — needs the same
+            // materializing temp construction materialize_queue_rvalue gives a
+            // queue key, written for a dynamic-array / assoc handle instead of a
+            // queue's ring.
+            fail("a non-variable dynamic-array / associative-array key expression "
+                 "is not supported");
+        }
         if (!is_agg_abi_ref(kr)) {
             return lower_expr(key, b);
         }
@@ -27823,14 +28008,49 @@ private:
         }
 
         // Unpacked aggregate equality (LRM 7.2, 11.2.2, 11.4.5, Table 11-1): a
-        // whole struct / fixed unpacked array / queue / dynamic array value
-        // cannot be loaded, so every equality-family operator reduces to a
-        // per-leaf comparison instead. slang wraps each operand in a bitstream
-        // Conversion, so the aggregate type is on the unwrapped operand.
+        // whole struct / fixed unpacked array / queue / dynamic array / associative
+        // array value cannot be loaded, so every equality-family operator reduces to
+        // a per-leaf (or, for an associative array, whole-map canonical byte)
+        // comparison instead. slang wraps each operand in a bitstream Conversion,
+        // so the aggregate type is on the unwrapped operand.
         if (bin.op == B::Equality || bin.op == B::Inequality || bin.op == B::CaseEquality ||
             bin.op == B::CaseInequality) {
-            const Expression& ule         = unwrap_conversion(bin.left());
-            const bool        agg_operand =
+            const Expression& ule = unwrap_conversion(bin.left());
+            if (is_assoc(ule)) {
+                // LRM 11.4.5 / 7.9 (P4a): two associative arrays are equal iff
+                // they hold the same set of (key, value) pairs -- no per-leaf
+                // walk here (a map has no positional "leaves" to Land-reduce
+                // over the way a struct/array/queue does); the backend compares
+                // each side's P3 canonical serialization byte for byte instead.
+                const Expression& re = unwrap_conversion(bin.right());
+                if (!is_struct_lvalue_shape(ule) || !is_struct_lvalue_shape(re)) {
+                    fail("associative array equality is only supported between "
+                         "array variables");
+                }
+                const ir::Ref  sty     = lower_type(*ule.type);
+                const bool     is_case = bin.op == B::CaseEquality || bin.op == B::CaseInequality;
+                if (!is_case) {
+                    const ir::Type t = std::get<ir::Type>(module_.pool.get(sty));
+                    if (assoc_value_may_carry_xz(t.element)) {
+                        // TODO: X-propagating logical equality for a
+                        // 4-state-capable value element (LRM 11.4.5) -- the
+                        // canonical byte serialization is bit-exact, which is
+                        // what case equality (===) wants, but logical equality
+                        // needs an unknown VALUE pair to propagate to an
+                        // ambiguous (x) result, and a flat byte compare cannot
+                        // give that.
+                        fail("logical equality of an associative array with a "
+                             "4-state-capable value element is not supported "
+                             "(LRM 11.4.5); use === instead");
+                    }
+                }
+                const ir::SourceLoc l   = loc(bin);
+                const ir::Index     acc = b.agg_eq(lower_lvalue(ule, b), lower_lvalue(re, b), sty, l);
+                return (bin.op == B::Equality || bin.op == B::CaseEquality)
+                       ? acc
+                       : b.unary(ir::Inst::Tag::Lnot, acc, l);
+            }
+            const bool agg_operand =
               is_unpacked_struct(*ule.type) ||
               ule.type->getCanonicalType().as_if<slang::ast::FixedSizeUnpackedArrayType>() !=
                 nullptr ||

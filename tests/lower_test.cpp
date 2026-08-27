@@ -1026,17 +1026,23 @@ TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
     // Binding a type parameter to a not-yet-lowered type must hit the same loud
     // guard as a direct declaration, not silently accept it. (`event`,
     // `chandle`, `class`, a virtual interface, an associative array with a
-    // class-handle value and one with an EVENT value were all prior examples here;
-    // every one of them lowers now.) A `chandle` associative-array KEY stands in as
-    // the still-unsupported type: it is a legal index type slang accepts, and
-    // clotho refuses it because a handle word has no equality-defined byte form.
+    // class-handle value and one with an EVENT value, and an associative array
+    // keyed by a chandle / event / virtual interface / unpacked union, were all
+    // prior examples here; every one of them lowers now.) `mailbox #(T)` bound to
+    // T = event stands in as the still-unsupported type, reached THROUGH the type
+    // parameter rather than written directly: an event ELEMENT's construction
+    // mints a new sync object (LRM Table 6-7), which mailbox's copy-in would
+    // overwrite and leak (Lower.cpp:4148).
     const LowerResult r = lower_text(R"(
         module m #(parameter type T = int);
-            T v[chandle];
+            mailbox #(T) v;
+        endmodule
+        module top;
+            m #(.T(event)) u();
         endmodule
     )");
     CHECK(!r.ok);
-    CHECK(r.diagnostic_text().find("associative array key type") != std::string::npos);
+    CHECK(r.diagnostic_text().find("a mailbox of events is not supported") != std::string::npos);
 }
 
 TEST_CASE("a class type parameter lowers as a handle") {
