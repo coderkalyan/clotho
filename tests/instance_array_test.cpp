@@ -230,6 +230,98 @@ TEST_CASE("whole unpacked sub-array (arr[i][j]) as a module port, in and out") {
     CHECK(run_capture(src) == "11 22 31 42\n");
 }
 
+// The same sub-array port actual, but with the two sides in DIFFERENT per-element
+// slot layouts. A 4-state NET keeps its z plane; a 4-state variable the may-z
+// analysis proves never holds z is elided to the mm word alone
+// (docs/design/never-x-inference.md), so `.wi(big[0])` onto a `wire` port pairs a
+// z-carrying destination slot with a z-elided source one. The whole-object copy
+// used to take the SOURCE's element slot from the DESTINATION whenever the source
+// was an offset place -- and a constant element-select is one, because ElemSelect
+// always carries the LRM 7.4.5 in-range gate -- so it memcpy'd a destination-shaped
+// 8 bytes out of a 4-byte object and every element past the first came out of the
+// next sub-array: `11 xx` for `11 22`. The `var` spelling was right only because
+// both sides happened to be elided alike. Both directions and both spellings are
+// pinned here, plus the whole-array net port that was always correct (no element
+// select, hence no override, hence honest slots on both sides).
+TEST_CASE("whole unpacked sub-array port actual across differing element slots") {
+    SUBCASE("input wire port: z-carrying net destination, z-elided source") {
+        constexpr std::string_view src = R"(
+            module child(input wire logic [7:0] wi [0:1], output logic [7:0] ro [0:1]);
+                assign ro[0] = wi[0] + 8'd1;
+                assign ro[1] = wi[1] + 8'd2;
+            endmodule
+            module m;
+                logic [7:0] big [0:3][0:1];
+                logic [7:0] out [0:3][0:1];
+                child c0(.wi(big[0]), .ro(out[0]));
+                initial begin
+                    big[0][0]=8'h10; big[0][1]=8'h20;
+                    #1; $display("%h %h", out[0][0], out[0][1]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "11 22\n");
+    }
+    SUBCASE("input var port: both sides z-elided") {
+        constexpr std::string_view src = R"(
+            module child(input var logic [7:0] wi [0:1], output logic [7:0] ro [0:1]);
+                assign ro[0] = wi[0] + 8'd1;
+                assign ro[1] = wi[1] + 8'd2;
+            endmodule
+            module m;
+                logic [7:0] big [0:3][0:1];
+                logic [7:0] out [0:3][0:1];
+                child c0(.wi(big[0]), .ro(out[0]));
+                initial begin
+                    big[0][0]=8'h10; big[0][1]=8'h20;
+                    #1; $display("%h %h", out[0][0], out[0][1]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "11 22\n");
+    }
+    // The opposite direction: the differing slot is the DESTINATION's. A singly
+    // driven net needs no resolver slot, so the output copy lands straight in the
+    // parent net's own storage (wire_ports), which keeps its z plane against the
+    // child's z-elided `ro`.
+    SUBCASE("output port into a net-typed parent sub-array actual") {
+        constexpr std::string_view src = R"(
+            module child(input logic [7:0] wi [0:1], output logic [7:0] ro [0:1]);
+                assign ro[0] = wi[0] + 8'd1;
+                assign ro[1] = wi[1] + 8'd2;
+            endmodule
+            module m;
+                logic [7:0] big [0:3][0:1];
+                wire logic [7:0] netout [0:3][0:1];
+                child c0(.wi(big[0]), .ro(netout[0]));
+                initial begin
+                    big[0][0]=8'h10; big[0][1]=8'h20;
+                    #1; $display("%h %h", netout[0][0], netout[0][1]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "11 22\n");
+    }
+    SUBCASE("whole-array (non-sub-array) net port") {
+        constexpr std::string_view src = R"(
+            module child(input wire logic [7:0] wi [0:1], output logic [7:0] ro [0:1]);
+                assign ro[0] = wi[0] + 8'd1;
+                assign ro[1] = wi[1] + 8'd2;
+            endmodule
+            module m;
+                logic [7:0] a [0:1];
+                logic [7:0] r [0:1];
+                child c(.wi(a), .ro(r));
+                initial begin
+                    a[0]=8'h10; a[1]=8'h20;
+                    #1; $display("%h %h", r[0], r[1]);
+                end
+            endmodule
+        )";
+        CHECK(run_capture(src) == "11 22\n");
+    }
+}
+
 // A non-lvalue aggregate actual (a `'{...}` pattern, or a struct-returning
 // function call) bound to a whole-struct / whole-array INPUT port used to be
 // refused outright ("aggregate/array port connection must be a variable"):

@@ -1,0 +1,267 @@
+diff --git a/source/ast/symbols/PortSymbols.cpp b/source/ast/symbols/PortSymbols.cpp
+index 1eb90a82e..0f529b9f0 100644
+--- a/source/ast/symbols/PortSymbols.cpp
++++ b/source/ast/symbols/PortSymbols.cpp
+@@ -34,6 +34,50 @@ const NetType& getDefaultNetType(const Scope& scope, SourceLocation location) {
+     return scope.getCompilation().getWireNetType();
+ }
+ 
++// Whether a port declaration is one that [6.7.1] permits a net to have: "A valid
++// data type for a net shall be one of the following: a) A 4-state integral type,
++// including a packed array or packed structure. b) A fixed-size unpacked array or
++// unpacked structure, where each element has a valid data type for a net."
++//
++// A port's kind has to be decided when its symbol is created, which is before its
++// type is resolved, so this answers from the syntax alone and is deliberately
++// conservative in two ways.
++//
++// Only the built-in keyword types whose four-state-ness is lexically evident say
++// yes: a named type, a struct, a union or an enum keeps the variable default
++// rather than guessing at what it will resolve to.
++//
++// And any unpacked dimension on the declarator says no, because the dimensions are
++// what decide whether the object is a fixed-size array -- clause (b), a net -- or a
++// dynamic array, a queue or an associative array, none of which a net may be. `[]`,
++// `[$]` and `[*]` are distinguishable here, but `[n]` is not: it is a fixed size
++// when `n` is an expression and an associative index when `n` is a type, which
++// needs the name resolved. Rather than half a rule, a declarator with any unpacked
++// dimension keeps the variable default.
++//
++// Both are deviations from [23.2.2.3] for the shapes they cover, and both are
++// strictly smaller than treating every typed input port as a variable.
++//
++// Finally, the rule names "a net of default net type", so it has nothing to name
++// under `default_nettype none: the variable default stands there rather than
++// warning ImplicitNetPortNoDefault at every `input logic` in a file that opens
++// with that directive, which is a very ordinary way to write SystemVerilog.
++bool canPortBeNet(const Scope& scope, const DataTypeSyntax& type,
++                  std::span<const VariableDimensionSyntax* const> dimensions) {
++    if (!dimensions.empty() || scope.getDefaultNetType().isError())
++        return false;
++
++    switch (type.kind) {
++        case SyntaxKind::LogicType:
++        case SyntaxKind::RegType:
++        case SyntaxKind::IntegerType:
++        case SyntaxKind::TimeType:
++            return true;
++        default:
++            return false;
++    }
++}
++
+ std::tuple<const DefinitionSymbol*, std::string_view> getInterfacePortInfo(
+     const Scope& scope, const InterfacePortHeaderSyntax& header) {
+ 
+@@ -166,20 +210,29 @@ public:
+                 // - For output, if we have a data type it's a var, otherwise net
+                 // - For ref it's always a var
+                 //
+-                // Unfortunately, all major simulators ignore the rule for input ports,
+-                // and treat them the same as output ports (i.e. it's not a net if there
+-                // is a data type specified). This is pretty noticeable as otherwise a
+-                // port like this:
++                // The rule for input ports cannot be applied literally, because
++                // [6.7.1] admits only four-state data types for a net, so
+                 //    input int i
+-                // will throw an error because int is not a valid type for a net. Actually
+-                // noticing the other fact, that it's a net port vs a variable port, is very
+-                // hard to do, so we go along with everyone else and use the same rule.
++                // would become a net of a type no net may have and be rejected --
++                // and slang has always accepted it. So an input port whose data
++                // type could not legally be a net's stays a variable, as it always
++                // has. An input port whose data type CAN be a net's
++                // follows [23.2.2.3] and is one, which is also what the inout arm
++                // right here already does for [23.2.2.3]'s own mh2 example,
++                //    module mh2 (inout integer x);   // inout wire integer x
++                // so this makes the two directions agree rather than inventing a
++                // rule. Getting it wrong is observable: an undriven net reads z and
++                // an undriven variable reads x, a net resolves multiple drivers
++                // where a variable diagnoses them, and only a variable may be the
++                // target of a procedural assignment.
+ 
+                 ArgumentDirection direction = getDirection(header.direction);
+                 const NetType* netType = nullptr;
+-                if (!header.varKeyword && (direction == ArgumentDirection::InOut ||
+-                                           (direction != ArgumentDirection::Ref &&
+-                                            header.dataType->kind == SyntaxKind::ImplicitType))) {
++                if (!header.varKeyword && direction != ArgumentDirection::Ref &&
++                    (direction == ArgumentDirection::InOut ||
++                     header.dataType->kind == SyntaxKind::ImplicitType ||
++                     (direction == ArgumentDirection::In &&
++                      canPortBeNet(scope, *header.dataType, decl.dimensions)))) {
+                     netType = &getDefaultNetType(scope, decl.name.location());
+                 }
+ 
+@@ -533,6 +586,24 @@ private:
+                             setInternalSymbol(*net, decl, nullptr, info);
+                             break;
+                         }
++
++                        // [23.2.2.3] again, exactly as in the ANSI builder above:
++                        // an input or inout port with no port kind is a net, applied
++                        // where [6.7.1] permits the data type to be a net's. Without
++                        // this an I/O declaration as ordinary as
++                        //    inout logic [7:0] data;
++                        // became a variable and was then rejected outright by the
++                        // InOutPortCannotBeVariable check below, and an
++                        //    input logic [7:0] d;
++                        // read x undriven where a net reads z.
++                        if ((info.direction == ArgumentDirection::In ||
++                             info.direction == ArgumentDirection::InOut) &&
++                            canPortBeNet(scope, *varHeader.dataType, decl.dimensions)) {
++                            auto net = comp.emplace<NetSymbol>(name, declLoc,
++                                                               getDefaultNetType(scope, declLoc));
++                            setInternalSymbol(*net, decl, varHeader.dataType, info);
++                            break;
++                        }
+                     }
+ 
+                     auto variable = comp.emplace<VariableSymbol>(name, declLoc,
+diff --git a/tests/unittests/ast/PortTests.cpp b/tests/unittests/ast/PortTests.cpp
+index 322d6a7ae..0b43a2080 100644
+--- a/tests/unittests/ast/PortTests.cpp
++++ b/tests/unittests/ast/PortTests.cpp
+@@ -99,6 +99,79 @@ module mh22(ref wire x); endmodule
+     CHECK(diags[1].code == diag::RefPortMustBeVariable);
+ }
+ 
++TEST_CASE("Port kind of an input port that declares a data type") {
++    auto tree = SyntaxTree::fromText(R"(
++// [23.2.2.3]: "If the port kind is omitted: For input and inout ports, the port
++// shall default to a net of default net type." Applied wherever [6.7.1] permits
++// the data type to be a net's, which is what the inout direction already did.
++module m0 (input logic [3:0] a); endmodule
++module m1 (input reg a); endmodule
++module m2 (input integer a); endmodule
++module m3 (input time a); endmodule
++module m4 (input logic a, b); endmodule
++
++// A two-state type is not a valid data type for a net ([6.7.1]), so applying the
++// rule literally would reject these -- and slang has always accepted them.
++// They stay variables.
++module m5 (input int a); endmodule
++module m6 (input bit [3:0] a); endmodule
++module m7 (input real a); endmodule
++
++// Untouched by the rule: an explicit var, an output that declares a data type,
++// and ref, which is always a variable.
++module m8 (input var logic a); endmodule
++module m9 (output logic [3:0] a); endmodule
++module m10(ref logic a); endmodule
++
++// A named type is conservatively left a variable: the port's kind is decided
++// before its type is resolved.
++typedef logic [3:0] nibble_t;
++module m11(input nibble_t a); endmodule
++
++// Non-ANSI I/O declarations follow the same rule. `inout logic` used to become a
++// variable and was then rejected as a variable port with an inout direction.
++module m12(a, b, c);
++    input logic [3:0] a;
++    inout logic [3:0] b;
++    output logic [3:0] c;
++endmodule
++)");
++
++    Compilation compilation;
++    compilation.addSyntaxTree(tree);
++    NO_COMPILATION_ERRORS;
++
++    auto portKind = [&](std::string_view moduleName, std::string_view portName) {
++        auto def = compilation.getRoot().find(moduleName);
++        REQUIRE(def);
++        auto port = def->as<InstanceSymbol>().body.findPort(portName);
++        REQUIRE(port);
++        auto internal = port->as<PortSymbol>().internalSymbol;
++        REQUIRE(internal);
++        return internal->kind;
++    };
++
++    CHECK(portKind("m0"sv, "a"sv) == SymbolKind::Net);
++    CHECK(portKind("m1"sv, "a"sv) == SymbolKind::Net);
++    CHECK(portKind("m2"sv, "a"sv) == SymbolKind::Net);
++    CHECK(portKind("m3"sv, "a"sv) == SymbolKind::Net);
++    CHECK(portKind("m4"sv, "a"sv) == SymbolKind::Net);
++    CHECK(portKind("m4"sv, "b"sv) == SymbolKind::Net);
++
++    CHECK(portKind("m5"sv, "a"sv) == SymbolKind::Variable);
++    CHECK(portKind("m6"sv, "a"sv) == SymbolKind::Variable);
++    CHECK(portKind("m7"sv, "a"sv) == SymbolKind::Variable);
++
++    CHECK(portKind("m8"sv, "a"sv) == SymbolKind::Variable);
++    CHECK(portKind("m9"sv, "a"sv) == SymbolKind::Variable);
++    CHECK(portKind("m10"sv, "a"sv) == SymbolKind::Variable);
++    CHECK(portKind("m11"sv, "a"sv) == SymbolKind::Variable);
++
++    CHECK(portKind("m12"sv, "a"sv) == SymbolKind::Net);
++    CHECK(portKind("m12"sv, "b"sv) == SymbolKind::Net);
++    CHECK(portKind("m12"sv, "c"sv) == SymbolKind::Variable);
++}
++
+ #ifdef _MSC_VER
+ #    pragma warning(disable : 4127)
+ #endif
+@@ -186,7 +259,7 @@ module test(a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r);
+     output a;           // Error, redefinition
+     ref b;              // Error, net type can't be ref
+     ref var c;
+-    inout logic d;      // Error, variable type can't be inout
++    inout logic d;      // OK: [23.2.2.3] makes this `inout wire logic d`
+     input wire e;
+     ref wire f;         // Error, net type can't be ref
+ 
+@@ -229,7 +302,7 @@ endmodule
+     checkPort("test", "a", InOut, wire, "logic");
+     checkPort("test", "b", Ref, wire, "logic");
+     checkPort("test", "c", Ref, nullptr, "logic");
+-    checkPort("test", "d", InOut, nullptr, "logic");
++    checkPort("test", "d", InOut, wire, "logic"); // a NET, per [23.2.2.3]
+     checkPort("test", "e", In, wire, "logic");
+     checkPort("test", "f", Ref, wire, "logic");
+ 
+@@ -252,7 +325,6 @@ endmodule
+     CHECK((it++)->code == diag::Redefinition);
+     CHECK((it++)->code == diag::Redefinition);
+     CHECK((it++)->code == diag::RefPortMustBeVariable);
+-    CHECK((it++)->code == diag::InOutPortCannotBeVariable);
+     CHECK((it++)->code == diag::RefPortMustBeVariable);
+     CHECK((it++)->code == diag::Redefinition);
+     CHECK((it++)->code == diag::RedefinitionDifferentType);
+@@ -957,7 +1029,13 @@ endmodule
+     compilation.addSyntaxTree(tree);
+ 
+     auto& diags = compilation.getAllDiagnostics();
+-    REQUIRE(diags.size() == 21);
++    // One PortConcatInOut fewer than before [23.2.2.3] was applied to input
++    // ports: module r's `{z, w}` is `input logic z; inout w;`, and now that a
++    // typed input port is a net, ALL of that concatenation's members are nets, so
++    // the "can't contain any 'inout' ports because not all of the ports are nets"
++    // rule no longer has anything to complain about. `{x, y}` still does, because
++    // `output logic y` is a variable.
++    REQUIRE(diags.size() == 20);
+     CHECK(diags[0].code == diag::MissingPortIODeclaration);
+     CHECK(diags[1].code == diag::Redefinition);
+     CHECK(diags[2].code == diag::Redefinition);
+@@ -970,15 +1048,14 @@ endmodule
+     CHECK(diags[9].code == diag::ValueExceedsMaxBitWidth);
+     CHECK(diags[10].code == diag::UndeclaredIdentifier);
+     CHECK(diags[11].code == diag::PortConcatInOut);
+-    CHECK(diags[12].code == diag::PortConcatInOut);
++    CHECK(diags[12].code == diag::PortConcatRef);
+     CHECK(diags[13].code == diag::PortConcatRef);
+-    CHECK(diags[14].code == diag::PortConcatRef);
+-    CHECK(diags[15].code == diag::IfacePortInExpr);
+-    CHECK(diags[16].code == diag::DisallowedPortDefault);
+-    CHECK(diags[17].code == diag::UndeclaredIdentifier);
++    CHECK(diags[14].code == diag::IfacePortInExpr);
++    CHECK(diags[15].code == diag::DisallowedPortDefault);
++    CHECK(diags[16].code == diag::UndeclaredIdentifier);
++    CHECK(diags[17].code == diag::DisallowedPortDefault);
+     CHECK(diags[18].code == diag::DisallowedPortDefault);
+-    CHECK(diags[19].code == diag::DisallowedPortDefault);
+-    CHECK(diags[20].code == diag::ConstEvalNonConstVariable);
++    CHECK(diags[19].code == diag::ConstEvalNonConstVariable);
+ }
+ 
+ TEST_CASE("Non-ansi port locations") {

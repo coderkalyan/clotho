@@ -15259,8 +15259,23 @@ private:
     // The per-element slot type of a whole-array place, per its storage model. Two
     // places of the same array TYPE agree byte for byte exactly when these agree,
     // which is what decides memcpy vs an element-wise copy.
+    //
+    // Always answered from the place whose bytes it describes, never from the type
+    // alone: the two models disagree precisely when one side's may-z analysis elided
+    // a z plane the other keeps, and that is invisible in the type.
     llvm::StructType* image_elem_slot(const LValue& lv, Ref type) {
-        return lv.is_agg ? agg_leaf_slot_ty(leaf_type(type)) : slot_of(lv.sig).slot_ty;
+        if (lv.is_agg) {
+            return agg_leaf_slot_ty(leaf_type(type));
+        }
+        // A flat aggregate place is always a module signal, for the reasons
+        // emit_agg_ret_copy enumerates (every non-signal aggregate lvalue is rooted
+        // in the canonical mirror). Loud rather than an assert, because the Release
+        // fallback is slot_of(Signal{ 0 }) -- some unrelated signal's element shape,
+        // i.e. exactly the silent stride corruption this function decides.
+        if (!lv.is_signal) {
+            throw BackendError{ "internal: flat aggregate place is not a signal" };
+        }
+        return slot_of(lv.sig).slot_ty;
     }
 
     // A read-only image of what an out-of-range whole-object read must yield
@@ -15306,9 +15321,22 @@ private:
         if (needs_agg_storage(info.type) || !is_agg_abi(info.type)) {
             st = agg_storage_ty(info.type);
         } else {
+            // Each side's element slot comes from ITS OWN place. A src_override
+            // redirects the source POINTER only -- to an associative entry's slot, or
+            // to the Table 7-1 image an out-of-range index must read (LRM 7.4.5) --
+            // and every override is built in the SOURCE's shape: agg_image_ptr of
+            // `slv`, and agg_copy_proto, which lays its image out against
+            // slot_of(slv.sig) for precisely that reason. Taking d_slot for the
+            // source instead sized the memcpy for the destination AND strode the
+            // source with the destination's element size, so every element past the
+            // first read the wrong bytes, silently, whenever the two elisions
+            // disagreed. It was reachable for any offset source, because an
+            // ElemSelect on a fixed unpacked array always gates on dyn_inrange (even
+            // for a constant, statically in-range index), hence always takes an
+            // override: a sub-array actual on a 4-state NET port copied 8 bytes out
+            // of the 4-byte z-elided variable behind it.
             llvm::StructType* const d_slot = image_elem_slot(dlv, info.type);
-            llvm::StructType* const s_slot =
-              src_override != nullptr ? d_slot : image_elem_slot(slv, info.type);
+            llvm::StructType* const s_slot = image_elem_slot(slv, info.type);
             if (d_slot != s_slot) {
                 // The two element layouts differ only in the z word's presence (the
                 // mm plane is an identical i(2W)), so copy element-wise, filling the
@@ -15322,6 +15350,11 @@ private:
                                         signal_has_waiters(dlv.sig));
                 return;
             }
+            // Equal slots make the two images byte-identical -- both are row-major
+            // runs of the same leaf -- so the copy stays ONE memcpy. A design that
+            // never mixes a z-carrying place with a z-elided one therefore emits
+            // exactly the code it did before.
+            //
             // The count comes from the copy TYPE, not the whole signal: a multi-dim
             // element select (`arr[i][j]`) addresses a SUB-array, whose flat leaf
             // offset the resolver above has already applied.

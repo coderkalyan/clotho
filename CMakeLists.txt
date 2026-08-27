@@ -186,6 +186,21 @@ FetchContent_Declare(
   # preceded the class member it read was misdiagnosed as "used before its
   # declaration". See docs/design/classes.md.
   #
+  # slang-input-port-net-kind: LRM 23.2.2.3 says an input or inout port that
+  # omits the port kind "shall default to a net of default net type", and its own
+  # mh1/mh2/mh15 examples spell that out for an explicit data type (`inout
+  # integer x` is `inout wire integer x`). slang applied the OUTPUT rule to
+  # inputs -- a data type means a variable -- deliberately, because LRM 6.7.1
+  # admits only 4-state types for a net and `input int i` would otherwise be
+  # rejected as a net of an illegal type. The patch keeps that escape hatch
+  # and follows the LRM for the rest, in both the ANSI and non-ANSI builders: a
+  # net only where the syntax alone proves one is legal, so `logic`/`reg`/
+  # `integer`/`time` with no unpacked dimension and a usable `default_nettype.
+  # Without it `input logic [7:0] d` read x undriven instead of z, and a non-ANSI
+  # `inout logic [7:0] d;` was rejected outright as a variable port with an inout
+  # direction. Carries its own slang unit test. See
+  # docs/design/program-blocks.md §11.
+  #
   # slang-randseq-rule-pairing: two randsequence elaboration defects, both of
   # which silently hand the frontend the wrong AST rather than diagnosing.
   # createCaseProd pushed one ProdItem per case LABEL but consumed one per case

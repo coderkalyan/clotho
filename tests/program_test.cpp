@@ -1491,15 +1491,11 @@ TEST_CASE("LRM 24.3's declaration shape lowers and reads in Reactive") {
 // ports needs no special case of its own: a top instance has no port connections
 // at all, which is the same "no copy process" outcome by a different route.
 //
-// The port kind is written out as `wire`. LRM 23.2.2.3 says it need not be --
-// "For input and inout ports, the port shall default to a net of default net
-// type" -- but slang classifies `input logic [7:0] d` as a VARIABLE (its own
-// diagnostic on a second driver says "multiple continuous assignments to
-// variable 'd'"), so that spelling reads `x` here instead of `z`. The defect
-// predates and is independent of programs -- a module port behaves identically,
-// and iverilog reads `z` for both spellings -- so this case pins the port
-// machinery rather than that bug; it is filed separately as a slang conformance
-// gap.
+// The port kind is omitted, which is the whole point: LRM 23.2.2.3 says "For
+// input and inout ports, the port shall default to a net of default net type", so
+// `input logic [7:0] d` is a net and reads `z`. slang classified such a port as a
+// variable -- reading `x` -- until patches/slang-input-port-net-kind.patch, which
+// this case pins from the clotho side (docs/design/program-blocks.md §11).
 TEST_CASE("an unconnected program port keeps its undriven default") {
     CHECK(run_capture(R"(
         module t;
@@ -1507,7 +1503,7 @@ TEST_CASE("an unconnected program port keeps its undriven default") {
           initial #20 $finish;
         endmodule
 
-        program p(input wire [7:0] d);
+        program p(input logic [7:0] d);
           initial $display("d=%b", d);
         endprogram
     )") == "d=zzzzzzzz\n");

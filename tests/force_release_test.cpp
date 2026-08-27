@@ -591,13 +591,39 @@ TEST_CASE("release: reestablishes a continuous assignment on the variable") {
     CHECK(run_capture_finish(src) == "d=3\nd=100\nd=12\nd=30\n");
 }
 
+// `input var` is what makes the port a VARIABLE. Spelled `input logic [7:0] p`
+// this is a net (LRM 23.2.2.3: "For input and inout ports, the port shall
+// default to a net of default net type"; patches/slang-input-port-net-kind.patch)
+// and a `force` on it is perfectly legal -- the case below.
 TEST_CASE("force on an input port variable is rejected") {
     constexpr std::string_view src = R"(
-        module sub(input logic [7:0] p); endmodule
+        module sub(input var logic [7:0] p); endmodule
         module m;
             logic [7:0] x;
             sub s(.p(x));
             initial begin force s.p = 8'd1; end
         endmodule)";
     CHECK(lower_error(src).find("input or inout port variable") != std::string::npos);
+}
+
+// The same port with its LRM-default kind is a net, and LRM 10.6.2 allows a
+// `force` on a net: the forced value overrides the port copy's driver until the
+// `release`, which is why the refusal above is about the VARIABLE case only and
+// not about ports.
+TEST_CASE("force on an input port net drives it") {
+    constexpr std::string_view src = R"(
+        module sub(input logic [7:0] p);
+            initial begin #1 $display("p=%0d", p); #2 $display("p=%0d", p); end
+        endmodule
+        module m;
+            logic [7:0] x;
+            sub s(.p(x));
+            initial begin
+                x = 5;
+                force s.p = 8'd1;
+                #2 release s.p;
+                #2 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "p=1\np=5\n");
 }

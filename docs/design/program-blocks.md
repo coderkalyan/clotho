@@ -977,3 +977,139 @@ clock, which is the case that would catch an over-refusal in `clocking_event`'s
 shared path. The landed "a clocking block in a program samples an input port"
 case is the third positive and is unchanged: its clocking event was already a
 hierarchical design signal, and its comment already said why.
+
+## 11. The slang defect this work found: an input port's kind
+
+Not a Clause 24 gap at all — it surfaced through §4 A3's unconnected-port case and
+is fixed in `patches/slang-input-port-net-kind.patch`.
+
+### 11.1 What the LRM says
+
+23.2.2.3, on a port that omits the port kind:
+
+> • For **input and inout** ports, the port shall default to a **net** of default
+> net type. […]
+> • For **output** ports, the default port kind depends on how the data type is
+> specified: […] If the data type is declared with the explicit data_type syntax,
+> the port kind shall default to **variable**.
+
+and its own examples leave no room:
+
+```systemverilog
+module mh1 (integer x);          // inout wire integer x
+module mh2 (inout integer x);    // inout wire integer x
+module mh11(output integer x);   // output var integer x
+```
+
+So the "explicit data type means variable" half is the **output** rule. slang
+applied it to inputs as well, deliberately: `input int i` would otherwise become
+a net of a type no net may have, and be rejected.
+
+That reason is sound, and it is narrow. LRM 6.7.1 restricts a net's data type to
+"a 4-state integral type […] or a fixed-size unpacked array or unpacked structure,
+where each element has a valid data type for a net", so `input int i` — 2-state —
+cannot be a net, and slang has always accepted it as a variable. But it says
+nothing about `input logic [7:0] d`, whose type a net may have, and which slang
+already treats as a net one direction over: `inout integer x` is mh2 above.
+
+### 11.2 What was wrong, observably
+
+| shape | before | LRM |
+|---|---|---|
+| `input logic [7:0] d` (ANSI or non-ANSI) | variable, reads **x** undriven | net, reads **z** |
+| `input reg` / `input integer` / `input time` | variable | net |
+| non-ANSI `inout logic [7:0] d;` | **rejected**: "variable port 'd' cannot have direction 'inout'" | net, legal |
+| `input int` / `input bit` | variable | (net, but 6.7.1 forbids it — keep the variable) |
+| `output logic [7:0] q` | variable | variable |
+
+The x/z difference is the visible one, and it is not cosmetic: it is the initial
+value of every undriven input port in the design. Net-vs-variable also decides
+whether multiple drivers resolve or are diagnosed, and whether a `force` on the
+port is the net or the variable case (`tests/force_release_test.cpp`). The
+non-ANSI `inout` row is worse than any of that — a hard error on an ordinary
+declaration.
+
+### 11.3 The patch
+
+Keeps slang's escape hatch exactly where its reason applies and follows the LRM
+everywhere else, in both port builders:
+
+- a file-local `canPortBeNet(const Scope&, const DataTypeSyntax&, dimensions)`
+  answers "may a net be declared this way?" from the **syntax**, because a port's
+  kind is decided before its type is resolved;
+- `AnsiPortListBuilder::createPort` gains one disjunct: an `input` that passes it
+  is a net, like `inout` already was;
+- `NonAnsiPortListBuilder::handleIODecl` gains the same, which is what makes
+  `inout logic [7:0] d;` legal again.
+
+`canPortBeNet` says yes to exactly `logic`, `reg`, `integer` and `time`, and it is
+conservative in three further ways. Each one was found by running slang's own test
+suite, not by reasoning:
+
+1. **Any unpacked dimension on the declarator says no.** The dimensions are what
+   decide whether the object is a fixed-size array — 6.7.1(b), a valid net — or a
+   dynamic array, queue or associative array, none of which a net may be. `[]`,
+   `[$]` and `[*]` are distinguishable in the syntax but `[n]` is not: fixed size
+   when `n` is an expression, associative index when `n` is a type. Without this,
+   `input logic a[]` became a net and slang rejected it: *"'logic$[]' is not a
+   valid type for a net"* (`HierarchyTests.cpp`).
+2. **`` `default_nettype none `` says no.** The rule names "a net of *default net
+   type*", and there is none, so the variable default stands rather than warning
+   `ImplicitNetPortNoDefault` at every `input logic` in a file that opens with
+   that directive — which is a very ordinary way to write SystemVerilog, and which
+   slang's `LookupTests.cpp` caught immediately.
+3. **A named type says no** — `typedef logic [7:0] nibble_t; input nibble_t d`
+   still reads x — because resolving a type during port creation would mean
+   resolving it before the body's declarations and imports are in scope.
+
+All three are deviations from 23.2.2.3 for the shapes they cover, and all three
+are strictly smaller than treating every typed input port as a variable.
+
+The patch carries a slang unit test (`tests/unittests/ast/PortTests.cpp`, "Port
+kind of an input port that declares a data type"), 64 assertions over every shape
+in §11.2's table plus the conservatism cases and the non-ANSI trio, so it is
+upstream-ready as it stands. Two existing slang tests moved with it, both because
+they pinned the old answer:
+
+- "Module non-ANSI ports" had `inout logic d;` commented *"Error, variable type
+  can't be inout"* and expected `InOutPortCannotBeVariable`. That declaration is
+  `inout wire logic d` per 23.2.2.3, so the diagnostic is gone and the case now
+  asserts the port is a net.
+- "Non-ansi port errors" expected two `PortConcatInOut`. Module `r`'s `{z, w}` is
+  `input logic z; inout w;`, and now that a typed input port is a net, *all* of
+  that concatenation's members are nets — so the "can't contain any 'inout' ports
+  because not all of the ports are nets" rule has nothing left to complain about
+  there. One spurious error fewer; `{x, y}` still reports, because `output logic y`
+  is a variable.
+
+slang's "Module ANSI ports" test — which transcribes 23.2.2.3's own mh0-mh22 —
+needed no change, because it has no `input <explicit 4-state type>` case: the
+LRM's examples never pinned the behaviour slang got wrong. Verified by building
+slang's `unittests` target against the patched tree: 2333 of 2335 pass, and the
+two failures are pre-existing, both in `ClassTests.cpp`, both caused by clotho's
+own `slang-class-forward-ref.patch` deliberately changing class-scope lookup.
+
+### 11.4 What it changed in clotho
+
+`tests/program_test.cpp`'s unconnected-port case (§4 A3) now asserts `z` for
+`input logic [7:0] d`, as the LRM requires, instead of documenting the defect.
+Two tests in `tests/force_release_test.cpp` moved with it: `force on an input port
+variable is rejected` says `input var` now, since that is what makes a port a
+variable, and it gained a sibling pinning that a `force` on an input port **net**
+drives it (LRM 10.6.2).
+
+An earlier, looser version of the predicate — before rule 1 above excluded
+unpacked dimensions — also exposed a **pre-existing clotho bug**, which was the
+most valuable thing to come out of this: a whole unpacked-array copy between a
+z-carrying **net** element slot and a z-elided **variable** one emitted a single
+destination-shaped memcpy and read the source with the destination's stride, so
+every element after the first was garbage. The cause was `emit_agg_copy` forcing
+the source's slot to equal the destination's whenever a `src_override` existed,
+and an `ElemSelect` on a fixed unpacked array always mints one (it carries LRM
+7.4.5's in-range gate even for a constant index), so every sub-array source took
+the forced-equal path.
+
+The final predicate no longer reaches that shape through `input logic [7:0] a
+[0:1]`, but the bug is real and independent: `input wire logic [7:0] a [0:1]` with
+a sub-array actual hit it before any of this work. Fixed, with the four shapes
+pinned in `tests/instance_array_test.cpp`.
