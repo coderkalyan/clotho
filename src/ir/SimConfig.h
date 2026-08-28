@@ -223,6 +223,12 @@ struct SimulationConfig {
     // `Sanitizer` bits, tested with sanitizer_on. Zero instruments nothing,
     // which is the default — a sanitizer costs code size and simulation time.
     uint32_t sanitizers = 0;
+    // Where to write the functional-coverage report (`--coverage=<file>`);
+    // empty, the default, writes none. The path belongs to the coverage model
+    // the backend compiles into the artifact rather than to a startup lookup, so
+    // a `build` and the `run` of what it built are given the same file (LRM 19,
+    // docs/design/functional-coverage.md).
+    std::string coverage_report;
     // Collect at every safepoint (`--gc-stress`). Not a performance mode: it
     // turns a latent missing root into a deterministic failure on the first
     // collection instead of a rare corruption much later, and it is the
