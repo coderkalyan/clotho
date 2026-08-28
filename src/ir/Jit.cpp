@@ -212,6 +212,8 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_defer_flush_final", &rt_defer_flush_final);
     expose("rt_oscillation_abort", &rt_oscillation_abort);
     expose("rt_ring_overflow", &rt_ring_overflow);
+    expose("rt_dpi_export_task_suspended", &rt_dpi_export_task_suspended);
+    expose("rt_dpi_export_task_no_task_frame", &rt_dpi_export_task_no_task_frame);
     expose("rt_queue_assign_dynarr", &rt_queue_assign_dynarr);
     expose("rt_severity", &rt_severity);
     expose("rt_bounds_report", &rt_bounds_report);

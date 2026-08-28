@@ -1811,6 +1811,22 @@ uint64_t rt_wheel_now(const rt_wheel* wheel);
 // this -- see the sizing arguments in ensure_active_queue and wait_counts.
 [[noreturn]] void rt_ring_overflow(uint32_t ring, uint32_t capacity);
 
+// An exported task (LRM 35.8) driven from a DPI import did not complete in zero
+// time: it executed a delay, event control or `wait`, so its coroutine suspended
+// while a native C frame sat between it and the scheduler. Parking that C frame
+// needs the stack handoff of DPI-task phase T2, which is not implemented, so this
+// prints a FATAL naming the task and ends the simulation (never returns).
+// `name` is the exported task's c_identifier.
+[[noreturn]] void rt_dpi_export_task_suspended(const char* name);
+
+// An exported task was reached from C with no imported-TASK frame live -- either
+// from inside an imported FUNCTION, or from C that no DPI import call reached at
+// all. LRM 35.8: "It is never legal to call an exported task from within an
+// imported function. This semantics is identical to native SystemVerilog
+// semantics, in which it is illegal for a function to perform a task enable."
+// Prints a FATAL naming the task and ends the simulation (never returns).
+[[noreturn]] void rt_dpi_export_task_no_task_frame(const char* name);
+
 // Non-zero iff the wheel has any timer scheduled. The design's sim loop ticks
 // the wheel until this reports empty.
 int rt_wheel_pending(const rt_wheel* wheel);

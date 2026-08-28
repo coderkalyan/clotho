@@ -4021,6 +4021,56 @@ extern "C" void rt_ring_overflow(uint32_t ring, uint32_t capacity) {
     std::exit(1);
 }
 
+namespace {
+
+// Shared tail of the two DPI export-task fatals: both are reached from inside a
+// native C frame the simulator cannot unwind, so neither can hand a settled state
+// back the way rt_finish_coop does. Same reasoning as rt_oscillation_abort --
+// report, close the dump while the design state is still live, exit nonzero.
+[[noreturn]] void dpi_export_task_fatal(const char* name, const char* what) {
+    std::fflush(stdout);
+    std::string line = "FATAL: exported task '";
+    line += name;
+    line += "' ";
+    line += what;
+    line += " at ";
+    append_finish_time(line, rt_diag_now());
+    line += '\n';
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+    rt_vcd_close();
+    rt_finishing = 1;
+    std::exit(1);
+}
+
+} // namespace
+
+extern "C" void rt_dpi_export_task_suspended(const char* name) {
+    // The task's coroutine came back from its first resume not done, so it parked
+    // on a delay / event control / `wait`. Its caller is a C frame on the
+    // simulation stack, and resuming that frame later needs the baton-pool stack
+    // handoff of DPI-task phase T2 (docs/design/dpi-c.md). Until it lands, only
+    // the zero-time case is supported and this one is refused loudly -- LRM
+    // 35.5.1.5 blesses the suspending case, so a wrong answer here would be a
+    // silent deviation, not a corner.
+    dpi_export_task_fatal(name,
+                          "suspended on a timing control, which needs the suspendable C "
+                          "frame of DPI-task phase T2 (not implemented)");
+}
+
+extern "C" void rt_dpi_export_task_no_task_frame(const char* name) {
+    // No imported-TASK frame is live on the way in (clotho.dpi.in_import_task is
+    // 0), so the innermost DPI frame is an imported FUNCTION -- or the C was not
+    // reached through a DPI import at all. LRM 35.8 calls the first case never
+    // legal, on the same ground SystemVerilog forbids a function performing a task
+    // enable; the second has no calling thread whose time and region the task
+    // could run in, so it is refused on the same line.
+    dpi_export_task_fatal(name,
+                          "was called from C with no imported DPI task frame live (LRM 35.8: "
+                          "it is never legal to call an exported task from within an imported "
+                          "function)");
+}
+
 // ---- Observed region (LRM 4.4.2.4) deferred reports ----
 //
 // A report produced while the Active/NBA regions settle an instant is not
