@@ -558,13 +558,68 @@ professional parity; M5 makes it complete.
 
 ### Time-consuming procedural code
 
-- [ ] **Intra-assignment timing remainder** (LRM 9.4.5) — a multi-signal trigger
-  `@(a or b)`, an `iff` qualifier on the trigger, and the target shapes that still
-  have no lvalue encoding to defer: a concatenation, a whole unpacked struct or
-  array, a string, and a queue / dynamic-array / associative-array element (none of
-  which plain NBA lowers either). (Blocking, nonblocking `#d`, and nonblocking
-  `@e`/`repeat(N) @e` all done below, now including bit/part-select, unpacked-array
-  element, packed/unpacked struct field, and real targets.)
+- [ ] **Intra-assignment timing remainder** (LRM 9.4.5) — **scoped**, six items in
+  docs/design/intra-assignment-timing.md § "The remainder", with a phase plan.
+  (Blocking, nonblocking `#d`, and nonblocking `@e`/`repeat(N) @e` all done below,
+  now including bit/part-select, unpacked-array element, packed/unpacked struct
+  field, and real targets.) The nonblocking gaps, grouped by what the deferred
+  record is actually missing rather than by syntax:
+  - **R1 — the decomposing targets**: a concatenation, a streaming concatenation, an
+    assignment-pattern lvalue, and a whole unpacked struct or array. Plain NBA
+    already decomposes each into N per-leaf `StoreNb`s (`store_concat`,
+    `store_stream_target`, `lower_pattern_assign`, `emit_struct_store` /
+    `emit_agg_copy`); the intra form is the same walk emitting `StoreNbDelay` /
+    `StoreNbEvent` per leaf, with one RHS sample, one delay/count evaluation, and
+    consecutive `seq` stamps in leaf order so a self-overlapping target lands exactly
+    as the plain-NBA form does. Frontend only, no record change.
+  - **R2 — a nonblocking write through a virtual interface handle** (`vif.sig <= #5
+    x`): one `SignalSlot` flag (`intra_ptr`, set the way `intra_masked` is) forcing
+    the pointer-carrying record tail and per-record destination load the array-element
+    path already uses. LRM 10.4.2 requires exactly this ("if `variable_lvalue`
+    requires an evaluation, such as an index expression, class handle, or virtual
+    interface reference, it shall be evaluated at the same time as the … right-hand
+    side"), so capturing the resolved instance at arm time is the semantics, not a
+    shortcut.
+  - **R3 — a string target and a whole container target** (`s <= #5 t`, `q <= #2 r`):
+    one new record tail class, `{ ptr owned }`. Plain NBA stages an owned deep copy
+    per signal (`emit_string_whole_commit` / `HandleCopyNb` →
+    `emit_handle_whole_commit`), which an intra site cannot reuse because it has N in
+    flight. The new work is the free discipline on the three drop paths (descheduled
+    inertial record, `$finish` with records armed, `rt_run_init`), not the copy.
+    Subsumes the separate `q <= #2 r` entry under Containers.
+  - **R4 — a multi-signal trigger** `@(a or b)`: an `ExtraSlice` of `(trig, edge)`
+    pairs in `StoreNbEventInfo`, one registration per event for the same record, and
+    real first-fire-wins removal via a `[intra_trigs × i32]` record tail. Lazy
+    "mark matured and skip" is unsafe — a committed record returns to its freelist, so
+    a stale pointer can match a reused record.
+  - **R5 — an `iff` qualifier on the trigger**: one `i1 <site>.guard(ptr state)`
+    function per site, its address in the record, called by `rt_intra_event_fire`
+    before the countdown. 9.4.2.3 makes `iff` part of the event, so only *enabled*
+    occurrences count down — which is why the plain-event mechanism (wrap the body in
+    `if (C)`) cannot transfer: for `repeat(N)` it would consume disabled edges.
+    Cheap because slang already forbids an automatic variable in an NBA's timing
+    control (`diag::AutoFromNonBlockingTiming`), so the guard reads design state only.
+  - **R6 — two non-target leftovers**: a runtime-offset select of a vector wider than
+    `wide_dyn_select_bits` (needs the heap-side payload that the whole-aggregate
+    memcpy follow-up wants; grouped with it), and a non-positive `repeat` count,
+    which waits 2**32 edges today because the record countdown is unsigned — fix is a
+    signed test at the arm site routing it to the existing runtime-zero-delay branch,
+    matching the blocking form's immediate store.
+  - **Blocking form (Class A)**: `s = #5 t` / `mem = #5 other` are refused because
+    the string and array store paths evaluate the LHS before the RHS, which 9.4.5
+    pins the other way round; and an assignment-pattern lvalue is refused for both
+    forms.
+  - **NOT a gap, corrected**: a queue / dynamic-array / associative-array **element**
+    was listed here as an unimplemented target shape. LRM **6.21** forbids it outright
+    — "Automatic variables and elements of dynamically sized array variables shall not
+    be written with nonblocking, continuous, or procedural continuous assignments" —
+    and slang enforces it (`diag::NonblockingDynamicAssign`, over
+    `Type::isDynamicallySizedArray()`, which covers queues) and, as measured, gets
+    there first for every shape tried — bare, struct-nested, array-of-structs-nested,
+    and a `ref int r[$]` formal. clotho's own queue-element guard is therefore defence
+    in depth and a legality refusal, not a TODO — reclassified in passing (it now says
+    so and cites 6.21; the neighbouring string-NBA comment's 10.4.2 citation was
+    corrected too). A class property is legal but is the separate class-property NBA gap.
 - [x] **`iff` event-control qualifier** (`@(posedge clk iff en)`, LRM 9.4.2.3).
   Single-event only, lowered as a body/`@`-loop guard (`if (cond)`). Per-event
   `iff` in a multi-event list (`@(posedge a iff x or ...)`) still rejected loud —
@@ -2070,7 +2125,9 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 - [ ] **Intra-assignment delay on a container NBA** (`q <= #2 r`) — refused loudly.
   The intra-assignment path stages an integral or real value, an unpacked-array
   element or a struct field; a container handle needs the HandleCopyNb record to
-  survive to the delayed commit. See docs/design/intra-assignment-timing.md.
+  survive to the delayed commit. **Scoped** as R3 (with the string target, which
+  needs the identical record tail) in docs/design/intra-assignment-timing.md
+  § "The remainder"; also itemized under the M2 intra-assignment remainder entry.
 - [ ] **Non-constant string replication count** — **a deliberate deviation from
   LRM 11.4.12.1, implemented; kept OPEN because the deviation itself must be
   revisited, not because work remains.** The clause requires the multiplier of

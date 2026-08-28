@@ -24449,16 +24449,21 @@ private:
             // each already reported elsewhere: a string character (`s[i] <= c`) above,
             // a class property in lower_assign / check_subroutine_nba_target, and an
             // element of a queue / dynamic / associative array of strings by slang
-            // itself (LRM 10.4.2 forbids a nonblocking assignment to an element of a
-            // dynamically sized array).
+            // itself (LRM 6.21 forbids a nonblocking assignment to an element of a
+            // dynamically sized array variable).
             fail("nonblocking assignment to a string is not supported");
         }
         if (a.isNonBlocking() && a.left().kind == ExpressionKind::ElementSelect &&
             is_queue(a.left().as<ElementSelectExpression>().value())) {
-            // TODO: nonblocking assignment to a queue element (needs a
-            // handle-aware NBA staging path; the per-signal shadow is
-            // plane-shaped and cannot reach the heap ring buffer).
-            fail("nonblocking assignment to a queue element is not supported");
+            // Not a gap: LRM 6.21 forbids a nonblocking assignment to an element of a
+            // dynamically sized array variable, and 7.10 makes a queue one. slang
+            // raises NonblockingDynamicAssign first for every shape tried (bare
+            // `q[0] <= v`, a struct field's queue, an array-of-structs field's queue,
+            // and a `ref int r[$]` formal), so this is defence in depth rather than a
+            // reachable path: slang's test is keyed on the value's
+            // getSymbolReference(), and a shape whose reference is null would skip it.
+            fail("a nonblocking assignment to a queue element is not legal "
+                 "SystemVerilog (LRM 6.21)");
         }
         // StoreNb gets correct two-phase NBA semantics in the backend: the RHS is
         // sampled here in the active region and committed in the NBA update region.
