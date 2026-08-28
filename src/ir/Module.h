@@ -686,6 +686,78 @@ struct ClassDesc {
     std::vector<uint32_t> iface_ids;
 };
 
+// -- Functional coverage (LRM 19, docs/design/functional-coverage.md) ----------
+//
+// The static half of the coverage model: what the frontend could evaluate at
+// lowering time. Everything below is emitted verbatim as read-only constants
+// beside the design (LlvmBackend's cover model emission) and read by
+// src/runtime/Coverage.h's identically-shaped structs; the run-time half (hit
+// counts, instances, percentages, the report) lives entirely in the runtime.
+//
+// Bin bounds are constant here because a non-constant one is refused in the
+// frontend for now: LRM 19.5.1 allows a covergroup formal in a bin range, which
+// makes the bin SET a per-instance run-time quantity. See the design document's
+// §6.2 on what lifting that costs.
+
+// One inclusive value range of one bin, in the coverpoint's own value space.
+struct CoverRange {
+    uint64_t lo;
+    uint64_t hi;
+};
+
+// Bin kinds, mirroring RT_COVER_BIN_* in src/runtime/Coverage.h.
+enum class CoverBinKind : uint32_t {
+    Normal  = 0,
+    Ignore  = 1,
+    Illegal = 2,
+    // A `default` bin (LRM 19.5): catches what no other bin of the coverpoint
+    // takes and is excluded from the coverage computation. Carries no ranges.
+    Default = 3,
+};
+
+struct CoverBin {
+    // The FULL LRM 19.5.1 bin name, rendered by the frontend: "lo", "b[7]",
+    // "auto[0:1]". Rendered once, here, because 19.11.3 compares bins across
+    // instances BY NAME, so a second naming implementation would be a silent
+    // mis-merge.
+    std::string             name;
+    CoverBinKind            kind = CoverBinKind::Normal;
+    std::vector<CoverRange> ranges;
+};
+
+struct CoverPoint {
+    std::string name;
+    // "<file>:<line>: ", for the illegal-bin fatal and the report.
+    std::string           banner;
+    std::vector<CoverBin> bins;
+    // Resolved instance options (LRM 19.7).
+    uint32_t weight   = 1;
+    uint32_t goal     = 100;
+    uint32_t at_least = 1;
+    // Set when the bins were created automatically (LRM 19.5.3): the coverage
+    // denominator is then `auto_total` = MIN(auto_bin_max, 2^M), per 19.11.1,
+    // which can exceed the number of bins actually laid out.
+    bool     is_auto    = false;
+    uint32_t auto_total = 0;
+    bool     is_signed  = false;
+};
+
+struct CoverType {
+    // The covergroup type name, or the property name for a class-embedded
+    // covergroup, whose type is anonymous in slang.
+    std::string name;
+    std::string banner;
+    // The instance path of the scope that declared it ("top.u1."), so one
+    // covergroup type in a module instantiated twice reports two distinguishable
+    // instances. A covergroup declaration is lowered once per instance, so this is
+    // fixed per entry.
+    std::string             scope;
+    std::vector<CoverPoint> points;
+    uint32_t                weight       = 1;
+    uint32_t                goal         = 100;
+    bool                    per_instance = false;
+};
+
 // `ChangeNotify::field` entry for an edge no `@` / `wait` in the design asks for,
 // so no notifier is laid out and no store classifies that transition.
 inline constexpr uint32_t kNoNotify = ~uint32_t{ 0 };
@@ -730,6 +802,11 @@ public:
     // Compiled concurrent assertions (LRM 16). Indexed by the monitor id a
     // process body refers to; see AssertionMonitor.
     std::vector<AssertionMonitor> monitors;
+    // Covergroup types (LRM 19), indexed by the type index a CoverInfo carries.
+    // One entry per covergroup DECLARATION per instance, not per source
+    // covergroup: a covergroup declared in a module instantiated twice covers two
+    // different sets of signals and reports as two types.
+    std::vector<CoverType> cover_types;
     // The first top instance's name (LRM 35.5.3). Every top gets its own DPI
     // svScope, registered from `tops()`; this is only the fallback name for a
     // design with no top instances at all, and the default `name` for a multi-top

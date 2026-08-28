@@ -732,6 +732,21 @@ Index Builder::proc_wait(ProcOp op, std::span<const Index> args, SourceLoc loc) 
     return emit({ Inst::Tag::ProcWait, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
+Index Builder::cover_query(CoverOp                op,
+                           std::span<const Index> args,
+                           Ref                    type,
+                           uint32_t               type_idx,
+                           uint32_t               point,
+                           SourceLoc              loc) {
+    const ExtraIndex extra = add_extra(CoverInfo{ add_slice(args), type, type_idx, point, op });
+    return emit({ Inst::Tag::CoverQuery, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
+Index Builder::cover_ctl(CoverOp op, std::span<const Index> args, uint32_t type_idx, uint32_t point, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(CoverInfo{ add_slice(args), Ref::Invalid, type_idx, point, op });
+    return emit({ Inst::Tag::CoverCtl, pay(&Inst::Payload::extra, extra) }, loc);
+}
+
 Index Builder::sync_wait(uint32_t site, std::span<const Index> args, SourceLoc loc) {
     const ExtraIndex extra = add_extra(SyncInfo{ add_slice(args), site, SyncOp::Park });
     return emit({ Inst::Tag::SyncWait, pay(&Inst::Payload::extra, extra) }, loc);

@@ -552,6 +552,59 @@ struct ProcCtlInfo {
     ProcOp op   = ProcOp::Self;
 };
 
+// Which functional-coverage primitive a CoverQuery / CoverCtl instruction
+// performs (LRM 19). Split across two tags for the reason the `process` family is
+// split across three: value-ness is a property of the TAG every analysis keys on,
+// not of the payload. See docs/design/functional-coverage.md.
+//
+// A covergroup instance is runtime-owned storage, not a collected object, and a
+// covergroup handle is its 64-bit address; the whole static coverage model (bins,
+// ranges, options) is emitted as read-only constants beside the design, so every
+// op here is a call into the coverage runtime with no IR-visible state.
+// u32-wide (not u8) so CoverInfo has no padding: the ExtraPayload concept
+// requires a unique object representation.
+enum class CoverOp : uint32_t {
+    // CoverQuery.
+    New,           // `cg_type ident = new` -> a covergroup handle
+    Ctx,           // the enclosing object captured at construction (embedded groups)
+    First,         // the first live instance of a covergroup type, or null
+    Next,          // the next instance after this one, or null
+    InstCoverage,  // h.get_inst_coverage() -> real
+    InstCovered,   // its covered-bin count (the `ref int` first argument)
+    InstTotal,     // its total-bin count (the `ref int` second argument)
+    PointCoverage, // h.cp.get_inst_coverage() -> real
+    PointCovered,
+    PointTotal,
+    TypeCoverage, // cg_type::get_coverage() -> real, over every instance
+    TypeCovered,
+    TypeTotal,
+    DesignCoverage, // $get_coverage() (LRM 19.9)
+    // CoverCtl.
+    Hit,     // one coverpoint's sampled value: match bins and count
+    Start,   // h.start() / h.stop()
+    SetName, // h.set_inst_name(s)
+};
+
+// Extra payload for the two coverage tags.
+struct CoverInfo {
+    // SSA operands, in order: the covergroup handle (absent for the type-level and
+    // design-level queries, which name a type index or nothing), then the op's
+    // value arguments -- for Hit the sampled value and its unknown-bit mask, for
+    // Start the 1-bit enable, for SetName the string.
+    ExtraSlice args;
+    // Result type, for CoverQuery only: the 64-bit handle type for New / Ctx /
+    // First / Next, the real type for a coverage percentage, 32-bit signed for a
+    // bin count. Invalid for CoverCtl.
+    Ref type = Ref::Invalid;
+    // Which covergroup type in Module::cover_types this op addresses. Meaningful
+    // for New and the type-level queries; the instance ops read the type off the
+    // instance record instead.
+    uint32_t type_idx = 0;
+    // Which coverpoint of that type, for Hit and the coverpoint-level queries.
+    uint32_t point = 0;
+    CoverOp  op    = CoverOp::New;
+};
+
 // Which wait-queue primitive a SyncWait / SyncCtl instruction performs, for the
 // built-in `semaphore` (LRM 15.3) and `mailbox #(T)` (LRM 15.4). Split across two
 // tags for the reason the `process` family is split across three: suspension is a
@@ -2257,6 +2310,21 @@ struct Inst {
         // ClassImplements above: inserting mid-enum renumbers every later tag and
         // changes the monitor digests sva_test pins.
         ProgramExit,
+
+        // -- Functional coverage (LRM 19, docs/design/functional-coverage.md) --
+        // Every one carries `extra -> CoverInfo`, whose `op` selects the primitive.
+        // A covergroup instance is runtime-owned, immortal storage (LRM 19.11.3
+        // aggregates type coverage over instances the design has dropped), and a
+        // covergroup handle is its address, so none of this touches the collector.
+        // Appended at the end of this enum deliberately, like the two tags above:
+        // inserting mid-enum renumbers every later tag and changes the monitor
+        // digests sva_test pins.
+        //
+        // Value-producing: `new`, the registry walk, and every coverage query.
+        CoverQuery,
+        // Statement, zero-time: a coverpoint sample, `start`/`stop`,
+        // `set_inst_name`.
+        CoverCtl,
     };
 
     // Which union member a tag activates. Drives payload_kind() / operands().
@@ -2612,6 +2680,9 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         // lvalues.
         case T::SyncWait:
         case T::SyncCtl:
+        // functional coverage: extra -> CoverInfo, whose `args` run is the operands.
+        case T::CoverQuery:
+        case T::CoverCtl:
             return K::Extra;
         case T::MonitorEmit:
             return K::FDisplay; // op = descriptor, extra = DisplayInfo
@@ -2715,6 +2786,10 @@ enum class ExtraOperandShape : uint8_t {
     // `extra` is a SyncInfo whose `args` slice is the operand run (the queue's
     // head-word and tail-word lvalues); the site id and op selector are not.
     SyncArgs,
+    // `extra` is a CoverInfo whose `args` slice is the operand run (the covergroup
+    // handle, then the op's value arguments); the type index, coverpoint index, op
+    // selector and result type are not.
+    CoverArgs,
 };
 
 // Constexpr for the same reason as payload_kind(): operand walks inline it.
@@ -2741,6 +2816,11 @@ constexpr ExtraOperandShape extra_operand_shape(Inst::Tag tag) {
         case T::SyncWait:
         case T::SyncCtl:
             return S::SyncArgs;
+        // functional coverage: the handle and the op's value arguments are operands;
+        // the type / coverpoint indices and the op selector are not.
+        case T::CoverQuery:
+        case T::CoverCtl:
+            return S::CoverArgs;
         // loop: the predicate and regions are not top-level operands (the
         // predicate is defined inside the cond region, walked via region()).
         case T::Loop:

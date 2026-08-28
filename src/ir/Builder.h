@@ -399,6 +399,28 @@ public:
     // A parking statement (`await`, `wait fork`).
     Index proc_wait(ProcOp op, std::span<const Index> args, SourceLoc loc);
 
+    // -- Functional coverage (LRM 19, docs/design/functional-coverage.md) --
+    // `args` is the operand run CoverInfo carries: the covergroup handle first
+    // (absent for the type-level and design-level queries), then the op's value
+    // arguments. `type_idx` selects the covergroup type in Module::cover_types and
+    // `point` its coverpoint, both ignored by ops that address neither.
+    //
+    // A value-producing query (`new`, the registry walk, a coverage number);
+    // `type` is its result type.
+    Index cover_query(CoverOp                op,
+                      std::span<const Index> args,
+                      Ref                    type,
+                      uint32_t               type_idx,
+                      uint32_t               point,
+                      SourceLoc              loc);
+    // A zero-time statement (a coverpoint sample, `start`/`stop`,
+    // `set_inst_name`).
+    Index cover_ctl(CoverOp                op,
+                    std::span<const Index> args,
+                    uint32_t               type_idx,
+                    uint32_t               point,
+                    SourceLoc              loc);
+
     // -- Wait queue of a built-in synchronization object (LRM 15.3, 15.4) --
     // `args` is the operand run SyncInfo carries: the queue's head-word lvalue,
     // then its tail-word lvalue. `site` identifies the wait, and a `Leave` MUST

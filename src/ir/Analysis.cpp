@@ -169,6 +169,12 @@ TagInfo tag_info(Inst::Tag tag) {
         // (docs/design/mailbox-and-semaphore.md §5.1).
         case Inst::Tag::SyncWait:
         case Inst::Tag::SyncCtl:
+        // Functional coverage (LRM 19). Sampling calls into the coverage runtime and
+        // is testbench code by construction, never the sensitivity-driven RTL shape
+        // thunk elision targets, so the family blocks elision rather than being
+        // modelled (docs/design/functional-coverage.md).
+        case Inst::Tag::CoverQuery:
+        case Inst::Tag::CoverCtl:
             return blocks;
 
         // -- Synthesizable but not pure: the assignments, and the aggregate
@@ -1550,6 +1556,11 @@ struct ValueSweep {
                 case Inst::Tag::ProcWait:
                 case Inst::Tag::SyncWait:
                 case Inst::Tag::SyncCtl:
+                // Functional coverage (LRM 19): a handle, a percentage, a bin count,
+                // or a statement -- all definite 2-state, none derived from an
+                // operand's planes.
+                case Inst::Tag::CoverQuery:
+                case Inst::Tag::CoverCtl:
                 case Inst::Tag::MonitorSet:
                 case Inst::Tag::MonitorEmit:
                 case Inst::Tag::MonitorOn:
