@@ -31,8 +31,18 @@ below: same-instant updates must commit in statement-execution order (a monotoni
 LRM 10.4.2), and a `#0` delay cannot arm the wheel (`deadline` must be `> now`) so
 it pushes straight onto the ready list to commit in the current instant's NBA
 region. B2 has since landed, as have bit/part-select, unpacked-array element, and
-packed/unpacked struct field targets; every remaining loud-failing shape is scoped
-in "The remainder" below.
+packed/unpacked struct field targets.
+
+**Remainder phases R-a and R-b have also landed.** R-a: every decomposing target
+(a concatenation, a streaming concatenation, an assignment-pattern lvalue, and a
+whole unpacked struct or array) now arms one deferred record per leaf over one
+sampled RHS and one evaluation of the delay / count, and a non-positive repeat
+count assigns with no wait per 9.4.5. R-b: a nonblocking write through a virtual
+interface handle commits into the instance the handle named, and a multi-signal
+trigger `@(a or b)` puts the record on every listed trigger with real
+first-fire-wins removal. R-c (`iff`) and R-d (the owned-handle record class, so
+`s <= #5 t` and `q <= #2 r`) remain scoped and loud-failing, as do the blocking
+form's own two gaps; all of them are in "The remainder" below.
 
 Ordering refinement: a **compile-time** `#0` is const-folded in the frontend and
 lowered as a plain `<=` (StoreNb), so it shares the one block-commit path and its
@@ -234,18 +244,30 @@ pointer past the end of its array (LRM 7.4.5 / 11.5.1).
   shapes the deferred record can encode: a whole integral or real scalar, a
   bit/part-select of an integral base (constant or variable index), an
   unpacked-array element, and a packed or unpacked struct field.
-- **Guards (fail loud)**: a concatenation, a streaming concatenation,
-  an assignment-pattern lvalue and a whole unpacked struct / array target (the
-  sampled RHS would have to be spread across one record per decomposed piece); a
-  string target and a whole container target (both need an owned staged handle the
-  record has no field for); a nonblocking write through a virtual interface handle
-  (the record carries no resolved instance); a multi-signal trigger `@(a or b)` or an
-  `iff` qualifier. A runtime-offset select of a vector wider than
-  `wide_dyn_select_bits` also fails loud in the backend: it addresses words through
-  `rt_wide_ins` rather than a storage-width mask, which is the only encoding the
-  record has room for. A queue / dynamic-array / associative-array **element** is
-  not in this list: LRM 6.21 forbids a nonblocking assignment to one outright, timed
-  or not (see "The remainder"). Each guard is scoped there.
+- **Decomposing targets** (R-a): a concatenation, a streaming concatenation, an
+  assignment-pattern lvalue and a whole unpacked struct / array are no longer
+  refused. `lower_assign` lowers the timing once into an `IntraNbTiming` and threads
+  it, as a nullable `const IntraNbTiming*` beside the existing store tag, through the
+  same walkers plain NBA uses (`store_concat` / `store_stream_target` /
+  `lower_pattern_assign` / `emit_agg_store` / `emit_agg_copy`); each leaf emits its
+  own `StoreNbDelay` / `StoreNbEvent`. A plain pointer rather than a leaf-emitter
+  callback, so every ordinary assignment pays a null test and not an indirect call.
+- **Guards (fail loud)**: a **string** target and a whole
+  **container** target (both need an owned staged handle the record has no field
+  for, R-d) — `Lower.cpp:5332`, `:6057`, `:5302`, `:24556`; an `iff` qualifier
+  (R-c) — `:24268`; a **conditional RHS** over a whole unpacked aggregate
+  (`:5215`), an **aggregate with a container member** (`:5318`), an **indexed
+  array-slice** target (`:24657`) and a **string / container operand of a streaming
+  target** (`:27590`), all narrowed out of the old blanket whole-aggregate refusal;
+  a write to a **force target**, including one reached as a concatenation operand
+  (`:24421`, `:8726`); and the **blocking** form's assignment-pattern lvalue
+  (`:24498`), whole unpacked aggregate (`:24519`) and string / array target
+  (`:24601`). A runtime-offset select of a vector wider than `wide_dyn_select_bits`
+  also fails loud in the backend (`LlvmBackend.cpp:21417`): it addresses words
+  through `rt_wide_ins` rather than a storage-width mask, which is the only encoding
+  the record has room for. A queue / dynamic-array / associative-array **element**
+  is not in this list: LRM 6.21 forbids a nonblocking assignment to one outright,
+  timed or not (see "The remainder"). Each remaining guard is scoped there.
 
 ## Efficiency
 
@@ -346,13 +368,12 @@ property) and plain NBA does not lower it either
 (`Lower.cpp:24131-24140`). It is the class-property NBA gap, tracked on its own; the
 intra path has nothing to reuse until that lands, and gets it for free afterwards.
 
-### R1 — the decomposing shapes: concat, streaming concat, pattern, whole aggregate
+### R1 — the decomposing shapes: concat, streaming concat, pattern, whole aggregate — LANDED
 
-Four refusals (`Lower.cpp:24159` assignment-pattern lvalue, `:24175` whole unpacked
-struct/array, and the `default: return false` in `intra_nb_target_path` for a
-concatenation and a streaming concatenation) share one answer: plain NBA already
-decomposes each into *N* ordinary `StoreNb`s over shapes the deferred record
-encodes today.
+Four refusals (assignment-pattern lvalue, whole unpacked struct/array, and the
+`default: return false` in `intra_nb_target_path` for a concatenation and a
+streaming concatenation) shared one answer: plain NBA already decomposes each into
+*N* ordinary `StoreNb`s over shapes the deferred record encodes today.
 
 | target | plain-NBA decomposition | site |
 |---|---|---|
@@ -363,9 +384,16 @@ encodes today.
 | `mem <= other` (whole unpacked array) | `emit_agg_copy`, per element | `Lower.cpp:24386-24396`, `:5877` |
 
 The intra version of each is the same walk emitting `StoreNbDelay` / `StoreNbEvent`
-per leaf instead of `StoreNb`. `store_concat` is already tag-parameterised, but a
-tag is not enough here: the deferred ops carry an `Extra` payload, so the walkers
-take a leaf-emitter callback rather than an `Inst::Tag`.
+per leaf instead of `StoreNb`. `store_concat` was already tag-parameterised, but a
+tag is not enough here: the deferred ops carry an `Extra` payload.
+
+**As built**, the walkers take a nullable `const IntraNbTiming*` *beside* the
+`Inst::Tag`, not the leaf-emitter callback this section originally proposed. The
+POD carries the already-lowered delay / count / trigger list; a null pointer is the
+ordinary path and every non-intra caller passes it by default. The reason is cost:
+these walkers lower every ordinary assignment in the design, so the feature has to
+be one null test per leaf rather than an indirect call on all of them. One shared
+`store_leaf` does the dispatch.
 
 Three semantics the walk must get right, all of them already decided:
 
@@ -392,10 +420,9 @@ heap-side payload** already listed as a plain-NBA perf follow-up
 (`Lower.cpp:24393-24396`); it serves both paths and belongs to neither
 exclusively. Decompose first, correctly; share that optimisation later.
 
-### R2 — one `SignalSlot` flag: the pointer-carrying scalar record
+### R2 — one `SignalSlot` flag: the pointer-carrying scalar record — LANDED
 
-`vif.sig <= #5 x` is refused at `Lower.cpp:24211-24224` for an exactly-stated
-reason: plain `vif.sig <= x` works because its record carries the resolved instance
+`vif.sig <= #5 x` was refused for an exactly-stated reason: plain `vif.sig <= x` works because its record carries the resolved instance
 (`arr_rec_ctx`), while `emit_intra_commit` resolves a non-array destination by
 hoisting the link-time-constant `storage_ptr(s)` out of the record loop
 (`LlvmBackend.cpp:21697-21700`) — so a deferred update through a handle would land in
@@ -417,8 +444,20 @@ This is not merely convenient; it is the semantics LRM 10.4.2 requires:
 
 Capturing the resolved destination at arm time *is* "evaluated at the same time as
 the RHS". The array-element path already obeys this clause; `intra_ptr` extends the
-same obedience to the handle-resolved scalar. The wake also follows the array
-precedent (level-only `service_any_waiters`, since a vif member has no `nba_id`).
+same obedience to the handle-resolved scalar.
+
+**Correction, found in implementation.** The wake does NOT follow the array
+precedent, and this section's original claim that it should ("level-only
+`service_any_waiters`, since a vif member has no `nba_id`") is wrong. An array
+element has no edge semantics — slang rejects `@(posedge mem[i])` — which is
+exactly why `service_any_waiters` serves only the Any bucket. A vif member is a
+scalar and `@(posedge intf.sig)` is legal, so a level-only wake would never wake
+its edge readers. It follows the PLAIN-NBA vif record instead: the record also
+carries the resolved instance context, and the commit wakes **per record** under a
+`CtxOverride` built from it (`service_wait_queue` + `vcd_touch_signal`), because
+two records of one signal may have landed in different instances. `collect_vif_nba`
+also had to learn to scan `StoreNbDelay` / `StoreNbEvent`, so an intra-only write
+marks the member.
 
 ### R3 — one new record class: the owned handle (string, whole container)
 
@@ -452,14 +491,13 @@ intra-assignment queues to power-on). That obligation is what makes this the
 largest single item in the remainder, and it is also what closes the standing
 `q <= #2 r` entry.
 
-### R4 — trigger side: a multi-signal trigger `@(a or b)`
+### R4 — trigger side: a multi-signal trigger `@(a or b)` — LANDED
 
-Refused at `Lower.cpp:24292-24295`. The single-trigger assumption is baked in at
-four levels: `StoreNbEventInfo` carries one `(Signal trig, uint32_t edge)` pair
-(`Ir.h:205-214`); the frontend checks `events.size() != 1`;
-`emit_intra_event_arm` calls `rt_intra_event_register` exactly once
-(`LlvmBackend.cpp:21650`); and `rt_intra_rec` has no way to be found in a *second*
-trigger's pending vector (`Runtime.cpp:3049-3070`).
+The single-trigger assumption was baked in at four levels: `StoreNbEventInfo`
+carried one `(Signal trig, uint32_t edge)` pair; the frontend checked
+`events.size() != 1`; `emit_intra_event_arm` called `rt_intra_event_register`
+exactly once; and `rt_intra_rec` had no way to be found in a *second* trigger's
+pending vector.
 
 What it needs: an `ExtraSlice` of `(trig, edge)` pairs in the payload, a `trig_id`
 allocated per listed event, one `rt_intra_event_register` call per event for the
@@ -475,7 +513,21 @@ targeting that signal — the same per-`SignalSlot` monomorphisation that `is_ar
 removes the record from each other listed id by pointer identity, which the existing
 in-place list compaction already does the work of. The scan is paid only on the
 maturing edge and only by multi-trigger sites; single-trigger codegen is unchanged
-(`intra_trigs == 1` adds no field).
+(`intra_trigs <= 1` adds no field), which was checked by diffing `clotho build
+--emit llvm` for a single-trigger design across the change.
+
+**As built**, two details this sketch did not have. The trigger list is an
+`ExtraSlice` of packed two-word `IntraTrigger` records (the `WaitInfo` encoding),
+packed ONCE per statement so an N-leaf decomposing target interns one list, not N.
+And the record's id array is filled from `trigger_id_value`, not from compile-time
+constants: a dense trigger id is a per-INSTANCE link-time constant
+(`abs_id_const`) while twin instances of a definition share the emitted code, so a
+constant global would name one instance's triggers from both. That is also why the
+array has to live in the record rather than beside it — a first attempt at a
+private constant global was wrong for exactly this reason, and there is a
+twin-instance test for it. The runtime learns the list through
+`rt_intra_event_register_group(ids, n, rec)`, where `ids` points into the record's
+own (stable) tail.
 
 ### R5 — trigger side: an `iff` qualifier
 
@@ -511,7 +563,7 @@ contemplate; with it, there is one honest evaluation point.
   of a storage-width mask, so its value and mask do not fit the record's
   storage-width fields. Same answer as the whole-aggregate case: a heap-side
   payload. Group it with that shared follow-up rather than growing the record.
-- **A non-positive repeat count.** 9.4.5: "If the repeat count literal, or signed
+- **A non-positive repeat count** — LANDED. 9.4.5: "If the repeat count literal, or signed
   variable holding the repeat count, is less than or equal to 0 at the time of
   evaluation, the assignment occurs as if there is no repeat construct." The blocking
   form gets this from its signed `Lt` bound (`lower_intra_timing`,
@@ -522,6 +574,21 @@ contemplate; with it, there is one honest evaluation point.
   `emit_intra_nba_arm` already has for a runtime zero delay
   (`LlvmBackend.cpp:21459-21462`), which is the nonblocking spelling of "the store
   happens immediately". Local, and it makes the two forms agree.
+
+  **As built**, the decision is made in the FRONTEND, not at the arm site: fold it
+  when the count is a constant, otherwise emit `count < 1` and route the true arm to
+  a plain `StoreNb`. Two corrections to the sketch above, both measured against
+  iverilog 13. The test is `count < 1` **in the count's own signedness**, which is
+  `<= 0` for a signed count and `== 0` for an unsigned one — so an unsigned count
+  does need a test, because zero is zero in both signednesses and clamps either way,
+  while an unsigned variable holding -3 is 4294967293 and correctly waits (the
+  clause's own example). And the bug was never only about NEGATIVE counts: a count
+  of exactly 0 underflowed the same `uint32_t` countdown. An x/z count narrows
+  through `CaseEq`, so the rule is "clamp only when the count is KNOWN
+  non-positive"; 9.4.5 says nothing about an unknown count. For a decomposing
+  target the test sits at each leaf, re-testing one already-evaluated SSA value,
+  rather than wrapping the walk — wrapping it would re-lower every leaf's RHS in
+  both arms and break single evaluation.
 
 ### The blocking form's own remainder (Class A)
 
@@ -537,12 +604,20 @@ Two gaps, both distinct from everything above:
 
 ### Phases
 
-- **R-a** — R1 (the four decomposing shapes) and R6's repeat-count clamp. Pure
-  frontend, no record change, closes the largest number of refusals for the least
-  new mechanism.
-- **R-b** — R2 (`intra_ptr`, the vif member) and R4 (multi-signal trigger). One
-  `SignalSlot` flag and one record-tail array; both are extensions of tails that
-  already exist.
+- **R-a** — LANDED. R1 (the four decomposing shapes) and R6's repeat-count clamp.
+  Pure frontend, no record change, closed the largest number of refusals for the
+  least new mechanism. It also narrowed what remains: the old blanket
+  whole-aggregate refusal is now four specific ones (a conditional RHS, an
+  aggregate with a container member, an indexed array slice, and a
+  string/container operand of a streaming target).
+- **R-b** — LANDED. R2 (`intra_ptr`, the vif member) and R4 (multi-signal
+  trigger). One `SignalSlot` flag and one record-tail array, both extensions of
+  tails that already existed. R2 turned out to need the instance CONTEXT as well as
+  the pointer (see the correction under R2), and R4's id array had to live in the
+  record rather than in a constant global (see R4). Landing R2 also surfaced and
+  fixed a latent runtime bug: `rt_intra_alloc` recycled a pooled record without
+  checking its stride, so a design whose record is wider than a previous
+  in-process design's for the same dense site id overflowed it.
 - **R-c** — R5 (`iff`), which needs the per-site guard function and a fire-time call.
 - **R-d** — R3 (the owned-handle record class), largest because of the free
   discipline. Closes `q <= #2 r` and `s <= #5 t` together.
@@ -555,6 +630,24 @@ Two gaps, both distinct from everything above:
 Permanent, by the LRM: a queue / dynamic-array / associative-array **element**
 (6.21), and an automatic variable (10.4.2). Tracked elsewhere: a class property
 (the class-property NBA gap). Everything else in the remainder above is closable.
+
+After R-a and R-b, what still fails loud, with where:
+
+| shape | guard |
+|---|---|
+| a `string` target (R-d) | `Lower.cpp:5332`, `:6057`, and the generic `:24556` |
+| a whole queue / dynamic array (R-d) | `Lower.cpp:5302`, `:24556` |
+| an aggregate with a container member (R-d) | `Lower.cpp:5318` |
+| an `iff` qualifier (R-c) | `Lower.cpp:24268` |
+| a conditional RHS over a whole aggregate | `Lower.cpp:5215` |
+| an indexed array-slice target | `Lower.cpp:24657` |
+| a string / container operand of a streaming target | `Lower.cpp:27590` |
+| a write to a force target (whole, or a concat operand) | `Lower.cpp:24421`, `:8726` |
+| a runtime-offset select of a very wide vector | `LlvmBackend.cpp:21417` |
+| BLOCKING: an assignment-pattern lvalue | `Lower.cpp:24498` |
+| BLOCKING: a whole unpacked struct / array | `Lower.cpp:24519` |
+| BLOCKING: a string or array target | `Lower.cpp:24601` |
+| a class property (tracked as the class-property NBA gap) | `Lower.cpp:24448` |
 
 ### Oracle
 
