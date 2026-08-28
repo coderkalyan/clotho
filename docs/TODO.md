@@ -3169,8 +3169,10 @@ unconnected ports) must seed the z-elision analysis (`compute_may_z`,
 - [ ] **`export pkg::*;` pure pass-through** — a name the exporting package never
   itself references fails to resolve (slang lookup limitation). The
   internally-referenced form works.
-- [ ] **Package-scope classes / covergroups / checkers / nettypes** — hit their
-  own (pre-existing) unsupported-construct guard if referenced.
+- [ ] **Package-scope checkers / nettypes** — hit their own (pre-existing)
+  unsupported-construct guard if referenced. Package-scope classes and covergroups
+  are fine: both are types lowered on demand at the point of use, so the declaring
+  scope never matters (see M4 "Functional coverage" for the covergroup half).
 - [x] **Packages** — `package`/`endpackage`; `import` (explicit `p::name` and
   wildcard `p::*`), bare `pkg::name` resolution, `$unit` scope, package/`$unit`-scope
   variables (one shared signal). Partial `export` re-export and package-importing-
@@ -4470,10 +4472,97 @@ project with its own algorithm, not tail cleanup on the property layer:
 
 ### Functional coverage
 
-- [ ] **`covergroup`** — `coverpoint`, `bins` (explicit, ranges, arrays),
-  transition bins, `wildcard`, `illegal_bins`/`ignore_bins`, `cross`.
-- [ ] **Coverage methods & options** — `sample()`, `get_coverage()`,
-  `get_inst_coverage()`, per-instance options, `option`/`type_option`.
+Designed and built in **docs/design/functional-coverage.md** — the type
+representation, the bin model, the sampling region, the coverage arithmetic, the
+report, and the phase plan. Clause 19 is four algorithms with almost no shared
+code (bin algebra; transition automaton; cross select algebra; accounting and
+report), plus cheap plumbing over mechanisms clotho already has.
+
+- [x] **P0 — type, instance, value bins, a number** — a covergroup type is a
+  nullable 64-bit HANDLE onto a runtime-owned instance record (not a
+  `Kind::Class`: LRM 19.11.3 aggregates type coverage over instances the design
+  has dropped, so an instance must outlive every reference and must not be
+  collected — which also meant not one of the seven `const ClassType*`-keyed
+  Lowerer maps had to be widened). `new` is one runtime call capturing the
+  enclosing `this` for an embedded group, so a covergroup covers the object that
+  BUILT it however sample() is later reached (19.4). Bins are static model data
+  the frontend folds and the backend emits as constants (`clotho.cover.config`,
+  mirroring src/runtime/Coverage.h), with the matcher, the counters and the 19.11
+  arithmetic in src/runtime/Coverage.cpp: explicit value bins (sets, ranges, `$`,
+  `[]` named `b[value]`, `[N]`, `default`), automatic bins including 19.5.3's enum
+  form named after the constants, `ignore_bins`, `illegal_bins` with the located
+  run-time fatal (19.5.6 precedence over every other bin), `option.at_least` /
+  `weight` / `goal` / `auto_bin_max` / `per_instance`, `sample()`,
+  `get_inst_coverage()` / `get_coverage()` in both arities, `$get_coverage`, and a
+  deterministic text report behind `--coverage <file>`.
+- [x] **P1 — the trigger** — `@(edge sig)` / `@(event)` coverage events as ONE
+  `Activation::Observed` process per covergroup type walking that type's instance
+  registry (per-instance processes would pay an unconditional coroutine round trip
+  each settled point), using the SVA monitor's `clk_now & ~clk_was` detector
+  (:17021) but latching the LIVE clock per Observed pass rather than a Preponed
+  shadow: 19.3 says a covergroup samples "the instant the clocking event takes
+  place" and samples again if the event recurs in the same time step, the opposite
+  of a clocking block's sticky latch. Plus `start()` / `stop()` and
+  `set_inst_name()`.
+- [ ] **P2 — guards, formals, cross** — `iff` at group / coverpoint / bin level;
+  `with function sample(args)` (the UVM shape: a covergroup sampled with values
+  the caller holds); `wildcard` bins; covergroup formals and, by the same
+  mechanism, non-constant bin bounds (LRM 19.5.1's `bins good = {[low:high]}`
+  makes the bin SET per-instance, so the table moves from static model data to one
+  built at construction); then cross — implicit coverpoints, auto cross bins,
+  `binsof` / `intersect` / `!` / `&&` / `||`, `with (expr) [matches N]`,
+  `cross_retain_auto_bins`, `cross_num_print_missing`.
+- [ ] **Transition bins** (P3) — `trans_list`, `[* r]` / `[-> r]` / `[= r]`,
+  `default sequence`, per-bin pending state, at-most-once-per-sample, overlapping
+  matches. A per-bin NFA over the sampled-value stream: libsva's problem SHAPE,
+  not its code (no clock, alphabet is value ranges, a match is a count).
+- [ ] **Accounting completeness** (P4) — `type_option.merge_instances`
+  union-by-bin-name and, with it, `max(at_least)` across instances (19.11.1);
+  `option.per_instance` reporting policy; `option.get_inst_coverage`;
+  `type_option.weight` / `goal` / `comment`; `option.name` / `comment`;
+  `detect_overlap` warnings. The rest of 19.11 landed in P0: the weighted
+  averages, the zero-denominator table at all three levels, per-instance and type
+  coverage, and `$get_coverage`.
+- [ ] **Coverage corners** (P5) — real-typed coverpoints and
+  `type_option.real_interval` (a second bin algebra over floats),
+  `covergroup extends` (19.4.1, needs `TransparentMemberSymbol` unwrapping —
+  slang's `membersOfType<T>()` silently returns nothing for an inherited
+  coverpoint), `type_option.strobe` (Postponed sampling; clotho has no Postponed
+  activation but `rt_strobe_pend`/`rt_strobe_pop` is the LRM's own analogy),
+  `distribute_first`, set-expression bins (19.5.1.2 / 19.6.1.4),
+  `@@(begin/end blk)` block events (no block entry/exit hook exists anywhere),
+  `detect_overlap`.
+- [ ] **The coverage database** — `$set_coverage_db_name`, `$load_coverage_db`,
+  `$coverage_merge`, `$coverage_save`, `$coverage_control`, `$coverage_get`,
+  `$coverage_get_max`. LRM 19.9 specifies no format; cross-run merge is an
+  interchange decision, not a simulation one. Refused; clotho emits a
+  deterministic text report instead.
+- [x] **A covergroup coverpoint may reference a class member declared later**
+  (LRM 8.6/19.4/19.5) — landed in slang via
+  `patches/slang-class-forward-ref.patch`; see the Classes entry above. A hard
+  prerequisite for every embedded covergroup in real UVM code.
+- [x] **`covergroup` misdiagnosis** — `lower_type` names covergroups instead of
+  falling through to `unsupported non-integral type`; see the UVM enablers entry
+  below.
+
+Oracle position, measured: **iverilog cannot parse covergroups at all**, and
+**Verilator's numbers are not LRM 19.11** — it reports pooled bins
+(2/5 = 40%) where 19.11 specifies the weighted average of per-item coverage
+(`(1/4 + 1/1)/2 = 62.5%`), names `bins hi[] = {[3:5]}` as `hi[0..2]` instead of
+19.5.1's `hi[3..5]`, names auto bins `auto_0` instead of `auto[0:1]`, and returns
+`0.0` from `cg::get_coverage()`. Verilator IS a good oracle for per-bin hit
+COUNTS (its 19.5.3 auto-bin distribution matched exactly). So percentages, bin
+names and type coverage are hand-derived from the clause text the way the SVA
+layer's `diff_not.sv` expectation was: tests/coverage_test.cpp carries 28 cases
+built that way, including 62.5%-not-40% as a NEGATIVE assertion so a refactor that
+pools bins fails the suite instead of silently agreeing with Verilator.
+
+Adjacent, exposed by this work and tracked with it: immediate `cover` counts
+nothing and does so SILENTLY (src/Lower.cpp:16064-16101 leaves the else-region
+empty), and
+`cover property`'s tally `sva.<id>.cov` (:13389) is correct, live, and read by
+nothing — reporting it needs `ir::AssertionMonitor::label`
+(src/ir/Module.h:447), declared "for a report" and never assigned.
 
 ### Foreign interface
 
@@ -4868,7 +4957,10 @@ project with its own algorithm, not tail cleanup on the property layer:
   functions in constraints, `disable soft`, iterative constraints, constraint
   inheritance.
 - [ ] **Coverage corners** — real coverpoints, type coverage, cross with `binsof`
-  expressions, coverage merge/database semantics.
+  expressions, coverage merge/database semantics. All five are itemized with their
+  blockers under M4 "Functional coverage" (P2, P4, P5 and the database entry) and
+  scoped in docs/design/functional-coverage.md; tracked here only so the M5 list
+  is complete.
 - [ ] **Attributes** (`(* ... *)`) — parse-through today via slang; expose where
   semantically meaningful.
 
