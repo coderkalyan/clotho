@@ -4972,10 +4972,12 @@ private:
         // 9.4.5). Empty when the decision folded at lower time, or when the count
         // is unsigned and so has no non-positive value to test for.
         std::optional<ir::Index> nonpos{};
-        // The (signal, edge) the event form waits on.
-        ir::Signal trig{};
-        uint32_t   edge     = 0;
-        bool       is_event = false;
+        // The (signal, edge) triggers the event form waits on, packed once into the
+        // builder's extra buffer so every leaf of a decomposing target shares one
+        // list. Several triggers means `@(a or b)`: the first to bring the countdown
+        // to zero matures the store.
+        ir::ExtraSlice trigs{};
+        bool           is_event = false;
     };
 
     // Emit one leaf store of an assignment. `t` null -- every caller but the
@@ -4996,7 +4998,7 @@ private:
             return;
         }
         if (!t->nonpos) {
-            b.store_nb_event(lv, v, t->count, t->trig, t->edge, l);
+            b.store_nb_event(lv, v, t->count, t->trigs, l);
             return;
         }
         // LRM 9.4.5: "If the repeat count literal, or signed variable holding the
@@ -5018,7 +5020,7 @@ private:
         const ir::ExtraSlice now_r = b.close_region();
 
         b.open_region();
-        b.store_nb_event(lv, v, t->count, t->trig, t->edge, l);
+        b.store_nb_event(lv, v, t->count, t->trigs, l);
         const ir::ExtraSlice wait_r = b.close_region();
 
         b.cond(*t->nonpos, now_r, wait_r, l);
@@ -24264,13 +24266,24 @@ private:
             // the deferred-record path (store_nb_event) has no guard hook.
             fail("iff qualifier on a nonblocking intra-assignment event is not supported");
         }
-        if (events.size() != 1) {
-            // TODO: a multi-signal trigger `@(a or b)` needs the record on
-            // several trigger lists with first-fire-wins removal.
-            fail("nonblocking intra-assignment multi-signal event trigger is not supported");
+        if (events.empty()) {
+            fail("nonblocking intra-assignment requires a delay or event control");
         }
-        t.trig = events[0].signal;
-        t.edge = static_cast<uint32_t>(events[0].edge);
+        // Duplicate (signal, edge) pairs are collapsed. The record is registered
+        // once per listed trigger, so `@(posedge a or posedge a)` would otherwise
+        // sit on one trigger's list twice and count a single edge down twice.
+        std::vector<ir::IntraTrigger> trigs;
+        trigs.reserve(events.size());
+        for (const ir::WaitEvent& ev : events) {
+            const ir::IntraTrigger it{ ev.signal, static_cast<uint32_t>(ev.edge) };
+            const bool             dup = std::any_of(trigs.begin(), trigs.end(), [&](const ir::IntraTrigger& o) {
+                return o.signal == it.signal && o.edge == it.edge;
+            });
+            if (!dup) {
+                trigs.push_back(it);
+            }
+        }
+        t.trigs = b.intra_trigger_run(trigs);
         return t;
     }
 

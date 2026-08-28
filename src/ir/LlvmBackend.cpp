@@ -660,6 +660,12 @@ struct SignalSlot {
     // time as the expression on the right-hand side." Capturing the resolved
     // destination at arm time IS that rule.
     bool     intra_ptr     = false;
+    // Longest `<= @(a or b)` trigger list over the sites targeting this signal.
+    // 0 or 1 means every site names one trigger, and the record carries no trigger
+    // array at all -- byte-identical codegen to before multi-trigger support. Above
+    // that, each record holds the dense ids IT registered on, so the first trigger
+    // to mature it can take it off the others (rt_intra_event_register_group).
+    uint32_t intra_trigs   = 0;
     uint32_t nba_id        = 0;
     uint32_t sh_mm_field   = 0;
     uint32_t sh_z_field    = 0;
@@ -4175,13 +4181,21 @@ private:
             // intra target (deferred record + NBA-region commit), and the trigger
             // (signal, edge) gets a dense id so both wake paths can fire its records.
             if (ir.tag(idx) == Inst::Tag::StoreNbEvent) {
-                const auto      info = ir.extra_data<StoreNbEventInfo>(ir.payload(idx).op_extra.extra);
-                const NbaTarget t    = nba_target(ir, ir.payload(idx).op_extra.op);
+                const NbaTarget t = nba_target(ir, ir.payload(idx).op_extra.op);
                 classify_intra_target(ir, ir.payload(idx).op_extra.op, t);
-                int32_t& tid = trigger_id_[static_cast<uint32_t>(info.trig)][info.edge];
-                if (tid < 0) {
-                    tid = static_cast<int32_t>(n_triggers_++);
+                // Every LISTED trigger needs its own dense id: `@(a or b)` puts the
+                // record on both lists, and signal_has_waiters / has_bucket key edge
+                // detection off `trigger_id(sig, e) >= 0`, so a listed signal that
+                // nothing else is sensitive to still has to be watched.
+                const auto trigs = ir.intra_trigs(ir.payload(idx).op_extra.extra);
+                for (const IntraTrigger& tr : trigs) {
+                    int32_t& tid = trigger_id_[static_cast<uint32_t>(tr.signal)][tr.edge];
+                    if (tid < 0) {
+                        tid = static_cast<int32_t>(n_triggers_++);
+                    }
                 }
+                SignalSlot& ts = slots_[static_cast<uint32_t>(t.sig)];
+                ts.intra_trigs = std::max(ts.intra_trigs, static_cast<uint32_t>(trigs.size()));
                 continue;
             }
             if (ir.tag(idx) == Inst::Tag::EventTriggerNbEvent) {
@@ -14392,6 +14406,10 @@ private:
     llvm::FunctionCallee intra_event_register_fn() {
         return rt_fn("rt_intra_event_register", b_.getVoidTy(), { b_.getInt32Ty(), raw_ptr_ty() });
     }
+    llvm::FunctionCallee intra_event_register_group_fn() {
+        return rt_fn("rt_intra_event_register_group", b_.getVoidTy(),
+                     { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
+    }
     llvm::FunctionCallee intra_event_fire_fn() {
         return rt_fn("rt_intra_event_fire", b_.getVoidTy(), { b_.getInt32Ty() });
     }
@@ -14454,6 +14472,16 @@ private:
                 f.push_back(ptr);
             }
         }
+        if (s.intra_trigs > 1) {
+            // The dense trigger ids this record registered on, so rt_intra_event_fire
+            // can remove it from the ones that did not fire. It lives in the RECORD
+            // rather than in a constant global because a trigger id is a per-INSTANCE
+            // link-time constant (abs_id_const): twin instances of one definition
+            // share the emitted code and have different ids, so a baked-in array
+            // would name the wrong instance's triggers. Placed last so that adding it
+            // moves no existing tail index.
+            f.push_back(llvm::ArrayType::get(i32, s.intra_trigs));
+        }
         return llvm::StructType::get(ctx_, f);
     }
     // Tail field indices of the scalar / array variant (mm_val=6, z_val=7 are
@@ -14466,6 +14494,17 @@ private:
     uint32_t intra_rec_z_ptr(const SignalSlot& s) const { return intra_rec_mm_ptr(s) + 1; }
     uint32_t intra_rec_ctx(const SignalSlot& s) const {
         return intra_rec_mm_ptr(s) + (s.has_z ? 2 : 1);
+    }
+    // Index of the trailing `[intra_trigs x i32]`; only when s.intra_trigs > 1.
+    uint32_t intra_rec_trigs(const SignalSlot& s) const {
+        uint32_t i = intra_rec_mm_ptr(s);
+        if (s.is_array || s.intra_ptr) {
+            i += s.has_z ? 2 : 1;
+        }
+        if (s.intra_ptr) {
+            i += 1;
+        }
+        return i;
     }
 
     // Per array-NBA signal: dense id (buffer index) and the record StructType
@@ -17651,10 +17690,13 @@ private:
                 emit_bounds_reports(lv, /*is_write=*/true);
                 // Deliberately bare, and asserted rather than assumed: see StoreNbDelay.
                 assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
-                const Plane   rhs   = value_of(info.value);
-                llvm::Value*  count = must_of(value_of(info.count));
-                emit_intra_event_arm(lv, rhs, count,
-                                     trigger_id_value(info.trig, info.edge));
+                const Plane  rhs   = value_of(info.value);
+                llvm::Value* count = must_of(value_of(info.count));
+                llvm::SmallVector<llvm::Value*, 4> ids;
+                for (const IntraTrigger& tr : ir_->intra_trigs(p.op_extra.extra)) {
+                    ids.push_back(trigger_id_value(tr.signal, tr.edge));
+                }
+                emit_intra_event_arm(lv, rhs, count, ids);
                 return;
             }
 
@@ -21674,7 +21716,8 @@ private:
     // trigger edge fires (blocking store or NBA commit), rt_intra_event_fire counts
     // the record down and, at zero, moves it to the target ready list for the NBA
     // region (emit_intra_commit). Same value/plane layout as emit_intra_nba_arm.
-    void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count, llvm::Value* trig_id) {
+    void emit_intra_event_arm(const LValue& lv, Plane rhs, llvm::Value* count,
+                              llvm::ArrayRef<llvm::Value*> trig_ids) {
         if (lv.dyn_inrange != nullptr) {
             // Out-of-range variable index: register nothing (see emit_intra_nba_arm).
             auto* fn   = b_.GetInsertBlock()->getParent();
@@ -21686,7 +21729,7 @@ private:
             LValue clean      = lv;
             clean.dyn_inrange = nullptr;
             clean.bounds_checks.clear();
-            emit_intra_event_arm(clean, rhs, count, trig_id);
+            emit_intra_event_arm(clean, rhs, count, trig_ids);
             b_.CreateBr(cont);
 
             b_.SetInsertPoint(cont);
@@ -21701,7 +21744,36 @@ private:
         b_.CreateStore(idxv, b_.CreateStructGEP(rt, rec, 2));
         b_.CreateStore(cast(count, 32, false), b_.CreateStructGEP(rt, rec, 4)); // event countdown
         fill_intra_payload(lv, rhs, rt, rec);
-        b_.CreateCall(intra_event_register_fn(), { trig_id, rec });
+        if (trig_ids.size() == 1) {
+            b_.CreateCall(intra_event_register_fn(), { trig_ids[0], rec });
+            return;
+        }
+        // `@(a or b)`: one record on several trigger lists, where the whole list is
+        // the event and the FIRST edge to bring the countdown to zero matures the
+        // store. The runtime then has to remove the record from the triggers that
+        // did not fire, which it does by pointer identity -- so it needs the id
+        // list, and the list has to outlive the arm.
+        //
+        // It goes in the RECORD's own tail: the record is stable from arm to commit
+        // (the wheel and the pending lists both hold pointers into it), and a
+        // trigger id is a per-INSTANCE link-time constant, so a compile-time
+        // constant global would bake one instance's ids into code twin instances
+        // share. The tail is sized to the longest list over this signal's sites, so
+        // a signal whose every site names one trigger carries no array at all.
+        //
+        // Lazy removal ("mark it matured and let the other lists skip it") is
+        // rejected: a committed record goes back to its site freelist, so a stale
+        // pointer left on another trigger's list can later match a REUSED record and
+        // mature it early.
+        auto* i32     = b_.getInt32Ty();
+        auto* arr_ty  = llvm::ArrayType::get(i32, s.intra_trigs);
+        auto* ids     = b_.CreateStructGEP(rt, rec, intra_rec_trigs(s));
+        for (uint32_t k = 0; k < trig_ids.size(); ++k) {
+            b_.CreateAlignedStore(trig_ids[k], b_.CreateConstInBoundsGEP2_32(arr_ty, ids, 0, k),
+                                  llvm::Align{ 1 });
+        }
+        b_.CreateCall(intra_event_register_group_fn(),
+                      { ids, b_.getInt32(static_cast<uint32_t>(trig_ids.size())), rec });
     }
 
     // Commit intra-NBA signal `sig`'s fired records in the NBA region: apply each

@@ -1947,9 +1947,24 @@ void rt_inertial_cb(rt_timer* timer, void* ctx);
 // Register `rec` (its idx/seq/count already filled) to fire on trigger `trig_id`.
 void rt_intra_event_register(uint32_t trig_id, void* rec);
 
+// Register `rec` on EVERY trigger in `ids` (`n` of them) -- a multi-signal trigger
+// `@(a or b)`, where the whole list is the event and the first edge to bring the
+// countdown to zero matures the store. `ids` must outlive the record's arming; the
+// backend points it at a private constant global, since the id list is fixed per
+// statement. On maturation the fire path uses it to remove the record from the
+// triggers that did not fire, by pointer identity -- a committed record returns to
+// its site freelist, so leaving a stale pointer on another list would let a later,
+// REUSED record mature early.
+//
+// `ids` points into `rec`'s own tail, which is stable from arm to commit; the
+// backend cannot use a constant global because a trigger id is a per-instance
+// link-time constant and twin instances share the emitted code.
+void rt_intra_event_register_group(const uint32_t* ids, uint32_t n, void* rec);
+
 // Fire trigger `trig_id`: decrement each pending record's count; at zero, move it
-// to its target's ready list (bumping the NBA-pending total), else keep it pending
-// for the next edge. Called from both wake paths when the trigger edge matches.
+// to its target's ready list (bumping the NBA-pending total) and drop it from its
+// other listed triggers, else keep it pending for the next edge. Called from both
+// wake paths when the trigger edge matches.
 void rt_intra_event_fire(uint32_t trig_id);
 
 // -- DPI-C packed-vector marshalling (LRM 35.5.6) --

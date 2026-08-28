@@ -1887,7 +1887,37 @@ std::vector<uint32_t>                         inertial_buf_bytes; // allocated s
 
 // Per trigger id (dense (trigger-signal, edge)): records armed on `x <= @e y`
 // waiting for that edge. Growable — an unbounded number can arm between two edges.
-std::vector<std::vector<void*>> intra_event_pending;
+// One record's registration on one trigger list. `ids` / `n` describe the WHOLE
+// set of triggers the record was registered on -- a compile-time constant array
+// the backend emitted for the statement -- so that when this record matures the
+// fire path can take it off the other lists. `ids` is null for the single-trigger
+// case, which has nothing to remove.
+struct IntraPending {
+    void*           rec;
+    const uint32_t* ids;
+    uint32_t        n;
+};
+
+std::vector<std::vector<IntraPending>> intra_event_pending;
+
+// Drop `rec` from trigger `trig_id`'s pending list by pointer identity, keeping
+// the survivors' order. Used for first-fire-wins removal across a multi-signal
+// trigger: the record has matured on another of its triggers and must not be
+// counted down again -- and cannot merely be MARKED, because a committed record
+// returns to its site freelist and a stale pointer would later match a reused one.
+void intra_event_drop(uint32_t trig_id, const void* rec) {
+    if (trig_id >= intra_event_pending.size()) {
+        return;
+    }
+    std::vector<IntraPending>& list = intra_event_pending[trig_id];
+    size_t                     w    = 0;
+    for (const IntraPending& e : list) {
+        if (e.rec != rec) {
+            list[w++] = e;
+        }
+    }
+    list.resize(w);
+}
 
 // Move a fired record onto its target's ready list, keeping the list in ascending
 // seq so the commit applies same-instant updates last-executed-wins (LRM 10.4.2).
@@ -3077,24 +3107,45 @@ extern "C" void rt_intra_event_register(uint32_t trig_id, void* rec) {
     if (trig_id >= intra_event_pending.size()) {
         intra_event_pending.resize(trig_id + 1);
     }
-    intra_event_pending[trig_id].push_back(rec);
+    intra_event_pending[trig_id].push_back(IntraPending{ rec, nullptr, 0 });
+}
+
+extern "C" void rt_intra_event_register_group(const uint32_t* ids, uint32_t n, void* rec) {
+    for (uint32_t k = 0; k < n; ++k) {
+        if (ids[k] >= intra_event_pending.size()) {
+            intra_event_pending.resize(ids[k] + 1);
+        }
+        intra_event_pending[ids[k]].push_back(IntraPending{ rec, ids, n });
+    }
 }
 
 extern "C" void rt_intra_event_fire(uint32_t trig_id) {
     if (trig_id >= intra_event_pending.size()) {
         return;
     }
-    std::vector<void*>& pend = intra_event_pending[trig_id];
-    size_t              w    = 0; // survivors compacted in place
-    for (void* p : pend) {
-        auto* rec = reinterpret_cast<rt_intra_rec*>(p);
-        if (--rec->count == 0) {
-            intra_ready_push(rec); // last awaited edge -> commit this instant
-        } else {
-            pend[w++] = p; // more edges to wait for
+    size_t w = 0; // survivors compacted in place
+    // Indexed, not range-based: a maturing multi-trigger record drops itself from
+    // its OTHER lists, and while that never touches this one (the removal skips
+    // trig_id), a registration cannot be held as a reference across it -- another
+    // list's resize is fine, but re-reading the vector each step keeps the
+    // invariant local instead of depending on which vector got touched.
+    for (size_t i = 0; i < intra_event_pending[trig_id].size(); ++i) {
+        const IntraPending e   = intra_event_pending[trig_id][i];
+        auto*              rec = reinterpret_cast<rt_intra_rec*>(e.rec);
+        if (--rec->count != 0) {
+            intra_event_pending[trig_id][w++] = e; // more edges to wait for
+            continue;
+        }
+        intra_ready_push(rec); // last awaited edge -> commit this instant
+        // First fire wins: this record is done, so take it off every OTHER trigger
+        // it was listed on. Skipping `trig_id` is what keeps the loop above stable.
+        for (uint32_t k = 0; k < e.n; ++k) {
+            if (e.ids[k] != trig_id) {
+                intra_event_drop(e.ids[k], e.rec);
+            }
         }
     }
-    pend.resize(w);
+    intra_event_pending[trig_id].resize(w);
 }
 
 extern "C" void* rt_intra_ready_base(uint32_t idx) {
@@ -3134,7 +3185,7 @@ extern "C" void rt_intra_reset(void) {
     // `stride` is deliberately kept: it is what lets the next design's first
     // rt_intra_alloc notice that this site's pooled records are the wrong size and
     // retire them, instead of filling a narrower block.
-    for (std::vector<void*>& pend : intra_event_pending) {
+    for (std::vector<IntraPending>& pend : intra_event_pending) {
         pend.clear();
     }
     // A fresh simulation has no pending inertial store and starts at epoch 0.

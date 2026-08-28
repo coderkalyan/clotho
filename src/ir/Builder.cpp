@@ -130,8 +130,8 @@ Index Builder::store_inertial_delay(Index lvalue, Index value, Index delay, Sour
     return emit({ Inst::Tag::StoreInertialDelay, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
 }
 
-Index Builder::store_nb_event(Index lvalue, Index value, Index count, Signal trig, uint32_t edge, SourceLoc loc) {
-    const ExtraIndex extra = add_extra(StoreNbEventInfo{ value, count, trig, edge });
+Index Builder::store_nb_event(Index lvalue, Index value, Index count, ExtraSlice trigs, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(StoreNbEventInfo{ value, count, trigs });
 
     return emit({ Inst::Tag::StoreNbEvent, Inst::Payload{ .op_extra = { lvalue, extra } } }, loc);
 }

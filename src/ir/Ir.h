@@ -199,18 +199,29 @@ struct StoreNbDelayInfo {
     Index delay;
 };
 
+// One (trigger signal, edge) of a nonblocking intra-assignment event. Two u32
+// fields, so a run of them overlays the extra buffer's words exactly -- the same
+// packing WaitEdge uses for a `wait` event list.
+struct IntraTrigger {
+    // Signal whose edge counts down the store.
+    Signal signal;
+    // Edge to trigger on (ir::Edge value).
+    uint32_t edge;
+};
+
 // Extra payload for `store_nb_event`: the sampled RHS value, the repeat count
-// (constant 1 for a plain `@e`), and the single (trigger signal, edge) the store
+// (constant 1 for a plain `@e`), and the (trigger signal, edge) list the store
 // waits on. The whole-signal lvalue is the enclosing op_extra `op`.
 struct StoreNbEventInfo {
     // Value stored when the trigger fires (sampled in the current instant).
     Index value;
     // Number of trigger occurrences to wait for (sampled now); 1 for plain `@e`.
     Index count;
-    // Trigger signal whose edge fires the store.
-    Signal trig;
-    // Edge to trigger on (ir::Edge value).
-    uint32_t edge;
+    // The triggers, as back-to-back IntraTrigger records. A plain `@e` lists one;
+    // `@(a or b)` lists each, and the store matures on whichever brings the
+    // countdown to zero FIRST -- it is then removed from the others (LRM 9.4.5's
+    // "N occurrences of the event", where the event is the whole list).
+    ExtraSlice trigs;
 };
 
 // Extra payload for `part_select`: a constant [msb:lsb] slice of the base.
@@ -3055,6 +3066,17 @@ public:
     // viewed directly over the extra buffer: WaitEdge is two u32-sized fields
     // (ExtraPayload), so the packed records overlay the words exactly. Valid
     // while this Ir lives, like every other extra view.
+    // The (signal, edge) triggers of a `store_nb_event` instruction's
+    // StoreNbEventInfo, viewed directly over the extra buffer (see wait_edges).
+    std::span<const IntraTrigger> intra_trigs(ExtraIndex info) const {
+        const StoreNbEventInfo si     = extra_data<StoreNbEventInfo>(info);
+        const auto             start  = static_cast<uint32_t>(si.trigs.start);
+        constexpr uint32_t     stride = sizeof(IntraTrigger) / sizeof(uint32_t);
+        const uint32_t         count  = (static_cast<uint32_t>(si.trigs.end) - start) / stride;
+
+        return { reinterpret_cast<const IntraTrigger*>(extra_.data() + start), count };
+    }
+
     std::span<const WaitEdge> wait_edges(ExtraIndex info) const {
         const WaitInfo     wi     = extra_data<WaitInfo>(info);
         const auto         start  = static_cast<uint32_t>(wi.events.start);

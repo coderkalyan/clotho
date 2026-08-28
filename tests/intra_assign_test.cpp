@@ -383,16 +383,104 @@ TEST_CASE("nonblocking intra-delay event samples now and orders same-edge arms")
     CHECK(run_capture_finish(src) == "a=9\n");
 }
 
-// A multi-signal trigger `@(a or b)` needs the record on several trigger lists
-// with first-fire-wins removal (a documented follow-up) and must fail loudly.
-TEST_CASE("nonblocking intra-assignment multi-signal event trigger is rejected") {
+// A multi-signal trigger `@(a or b)`: the whole list is the event, so the FIRST
+// edge to bring the countdown to zero matures the store. The record then has to be
+// removed from the other trigger's list -- asserted here by firing that other
+// trigger afterwards and observing no second commit, which is the case a "mark it
+// matured and skip it" implementation gets wrong once the record is recycled.
+// Verified against iverilog 13.
+TEST_CASE("nonblocking intra-assignment multi-signal trigger: first edge wins") {
     constexpr std::string_view src = R"(
         module m;
-            logic [7:0] a, b;
-            logic       c = 0, d = 0;
-            initial a <= @(posedge c or posedge d) b;
+            logic a, b;
+            logic [7:0] x, y;
+            initial begin
+                a = 0; b = 0; x = 0; y = 8'h33;
+                #1 x <= @(posedge a or posedge b) y;
+                #1 a = 1;
+                #1 $display("t=%0t x=%h", $time, x);
+                y = 8'h77; x = 0;
+                #1 b = 1;
+                #1 $display("t=%0t x=%h", $time, x);
+                $finish;
+            end
         endmodule)";
-    CHECK(lower_error(src).find("multi-signal event trigger") != std::string::npos);
+    CHECK(run_capture_finish(src) == "t=3 x=33\nt=5 x=00\n");
+}
+
+// `repeat(N) @(a or b)` counts an occurrence of EITHER trigger: the countdown
+// lives in the one record, which both lists hold. Verified against iverilog 13.
+TEST_CASE("nonblocking intra-assignment repeat over a multi-signal trigger") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b;
+            logic [7:0] x, y;
+            initial begin
+                a = 0; b = 0; x = 0; y = 8'h44;
+                #1 x <= repeat(3) @(posedge a or posedge b) y;
+                #1 a = 1; #1 a = 0;
+                #1 b = 1; #1 b = 0;
+                #1 $display("t=%0t x=%h", $time, x);
+                #1 a = 1;
+                #1 $display("t=%0t x=%h", $time, x);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=6 x=00\nt=8 x=44\n");
+}
+
+// A decomposing target under a multi-signal trigger: every leaf record registers
+// on the same list pair and matures together, and first-fire-wins removal has to
+// hold for each of them independently. Verified against iverilog 13.
+TEST_CASE("nonblocking intra-assignment concat target with a multi-signal trigger") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a, b;
+            logic [3:0] p, q;
+            logic [7:0] x;
+            initial begin
+                a = 0; b = 0; p = 0; q = 0; x = 8'h5c;
+                #1 {p, q} <= @(posedge a or posedge b) x;
+                x = 8'hff;
+                #1 b = 1;
+                #1 $display("t=%0t p=%h q=%h", $time, p, q);
+                p = 0; q = 0;
+                #1 a = 1;
+                #1 $display("t=%0t p=%h q=%h", $time, p, q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=3 p=5 q=c\nt=5 p=0 q=0\n");
+}
+
+// A multi-signal trigger inside a module instantiated TWICE. A dense trigger id
+// is a per-instance link-time constant (abs_id_const) while twin instances share
+// the emitted code, so the id list the record registers on -- and is removed from
+// -- has to be built per instance. It lives in the record's own tail for exactly
+// this reason; a compile-time constant global would bake u0's ids into u1. Each
+// instance must respond only to its own triggers. Verified against iverilog 13.
+TEST_CASE("nonblocking intra-assignment multi-signal trigger in twin instances") {
+    constexpr std::string_view src = R"(
+        module sub(input logic a, input logic b, output logic [7:0] o);
+            initial begin
+                o = 0;
+                #1 o <= @(posedge a or posedge b) 8'h9e;
+            end
+        endmodule
+        module m;
+            logic a0 = 0, b0 = 0, a1 = 0, b1 = 0;
+            logic [7:0] o0, o1;
+            sub u0(a0, b0, o0);
+            sub u1(a1, b1, o1);
+            initial begin
+                #2 a0 = 1;
+                #1 $display("t=%0t o0=%h o1=%h", $time, o0, o1);
+                #1 b1 = 1;
+                #1 $display("t=%0t o0=%h o1=%h", $time, o0, o1);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=3 o0=9e o1=00\nt=5 o0=9e o1=9e\n");
 }
 
 // A whole real / shortreal target rides the same narrow deferred record as an
@@ -698,4 +786,425 @@ TEST_CASE("nonblocking intra-assignment repeat-event timing to a real target") {
             end
         endmodule)";
     CHECK(run_capture_finish(src) == "t=7 r=1.00\nt=17 r=3.25\n");
+}
+
+// -- Decomposing targets (docs/design/intra-assignment-timing.md, R1) ----------
+//
+// A target that names N places lowers to N deferred records over ONE sampled RHS
+// and ONE evaluation of the delay / count (LRM 9.4.5: "the right-hand expression
+// shall be evaluated before the delay"). Every case below mutates the RHS during
+// the delay, so a second evaluation would show.
+
+// `{a,b} <= #5 x`: the concatenation walk plain NBA already uses, emitting a
+// deferred record per operand. Byte-checked against iverilog 13.
+TEST_CASE("nonblocking intra-delay to a concatenation target") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a, b;
+            logic [7:0] x;
+            initial begin
+                a = 4'h0; b = 4'h0; x = 8'hab;
+                #1 {a, b} <= #5 x;
+                x = 8'hcd;
+                #4 $display("t=%0t a=%h b=%h", $time, a, b);
+                #2 $display("t=%0t a=%h b=%h", $time, a, b);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=5 a=0 b=0\nt=7 a=a b=b\n");
+}
+
+// A SELF-OVERLAPPING concatenation, `{a, a[0]} <= #5 x`: two records land on one
+// signal, and they must apply in leaf order so the answer matches the plain `<=`
+// form exactly -- there is one answer to explain, not two. The records take
+// consecutive seq stamps in walk order, which is what makes the whole-`a` write
+// (later in the walk) win over the `a[0]` write. iverilog 13 gives 5 for both
+// forms; so must clotho.
+TEST_CASE("nonblocking intra-delay to a self-overlapping concatenation matches plain NBA") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a;
+            logic [7:0] x;
+            initial begin
+                a = 4'h0; x = 8'hab;
+                #1 {a, a[0]} <= #5 x;
+                #6 $display("intra a=%h", a);
+                a = 4'h0;
+                #1 {a, a[0]} <= x;
+                #1 $display("plain a=%h", a);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "intra a=5\nplain a=5\n");
+}
+
+// A whole unpacked STRUCT target: one sample of the source struct, one delay,
+// one record per field. iverilog rejects unpacked structs outright, so the oracle
+// is the hand-decomposed per-field form (`sp <= #5 rp; sq <= #5 rq;`), which is
+// what the clause makes this equivalent to; that form prints the same two lines
+// under iverilog 13.
+TEST_CASE("nonblocking intra-delay to a whole unpacked struct target") {
+    constexpr std::string_view src = R"(
+        typedef struct { logic [3:0] p; logic [3:0] q; } s_t;
+        module m;
+            s_t s, r;
+            initial begin
+                s = '{4'h0, 4'h0};
+                r = '{4'h1, 4'h2};
+                #1 s <= #5 r;
+                r = '{4'h9, 4'h9};
+                #4 $display("t=%0t p=%h q=%h", $time, s.p, s.q);
+                #2 $display("t=%0t p=%h q=%h", $time, s.p, s.q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=5 p=0 q=0\nt=7 p=1 q=2\n");
+}
+
+// A whole unpacked ARRAY target: one record per element, all sharing the sample
+// and the deadline. Same oracle argument as the struct case -- iverilog rejects a
+// whole-array assignment even without timing, and its per-element form
+// (`mem[0] <= #5 other[0]; ...`) prints exactly these two lines.
+TEST_CASE("nonblocking intra-delay to a whole unpacked array target") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] mem [0:2];
+            logic [7:0] other [0:2];
+            initial begin
+                mem[0] = 0; mem[1] = 0; mem[2] = 0;
+                other[0] = 8'd10; other[1] = 8'd11; other[2] = 8'd12;
+                #1 mem <= #5 other;
+                other[0] = 8'd99; other[1] = 8'd99; other[2] = 8'd99;
+                #4 $display("t=%0t %0d %0d %0d", $time, mem[0], mem[1], mem[2]);
+                #2 $display("t=%0t %0d %0d %0d", $time, mem[0], mem[1], mem[2]);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=5 0 0 0\nt=7 10 11 12\n");
+}
+
+// A streaming-concatenation target, `{>>{a,b}} <= #5 x`. `>>` packs left to
+// right, so `a` takes the high nibble. iverilog has no streaming-concatenation
+// support, so this is derived from LRM 11.4.14.3 plus the concat case above --
+// the same unpack walk, only the bit apportionment differs.
+TEST_CASE("nonblocking intra-delay to a streaming-concatenation target") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a, b;
+            logic [7:0] x;
+            initial begin
+                a = 4'h0; b = 4'h0; x = 8'hab;
+                #1 {>>{a, b}} <= #5 x;
+                x = 8'hcd;
+                #4 $display("t=%0t a=%h b=%h", $time, a, b);
+                #2 $display("t=%0t a=%h b=%h", $time, a, b);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=5 a=0 b=0\nt=7 a=a b=b\n");
+}
+
+// An assignment-pattern lvalue over a packed-struct source (LRM 10.9): positional,
+// one record per member. iverilog does not parse a pattern lvalue, so this is
+// derived from 10.9 -- element order equals concatenation order, so the expected
+// split is the concat case's.
+TEST_CASE("nonblocking intra-delay to an assignment-pattern lvalue") {
+    constexpr std::string_view src = R"(
+        typedef struct packed { logic [3:0] p; logic [3:0] q; } p_t;
+        module m;
+            logic [3:0] a, b;
+            p_t         v;
+            initial begin
+                a = 4'h0; b = 4'h0; v = 8'hab;
+                #1 '{a, b} <= #5 v;
+                v = 8'hcd;
+                #4 $display("t=%0t a=%h b=%h", $time, a, b);
+                #2 $display("t=%0t a=%h b=%h", $time, a, b);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=5 a=0 b=0\nt=7 a=a b=b\n");
+}
+
+// The EVENT form of a decomposing target, so the shared-COUNT path is exercised
+// and not only the shared-deadline one: all N records register on the trigger with
+// the same countdown and mature on the same edge. Byte-checked against iverilog 13.
+TEST_CASE("nonblocking intra-event to a concatenation target") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0;
+            logic [3:0] a, b;
+            logic [7:0] x;
+            initial forever #5 clk = ~clk;
+            initial begin
+                a = 4'h0; b = 4'h0; x = 8'hab;
+                #1 {a, b} <= @(posedge clk) x;
+                x = 8'hcd;
+                #3 $display("t=%0t a=%h b=%h", $time, a, b);
+                #4 $display("t=%0t a=%h b=%h", $time, a, b);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=4 a=0 b=0\nt=8 a=a b=b\n");
+}
+
+// A whole unpacked struct on the repeat-event form: one count evaluation shared by
+// every field's record. Oracle is again the hand-decomposed per-field form, which
+// iverilog 13 runs and which prints these two lines.
+TEST_CASE("nonblocking intra-repeat-event to a whole unpacked struct target") {
+    constexpr std::string_view src = R"(
+        typedef struct { logic [3:0] p; logic [3:0] q; } s_t;
+        module m;
+            logic clk = 0;
+            s_t   s, r;
+            initial forever #5 clk = ~clk;
+            initial begin
+                s = '{4'h0, 4'h0};
+                r = '{4'h3, 4'h4};
+                #1 s <= repeat(2) @(posedge clk) r;
+                r = '{4'h9, 4'h9};
+                #10 $display("t=%0t p=%h q=%h", $time, s.p, s.q);
+                #10 $display("t=%0t p=%h q=%h", $time, s.p, s.q);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=11 p=0 q=0\nt=21 p=3 q=4\n");
+}
+
+// A whole unpacked array on the event form.
+TEST_CASE("nonblocking intra-event to a whole unpacked array target") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0;
+            logic [7:0] mem [0:2];
+            logic [7:0] other [0:2];
+            initial forever #5 clk = ~clk;
+            initial begin
+                mem[0] = 0; mem[1] = 0; mem[2] = 0;
+                other[0] = 8'd10; other[1] = 8'd11; other[2] = 8'd12;
+                #1 mem <= @(posedge clk) other;
+                other[0] = 8'd99; other[1] = 8'd99; other[2] = 8'd99;
+                #3 $display("t=%0t %0d %0d %0d", $time, mem[0], mem[1], mem[2]);
+                #4 $display("t=%0t %0d %0d %0d", $time, mem[0], mem[1], mem[2]);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=4 0 0 0\nt=8 10 11 12\n");
+}
+
+// A compile-time `#0` on a decomposing target is a plain `<=`, so it lands in the
+// arming instant's NBA region -- the null-timing walk, not N deferred records.
+TEST_CASE("nonblocking intra-delay #0 to a concatenation target commits in the current instant") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] a, b;
+            logic [7:0] x;
+            initial begin
+                a = 4'h0; b = 4'h0; x = 8'hab;
+                #1 {a, b} <= #0 x;
+                $display("t=%0t active a=%h b=%h", $time, a, b);
+                #1 $display("t=%0t next   a=%h b=%h", $time, a, b);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=1 active a=0 b=0\nt=2 next   a=a b=b\n");
+}
+
+// -- The repeat-count clamp (LRM 9.4.5, R6) -----------------------------------
+//
+// "If the repeat count literal, or signed variable holding the repeat count, is
+// less than or equal to 0 at the time of evaluation, the assignment occurs as if
+// there is no repeat construct", and the clause's example fixes what that means:
+// "repeat (-3) @ (event_expression) // will not execute event_expression". So the
+// store happens with no wait -- the current instant's NBA region -- which is what
+// the blocking form's signed bound already does. All byte-checked against
+// iverilog 13.
+
+TEST_CASE("nonblocking intra-repeat with a negative signed count stores in the current instant") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0;
+            logic [7:0] x, w, y;
+            integer     n;
+            initial forever #5 clk = ~clk;
+            initial begin
+                x = 0; w = 0; y = 8'h55; n = -1;
+                #1;
+                x <= repeat(n) @(posedge clk) y;
+                w <= y;
+                $display("t=%0t active x=%h w=%h", $time, x, w);
+                #1 $display("t=%0t next   x=%h w=%h", $time, x, w);
+                $finish;
+            end
+        endmodule)";
+    // Identical to the plain `w <= y` beside it: same region, same instant.
+    CHECK(run_capture_finish(src) == "t=1 active x=00 w=00\nt=2 next   x=55 w=55\n");
+}
+
+TEST_CASE("nonblocking intra-repeat with a negative real count stores in the current instant") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0;
+            logic [7:0] x, y;
+            real        r;
+            initial forever #5 clk = ~clk;
+            initial begin
+                x = 0; y = 8'h55; r = -1.4;
+                #1 x <= repeat(r) @(posedge clk) y;
+                #1 $display("t=%0t x=%h", $time, x);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=2 x=55\n");
+}
+
+// The clause's own asymmetry: "if a is assigned -3, it will execute the
+// event_expression if a is declared as an unsigned variable, but not if a is
+// signed". An unsigned 8-bit variable holding -3 is 253, so the store waits 253
+// posedges (t=2525 at this clock) and is nowhere in sight at t=104.
+TEST_CASE("nonblocking intra-repeat with an unsigned count holding -3 still waits") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0;
+            logic [7:0] x, y, u;
+            initial forever #5 clk = ~clk;
+            initial begin
+                x = 0; y = 8'h55; u = -3;
+                #1 x <= repeat(u) @(posedge clk) y;
+                #1   $display("t=%0t x=%h", $time, x);
+                #102 $display("t=%0t x=%h", $time, x);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=2 x=00\nt=104 x=00\n");
+}
+
+// Zero is zero in both signednesses, so it clamps either way -- the test is
+// `count < 1` in the count's OWN signedness, which for an unsigned count
+// degenerates to `count == 0`. Without the clamp the uint32 countdown would
+// underflow and wait 2**32 edges. iverilog 13 stores all three immediately.
+TEST_CASE("nonblocking intra-repeat with a zero count stores in the current instant") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0;
+            logic [7:0] x, w, z, y;
+            logic [7:0] uz;
+            integer     sz;
+            initial forever #5 clk = ~clk;
+            initial begin
+                x = 0; w = 0; z = 0; y = 8'h66; uz = 0; sz = 0;
+                #1;
+                x <= repeat(0)  @(posedge clk) y;
+                w <= repeat(uz) @(posedge clk) y;
+                z <= repeat(sz) @(posedge clk) y;
+                #1 $display("t=%0t lit=%h unsigned=%h signed=%h", $time, x, w, z);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=2 lit=66 unsigned=66 signed=66\n");
+}
+
+// The clamp reaches every leaf of a decomposing target: the count is evaluated
+// once and each leaf re-tests that one value, so all N land in the same instant.
+TEST_CASE("nonblocking intra-repeat clamp applies to every leaf of a concatenation target") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0;
+            logic [3:0] a, b;
+            logic [7:0] x;
+            integer     n;
+            initial forever #5 clk = ~clk;
+            initial begin
+                a = 0; b = 0; x = 8'hab; n = -2;
+                #1 {a, b} <= repeat(n) @(posedge clk) x;
+                #1 $display("t=%0t a=%h b=%h", $time, a, b);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=2 a=a b=b\n");
+}
+
+// -- Shapes that must STILL fail loudly ---------------------------------------
+
+// A whole queue / dynamic array is a single owned handle, not N leaves: the
+// deferred record has no owned-handle tail class to stage a deep copy into, and an
+// intra site can have N copies in flight where a plain NBA has one
+// (docs/design/intra-assignment-timing.md, R3).
+TEST_CASE("intra-assignment timing on a whole queue target is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$], r[$];
+            initial q <= #2 r;
+        endmodule)";
+    CHECK(!lower_error(src).empty());
+}
+
+TEST_CASE("intra-assignment timing on a whole dynamic-array target is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            int d[], e[];
+            initial d <= #2 e;
+        endmodule)";
+    CHECK(!lower_error(src).empty());
+}
+
+// LRM 9.4.2.3 makes `iff` part of the EVENT, so the guard has to be evaluated at
+// fire time and only enabled occurrences may count down; the deferred record has
+// no guard hook (R5).
+TEST_CASE("iff on a nonblocking intra-assignment event is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] a, b;
+            logic       clk = 0, en = 1;
+            initial a <= @(posedge clk iff en) b;
+        endmodule)";
+    CHECK(lower_error(src).find("iff qualifier on a nonblocking intra-assignment event") !=
+          std::string::npos);
+}
+
+// The BLOCKING form of a pattern lvalue still has to reorder the sampled RHS
+// across a real suspend, which the nonblocking form never does.
+TEST_CASE("blocking intra-assignment timing on an assignment-pattern lvalue is rejected") {
+    constexpr std::string_view src = R"(
+        typedef struct packed { logic [3:0] p; logic [3:0] q; } p_t;
+        module m;
+            logic [3:0] a, b;
+            p_t         v;
+            initial '{a, b} = #5 v;
+        endmodule)";
+    CHECK(lower_error(src).find("intra-assignment timing control on an assignment-pattern") !=
+          std::string::npos);
+}
+
+// The BLOCKING form of a whole unpacked aggregate: the aggregate store path
+// evaluates the LHS before the RHS, so hoisting the sample across the suspend
+// reorders two evaluations 9.4.5 pins in the other order.
+TEST_CASE("blocking intra-assignment timing on a whole unpacked struct is rejected") {
+    constexpr std::string_view src = R"(
+        typedef struct { logic [3:0] p; logic [3:0] q; } s_t;
+        module m;
+            s_t s, r;
+            initial s = #5 r;
+        endmodule)";
+    CHECK(lower_error(src).find("whole unpacked struct or array target") != std::string::npos);
+}
+
+TEST_CASE("blocking intra-assignment timing on a whole array target is rejected") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] mem [0:2], other [0:2];
+            initial mem = #5 other;
+        endmodule)";
+    CHECK(lower_error(src).find("string or array target") != std::string::npos);
+}
+
+// A class property has no per-object shadow for any NBA path, timed or not.
+TEST_CASE("intra-assignment timing on a class property is rejected") {
+    constexpr std::string_view src = R"(
+        class c; int p; endclass
+        module m;
+            c o = new;
+            initial o.p <= #5 3;
+        endmodule)";
+    CHECK(lower_error(src).find("class property") != std::string::npos);
 }
