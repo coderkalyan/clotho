@@ -621,6 +621,14 @@ struct Function {
     // A `pure` DPI import (LRM 35.6): side-effect-free and value-only, so the
     // backend marks its declaration readnone + willreturn for the optimizer.
     bool is_pure = false;
+    // A DPI import TASK (LRM 35.8) rather than an import function. An SV task has
+    // no return value, but its C prototype returns `int` -- the disable-protocol
+    // channel of LRM 35.9, which no SV expression can observe ("Calls to import
+    // tasks in SystemVerilog code are indistinguishable from calls to native
+    // SystemVerilog tasks"). So the C return is PRESENT while dpi_ret_ctype stays
+    // Void: declare_dpi_import emits i32 and lower_dpi_call binds no result Plane,
+    // discarding the value until the disable protocol lands (phase T3).
+    bool is_dpi_task = false;
     // C linkage name of a DPI import (the `c_identifier`, or the SV name when the
     // import omits it — LRM 35.5.4). Empty for a non-DPI function.
     std::string extern_name;
@@ -639,17 +647,23 @@ struct Function {
     Ir ir;
 };
 
-// An `export "DPI-C"` directive (LRM 35.5): a SystemVerilog function made
-// callable from native C. The backend emits a C-ABI thunk named `extern_name`
-// that marshals C arguments to the SV function's plane ABI, calls it against the
-// design-state global, and marshals the result back. `func` is the lowered SV
-// function (an ordinary IR Function).
+// An `export "DPI-C"` directive (LRM 35.5 / 35.8): a SystemVerilog function or
+// task made callable from native C. The backend emits a C-ABI thunk named
+// `extern_name` that marshals C arguments to the subroutine's plane ABI, calls it
+// against the design-state global, and marshals the result back. `func` is the
+// lowered SV subroutine (an ordinary IR Function).
 struct DpiExport {
     FunctionId            func;
     std::string           extern_name;   // C linkage name (the c_identifier)
     std::vector<DpiCType> arg_ctypes;    // parallel to the function's formals
     std::vector<ArgDir>   arg_dirs;      // direction of each formal (In / Out / Inout)
     DpiCType              ret_ctype;
+    // An exported TASK (LRM 35.8): `func` is a coroutine (Function::is_task), so
+    // the thunk drives it the way lower_task_call_inst does -- ramp, coro_resume,
+    // coro_done -- rather than making a plain call, and its C prototype returns
+    // `int` whatever ret_ctype says (a task has no SV return; the int is 35.9's
+    // disable channel). ret_ctype is always Void here.
+    bool is_task = false;
 };
 
 // Deepest inheritance chain a class may have (LRM 8.13 puts no limit on it).

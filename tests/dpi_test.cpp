@@ -482,13 +482,30 @@ TEST_CASE("DPI import: unsupported forms are rejected") {
             endmodule)";
         CHECK(lower_fail(src).find("output/inout string") != std::string::npos);
     }
-    SUBCASE("DPI import task") {
+    SUBCASE("`pure` on an imported task (LRM 35.5.1.3)") {
+        // "An imported task can never be declared pure." slang only warns
+        // (-Wdpi-pure-task), so the refusal has to be Clotho's: is_pure would mark
+        // the C declaration readnone + willreturn and let the optimizer CSE or
+        // delete a call kept purely for its side effects.
+        constexpr std::string_view src = R"(
+            module m;
+              import "DPI-C" pure task t(input int x);
+              initial t(1);
+            endmodule)";
+        CHECK(lower_fail(src).find("cannot be declared `pure`") != std::string::npos);
+    }
+    SUBCASE("an import task enabled from a function (inherited from slang)") {
+        // LRM 35.8's SV-side half: a function may not perform a task enable, so a
+        // DPI import task is unreachable from a function body. slang rejects this
+        // before lowering ("cannot invoke a task from within a function"), which is
+        // what makes the export-thunk legality check the only run-time piece.
         constexpr std::string_view src = R"(
             module m;
               import "DPI-C" task t(input int x);
-              initial t(1);
+              function int f(input int y); t(y); return y; endfunction
+              initial $display("%0d", f(1));
             endmodule)";
-        CHECK(lower_fail(src).find("DPI import tasks") != std::string::npos);
+        CHECK(lower_fail(src).find("cannot invoke a task from within a function") != std::string::npos);
     }
     SUBCASE("open array of unsupported element (string)") {
         constexpr std::string_view src = R"(
@@ -510,6 +527,38 @@ TEST_CASE("DPI import: context is accepted") {
           initial $display("%0d", strlen("hello"));   // 5
         endmodule)";
     CHECK(run_capture(src) == "5\n");
+}
+
+// A DPI import TASK (LRM 35.8), end to end against libc. `puts` is the exact
+// shape a task import needs from the harness: it takes the `input string` the
+// import path already marshals zero-copy, and it returns `int` -- which is what
+// an import task's C prototype returns anyway (35.8's disable channel), and which
+// the SV side never sees. So this covers the whole T1 import path with no
+// --dpi-lib: the i32 C return is declared and discarded, and the call site stays
+// an ordinary plain call rather than growing a task ramp.
+TEST_CASE("DPI import: a task lowers, runs, and discards its int return") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" context puts = task sv_puts(input string s);
+          initial begin
+            sv_puts("from a DPI import task");
+            $display("back in SV");
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "from a DPI import task\nback in SV\n");
+}
+
+// The C declaration an import task gets: `int`-returning (LRM 35.8) even though
+// the SV task has no result, and reached by a plain `call` -- no coroutine ramp,
+// no task record -- because T1's import call site cannot suspend.
+TEST_CASE("DPI import: a task declares an int-returning C prototype") {
+    constexpr std::string_view src = R"(
+        module m;
+          import "DPI-C" context task t(input int x);
+          initial t(7);
+        endmodule)";
+    const std::string ir = emit_llvm_text(src);
+    CHECK(ir.find("declare i32 @t(i32)") != std::string::npos);
 }
 
 // export "DPI-C" (LRM 35.5): the SV function is exposed as a C-callable thunk and
@@ -560,13 +609,33 @@ TEST_CASE("DPI export: an exported function may draw from the RNG") {
 
 // Export out-of-scope forms loud-fail (collect_dpi_exports guards).
 TEST_CASE("DPI export: unsupported forms are rejected") {
-    SUBCASE("exported task") {
+    // LRM 35.8: "All aspects of exported functions described above in 35.7 apply to
+    // exported tasks." So an exported TASK inherits every refusal the function path
+    // has, rather than slipping past them on a task-only code path.
+    SUBCASE("exported task: output string argument (inherited refusal)") {
         constexpr std::string_view src = R"(
             module m;
               export "DPI-C" task t;
-              task t(input int x); endtask
+              task t(output string s); s = "x"; endtask
             endmodule)";
-        CHECK(lower_fail(src).find("DPI export tasks") != std::string::npos);
+        CHECK(lower_fail(src).find("output/inout string") != std::string::npos);
+    }
+    SUBCASE("exported task: unpacked-aggregate argument (inherited refusal)") {
+        constexpr std::string_view src = R"(
+            module m;
+              typedef struct { int a; int b; } p_t;
+              export "DPI-C" task t;
+              task t(input p_t p); endtask
+            endmodule)";
+        CHECK(lower_fail(src).find("export argument type is not supported") != std::string::npos);
+    }
+    SUBCASE("exported task: inout string argument (inherited refusal)") {
+        constexpr std::string_view src = R"(
+            module m;
+              export "DPI-C" task t;
+              task t(inout string s); s = "x"; endtask
+            endmodule)";
+        CHECK(lower_fail(src).find("output/inout string") != std::string::npos);
     }
     SUBCASE("exported string return (returned-char* lifetime)") {
         constexpr std::string_view src = R"(
@@ -584,6 +653,108 @@ TEST_CASE("DPI export: unsupported forms are rejected") {
             endmodule)";
         CHECK(lower_fail(src).find("output/inout string") != std::string::npos);
     }
+}
+
+// export "DPI-C" task (LRM 35.8): the SV task is exposed as a C-callable thunk and
+// still works as an ordinary SV task. As for exported functions, the C-calls-into-
+// SV round trip needs a .o linked through addObjectFile, which the doctest harness
+// does not wire -- that half is the verilator CLI cross-check recorded in
+// docs/design/dpi-c.md (measured byte-identical). Here: the directive lowers, the
+// thunk emits, and the design runs.
+TEST_CASE("DPI export: a design with an exported task lowers and runs") {
+    constexpr std::string_view src = R"(
+        module m;
+          export "DPI-C" task sv_note;
+          export "DPI-C" function get_base;
+          int base;
+          task sv_note(input int v, output int doubled);
+            doubled = v * 2 + base;
+          endtask
+          function int get_base(); return base; endfunction
+          int r;
+          initial begin
+            base = 100;
+            sv_note(4, r);                       // SV-side use of the exported task
+            $display("%0d %0d", r, get_base());  // 108 100
+          end
+        endmodule)";
+    CHECK(run_capture(src) == "108 100\n");
+}
+
+// The export-TASK thunk's shape, which is where T1 actually lives. Four things
+// have to be true of it and none is observable from SV: the C prototype returns
+// i32 (LRM 35.8, not the SV task's void), the callee is the task COROUTINE driven
+// through its resume/destroy pointers rather than a plain function call, a task
+// that fails to complete reaches the T2 fatal, and an entry with no imported-task
+// frame live reaches the 35.8 legality fatal.
+//
+// emit_llvm_text runs the coroutine passes, so the llvm.coro.* intrinsics are
+// already gone here -- CoroSplit has rewritten them into the ramp's resume /
+// destroy function pointers. Match what survives that: the task coroutine symbol
+// (`m.task.<name>`, not the `m.fn.<name>` a plain function would give) and the
+// three arms the thunk branches into.
+TEST_CASE("DPI export: the exported-task thunk drives a coroutine and guards both fatals") {
+    constexpr std::string_view src = R"(
+        module m;
+          export "DPI-C" task sv_note;
+          task sv_note(input int v, output int doubled); doubled = v * 2; endtask
+          int r;
+          initial sv_note(1, r);
+        endmodule)";
+    const std::string thunk = llvm_definition(emit_llvm_text(src), "sv_note");
+    CHECK(thunk.find("define i32 @sv_note(") != std::string::npos);
+    CHECK(thunk.find("m.task.sv_note") != std::string::npos);
+    CHECK(thunk.find("dpi.task.done") != std::string::npos);
+    CHECK(thunk.find("dpi.task.suspended") != std::string::npos);
+    CHECK(thunk.find("dpi.task.no_frame") != std::string::npos);
+    CHECK(thunk.find("@clotho.dpi.in_import_task") != std::string::npos);
+    CHECK(thunk.find("rt_dpi_export_task_suspended") != std::string::npos);
+    CHECK(thunk.find("rt_dpi_export_task_no_task_frame") != std::string::npos);
+    // 0 = "no disable is active on the current execution thread" (LRM 35.8).
+    CHECK(thunk.find("ret i32 0") != std::string::npos);
+}
+
+// One c_identifier exported from two scopes is dropped by slang before
+// getDPIExports() is visible (measured: only ONE @dup thunk is emitted, bound to
+// the first scope's task). Clotho's own duplicate-extern_name guard in
+// collect_dpi_exports is therefore unreachable today and stays as the invariant's
+// statement; this pins the upstream behaviour a task inherits, so a slang change
+// that started handing both entries over would surface here rather than silently
+// binding C to an arbitrary instance.
+TEST_CASE("DPI export: one c_identifier from two scopes collapses upstream in slang") {
+    constexpr std::string_view src = R"(
+        module ma;
+          export "DPI-C" dup = task t;
+          task t(input int x); endtask
+        endmodule
+        module mb;
+          export "DPI-C" dup = task u;
+          task u(input int x); endtask
+        endmodule)";
+    const std::string ir = emit_llvm_text(src);
+    size_t             n = 0;
+    for (size_t at = ir.find("define i32 @dup("); at != std::string::npos;
+         at      = ir.find("define i32 @dup(", at + 1)) {
+        ++n;
+    }
+    CHECK(n == 1);
+}
+
+// An exported FUNCTION keeps the plain-call thunk it always had: no coroutine
+// drive, no caller-identity load, no task fatals. The task arm is additive.
+TEST_CASE("DPI export: an exported function's thunk is unchanged by the task path") {
+    constexpr std::string_view src = R"(
+        module m;
+          export "DPI-C" function dbl;
+          function int dbl(input int x); return x * 2; endfunction
+          initial $display("%0d", dbl(21));
+        endmodule)";
+    const std::string thunk = llvm_definition(emit_llvm_text(src), "dbl");
+    CHECK(thunk.find("define i32 @dbl(") != std::string::npos);
+    CHECK(thunk.find("llvm.coro.resume") == std::string::npos);
+    CHECK(thunk.find("rt_dpi_export_task_suspended") == std::string::npos);
+    CHECK(thunk.find("rt_dpi_export_task_no_task_frame") == std::string::npos);
+    CHECK(thunk.find("clotho.dpi.caller_proc") == std::string::npos);
 }
 
 // A multi-top design (LRM 23.3.1) may export from every top. slang hands Clotho one

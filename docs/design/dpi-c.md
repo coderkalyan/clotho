@@ -1,12 +1,18 @@
-# DPI-C — direct C function imports
+# DPI-C — direct C function and task imports
 
 **Status:** implemented. **Import**: `import "DPI-C" [pure] [context] function` over
 scalar, packed-vector, `chandle`, and `string` types, `input`/`output`/`inout` args,
-scalar/chandle/string return. **Export**: `export "DPI-C" function` (C calls
-into SV) for functions — `input`/`output`/`inout` scalar/chandle/real/vec args,
+scalar/chandle/string return, plus `import "DPI-C" [context] task` (LRM 35.8) over
+the same formals. **Export**: `export "DPI-C" function` **and** `export "DPI-C" task`
+(C calls into SV) — `input`/`output`/`inout` scalar/chandle/real/vec args,
 `input` string, scalar/chandle/real/void return, any number of tops. `--dpi-lib`
 accepts a `.o`/`.a` (JIT-linked, needed for export) or a `.so` (dlopen, import only —
 refused outright when the design exports).
+**DPI tasks are phase T1 — the zero-time case.** Both directions work end to end
+(byte-identical to verilator, see "DPI tasks" below); an exported task that
+actually *suspends* is a located runtime fatal, not a wrong answer, because
+parking the native C frame is phase T2. `pure` on an imported task is refused
+permanently (LRM 35.5.1.3).
 1-D **open arrays** (`[]` formals, LRM 35.5.6.2) are supported in all directions
 (`input`/`output`/`inout`): named-scalar elements are zero-copy (Clotho's storage is
 the C array), packed `bit`/`logic` elements marshal through autovectorized
@@ -18,8 +24,9 @@ per-top scope API (`svGetScope`/`svSetScope`/`svGetNameFromScope`/
 (`svSize`/`svLeft`/`svRight`/`svLow`/`svHigh`/`svIncrement`/`svGetArrElemPtr1`/
 `svGet/PutBit|LogicArrElem1VecVal`/…) are implemented (`src/runtime/svdpi.h`). Still
 **loud-fails** / unresolved with a TODO: import `output`/`inout` string, multi-dim /
-dynamic open arrays, open-array export args, DPI import/export tasks (**scoped in
-full** under "DPI tasks" below), export string return + `output`/`inout` string, one
+dynamic open arrays, open-array export args, a **suspending** exported task (T2) and
+the LRM 35.9 **disable protocol** (T3) — both **scoped in full** under "DPI tasks"
+below — export string return + `output`/`inout` string, one
 c_identifier exported from several scopes (blocked upstream in slang), `svScope`
 handles for non-top instances, and `svGetCallerInfo` / the disable API.
 
@@ -349,8 +356,9 @@ x/z it drops the unknowns (`bval=0`), so clotho's correct svLogicVecVal encoding
 (the same `dpi_vec_copyin` the import path uses) diverges there; that path is
 covered by the import marshal's own tests rather than by verilator. Deferred:
 string return
-(returned-`char*` lifetime), `output`/`inout` string, exported tasks (see "DPI
-tasks" below), and one c_identifier exported from more than one scope.
+(returned-`char*` lifetime), `output`/`inout` string, and one c_identifier exported
+from more than one scope. Exported **tasks** were deferred out of V1 and have since
+landed for the zero-time case — see "DPI tasks" below.
 
 **Why `context` is accepted, not required.** LRM 35.5.3: C may only call an
 exported function from within a `context` import, which establishes the SV scope
@@ -436,10 +444,11 @@ emission below.
 
 ### Deferred (mirror the import guards)
 
-- **Exported tasks** — deferred out of V1; scoped in full under "DPI tasks" below.
-  (The reason recorded here originally — "a task needs the timing wheel, a
-  `main`-local alloca, not a global" — was already stale when it was written: the
-  wheel is `@clotho.wheel`, a module global, see that section.)
+- **Exported tasks** — deferred out of V1; **T1 (zero-time) has since landed**, see
+  "DPI tasks" below. (The reason recorded here originally — "a task needs the timing
+  wheel, a `main`-local alloca, not a global" — was already stale when it was
+  written: the wheel is `@clotho.wheel`, a module global, and the export-task thunk
+  simply loads it.)
 - **One c_identifier exported from several scopes** (LRM 35.5.3) — `svSetScope`
   selecting *which instance* a shared C name reaches. Absolute addressing means every
   distinct c_identifier already binds to its own instance with no scope lookup, so
@@ -460,18 +469,25 @@ and consider a "sim started" guard.
 Symbol resolution: **small** (the `.o` loader already exists per the unified
 `--dpi-lib` dispatch; export adds only the "gave a `.so`, need a `.o`" guard).
 Reverse thunk + scalar/vec/chandle marshal: **medium**, dominated by reuse.
-`context`/`svScope` are the genuinely deferred pieces here; exported tasks are
-scoped separately below and are not the large item that line once claimed. A
+`context`/`svScope` are the genuinely deferred pieces here; exported tasks were
+scoped separately below and were not the large item that line once claimed — their
+zero-time case landed as an extra arm in the same thunk emitter. A
 functions-only, scalar+vec+chandle+string-return export V1 is medium and mostly
 mechanical — the scary part (resolution) is solved.
 
-## DPI tasks — import and export (scoped, not implemented)
+## DPI tasks — import and export (T1 landed; T2 and T3 scoped)
 
-Both directions loud-fail today, each its own unconditional guard on slang's
-`SubroutineKind::Task`: `build_dpi_import` (`Lower.cpp:30471-30474`, "DPI import
-tasks are not supported") and `collect_dpi_exports` (`Lower.cpp:30685-30689`, "DPI
-export tasks are not supported"). These are the only task/function fork on the
-whole DPI path; every other DPI guard is about types, directions or duplicates.
+**Phase T1 has landed**: both guards are gone, and an import task whose C calls a
+zero-time exported task works end to end, byte-identical to verilator (measured
+below). What replaced them is a pair of *runtime* refusals, because the two
+remaining gaps are dynamic properties of a call chain, not static properties of a
+declaration: an exported task that suspends
+(`rt_dpi_export_task_suspended`, T2) and an exported task entered with no
+imported-task frame live (`rt_dpi_export_task_no_task_frame`, LRM 35.8). One
+static refusal is new and permanent: `pure` on an imported task
+(`build_dpi_import`, LRM 35.5.1.3). The rest of this section is the original
+scoping; **What T1 actually shipped** below records where the implementation
+diverged from it.
 
 ### The two directions are one feature
 
@@ -585,6 +601,9 @@ thunk means the live C frame belongs to an imported *function* (or to no DPI fra
 at all), which is exactly the case the clause calls never legal → located fatal
 naming both subroutines.
 
+*Superseded in the implementation*: it landed as **four** globals, and the 35.8
+check does not read `caller_proc` — see "What T1 actually shipped" below.
+
 **(3) Suspension across the C frame.** The rest of this section.
 
 ### Suspension: the mechanism, and why the cheap one is wrong
@@ -675,61 +694,190 @@ mechanism. Teardown gets one new obligation: a worker still parked at
 
 ### Phases
 
-- **T1 — tasks, zero-time.** Both guards lift. Import tasks lower at a *task* call
-  site (so the site is suspendable, is inside the `compute_may_finish` closure, and
-  a call from a function body is rejected by the existing task-in-function rule);
-  `pure` on an import task is refused; the synthetic `int` is generated and ignored;
-  caller identity globals land; the export thunk drives the task coroutine and takes
-  only the sync arm. An exported task that *does* suspend is a **located fatal**
-  naming the task and the importing subroutine — loud, never silently wrong.
-  This is the phase that covers task-shaped hooks that complete instantly.
+- **T1 — tasks, zero-time. LANDED.** Both guards lifted; `pure` on an import task
+  refused; the synthetic `int` generated on both sides and ignored; caller-identity
+  globals landed; the export thunk drives the task coroutine and takes only the sync
+  arm. An exported task that *does* suspend is a **located fatal** naming the task —
+  loud, never silently wrong. This is the phase that covers
+  task-shaped hooks completing instantly. See "What T1 actually shipped".
 - **T2 — real suspension.** The baton pool, the DPI ticket in `record.parent`, the
   async arm at the import-task call site, `rt_dpi_task_enter/resume/leave`, and
-  teardown's parked-worker check. Removes T1's fatal.
+  teardown's parked-worker check. Removes T1's fatal, and converts the import-task
+  call site from a plain `Call` into a real task call site.
 - **T3 — the disable protocol (35.9).** Export returns 1 on a disable-terminated
-  task; `svIsDisabledState` / `svAckDisabledState`; the simulator-side checks the
+  task; the import task's `int` return is read instead of discarded;
+  `svIsDisabledState` / `svAckDisabledState`; the simulator-side checks the
   clause mandates for items b), c) and d), each a fatal. Rides the existing disable
-  machinery (`design_uses_disable_`, `emit_disable_poll`, `LlvmBackend.cpp:15871`,
+  machinery (`design_uses_disable_`, `emit_disable_poll`, `LlvmBackend.cpp`,
   `docs/design/disable.md`), which already polls at every suspending tag.
   `svGetCallerInfo` belongs here too.
 
+### What T1 actually shipped
+
+Three places diverge from the scoping above; each was decided against the clause
+text and is commented at the site that implements it.
+
+**The import-task call site stayed a plain `Call`.** The plan said it would lower at
+a *task* call site "so the site is suspendable, is inside the `compute_may_finish`
+closure, and a call from a function body is rejected by the existing
+task-in-function rule". Only the middle clause turned out to be load-bearing:
+
+- *Suspendable* is exactly what T1 does not need — nothing on this path can consume
+  time, since an exported task that suspends is refused. A task ramp, record slot
+  and suspend arm would all be dead weight the optimizer cannot remove (the callee
+  is an opaque external).
+- *Task-in-function* is inherited for free either way: slang rejects the enable
+  itself ("cannot invoke a task from within a function"), before lowering, measured.
+- *may-finish* was real, and needed its own fix rather than the call-site change.
+  `compute_may_finish` seeds from a subroutine's IR, and a DPI import has none, so
+  an import had **no callees at all** — yet its C can call back into any export
+  whose SV body reaches `$finish`. `lower_call_inst`'s DPI branch also returned
+  before `emit_finish_check`. Both fixed: the closure gains an edge from every DPI
+  import to every `DpiExport`, and the DPI call site emits the check. Exact whenever
+  no export finishes; conservative otherwise. This was a latent hole on the export-
+  *function* path too — an import function calling an exported function that
+  `$finish`es had the same reachability — so the fix is not task-specific.
+
+**Caller identity is four globals, not two.** `clotho.dpi.caller_proc` (ptr) and
+`clotho.dpi.caller_home` (i8) are gated exactly as `declare_task` gates those
+parameters. Two more were needed:
+
+- `clotho.dpi.caller_rng` (ptr). The export-*function* thunk passes the module-wide
+  `@clotho.rng` with the rationale that "C drove this call, so there is no calling
+  process whose stream a `$urandom` could continue (LRM 18.13)". For a *task* that
+  rationale inverts: there **is** a calling thread, the task runs on it, and a
+  `$urandom` inside it must continue that thread's sequence. Passing the module-wide
+  stream would have been a silent wrong answer, not a loud gap.
+- `clotho.dpi.in_import_task` (i8), and it is the one emitted **unconditionally**
+  once the design has DPI tasks. The scoping proposed deriving 35.8's legality check
+  from `caller_proc == null`, but `caller_proc` only exists when
+  `design_uses_process_` — which is false for most designs — and 35.8's rule does
+  not depend on whether the design happens to mention `process`. A dedicated flag
+  makes the check independent of an ABI-gating decision unrelated to legality.
+
+All four save/restore around the import-task call, because import tasks nest. That
+is verified: import task → exported task → *another* import task → another exported
+task returns correctly, and after a legal import-task call returns, the flag is back
+to 0 so a subsequent call from an import *function* still fatals.
+
+**`record_slot()` is not reusable here.** It anchors its alloca after the current
+coroutine's `coro_begin_`; a C thunk is not a coroutine, so the thunk uses a plain
+`entry_alloca` of the same `{ ptr parent }` shape, stored null before the ramp.
+
 ### Refusal surface after T1 (each loud, each with a TODO)
 
-An exported task that suspends (T2); the disable protocol and
+An exported task that suspends (T2, `rt_dpi_export_task_suspended`); an exported
+task with no imported-task frame live (LRM 35.8,
+`rt_dpi_export_task_no_task_frame`); the disable protocol and
 `svIsDisabledState`/`svAckDisabledState` (T3); `pure` on an imported task (LRM
 35.5.1.3, permanent); everything the export *function* path already refuses
 (string return, `output`/`inout` string, open-array formals, one c_identifier from
 several scopes) — a task inherits every one of those, since 35.7 says exported tasks
-share the function argument rules; and a `.so` given to a design that exports, which
-the existing `run_jit` guard already covers.
+share the function argument rules, and the inheritance is tested rather than
+assumed; and a `.so` given to a design that exports, which the existing `run_jit`
+guard already covers.
+
+One of those inherited refusals is enforced upstream rather than by clotho, and T1
+re-measured it for tasks: **one c_identifier exported from two scopes** is collapsed
+by slang before `getDPIExports()` is visible, so exactly one thunk is emitted and
+clotho's own duplicate-`extern_name` `fail` in `collect_dpi_exports` is unreachable.
+It stays as the invariant's statement, and a test pins the upstream behaviour so a
+slang change surfaces rather than silently binding C to an arbitrary instance.
 
 ### Oracle — measured, not assumed
 
 - **iverilog is not an oracle for any of this**: iverilog 13 still cannot parse
   `import "DPI-C"` / `export "DPI-C"` at all ("Invalid module item", re-measured).
-- **Verilator 5.050 is an oracle for T1 only.** A `context` import task whose C calls
-  a zero-time exported task runs correctly and is byte-checkable (measured: three
-  `sv_note` calls interleaved with the C's own prints, all at the caller's `t=5`).
-  But it **refuses a timing control inside an exported task outright** —
-  `%Error-UNSUPPORTED: Timing controls inside DPI-exported tasks` — so it cannot
-  oracle T2 at all. And it declares an exported task `extern void sv_note(int v)`,
-  *void*, not `int`, so it does not implement 35.8's return value and cannot oracle
-  T3 either.
+- **Verilator 5.050 is an oracle for T1 only**, and T1 is now checked against it
+  **byte-identically** (measured, below). Two divergences, both re-measured:
+  1. It declares an exported task `extern void sv_note(int v, int* doubled)` —
+     *void*, not `int` — so it does not implement 35.8's return value and cannot
+     oracle T3. The two runs therefore share one `.sv` byte for byte, and the `.c`
+     differs only in that one prototype (clotho's reads the `int`, verilator's
+     cannot). Clotho returns 0 there, which is 35.8's "no disable is active".
+  2. It **refuses a timing control inside an exported task outright** —
+     `%Error-UNSUPPORTED: Timing controls inside DPI-exported tasks` (re-measured
+     on the same `susp.sv` clotho fatals on) — so it cannot oracle T2 at all.
+     Notably both tools refuse the same program; clotho refuses it at run time with
+     a located fatal, verilator at compile time.
+  Verilator's `--binary` flow also needs the shim wrapped in `extern "C"`: it
+  compiles a `.c` with `g++`, so a plain C file fails to link (measured:
+  `undefined reference to c_driver`).
 - T2 and T3 are therefore derived from the clause text, the way the SVA layer's
   `diff_not.sv` expectation and the LRM 19.11 coverage percentages were.
 
+#### The measured T1 cross-check
+
+A `context` import task (`c_driver`) whose C calls a zero-time exported task
+(`sv_note`, with an `output` formal) three times, plus an exported *function*
+(`get_base`) reading a design signal, from an `initial` that has already advanced
+to `t=5`. `clotho run --dpi-lib rt.o rt.sv` and `verilator --binary --timing`
+produce the same eight lines, `diff`-clean:
+
+```
+[c]   c_driver n=3 base=100
+[sv]  sv_note v=1 doubled=2 base=100 t=5
+[c]   sv_note(1) -> doubled=2 disabled=0
+[sv]  sv_note v=2 doubled=4 base=100 t=5
+[c]   sv_note(2) -> doubled=4 disabled=0
+[sv]  sv_note v=3 doubled=6 base=100 t=5
+[c]   sv_note(3) -> doubled=6 disabled=0
+[sv]  back from c_driver at t=5
+```
+
+This covers, in one run: the C→SV task round trip through a JIT-linked `.o`, an
+`output` formal marshalled back across the C boundary, a design-signal read from
+inside an exported task, the caller's time observed inside it (`t=5`, not 0),
+interleaving of the C's own stdout with the SV body's `$display`, and an exported
+function and task coexisting.
+
+The three clotho-only cases, none of which verilator can run:
+
+```
+# an exported task that suspends (T2)
+FATAL: exported task 'sv_wait' suspended on a timing control, which needs the
+suspendable C frame of DPI-task phase T2 (not implemented) at 1 s
+
+# an exported task called from an imported FUNCTION (LRM 35.8)
+FATAL: exported task 'sv_note2' was called from C with no imported DPI task frame
+live (LRM 35.8: it is never legal to call an exported task from within an imported
+function) at 0 s
+```
+
+```
+# nesting: import task -> exported task -> another import task -> another exported task
+[c]   outer_c -> sv_outer
+[sv]  sv_outer v=5 t=2
+[c]   inner_c -> sv_deep
+[sv]  sv_deep v=50
+[c]   inner_c done
+[sv]  sv_outer after inner_c
+[c]   outer_c got r=6
+[sv]  done t=2
+```
+
+`$finish` inside an exported task also unwinds correctly now (it did not before the
+`compute_may_finish` fix above): the SV statement after the import call does not
+run. The C between the exported task's return and the import's own return still
+does — unavoidable for any simulator that cannot unwind a foreign frame, as the
+`$finish` discussion above notes.
+
 ### Test plan
 
-- T1 automated (`tests/dpi_test.cpp`): the two guard tests at `:485` and `:563`
-  invert into positive lowering tests; a zero-time exported task called from a
-  `context` import task, checked against the verilator run above. The C-calls-into-SV
-  round trip needs a `.o` through `addObjectFile` (`Jit.cpp:541`), which the doctest
-  harness does not wire — so the round trip is the CLI cross-check and the suite
-  covers lowering, thunk emission, and the new fatals.
-- T1 fatal: an exported task containing `#5`, run, must report the located fatal
-  rather than complete.
-- T1 legality: an exported task called from an imported *function* must report the
-  35.8 fatal (`caller_proc == null`).
+- **T1 automated (`tests/dpi_test.cpp`, landed).** The two guard subcases inverted:
+  the import one became `pure`-refusal plus the inherited task-in-function
+  rejection, the export one became three inherited-refusal subcases
+  (`output` string, `inout` string, unpacked aggregate). Added: an import task
+  resolving against libc `puts` that lowers, runs and prints; the emitted
+  `declare i32 @t(i32)` C prototype; an exported task that lowers and runs
+  SV-side; the export-task thunk's shape (i32 return, task coroutine callee, the
+  `done`/`suspended`/`no_frame` arms, both fatal symbols, `ret i32 0`); the upstream
+  slang collapse of one c_identifier from two scopes; and a regression check that an
+  exported *function*'s thunk gained none of the task machinery. The C-calls-into-SV
+  round trip needs a `.o` through `addObjectFile`, which the doctest harness does
+  not wire, so it stays the CLI cross-check above.
+- **T1 fatals** are CLI-checked (both transcripts above); the thunk test pins that
+  each fatal is reachable from the emitted IR.
 - T2: the non-LIFO case that kills the nested drain — two processes, two import-task
   frames, exported tasks waiting `#20` and `#5`, both must return in delay order and
   the SV side must observe the two import calls returning in that same order. Derived
@@ -739,11 +887,15 @@ the existing `run_jit` guard already covers.
 
 ### Sizing
 
-T1 is **small-to-medium** and almost entirely reuse: two guards lift, the export
-thunk gains `lower_task_call_inst`'s sync arm, the import-task call site *is* a task
-call site, and the wheel/state/ring globals it needs already exist. T2 is
-**medium** and self-contained: one runtime file for the baton pool, one tag value in
-`record.parent`, one branch in the task epilogue. T3 is **medium** and is mostly
+T1 was **small-to-medium** and almost entirely reuse, as estimated: two guards
+lifted, the export thunk gained `lower_task_call_inst`'s sync arm, and the
+wheel/state/ring globals it needs already existed. The estimate was wrong on one
+clause — the import-task call site is *not* a task call site (see "What T1 actually
+shipped") — and it missed two things that were not task-specific at all: the
+`compute_may_finish` edge from a DPI import to every export, and the missing
+`emit_finish_check` on the DPI call path. T2 is **medium** and self-contained: one
+runtime file for the baton pool, one tag value in `record.parent`, one branch in the
+task epilogue, plus converting the import call site. T3 is **medium** and is mostly
 bookkeeping over the existing disable machinery.
 
 ## svdpi.h runtime (Phase A landed: packed-vector accessors)
@@ -857,10 +1009,12 @@ is blocked in slang (type mismatch), not deferrable here.
 ## Restrictions — loud-fail with a TODO
 
 Supported: **import** — scalar types, packed vectors, `chandle`, `string` (input
-arg + return), `input`/`output`/`inout`, `pure`, `context`. **export** — functions,
+arg + return), `input`/`output`/`inout`, `pure`, `context`, **functions and tasks**.
+**export** — **functions and tasks**,
 `input`/`output`/`inout` scalar/chandle/real/vec args, `input` string args,
 scalar/chandle/real/void return, any number of tops. Still loud-fail (guards in
-`build_dpi_import` / `collect_dpi_exports`), each with a TODO:
+`build_dpi_import` / `collect_dpi_exports`, or the two runtime fatals), each with a
+TODO:
 
 - Import `output`/`inout` **string** (the unbounded copy-out buffer hazard — see
   the string section) and any non-open-array unpacked aggregate arg/return. **1-D
@@ -870,12 +1024,22 @@ scalar/chandle/real/void return, any number of tops. Still loud-fail (guards in
 - Export string return (returned-`char*` lifetime), export `output`/`inout` string,
   and one c_identifier exported from more than one scope (`svScope`, LRM 35.5.3, would
   pick the instance; blocked upstream — slang drops the duplicate cId entries).
+  An exported **task** inherits every one of these (LRM 35.8 puts a task under
+  35.7's argument rules), and the inheritance is tested, not assumed.
 - The svScope C API is provided with one scope per top; a handle naming a nested
   instance is not available.
-- DPI import **and** export **tasks** (`SubroutineKind::Task`) — a task can consume
-  time, and LRM 35.5.1.5 requires the C frame itself to be suspendable. **Scoped in
-  full** under "DPI tasks" above (T1 zero-time, T2 suspension, T3 the 35.9 disable
-  protocol); functions only today.
+- `pure` on an imported **task** (LRM 35.5.1.3, "An imported task can never be
+  declared `pure`") — a permanent refusal, not a phase. slang only warns.
+- An exported task that **suspends** (executes a delay, event control or `wait`):
+  a located runtime fatal, `rt_dpi_export_task_suspended`. Parking the native C
+  frame is phase **T2** — see "DPI tasks" above.
+- An exported task entered with **no imported-task frame live** — from inside an
+  imported function, or from C no DPI import reached: a located runtime fatal,
+  `rt_dpi_export_task_no_task_frame`. LRM 35.8 makes the first case never legal;
+  the second has no calling thread to borrow. This is a permanent refusal too.
+- The LRM 35.9 **disable protocol**: an exported task always returns 0, an imported
+  task's `int` return is discarded, and `svIsDisabledState` / `svAckDisabledState`
+  are not provided. Phase **T3**, together with `svGetCallerInfo`.
 
 ## Oracle
 
@@ -900,17 +1064,25 @@ Checked at the CLI (clotho `--dpi-lib`), **byte-identical to the expected
   exercised), and an **input string** via `strlen` (zero-copy `const char*`, empty
   and non-empty) — all resolve through run_jit's existing process-symbol generator,
   so the tests need no `.so` build. `pure` import runs correctly. Guard rejections
-  (`output` string, DPI task, `context`) confirmed to loud-fail via `lower_text`.
+  (`output` string, `pure` task, the inherited export-task refusals) confirmed to
+  loud-fail via `lower_text`.
   Full suite byte-identical — DPI is additive, no default path changed.
+- An **import task** is automated the same way: `puts` is the one libc symbol whose
+  shape matches a task import exactly — it takes the `input string` the marshal
+  already handles zero-copy and returns the `int` LRM 35.8 wants and SV never sees —
+  so the whole T1 import path (i32 C prototype, discarded return, plain call site)
+  runs in-suite with no `--dpi-lib`.
 - Return string (C returns `char*`), plus the byte/logic/vec/chandle matrix and
   the `--dpi-lib .so` path, are covered by the CLI matrix, since libc has no
   deterministic `char*`-returning function to probe with.
 - **Export** is the CLI-vs-**verilator** cross-check (`result=105` on both): a
   `context` import's C calls an exported SV function through one JIT-linked `.o`,
-  covering the round-trip, a design-signal read, real, and void. Automated tests
-  cover the export guards and that an export directive lowers + runs; the C-calls-
-  into-SV round-trip needs a `.o` (addObjectFile), which the doctest harness does
-  not wire.
+  covering the round-trip, a design-signal read, real, and void. The **exported
+  task** cross-check is the eight-line transcript under "DPI tasks" above, also
+  byte-identical to verilator. Automated tests cover the export guards, that an
+  export directive lowers + runs, and the export-task thunk's emitted shape; the
+  C-calls-into-SV round-trip needs a `.o` (addObjectFile), which the doctest harness
+  does not wire.
 - The byte/shortint/bit/logic + svLogic x/z paths and the `--dpi-lib .so` path
   are covered by the CLI matrix above (not automated, since libc has no clean
   byte/logic-returning functions and building a test `.so` in-suite is fragile).

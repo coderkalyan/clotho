@@ -5452,7 +5452,14 @@ private:
             const bool by_ptr = is_dpi_vec(ct) || ct == DpiCType::OpenArray || dir != ArgDir::In;
             params.push_back(by_ptr ? ptr : dpi_c_llvm_ty(ct));
         }
-        auto* fnty   = llvm::FunctionType::get(dpi_c_llvm_ty(f.dpi_ret_ctype), params, false);
+        // An import TASK's C prototype returns `int` even though the SV task has no
+        // return value (LRM 35.8: "imported tasks return an int value that is used
+        // to indicate that the imported task has acknowledged a disable"). The SV
+        // side never sees it -- dpi_ret_ctype stays Void, so lower_dpi_call binds no
+        // result Plane and drops the value. Reading it is the disable protocol (LRM
+        // 35.9), phase T3.
+        llvm::Type* rty  = f.is_dpi_task ? b_.getInt32Ty() : dpi_c_llvm_ty(f.dpi_ret_ctype);
+        auto* fnty   = llvm::FunctionType::get(rty, params, false);
         auto  callee = env_->llmod.getOrInsertFunction(f.extern_name, fnty);
         auto* fn     = llvm::dyn_cast<llvm::Function>(callee.getCallee());
         if (fn == nullptr) {
@@ -10115,6 +10122,28 @@ private:
         std::vector<std::vector<FunctionId>> callees(nf);
         for (uint32_t f = 0; f < nf; ++f) {
             direct[f] = scan_finish(mod_.function(static_cast<FunctionId>(f)).ir, &callees[f]) ? 1 : 0;
+        }
+        // A DPI import has no IR body, so the scan above gives it no callees at all
+        // -- yet its native C can call straight back into any `export "DPI-C"`
+        // subroutine, and an exported body is ordinary SV that may `$finish`. Add
+        // that edge explicitly: without it, an import whose C reaches a $finish is
+        // not in the closure, its call site emits no post-call rt_finishing test,
+        // and the finish does not unwind -- the caller runs on past a $finish, which
+        // is a wrong answer rather than a missing optimization. Which export the C
+        // picks is unknowable here, so the edge goes to every one; that is exact
+        // whenever no export finishes (the overwhelmingly common case adds nothing)
+        // and conservative otherwise. This matters most for an import TASK, whose
+        // whole purpose is to reach an exported task, but an import FUNCTION calling
+        // an exported function has always had the same reachability.
+        if (!mod_.dpi_exports.empty()) {
+            for (uint32_t f = 0; f < nf; ++f) {
+                if (!mod_.function(static_cast<FunctionId>(f)).is_dpi) {
+                    continue;
+                }
+                for (const DpiExport& ex : mod_.dpi_exports) {
+                    callees[f].push_back(ex.func);
+                }
+            }
         }
         // Memoized DFS, the same shape as the per-function write-set closure. A
         // cycle contributes what the in-progress callee has so far; a recursive
@@ -14892,6 +14921,14 @@ private:
     }
     llvm::FunctionCallee ring_overflow_fn() {
         return rt_fn("rt_ring_overflow", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
+    }
+    // The two DPI export-task fatals (LRM 35.8). Both take the exported task's
+    // c_identifier and never return; the thunk follows each with `unreachable`.
+    llvm::FunctionCallee dpi_export_task_suspended_fn() {
+        return rt_fn("rt_dpi_export_task_suspended", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee dpi_export_task_no_task_frame_fn() {
+        return rt_fn("rt_dpi_export_task_no_task_frame", b_.getVoidTy(), { raw_ptr_ty() });
     }
 
     // The timing wheel's storage, as a module global rather than main's alloca.
@@ -24932,6 +24969,12 @@ private:
         const Function& f  = mod_.function(ci.func);
         if (f.is_dpi) {
             lower_dpi_call(i, ci, f);
+            // A DPI import needs the post-call rt_finishing test as much as an SV
+            // callee does: its native C can call back into an `export "DPI-C"`
+            // subroutine whose SV body reaches $finish, and compute_may_finish
+            // models exactly that edge. Without this the finish would set the flag
+            // and then the caller would run on past the call site.
+            emit_finish_check(callee_may_finish(ci.func));
             return;
         }
         llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(ci.func)]);
@@ -25581,6 +25624,89 @@ private:
                            b_.getInt32(elem_bytes), b_.getInt32(ew), b_.getInt32(is_logic));
     }
 
+    // Lazily create one of the DPI caller-identity globals (see the member
+    // declarations). Internal linkage: a DPI `.o` links into the same JITDylib, but
+    // nothing outside the generated module has any business reading these -- the
+    // protocol is entirely between an import-task call site and an export-task
+    // thunk. Created on first use, so a design with no DPI tasks emits none.
+    llvm::GlobalVariable* dpi_caller_gv(llvm::GlobalVariable*& slot, llvm::Type* ty, const char* name) {
+        if (slot == nullptr) {
+            slot = new llvm::GlobalVariable(env_->llmod, ty, false, llvm::GlobalValue::InternalLinkage,
+                                            llvm::Constant::getNullValue(ty), name);
+        }
+        return sym(slot);
+    }
+    llvm::GlobalVariable* dpi_in_task_gv() {
+        return dpi_caller_gv(dpi_in_task_gv_, b_.getInt8Ty(), "clotho.dpi.in_import_task");
+    }
+    llvm::GlobalVariable* dpi_caller_proc_gv() {
+        return dpi_caller_gv(dpi_caller_proc_gv_, raw_ptr_ty(), "clotho.dpi.caller_proc");
+    }
+    llvm::GlobalVariable* dpi_caller_home_gv() {
+        return dpi_caller_gv(dpi_caller_home_gv_, b_.getInt8Ty(), "clotho.dpi.caller_home");
+    }
+    llvm::GlobalVariable* dpi_caller_rng_gv() {
+        return dpi_caller_gv(dpi_caller_rng_gv_, raw_ptr_ty(), "clotho.dpi.caller_rng");
+    }
+
+    // The caller identity an import-TASK call site publishes for the duration of
+    // the call, and the saved previous values to restore afterwards. Import tasks
+    // NEST -- an exported task may call another import task -- so this is a
+    // save/restore, not a set/clear: on the way out the enclosing frame's identity
+    // has to come back, including the 0 that means "the innermost DPI frame is an
+    // imported function".
+    struct DpiCallerSave {
+        llvm::Value* in_task = nullptr;
+        llvm::Value* proc    = nullptr;
+        llvm::Value* home    = nullptr;
+        llvm::Value* rng     = nullptr;
+    };
+
+    // Publish this call site's identity, returning what was there. Only the pieces
+    // the design's task ABI actually carries are written (the same design_uses_*
+    // gates declare_task uses); in_import_task is unconditional because LRM 35.8's
+    // legality rule is.
+    DpiCallerSave dpi_publish_caller() {
+        DpiCallerSave saved;
+        auto* i8 = b_.getInt8Ty();
+        saved.in_task = b_.CreateLoad(i8, dpi_in_task_gv(), "dpi.in_task.save");
+        b_.CreateStore(b_.getInt8(1), dpi_in_task_gv());
+        if (design_uses_process_) {
+            // The calling THREAD's control block: an exported task reached from this
+            // C runs in that thread (LRM 9.7), so `process::self()` inside it must
+            // name the process that entered the import task, not "no caller".
+            saved.proc = b_.CreateLoad(raw_ptr_ty(), dpi_caller_proc_gv(), "dpi.proc.save");
+            b_.CreateStore(proc_arg(), dpi_caller_proc_gv());
+        }
+        if (design_uses_home_arg_) {
+            // ... and its scheduling home region (LRM 24.3.1), which decides where a
+            // `#0` inside the exported task lands. callee_home() is this thread's
+            // answer here, exactly as at an ordinary task call.
+            saved.home = b_.CreateLoad(i8, dpi_caller_home_gv(), "dpi.home.save");
+            b_.CreateStore(callee_home(), dpi_caller_home_gv());
+        }
+        // ... and its RNG stream. LRM 18.13 gives every thread an independent
+        // stream, and an exported task is not a thread -- it runs on the caller's,
+        // so a `$urandom` inside it must continue the caller's sequence. This is
+        // where an export TASK differs from an export FUNCTION, which correctly
+        // passes the module-wide state (see emit_dpi_export): a function reached
+        // from C has no calling thread at all, a task always does.
+        saved.rng = b_.CreateLoad(raw_ptr_ty(), dpi_caller_rng_gv(), "dpi.rng.save");
+        b_.CreateStore(rng_slot_, dpi_caller_rng_gv());
+        return saved;
+    }
+
+    void dpi_restore_caller(const DpiCallerSave& saved) {
+        b_.CreateStore(saved.in_task, dpi_in_task_gv());
+        if (saved.proc != nullptr) {
+            b_.CreateStore(saved.proc, dpi_caller_proc_gv());
+        }
+        if (saved.home != nullptr) {
+            b_.CreateStore(saved.home, dpi_caller_home_gv());
+        }
+        b_.CreateStore(saved.rng, dpi_caller_rng_gv());
+    }
+
     // Lower a `call` to a DPI-C import (LRM 35): marshal each argument — scalar by
     // value (input) or through a C-native scratch pointer (output / inout), packed
     // vector always through an svBitVecVal* / svLogicVecVal* scratch — call the
@@ -25656,7 +25782,16 @@ private:
             }
             ++k;
         }
-        llvm::Value* r = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        // An import TASK publishes the calling thread's identity for the duration of
+        // the C call, so an exported task the C reaches can run on that thread
+        // (LRM 35.8). An import FUNCTION publishes nothing: 35.8 makes an exported
+        // task illegal from one, and the export-task thunk detects exactly that by
+        // finding in_import_task still 0.
+        const DpiCallerSave saved = f.is_dpi_task ? dpi_publish_caller() : DpiCallerSave{};
+        llvm::Value*        r     = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        if (f.is_dpi_task) {
+            dpi_restore_caller(saved);
+        }
         for (const DpiOut& o : outs) {
             const Plane pl = is_dpi_vec(o.ct)
                                ? dpi_vec_copyout(o.ct, o.scratch, o.w)
@@ -25677,6 +25812,10 @@ private:
         } else if (f.dpi_ret_ctype != DpiCType::Void) {
             set_value(i, dpi_c_to_plane(f.dpi_ret_ctype, r));
         }
+        // An import task falls through both arms: dpi_ret_ctype is Void because the
+        // SV task has no result, so its i32 C return -- 35.9's disable
+        // acknowledgement -- is discarded. TODO: T3 reads it, and a 1 must then
+        // unwind the enclosing disable rather than being dropped here.
     }
 
     // Whether the design has any DPI import or export — gates the svScope init.
@@ -25719,12 +25858,52 @@ private:
         argv.push_back(four.z);
     }
 
+    // One `output` / `inout` formal of an export thunk, recorded during the
+    // argument marshal and copied back after the callee returns: the (mm, z) plane
+    // cells the exported subroutine wrote, plus the C pointer to store through.
+    struct ExpOut {
+        llvm::Value* c_ptr;   // the C output pointer (scalar*) or svVecVal*
+        llvm::Value* mm_ptr;  // SV out ABI: i(2W) cell
+        llvm::Value* z_ptr;   // SV out ABI: iW cell
+        DpiCType     ct;
+        uint32_t     w;
+    };
+
+    // Copy every output / inout cell back to its C pointer and release the input
+    // string temporaries. Shared by the function and task arms of emit_dpi_export:
+    // a task reaches it only on the completed path, so it has exactly one caller
+    // per arm, but the marshal is delicate enough (real reconstruction, vec
+    // chunking, x/z) that a second copy would be a standing correctness hazard.
+    void emit_dpi_export_copyout(const std::vector<ExpOut>&       outs,
+                                 const std::vector<llvm::Value*>& str_temps) {
+        for (const ExpOut& o : outs) {
+            Plane pl{ b_.CreateLoad(int_ty(2 * o.w), o.mm_ptr), b_.CreateLoad(int_ty(o.w), o.z_ptr) };
+            if (is_dpi_vec(o.ct)) {
+                dpi_vec_copyin(o.ct, pl, o.w, o.c_ptr); // plane -> C svVecVal
+            } else {
+                if (o.ct == DpiCType::Real || o.ct == DpiCType::Shortreal) {
+                    pl = real_plane(planes_to_real(pl, o.w));
+                }
+                b_.CreateStore(dpi_arg_to_c(o.ct, pl), o.c_ptr);
+            }
+        }
+        for (llvm::Value* h : str_temps) {
+            b_.CreateCall(str_deinit_fn(), { h });
+        }
+    }
+
     // A C-callable entry point `<c_ret> <cid>(<c_args>)` (external linkage) that
-    // marshals C arguments into the SV function's plane ABI, calls it against the
-    // design-state global, and marshals results back to C. Input scalar/chandle/
-    // real/vec and input string args; output/inout scalar/chandle/real/vec args;
-    // scalar/chandle/real/void return (the frontend guards the rest). The marshal
-    // reuses the import helpers in reverse.
+    // marshals C arguments into the exported subroutine's plane ABI, calls it
+    // against the design-state global, and marshals results back to C. Input
+    // scalar/chandle/real/vec and input string args; output/inout
+    // scalar/chandle/real/vec args; scalar/chandle/real/void return (the frontend
+    // guards the rest). The marshal reuses the import helpers in reverse.
+    //
+    // An exported TASK (LRM 35.8) shares all of that -- 35.7's argument rules apply
+    // to a task unchanged -- and differs in three places: its C prototype returns
+    // `int` whatever the SV side says, the callee is a coroutine that must be
+    // ramped and resumed rather than called, and the caller identity is real
+    // rather than absent (see dpi_publish_caller).
     void emit_dpi_export(const DpiExport& ex) {
         const Function& f    = mod_.function(ex.func);
         llvm::Function* svfn = sym(fn_decls_[static_cast<uint32_t>(ex.func)]);
@@ -25734,36 +25913,76 @@ private:
         for (size_t k = 0; k < ex.arg_ctypes.size(); ++k) {
             cparams.push_back(dpi_export_c_param_ty(ex.arg_ctypes[k], ex.arg_dirs[k]));
         }
-        auto* fnty  = llvm::FunctionType::get(dpi_c_llvm_ty(ex.ret_ctype), cparams, false);
+        // LRM 35.8: "The return value of an exported task is an int value that
+        // indicates if a disable is active or not on the current execution thread."
+        // An SV task has no result, so this return is generated, never marshalled;
+        // T1 always answers 0, since there is no disable protocol yet (T3).
+        auto* cret  = ex.is_task ? b_.getInt32Ty() : dpi_c_llvm_ty(ex.ret_ctype);
+        auto* fnty  = llvm::FunctionType::get(cret, cparams, false);
         auto* thunk = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, ex.extern_name, env_->llmod);
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", thunk));
 
-        // Output / inout copy-back after the call: the (mm, z) plane cells the SV
-        // function wrote, plus the C pointer to store the result through.
-        struct ExpOut {
-            llvm::Value* c_ptr;   // the C output pointer (scalar*) or svVecVal*
-            llvm::Value* mm_ptr;  // SV out ABI: i(2W) cell
-            llvm::Value* z_ptr;   // SV out ABI: iW cell
-            DpiCType     ct;
-            uint32_t     w;
-        };
+        // LRM 35.8's legality rule, enforced where it becomes decidable. "It is
+        // never legal to call an exported task from within an imported function.
+        // This semantics is identical to native SystemVerilog semantics, in which it
+        // is illegal for a function to perform a task enable." The SV half is
+        // slang's ("cannot invoke a task from within a function"); the C half is
+        // only knowable at run time, because WHICH DPI frame is live is a property
+        // of the call chain rather than of this thunk. clotho.dpi.in_import_task is
+        // 1 exactly while an import-TASK call is in flight, so 0 here means the
+        // innermost DPI frame belongs to an imported function -- or that no DPI
+        // import reached this C at all, which is equally unrunnable: there would be
+        // no thread whose time, region and RNG stream the task could borrow.
+        if (ex.is_task) {
+            auto* legal_bb = llvm::BasicBlock::Create(ctx_, "dpi.task.legal", thunk);
+            auto* bad_bb   = llvm::BasicBlock::Create(ctx_, "dpi.task.no_frame", thunk);
+            b_.CreateCondBr(b_.CreateICmpNE(b_.CreateLoad(b_.getInt8Ty(), dpi_in_task_gv(), "dpi.in_task"),
+                                            b_.getInt8(0)),
+                            legal_bb, bad_bb);
+            b_.SetInsertPoint(bad_bb);
+            b_.CreateCall(dpi_export_task_no_task_frame_fn(), { b_.CreateGlobalString(ex.extern_name) });
+            b_.CreateUnreachable();
+            b_.SetInsertPoint(legal_bb);
+        }
+
         std::vector<ExpOut>       outs;
         std::vector<llvm::Value*> str_temps; // input rt_string handles to deinit
 
+        auto*                     ptr_ty = llvm::PointerType::getUnqual(ctx_);
         std::vector<llvm::Value*> argv;
         argv.push_back(sym(state_global_));
-        // No calling process exists on this path -- native C drove the call -- so
-        // the exported subroutine draws from the module-wide state.
-        argv.push_back(sym(rng_global_));
-        // Nor a calling thread: `process::self()` in an exported subroutine has no
-        // answer, and reports a located fatal rather than inventing one.
-        if (design_uses_process_) {
-            argv.push_back(llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_)));
+        // The RNG stream the exported subroutine draws from (LRM 18.13). A FUNCTION
+        // has no calling process -- native C drove the call -- so it draws from the
+        // module-wide state main seeds at startup. A TASK does have one: it runs on
+        // the thread that entered the import task, so a `$urandom` inside it has to
+        // continue THAT thread's sequence, which the import-task call site parked in
+        // clotho.dpi.caller_rng.
+        argv.push_back(ex.is_task ? static_cast<llvm::Value*>(
+                                      b_.CreateLoad(ptr_ty, dpi_caller_rng_gv(), "dpi.rng"))
+                                  : static_cast<llvm::Value*>(sym(rng_global_)));
+        // A task's ABI carries the wheel (declare_task); a function's does not, since
+        // a function cannot reach a timing control.
+        if (ex.is_task) {
+            argv.push_back(sym(wheel_gv_));
         }
-        // Nor a home region: native C drove the call, so there is no calling thread
-        // whose scheduling region an exported subroutine could inherit (LRM 24.3.1).
+        // The calling thread. A function has none, so `process::self()` inside an
+        // exported function has no answer and reports a located fatal rather than
+        // inventing one. A task has one, and carrying it is the whole point of the
+        // caller-identity globals: `process::self()` inside an exported task names
+        // the process that entered the import task.
+        if (design_uses_process_) {
+            argv.push_back(ex.is_task ? static_cast<llvm::Value*>(
+                                          b_.CreateLoad(ptr_ty, dpi_caller_proc_gv(), "dpi.proc"))
+                                      : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptr_ty)));
+        }
+        // Its scheduling home region (LRM 24.3.1), the same split: an exported
+        // function inherits nothing because no thread called it; an exported task
+        // inherits the region of the thread that did, which is what decides where a
+        // `#0` inside it would land.
         if (design_uses_home_arg_) {
-            argv.push_back(b_.getInt8(0));
+            argv.push_back(ex.is_task ? static_cast<llvm::Value*>(
+                                          b_.CreateLoad(b_.getInt8Ty(), dpi_caller_home_gv(), "dpi.home"))
+                                      : static_cast<llvm::Value*>(b_.getInt8(0)));
         }
         for (size_t k = 0; k < ex.arg_ctypes.size(); ++k) {
             const DpiCType ct     = ex.arg_ctypes[k];
@@ -25807,35 +26026,58 @@ private:
             }
         }
 
-        llvm::Value* r = b_.CreateCall(svfn->getFunctionType(), svfn, argv);
-
-        // Copy each output / inout result back to its C pointer.
-        for (const ExpOut& o : outs) {
-            Plane pl{ b_.CreateLoad(int_ty(2 * o.w), o.mm_ptr), b_.CreateLoad(int_ty(o.w), o.z_ptr) };
-            if (is_dpi_vec(o.ct)) {
-                dpi_vec_copyin(o.ct, pl, o.w, o.c_ptr); // plane -> C svVecVal
-            } else {
-                if (o.ct == DpiCType::Real || o.ct == DpiCType::Shortreal) {
-                    pl = real_plane(planes_to_real(pl, o.w));
-                }
-                b_.CreateStore(dpi_arg_to_c(o.ct, pl), o.c_ptr);
+        if (!ex.is_task) {
+            llvm::Value* r = b_.CreateCall(svfn->getFunctionType(), svfn, argv);
+            emit_dpi_export_copyout(outs, str_temps);
+            if (ex.ret_ctype == DpiCType::Void) {
+                b_.CreateRetVoid();
+                return;
             }
-        }
-        for (llvm::Value* h : str_temps) {
-            b_.CreateCall(str_deinit_fn(), { h });
-        }
-
-        if (ex.ret_ctype == DpiCType::Void) {
-            b_.CreateRetVoid();
+            // Unpack the SV {mm, z} return struct into a Plane, then marshal to C.
+            Plane         rp{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
+            const ValType t = from_ref(f.return_type);
+            if (t.is_real) {
+                rp = real_plane(planes_to_real(rp, t.width));
+            }
+            b_.CreateRet(dpi_arg_to_c(ex.ret_ctype, rp));
             return;
         }
-        // Unpack the SV {mm, z} return struct into a Plane, then marshal to C.
-        Plane         rp{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
-        const ValType t = from_ref(f.return_type);
-        if (t.is_real) {
-            rp = real_plane(planes_to_real(rp, t.width));
-        }
-        b_.CreateRet(dpi_arg_to_c(ex.ret_ctype, rp));
+
+        // A task is a coroutine, so drive it exactly the way lower_task_call_inst
+        // drives an SV task enable: null the record so the callee sees no parent and
+        // enqueues nobody, ramp it, resume once, then ask whether it finished.
+        llvm::Value* record = entry_alloca(ptr_ty, "dpi.task_record");
+        b_.CreateStore(llvm::ConstantPointerNull::get(ptr_ty), record);
+        argv.push_back(record);
+        llvm::Value* hdl  = b_.CreateCall(svfn->getFunctionType(), svfn, argv);
+        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
+        llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { hdl });
+
+        auto* done_bb = llvm::BasicBlock::Create(ctx_, "dpi.task.done", thunk);
+        auto* susp_bb = llvm::BasicBlock::Create(ctx_, "dpi.task.suspended", thunk);
+        b_.CreateCondBr(done, done_bb, susp_bb);
+
+        // Not done: the task parked on a delay / event control / `wait`.
+        // lower_task_call_inst's async arm would store the CALLER's coroutine handle
+        // in the record and suspend, but this caller is a native C frame -- it has
+        // no handle and no way to be parked, which is exactly what phase T2 adds.
+        // Refuse loudly rather than return to C with the task half-run: its outputs
+        // are unwritten and its body never completes, so continuing would be a
+        // silent wrong answer.
+        // TODO: T2 -- hand the baton to a pooled worker stack here and take
+        // lower_task_call_inst's async arm at the import-task call site instead.
+        b_.SetInsertPoint(susp_bb);
+        b_.CreateCall(dpi_export_task_suspended_fn(), { b_.CreateGlobalString(ex.extern_name) });
+        b_.CreateUnreachable();
+
+        // Done: it ran to completion in zero time and its epilogue has already
+        // written the output / inout cells, so destroy the frame and marshal back.
+        b_.SetInsertPoint(done_bb);
+        b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
+        emit_dpi_export_copyout(outs, str_temps);
+        // 0 = "no disable is active on the current execution thread" (LRM 35.8), the
+        // only answer T1 can give. TODO: T3 returns 1 for a disable-terminated task.
+        b_.CreateRet(b_.getInt32(0));
     }
 
     // Marshal an SV scalar value (a Plane the frontend resized to the formal type)
@@ -30281,6 +30523,24 @@ private:
     // The timing wheel's storage (clotho.wheel). A global so a function body, which
     // has no wheel parameter, can still read the clock.
     llvm::GlobalVariable*   wheel_gv_     = nullptr;
+    // DPI caller identity across a native C frame (LRM 35.8), lazily created by
+    // dpi_caller_gv and written with save/restore around every import-TASK call
+    // (lower_dpi_call). An export FUNCTION thunk needs none of this -- C drove that
+    // call, so there is no calling thread -- but an export TASK runs on behalf of
+    // the process that entered the import task, and that process's identity has to
+    // cross the C frame somehow. A global is enough because exactly one of
+    // {simulation stack, C} runs at a time in T1, and save/restore handles the
+    // nesting an exported task calling another import task creates.
+    //
+    // in_import_task is the one that is ALWAYS emitted once the design has DPI
+    // tasks: it answers 35.8's legality question ("is the innermost DPI frame a
+    // task?"), which is not conditional on whether the design happens to mention
+    // `process`. The other three carry ABI arguments and so are gated on exactly
+    // the conditions that put those arguments in the task signature.
+    llvm::GlobalVariable* dpi_in_task_gv_     = nullptr; // i8: an import-task frame is live
+    llvm::GlobalVariable* dpi_caller_proc_gv_ = nullptr; // ptr: calling thread's PCB
+    llvm::GlobalVariable* dpi_caller_home_gv_ = nullptr; // i8: calling thread's home region
+    llvm::GlobalVariable* dpi_caller_rng_gv_  = nullptr; // ptr: calling thread's RNG state
     // Slot-type memo, one `{ i(2W)[, iW] }` per (width, domain, has_z).
     std::vector<std::tuple<uint32_t, bool, bool, bool, llvm::StructType*>> slot_types_;
     // Per-definition state-struct memo: (definition name, field types, type).

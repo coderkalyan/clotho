@@ -297,22 +297,32 @@ professional parity; M5 makes it complete.
   out/inout string formal (1 param vs 2), which would have mis-indexed every later
   formal. Still refused: a mixed string / packed actual (slang rejects it first —
   neither direction is assignment compatible), and a string-element ARRAY by value.
-- [x] **DPI-C import function** (LRM 35) — `import "DPI-C" [pure] function` over
+- [x] **DPI-C import function and task** (LRM 35) — `import "DPI-C" [pure] function` over
   the scalar-mapped types (byte/shortint/int/longint/real/shortreal/bit/logic;
   by-value, direct native `call`, ~1.8ns/call), packed vectors (bit[N]→
   svBitVecVal, logic[N]→svLogicVecVal via rt_dpi_pack/unpack_logicvec), and
   `chandle` (opaque i64↔void*), and `string` (input arg via rt_string_data
   zero-copy — needs the rt_string NUL invariant — and return via rt_dpi_str_out);
   `input`/`output`/`inout` args, scalar/chandle/string return, `pure`+`context`.
+  `import "DPI-C" [context] task` (LRM 35.8) takes the same formals; its C prototype
+  returns `int` (35.9's disable channel) which SV never sees and T1 discards, and
+  `pure` on one is refused (35.5.1.3, slang only warns).
   **export "DPI-C"**: C calls into SV — a C-ABI thunk marshals args and calls the
-  lowered SV function, which addresses its own instance's state absolutely, so an
-  export binds at lowering time and needs no scope lookup; functions,
+  lowered SV subroutine, which addresses its own instance's state absolutely, so an
+  export binds at lowering time and needs no scope lookup; functions **and tasks**,
   `input`/`output`/`inout` scalar/chandle/real/vec args, `input` string,
-  scalar/chandle/real/void return, any number of tops. Loader: `--dpi-lib` takes a
+  scalar/chandle/real/void return, any number of tops. An exported TASK is driven as
+  a coroutine (ramp / `coro_resume` / `coro_done`) with the calling thread's
+  identity carried across the C frame in the `clotho.dpi.*` globals; only the
+  zero-time case is implemented — a task that suspends is a located runtime fatal
+  (phase T2), as is one entered with no imported-task frame live (LRM 35.8).
+  Loader: `--dpi-lib` takes a
   `.o`/`.a` (JIT-linked via addObjectFile — both directions) or a `.so` (dlopen,
   import only; refused when the design exports). Export direction is checked
-  against verilator (not a 4-state oracle — it drops x/z on logic vecs). See
-  docs/design/dpi-c.md. **svdpi.h runtime** (Annex H): packed-vector
+  against verilator, byte-identical for both functions and zero-time tasks (not a
+  4-state oracle, though — it drops x/z on logic vecs, and declares an exported task
+  `void` rather than `int`).
+  See docs/design/dpi-c.md. **svdpi.h runtime** (Annex H): packed-vector
   bit/part-select accessors (svGet/PutBitsel/Partsel Bit/Logic, svDpiVersion) +
   per-top scope table (svGetScope/svSetScope/svGetNameFromScope/
   svGetScopeFromName/svPut+GetUserData), and 1-D open-array accessors
@@ -4677,21 +4687,35 @@ nothing — reporting it needs `ir::AssertionMonitor::label`
 - [ ] **`svScope` handles for non-top instances** — a scope is registered per top, so
   `svGetScopeFromName` cannot name a nested instance. Exports themselves bind
   absolutely at lowering time, so this is only about the scope API's reach.
-- [ ] **DPI import/export tasks** (LRM 35.8) — **scoped**: docs/design/dpi-c.md
-  § "DPI tasks", three phases. The two directions are one feature — 35.8 makes an
-  exported task callable only from a `context` imported task and never from an
-  imported function, so lifting the export guard alone yields an entry point with no
-  legal caller. **T1 (zero-time)** is mostly reuse: a time-consuming SV task is
-  already a standalone presplit coroutine with a `(state, rng, wheel, [proc], [home],
-  args…, record)` ABI, `lower_task_call_inst` already has the ramp / `coro_resume` /
-  `coro_done` sync-async split an export thunk needs, and the wheel, `@clotho.state`
-  and every scheduler ring are already module globals — the old "the wheel is a
-  `main`-local alloca" premise for deferring this was stale. New in T1: the synthetic
-  `int` C return both directions carry (35.8), two caller-identity globals so the
-  export thunk can pass the calling process and its home region (the function thunk
-  passes null/0 because C drove the call, which is false for a task), and the 35.8
-  "never from an imported function" fatal, which falls out of `caller_proc == null`.
-  An exported task that actually suspends is a located FATAL in T1.
+- [~] **DPI import/export tasks** (LRM 35.8) — **T1 landed; T2 and T3 open**.
+  docs/design/dpi-c.md § "DPI tasks". The two directions are one feature — 35.8
+  makes an exported task callable only from a `context` imported task and never from
+  an imported function, so the two guards lifted together.
+  **T1 (zero-time) is done**: `import "DPI-C" [context] task` and
+  `export "DPI-C" task` both work, and an import task whose C calls a zero-time
+  exported task is byte-identical to verilator (measured, eight-line transcript in
+  the design doc). It was mostly reuse, as scoped: the export thunk is
+  `lower_task_call_inst`'s sync arm (ramp / `coro_resume` / `coro_done` / destroy)
+  against the already-global wheel and `@clotho.state`. What T1 added beyond the
+  scoping: the synthetic `int` C return both directions carry (generated, discarded);
+  **four** caller-identity globals rather than two, save/restored around the
+  import-task call because import tasks nest —
+  `clotho.dpi.caller_proc` / `caller_home` gated as `declare_task` gates those
+  params, plus `caller_rng` (an exported task runs on the calling thread, so LRM
+  18.13 makes its `$urandom` continue that thread's stream, not the module-wide one)
+  and an unconditional `in_import_task` flag (35.8's legality rule does not depend on
+  whether the design mentions `process`, which `caller_proc`'s gate does). The import
+  CALL SITE stays a plain `Call`, not a task call site: nothing on the T1 path can
+  consume time. Two latent non-task holes were fixed on the way: `compute_may_finish`
+  gave a DPI import no callees at all (it has no IR body) though its C can call back
+  into any export that `$finish`es, and `lower_call_inst`'s DPI branch emitted no
+  post-call `rt_finishing` test — so a `$finish` inside any exported subroutine did
+  not unwind its SV caller.
+  Refused loudly after T1: `pure` on an imported task (LRM 35.5.1.3, permanent —
+  slang only warns), an exported task that **suspends**
+  (`rt_dpi_export_task_suspended`, = T2), and an exported task entered with no
+  imported-task frame live (`rt_dpi_export_task_no_task_frame`, LRM 35.8). A task
+  also inherits every export-*function* refusal (35.7's argument rules), tested.
   **T2 (suspension)** is the hard half and 35.5.1.5 states the requirement — an
   imported task's C "can be simultaneously active in multiple execution threads" — so
   each in-flight import-task frame needs its own machine stack. A nested drain from
@@ -4703,23 +4727,29 @@ nothing — reporting it needs `ir::AssertionMonitor::label`
   time advances inside a DPI call and so can never be hot, `src/` has no
   `thread_local`, and the collector never scans a machine stack
   (`push_frame_roots` / `push_range_roots`) — a hand-rolled context switch is a
-  measured follow-up, not a prerequisite. **T3** is the 35.9 disable protocol
-  (`svIsDisabledState` / `svAckDisabledState` plus the checks the clause obliges the
-  simulator to make) and `svGetCallerInfo`. Oracle position, measured: iverilog 13
+  measured follow-up, not a prerequisite. T2 also converts the import call site to a
+  real task call site and removes T1's suspension fatal. **T3** is the 35.9 disable
+  protocol (`svIsDisabledState` / `svAckDisabledState` plus the checks the clause
+  obliges the simulator to make, and reading the import task's `int` instead of
+  discarding it) and `svGetCallerInfo`. Oracle position, re-measured: iverilog 13
   still cannot parse `import "DPI-C"` at all; verilator 5.050 runs a zero-time
-  exported task correctly (so it oracles T1) but refuses a timing control inside an
-  exported task outright ("Unsupported: Timing controls inside DPI-exported tasks")
-  and declares an exported task `void`, not `int` — so T2 and T3 are derived from the
-  clause text.
+  exported task correctly (so it oracles T1, and does — byte-identical) but refuses a
+  timing control inside an exported task outright ("Unsupported: Timing controls
+  inside DPI-exported tasks", the same program clotho fatals on) and declares an
+  exported task `void`, not `int` — so T2 and T3 are derived from the clause text.
 - [ ] **`svGetCallerInfo` + the DPI disable API** — not provided; C calling one hits
   an unresolved symbol. Scoped as T3 of the DPI-task entry above (LRM 35.9): the
-  disable protocol is what the `int` return of an imported/exported task exists for,
-  so the API and the task work land together.
+  disable protocol is what the `int` return of an imported/exported task exists for.
+  T1 landed that `int` on both sides but always answers 0 on export and discards it
+  on import, so the API and the remaining task work still land together.
 - [x] **DPI-C** — import (scalar/vec/chandle/string, in/out/inout, pure/context, 1-D
-  open arrays in/out/inout at any element width, dynamic-array zero-copy actuals) and
-  export V1 (C→SV, functions, scalar/chandle/real/vec/string args) landed, with the
+  open arrays in/out/inout at any element width, dynamic-array zero-copy actuals,
+  **tasks**) and
+  export V1 (C→SV, functions **and zero-time tasks**, scalar/chandle/real/vec/string
+  args) landed, with the
   svdpi.h accessors (bit/part-select, one scope per top, open-array). See the M1
-  Subroutines entry and docs/design/dpi-c.md.
+  Subroutines entry, the DPI-task entry above for what T1 left open, and
+  docs/design/dpi-c.md.
 
 ### UVM enablers
 

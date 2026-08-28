@@ -30788,15 +30788,26 @@ private:
 
     // Lower a DPI-C import (LRM 35) into the reserved slot. There is no IR body:
     // the backend emits an external C declaration keyed on the linkage name and
-    // marshals each scalar argument at the call site (lower_dpi_call). PoC scope:
-    // import functions, `input` arguments, scalar-mapped types only — everything
-    // else loud-fails with a TODO (see docs/design/dpi-c.md).
+    // marshals each scalar argument at the call site (lower_dpi_call). Functions
+    // and tasks; scalar / packed-vector / chandle / string / 1-D open-array
+    // formals in every direction -- everything else loud-fails with a TODO (see
+    // docs/design/dpi-c.md).
     void build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id) {
-        if (sub.subroutineKind == SubroutineKind::Task) {
-            // TODO: DPI import tasks (LRM 35.5.5) — can consume time via disable;
-            // the native boundary is coroutine-shaped. Import functions only.
-            fail("DPI import tasks are not supported");
+        const bool is_task = sub.subroutineKind == SubroutineKind::Task;
+        if (is_task && sub.flags.has(MethodFlags::Pure)) {
+            // LRM 35.5.1.3: "An imported task can never be declared pure." slang
+            // only warns (-Wdpi-pure-task), and the mistake is not benign here --
+            // is_pure marks the C declaration readnone + willreturn, so the
+            // optimizer would CSE or delete calls to a task whose whole purpose is
+            // its side effects. Refuse rather than silently miscompile.
+            fail("an imported DPI task cannot be declared `pure` (LRM 35.5.1.3)");
         }
+        // TODO: T2 -- an import task whose C calls an exported task that consumes
+        // time. The call site below stays an ordinary plain `Call`, which cannot
+        // suspend, so the C frame is not suspendable; the export-task thunk reports
+        // a located fatal if the task it drives does not complete in zero time
+        // (rt_dpi_export_task_suspended). Lifting that needs the baton-pool stack
+        // handoff and a task call site here (docs/design/dpi-c.md, "DPI tasks").
         // `context` (LRM 35.5.3) is accepted and lowered identically to a plain
         // import: its purpose is to let the C call exported SV functions (and the
         // svScope APIs), and an export thunk needs no scope to find its instance —
@@ -30897,6 +30908,7 @@ private:
                                            .local_types         = std::move(local_types),
                                            .is_dpi              = true,
                                            .is_pure             = sub.flags.has(MethodFlags::Pure),
+                                           .is_dpi_task         = is_task,
                                            .extern_name         = std::move(cid),
                                            .dpi_arg_ctypes      = std::move(arg_cts),
                                            .dpi_ret_ctype       = ret_ct,
@@ -30968,14 +30980,15 @@ private:
         return top;
     }
 
-    // Collect `export "DPI-C"` directives (LRM 35.5): for each, force-lower the SV
-    // function and record a DpiExport so the backend emits its C-callable thunk.
-    // slang resolves the export -> subroutine binding and the c_identifier
-    // (Compilation::getDPIExports). Scope: functions; input/output/inout scalar /
-    // chandle / real / packed-vector args; input string args; scalar/chandle/real/
-    // void return. Deferred (loud-fail): string return (returned-char* lifetime),
-    // output/inout string, open-array/unpacked args, tasks. Public: called by
-    // lower_compilation.
+    // Collect `export "DPI-C"` directives (LRM 35.5 / 35.8): for each, force-lower
+    // the SV subroutine and record a DpiExport so the backend emits its C-callable
+    // thunk. slang resolves the export -> subroutine binding and the c_identifier
+    // (Compilation::getDPIExports). Scope: functions AND tasks; input/output/inout
+    // scalar / chandle / real / packed-vector args; input string args;
+    // scalar/chandle/real/void return. LRM 35.8 puts a task under exactly 35.7's
+    // argument rules, so every guard below applies to one unchanged. Deferred
+    // (loud-fail): string return (returned-char* lifetime), output/inout string,
+    // open-array/unpacked args. Public: called by lower_compilation.
     //
     // getDPIExports is compilation-wide, but every top has its own Lowerer that only
     // knows its own symbols, and instance binding is baked into the lowered body (the
@@ -31006,11 +31019,12 @@ public:
             } else if (top == nullptr || owning_top(sub) != top) {
                 continue; // another top's export (or no elaborated instance at all)
             }
-            if (sub.subroutineKind == SubroutineKind::Task) {
-                // TODO: exported tasks — need the timing wheel + coroutine driving
-                // from C (docs/design/dpi-c.md).
-                fail("DPI export tasks are not supported");
-            }
+            const bool is_task = sub.subroutineKind == SubroutineKind::Task;
+            // An exported TASK (LRM 35.8) is admitted here and lowers as an ordinary
+            // task coroutine; the backend thunk drives it (emit_dpi_export). Only the
+            // ZERO-TIME case works: a task that actually suspends is a located
+            // runtime fatal, since the C frame that called it cannot be parked.
+            // TODO: T2 -- suspension across the C frame (docs/design/dpi-c.md).
             ir::DpiCType ret_ct = ir::DpiCType::Void;
             if (!sub.getReturnType().isVoid()) {
                 const auto c = dpi_ctype(sub.getReturnType());
@@ -31053,9 +31067,11 @@ public:
                          "' (one C name cannot bind two SystemVerilog functions)");
                 }
             }
-            const ir::FunctionId id = function_id(sub); // force-lower the SV function
-            module_.dpi_exports.push_back(
-              ir::DpiExport{ id, std::string(ex.cIdentifier), std::move(arg_cts), std::move(arg_dirs), ret_ct });
+            // function_id force-lowers the SV subroutine: a task takes build_task,
+            // so the thunk has a real coroutine ramp to drive.
+            const ir::FunctionId id = function_id(sub);
+            module_.dpi_exports.push_back(ir::DpiExport{ id, std::string(ex.cIdentifier), std::move(arg_cts),
+                                                         std::move(arg_dirs), ret_ct, is_task });
         }
     }
 
@@ -32914,7 +32930,16 @@ private:
         if (bare_vif) {
             this_val = vif_ctx_arg(sub, b, loc(call));
         }
-        if (sub.subroutineKind == SubroutineKind::Task) {
+        // A DPI import task is a task to SystemVerilog (a statement, no result, and
+        // slang already refuses it inside a function) but NOT a coroutine: it has no
+        // IR body to ramp, only a native C symbol. In T1 nothing on this path can
+        // consume time -- an exported task the C reaches must complete in zero time
+        // or the thunk reports a located fatal -- so the call site stays the ordinary
+        // plain `Call` that lower_dpi_call marshals, and never grows a task ramp,
+        // record slot or suspend arm it could not use.
+        // TODO: T2 makes this a real task call site, so the caller can be parked
+        // while the C frame waits (docs/design/dpi-c.md, "DPI tasks").
+        if (sub.subroutineKind == SubroutineKind::Task && !sub.flags.has(MethodFlags::DPIImport)) {
             // A task is a statement, never a value; it blocks the caller until done.
             lower_task_call(call, sub, b, this_val);
             return std::nullopt;
