@@ -558,28 +558,41 @@ professional parity; M5 makes it complete.
 
 ### Time-consuming procedural code
 
-- [ ] **Intra-assignment timing remainder** (LRM 9.4.5) — **scoped**, six items in
-  docs/design/intra-assignment-timing.md § "The remainder", with a phase plan.
+- [ ] **Intra-assignment timing remainder** (LRM 9.4.5) — **R-a and R-b landed**
+  (R1, R6, R2, R4); R-c (`iff`) and R-d (the owned-handle record) remain, scoped in
+  docs/design/intra-assignment-timing.md § "The remainder".
   (Blocking, nonblocking `#d`, and nonblocking `@e`/`repeat(N) @e` all done below,
   now including bit/part-select, unpacked-array element, packed/unpacked struct
   field, and real targets.) The nonblocking gaps, grouped by what the deferred
   record is actually missing rather than by syntax:
-  - **R1 — the decomposing targets**: a concatenation, a streaming concatenation, an
-    assignment-pattern lvalue, and a whole unpacked struct or array. Plain NBA
-    already decomposes each into N per-leaf `StoreNb`s (`store_concat`,
-    `store_stream_target`, `lower_pattern_assign`, `emit_struct_store` /
-    `emit_agg_copy`); the intra form is the same walk emitting `StoreNbDelay` /
-    `StoreNbEvent` per leaf, with one RHS sample, one delay/count evaluation, and
-    consecutive `seq` stamps in leaf order so a self-overlapping target lands exactly
-    as the plain-NBA form does. Frontend only, no record change.
-  - **R2 — a nonblocking write through a virtual interface handle** (`vif.sig <= #5
-    x`): one `SignalSlot` flag (`intra_ptr`, set the way `intra_masked` is) forcing
-    the pointer-carrying record tail and per-record destination load the array-element
-    path already uses. LRM 10.4.2 requires exactly this ("if `variable_lvalue`
-    requires an evaluation, such as an index expression, class handle, or virtual
-    interface reference, it shall be evaluated at the same time as the … right-hand
-    side"), so capturing the resolved instance at arm time is the semantics, not a
-    shortcut.
+  - [x] **R1 — the decomposing targets** — DONE. A concatenation, a streaming
+    concatenation, an assignment-pattern lvalue, and a whole unpacked struct or
+    array all decompose: `lower_assign` lowers the timing once into an
+    `IntraNbTiming` and threads it as a nullable `const IntraNbTiming*` beside the
+    store tag through the same walkers plain NBA uses (`store_concat`,
+    `store_stream_target`, `lower_pattern_assign`, `emit_agg_store`,
+    `emit_agg_copy`), each leaf emitting `StoreNbDelay` / `StoreNbEvent`. One RHS
+    sample, one delay/count evaluation, consecutive `seq` stamps in leaf order — so
+    `{a, a[0]} <= #5 x` lands exactly as its plain-NBA form does (checked, not
+    assumed). A pointer rather than a leaf-emitter callback so ordinary assignments
+    pay a null test, not an indirect call. Frontend only, no record change.
+    Narrowed rather than removed: a conditional RHS over a whole aggregate
+    (`Lower.cpp:5215`), an aggregate with a container member (`:5318`), an indexed
+    array-slice target (`:24657`) and a string/container operand of a streaming
+    target (`:27590`) still fail loud, each with a TODO.
+  - [x] **R2 — a nonblocking write through a virtual interface handle** — DONE.
+    `vif.sig <= #5 x` commits into the instance the handle named. One `SignalSlot`
+    flag (`intra_ptr`, set the way `intra_masked` is, from the same `vif_rec` fact
+    that routes the member's plain NBA) forces the pointer-carrying record tail and
+    the per-record destination load. LRM 10.4.2 requires exactly this ("if
+    `variable_lvalue` requires an evaluation, such as an index expression, class
+    handle, or virtual interface reference, it shall be evaluated at the same time
+    as the … right-hand side"), so capturing the resolved instance at arm time is
+    the semantics, not a shortcut. The wake follows the PLAIN-NBA vif record, not
+    the array one: `@(posedge intf.sig)` is legal where `@(posedge mem[i])` is not,
+    so the record also carries the instance context and the commit wakes per record
+    under a `CtxOverride` — the design doc's "level-only" sketch was wrong and is
+    corrected there.
   - **R3 — a string target and a whole container target** (`s <= #5 t`, `q <= #2 r`):
     one new record tail class, `{ ptr owned }`. Plain NBA stages an owned deep copy
     per signal (`emit_string_whole_commit` / `HandleCopyNb` →
@@ -587,11 +600,19 @@ professional parity; M5 makes it complete.
     flight. The new work is the free discipline on the three drop paths (descheduled
     inertial record, `$finish` with records armed, `rt_run_init`), not the copy.
     Subsumes the separate `q <= #2 r` entry under Containers.
-  - **R4 — a multi-signal trigger** `@(a or b)`: an `ExtraSlice` of `(trig, edge)`
-    pairs in `StoreNbEventInfo`, one registration per event for the same record, and
-    real first-fire-wins removal via a `[intra_trigs × i32]` record tail. Lazy
-    "mark matured and skip" is unsafe — a committed record returns to its freelist, so
-    a stale pointer can match a reused record.
+  - [x] **R4 — a multi-signal trigger** `@(a or b)` — DONE. `StoreNbEventInfo`
+    carries an `ExtraSlice` of packed `IntraTrigger` records (the `WaitInfo`
+    encoding), packed once per statement so an N-leaf target interns one list. The
+    record registers on every listed trigger through
+    `rt_intra_event_register_group`, and the first edge to zero the countdown
+    removes it from the others by pointer identity. Lazy "mark matured and skip" is
+    unsafe — a committed record returns to its freelist, so a stale pointer can
+    match a reused record. The id array is a `[intra_trigs × i32]` record tail
+    (sized to the longest list over the signal's sites, placed last so no existing
+    tail index moves) and is filled from `trigger_id_value`, NOT baked into a
+    constant global: a trigger id is a per-instance link-time constant while twin
+    instances share the emitted code. Single-trigger codegen is byte-identical,
+    verified by diffing `clotho build --emit llvm` across the change.
   - **R5 — an `iff` qualifier on the trigger**: one `i1 <site>.guard(ptr state)`
     function per site, its address in the record, called by `rt_intra_event_fire`
     before the countdown. 9.4.2.3 makes `iff` part of the event, so only *enabled*
@@ -599,16 +620,26 @@ professional parity; M5 makes it complete.
     `if (C)`) cannot transfer: for `repeat(N)` it would consume disabled edges.
     Cheap because slang already forbids an automatic variable in an NBA's timing
     control (`diag::AutoFromNonBlockingTiming`), so the guard reads design state only.
-  - **R6 — two non-target leftovers**: a runtime-offset select of a vector wider than
-    `wide_dyn_select_bits` (needs the heap-side payload that the whole-aggregate
-    memcpy follow-up wants; grouped with it), and a non-positive `repeat` count,
-    which waits 2**32 edges today because the record countdown is unsigned — fix is a
-    signed test at the arm site routing it to the existing runtime-zero-delay branch,
-    matching the blocking form's immediate store.
-  - **Blocking form (Class A)**: `s = #5 t` / `mem = #5 other` are refused because
-    the string and array store paths evaluate the LHS before the RHS, which 9.4.5
-    pins the other way round; and an assignment-pattern lvalue is refused for both
-    forms.
+  - **R6 — two non-target leftovers**. The runtime-offset select of a vector wider
+    than `wide_dyn_select_bits` REMAINS (`LlvmBackend.cpp:21417`): it needs the
+    heap-side payload the whole-aggregate memcpy follow-up wants, and is grouped
+    with it. The non-positive `repeat` count is [x] **DONE**: the frontend folds a
+    constant count and otherwise emits `count < 1` in the count's OWN signedness,
+    routing the true arm to a plain `StoreNb` (the current instant's NBA region),
+    which matches the blocking form. Two corrections found by measuring against
+    iverilog 13 — an UNSIGNED count needs the test too (it degenerates to
+    `count == 0`, and zero clamps in both signednesses, while an unsigned variable
+    holding -3 correctly waits), and a count of exactly 0 was broken as well, not
+    just negatives.
+  - **Blocking form (Class A)**, both still open: `s = #5 t` / `mem = #5 other`
+    (`Lower.cpp:24601`, `:24519`) are refused because the string and array store
+    paths evaluate the LHS before the RHS, which 9.4.5 pins the other way round;
+    and an assignment-pattern lvalue (`Lower.cpp:24498`) is refused for the
+    BLOCKING form only now — the nonblocking form decomposes (R1).
+  - Also still open, and not target shapes: a write to a force target with
+    intra-assignment timing (`Lower.cpp:24421`, and `:8726` for one reached as a
+    concatenation operand) — LRM 10.6.2 decides the suppression when the deferred
+    update commits, not when it is armed, and the deferred ops carry no predicate.
   - **NOT a gap, corrected**: a queue / dynamic-array / associative-array **element**
     was listed here as an unimplemented target shape. LRM **6.21** forbids it outright
     — "Automatic variables and elements of dynamically sized array variables shall not
@@ -857,9 +888,12 @@ professional parity; M5 makes it complete.
   slot — the event form's claimed gap was stale and is deleted (two cases in
   tests/intra_assign_test.cpp, values from iverilog 13). The repeat count may be
   **real** in either form and rounds per LRM 6.12.1 (`repeat (1.6) @e` waits two
-  edges). A count <= 0 assigns as if there were no repeat in the blocking form; the
-  nonblocking form still waits, its record countdown being unsigned — a TODO in
-  `lower_assign`. Design: docs/design/intra-assignment-timing.md.
+  edges). A count <= 0 assigns as if there were no repeat construct in BOTH forms
+  now (9.4.5), tested in the count's own signedness so an unsigned one clamps only
+  at zero. Since then: every decomposing target (concatenation, streaming
+  concatenation, assignment-pattern lvalue, whole unpacked struct or array), a write
+  through a virtual interface handle, and a multi-signal trigger `@(a or b)` with
+  first-fire-wins removal. Design: docs/design/intra-assignment-timing.md.
 - [x] **`wait (expr)` statement** (LRM 9.4.3) — level-sensitive suspend; subsumes
   `wait(e.triggered)`.
 - [x] **Event control and `wait` on a class PROPERTY** (LRM 9.4.2 / 9.4.3) — `@p`

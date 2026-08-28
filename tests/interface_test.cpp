@@ -952,23 +952,83 @@ TEST_CASE("virtual interface: NBA to the handle property itself is the class-pro
           std::string::npos);
 }
 
-// Intra-assignment timing on a nonblocking write through a handle: the deferred
-// intra record carries no instance context (unlike the plain vif NBA record), so
-// the delayed update would commit into the representative instance -- refused
-// with the construct named, not misdescribed by the generic scalar-target check
-// (which `vif.d` satisfies).
-TEST_CASE("virtual interface: intra-assignment delay on a handle write is refused") {
-    const std::string diag = reject(R"(
+// Intra-assignment timing on a nonblocking write through a handle (LRM 9.4.5 +
+// 25.9). The deferred record carries the destination pointer and the instance
+// context the handle resolved to AT ARM TIME, which is LRM 10.4.2's rule and not
+// an optimization: "If variable_lvalue requires an evaluation, such as an index
+// expression, class handle, or virtual interface reference, it shall be evaluated
+// at the same time as the expression on the right-hand side."
+//
+// Two instances, the handle pointing at the second: the update must land in the
+// second and leave the first untouched. Not expressible against iverilog (no
+// interface support at all), so this is derived from 10.4.2 -- and it is the
+// assertion the old refusal existed to make unnecessary, because the wrong answer
+// (committing into the representative instance) is silent.
+TEST_CASE("virtual interface: intra-assignment delay commits into the handle's instance") {
+    const std::string out = run_capture(R"(
         interface ibus; logic [7:0] d; endinterface
         module top;
-            ibus bus();
+            ibus b0(); ibus b1();
             virtual ibus vif;
             initial begin
-                vif = bus;
-                vif.d <= #5 8'h1;
+                b0.d = 8'h00;
+                b1.d = 8'h00;
+                vif  = b1;
+                #1 vif.d <= #5 8'ha5;
+                #4 $display("t=%0t b0=%h b1=%h", $time, b0.d, b1.d);
+                #2 $display("t=%0t b0=%h b1=%h", $time, b0.d, b1.d);
+                $finish;
             end
         endmodule
     )");
-    CHECK(diag.find("intra-assignment timing on a nonblocking write through a virtual "
-                    "interface handle is not supported") != std::string::npos);
+    CHECK(out == "t=5 b0=00 b1=00\nt=7 b0=00 b1=a5\n");
+}
+
+// The wake goes with the value. A vif member is a scalar with real edge semantics
+// (`@(posedge b1.d)` is legal, unlike `@(posedge mem[i])`), so the commit cannot
+// wake level-only the way the array path does -- it wakes PER RECORD under the
+// instance context the record captured. The waiter on the written instance fires
+// once, at the deferred instant; the waiter on the twin never fires.
+TEST_CASE("virtual interface: intra-assignment delay wakes only the written instance") {
+    const std::string out = run_capture(R"(
+        interface ibus; logic d; endinterface
+        module top;
+            ibus b0(); ibus b1();
+            virtual ibus vif;
+            initial begin
+                b0.d = 1'b0;
+                b1.d = 1'b0;
+                vif  = b1;
+                #1 vif.d <= #5 1'b1;
+                #20 $finish;
+            end
+            always @(posedge b1.d) $display("t=%0t posedge b1", $time);
+            always @(posedge b0.d) $display("t=%0t posedge b0", $time);
+        endmodule
+    )");
+    CHECK(out == "t=6 posedge b1\n");
+}
+
+// The event form takes the same pointer-carrying record as the delay form: the
+// countdown changes when the update lands, not where.
+TEST_CASE("virtual interface: intra-assignment event commits into the handle's instance") {
+    const std::string out = run_capture(R"(
+        interface ibus; logic [7:0] d; endinterface
+        module top;
+            ibus b0(); ibus b1();
+            virtual ibus vif;
+            logic clk = 0;
+            always #5 clk = ~clk;
+            initial begin
+                b0.d = 8'h00;
+                b1.d = 8'h00;
+                vif  = b1;
+                #1 vif.d <= repeat(2) @(posedge clk) 8'h3c;
+                #10 $display("t=%0t b0=%h b1=%h", $time, b0.d, b1.d);
+                #12 $display("t=%0t b0=%h b1=%h", $time, b0.d, b1.d);
+                $finish;
+            end
+        endmodule
+    )");
+    CHECK(out == "t=11 b0=00 b1=00\nt=23 b0=00 b1=3c\n");
 }

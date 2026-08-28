@@ -69,7 +69,23 @@ public:
     // Nonblocking intra-assignment event `lvalue <= repeat(count) @(edge trig) value`
     // (LRM 9.4.5): sample `value` and `count` now, store to `lvalue` after `count`
     // occurrences of `trig`'s `edge`. `count` is a constant 1 for a plain `@e`.
-    Index store_nb_event(Index lvalue, Index value, Index count, Signal trig, uint32_t edge, SourceLoc loc);
+    Index store_nb_event(Index lvalue, Index value, Index count, ExtraSlice trigs, SourceLoc loc);
+
+    // Pack a run of (signal, edge) triggers into the extra buffer for
+    // store_nb_event. Packed ONCE per statement and shared by every leaf a
+    // decomposing target expands to, so an N-leaf `{a,b} <= @(x or y) v` interns
+    // one trigger list, not N.
+    ExtraSlice intra_trigger_run(std::span<const IntraTrigger> trigs) {
+        const auto start = static_cast<uint32_t>(extra_.size());
+        for (const IntraTrigger& t : trigs) {
+            constexpr size_t n     = sizeof(IntraTrigger) / sizeof(uint32_t);
+            const auto       words = std::bit_cast<std::array<uint32_t, n>>(t);
+            extra_.insert(extra_.end(), words.begin(), words.end());
+        }
+        const auto end = static_cast<uint32_t>(extra_.size());
+
+        return { static_cast<ExtraIndex>(start), static_cast<ExtraIndex>(end) };
+    }
 
     // -- Irregular shapes --
     Index resize(Index op, Ref type, SourceLoc loc);

@@ -4950,6 +4950,82 @@ private:
                ct.as_if<slang::ast::AssociativeArrayType>() != nullptr;
     }
 
+    // Already-lowered nonblocking intra-assignment timing (LRM 9.4.5), threaded
+    // beside the store tag through every decomposition walker. A target that
+    // decomposes into N leaves -- `{a,b} <= #5 x`, a streaming or
+    // assignment-pattern lvalue, a whole unpacked struct or array -- then arms N
+    // deferred records against ONE sampled RHS and ONE evaluation of the delay /
+    // repeat count, which is what 9.4.5's "the right-hand expression shall be
+    // evaluated before the delay" requires of the decomposed form too.
+    //
+    // A plain pointer, not a leaf-emitter callback: every ordinary assignment in
+    // the design walks this same code, so the cost of the feature has to be one
+    // null test per leaf rather than an indirect call. Null is the ordinary path,
+    // and is what every caller but the nonblocking intra-assignment one passes.
+    struct IntraNbTiming {
+        // `<= #d` form: the scaled delay in wheel ticks.
+        ir::Index delay{};
+        // `<= @e` / `<= repeat(N) @e` form: the countdown, sampled now.
+        ir::Index count{};
+        // `repeat(N) @e` with a runtime SIGNED or real count: the `N <= 0`
+        // predicate that routes the store to the current instant instead (LRM
+        // 9.4.5). Empty when the decision folded at lower time, or when the count
+        // is unsigned and so has no non-positive value to test for.
+        std::optional<ir::Index> nonpos{};
+        // The (signal, edge) triggers the event form waits on, packed once into the
+        // builder's extra buffer so every leaf of a decomposing target shares one
+        // list. Several triggers means `@(a or b)`: the first to bring the countdown
+        // to zero matures the store.
+        ir::ExtraSlice trigs{};
+        bool           is_event = false;
+    };
+
+    // Emit one leaf store of an assignment. `t` null -- every caller but the
+    // nonblocking intra-assignment one -- is the ordinary immediate / NBA store;
+    // non-null defers this leaf through its own record (LRM 9.4.5).
+    void store_leaf(ir::Inst::Tag        tag,
+                    const IntraNbTiming* t,
+                    ir::Index            lv,
+                    ir::Index            v,
+                    ir::Builder&         b,
+                    ir::SourceLoc        l) {
+        if (t == nullptr) {
+            b.binary(tag, lv, v, l);
+            return;
+        }
+        if (!t->is_event) {
+            b.store_nb_delay(lv, v, t->delay, l);
+            return;
+        }
+        if (!t->nonpos) {
+            b.store_nb_event(lv, v, t->count, t->trigs, l);
+            return;
+        }
+        // LRM 9.4.5: "If the repeat count literal, or signed variable holding the
+        // repeat count, is less than or equal to 0 at the time of evaluation, the
+        // assignment occurs as if there is no repeat construct" -- and the clause's
+        // own example settles what that means: `repeat (-3) @ (event_expression)
+        // // will not execute event_expression`. So the store happens with no wait
+        // at all, which for the nonblocking form is a plain StoreNb -- the current
+        // instant's NBA region. That is what the blocking form already does via its
+        // signed `Lt` bound (lower_intra_timing waits zero times), so the two forms
+        // agree. Measured against iverilog 13.
+        //
+        // Per leaf rather than around the whole walk: `count` is evaluated exactly
+        // once, before the walk, and re-testing that one SSA value at each leaf is
+        // free, whereas wrapping the walk would re-lower every leaf's RHS inside
+        // both arms and break 9.4.5's single evaluation.
+        b.open_region();
+        b.binary(ir::Inst::Tag::StoreNb, lv, v, l);
+        const ir::ExtraSlice now_r = b.close_region();
+
+        b.open_region();
+        b.store_nb_event(lv, v, t->count, t->trigs, l);
+        const ir::ExtraSlice wait_r = b.close_region();
+
+        b.cond(*t->nonpos, now_r, wait_r, l);
+    }
+
     // Store a whole unpacked struct: one blocking store per member (the aggregate
     // has no flat value, so a whole-object copy decomposes field-wise). `lhs_base`
     // is the struct's lvalue; `sty` its interned Kind::Struct type. The RHS is
@@ -4957,13 +5033,14 @@ private:
     // in declaration order and type-converted by slang) or another struct lvalue
     // (member-by-member copy). Members are scalar (nested unpacked struct members
     // are guarded at lower_type), so each store is a plain scalar store.
-    void emit_struct_store(ir::Index         lhs_base,
-                           ir::Ref           sty,
-                           const Expression& rhs,
-                           ir::Inst::Tag     tag,
-                           ir::Builder&      b,
-                           ir::SourceLoc     l) {
-        emit_agg_store(lhs_base, sty, rhs, tag, b, l);
+    void emit_struct_store(ir::Index            lhs_base,
+                           ir::Ref              sty,
+                           const Expression&    rhs,
+                           ir::Inst::Tag        tag,
+                           ir::Builder&         b,
+                           ir::SourceLoc        l,
+                           const IntraNbTiming* nbt = nullptr) {
+        emit_agg_store(lhs_base, sty, rhs, tag, b, l, nbt);
     }
 
     // True if a (possibly struct-nested) unpacked struct type has any field
@@ -5067,9 +5144,10 @@ private:
                                          ir::Ref          type,
                                          const ir::Type&  t,
                                          std::string_view text,
-                                         ir::Inst::Tag    tag,
-                                         ir::Builder&     b,
-                                         ir::SourceLoc    l) {
+                                         ir::Inst::Tag        tag,
+                                         ir::Builder&         b,
+                                         ir::SourceLoc        l,
+                                         const IntraNbTiming* nbt = nullptr) {
         const uint32_t array_len = (t.left > t.right ? t.left - t.right : t.right - t.left) + 1;
         for (uint32_t k = 0; k < array_len; ++k) {
             const int32_t coord =
@@ -5079,7 +5157,7 @@ private:
               module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(coord))),
               l);
             const ir::Index val = b.constant(module_.pool.put_int(t.element, byte_val), l);
-            b.binary(tag, b.elem_select(lhs, idx, type, l), val, l);
+            store_leaf(tag, nbt, b.elem_select(lhs, idx, type, l), val, b, l);
         }
     }
 
@@ -5090,12 +5168,13 @@ private:
     // samples each leaf's RHS now and commits per-leaf, which is whole-object NBA
     // semantics. Array-typed members are guarded (element-wise unroll is a
     // follow-up), so nesting is struct-through-struct here.
-    void emit_agg_store(ir::Index         lhs,
-                        ir::Ref           type,
-                        const Expression& rhs,
-                        ir::Inst::Tag     tag,
-                        ir::Builder&      b,
-                        ir::SourceLoc     l) {
+    void emit_agg_store(ir::Index            lhs,
+                        ir::Ref              type,
+                        const Expression&    rhs,
+                        ir::Inst::Tag        tag,
+                        ir::Builder&         b,
+                        ir::SourceLoc        l,
+                        const IntraNbTiming* nbt = nullptr) {
         // By value, not by reference: InternPool::get hands back a reference into
         // its items_ vector, and interning anything (a constant index below, or a
         // type while lowering an element expression) push_backs onto that vector
@@ -5115,7 +5194,7 @@ private:
         // bits. Only ValueCat::scalar: a handle (queue / dynamic array) or string
         // leaf keeps its own copy path below.
         if (value_cat(type) == ValueCat::scalar) {
-            b.binary(tag, lhs, lower_expr(rhs, b), l);
+            store_leaf(tag, nbt, lhs, lower_expr(rhs, b), b, l);
             return;
         }
         // LRM 11.4.11 over an aggregate operand, intercepted ahead of every RHS
@@ -5125,6 +5204,17 @@ private:
         // integral path (lower_lazy_conditional), which implements the same clause
         // for a flat value.
         if (const ConditionalExpression* cond = as_agg_conditional(rhs, type)) {
+            if (nbt != nullptr) {
+                // TODO: nonblocking intra-assignment timing (LRM 9.4.5) on a whole
+                // unpacked aggregate whose RHS is a conditional. 11.4.11 makes the
+                // arms conditional, so they lower into Cond regions and the
+                // ambiguous arm into per-element Table 7-1 defaults; deferring
+                // those leaves means threading the timing through
+                // emit_agg_cond_ambiguous / _elementwise / emit_table7_1_default
+                // too. Every other whole-aggregate RHS shape defers today.
+                fail("intra-assignment timing on a whole unpacked aggregate target "
+                     "with a conditional right-hand side is not supported");
+            }
             emit_agg_conditional(lhs, type, *cond, tag, b, l);
             return;
         }
@@ -5140,6 +5230,14 @@ private:
             // An associative-array literal is keyed, never positional, so it has no
             // element list to walk (slang keeps the entries and the `default:` in
             // the structured pattern's own setters).
+            if (nbt != nullptr) {
+                // Not reachable from legal source today (an associative array is a
+                // whole-container target, refused ahead of here), and refused rather
+                // than silently dropped if it ever becomes reachable: the deferred
+                // record has no owned-handle tail class to stage a container into.
+                fail("intra-assignment timing on an associative-array literal target "
+                     "is not supported");
+            }
             emit_assoc_literal_init(lhs, type, rhs, tag, b, l);
             return;
         }
@@ -5166,7 +5264,7 @@ private:
                 // the modulo is a no-op there.
                 for (uint32_t i = 0; i < nfields; ++i) {
                     const ir::Field f = module_.pool.struct_fields(t.fields_id)[i];
-                    emit_agg_store(b.member_select(lhs, i, type, l), f.type, *elems[i % nelems], tag, b, l);
+                    emit_agg_store(b.member_select(lhs, i, type, l), f.type, *elems[i % nelems], tag, b, l, nbt);
                 }
                 return;
             }
@@ -5192,11 +5290,18 @@ private:
                       b.constant(module_.pool.put_int(make_int_type(32, false, true),
                                                       static_cast<uint64_t>(static_cast<int64_t>(coord))),
                                  l);
-                    emit_agg_store(b.elem_select(lhs, idx, type, l), t.element, *elems[k % n], tag, b, l);
+                    emit_agg_store(b.elem_select(lhs, idx, type, l), t.element, *elems[k % n], tag, b, l, nbt);
                 }
                 return;
             }
             if (t.kind == ir::Type::Kind::DynArray || t.kind == ir::Type::Kind::Queue) {
+                if (nbt != nullptr) {
+                    // A whole queue / dynamic-array target: LRM 6.21 and the missing
+                    // owned-handle record tail, the same refusal the top-level form
+                    // gets. Never silently dropped here.
+                    fail("intra-assignment timing on a whole queue or dynamic-array "
+                         "target is not supported");
+                }
                 emit_handle_literal_init(lhs, type, t, elems, reps, tag, b, l);
                 return;
             }
@@ -5206,11 +5311,26 @@ private:
             // A queue / dynamic-array member: deep-copy from another handle
             // lvalue. A pattern / concat / slice source needs an element-wise
             // build (same follow-up as the top-level queue assignment).
+            if (nbt != nullptr) {
+                // A queue / dynamic-array member of the aggregate: no deferred
+                // analogue of HandleCopyNb exists (the record has no owned-handle
+                // tail), so refuse rather than drop the timing.
+                fail("intra-assignment timing on an aggregate with a queue or "
+                     "dynamic-array member is not supported");
+            }
             emit_handle_member_copy(lhs, rhs, type, tag, b, l);
             return;
         }
         if (is_leaf_ref(type)) {
             // A string leaf (a scalar plane leaf already returned at the top).
+            if (nbt != nullptr) {
+                // TODO: a string leaf under intra-assignment timing. Plain NBA
+                // stages an OWNED deep copy per signal, which is sound only because
+                // one signal has one pending same-instant value; an intra site can
+                // have N in flight, so this needs the deferred record's owned-handle
+                // tail class (docs/design/intra-assignment-timing.md, R3).
+                fail("intra-assignment timing on a string target is not supported");
+            }
             b.binary(tag, lhs, lower_expr(rhs, b), l);
             return;
         }
@@ -5228,7 +5348,7 @@ private:
                 fail("a string literal is only assignable to an unpacked array of "
                      "bytes (LRM 5.9)");
             }
-            emit_string_literal_array_store(lhs, type, t, src.as<StringLiteral>().getValue(), tag, b, l);
+            emit_string_literal_array_store(lhs, type, t, src.as<StringLiteral>().getValue(), tag, b, l, nbt);
             return;
         }
         if (src.kind == ExpressionKind::Call) {
@@ -5245,7 +5365,7 @@ private:
             if (tag == ir::Inst::Tag::Store && is_trivially_copyable(type)) {
                 b.agg_copy(lhs, *cv, type, l);
             } else {
-                emit_agg_copy(lhs, *cv, type, tag, b, l);
+                emit_agg_copy(lhs, *cv, type, tag, b, l, nbt);
             }
             return;
         }
@@ -5262,7 +5382,7 @@ private:
             b.agg_copy(lhs, src_lv, type, l);
             return;
         }
-        emit_agg_copy(lhs, src_lv, type, tag, b, l);
+        emit_agg_copy(lhs, src_lv, type, tag, b, l, nbt);
     }
 
     // -- LRM 11.4.11 conditional operator over an aggregate operand --
@@ -5874,7 +5994,13 @@ private:
     // recursing structs and (for a blocking copy) unrolling arrays. Reached only
     // for a string-containing aggregate or a nonblocking copy; a nonblocking
     // whole-array copy is guarded (element-wise deferral is a follow-up).
-    void emit_agg_copy(ir::Index lhs, ir::Index rhs, ir::Ref type, ir::Inst::Tag tag, ir::Builder& b, ir::SourceLoc l) {
+    void emit_agg_copy(ir::Index            lhs,
+                       ir::Index            rhs,
+                       ir::Ref              type,
+                       ir::Inst::Tag        tag,
+                       ir::Builder&         b,
+                       ir::SourceLoc        l,
+                       const IntraNbTiming* nbt = nullptr) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(type));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             // A nonblocking copy decomposes to per-element StoreNb: each element
@@ -5887,7 +6013,8 @@ private:
                   b.constant(module_.pool.put_int(make_int_type(32, false, true),
                                                   static_cast<uint64_t>(static_cast<int64_t>(coord))),
                              l);
-                emit_agg_copy(b.elem_select(lhs, idx, type, l), b.elem_select(rhs, idx, type, l), t.element, tag, b, l);
+                emit_agg_copy(
+                  b.elem_select(lhs, idx, type, l), b.elem_select(rhs, idx, type, l), t.element, tag, b, l, nbt);
             }
             return;
         }
@@ -5895,7 +6022,7 @@ private:
             const auto fields = module_.pool.struct_fields(t.fields_id);
             for (uint32_t i = 0; i < fields.size(); ++i) {
                 emit_agg_copy(
-                  b.member_select(lhs, i, type, l), b.member_select(rhs, i, type, l), fields[i].type, tag, b, l);
+                  b.member_select(lhs, i, type, l), b.member_select(rhs, i, type, l), fields[i].type, tag, b, l, nbt);
             }
             return;
         }
@@ -5920,7 +6047,16 @@ private:
         // moves it into the leaf in the NBA region (emit_string_whole_nba), the same
         // machinery a whole-string `s <= t` uses — the record carries the leaf's
         // destination pointer, so a member or a fixed-array element works the same.
-        b.binary(tag, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), l);
+        // An INTRA-timed one does need a guard, and for the reason that machinery
+        // works: the staged copy is per SIGNAL, sound only because a signal has one
+        // pending same-instant value, while an intra site can have N in flight
+        // (docs/design/intra-assignment-timing.md, R3).
+        if (nbt != nullptr && value_cat(type) == ValueCat::string) {
+            // TODO: a string leaf under intra-assignment timing -- needs the deferred
+            // record's owned-handle tail class.
+            fail("intra-assignment timing on a string target is not supported");
+        }
+        store_leaf(tag, nbt, lhs, b.unary(ir::Inst::Tag::Load, rhs, l), b, l);
     }
 
     // Deep-copy into a queue / dynamic-array member of an aggregate from an
@@ -8569,15 +8705,26 @@ private:
     // override owns the target. LRM 10.6.2 suppresses the update alone — whatever
     // the statement already evaluated (RHS, lvalue selectors, the read of a
     // read-modify-write) stands, and the override's value survives untouched.
-    void store_or_gate(const ForceInfo* fi,
-                       ir::Inst::Tag    tag,
-                       ir::Index        lv,
-                       ir::Index        v,
-                       ir::Builder&     b,
-                       ir::SourceLoc    l) {
+    void store_or_gate(const ForceInfo*     fi,
+                       ir::Inst::Tag        tag,
+                       ir::Index            lv,
+                       ir::Index            v,
+                       ir::Builder&         b,
+                       ir::SourceLoc        l,
+                       const IntraNbTiming* nbt = nullptr) {
         if (fi == nullptr) {
-            b.binary(tag, lv, v, l);
+            store_leaf(tag, nbt, lv, v, b, l);
             return;
+        }
+        if (nbt != nullptr) {
+            // TODO: the same gap lower_assign's force-target guard names, reached
+            // through a DECOMPOSING target instead of a whole one -- a concatenation
+            // or streaming operand whose own root is a force target, which
+            // lvalue_root of the statement's lvalue cannot see. LRM 10.6.2 decides
+            // the suppression when the deferred update commits, not when it is
+            // armed, and store_nb_delay / store_nb_event carry no predicate.
+            fail("intra-assignment timing on a write to a force-target variable "
+                 "is not supported");
         }
         const ir::Index pred = not_forced(*fi, /*also_assign=*/true, b, l);
         b.open_region();
@@ -23944,29 +24091,6 @@ private:
         return b.binary(ir::Inst::Tag::Mul, w, mul, l);
     }
 
-    // Whether an lvalue select chain reaches its target THROUGH a virtual interface
-    // handle (LRM 25.9). The written storage is then a signal in whichever instance
-    // the handle names, not one this body addresses statically, so the handle access
-    // is the deepest member access in the chain and the walk stops there. A
-    // bit/part-select or an array-element select above it does not change the answer.
-    static bool is_vif_member_lvalue(const Expression& e) {
-        switch (e.kind) {
-            case ExpressionKind::ElementSelect:
-                return is_vif_member_lvalue(e.as<ElementSelectExpression>().value());
-            case ExpressionKind::RangeSelect:
-                return is_vif_member_lvalue(e.as<RangeSelectExpression>().value());
-            case ExpressionKind::Conversion:
-                return is_vif_member_lvalue(e.as<ConversionExpression>().operand());
-            case ExpressionKind::MemberAccess: {
-                const MemberAccessExpression& ma = e.as<MemberAccessExpression>();
-                return ma.value().type->getCanonicalType().isVirtualInterface() ||
-                       is_vif_member_lvalue(ma.value());
-            }
-            default:
-                return false;
-        }
-    }
-
     // Whether a nonblocking intra-assignment target's select chain resolves
     // through storage the deferred record can address. The record reuses plain
     // NBA's lvalue encoding, so the supported chain is exactly what that
@@ -23997,6 +24121,20 @@ private:
                 // A packed or unpacked struct field. A class property has no
                 // signal storage and is rejected ahead of the timing block.
                 const MemberAccessExpression& ma = e.as<MemberAccessExpression>();
+                if (ma.value().type->getCanonicalType().isVirtualInterface()) {
+                    // `vif.sig <= #d x` (LRM 25.9). The member is an interface
+                    // SIGNAL and the handle picks which INSTANCE's storage it names,
+                    // so the record cannot re-derive the destination at commit from
+                    // the representative instance's static address. It carries the
+                    // resolved destination pointer and instance context instead
+                    // (SignalSlot::intra_ptr), captured when the statement executes
+                    // -- which is not a convenience but the rule, LRM 10.4.2: "If
+                    // variable_lvalue requires an evaluation, such as an index
+                    // expression, class handle, or virtual interface reference, it
+                    // shall be evaluated at the same time as the expression on the
+                    // right-hand side."
+                    return true;
+                }
                 return ma.member.as_if<FieldSymbol>() != nullptr && intra_nb_target_path(ma.value());
             }
             default:
@@ -24014,6 +24152,176 @@ private:
             return false;
         }
         return intra_nb_target_path(e);
+    }
+
+    // Whether a nonblocking intra-assignment target DECOMPOSES into several leaf
+    // stores instead of encoding as one deferred record (LRM 9.4.5). These are
+    // exactly the shapes plain NBA already scatters -- a concatenation, a streaming
+    // concatenation, an assignment-pattern lvalue, and a whole unpacked struct or
+    // array -- so the intra form is the same walk emitting one record per leaf
+    // (docs/design/intra-assignment-timing.md, R1).
+    //
+    // A whole container (queue / dynamic array / associative array) is deliberately
+    // NOT one of them: it is a single owned handle, not N leaves, and is refused
+    // further down for want of the record's owned-handle tail class.
+    static bool intra_nb_target_decomposes(const Expression& e) {
+        if (e.kind == ExpressionKind::Concatenation || e.kind == ExpressionKind::Streaming ||
+            as_assignment_pattern(e) != nullptr) {
+            return true;
+        }
+        if (is_dyn_array(e) || is_queue(e) || is_assoc(e)) {
+            return false;
+        }
+        return is_aggregate(*e.type) || is_unpacked_array(e);
+    }
+
+    // Lower the EVENT half of a nonblocking intra-assignment's timing control
+    // (`<= @e` / `<= repeat(N) @e`) once, into the timing every leaf of the
+    // statement shares. Empty means "no timing at all": LRM 9.4.5 makes a
+    // compile-time non-positive repeat count a plain `<=`, so the caller emits an
+    // ordinary StoreNb and the event expression is never executed.
+    std::optional<IntraNbTiming> lower_intra_nb_event(const AssignmentExpression& a, ir::Builder& b) {
+        const TimingControl& tc = *a.timingControl;
+        const ir::SourceLoc  l  = loc(a);
+        const TimingControl* evt = &tc;
+        IntraNbTiming        t;
+        t.is_event = true;
+        if (tc.kind == TimingControlKind::RepeatedEvent) {
+            const RepeatedEventControl& rec = tc.as<RepeatedEventControl>();
+            evt = &rec.event;
+            // LRM 9.4.5: "If the repeat count literal, or signed variable holding
+            // the repeat count, is less than or equal to 0 at the time of
+            // evaluation, the assignment occurs as if there is no repeat
+            // construct", and the clause's example fixes what that means --
+            // "repeat (-3) @ (event_expression) // will not execute
+            // event_expression". So a non-positive count stores with no wait,
+            // which for the nonblocking form is the current instant's NBA region.
+            // The record's countdown is uint32_t and rt_intra_event_fire tests
+            // `--count == 0`, so without this a count of 0 or -1 would wait 2**32
+            // edges rather than none.
+            //
+            // The test is `count < 1` IN THE COUNT'S OWN SIGNEDNESS, which is the
+            // clause's rule exactly: for a signed count it is `count <= 0`, and for
+            // an unsigned one it degenerates to `count == 0`. That asymmetry is the
+            // clause's own, stated in the same example -- "repeat (a) @
+            // (event_expression) // if a is assigned -3, it will execute the
+            // event_expression if a is declared as an unsigned variable, but not if
+            // a is signed" -- because an unsigned `a` holding -3 is 4294967293, a
+            // large positive count. Zero is zero in both signednesses and clamps
+            // either way. Measured against iverilog 13: a literal 0, an unsigned
+            // variable holding 0 and a signed variable holding 0 all store in the
+            // arming instant, while an unsigned variable holding -3 waits.
+            const ir::Ref cty =
+              rec.expr.type->isFloating() ? make_int_type(64, false, true) : lower_type(*rec.expr.type);
+            slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ev(ectx);
+            const slang::ConstantValue cv = rec.expr.eval(ev);
+            std::optional<bool>        folded;
+            if (cv.isInteger() && !cv.integer().hasUnknown()) {
+                folded = rec.expr.type->isSigned() ? cv.integer().as<int64_t>().value_or(1) <= 0
+                                                   : cv.integer().as<uint64_t>().value_or(1) == 0;
+            } else if (cv.isReal()) {
+                folded = cv.real() <= 0.0;
+            }
+            if (folded && *folded) {
+                // Folded away: no repeat construct, so neither the count nor the
+                // event expression is lowered at all. Nothing here validates the
+                // event, deliberately -- an unexecuted `@(a or b)` or `@(e iff c)`
+                // must not be refused when the LRM says it never runs.
+                return std::nullopt;
+            }
+            t.count = lower_expr(rec.expr, b);
+            if (rec.expr.type->isFloating()) {
+                // A real count rounds half away from zero into the countdown
+                // (LRM 6.12.1's real -> integral conversion, which coerce ends
+                // in), in the same signed 64-bit type the repeat statement
+                // counts a real in (lower_repeat); the deferred record's own
+                // 32-bit countdown then narrows it exactly as it narrows an
+                // integral longint count.
+                t.count = coerce(t.count, *rec.expr.type, cty, b, l);
+            }
+            if (!folded) {
+                ir::Index nonpos =
+                  b.binary(ir::Inst::Tag::Lt, t.count, b.constant(module_.pool.put_int(cty, 1), l), l);
+                if (rec.expr.type->isFourState()) {
+                    // An x/z count makes the comparison ambiguous; narrow it to the
+                    // definite bit so the rule is "clamp only when the count is
+                    // KNOWN non-positive" rather than whatever an x predicate
+                    // happens to do. 9.4.5 says nothing about an unknown count.
+                    nonpos = b.binary(ir::Inst::Tag::CaseEq, nonpos,
+                                      b.constant(module_.pool.put_int(make_int_type(1, true, false), 1), l), l);
+                }
+                t.nonpos = nonpos;
+            }
+        } else {
+            // Plain `@e` waits for one occurrence.
+            t.count = b.constant(module_.pool.put_int(make_int_type(32, false, false), 1), l);
+        }
+        if (!is_event_control(*evt)) {
+            fail("nonblocking intra-assignment requires a delay or event control");
+        }
+        std::vector<ir::WaitEvent> events;
+        if (collect_wait_events(*evt, events) != nullptr) {
+            // TODO: `iff` on a nonblocking intra-assignment event trigger —
+            // the deferred-record path (store_nb_event) has no guard hook.
+            fail("iff qualifier on a nonblocking intra-assignment event is not supported");
+        }
+        if (events.empty()) {
+            fail("nonblocking intra-assignment requires a delay or event control");
+        }
+        // Duplicate (signal, edge) pairs are collapsed. The record is registered
+        // once per listed trigger, so `@(posedge a or posedge a)` would otherwise
+        // sit on one trigger's list twice and count a single edge down twice.
+        std::vector<ir::IntraTrigger> trigs;
+        trigs.reserve(events.size());
+        for (const ir::WaitEvent& ev : events) {
+            const ir::IntraTrigger it{ ev.signal, static_cast<uint32_t>(ev.edge) };
+            const bool             dup = std::any_of(trigs.begin(), trigs.end(), [&](const ir::IntraTrigger& o) {
+                return o.signal == it.signal && o.edge == it.edge;
+            });
+            if (!dup) {
+                trigs.push_back(it);
+            }
+        }
+        t.trigs = b.intra_trigger_run(trigs);
+        return t;
+    }
+
+    // Lower a nonblocking intra-assignment's whole timing control once, for a
+    // target that decomposes into N leaves. Empty means the timing folded away and
+    // the statement is an ordinary `<=`: a compile-time `#0` (already the current
+    // instant's NBA region -- keeping it on the block-commit path preserves
+    // execution-order tie-breaking, see the scalar `#0` note in lower_assign), or a
+    // compile-time non-positive repeat count.
+    std::optional<IntraNbTiming> lower_intra_nb_timing(const AssignmentExpression& a, ir::Builder& b) {
+        const TimingControl& tc = *a.timingControl;
+        if (tc.kind != TimingControlKind::Delay) {
+            return lower_intra_nb_event(a, b);
+        }
+        const Expression& delay_expr = tc.as<DelayControl>().expr;
+        if (intra_nb_delay_is_const_zero(delay_expr)) {
+            return std::nullopt;
+        }
+        IntraNbTiming t;
+        t.delay = scaled_delay(delay_expr, b);
+        return t;
+    }
+
+    // Whether an intra-assignment `#d` is a COMPILE-TIME zero. Such a store lands
+    // in the current instant's NBA region either way, so it is lowered as a plain
+    // `<=`: that keeps its ordering against the same signal's other NBAs by
+    // statement-execution order (LRM 10.4.2) through the one block-commit path,
+    // instead of splitting the signal across block-commit and the deferred record
+    // path, whose commit order is fixed rather than execution order.
+    bool intra_nb_delay_is_const_zero(const Expression& delay_expr) {
+        slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
+        slang::ast::EvalContext    ev(ectx);
+        const slang::ConstantValue cv = delay_expr.eval(ev);
+        if (!cv.isInteger()) {
+            return false;
+        }
+        const auto v = cv.integer().as<uint64_t>();
+        return v && *v == 0;
     }
 
     // Reject the one nonblocking-assignment target a subroutine (task or function)
@@ -24138,6 +24446,31 @@ private:
             // that form is supported and never reaches this guard.
             fail("nonblocking assignment to a class property is not supported");
         }
+        // Nonblocking intra-assignment timing (LRM 9.4.5) on a target that
+        // DECOMPOSES -- a concatenation, a streaming concatenation, an
+        // assignment-pattern lvalue, or a whole unpacked struct / array. Plain NBA
+        // already scatters each of these into N ordinary StoreNbs over shapes the
+        // deferred record encodes, so the intra form is the same walk emitting one
+        // record per leaf; the dispatch sites below thread `nbt` into that walk.
+        //
+        // Lowered ONCE, here: 9.4.5 gives the statement one delay (or one repeat
+        // count), not one per leaf, so all N records share this evaluation. The
+        // leaves then take consecutive `seq` stamps in walk order, which is what
+        // makes a self-overlapping target (`{a, a[0]} <= #5 x`) land exactly as its
+        // plain-NBA form does -- one answer to explain, not two.
+        //
+        // The whole-SCALAR case is deliberately not routed through here: it keeps
+        // lowering its RHS before its delay, the order it has always used.
+        const bool                   intra_decomposed = a.isNonBlocking() && a.timingControl != nullptr &&
+                                       intra_nb_target_decomposes(a.left());
+        std::optional<IntraNbTiming> intra_timing;
+        const IntraNbTiming*         nbt = nullptr;
+        if (intra_decomposed) {
+            intra_timing = lower_intra_nb_timing(a, b);
+            if (intra_timing) {
+                nbt = &*intra_timing;
+            }
+        }
         if (const auto* pat = as_assignment_pattern(a.left())) {
             // `'{a, b, c} = rhs` (LRM 10.9): a positional assignment-pattern
             // lvalue. Must be intercepted ahead of the is_aggregate /
@@ -24155,13 +24488,17 @@ private:
                 fail("compound assignment to an assignment-pattern lvalue is not "
                      "legal SystemVerilog");
             }
-            if (a.timingControl != nullptr) {
-                // TODO: intra-assignment timing control on a pattern lvalue.
+            if (a.timingControl != nullptr && !a.isNonBlocking()) {
+                // TODO: intra-assignment timing control on a pattern lvalue, BLOCKING
+                // form. Unlike the nonblocking form below, this one has to reorder the
+                // sampled RHS across a real suspend, and the pattern walk resolves each
+                // member's lvalue as it goes -- so the addresses would have to be
+                // spilled across the suspend too (the same obstacle as `s = #5 t`).
                 fail("intra-assignment timing control on an assignment-pattern "
                      "lvalue is not supported");
             }
             const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
-            return lower_pattern_assign(*pat, a.right(), tag, b, loc(a));
+            return lower_pattern_assign(*pat, a.right(), tag, b, loc(a), nbt);
         }
         if (is_aggregate(*a.left().type)) {
             // Whole unpacked-struct assignment: decompose to per-member stores
@@ -24171,24 +24508,31 @@ private:
             if (a.isCompound()) {
                 fail("compound assignment to an unpacked struct is not supported");
             }
-            if (a.timingControl != nullptr) {
-                // TODO: intra-assignment timing on a WHOLE unpacked aggregate. A
-                // field of one is supported (each leaf defers its own record); a
-                // whole-object target would have to sample the RHS once and spread
-                // it across one record per decomposed leaf, sharing the single
-                // delay. Selects, struct fields and array elements go through the
-                // nonblocking timing block below instead.
+            if (a.timingControl != nullptr && !a.isNonBlocking()) {
+                // TODO: intra-assignment timing on a whole unpacked aggregate,
+                // BLOCKING form -- `s = #5 t`. The aggregate store path resolves the
+                // LHS before the RHS, so hoisting the sample across the suspend
+                // reorders two evaluations 9.4.5 pins in the other order; the fix is a
+                // lowering discipline (spill the LHS address AND the RHS before the
+                // suspend), not a record. The nonblocking form decomposes below.
                 fail("intra-assignment timing on a whole unpacked struct or array target "
                      "is not supported");
             }
             const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
-            emit_struct_store(lower_lvalue(a.left(), b), lower_type(*a.left().type), a.right(), tag, b, l);
+            emit_struct_store(lower_lvalue(a.left(), b), lower_type(*a.left().type), a.right(), tag, b, l, nbt);
             return true_const(b, l);
         }
         if (a.isCompound()) {
             return lower_compound_assign(a, b);
         }
-        if (a.timingControl != nullptr) {
+        // A decomposing nonblocking target (a concatenation, a streaming
+        // concatenation, or a whole unpacked array -- a pattern lvalue and a whole
+        // unpacked struct already returned above) skips this block entirely: its
+        // timing is in `nbt` and rides the ordinary store dispatch below. `nbt` is
+        // null there too when the timing FOLDED to a plain `<=` (a compile-time `#0`
+        // or a non-positive repeat count), which is why the flag is tested and not
+        // the pointer.
+        if (a.timingControl != nullptr && !intra_decomposed) {
             // Intra-assignment timing (LRM 9.4.5): sample the RHS now, suspend on
             // the delay/event, then store the sampled value. The blocking form is a
             // pure reorder over the existing Delay/Wait suspends — the sampled RHS
@@ -24207,20 +24551,6 @@ private:
                 // (constant or variable), an unpacked-array element, and a packed
                 // or unpacked struct field. A real rides its IEEE pattern through
                 // the same narrow record (intra_pack_mm).
-                if (is_vif_member_lvalue(a.left())) {
-                    // TODO: intra-assignment timing on a nonblocking write through a
-                    // virtual interface handle. Plain `vif.sig <= x` works because its
-                    // record carries the resolved instance (arr_rec_ctx), but the
-                    // intra-timing record has no such field (intra_rec_ty) and
-                    // emit_intra_commit resolves a non-array destination with a static
-                    // storage_ptr, so the deferred update would land in the
-                    // representative instance instead of the one the handle named --
-                    // silently the wrong interface. Reported ahead of the generic target
-                    // check below, whose wording ("a whole integral or real scalar")
-                    // describes `vif.sig` and so would deny what it just admitted.
-                    fail("intra-assignment timing on a nonblocking write through a "
-                         "virtual interface handle is not supported");
-                }
                 if (!intra_nb_target_supported(a.left())) {
                     fail("nonblocking intra-assignment timing is only supported for a whole "
                          "integral or real scalar, a bit/part-select of one, an "
@@ -24229,25 +24559,20 @@ private:
                 const TimingControl& tc = *a.timingControl;
                 if (tc.kind == TimingControlKind::Delay) {
                     const Expression& delay_expr = tc.as<DelayControl>().expr;
-                    // A compile-time `#0` nonblocking assignment is identical to a plain
-                    // `<= ` — the update lands in the current instant's NBA region — so
-                    // lower it as a normal NBA. This keeps update ordering to a signal
-                    // uniform with its other NBAs (LRM 10.4.2, statement-execution order:
-                    // last written wins) via the one block-commit path, instead of
-                    // splitting the same signal across block-commit and the deferred
-                    // record path (whose commit order is fixed, not execution order).
-                    slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
-                    slang::ast::EvalContext    ev(ectx);
-                    const slang::ConstantValue cv = delay_expr.eval(ev);
-                    if (cv.isInteger()) {
-                        const auto v = cv.integer().as<uint64_t>();
-                        if (v && *v == 0) {
-                            const ir::Index val0 = lower_expr(a.right(), b);
-                            b.binary(ir::Inst::Tag::StoreNb, lower_lvalue(a.left(), b, /*is_write=*/true), val0,
-                                     loc(a));
-                            return val0;
-                        }
+                    if (intra_nb_delay_is_const_zero(delay_expr)) {
+                        // A compile-time `#0` is identical to a plain `<=`; see
+                        // intra_nb_delay_is_const_zero for why it stays on the
+                        // block-commit path rather than the deferred record's.
+                        const ir::Index val0 = lower_expr(a.right(), b);
+                        b.binary(ir::Inst::Tag::StoreNb, lower_lvalue(a.left(), b, /*is_write=*/true), val0, loc(a));
+                        return val0;
                     }
+                    // RHS before delay, the order this form has always used. The event
+                    // form below lowers its count first instead, and both are equally
+                    // correct: the two expressions evaluate in the same instant with no
+                    // suspend between them, and 9.4.5's "the right-hand expression
+                    // shall be evaluated before the delay" is about the delay ELAPSING
+                    // ("instead of after the delay"), not about the delay expression.
                     const ir::Index val   = lower_expr(a.right(), b);
                     const ir::Index delay = scaled_delay(delay_expr, b);
                     b.store_nb_delay(lower_lvalue(a.left(), b, /*is_write=*/true), val, delay, loc(a));
@@ -24255,51 +24580,14 @@ private:
                 }
                 // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.
                 // Sample the value (and N) now; store after N occurrences of the
-                // trigger edge. Only a single (signal, edge) trigger is lowered.
-                const TimingControl* evt   = &tc;
-                ir::Index            count = ir::Index{};
-                if (tc.kind == TimingControlKind::RepeatedEvent) {
-                    const RepeatedEventControl& rec = tc.as<RepeatedEventControl>();
-                    evt   = &rec.event;
-                    count = lower_expr(rec.expr, b);
-                    if (rec.expr.type->isFloating()) {
-                        // A real count rounds half away from zero into the countdown
-                        // (LRM 6.12.1's real -> integral conversion, which coerce ends
-                        // in), in the same signed 64-bit type the repeat statement
-                        // counts a real in (lower_repeat); the deferred record's own
-                        // 32-bit countdown then narrows it exactly as it narrows an
-                        // integral longint count.
-                        count = coerce(count, *rec.expr.type, make_int_type(64, false, true), b, loc(a));
-                    }
-                    // TODO: LRM 9.4.5 makes a count <= 0 (rounded or integral) assign
-                    // as if there were no repeat construct, but the record countdown is
-                    // unsigned, so a non-positive count waits 2**32 edges instead. A
-                    // pre-existing gap of the integral path, shared by the real one.
-                } else {
-                    // Plain `@e` waits for one occurrence.
-                    count = b.constant(module_.pool.put_int(make_int_type(32, false, false), 1), loc(a));
-                }
-                if (!is_event_control(*evt)) {
-                    fail("nonblocking intra-assignment requires a delay or event control");
-                }
-                std::vector<ir::WaitEvent> events;
-                if (collect_wait_events(*evt, events) != nullptr) {
-                    // TODO: `iff` on a nonblocking intra-assignment event trigger —
-                    // the deferred-record path (store_nb_event) has no guard hook.
-                    fail("iff qualifier on a nonblocking intra-assignment event is not supported");
-                }
-                if (events.size() != 1) {
-                    // TODO: a multi-signal trigger `@(a or b)` needs the record on
-                    // several trigger lists with first-fire-wins removal.
-                    fail("nonblocking intra-assignment multi-signal event trigger is not supported");
-                }
-                const ir::Index val = lower_expr(a.right(), b);
-                b.store_nb_event(lower_lvalue(a.left(), b, /*is_write=*/true),
-                                 val,
-                                 count,
-                                 events[0].signal,
-                                 static_cast<uint32_t>(events[0].edge),
-                                 loc(a));
+                // trigger edge. The count clamp (LRM 9.4.5) and the trigger guards
+                // live in lower_intra_nb_event, shared with the decomposing targets so
+                // the two cannot drift; an empty result means the count folded to a
+                // non-positive constant and this is just a plain `<=`.
+                const std::optional<IntraNbTiming> t   = lower_intra_nb_event(a, b);
+                const ir::Index                    val = lower_expr(a.right(), b);
+                store_leaf(ir::Inst::Tag::StoreNb, t ? &*t : nullptr,
+                           lower_lvalue(a.left(), b, /*is_write=*/true), val, b, loc(a));
                 return val;
             }
             const bool string_lhs =
@@ -24359,6 +24647,15 @@ private:
                 // Resolve the RHS to an array lvalue of the slice's type and copy it
                 // in position-wise; an out-of-range position drops its write (LRM
                 // 7.4.5), the same as an ordinary `a[i] = v`.
+                if (nbt != nullptr) {
+                    // TODO: intra-assignment timing on an INDEXED array slice
+                    // (`a[i +: n] <= #5 rhs`). The target positions are runtime
+                    // indices resolved inside emit_indexed_slice_copy, with an
+                    // out-of-range position dropping its own write (LRM 7.4.5); the
+                    // whole-array and element forms defer today, this shape does not.
+                    fail("intra-assignment timing on an indexed array-slice target is "
+                         "not supported");
+                }
                 emit_indexed_slice_copy(a.left().as<RangeSelectExpression>(),
                                         array_copy_source(a.left(), src, ty, b, loc(a)),
                                         /*into_slice=*/true, tag, b, loc(a));
@@ -24373,13 +24670,13 @@ private:
                 // `mem = '{...}`: element-wise store of the (slang-ordered) pattern
                 // into a scalar-element unpacked array (`is_aggregate` routes an
                 // array of aggregates through emit_struct_store instead).
-                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a));
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a), nbt);
                 return true_const(b, loc(a));
             }
             if (src.kind == ExpressionKind::StringLiteral) {
                 // `mem = "literal"` (LRM 5.9): same element-wise store as the
                 // '{...} pattern case above.
-                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a));
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a), nbt);
                 return true_const(b, loc(a));
             }
             const bool slice_src = src.kind == ExpressionKind::RangeSelect && is_unpacked_array(src);
@@ -24391,8 +24688,8 @@ private:
                 // the source), reading the source through a staging temp when the
                 // two may overlap. A single-memcpy deferred record for the NBA
                 // whole-array case is a perf follow-up.
-                emit_agg_copy(
-                  lower_lvalue(a.left(), b), array_copy_source(a.left(), src, ty, b, loc(a)), ty, tag, b, loc(a));
+                emit_agg_copy(lower_lvalue(a.left(), b), array_copy_source(a.left(), src, ty, b, loc(a)), ty, tag,
+                              b, loc(a), nbt);
                 return true_const(b, loc(a));
             }
             if (src.kind == ExpressionKind::Call) {
@@ -24406,7 +24703,7 @@ private:
                 if (!cv) {
                     fail("whole-array assignment from a void call");
                 }
-                emit_agg_copy(lower_lvalue(a.left(), b), *cv, ty, tag, b, loc(a));
+                emit_agg_copy(lower_lvalue(a.left(), b), *cv, ty, tag, b, loc(a), nbt);
                 return true_const(b, loc(a));
             }
             if (src.kind == ExpressionKind::ConditionalOp) {
@@ -24415,7 +24712,7 @@ private:
                 // is handed to emit_agg_store here for the same destination-directed
                 // branch an array of aggregates gets: the selected arm is copied
                 // straight into the target and the other arm is not evaluated.
-                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a));
+                emit_agg_store(lower_lvalue(a.left(), b), ty, src, tag, b, loc(a), nbt);
                 return true_const(b, loc(a));
             }
             // A whole-array assignment whose source is none of the shapes above (a
@@ -24472,18 +24769,24 @@ private:
         const ir::Inst::Tag tag = a.isNonBlocking() ? ir::Inst::Tag::StoreNb : ir::Inst::Tag::Store;
         const ir::Index     rhs = lower_expr(a.right(), b);
         if (a.left().kind == ExpressionKind::Streaming) {
-            store_stream_target(a.left().as<StreamingConcatenationExpression>(), a.right(), rhs, tag, b, loc(a));
+            store_stream_target(a.left().as<StreamingConcatenationExpression>(), a.right(), rhs, tag, b, loc(a),
+                                nbt);
             return rhs;
         }
         if (a.left().kind == ExpressionKind::Concatenation) {
-            store_concat(a.left().as<ConcatenationExpression>(), rhs, tag, b, loc(a));
+            store_concat(a.left().as<ConcatenationExpression>(), rhs, tag, b, loc(a), nbt);
             return rhs;
         }
         // A tagged-union member write needs no special case: LRM 11.9 forbids it
         // from moving the tag (only a whole-value `tagged` expression does that), so
         // it is an ordinary narrowing store over the member's part-select, guarded
         // against the current tag inside lower_member_lvalue.
-        b.binary(tag, lower_lvalue(a.left(), b, /*is_write=*/true), rhs, loc(a));
+        //
+        // `nbt` is always null here -- every decomposing target returned above, and a
+        // whole scalar took the timing block -- but the store still routes through
+        // store_leaf so that widening intra_nb_target_decomposes can never silently
+        // drop a statement's timing.
+        store_leaf(tag, nbt, lower_lvalue(a.left(), b, /*is_write=*/true), rhs, b, loc(a));
         return rhs;
     }
 
@@ -26318,8 +26621,9 @@ private:
                       ir::Index                      rhs,
                       ir::Inst::Tag                  tag,
                       ir::Builder&                   b,
-                      ir::SourceLoc                  l) {
-        store_concat_ops(cc.operands(), rhs, tag, b, l);
+                      ir::SourceLoc                  l,
+                      const IntraNbTiming*           nbt = nullptr) {
+        store_concat_ops(cc.operands(), rhs, tag, b, l, nbt);
     }
 
     // Shared slice-and-scatter loop for a packed concatenation lvalue (LRM
@@ -26333,7 +26637,8 @@ private:
                           ir::Index                          rhs,
                           ir::Inst::Tag                      tag,
                           ir::Builder&                       b,
-                          ir::SourceLoc                      l) {
+                          ir::SourceLoc                      l,
+                          const IntraNbTiming*               nbt = nullptr) {
         uint32_t offset = 0;
         for (size_t k = ops.size(); k-- > 0;) {
             const Expression& op = unwrap_lvalue_elem(*ops[k]);
@@ -26347,18 +26652,18 @@ private:
             }
             const ir::Index val = b.resize(chunk, lower_type(*op.type), l);
             if (op.kind == ExpressionKind::Concatenation) {
-                store_concat(op.as<ConcatenationExpression>(), val, tag, b, l);
+                store_concat(op.as<ConcatenationExpression>(), val, tag, b, l, nbt);
             } else if (const auto* nested = as_assignment_pattern(op)) {
                 if (op.kind != ExpressionKind::SimpleAssignmentPattern) {
                     fail_keyed_pattern_lvalue();
                 }
-                store_concat_ops(nested->elements(), val, tag, b, l);
+                store_concat_ops(nested->elements(), val, tag, b, l, nbt);
             } else {
                 // Each operand carries its own force/assign state, so the scatter
                 // gates per operand: a forced operand keeps its forced value while
                 // its siblings still take their slice (LRM 10.6.2, matching
                 // iverilog 13). Unforced operands lower to a plain store.
-                store_or_gate(pca_info_of_lvalue(op), tag, lower_lvalue(op, b, /*is_write=*/true), val, b, l);
+                store_or_gate(pca_info_of_lvalue(op), tag, lower_lvalue(op, b, /*is_write=*/true), val, b, l, nbt);
             }
             offset += op.type->getBitWidth();
         }
@@ -26385,7 +26690,8 @@ private:
                                    const Expression&                                  rhs_expr,
                                    ir::Inst::Tag                                      tag,
                                    ir::Builder&                                       b,
-                                   ir::SourceLoc                                      l) {
+                                   ir::SourceLoc                                      l,
+                                   const IntraNbTiming*                               nbt = nullptr) {
         if (is_queue(rhs_expr) || is_dyn_array(rhs_expr) || is_assoc(rhs_expr)) {
             fail("an assignment-pattern lvalue is not legal with a queue, dynamic "
                  "array or associative array right-hand value (no statically known "
@@ -26395,7 +26701,7 @@ private:
         if (!is_agg_abi_ref(rty)) {
             // Packed struct or plain bit vector: field/element order already
             // equals concatenation order (see store_concat_ops above).
-            store_concat_ops(pat.elements(), lower_expr(rhs_expr, b), tag, b, l);
+            store_concat_ops(pat.elements(), lower_expr(rhs_expr, b), tag, b, l, nbt);
             return true_const(b, l);
         }
         const Expression& src = unwrap_conversion(rhs_expr);
@@ -26406,7 +26712,7 @@ private:
             fail("assignment-pattern lvalue from a non-variable right-hand value is "
                  "not supported");
         }
-        store_pattern(pat, lower_lvalue(src, b), rty, tag, b, l);
+        store_pattern(pat, lower_lvalue(src, b), rty, tag, b, l, nbt);
         return true_const(b, l);
     }
 
@@ -26420,7 +26726,8 @@ private:
                        ir::Ref                                            rhs_ty,
                        ir::Inst::Tag                                      tag,
                        ir::Builder&                                       b,
-                       ir::SourceLoc                                      l) {
+                       ir::SourceLoc                                      l,
+                       const IntraNbTiming*                               nbt = nullptr) {
         const ir::Type rt    = std::get<ir::Type>(module_.pool.get(rhs_ty));
         const auto     elems = pat.elements();
         if (rt.kind == ir::Type::Kind::Struct) {
@@ -26430,8 +26737,8 @@ private:
                      "right-hand struct's member count");
             }
             for (uint32_t i = 0; i < fields.size(); ++i) {
-                store_pattern_elem(
-                  unwrap_lvalue_elem(*elems[i]), b.member_select(rhs_addr, i, rhs_ty, l), fields[i].type, tag, b, l);
+                store_pattern_elem(unwrap_lvalue_elem(*elems[i]), b.member_select(rhs_addr, i, rhs_ty, l),
+                                   fields[i].type, tag, b, l, nbt);
             }
             return;
         }
@@ -26447,8 +26754,8 @@ private:
             const ir::Index idx = b.constant(
               module_.pool.put_int(make_int_type(32, false, true), static_cast<uint64_t>(static_cast<int64_t>(coord))),
               l);
-            store_pattern_elem(
-              unwrap_lvalue_elem(*elems[k]), b.elem_select(rhs_addr, idx, rhs_ty, l), rt.element, tag, b, l);
+            store_pattern_elem(unwrap_lvalue_elem(*elems[k]), b.elem_select(rhs_addr, idx, rhs_ty, l), rt.element,
+                               tag, b, l, nbt);
         }
     }
 
@@ -26458,22 +26765,23 @@ private:
     // requires a member to have "the same number of bits" as its RHS element;
     // Clotho does not enforce that here, and lets a mismatch truncate or extend
     // exactly like the plain scalar assignment this is sugar for.)
-    void store_pattern_elem(const Expression& member,
-                            ir::Index         rhs_elem_addr,
-                            ir::Ref           elem_ty,
-                            ir::Inst::Tag     tag,
-                            ir::Builder&      b,
-                            ir::SourceLoc     l) {
+    void store_pattern_elem(const Expression&    member,
+                            ir::Index            rhs_elem_addr,
+                            ir::Ref              elem_ty,
+                            ir::Inst::Tag        tag,
+                            ir::Builder&         b,
+                            ir::SourceLoc        l,
+                            const IntraNbTiming* nbt = nullptr) {
         if (const auto* nested = as_assignment_pattern(member)) {
             if (member.kind != ExpressionKind::SimpleAssignmentPattern) {
                 fail_keyed_pattern_lvalue();
             }
-            store_pattern(*nested, rhs_elem_addr, elem_ty, tag, b, l);
+            store_pattern(*nested, rhs_elem_addr, elem_ty, tag, b, l, nbt);
             return;
         }
         if (member.kind == ExpressionKind::Concatenation) {
-            store_concat(
-              member.as<ConcatenationExpression>(), b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l), tag, b, l);
+            store_concat(member.as<ConcatenationExpression>(), b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l), tag,
+                         b, l, nbt);
             return;
         }
         if (is_string_expr(member) || value_cat(elem_ty) == ValueCat::string ||
@@ -26488,12 +26796,12 @@ private:
             if (tag == ir::Inst::Tag::Store && is_trivially_copyable(elem_ty)) {
                 b.agg_copy(dst, rhs_elem_addr, elem_ty, l);
             } else {
-                emit_agg_copy(dst, rhs_elem_addr, elem_ty, tag, b, l);
+                emit_agg_copy(dst, rhs_elem_addr, elem_ty, tag, b, l, nbt);
             }
             return;
         }
         const ir::Index val = b.resize(b.unary(ir::Inst::Tag::Load, rhs_elem_addr, l), lower_type(*member.type), l);
-        b.binary(tag, lower_lvalue(member, b), val, l);
+        store_leaf(tag, nbt, lower_lvalue(member, b), val, b, l);
     }
 
     // -- Expressions --
@@ -27250,11 +27558,12 @@ private:
     }
 
     // Scatter the trimmed source over one destination operand.
-    void unpack_stream_dest(const Expression& dest,
-                            StreamUnpack&     u,
-                            ir::Inst::Tag     tag,
-                            ir::Builder&      b,
-                            ir::SourceLoc     l) {
+    void unpack_stream_dest(const Expression&    dest,
+                            StreamUnpack&        u,
+                            ir::Inst::Tag        tag,
+                            ir::Builder&         b,
+                            ir::SourceLoc        l,
+                            const IntraNbTiming* nbt = nullptr) {
         if (dest.kind == ExpressionKind::Streaming) {
             const auto& inner = dest.as<StreamingConcatenationExpression>();
             if (inner.getSliceSize() > 0) {
@@ -27263,36 +27572,47 @@ private:
                 fail("nested slice size in a streaming assignment target is not supported");
             }
             for (const auto& stream : inner.streams()) {
-                unpack_stream_dest(*stream.operand, u, tag, b, l);
+                unpack_stream_dest(*stream.operand, u, tag, b, l, nbt);
             }
             return;
         }
         const Expression& d = unwrap_lvalue_elem(dest);
         if (is_string_expr(d) || is_queue(d) || is_dyn_array(d)) {
+            if (nbt != nullptr) {
+                // TODO: a string / queue / dynamic-array operand of an intra-timed
+                // streaming target. The greedy destination is rebuilt in place from
+                // the trimmed stream (it resizes a container, writes it, then fills
+                // it), which is not one deferrable leaf store; it needs the deferred
+                // record's owned-handle tail class
+                // (docs/design/intra-assignment-timing.md, R3).
+                fail("intra-assignment timing on a streaming target with a string, "
+                     "queue or dynamic-array operand is not supported");
+            }
             const uint32_t bits = u.dyn_taken ? 0 : u.dyn_bits;
             u.dyn_taken         = true;
             unpack_stream_dynamic_dest(d, bits, u, b, l);
             return;
         }
         if (is_agg_bitstream_operand(d)) {
-            unpack_stream_agg(lower_lvalue(d, b, /*is_write=*/true), lower_type(*d.type), u, tag, b, l);
+            unpack_stream_agg(lower_lvalue(d, b, /*is_write=*/true), lower_type(*d.type), u, tag, b, l, nbt);
             return;
         }
         const ir::Ref   ty  = lower_type(*d.type);
         const ir::Index val = take_stream_bits(u, module_.pool.layout(ty).width, ty, b, l);
         // Same per-operand force gating as an lvalue concatenation: a forced
         // destination keeps its value while its siblings still take their slice.
-        store_or_gate(pca_info_of_lvalue(d), tag, lower_lvalue(d, b, /*is_write=*/true), val, b, l);
+        store_or_gate(pca_info_of_lvalue(d), tag, lower_lvalue(d, b, /*is_write=*/true), val, b, l, nbt);
     }
 
     // A fixed unpacked array / struct destination: the exact inverse of
     // serialize_agg_lvalue, walking leaves in declared order.
-    void unpack_stream_agg(ir::Index     lv,
-                           ir::Ref       ty,
-                           StreamUnpack& u,
-                           ir::Inst::Tag tag,
-                           ir::Builder&  b,
-                           ir::SourceLoc l) {
+    void unpack_stream_agg(ir::Index            lv,
+                           ir::Ref              ty,
+                           StreamUnpack&        u,
+                           ir::Inst::Tag        tag,
+                           ir::Builder&         b,
+                           ir::SourceLoc        l,
+                           const IntraNbTiming* nbt = nullptr) {
         const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
         if (t.kind == ir::Type::Kind::UnpackedArray) {
             const uint32_t n = (t.left >= t.right ? t.left - t.right : t.right - t.left) + 1;
@@ -27303,14 +27623,14 @@ private:
                   b.constant(module_.pool.put_int(make_int_type(32, false, true),
                                                   static_cast<uint64_t>(static_cast<int64_t>(coord))),
                              l);
-                unpack_stream_agg(b.elem_select(lv, idx, ty, l), t.element, u, tag, b, l);
+                unpack_stream_agg(b.elem_select(lv, idx, ty, l), t.element, u, tag, b, l, nbt);
             }
             return;
         }
         if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
             const auto fields = module_.pool.struct_fields(t.fields_id);
             for (uint32_t i = 0; i < fields.size(); ++i) {
-                unpack_stream_agg(b.member_select(lv, i, ty, l), fields[i].type, u, tag, b, l);
+                unpack_stream_agg(b.member_select(lv, i, ty, l), fields[i].type, u, tag, b, l, nbt);
             }
             return;
         }
@@ -27319,7 +27639,7 @@ private:
             // the mirror of serialize_agg_lvalue's own guard.
             fail("unpacking a stream into a non-integral aggregate leaf is not supported");
         }
-        b.binary(tag, lv, take_stream_bits(u, module_.pool.layout(ty).width, ty, b, l), l);
+        store_leaf(tag, nbt, lv, take_stream_bits(u, module_.pool.layout(ty).width, ty, b, l), b, l);
     }
 
     // The greedy destination: it takes every bit the fixed-size destinations left
@@ -27373,7 +27693,8 @@ private:
                              ir::Index                               rhs,
                              ir::Inst::Tag                           tag,
                              ir::Builder&                            b,
-                             ir::SourceLoc                           l) {
+                             ir::SourceLoc                           l,
+                             const IntraNbTiming*                    nbt = nullptr) {
         for (const auto& stream : sc.streams()) {
             if (stream.withExpr) {
                 fail("streaming concatenation `with` clause is not supported");
@@ -27420,7 +27741,7 @@ private:
             u.src = b.stream_reverse(u.src, static_cast<uint32_t>(s), l);
         }
         for (const auto& stream : sc.streams()) {
-            unpack_stream_dest(*stream.operand, u, tag, b, l);
+            unpack_stream_dest(*stream.operand, u, tag, b, l, nbt);
         }
     }
 

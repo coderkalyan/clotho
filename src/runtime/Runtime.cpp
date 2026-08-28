@@ -1852,6 +1852,13 @@ struct IntraSite {
     std::vector<std::unique_ptr<unsigned char[]>> pool;
     std::vector<void*>                             freelist;
     std::vector<void*>                             ready;
+    // Byte size every record in `pool` was allocated at. The backend monomorphizes
+    // the record per target signal, so this is constant for the life of a design --
+    // but `intra_sites` is process-global and outlives one, and a dense site id is
+    // reused from zero by the next design. Reusing a pooled block for a WIDER
+    // record would let the fill run off its end, so a changed stride retires the
+    // pool (see rt_intra_alloc).
+    uint32_t stride = 0;
 };
 
 std::vector<IntraSite> intra_sites; // indexed by dense intra-nba id
@@ -1875,11 +1882,42 @@ std::vector<InertialState> inertial_states; // indexed by dense intra-nba id
 // byte layout (mm plane [+ z plane]) and does every value compare itself via
 // `icmp` on values loaded from this buffer; the runtime never interprets these
 // bytes, exactly like the general rt_intra_rec pool.
-std::vector<std::unique_ptr<unsigned char[]>> inertial_bufs; // indexed by dense intra-nba id
+std::vector<std::unique_ptr<unsigned char[]>> inertial_bufs;      // indexed by dense intra-nba id
+std::vector<uint32_t>                         inertial_buf_bytes; // allocated size of each, parallel
 
 // Per trigger id (dense (trigger-signal, edge)): records armed on `x <= @e y`
 // waiting for that edge. Growable — an unbounded number can arm between two edges.
-std::vector<std::vector<void*>> intra_event_pending;
+// One record's registration on one trigger list. `ids` / `n` describe the WHOLE
+// set of triggers the record was registered on -- a compile-time constant array
+// the backend emitted for the statement -- so that when this record matures the
+// fire path can take it off the other lists. `ids` is null for the single-trigger
+// case, which has nothing to remove.
+struct IntraPending {
+    void*           rec;
+    const uint32_t* ids;
+    uint32_t        n;
+};
+
+std::vector<std::vector<IntraPending>> intra_event_pending;
+
+// Drop `rec` from trigger `trig_id`'s pending list by pointer identity, keeping
+// the survivors' order. Used for first-fire-wins removal across a multi-signal
+// trigger: the record has matured on another of its triggers and must not be
+// counted down again -- and cannot merely be MARKED, because a committed record
+// returns to its site freelist and a stale pointer would later match a reused one.
+void intra_event_drop(uint32_t trig_id, const void* rec) {
+    if (trig_id >= intra_event_pending.size()) {
+        return;
+    }
+    std::vector<IntraPending>& list = intra_event_pending[trig_id];
+    size_t                     w    = 0;
+    for (const IntraPending& e : list) {
+        if (e.rec != rec) {
+            list[w++] = e;
+        }
+    }
+    list.resize(w);
+}
 
 // Move a fired record onto its target's ready list, keeping the list in ascending
 // seq so the commit applies same-instant updates last-executed-wins (LRM 10.4.2).
@@ -2931,7 +2969,21 @@ extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
         intra_sites.resize(idx + 1);
     }
     IntraSite& site = intra_sites[idx];
-    void*      p;
+    if (site.stride != stride) {
+        // A different design (or a differently monomorphized signal) now owns this
+        // dense id: its records are a different size, so nothing pooled here can be
+        // reused. Within one design the stride never changes, so this fires only at
+        // a run boundary -- where rt_intra_reset has already emptied `ready`, making
+        // the drop safe. Without it, a run whose record is wider than the previous
+        // run's silently writes past the end of a recycled block; an embedder that
+        // runs two designs in one process (the test runner does) hits it.
+        intra_total -= static_cast<uint32_t>(site.ready.size());
+        site.ready.clear();
+        site.freelist.clear();
+        site.pool.clear();
+        site.stride = stride;
+    }
+    void* p;
     if (!site.freelist.empty()) {
         p = site.freelist.back();
         site.freelist.pop_back();
@@ -2952,9 +3004,14 @@ extern "C" void rt_intra_cb(rt_timer* timer, void* /*ctx*/) {
 extern "C" void* rt_inertial_buf(uint32_t idx, uint32_t nbytes) {
     if (idx >= inertial_bufs.size()) {
         inertial_bufs.resize(idx + 1);
+        inertial_buf_bytes.resize(inertial_bufs.size(), 0);
     }
-    if (!inertial_bufs[idx]) {
-        inertial_bufs[idx] = std::make_unique<unsigned char[]>(nbytes);
+    if (!inertial_bufs[idx] || inertial_buf_bytes[idx] < nbytes) {
+        // Same process-global-outlives-a-design hazard as rt_intra_alloc: the buffer
+        // is sized to the site's monomorphized pending-value width, and the next
+        // design reuses the dense id for a possibly wider one.
+        inertial_bufs[idx]     = std::make_unique<unsigned char[]>(nbytes);
+        inertial_buf_bytes[idx] = nbytes;
     }
     return inertial_bufs[idx].get();
 }
@@ -3050,24 +3107,45 @@ extern "C" void rt_intra_event_register(uint32_t trig_id, void* rec) {
     if (trig_id >= intra_event_pending.size()) {
         intra_event_pending.resize(trig_id + 1);
     }
-    intra_event_pending[trig_id].push_back(rec);
+    intra_event_pending[trig_id].push_back(IntraPending{ rec, nullptr, 0 });
+}
+
+extern "C" void rt_intra_event_register_group(const uint32_t* ids, uint32_t n, void* rec) {
+    for (uint32_t k = 0; k < n; ++k) {
+        if (ids[k] >= intra_event_pending.size()) {
+            intra_event_pending.resize(ids[k] + 1);
+        }
+        intra_event_pending[ids[k]].push_back(IntraPending{ rec, ids, n });
+    }
 }
 
 extern "C" void rt_intra_event_fire(uint32_t trig_id) {
     if (trig_id >= intra_event_pending.size()) {
         return;
     }
-    std::vector<void*>& pend = intra_event_pending[trig_id];
-    size_t              w    = 0; // survivors compacted in place
-    for (void* p : pend) {
-        auto* rec = reinterpret_cast<rt_intra_rec*>(p);
-        if (--rec->count == 0) {
-            intra_ready_push(rec); // last awaited edge -> commit this instant
-        } else {
-            pend[w++] = p; // more edges to wait for
+    size_t w = 0; // survivors compacted in place
+    // Indexed, not range-based: a maturing multi-trigger record drops itself from
+    // its OTHER lists, and while that never touches this one (the removal skips
+    // trig_id), a registration cannot be held as a reference across it -- another
+    // list's resize is fine, but re-reading the vector each step keeps the
+    // invariant local instead of depending on which vector got touched.
+    for (size_t i = 0; i < intra_event_pending[trig_id].size(); ++i) {
+        const IntraPending e   = intra_event_pending[trig_id][i];
+        auto*              rec = reinterpret_cast<rt_intra_rec*>(e.rec);
+        if (--rec->count != 0) {
+            intra_event_pending[trig_id][w++] = e; // more edges to wait for
+            continue;
+        }
+        intra_ready_push(rec); // last awaited edge -> commit this instant
+        // First fire wins: this record is done, so take it off every OTHER trigger
+        // it was listed on. Skipping `trig_id` is what keeps the loop above stable.
+        for (uint32_t k = 0; k < e.n; ++k) {
+            if (e.ids[k] != trig_id) {
+                intra_event_drop(e.ids[k], e.rec);
+            }
         }
     }
-    pend.resize(w);
+    intra_event_pending[trig_id].resize(w);
 }
 
 extern "C" void* rt_intra_ready_base(uint32_t idx) {
@@ -3104,7 +3182,10 @@ extern "C" void rt_intra_reset(void) {
         }
         site.ready.clear();
     }
-    for (std::vector<void*>& pend : intra_event_pending) {
+    // `stride` is deliberately kept: it is what lets the next design's first
+    // rt_intra_alloc notice that this site's pooled records are the wrong size and
+    // retire them, instead of filling a narrower block.
+    for (std::vector<IntraPending>& pend : intra_event_pending) {
         pend.clear();
     }
     // A fresh simulation has no pending inertial store and starts at epoch 0.
