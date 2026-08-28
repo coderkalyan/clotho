@@ -7940,8 +7940,9 @@ private:
         // sim_drain(state, wheel): seed every non-final process and run the event
         // loop to quiescence. Split out of main so rt_sim_run can wrap it in the
         // finals — a $finish stops the drain, which returns into rt_sim_run below
-        // main's frame, so the heap state pointer and the wheel alloca stay live
-        // and the final blocks still observe the settled design state.
+        // main's frame, so the heap state pointer stays live (the wheel is the
+        // @clotho.wheel global, build_wheel_global, and outlives every frame) and
+        // the final blocks still observe the settled design state.
         auto* drain = llvm::Function::Create(subfnty, llvm::Function::InternalLinkage, "sim_drain", env_->llmod);
         b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", drain));
         emit_active_run(drain->getArg(0), drain->getArg(1), procs);

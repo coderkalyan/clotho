@@ -18,10 +18,10 @@ per-top scope API (`svGetScope`/`svSetScope`/`svGetNameFromScope`/
 (`svSize`/`svLeft`/`svRight`/`svLow`/`svHigh`/`svIncrement`/`svGetArrElemPtr1`/
 `svGet/PutBit|LogicArrElem1VecVal`/…) are implemented (`src/runtime/svdpi.h`). Still
 **loud-fails** / unresolved with a TODO: import `output`/`inout` string, multi-dim /
-dynamic open arrays, open-array export args, DPI import/export tasks, export string
-return + `output`/`inout` string, one c_identifier exported from several scopes
-(blocked upstream in slang), `svScope` handles for non-top instances, and
-`svGetCallerInfo` / the disable API.
+dynamic open arrays, open-array export args, DPI import/export tasks (**scoped in
+full** under "DPI tasks" below), export string return + `output`/`inout` string, one
+c_identifier exported from several scopes (blocked upstream in slang), `svScope`
+handles for non-top instances, and `svGetCallerInfo` / the disable API.
 
 This doc is written design-first: the early sections capture the original
 scalar-first plan and its rationale, and the **Directions — phasing** and **Phase
@@ -349,8 +349,8 @@ x/z it drops the unknowns (`bval=0`), so clotho's correct svLogicVecVal encoding
 (the same `dpi_vec_copyin` the import path uses) diverges there; that path is
 covered by the import marshal's own tests rather than by verilator. Deferred:
 string return
-(returned-`char*` lifetime), `output`/`inout` string, exported tasks, and one
-c_identifier exported from more than one scope.
+(returned-`char*` lifetime), `output`/`inout` string, exported tasks (see "DPI
+tasks" below), and one c_identifier exported from more than one scope.
 
 **Why `context` is accepted, not required.** LRM 35.5.3: C may only call an
 exported function from within a `context` import, which establishes the SV scope
@@ -436,8 +436,10 @@ emission below.
 
 ### Deferred (mirror the import guards)
 
-- **Exported tasks** — a task needs the timing `wheel` (a `main`-local alloca, not
-  a global) and coroutine driving from C. Functions only in V1.
+- **Exported tasks** — deferred out of V1; scoped in full under "DPI tasks" below.
+  (The reason recorded here originally — "a task needs the timing wheel, a
+  `main`-local alloca, not a global" — was already stale when it was written: the
+  wheel is `@clotho.wheel`, a module global, see that section.)
 - **One c_identifier exported from several scopes** (LRM 35.5.3) — `svSetScope`
   selecting *which instance* a shared C name reaches. Absolute addressing means every
   distinct c_identifier already binds to its own instance with no scope lookup, so
@@ -458,9 +460,291 @@ and consider a "sim started" guard.
 Symbol resolution: **small** (the `.o` loader already exists per the unified
 `--dpi-lib` dispatch; export adds only the "gave a `.so`, need a `.o`" guard).
 Reverse thunk + scalar/vec/chandle marshal: **medium**, dominated by reuse.
-`context`/`svScope` and exported tasks are the genuinely large, deferred pieces. A
+`context`/`svScope` are the genuinely deferred pieces here; exported tasks are
+scoped separately below and are not the large item that line once claimed. A
 functions-only, scalar+vec+chandle+string-return export V1 is medium and mostly
 mechanical — the scary part (resolution) is solved.
+
+## DPI tasks — import and export (scoped, not implemented)
+
+Both directions loud-fail today, each its own unconditional guard on slang's
+`SubroutineKind::Task`: `build_dpi_import` (`Lower.cpp:30471-30474`, "DPI import
+tasks are not supported") and `collect_dpi_exports` (`Lower.cpp:30685-30689`, "DPI
+export tasks are not supported"). These are the only task/function fork on the
+whole DPI path; every other DPI guard is about types, directions or duplicates.
+
+### The two directions are one feature
+
+LRM 35.8 makes an exported task unreachable without an imported task:
+
+> It is never legal to call an exported task from within an imported function. This
+> semantics is identical to native SystemVerilog semantics, in which it is illegal
+> for a function to perform a task enable. It is legal for an imported task to call
+> an exported task only if the imported task is declared with the `context`
+> property.
+
+C code only ever runs inside an import call, so lifting the export guard alone
+would produce an entry point with no legal caller. The two guards lift together,
+in one phase plan.
+
+### What the LRM adds beyond the function case
+
+**1. A synthetic `int` return in C, both directions (35.8).** "The return value of an
+exported task is an `int` value that indicates if a disable is active or not on the
+current execution thread. Similarly, imported tasks return an `int` value that is
+used to indicate that the imported task has acknowledged a disable." An SV task has
+no return type; this `int` is the disable protocol's channel and is never visible to
+SV — "Calls to import tasks in SystemVerilog code are indistinguishable from calls
+to native SystemVerilog tasks."
+
+**2. The disable protocol (35.9).** Item a) — "When an exported task returns due to a
+disable, it shall return a value of 1. Otherwise, it shall return 0." — is the
+simulator's obligation. Items b) (import task returns 1 on disable), c) (import
+function calls `svAckDisabledState()` before returning on disable) and d) (no
+further export calls once disabled) are the C's, and the clause obliges the
+simulator to *check* them: "simulators shall implement checks to verify that item
+b), item c), and item d) are correctly followed by imported tasks and functions. If
+any protocol item is not correctly followed, a fatal simulation error is issued."
+`svIsDisabledState()` and `svAckDisabledState()` are part of the API and clotho
+provides neither today (a C call to one hits an unresolved symbol).
+
+**3. Reentrancy (35.5.1.5) — the load-bearing clause.**
+
+> A call to an imported task can result in the suspension of the currently executing
+> thread. This occurs when an imported task calls an exported task, and the exported
+> task executes a delay control, event control, or `wait` statement. Thus it is
+> possible for an imported task's C code to be simultaneously active in multiple
+> execution threads.
+
+That last sentence is the whole difficulty and it decides the mechanism (below).
+
+**4. `pure` is illegal on an imported task** (35.5.1.3: "An imported task can never
+be declared `pure`"). slang only *warns* (`DPIPureTask`), so clotho refuses.
+
+**5. Nothing requires an exported task to consume time.** 35.5.1.1's NOTE says
+imported tasks *can* consume time; the exported-task clause never says they must.
+A task-shaped DPI hook that completes instantly is legal, common (it is a task
+because the C API wanted the `int` channel, or because the SV body writes an
+`output`), and is a complete, useful feature on its own — which is what makes the
+phasing below honest rather than a stub.
+
+### What already exists (most of this is plumbing)
+
+- **A time-consuming SV task is already a standalone driveable coroutine**, not a
+  body inlined into its caller. `declare_task` (`LlvmBackend.cpp:5537`) emits
+  `(state, rng, wheel, [proc], [home], args…, record)`, returns a coroutine handle,
+  and calls `setPresplitCoroutine()`. An export thunk therefore has something
+  callable to point at; nothing about the task ABI has to change.
+- **The call protocol the thunk needs is already written.**
+  `lower_task_call_inst` (`:26077`) ramps the callee, `coro_resume`s it, tests
+  `coro_done`, and takes one of two arms: *sync* (`:26256`) destroy the frame and
+  continue inline; *async* (`:26264`) store the caller's parked handle into the
+  callee's `record.parent` and suspend the caller. An export-task thunk is that
+  same split with a different answer to "who is the caller".
+- **The wheel is already a module global**, and so is every other piece of
+  scheduler state. `build_wheel_global` (`:14825`) emits `@clotho.wheel`; `main`
+  only `rt_wheel_init`s it (`:8091-8092`); the comment at `:14823` gives the reason
+  ("a function's ABI carries state and rng but no wheel, and every event op needs
+  the current tick"). The active / inactive / reactive / re-inactive rings and their
+  head/tail indices are internal-linkage globals (`ensure_active_queue` and
+  siblings, `:11991-12186`), and `@clotho.state` is a global (`:4441`). **Nothing
+  needs promoting** — the "main-local alloca" premise of the original deferral was
+  never true.
+- **C driving JIT code that resumes a coroutine already happens.**
+  `rt_sim_run(state, wheel, drain, finals)` (`Runtime.cpp:5052-5071`) is genuine C
+  calling JIT function pointers, and `sim_finals` resumes `final`-block coroutines.
+  It is a precedent for the *shape* only: a `final` block cannot suspend (LRM
+  9.2.3), so that edge never advances time.
+- **The GC never scans a machine stack.** Roots are the static root tables, the
+  intrusive registry of heap CoroSplit frames, and explicitly registered ranges
+  (`push_frame_roots` / `push_range_roots`, `Gc.cpp:1809-1826`; `scan_conservative`
+  at `:1781` only ever walks those). A C frame holds no GC roots wherever its stack
+  lives, so the suspension mechanism below is GC-neutral by construction and needs
+  no stack registration.
+- **`src/` contains no `thread_local`** (zero grep hits), which the mechanism choice
+  below leans on.
+
+### Three genuinely new pieces
+
+**(1) The synthetic `int`.** Both directions grow a C return no SV type produces.
+`DpiCType` needs no new member — it is an `int` — but the descriptor must record
+"return present in C, absent in SV" so `lower_dpi_call` does not try to bind it to a
+result `Plane`, and so the export thunk's return is generated rather than marshalled.
+
+**(2) Caller identity.** The export *function* thunk passes `null` for `proc` and `0`
+for `home` (`:25584-25592`), with the comment that C drove the call so there is no
+calling process, no thread whose region to inherit, and `process::self()` reports a
+located fatal. For a *task* that is false: the caller is the process that entered
+the import task, and `process::self()`, the region a `#0` inside the exported task
+lands in, and any `disable` targeting the chain all belong to it. Fix: two globals
+(`@clotho.dpi.caller_proc`, `@clotho.dpi.caller_home`) written at the import-*task*
+call site and read by the export thunk. They save/restore around the call, because
+import tasks nest (an exported task may itself call another import task). This also
+buys the 35.8 legality check for free: `caller_proc == null` inside an export-*task*
+thunk means the live C frame belongs to an imported *function* (or to no DPI frame
+at all), which is exactly the case the clause calls never legal → located fatal
+naming both subroutines.
+
+**(3) Suspension across the C frame.** The rest of this section.
+
+### Suspension: the mechanism, and why the cheap one is wrong
+
+**Rejected — a nested drain from the thunk** (running the region loop recursively
+until the exported task's coroutine completes). It is the tempting shape, because
+the drain reads only globals and would re-enter cleanly. It is wrong for two
+independent reasons.
+
+- *Completion order is not stack order.* Process A enters an import task whose C
+  calls an exported task that waits `#20`; the nested drain runs and, inside it,
+  process B enters the same (or another) import task whose C calls an exported task
+  that waits `#5`. B's drain frame now sits **above** A's. At `t+5` B's task
+  completes and B's nested drain returns — fine. At `t+20` A's task completes and
+  A's C frame must resume, but A's drain frame is below B's on the machine stack and
+  cannot return until B's does; if B's C is still parked, it never will. Stack
+  nesting forces LIFO completion, and LRM 35.5.1.5 explicitly blesses the
+  non-LIFO case ("simultaneously active in multiple execution threads").
+- *`$finish` assumes an all-JIT stack.* The cooperative finish sets the
+  `rt_finishing` global (`Runtime.cpp:3958-3964`) and every JIT frame in the
+  statically-computed may-finish closure tests it after a call
+  (`emit_finish_check`, `LlvmBackend.cpp:22468-22481`), returning through its own
+  epilogue. A nested drain multiplies the number of C frames between the `$finish`
+  site and the real drain, and none of them tests the flag.
+
+**Accepted — one machine stack per in-flight import-task frame.** The C frame becomes
+suspendable because it owns a stack that can be parked. Topology, with the drain on
+the simulation stack:
+
+1. Process P (a JIT coroutine, resumed by the drain) reaches its import-task call
+   site and calls `rt_dpi_task_enter(thunk, argpack)`. That takes a worker from a
+   pool, hands it the baton, and blocks the simulation stack.
+2. The worker runs the C. The C calls exported task `t`; `t`'s thunk — now running
+   on the worker — ramps `t`'s coroutine with `(state, rng, wheel, caller_proc,
+   caller_home, args…, record)` and `coro_resume`s it, exactly as
+   `lower_task_call_inst` does.
+3. `coro_done` → the thunk destroys the frame, marshals `output`/`inout` args back,
+   and returns 0 (or 1 per 35.9(a)). The C continues on the worker. This is the
+   whole of phase T1.
+4. Not done → the thunk records a **DPI resume ticket** in `t`'s `record.parent` in
+   place of a coroutine handle, hands the baton back, and the worker blocks.
+   `rt_dpi_task_enter` returns `SUSPENDED` on the simulation stack, and P takes
+   `lower_task_call_inst`'s async arm verbatim: park P's own handle, suspend, let
+   the drain carry on. No nesting, no LIFO constraint.
+5. `t`'s coroutine eventually completes and, per the existing convention, resumes
+   `record.parent`. That epilogue now branches on the parent's tag: a coroutine
+   handle → `coro_resume` as today; a DPI ticket → `rt_dpi_task_resume(idx)`, which
+   hands the baton to the worker and blocks the simulation stack until the worker
+   either parks again in another exported task or returns from the import — at
+   which point `rt_dpi_task_leave` pushes P's handle onto the ready ring, releases
+   the worker, and returns. The drain continues from an ordinary JIT frame.
+
+`record.parent` already carries a tag: `parked_handle` packs the handle with its
+home region, so a "this parent is DPI worker *i*" encoding is a spare tag value,
+not a new field.
+
+**Which stack primitive.** Two candidates:
+
+- **Pooled OS threads with a strict baton** (one mutex + one condvar per worker;
+  exactly one of {simulation stack, one worker} runnable at any instant). Portable,
+  no per-architecture assembly, clean under sanitizers and the DAP debugger, and
+  safe against the runtime's globals precisely because the baton serialises — the
+  simulator stays single-threaded in the only sense that matters. No TLS hazard:
+  `src/` has no `thread_local`. GC-neutral: the collector never scans a machine
+  stack. Cost: one pooled thread creation on first use (~30 µs) and two futex
+  handoffs per switch (~2–5 µs).
+- **A hand-rolled context switch** (x86-64 / aarch64 `swapcontext`-shaped assembly,
+  ~20 ns per switch; `ucontext`'s own `swapcontext` is disqualified by its
+  `sigprocmask` syscall). Faster, but it is new per-architecture assembly in a
+  project that has none, plus unwinder / sanitizer / debugger exposure.
+
+**Choose the baton pool.** A switch happens only when simulation time advances
+*inside* a DPI call, which by construction cannot be a hot loop: each switch is
+paired with an event-wheel round trip and a full region pass, both orders of
+magnitude more expensive than the handoff. The assembly path buys nothing
+measurable here and costs a permanent portability surface, so it is recorded as a
+follow-up gated on a measurement, not taken up front. This is an implementation
+choice, not a semantic one — LRM compliance is identical either way.
+
+**`$finish` reached inside an exported task.** The thunk tests `rt_finishing` after
+the resume and returns to C immediately; the C between that return and the import's
+own return still runs, and the SV import call site's `emit_finish_check` then
+unwinds normally. That residual C execution is unavoidable for any simulator that
+cannot unwind a foreign frame, and is worth one sentence in the manual rather than a
+mechanism. Teardown gets one new obligation: a worker still parked at
+`sim_teardown` means a C frame's state is unrecoverable, so report it loudly
+(naming the import) instead of leaking a blocked thread.
+
+### Phases
+
+- **T1 — tasks, zero-time.** Both guards lift. Import tasks lower at a *task* call
+  site (so the site is suspendable, is inside the `compute_may_finish` closure, and
+  a call from a function body is rejected by the existing task-in-function rule);
+  `pure` on an import task is refused; the synthetic `int` is generated and ignored;
+  caller identity globals land; the export thunk drives the task coroutine and takes
+  only the sync arm. An exported task that *does* suspend is a **located fatal**
+  naming the task and the importing subroutine — loud, never silently wrong.
+  This is the phase that covers task-shaped hooks that complete instantly.
+- **T2 — real suspension.** The baton pool, the DPI ticket in `record.parent`, the
+  async arm at the import-task call site, `rt_dpi_task_enter/resume/leave`, and
+  teardown's parked-worker check. Removes T1's fatal.
+- **T3 — the disable protocol (35.9).** Export returns 1 on a disable-terminated
+  task; `svIsDisabledState` / `svAckDisabledState`; the simulator-side checks the
+  clause mandates for items b), c) and d), each a fatal. Rides the existing disable
+  machinery (`design_uses_disable_`, `emit_disable_poll`, `LlvmBackend.cpp:15871`,
+  `docs/design/disable.md`), which already polls at every suspending tag.
+  `svGetCallerInfo` belongs here too.
+
+### Refusal surface after T1 (each loud, each with a TODO)
+
+An exported task that suspends (T2); the disable protocol and
+`svIsDisabledState`/`svAckDisabledState` (T3); `pure` on an imported task (LRM
+35.5.1.3, permanent); everything the export *function* path already refuses
+(string return, `output`/`inout` string, open-array formals, one c_identifier from
+several scopes) — a task inherits every one of those, since 35.7 says exported tasks
+share the function argument rules; and a `.so` given to a design that exports, which
+the existing `run_jit` guard already covers.
+
+### Oracle — measured, not assumed
+
+- **iverilog is not an oracle for any of this**: iverilog 13 still cannot parse
+  `import "DPI-C"` / `export "DPI-C"` at all ("Invalid module item", re-measured).
+- **Verilator 5.050 is an oracle for T1 only.** A `context` import task whose C calls
+  a zero-time exported task runs correctly and is byte-checkable (measured: three
+  `sv_note` calls interleaved with the C's own prints, all at the caller's `t=5`).
+  But it **refuses a timing control inside an exported task outright** —
+  `%Error-UNSUPPORTED: Timing controls inside DPI-exported tasks` — so it cannot
+  oracle T2 at all. And it declares an exported task `extern void sv_note(int v)`,
+  *void*, not `int`, so it does not implement 35.8's return value and cannot oracle
+  T3 either.
+- T2 and T3 are therefore derived from the clause text, the way the SVA layer's
+  `diff_not.sv` expectation and the LRM 19.11 coverage percentages were.
+
+### Test plan
+
+- T1 automated (`tests/dpi_test.cpp`): the two guard tests at `:485` and `:563`
+  invert into positive lowering tests; a zero-time exported task called from a
+  `context` import task, checked against the verilator run above. The C-calls-into-SV
+  round trip needs a `.o` through `addObjectFile` (`Jit.cpp:541`), which the doctest
+  harness does not wire — so the round trip is the CLI cross-check and the suite
+  covers lowering, thunk emission, and the new fatals.
+- T1 fatal: an exported task containing `#5`, run, must report the located fatal
+  rather than complete.
+- T1 legality: an exported task called from an imported *function* must report the
+  35.8 fatal (`caller_proc == null`).
+- T2: the non-LIFO case that kills the nested drain — two processes, two import-task
+  frames, exported tasks waiting `#20` and `#5`, both must return in delay order and
+  the SV side must observe the two import calls returning in that same order. Derived
+  from 35.5.1.5; neither iverilog nor Verilator can oracle it.
+- T2: `$time` inside an exported task equals the caller's time on entry and the
+  advanced time after the wait; `process::self()` inside one is the calling process.
+
+### Sizing
+
+T1 is **small-to-medium** and almost entirely reuse: two guards lift, the export
+thunk gains `lower_task_call_inst`'s sync arm, the import-task call site *is* a task
+call site, and the wheel/state/ring globals it needs already exist. T2 is
+**medium** and self-contained: one runtime file for the baton pool, one tag value in
+`record.parent`, one branch in the task epilogue. T3 is **medium** and is mostly
+bookkeeping over the existing disable machinery.
 
 ## svdpi.h runtime (Phase A landed: packed-vector accessors)
 
@@ -589,8 +873,9 @@ scalar/chandle/real/void return, any number of tops. Still loud-fail (guards in
 - The svScope C API is provided with one scope per top; a handle naming a nested
   instance is not available.
 - DPI import **and** export **tasks** (`SubroutineKind::Task`) — a task can consume
-  time; the coroutine-shaped native boundary (imports) / wheel-from-C (exports) is
-  deferred. Functions only.
+  time, and LRM 35.5.1.5 requires the C frame itself to be suspendable. **Scoped in
+  full** under "DPI tasks" above (T1 zero-time, T2 suspension, T3 the 35.9 disable
+  protocol); functions only today.
 
 ## Oracle
 
