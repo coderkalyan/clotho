@@ -4967,6 +4967,11 @@ private:
         ir::Index delay{};
         // `<= @e` / `<= repeat(N) @e` form: the countdown, sampled now.
         ir::Index count{};
+        // `repeat(N) @e` with a runtime SIGNED or real count: the `N <= 0`
+        // predicate that routes the store to the current instant instead (LRM
+        // 9.4.5). Empty when the decision folded at lower time, or when the count
+        // is unsigned and so has no non-positive value to test for.
+        std::optional<ir::Index> nonpos{};
         // The (signal, edge) the event form waits on.
         ir::Signal trig{};
         uint32_t   edge     = 0;
@@ -4990,7 +4995,33 @@ private:
             b.store_nb_delay(lv, v, t->delay, l);
             return;
         }
+        if (!t->nonpos) {
+            b.store_nb_event(lv, v, t->count, t->trig, t->edge, l);
+            return;
+        }
+        // LRM 9.4.5: "If the repeat count literal, or signed variable holding the
+        // repeat count, is less than or equal to 0 at the time of evaluation, the
+        // assignment occurs as if there is no repeat construct" -- and the clause's
+        // own example settles what that means: `repeat (-3) @ (event_expression)
+        // // will not execute event_expression`. So the store happens with no wait
+        // at all, which for the nonblocking form is a plain StoreNb -- the current
+        // instant's NBA region. That is what the blocking form already does via its
+        // signed `Lt` bound (lower_intra_timing waits zero times), so the two forms
+        // agree. Measured against iverilog 13.
+        //
+        // Per leaf rather than around the whole walk: `count` is evaluated exactly
+        // once, before the walk, and re-testing that one SSA value at each leaf is
+        // free, whereas wrapping the walk would re-lower every leaf's RHS inside
+        // both arms and break 9.4.5's single evaluation.
+        b.open_region();
+        b.binary(ir::Inst::Tag::StoreNb, lv, v, l);
+        const ir::ExtraSlice now_r = b.close_region();
+
+        b.open_region();
         b.store_nb_event(lv, v, t->count, t->trig, t->edge, l);
+        const ir::ExtraSlice wait_r = b.close_region();
+
+        b.cond(*t->nonpos, now_r, wait_r, l);
     }
 
     // Store a whole unpacked struct: one blocking store per member (the aggregate
@@ -24153,8 +24184,9 @@ private:
 
     // Lower the EVENT half of a nonblocking intra-assignment's timing control
     // (`<= @e` / `<= repeat(N) @e`) once, into the timing every leaf of the
-    // statement shares. The optional return is what lets a future fold report "no
-    // timing at all"; today only the delay form's compile-time `#0` uses it.
+    // statement shares. Empty means "no timing at all": LRM 9.4.5 makes a
+    // compile-time non-positive repeat count a plain `<=`, so the caller emits an
+    // ordinary StoreNb and the event expression is never executed.
     std::optional<IntraNbTiming> lower_intra_nb_event(const AssignmentExpression& a, ir::Builder& b) {
         const TimingControl& tc = *a.timingControl;
         const ir::SourceLoc  l  = loc(a);
@@ -24164,6 +24196,47 @@ private:
         if (tc.kind == TimingControlKind::RepeatedEvent) {
             const RepeatedEventControl& rec = tc.as<RepeatedEventControl>();
             evt = &rec.event;
+            // LRM 9.4.5: "If the repeat count literal, or signed variable holding
+            // the repeat count, is less than or equal to 0 at the time of
+            // evaluation, the assignment occurs as if there is no repeat
+            // construct", and the clause's example fixes what that means --
+            // "repeat (-3) @ (event_expression) // will not execute
+            // event_expression". So a non-positive count stores with no wait,
+            // which for the nonblocking form is the current instant's NBA region.
+            // The record's countdown is uint32_t and rt_intra_event_fire tests
+            // `--count == 0`, so without this a count of 0 or -1 would wait 2**32
+            // edges rather than none.
+            //
+            // The test is `count < 1` IN THE COUNT'S OWN SIGNEDNESS, which is the
+            // clause's rule exactly: for a signed count it is `count <= 0`, and for
+            // an unsigned one it degenerates to `count == 0`. That asymmetry is the
+            // clause's own, stated in the same example -- "repeat (a) @
+            // (event_expression) // if a is assigned -3, it will execute the
+            // event_expression if a is declared as an unsigned variable, but not if
+            // a is signed" -- because an unsigned `a` holding -3 is 4294967293, a
+            // large positive count. Zero is zero in both signednesses and clamps
+            // either way. Measured against iverilog 13: a literal 0, an unsigned
+            // variable holding 0 and a signed variable holding 0 all store in the
+            // arming instant, while an unsigned variable holding -3 waits.
+            const ir::Ref cty =
+              rec.expr.type->isFloating() ? make_int_type(64, false, true) : lower_type(*rec.expr.type);
+            slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
+            slang::ast::EvalContext    ev(ectx);
+            const slang::ConstantValue cv = rec.expr.eval(ev);
+            std::optional<bool>        folded;
+            if (cv.isInteger() && !cv.integer().hasUnknown()) {
+                folded = rec.expr.type->isSigned() ? cv.integer().as<int64_t>().value_or(1) <= 0
+                                                   : cv.integer().as<uint64_t>().value_or(1) == 0;
+            } else if (cv.isReal()) {
+                folded = cv.real() <= 0.0;
+            }
+            if (folded && *folded) {
+                // Folded away: no repeat construct, so neither the count nor the
+                // event expression is lowered at all. Nothing here validates the
+                // event, deliberately -- an unexecuted `@(a or b)` or `@(e iff c)`
+                // must not be refused when the LRM says it never runs.
+                return std::nullopt;
+            }
             t.count = lower_expr(rec.expr, b);
             if (rec.expr.type->isFloating()) {
                 // A real count rounds half away from zero into the countdown
@@ -24172,12 +24245,21 @@ private:
                 // counts a real in (lower_repeat); the deferred record's own
                 // 32-bit countdown then narrows it exactly as it narrows an
                 // integral longint count.
-                t.count = coerce(t.count, *rec.expr.type, make_int_type(64, false, true), b, l);
+                t.count = coerce(t.count, *rec.expr.type, cty, b, l);
             }
-            // TODO: LRM 9.4.5 makes a count <= 0 (rounded or integral) assign
-            // as if there were no repeat construct, but the record countdown is
-            // unsigned, so a non-positive count waits 2**32 edges instead. A
-            // pre-existing gap of the integral path, shared by the real one.
+            if (!folded) {
+                ir::Index nonpos =
+                  b.binary(ir::Inst::Tag::Lt, t.count, b.constant(module_.pool.put_int(cty, 1), l), l);
+                if (rec.expr.type->isFourState()) {
+                    // An x/z count makes the comparison ambiguous; narrow it to the
+                    // definite bit so the rule is "clamp only when the count is
+                    // KNOWN non-positive" rather than whatever an x predicate
+                    // happens to do. 9.4.5 says nothing about an unknown count.
+                    nonpos = b.binary(ir::Inst::Tag::CaseEq, nonpos,
+                                      b.constant(module_.pool.put_int(make_int_type(1, true, false), 1), l), l);
+                }
+                t.nonpos = nonpos;
+            }
         } else {
             // Plain `@e` waits for one occurrence.
             t.count = b.constant(module_.pool.put_int(make_int_type(32, false, false), 1), l);
@@ -24203,9 +24285,10 @@ private:
 
     // Lower a nonblocking intra-assignment's whole timing control once, for a
     // target that decomposes into N leaves. Empty means the timing folded away and
-    // the statement is an ordinary `<=`: a compile-time `#0`, which already lands
-    // in the current instant's NBA region -- keeping it on the block-commit path
-    // preserves execution-order tie-breaking (see intra_nb_delay_is_const_zero).
+    // the statement is an ordinary `<=`: a compile-time `#0` (already the current
+    // instant's NBA region -- keeping it on the block-commit path preserves
+    // execution-order tie-breaking, see the scalar `#0` note in lower_assign), or a
+    // compile-time non-positive repeat count.
     std::optional<IntraNbTiming> lower_intra_nb_timing(const AssignmentExpression& a, ir::Builder& b) {
         const TimingControl& tc = *a.timingControl;
         if (tc.kind != TimingControlKind::Delay) {
@@ -24442,8 +24525,9 @@ private:
         // concatenation, or a whole unpacked array -- a pattern lvalue and a whole
         // unpacked struct already returned above) skips this block entirely: its
         // timing is in `nbt` and rides the ordinary store dispatch below. `nbt` is
-        // null there too when the timing FOLDED to a plain `<=` (a compile-time
-        // `#0`), which is why the flag is tested and not the pointer.
+        // null there too when the timing FOLDED to a plain `<=` (a compile-time `#0`
+        // or a non-positive repeat count), which is why the flag is tested and not
+        // the pointer.
         if (a.timingControl != nullptr && !intra_decomposed) {
             // Intra-assignment timing (LRM 9.4.5): sample the RHS now, suspend on
             // the delay/event, then store the sampled value. The blocking form is a
@@ -24506,8 +24590,10 @@ private:
                 }
                 // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.
                 // Sample the value (and N) now; store after N occurrences of the
-                // trigger edge. The trigger guards live in lower_intra_nb_event,
-                // shared with the decomposing targets so the two cannot drift.
+                // trigger edge. The count clamp (LRM 9.4.5) and the trigger guards
+                // live in lower_intra_nb_event, shared with the decomposing targets so
+                // the two cannot drift; an empty result means the count folded to a
+                // non-positive constant and this is just a plain `<=`.
                 const std::optional<IntraNbTiming> t   = lower_intra_nb_event(a, b);
                 const ir::Index                    val = lower_expr(a.right(), b);
                 store_leaf(ir::Inst::Tag::StoreNb, t ? &*t : nullptr,
