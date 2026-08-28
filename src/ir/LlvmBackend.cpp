@@ -7977,6 +7977,13 @@ private:
         // `->> @(x) e` subscription table, which otherwise carry a finished
         // design's pointers and trigger ids into this one (Runtime.h:1472).
         b_.CreateCall(run_init_fn(), { sym(events_gv_), b_.getInt32(event_slot_count_) });
+        // The coverage model (LRM 19), before any `new` can register an instance
+        // against it. Only for a design that has a covergroup: rt_cover_init would
+        // otherwise be a declaration nothing needs, and the runtime treats an
+        // uninitialized model as an empty one anyway.
+        if (!mod_.cover_types.empty()) {
+            b_.CreateCall(cover_init_fn(), { cover_config_global() });
+        }
         emit_gc_root_tables();
         // The fallback RNG (LRM 18.13), seeded before anything can draw from it.
         // Its selector is deliberately outside the process-index space every
@@ -8295,21 +8302,183 @@ private:
         if (auto* g = env_->llmod.getNamedGlobal("clotho.gc.config")) {
             return g;
         }
-        auto* init = llvm::ConstantStruct::get(
-          gc_config_ty(),
-          { b_.getInt64(config_.gc_nursery_bytes), b_.getInt64(config_.gc_heap_bytes_max),
-            b_.getInt32(config_.gc_stress ? 1u : 0u),
-            b_.getInt32(config_.gc_stats ? 1u : 0u), b_.getInt32(gc_map_vptr_offset()),
-            b_.getInt32(gc_mutator_request_offset()),
-            b_.getInt32(static_cast<uint32_t>(gc_mutator_bytes())),
-            // 0 (the --gc-full-every default) hands the young/full split to the
-            // runtime's heap-growth heuristic (Gc.h:241-243). `reserved` pads the
-            // struct to a multiple of 8 explicitly rather than letting the two
-            // layouts disagree about tail padding.
-            b_.getInt32(config_.gc_full_every), b_.getInt32(0) });
-        return new llvm::GlobalVariable(env_->llmod, gc_config_ty(), /*isConstant=*/true,
-                                        llvm::GlobalValue::PrivateLinkage, init,
+        auto* init = llvm::ConstantStruct::get(gc_config_ty(),
+                                               { b_.getInt64(config_.gc_nursery_bytes),
+                                                 b_.getInt64(config_.gc_heap_bytes_max),
+                                                 b_.getInt32(config_.gc_stress ? 1u : 0u),
+                                                 b_.getInt32(config_.gc_stats ? 1u : 0u),
+                                                 b_.getInt32(gc_map_vptr_offset()),
+                                                 b_.getInt32(gc_mutator_request_offset()),
+                                                 b_.getInt32(static_cast<uint32_t>(gc_mutator_bytes())),
+                                                 // 0 (the --gc-full-every default) hands the young/full split to the
+                                                 // runtime's heap-growth heuristic (Gc.h:241-243). `reserved` pads the
+                                                 // struct to a multiple of 8 explicitly rather than letting the two
+                                                 // layouts disagree about tail padding.
+                                                 b_.getInt32(config_.gc_full_every),
+                                                 b_.getInt32(0) });
+        return new llvm::GlobalVariable(env_->llmod,
+                                        gc_config_ty(),
+                                        /*isConstant=*/true,
+                                        llvm::GlobalValue::PrivateLinkage,
+                                        init,
                                         "clotho.gc.config");
+    }
+
+    // -- Functional coverage (LRM 19, docs/design/functional-coverage.md) ------
+    //
+    // The frontend evaluated every bin bound, so the whole model is emit-time
+    // constant data: four nested constant arrays plus their strings, mirroring
+    // src/runtime/Coverage.h field for field. rt_cover_init cross-checks the four
+    // struct sizes computed here against the runtime's own, so a layout
+    // divergence fails loudly instead of reading garbage -- the same discipline
+    // rt_gc_init applies to its one offset.
+    llvm::StructType* cover_range_ty() {
+        if (cover_range_ty_ == nullptr) {
+            cover_range_ty_ = llvm::StructType::create(ctx_, { b_.getInt64Ty(), b_.getInt64Ty() }, "clotho.coverrange");
+        }
+        return cover_range_ty_;
+    }
+    llvm::StructType* cover_bin_ty() {
+        if (cover_bin_ty_ == nullptr) {
+            cover_bin_ty_ = llvm::StructType::create(
+              ctx_, { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() }, "clotho.coverbin");
+        }
+        return cover_bin_ty_;
+    }
+    llvm::StructType* cover_point_ty() {
+        if (cover_point_ty_ == nullptr) {
+            cover_point_ty_ = llvm::StructType::create(ctx_,
+                                                       { raw_ptr_ty(),
+                                                         raw_ptr_ty(),
+                                                         b_.getInt32Ty(),
+                                                         raw_ptr_ty(),
+                                                         b_.getInt32Ty(),
+                                                         b_.getInt32Ty(),
+                                                         b_.getInt32Ty(),
+                                                         b_.getInt32Ty(),
+                                                         b_.getInt32Ty(),
+                                                         b_.getInt32Ty() },
+                                                       "clotho.coverpoint");
+        }
+        return cover_point_ty_;
+    }
+    llvm::StructType* cover_type_ty() {
+        if (cover_type_ty_ == nullptr) {
+            cover_type_ty_ = llvm::StructType::create(ctx_,
+                                                      { raw_ptr_ty(),
+                                                        raw_ptr_ty(),
+                                                        b_.getInt32Ty(),
+                                                        raw_ptr_ty(),
+                                                        b_.getInt32Ty(),
+                                                        b_.getInt32Ty(),
+                                                        b_.getInt32Ty(),
+                                                        raw_ptr_ty() },
+                                                      "clotho.covertype");
+        }
+        return cover_type_ty_;
+    }
+    llvm::StructType* cover_config_ty() {
+        if (cover_config_ty_ == nullptr) {
+            cover_config_ty_ = llvm::StructType::create(ctx_,
+                                                        { raw_ptr_ty(),
+                                                          b_.getInt32Ty(),
+                                                          b_.getInt32Ty(),
+                                                          b_.getInt32Ty(),
+                                                          b_.getInt32Ty(),
+                                                          b_.getInt32Ty(),
+                                                          raw_ptr_ty() },
+                                                        "clotho.coverconfig");
+        }
+        return cover_config_ty_;
+    }
+
+    // A private constant array of `rows`, or a null pointer when empty: the
+    // runtime pairs a zero count with a null pointer everywhere, so an empty
+    // array must not become a zero-length global whose address is compared.
+    llvm::Constant* cover_array(llvm::StructType*                   row_ty,
+                                const std::vector<llvm::Constant*>& rows,
+                                const std::string&                  nm) {
+        if (rows.empty()) {
+            return llvm::Constant::getNullValue(raw_ptr_ty());
+        }
+        auto* arr_ty = llvm::ArrayType::get(row_ty, rows.size());
+        return new llvm::GlobalVariable(env_->llmod,
+                                        arr_ty,
+                                        /*isConstant=*/true,
+                                        llvm::GlobalValue::PrivateLinkage,
+                                        llvm::ConstantArray::get(arr_ty, rows),
+                                        nm);
+    }
+
+    llvm::Constant* cover_config_global() {
+        if (auto* g = env_->llmod.getNamedGlobal("clotho.cover.config")) {
+            return g;
+        }
+        std::vector<llvm::Constant*> types;
+        types.reserve(mod_.cover_types.size());
+        for (size_t ti = 0; ti < mod_.cover_types.size(); ++ti) {
+            const CoverType&             ct = mod_.cover_types[ti];
+            const std::string            tn = "clotho.cover." + std::to_string(ti);
+            std::vector<llvm::Constant*> points;
+            points.reserve(ct.points.size());
+            for (size_t pi = 0; pi < ct.points.size(); ++pi) {
+                const CoverPoint&            cp = ct.points[pi];
+                const std::string            pn = tn + "." + std::to_string(pi);
+                std::vector<llvm::Constant*> bins;
+                bins.reserve(cp.bins.size());
+                for (size_t bi = 0; bi < cp.bins.size(); ++bi) {
+                    const CoverBin&              cb = cp.bins[bi];
+                    std::vector<llvm::Constant*> ranges;
+                    ranges.reserve(cb.ranges.size());
+                    for (const CoverRange& r : cb.ranges) {
+                        ranges.push_back(
+                          llvm::ConstantStruct::get(cover_range_ty(), { b_.getInt64(r.lo), b_.getInt64(r.hi) }));
+                    }
+                    bins.push_back(llvm::ConstantStruct::get(
+                      cover_bin_ty(),
+                      { b_.CreateGlobalString(cb.name),
+                        b_.getInt32(static_cast<uint32_t>(cb.kind)),
+                        b_.getInt32(static_cast<uint32_t>(cb.ranges.size())),
+                        cover_array(cover_range_ty(), ranges, pn + "." + std::to_string(bi) + ".ranges") }));
+                }
+                points.push_back(llvm::ConstantStruct::get(cover_point_ty(),
+                                                           { b_.CreateGlobalString(cp.name),
+                                                             b_.CreateGlobalString(cp.banner),
+                                                             b_.getInt32(static_cast<uint32_t>(cp.bins.size())),
+                                                             cover_array(cover_bin_ty(), bins, pn + ".bins"),
+                                                             b_.getInt32(cp.weight),
+                                                             b_.getInt32(cp.goal),
+                                                             b_.getInt32(cp.at_least),
+                                                             b_.getInt32(cp.is_auto ? 1u : 0u),
+                                                             b_.getInt32(cp.auto_total),
+                                                             b_.getInt32(cp.is_signed ? 1u : 0u) }));
+            }
+            types.push_back(llvm::ConstantStruct::get(cover_type_ty(),
+                                                      { b_.CreateGlobalString(ct.name),
+                                                        b_.CreateGlobalString(ct.banner),
+                                                        b_.getInt32(static_cast<uint32_t>(ct.points.size())),
+                                                        cover_array(cover_point_ty(), points, tn + ".points"),
+                                                        b_.getInt32(ct.weight),
+                                                        b_.getInt32(ct.goal),
+                                                        b_.getInt32(ct.per_instance ? 1u : 0u),
+                                                        b_.CreateGlobalString(ct.scope) }));
+        }
+        llvm::Constant* path = config_.coverage_report.empty()
+                                 ? llvm::Constant::getNullValue(raw_ptr_ty())
+                                 : llvm::cast<llvm::Constant>(b_.CreateGlobalString(config_.coverage_report));
+        auto*           dl   = &env_->llmod.getDataLayout();
+        auto*           init =
+          llvm::ConstantStruct::get(cover_config_ty(),
+                                    { cover_array(cover_type_ty(), types, "clotho.cover.types"),
+                                      b_.getInt32(static_cast<uint32_t>(types.size())),
+                                      b_.getInt32(static_cast<uint32_t>(dl->getTypeAllocSize(cover_type_ty()))),
+                                      b_.getInt32(static_cast<uint32_t>(dl->getTypeAllocSize(cover_point_ty()))),
+                                      b_.getInt32(static_cast<uint32_t>(dl->getTypeAllocSize(cover_bin_ty()))),
+                                      b_.getInt32(static_cast<uint32_t>(dl->getTypeAllocSize(cover_range_ty()))),
+                                      path });
+        return new llvm::GlobalVariable(env_->llmod, cover_config_ty(), /*isConstant=*/true,
+                                        llvm::GlobalValue::PrivateLinkage, init,
+                                        "clotho.cover.config");
     }
 
     // Per-(signal, edge) capacities for the two wait queues. Indexed
@@ -13415,6 +13584,48 @@ private:
         return rt_fn("rt_free", b_.getVoidTy(), { raw_ptr_ty() });
     }
 
+    // -- Functional coverage entry points (src/runtime/Coverage.h) --------------
+    // Declared on demand like the collector's, so a design with no covergroup
+    // carries none of them and rt_cover_init is never called.
+    llvm::FunctionCallee cover_init_fn() {
+        return rt_fn("rt_cover_init", b_.getVoidTy(), { raw_ptr_ty() });
+    }
+    llvm::FunctionCallee cover_new_fn() {
+        return rt_fn("rt_cover_new", b_.getInt64Ty(), { b_.getInt32Ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee cover_ctx_fn() {
+        return rt_fn("rt_cover_ctx", b_.getInt64Ty(), { b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee cover_first_fn() {
+        return rt_fn("rt_cover_first", b_.getInt64Ty(), { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee cover_next_fn() {
+        return rt_fn("rt_cover_next", b_.getInt64Ty(), { b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee cover_hit_fn() {
+        return rt_fn("rt_cover_hit", b_.getVoidTy(),
+                     { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee cover_start_fn() {
+        return rt_fn("rt_cover_start", b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee cover_set_name_fn() {
+        return rt_fn("rt_cover_set_inst_name", b_.getVoidTy(),
+                     { b_.getInt64Ty(), raw_ptr_ty(), b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee cover_inst_query_fn(const char* name, llvm::Type* ret) {
+        return rt_fn(name, ret, { b_.getInt64Ty() });
+    }
+    llvm::FunctionCallee cover_point_query_fn(const char* name, llvm::Type* ret) {
+        return rt_fn(name, ret, { b_.getInt64Ty(), b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee cover_type_query_fn(const char* name, llvm::Type* ret) {
+        return rt_fn(name, ret, { b_.getInt32Ty() });
+    }
+    llvm::FunctionCallee cover_design_coverage_fn() {
+        return rt_fn("rt_cover_design_coverage", b_.getDoubleTy(), {});
+    }
+
     // -- Garbage collection entry points (src/runtime/Gc.h) ----------------------
     // rt_fn declares on demand, so each of these lands in the module only if some
     // emitter actually calls it: a design that never allocates carries no
@@ -15798,6 +16009,13 @@ private:
                 // bit the frontend ANDs with its own resource test.
                 return { 1, false, false };
             case Inst::Tag::SyncCtl:
+                // A statement, never a value.
+                return { 1, false, false };
+            case Inst::Tag::CoverQuery:
+                // A covergroup handle, a coverage percentage, or a bin count -- the
+                // frontend recorded which on the op.
+                return from_ref(ir_->extra_data<CoverInfo>(p.extra).type);
+            case Inst::Tag::CoverCtl:
                 // A statement, never a value.
                 return { 1, false, false };
             case Inst::Tag::EventTriggered:
@@ -18199,6 +18417,12 @@ private:
                 return;
             case Inst::Tag::SyncCtl:
                 lower_sync_ctl(i);
+                return;
+            case Inst::Tag::CoverQuery:
+                lower_cover_query(i);
+                return;
+            case Inst::Tag::CoverCtl:
+                lower_cover_ctl(i);
                 return;
             case Inst::Tag::MonitorSet:
                 b_.CreateCall(monitor_set_fn(),
@@ -23101,11 +23325,10 @@ private:
     // vector or a dynamic string) and call the FD opener; the result is the
     // descriptor.
     void lower_fopen_fd(Index i) {
-        const auto& p    = ir_->payload(i).binary;
-        const AsciiArg n = spill_ascii_arg(p.l, "fopen.name");
-        const AsciiArg m = spill_ascii_arg(p.r, "fopen.mode");
-        llvm::Value*   desc =
-          b_.CreateCall(fopen_fd_fn(), { n.ptr, n.len, n.fwd, m.ptr, m.len, m.fwd });
+        const auto&    p    = ir_->payload(i).binary;
+        const AsciiArg n    = spill_ascii_arg(p.l, "fopen.name");
+        const AsciiArg m    = spill_ascii_arg(p.r, "fopen.mode");
+        llvm::Value*   desc = b_.CreateCall(fopen_fd_fn(), { n.ptr, n.len, n.fwd, m.ptr, m.len, m.fwd });
         // The descriptor is a plain known integer (no x/z): must == may, z == 0.
         set_value(i, packed(desc, desc, zero(32)));
     }
@@ -23130,6 +23353,129 @@ private:
         llvm::Value*   rc      = b_.CreateCall(system_fn(), { c.ptr, c.len, c.fwd, has_arg });
         // The return is a plain known integer (no x/z): must == may, z == 0.
         set_value(i, packed(rc, rc, zero(32)));
+    }
+
+    // -- Functional coverage (LRM 19) ------------------------------------------
+    //
+    // Every op is one call into the coverage runtime; the model it indexes is the
+    // constant data cover_config_global emitted. Nothing here touches the
+    // collector: a covergroup instance is runtime-owned storage that outlives the
+    // design (LRM 19.11.3 aggregates dropped instances), so its handle is an
+    // opaque 2-state 64-bit word and never a traced root.
+    void lower_cover_query(Index i) {
+        const auto info = ir_->extra_data<CoverInfo>(ir_->payload(i).extra);
+        const auto args = ir_->region(info.args);
+        auto*      i32  = b_.getInt32Ty();
+        auto*      dbl  = b_.getDoubleTy();
+        // Every instance-addressed op takes the handle as operand 0; the
+        // type-addressed ones carry the index on the op instead.
+        const auto handle = [&]() -> llvm::Value* {
+            if (args.empty()) {
+                throw BackendError{ "internal: cover_query with no handle operand" };
+            }
+            return cast(must_of(value_of(args[0])), 64, false);
+        };
+        const auto ival = [&](llvm::Value* v) { set_value(i, packed(v, v, zero(32))); };
+        const auto hval = [&](llvm::Value* v) { set_value(i, two_val(v)); };
+        switch (info.op) {
+            case CoverOp::New:
+                // `ctx` is the enclosing object for a class-embedded covergroup, so
+                // the generated sample body can reach the class properties its
+                // coverpoints name, and null otherwise.
+                hval(b_.CreateCall(cover_new_fn(),
+                                   { b_.getInt32(info.type_idx),
+                                     args.empty() ? b_.getInt64(0) : cast(must_of(value_of(args[0])), 64, false) }));
+                return;
+            case CoverOp::Ctx:
+                hval(b_.CreateCall(cover_ctx_fn(), { handle() }));
+                return;
+            case CoverOp::First:
+                hval(b_.CreateCall(cover_first_fn(), { b_.getInt32(info.type_idx) }));
+                return;
+            case CoverOp::Next:
+                hval(b_.CreateCall(cover_next_fn(), { handle() }));
+                return;
+            case CoverOp::InstCoverage:
+                set_value(i,
+                          real_plane(b_.CreateCall(cover_inst_query_fn("rt_cover_inst_coverage", dbl), { handle() })));
+                return;
+            case CoverOp::InstCovered:
+                ival(b_.CreateCall(cover_inst_query_fn("rt_cover_inst_covered", i32), { handle() }));
+                return;
+            case CoverOp::InstTotal:
+                ival(b_.CreateCall(cover_inst_query_fn("rt_cover_inst_total", i32), { handle() }));
+                return;
+            case CoverOp::PointCoverage:
+                set_value(i,
+                          real_plane(b_.CreateCall(cover_point_query_fn("rt_cover_point_coverage", dbl),
+                                                   { handle(), b_.getInt32(info.point) })));
+                return;
+            case CoverOp::PointCovered:
+                ival(b_.CreateCall(cover_point_query_fn("rt_cover_point_covered", i32),
+                                   { handle(), b_.getInt32(info.point) }));
+                return;
+            case CoverOp::PointTotal:
+                ival(b_.CreateCall(cover_point_query_fn("rt_cover_point_total", i32),
+                                   { handle(), b_.getInt32(info.point) }));
+                return;
+            case CoverOp::TypeCoverage:
+                set_value(i,
+                          real_plane(b_.CreateCall(cover_type_query_fn("rt_cover_type_coverage", dbl),
+                                                   { b_.getInt32(info.type_idx) })));
+                return;
+            case CoverOp::TypeCovered:
+                ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_covered", i32), { b_.getInt32(info.type_idx) }));
+                return;
+            case CoverOp::TypeTotal:
+                ival(b_.CreateCall(cover_type_query_fn("rt_cover_type_total", i32), { b_.getInt32(info.type_idx) }));
+                return;
+            case CoverOp::DesignCoverage:
+                set_value(i, real_plane(b_.CreateCall(cover_design_coverage_fn(), {})));
+                return;
+            default:
+                throw BackendError{ "internal: non-query op on a cover_query" };
+        }
+    }
+
+    void lower_cover_ctl(Index i) {
+        const auto info = ir_->extra_data<CoverInfo>(ir_->payload(i).extra);
+        const auto args = ir_->region(info.args);
+        if (args.empty()) {
+            throw BackendError{ "internal: cover_ctl with no handle operand" };
+        }
+        llvm::Value* h = cast(must_of(value_of(args[0])), 64, false);
+        switch (info.op) {
+            case CoverOp::Hit: {
+                if (args.size() != 3) {
+                    throw BackendError{ "internal: cover_ctl hit takes a value and an x mask" };
+                }
+                // The unknown-bit mask is what makes 19.5.3's "automatic bins only
+                // consider 2-state values" a runtime test rather than a frontend
+                // refusal: a sampled x/z matches no bin at all.
+                b_.CreateCall(cover_hit_fn(),
+                              { h, b_.getInt32(info.point), cast(must_of(value_of(args[1])), 64, false),
+                                cast(must_of(value_of(args[2])), 64, false) });
+                return;
+            }
+            case CoverOp::Start:
+                if (args.size() != 2) {
+                    throw BackendError{ "internal: cover_ctl start takes an enable" };
+                }
+                b_.CreateCall(cover_start_fn(),
+                              { h, cast(must_of(value_of(args[1])), 32, false) });
+                return;
+            case CoverOp::SetName: {
+                if (args.size() != 2) {
+                    throw BackendError{ "internal: cover_ctl set_inst_name takes a string" };
+                }
+                const AsciiArg s = spill_ascii_arg(args[1], "cover.name");
+                b_.CreateCall(cover_set_name_fn(),
+                              { h, s.ptr, b_.CreateZExt(s.len, b_.getInt64Ty()) });
+                return;
+            }
+            default:
+                throw BackendError{ "internal: non-statement op on a cover_ctl" };
+        }
     }
 
     // Lower a $fclose: close the descriptor operand.
@@ -30411,6 +30757,12 @@ private:
     llvm::StructType* gc_map_ty_     = nullptr;
     llvm::StructType* gc_roots_ty_   = nullptr;
     llvm::StructType* gc_frame_ty_   = nullptr;
+    // The coverage model's four record types plus its config (Coverage.h).
+    llvm::StructType* cover_range_ty_  = nullptr;
+    llvm::StructType* cover_bin_ty_    = nullptr;
+    llvm::StructType* cover_point_ty_  = nullptr;
+    llvm::StructType* cover_type_ty_   = nullptr;
+    llvm::StructType* cover_config_ty_ = nullptr;
     // rt_gc_container / rt_gc_container_table (Gc.h:249-261), the container-root ABI.
     llvm::StructType* gc_container_ty_       = nullptr;
     llvm::StructType* gc_container_table_ty_ = nullptr;

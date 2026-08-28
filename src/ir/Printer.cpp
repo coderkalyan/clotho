@@ -452,6 +452,10 @@ const char* tag_name(Inst::Tag tag) {
             return "sync_wait";
         case T::SyncCtl:
             return "sync_ctl";
+        case T::CoverQuery:
+            return "cover_query";
+        case T::CoverCtl:
+            return "cover_ctl";
         case T::MonitorSet:
             return "monitor_set";
         case T::MonitorEmit:

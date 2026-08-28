@@ -1412,33 +1412,41 @@ TEST_CASE("parameterized class: self-referential singleton static over class/vif
     CHECK(run_capture(src) == "1 1 1 1\n");
 }
 
-// The actual root cause the misattribution above named: a covergroup type has
-// no IR representation at all (functional coverage is unimplemented, see
-// docs/TODO.md "Functional coverage"). Reaching one through `lower_type` --
-// here, directly as a class property's type, the same way a UVM register
-// model class embeds one and gets pulled through a generic-class type
-// parameter under eager static init (LRM 6.21) -- must name covergroups
-// specifically, not the generic (and misleading) "unsupported non-integral
-// type" every OTHER admitted non-integral kind used to share this refusal
-// with.
-TEST_CASE("a covergroup-typed property is refused by name, not the generic non-integral message") {
-    // `covergroup cg; endgroup` inside a class implicitly declares `cg` as
-    // BOTH the embedded covergroup type and a property of that type (LRM 19.3
-    // -- `cg = new()` in the constructor addresses it directly, no separate
-    // property declaration). A bare module-scope `covergroup` is a different,
-    // unrelated gap (an unsupported module member kind), so the property has
-    // to be reached the way real UVM code reaches it: embedded in a class.
-    const std::string d = fails(R"(
+// The shape the misattribution above named: a class embedding a covergroup,
+// reached through `lower_type` as a class property's type -- the way a UVM
+// register model class embeds one and gets pulled through a generic-class type
+// parameter under eager static init (LRM 6.21). This used to be the design's
+// most common route into the "unsupported non-integral type" refusal, which
+// named neither covergroups nor the class that actually held one.
+//
+// Functional coverage now lowers (docs/design/functional-coverage.md): a
+// covergroup type is a nullable 64-bit handle, so an embedded one is an ordinary
+// integral property and a class holding it lays out like any other. A covergroup
+// the constructor never builds stays null and samples nothing, which is exactly
+// what LRM 19.4 says of one left unconstructed -- so this compiles and runs.
+TEST_CASE("a class may embed a covergroup (LRM 19.4)") {
+    // `covergroup cg; endgroup` inside a class implicitly declares `cg` as BOTH
+    // the embedded covergroup type and a property of that type (LRM 19.3 --
+    // `cg = new()` in the constructor addresses it directly, no separate property
+    // declaration).
+    CHECK(run_capture(R"(
         module m;
             class C;
+                bit [1:0] v;
                 covergroup cg;
+                    cp: coverpoint v;
                 endgroup
-                function new(); endfunction
+                function new(); cg = new(); endfunction
             endclass
-            initial begin C o = new(); end
+            initial begin
+                C o = new();
+                o.v = 2;
+                o.cg.sample();
+                $write("%0f\n", o.cg.get_inst_coverage());
+                $finish;
+            end
         endmodule
-    )");
-    CHECK(d.find("covergroup") != std::string::npos);
+    )") == "25.000000\n");
 }
 
 // -- Forward typedef classes (`typedef class C;`, LRM 6.18 / 8.27) --
@@ -3726,14 +3734,15 @@ TEST_CASE("class method: cannot forward-reference a member of an unrelated, late
 // coverpoint here reads `analysis_txn`, a property declared textually AFTER
 // the covergroup (the shape of a real corpus hit,
 // uvm-examples/apb_coverage_monitor.svh's `OPCODE: coverpoint
-// analysis_txn.we` preceding `apb_seq_item analysis_txn;`). This only pins
-// the FRONTEND fix: clotho's backend does not lower covergroups at all yet
-// (no class property may have a CovergroupType, so `mon`'s layout refuses
-// with "unsupported non-integral type" regardless of order -- a separate,
-// pre-existing gap, not a symptom of the bug this fixes), so the class still
-// fails to lower; what changed is *which* diagnostic fires. Before the fix
-// this failed to even resolve the name, with "identifier 'analysis_txn' used
-// before its declaration".
+// analysis_txn.we` preceding `apb_seq_item analysis_txn;`). Before the slang
+// patch this failed to resolve the name at all, with "identifier
+// 'analysis_txn' used before its declaration".
+//
+// Now that functional coverage lowers (docs/design/functional-coverage.md), the
+// whole shape compiles and samples: the class covers the txn its own handle
+// names, through the `this` the covergroup captured in the constructor. The
+// coverpoint is 4 bits wide with no explicit bins, so LRM 19.5.3 gives it 16
+// automatic bins and one sample of we == 0 covers one of them.
 TEST_CASE("covergroup: a coverpoint may reference a property declared later in the class") {
     constexpr std::string_view src = R"(
         module m;
@@ -3745,10 +3754,15 @@ TEST_CASE("covergroup: a coverpoint may reference a property declared later in t
                 txn analysis_txn;
                 function new(); analysis_txn = new(); cg = new(); endfunction
             endclass
-            initial begin mon m = new(); m.cg.sample(); end
+            initial begin
+                mon m = new();
+                m.cg.sample();
+                $display("cov=%0f", m.cg.get_inst_coverage());
+                $finish;
+            end
         endmodule
     )";
-    const std::string diag = fails(src);
-    CHECK(diag.find("used before its declaration") == std::string::npos);
-    CHECK(diag.find("unsupported-construct") != std::string::npos);
+    const LowerResult r = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    CHECK(r.diagnostic_text().find("used before its declaration") == std::string::npos);
 }

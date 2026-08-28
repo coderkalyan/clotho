@@ -58,6 +58,7 @@ There is no second help and nothing to forward — see "One parser" below.
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
 | `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel` |
 | `--sanitize <list>` | both | dynamic bug checks instrumented into the emitted code, reported to stderr and non-fatal: `bounds` (an index outside what it indexes — array element, packed bit/part select, string character, queue method index, pop from an empty queue; x/z index included), `xprov` (xsan, x provenance — not yet implemented, so **Debug builds only**, `CLOTHO_XSAN`; a shipped build rejects the name). Off by default |
+| `--coverage <file>` | both | write the design's functional-coverage report here (LRM 19): which of the bins its `covergroup`s declare the run reached, and which it never did. No report by default. The destination is compiled into the artifact — the emitted coverage model names its own — so a `build` and the `run` of what it built must be given the same file |
 | `--gc-stress` | both | collect class objects at every opportunity instead of when the design has created enough of them. Slow by design: it turns an object clotho failed to keep into an immediate wrong answer rather than a rare one, so it is for working on clotho itself. **Changes the generated code** (garbage-collection.md), so a `build` and the `run` of what it built must be given the same setting |
 | `--gc-stats` | both | collection summary when the design exits: how many collections, how much was reclaimed, how long the design was paused |
 | `--gc-nursery <bytes>` | both | bytes of class objects the design may allocate between collections (default `8388608`). A plain integer — no `k`/`m`/`g` suffix, because no option on this surface has one. `0` is refused: it means `--gc-stress`, and `0` already means "no ceiling" for `--gc-heap-max` |
@@ -76,10 +77,11 @@ same namespace as slang's `-D`, `-I`, `-y`,
 `-v`, `-f`, `--top`, `-G`, `--timescale`, `--std`, `-W`, `--error-limit` and
 `-j`, which are options this tool has rather than options it forwards.
 
-"both" in the table means `build` and `run`. The `--gc-*` group is the only such
-set that is *refused* elsewhere, because it is the only one that means something
-specific to compiling and running rather than nothing at all: `--help` tags it
-`[build|run]`, and `lint`, which compiles nothing, rejects it.
+"both" in the table means `build` and `run`. The `--gc-*` group and `--coverage`
+are the only options in it that are *refused* elsewhere, because they are the
+ones that mean something specific to compiling and running rather than nothing
+at all: `--help` tags them `[build|run]`, and `lint`, which compiles nothing,
+rejects them.
 
 Sources always share one compilation unit (LRM 3.12; `Lower.cpp` forces
 `singleUnit`), so `` `define `` macros and `$unit` declarations span files.
@@ -213,6 +215,16 @@ behaviour change; docs quoting the old spellings were migrated with this commit.
 - Help text and messages say what an option does for the design, never how
   Clotho implements it. The exception is an option that exists only for working
   on Clotho (`--stat`, `--emit=llvm-raw`, `--perf-jitdump`), which says so.
+
+`--coverage` is the one carve-out from the `--stat=` rule above, and the line is
+whose result it is. A `Stat` bit is a *compiler* statistic: `--stat` is
+documented as "for working on clotho", and every bit it has (`dedup`,
+`dedup-sets`, `comb-fuse`, `finish`, `parallel`) fires at compile time, prints to
+stderr and changes nothing about the emitted code. Functional coverage is a
+*design* result — what the design's own stimulus reached (LRM 19) — produced
+while the design runs and written to a file the operator names, so it gets its
+own valued option, tagged `[build|run]` like the other modes an artifact is
+compiled with.
 
 ## Out of scope
 

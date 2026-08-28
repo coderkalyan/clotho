@@ -34,6 +34,7 @@
 #include "LlvmBackend.h"
 #include "runtime/Runtime.h"
 #include "runtime/Gc.h"
+#include "runtime/Coverage.h"
 #include "runtime/svdpi.h"
 
 #if defined(__MINGW32__)
@@ -300,6 +301,27 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_gc_containers_add", &rt_gc_containers_add);
     expose("rt_gc_container_add", &rt_gc_container_add);
     expose("rt_gc_container_remove", &rt_gc_container_remove);
+    // Functional coverage (LRM 19; docs/design/functional-coverage.md). Exposed
+    // unconditionally, like the collector's: the allow-list is a property of the
+    // runtime, and a design with no covergroup emits no reference to any of them.
+    expose("rt_cover_init", &rt_cover_init);
+    expose("rt_cover_new", &rt_cover_new);
+    expose("rt_cover_ctx", &rt_cover_ctx);
+    expose("rt_cover_first", &rt_cover_first);
+    expose("rt_cover_next", &rt_cover_next);
+    expose("rt_cover_hit", &rt_cover_hit);
+    expose("rt_cover_start", &rt_cover_start);
+    expose("rt_cover_set_inst_name", &rt_cover_set_inst_name);
+    expose("rt_cover_inst_coverage", &rt_cover_inst_coverage);
+    expose("rt_cover_inst_covered", &rt_cover_inst_covered);
+    expose("rt_cover_inst_total", &rt_cover_inst_total);
+    expose("rt_cover_point_coverage", &rt_cover_point_coverage);
+    expose("rt_cover_point_covered", &rt_cover_point_covered);
+    expose("rt_cover_point_total", &rt_cover_point_total);
+    expose("rt_cover_type_coverage", &rt_cover_type_coverage);
+    expose("rt_cover_type_covered", &rt_cover_type_covered);
+    expose("rt_cover_type_total", &rt_cover_type_total);
+    expose("rt_cover_design_coverage", &rt_cover_design_coverage);
     expose("rt_run_init", &rt_run_init);
     expose("rt_event_new", &rt_event_new);
     expose("rt_event_ptr", &rt_event_ptr);

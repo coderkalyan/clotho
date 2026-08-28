@@ -90,6 +90,13 @@ std::span<const Index> Ir::operands(Index inst, std::array<Index, 4>& scratch) c
                     const auto info = extra_data<SyncInfo>(p.extra);
                     return index_slice(info.args);
                 }
+                case ExtraOperandShape::CoverArgs: {
+                    // functional coverage (LRM 19): the covergroup handle plus the
+                    // op's value arguments; the type and coverpoint indices, the op
+                    // selector and the result type are not operands.
+                    const auto info = extra_data<CoverInfo>(p.extra);
+                    return index_slice(info.args);
+                }
                 case ExtraOperandShape::NotExtra:
                     break;
             }

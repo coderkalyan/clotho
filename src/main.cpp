@@ -84,6 +84,7 @@ struct Options {
     std::optional<bool>        o3;
     std::vector<std::string>   stats;
     std::vector<std::string>   sanitizers;
+    std::optional<std::string> coverage;
     std::optional<bool>        gc_stress;
     std::optional<bool>        gc_stats;
     std::optional<uint64_t>    gc_nursery_bytes;
@@ -153,6 +154,14 @@ void register_options(slang::CommandLine& cl, Options& o) {
            ". Costs simulation time (repeatable, comma-separated)",
            "<check>",
            slang::CommandLineFlags::CommaList);
+    cl.add("--coverage",
+           o.coverage,
+           "[build|run] Write the design's functional-coverage report here: which of the bins its "
+           "covergroups declare the run reached, and which it never did (LRM 19). No report by "
+           "default. The destination is compiled into the generated code, so a build and the run "
+           "of what it built must be given the same file",
+           "<file>",
+           slang::CommandLineFlags::FilePath);
     cl.add("--gc-stress",
            o.gc_stress,
            "[build|run] Reclaim unused class objects at every opportunity instead of when the "
@@ -318,6 +327,9 @@ bool check_scope(const Options& o, Command command, int& status) {
     // reason: its settings are compiled in (the backend bakes an rt_gc_config into
     // the emitted module and calls rt_gc_init from its main), so `build` is told
     // them exactly as `run` is, and `lint`, which emits no code, refuses them.
+    // `--coverage` is in that set for the same reason: the coverage model the
+    // backend emits names its own destination, so the report file is a mode
+    // compiled in, not something `run` can add to an artifact built without it.
     struct Check {
         bool             given;
         std::string_view name;
@@ -332,6 +344,7 @@ bool check_scope(const Options& o, Command command, int& status) {
         { o.gc_nursery_bytes.has_value(), "--gc-nursery", Command::Build, Command::Run },
         { o.gc_heap_bytes_max.has_value(), "--gc-heap-max", Command::Build, Command::Run },
         { o.gc_full_every.has_value(), "--gc-full-every", Command::Build, Command::Run },
+        { o.coverage.has_value(), "--coverage", Command::Build, Command::Run },
         { !o.dpi_libs.empty(), "--dpi-lib", Command::Run },
         { o.perf_jitdump.has_value(), "--perf-jitdump", Command::Run },
         { o.loose_stale_ref.has_value(), "--loose-stale-ref", Command::Run },
@@ -603,6 +616,10 @@ int main(int argc, char** argv) {
               std::format("unknown --sanitize check '{}'; expected {}", name, kSanitizeList));
         }
     }
+    // Where the functional-coverage report goes (LRM 19). Compiled in rather
+    // than looked up at startup, for the reason check_scope records: the emitted
+    // coverage model carries its own destination.
+    config.coverage_report = options.coverage.value_or(config.coverage_report);
     // Class objects are always collected (LRM 8.4 makes reclamation unobservable,
     // and docs/design/garbage-collection.md §12 records the measurements that made
     // an uncollected mode not worth keeping). What is left on the CLI only tunes
