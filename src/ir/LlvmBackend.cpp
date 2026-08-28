@@ -646,6 +646,20 @@ struct SignalSlot {
     // plain-NBA sibling (nba_partial for a scalar, arr_masked / agg_masked for an
     // array element or aggregate leaf).
     bool     intra_masked  = false;
+    // Nonblocking intra-assignment target whose destination is NOT a link-time
+    // constant address: a member written through a virtual interface handle, where
+    // the handle picks the instance. Its deferred records carry the resolved
+    // destination pointer (and the instance context for the wake) the way an array
+    // element's do, and emit_intra_commit loads them per record instead of hoisting
+    // storage_ptr. Set by classify_intra_target from vif_rec, the same fact that
+    // routes the member's PLAIN NBA to the pointer-carrying array queue.
+    //
+    // LRM 10.4.2 is what makes this the semantics and not an optimization: "If
+    // variable_lvalue requires an evaluation, such as an index expression, class
+    // handle, or virtual interface reference, it shall be evaluated at the same
+    // time as the expression on the right-hand side." Capturing the resolved
+    // destination at arm time IS that rule.
+    bool     intra_ptr     = false;
     uint32_t nba_id        = 0;
     uint32_t sh_mm_field   = 0;
     uint32_t sh_z_field    = 0;
@@ -3545,10 +3559,17 @@ private:
         const auto scan = [&](const Ir& ir, bool whole_body_is_vif) {
             for (size_t k = 0; k < ir.inst_count(); ++k) {
                 const auto idx = static_cast<Index>(k);
-                if (ir.tag(idx) != Inst::Tag::StoreNb) {
+                // The deferred stores count too (`vif.sig <= #d x` / `<= @e x`): the
+                // mark is what gives their records the resolved instance, and it also
+                // has to move the member's plain NBAs onto the same pointer-carrying
+                // path so the two agree on where the member lives.
+                const bool deferred =
+                  ir.tag(idx) == Inst::Tag::StoreNbDelay || ir.tag(idx) == Inst::Tag::StoreNbEvent;
+                if (ir.tag(idx) != Inst::Tag::StoreNb && !deferred) {
                     continue;
                 }
-                const LvalueRoot r = lvalue_root(ir, ir.payload(idx).binary.l);
+                const LvalueRoot r =
+                  lvalue_root(ir, deferred ? ir.payload(idx).op_extra.op : ir.payload(idx).binary.l);
                 if (ir.tag(r.root) == Inst::Tag::IfaceSignal) {
                     vif_nba_[static_cast<uint32_t>(
                       ir.extra_data<IfaceMember>(ir.payload(r.root).op_extra.extra).signal)] = true;
@@ -4110,6 +4131,14 @@ private:
             s.intra_masked = s.intra_masked || lvalue_has_subselect(ir, lv_idx);
         } else if (std::get<Type>(mod_.pool.get(ty)).kind == Type::Kind::UnpackedArray) {
             s.intra_masked = s.intra_masked || lvalue_has_subselect(ir, lv_idx);
+        } else if (s.vif_rec) {
+            // A member some handle writes: the destination is whichever instance the
+            // handle named, so the record carries the pointer and the context rather
+            // than re-deriving a static address (LRM 10.4.2). Deliberately does NOT
+            // set `nba`: the member's plain NBAs take the pointer-carrying array
+            // queue for the same reason, so there is no block shadow to commit from.
+            s.intra_ptr    = true;
+            s.intra_masked = s.intra_masked || !t.whole;
         } else {
             s.nba          = true;
             s.intra_masked = s.intra_masked || !t.whole;
@@ -14413,9 +14442,15 @@ private:
         if (s.intra_masked) {
             f.push_back(int_ty(s.width));
         }
-        if (s.is_array) {
+        if (s.is_array || s.intra_ptr) {
             f.push_back(ptr);
             if (s.has_z) {
+                f.push_back(ptr);
+            }
+            if (s.intra_ptr) {
+                // The instance the handle resolved to, so the commit's wake reports
+                // the transition of the instance the value actually landed in --
+                // mirrors arr_rec_ctx on the plain-NBA record for the same member.
                 f.push_back(ptr);
             }
         }
@@ -14429,6 +14464,9 @@ private:
         return intra_rec_mask(s) + (s.intra_masked ? 1 : 0);
     }
     uint32_t intra_rec_z_ptr(const SignalSlot& s) const { return intra_rec_mm_ptr(s) + 1; }
+    uint32_t intra_rec_ctx(const SignalSlot& s) const {
+        return intra_rec_mm_ptr(s) + (s.has_z ? 2 : 1);
+    }
 
     // Per array-NBA signal: dense id (buffer index) and the record StructType
     // { ptr mm_ptr, iMM mm_val, [ptr z_ptr, iW z_val], [iW mask] }.
@@ -21364,11 +21402,28 @@ private:
         if (s.intra_masked) {
             b_.CreateAlignedStore(store_mask(lv, W), b_.CreateStructGEP(rt, rec, intra_rec_mask(s)), a1);
         }
-        if (s.is_array) {
+        if (s.is_array || s.intra_ptr) {
             b_.CreateAlignedStore(lv_mm_ptr(lv), b_.CreateStructGEP(rt, rec, intra_rec_mm_ptr(s)), a1);
             if (s.has_z) {
                 b_.CreateAlignedStore(lv_z_ptr(lv), b_.CreateStructGEP(rt, rec, intra_rec_z_ptr(s)), a1);
             }
+        }
+        if (s.intra_ptr) {
+            // Through a handle, the instance it named; inside a subroutine reached
+            // through one, the instance formal 0 named (the body-wide override);
+            // from the member's own instance, that instance's own record. Resolved
+            // HERE, at statement execution, which is what LRM 10.4.2 requires of a
+            // "virtual interface reference" in an lvalue. Same resolution order as
+            // emit_array_nba's arr_rec_ctx, deliberately -- the two paths must agree
+            // on which instance a given statement writes.
+            llvm::Value* ctx = lv.vif_ctx;
+            if (ctx == nullptr && ctx_override_for(s)) {
+                ctx = ctx_override_;
+            }
+            if (ctx == nullptr) {
+                ctx = ensure_ctx(anchors_[s.anchor]);
+            }
+            b_.CreateAlignedStore(ctx, b_.CreateStructGEP(rt, rec, intra_rec_ctx(s)), a1);
         }
     }
 
@@ -21697,7 +21752,7 @@ private:
         llvm::Value* live_z  = nullptr;
         llvm::Value* old_mm  = nullptr;
         llvm::Value* old_z   = nullptr;
-        if (!s.is_array) {
+        if (!s.is_array && !s.intra_ptr) {
             llvm::Value* live = storage_ptr(s);
             live_mm           = b_.CreateStructGEP(s.slot_ty, live, 0);
             live_z            = s.has_z ? b_.CreateStructGEP(s.slot_ty, live, 1) : nullptr;
@@ -21716,12 +21771,21 @@ private:
         llvm::Value* recp   = b_.CreateLoad(ptr, b_.CreateInBoundsGEP(ptr, base, i));
         llvm::Value* dst_mm = live_mm;
         llvm::Value* dst_z  = live_z;
-        if (s.is_array) {
+        if (s.is_array || s.intra_ptr) {
             dst_mm = b_.CreateAlignedLoad(ptr, b_.CreateStructGEP(rt, recp, intra_rec_mm_ptr(s)), a1);
             dst_z  = s.has_z
                        ? b_.CreateAlignedLoad(ptr, b_.CreateStructGEP(rt, recp, intra_rec_z_ptr(s)), a1)
                        : nullptr;
         }
+        // A handle-written member wakes PER RECORD, not once for the pass: two
+        // records of the same signal may have landed in different instances, and a
+        // scalar member has real edge semantics (`@(posedge intf.sig)` is legal,
+        // unlike `@(posedge mem[i])`). Snapshot before the store so the transition
+        // can be classified after it -- exactly emit_array_commit's vif_rec path.
+        llvm::Value* rec_old_mm =
+          s.intra_ptr ? b_.CreateAlignedLoad(mmty, dst_mm, mm_al) : nullptr;
+        llvm::Value* rec_old_z =
+          (s.intra_ptr && s.has_z) ? b_.CreateAlignedLoad(zty, dst_z, z_al) : nullptr;
         llvm::Value* mm_val = b_.CreateAlignedLoad(mmty, b_.CreateStructGEP(rt, recp, 6), a1);
         llvm::Value* mask   = nullptr;
         if (s.intra_masked) {
@@ -21750,11 +21814,25 @@ private:
                 b_.CreateAlignedStore(z_val, dst_z, z_al);
             }
         }
+        if (s.intra_ptr) {
+            // Re-read through the recorded pointer: a masked merge means the
+            // committed word is not the staged one.
+            llvm::Value* new_mm  = b_.CreateAlignedLoad(mmty, dst_mm, mm_al);
+            llvm::Value* new_z   = s.has_z ? b_.CreateAlignedLoad(zty, dst_z, z_al) : nullptr;
+            llvm::Value* rec_ctx = b_.CreateAlignedLoad(ptr, b_.CreateStructGEP(rt, recp, intra_rec_ctx(s)), a1);
+            CtxOverride  ov(*this, rec_ctx, s.anchor);
+            service_wait_queue(sig, rec_old_mm, new_mm, rec_old_z, new_z);
+            vcd_touch_signal(sig);
+        }
         i->addIncoming(b_.CreateAdd(i, b_.getInt32(1)), b_.GetInsertBlock());
         b_.CreateBr(head);
 
         b_.SetInsertPoint(after);
-        if (s.is_array) {
+        if (s.intra_ptr) {
+            // Already woken per record above, with that record's own instance and
+            // edge facts; a second whole-pass wake would report the representative
+            // instance's transition instead.
+        } else if (s.is_array) {
             // An element write carries no edge semantics (slang rejects
             // @(posedge mem[i])), so wake the array's level readers -- the service
             // the plain array commit uses. An array signal has no nba_id, so the

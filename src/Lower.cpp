@@ -24089,29 +24089,6 @@ private:
         return b.binary(ir::Inst::Tag::Mul, w, mul, l);
     }
 
-    // Whether an lvalue select chain reaches its target THROUGH a virtual interface
-    // handle (LRM 25.9). The written storage is then a signal in whichever instance
-    // the handle names, not one this body addresses statically, so the handle access
-    // is the deepest member access in the chain and the walk stops there. A
-    // bit/part-select or an array-element select above it does not change the answer.
-    static bool is_vif_member_lvalue(const Expression& e) {
-        switch (e.kind) {
-            case ExpressionKind::ElementSelect:
-                return is_vif_member_lvalue(e.as<ElementSelectExpression>().value());
-            case ExpressionKind::RangeSelect:
-                return is_vif_member_lvalue(e.as<RangeSelectExpression>().value());
-            case ExpressionKind::Conversion:
-                return is_vif_member_lvalue(e.as<ConversionExpression>().operand());
-            case ExpressionKind::MemberAccess: {
-                const MemberAccessExpression& ma = e.as<MemberAccessExpression>();
-                return ma.value().type->getCanonicalType().isVirtualInterface() ||
-                       is_vif_member_lvalue(ma.value());
-            }
-            default:
-                return false;
-        }
-    }
-
     // Whether a nonblocking intra-assignment target's select chain resolves
     // through storage the deferred record can address. The record reuses plain
     // NBA's lvalue encoding, so the supported chain is exactly what that
@@ -24142,6 +24119,20 @@ private:
                 // A packed or unpacked struct field. A class property has no
                 // signal storage and is rejected ahead of the timing block.
                 const MemberAccessExpression& ma = e.as<MemberAccessExpression>();
+                if (ma.value().type->getCanonicalType().isVirtualInterface()) {
+                    // `vif.sig <= #d x` (LRM 25.9). The member is an interface
+                    // SIGNAL and the handle picks which INSTANCE's storage it names,
+                    // so the record cannot re-derive the destination at commit from
+                    // the representative instance's static address. It carries the
+                    // resolved destination pointer and instance context instead
+                    // (SignalSlot::intra_ptr), captured when the statement executes
+                    // -- which is not a convenience but the rule, LRM 10.4.2: "If
+                    // variable_lvalue requires an evaluation, such as an index
+                    // expression, class handle, or virtual interface reference, it
+                    // shall be evaluated at the same time as the expression on the
+                    // right-hand side."
+                    return true;
+                }
                 return ma.member.as_if<FieldSymbol>() != nullptr && intra_nb_target_path(ma.value());
             }
             default:
@@ -24547,20 +24538,6 @@ private:
                 // (constant or variable), an unpacked-array element, and a packed
                 // or unpacked struct field. A real rides its IEEE pattern through
                 // the same narrow record (intra_pack_mm).
-                if (is_vif_member_lvalue(a.left())) {
-                    // TODO: intra-assignment timing on a nonblocking write through a
-                    // virtual interface handle. Plain `vif.sig <= x` works because its
-                    // record carries the resolved instance (arr_rec_ctx), but the
-                    // intra-timing record has no such field (intra_rec_ty) and
-                    // emit_intra_commit resolves a non-array destination with a static
-                    // storage_ptr, so the deferred update would land in the
-                    // representative instance instead of the one the handle named --
-                    // silently the wrong interface. Reported ahead of the generic target
-                    // check below, whose wording ("a whole integral or real scalar")
-                    // describes `vif.sig` and so would deny what it just admitted.
-                    fail("intra-assignment timing on a nonblocking write through a "
-                         "virtual interface handle is not supported");
-                }
                 if (!intra_nb_target_supported(a.left())) {
                     fail("nonblocking intra-assignment timing is only supported for a whole "
                          "integral or real scalar, a bit/part-select of one, an "
