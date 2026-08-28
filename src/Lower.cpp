@@ -33986,7 +33986,6 @@ private:
         }
         const auto&     cgt  = rt.as<slang::ast::CovergroupType>();
         const uint32_t  idx  = cover_type_of(cgt);
-        const ir::Ref   word = make_int_type(64, false, false);
         const ir::Ref   real = module_.pool.real_type;
         const ir::Index h    = lower_expr(*recv, b);
         const auto      args = call.arguments();
