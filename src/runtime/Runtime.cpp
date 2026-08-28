@@ -1852,6 +1852,13 @@ struct IntraSite {
     std::vector<std::unique_ptr<unsigned char[]>> pool;
     std::vector<void*>                             freelist;
     std::vector<void*>                             ready;
+    // Byte size every record in `pool` was allocated at. The backend monomorphizes
+    // the record per target signal, so this is constant for the life of a design --
+    // but `intra_sites` is process-global and outlives one, and a dense site id is
+    // reused from zero by the next design. Reusing a pooled block for a WIDER
+    // record would let the fill run off its end, so a changed stride retires the
+    // pool (see rt_intra_alloc).
+    uint32_t stride = 0;
 };
 
 std::vector<IntraSite> intra_sites; // indexed by dense intra-nba id
@@ -1875,7 +1882,8 @@ std::vector<InertialState> inertial_states; // indexed by dense intra-nba id
 // byte layout (mm plane [+ z plane]) and does every value compare itself via
 // `icmp` on values loaded from this buffer; the runtime never interprets these
 // bytes, exactly like the general rt_intra_rec pool.
-std::vector<std::unique_ptr<unsigned char[]>> inertial_bufs; // indexed by dense intra-nba id
+std::vector<std::unique_ptr<unsigned char[]>> inertial_bufs;      // indexed by dense intra-nba id
+std::vector<uint32_t>                         inertial_buf_bytes; // allocated size of each, parallel
 
 // Per trigger id (dense (trigger-signal, edge)): records armed on `x <= @e y`
 // waiting for that edge. Growable — an unbounded number can arm between two edges.
@@ -2931,7 +2939,21 @@ extern "C" void* rt_intra_alloc(uint32_t idx, uint32_t stride) {
         intra_sites.resize(idx + 1);
     }
     IntraSite& site = intra_sites[idx];
-    void*      p;
+    if (site.stride != stride) {
+        // A different design (or a differently monomorphized signal) now owns this
+        // dense id: its records are a different size, so nothing pooled here can be
+        // reused. Within one design the stride never changes, so this fires only at
+        // a run boundary -- where rt_intra_reset has already emptied `ready`, making
+        // the drop safe. Without it, a run whose record is wider than the previous
+        // run's silently writes past the end of a recycled block; an embedder that
+        // runs two designs in one process (the test runner does) hits it.
+        intra_total -= static_cast<uint32_t>(site.ready.size());
+        site.ready.clear();
+        site.freelist.clear();
+        site.pool.clear();
+        site.stride = stride;
+    }
+    void* p;
     if (!site.freelist.empty()) {
         p = site.freelist.back();
         site.freelist.pop_back();
@@ -2952,9 +2974,14 @@ extern "C" void rt_intra_cb(rt_timer* timer, void* /*ctx*/) {
 extern "C" void* rt_inertial_buf(uint32_t idx, uint32_t nbytes) {
     if (idx >= inertial_bufs.size()) {
         inertial_bufs.resize(idx + 1);
+        inertial_buf_bytes.resize(inertial_bufs.size(), 0);
     }
-    if (!inertial_bufs[idx]) {
-        inertial_bufs[idx] = std::make_unique<unsigned char[]>(nbytes);
+    if (!inertial_bufs[idx] || inertial_buf_bytes[idx] < nbytes) {
+        // Same process-global-outlives-a-design hazard as rt_intra_alloc: the buffer
+        // is sized to the site's monomorphized pending-value width, and the next
+        // design reuses the dense id for a possibly wider one.
+        inertial_bufs[idx]     = std::make_unique<unsigned char[]>(nbytes);
+        inertial_buf_bytes[idx] = nbytes;
     }
     return inertial_bufs[idx].get();
 }
@@ -3104,6 +3131,9 @@ extern "C" void rt_intra_reset(void) {
         }
         site.ready.clear();
     }
+    // `stride` is deliberately kept: it is what lets the next design's first
+    // rt_intra_alloc notice that this site's pooled records are the wrong size and
+    // retire them, instead of filling a narrower block.
     for (std::vector<void*>& pend : intra_event_pending) {
         pend.clear();
     }
