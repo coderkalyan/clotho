@@ -1,5 +1,7 @@
 #include "Runtime.h"
 
+#include "Coverage.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -5036,6 +5038,14 @@ void sim_teardown() {
     g_defer.clear();
     rt_nba_arr_reset();
     rt_intra_reset();
+    // Functional coverage (LRM 19): drop the model and every instance now that
+    // the report is written. The model is emitted as JIT-owned constant data, so
+    // holding a pointer to it past the run would dangle the moment the host tears
+    // the JIT down -- and a NEXT design in the same process, one with no
+    // covergroup and therefore no rt_cover_init, would otherwise inherit this
+    // one's model and re-report it. The CLI runs one simulation per process;
+    // clotho_test runs thousands.
+    rt_cover_shutdown();
 }
 } // namespace
 
@@ -5050,6 +5060,13 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     g_diag_wheel = static_cast<const rt_wheel*>(wheel);
     drain(state, wheel);
     finals(state, wheel);
+    // Functional coverage (LRM 19.9: the database is written "at the end of a
+    // simulation run"). Here rather than from a synthesized `final` process
+    // because both exit paths -- natural drain and $finish -- pass through this
+    // one point, and because the report must not be able to observe a design that
+    // a `final` block is still changing. A design with no covergroup writes
+    // nothing: rt_cover_report returns immediately on an empty model.
+    rt_cover_report();
     g_diag_wheel = nullptr;
     sim_teardown();
 }
