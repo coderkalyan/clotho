@@ -2,3 +2,10 @@
 compile_commands.json
 .claude
 docs/ieee-1800-2023.pdf
+
+# Local agent instructions and references, kept out of the repository.
+/AGENTS.md
+/CLAUDE.md
+/docs/AGENTS.md
+/docs/TIGER_STYLE.md
+/docs/SLANG.md
