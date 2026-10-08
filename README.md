@@ -77,4 +77,14 @@ TigerStyle describes the style the codebase holds itself to.
 
 ## License
 
-GPL-3.0-only. See `LICENSE.txt`.
+Clotho is licensed under the GNU General Public License, version 3 only
+(`GPL-3.0-only`, see `LICENSE.txt`). The runtime in `src/runtime/`, which is
+linked into every simulation, is licensed under the Mozilla Public License 2.0
+(`MPL-2.0`, see `src/runtime/LICENSE`), so a design simulated or compiled by
+Clotho can be distributed under any terms its authors choose.
+
+The license covers Clotho itself. Designs and testbenches you run with Clotho,
+and the output Clotho produces from them, are yours.
+
+Third-party components and their licenses are listed in
+`THIRD_PARTY_NOTICES.md`.
