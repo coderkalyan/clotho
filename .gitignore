@@ -1,8 +1,4 @@
-build
+/build*/
 compile_commands.json
 .claude
 docs/ieee-1800-2023.pdf
-build-perf/
-build-rel/
-build-asan/
-build-dbg/
