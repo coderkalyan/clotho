@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Garbage collection for SystemVerilog class objects (LRM 8.4): the Immix-shaped,
 // non-moving, stop-the-world mark-region collector specified in
 // docs/design/garbage-collection.md §3-§6. Gc.h is the ABI contract and already

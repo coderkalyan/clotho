@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 #pragma once
 
 // Clotho simulation runtime: native support routines linked into the JIT
@@ -1756,7 +1762,7 @@ void rt_proc_randstate_set(void* rng, const rt_string* s, const rt_null_site* si
 
 // -- Timing wheel --
 //
-// The wheel (src/Wheel.h) is the design's event scheduler, surfaced here behind
+// The wheel (src/runtime/Wheel.h) is the design's event scheduler, surfaced here behind
 // a C ABI. Tick values are an abstract uint64 the wheel never interprets; the
 // design owns the mapping from simulation time to ticks. The fired-timer
 // context is a single opaque pointer the design threads through tick().

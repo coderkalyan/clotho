@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // DPI-C helper API (IEEE 1800-2023 Annex H) implementation — the packed-vector
 // bit/part-select accessors DPI C calls to manipulate svBitVecVal / svLogicVecVal
 // without poking the raw layout. Pure operations on the canonical representation
