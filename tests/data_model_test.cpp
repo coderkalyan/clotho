@@ -20,7 +20,9 @@ using namespace clotho;
 //   axis C  the aggregate or container       (8 rows, `conts`)
 //   axis P  the passing mode                (16 rows, `modes`)
 //
-// 19 x 8 x 18 = 2736 cells. Each cell is one complete SystemVerilog design, and
+// 19 x 8 x 16 = 2432 combinations, of which the 76 that would be illegal SV (a
+// nonblocking assignment to a dynamically sized array element) are not generated,
+// leaving 2356 cells. Each cell is one complete SystemVerilog design, and
 // each cell has exactly one of two acceptable outcomes:
 //
 //   supported  lowering succeeds, the design runs, and stdout equals the axis-E
@@ -302,9 +304,6 @@ const Cont conts[] = {
 
 enum class P {
     var_decl,
-    port_in,
-    port_out,
-    port_inout,
     func_in,
     func_out,
     func_inout,
@@ -393,9 +392,8 @@ Formal formal_of(P p) {
 
 // The whole design for one cell. Layout, for every mode:
 //
-//     <axis-E named types>            compilation-unit scope, so a child
-//     typedef <axis-E type> ET;       module's port list can name ET too
-//     [module dm_sub(<port> ET p); ... endmodule]
+//     <axis-E named types>            compilation-unit scope
+//     typedef <axis-E type> ET;
 //     module m;
 //         <axis-C declarations>
 //         <axis-C storage `v`>
@@ -412,7 +410,7 @@ Formal formal_of(P p) {
 // deposited into the container by a whole-element copy — which is itself a
 // data-model operation (§1 Copy) that every cell therefore exercises.
 //
-// An `output` formal or port has the caller pre-fill the slot before the callee
+// An `output` formal has the caller pre-fill the slot before the callee
 // writes it. The slot must exist for the call to be legal at all (a dynamic
 // array element, an assoc entry), and pre-filling it keeps the caller's later
 // read of a Managed or handle element well defined even if the copy-out path is
@@ -423,7 +421,6 @@ std::string build_cell(const Cell& k) {
     const Cont& c   = *k.c;
     const std::string acc = c.access;
 
-    std::string outer; // before `module m`
     std::string decls; // module-scope declarations the mode adds
     std::string subs;  // the mode's subroutine
     std::string act;   // statements after `place`, inside the parent's initial
@@ -449,36 +446,6 @@ std::string build_cell(const Cell& k) {
         switch (k.m->kind) {
         case P::var_decl:
             act = subst(e.show, acc) + "\n";
-            break;
-        case P::port_in:
-            outer = "module dm_sub(input var ET p);\n"
-                    "    initial begin\n"
-                    "        #1;\n" +
-                    indent(subst(e.show, "p"), 8) +
-                    "    end\n"
-                    "endmodule\n";
-            decls = "    dm_sub u(" + acc + ");\n";
-            break;
-        case P::port_out:
-            outer = "module dm_sub(output var ET p);\n"
-                    "    initial begin\n" +
-                    indent(subst(e.init, "p"), 8) +
-                    "    end\n"
-                    "endmodule\n";
-            decls = "    dm_sub u(" + acc + ");\n";
-            act   = "#1;\n" + subst(e.show, acc) + "\n";
-            break;
-        case P::port_inout:
-            // Deliberately no `var`: `inout` is the one direction left at the
-            // LRM 23.2.2.3 default, so what a bidirectional port of this type
-            // resolves to is what is under test (§6: the net mode is Plane-only).
-            outer = "module dm_sub(inout ET p);\n"
-                    "    initial begin\n"
-                    "        #1;\n" +
-                    indent(subst(e.show, "p"), 8) +
-                    "    end\n"
-                    "endmodule\n";
-            decls = "    dm_sub u(" + acc + ");\n";
             break;
         case P::func_return:
             subs = "    function automatic ET fn();\n"
@@ -526,7 +493,6 @@ std::string build_cell(const Cell& k) {
         src += std::string(e.pre) + "\n";
     }
     src += std::string(e.type_def) + "\n";
-    src += outer;
     src += "module m;\n";
     if (c.pre[0] != '\0') {
         src += indent(c.pre, 4);
@@ -575,11 +541,6 @@ bool is_event(const Cell& k) {
     return (k.e->traits & t_event) != 0;
 }
 
-bool is_port(const Cell& k) {
-    return k.m->kind == P::port_in || k.m->kind == P::port_out ||
-           k.m->kind == P::port_inout;
-}
-
 // clang-format off
 const Allow allowlist[] = {
     // An event ARRAY needs one object per element, and the object slot array is
@@ -613,33 +574,14 @@ const Allow allowlist[] = {
       "associative array value element type is not supported",
       "§7: an event value element needs per-element trigger state (LRM 15.5)." },
 
-    // An inout port aliases whole storage, and a sub-object of an aggregate or
-    // a container has no independent net identity to resolve drivers on.
-    { [](const Cell& k) { return k.m->kind == P::port_inout && k.c->kind != C::none; },
-      "inout/ref port with a non-whole-signal connection is not supported",
-      "§6: the net mode is Plane-only; a container or aggregate sub-object is "
-      "not a whole net (LRM 23.3.3.7)." },
-    // -- The two remaining gaps, each its own separately tracked item. Both are a
-    // shape whose value is a heap handle that some path cannot stage or copy; neither
-    // is an element x container x mode interaction. --
-    //
-    // Every NBA staging buffer -- the scalar shadow slot, the aggregate image and
-    // the container-handle record -- is indexed by Signal. An object body is a heap
-    // block with no signal, so a class property reaches none of them.
+    // The one gap that is not about events, tracked on its own: every NBA staging
+    // buffer -- the scalar shadow slot, the aggregate image and the container-handle
+    // record -- is indexed by Signal. An object body is a heap block with no signal,
+    // so a class property reaches none of them.
     { [](const Cell& k) { return k.m->kind == P::nba_target && k.c->kind == C::cprop; },
       "nonblocking assignment to a class property is not supported",
       "§7: NBA staging is signal-keyed; a per-object shadow does not exist "
       "(docs/design/classes.md §8)." },
-    // LRM 7.9 defines an associative-array right-hand side as a variable, a call
-    // result or a literal; anything else has no defined whole-array value.
-    { [](const Cell& k) {
-          return k.e->name == std::string("assoc") &&
-                 (k.m->kind == P::blocking || k.m->kind == P::nonblocking ||
-                  k.m->kind == P::var_decl);
-      },
-      "associative array assignment from a non-variable value is not supported",
-      "LRM 7.9 admits a variable, a call result or a literal as the source; the "
-      "generated cell is none of those." },
 };
 // clang-format on
 
@@ -653,7 +595,7 @@ struct Bad {
 
 // Run one cell and record it if its outcome is neither of the two acceptable
 // ones. A cell never aborts the walk, so one regression cannot hide the other
-// 2735 results.
+// results.
 //
 // The cell is lowered in this process, because the diagnostic is what the
 // exclusion allowlist matches on, but SIMULATED in a child process. A cell that
