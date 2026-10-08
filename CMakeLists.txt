@@ -633,6 +633,7 @@ add_executable(clotho_test
   tests/lsp_test.cpp
   tests/lsp_tokens_test.cpp
   tests/dap_test.cpp
+  tests/todo_test.cpp
 )
 target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize clotho_lsp clotho_dap
                                           doctest::doctest glaze::glaze clotho_warnings)
