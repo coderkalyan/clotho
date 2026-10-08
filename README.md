@@ -77,6 +77,8 @@ TigerStyle describes the style the codebase holds itself to.
 
 ## License
 
+Copyright (C) 2026 Kalyan Sriram.
+
 Clotho is licensed under the GNU General Public License, version 3 only
 (`GPL-3.0-only`, see `LICENSE.txt`). The runtime in `src/runtime/`, which is
 linked into every simulation, is licensed under the Mozilla Public License 2.0
