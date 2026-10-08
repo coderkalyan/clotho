@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "Wheel.h"
+#include "runtime/Wheel.h"
 
 using namespace clotho;
 

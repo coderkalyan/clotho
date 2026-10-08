@@ -192,7 +192,7 @@ Invariants a consumer may rely on:
 3. **Records are ordered.** `Time` markers are non-decreasing and, in practice,
    strictly increasing per emitted instant (the wheel's `now` *"starts at zero,
    advances only through rt_wheel_tick"*, `src/runtime/Runtime.h:1148-1149`, and
-   the only two writes to `now_` both increase it, `src/Wheel.cpp:59-63`;
+   the only two writes to `now_` both increase it, `src/runtime/Wheel.cpp:59-63`;
    verified over 2001 instants in `tests/vcd_test.cpp:320-360`, which asserts
    `times == 2001` at `:357`).
 4. **Only changes are sent**, never snapshots, except the three force-all

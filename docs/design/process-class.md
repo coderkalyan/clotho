@@ -144,7 +144,7 @@ use-after-free and no ring supports removal (`disable.md` Hazard 3);
 `coro_cleanup_bb_` is `coro.free` only (`:3588-3595`), so a raw destroy leaks every
 frame-owned string, container and aggregate — the deinit walk
 (`deinit_body_strings`, `:4198-4221`) runs solely at normal exits. The wheel cannot
-cancel (`src/Wheel.h`: `now`/`empty`/`schedule`/`advance`/`tick`, nothing else), and
+cancel (`src/runtime/Wheel.h`: `now`/`empty`/`schedule`/`advance`/`tick`, nothing else), and
 static wait buckets are never compacted (`:5001`, scan at `:9542-9581`); only
 dynamic buckets can be compacted out (`emit_dynamic_remove`, `:8831-8873`).
 

@@ -323,7 +323,7 @@ add_library(clotho_runtime STATIC
   src/runtime/Gc.cpp
   src/runtime/Svdpi.cpp
   src/runtime/Coverage.cpp
-  src/Wheel.cpp
+  src/runtime/Wheel.cpp
 )
 target_include_directories(clotho_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # unordered_dense is header-only (INTERFACE), so it adds only an include dir:
