@@ -71,9 +71,8 @@ iverilog and Verilator for context.
 
 ## Contributing
 
-Issues and pull requests are welcome. Two things worth knowing before you
-start: the LRM is the source of truth for every semantic question, and
-TigerStyle describes the style the codebase holds itself to.
+Issues and pull requests are welcome; see `CONTRIBUTING.md`. Contributions
+require agreeing to the Clotho Contributor License Agreement.
 
 ## License
 
