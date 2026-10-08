@@ -61,7 +61,9 @@ clotho dap     debug adapter over stdio
 
 ```sh
 cmake --build build --target clotho_test
-./build/clotho_test --duration=true --order-by=file
+ctest --test-dir build -j 8                        # the whole suite, in parallel
+./build/clotho_test -sf='*/class_test.cpp'         # one file
+./build/clotho_test -tc='*virtual*'                # cases by name
 ```
 
 The suite is doctest-based and lives in `tests/`. `tests/perf/` is a benchmark

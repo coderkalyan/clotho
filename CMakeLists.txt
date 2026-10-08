@@ -551,7 +551,7 @@ target_compile_definitions(clotho_cli PRIVATE
 
 # Single doctest executable aggregating every tests/*.cpp.
 enable_testing()
-add_executable(clotho_test
+set(CLOTHO_TEST_SOURCES
   tests/test_main.cpp
   tests/sva_test.cpp
   tests/coverage_test.cpp
@@ -635,6 +635,7 @@ add_executable(clotho_test
   tests/dap_test.cpp
   tests/todo_test.cpp
 )
+add_executable(clotho_test ${CLOTHO_TEST_SOURCES})
 target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize clotho_lsp clotho_dap
                                           doctest::doctest glaze::glaze clotho_warnings)
 # The reset corpus is 28 readable .sv files rather than embedded strings: they are
@@ -662,7 +663,34 @@ if(WIN32 AND NOT MSVC)
   target_link_options(clotho_test PRIVATE -Wl,--export-all-symbols)
 endif()
 
-# Register each doctest case as its own CTest test for parallelism and
-# per-case reporting.
-include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
-doctest_discover_tests(clotho_test)
+# Register the suite with CTest as one entry per test file, for `ctest -j`. One
+# entry per case (doctest_discover_tests) starts the test binary ~2700 times, and
+# that startup outweighed the cases themselves. The data-model matrix is a third
+# of the suite, so each of its columns is an entry of its own; its summary case
+# re-walks every column and runs only in a plain `clotho_test` invocation.
+#
+# The file filter is anchored on the directory separator, in both spellings,
+# because doctest wildcards cannot otherwise tell case_test.cpp from
+# randcase_test.cpp. Commas separate alternatives in a doctest filter, which is
+# why the matrix columns whose names contain one are matched by wildcard.
+foreach(source IN LISTS CLOTHO_TEST_SOURCES)
+  get_filename_component(stem "${source}" NAME_WE)
+  if(stem STREQUAL "test_main")
+    continue()
+  endif()
+  set(file_filter "-sf=*/${stem}.cpp,*\\${stem}.cpp")
+  if(stem STREQUAL "data_model_test")
+    add_test(NAME ${stem} COMMAND clotho_test --duration=true ${file_filter}
+                                  "-tce=data model matrix*")
+  else()
+    add_test(NAME ${stem} COMMAND clotho_test --duration=true ${file_filter})
+  endif()
+endforeach()
+foreach(column IN ITEMS "bare element" "fixed unpacked array" "unpacked struct member"
+                        "dynamic array element" "queue element" "*int key" "*string key"
+                        "class property")
+  string(REGEX REPLACE "[^a-z]+" "_" name "${column}")
+  string(REGEX REPLACE "^_" "" name "${name}")
+  add_test(NAME data_model_matrix_${name}
+           COMMAND clotho_test --duration=true "-tc=data model matrix: ${column}")
+endforeach()

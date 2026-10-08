@@ -205,12 +205,10 @@ jobs:
       - name: Test
         run: |
           set -eu
-          exe=build/clotho_test
-          if [ -f "$exe.exe" ]; then exe="$exe.exe"; fi
-          # --duration names each case as it runs, so a hard crash (which prints
-          # no doctest summary at all) still identifies itself; --order-by=file
-          # keeps the sequence comparable across platforms.
-          "$exe" --duration=true --order-by=file
+          # One CTest entry per test file (CMakeLists.txt), run in parallel. Each
+          # entry passes --duration, so a hard crash (which prints no doctest
+          # summary at all) still names its case in that entry's output.
+          ctest --test-dir build --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)"
 
       # End-to-end proof the JIT actually executes on this host, independent of
       # the doctest harness: parse, lower, compile, run.
