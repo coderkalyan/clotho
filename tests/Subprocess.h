@@ -1,15 +1,16 @@
 #pragma once
 
-// Out-of-process execution of a design, for tests whose design only ends at
-// $finish.
+// Out-of-process execution of a design, for tests whose design is expected to
+// end the process or whose exit status is the assertion.
 //
-// Such a design must not be simulated in the test runner's own process. $finish
-// longjmps out of the middle of the simulation (ir::run_jit installs the
-// jmp_buf), abandoning live coroutine frames and leaving the runtime's globals
-// part-way through whatever they were doing. Enough of those in one process and
-// the heap is corrupted: the suite segfaults inside the allocator during a later,
-// unrelated LLVM compile. So the simulation gets a process of its own, which
-// $finish is then free to leave in any state.
+// A runtime fatal ends the simulation with std::exit, so a test of one cannot run
+// the design in the test runner's own process. Such a design gets a process of its
+// own, whose exit status and stderr the test then reads back.
+//
+// TODO: some callers spawn only because their design ends in $finish. That was
+// required while $finish longjmped out of live coroutine frames; it now returns
+// cooperatively (docs/design/cooperative-finish.md), so those designs can run
+// in-process like any other.
 //
 // The mechanism is a re-execution of the test binary in the hidden mode
 // test_main.cpp implements: the parent writes the source to a temp file, spawns

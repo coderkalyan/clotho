@@ -1,6 +1,8 @@
 #include <doctest/doctest.h>
 
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <string_view>
@@ -593,17 +595,64 @@ struct Bad {
     std::string detail; // the diagnostic, or both texts
 };
 
+// The cell being lowered or simulated, so an abrupt end of the test runner still
+// names it. Cells run in this process like every other test's designs, so a
+// segfault or a runtime fatal (which ends in std::exit) takes the whole runner
+// down, and doctest names only the column's TEST_CASE. A fixed buffer, because
+// the crash path must not allocate.
+char cell_in_flight[256] = {};
+
+void report_cell_in_flight() {
+    if (cell_in_flight[0] == '\0') {
+        return;
+    }
+    std::fputs("data model matrix: the run ended inside cell ", stderr);
+    std::fputs(cell_in_flight, stderr);
+    std::fputs("\n", stderr);
+    std::fflush(stderr);
+}
+
+using SignalHandler = void (*)(int);
+SignalHandler previous_segv = SIG_DFL;
+SignalHandler previous_abrt = SIG_DFL;
+
+// Names the cell, then hands the signal to whoever handled it before, which is
+// doctest's crash reporter while a test case runs.
+void on_crash_in_cell(int signal) {
+    report_cell_in_flight();
+    std::signal(signal, signal == SIGSEGV ? previous_segv : previous_abrt);
+    std::raise(signal);
+}
+
+// Installed for the duration of one column: a crash reaches the signal handler,
+// a runtime fatal's std::exit reaches the atexit hook.
+struct CellReporter {
+    CellReporter() {
+        static const bool registered = [] { return std::atexit(report_cell_in_flight) == 0; }();
+        REQUIRE(registered);
+        previous_segv = std::signal(SIGSEGV, on_crash_in_cell);
+        previous_abrt = std::signal(SIGABRT, on_crash_in_cell);
+        REQUIRE(previous_segv != SIG_ERR);
+        REQUIRE(previous_abrt != SIG_ERR);
+    }
+
+    CellReporter(const CellReporter&)            = delete;
+    CellReporter& operator=(const CellReporter&) = delete;
+
+    ~CellReporter() {
+        std::signal(SIGSEGV, previous_segv);
+        std::signal(SIGABRT, previous_abrt);
+        cell_in_flight[0] = '\0';
+    }
+};
+
 // Run one cell and record it if its outcome is neither of the two acceptable
-// ones. A cell never aborts the walk, so one regression cannot hide the other
-// results.
-//
-// The cell is lowered in this process, because the diagnostic is what the
-// exclusion allowlist matches on, but SIMULATED in a child process. A cell that
-// segfaults or exits under a runtime fatal is then recorded as a loud failure
-// with its exit status instead of taking the whole test runner down and
-// reporting nothing at all — which is exactly what the `int [2]` / bare element
-// / `function ref` cell did before this walked out of process.
+// ones. A cell that merely fails never aborts the walk, so one regression cannot
+// hide the other results.
 void run_cell(const Cell& k, std::vector<Bad>& bad) {
+    const std::string name = cell_name(k);
+    std::snprintf(cell_in_flight, sizeof(cell_in_flight), "%s", name.c_str());
+
     const std::string src = build_cell(k);
     const LowerResult r   = lower_text(src);
 
@@ -614,27 +663,23 @@ void run_cell(const Cell& k, std::vector<Bad>& bad) {
                 return;
             }
         }
-        bad.push_back({ cell_name(k), "refused, and not on the exclusion allowlist", diag });
+        bad.push_back({ name, "refused, and not on the exclusion allowlist", diag });
         return;
     }
 
-    // Out of process, so this asserts the child's exit code. Under an ASan build
-    // that leaves leak detection on, LeakSanitizer exits non-zero for the two
-    // documented positions ($finish's longjmp out of live coroutine frames, and
-    // class objects, which have no GC by direction) and every cell reports here.
-    // Run the matrix with ASAN_OPTIONS=detect_leaks=0; the walk itself is clean.
-    const test::DesignRun run = test::run_design_captured(src);
-    if (test::design_exit_code(run) != 0) {
-        bad.push_back({ cell_name(k), "lowered, but the run did not exit cleanly",
-                        "rc " + std::to_string(test::design_exit_code(run)) + ", stderr \"" +
-                          run.err + "\"" });
+    CapturedStdout cap;
+    const int      rc  = ir::run_jit(*r.module, /*timings=*/nullptr, /*config=*/{},
+                                     /*plusargs=*/{}, loc_resolver(r));
+    const std::string out = cap.text();
+    if (rc != 0) {
+        bad.push_back({ name, "lowered, but the run did not exit cleanly",
+                        "rc " + std::to_string(rc) + "; its diagnostics are on stderr" });
         return;
     }
 
     const std::string want = expected_text(k);
-    if (run.out != want) {
-        bad.push_back({ cell_name(k), "wrong output",
-                        "want \"" + want + "\", got \"" + run.out + "\"" });
+    if (out != want) {
+        bad.push_back({ name, "wrong output", "want \"" + want + "\", got \"" + out + "\"" });
     }
 }
 
@@ -647,6 +692,7 @@ const std::vector<Bad>& column(const Cont& c) {
         return found->second;
     }
     std::vector<Bad>& bad = memo[&c];
+    const CellReporter reporter;
     for (const Elem& e : elems) {
         for (const Mode& m : modes) {
             // LRM 10.4.2 forbids a nonblocking assignment to an element of a
