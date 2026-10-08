@@ -9,7 +9,7 @@ and no generated C++ to build: `clotho run design.sv` goes from source to a
 running simulation in one process.
 
 Targeting IEEE 1800-2023 (the LRM) in full. Not there yet — `docs/TODO.md`
-tracks coverage item by item, organised by milestone. Anything clotho does not
+lists what is still missing, by milestone. Anything clotho does not
 implement fails loudly; it never silently accepts a construct it cannot
 correctly simulate.
 
@@ -20,8 +20,8 @@ unpacked aggregates, dynamic arrays, queues, associative arrays, strings,
 classes), processes and fine-grained timing control, interfaces, packages,
 generate, gates and net resolution, immediate and concurrent assertions,
 DPI-C import and export, VCD output, and language-server and debug-adapter
-front ends. See `docs/TODO.md` for the precise state of each construct and
-`docs/design/` for how the interesting parts work.
+front ends. See `docs/TODO.md` for what is missing and `docs/design/` for how
+the interesting parts work.
 
 ## Building
 

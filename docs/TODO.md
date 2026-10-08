@@ -1,5153 +1,710 @@
-# TODO — Road to full IEEE 1800-2023
+# TODO — gaps to full IEEE 1800-2023
 
-This is a TODO **spec**, not a changelog or design doc. Treat it as such: when a
-line item is partially implemented, split it so the unimplemented remainder
-stays tracked. Clotho must never silently accept a construct it does not
-correctly lower; every unimplemented gap below is guarded by a loud
-`fail`, or must grow one when its surrounding feature lands.
+This file lists what Clotho does not do yet. It is not a changelog and not a
+feature list: whatever the LRM describes and this file does not list is meant
+to work, and when a gap closes its entry is deleted. Every missing construct
+here is refused loudly by the compiler rather than accepted silently
+(`docs/PRINCIPLES.md`); entries marked (performance) are not refusals.
 
-Most of those guards are in the frontend, and a few are necessarily in the
-backend: whether a destination is a `string` handle, a part-select or a whole
-slot is not known until storage is assigned. Both kinds now report identically —
-`file:line:col: error: <message> [<code>]`, the shape `render` (src/Diagnostic.cpp)
-gives a frontend item. A backend refusal used to print `llvm backend error:
-<prose>` with no location and no code, so there was nothing to jump to and
-nothing to filter on, and it named an internal pipeline stage at a user whose
-language feature had been refused. `lower_region` (src/ir/LlvmBackend.cpp)
-attaches the offending instruction's source extent to the `BackendError` on its
-way out, which covers every refusal raised while lowering an instruction, and
-`report_backend_error` renders it: `unsupported-construct` for a legal construct
-the backend does not lower, `internal-error` for a broken invariant (the guards
-whose message opens with `internal:`). Still outstanding: the refusals raised
-OUTSIDE instruction lowering have no instruction to point at and stay unlocated
-— the per-process reactive / `program`-region pre-passes, DPI signature and
-declaration emission, class-descriptor and id-global emission, and VCD variable
-emission. Each names the process or symbol it is about in its message instead,
-so they are legible but not navigable.
+Rules, enforced by `tests/todo_test.cpp`:
 
-Items are organized by the five delivery milestones, then grouped by logical
-similarity. Within each group, unimplemented items come first for visibility,
-then completed items as one-liners. Lower milestones unblock higher ones.
+- One entry per gap, named by the LRM construct and clause, and phrased as what
+  is missing. Never "X works except Y": name Y.
+- An entry is at most three lines. Why a gap is hard or how to close it belongs
+  in `docs/design/`; why a change was made belongs in its commit message.
+- `[ ]` is an open gap. `[~]` groups the open pieces of a partly implemented
+  construct, listed as `[ ]` children; while that work is active it may carry
+  one `Works so far:` line, removed when the work stops.
+- No source line numbers, internal phase labels, measurements, oracle results
+  or history. Those go stale; the code and the commit log keep them.
+- Rewrite, split, merge or delete any entry, including ones you did not write.
 
-- **M1 — Verilog-2005 RTL.** Run typical synthesizable V2005 (picorv32, small
-  custom designs) end to end.
-- **M2 — Icarus Verilog parity.** Everything iverilog handles: full V2005 plus
-  the SV subset and tooling (VCD, tasks, gates, UDPs, real, file I/O).
-- **M3 — Common SystemVerilog.** The SV that icarus/verilator/yosys accept:
-  user types, packages, interfaces, dynamic data, basic classes, immediate
-  assertions.
-- **M4 — Industrial SV + UVM.** Run a real UVM testbench (suggest OpenTitan's
-  Ibex UVM env, or the smaller CV32E40P / a minimal UVM agent as a stepping
-  stone): full OOP, randomization, concurrent assertions, coverage, DPI.
-- **M5 — Full LRM.** No exceptions or compromises: complete system
-  tasks/functions, VPI/PLI, specify/timing, nettypes, config, checkers.
+Good:
 
-M1–M3 make Clotho usable in the open-source community; M4 brings it to
-professional parity; M5 makes it complete.
+    - [ ] **`?:` over a queue, dynamic array or associative array** (11.4.11) —
+      an ambiguous condition needs both arms staged in container temps.
 
----
+Bad (a done feature, a narrowed claim, and history):
+
+    - [~] **`?:` over aggregates** — landed for structs and fixed arrays; a
+      queue arm is refused for now, measured 46 IR lines vs 84, which used to ...
+
+Milestones, in order; lower ones unblock higher ones:
+
+- **M1 — Verilog-2005 RTL.** Typical synthesizable Verilog-2005 runs end to end.
+- **M2 — Icarus Verilog parity.** Everything Icarus Verilog handles: full
+  Verilog-2005 plus its SystemVerilog subset and tooling.
+- **M3 — Common SystemVerilog.** What open-source tools accept: user types,
+  packages, interfaces, dynamic data, basic classes, immediate assertions.
+- **M4 — Industrial SystemVerilog and UVM.** A real UVM testbench runs: full
+  OOP, randomization, concurrent assertions, coverage, DPI.
+- **M5 — Full LRM.** Everything else: VPI, specify and timing, nettypes,
+  configurations, checkers, the complete system task library.
 
 ## M1 — Verilog-2005 RTL
 
 ### Operators & expressions
 
-- [x] **Division / modulo / power** (`/`, `%`, `**`) — all widths, signed+unsigned
-  (`**` signed base/exponent corners per Table 11-4).
-- [x] **Signed arithmetic** — sign extension, signed compare/divide/modulo/shift,
-  mixed-sign rule (§11.8.1), `$signed`/`$unsigned`, shift-amount >= width.
-- [x] **Multi-bit `if` / `?:` / loop condition** — reduced to 1-bit truth (§12.4, §12.7).
-- [x] **Lazy `?:` arm evaluation** (LRM 11.4.11) — a definite condition evaluates
-  only its arm; an ambiguous one evaluates both and blends them bitwise (Table 11-20),
-  which is a run-time branch inside `lower_lazy_conditional`, not a compile-time
-  choice. Which arms may instead take the branchless packed select is decided by
-  `is_speculation_safe` (`Lower.cpp`'s `SpeculationScan`), a WHITELIST over
-  `ExpressionKind`.
-  It used to be a blacklist of three node kinds — a call, an embedded assignment, an
-  increment / decrement — and that polarity fails OPEN: every construct clotho lowers
-  to a trapping runtime check silently became a wrong answer at this one site, and
-  five such traps exist that are none of those three. `(h == null) ? -1 : h.x` fataled
-  on a null handle deref from the arm the condition had ruled out; so did a null
-  virtual-interface deref, a read of a non-active tagged-union member (LRM 11.9), a
-  read of a stale `ref` formal (LRM 13.5.2), and `new src`'s virtual dispatch through
-  a possibly-null source. A whitelist fails CLOSED: an unlisted kind merely takes the
-  branching path, which is correct for every expression by construction, so being
-  conservative costs one `SelectLazy` and being wrong costs a fatal on legal code.
-  Deliberately still speculatable, because each has an LRM-defined value and no trap:
-  an out-of-range index into a fixed / dynamic array or queue, a missing
-  associative-array key, integer divide / modulo by zero (all-x), real divide by zero,
-  and a string index out of range.
-- [x] **Real result through the lazy `?:` merge** (LRM 11.4.11) — a mixed
-  real/integral conditional with a non-speculatable arm fataled
-  "internal: integer plane of a real value". Motivated by Accellera UVM's
-  `uvm_transaction.svh:829`,
-  `this.end_time = (end_time == 0) ? $realtime : end_time;` on the
-  transaction-recording path ($realtime real, end_time a `time`).
-  THE CLAUSE'S PROMOTION WAS NEVER THE DEFECT. 11.4.11's rule — real+integral
-  and real+shortreal cast the other arm to real, shortreal+integral casts to
-  shortreal — is slang's to apply, and slang applies it: propagateType wraps
-  the integral arm in a Conversion, `--emit ir` shows `itof` on BOTH arms, and
-  the eager Select's is_real dispatch (lower_real_mux) consumed the result
-  correctly all along. The full promotion matrix passes eagerly,
-  type-observability included: `(c ? 1 : 2.5) / 2` is 0.5, so the chosen
-  integral arm really became 1.0 before the divide. What was missing was one
-  CARRIER: lower_select_lazy merged an integer Plane or a string handle and
-  nothing else, so a REAL-typed `?:` routed through lower_lazy_conditional
-  (here because $realtime is a SystemCall, unsafe by the whitelist's default
-  arm) sent an fp-only Plane into must_of and tripped its depth guard. The
-  guard's comment blames the frontend, but the frontend had done its job — the
-  merge node was incomplete. A real result now merges as one fp PHI, the lazy
-  analogue of the eager dispatch and the exact shape of the string pointer PHI
-  beside it. Short-circuit &&/||/-> cannot reach the new arm:
-  lower_short_circuit reduces a real operand to its truth bit (FNe against
-  0.0) before the merge, so its select_lazy values are always 1-bit.
-  THE AMBIGUOUS CONDITION NEEDED NO NEW DECISION, and that is worth recording
-  because falling through to the integer path is exactly how the fatal arose:
-  lower_lazy_conditional's x region re-lowers both arms into an eager Select,
-  so an x/z condition lands in lower_real_mux's existing rule — arms equal
-  after promotion return the common value, unequal fall to the real default
-  0.0 (Table 7-1), Table 11-20 being defined for integral results only. Same
-  reading as the string mux and the aggregate whole-type default above.
-  iverilog 13 agrees byte-for-byte (`(1'bx) ? fr() : 7.25` is 7.25,
-  `(1'bx) ? fr() : 5.0` is 0, with the promoted `(1'bx) ? 3.0 : i` at i == 3
-  logically equivalent, so 3); Verilator 5.050 returns the false arm and is
-  not an oracle here.
-  SIBLING AUDIT — every other context sharing the promotion rule was already
-  correct, and at the same seam (slang's inserted Conversion plus an
-  isFloating() dispatch in the consumer): mixed compare and arithmetic
-  (lower_binary routes either floating operand to lower_real_binary), a real
-  case selector or item (has_real_case_operand routes the whole statement to
-  lower_case_real, FEq over operands coerced to real), an int actual bound to
-  a real formal and an int return from a real function (both assignment
-  contexts, so slang's Conversion lowers through coerce's ItoF). The store
-  back into the `time` destination is the ordinary FtoI, which rounds half
-  away from zero (LRM 6.12.1, llvm.round + fptosi.sat) — pinned at fractional
-  NONZERO sim times in real_test.cpp so the conversion is not trivially exact.
-- [x] **Aggregate `?:`** (LRM 11.4.11 over an unpacked struct / fixed unpacked
-  array) — `o = c ? x : y;`, `st d = c ? x : y;`, `return c ? x : y;`,
-  `(c ? x : y).m`, `$display("%p", c ? x : y)`, `(c ? x : y) == z`. The clause's
-  last legality rule is what routes an aggregate here — "For all other cases, the
-  type of the first expression and second expression shall be equivalent (see
-  6.22.2)" — so both arms and the result share one layout and the only question is
-  which arm reaches the destination. Motivated by Accellera UVM's
-  `uvm_factory.svh:2318`,
-  `m_uvm_factory_type_pair_t match_type_pair = match_original_type ? override.orig : override.ovrd;`
-  over a `{ uvm_object_wrapper, string }` struct, which fataled on
-  "unsupported unpacked struct rvalue".
-  DESTINATION-DIRECTED, not staged: `emit_agg_conditional` opens two `Cond`
-  regions and recurses into `emit_agg_store` with the SAME destination lvalue, so
-  the selected arm is built straight into the target and no temp exists on either
-  definite path. A variable arm is one `AggCopy` memcpy, a `'{...}` arm is built
-  in place, a call arm writes through its own out-param, and a nested chain
-  (`c1 ? x : c2 ? y : z`) falls out of the recursion for free. `return` needed no
-  case of its own for the same reason — `agg_return_operand` already falls
-  through to `emit_agg_store`, whose destination is the return variable.
-  Arm evaluation is CONDITIONAL, never speculative, and `is_speculation_safe` is
-  not consulted at all: the whitelist exists to preserve the branchless packed
-  select, and an aggregate has none — a copy is a sequence of stores whichever arm
-  wins — so there is nothing to trade against the clause's "without evaluating".
-  A call arm, a trapping arm and a pure arm all take the same branch, which is
-  strictly stronger than the integral path's guarantee.
-  A 2-STATE CONDITION EMITS NO AMBIGUITY MACHINERY. `conditions_may_be_ambiguous`
-  proves the ambiguous rule unreachable from the condition's type, mirroring
-  `lower_predicate`, which is what fixes the predicate's representation: a string
-  condition reduces `StrLen` and a real condition compares against 0.0, both
-  definite; everything else reduces the operand's own bits, which can be x exactly
-  when those bits have an unknown plane to carry one, and a 2-state type has none
-  by construction. So a `bit` condition emits one `Cond` over two `AggCopy`s and
-  nothing else — verified with `clotho build --emit ir`: 46 IR lines, zero
-  `agg_eq`, zero `case_eq`, against 84 lines with one `agg_eq` and three `case_eq`
-  for the same design on a `logic` condition. That is the case UVM takes, and it
-  also WIDENS what compiles: with no 11.4.5 compare emitted, a 2-state condition
-  works over a struct with an associative-array member, which the compare itself
-  cannot handle. A `matches` condition counts as possibly ambiguous even though
-  `lower_pattern` builds its result from definite `CaseEq` tests — same
-  fails-CLOSED polarity `is_speculation_safe` uses, since being conservative costs
-  one dead compare and being wrong silently drops the merge.
-  THE AMBIGUOUS PATH follows the clause in its own order: "then both the first
-  expression and the second expression shall be evaluated, and compared for
-  logical equivalence as described in 11.4.5. If that comparison is true (1), the
-  operator shall return either the first or second expression." Both arms are
-  staged into `make_canonical_agg_temp` temps rather than one being built into the
-  destination first, because the destination may ALIAS an arm (`v = c ? y : v`)
-  and `emit_agg_store` is handed only the destination's `ir::Index`, never the
-  expression, so there is nothing to test aliasing against the way
-  `array_copy_source` can. It costs nothing where it matters — this is the cold
-  path and neither definite branch allocates. The compare is `AggEq` narrowed with
-  `CaseEq` against 1, because 11.4.5 propagates X and the clause says TRUE (1).
-  Then the two shapes split, and the split is the whole point:
-  - An unpacked STRUCT takes "For all other data types, the value specified in
-    Table 7-1 for the resulting type as defined previously shall be returned" —
-    the WHOLE type default, not a member-wise merge. `struct {int a; byte b;}`
-    with differing arms is `'{a:0, b:0}`.
-  - A fixed unpacked ARRAY takes "their results shall be combined element by
-    element. If the elements match, the element shall be returned. If they do not
-    match, then the value specified in Table 7-1 for that element's type shall be
-    returned." So `'{1,2,3}` against `'{1,9,3}` is `'{1, 0, 3}`.
-    Read LITERALLY and one level deep: a mismatching element that is itself an
-    array or struct takes Table 7-1 for the ELEMENT TYPE, not a recursive merge,
-    because the clause names the table rather than reapplying itself. No
-    whole-array compare precedes the walk — `AggEq` over an array is the
-    AND-reduce of exactly these per-element compares, so it would be dead weight.
-  Neither Verilator nor iverilog is an oracle for the ambiguous path, and clotho is deliberately stricter
-  than both. Verilator 5.050 is NON-CONFORMANT here: for
-  `c = 1'bx` it returns the FALSE arm, `'{a:3, b:4}`, where the clause requires
-  `'{a:0, b:0}` (its definite branches do agree). iverilog 13.0 cannot compile an
-  unpacked struct at all — "sorry: Unpacked structs not supported." So the
-  ambiguous expectations in `struct_test.cpp` come from the clause text, and are
-  labelled as such rather than cross-checked.
-- [x] **Table 7-1 defaults, separately from Table 6-7** — `emit_table7_1_default`
-  is its own recursion and deliberately NOT a call into `emit_default_init`, which
-  implements Table 6-7 (declaration defaults). Three rows disagree, so reusing it
-  would have been silently wrong:
-  1. EVENT. `emit_default_init` binds a FRESH event (`EventNew`) because Table 6-7
-     says "New event" and two concurrent activations of one task must not share a
-     synchronization object. Table 7-1 says `null`, which for clotho's event
-     handle is the all-zero word (`InternPool` `Type::Kind::Event`: "`null` is the
-     all-zero handle, which resolves to the reserved null object at slot 0"). The
-     Table 7-1 path stores zero.
-  2. UNPACKED UNION. Table 7-1 returns "Value specified in this table for the type
-     of the FIRST member of the union". Refused loud rather than approximated, and
-     the guard has to key on the SLANG type: clotho interns an unpacked union with
-     `is_packed` SET (`lower_type` lowers it "identically to a packed union", one
-     flat plane sized to the widest member), so the IR `is_union` flag does not
-     distinguish one and a first attempt at this guard was dead code. The
-     singular-leaf fill it fell through to is observably wrong, which is what makes
-     the refusal necessary rather than pedantic: the blob's domain is the union of
-     ALL members (`four |= mt.isFourState()`), while the table wants the first
-     member's. For `union { int i; logic [7:0] w; }` inside a struct, an ambiguous
-     condition filled all-x and `v.u.w` read back `xx`, where the first member is
-     2-state and the table therefore requires `'0`. Writing only the first member's
-     low bits instead would leave the blob's high bits undefined, and LRM 7.3 fixes
-     no bit-level overlay for the unpacked case to say what they should become.
-  3. MEMBER INITIALIZERS. `emit_default_init` has no notion of them; Table 7-1
-     keeps a member's declared initial assignment in preference to its type
-     default — "unless the member has an initial assignment as part of its
-     declaration (see 7.2.2), in which case the member's value shall be as given
-     by its initial assignment". Applied inline, one store per member, rather than
-     as a second overlay pass over a default that would be thrown away.
-     `struct {int a; int b = 7; string s = "keep";}` defaults to
-     `'{a:0, b:7, s:"keep"}`.
-  Every other row checked and agreeing: 4-state integral `'x`, 2-state `'0`, enum
-  via its base type (an enum interns as its base, so the integral branch already
-  answers at the base's domain), real/shortreal `0.0`, string `""`, class /
-  interface-class / chandle / virtual-interface `null` (all-zero, which is what the
-  2-state branch writes), variable-size unpacked array (dynamic / queue /
-  associative) empty, fixed-size unpacked array per element.
-- [ ] **`?:` over a queue / dynamic array / associative array** (LRM 11.4.11) —
-  refused loud with its own message naming the clause. The two definite branches
-  are reachable (they are the existing handle copy inside a `Cond`), but the
-  ambiguous half is not: it has to stage BOTH arms in temps of the container's own
-  type to compare them, and `make_canonical_agg_temp` builds aggregate storage,
-  not a container handle. Refused whole rather than only for a 4-state condition,
-  so the supported set does not depend on the condition's domain. For an
-  ASSOCIATIVE operand the clause is explicit that the element-wise merge does not
-  apply — "For aggregate array data types, EXCEPT associative arrays" — so the
-  mismatch result would be the whole-type Table 7-1 default, an empty array.
-  A struct with a queue or associative MEMBER is a different matter and already
-  works under a 2-state condition (no compare is emitted); under a 4-state one an
-  associative member is refused by `guard_agg_eq_members`, which owns that gap.
-- [ ] **`?:` over an aggregate whose result type interns differently from the
-  assignment target's** — refused loud. 11.4.11 requires the two ARMS be
-  equivalent (6.22.2) to each other, not that either match the target, so slang
-  can hand over a distinct-but-equivalent type; every member / element walk
-  addresses the target's interned type, so a merely equivalent layout needs a
-  converting copy rather than the direct one.
-- [x] **`AggEq` miscompared a `real` leaf** — found while adding the aggregate `?:`,
-  whose ambiguous path reaches the same node, but it PREDATED that and reproduced on
-  `main`: `x == y` over `struct { real r; string s; }` SEGFAULTED with no diagnostic
-  at all (exit 139). `LlvmBackend.cpp`'s `lower_agg_eq` converted a real leaf to a
-  real plane in its `vt.is_real` tail and then compared it with
-  `lower_compare(Inst::Tag::Eq, ...)` — the INTEGER compare — which read the
-  `double`'s bit pattern as an integer image and walked unknown planes that a real
-  plane does not carry. The leaf compare now picks `FEq` through
-  `lower_real_compare`, the same helper the scalar `==` reaches; reals carry no x/z,
-  so the definite 1-bit result needs none of `lower_compare`'s unknown-plane
-  machinery. The stopgap frontend refusal in `guard_agg_eq_members` is gone and its
-  test is now a behaviour test, cross-checked against Verilator on a real+string
-  struct, a real+int struct, and `!=`. The ELEMENT-wise path was never affected: the
-  aggregate `?:`'s per-element merge already picked `FEq` for a real element, so
-  `real p[0:1]` merged to `'{1.5, 0}` correctly throughout.
-- [ ] **Eager predicate evaluation outside `?:`** — the same deficiency, in three
-  places that do not consult `is_speculation_safe` at all because they evaluate
-  predicates up front unconditionally: `&&&` conjuncts in a `cond_predicate`
-  (`lower_conditions` ANDs every `cond.expr`, so `if (h != null &&& h.x)` fatals
-  where LRM 12.4 reads as short-circuiting), every `case` flavour's item-label
-  predicates (built before dispatch, while LRM 12.5 specifies in-order comparison),
-  and `unique` / `unique0` / `priority` `if` arm conditions (defensible under 12.4.2's
-  any-order licence for overlap detection, but it still fatals). `&&` / `||` / `->`
-  are already correctly lazy via `lower_short_circuit`; `<->` is eagerly evaluated by
-  definition. Fixing these is a structural change to each lowering (a `SelectLazy`
-  chain plus pattern-variable binding order), not a reuse of the predicate.
+- [ ] **Table 7-1 default of an unpacked union** (7.3, Table 7-1) — the first member's default
+  is not produced, so an ambiguous `?:` over an aggregate holding an unpacked union is refused.
+- [ ] **`?:` over a queue, dynamic array or associative array** (11.4.11) — an ambiguous
+  condition needs both arms staged in container temps.
+- [ ] **Aggregate `==` over a struct with an associative-array member** — refused, and with it an
+  ambiguous `?:` over such a struct under a 4-state condition.
+- [ ] **`?:` over aggregates of a type distinct from the target's** (11.4.11, 6.22.2) — arms
+  equivalent to, but interned differently from, the assignment target need a converting copy.
+- [ ] **Short-circuit `&&&` conjuncts** (12.4) — every conjunct of a `cond_predicate` is
+  evaluated, so `if (h != null &&& h.x)` fatals on a null `h`.
+- [ ] **In-order `case` item comparison** (12.5) — all item-label predicates are evaluated
+  before dispatch, so a trapping later label fatals even when an earlier one matches.
+- [ ] **Lazy `unique` / `unique0` / `priority` `if` conditions** (12.4.2) — every arm condition
+  is evaluated up front, so a trapping arm fatals even when an earlier arm is taken.
 
 ### Subroutines
 
-- [x] **Output / inout string formals** (function and task, LRM 13.5) — a string is
-  Managed, so it now takes the Managed ABI of data-model.md §6 like a queue or a
-  dynamic array: ONE `rt_string*` per formal in every direction (the caller temp),
-  `rt_string_assign` copy-in for `inout`, and `rt_string_move` out of the frame slot
-  in the callee's epilogue — free, since copy-out is always immediately followed by
-  `deinit_body_strings`. The frontend's post-call copy re-resolves the actual, so
-  any place a string store can name is a legal actual (queue / dynarr / assoc
-  element, struct member, fixed-array element, class property, hierarchical ref),
-  and a task's copy-out rides its completion epilogue (visible when the caller
-  resumes, not when the body writes). A `disable`d activation skips copy-out, so the
-  actual keeps the temp's content — the same policy as a scalar out/inout arg (LRM
-  9.6.2 leaves it undefined; iverilog copies the pre-abort value instead). Fixed in
-  passing: `formal_param_count` and `declare_function` disagreed on a function's
-  out/inout string formal (1 param vs 2), which would have mis-indexed every later
-  formal. Still refused: a mixed string / packed actual (slang rejects it first —
-  neither direction is assignment compatible), and a string-element ARRAY by value.
-- [x] **DPI-C import function and task** (LRM 35) — `import "DPI-C" [pure] function` over
-  the scalar-mapped types (byte/shortint/int/longint/real/shortreal/bit/logic;
-  by-value, direct native `call`, ~1.8ns/call), packed vectors (bit[N]→
-  svBitVecVal, logic[N]→svLogicVecVal via rt_dpi_pack/unpack_logicvec), and
-  `chandle` (opaque i64↔void*), and `string` (input arg via rt_string_data
-  zero-copy — needs the rt_string NUL invariant — and return via rt_dpi_str_out);
-  `input`/`output`/`inout` args, scalar/chandle/string return, `pure`+`context`.
-  `import "DPI-C" [context] task` (LRM 35.8) takes the same formals; its C prototype
-  returns `int` (35.9's disable channel) which SV never sees and T1 discards, and
-  `pure` on one is refused (35.5.1.3, slang only warns).
-  **export "DPI-C"**: C calls into SV — a C-ABI thunk marshals args and calls the
-  lowered SV subroutine, which addresses its own instance's state absolutely, so an
-  export binds at lowering time and needs no scope lookup; functions **and tasks**,
-  `input`/`output`/`inout` scalar/chandle/real/vec args, `input` string,
-  scalar/chandle/real/void return, any number of tops. An exported TASK is driven as
-  a coroutine (ramp / `coro_resume` / `coro_done`) with the calling thread's
-  identity carried across the C frame in the `clotho.dpi.*` globals; only the
-  zero-time case is implemented — a task that suspends is a located runtime fatal
-  (phase T2), as is one entered with no imported-task frame live (LRM 35.8).
-  Loader: `--dpi-lib` takes a
-  `.o`/`.a` (JIT-linked via addObjectFile — both directions) or a `.so` (dlopen,
-  import only; refused when the design exports). Export direction is checked
-  against verilator, byte-identical for both functions and zero-time tasks (not a
-  4-state oracle, though — it drops x/z on logic vecs, and declares an exported task
-  `void` rather than `int`).
-  See docs/design/dpi-c.md. **svdpi.h runtime** (Annex H): packed-vector
-  bit/part-select accessors (svGet/PutBitsel/Partsel Bit/Logic, svDpiVersion) +
-  per-top scope table (svGetScope/svSetScope/svGetNameFromScope/
-  svGetScopeFromName/svPut+GetUserData), and 1-D open-array accessors
-  (svSize/svLeft/svRight/svLow/svHigh/svIncrement/svGetArrElemPtr1/
-  svGet+PutBit|LogicArrElem1VecVal) in src/runtime/Svdpi.cpp, header
-  src/runtime/svdpi.h, exposed as JIT absolute symbols. **1-D open arrays**
-  (LRM 35.5.6.2, all directions, any element width): named-scalar element zero-copy
-  (narrow [N×iW] storage is the C array; output/inout write it in place), packed
-  bit/logic element marshal via inline LLVM IR at any width (emit_dpi_oa_pack/
-  unpack_ir — constant-trip loop over the native iW/i2W design slot, N is a compile-
-  time constant; LLVM legalizes must=trunc / may=lshr-i2W-W / reconstruct=shl-i2W-W,
-  no hand funnel shift, z field gated on the slot's real has_z); output/inout unpack
-  back after the call; svOpenArrayHandle = rt_svopen descriptor built per call. No C
-  marshal — one mechanism at all widths (an earlier ≤64-bit autovectorized C fast
-  path was dropped: thin edge only at -O0, standing two-impl hazard). Actuals: fixed
-  unpacked array + dynamic array (LRM 7.5; named-scalar element zero-copy off the
-  runtime {data,len} handle — verilator rejects dynarray open-array actuals; an
-  empty array is handled robustly rather than fatally). Remaining DPI gaps are
-  tracked as `[ ]` items under M4 "Foreign interface".
-- [ ] **Class-method call in a function**.
-- [ ] **Nonblocking assignment in a function**.
-- [x] **Procedural-block variable lifetime** (LRM 6.21) — a declaration in a
-  procedural block defaults to STATIC lifetime (one instance, initializer evaluated
-  once before time zero, LRM 10.5), and an `automatic` one has the lifetime of the
-  BLOCK: it is initialized on every entry, with its initializer if it has one, else
-  with the type's default (LRM 6.8, Table 6-7). Neither reset happened before, in a
-  process or inside a subroutine, so both lifetimes behaved identically and neither
-  matched the LRM: an automatic declaration with no initializer kept the previous
-  entry's value (a container local in a loop body accumulated across iterations),
-  and a static one re-ran its initializer on every entry. `is_static_local` no
-  longer requires a subroutine (the LIFETIME decides when the initializer runs, and
-  a process local's storage is likewise persistent), and `emit_default_init` writes
-  the Table 6-7 default at the declaration's own position: x / 0 per integral leaf,
-  0.0 real, `""` string, `null` handle, an emptied container, per member / element
-  for an aggregate. LRM 6.21's worked example now prints its documented
-  `1 2 3 1 2 3 1 2 3` / `1 2 3 4 5 6 7 8 9`. A block re-entered WITHIN one call is
-  covered too: the frame is per call, so `init_frame` alone was not enough.
-  lower_var_decl still clears fn_ctx_ around the PreInit lowering, so a static
-  initializer that reaches for a frame local fails loud rather than mis-resolving.
-  An `event` local is skipped: its power-on value is its own handle, baked into the
-  state initializer, and re-running a default init would unbind it. An
-  automatic-lifetime event local is refused instead (Table 6-7's "new event" per
-  activation would need a fresh object).
-  * Perf follow-up: the aggregate default is unrolled per leaf, and tier-0 does not
-    fold it (measured: 279 stores for `automatic byte mem[256]`). A bulk reset needs
-    an op that memcpys the type's proto image, valid only for a trivially-copyable
-    aggregate — a managed leaf has to keep the per-leaf path, which frees the
-    previous entry's string / container instead of leaking it.
-- [x] **`$time` / `$stime` / `$realtime` in a function** — the wheel is a module
-  global (`clotho.wheel`), not a body parameter, so a plain function reads the
-  clock exactly as a task does; the guard that refused it was stale. The value
-  scales to the unit of the scope that DECLARES the function (LRM 3.14.2.3, the
-  same rule as a subroutine delay), which is what makes one shared body correct
-  for callers of different timescales. `$strobe` / `$monitor` stay refused there:
-  their deferred body rides the caller's task-call record slot, which only a
-  coroutine has.
-- [ ] **NBA to a task frame local / output-inout formal**.
-- [x] **Functions** — combinational callables (not inlined); `automatic`/`static`
-  locals, recursion, early `return`, callee-descending sensitivity, NBA to a
-  module signal / `static` local / array element (LRM 13.4.4 — same shadow-staging
-  path as a task; frame-local NBA guarded).
-- [x] **ref / const ref args** (13.5.2) — a pointer to the actual's storage,
-  uniform for every storage class, so the formal may be any type at all (an
-  `event` formal aliases its 64-bit handle word like a class handle) and
-  the actual any whole place: a container element, an assoc element, a struct
-  member, a class property, nested to any depth. A ref into a container's heap
-  storage additionally carries that container's relocation epoch and is re-checked
-  on every dereference, so a push or resize under a live ref is a located fatal
-  rather than a dangling write (`--loose-stale-ref` downgrades it). Every other
-  shape aliases storage that cannot move, and narrows to one plain pointer with no
-  check — decided per formal from its actuals, unioned across each vtable slot.
-  Nothing for the report rides on the call: the formal's name is the callee's, and
-  the container's comes from the epoch pointer. See docs/design/data-model.md §3.
-- [x] **Function output / inout args** (13.5) — pointer copy-in/copy-out ABI,
-  coexists with the return value.
-- [x] **Tasks** (13.3) — time-consuming coroutines with per-call frames;
-  input/output/inout args, `automatic`/`static` locals, `#delay`/`@event`/`$time`/
-  recursion, NBA to module signal / `static` local / array element.
+- [ ] **DPI export from a shared library** (35) — a `--dpi-lib` `.so`, loaded by dlopen, cannot
+  resolve the design's exported SV subroutines.
+- [ ] **Class-method call in a function** — a function body cannot call a class method.
+- [ ] **Nonblocking assignment to a function frame local** (13.4.4) — refused.
+- [ ] **Automatic-lifetime `event` local** (6.21, Table 6-7) — each activation needs a fresh
+  event object.
+- [ ] **Bulk default reset of an automatic aggregate (performance)** (6.21) — the Table 6-7
+  default is stored per leaf; a trivially copyable aggregate could copy its prototype image.
+- [ ] **`$strobe` / `$monitor` in a function** — the deferred body needs a task-call record slot,
+  which a function lacks.
+- [ ] **Nonblocking assignment to a task frame local or `output` / `inout` formal** — refused.
 
 ### Memories & arrays
 
-- [x] **Nonblocking whole-array copy** of an unpacked array (per-element
-  deferred; single-memcpy record is a perf follow-up).
-- [x] **Nonblocking `'{...}` pattern** to an unpacked array.
-- [x] **Whole unpacked-array `==` / `!=`** (per-leaf AggEq, X-propagating).
-- [x] **Fixed unpacked-array slice** `busB = busA[7:6]` (LRM 7.4.5): copy /
-  equality / lvalue / NBA target, either direction. Flat-storage elements
-  only; an aggregate-element slice and a whole by-value slice read (concat /
-  `%p`) stay guarded.
-- [x] **Indexed part-select slice** `a[i +: n]` / `a[i -: n]` of an unpacked array
-  (LRM 7.4.5, constant width + runtime base): copy source / target, NBA either
-  side, equality operand, and `input` / `output` / `inout` subroutine argument,
-  over both endiannesses, a struct's array member, and a multidimensional array's
-  outer dimension. Expanded at lower time into one ordinary element access per
-  position (`emit_indexed_slice_copy`), which is what gives it LRM 7.4.5's
-  per-position invalid-index rule for free: a position past the bound reads the
-  element default and drops its write, and an x/z base invalidates every
-  position. The base is evaluated once. A read is
-  staged in a canonical temp. A string / handle-element slice works too (the copy
-  is per element, each leaf a deep copy); the remaining gap the constant-bounds
-  form shares is a general by-value read.
-- [x] **Unpacked arrays of `string`** — a fixed array whose leaves own heap is now
-  a first-class value: subroutine local, by-value argument in every direction,
-  by-value return, whole-array assignment and slice. The copy that made it work is
-  `emit_agg_deep_copy`, the per-leaf sibling of `emit_agg_init`/`emit_agg_deinit`:
-  every string leaf is `rt_string_assign`'d and every container leaf deep-copied,
-  with a memcpy short-circuit for any subtree that owns no heap. It replaces the
-  raw memcpy at the three ABI copies (`emit_agg_copyin`, `emit_copyout`'s aggregate
-  arm, the aggregate `Ret`), which would otherwise have duplicated ownership of one
-  allocation and freed it twice. A managed-leaf RESULT also gets a body-lifetime,
-  proto-initialized, GC-registered return buffer (`build_agg_elem_temps`) instead
-  of a bare per-call `alloca`, since the callee assigns into its leaves and the
-  heap it hands back has to be released at a body exit.
-- [x] **Unpacked array as a function / task local, by-value argument, or return**
-  (LRM 13.4/13.5): canonical aggregate frame storage; value semantics via a
-  canonical-temp copy-in (the flat-vs-canonical z-elision layout hazard).
-  `input` / `output` / `inout` all work for both functions and tasks; a task's
-  copy-out rides its completion epilogue, so it lands when the task returns.
-  Managed-leaf arrays included; `ref` aggregate formals stay guarded.
-  The RESULT copy-out carried the mirrored hazard and crashed on it. It resolved
-  the returned object with `agg_slot_ptr` unconditionally -- the RECURSIVE
-  addressing mode, which reads `LValue::root_ty` -- and that field is filled only
-  for a place in the canonical mirror. The two predicates part company exactly
-  there: `is_agg_abi` is true for ANY fixed unpacked array, since it names the
-  by-pointer ABI role, while `needs_agg_storage` / `contains_struct` are false for
-  a plain scalar-leaf array, which stays FLAT `[N x slot]`. Nothing forces a
-  returned object into the mirror, and a subroutine variable declared without
-  `automatic` is static (13.4.2), so `return a;` returns a module SIGNAL: flat,
-  `root_ty` null, GEP off null -- the compiler segfaulted on
-  `function arr_t f(); arr_t a; ... return a;` with no diagnostic at all. Missed
-  because every test here returned an `automatic` local, which
-  `build_frame_layout` always puts in the mirror. `emit_agg_ret_copy` now resolves
-  the source through `agg_image_ptr`, the one whole-object image resolver, and
-  picks the copy from the two ELEMENT slots instead of assuming they agree --
-  because they routinely do not. A flat slot is may-z analysed per signal while an
-  aggregate leaf's is fixed by its type, so a never-z `logic [7:0] a[0:1]` is
-  `[2 x { i16 }]` against the canonical `[2 x { i16, i8 }]`, and a 2-state array
-  the analysis cannot clear is `[2 x { i64, i32 }]` against `[2 x { i32 }]`. The
-  memcpy the crash was hiding would have over-read the signal by four bytes in the
-  first and taken one element's low half for the whole array in the second, so
-  equal slots memcpy and unequal ones convert per element through
-  `emit_array_zdiff_copy`. A string-leaf array needs no conversion (a managed slot
-  has no planes to narrow) and its flat `[N x rt_string]` is the mirror's bytes
-  exactly, so the per-leaf deep copy addresses it unchanged.
-- [ ] **Sliced memory target** for `$readmem*` / `$fread`.
-- [x] **Unpacked arrays / memories** — element-addressed; decl, read,
-  blocking/nonblocking write, nested bit/part-select, multidimensional,
-  descending ranges, X power-on, async-read sensitivity.
-- [x] **`$readmemh` / `$readmemb`** (§21.4).
-- [x] **`$readmem*` / `$fread` element width > 64 bits**.
+- [ ] **Single-record nonblocking whole-array copy (performance)** — each element of an
+  unpacked-array NBA is deferred separately instead of as one memcpy record.
+- [~] **Unpacked-array slices** (7.4.5) — two slice shapes are still refused.
+  - [ ] **Slice of an array with struct or array elements** — refused.
+  - [ ] **By-value read of a slice** — a constant or indexed slice as a concatenation operand
+    or `%p` argument is refused.
+- [ ] **Sliced memory target for `$readmem*` / `$fread`** — a slice destination is refused.
 
 ### Elaboration & structure
 
-- [x] **Module variable declaration initializer** (LRM 6.8) — applied via a
-  run-once `PreInit` process before any Initial/Always.
-- [x] **Runtime-indexed constant table** (LRM 6.20 + 11.5.1) — a parameter /
-  localparam with an aggregate value read at a non-constant index (`localparam
-  int P[0:3] = '{...}; x = P[i]`), the constant lookup-table idiom. A parameter
-  has no storage and a runtime index defeats the fold, so the value is
-  materialized as an unscoped read-only signal, in one of two ways. A value with
-  a plane image (integral / real / enum / packed struct / handle leaves, fixed
-  unpacked arrays of them, and unpacked structs) is interned whole
-  (`SignalInfo::const_data`) and baked into the state initializer: no elaboration
-  loop, no time-zero fill, every read an ordinary indexed load. A value holding a
-  heap-backed leaf (string, queue, dynamic / associative array) has no static
-  form, so it is seeded once in the `PreInit` process instead, from the
-  elaborated value rather than the initializer expression (a defparam / config
-  override has no initializer). Covers module / package / class parameters,
-  per-instance overrides, multidimensional and 4-state tables (x/z round-trip),
-  whole-array copy, by-value actuals and `foreach`; scalar `string` and `null`
-  parameters fold too. Refused loudly: a wildcard-index associative array, and a
-  queue / associative array of aggregate elements. See
-  docs/design/const-tables.md.
-- [x] **Net declaration assignment** (`wire w = a & b;`, LRM 6.7.1).
-- [x] **`generate`** — `for`/`if`/`case` and nesting.
-- [x] **`defparam`** — parameter override by hierarchical path; cross-top paths
-  unsupported.
-- [x] **Instance arrays** (`foo u[N:M] (...)`, LRM 23.3.6) — multidimensional,
-  bit-sliced port connections.
-- [x] **Multiple top-level modules** — each flattened into the one design,
-  shared timeline; cross-top hierarchical refs unsupported (see M2 Hierarchy reach).
+- [~] **Runtime-indexed aggregate parameter** (6.20, 11.5.1) — two value shapes are refused.
+  - [ ] **Wildcard-index associative-array parameter** — cannot be materialized for a runtime
+    read.
+  - [ ] **Queue or associative-array parameter with aggregate elements** — cannot be seeded
+    for a runtime read.
+- [ ] **`defparam` across top-level modules** — a path into another top is refused.
 
 ### Procedural control
 
-- [x] **`disable`** of a named block and of a task (LRM 9.6.2) — all three forms
-  lower and simulate. LEXICAL in a process body: the block becomes an
-  `ir::NamedBlock` region and `ir::Disable` branches to its end, a structured
-  multi-level exit (SV has no labelled `break`), with no runtime at all. REMOTE
-  (`ir::DisableRemote`): a sibling block, a block in another process, a block in a
-  task or fork child, or a TASK — every activation the target names is marked and
-  force-woken, and each aborts itself at its own poll point. LEXICAL in a body with
-  several activations: both, since 9.6.2 ends them all. LRM 16.4.4's outermost-scope
-  flush lands too, lexically and remotely, as an `ir::DeferFlush` generation bump.
-
-  A disabled task's caller resumes after the task-enabling statement, which is what
-  the existing epilogue already does, so an aborted activation takes that epilogue
-  with copy-out skipped (9.6.2 leaves output/inout results unspecified). The
-  machinery is one activation list per target: a frame-resident doubly-linked node,
-  linked on entry and unlinked on exit, plus a claim on the `#delay` park record so
-  the wheel and a `disable` cannot both wake the same park. No epoch, no process
-  table, no `Wheel.h` change, no runtime change.
-
-  Matches iverilog on 9.6.2 examples 1, 2, 3 (both readings), 4 and 5, plus: a target
-  parked on a delay whose LATER delays must still land on time, an `always` body that
-  re-arms, two instances disabled independently, two activations of one task ended by
-  one statement, `#0` inside a target, a fork child from either side, and an
-  assertion action block as the disabler. A design that uses only the lexical form
-  pays nothing — picorv32's emitted LLVM is byte-identical.
-
-  Still refused: a target whose body can park where the abort cannot claim the park
-  (a TIME-CONSUMING task call, a fork, an `expect`). 9.6.2 disables downward along
-  the enable chain, so the nested-call case needs the callee's activation ended too,
-  which is a second list walk.
-- [x] **`repeat (N)` loop** — negative or X/Z count runs zero times. The hidden
-  counter and bound are per-*activation* cells (`make_temp_cell`): a frame Local
-  inside anything with a frame (task, function, fork child, action block), a
-  module Signal only in a process, which has none and is single-activation, so
-  process IR is unchanged. Module-signal storage made every activation share one
-  cell, so a recursive `repeat (3)` two levels deep ran 5 body iterations instead
-  of 39 and two forked calls to one task ended on whichever count expired first.
-  `foreach`'s snapshotted bound and its associative-array step flag share the
-  mechanism, as does `lhs = repeat (n) @e rhs` (LRM 9.4.5).
-  A **real count** is legal (12.7.2 wants only a numeric expression) and rounds
-  half away from zero into a signed 64-bit count (LRM 6.12.1, `coerce`'s `FtoI`),
-  so `repeat (2.5)` runs 3 times, `repeat (2.4)` 2 and `repeat (-0.6)` none; 64
-  bits because that is where `FtoI` saturates instead of wrapping.
-- [x] **`final` block** (LRM 9.2.3) — source order, zero-time.
-- [x] **Looping `always` with timing control** (`always #5 clk = ~clk;`).
-
-### System tasks
-
-- [x] **`$random`** — unseeded V2005 signed-32 PRNG.
-- [x] **Seeded `$random(seed)`** (LRM §20.15.1) — reads the inout seed lvalue,
-  advances the reference stream, writes the updated seed back.
-- [x] **`%0d` / width / left-justify format flags** (§21.2.1.2).
-- [x] **`$display` / `$write` operands wider than 64 bits** — all radices multi-word.
-- [x] **`%m`** — hierarchical scope name.
-- [x] **`%u` / `%z`** — unformatted 2-/4-value output.
-
----
+- [ ] **`disable` of a target that can suspend in a callee** (9.6.2) — a target parked in a
+  time-consuming task call, a `fork` or an `expect` cannot be aborted down the enable chain.
 
 ## M2 — Icarus Verilog parity
 
 ### Time-consuming procedural code
 
-- [ ] **Intra-assignment timing remainder** (LRM 9.4.5) — **R-a and R-b landed**
-  (R1, R6, R2, R4); R-c (`iff`) and R-d (the owned-handle record) remain, scoped in
-  docs/design/intra-assignment-timing.md § "The remainder".
-  (Blocking, nonblocking `#d`, and nonblocking `@e`/`repeat(N) @e` all done below,
-  now including bit/part-select, unpacked-array element, packed/unpacked struct
-  field, and real targets.) The nonblocking gaps, grouped by what the deferred
-  record is actually missing rather than by syntax:
-  - [x] **R1 — the decomposing targets** — DONE. A concatenation, a streaming
-    concatenation, an assignment-pattern lvalue, and a whole unpacked struct or
-    array all decompose: `lower_assign` lowers the timing once into an
-    `IntraNbTiming` and threads it as a nullable `const IntraNbTiming*` beside the
-    store tag through the same walkers plain NBA uses (`store_concat`,
-    `store_stream_target`, `lower_pattern_assign`, `emit_agg_store`,
-    `emit_agg_copy`), each leaf emitting `StoreNbDelay` / `StoreNbEvent`. One RHS
-    sample, one delay/count evaluation, consecutive `seq` stamps in leaf order — so
-    `{a, a[0]} <= #5 x` lands exactly as its plain-NBA form does (checked, not
-    assumed). A pointer rather than a leaf-emitter callback so ordinary assignments
-    pay a null test, not an indirect call. Frontend only, no record change.
-    Narrowed rather than removed: a conditional RHS over a whole aggregate
-    (`Lower.cpp:5215`), an aggregate with a container member (`:5318`), an indexed
-    array-slice target (`:24657`) and a string/container operand of a streaming
-    target (`:27590`) still fail loud, each with a TODO.
-  - [x] **R2 — a nonblocking write through a virtual interface handle** — DONE.
-    `vif.sig <= #5 x` commits into the instance the handle named. One `SignalSlot`
-    flag (`intra_ptr`, set the way `intra_masked` is, from the same `vif_rec` fact
-    that routes the member's plain NBA) forces the pointer-carrying record tail and
-    the per-record destination load. LRM 10.4.2 requires exactly this ("if
-    `variable_lvalue` requires an evaluation, such as an index expression, class
-    handle, or virtual interface reference, it shall be evaluated at the same time
-    as the … right-hand side"), so capturing the resolved instance at arm time is
-    the semantics, not a shortcut. The wake follows the PLAIN-NBA vif record, not
-    the array one: `@(posedge intf.sig)` is legal where `@(posedge mem[i])` is not,
-    so the record also carries the instance context and the commit wakes per record
-    under a `CtxOverride` — the design doc's "level-only" sketch was wrong and is
-    corrected there.
-  - **R3 — a string target and a whole container target** (`s <= #5 t`, `q <= #2 r`):
-    one new record tail class, `{ ptr owned }`. Plain NBA stages an owned deep copy
-    per signal (`emit_string_whole_commit` / `HandleCopyNb` →
-    `emit_handle_whole_commit`), which an intra site cannot reuse because it has N in
-    flight. The new work is the free discipline on the three drop paths (descheduled
-    inertial record, `$finish` with records armed, `rt_run_init`), not the copy.
-    Subsumes the separate `q <= #2 r` entry under Containers.
-  - [x] **R4 — a multi-signal trigger** `@(a or b)` — DONE. `StoreNbEventInfo`
-    carries an `ExtraSlice` of packed `IntraTrigger` records (the `WaitInfo`
-    encoding), packed once per statement so an N-leaf target interns one list. The
-    record registers on every listed trigger through
-    `rt_intra_event_register_group`, and the first edge to zero the countdown
-    removes it from the others by pointer identity. Lazy "mark matured and skip" is
-    unsafe — a committed record returns to its freelist, so a stale pointer can
-    match a reused record. The id array is a `[intra_trigs × i32]` record tail
-    (sized to the longest list over the signal's sites, placed last so no existing
-    tail index moves) and is filled from `trigger_id_value`, NOT baked into a
-    constant global: a trigger id is a per-instance link-time constant while twin
-    instances share the emitted code. Single-trigger codegen is byte-identical,
-    verified by diffing `clotho build --emit llvm` across the change.
-  - **R5 — an `iff` qualifier on the trigger**: one `i1 <site>.guard(ptr state)`
-    function per site, its address in the record, called by `rt_intra_event_fire`
-    before the countdown. 9.4.2.3 makes `iff` part of the event, so only *enabled*
-    occurrences count down — which is why the plain-event mechanism (wrap the body in
-    `if (C)`) cannot transfer: for `repeat(N)` it would consume disabled edges.
-    Cheap because slang already forbids an automatic variable in an NBA's timing
-    control (`diag::AutoFromNonBlockingTiming`), so the guard reads design state only.
-  - **R6 — two non-target leftovers**. The runtime-offset select of a vector wider
-    than `wide_dyn_select_bits` REMAINS (`LlvmBackend.cpp:21417`): it needs the
-    heap-side payload the whole-aggregate memcpy follow-up wants, and is grouped
-    with it. The non-positive `repeat` count is [x] **DONE**: the frontend folds a
-    constant count and otherwise emits `count < 1` in the count's OWN signedness,
-    routing the true arm to a plain `StoreNb` (the current instant's NBA region),
-    which matches the blocking form. Two corrections found by measuring against
-    iverilog 13 — an UNSIGNED count needs the test too (it degenerates to
-    `count == 0`, and zero clamps in both signednesses, while an unsigned variable
-    holding -3 correctly waits), and a count of exactly 0 was broken as well, not
-    just negatives.
-  - **Blocking form (Class A)**, both still open: `s = #5 t` / `mem = #5 other`
-    (`Lower.cpp:24601`, `:24519`) are refused because the string and array store
-    paths evaluate the LHS before the RHS, which 9.4.5 pins the other way round;
-    and an assignment-pattern lvalue (`Lower.cpp:24498`) is refused for the
-    BLOCKING form only now — the nonblocking form decomposes (R1).
-  - Also still open, and not target shapes: a write to a force target with
-    intra-assignment timing (`Lower.cpp:24421`, and `:8726` for one reached as a
-    concatenation operand) — LRM 10.6.2 decides the suppression when the deferred
-    update commits, not when it is armed, and the deferred ops carry no predicate.
-  - **NOT a gap, corrected**: a queue / dynamic-array / associative-array **element**
-    was listed here as an unimplemented target shape. LRM **6.21** forbids it outright
-    — "Automatic variables and elements of dynamically sized array variables shall not
-    be written with nonblocking, continuous, or procedural continuous assignments" —
-    and slang enforces it (`diag::NonblockingDynamicAssign`, over
-    `Type::isDynamicallySizedArray()`, which covers queues) and, as measured, gets
-    there first for every shape tried — bare, struct-nested, array-of-structs-nested,
-    and a `ref int r[$]` formal. clotho's own queue-element guard is therefore defence
-    in depth and a legality refusal, not a TODO — reclassified in passing (it now says
-    so and cites 6.21; the neighbouring string-NBA comment's 10.4.2 citation was
-    corrected too). A class property is legal but is the separate class-property NBA gap.
-- [x] **`iff` event-control qualifier** (`@(posedge clk iff en)`, LRM 9.4.2.3).
-  Single-event only, lowered as a body/`@`-loop guard (`if (cond)`). Per-event
-  `iff` in a multi-event list (`@(posedge a iff x or ...)`) still rejected loud —
-  needs waking-source identification the shared-wake engine lacks.
-- [x] **Event handles and every event storage class** (LRM 15.5) — `event` is a
-  reference type: a 2-state 64-bit handle `{ u32 slot, u32 gen }` naming an event
-  OBJECT, laid out and passed exactly like a class handle. `a = b` merges onto one
-  sync object, `a = null` unbinds (`-> null` is a no-op, `null.triggered` is 0,
-  `@(null)` blocks -- 15.5.5.2 leaves it undefined), `==`/`!=`/`===`/`!==` are
-  identity and `if (e)` is the Boolean test (15.5.5.3).
-
-  LRM Table 6-7 makes an event's default initial value a **New event**, so every
-  event-typed storage location binds its own object when that storage comes into
-  existence: a declared variable, an **unpacked-array element** (any dimension), an
-  **unpacked-struct member**, a **class property** (per instance and `static`), an
-  **automatic-lifetime local** (a fresh object per activation), and a **queue /
-  dynamic-array / associative-array element**. A scalar declared event takes a
-  compile-time slot in a static block; everything else draws from a chunked runtime
-  pool whose chunks never move, so an object address survives growth while a
-  process is parked on its waiter list.
-
-  Waiters are an intrusive doubly-linked list on the object -- persistent nodes in a
-  contiguous array, one-shot nodes frame-resident -- so the number of simultaneous
-  waiters is unbounded. `@(<any event expression>)` works: a `WaitEdge` carries an
-  optional handle operand, and a sensitivity list that would need one is left in the
-  body, where it re-reads the handle each pass (a static subscription is issued from
-  the seed loop and cannot re-resolve). Events pass as **subroutine arguments** in
-  every direction and across **module ports** (aliasing, not copying, in both
-  directions -- `inout event` is illegal SV).
-
-  `->> e` defers to the NBA region through a runtime pending chain; `->> #d e`
-  schedules one detached wheel timer carrying the handle; **`->> @(x) e` /
-  `->> repeat(n) @(x) e`** register a detached one-shot subscription on the edge,
-  growable because a loop makes one per pass. **`wait_order`** (15.5.4) desugars to
-  one park per stage, each waiting on the events still ahead of it, with the
-  else-arm on an out-of-order trigger and a run-time error when it is absent.
-
-  Event operations work **inside a function**: the timing wheel is a module global,
-  so a body with no wheel parameter still reads the clock. A monomorphism analysis
-  keeps an event that is never assigned folded to a constant object address, so a
-  design that does not merge pays nothing.
-
-  Objects are never freed: LRM 15.5.5.2's reclamation is garbage collection, which
-  Clotho does not have (class bodies leak by the same direction).
-  Design: docs/design/event-handles.md, docs/design/named-events.md.
-- [x] **`join_any` / `join_none`** (LRM 9.3.2, V2) — the join kinds differ at run
-  time in one join-record field (`wake_at`: 0 for `join`, W-1 for `join_any`, never
-  reached for `join_none`) and in when a child starts. `join` keeps resuming children
-  inline at the fork; the detaching kinds must not run a child the parent is not
-  waiting for, so `join_none` queues every child and `join_any` runs them only until
-  one completes. Their record is heap-allocated per fork SITE and reference-counted,
-  because the parent no longer outlives its children; `join`'s stays a frame slot and
-  its codegen is byte-identical. Unbounded live children saturate the activation
-  bound, which sizes the rings, the `#0` batches and the wait buckets alike.
-  A capture of an enclosing task frame was refused for the detaching kinds (the ref
-  ABI needed the frame to outlive the child); lifted by V4, which made a capture a GC
-  box handle for every kind.
-  Design: docs/design/fork-join.md §"V2 scope".
-- [x] **`fork … join_none` inside a function** (LRM 13.4.4) — the only kind the LRM
-  allows there ("fork-join_none constructs shall be allowed inside a function", with
-  children holding anything a task may); `join` / `join_any` in a function are
-  illegal SV and slang rejects them itself, so `lower_fork`'s non-task check is now
-  kind-specific. The spawn path needed almost nothing a function lacks — `state`,
-  `rng` and (with process control) the caller's `proc` block are parameters, the
-  wheel is the `clotho.wheel` global, the record is heap and refcounted, the region
-  is a compile-time bit, and a detaching kind carries no captures. One line did need
-  gating: V3 published the heap record into the `coro_begin_`-anchored
-  `fork_live_slot`, which `join_none` never needs (it cannot park, so no abort can
-  intervene) — now `!none`, which also removes two stores from every detached fork
-  in a process-control design. The real work was 13.4.4's second paragraph: the
-  calling thread must belong to an `initial` / `always` procedure, so
-  `check_spawn_roots` (a spawn-reachability fixpoint over the call graph) plus
-  `Process::spawn_root` report a static-variable initializer, a continuous
-  assignment, a `final` block, a Preponed / Observed / Re-NBA process, a `$strobe` /
-  `$monitor` body and a DPI export, each with the fork site and a "called from here"
-  note. All five accepted the spawn silently before, and the `final` one leaked the
-  record and the child frame. `reject_resume_once` now closes over calls as the
-  backend backstop. Children spawned in a function belong to the CALLING thread, so
-  `wait fork` / `disable fork` in the caller reach them (LRM 9.6.3). A child still
-  can now read the function's own formals and locals — exactly what the LRM's own
-  `watch_for_zero` example does — since they ride GC boxes rather than frame pointers
-  (see "Captured-automatic lifetime"). (`$time`
-  in a function was refused when V5 landed; it is supported now — see "`$time` /
-  `$stime` / `$realtime` in a function" under Subroutines.) Design:
-  docs/design/fork-join.md §"V5 scope".
-- [x] **`fork`-child capture of a local the ref ABI cannot carry** — no fork capture
-  goes through the `ref` ABI any more, for any join kind, so the type restriction is
-  gone with it: the capture rides a per-variable GC box and only the box HANDLE is
-  passed (see "Captured-automatic lifetime" below). A string, a real, an unpacked
-  struct, a queue, a class handle and a formal all capture, under `join` as much as
-  under the detaching kinds.
-  The generalization is the point. Keying the capture ABI on the JOIN KIND produced
-  two refusals that both read as fork limitations and were neither about forking: the
-  fat ref could only carry a packed integral or a dynamic array (a type limit), and
-  `join`'s "the parent outlives every child" is false under `kill`
-  (process-class.md §11 hazard 3 — reachable with a plain `logic [7:0]` capture, so
-  `join`'s by-ref path was not sound either). One storage rule for all three kinds
-  retires both. It also cannot be written any other way: the boxing decision is made
-  per subroutine before its frame is laid out, and `design_uses_process_` — which the
-  design doc used to prescribe as half the predicate — is an IR fact computed after
-  the whole module has lowered.
-  Cost: one `ClassNew` per captured variable per activation, paid only by a body that
-  forks over its own frame variables. A fork in a PROCESS body has no captures at all
-  (a process-scope local is signal-like storage), so the common testbench idiom is
-  unaffected and emits the same code.
-- [x] **`fork`-child capture of a class property through the implicit `this`** — a
-  bare property reference inside a method needs the method's `this`, not the property,
-  and `this` is an ordinary automatic of the frame: slang's
-  `SubroutineSymbol::thisVar` is a real `VariableSymbol` already living in `localmap`
-  as Local 0. So `ForkCaptureDetector` maps a non-static `ClassPropertySymbol` onto
-  `thisVar` and captures that; an explicit `this.p` already arrived that way. The
-  refusal existed only because the ref ABI carried a packed-slot pointer rather than a
-  handle, so it died with the ref. Three supporting pieces: `install_capture_boxes`
-  boxes `thisVar` explicitly (it is in neither `getArguments()` nor the body's
-  declarations, and the implied `this` reference is not written anywhere in the AST, so
-  `ValueRefScan` flags it); the four sites that loaded `this` out of Local 0 now share
-  one `this_handle()` that consults the box first; and `build_fork_child` installs
-  `has_this` / `this_var` / `this_class` from a captured `this` so a bare property
-  inside the CHILD re-roots the same way.
-- [x] **`wait fork` / `disable fork`** — landed, but not here: the live-descendant SET
-  V2's count-and-`wake_at` record could not carry is the `process` control-block tree
-  (LRM 9.7), so both statements came with it. `disable fork` is `kill` over the
-  caller's subtree; `wait fork` is `first_child == null`, exact because a completing
-  thread re-parents its live children. Design: docs/design/process-class.md §8.
-- [x] **Captured-automatic lifetime** (LRM 9.3.2, fork-join.md V4) — this entry used
-  to ask for "per-spawn automatic-variable lifetime", i.e. copies. **That was the wrong
-  target**: 9.3.2 makes a reference to an enclosing scope's automatic a reference to
-  THAT variable, which is why the clause has to write `automatic int k = j;` to get a
-  copy. Measured on the clause's own idiom: iverilog `4 4 4` (shared), Verilator
-  `1 2 3` (copies, a deviation), and slang warns by name (-Wfork-loop-var, "all loop
-  iterations will see the same stale value"). Copying would have regressed a case
-  clotho already got right in a process, where a local has static signal-like storage.
-  The real gap was LIFETIME, and it is closed: a captured automatic lives in a
-  per-variable GC box (a synthetic one-field class, so ClassNew allocates it, the trace
-  map falls out of the field table, and the place is HandleDeref + MemberSelect 0), and
-  the child receives the box handle by value. Live coroutine frames are already
-  conservative pinning GC roots, so nothing refcounts and no frame ownership moves.
-  Landed: shared reads in a task/function (`4 4 4`), a child's WRITE seen by the
-  parent, a captured class-handle formal outliving the call (13.4.4's
-  `watch_for_zero`), a string capture, `join_any` with several children. Also fixed on
-  the way: a capture referenced from a child's DECLARATION INITIALIZER was invisible to
-  the capture walk (an initializer hangs off the symbol, not the statement), so 9.3.2's
-  own idiom failed as an unknown signal instead of capturing.
-- [x] **Spawn-time initialization of a fork's own declarations** (LRM 9.3.2,
-  fork-join.md §V4b) — the other half of V4, and the entry above listed it as the
-  remainder. The clause: variables declared in the `block_item_declaration` of a
-  fork-join block "shall be initialized to their initialization value expression
-  whenever execution enters their scope and **before any processes are spawned**". So
-  they are lowered IN THE PARENT at the fork, in declaration order, before any child is
-  built or spawned — which also makes a later initializer able to read an earlier
-  declaration (`automatic int a = j; automatic int b = a + 1;`). Once the variable is
-  parent-side storage a child referencing it is an ORDINARY CAPTURE, and V4's box
-  machinery carried that unchanged: no new IR, no backend change, no child-side
-  mechanism.
-  **TWO POSITIONS, and the old refusal conflated them.** `SpawnInitScan` fired for a
-  declaration of the FORK's scope and for one of a child's own `begin … end` alike,
-  while its message described only the first. The clause's own example settles the
-  second: `fork automatic int k = j; … begin automatic int m = j; … end join_none` —
-  `k` is "a local copy, k, for each value of j" (1, 2, 3) while `m` is annotated "the
-  value of m is 4", because the nested block is a DIFFERENT block whose scope is
-  entered when the child body runs. So the fork-scope form needed implementing and the
-  body-local form needed the guard to stop firing: clotho's ordinary late lowering was
-  already right there. Both are now pinned side by side with the bare capture —
-  `444|123|444` — so the three cannot decay into each other.
-  **PER ENTRY, NOT PER ACTIVATION.** This is the part that looks like a working feature
-  when it is wrong. The box must be fresh per EXECUTION of the fork statement; reusing
-  the per-activation box `install_capture_boxes` hands out makes the clause's example
-  print `333` (one box, rewritten by each iteration, every child reading the last
-  value) instead of `123`. What buys it is that lowering happens once while the fork
-  executes many times: the home holding the handle is allocated once at lower time — a
-  frame Local in a subroutine, a design-state signal in a process body, which has no
-  frame and whose storage is a precise GC root (garbage-collection.md §5.4) — and the
-  `ClassNew` that fills it is emitted AT the fork. Cost per fork execution: one
-  `ClassNew` plus one handle store per declared variable, plus the initializer itself.
-  A fork that declares nothing emits nothing.
-  **THE REF-FORMAL CARVE-OUT.** 9.3.2 makes it illegal to refer to a formal passed by
-  reference inside a `join_any` / `join_none` block "other than in the initialization
-  value expressions of variables declared in a `block_item_declaration` of the fork".
-  clotho refused capturing an `output` / `inout` formal outright, which refused this
-  legal position too. Legal and implementable for the same reason: the initializer is
-  evaluated in the PARENT, so no child-side access and no lost copy-out. Implemented by
-  narrowing the scan rather than adding a check — `BoxCandidateScan` no longer collects
-  references inside a fork-scope initializer — so a child BODY reading such a formal is
-  still refused, now as the exact complement.
-  **The `join` exemption was wrong.** The old guard exempted `join`, on the grounds that
-  a `join` child is ramped and resumed inline at the fork so its initializers already
-  run at the spawn. Measured: that held only in a subroutine body, and only by accident
-  of the per-activation box; `fork automatic int k = 5; … join` in a PROCESS body failed
-  outright with `reference to unknown signal 'k'`, and under `join_any` the declaration
-  — lowered as a child process — completes immediately and satisfies the join before any
-  real child runs. All three are the same root cause: a flat walk made every top-level
-  statement of the fork body a child, so a declaration became a process.
-  **THE OTHER LIFETIME, and this entry first recorded it as a refusal by mistake.** A
-  STATIC declaration in a fork's `block_item_declaration` was rejected on the grounds
-  that 6.21 and 9.3.2 disagree. They do not, and 6.21 says so outright: the `static`
-  keyword "shall be required when an initialization value is specified … to indicate the
-  user's intent of executing that initialization only once at the beginning of
-  simulation". `static` is exactly the modifier that opts OUT of per-entry
-  initialization, so 9.3.2's "whenever execution enters their scope" is the rule
-  `automatic` selects — which is why the clause's own example spells it
-  `automatic int k = j` — and its "before any processes are spawned" is a rule about
-  WHERE, satisfied for either lifetime by lowering in the parent at the fork. The
-  refusal also fired for a declaration with NO initializer, where neither clause is even
-  engaged, and took a working construct with it: `initial fork : c reg x; join` plus a
-  hierarchical `a.c.x` passed before that commit and failed after. Restored to what it
-  was — ordinary static storage in the block's own scope (`lower_var_decl`, so a module
-  signal in a process body and a persistent signal in a subroutine, initializer in
-  PreInit) — which needs no box and is no capture, since shared storage already outlives
-  every child and a named fork stays a hierarchical scope.
-  **Oracles.** Verilator 5.050 `--timing` agrees on every fork-scope case measured —
-  the clause example, both UVM shapes including the labelled `fork : guard`, all six
-  initializer sources, the once-per-execution side effect, sharing, and all three join
-  kinds with timestamps — but is NOT an oracle for the body-local form: it prints
-  `1 2 3` for the nested `m`, contradicting the clause's own comment. **iverilog 13
-  cannot compile the `automatic` form at all** ("sorry: Overriding the default variable
-  lifetime is not yet supported"), so the oracle that covered V1–V3 is unavailable
-  there — but it does compile the STATIC form, and it and Verilator both print
-  `PASSED x=1` for the hierarchical `a.c.x` case and `101 102 103` / `201 202 203` for
-  the once-only initializer in a looping module fork and a task fork. Verilator alone
-  covers the mixed fork, and agrees. Unchanged: the bare captured loop variable stays
-  `4 4 4`. Verilator's `1 2 3` deviation there is process-body-specific — in a task
-  body it prints `444` too.
-- [ ] **1024 concurrent detached children** is the ceiling: an unbounded spawn edge
-  saturates the activation bound, and past it the scheduler-buffer guards report a
-  located FATAL. Lifting it means a spill on the already-emitted overflow edge; the
-  dynamic wait bucket, which is scanned, is the hard half (fork-join.md §V2.3).
-- [x] **Tasks** — time-consuming (see Subroutines).
-- [x] **Intra-assignment timing** (LRM 9.4.5) — blocking (`x = #5 y;`,
-  `x = @(edge) y;`, `x = repeat(N) @(edge) y;`), nonblocking `#d` (deferred wheel
-  record, last-executed-wins per LRM 10.4.2), nonblocking `@e` / `repeat(N) @e`
-  (deferred record on the trigger edge). A **real** target works on every form,
-  including the event ones: `emit_intra_event_arm` and `emit_intra_nba_arm` both
-  fill the deferred record through `fill_intra_payload`, whose first act is
-  `real_to_planes`, so the record carries the IEEE-754 bit pattern in its narrow
-  slot — the event form's claimed gap was stale and is deleted (two cases in
-  tests/intra_assign_test.cpp, values from iverilog 13). The repeat count may be
-  **real** in either form and rounds per LRM 6.12.1 (`repeat (1.6) @e` waits two
-  edges). A count <= 0 assigns as if there were no repeat construct in BOTH forms
-  now (9.4.5), tested in the count's own signedness so an unsigned one clamps only
-  at zero. Since then: every decomposing target (concatenation, streaming
-  concatenation, assignment-pattern lvalue, whole unpacked struct or array), a write
-  through a virtual interface handle, and a multi-signal trigger `@(a or b)` with
-  first-fire-wins removal. Design: docs/design/intra-assignment-timing.md.
-- [x] **`wait (expr)` statement** (LRM 9.4.3) — level-sensitive suspend; subsumes
-  `wait(e.triggered)`.
-- [x] **Event control and `wait` on a class PROPERTY** (LRM 9.4.2 / 9.4.3) — `@p`
-  on the enclosing `this`, `@(obj.p)` through any handle expression, and
-  `wait(<cond reading properties>)`, for integral instance properties, non-edge and
-  edge. This unblocks Accellera UVM: `uvm_event_base::wait_off`
-  (`base/uvm_event.svh:120`) parks on `@on`, where `on` is the `protected bit`
-  property declared at :54, and nothing in a UVM run gets past it.
-  All three shapes failed before, and the third failed SILENTLY, which is the part
-  that mattered most. `lower_wait_stmt` lowers `wait(c)` to
-  `forever { if (c) break; @(read set of c); }` and the read set is built from
-  SIGNALS; a property is heap storage inside an object, so the set came back empty
-  and the process suspended on an event list nothing could ever fire — a permanent
-  park with no diagnostic at lowering, at elaboration or at run time. The `@` forms
-  were at least loud: `@p` reported "reference to unknown signal 'on'", and
-  `@(c.p)` resolved the object while the process was being BUILT and aborted with
-  "dereference of a null class handle, at 0 s" because `c = new` had not run yet.
-  **Mechanism** (docs/design/classes.md, "Waiting on a property"): a property some
-  `@` / `wait` in the design waits on carries hidden `event`-typed sibling
-  properties — its change notifiers, one per waited edge — and a blocking store to
-  the property classifies its own old -> new transition through the *same*
-  `emit_edge_facts` a signal store uses, then wakes the notifiers whose edge that
-  transition produced. Waiting is then literally `@(obj.<hidden event>)`, an
-  existing tested path, so there is no new IR op, no new runtime state and no new
-  wait engine. Because the classification is at the write, a fire always means a
-  real change of the kind that waiter asked for: `p = p` fires nothing at all, and
-  the waiter needs no snapshot and no re-comparison on resume.
-  **Granularity: per property per edge, not per object.** A per-object notifier
-  would also have been correct (9.4.2 forces a value comparison somewhere), but it
-  is strictly worse here for one concrete reason: `uvm_event` writes `num_waiters`,
-  `m_event`, `trigger_data` and `on` through the same object, so every unrelated
-  write would wake every `@on` waiter and each would have to re-compare. Per
-  property costs one hidden field per waited property and gives exact wakes.
-  Per-EDGE on top of that is what makes edges exact rather than approximate: with
-  one shared notifier a same-instant `0->1->0` pulse would wake a `posedge` waiter
-  that then re-reads 0 and misses the edge, whereas classifying at the write cannot
-  miss it. Only the edges the design uses are laid out, so `@p` alone costs one
-  field and `@(posedge p)` alone costs one, never three.
-  **Zero cost for a class nothing waits on**, by construction and asserted:
-  a design-wide pre-pass (`WaitPropScan`, modelled on `EventMergeScan`) collects the
-  (property, edge) pairs before any class is laid out — it must, since
-  `lower_class_type` runs on demand from the first reference anywhere and can
-  precede the `@` that needs a notifier. An unnamed class gets no field, no store
-  barrier and no descriptor change; `Module::change_notify`'s empty-table early-out
-  means even the compile-time question folds away. `tests/class_test.cpp` pins the
-  field lists on both sides of that line.
-  **Write paths**, enumerated from the code rather than guessed. The notifier rides
-  `service_snapshot` / `service_after_write`, which is already documented as THE
-  bracket around every blocking write path, so all ten sites are covered by
-  construction and a new one cannot forget: `Store`, the dyn/queue element store,
-  `$fgets`, `$sformat`/`$swrite`, `$ferror`, `$fscanf`/`$sscanf`, `$value$plusargs`,
-  `$fread`, and the `ref` actual bracket at a function call and at a task call.
-  That last pair is what makes a `ref` formal work at all, since a `ref` is a raw
-  aliased pointer the callee writes through and never copies back. Also covered,
-  through `Store`: a base-class method writing an inherited property (which is why
-  a notifier is laid out immediately AFTER its property — appending after all
-  properties would give the base and the derived class different indices and break
-  prefix layout), `randomize()` writeback, and `output`/`inout` copy-out. Refused
-  loudly, not silently: a non-integral property in either construct (no old -> new
-  transition to classify), and `wait` over a condition whose only class-property
-  reads are non-notifiable — that one used to be the silent park. NBA to a class
-  property was already refused (TODO.md:1242), so that path cannot exist.
-  **One inherited imprecision, uniform with signals**: a `ref` bound to a property
-  and written by a task AFTER an intervening suspend wakes at the task's RETURN
-  rather than at the write, because the bracket is at the call site and the callee
-  writes through a bare pointer. Measured identical for a `ref` to an ordinary
-  signal, so it is a property of clotho's `ref` ABI, not of this feature.
-  **Oracle**: Verilator 5.050 agrees on every shape it can run (`woke at 1` for all
-  three headline cases, and byte-identical on the mock `uvm_event`); it *aborts*
-  with "Null pointer dereferenced" on `wait(c.on && g)`, resolving the handle too
-  early — the bug clotho just fixed. iverilog 13 is no oracle: it rejects all three
-  ("cannot synthesize expression: @.<0>", and for the `wait` form "Empty NexusSet
-  from wait expression", which is the very same root cause named out loud).
-  Table 9-2 edge behaviour is pinned to clotho's existing signal path, asserted
-  equal to it in the same test; Verilator diverges there for signals too (it does
-  not treat `x -> 0` as a negedge).
-  Covered in tests/event_test.cpp, tests/wait_test.cpp and tests/class_test.cpp,
-  including the four distinct UVM call shapes: `@on`, `@(obj.p)`,
-  `wait(obj.p)`, and `@(m_events[obj].raised)` on an object held in an associative
-  array keyed by a class handle (uvm_objection.svh:1078) — the last works with
-  nothing added, because the notifier handle is loaded from whatever object the
-  expression evaluates to at the moment the statement runs.
-- [x] **`wait` on a CONTAINER class property** (LRM 9.4.3) — `wait(q.size() > 0)`,
-  `wait(q[0] == 3)`, `wait(a.num() > 0)` and the like on a queue (7.10), dynamic
-  array (7.5) or associative array (7.8) instance property, including a nested
-  container (`q[0].size()`) and a mix of a container and an integral property in
-  one condition. This unblocks the next UVM site after `uvm_event_base::wait_off`:
-  `uvm_queue#(T)::wait_until_not_empty` (`base/uvm_queue.svh:218`) is
-  `wait(queue.size() > 0)` over the `protected T queue[$]` at :58, and it failed
-  with "wait on a class property of a type with no change notifier is not
-  supported".
-  **Why it is not just a wider type test.** The entry above rests on the STORE
-  having an old and a new word to compare. A container has neither: its value is
-  its contents, and `q.size()` is computed from the handle, not stored anywhere a
-  write could snapshot. So a container property's single any-change notifier fires
-  on MUTATION, with no comparison at all.
-  **The `wait` / `@` asymmetry is what makes that sound, and it is the whole
-  argument.** 9.4.3 `wait` is level-sensitive: it re-evaluates and parks again, so
-  a fire that leaves the condition false costs one re-test and is unobservable,
-  while a fire that never happens is a permanent park. Over-firing is free;
-  under-firing is a silent hang. 9.4.2 `@` is the opposite: "a non-edge implicit
-  event shall be detected on any CHANGE in the value of the expression", so a
-  spurious fire there is an observable wrong wake — and mutation genuinely is not
-  change, since `q.push_back(x); q.pop_back();` is two mutations and leaves
-  `q.size()` where it started. **`@` over a container-dependent expression is
-  therefore REFUSED LOUDLY** ("an event control on a container class property … is
-  not supported; only `wait` can park on one") rather than silently given the
-  mutation notifier. Doing it properly needs the expression's value snapshotted in
-  the WAITER's frame and compared on each wake — a different mechanism, since the
-  write side has nothing to classify; that is the `TODO:` on the refusal. A
-  consequence worth naming: because only `wait` can reach a container notifier,
-  only `Edge::Any` is ever requested, so a container property carries exactly one
-  hidden field and never `.pos` / `.neg`.
-  **The mutation surface, and why the list is closed** — two facts, not a survey.
-  First, a SystemVerilog container is a VALUE TYPE: there is no handle to one, so
-  the only reachable mutations are through an lvalue rooted at the property or
-  through a `ref` formal bound to such an lvalue. Second, every mutation needs a
-  writable pointer to the container's rt handle slot, and `lv_handle_ptr` is the
-  only thing that produces one — every runtime mutator takes it as its first
-  argument. Its second parameter is now a three-valued `HandleUse`
-  (`Read` / `Mutate` / `Place`) **with no default**, so all 47 call sites had to be
-  classified and one added later cannot compile without answering. Covered:
-  queue `push_back` / `push_front` / `pop_back` / `pop_front` / `insert` /
-  `delete(i)` / `delete()` / `sort` / `rsort` / `reverse` / `shuffle` / whole
-  assignment (from a queue and from a dynamic array) / append-range; dynamic array
-  `new[]` / `new[](src)` / whole assignment / `delete()` / the four ordering
-  methods; associative array `delete(key)` / `delete()` / whole assignment /
-  `'{...}` reset. An ELEMENT write is the one shape that does not touch the
-  handle, so it is `Place` and fires from the direction the frontend already
-  threads — `ir::ElemSelect::for_write` for `q[i] = v` / `d[i] = v`, and
-  `assoc_elem_lvalue(for_write)` for `a[k] = v` and the `'{default: v}` slot; the
-  assoc case must fire even when the value written equals the element default,
-  because creating the entry changes `a.num()`. A `ref` / `output` / `inout`
-  container formal is `Place` too and rides the existing `service_snapshot` /
-  `service_after_write` bracket, which now carries a `container` flag: a `ref` is a
-  raw aliased pointer the callee mutates and never copies back, and a task callee
-  may suspend first, so the notify has to be at the call's RETURN. One fire per
-  call instead of one per mutation inside it, which a level wait absorbs.
-  A base-class method mutating an inherited container works through the same
-  member select at the base-relative index, and `$copy` fires the DESTINATION's own
-  notifier because the copy emits the same container ops (notifier rows are still
-  skipped, for the aliasing reason above).
-  A `Mutate` fire is emitted immediately BEFORE the runtime call it precedes, which
-  is sound because `emit_event_wake_list` only pushes onto the ready list and a
-  woken process cannot run before this one suspends; the only sites where a suspend
-  can intervene are the `ref` / `inout` ones, which is exactly why those use the
-  call bracket instead.
-  **Also refused loudly**: a FIXED unpacked-array property (its extent never
-  changes, so it has no mutation op — every write is an element store, and
-  `agg_member` deliberately clears the notifier when descending into an interior
-  aggregate, so it needs a separate change). NBA to a class property was already
-  refused. (String / real / class-handle properties were refused here too; the
-  entry below is what changed that.)
-  **Zero cost** for a container nothing waits on, by construction and asserted:
-  the pre-pass admits a container property only from a `wait` condition, and
-  `class_test.cpp` pins the same class — one that churns its queue through
-  `push_back`, `push_front`, an element write and `delete` — on both sides of the
-  line, `{q, n}` versus `{q, $chg.q, n}`, plus prefix layout with the notifier in
-  place (`B{q, $chg.q, pad}` / `D{q, $chg.q, pad, extra}`).
-  Design: docs/design/classes.md, "Waiting on a container property". Covered in
-  tests/wait_test.cpp (the UVM `uvm_queue` shape with a producer and a parked
-  consumer, one case per mutation op, all three container kinds, a `ref` mutation,
-  a base-class mutation, a mixed container + integral condition, containers of two
-  objects, a nested container, and the negative space — a push-then-pop and an
-  unrelated-key delete must leave the waiter parked) and tests/class_test.cpp.
-- [x] **`@` and `wait` on a SCALAR class property** (LRM 9.4.2 / 9.4.3) — the third
-  rung, and the one the UVM run actually stopped on: `uvm_sequence_base.svh:430` is
-  `wait (m_killing_process == null)` on a CLASS HANDLE property, which failed with
-  "wait on a class property of a type with no change notifier is not supported".
-  Now covered, in both constructs: a class or interface-class handle, a `chandle`
-  (6.14), a virtual interface handle (25.9), `real` and `shortreal` (6.12), and
-  `string` (6.16).
-  **Most of it is the first rung with a wider door.** A class handle, a chandle and
-  a virtual interface handle are each a 2-state 64-bit word in the object body, and
-  a real is its 64-bit IEEE-754 pattern (a shortreal, 32), so `emit_edge_facts`'s
-  `changed` fact — a plain `!=` over the stored word — is already exactly the right
-  predicate, and the store path needed NO backend change at all. For the three
-  handle kinds that is not a coincidence: LRM 8.4 / 6.14 / 25.9 give the variable
-  only assignment, `==`/`!=` and `null`, so the value IS the handle and a change is
-  an identity change — precisely what `== null` tests. For a real it is worth
-  naming what the word compare decides, since it is a BIT-PATTERN compare and
-  matches what a real SIGNAL store already does: `-0.0` -> `+0.0` counts as a
-  change, and a store of a bit-identical `NaN` does not.
-  **A string is the one type whose value is not the word the place holds.**
-  `obj.s = t` replaces the rt_string's buffer, so comparing handles would call
-  every write a change; and two distinct handles over the same characters are the
-  SAME value, which 9.4.2's "any change in the value" makes observable — assigning
-  equal text must fire nothing. So a string property is bracketed:
-  `str_chg_snapshot` copies the old CONTENT out before the write and
-  `str_chg_after` compares it with `rt_string_cmp` after, firing only on a
-  difference. The copy costs a malloc, paid only for a property something waits on.
-  **The string write surface is closed the way the container one was.**
-  `lv_string_ptr` is the only thing that yields a writable rt_string handle, and its
-  second parameter is now a three-valued `StringUse` (`Read` / `Write` / `Place`)
-  **with no default**, so all 18 call sites had to be classified. `Write` is also
-  CHECKED against an open bracket, so a write site that forgets one fails the build
-  instead of parking a waiter forever — and the check can only fire for a property
-  someone waits on. Covered: `Store` (which is also how `$copy` and an
-  `output` / `inout` copy-out arrive), `$sformat` / `$swrite`, `$fgets`, `$ferror`,
-  `$value$plusargs`, `.putc()`, `itoa` / `hextoa` / `octtoa` / `bintoa` /
-  `realtoa`, the packed-append, and an associative array's string KEY write-back
-  (`a.next(obj.k)`, which is a real property write). A `ref` / `output` / `inout`
-  string formal is `Place` and rides the existing `service_snapshot` /
-  `service_after_write` bracket — which now has a string arm — so the notify lands
-  at the call's RETURN, for the same reason the container case does.
-  **Edges are meaningless for every type here, and the LANGUAGE already says so.**
-  9.4.2 with Table 9-2 defines posedge / negedge as the LEAST SIGNIFICANT BIT of
-  the expression moving through the `0 < x/z < 1` lattice, so an edge-qualified
-  event expression must be integral; bit 0 of a heap pointer, of an IEEE-754
-  significand or of a string's first character is not a logic level, and the LRM
-  assigns it none. slang enforces that directly — `@(posedge <real | shortreal |
-  string | chandle | class handle | virtual interface>)` is rejected as "expression
-  type 'T' is not integral" before lowering runs — so nothing was invented and no
-  clotho diagnostic was needed. The pre-pass still refuses to MINT `.pos` / `.neg`
-  for such a property, which is load-bearing for a different reason: a stray
-  notifier row would shift every later field and break the prefix invariant a
-  base-class method writes through. A non-edge `@p` and `wait(...)` are what these
-  types support, and each carries exactly one hidden `$chg.<prop>` field.
-  **Still refused loudly**: an unpacked struct / union property and a FIXED
-  unpacked-array property. Both need a comparison over the whole aggregate rather
-  than over one word, which is a different mechanism; `wait` over one of their
-  leaves keeps failing with "no change notifier", and `@` on a whole aggregate is
-  rejected by slang ("invalid type 'T' for event expression").
-  **Zero cost** unchanged and re-asserted on these types: `class_test.cpp` pins the
-  same class — one that writes its handle, string, real and int in both designs —
-  on both sides of the line, `{h, s, r, n}` versus
-  `{h, $chg.h, s, $chg.s, r, $chg.r, n}`, plus `{ch, $chg.ch, v, $chg.v, pad}` for
-  the chandle / virtual-interface pair and prefix layout with a scalar notifier in
-  place (`B{h, $chg.h, pad}` / `D{h, $chg.h, pad, extra}`).
-  Design: docs/design/classes.md, "Waiting on a scalar property". Covered in
-  tests/wait_test.cpp (the `uvm_sequence_base` kill shape, each type in scope, a
-  store through a `ref` formal and from a base-class method, and two objects of one
-  class each with a waiter), tests/event_test.cpp (bare `@p` per type, the
-  no-value-change cases — the same handle, the same real, and the same string
-  CONTENT through a different handle, which is the one that catches comparing
-  pointers — and the edge / aggregate refusals) and tests/class_test.cpp.
-  One honest gap: SystemVerilog offers no way to MAKE a non-null `chandle` without
-  DPI, so the chandle transition itself is not exercised end to end; what is pinned
-  is that the property is notifiable, that its notifier is laid out, and that a
-  null -> null store is not a change.
-- [x] **Bare `@e` on an EVENT class property, and `wait(e.triggered)` on one**
-  (LRM 9.4.2 over 15.5) — the fourth rung, and the easyUVM driver's `record_tr`:
-  `@(begin_record)` inside a method, on the `event begin_record` property of
-  `this`. An event property needs NO notifier — the property IS an object with a
-  waiter list, the very one `-> e` fires — which is why the first rung excluded
-  it from the notified set. What was missing was RESOLUTION: `@(obj.e)` and
-  `@(this.e)` already took the event-handle path (a MemberAccess), but a bare
-  `@e` is a NamedValue and fell through to `event_signal` -> `signal_of`, and a
-  property is heap storage, not a signal — "reference to unknown signal
-  'begin_record'". (Under `events_merge` the handle fallback hid the hole, and
-  UVM designs do merge events, which is why the scalar rung could truthfully
-  report event properties working there.) `event_wait_needs_handle` now admits
-  an event-typed INSTANCE property (`instance_class_prop`), so the wait parks on
-  the handle the property holds when the statement executes — object resolution
-  at execution time, and wake times byte-identical to Verilator 5.050 on the
-  easyUVM fork shape. `wait(e.triggered)` parks on the same object
-  (`ClassPropReadScan::event_props` in lower_wait_stmt): `-> e` is the only
-  thing that changes that condition, and the persistent within-step `triggered`
-  still satisfies a wait that starts AFTER the trigger in the same instant,
-  which `@e` would miss. A STATIC event property keeps the signal path
-  (`declare_static_prop`); `->` / `->>` on a property were already the generic
-  rvalue path and are unchanged, as are an event ARRAY / queue element
-  (`@(arr[i])`, the existing element-handle path).
-  **The second message was not this gap.** easyUVM's `FATAL: driver.sv:36:
-  intra-body event wait has no signal events` was `@(negedge vif.rst)` — a
-  virtual-interface member wait inside a $unit class task, whose method body the
-  eager static pass built at the end of lower_globals, BEFORE any top's Collect
-  pass registered `input_if`'s instance: the registry came back empty, the
-  member contributed no event, and the empty list was refused with an internal
-  invariant's wording, stubbing the whole method. Vtable-forced package/$unit
-  bodies now drain at the FIRST TOP's phase boundary instead (a top's
-  drain_pending_bodies already pulls the globals queue, which now still holds
-  them; lower_compilation drains any remainder after every top), so the wait
-  binds the instance the top elaborates. A body drained there can append
-  function-static initializers to the already-finalized globals PreInit builder;
-  they flush into a PreInit process of their own, still ahead of that top's.
-  **A genuinely never-bound vif member wait** is now the located LRM 25.9
-  run-time fatal the ACCESS paths already emit ("use of a null virtual
-  interface", after the analysis warning) — reaching the wait IS the use — not a
-  compile-time stub of the whole method. The empty-list refusal that survives is
-  reworded to name its one remaining construct (an implicit `@*` inside a
-  procedural body).
-  **Still refused / unchanged**: an edge qualifier on an event expression
-  (slang: not integral); `@` on a container property; the aggregate property
-  shapes; and a multi-top design still drains the globals queue at the FIRST
-  top, so a $unit class body waiting on an interface only a LATER top
-  instantiates keeps the never-bound behavior (the same pre-existing cross-top
-  boundary vif_scopes already documents).
-  Design: docs/design/classes.md, "Waiting on an event property". Covered in
-  tests/event_test.cpp (the easyUVM fork shape pinned to Verilator's wake times,
-  all five spellings, `->>`, the wrong-property / wrong-object negatives, two
-  waiters on one property, base-triggers/derived-waits over the prefix
-  invariant, `wait(e.triggered)` including the same-instant start, and the
-  never-bound run-time fatal) and tests/class_test.cpp (the eager class whose
-  vif wait binds the top's interface).
-- [x] **`wait` (and inferred sensitivity) on SIGNAL-resident storage: static class
-  properties and module-level containers** (LRM 9.4.3 / 9.4.2.2) — the fifth rung,
-  and the one that held every UVM phase open: after `drop_objection` at 10ns the
-  run phase never ended, every test sat at the 9200s default timeout
-  (`uvm_phase_hopper.svh:587` PH_TIMEOUT), and `report_phase` never executed.
-  The site is `uvm_objection.svh:805`: the single background drain process
-  (`m_execute_scheduled_forks`) parks on `wait (m_scheduled_list.size() != 0)`,
-  and `m_drop` hands it work by `m_scheduled_list.push_back(ctxt)` (:707). The
-  source-level trace showed the drop propagating fully — five contexts pushed,
-  size 0 -> 5 — and the wait never waking, so `m_forked_drain` never ran,
-  `all_dropped` never fired, and the phase's `wait_for(UVM_ALL_DROPPED)` waited
-  forever. `m_scheduled_list` is a `local static uvm_objection_context_object
-  m_scheduled_list[$]` — SIGNAL storage (declare_static_prop), not an object
-  property — and TWO independent defects each left a waiter on such storage
-  parked forever. Neither fails loudly; both are silent hangs, which is why every
-  regression pins the resume TIME.
-  **Defect 1: the sensitivity walk dropped a static property it was first to
-  reach.** `SensitivityCollector::record_read` resolved reads through `sigmap_`
-  alone, while a static class property's signal is minted LAZILY at its first
-  VALUE access — eagerly only when it has an initializer, and for a module-scope
-  class only AFTER every process body has lowered (lower_top runs
-  init_static_class_props after the Emit pass; packages get it in lower_globals,
-  but an initializer-less property like `m_scheduled_list` is not in that pass at
-  all). A `wait` whose condition was the property's first-lowered reference
-  collected an EMPTY event list: a suspend with no waker, appearing and
-  disappearing with method DECLARATION ORDER (declaring `@(m)` before the wait
-  hid it, since the `@`'s value path minted the signal first). The collector now
-  carries a `declare_static` callback (Lowerer::declare_static_prop through a
-  slang::function_ref) and its `lookup` mints the signal itself, so the walk and
-  the value paths meet at one signal BY CONSTRUCTION — a pre-pass would have had
-  to re-derive the collector's descent rules and drift. All five
-  SensitivityCollector users take the callback: `wait` (collect_expr_reads),
-  `always @*` / always_comb / always_latch (collect_inferred_sensitivity),
-  continuous assigns (continuous_events), gate inputs, and SVA shadow sampling.
-  **Defect 2: a container mutation never serviced a SIGNAL's wait buckets.** The
-  container rung above wakes waiters through the property's hidden notifier
-  (`lv.chg`), which is NULL for a signal-resident container — a module-level
-  queue / dynamic / associative array, or a static property's shared slot — and a
-  mutation is not a Store, so the store-side service bracket never sees it
-  either: `push_back` compiled to a bare rt_queue call and nobody woke. Waiters
-  on such storage park on the signal's own any-change bucket (that half always
-  worked), so `notify_container_mutation` now has a signal arm:
-  `service_signal_container_mutation` fires the Any bucket UNCONDITIONALLY —
-  static queue scan, dynamic queue scan, vif heads, `<= @e` triggers — for
-  exactly the reason the property notifier fires unconditionally (9.4.3 `wait`
-  re-tests, so an over-fire costs one re-test and an under-fire is a permanent
-  park; `@` over a container is rejected by slang's type check, "invalid type
-  'T$[$]' for event expression", so no 9.4.2 wrong-wake exists to make). The
-  audit of the mutation surface is the container rung's own: every mutator
-  reaches storage through `lv_handle_ptr(…, Mutate)`, whose no-default HandleUse
-  already forced all sites to classify, so the signal arm covers the same closed
-  list with no new site enumeration. Two carriers had to be added where the
-  map's identity is otherwise lost: the deferred assoc element (`a[k] = v`,
-  `'{default: v}`) now carries `mut_sig` — the signal-side analog of the `chg`
-  fields it already carried, set at the same two construction sites — because
-  `is_signal` on a deferred element would send Store servicing down the
-  mm-snapshot path with a null base; and the `ref` / `out` / `inout` container
-  brackets at both call sites (function and task) now take the
-  after-return-container arm for a signal (or signal-map-element) actual, not
-  only for a notified property.
-  **PreInit stays silent** (declaration initializers generate no events, same
-  rule as service_snapshot), and a signal nothing waits on emits NO wake code —
-  all four bucket checks are compile-time nulls — so a design that never waits
-  on signal-resident storage pays nothing.
-  **Result**: the reproducer prints `[TB] report_phase at 10` and finishes with
-  no PH_TIMEOUT; the full suite is green. easyUVM was NOT this defect: its
-  sequencer/driver rendezvous was the sixth rung, the fork-captured-automatic
-  entry below.
-  **One reference divergence, argued**: Verilator 5.050 omits class statics from
-  `@*` inferred sensitivity and does not re-fire; 9.4.2.2 says "sensitive to
-  every operand", and a static property is a variable with module-storage
-  semantics (6.21 / 8.9), so clotho includes it. The continuous-assign shape
-  matches Verilator exactly; so do all four wait shapes (times byte-identical).
-  **Unexercised**: a `wait` on a CONTAINER member reached through a virtual
-  interface (`wait(vif.q.size())`) — the mutation arm fires vif heads, but no
-  test pins that shape end to end.
-  Covered in tests/wait_test.cpp: the uvm_objection shape itself (an
-  initializer-less static queue, the waiter a static task lowered first, a
-  producer ten units later), the declaration-order pair on a static scalar (both
-  orders in one design), one waiter per module-level mutation family (push_back /
-  assoc element create / `new[n]` / `delete()`), the `ref`-formal signal queue
-  and map, and the `@*` + continuous-assign siblings.
-- [x] **`wait` on a FORK-CAPTURED AUTOMATIC: the capture-box change notifier**
-  (LRM 9.4.3 over 9.3.2) — the sixth rung, and the one that hung the easyUVM
-  sequencer/driver rendezvous: `finish_item` never returned after `start_item`
-  returned at 25, the process pinned a core at ~99.7% (the free-running clock
-  and the always-comb adder kept the scheduler busy while every UVM process sat
-  parked), and the run never advanced past the first transaction. The site is
-  `uvm_sequencer_param_base.svh:535` (`m_safe_select_item`): the driver's `get`
-  forks a join_none watchdog that writes `select_process = process::self()`,
-  then the parent parks on `wait (select_process != null)` before
-  `m_req_fifo.peek` — and `select_process` is a TASK AUTOMATIC the fork
-  captured. The instrumented source trace showed the watchdog reaching its
-  await (`ssi_wd_await_pre`) and the parent never printing `ssi_waitproc_post`:
-  the write landed in the box, nobody woke, `peek` was never called, `item_done`
-  never ran, and the sequence's `wait_for_item_done` waited forever.
-  **The defect.** A fork-captured automatic is ONE variable shared by parent and
-  children (9.3.2), and it lives in a GC capture box — a one-field synthetic
-  class (`$capture`, docs/design/fork-join.md V4) — not in a signal and not in a
-  class property. A `wait` whose condition read one therefore collected NO
-  sensitivity at all: SensitivityCollector::lookup answers nullopt for a
-  frame-resident local (correctly — a plain local is unshared), ClassPropReadScan
-  sees no property, and the wait parked on an EMPTY event list. The fifth rung's
-  silent-permanent-park shape exactly, one storage class over.
-  **The fix, at the primitive.** The box now carries the same hidden
-  change-notifier machinery a waited class property carries. The design-wide
-  pre-pass (WaitPropScan) records every value symbol any `wait` condition names
-  (WaitedProps::locals); box_class_for mints the NOTIFIED box variant for a
-  captured symbol in that set — field 1 an event (`$chg.$capture`), registered
-  with set_change_notify(box, field 0, Any) — so every store and every container
-  mutation of the boxed value fires it through the very lv.chg path property
-  stores already take (service_snapshot / service_after_write / the string
-  content compare / notify_container_mutation: NO new backend code). The wait
-  lowering parks on the box's notifier (boxed_notifier_handle), loading the box
-  handle inside the re-test loop so a re-entered fork that re-boxes is re-read
-  per pass. build_fork_child types the child's capture formal through
-  box_class_for too — the child's stores must resolve the same (class, field)
-  change-notify entry or they would fire nothing, and the CHILD is the writer in
-  the UVM shape. Both homes take it: a frame-slot box (install_capture_boxes)
-  and a fork-scope declaration's design-state box (install_fork_decl_box).
-  **Cost**: a box whose symbol no `wait` reads is minted exactly as before
-  (plain one-field class, byte-identical); the notified variant is a second
-  interned class per inner type, one extra event word per box, and the standard
-  notifier fire per store. A design with no fork, or no wait on a capture, pays
-  nothing.
-  **Sibling audit** (all pinned in tests/wait_test.cpp, resume TIME asserted):
-  parent-waits/child-writes (the easyUVM shape, plus the literal process-typed
-  watchdog with process::self() and kill), child-waits/parent-writes,
-  child-waits/sibling-writes, join_any, a fork-scope declaration in a process
-  body, a captured queue (mutation-fired flavour), a captured string (content
-  compare), two captured locals in one condition (re-test), and a write through
-  a `ref` formal (the after-return bracket resolves the box's lv.chg). A
-  captured automatic of a type with NO notifier surface (unpacked struct /
-  union / fixed unpacked array) is refused loudly at the wait, same rule and
-  same reason as the property arm.
-  **Still refused loudly, unchanged**: `@` on a captured automatic ("reference
-  to unknown signal") — an event CONTROL needs a value-change classification
-  per 9.4.2 that the wait's unconditional any-change notifier deliberately does
-  not provide for containers, and the signal resolver never sees a boxed local.
-  It fails loudly, not silently, so it stays a gap, not a hazard.
-  **Result**: easyUVM's rendezvous completes — `start_item` returns at 25,
-  `finish_item` returns at 25, the driver's `get` returns at 25 and iteration 1
-  begins; the run then advances to 35 where it hits the NEXT wall,
-  `FATAL: packet_out.sv:4: aggregate argument must be a variable` (the
-  `__m_uvm_execute_field_op` aggregate-formal stub, a known M4 gap: the field
-  macros hand `'{...}`-shaped actuals to a function taking an aggregate by
-  value). The full suite is green.
-- [x] **Named events** (LRM 15.5) — `event e;`, `-> e`, `->> e`, `->> #d e`,
-  `@(e)` / `always @(e)`, `wait(e.triggered)`, at module, package, generate,
-  procedural-block and `static`-local scope. An event is an OBJECT (trigger tick +
-  intrusive waiter list + `->>` pending state) in the `clotho.events` array; its
-  waiters are a doubly-linked list of frame- or array-resident nodes, so the number
-  of simultaneous waiters is unbounded. Design: docs/design/named-events.md, and
-  docs/design/event-handles.md for the handle layer.
-- [x] **`fork` / `join`** (LRM 9.3.2, V1) — each child a coroutine; the parent
-  joins all. Also inside a **task** body (and an assertion action block, which is
-  lowered as one): a child takes the enclosing frame's packed integral /
-  dynamic-array locals as `ref` formals, and the active-ring bound counts task
-  activations rather than child bodies. The ring-overflow fatal the design doc
-  promised is landed too (`rt_ring_overflow`).
-  Two bounds that a fork child reaches but that were still sized as if it did not
-  exist are fixed: the dynamic wait bucket counted `mod_.processes().size()`
-  waiters, so a width-4 fork on one edge stored past the end of the bucket, and the
-  `#0` batches were unguarded bump stores, so exceeding the saturated ring cap died
-  with no diagnostic. The activation fixpoint is now `body_activations()`, shared by
-  the ring and the bucket, and `emit_len_full_check` guards every bump-pushed
-  buffer — both behind the existing `design_forks()` gate, so a design without a
-  fork emits byte-identical code.
-  Design: docs/design/fork-join.md.
+- [~] **Intra-assignment timing** (9.4.5) — target shapes and qualifiers still refused; see
+  docs/design/intra-assignment-timing.md.
+  - [ ] **String or whole-container nonblocking target** (`s <= #5 t`, `q <= #2 r`) —
+    needs an owned-copy record that is freed on every drop path.
+  - [ ] **`iff` on a nonblocking intra-assignment event** (9.4.2.3) — only enabled
+    occurrences may count down, so a `repeat` count cannot reuse the body guard.
+  - [ ] **Runtime-offset select of a very wide vector as a nonblocking target** —
+    needs a heap-side record payload.
+  - [ ] **Conditional RHS over a whole aggregate in a nonblocking form** — refused.
+  - [ ] **Aggregate target with a container member in a nonblocking form** — refused.
+  - [ ] **Indexed array-slice target in a nonblocking form** (`a[i +: n] <= #5 x`) —
+    refused.
+  - [ ] **String or container operand of a streaming target in a nonblocking form** —
+    refused.
+  - [ ] **Blocking form onto a string or a whole unpacked array** (`s = #5 t`,
+    `mem = #5 other`) — the store path evaluates the LHS before the RHS.
+  - [ ] **Blocking form onto an assignment-pattern lvalue** — refused.
+  - [ ] **Intra-assignment timing on a force target** (10.6.2), also as a concatenation
+    operand — suppression is decided at commit, not when the update is armed.
+- [ ] **Per-event `iff` in a multi-event list** (9.4.2.3) — `@(posedge a iff x or b)` needs
+  identification of the waking source.
+- [ ] **Event object reclamation** (15.5.5.2) — event objects are never freed.
+- [ ] **More than 1024 concurrent detached `fork` children** — past the activation
+  bound the scheduler buffers report a fatal; see docs/design/fork-join.md.
+- [ ] **Wake time of a `ref` write after a suspend** — a task writing a
+  `ref` actual after a suspend wakes its waiters at the task's return, not at the write.
+- [~] **Event control and `wait` on a class property** (9.4.2, 9.4.3) — whole-aggregate and
+  container-valued waits are refused.
+  - [ ] **`@` over a container property expression** (9.4.2) — needs the value
+    snapshotted in the waiter and compared on each wake.
+  - [ ] **`wait` on an unpacked struct, union or fixed unpacked-array property**
+    (9.4.3) — needs a whole-aggregate change compare.
+  - [ ] **Non-null `chandle` property transition** — not exercised end to end; making one
+    needs DPI.
+- [ ] **Virtual-interface wait in a `$unit` class body bound by a later top** — a
+  multi-top design binds such a body at the first top, so the wait stays never-bound.
+- [ ] **Implicit `@*` that collects no signal event inside a procedural body** —
+  refused.
+- [ ] **`wait` on a container member reached through a virtual interface** (9.4.3) —
+  `wait(vif.q.size())` is not exercised end to end.
+- [~] **Event control and `wait` on a fork-captured automatic** (9.4.2, 9.4.3, 9.3.2) — only
+  scalar-valued `wait` is supported.
+  - [ ] **`@` on a fork-captured automatic** (9.4.2) — needs a value-change
+    classification the capture box does not provide.
+  - [ ] **`wait` on a fork-captured unpacked struct, union or fixed unpacked array**
+    (9.4.3) — the capture box has no aggregate change notifier.
 
 ### Continuous / structural timing
 
-- [x] **Continuous-assign delay** (`assign #N lhs = rhs;`) — inertial delay on
-  the driven net (LRM 10.3.3), pulse rejection via an epoch-cancelled detached
-  record on the timing wheel, committed in the active region ahead of the drain
-  (`emit_inertial_arm` / `rt_inertial_decide`). A delay on a whole driver of a
-  multiply-driven (resolved) net rides that driver's own slot store, ahead of
-  resolution (`store_driver_slot`). No width limit: `rt_inertial_decide` takes
-  0/1 compare-result flags rather than the value planes packed into a `uint64_t`,
-  so the backend does every equality compare as an ordinary `icmp` on values
-  loaded from a per-site persistent buffer (`rt_inertial_buf`) — arbitrary width,
-  including a 4-state mm plane that is not a multiple of 8 bits, where a
-  byte-level `memcmp` of two independently materialized buffers would have hit
-  an LLVM-unspecified padding-bit mismatch that `icmp` on the actual `iN` values
-  never can. Gaps (guarded loud): rise/fall/turn-off delay triples `#(a,b,c)`, a
-  select / concat / aggregate target, and a delay on a PARTIAL driver of a
-  resolved net (its slot powers up all-x, so the undriven bits would fold as x
-  instead of z until the first store lands).
-- [x] **Single-value gate delay** (`and #2 (...)`, LRM 28.16) — inertial, reusing
-  the continuous-assign delay record (`emit_gate_as_process` -> `store_inertial_delay`),
-  so it carries the same no-width-limit fix. A gate driving a multiply-driven
-  (resolved) net delays its own slot, and `cmos #d` / `rcmos #d` delay each of
-  the two halves LRM 28.9 decomposes them into (identical waveforms to `nmos #d`
-  + `pmos #d` under iverilog 13). Gaps (guarded loud): rise/fall/turn-off triples
-  `#(a,b,c)` (now also rejected on cmos/rcmos), a bit-addressed output on a
-  single-driver net, and a delay on a partial driver of a resolved net.
-- [x] **Net delays** (`wire #3 w;`, LRM 28.16) — distinct from a continuous/gate
-  assign delay, and lowered differently: the delay sits on the NET, "the time it
-  takes from any driver on the net changing value to the time when the net value
-  is updated," so it applies once to the resolved value regardless of driver
-  count, and stacks additively with any driver's OWN delay rather than replacing
-  it. Implemented by forcing the net onto the per-driver-slot/resolver path even
-  with a single real driver (`collect_scope_signals`, mirroring how `force` and
-  `cmos`/`rcmos` already force resolution) — using the net kind's own fold op
-  (`net_resolve_tag`), not the resolved-by-default `WireRes`, so a delayed
-  `wand`/`wor` net still folds by value instead of the wrong reducer — and then
-  making `emit_wire_resolvers`'s base fold-into-net store inertial
-  (`net_delay_` : signal -> delay expression) instead of plain, while the force
-  overlay stores stay immediate (force is an override, not a driver LRM 28.16
-  times). Every existing driver kind (assign, gate, net initializer, port
-  connection copy, cmos/mos switch) already routes through that same slot path
-  for any resolved net, so none of them needed a dedicated net-delay code path.
-  A delay embedded IN a net declaration's own assignment (`wire #5 w = expr;`)
-  is a DIFFERENT thing per LRM 10.3.3's closing paragraph — that ONE driver's own
-  continuous-assign delay, "not added to the delay of other drivers on the net"
-  — and lowers through `lower_net_initializer` exactly like a bare `assign #d`
-  (whole-net direct `store_inertial_delay`, or a slot store when the net is
-  otherwise resolved); `collect_scope_signals`'s net-delay guard keys off
-  `getInitializer() == nullptr` to route the two cases separately. Gaps (guarded
-  loud): rise/fall/turn-off triples `#(a,b,c)` on either form, and a net delay on
-  an unpacked-aggregate net (forcing resolution hits the pre-existing
-  packed-plane-only `WireRes` fold; a real fix needs a leaf-wise inertial replay
-  like the intra-assignment aggregate commit, not attempted here) on either form.
-  A net delay on a user-defined-nettype net is excluded pending nettype
-  resolution-function support generally. `tests/net_delay_test.cpp`.
+- [~] **Continuous assignment delay** (10.3.3) — missing pieces:
+  - [ ] **Rise / fall / turn-off delays** — `assign #(r, f)` and `assign #(r, f, t)`.
+  - [ ] **Delay on a select, concatenation or aggregate target**.
+  - [ ] **Delay on a partial driver of a resolved net** — its slot powers up all-x, so the
+    undriven bits would fold as x instead of z.
+- [~] **Gate delay** (28.16) — missing pieces:
+  - [ ] **Rise / fall / turn-off delays** — `#(r, f)` and `#(r, f, t)` on any gate or
+    switch, including `cmos` / `rcmos` and the turn-off delay of tri-state gates (28.6).
+  - [ ] **Delayed gate with a bit-addressed output on a single-driver net**.
+  - [ ] **Delayed gate as a partial driver of a resolved net**.
+- [~] **Net delay** (28.16) — missing pieces:
+  - [ ] **Rise / fall / turn-off delays** — on `wire #(r, f, t) w;` and on a net
+    declaration assignment `wire #(r, f) w = e;` (10.3.3).
+  - [ ] **Net delay on an unpacked-aggregate net** — resolution folds packed planes only;
+    needs a leaf-wise inertial replay.
+  - [ ] **Net delay on a user-defined-nettype net** — needs nettype resolution functions.
 
 ### Procedural continuous assignment & force
 
-- [x] **`force` / `release`** on a whole-scalar **variable** (integral or real; LRM 10.6.2,
-  Phase 1): per-target hidden `force_site` state, gated ordinary writers, continuous
-  re-eval process, last-force-wins. Includes **release-reestablish** of a variable
-  driven by a module-level `assign` (the driver is made force_site-sensitive so
-  release re-evaluates it). Input/inout-port targets guarded loud (port-copy driver
-  is not force_site-aware). The gate keys off the write's ROOT, not its shape, so
-  every ordinary write rooted at the target is suppressed: whole-variable,
-  bit/part/element-select, packed-struct member, read-modify-write (`x += 1`,
-  `x++`), a forced operand of a concatenation lvalue, and a task/function output
-  copy-back — all byte-identical to iverilog 13. See
-  docs/design/force-release.md.
-- [x] **`assign` / `deassign`** (procedural continuous assignment to a variable,
-  LRM 10.6.1, Phase 1b): second override layer below force (force > assign >
-  ordinary procedural), `assign_site` state + gated re-eval process; `release`
-  reverts to an active `assign` (the assign's re-eval process is force_site-aware);
-  `deassign` holds; both last-wins. Full ladder byte-identical to iverilog.
-- [x] **`force` / `release`** on **nets** (LRM 10.6.2, Phase 1.5): resolver-level
-  override — a forced net always resolves through `emit_wire_resolvers`, which injects
-  `force_site != 0 ? force_val : <driver fold>` and reverts on `release`. Uniform over
-  single-driver, gate-driven, multi-driver/resolved, and undriven (reverts to z) nets;
-  continuous RHS tracking, which iverilog does not do (it evaluates the
-  net-force RHS once — its own documented limitation).
-- [x] **`force` / `release`** on a constant **bit/part-select of a net** (LRM 10.6.2,
-  Phase 2): per-force-site `{active, range-wide val, [lo,hi]}`; the net resolver stores
-  the driver fold then positionally overlays each active site's bits (z-preserving),
-  reverting on release. Non-overlapping sites exact; byte-identical to iverilog.
-  Bit/part-select of a **variable** is LRM-illegal (§10.6.2) yet accepted by
-  iverilog — rejected loud pending a decision (see below).
-- [x] **Shape-agnostic write gate** for force/assign targets (LRM 10.6.2 suppresses the
-  *update*, not the statement): one `store_or_gate` helper wraps the store alone, so the
-  RHS, the lvalue's selectors and a read-modify-write's read still run (`x++` under force
-  yields the forced value and leaves it standing). The write predicate is
-  `pca_info_of_lvalue` — `force_info_of(lvalue_root(lhs))` — replacing the old
-  force-STATEMENT predicate. Covers selects, packed-struct members, compound
-  assignment, `++`/`--`, per-operand gating of a concatenation lvalue, and the
-  output-argument copy-back — the last three were silently overriding the force before.
-  Intra-assignment timing on a write to a force target (`x = #5 e`) is guarded loud: the
-  update commits after the delay, so the gate must ride the deferred record.
-- [ ] **`force` / `release`** on a **concatenation** of nets/selects (LRM 10.6.2), and
-  the LRM-illegal-but-iverilog-accepted variable bit/part-select force.
+- [ ] **`force` of an input or inout port target** (10.6.2) — the port-copy driver does not
+  honour the force.
+- [ ] **Intra-assignment timing on a write to a `force` target** (10.6.2) — suppression must
+  be decided when the deferred update commits, but the deferred record carries no gate.
+- [ ] **`force` / `release` of a concatenation** (10.6.2) — a concatenation of nets or net
+  bit/part-selects as the target.
 
 ### Real numbers
 
-- [x] **`case` on a real selector / label** (LRM 12.5) — 12.5 words matching as a
-  bit-for-bit `===` and Table 11-1 bars `===` on a real, so the standard defines the
-  comparison only for integral operands; a real carries no x/z, which is the whole
-  content of the 4-state rule, so it degenerates to IEEE-754 equality (the same call
-  clotho already makes for strings, 6.16.9). A real selector or a real item label
-  routes the whole statement to `lower_case_real`, which matches with `FEq` after
-  widening both sides to `real` — an integral operand converts first (11.8.1), so
-  `case (2.0) 2:` hits; `-0.0` matches `0.0`; a NaN selector matches nothing and
-  takes `default`. It keeps 12.5's lazy first-match chain, so a later label's side
-  effects never run once an earlier item matched; keeps the `unique` / `unique0` /
-  `priority` 12.5.3 overlap and no-match violation checks, built from the same
-  per-item predicates; and compares a `case ... inside` range member with `FGe` /
-  `FLe` (11.4.13 membership is relational, which Table 11-1 does define for reals).
-  The `(* full_case *)` / `(* parallel_case *)` analysis is skipped — it enumerates
-  the selector's integral value space. The same matching rule applies to the `case`
-  PROPERTY (16.12.16, `eval_case_match`). `casez` / `casex` over a real stay
-  rejected, by slang's binder rather than by clotho: it refuses a non-integral
-  selector for either keyword, reading 12.5.1's do-not-care positions as bit
-  positions. iverilog accepts that spelling and treats it as a plain case, so
-  this is a deliberate deviation. Still guarded loud on the real path exactly as
-  on the integral one: `case ... inside` tolerance ranges (`+/-`, `+%-`) and `$`
-  range bounds.
-- [x] **Fractional (real) delays** (LRM 3.14 / 22.7) — a real `#delay` (procedural,
-  intra-assign, continuous, gate) rounds to its module's time precision then scales
-  to wheel ticks (`FtoI` half-away, LRM 6.12.1). The wheel tick is the design-wide
-  GCD of every module's *unit* plus the *precision* of every scope that actually
-  contains a real delay -- including inside a subroutine body
-  (`scope_has_own_real_delay` / `design_tick_fs` / `global_scope_tick_fs` in
-  `src/Lower.cpp`), so an integer-only design keeps the coarse minimum-unit tick and
-  its generated IR is byte-identical to before — zero cost. A constant `#1.5` folds
-  to a single tick constant; a runtime `#(rvar)` costs one round + one integer
-  multiply. Follow-ups (only real-delay designs, and only these shapes, pay): (a)
-  many *concurrent* fractional timers whose fine-tick periods all exceed the wheel's
-  1024-slot window spill to the O(log n) overflow heap (~2.5x on a 64-timer
-  microbench; a single/sparse clock is free — the wheel jumps straight to the lone
-  overflow deadline). A hierarchical wheel (below) removes this; a cheaper partial
-  win is to set the tick to the GCD of a module's *constant* real-delay values
-  instead of its full precision when the module has no runtime real delay. (b)
-  negative / NaN / inf real delays are not clamped (parity with the integer path).
-- [ ] **A `$unit`-scope subroutine / class has no time unit** — a `timescale`
-  directive applies to design elements (LRM 3.14.2.2), so slang leaves
-  `CompilationUnitSymbol::timeScale` unset unless `$unit` carries an explicit
-  `timeunit` / `timeprecision`, and `apply_time_scale` then falls back to unitless
-  (multiplier 1). A function, task or class method declared directly in `$unit`
-  therefore reads `$time` in *wheel ticks* and writes `#5` as five ticks — a unit
-  that moves with unrelated parts of the design (adding a `#0.5` anywhere shifts
-  the tick from 1 ns to 1 ps and with it every `$unit` reading). Measured on
-  `` `timescale 1ns/1ps `` + a `$unit` function: clotho reports 3000 where the
-  module reports 3; iverilog reports 0, i.e. its own 1 s default. The fix is a
-  fixed tool-default timescale for a scope slang hands back no timescale for
-  (and folding that unit into the wheel tick, like `global_scope_tick_fs` already
-  does for package / `$unit` scopes that DO declare one). Declaring the class or
-  subroutine in a package or module — the usual case — is unaffected.
-- [x] **Subroutine delays and `$time` use the declaring scope's timescale**
-  (LRM 3.14.2.3) — a `#5` or a `$time` read inside a task/function is in the time
-  units of the scope that *declares* it, not the one that calls it. Clotho lowers
-  each subroutine body once and shares it across call sites, so the caller's
-  multiplier left at most one caller correct: a `1ns` package task called from a
-  `1us` module delayed 5 us, silently, 1000x off. `function_id` now sets
-  `time_mul_` / `prec_over_tick_` from `sub.getParentScope()->getTimeScale()`
-  around the body build (`apply_time_scale`), which makes memoization sound —
-  the body's scaling depends only on the declaration. Two supporting fixes: the
-  wheel tick folds in the unit (and real-delay precision) of any package /
-  `$unit` scope that declares a subroutine (`global_scope_tick_fs`), since those
-  sit outside the instance tree and a coarser tick cannot represent their delays
-  at all; and `scope_has_own_real_delay` now reads subroutine and class-method
-  bodies, so a real delay inside a task rounds to its own precision (`#1.5` in a
-  `1ns/1ps` task was rounding to 2 ns instead of 1500 ps). Cross-checked against
-  iverilog; see tests/task_test.cpp.
-- [x] **`real` / `shortreal` types** — storage, arithmetic, conversions, literals,
-  parameters, comparisons, `?:`, sensitivity / NBA / continuous / ports / unpacked
-  arrays, display formats.
-- [x] **`$realtime`** — including inside a plain function, in the units of the
-  scope that declares it.
-- [x] **Real `$display` formats** (`%f`, `%e`, `%g`) and the 21 real math system
-  functions (LRM 20.8.2). A real under `%d`/`%h`/`%x`/`%o`/`%b` also converts to
-  its rounded integer (LRM 21.2.1.2 / Table 21-1, rounding per 6.12.1) and formats
-  in the requested base. Still guarded loud: `%c` and `%u`/`%z` of a real.
+- [ ] **Concurrent fractional-delay timers (performance)** (3.14) — fine-tick periods past
+  the wheel window spill to the overflow heap; needs a hierarchical wheel or a coarser tick.
+- [ ] **Negative, NaN or infinite real delay** — not clamped, as for the integer path.
+- [ ] **Time unit of a `$unit`-scope subroutine or class** (3.14.2.2) — with no `timeunit`
+  in `$unit`, `#d` and `$time` count raw wheel ticks; needs a fixed default timescale.
+- [ ] **`%c`, `%u` and `%z` of a real argument**.
 
 ### Observability & debug
 
-- [ ] **VCD sparse / scope-subset selection** (whole-design dump only today).
-- [ ] **VCD of a string signal** — blocked on the format, not the engine: IEEE
-  1800-2023 21.7.2 defines no `string` var type, and iverilog and Verilator both
-  omit string signals from the dump entirely. Belongs in FST, which carries
-  variable-length values natively.
+- [ ] **Located backend refusals outside instruction lowering** — refusals from the
+  program-region pre-passes, DPI and class-descriptor emission, and VCD variable
+  emission name their subject but carry no source location.
+- [ ] **Selective VCD dump** — `$dumpvars` scope-subset and sparse selection; only a
+  whole-design dump is produced.
+- [ ] **VCD of a string signal** (21.7.2) — the format has no `string` var type; needs a
+  format with variable-length values such as FST.
 - [ ] **VCD of a multidimensional array**.
-- [x] **VCD of a signal with no `$var` form is refused, loudly** — a $dumpvars over
-  a design declaring a string, a container (queue / dynamic array / associative
-  array), an unpacked struct or a class handle used to be silently wrong: the queue
-  got `$var reg 1 ! q $end` aliased to its RING POINTER (never changing), the class
-  handle dumped a heap address, and the unpacked struct SEGV'd in codegen on its
-  null leaf slot type. `check_vcd_scope` now refuses the dump at lowering, naming
-  the offending declaration, and the backend keeps a matching throw as the second
-  line of defence (a compiler-synthesized signal is skipped instead — it is not
-  design state). Walks exactly the set the backend registers, so a package-scope
-  variable, which is never dumped, does not trigger it. The follow-up that removes
-  the most common cause is dumping an unpacked struct / array as one `$var` per
-  leaf.
-- [x] **VCD of a named event** — `$var event 1`, and the bare pulse `1<id>` at
-  each instant the event triggers (all three forms: `-> e`, `->> e`, `->> #d e`,
-  hooked at the single `emit_event_fire` stamp point). The runtime diffs the
-  event's last-trigger tick, so repeated triggers in one instant collapse to one
-  pulse; a forced dump and the `$dumpoff` checkpoint never invent one, which
-  iverilog does at time 0, `$dumpall` and `$dumpon`.
-- [x] **`$monitor` / `$monitoron` / `$monitoroff`** (+ radix `$monitorb/o/h`,
-  LRM 21.2.2) — one persistent monitor (a new `$monitor` replaces the previous),
-  reprinting at the Postponed region of every time step only when an argument
-  changed. A synthesized zero-formal body (`build_deferred_body`) renders the arg
-  list and calls `rt_monitor_emit`, which prints only when the rendered output
-  differs from the last (render-compare change-detection — no per-signal wiring).
-  The body's ramp function pointer is registered via `MonitorSet`/`rt_monitor_set`;
-  the drain (`emit_active_run`, after the `$strobe` loop, gated by
-  `design_uses_monitor_`) indirectly ramps + resumes it each settled instant.
-  `$monitoron`/`$monitoroff` toggle (reon reprints). Rejected inside a plain
-  function (no record slot for the deferred body), like `$strobe`. Caveat:
-  change-detection is on the rendered output, so `$time`/`%t` in the arg list
-  reprints every step.
-- [ ] **`$timeformat` dynamic-string suffix & zero-arg reset form** (only a
-  string-literal suffix accepted).
-- [x] **VCD dump** (`$dumpfile`, `$dumpvars`, `$dumpon`/`$dumpoff`, `$dumpall`,
-  `$dumpflush`, `$dumplimit`) — whole-design dump, background writer thread,
-  activity-driven dirty set, memories, reals, events (docs/VCD.md).
-- [x] **`$timeformat` + `%t`**.
-- [x] **`$strobe`** (LRM 21.2.2) — `$strobe`/`$strobeb`/`$strobeo`/`$strobeh`;
-  a synthesized zero-formal task holds the deferred arg evaluation, ramped (not
-  resumed) at the call site and drained once per settled instant in the
-  Postponed region, just before the wheel advances. Rejected inside a plain
-  function (its deferred body rides the caller's task-call record slot, which only
-  a coroutine has) and of an automatic-lifetime argument (its storage cannot
-  outlive the call — slang's own binder catches this, matching iverilog).
-- [x] **`--emit ir` of a self-referential class type terminates** — the IR type
-  printer walked a type structurally with no cycle guard, so a MODULE-SCOPE signal
-  whose class type reaches itself made `render_type` recurse until the stack ran
-  out: 2.3 MB of `s0: class{nm:string, kids:class{nm:string, kids:class{...`,
-  truncated mid-identifier, then SIGSEGV (exit 139) with a mutually-recursive frame
-  pair inside `std::__ostream_insert`. A local inside an `initial` did not trigger
-  it — only the signal table renders a signal's type — and `clotho run` on the same
-  file was always fine, because nothing but the printer expands a class body. It
-  fired on ALL of UVM (`uvm_printer.svh:419` declares
-  `local uvm_printer_element m_children[$]`, a queue of the enclosing class), which
-  cost more than a dump: `--emit ir` is THE tool for diagnosing a backend problem,
-  so the one design whose backend problems most need inspecting was the one design
-  that could not be inspected. `render_type` now carries the stack of classes whose
-  bodies it is inside and renders a re-entered one as `class^N` instead of expanding
-  it again — a de Bruijn index counting outward from the class being expanded, so
-  `class^1` is the innermost one. Positional rather than named because the pool
-  carries no source name for a class: it identifies one by its `Ref` alone (the
-  backend's own `clotho.classdesc.<ref>`), and a bare `Ref` in the dump would name
-  nothing a reader could resolve. `^` appears in no other type rendering, so an
-  elided cycle is never mistaken for a leaf. ONE guard covers every cycle shape,
-  because `Kind::Class` is the only cyclic node in the type graph — a value struct
-  cannot contain itself (`reserve_struct_fields` exists for classes and nothing
-  else), so every cycle must pass through a handle: direct self-reference, mutual
-  A<->B, three-hop A->B->C->A, and a cycle through a queue / dynamic-array /
-  associative-array element or a struct member all stop at the same test. The
-  struct-member form is not reachable from source today — slang refuses any struct
-  that transitively reaches itself through a class handle ("'wrap' recursively
-  depends on its own definition") — so it is pinned against a pool-built type
-  instead, since the type graph models it and the printer must survive it either
-  way. Ordinary output is byte-identical by construction — the guard emits only on
-  the re-entry branch — and tests/ir_test.cpp pins a non-recursive class's
-  rendering so it stays that way. Audited every other structural type walk for the
-  same hazard and found none: the backend's `agg_storage_ty` / `class_body_ty` bottom
-  out at the class HANDLE slot rather than descending into the body,
-  `reaches_class_handle` is already an explicit worklist that never expands a Class node,
-  `InternPool::compute_layout` answers Class with the 64-bit handle layout without
-  reading its property table, `unsynthesizable_type` and `guard_agg_key_leaves`
-  stop at the same boundary, and `%p` deliberately prints a handle's class name at
-  every depth for exactly this reason (Lower.cpp:19419-19440). `--stat` emits
-  counts and timings only, and no LSP / DAP path renders an IR type today. The
-  `class^N` notation this describes is SUPERSEDED by the item below: a class is now
-  named rather than expanded, so render_type never re-enters a class body and there is
-  no cycle left to guard. The audit above still holds.
-- [x] **`--emit ir` prints a class by NAME, once per class** — the second, pre-existing
-  unboundedness in the same walk, untouched by the cycle guard above: `render_type`
-  expanded a class body structurally at every occurrence, so a class reachable by k
-  distinct paths was printed k times and the dump grew exponentially in the class
-  count. Measured on a strictly ACYCLIC chain where class i holds handles to i+1, i+2
-  and i+3 (no cycle, so the guard never fires — the dump contains zero `^`, which is
-  what proves it was the old output byte for byte): 7.3 KB at 10 classes, 88 KB at 14,
-  1.02 MB at 18, 11.7 MB at 22, i.e. ~1.8x per class added. It cost the tool on the
-  design that needs it: the easyuvm testbench's dump did not complete in 600 s, having
-  emitted 64 KB of a single unterminated signal line.
-
-  A class now renders as `class <name>`, and `print_module` describes each one exactly
-  once in a class table ahead of the signals: `class node {nm:string, kids:class node
-  [$]}`. Same chain now: 655 B, 887 B, 1119 B, 1351 B — 58 bytes per added class, flat.
-  The easyuvm dump completes in under a second at 183 KB / 1268 lines, describing 457
-  UVM classes. Always naming, rather than expanding the first mention and naming
-  after, because a first-mention expansion is keyed on traversal order: it makes the
-  dump churn under unrelated edits, and it still inlines the whole reachable class DAG
-  into whichever signal line comes first. A small design does not get worse — one
-  table line per class replaces the same braces inlined in the signal line, and the
-  signal line becomes `s0: class plain p (internal)`.
-
-  Naming also RETIRES the `class^N` cycle marker rather than coexisting with it:
-  render_type can no longer enter a class body, so there is no recursion to guard and
-  nothing to elide, and a cycle reads as the name recurring inside the body the way
-  the source writes it. `^` is gone from the type grammar; the cycle shapes "printer: a cycle guard for the IR type printer"
-  pinned still terminate and now read as named classes.
-
-  The name is threaded through a class-name side table on `InternPool`, not on
-  `Module` as this item first guessed: `print(const Ir&)` renders local, argument and
-  operand types with nothing but `Ir::pool()` in hand, so a table on `Module` would
-  leave every instruction-level mention unnamed. Registered by `Lower`'s
-  `bind_class_type` at the one moment a Ref becomes the design's handle on a
-  ClassType, which is also the only moment the name is available. It is the type's own
-  rendering (`ClassType::toString()`): unqualified by scope, but WITH a
-  specialization's arguments — `uvm_queue#(uvm_callback)`, not `uvm_queue`. slang
-  monomorphizes each `C#(args)` into its own ClassType yet names every one of them
-  plainly `C` (the arguments live in genericParameters and only the type printer
-  appends them, TypePrinter.cpp:373-379), so a bare name would collide across every
-  specialization of a generic class, which in UVM is most of them. That is where the
-  label deliberately differs from what `%p` prints for a handle, which is the bare
-  `ClassType::name`: `%p` renders a value for someone reading simulation output and
-  LRM 21.2.1.6 leaves its form implementation-defined, so it owes no uniqueness (the
-  comment there claiming slang's name already carried the arguments was wrong, and is
-  corrected).
-
-  A label has to name ONE class, because the class table is keyed by it and every
-  mention resolves through it, so two classes sharing a name both take the Ref:
-  `class c#8` beside `class c#13`, never `class c` beside `class c#13`, which would
-  read as one class described twice. A class the pool has no name for prints
-  `class#<ref>` — the compiler-synthesized fork-capture box (named `$capture`) and any
-  class interned straight into the pool. The Ref is the disambiguator rather than a
-  scope qualifier for two reasons: qualification would not make a label unique on its
-  own, since one ClassType lowers once per top and each Lowerer mints its own nominal
-  Ref, so the Ref is needed either way; and the Ref is the backend's own name for the
-  class (`clotho.classdesc.<ref>`), so where the dump falls back on a number it is the
-  number that cross-references the output the reader came to diagnose.
+- [ ] **VCD of an unpacked struct or unpacked array** — a dump over one is refused; needs
+  one `$var` per leaf.
+- [ ] **VCD of a container or class-handle signal** — a dump over a queue, dynamic array,
+  associative array or class handle is refused.
+- [ ] **`$monitor` with `$time` or `%t` in its arguments** (21.2.2) — change detection
+  compares rendered output, so it reprints every time step.
+- [ ] **`$strobe` and `$monitor` inside a function** (21.2.2) — the deferred body needs a
+  task-call record slot that only a coroutine has.
+- [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
+  string-literal suffix is accepted.
 
 ### File and string I/O
 
-- [ ] **Non-byte-multiple / part-select `$fgets` target**.
-- [ ] **Scanf target width** — targets must be whole-storage and <= 64 bits.
-- [x] **Streaming file output** — `$fstrobe` / `$fmonitor` (+ radix). The first
-  argument is the destination descriptor; the synthesized deferred body targets
-  that fd. `$fstrobe` reuses the `$strobe` Postponed drain; `$fmonitor` reuses the
-  `$monitor` per-instant run and change-detection (`build_deferred_body` handles
-  both the fd and monitor variants).
-- [x] **`$value$plusargs` into a `string` object** (§21.6) — the `%s` form, which
-  is "string (no conversion)": the plusarg remainder IS the value, so
-  `rt_value_plusargs_str` assigns it to the `rt_string` handle verbatim with no
-  width cap, no right-justification and no padding, unlike the packed-vector
-  path's `rt_value_plusargs`. Same pattern as `$fgets` / `$ferror` into a string
-  (`rt_fgets_str` / `rt_ferror_str`), and the same LRM answers as the integral
-  destinations: a match returns nonzero, no match returns 0 and leaves the
-  variable untouched, an empty remainder stores the empty string ("either a zero
-  or an empty string value"). Load-bearing for UVM: `uvm_root.svh:551`
-  (`+UVM_TESTNAME`, into `run_test`'s own `string test_name=""` formal) and
-  `uvm_cmdline_report.svh:66` (`+UVM_VERBOSITY`, into a function local) are the
-  only two `$value$plusargs` sites in the library, and UVM cannot select a test
-  without the first.
-
-  The specifier matrix as it now stands, per §21.6's list (uppercase and leading-0
-  forms are accepted spellings of each, folded by `tolower` in the frontend):
-
-  | conv | packed / integral | `string` | `real` |
-  |------|-------------------|----------|--------|
-  | `%d` | yes | refused | refused |
-  | `%o` | yes | refused | refused |
-  | `%h`, `%x` | yes | refused | refused |
-  | `%b` | yes | refused | refused |
-  | `%s` | yes (width-capped, right-justified) | **yes** | refused |
-  | `%e`, `%f`, `%g` | refused | refused | refused |
-
-  A part-select destination (`v[7:0]`) is refused for every conversion; a whole
-  aggregate or class handle slang itself rejects as an argument type. Truncation
-  to a narrower destination and the all-`'bx` illegal-character result are the
-  clause's own rules and are unchanged.
-- [ ] **`$value$plusargs` `%e`/`%f`/`%g` (real) conversion**, and with it any
-  `real` destination at all. Refused in the frontend for every conversion now: an
-  integral conversion into a real used to be accepted and write the parsed bit
-  pattern into the IEEE-754 mantissa, so `+V=12` with `%d` read back as
-  `0.000000` with no diagnostic. Needs the same ASCII->real scan
-  `$fscanf`/`$sscanf`'s own `%f`/`%e`/`%g` needs, plus a real-slot write-back
-  (`rt_value_plusargs`'s `rt_scan_arg` is must/may planes).
-- [ ] **`$value$plusargs` numeric conversion into a `string` object** — `%d` and
-  friends with a `string` destination. §21.6 stores the CONVERTED value, so this
-  is 6.16's integral-to-string assignment of it (a one-byte string holding a
-  character code), which is a separate question from the `%s` "no conversion"
-  form above and is what real code uses. Refused in the backend, where the
-  destination's storage kind is known.
-- [x] **`$fscanf` / `$sscanf` write-back into a `string` object** (§21.3.4.3) —
-  the shape the old entry predicted: the shared `rt_scan_arg` descriptor grew a
-  string-handle variant (`str` + `site`, flags bit1) and the scan engine's store
-  step a branch on it, so several targets still interleave through one array and
-  `rt_fscanf` / `rt_sscanf` needed no new JIT-exposed entry point. The `%s`
-  token is assigned to the `rt_string` handle verbatim — no width cap, no
-  right-justification, no padding — like `rt_value_plusargs_str`; `%5s` into an
-  unbounded string needed no "own answer" after all, because the field width
-  already caps the TOKEN in the engine and the capped token is the value.
-  Unblocks `uvm_root.svh:916`,
-  `$sscanf(timeout, "%d,%s", timeout_int, override_spec)`.
-
-  The `%s` delimiter decision: an input field is "a string of nonspace
-  characters" and `%s` "matches a string, which is a sequence of nonwhite space
-  characters" (Table 21-7), so `%s` skips leading whitespace and stops at
-  whitespace or end of input — NOT at a format literal. `"%d,%s"` over
-  `"1000,YES"` therefore stores `YES` (the ',' was already consumed by the
-  literal match), which is what UVM's case-over-`override_spec` needs; with the
-  string FIRST, `"%s,%d"` over `"YES,1000"` stores `YES,1000` and returns 1,
-  because the bare `%s` swallows the comma before the literal can match. Both
-  cross-checked against Icarus Verilog, which agrees byte-for-byte.
-
-  The specifier matrix for scan destinations, per §21.3.4.3's own sentences
-  ("The integer format specifiers ... may be used to read into any of the
-  integral data types"; "The string format specifier %s (or %S) may be used to
-  read into a variable of integral, unpacked array of byte, or string data
-  types"; integer specifiers "shall not be used with any unpacked aggregate
-  data type"):
-
-  | conv | packed / integral | `string` | `real` | unpacked aggregate |
-  |------|-------------------|----------|--------|--------------------|
-  | `%d`, `%o`, `%h`/`%x`, `%b` | yes | refused (frontend, names the specifier) | refused | refused |
-  | `%c` | yes | refused (a string destination under `%c` is not in the clause's list; `.putc`/6.16 territory) | refused | refused |
-  | `%s` | yes (width-capped, right-justified) | **yes** (verbatim token) | refused | refused (see below) |
-  | `%e`, `%f`, `%g`, `%v`, `%t`, `%u`, `%z`, `%m` | refused | refused | refused | refused |
-
-  Two silent wrong answers found while tabulating, both now loud:
-  - An unpacked aggregate destination flat-plane-stored, so the clause's own
-    sanctioned `%s` into an unpacked array of byte landed the token
-    right-justified — REVERSED across elements (`$sscanf("hello", "%s", b)` put
-    `'o'` in `b[0]`) — and the integer specifiers accepted a destination the
-    clause forbids outright. Both refuse in the frontend now.
-  - The scan return value conflated the clause's two failure kinds: a directive
-    failing on a CONFLICTING character is a matching failure and returns the
-    count so far ("this number can be 0 in the event of an early matching
-    failure"), while EOF (-1) is only "if the input ends before the first
-    matching failure or conversion". The engine returned -1 for both, so
-    `$sscanf("abc", "%d")` read -1 where the clause, glibc and Icarus all say
-    0. The engine now tracks input-end vs conflict per directive; the one
-    deliberate divergence from Icarus is `$sscanf("a", "a%d")`, where a matched
-    LITERAL is neither a matching failure nor a conversion, so the clause (and
-    glibc) return -1 while Icarus returns 0 — clotho sides with the clause.
-
-  `$sformat` / `$swrite` were audited for the same gap and DO NOT have it:
-  their backend `lower_sformat` already branches on `lv.is_string` into
-  `rt_sformat_str` with the change-notify bracket, verified end-to-end through
-  the CLI. A failed conversion leaves its destination untouched, and earlier
-  conversions in the same call still count and store — the UVM mixed shape
-  works in both orders.
-- [ ] **`$fscanf` / `$sscanf` `%s` into an unpacked array of byte** — sanctioned
-  by §21.3.4.3 but refused today (see the matrix above): the store must be
-  element-ordered (`b[0]` = first character), so it needs a descriptor variant
-  carrying element stride and count like `rt_fread`'s, not the flat plane
-  right-justification the engine does for packed targets. No known real-code
-  blocker reaches it; UVM's paths use `string` and packed destinations.
-- [ ] **`$value$plusargs` runtime (non-literal) `str` argument**. Shared with
-  `$test$plusargs`, whose query string is under the same restriction; §21.6's own
-  `ieee1364_example` exercises it through a `pstring` variable. Both refuse in
-  the frontend today. One feature, not two: the prefix has to be materialized and
-  handed to the runtime as bytes at the call rather than baked into a global.
-- [~] **Persist the Driver / SourceManager across runs** for buffer + parse
-  caching (SM/loader/trees are public so a cache layer can sit above them).
-  Within-process retention has landed: `lower_*` returns a `SourceContext`
-  (`src/SourceContext.h`) owning the Driver / SourceManager / Compilation, so an
-  `ir::SourceLoc` stays resolvable after lowering returns. Reuse ACROSS runs
-  (parse caching) is still outstanding and needs the content-addressed cache.
-- [x] **Run-start reset of process-global runtime state** — `rt_run_init`
-  (`src/runtime/Runtime.h`, `src/runtime/Runtime.cpp`), emitted unconditionally at
-  the top of the design's main beside `rt_gc_init` and subsuming the old
-  `rt_event_pool_init`. A host that runs more than one design per process — which
-  is every `clotho_test` process, since `ir::run_jit` builds a fresh LLJIT per
-  design — used to carry state across designs: an unclosed `$fopen` kept its MCD
-  channel until the 30-wide space ran out, the unseeded `$random` stream was
-  deterministic only for the first design, a detached `->> @(x) e` record survived
-  `$finish` keyed by a `trig_id` the next design reused, and the PCB and event
-  pools grew without bound. `rt_run_init` returns the PCB pool, the event pool,
-  the detach table, the NBA-array and intra-assignment queues, the file tables,
-  the per-site diagnostic suppression maps and the `$random` seed to power-on.
-  Deliberately out of scope: GC state (`rt_gc_init` owns it and preserves
-  `g.stats`), VCD, and host-armed configuration set before the module runs.
-  `sim_teardown` stays as it is — it drops what would dangle into dead JIT code
-  the moment a run ends, but it cannot be the seam, because it runs before the
-  emitted signal deinit and `rt_gc_shutdown` and is skipped entirely by the fatal
-  `std::exit` paths. Still owed: the wait queues, the observed/deferred queues and
-  the string pools (docs/design/cooperative-finish.md §Why).
-- [ ] **`param-overrides` (`-G`), config/library-map (`--libmap`)** not yet surfaced.
-- [x] **File output** (§21.3) — `$fopen` (MCD + FD), `$fclose`, `$fdisplay`/`$fwrite`,
-  `$fflush`.
-- [x] **File input / positioning** (§21.3.4–5) — `$fgetc`, `$ungetc`, `$fgets`,
-  `$feof`, `$ftell`, `$fseek`, `$rewind`. `$fgets` into a `string` object
-  reads the whole line with no fixed-width cap (`rt_fgets_str`); a
-  packed-vector destination keeps the width-capped right-justified path.
-- [x] **String formatting** (§21.3.3, §21.3.6) — `$sformat`, `$swrite`,
-  `$ferror`. `$ferror` into a `string` object writes the message via
-  `rt_ferror_str`, same error-code semantics as the packed-vector path.
-- [x] **A `$sformat` / `$sformatf` format that is not a string literal**
-  (§21.3.3). The clause makes these two the one exception in the family: "The
-  format arguments to these tasks must be string literals, i.e., they cannot be
-  expressions of string data type. The only exception is `$sformat`, whose second
-  argument can be an expression of string data type." Clotho used to refuse every
-  non-literal format with a TODO claiming a runtime format "needs dynamic string
-  support, which Clotho lacks". **That premise was stale**: `rt_sformat` /
-  `rt_sformat_str` have always parsed the format at run time, and `rt_arg` has
-  always been a tagged descriptor carrying width, signedness and the string / real
-  flags. Only the frontend was baking the format into a constant. Two paths now:
-
-  **A CONSTANT format folds and costs nothing.** The blocker that motivated this
-  is Accellera UVM's `uvm_phase.svh:1963`, whose jump-failure message is a
-  four-piece concatenation of string literals — not a literal, but a compile-time
-  constant, as are a `localparam string` and a stringified macro.
-  `const_format_text` evaluates the format expression through slang's
-  `ASTContext` / `EvalContext` and hands the text to the EXISTING compile-time
-  path (`build_format`'s new `lead_text`), so specifier validation, `%m` / `%l`
-  splicing and `%p` expansion all come for free. A concatenation has type
-  `bit[N]` (LRM 5.9), so the constant arrives as an integral whose bytes are the
-  text; `ConstantValue::convertToStr()` is slang's own LRM 6.16 conversion (8-bit
-  chunks most significant first, a zero chunk dropped, a short leading chunk when
-  `N` is not a multiple of 8) and is the same rule `rt_string_from_packed` applies
-  at run time, so a folded format and a computed one that hold the same bits
-  agree. Verified free: `clotho build --emit ir` for `$sformat(s, "a=%0d b=%0d",
-  1, 2)` and for the equivalent concatenation are IDENTICAL modulo the file name
-  in the source locations, and both emit the same `rt_sformat_str` call with the
-  baked format global and a null dynamic context.
-
-  **A genuinely RUNTIME format pays only for itself.** The format's `rt_string`
-  hands the renderer its own NUL-terminated character buffer (`rt_string_data`,
-  the guarantee the DPI `string` argument path already relies on) — no copy, read
-  only within the call, never retained; an empty string is a pointer to a NUL and
-  renders nothing. Text past an embedded NUL is unreachable, since a `const char*`
-  format cannot express one. Each value argument is marshalled raw into an
-  `rt_arg`, because which specifier it will meet is not knowable at compile time,
-  and the renderer then does everything `build_format` used to do in the IR: the
-  LRM 6.12.1 integral↔real reconciliation, the `%t` tick scaling, and `%p`. The
-  one call-site fact it cannot derive is the calling module's ticks-per-time-unit,
-  which rides a new `rt_fmt_dyn` (null on the constant path, so that path takes no
-  extra branch). `%p` of a singular value gained a runtime case
-  (`render_p_scalar`), which mirrors `expand_p_scalar` deliberately and says so on
-  both sides: minimal decimal at the operand's own signedness, `%g` for a real,
-  quotes around a string. The IR carries the format as a real SSA operand
-  (`SformatInfo` / `SformatfInfo::fmt_value`, reported through
-  `ExtraOperandTail`), so def-use, liveness and DCE see it.
-
-  **Refused loudly, never approximated.** An aggregate or container argument
-  against a runtime format is a COMPILE error naming the argument position and the
-  type kind ("$sformat argument 4 is an unpacked struct"): `rt_arg` has no image of
-  an aggregate, and with a format unknown until run time the frontend cannot tell
-  whether the argument will meet a `%p` and so cannot expand one. At run time,
-  every rejection `check_specifier` makes at compile time is made again with the
-  text in hand — an undefined conversion, `%v`, more specifiers than arguments, a
-  string under a numeric conversion, `%c` / `%u` / `%z` of a real — each a located
-  fatal naming the specifier, with a source caret and the simulation time, never
-  wrong text.
-
-  **`$display` / `$write` are deliberately unchanged and clause-backed.** Their
-  format must be a literal, so `$display({"a=%0d ", "b=%0d"}, 1, 2)` correctly
-  prints the concatenation as one integral value and `$display(f, 7)` prints `f`
-  under `%s` followed by a bare `7`. Verilator 5.050 agrees byte for byte;
-  iverilog is lenient that treats both as formats, and is wrong on the
-  clause. Pinned by a regression test in `display_test.cpp` so nothing added to
-  the shared `build_format` can leak `$sformat`'s exception into the family.
-  iverilog 13 and Verilator 5.050 do agree with each other, and with Clotho, on
-  every `$sformat` shape above.
-- [x] **`$psprintf`** — a nonstandard tool extension some simulators (VCS,
-  Questa) accept as an alias for `$sformatf`; found via UVM examples using it
-  in `convert2string`/`do_print` overrides. slang itself models the two
-  identically, registering both through the same `SFormatFunction` class
-  (`build/_deps/slang-src/source/ast/builtins/MiscSystemFuncs.cpp:453-454`),
-  differing only by a nonstandard-extension warning flag — same argument
-  validation, same return type, same eval. Dispatches to `lower_sformatf`
-  alongside `$sformatf`.
-- [ ] **`%m` / `%l` in a runtime `$sformat` format** — they name the invoking
-  scope, which only the compiler knows; `append_format_literal` splices the text
-  in for a constant format and the renderer never learns either name. Would need
-  the hierarchical name and the `library.cell` to ride the IR record (two more
-  byte runs on `SformatInfo` / `SformatfInfo`) and reach the renderer through
-  `rt_fmt_dyn`.
-- [ ] **An aggregate or container argument to a runtime `$sformat` format** —
-  refused today (above). Clotho already has runtime container descriptors for
-  `%p` of a queue / dynamic array (`ir::Inst::Tag::ContainerFmtP` →
-  `rt_container_fmt_p`), so a future version could pass a type descriptor
-  alongside each `rt_arg` and let the renderer walk the value once it turns out
-  to meet a `%p`.
-- [ ] **An operand wider than 64 bits under `%e` / `%f` / `%g` from a runtime
-  format** — the constant path handles it (`ItoF` lowers to `SIToFP` on the full
-  `iW`); accumulating the planes in the renderer would round at every word
-  boundary instead of once, so it refuses rather than being quietly off.
-- [ ] **An empty argument (adjacent commas) against a runtime `$sformat` format**
-  — an empty argument contributes format TEXT (LRM 21.2.1), and there is no format
-  text at compile time to contribute to. Would need a "renders as a space,
-  consumes no specifier" marker in `rt_arg`.
-- [x] **Format scanning** (§21.3.4) — `$fscanf`, `$sscanf`, into packed targets
-  or (for `%s`) a `string` object.
-- [x] **Binary read** (§21.3.4) — `$fread` into a scalar or unpacked-array memory.
-- [x] **Command-line plusargs** (§21.6) — `$test$plusargs` / `$value$plusargs`,
-  the latter into a packed vector or (for `%s`) a `string` object.
-- [x] **slang `driver::Driver` frontend** — `-D`/`+define+`, `-I`/`+incdir+`, `-f`
-  command files, `-y`/`-v` libraries, `--top`, `--timescale`, `--std`; single-unit
-  compile. `--loose-timescale` accepts a design mixing elements that declare a
-  time scale with elements that do not (LRM 3.14.2.2), giving the un-annotated
-  ones `--timescale`'s value or `1ns/1ns`; refused by default, since a missing
-  unit otherwise makes a `#5` mean whatever the design's finest unit happens to
-  be.
+- [ ] **`$fgets` into a part-select or non-byte-multiple target**.
+- [~] **`$fscanf` / `$sscanf`** (21.3.4.3) — missing pieces:
+  - [ ] **Target wider than 64 bits or not a whole variable**.
+  - [ ] **`%e`, `%f`, `%g` conversions and any `real` destination**.
+  - [ ] **`%t`, `%u`, `%z`, `%v` and `%m` conversions**.
+  - [ ] **`%s` into an unpacked array of `byte`** — needs an element-ordered store
+    (`b[0]` is the first character) rather than a right-justified plane.
+- [~] **`$value$plusargs`** (21.6) — missing pieces:
+  - [ ] **Part-select destination** — refused for every conversion.
+  - [ ] **`%e`, `%f`, `%g` conversions and any `real` destination** — needs an ASCII-to-real
+    scan and a real write-back.
+  - [ ] **Numeric conversion into a `string` destination** — `%d` and friends must store the
+    converted value as an integral-to-string assignment (6.16).
+  - [ ] **Non-literal search string** — also missing for `$test$plusargs`.
+- [ ] **Parse caching across runs (performance)** — the Driver, SourceManager and syntax
+  trees are rebuilt each run; needs a content-addressed cache.
+- [ ] **Run-start reset of wait queues, observed/deferred queues and string pools** — not
+  returned to power-on between designs in one process (docs/design/cooperative-finish.md).
+- [ ] **`-G` parameter overrides and `--libmap` library maps** — not exposed on the
+  command line.
+- [~] **Non-literal `$sformat` / `$sformatf` format** (21.3.3) — missing pieces:
+  - [ ] **`%m` and `%l`** — the scope and `library.cell` names never reach the renderer.
+  - [ ] **Aggregate or container argument** — refused at compile time.
+  - [ ] **Operand wider than 64 bits under `%e`, `%f`, `%g`**.
+  - [ ] **Empty argument (adjacent commas)** (21.2.1) — contributes format text, which is
+    unknown at compile time.
 
 ### Structural primitives
 
-- [x] **Tristate gates** `bufif0`/`bufif1`/`notif0`/`notif1` (LRM 28.6, Table
-  28-5) — lowered as continuous-assign drivers that emit Z when disabled (X when
-  the control is x/z; the weak L/H strengths collapse to X). Ride
-  the existing driver-resolution path, so multiple tri-state drivers on one net
-  resolve. `gate_tristate_value` in `Lower.cpp`.
-- [x] **Gate delays** — single `#d` inertial delay landed (see Continuous /
-  structural timing above). Remaining: rise/fall `#(r,f)` triples and the third
-  (turn-off) delay of the tri-state gates (LRM 28.6).
-- [x] **Drive strengths on gates** — the gate output's `(strength0, strength1)`
-  threads to its driver slot and competes in the strength fold (see Drive
-  strengths below); no charge / strength-reduction-through-gates.
-- [x] **Gate outputs on 2-state targets** — the coercion policy is LRM 6.11.2's
-  automatic 4-state -> 2-state conversion (x and z become 0), applied to the gate's
-  1-bit fold by `gate_output_value` in `Lower.cpp` so a gate matches the equivalent
-  continuous assign, whose conversion slang inserts on the RHS. Reaches a `bit`
-  variable (LRM 10.3.2 allows one primitive output to drive a variable) and a
-  2-state member of a 4-state packed net; a 2-state NET does not exist (LRM 6.7.1,
-  enforced by slang's `isValidForNet`), so the question never had a net form. A
-  SINGLE gate driving a packed-net member is still refused loud (`unsupported gate
-  output terminal`: `gate_select_base` wants a `NamedValue` base, so `s.lo[0]` has
-  no static (signal, bit) terminal) — only the resolved, multi-driver spelling of
-  that shape works.
-- [ ] **Concat / part-select gate output lvalues**.
-- [ ] **Bit-select gate outputs** (one bit of a packed wire) — pay a whole-word
-  read-modify-write and drop out of thunk/fusion eligibility; per-bit
-  packed-signal fusion is the follow-up.
-- [x] **MOS switches** — `nmos`/`pmos`/`rnmos`/`rpmos` (LRM 28.7, Table 28-6) and
-  `cmos`/`rcmos` (LRM 28.9). Lowered on the tri-state gate path with a pass-device
-  reading of a floating data input: a z data bit propagates as z instead of
-  reading as x, so the whole DATA=z row is z. A `cmos` becomes the two drivers
-  LRM 28.9 defines it as and folds through net resolution. No strength reduction
-  through the r-variants, so `rnmos` ≡ `nmos` (LRM 28.14).
-  `mos_switch_of` / `lower_cmos_switch` in `Lower.cpp`.
-- [ ] **Bidirectional pass switches** — `tran`/`rtran` and `tranif0`/`tranif1`/
-  `rtranif0`/`rtranif1` (LRM 28.8). Conduction is a net merge, not a driver: the
-  unconditional pair could alias both terminals onto one signal, but the
-  conditional ones need each side to see the other's resolved value excluding its
-  own contribution, which the one-pass driver-slot fold cannot express.
-- [ ] **UDPs** — combinational and sequential user-defined primitives.
-- [x] **Combinational gate primitives** — `and`/`or`/`nand`/`nor`/`xor`/`xnor`/
-  `buf`/`not`: n-input/output forms, instance arrays, x/z truth tables; lowered to
-  self-starting continuous-assign comb processes.
+- [~] **Gate output terminals** — missing pieces:
+  - [ ] **Member of a packed-struct net driven by a single gate** — `s.lo[0]` has no static
+    terminal; only the multi-driver resolved form works.
+  - [ ] **Concatenation or part-select output**.
+- [ ] **Bit-select gate output (performance)** — each update rewrites the whole word and
+  drops thunk/fusion eligibility; needs per-bit packed-signal fusion.
+- [ ] **Bidirectional pass switches** (28.8) — `tran`, `rtran`, `tranif0`, `tranif1`,
+  `rtranif0`, `rtranif1`; conduction is a net merge the one-pass driver fold cannot express.
+- [ ] **User-defined primitives** — combinational and sequential UDPs.
 
 ### Net types, strengths, resolution
 
-NOTE: anything here that can drive z (tri nets, tristate primitives, z-defaulted
-unconnected ports) must seed the z-elision analysis (`compute_may_z`,
-`ir/ZElision.cpp`) when implemented.
-
-- [~] **Resolved / strength net kinds** — `wand`/`triand` (wired-AND),
-  `wor`/`trior` (wired-OR), `tri0`/`tri1` (resistive Pull to 0/1), and
-  `supply0`/`supply1` (Supply-strength constant 0/1 that beats a Strong driver;
-  a Supply pull always folds as a strength driver, `net_pull_strength`) modeled
-  (multi-driver resolution below). Remaining: `trireg` (strength / charge).
-- [~] **Multiple-driver resolution** — default resolution (LRM 6.6) done for
-  drivers of a **packed** net sharing one instance scope: whole-net drivers stage
-  their value, constant packed bit/part-select drivers stage it with a Z
-  background so each bit resolves only across its own drivers; a resolver process
-  folds every driver's slot (`build_driver_slot_value` / `emit_wire_resolvers` in
-  Lower.cpp). Reducers: `wire`/`tri` (`WireRes`, X on conflict), `wand`/`triand`
-  (`WandRes`, wired-AND), `wor`/`trior` (`WorRes`, wired-OR) — all z ⊑ {0,1} ⊑ x
-  lattice folds; `tri0`/`tri1` fold as wire, then `NetPull` fills undriven bits
-  with 0/1 (LRM 6.6.4), always resolved (a driverless net still pulls). A slot is
-  cut from the net's own type, hence always 4-state and always able to hold the Z
-  background (LRM 6.7.1 admits no 2-state net; a 2-state MEMBER of a 4-state packed
-  net converts per LRM 6.11.2 and resolves normally, so what used to be a guard is
-  now the invariant `internal: resolved net storage is not 4-state`). Gate-primitive
-  outputs stage into slots like any other driver. Non-overlapping constant
-  bit/part-select drivers stay on the single-driver fast path.
-  **Cross-scope WHOLE-net drivers now resolve too** (previously the one
-  remaining item here), found blocking a real design
-  (`uvm_tb_build_ss_tb/sub_system_tbs/pss_tb`'s `apb_if.sv`: `APB.PCLK`, the
-  interface's own header net, bound as an input port from `hdl_top`'s `HCLK`
-  AND separately driven by a `bind`-inserted `apb_prober`'s `assign APB.PCLK =
-  PCLK;` reaching it through LRM 23.8 upward name referencing — TWO drivers in
-  two unrelated instance scopes on a genuine `wire`, not the `PSEL` variable
-  the report first suspected). `alloc_driver_slot` used to refuse outright the
-  moment a net's second driver was discovered in a DIFFERENT scope than its
-  first ("the slots would span scopes"), on the assumption that a driver slot
-  could only be addressed from the scope that allocated it. False:
-  `register_signal` already gives every slot a design-wide, flat `ir::Signal`
-  id regardless of which scope's Classify/Emit pass allocates it (the scope it
-  records a slot under is purely for VCD grouping of that ONE slot), so
-  `emit_wire_resolvers`'s fold already reaches a cross-scope slot with zero
-  change. The only real question was which ONE scope the RESOLVER process
-  itself — the thing that reads every slot and writes the net, one per net —
-  should be attributed to once its slots span more than one: answered with
-  `ir::Process::no_scope`, the existing "belongs to no single instance" marker
-  a per-top PreInit process already uses, rather than an arbitrary pick of one
-  driver's scope. `wire_ports`'s INPUT-port branch separately needed its own
-  fix: it never staged the port's own copy as a driver slot at all (an
-  ordinary, common single-driver input port has no need to), so it hit the
-  refusal above unconditionally whenever `resolved_nets_` already knew the
-  net had another driver — now it stages through `alloc_driver_slot` exactly
-  as a resolved OUTPUT port connection already did. Verified behaviorally, not
-  just "does not crash": a synthetic two-instance tri-state bus
-  (`tests/xhier_test.cpp`, "a tri-state bus driven from two different
-  instance scopes resolves correctly") reproduces the ordinary WireRes
-  lattice — undriven is z, either driver alone wins, two disagreeing drivers
-  fold to x — identically whether or not the drivers share a scope. Remaining,
-  all still loud-failing, all now genuinely narrower than "cross-scope" alone:
-  unpacked-array / unpacked-struct nets (per-element slots + per-element
-  resolver), concatenation-operand drivers (split into per-net stores), and a
-  cross-scope PARTIAL (bit/part-select) driver (the whole-net case above
-  covers only `is_whole_net_lvalue`; a constant packed sub-range driver from a
-  different scope than the net's other drivers still has no code path routing
-  it through `alloc_driver_slot` at the input-port site above, only at the
-  continuous-assign / gate-output sites, which were already scope-agnostic
-  before this fix took effect since they always routed through
-  `alloc_driver_slot`).
-- [~] **Drive strengths** — `(strong0, weak1)` etc. on continuous assigns, net
-  declarations, and gates lower and resolve. Each driver slot carries a
-  compile-time packed `(strength0, strength1)`; a net with any non-default
-  strength folds through `StrengthRes` (level-by-level per-side-max, `Lower.cpp`
-  `emit_wire_resolvers` / backend `lower_strength_res`) instead of `WireRes`.
-  A `tri0`/`tri1` pull is injected as a synthetic Pull-strength driver so a
-  Weak driver correctly loses to it. Symmetric strengths, open-drain /
-  open-source (highz on one side), and pull competition all resolve exactly.
-  `pullup`/`pulldown` (LRM 28.5) lower as a lone permanent Pull-strength driver
-  slot of 1 / 0 (`lower_pull_source`), forcing the net resolved so a stronger
-  driver wins and an all-off net holds the pull value.
-  Remaining, all deferred: **strength ranges** (an x/z value on an
-  *asymmetric*-strength driver spans two strengths — resolved to a definite
-  value where the range model would yield x), drive strengths on
-  `wand`/`wor` nets (loud-failing), `pullup`/`pulldown` on a bit/part-select
-  target, strength reduction through gates, and `trireg` charge.
-- [x] **Single-driver, z-defaulting net kinds** — `wire`, `tri`, `uwire`
-  (single-driver `uwire`, LRM 6.6.7, complete).
+- [ ] **`trireg` nets** — strength and charge storage.
+- [~] **Multiple-driver net resolution** (6.6) — missing pieces:
+  - [ ] **Unpacked-array and unpacked-struct nets** — needs per-element slots and resolvers.
+  - [ ] **Concatenation-operand driver** — needs a split into per-net stores.
+  - [ ] **Cross-scope partial driver** — a constant bit/part-select driver from a different
+    scope than the net's other drivers, entering through an input port.
+- [~] **Drive strengths** — missing pieces:
+  - [ ] **Strength ranges** — an x/z value on an asymmetric-strength driver resolves to a
+    definite value where the range model yields x.
+  - [ ] **Drive strength on `wand` / `wor` nets**.
+  - [ ] **`pullup` / `pulldown` on a bit- or part-select target** (28.5).
+  - [ ] **Strength reduction through gates** — including the r-variants (`rnmos`, `rpmos`,
+    `rcmos`), which behave as their nonresistive forms (28.14).
 
 ### Hierarchy reach
 
-- [ ] **Cross-top hierarchical refs** (`top2.sig` from `top1`) — each top has its
-  own Lowerer / `sigmap_`.
-- [ ] **Path into an instance nested in a generate block** (`g.u.sig`) or an
-  instance-array element (`arr[i].sig`) — reported as a slang elaboration error
-  before lowering. (Signals declared directly in a generate-loop block `g[i].sig`
-  work.)
-- [~] **`inout` / `ref` ports** (LRM 23.3.3) — shared-storage collapse: the child
-  port's internal net/variable aliases the parent connection's signal
-  (`build_inout_aliases`, no copy process), so both sides read/write one net and
-  net resolution folds any drivers. Whole-signal connection with a single-scope
-  effective driver works (either direction). Deferred, loud: a bit-select /
-  part-select / concat connection (needs sub-signal aliasing the whole-signal
-  collapse cannot express). A bidirectional bus with drivers in two instance
-  scopes now resolves too (the general cross-scope multi-driver limitation,
-  see the entry below) — a same-scope OR cross-scope tri-state bus is one path
-  either way, `inout` having nothing special about it beyond the storage
-  collapse itself.
-- [x] **Cross-hierarchy references** (`top.u1.sig`, LRM 23.6) — reads and writes
-  any direction, bit/part-select, `@(edge)`, blocking and nonblocking assign.
-- [x] **Unconnected ports** — unconnected input reads `z` (LRM 6.6).
+- [ ] **Cross-top hierarchical reference** — `top2.sig` from `top1`; each top lowers with
+  its own signal map.
+- [ ] **Hierarchical path through a generate-block instance or an instance-array element**
+  — `g.u.sig` and `arr[i].sig` fail at elaboration.
+- [ ] **`inout` / `ref` port connected to a select or concatenation** (23.3.3) — needs
+  sub-signal aliasing.
 
 ### Timing checks (basic)
 
-- [ ] **`specify` blocks** — module path delays (`(a => b) = 3;`) and the common
-  timing checks `$setup`, `$hold`, `$setuphold`, `$width`, `$period`. (Full set
-  and SDF annotation are M5.)
-
----
+- [ ] **`specify` blocks** — module path delays (`(a => b) = 3;`) and the timing checks
+  `$setup`, `$hold`, `$setuphold`, `$width`, `$period`.
 
 ## M3 — Common SystemVerilog
 
 ### Data types
 
-- [ ] **2-state call-ABI micro-opt** — the function/task ABI still passes a 2-state
-  formal as the packed (mm, z) pair (constant-0 z). Size opt, not a correctness gap.
-- [x] **NBA to a string** (`s <= t`, LRM 10.4.2 / 4.9.4) — a fourth range of the
-  shared `rt_nba_arr_*` record space holding `{ ptr dest, rt_string staged }`: the
-  Active region `rt_string_init`s the staged handle and `rt_string_assign`s the RHS
-  into it (sample-now with owned storage), the NBA region `rt_string_move`s it into
-  the destination (release-and-take, so a target written twice keeps the last write
-  and frees the superseded buffer once). Reuses `StoreNb` — no new IR tag — because
-  `HandleCopyNb`'s payload is a source handle LVALUE and a string rvalue is often a
-  body temp with none. Since the record carries the destination POINTER, a string
-  member of an unpacked struct and an element of a fixed unpacked array come free,
-  and with them a whole-aggregate NBA carrying a string member (decomposed per
-  leaf). No wake and no VCD touch: a string is refused from sensitivity lists and
-  has no `$var` form. Two traps documented in
-  docs/design/queue-nba-and-nonpod.md §3: an empty `rt_string` is NOT all-zero (so
-  `init`, never `memset`), and the classify branch must precede the array /
-  aggregate ones. Still refused: `s[i] <= c` (a masked CHARACTER record, a
-  different shape), `s <= #5 t` (the separate intra-assignment pool), and a string
-  class property (signal-keyed staging). Fixed in passing: an UNQUALIFIED class
-  property NBA inside a method (`p <= v`) reached the backend as an unaddressable
-  root and failed with no source location, for every type — now a located refusal
-  in `check_subroutine_nba_target`.
-- [ ] **NBA to a class property** (`c.x <= v`) — legal SV (LRM 6.21 bans only the
-  continuous forms on a non-static property), refused loudly. Every
-  NBA staging buffer (the scalar shadow slot, the aggregate image, the container
-  handle record) is indexed by `Signal`; an object body is a heap block with no
-  signal, so a property reaches none of them. Needs staging keyed by destination
-  ADDRESS rather than by signal, with last-write-wins resolved by comparing
-  addresses at commit. See docs/design/classes.md §8. The refusal fires only for a
-  property TARGET now: `vif.sig <= x` with the handle held in a property is a write
-  to interface signal storage (the property is only read to pick the instance) and
-  used to be caught in the same net inside a subroutine — the vif-in-class-task
-  entry under UVM enablers.
-- [ ] **Intra-assignment delay on a container NBA** (`q <= #2 r`) — refused loudly.
-  The intra-assignment path stages an integral or real value, an unpacked-array
-  element or a struct field; a container handle needs the HandleCopyNb record to
-  survive to the delayed commit. **Scoped** as R3 (with the string target, which
-  needs the identical record tail) in docs/design/intra-assignment-timing.md
-  § "The remainder"; also itemized under the M2 intra-assignment remainder entry.
-- [ ] **Non-constant string replication count** — **a deliberate deviation from
-  LRM 11.4.12.1, implemented; kept OPEN because the deviation itself must be
-  revisited, not because work remains.** The clause requires the multiplier of
-  `{N{...}}` to be a non-negative, non-x, non-z CONSTANT expression, so clotho
-  was CONFORMANT to refuse `int m; dash = {m{"-"}}` (uvm_printer.svh:1501, the
-  only two such sites in uvm-core), and so is iverilog 13 ("a reference to a net
-  or variable (`m`) is not allowed in a constant expression"). Verilator 5.050
-  accepts it and yields `-----`. UVM ships it regardless. A runtime multiplier
-  is now accepted when — and only when — the replication's own slang type is
-  `string`: the clause demands a constant because a concatenation's WIDTH must
-  be known at elaboration, and a string result has no elaboration-time width, so
-  the restriction's own reason does not apply there. That boundary — not "UVM
-  needs it" — is what makes the narrow form defensible. String-ness is slang's
-  typing (`ReplicationExpression::fromSyntax` types a non-constant multiplier
-  over an implicitly-string operand as `string`), never a syntax pattern.
-  Lowered as `StrRepl` (a runtime count operand, unlike packed `Repl`'s
-  immediate) into `rt_string_repl`. The clause's other two demands bind at RUN
-  TIME, where a variable can violate them and a constant could not: ZERO yields
-  the empty string (the clause's own zero rule); NEGATIVE and X/Z are located
-  fatals (`rt_string_repl_invalid`) naming the construct and, for the negative,
-  the value — clamping to zero would invent semantics the clause does not grant,
-  and Verilator is NO oracle for the negative case (its generated C++ for
-  `{-2{"ab"}}` fails to compile, make exits 2), so there is no reference
-  behaviour to match. The x/z probe is emitted only for a 4-state count plane,
-  so the UVM `int m` shape pays nothing. Still refused: a non-constant
-  multiplier with a PACKED result — slang rejects it at elaboration (the
-  multiplier fails constant evaluation), and clotho's own backstop in
-  `lower_expr`'s Replication case names the construct and the clause instead of
-  the old bare "expected a constant integer".
-- [ ] **String ports** — including a string reached through a struct member or a
-  container element, which the old array-only walk let through to the plane-copy
-  path (now guarded).
-- [ ] **String event control / sensitivity**.
-- [x] **`case` over strings** (LRM 12.5 / 6.16.9) — **an LRM ambiguity resolved
-  deliberately, not a sanctioned construct.** 12.5 words matching as a bit-for-bit
-  `===` over operands zero-extended to the widest, and Table 11-1 bars `===` on a
-  string exactly as it does on a real, so the standard defines the comparison only
-  for integral operands; 6.16.9 defines `==` over string content and no `===`. But
-  12.5 puts no type restriction on the case expression and nothing prohibits the
-  spelling, so it is read as content equality — the only well-defined reading, and
-  the one `===` degenerates to on an operand with no x/z, which is the same call the
-  real path makes. The zero-extension half is dropped: there is no width to extend
-  to, and padding one side would contradict 6.16.9. A literal's NUL bytes are
-  already dropped where it becomes a string (6.16), so `"\000A"` and `"A"` are one
-  value and match.
-  A string selector routes the statement to `lower_case_string`, which matches with
-  the existing string `Eq`. It keeps 12.5's lazy first-match chain (a later label's
-  side effects never run once an earlier item matched), keeps the `unique` /
-  `unique0` / `priority` 12.5.3 overlap and no-match checks off the same per-item
-  predicates, and handles multi-label items and `case ... inside` over a label SET.
-  `(* full_case *)` / `(* parallel_case *)` are skipped — they enumerate the
-  selector's integral value space. Guarded loud: a `case ... inside` string RANGE
-  bound (11.4.13 over 6.16.9's relational operators — implementable, unreached).
-  `casez` / `casex` over a string and a mixed string/integral label list are both
-  refused by slang's binder before clotho sees them; the clotho-side guards are
-  kept and labelled unreachable.
-  **No oracle**: iverilog 13 cannot compile a string `case` at all (it aborts
-  in `draw_eval_vec4`), so this is pinned to the LRM text rather than to a
-  simulator. Verilator 5.050 accepts it and agrees on content equality, which is
-  corroboration, not authority. Motivated by UVM: `uvm_string_to_verbosity` /
-  `uvm_string_to_action` dispatch `+UVM_VERBOSITY=` this way, nine such statements
-  in the reachable part of uvm-core.
-- [x] **`?:` over strings** — the arms are borrowed `rt_string` handles, so the
-  eager path selects a pointer (`lower_string_mux`) and the lazy path merges the
-  two arms with a pointer PHI; no string temp and no deep copy. An ambiguous
-  condition yields the common value when the arms are equal and `""` otherwise,
-  matching what `real` does with 0.0 (LRM 11.4.11 defines the bitwise merge for
-  integral results only). See docs/design/x-semantics.md §1.4.
-- [x] **Strings inside structs / queues / dynamic arrays** — recursive aggregate
-  string leaves (init/deinit/copy walks) and rt_elem_ops string elements. A
-  string as an associative-array VALUE element is now supported (a[k] routes the
-  string handle through the OOB sink); string KEYS are supported.
-- [ ] **enum non-constant `next`/`prev` step**.
-- [x] **Nonblocking whole-object copy / equality over an unpacked-array member**
-  — NBA of a struct with an array member decomposes per leaf (deferred queue);
-  `==` / `!=` recurse into array members (per-element AggEq).
-- [x] **Aggregate task arguments, and `output`/`inout` function arguments** —
-  one storage pointer per aggregate formal in every by-value direction
-  (`declare_task` mirrors `declare_function`); the callee copies in at its
-  prologue (a task: at the body's start block) and copies an `output` / `inout`
-  formal back at return (a task: in the completion epilogue, after any delay).
-  Covered for nesting, recursion, fork concurrency, a class method task, and
-  struct-with-array / array-of-struct / 2-D / slice actuals.
-- [x] **`ref` aggregate formal** — subsumed by the uniform ref above; an aggregate
-  ref aliases its image pointer with no copy either way.
-- [x] **Non-lvalue aggregate actual on an `input` formal** (LRM 13.5: an input
-  actual "can be any expression"; 13.5.1 copies it into the subroutine area) —
-  `f('{3,4})`, `f('{b:4,a:3})`, `f('{default:5})`, `f('{4{7}}')`, `f(g())`,
-  `f(g(h()))`, `f(c ? x : '{...})`, and the task forms, for an unpacked struct
-  and a fixed unpacked array alike. `build_call_args` guarded every by-value
-  aggregate actual with `is_struct_lvalue_shape` and refused the rest
-  ("aggregate argument must be a variable"), which stubbed every
-  `__m_uvm_execute_field_op` in the stock easyUVM testbench:
-  `m_uvm_field_begin`'s UVM_CHECK_FIELDS arm calls
-  `uvm_queue#(uvm_acs_name_struct)::push_back('{`"ARG`", REGEX})` — a
-  string-bearing struct PATTERN on a user method's input formal. The fix is
-  `agg_input_actual`, the call-actual twin of `agg_return_operand` (one
-  boundary over): a CALL result passes `lower_lvalue(src)` directly — the
-  callee already wrote it through the caller-side out-param temp that IS the
-  call's lvalue, so the callee's copy-in is the only copy and the operand is
-  evaluated exactly once; every other rvalue is built into a fresh
-  `make_canonical_agg_temp` by `emit_agg_store`, which already owns the
-  pattern / replication / `?:` / concat-literal shapes and their diagnostics.
-  An aggregate `?:` actual stays destination-directed and CONDITIONAL
-  (11.4.11: the unchosen arm's side effects do not run). Copy semantics
-  (13.5.1: "changes are not visible outside") hold because the temp is private
-  per call site; aliasing cannot happen because each `make_canonical_agg_temp`
-  mints fresh storage — a frame Local per activation inside a subroutine
-  (recursion-safe, `f('{1,2}) + f('{3,4})` holds two live temps), a module
-  signal in a process (safe across sequential calls: a function is zero-time
-  and a task's prologue copies the pointee into its frame before any delay).
-  Managed leaves (a string / queue member in the pattern) deep-copy per leaf —
-  `emit_agg_store` builds the temp leaf-wise and the existing
-  `emit_agg_copyin` deep-copy does the boundary. The non-input directions need
-  no new guard: slang rejects a pattern / call result on an `output` / `inout`
-  ("expression is not assignable", 13.5) and on a `ref` ("invalid expression
-  for pass by reference", 13.5.2; a pattern additionally fails type deduction)
-  — pinned in tests so a guard change cannot let one through. Verilator 5.050
-  accepts a call result on a `ref` formal; 13.5.2 passes "a reference to the
-  original argument" and a call result is no such place, so slang's refusal is
-  the LRM reading and clotho keeps it. Cross-checked against verilator 5.050
-  (iverilog has no unpacked-struct or array-formal support). Covered in
-  tests/struct_test.cpp (shapes, copy + single-evaluation proof, two live
-  temps, recursion, managed leaves, refusals) and tests/function_test.cpp
-  (array shapes).
-  Stock easyUVM after this fix: the aggregate-argument stub is gone, and
-  `__m_uvm_execute_field_op` now stubs on the NEXT gaps in the same generated
-  function — "queue / dynamic array member assignment from a non-variable
-  value", reproduced minimally as `bit __array[] = new [$bits(data)];`, a
-  dynamic-array LOCAL declaration initializer inside a CLASS method (the
-  statically dead SIZE > 64 branch of `uvm_unpack_intN`; the same statements
-  lower fine in a module-scope subroutine), and "array query function on a
-  dynamically-sized operand" in a third class's field op — so the run still
-  fatals at packet_out.sv:4 t=35, now with the do_unpack-family message. NOT
-  fixable by `agg_input_actual`: those values are queues / dynamic arrays —
-  ValueCat::handle, heap-backed — and `make_canonical_agg_temp` builds
-  canonical aggregate storage, not a container handle; the handle twin is
-  `materialize_queue_rvalue` (queues only; the dynamic-array twin is a named
-  TODO in `lower_container_element_value`). With field automation removed
-  the full bench runs: 101 matched, UVM_ERROR 0, UVM_FATAL 0,
-  `$finish` from uvm_root.svh:633 at t=3045.
-  **`new[]` as a declaration initializer** (LRM 6.21 static/automatic timing,
-  7.5/7.5.1 `new[n]` / `new[n](src)`, 8.7/8.8 a class property) closes the
-  "non-variable value" stub above — the exact minimal repro was
-  `bit __array[] = new[$bits(data)];`. The statement form `arr = new[n]`
-  already special-cased `NewArrayExpression` in `lower_dyn_array_assign`; the
-  declaration-initializer form routed through `emit_handle_member_copy`
-  instead, which only admitted a handle LVALUE as its source (a variable /
-  member / element, never a constructor) and fell into the same refusal.
-  Extracted the construction itself — sizing, and the `has_init` dispatch to
-  the pattern / copy-source / bare forms — into `emit_dyn_array_new_expr`,
-  called from both `lower_dyn_array_assign` and `emit_handle_member_copy`, so
-  an automatic local, a `static` local and a module-scope variable all take
-  one path and a future change to sizing / truncate / fill semantics cannot
-  land in only one of them. A class property hit a SEPARATE, more primitive
-  gap: `emit_class_property_inits` had no aggregate/container gate at all —
-  unlike `lower_var_initializer` and `declare_static_prop`, which already
-  routed an aggregate/container initializer through `emit_struct_store` — so
-  ANY unpacked-struct or container property initializer, not only `new[]`,
-  fell into the generic expression lowerer and its bare
-  `unsupported expression kind=` fallback. Since the gap was a missing gate
-  rather than a missing per-property capability, and LRM 8.7 runs a property
-  initializer "as part of construction" (the same declaration-initializer
-  semantics `lower_var_initializer` / `declare_static_prop` already implement,
-  just per-object instead of per-frame or once), added the gate rather than a
-  separate refusal. Covered in tests/dynamic_array_test.cpp: both `new[n]`
-  forms as a declaration initializer in each of the three lifetimes plus a
-  class property, `n` vs `src.size()` (grow / same / truncate), `n=0`,
-  per-object independence of a class property's array, and the size
-  expression itself as a constant, `$bits`, a runtime argument, a call, and a
-  mix — cross-checked against verilator 5.050 (agreeing on every case) and
-  iverilog 13 where its parser accepts the shape. Stock easyUVM after this
-  fix: the "non-variable value" stub is gone; the array-query-function stub
-  and the two streaming-concatenation stubs below are what remain, so the run
-  still fatals at packet_out.sv:4 t=35 on the do_unpack-family
-  streaming-concatenation message, unchanged from before — the array-query and
-  streaming-concatenation gaps are each their own ticket.
-  Remaining gaps, refused loud:
-  - [ ] **A slice of a struct-bearing array as an actual** ("a slice of a
-    struct-bearing array argument is not supported") — the same missing
-    backend aggregate-element slice the return path documents; a FLAT array's
-    slice actual works (it is an lvalue shape and copies element-wise into the
-    canonical temp).
-  - [ ] **An aggregate-typed streaming lvalue actual on an `output` / `inout`
-    formal** (LRM 11.4.14.3) — the backstop in `build_call_args` keeps the old
-    message. A streaming RVALUE actual on an input formal is refused by
-    `emit_agg_store` ("unsupported unpacked struct rvalue"; verilator 5.050
-    ICEs on the same cast).
-  **A non-lvalue aggregate actual bound to a module port** ("aggregate/array
-  port connection must be a variable") was the same refusal at a second call
-  site: LRM 23.3.3 makes a port connection a continuous copy exactly like a
-  value-typed call argument, so `wire_ports`'s input-port branch now stages a
-  non-`is_struct_lvalue_shape` source through `agg_input_actual` too, instead
-  of refusing it — a `'{...}` pattern, a struct-returning call, and a `?:`
-  actual all reach a whole-struct or whole-array `input` port. An lvalue
-  actual (the common case: a plain variable / member / element) still copies
-  straight through with no extra temp. The slice-of-a-struct-array gap above
-  is inherited unchanged (same helper, same guard). Covered in
-  tests/instance_array_test.cpp ("non-lvalue aggregate actual bound to an
-  input port": literal struct, literal array, and call-result subcases).
-- [ ] **String-containing aggregate by value** through a function.
-- [x] **Non-lvalue aggregate RETURN, and an aggregate call result in a read
-  context** (LRM 13.4) — `return g();`, `return '{1,2};`,
-  `return q.pop_back();`, plus `$display("%p", g())`, `g().a` and `ga()[1]`, for
-  an unpacked struct and a fixed unpacked array alike. Two separate refusals sat
-  behind this. The return path guarded its operand with `is_struct_lvalue_shape`
-  (NamedValue / HierarchicalValue / MemberAccess / ElementSelect) and failed with
-  "aggregate return of a non-lvalue expression is not supported"; the read
-  contexts hit `lower_lvalue`'s `case Call:`, which handled only a
-  HANDLE-returning call and fell through to "unsupported assignment target
-  kind=Call" — an assignment-target message for a pure read. The root cause was
-  the same in both: an aggregate call result HAS anchored storage (the callee
-  writes through the caller-side out-param temp the call allocates, and the
-  call's value IS that temp's lvalue), but nothing said so, so every consumer
-  that structurally needs an lvalue refused it. Teaching the `Call` arm that one
-  fact fixes the read contexts and the returned-call form together, since
-  `lower_return` routes through `lower_lvalue`.
-  The non-call rvalues take 13.4 literally instead: the clause defines
-  `return expr` as assigning `expr` to the function's implicit return variable
-  and returning it, so a `'{...}` pattern is built by the ordinary
-  `emit_agg_store` path directly INTO that variable, whose frame storage already
-  existed for the bare-`return;` path. **Deliberately not** staged through
-  `array_rvalue_lvalue` or a struct-flavoured sibling of it: both allocate a
-  fresh `make_canonical_agg_temp`, and `return` already owns its destination, so
-  reusing the layer below both (`emit_agg_store`) costs one fewer frame local and
-  no extra copy. `return g();` therefore performs exactly two memcpys, one per
-  ABI boundary crossed — the callee's copy-out into its out-param, then the
-  caller's copy of that temp into its own — with no temp→temp staging, and
-  `return '{...}` allocates no temp at all (verified in the emitted LLVM IR).
-  Deciding it this way is also what keeps the LRM's assignment-equivalence
-  honest: `return` accepts exactly what an assignment accepts, so when the
-  aggregate `?:` landed (Operators & expressions above) `return c ? x : y;` began
-  working through the assignment path with no case of its own in
-  `agg_return_operand` — the operand falls through to `emit_agg_store`, which
-  branches and builds the selected arm straight into the return variable.
-  The `%p` case had a standing hazard — a `%p` operand was once lowered
-  twice, running a call operand twice (see String formatting below) — so the
-  call is lowered once for the whole leaf walk and a counter test pins the
-  operand at exactly one evaluation. Motivated by Accellera UVM's
-  `uvm_queue.svh:189`,
-  `virtual function T pop_back(); return queue.pop_back(); endfunction`, which is
-  covered end to end with a struct `T` that owns a string.
-  Remaining gaps:
-  - [x] **Aggregate ternary rvalue** (`o = c ? x : y;`, and so
-    `return c ? x : y;`) — done; see **Aggregate `?:`** under Operators &
-    expressions.
-  - [ ] **Return of an unpacked-array slice** (`return x[0:1];`) — refused loud
-    with its own message. Not a return-path limit: inside a subroutine both the
-    slice source and the return variable are canonical aggregate frame storage,
-    and the backend has no aggregate-element slice, so a plain `o = x[0:1];`
-    between two frame locals already fails the same way. Lowering it here would
-    only move the failure into the backend.
-- [x] **Whole aggregate in a general rvalue context** — `$display %p`
-  (LRM 21.2.1.6, lower-time `'{...}` expansion; a tagged union and a
-  queue / dynamic array render at runtime instead) and streaming-concat operand
-  (LRM 11.4.14, leaf bit-serialization). A whole-array by-value read outside
-  these contexts routes through the function-ABI copy-in, not a flat load.
-- [ ] **inout / ref aggregate PORTS** (the subroutine side is done). A port copy is
-  a continuous assignment, so it needs change detection over aggregate storage.
-- [ ] **Aggregate port driven by a `'{...}` pattern / call**.
-- [x] **Event control on a member / select / expression** (`@(posedge x.f)`,
-  `@(arr[i])`, part-selects). `event_signal` synthesizes a temp net continuously
-  assigned from the expression and subscribes to it (bit 0 = the expression's
-  LSB, exact for edge; whole word for level). One delta of latency vs. a direct
-  signal. Integral operands only; real / aggregate operands rejected loud.
-- [x] **Unions** (LRM 7.3) — packed and unpacked. Both lower to a flat plane
-  value (`Kind::Struct`, is_packed, is_union): a packed union is the widest
-  member's width (all equal, 7.3.1); an unpacked union is sized to the widest
-  member, every member overlaying the LSB (the natural, verilator-matching
-  overlay). Member access reuses the packed part-select path
-  with no backend changes; whole-union assignment, NBA, VCD, and change detection
-  all ride the normal plane-signal path. Unpacked-union members are restricted to
-  integral types (real / string / unpacked aggregate / handle members gated loud —
-  no flat-bit overlay).
-- [x] **Tagged unions** (LRM 7.3.2) — both packed and unpacked lower to the same
-  flat `{tag, payload}` bit-vector: the tag in the high `tagBits` bits (packed:
-  slang's `tagBits`/width; unpacked: synthesized `ceil(log2 n)`), the member
-  payload overlaying the LSB. The `tagged Member(v)` setter
-  (`TaggedUnionExpression`) is the only thing that moves the tag; it concatenates
-  tag / gap / payload, and the gap between a narrow payload and the tag takes the
-  power-on default (x for 4-state, 0 for 2-state), matching slang const-eval so
-  runtime and folded-parameter forms agree. **Every member access — read and
-  write — is tag-checked at run time** (LRM 11.9: an attempt to read or assign a
-  value inconsistent with the tag "results in a run-time error"), emitted from the
-  single `lower_member_lvalue` funnel as a `TaggedCheck` node — one 4-state
-  compare plus a branch weighted toward the fall-through, into the
-  `rt_tagged_access` located fatal. A member write requires the tag to *already*
-  select that member and never retags (LRM 7.3.2: "The tag and value can only be
-  updated together consistently using a statically type-checked tagged union
-  expression"); an x/z tag selects no member and reports. The check is elided for a
-  plain union and for a single-member tagged union, and is never reached from a
-  pattern-matched arm. `%p` prints `'{tag:value}` with the payload at the active
-  member's own width and signedness (LRM 21.2.1.6, runtime `TaggedFmtP` /
-  `rt_tagged_format_p`);
-  `%b` stays the raw N-bit value, gap bits included. Member read, whole-union
-  assign / `==` / VCD ride the flat path. Members restricted to integral (+ void).
-  Pattern matching (`case matches` / `if matches` / `?: matches`, LRM 12.6) is
-  implemented — see Pattern matching under M5 Language corners. iverilog /
-  verilator have no tagged-union support, so neither can cross-check this
-  shape; the 11.9 run-time check is enforced because 11.9 requires
-  it. See docs/design/tagged-unions.md.
-  Remaining gaps:
-  - [ ] Non-integral member of an **unpacked** tagged union (`real` / `string` /
-    unpacked aggregate / class payload) — the Phase 3 gap, gated loud.
-  - [ ] `force`/`release`, DPI, and queue / dynamic-array / associative-array
-    element positions loud-fail for the **unpacked** tagged-union form only (all
-    key on slang's `isIntegral()`); the packed form works in each.
-  - [ ] `%p` of a queue / dynamic array of tagged unions — rejected loud; the
-    runtime container descriptor carries no member-name table.
-  - [ ] VCD dumps a tagged union as one flat anonymous `$var`. LRM 21.7 has no
-    tagged-union notion so this is defensible, but no variant name is recoverable
-    from the dump.
-  - [ ] Latent: an all-`void` unpacked tagged union computes
-    `max_width + tag_bits - 1` with both terms zero, underflowing. Currently
-    masked — the width lands at 1 and VCD shows `$var reg 1` — so there is no
-    observable misbehaviour. Recorded as latent, not as a bug.
-- [x] **Unpacked-array full slicing / whole-array assignment** beyond the memcpy
-  path (ArrSlice IR node for constant bounds, position-wise element expansion for
-  an indexed part-select; per-element copy/eq/store; see Memories & arrays).
-- [x] **Nonblocking `'{...}` to an unpacked array**.
-- [x] **Associative-array `'{...}` literals** (LRM 7.9.11) — `'{key:value, …}`
-  and the `default:` value a read of an absent key yields, at a declaration or as
-  an assignment, on a module variable / procedural local / frame storage. The
-  default is per-array runtime state (an `AssocMap` slot, not an entry): it is
-  invisible to `num`/`exists`/`first`/`next`, survives `a.delete()`, travels with a
-  whole-array copy, and does NOT seed a created entry. Before
-  this the initializer was **silently dropped** (a zero-width store into the
-  handle slot), which is what made it a bug rather than a gap. Guarded loud: a
-  nonblocking literal, and an aggregate value element (needs a per-leaf store per
-  entry). Dynamic-array / queue `'{...}` literals already worked.
-- [x] **Non-POD dynamic-array / queue elements** (LRM 7.5 / 7.10) — every element
-  kind but an associative array or an event: integral of any width, real, `string`,
-  **class handle**, **unpacked struct / union or fixed unpacked array** (with
-  string / container leaves at any depth), and a **nested queue / dynamic array**.
-  Both containers share one gate (`guard_container_element`) because they share
-  DynElem and the `rt_elem_ops` descriptor.
-  * A class-handle element is a plain 64-bit POD word: objects are never freed
-    (classes.md §7), so it needs no lifecycle, `null` is the all-zero Table 7-1
-    default, and `==` is the identity compare a word compare gives.
-  * An aggregate element slot holds the recursive storage image, and
-    `dyn_agg_elem_lvalue` hands back a HEAP-ANCHORED aggregate lvalue — base
-    advanced to the physical slot, `dyn_inrange` carried — so `q[i].f`, `q[i][j]`,
-    whole-element copies, `foreach` and equality all reuse the ordinary aggregate
-    machinery with no container-specific code. Whole elements cross the
-    `rt_queue_*` ABI by pointer (no ABI change: `elem` / `out` were already
-    `void*`); a `'{...}` actual stages into a canonical aggregate temp.
-  * A managed leaf (string / nested container) inside an aggregate element rides a
-    new **kind-4 `rt_elem_ops` leaf table**: the backend emits an offset-sorted
-    `{offset, ops}` array beside the descriptor, and the runtime deep-copies each
-    leaf and raw-copies the POD gaps between them (that walk is why the order is a
-    contract). The runtime side already existed and was dead code.
-  * A nested container element is a handle slot chaining through
-    `rt_elem_ops::inner`. Out of range it redirects to a per-element-type sink
-    handle, emptied at every access, so `q[99].size()` is 0 and `q[99].push_back(x)`
-    is dropped (LRM 7.4.5) instead of addressing the heap past the live length —
-    the same shape as the string-element sink.
-  * A pop RELOCATES the element into a body-lifetime buffer, so the buffer owns
-    whatever heap storage it carries: the pop site releases the previous contents
-    (a pop in a loop) and every body exit releases the last (`build_agg_elem_temps`
-    + `deinit_body_strings`). Verified leak-free and double-free-free under
-    ASan/LSan.
-  * Fixed en route: `str_slot_ty` was `{ [32 x i8] }` (align 1) while `rt_string`
-    is `alignas(8)`, so a string leaf inside ANY aggregate (a plain struct signal
-    included) was accessed misaligned — UB that UBSan reported 13 times on a
-    two-member struct. The mirror now leads with an i64.
-  An associative-array element works too, through the `rt_elem_assoc` (kind 5)
-  descriptor. Still guarded loud: an event element, which needs one event OBJECT per
-  element; the object slot array is sized at compile time from the declared events
-  (docs/design/event-handles.md §9).
-- [x] **`chandle` admitted as a dynamic-array / queue / mailbox-message / assoc-value
-  element, and in the fixed-array ordering mirror** (LRM 6.14 with 7.5 / 7.10 / 15.4) --
-  the same `guard_container_element` gate that already admitted a class handle now
-  admits a chandle too. The two are identical by the same argument: LRM 6.14 gives a
-  chandle the same closed `==`/`!=`/`null`/assignment operator set a class handle has,
-  so it is a plain 64-bit POD word needing no lifecycle beyond the `rt_elem_ops` POD
-  copy, `null` the all-zero Table 7-1 default, and `==` the identity compare a word
-  compare already gives. The two diverge in exactly one place -- whether the GC traces
-  the word -- and that fork costs no new code: `lower_type` puts a class handle in
-  `Kind::Class` and a chandle in a plain `Kind::Int`, and the GC's handle-offset walk
-  (`collect_class_handles`, LlvmBackend.cpp) keys on `Kind::Class` alone, so a chandle
-  element's `rt_elem_ops::handles` table comes out empty by construction -- tracing one
-  would hand the collector a foreign DPI pointer it never allocated
-  (docs/design/garbage-collection.md §0, "Never in scope"). `%p` of a chandle
-  container element needed no new code either (see the `%p` entry below); a bare
-  `sort()`/`rsort()` (no `with` clause) on a chandle array is refused by SLANG's own
-  binder ("unpacked arrays of comparable values"), since 6.14 gives chandle no
-  `<`/`>`, while `reverse()`/`shuffle()` need no ordering relation and work.
-  This was the last thing standing between clotho and any UVM run that does not pass
-  `+define+UVM_NO_DPI`: `uvm_regex_cache` (`class uvm_regex_cache extends
-  uvm_lru_cache#(string, chandle);`) is on UVM's DEFAULT (DPI-enabled) boot path and
-  its base class's `typedef chandle optional_data[$];` used to fail lowering at
-  `uvm_lru_cache.svh:193` with "queue element type is not supported".
-  Associative-array KEY admission was a separate question, left UNTOUCHED here --
-  6.14's own text ("chandles can be inserted into associative arrays ... the relative
-  ordering of any two entries ... can vary") reads, together with 7.8.5's
-  equality-only legality rule, as though a chandle key should already be legal, which
-  is exactly what docs/design/assoc-keys.md's P0 phase later admitted (now
-  **landed**, `assoc: admit chandle / event / virtual-interface / unpacked-union
-  keys (P0)`) with the class-handle key normalizer reused verbatim; `int q[chandle]`
-  now works, covered by a dedicated test. Verilator's chandle/DPI support does not
-  extend to a container of them, so Verilator is no runtime oracle for the container
-  shapes; behaviour is pinned to the LRM 6.14 / 7.10 / 7.5 / 15.4 / 7.12.2 text
-  directly, the same precedent already used for associative-array tests. Covered in
-  tests/queue_test.cpp, tests/dynamic_array_test.cpp, tests/associative_array_test.cpp,
-  tests/array_ordering_test.cpp, tests/sync_test.cpp and tests/display_test.cpp.
-- [x] **NBA to a dynamic array** — and to an associative array. `HandleCopyNb`
-  stages a deep copy in the Active region and MOVES it into the live handle in the
-  NBA region, generalizing the queue's path to all three container kinds. A
-  `'{...}` literal / `new[n]` right-hand side on a dynamic array now works too:
-  neither is a copyable handle (a literal fills element-by-element, `new[n]`
-  allocates), so `lower_dyn_array_assign`'s NBA branch materializes it into a
-  FRESH temp handle at Active-region time (the same blocking-assignment
-  machinery — `emit_agg_store` / `emit_dyn_array_new_expr` — redirected at a
-  scratch handle instead of the live one), then feeds that temp through the
-  same `HandleCopyNb` the plain-variable case already used, mirroring
-  `materialize_queue_rvalue`'s "materialize into a temp, then move" shape for
-  a queue. Confirmed via a real design (`uvm_id_register`, `reg_dut.sv`:
-  `id_register_value <= '{'ha0, 'ha1, ...};` nonblocking-assigning an
-  assignment-pattern literal directly into a `int id_register_value[];`
-  dynamic array inside an `always @(posedge PCLK)`). A keyed `'{key:value}`
-  literal on the right of an associative array's NBA is still refused
-  (`emit_assoc_literal_init`'s own guard) — an associative array literal has
-  no upfront size to allocate the way a dynamic array's does, so staging it
-  into a temp handle needs its own follow-up, not this one.
-- [x] **Array ordering methods** (LRM 7.12.2) — `reverse` / `sort` / `rsort` /
-  `shuffle` on a dynamic array or queue (`rt_dynarr_*` / `rt_queue_*` helpers),
-  and on a fixed-size unpacked array through a mirror of one (see the fixed-size
-  entry below).
-  `reverse` / `shuffle` are element-agnostic; `sort` / `rsort` are value-keyed,
-  taking an integral (width <= 64) or real element. `shuffle` draws
-  from the calling thread's RNG (which forces its process to a coroutine, and
-  reaches a subroutine body through the call ABI). This is the FLAT-VALUE path
-  only — the element is its own key, which is what makes an unstable `std::sort`
-  and an ascending-then-reverse `rsort` correct for a 2-state or real element. A
-  `with` clause, a string element and a wide element go through the IR permutation
-  sort instead (next entry but one). A **4-state** element takes its own
-  comparator kinds (`sort_unsigned4` / `sort_signed4` -> `slot_cmp4` /
-  `sort_run4`), which decode the slot's must/may planes and order under the total
-  order for unknowns (see the 4-state entry below): that path is stable and orders
-  descending directly, because neither flat-value shortcut survives unknowns —
-  `8'b1111_111x` ties with `8'b0000_000x` without being byte-equal to it. Keeping
-  them separate KINDS rather than a flag is what keeps the 2-state comparator free
-  of a plane test: `slot_less` and `sort_run` are untouched, and the choice is one
-  test in `rt_dynarr_sort` / `rt_queue_sort` beside the `len < 2` test.
-- [x] **Array locator + reduction methods** (LRM 7.12.1 / 7.12.3) and the `with`
-  iterator clause (7.12 / 7.12.4) — `find` / `find_index` / `find_first` /
-  `find_first_index` / `find_last` / `find_last_index` / `min` / `max` /
-  `unique` / `unique_index`, and `sum` / `product` / `and` / `or` / `xor`, on a
-  dynamic array or queue. Lowered as one IR loop over the container, not a
-  runtime helper: the clause is arbitrary IR, and going through the ordinary
-  expression path makes 4-state, wide, real, string and struct elements work with
-  no per-type comparator (so none of `sort`'s element restrictions apply here).
-  A locator fills a fresh result queue; a reduction folds at the result type's
-  width, so a `byte` sum wraps (7.12.3). `item.index` resolves through a binding
-  stack, so a nested clause and `unique`'s dedup scan both keep their own index.
-  Empty-array reductions answer 0 rather than the fold identity and 4-state
-  `min`/`max` skip unknowns. An unpacked struct / array element works through
-  the same loop: the iterator variable binds by
-  aggregate copy and a locator's result queue receives whole elements, so
-  `q.find(x) with (x.f > 2)` / `q.sum(x) with (x.f)` are ordinary. Guarded loud: an
-  associative-array receiver (7.12 allows it; it needs key traversal), and an
-  aggregate element with NO `with` clause — the bare form makes the element itself
-  the key (7.12.1), and an unpacked aggregate has no ordering or fold. A
-  fixed-size receiver is no longer among these (see the fixed-size entry below).
-- [x] **`with` clause on `sort` / `rsort`** (LRM 7.12.2) — and, from the same
-  mechanism, `sort` of a **string** and a **wide (> 64-bit)** element. The
-  motivating shape is Accellera UVM `uvm_phase_hopper.svh:763`,
-  `succ_q.sort with ( item.get_full_name() )`: a queue of class handles ordered by
-  a string a method call returns, so the key is neither the element nor a field of
-  it. The renameable iterator the prototype allows
-  (`function void ordering_method ( array_type iterator = item )`) works, which is
-  what the clause's own second example needs: `c.sort( x ) with ( {x.blue, x.green} )`.
-  Keys: integral of any width, real, string, enum (integral, so it orders by base
-  value) — the types 7.12.2's "the relational operators shall be defined for the
-  type of the expression" admits. Anything else is refused by name.
-  * **Lowered as IR, not a runtime comparator with a callback.** A keyed sort is a
-    stable bottom-up merge sort over an index permutation emitted by
-    `lower_array_sort_iter`, with one gather applying the permutation at the end —
-    so the O(n log n) moves are on 32-bit indices and exactly n elements are
-    copied. This is the locator family's reasoning (7.12.1) applied to ordering:
-    the key is arbitrary IR, so the ordinary expression path makes string, wide,
-    real, enum, struct-field and concatenation keys work with no C comparator and
-    no `{kind, width}` element descriptor. The considered alternative was a
-    generated `less` thunk handed to the runtime as a function pointer; it was
-    rejected because the key expression can read enclosing frame locals, `this`
-    and the call-ABI RNG pointer, none of which a standalone thunk can reach —
-    clotho has no closure mechanism, and `rt_elem_ops` (which the idea was
-    modelled on) carries no function pointers at all, only layout data.
-  * **The key is evaluated per COMPARISON, not precomputed.** 7.12.2 fixes no
-    evaluation count, so a side-effecting clause observes two calls per
-    comparison; a test pins the count so switching to precomputed keys later is a
-    deliberate, visible change. Precomputing n keys into a buffer was the
-    alternative: fewer evaluations, but O(n) key storage, a second heap container
-    for a string key, and a divergence from `unique`'s dedup scan, which likewise
-    re-evaluates rather than caching.
-  * **Ordering is stable, because a `with` clause makes ties observable.** With no
-    clause the element IS the key, so equal keys mean byte-equal elements and tie
-    order cannot be seen — which is why the flat path's `std::sort` was always
-    fine. A clause breaks that: two DIFFERENT elements can share a key. The
-    trap this creates is `rsort`: the flat path implements it as ascending then
-    `reverse_run`, and that is NOT a descending sort once ties are observable,
-    because it reverses each tie GROUP too. The keyed path therefore orders
-    descending directly (compare with the operands swapped) and keeps equal keys
-    in original order; a test asserts stability for both directions, the `rsort`
-    one specifically to catch a reintroduced ascending-then-reverse.
-  * **The GC-during-callback hazard does not exist on this design, and would not
-    have bitten even on the other one.** Three independent facts: a container's
-    payload is `malloc`'d, not GC-heap memory (`Gc.h:333`), so no collector — even
-    a future evacuating one — relocates it; allocation never collects inline, the
-    slow path only sets `mutator->request` (`Gc.cpp:1855`, `:3011`); and emitted
-    code has exactly ONE poll site, the drain loop's quiescent edge after
-    `rt_wheel_advance` ("THE safepoint", `LlvmBackend.cpp:11850`), which a sort
-    running inside a process body is by construction not at. Measured, not
-    assumed: a 400-element sort whose key allocates a fresh string per evaluation
-    reports `gc: 1 collections` under `--gc-stress`, i.e. none during the sort.
-    On this design the question is moot anyway — the runtime is never inside the
-    sort, and every element access re-resolves through `elem_select`.
-  * **A key expression that MUTATES the receiver is defined, not refused.** 7.12.2
-    is silent. The element count is snapshotted at entry, the same rule `foreach`
-    uses for its bound, so the sort orders exactly the elements that were there
-    and anything the clause pushes stays past them; nothing dangles because no raw
-    pointer is held across the clause. Refusing would have needed an epoch check
-    per comparison to catch a case that cannot corrupt anything.
-  * The plain scalar path is untouched: a bare `sort` / `rsort` on an integral of
-    width <= 64 (either domain) or a real still emits `queue_sort` /
-    `dyn_array_sort` and reaches `std::sort` with no call into generated code
-    (verified on `--emit ir` / `--emit llvm`: an `int`, a `logic [7:0]` and a
-    `logic [95:0]` queue emit two runtime sort calls — `kind 1 width 32` and
-    `kind 3 width 8` — and exactly one merge-sort loop, the wide one; the keyed
-    and string cases likewise emit loops and no runtime sort call).
-  * Fixed en route: a string key, or any key that lowers to a PLACE inside the
-    iterator variable rather than a value (a member select of an aggregate
-    element), compared the left element against itself and reported every pair a
-    tie — binding the iterator for the second key overwrote the storage the first
-    key was still aiming at. The right key is now stored into a cell of the key
-    type before the left is evaluated, which is why `min`/`max` and `unique` hold
-    their keys in cells too.
-  **4-state elements and keys are ordered, not refused** (the refusal this entry
-  used to record is gone). LRM 11.4.4 says a relational compare "shall be 1'bx"
-  when either operand carries an unknown, and the earlier reading was that 7.12.2
-  therefore leaves x/z placement unspecified and refusable. That reading
-  understates the problem and overstates the cost: x is not an unspecified RESULT
-  to a comparison sort, it is an **inconsistent comparator** — collapse it to
-  false and the relation is neither transitive nor consistent between `less(a,b)`
-  and `less(b,a)`, which is UB in the algorithm. So clotho defines a strict weak
-  ordering instead of refusing:
-
-  ```
-  unknown  <  defined,     unknown_i  ==  unknown_j   for all i, j
-  ```
-
-  Unknown means ANY x or z bit, so `8'b1111_111x` and `8'b0000_000x` are both
-  unknown and equal to each other; x is not distinguished from z; defined values
-  order numerically at the operand's signedness; and the order is stable, which is
-  what makes the position of the mutually-equal unknowns deterministic rather than
-  merely legal. `rsort` is the mirror (unknowns last), ordered directly — the one
-  tie group containing every unknown is exactly what an ascending-then-reverse
-  would flip. Signed 4-state is resolved by the same rule, since the unknown plane
-  alone decides unknown-ness and signedness only ever orders DEFINED values. Reals
-  and strings carry no x/z, so they are unaffected and got no new check. The keyed
-  path tests `IsUnknown` (`$isunknown`, LRM 20.9) on each key, which is one
-  reduction of the unknown plane and so needed nothing extra for a wide (> 64-bit)
-  4-state element; the bare scalar path decodes the slot's must/may planes
-  (`slot_cmp4`). The motivating shape is Accellera UVM `uvm_root.svh:827`,
-  `m_time_settings.sort() with ( item.offset )` over `time offset`
-  (`uvm_cmdline_report.svh:179`): `time` is 64-bit 4-STATE, so the refusal fired
-  on a sort of ordinary simulation times with no unknown in them.
-  Oracles: **verilator 5.050 fabricates a value** — it maps an unknown bit to 0
-  and sorts the result as that value. Measured: `'{8'd3, 8'hxx, 8'd1}` sorts to
-  `'{'h0, 'h1, 'h3}`, and `'{8'b0000_0000, 8'b1111_111x, 8'b0000_000x}` to
-  `'{'b0000_0000, 'b0000_0000, 'b1111_1110}`, i.e. a partial unknown is ordered by
-  the bits it does know. Clotho gives an unknown an explicit position instead of
-  inventing a value for it. **iverilog 13 does not implement `sort()` at all**:
-  "sorry: 'sort()' array sorting method is not currently supported"; it cannot
-  even parse `s.sort()` on a string array, let alone a `with` clause.
-- [x] **Fixed-size unpacked-array receiver** (LRM 7.12) — all three families on
-  `int q[5]`, `int q[3:7]` and the descending `int q[7:3]`. 7.12 applies to "any
-  unpacked array" and 7.12.2 spells it out ("fixed or dynamically sized"), so the
-  refusal that stood at the shared container-method dispatch was clotho's own gap,
-  not the clause's. The motivating shape is Accellera UVM
-  `uvm_printer.svh:1498`, `int q[5]; int qq[$]; qq = q.max; m = qq[0];` — one of
-  41 array-method call sites in uvm-core, and the only one not on a queue.
-  * **What a fixed receiver actually changes is one thing: its indices are its
-    DECLARED range, not 0 .. n-1.** That is threaded as a `DeclIndexMap`
-    (`{first, step, count}`) carried beside the receiver: iteration position `p`
-    holds the element at declared index `first + step*p`. A queue or dynamic array
-    is `{0, +1}`, for which every expression the map builds collapses to the
-    position itself — so this is ONE path with the old receivers as its
-    degenerate case, not a fork, and the queue paths emit the instructions they
-    emitted before. The walk itself stays 0-based; the map is applied only where
-    an index is REPORTED or an element is ADDRESSED.
-  * **Three consumers, one map.** `find_index` / `find_first_index` /
-    `find_last_index` / `unique_index` push `decl_of(k)`; `item.index` (7.12.4)
-    reads it through the `IterBinding` the clause already resolved by symbol
-    identity; and `elem_select` takes it directly, because an `ir::ElemSelect`
-    index into a fixed array is ALREADY a declared-range coordinate that the
-    backend normalizes (`at.left`, either direction). Computing it once is what
-    keeps a reported index and the element it names from disagreeing.
-  * **Direction is the part a 0-based test cannot catch.** 7.12.1 defines the
-    first element as the one "closest to the leftmost indexed element", so the
-    walk starts at the declared LEFT bound whichever side it is on: position 0 is
-    index 3 for `int b[3:7]` and index 7 for `int c[7:3]`, and `step` is -1 for
-    the latter. Ordering likewise permutes in declared-address order, so `sort`
-    puts the smallest element at the left bound and `c.sort()` reads ascending
-    from index 7 down to 3. Both ranges are pinned by tests; negative bounds
-    (`int a[-1:1]`) are still refused by the existing `lower_type` guard.
-  * **Ordering reuses the dynamic-array implementations rather than growing a
-    second copy.** The elements are mirrored into a temporary dynamic array in
-    declared-address order, reordered THERE, and copied back
-    (`lower_fixed_array_order`). So `reverse` / bare `sort` / `rsort` keep the
-    runtime fast path including the 4-state comparators (`sort_run4`, so the total
-    order for unknowns applies unchanged), `shuffle` is the same
-    `rt_dynarr_shuffle` call and therefore draws the SAME RNG stream — a
-    six-element fixed shuffle produces the permutation the dynamic-array test
-    already pins and leaves `$urandom` at the same point — and a keyed `sort` goes
-    through `lower_array_sort_iter` unchanged, with the receiver's map installed
-    so `item.index` still reports declared indices. Reuse is pinned by RESULT:
-    stability and the per-comparison clause count come out to the same
-    `12 13 15 10 11 14` / `calls=8` the queue cases pin.
-  * **One real bug the mirror exposed, fixed here.** An aggregate element crosses
-    the `rt_*` ABI as a pointer to a CANONICAL aggregate image, but a fixed array
-    of scalar-element sub-arrays stores FLAT leaf slots that may be independently
-    z-widened — a different image size. Handing that pointer to `queue_push` made
-    the runtime copy the wrong byte count and segfaulted on
-    `int m[2][3]; mq = m.max with (item.sum);`. Result pushes now stage such an
-    element through a canonical temp (`canonical_elem_ptr`, the rule
-    `lower_container_element_value` already applies to a pushed actual), and the
-    mirror copy decomposes per leaf instead of taking the whole-image memcpy
-    shortcut. A queue receiver is unaffected: its elements already live in a
-    canonical image, and it emits what it emitted before.
-  * **Multidimensional receivers work through the clause's own nested form.**
-    7.12.3's worked example `logic [7:0] m [2][2]; m.sum with (item.sum with
-    (item))` gives 50, because the ELEMENTS of `m` are its sub-arrays and the
-    inner clause reduces one of them per iteration — not a flattened leaf sum.
-    Index results name the outer dimension in declared coordinates
-    (`int n[2:3][3]` answers 3), `min`/`max` return a queue OF sub-arrays, and
-    `reverse` / `shuffle` reorder sub-arrays because they move whole slots. A
-    BARE `m.sum` or `m.max` is refused — with 7.12.3's and 7.12.1's own words, by
-    slang's binder ("unpacked arrays of integral values" / "of comparable
-    values"), which is the right place for a type rule — since no arithmetic or
-    relational operator is defined for a sub-array. `item.index(2)` for the
-    second dimension is still refused by clotho.
-  * **Refused loudly, each on the clause:** a bare reduction of a
-    non-integral element (multidimensional, `string`, `real`) and a bare
-    `min`/`max`/`sort` of a non-comparable one, both by slang ahead of lowering
-    (7.12.3 "any unpacked array of integral values"; 7.12.1 / 7.12.2 "the
-    relational operators shall be defined for"); an aggregate element with no
-    `with` clause, by clotho, now citing both clauses; a virtual-interface
-    element, which the ordering mirror still refuses
-    (`guard_container_element` -- a `chandle` element now lowers, see the
-    container-element-type entry above); and `item.index(d)` for `d > 1`.
-  * Remaining receiver gap: the **associative** array, whose index family is
-    key-typed and whose walk is the `assoc_traverse` chain.
-- [ ] **`map`** (LRM 7.12.5, 1800-2023 only) — the one array manipulation method
-  slang binds that clotho does not lower, so `q.map(x) with (x * 2)` hits the
-  container-method guard (`--std 1800-2023`; older versions reject it in the
-  binder). It is the locator loop with the CLAUSE VALUE collected instead of the
-  element, so it reuses the `with`-iterator infra; the result keeps the receiver's
-  container kind with the clause's element type (queue -> queue, dynamic ->
-  dynamic, assoc -> same key type, fixed -> same range).
-- [ ] **Multidimensional dynamic arrays**.
-- [x] **`%p` of a container with a non-scalar or wide element** (LRM 21.2.1.6) —
-  the runtime formatter renders an element from a flat descriptor (one word, no
-  member names), which covers a single-word integral, a real and a string. An
-  aggregate, a nested container, an element wider than one word and a tagged union
-  now render through a frontend loop instead: one `$sformatf` per element built by
-  the ORDINARY aggregate expansion, concatenated over the live element count. So
-  member names, nested arrays, string leaves and tag names all print exactly as
-  they do outside a container (`'{'{a:1, s:"hi"}, ...}`).
-- [x] **NBA to a whole queue** (`q <= rhs`, LRM 10.4.2) — `QueueCopyNb` stages a
-  deep copy of the RHS in the Active region (per-queue `rt_nba_arr` buffer), then
-  `rt_queue_move`s it into the live handle in the NBA region (managed-element
-  safe). Pattern/concat/slice RHS reuse the materialize path.
-- [n/a] **NBA to a queue element** (`q[i] <= x`) — **illegal SystemVerilog**, not
-  a gap. LRM 10.4.2 forbids a nonblocking assignment to an element of a
-  dynamically-sized array (queue / dynamic array); slang rejects it before Clotho
-  ("nonblocking assignments to elements of dynamically sized arrays are not
-  allowed"), which sidesteps the sample-vs-commit realloc hazard by disallowing
-  the construct. Nothing to implement.
-- [x] **Queue slice `q[a:b]`** (LRM 7.10.4) — materialized element-wise into a
-  temp handle via `QueueAppendRange` (`rt_queue_append_range`), usable in any
-  rvalue position; bounds runtime-clamped. Dynamic-array slice still guarded.
-- [x] **Non-variable queue assignment** (concat `{q,e}` / pattern `'{...}`) —
-  `materialize_queue_rvalue` builds a temp handle (alias-safe for `q = {q,e}`),
-  then a deep copy into the target; splices whole-queue operands, pushes scalars.
-  A queue that IS an element or a member of something (`q = qq[i]`, `q = s.inner`)
-  needs no temp: it already has a handle lvalue.
-- [x] **Queue / dynamic-array equality** (`==` / `!=` / `===` / `!==`, LRM
-  11.2.2/11.4.5) — direct and as an aggregate member, reached from the AggEq
-  leaf walk: size mismatch is a definite 0, else per-element 4-state compare
-  with x-propagation. Fixed a prior silent miscompile (handle compared as a
-  value). A single-word integral / real / string element goes through
-  `rt_container_eq`; an aggregate, a nested container or an element wider than
-  one word walks element-wise in the backend (`emit_container_eq_loop`),
-  recursing through the same aggregate compare — which is also what gives a
-  queue of queues (and a struct holding a queue) a compare. `===`/`!==` used to
-  fall through this reduction entirely (only `Equality`/`Inequality` were
-  special-cased), reaching a generic bitstream-cast lowering that tried to Load
-  the whole struct/container as a scalar — silently wrong for a struct (no
-  invariant to catch it) and an unlocated backend abort for a queue/dynamic
-  array (`"plane load of a container handle"`, the backend's defense-in-depth
-  check for exactly this shape). Found via UVM's `uvm_field_queue_string`
-  field-automation macro comparing a `string q[$]` field with `===`. Reusing
-  the X-propagating `==` walk for `===` is exact whenever no leaf can ever
-  carry x/z (`case_eq_matches_logical`: true for a string, class-handle or
-  chandle leaf, per 6.16.9/6.14 — none of those can be x/z); a leaf that CAN
-  (4-state integral, real, or an associative-array leaf with no case-compare
-  implementation) stays a located refusal citing 11.4.5/12.5, since case and
-  logical equality genuinely disagree on how x/z compares once that is
-  possible.
-- [ ] **Bit-stream casting** (`{<<{}}` / `{>>{}}` cast operands, LRM 6.24.3).
-- [ ] **Casts to/from enum / struct / union**. `$cast` is tracked under M4. Open
-  question, low confidence that it is a real violation: `$cast` into a **packed
-  tagged union** is a plain bit cast and is *not* tag-checked, so it can install a
-  tag/payload pairing no `tagged` expression could build — which LRM 11.9's
-  "completely type-checked" accesses then trip over. Packed-to-packed bit casts
-  are legal, so this may be correct as it stands; needs a reading. Note the entry
-  previously claimed union casts were unsupported, which under-claimed what
-  actually happens.
-- [x] **2-state and sized integer types** — `bit`/`byte`/`shortint`/`int`/`longint`
-  as genuine 2-state; 4-state<->2-state conversion (LRM 6.3.1).
-- [x] **`string` type** (LRM 6.16) — SSO storage, assignment, concat, comparisons,
-  `s[i]` read/write, the method set, string<->packed casts, `%s`, by-value
-  args/returns, fixed unpacked arrays, string conditions.
-- [x] **`enum`** — base type, member folding, methods (LRM 6.19:
-  `first`/`last`/`num`/`next`/`prev`/`name`).
-- [x] **`struct`** — packed member select/assignment; unpacked struct / arbitrary
-  aggregate nesting (recursive storage mirror, composed-GEP path); read,
-  blocking/nonblocking write, whole-object copy / `==` `!=`, by-value through
-  functions, across module ports, aggregate net declaration assignment. Design:
-  docs/design/unpacked-struct.md.
-- [x] **Assignment patterns `'{...}`** (LRM 10.9) — positional, keyed
-  (member / array-index / `default`), and replicated forms over packed structs /
-  vectors / multi-dim packed arrays, unpacked structs, and fixed unpacked arrays.
-- [x] **Assignment-pattern lvalue destructuring** (`'{a,b,c} = rhs` / typed
-  `U'{a,b,c} = rhs`, LRM 10.9) — positional only, over a packed value (bit-slice,
-  shares `store_concat`), an unpacked struct, or a fixed unpacked array
-  (structural per-element walk); nested pattern/concat members recurse. Element
-  count / keyed-or-replicated-as-lvalue / compound-assignment are guarded loud
-  (slang itself rejects most of these at binding time already). Queue / dynamic
-  / associative-array right-hand side, and a string / handle-typed member, are
-  guarded loud (not supported); iverilog and verilator both reject the syntax
-  outright.
-- [x] **`typedef`** — alias resolution, canonicalized at `lower_type`.
-- [x] **Packed multidimensional arrays** — element / range / nested bit & part
-  select, read + lvalue, constant + dynamic indices, arbitrary nesting (LRM
-  7.4.5/7.4.6). Array query functions `$size` / `$dimensions` /
-  `$unpacked_dimensions` / `$left` / `$right` / `$low` / `$high` / `$increment`
-  (LRM 20.7) — const-folds for a fixed-size operand; `$dimensions` /
-  `$unpacked_dimensions` fold even for a dynamically-sized one (pure type
-  walks, slang's `ArrayDimensionFunction::eval` never touches the value). A
-  dynamically-sized operand (dynamic array, queue, or an integral-keyed
-  associative array) takes a runtime path reusing `$size`'s
-  `dyn_array_size`/`queue_size`/`assoc_num` mechanism: `$left`/`$low` = 0 and
-  `$increment` = -1 are 20.7's own UNCONDITIONAL rule for a queue/dynamic-array
-  dimension — never a runtime `$left`-vs-`$right` comparison, and an empty or
-  single-element collection is not special (`$increment` stays -1; verified
-  against slang's `QueryFuncs.cpp` and Verilator 5.050, which corrects an
-  earlier assumption that increment needed computing) — so only `$right`/
-  `$high` (`size - 1`, computed in the signed result type so an empty
-  collection lands on -1 rather than an unsigned wraparound) need a runtime
-  call. An associative array (restricted to an integral index type, 20.7; a
-  non-integral key is refused by slang's own `checkArguments` with
-  `QueryOnAssociativeWildcard` before Clotho ever sees the call) additionally
-  needs `$right` = the index type's all-ones bit pattern (a type constant,
-  matching slang's reference eval — for a signed key type this reads back as
-  -1, not the largest positive value) and `$low`/`$high` = the lowest /
-  highest currently ALLOCATED key (`assoc_traverse` First/Last, `'x` if
-  empty, degrading to 0 for a 2-state key type). `$size` gained an
-  `assoc_num` branch alongside its existing dynamic-array / queue ones for
-  this consistency (`$size` of an associative array was previously refused,
-  same as the other six would have been). Refused loud: a dimension argument
-  that is not the constant 1 on a dynamically-sized operand (LRM 20.7.1
-  defines no other runtime shape — a fixed inner dimension or a
-  nested-dynamic dimension already fold or hard-fail above), and a
-  multidimensional dynamic collection (matches `$size`'s pre-existing
-  boundary).
-- [ ] **A bounded queue's `[$:N]` bound is not respected by WHOLE assignment**
-  (`qb = other` for any source kind — queue, dynamic array, or fixed array;
-  found while verifying the resizeable-assignment fixes below, reproduces
-  queue-to-queue with neither involved, so it predates and is unrelated to
-  them). `rt_queue_assign` / `rt_queue_assign_dynarr` (the mirrored
-  `rt_dynarr_assign_queue` inherits it too) just set `dst->len = src->len`
-  unconditionally — unlike `q_push_back_raw` (Runtime.h's per-element push /
-  insert path), which already clamps correctly against `bound`, WHOLE
-  assignment has no clamp at all, so `int qb[$:2]; qb = '{1,2,3,4,5};` keeps
-  all 5 elements instead of truncating to 3. Needs the assign functions to
-  take the queue's `bound` (already computed elsewhere as
-  `std::get<Type>(pool.get(queue_type)).left`, see `lower_queue_append_range`)
-  and clamp `len` the same way push does, not just copy `src->len` through.
-- [x] **Dynamic arrays** — `[]`, `new[n]` / `new[n](src)`, `.size()`, `.delete()`,
-  element r/w, whole-array deep-copy, `foreach`, full subroutine ABI, and a
-  slice `da[a:b]` / `da[i +: n]` / `da[i -: n]` (LRM 7.4.5/11.5.1, extended to
-  a dynamic array by 7.5.1). Unlike a queue slice, this types as a
-  `FixedSizeUnpackedArrayType`, never a queue, so `$` and a runtime bound in
-  the `a:b` form stay queue-only (both bounds must be compile-time constant);
-  the indexed form's base `i` MAY be runtime, only its width `n` must stay
-  constant. Storage is handle-indirect (`rt_dynarr{data,len}`, heap,
-  relocatable) rather than flat/address-indexed, so unlike a fixed array's own
-  constant-bounds slice (a live, zero-copy `ArrSlice` view) it is ALWAYS
-  materialized position-wise (`emit_indexed_slice_copy`, generalized from the
-  fixed array's indexed-only form to cover both selection kinds and either
-  base): a plain `ElemSelect` per position, so out-of-range clamping (read ->
-  default, write -> no-op) and, on a write, `HandleUse::Mutate`'s waited-on
-  notification (LRM 9.4.3) come for free from the SAME already-proven
-  single-element path an ordinary `da[i]` uses. Covers: read/write, an
-  equality operand, a by-value / output / inout subroutine argument (the
-  output case is what needs the write's `for_write` threaded through — a
-  by-value read does not touch the flag), and overlap-safe self-assignment
-  (`da[0:2] = da[1:3]`, inherently safe: the RHS is always independently
-  materialized first, never a live view of the same storage). NOT covered: an
-  aggregate (struct / heap-handle) element, matching the fixed array's own
-  indexed-slice gap; a `ref` argument (already refused generically — no slice
-  of any kind has an anchored lvalue a pointer can name, LRM 13.5.2). No
-  oracle: verilator 5.050 rejects `da[a:b]` outright ("Illegal range select");
-  iverilog 13 crashes an internal assertion on it. Hand-checked against the
-  LRM: the open `$` bound and a runtime bound in the `a:b` form are
-  queue-only, and a constant-bounds dynamic-array slice is legal (7.4.5).
-  Resizeable assignment INTO a dynamic array (LRM 7.5.1: `d = f` / `d = q`,
-  a fixed-size array or a queue source, both the statement-assignment and the
-  declaration-initializer / handle-member-store / class-property form) was a
-  genuine data-corrupting bug, not merely unsupported: the fallback fed the
-  mismatched source's lvalue straight to `dyn_array_copy`, which either hit
-  an unrelated refusal (a fixed-array source arrives wrapped in slang's
-  implicit Conversion node, so `lower_lvalue`'s default case fired) or, worse,
-  silently reinterpreted another container's handle bytes as an
-  `rt_dynarr{data,len}` (a queue source has no Conversion node to catch it) —
-  a garbage `data` pointer read through a garbage `len`. Fixed by checking the
-  source's ACTUAL kind before dispatching: `dyn_array_copy_queue` (new,
-  mirrors `rt_queue_assign_dynarr`) for a queue source, and a compile-time-
-  constant-count allocate-then-position-wise-copy loop
-  (`emit_fixed_array_into_dynarr`) for a fixed-array source — reused by both
-  entry points, and by the symmetric queue-target fix below.
-- [x] **Checked container allocation** — every heap buffer a design's containers
-  need routes through `rt_alloc_checked` / `rt_alloc_elems_size` (Runtime.h).
-  Three silent failures are now located fatals instead of a corrupt heap: a
-  `new[n]` count that arrived zero-extended (so `new[-1]` asked for 4294967295
-  elements — the count is `int64_t` at the ABI now, the backend sign-extends a
-  signed count and zero-extends an unsigned one, and the runtime rejects `n < 0`),
-  an element-count-times-stride product formed by wrapping multiplication
-  (`__builtin_mul_overflow` now), and a `malloc` that simply returned null. Each
-  reports through an `rt_alloc_site` constant the backend emits beside the call,
-  so the diagnostic carries the file position, source line and caret rather than
-  naming the runtime. The only ceiling is `size_t`. Covers dynamic arrays,
-  queues, strings (including the `{N{s}}` replication product) and associative
-  arrays; coroutine frames (`rt_alloc`) keep their own path.
-- [x] **Queues** — `.size()`, push/pop/insert/delete, `q[i]` / `q[$]`, `foreach`,
-  whole-queue deep-copy, bounded `q[$:N]`, full subroutine ABI, `q = {}` (empty
-  concatenation clears, LRM 7.10.2), a slice bound spelled `$` (LRM 7.10.4:
-  `q = q[1:$]` == `q.delete(0)`, `q = q[0:$-1]` pops the tail, `q[$:$]` the last
-  element alone) — `$` there is the queue's runtime `size() - 1`, not a
-  constant, unlike a fixed/packed array's declared high bound — and the
-  indexed part-select form `q[i +: n]` / `q[i -: n]` (LRM 11.5.1, extended to
-  queues by 7.10.4): `i` and (unlike a fixed/packed array) `n` are both
-  ordinary runtime expressions, `i` may itself spell `$`, and both ends clamp
-  against the queue's actual length exactly like the `a:b` form. A slice of a
-  DYNAMIC ARRAY is a different shape entirely (not queue-typed at all --
-  `da[a:b]` binds as a `FixedSizeUnpackedArrayType` with constant bounds, LRM
-  7.4.5/11.5.1) — see the dynamic arrays entry above, which covers it.
-  Resizeable assignment FROM a fixed-size array (`q = f`, LRM 7.10.2) had the
-  identical data-corrupting bug the dynamic-array-target fix above describes
-  (a fixed array's flat storage read as an `rt_queue{base,head,len,cap}`
-  handle) — fixed the same way: stage through a temp dynamic array
-  (`emit_fixed_array_into_dynarr`, the exact fill the dynamic-array-target
-  case uses) and reuse the already-proven `queue_copy_dynarr`
-  (`emit_fixed_array_into_queue`), rather than build a parallel fixed-array
-  ring-push path. NOT covered: a bounded queue target's `[$:N]` bound is not
-  respected by whole assignment from any source — see the dedicated entry
-  below (found while verifying this fix, a pre-existing gap unrelated to it).
-- [x] **Associative arrays** (LRM 7.8/7.9) — every legal key kind (integral of
-  any width / enum / packed / `string` / `[*]`-wildcard / class handle (7.8.3) /
-  chandle / event / virtual interface / unpacked union / unpacked struct or
-  fixed array (7.8.5) / queue / dynamic array / associative array, and any
-  nesting of these through structs and fixed arrays to arbitrary depth,
-  including the LRM's own example `struct { byte B; int I[*]; }`), unified as
-  normalized order-preserving byte spans — fixed-width for a leaf without a
-  string/queue/dynarray/assoc component, length/count-prefixed variable-width
-  otherwise (see docs/design/assoc-keys.md, which supersedes
-  docs/design/dynamic-arrays.md §4a). Index r/w,
-  `.num`/`.size`/`.exists`/`.delete(k)`/`.delete`/`.first`/`.last`/`.next`/
-  `.prev`, ascending-key `foreach`, whole-array deep-copy AND equality
-  (`==`/`!=`/`===`/`!==`, LRM 11.4.5, element-wise on the map's contents —
-  logical `==`/`!=` refuses a 4-state-capable value element, where X-propagation
-  differs from a byte compare; `===`/`!==` are bit-exact and always work),
-  `'{key:value,
-  default:v}` literals (7.9.11, including a non-scalar key), full subroutine ABI.
-  Value element: every kind a queue / dynamic-array element takes (one shared
-  rule, `guard_container_element`) — integral / real / `string` / class handle /
-  unpacked struct or array including one with string or container leaves /
-  a nested queue, dynamic array or associative array (`rt_elem_assoc`). Member,
-  element and whole-value r/w, equality, absent-key default. `a[k]` resolves its
-  entry by DIRECTION: a mutating method creates it, a query reads through get_ptr
-  and falls back to the empty-container default, so `a["absent"].size()` is 0 and
-  leaves `num()` alone (LRM 7.8.6).
-  An element select THROUGH a container-valued entry (`a[k][i]`) works, to any
-  nesting depth, in both directions and for a mutating method's receiver: the access
-  direction is threaded down the select chain (`ir::ElemSelect::for_write`) rather
-  than deferred to the consumer, so a read resolves get_ptr and creates nothing (LRM
-  7.8.6) while a write and a mutating receiver resolve put_ptr (7.8 / 7.10). A `ref`
-  bound through one is checked at every level (docs/design/data-model.md §3.1).
-  Still guarded loud: a class handle combined with a string / queue / dynamic-array
-  / associative-array component in the SAME key (a variable key's byte offsets are
-  runtime-dependent, so the collector's key-handle trace -- a compile-time static
-  offset table -- cannot describe one; a handle in an otherwise-fixed key is
-  unaffected). Whole-array NBA works (`HandleCopyNb`); a literal RHS under NBA does
-  not. An x/z index is invalid per 7.8.4 / 7.8.5: the read yields the element
-  default, the write is dropped without creating an entry, `exists` answers 0 and
-  `delete` is a no-op, and a warning is issued under `--sanitize=bounds`
-  (`RT_BOUNDS_ASSOC_KEY`, LRM 7.8.6). iverilog cannot parse associative arrays at
-  all, and verilator creates an entry on an absent read, violating LRM 7.8, so
-  neither models this behaviour.
-- [x] **Casting (scalar/packed)** — static / size / sign / const cast,
-  string<->packed, real<->int. A widening cast extends by the SOURCE's
-  signedness: LRM 6.24.1 defines a cast as "the value that a variable of the
-  casting type would hold after being assigned the expression", which is LRM
-  11.8.3's "sign extension if, and only if, the type of the right-hand side is
-  signed". This was wrong until `fix/int-cast-signedness`: the cast lowered to a
-  single `Resize`, whose extension follows its TARGET type (LRM 11.8.2's
-  propagated-operand rule), so `int'(1'b1)` answered -1. Measured extent over a
-  396-case matrix (source signedness x cast target x widths 1/2/7/8/31/32/33/64,
-  in tests/llvm_backend_test.cpp): 61 wrong, every one of them an UNSIGNED source
-  widened into a SIGNED target — `bit`, `logic`, `byte unsigned`, a packed struct
-  and an enum alike, at every width, so it was never a width-1 story.
-  `signed'` / `unsigned'` / `$signed` / `$unsigned` (LRM 20.5) never widen and a
-  size cast `N'()` passes signedness through, so all four were already right;
-  implicit assignment conversion was right only because slang already splits it
-  into widen-then-retag; call arguments and return values, which the frontend
-  coerces itself with nothing to split them, carried the bug. The constant-folded
-  path (`localparam int P = int'(1'b1)`) is slang's own evaluator and was already
-  correct. iverilog 13 and Verilator 5.050 agree with each other on all 396
-  cases. The fix is in `Lower::coerce`, which now takes an `Extend` selecting
-  between the two LRM rules and, for the 11.8.3 one, emits the widening `Resize`
-  under the source's sign before the retag; a slang `ConversionKind::Propagated`
-  node still gets 11.8.2, which genuinely differs in both directions
-  (`logic [7:0] u; logic signed [3:0] s = -1;` gives `u + s` == 16 but
-  `u = s` == 255).
-- [x] **Parameterized types / type parameters** (LRM 6.20.3).
+- [ ] **2-state formal in the call ABI (performance)** — a 2-state formal is still passed as a
+  4-state (mm, z) plane pair whose z plane is constant 0.
+- [ ] **Nonblocking assignment to a string character** (10.4.2) — `s[i] <= c` is refused; it needs
+  a masked character record rather than a whole-string one.
+- [ ] **NBA to a class property** — `c.x <= v`, of any type including `string`, is refused; NBA
+  staging is keyed by signal and an object body has none. See docs/design/classes.md §8.
+- [ ] **Intra-assignment delay on a string or container NBA** — `s <= #5 t` and `q <= #2 r` are
+  refused; the deferred record has no owned-handle tail. See
+  docs/design/intra-assignment-timing.md.
+- [ ] **Non-constant string replication count** (11.4.12.1) — deliberate deviation, kept open to
+  revisit: `{m{"-"}}` with a runtime `m` is accepted when the result is a `string`.
+- [ ] **`string` ports** — a string port, including a string reached through a struct member or a
+  container element, is refused.
+- [ ] **String event control / sensitivity** — `@(s)` and inferred sensitivity on a string are
+  refused.
+- [ ] **`case ... inside` string range bound** (11.4.13) — a `[lo:hi]` item over a string selector
+  is refused.
+- [ ] **Enum `next` / `prev` with a non-constant step** — only a constant step is lowered.
+- [~] **Slice of an unpacked array with aggregate elements** (7.4.5) — the backend has no slice
+  over aggregate element storage.
+  - [ ] **Struct-bearing array slice as an actual** — refused as a subroutine argument and as an
+    `input` port connection.
+  - [ ] **Slice copy between aggregate frame locals** — `o = x[0:1];` and `return x[0:1];` are
+    refused.
+  - [ ] **Dynamic-array slice with aggregate elements** (7.4.5) — a struct or heap-handle element
+    is refused.
+- [ ] **Array slice as a `ref` actual** (13.5.2) — no slice has an anchored place a pointer can
+  name, so it is refused.
+- [ ] **Streaming concatenation as an unpacked-aggregate actual** (11.4.14.3) — an lvalue on an
+  `output` / `inout` formal and an rvalue on an `input` formal are refused.
+- [ ] **Dynamic-array rvalue materialization** — a dynamic-array value that is not a variable has
+  no temp-handle path as a container element value; queues have one.
+- [ ] **`inout` / `ref` aggregate ports** — a port copy is a continuous assignment and needs
+  change detection over aggregate storage.
+- [ ] **Aggregate port driven by a `'{...}` pattern or call** — such a connection to an aggregate
+  port is unsupported.
+- [ ] **Event control on a `real` expression** — `@(x.r)` and other `real`-typed member, select or
+  expression operands are refused; only integral operands lower.
+- [ ] **Unpacked union with a non-integral member** (7.3) — a `real`, `string`, unpacked
+  aggregate or handle member is refused; members overlay one flat bit plane.
+- [~] **Tagged unions** (7.3.2) — open pieces of the unpacked form, formatting and the dump.
+  - [ ] **Non-integral member of an unpacked tagged union** — a `real`, `string`, unpacked
+    aggregate or class payload is refused.
+  - [ ] **Unpacked tagged union in `force` / `release`, DPI and container elements** — each
+    position is refused for the unpacked form.
+  - [ ] **`%p` of a queue or dynamic array of tagged unions** (21.2.1.6) — refused; the runtime
+    container descriptor carries no member-name table.
+  - [ ] **VCD of a tagged union** (21.7) — dumped as one flat anonymous `$var`, so the active
+    member name is not recoverable.
+  - [ ] **Latent: all-`void` unpacked tagged union width** — `max_width + tag_bits - 1`
+    underflows when both terms are zero; masked because the width lands at 1.
+- [ ] **Associative-array literal under NBA** (7.9.11) — `a <= '{k: v}` is refused; a keyed
+  literal has no upfront size to stage into a temp handle.
+- [ ] **Associative-array literal with an aggregate value element** (7.9.11) — refused; it needs a
+  per-leaf store per entry.
+- [ ] **Event element of a queue or dynamic array** (7.5, 7.10) — refused; each element needs its
+  own event object and the event slot array is sized at compile time.
+- [ ] **Locator methods on an associative array** (7.12) — `find`, `find_index`, `min` and the
+  rest are refused; they need key traversal.
+- [ ] **`item.index(d)` for `d > 1`** (7.12.4) — the second and later dimension indices are
+  refused.
+- [ ] **Virtual-interface element in a fixed-array ordering method** (7.12) — the ordering mirror
+  refuses the element type.
+- [ ] **Unpacked array with a negative bound** — `int a[-1:1]` is refused.
+- [ ] **`map`** (7.12.5) — `q.map(x) with (...)` is not lowered; the result keeps the receiver's
+  container kind with the clause's element type.
+- [ ] **Multidimensional dynamic arrays** — refused.
+- [ ] **Array query dimension argument beyond 1 on a dynamically sized operand** (20.7) — a nested
+  dynamic dimension, as in a queue of queues, is refused.
+- [ ] **Bounded queue `[$:N]` under whole assignment** — `qb = other` from a queue, dynamic array
+  or fixed array keeps every source element instead of truncating to the bound.
+- [ ] **`===` / `!==` over a container with a 4-state leaf** (11.4.5) — a 4-state integral, `real`
+  or associative-array leaf is refused.
+- [ ] **Logical `==` / `!=` over an associative array with a 4-state value element** (11.4.5) —
+  refused; X propagation differs from a byte compare.
+- [ ] **Associative-array key mixing a class handle with a variable-width component** (7.8) — a
+  `string`, queue, dynamic-array or associative-array component beside the handle is refused.
+- [ ] **Assignment-pattern lvalue over a container or handle** (10.9) — a queue, dynamic-array or
+  associative-array right-hand side, or a `string` / handle member, is refused.
+- [ ] **Bit-stream casting** (6.24.3) — `{<<{...}}` / `{>>{...}}` as cast operands.
+- [ ] **Open question: `$cast` into a packed tagged union** (11.9) — the bit cast is not
+  tag-checked and can install a tag/payload pair no `tagged` expression builds; is that legal?
 
 ### Operators & expressions
 
-- [ ] **Concatenation compound-assignment lvalue** (`{a,b} += x`).
-- [ ] **String-element compound-assignment lvalue** (`s[i] += c`).
-- [ ] **`inside` string / real left operand**.
-- [ ] **`inside` unpacked-array set member** (`sel inside {arr}`).
-- [ ] **`inside` tolerance ranges** (`[c +/- d]`).
-- [ ] **`inside` unbounded `$` range bounds**.
-- [x] **Part-select / dynamic bit-select OOB bounds check** (LRM 11.5.1: OOB read
-  -> X (2-state: 0), write -> no-op, per bit for a partially out-of-range access;
-  an x/z index is wholly out of range). Clamped against the container's declared
-  range in both directions, negative indices included; `--sanitize=bounds` reports
-  the same sites. A **runtime-offset** select of a vector wider than 4096 bits goes
-  through the runtime word-indexed path (`rt_wide_sel` / `rt_wide_ins`) rather than
-  a whole-value variable shift, which cost O(width^2) JIT time and made a 65 Kbit
-  vector (ivtest pr722) appear to hang; blocking and nonblocking, any selection
-  width. See tests/wide_select_test.cpp.
-- [ ] **Dynamic part-select** (`sig[msb_expr:lsb_expr]`) — variable bounds
-  (const-bounds only today).
-- [ ] **Streaming operators, what still needs a bit-level buffer** — `with`
-  clause; an operand or destination whose width does not divide into whole
-  destination granules (`bit [5:0] q[$]` into a string, a 12-bit value into a byte
-  queue); `{<<S{...}}` over a dynamically sized stream feeding a string / queue /
-  dynamic-array destination (which block a bit lands in depends on the total
-  width, so the whole stream has to exist first, and each of those three
-  destinations consumes one granule at a time — a **fixed** packed target does
-  not have this problem and is implemented, see below); a dynamically sized
-  SOURCE in an unpack (`{>>{q}} = s`). Each is refused loudly with the width in
-  the message.
-- [x] **Logical implication / equivalence** (`->`, `<->`) in expressions
-  (LRM 11.4.7) — dedicated `Limplies`/`Lequiv` IR ops with direct 3-valued
-  truth tables. `->` short-circuits (skips lowering the right operand
-  entirely when the left is definitely false, LRM 11.3.5); `<->` always
-  lowers both operands exactly once (LRM 11.3.5 excludes it from the
-  short-circuit list). iverilog does not implement `->`'s short-circuit but
-  otherwise agrees on truth-table values.
-- [x] **Increment / decrement** (`++`, `--`, pre and post, LRM 11.4.2).
-- [x] **Compound assignments** (`+= -= *= /= %= &= |= ^= <<= >>= <<<= >>>=`,
-  LRM 11.4.1) — single-evaluation LHS.
-- [x] **Assignment as an rvalue** (`y = (x += 1)`, LRM 11.3.1).
-- [x] **Case-equality operators** (`===`, `!==`).
-- [x] **Wildcard equality** (`==?`, `!=?`) — wildcards only the right operand's x/z.
-- [x] **Short-circuit `&&` / `||`** — value-producing `SelectLazy` (LRM 11.3.5, 11.4.7).
-- [x] **`inside` operator** (LRM 11.4.13) — integral scalar / packed operands
-  (members compare with `==?`, so a member's x/z bits are do-not-cares and the
-  left operand's are not) and REAL operands, which 11.4.13 compares with `==`
-  because they are nonintegral: `FEq` per value member and `FGe` / `FLe` for a
-  range, folded with the same OR reduction. An UNPACKED-ARRAY member is traversed
-  elementwise ("descending into the array until reaching a singular value"): a
-  fixed-size member unrolls and recurses through nested dimensions, a queue or
-  dynamic array walks at runtime (11.4.13's own example is a queue member).
-  iverilog 13 cannot compile `inside` at all. Still guarded loud: a string left
-  operand, an associative-array member (its traversal is the 7.9.4 first/next
-  key walk, not an index loop), a queue / dynamic-array member whose elements
-  are themselves non-singular, tolerance ranges and `$` bounds.
-- [x] **Indexed part-select** (`sig[base +: width]`, `sig[base -: width]`).
-- [x] **Streaming operators** (`{<<{...}}`, `{>>{...}}`, LRM 11.4.14) — pack and
-  unpack, fixed-size and dynamically-sized operands, into a fixed packed target,
-  a string, a queue, or a dynamic array. A fixed-size stream is one packed value
-  (reversal included, `lower_streaming_concat`); a stream with a queue /
-  dynamic-array / string operand keeps its operands apart as chunks
-  (`collect_stream_chunks` / `StreamChunk`) and the destination consumes them
-  granule by granule: bytes for a string (`StrAppendPacked` / whole-string
-  concat, which makes `s = {>>{string_q}}` the join UVM's
-  `m_uvm_string_queue_join` wants, one runtime call per element), elements for a
-  queue (pushed) or dynamic array (counted, then sized and stored), or — for a
-  **fixed** packed target (UVM's `uvm_unpack_intN`: `VAR = {<<bit{__array}}`) —
-  one bit at a time into a run-time-computed shift position (`stream_to_fixed`),
-  which is also where `{<<S{...}}` over a dynamically sized stream is
-  implemented (`stream_reorder_pos`, a per-bit LRM 11.4.14.2 block-reversal
-  position map — the only one of the four destinations that has this, since a
-  fixed target's width is known at lower time). A dynamically sized stream
-  narrower than its fixed target is left-aligned and zero-padded on the right
-  (LRM 11.4.14), for both `<<` and `>>`; wider is a run-time fatal (LRM
-  11.4.14: "an error shall be generated"). Verilator 5.050 disagrees with the
-  LRM on both points for this shape: it truncates silently (no diagnostic) on
-  overflow instead of erroring, and right-justifies (zero-pads on the left)
-  rather than left-aligning a narrower `>>` stream specifically — `<<`
-  matches the LRM already, only the no-reorder `>>` case is off — so Clotho
-  follows the LRM text over the oracle for both deviations. An operand shape
-  can be a dynamic array, a queue, a string, a dynamic array of a packed struct,
-  or a dynamic array
-  nested inside an otherwise-fixed aggregate (`collect_agg_stream_chunks`, the
-  dynamic analogue of `serialize_agg_lvalue`); an associative-array operand is
-  refused (LRM 6.24.1 excludes it from the bit-stream types) at the top level
-  or as an aggregate member. Unpack takes the source's leftmost bits, LRM
-  11.4.14.3's greedy rule giving the first dynamically sized destination
-  everything the fixed ones leave; a fixed unpacked array / struct destination
-  walks leaves in declared order (`unpack_stream_agg`, the inverse of
-  `serialize_agg_lvalue`). A packed operand reaching a string converts through
-  LRM 6.16's 8-bit-chunk rule, dropped 0x00 chunk included, so a folded
-  `localparam` and the runtime path agree. Oracle: Verilator for every shape it
-  supports and agrees with the LRM on (fixed unpack, `<<` reversal, unpacked
-  struct, string join, dynamic-operand-into-fixed narrower/exact/empty `<<`),
-  slang's constant evaluator otherwise, and the LRM text directly (with the own
-  derivation pinned in a test comment) for the handful of cases above where
-  Verilator disagrees with it. `uvm_reg_map::do_bus_access` (register layer,
-  never reached by easyUVM) needs `{<<S{...}}` over a dynamically sized stream
-  into a QUEUE destination, which stays refused (see above) — a fixed target's
-  mechanism does not extend to it, since the destination-side reordering it
-  would need is a separate, comparably-sized change.
+- [ ] **Concatenation as a compound-assignment target** — `{a, b} += x` is refused.
+- [ ] **String element as a compound-assignment target** — `s[i] += c` is refused.
+- [~] **`inside` operator** (11.4.13) — missing set-member and range forms:
+  - [ ] **Associative-array set member** — needs the first/next key walk (7.9.4) rather
+    than an index loop.
+  - [ ] **Queue or dynamic-array set member with non-singular elements** — refused.
+  - [ ] **Tolerance ranges** — `[c +/- d]` and `[c +%- d]` are refused.
+  - [ ] **Unbounded `$` range bounds** — `[$:a]` and `[a:$]` are refused.
+- [~] **Streaming operators** (11.4.14) — forms that need a bit-level stream buffer:
+  - [ ] **`with` clause on a stream operand** — refused.
+  - [ ] **Width not a multiple of the destination granule** — e.g. `bit [5:0] q[$]` into a
+    string, or a 12-bit value into a byte queue, is refused.
+  - [ ] **Block reversal of a dynamically sized stream** (11.4.14.2) — `{<<S{...}}` into a
+    string, queue or dynamic array is refused; block placement needs the total width.
+  - [ ] **Unpack from a dynamically sized source** (11.4.14.3) — `{>>{q}} = s` is refused.
 
 ### Procedural control
 
-- [ ] **`case … inside` tolerance ranges** (`[a +/- b]`, `[a +%- b]`).
-- [ ] **`case … inside` unbounded range bounds** (`[$:a]`, `[a:$]`).
-- [~] **`unique`/`unique0`/`priority` Observed-region reporting** — reports now
-  emit in the Observed region (LRM 4.4.2.4) via the deferred report queue
-  (`rt_observed_flush`), not the Active region. Still missing: per-statement
-  *maturation* (flush-on-re-execution) for glitch immunity per LRM 12.4.2, which
-  lands with deferred immediate assertions (they share the queue).
-- [ ] **`&&&` / `matches` predicates** in `if`/`?:`, and `case … matches` pattern
-  matching.
-- [ ] **`always_ff` non-sequential-behavior warning** (LRM 9.2.2.4) — the block
-  executes correctly; slang emits no diagnostic when the body is not sequential.
-- [x] **`foreach`** (12.7.3) — fixed-size arrays + `string`; dynamic arrays and
-  queues iterate the runtime size; associative arrays iterate keys in ascending
-  order via first/next (a `[*]`-wildcard index has no key type, so foreach over
-  it is illegal per LRM and rejected by slang). A NESTED runtime dimension
-  (`foreach (a[k, i])` over an assoc of queues, a queue of queues, an assoc of
-  assocs) measures and iterates the entry the outer dimension is sitting on,
-  rebuilt per region from the outer loop variables (`foreach_base_lv`); dimensions
-  are peeled through the interned IR type, since slang answers
-  `isDynamicallySizedArray()` for a map as well. Before that every runtime
-  dimension measured the whole array, so the inner dimension re-walked the OUTER
-  container with the inner loop variable bound to a key — wrong trip count, wrong
-  index, and silent. Refused loud: a skipped outer dimension over a nested runtime
-  one (`foreach (a[, i])`), which names no entry to descend into.
-- [x] **`do … while`**.
-- [x] **`break` / `continue`**.
-- [x] **`case … inside`** (12.5.4 / 11.4.13) — singular labels via wildcard
-  equality, `[lo:hi]` ranges via inclusive membership; jump-tables a run of
-  clean-constant singular labels.
-- [x] **`unique` / `unique0` / `priority` on `case` and `if`** — no-match and
-  overlap violation reports (LRM 12.5.3 / 12.4.2).
-- [x] **`final`** blocks (see M1 Procedural control).
-- [x] **`void`-cast calls, function/task default args, named arg binding** — slang
-  fills defaults / reorders named args into the positional list.
+- [ ] **`case … inside` tolerance ranges** (12.5.4) — `[a +/- b]` and `[a +%- b]` labels
+  are refused.
+- [ ] **`case … inside` unbounded range bounds** (12.5.4) — `[$:a]` and `[a:$]` labels are
+  refused.
+- [ ] **`unique` / `unique0` / `priority` violation maturation** (12.4.2) — a pending report
+  is not flushed when the statement re-executes in the same time step, so glitches report.
+- [ ] **`always_ff` non-sequential body warning** (9.2.2.4) — no diagnostic is issued when
+  the body does not describe sequential logic.
+- [ ] **`foreach` skipping an outer dimension over a nested runtime one** (12.7.3) —
+  `foreach (a[, i])` over a container of containers is refused.
 
 ### Hierarchy & namespaces
 
-- [ ] **Interfaces & modports, remaining** — bidirectional/multi-driver interface
-  nets (a net continuously driven from both sides fails loud, shared with `inout`;
-  single-driver works), modport `export` methods, and structural modport
-  expression ports (`.name(sig[hi:lo])` / concat; the whole-signal rename form
-  `.name(sig)` works). Virtual interfaces (LRM 25.9) are under M4, below.
-- [x] **Interfaces & modports** (LRM 25) — interface instantiation, plain and
-  modport-restricted interface ports, generic interface ports (`interface p`),
-  modport views/directions, whole-signal modport expression (rename) ports,
-  signals/tasks/functions in interfaces, parameterized interfaces, interface
-  arrays, and interface ports forwarded through submodules. Storage is shared
-  (no copy process): every reference — plain-port, modport, rename, or
-  hierarchical — canonicalizes to the interface instance's own `ValueSymbol`
-  (`canonical_value_symbol` in `src/Lower.cpp`). iverilog has no interface
-  support. Design: docs/design/interfaces.md.
-- [ ] **`bind`** — bind a module/interface into another scope.
-- [ ] **Nested / extern module declarations**.
-- [ ] **`export pkg::*;` pure pass-through** — a name the exporting package never
-  itself references fails to resolve (slang lookup limitation). The
-  internally-referenced form works.
-- [ ] **Package-scope checkers / nettypes** — hit their own (pre-existing)
-  unsupported-construct guard if referenced. Package-scope classes and covergroups
-  are fine: both are types lowered on demand at the point of use, so the declaring
-  scope never matters (see M4 "Functional coverage" for the covergroup half).
-- [x] **Packages** — `package`/`endpackage`; `import` (explicit `p::name` and
-  wildcard `p::*`), bare `pkg::name` resolution, `$unit` scope, package/`$unit`-scope
-  variables (one shared signal). Partial `export` re-export and package-importing-
-  package verified vs iverilog.
+- [~] **Interfaces and modports** (25) — missing pieces:
+  - [ ] **Interface net driven from both sides** — a net continuously driven from inside and
+    outside the interface is refused, as for `inout` ports.
+  - [ ] **Modport `export` methods** — refused.
+  - [ ] **Modport expression over a select or concatenation** — `.name(sig[hi:lo])` and
+    concatenation forms are refused.
+- [ ] **`bind`** — binding a module or interface into another scope is refused.
+- [ ] **Nested and extern module declarations** — refused.
+- [ ] **`export pkg::*;` of a name the exporting package never references** — the name does
+  not resolve through the export (slang lookup limitation).
+- [ ] **Checkers and nettypes declared in a package** — refused when referenced.
 
 ### Classes (basic OOP)
 
-- [x] **Class declaration & objects** (Phase 1) — properties (scalar / real /
-  string / nested struct-array / self-referential handle), methods (functions +
-  tasks, `this`, recursion), constructor `new` + default property initializers,
-  field read/write, handle assignment (reference semantics), `null`, `==`/`!=`
-  identity, pass-by-value through the subroutine ABI. A class handle is a 2-state
-  64-bit value (like `chandle`); the object body reuses the unpacked-aggregate
-  storage. Lifetime: leaked by default (LRM 8.4 objects are GC'd — unobservable);
-  collected under `--gc`, see docs/design/garbage-collection.md and the M4 item
-  below. See docs/design/classes.md; verified vs iverilog in tests/class_test.cpp.
-  Deferred within Phase 1, guarded loud: nonblocking assignment to a class
-  property. (`$display("%p")` of a handle was listed here too and is not:
-  a class handle prints its class name and the other four reference types print
-  theirs — String formatting, under UVM enablers.) (Class handles as queue /
-  dynamic-array / assoc-array elements were listed here as guarded and are not:
-  all three work. They are refused only under `--gc`, which cannot yet trace
-  through a container — garbage-collection.md §3.3.) A property initializer may
-  now CALL a method of its
-  own class (LRM 8.7 runs initializers as part of construction, so `this` is in
-  scope; `ctor_this_` carries the object under construction from the `new` site and
-  is consulted ahead of the enclosing frame's `this`, which the old code handed to
-  the callee whenever the `new` sat inside another object's method — a silent
-  miscompile, not just a refusal). A bare instance-method call with neither an
-  object under construction nor a frame `this` is still guarded loud. A property
-  initializer that READS a sibling property resolves the same way, through
-  `value_lvalue`'s own `ctor_this_` arm: it used to die as an unknown signal when
-  the `new` sat outside a method, and silently read the ENCLOSING object's
-  same-named property when it sat inside one.
-- [x] **Shallow copy** (`dst = new src`, LRM 8.12) — allocates a second object and
-  copies every non-static property member-wise, running neither the constructor nor
-  the declaration initializers (8.12 step 1). What each property does follows from
-  its type, through the same `emit_agg_copy` an aggregate assignment uses: a string
-  / queue / dynamic array / associative array property deep-copies, a class-handle
-  property copies as a handle, so the copy and the source share what they point at
-  (8.12: "objects, however, are not copied, only their handles"). The object
-  allocated is of the SOURCE's class, not the expression's static type: every
-  class carries a synthesized copy thunk in a reserved descriptor slot
-  (`kCopySlot`), so `new base_handle` dispatches to the concrete class and allocates
-  its size (iverilog 13 asserts on the polymorphic case, so it cannot cover
-  this). A null source is the usual located fatal. Randomization state (8.12 step 2)
-  is moot: `rand`/`randc` properties and covergroups are refused upstream.
-- [x] **Null-handle dereference is a located fatal** (LRM 8.4) — accessing a
-  non-static property, or dispatching a virtual method, through a handle that
-  holds no object is illegal with an indeterminate result the LRM lets an
-  implementation error on. A handle is raw pointer bits, so the untrapped outcome
-  was `inttoptr 0` and an unattributed segfault. Every `HandleDeref` and every
-  vtable load now branches on a compare against zero (`emit_null_handle_check`,
-  weighted 1:2^20 into a `cold noreturn` block ending in `unreachable`) into
-  `rt_null_handle`, which prints a compiler-style diagnostic — file position,
-  source line, caret under the handle expression — and exits nonzero. The
-  frontend records the object expression's span on the deref so `obj.prop`
-  underlines `obj`; the deref rooted directly at `ClassNew` (a `new`'s own
-  property default-initializer stores) skips the guard. A non-virtual method
-  called on a null handle is caught at the first property its body touches; one
-  that touches none runs, which the LRM's "indeterminate" permits.
-- [x] **Forward typedef classes** (`typedef class C;`, LRM 6.18 / 8.27) — the
-  class-resolution half needed no work: `lower_class_type`'s intern-first
-  cache is keyed on the `ClassType` symbol pointer, which slang resolves a
-  forward declaration and its later full definition to identically, so mutual
-  cross-class handle references (2-way and N-way cycles) fall out for free.
-  The one real gap was `lower_members`, which walked module/generate-block
-  members through an exhaustive switch that had no case for
-  `SymbolKind::ForwardingTypedef` (the forward declaration itself, as
-  opposed to the class it names) and loud-failed on it — the declaration is
-  legal only inside a module/generate scope's member list, so every forward
-  typedef anywhere but the top compilation-unit scope hit this. Fixed by
-  adding it to `lower_members`' inert-member case list (it carries no
-  type/value/statement content, same as `TypeAlias`). Covered (iverilog has no
-  class support): 2-way and 3-way mutual handle references (fields, method
-  params, method calls through the handle, null comparison), a forward decl
-  after its definition, duplicate forward decls in one scope, and the
-  LRM-mandated error for a forward decl that never resolves. See
-  tests/class_test.cpp.
-- [x] **Single inheritance** (`extends`, `super`, non-virtual override, LRM 8.13)
-  — Phase 2. Prefix layout: base properties lay first in the object body
-  (`element` records the base Ref, `lower_class_type` copies the base's flattened
-  field table as the prefix), so an inherited property keeps its base-relative
-  field index and an upcast is the same pointer. A non-virtual method binds
-  statically (slang resolves the SubroutineSymbol by the handle's static type;
-  the per-symbol method table needs no change). Base construction (LRM 8.15) runs
-  at each constructor's entry from `getBaseConstructorCall()` — implicit no-arg,
-  `extends B(args)` (class-scope args), or an explicit `super.new(args)` (the body
-  statement is a no-op marker); `emit_base_construction` / `emit_ctor_call` recurse
-  through a constructor-less intermediate class. Whole-chain property defaults apply
-  base-first at allocation. `super.method()` reuses the ordinary method-call path.
-  A **virtual** method is guarded loud (Phase 3 needs a vtable); the built-in
-  `randomize` virtual is skipped via `MethodFlags::BuiltIn` (iverilog cannot
-  resolve inherited methods from a derived method body). See
-  docs/design/classes.md and tests/class_test.cpp.
-- [x] **Access control & statics** (Phase 2) — `static` properties are one slot
-  shared across all instances (and inherited by derived classes), persistent
-  module-signal storage keyed by the property symbol (`declare_static_prop`), not
-  part of the per-object body; initialized once at time zero in the PreInit
-  process (LRM 8.9.2). Reachable as `obj.p`, `C::p`, or a bare `p` in a method
-  (all routed to the shared signal in `value_lvalue` / `lower_member_lvalue`).
-  `static` methods reuse the free-subroutine path (no `this`). `local` /
-  `protected` / `const` carry no runtime obligation (slang enforces at
-  elaboration). An aggregate / container initializer (unpacked struct or array,
-  queue, dynamic array, associative array) routes through `emit_struct_store` into
-  the shared slot, the same element-wise path a module-level declaration
-  initializer takes; a `string` initializer stores whole, bypassing `coerce`
-  (whose `Resize` rejects a string value). Lowered with `fn_ctx_` / `ctor_this_`
-  cleared, since LRM 8.11 scopes `this` to non-static methods only. Still missing:
-  a static property of aggregate type with FIELD-level defaults and no initializer
-  of its own reads the power-on default instead (`declare_static_prop` returns early
-  on a null initializer) — silent, not guarded.
-  A `static` method is now callable through an OBJECT HANDLE (`p.f(x)`), not only
-  as `C::f(x)` or bare inside the class — LRM 8.9 grants a static member that
-  freedom explicitly, and its own example reads `p.fileID` through a handle that
-  was never assigned, so a null receiver is legal and dereferences nothing.
-  `resolve_method_this` returned the receiver for any non-null `thisClass()`
-  without asking whether the callee was static, and slang gives a static method no
-  `thisVar`, so `build_function`/`splice_this` had built no receiver formal: the
-  spliced handle shifted every actual one formal to the LEFT. The IR shape that
-  turned that into a crash is a static method whose first formal is `ref` —
-  `lower_call_common` read `arg_dirs[0] == Ref` for the handle operand and asked
-  `lvalue_of` for a place, but a handle is a VALUE, so `lvals_` held a DISENGAGED
-  `std::optional<LValue>`; dereferencing it read the all-zero buffer as an LValue
-  and faulted on the first null member (`bit_off`, in `ref_actual_ptr` →
-  `is_zero_const` → `dyn_cast<ConstantInt>(nullptr)`) with NO diagnostic at all,
-  exit 139. Found compiling `uvm_component::apply_config_settings`, whose
-  `rp.sort_by_precedence(rq)` calls `static function void (ref rsrc_q_t)`; the
-  11-line repro needs no UVM. The gate is slang's `MethodFlags::Static`, not
-  `thisVar == nullptr`: a PURE VIRTUAL also has a null `thisVar` in slang's
-  degenerate representation and must keep taking a receiver. The receiver
-  expression is still LOWERED for its side effects and then dropped, matching what
-  the static-PROPERTY path already does with its prefix (`make_pool().f()` bumps
-  its counter exactly once). Sibling audit: the same misalignment hit every static
-  shape reached through a handle, not just `ref` — a `void` method with a plain
-  argument, a zero-argument function (which indexed `param_types[0]` on an EMPTY
-  vector), and a static task all produced LLVM's own unlocated `Incorrect number of
-  arguments passed to called function!`; all four now agree with the `C::f` form.
-  `super.f()` and bare in-method calls were already correct (both reach the
-  `thisVar == nullptr && !is_user_virtual` arm), and the two capture detectors that
-  mirror this condition (`ForkCaptureDetector` and the implicit-`this` visitor) test
-  `thisVar` directly, so they already excluded static callees. Two backend guards
-  close the class of defect rather than this one instance: `lvalue_of` refuses a
-  disengaged entry (the single chokepoint every place consumer funnels through), and
-  `lower_call_common` / `lower_task_call_inst` refuse an actual list whose length
-  does not match `param_types` before any of the seven per-formal indexing sites
-  runs. Both are located `BackendError`s, so a future marshalling slip is a
-  `file:line:col` refusal instead of a silent segfault.
-- [ ] **Cross-module class type identity** — the class type cache is per-Lowerer,
-  so a `$unit`/package-scope class referenced by two modules interns two distinct
-  (nominal) Refs; V1 exercises classes only within one module. Route
-  `lower_class_type` through `globals_` like subroutines when this matters.
-- [x] **A class method, constraint block, or embedded covergroup expression may
-  reference a member declared later in the same class** (LRM 8.6, 18.5,
-  19.4/19.5) — "A class's properties are freely and broadly available to the
-  methods of the class" carries no declaration-order caveat, and 8.11 groups
-  covergroups with methods/constraints for the same `this`-visibility; this is
-  an explicit, LRM-stated exception to SV's general declare-before-use default
-  (LRM 3.13 / 6.21), which clotho correctly enforces everywhere else (module
-  scope, `$unit`, a class's own property-initializer expressions, which stay
-  positional — LRM 8.6 exempts methods, not initializers). All three shapes
-  used to fail to even compile, with `identifier 'X' used before its
-  declaration`, whenever the reference textually preceded the member —
-  `function void show(); $display("%0d", x); endfunction int x;` inside one
-  class, a `constraint c { x < 10; } rand int x;`, and a
-  `covergroup cg; coverpoint analysis_txn.we; endgroup apb_seq_item
-  analysis_txn;` (the real shape hit by 7 copies of one shared header in the
-  uvm-examples corpus, `apb_coverage_monitor.svh:37`). The bug was entirely in
-  vendored **slang**, not clotho: `SubroutineSymbols.cpp` and
-  `ClassSymbols.cpp`'s `ConstraintBlockSymbol::getConstraints` already seed a
-  method/constraint body's root `ASTContext` with `LookupLocation::max` (the
-  "no order restriction" sentinel) as if this were already handled, but
-  `Lookup.cpp`'s `unqualifiedImpl` — the scope-chain walk-up run when a name
-  isn't found in the immediate scope — unconditionally discards whatever
-  location it was given and re-anchors to `LookupLocation::after(scope's own
-  declaration position)` on every hop up to the parent, including the hop that
-  lands on the class scope itself. A covergroup coverpoint reaches the same
-  walk-up two hops deeper (coverpoint → `CovergroupBodySymbol` →
-  `CovergroupType` → class), seeded from an already-positional
-  `DeclaredType::getASTContext` location rather than `max`, but the SAME
-  walk-up bug is what actually decides the outcome regardless of the seed.
-  Fixed at that one choke point (`patches/slang-class-forward-ref.patch`,
-  applied via the `slang` `FetchContent_Declare`'s `PATCH_COMMAND` in
-  CMakeLists.txt, `cmake/ApplySlangPatch.cmake`): when the scope about to be
-  searched next is a `SymbolKind::ClassType`, the walk-up now uses an
-  unbounded location for that one hop instead of anchoring to the escaping
-  construct's own position; escaping the class scope itself (to its
-  enclosing package/module/`$unit`) is a separate, later hop, untouched and
-  still positional. This is why the fix does not need to (and does not) touch
-  clotho's own `src/Lower.cpp` — the defect and the fix are both entirely in
-  name resolution, upstream of anything clotho lowers. Verified: both
-  ordering shapes for a method, a constraint block, and a covergroup
-  coverpoint (tests/class_test.cpp, tests/randomize_test.cpp); a module-level
-  `initial` block referencing a not-yet-declared module variable still
-  correctly fails (the general default is untouched outside classes); a
-  method of one class still cannot forward-reference an unrelated sibling
-  class's later-declared member (the exception does not leak across class
-  boundaries); a property initializer forward-referencing a later property of
-  the same class still correctly fails (LRM 8.6 exempts methods/constraints/
-  covergroups, not initializers, and initializers never reach this walk-up —
-  they bind directly against the class scope with a positional location
-  derived from their own declaration point). See docs/design/classes.md for
-  the patch mechanism and the slang-side trace.
+- [ ] **Bare instance-method call with no receiver in scope** (8.7) — refused when neither
+  an object under construction nor an enclosing method supplies `this`.
+- [ ] **Static class property of a struct type with member defaults** (8.9) — with no
+  initializer of its own it silently reads the power-on default, not the member defaults.
+- [ ] **Class type identity across modules** — a `$unit` or package class referenced
+  from two modules lowers as two distinct types.
 
 ### Assertions (immediate)
 
-- [ ] **Immediate `cover` count + report** (LRM 16.3 / 16.5) — the observable
-  pass-action-on-true behavior is done; the per-point coverage count and
-  end-of-sim report belong with a dedicated coverage engine.
-- [~] **Deferred immediate assertions** (`assert #0`, `assert final`, LRM 16.4) —
-  Phase 1 done: observed + final, per-process generation flush (glitch
-  suppression), args sampled at execution, Observed/Postponed
-  maturation (`rt_defer_report` / `rt_defer_flush_*`).
-  Multi-instance is supported (each instance flattens to its own coroutine +
-  generation global). Remaining (each guarded loud): user task / void-function
-  action blocks (generic deferred-call ABI), `$display`/`$write`/`$fatal`
-  actions, deferred assertions inside a function/task (generation threaded
-  through the call ABI), and `disable`-based flush points (16.4.4). The
-  observed/final distinction now has the Reactive region it was waiting on
-  (`@clotho.reactive`), but a deferred report still matures through the deferred
-  queue instead of scheduling an action block into Reactive, so the LRM's
-  Reactive-region double-report is still not reproduced.
-- [x] **Immediate assertions** — `assert` / `assume` / `cover` (LRM 16.3) with
-  pass/fail action blocks; branch selection verified vs iverilog.
-- [x] **Severity system tasks** — `$error`, `$fatal`, `$warning`, `$info` (LRM 20.10).
-- [x] **`$signed` / `$unsigned` / `$clog2`**.
-- [x] **Utility system functions** — `$bits`, `$countones`, `$countbits`,
-  `$onehot`/`$onehot0`, `$isunknown`, `$typename`, `$isunbounded` (LRM 20.6.1).
-  Sub-gaps:
-  - [ ] `$countbits` with a **non-constant** control bit.
-  - [x] `$typename` of an enum / struct / union / class / container type — every
-    kind, from slang's own `TypePrinter` (which implements the clause in full)
-    rather than a second hand-written formatter. The old refusal reasoned that
-    Clotho must not name a type it does not lower; that expired once those types
-    landed, and the hand-rolled output was byte-identical to slang's for every kind
-    it covered. An anonymous type gets the clause's implementation-generated unique
-    name, which is load-bearing: `$typename` strings match only for equivalent types.
-  - [ ] `$isunbounded` of a **hierarchical** reference (slang refuses to
-    constant-evaluate it, and Clotho has no cross-instance constant context).
-
----
+- [ ] **Immediate `cover` statistics** (16.3) — no per-statement coverage count and no
+  end-of-simulation report.
+- [~] **Deferred immediate assertions** (16.4) — missing pieces:
+  - [ ] **Subroutine-call action block** — a user task or void function as the action is
+    refused.
+  - [ ] **`$display` / `$write` / `$fatal` action** — refused.
+  - [ ] **Deferred assertion inside a function or task** — refused.
+  - [ ] **`disable` as a flush point** (16.4.4) — refused.
+  - [ ] **Action block scheduled in the Reactive region** — the report matures through the
+    deferred queue instead of scheduling the action block in Reactive.
+- [ ] **`$countbits` with a non-constant control bit** — refused.
+- [ ] **`$isunbounded` of a hierarchical reference** — refused; slang does not
+  constant-evaluate it.
 
 ## M4 — Industrial SystemVerilog + UVM
 
 ### Full object orientation
 
-- [~] **Garbage collection** (LRM 8.4) — class objects are always collected; no
-  design leaks them any more. Design and phasing:
-  docs/design/garbage-collection.md. Landed: an Immix-shaped mark-region heap
-  (32 KiB blocks / 128 B lines, `src/runtime/Gc.cpp`), a GC word below the
-  descriptor pointer at handle[-1], a per-class trace map and finalizer emitted
-  beside each class descriptor, precise `clotho.gcroots` tables over design state
-  and statics, conservative pinned coroutine-frame roots through an intrusive
-  registry node CoroSplit hoists into the frame, and stop-the-world collection at
-  the drain loop's quiescent edge. Non-moving; the header reserves the forwarding
-  and pin encodings so evacuation stays a policy change. 48 cases in
-  tests/gc_test.cpp. P2 landed: the bump-allocation fast path and the
-  frame registry are emitted inline, and allocation is 2x faster than the leaking
-  path. P3 landed: generational in place, sticky mark bits, an inlined write
-  barrier over object remembering, per-line age records, young/full kinds and
-  `--gc-full-every`; 3.3-5.9x over forcing every collection full. P4 landed: class
-  handles inside dynamic arrays, queues, assoc arrays and aggregates are described
-  and rooted, so a UVM-shaped component tree runs collected. Remaining: event
-  handles / `std::mailbox` / `semaphore` / `process` / `std::weak_reference` as
-  those features land; then evacuation and multi-mutator as independent,
-  measurement-gated tracks. Nothing is refused that was accepted before the
-  collector existed: the assoc key-handle table (Runtime.h `nkeyhandles`) closed
-  the last gap, so a key containing a class handle traces too. The collector is
-  unconditional -- `--gc` is gone and only its cadence and budgets are on the CLI
-  (`--gc-stress`, `--gc-stats`, `--gc-nursery`, `--gc-heap-max`,
-  `--gc-full-every`); docs/design/garbage-collection.md 12a records why.
-
-- [x] **Wide accesses through a collected object claimed 16-byte alignment the
-  heap never provides** — the easyUVM run SIGSEGV'd inside generated code before
-  UVM's first line of output, with no diagnostic. gdb at the fault:
-  `vmovdqa 0x160(%rax),%xmm0` with rax ≡ 8 (mod 16) — an ALIGNED 16-byte vector
-  load off a class handle. The two halves of the lie: a collected object's handle
-  sits RT_GC_HEADER_BYTES=8 past a 16-aligned cell (Gc.h:54-59), so every object
-  body is 8 mod 16 permanently; and IRBuilder's default load/store claim is the
-  value type's ABI alignment — 16 for the i128-and-wider plane of a 4-state
-  33..64-bit (`time`, `logic [63:0]`) or any >=128-bit slot — and the
-  aggregate-copy memcpys (emit_agg_storage_copy / emit_agg_deep_copy) claim the
-  aggregate's ABI alignment the same way. x86-64 lowers a wide equality compare
-  of such loads to movdqa+pxor+ptest, and movdqa #GPs on the honest address. The
-  defect predates the collector's unconditional landing only in the sense that
-  rt_alloc's 64-byte alignment used to make the claim accidentally true; the
-  class-property wait machinery's full-plane change-notifier compare (the
-  waited-on-property entries above) is what first loaded a whole >=128-bit plane
-  off a GC object and tripped it — in UVM, `uvm_coreservice_t::get()` →
-  `uvm_init` → uvm_root construction, hence "before the banner". DPI was
-  separated explicitly: the crash reproduced with the DPI import stubbed out and
-  no `--dpi-lib`. Fix: `clamp_unproven_align` (LlvmBackend.cpp, run per module in
-  build_modules_unoptimized before verification) clamps every load/store and
-  mem-intrinsic alignment claim that `getKnownAlignment` cannot re-derive from
-  the pointer down to 8, the floor every storage base and slot layout does
-  guarantee (GC handle 8, malloc >= 16, rt_alloc 64; i64-and-wider leaves sit at
-  8-aligned offsets). A provable claim keeps its strength — an alloca, the
-  align-64 state global's fields — and the pipeline only re-raises what it can
-  re-prove, so tier-0 signal traffic is unchanged where it was ever legal.
-  Sibling audit: every load/store in every emitted module is covered by
-  construction; the explicit mem-intrinsic claims were audited one by one — the
-  three ABI-align aggregate memcpys (clamped), the rt_alloc'd process-object
-  memset's MaybeAlign(64) (true but unprovable, now clamped, cost-free), the GC
-  fast path's MaybeAlign(8) and the MaybeAlign(1)s (already honest). No atomic
-  ops are emitted. Cost of an unprovable-but-true 16 (a malloc'd container
-  payload): the unaligned vector encoding, penalty-free on aligned data on this
-  microarchitecture. Three regression tests in tests/class_test.cpp assert
-  values, not survival: the waited-on `logic [63:0]` property (the UVM shape),
-  the `bit [127:0]` cross-object compare, and the wide-leaf struct property copy
-  (the memcpy shape). With the fix the easyUVM invocation boots UVM, prints the
-  1800.2-2020 banner and the report summary, and exits 0.
-
-- [x] **Eager static class property initialization** (LRM 6.21 / 8.9) — a static
-  property's initializer now runs once at the beginning of simulation, reader or
-  no reader, object or no object. It used to run LAZILY: `declare_static_prop`
-  registered storage and queued the initializer into PreInit, but was only
-  reached from ACCESS sites, so a property nobody names never initialized at
-  all — `count=0` where Verilator says 1. LRM 6.21 is explicit that the
-  `static` keyword marks "executing that initialization only once at the
-  beginning of simulation", and 8.9's own example (`static integer fileID =
-  $fopen("data","r")`) is used "without creating an object of that type". The
-  UVM consequence was terminal: `uvm_registry.svh`'s `local static bit
-  m__initialized = __deferred_init()` is read by NOBODY — its only purpose is
-  the factory-registration side effect — so the factory stayed empty and
-  easyUVM died at `UVM_FATAL [INVTST]` at time 0. Fix: a design-wide pre-pass
-  (`collect_class_types` + `init_static_class_props`), same shape as
-  WaitPropScan and for the same reason — a specialization named only in a
-  typedef may never be lowered on demand at all. Enumeration walks packages and
-  `$unit` on the globals Lowerer (so a package class initializes ONCE per
-  design, not once per top that imports it — each top's sigmap seed makes its
-  accesses cache hits; pinned by the two-top test in package_test.cpp) and each
-  top's instance tree on that top's Lowerer (a module-scope class's initializer
-  may read module signals). Generic classes are the load-bearing part: slang
-  monomorphizes each `C#(args)` into a ClassType that is a member of NO scope,
-  living only in the GenericClassDefSymbol's specialization hash map, so the
-  walk visits `specializations()` explicitly — which is exactly how a
-  typedef-only `uvm_component_registry#(T,"T")` is found. Exactly-once falls
-  out of the sigmap_ cache (access sites and the pre-pass meet at one signal
-  and one queued initializer). Order, which the LRM leaves undefined across
-  classes: declaration order within a class, declaration order across classes,
-  a generic's specializations sorted by their rendered `C#(args)` name (the
-  hash map's own order would be run-to-run stable but layout-dependent);
-  implementation-defined and deliberately so — UVM's `__deferred_init` checks
-  `get_core_state()` and defers precisely because the LRM promises no
-  order. An initializer reading ANOTHER class's static forces that property's
-  declaration mid-emission (the shared PreInit builder is append-only, so the
-  nested store lands before the read) and observes the initialized value;
-  verified against Verilator both directions, forward reference via `typedef
-  class`. Cost, which 6.21 simply requires: a design now pays every elaborated
-  specialization's initializers at time zero whether it uses them or not — all
-  of uvm_pkg's registries run for easyUVM — and a failure inside one (a null
-  deref, a `$fatal`) now kills the design before time zero on a type it never
-  "used"; that is the clause's own semantics, not a clotho choice. A class
-  with no initialized statics contributes nothing (pinned structurally: no
-  PreInit process exists at all).
-
-  Eagerly lowering every factory-registered class tore down four more walls
-  that were never reachable before, each relocated or implemented rather than
-  left refusing all of UVM:
-  - **Randomization guards moved from the TYPE to the act** — refusing a class
-    that merely CARRIES a `constraint` block (or a rand property of an
-    undrawable type, `uvm_reg_item`'s `rand uvm_reg_data_t value[]`) at
-    lower_class_type refused every design that NAMES the register layer. The
-    reason now travels in `ClassRand::unsupported`; the class lowers, lays out
-    no rand block, and its generated `$randomize` body is a located run-time
-    fatal — the one point every randomize() of the class must reach, virtual
-    dispatch included, so a base-typed handle over a constrained derived object
-    still dies loudly instead of drawing unconstrained. `value.rand_mode()` on
-    such a class (uvm_reg_field::get_rand_mode) takes the same run-time fatal;
-    std::randomize keeps its compile-time refusal (a direct call site).
-  - **Vtable-forced method bodies that fail to lower become stubs** — a body
-    built from drain_pending_bodies exists because vtable completeness demands
-    it, not because the design calls it (uvm_reg_map::do_bus_access needs
-    dynamic streaming slices no easyUVM run executes). Such a CLASS-METHOD
-    body now compiles to a warning (`unsupported-construct`, original message
-    and span) plus a run-time fatal stub with the same message; the signature
-    is the real one, so every call site stays ABI-correct. A subroutine built
-    from a direct call site keeps its compile-time diagnostic.
-  - **`inside` over strings** (LRM 11.4.13) — `get_access() inside
-    {"RO","RC","RS"}` is uvm_reg_field::needs_update; per-member string
-    equality and lexicographic range compares folded with Lor, no new
-    instruction. Verified vs Verilator.
-  - **`%m` in a package/$unit subroutine** rendered `.f` (empty instance path);
-    uvm_misc.svh's uvm_instance_scope scans %m for a separator and reported 128
-    `UVM_ERROR [SCPSTR]` then `UVM_FATAL [BUILDERR]`. It now renders `pkg.f` /
-    `$unit.f` (Verilator: `p.f`). Also: queue assignment from a member-access
-    dynamic array (`addrs = map_info.addr`, uvm_reg_map) — the guard demanded a
-    NamedValue where lower_lvalue already handles a MemberAccess slot.
-
-  Known consequence, SINCE FIXED by the event-property rung above: package/$unit
-  class bodies built on the globals Lowerer BEFORE any top lowered, so
-  `vif_defs_->insts` was empty at that point and a virtual-interface member
-  access in such a body warned `virtual-interface-never-bound` even when a top
-  did instantiate the interface. Vtable-forced bodies now stay queued through
-  lower_globals and drain at the first top's phase boundary, after its Collect
-  pass fills the registry. The ordering was load-bearing for the vif NBA half of
-  what those bodies do (the vif-in-class-task entry under UVM enablers): under
-  the old ordering, a class-task NBA through a handle deferred to the never-bound
-  run-time fatal instead of landing.
-
-  Outcome: both measured programs match Verilator (`count=1`, `count=2`);
-  easyUVM now boots, prints the 1800.2-2020 banner, POPULATES THE FACTORY,
-  finds the test — `UVM_INFO @ 0: reporter [RNTST] Running test simple_test...`,
-  INVTST gone — builds and connects the component hierarchy
-  (uvm_test_top.env_h.slv.drv_out), starts the run phases, and stops at time 0
-  where the driver's run_phase executes its first refused body: `FATAL:
-  driver.sv:26: nonblocking assignment to a class property is not supported`
-  (a MISNAMED refusal, since fixed — the target was a vif member, not a
-  property; the vif-in-class-task entry) and `FATAL: driver.sv:36: intra-body
-  event wait has no signal events`. The next wall between clotho and a passing
-  UVM test is therefore virtual interface traffic inside class tasks:
-  edge/event waits on a vif member, and the registry-ordering consequence
-  above.
-
-- [x] **A default argument's implicit `this` was the caller's, not the
-  receiver's** (LRM 13.5.3) — the easyUVM run-phase SIGSEGV at time 0, inside
-  JIT code with no diagnostic. gdb at the fault: RIP == RAX pointing INTO
-  STRING DATA (`"  const local uvm_event_pool events = new(\"events\");"` —
-  uvm_transaction.svh source text), reached from `mov (%rax),%rax; mov
-  0x140(%rax),%rax; call *%rax` — a virtual dispatch, vtable slot 40. The
-  receiver's descriptor (matched by its ancestor display `[1,3,38,254,585]`
-  to `clotho.classdesc.2934`) is **packet_in, whose vtable has 39 slots**;
-  slots 39+ read past the global into an adjacent severity-site constant,
-  which is why the "callee" was a pointer into a source-line banner. Slot 40
-  is `get_default_data` in **uvm_event#(uvm_object)'s** 44-slot map
-  (`trigger` is 38). The call is uvm_transaction::m_begin_tr's
-  `begin_event.trigger()`, whose declaration is `virtual function void
-  trigger(T data = get_default_data())`: slang binds an omitted actual as the
-  FORMAL'S OWN default expression (CallExpression::bindArgs), bound in the
-  callee's declaration scope — so the implicit `this` inside it is the CALL's
-  receiver (`begin_event`). Clotho lowered it in the caller's frame:
-  resolve_method_this handed it the enclosing method's `this` (the
-  packet_in), while virtual_slot_of correctly took the slot from the
-  DECLARING class's map — wrong object under the right slot number, and
-  8.20's dispatch loaded garbage. Driver path: record_tr → begin_tr(req) →
-  uvm_component::begin_tr → tr.begin_tr → m_begin_tr, req a packet_in.
-  **The same shape without the vtable overrun is a SILENT WRONG-OBJECT
-  READ**: a non-virtual default (`take(int n = dflt())`, `take(int n =
-  amount)`) called on another object read the CALLER's same-named state; and
-  a defaulted call from module scope (no frame `this` at all) was a compile
-  refusal of legal SV.
-  Fix: `default_arg_this_`, a scoped receiver context exactly like
-  `ctor_this_` (handle + the callee's DECLARING class, the static type
-  `this` has inside the callee's own body). build_call_args detects a
-  default by pointer identity (`actuals[i] ==
-  formals[i]->getDefaultValue()`; a written actual is always a fresh bound
-  expression) and installs the override around lowering exactly that actual;
-  a written actual keeps the enclosing context even when the call itself
-  sits inside another call's default. Consulted, ahead of `ctor_this_` (a
-  default is the innermost context and the object under construction is a
-  different object whenever the receiver was spelled out), by
-  resolve_method_this (bare calls), value_lvalue (bare property reads),
-  implicit_this (randomization spellings), and virtual_recv_class (the
-  vtable-layout selector — receiver handle and slot map describe one object
-  again). Threaded from lower_user_call and lower_task_call
-  (default_arg_recv: the resolved receiver + callee's class; nullopt for a
-  free subroutine or vif receiver, whose scope walk finds no ClassType) and
-  from emit_ctor_call (a defaulted CONSTRUCTOR argument evaluates against
-  the object under construction, typed as the class declaring the ctor — a
-  base ctor's default sees the base). build_function / build_task /
-  declare_static_prop reset it across body boundaries exactly as they do
-  ctor_this_, and for the same reason: the handle is another builder's
-  Index.
-  **Stub verdict: innocent.** The three `run-time fatal stub` warnings
-  (do_bus_access, do_unpack, __m_uvm_execute_field_op) name bodies that are
-  never called on this path: the fault PC is a vtable dispatch in m_begin_tr,
-  not a stub body; no stub fatal ever printed; and post-fix the run executes
-  the full sequencer/driver handshake indefinitely with none reached.
-  Sibling audit (what else reaches the default-arg site): instance-method
-  call in a default (the crash, virtual; and non-virtual — silent
-  wrong-object), bare property READ in a default (value_lvalue arm), task
-  defaults (lower_task_call), constructor defaults (emit_ctor_call, both the
-  explicit-call and the implicit-base-construction fill), module-scope
-  callers (no enclosing `this`; previously refused), and the unchanged
-  same-object bare call (receiver == caller's `this`, where the old code was
-  accidentally right). Built-in class methods (semaphore/mailbox `new`,
-  randomize) have literal defaults and keep their intercepts; a
-  virtual-interface receiver contributes no class context by construction.
-  Covered in tests/class_test.cpp (four cases asserting VALUES, not
-  survival: the receiver's-method default across objects, the
-  vtable-overrun shape — callee's slot absent from the caller's map, the
-  property-read/task/module-scope trio, and the ctor default + same-object
-  call).
-  Outcome: easyUVM no longer SIGSEGVs. The run passes begin_tr, executes the
-  TLM pull handshake (sequencer arbitration, randomize, drive_transfer,
-  monitors collecting — confirmed by perf profile of the live run), and
-  simulates indefinitely: the NEXT wall is that the run phase never ENDS
-  under the zero-objection shortcut (uvm_phase_hopper::execute_phase's
-  ALL-DROPPED branch) — a clockless trivial test exits 0 silently without
-  the report phase, and easyUVM's clock keeps the wheel alive forever at
-  ~7 ns of sim time per wall-clock second. That phase-end wall is a separate
-  root cause (phasing/objection machinery, not call lowering).
-
-- [x] **Polymorphism** — `virtual` **functions** with dynamic dispatch (LRM 8.20)
-  landed. Every class carries a descriptor pointer at object-body field 0
-  (`class_body_ty`); each class registers a per-concrete-type dispatch
-  table (`Module::set_class_desc`) whose slots are keyed by method NAME per hierarchy
-  (base virtuals 0..k-1, an override — implicit or of a pure prototype — reuses the
-  base slot of the same name, a new virtual appends, `compute_vtable` in Lower.cpp).
-  A virtual call through a handle lowers to the new `CallVirtual` IR op (loads the
-  callee from the object's vtable, `lower_virtual_call_inst`); a `super.method()`
-  binds statically (detected syntactically). **Abstract classes** (`virtual class`,
-  LRM 8.21) with concrete virtual methods lower normally; a direct `new` is
-  rejected. **Pure virtual** methods (LRM 8.21) dispatch on the concrete type
-  through an abstract base handle, with and without arguments, and via an internal
-  call — the name-keyed slot matches the concrete override (which slang does not
-  link to the prototype via `getOverride()`), and an abstract class's un-overridden
-  slot is filled by a stub whose signature is rebuilt from the `MethodPrototypeSymbol`
-  (slang's associated subroutine is degenerate: null `thisVar` / `returnValVar`,
-  empty `getArguments()`); the stub is never executed. A virtual method returning a
-  **non-scalar** (string / struct / queue / dynamic array) dispatches like any
-  virtual call — the call-temp scanners recognize `CallVirtual`. Covered:
-  override, inherited body, internal call, `super`, derived-introduced slot,
-  abstract + pure with/without args, implicit override, multi-level abstract.
-  A **virtual task** dispatches on the concrete type over the task (coroutine) ABI
-  — the vtable slot holds the task ramp pointer, `TaskCallVirtual` loads it and
-  drives the coroutine exactly like a direct `TaskCall`; time-consuming (`#delay`)
-  virtual tasks and non-virtual tasks calling virtual ones internally work. The
-  `CallVirtual`/`TaskCallVirtual` signature source is `function_id(sub)` (concrete)
-  or the prototype stub (pure), NOT the receiver's vtable — so it is available even
-  while the receiver class's own vtable is mid-computation (a virtual method whose
-  body virtual-calls a sibling). A **pure virtual task** dispatches over the task
-  (coroutine) ABI too: slang types a task prototype's return as `void`, so the stub's
-  existing void body is already right and the only task-specific part is the `is_task`
-  flag on its `Function` record, which is what selects the
-  `(state, rng, wheel, <formals>, record)` signature a `TaskCallVirtual` drives the
-  override's ramp through. A **pure virtual with a non-scalar return** reuses
-  `build_function`'s fall-through return shape, so the stub's signature is the one
-  every override was built with: an unpacked struct / fixed array and a container
-  (queue, dynamic array, assoc) `Ret` their frame lvalue for the backend's trailing
-  return out-param, while a string handle and a class handle `Ret` a loaded value. The
-  stub stays never-executed (an abstract class is never `new`'d, so its vtable is
-  never materialized). Covered: a pure virtual task with an argument,
-  time-consuming and internally enabled; string, unpacked-struct and queue
-  returns.
-  An **`extern virtual`** method (LRM 8.24) dispatches too: the class member is the
-  prototype and the body sits outside the class, so it is not a member
-  `SubroutineSymbol` and a table filled only from members left the slot empty —
-  reported as an internal error, since the un-overridden slot then found no pure
-  prototype to stub. `compute_vtable` now also walks each class's
-  `MethodPrototypeSymbol`s and fills the slot from `getSubroutine()`, the
-  out-of-block implementation; a prototype with none is pure and still gets the
-  stub. Covered: an abstract root whose extern body is the slot's implementation, a
-  derived class overriding one extern with another and inheriting the other, a leaf
-  overriding an inherited extern with an inline body, functions and tasks.
-  A pure virtual returning a by-value aggregate that owns heap (a string member)
-  works too, now that the return ABI's copy is per-leaf.
-- [x] **Class registration reentrancy/exception-safety** — a base class's own
-  property can legally hold a forward-declared handle to a class that EXTENDS
-  it (UVM's `uvm_sequence_item::m_parent_sequence : uvm_sequence_base`, where
-  `uvm_sequence_base extends uvm_sequence_item`). `lower_class_type` interns a
-  class only after its own base is fully resolved; if resolving the base
-  recurses back into the derived class before the derived class is interned,
-  that reentrant call correctly mints and fully registers it. The outer,
-  still-in-flight `lower_class_type` frame used to be unaware of this: on
-  resuming it minted a SECOND `ir::Ref` for the same class and (via
-  `compute_vtable`'s idempotency guard, keyed on the AST node rather than the
-  Ref) silently treated it as already numbered without ever calling
-  `set_class_desc` — a structurally valid but permanently undescribed Ref,
-  which crashed the LLVM backend as an unlocated `internal: class without a
-  descriptor` the first time codegen needed it. Reproduced by a real UVM
-  sequence testbench (`class C extends uvm_sequence;`, no parameterization
-  needed) against `uvm_pkg.sv`; not by every UVM design using the same
-  `uvm_sequence#(item)` shape, since the race only fires when
-  `uvm_sequence_base` (rather than `uvm_sequence_item`) is the first of the
-  pair reached by top-level lowering. Fixed at the root: `lower_class_type`
-  re-checks the class-type cache immediately after its base-class recursion
-  returns, adopting a reentrant registration instead of minting a second one.
-  `compute_vtable` separately guards the exception-safety half of the same
-  "done but undescribed" state with an RAII un-number-on-throw guard, so a
-  recoverable `LowerError` between numbering and `set_class_desc` (today
-  unreachable from any known legal construct, but structurally possible if a
-  future copy-thunk/interface/randomization guard grows one) propagates as a
-  located refusal instead of leaving a half-registered class behind.
-- [x] **"class without a descriptor" recurrence through the generic component
-  registry** — the same internal-error class the reentrancy/exception-safety fix
-  above closed for `uvm_sequence#(item)`'s base-recursion shape recurred through a
-  DIFFERENT path, root-caused against the real `biquad_example` design:
-  `apb_coverage_monitor extends uvm_subscriber#(apb_seq_item)` embeds a
-  `covergroup`, a property type `lower_type` refuses outright (LRM 19, not
-  implemented — see M4 "Functional coverage"). `lower_class_type` interns a class
-  (`class_type_cache_`) BEFORE laying out its own properties, so that refusal
-  throws AFTER `apb_coverage_monitor` is interned but BEFORE `compute_vtable` ever
-  runs — and `` `uvm_component_utils`` forces every registered class's
-  factory-registry proxy (`uvm_component_registry#(T,Tname)`) through here
-  eagerly, via its `local static this_type me = get();` singleton (LRM 6.21),
-  whether or not the design ever constructs one. The `LowerError` unwinds out of
-  `lower_class_type` with no try/catch of its own; the first caller to catch it
-  (`build_function`'s `stub_eligible` degrade, reached from
-  `apb_coverage_monitor`'s own `create_component`'s `T obj;`) left
-  `class_type_cache_` still pointing at the abandoned Ref — the fix above's
-  mid-function re-check only guards the base-class-recursion window, not this
-  one. A LATER, unrelated reference to the same class — `apb_coverage_monitor`'s
-  own registry `create`'s `$cast(create, obj)` (`uvm_registry.svh:116`) — hit
-  that stale cache entry and silently reused it as if valid: a structurally
-  well-typed class with an intact (empty) field table but no vtable and no
-  descriptor, crashing the LLVM backend as an unlocated `internal: class without
-  a descriptor` in `ClassIsA` codegen the first time `$cast`'s runtime check
-  needed it. Fixed at the root, the same way as the base-recursion case but one
-  step earlier: `lower_class_type` now un-interns `class_type_cache_[&clt]` on
-  the way out if anything after `bind_class_type` throws (mirroring
-  `compute_vtable`'s own `VslotGuard`), so a later reference gets its own honest,
-  located `LowerError` instead of inheriting a landmine. Functional coverage
-  itself stays unimplemented (unchanged, tracked separately under M4); the fix is
-  that failing to lower one no longer corrupts an unrelated, later lowering
-  attempt of the same class.
-- [ ] **A vtable-forced method's own SIGNATURE (return type / formal types)
-  failing to lower is not stub-eligible, only a body STATEMENT failing is** —
-  found writing the regression test for the entry above. `build_function`
-  lowers the return type (`lower_type(sub.returnValVar->getType())`) and every
-  formal's type BEFORE its `try { lower_stmt(sub.getBody(), b); } catch
-  (LowerError&) { if (stub_eligible(sub)) emit_unsupported_body_stub(...); }`
-  even starts, so a `LowerError` from the SIGNATURE itself (e.g. a virtual
-  method returning a class whose own field layout is unsupported, such as one
-  embedding a covergroup) is never eligible for the graceful degrade
-  `drain_pending_bodies`'s `stub_unsupported_bodies_` otherwise gives every
-  vtable-forced (never directly called) body — it crashes the whole
-  compilation instead of the single method. Distinct from the body-statement
-  case (which already degrades correctly, per the entry above): there is no
-  obvious sound fallback return/formal type to build a stub AROUND, since a
-  real caller elsewhere in the design may depend on the true ABI. Not yet hit
-  by a real design (both known real triggers, `uvm_registry.svh`'s
-  `create_object`/`create_component`, return `uvm_object`/`uvm_component` —
-  ordinary, always-lowerable types — and fail from a STATEMENT inside their
-  body instead, which already degrades correctly); reproduced only by a
-  from-scratch minimal case (`virtual function Broken get(); return
-  cached; endfunction` where `Broken` itself fails to lower).
-- [ ] **Backend crash on a class field whose type is (transitively) its own
-  descendant** — found while constructing a standalone repro for the
-  registration-reentrancy fix above. `class Base; Helper h; ... endclass class
-  Helper; Derived d; ... endclass class Derived extends Base; ... endclass`
-  (Base's field graph eventually reaches Derived, which extends Base) lowers
-  to valid `ir::Module` IR (`--emit ir` succeeds) but SIGSEGVs in
-  `--emit llvm` / `run` — LlvmBackend.cpp, not Lower.cpp; a plain
-  self-reference (`class Node; Node next; endclass`) is unaffected, so this is
-  specific to an ANCESTOR/DESCENDANT field cycle, not self-reference in
-  general. Does not reproduce against the real UVM library (`uvm_sequence_item`
-  holding a `uvm_sequence_base` field, the shape that motivated the entry
-  above, lowers and runs fine end to end), so something about a minimal
-  from-scratch construction differs from UVM's actual class bodies in a way
-  not yet root-caused. Unrelated to the registration fix above (verified: the
-  crash reproduces identically with that fix applied or reverted). Needs its
-  own investigation before a location + diagnostic (or a real fix) can land.
-- [x] **Parameterized classes** (`class C #(...)`, LRM 8.25) — type and value
-  parameters, param-sized members, methods over the type parameter, inheritance
-  from a specialization (`extends base#(5)`), per-specialization static members,
-  and a value parameter read via an instance (`obj.param`, LRM 8.5) or scope
-  resolution (`C#(N)::param`). slang monomorphizes each `C#(args)` into a distinct,
-  fully parameter-substituted `ClassType` (`genericClass` points to the generic
-  definition), so each specialization lowers as an independent nominal class —
-  distinct members, own-FunctionId methods, own static signals, keyed per
-  `ClassType`. Lowering needed only the guard lifted plus folding an `obj.param`
-  member to the specialization constant. (Cross-module
-  specialization identity inherits the existing per-Lowerer class-cache limitation
-  below.)
-- [x] **Interface classes** (LRM 8.26) — `interface class` as a type and a handle
-  type, `implements` (one or many, on a class or a `virtual class`), `extends`
-  between interface classes including diamonds, dispatch through an interface-class
-  handle (functions and time-consuming tasks), an implementation supplied by a base
-  class (8.26.2), partial implementation in a `virtual class` (8.26.7), parameterized
-  interface classes, `::` typedef / parameter access (8.26.3), `$cast` in every
-  direction that involves one (8.26.5), and `randomize()` through an interface handle
-  (8.26.9). An interface class interns as an ordinary nominal `Kind::Class` Ref with
-  an EMPTY field table — no object, no display id, no vtable, no copy or
-  randomization body. Interface method NAMES get one design-wide index (name keying
-  IS 8.26.6.1's "one implementation satisfies every same-named prototype"), and each
-  implementing class's descriptor grows an interface-method table indexed by it plus a
-  bitmap of the interface ids it implements, both at design-wide constant negative
-  offsets BELOW the trace-map pointer — so dispatch is one vptr load plus one
-  constant-offset load (identical to an ordinary virtual call), the implements test is
-  one load and one AND, and the GC's map offset and its startup cross-check are
-  untouched. Both regions are emitted only in a design that declares an interface
-  class: `--emit llvm` is byte-identical otherwise (measured). The interface closure
-  unions `getImplementedInterfaces()` over the whole base chain, because slang's
-  flattened list stops at the class carrying the `implements` clause — the bug
-  Verilator 5.050 ships on 8.26.2's own example. slang's `DynamicCastConst` warning
-  is dropped for an interface operand: its "always fails" condition is wrong on
-  8.26.5's own legal `$cast(get_ref, put_ref)`. **Refused, loud:** `rand_mode`
-  through an interface handle (8.26.9 makes it illegal, slang accepts it). 19 cases
-  in `tests/class_test.cpp` plus a GC case in `tests/gc_test.cpp`. See
-  docs/design/interface-classes.md.
-- [~] **Class scope & nesting** — out-of-block method bodies (`function C::f();`,
-  LRM 8.24) work, in a module or a package scope, for functions, tasks, `static`
-  methods, `new`, and `virtual` (see Polymorphism above). Remaining: nested classes
-  and `::` on parameterized specializations.
-- [x] **`$cast`** (LRM 6.24.2 / 8.16) — all destinations. A numeric `$cast`
-  converts and always succeeds (returns 1); an enum `$cast` succeeds only if the
-  source is a legal member value (runtime `===` membership over `enum_members`);
-  a class-handle `$cast` is the dynamic down-cast. Every class carries a
-  descriptor pointer at object-body field 0 whose **ancestor display** (Cohen's
-  display, `display[depth] == id`, one load and one compare, ids unique but
-  unordered so nothing needs a whole-design numbering pass) answers the test. Only
-  LRM 8.16 case 2 reaches run time: a cast to the source's own class or an
-  ancestor of it, and a literal `null` source, always succeed; two unrelated class
-  types always fail — a fold that holds only for a pair of ORDINARY classes, since
-  an interface class on either side lets a common implementer relate them
-  (LRM 8.26.5). A source that is null at run time succeeds and assigns null
-  (8.16 is ambiguous; the reading is recorded at `lower_cast` and in
-  docs/design/classes.md). An **interface-class destination** tests the object's
-  implemented-interface bitmap instead of the display (`ClassImplements`); an
-  interface-class SOURCE needs nothing new, since the object behind the handle is
-  always a real class (docs/design/interface-classes.md §6). The function form
-  returns the 1/0; the task form reports a run-time error on failure, for an enum
-  destination as well. All of it dispatches through `lower_cast`. Deferred: a
-  `chandle` destination (guarded loud — a chandle carries no type identity).
+- [~] **Garbage collection** (8.4) — collector coverage and policy still missing.
+  - [ ] **Collector tracing of event, `mailbox`, `semaphore`, `process` and
+    `std::weak_reference` handles** (8.4) — not yet described to the collector.
+  - [ ] **Evacuating collection (performance)** — the heap is non-moving.
+  - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.
+- [ ] **Vtable-forced method with an unlowerable signature** — a return or formal type that
+  fails to lower aborts the whole compilation instead of stubbing that one method.
+- [ ] **Class field typed as its own descendant** — `Base` holding `Helper` holding
+  `Derived extends Base` crashes the backend with no diagnostic; root cause unknown.
+- [~] **Class scope and nesting** — open pieces of class scope resolution.
+  - [ ] **Nested classes** — a class declared inside another class.
+  - [ ] **`::` on a parameterized class specialization** — `C#(args)::` resolution.
+- [ ] **`$cast` to a `chandle` destination** (6.24.2) — refused; a chandle carries no type
+  identity to test.
 
 ### Constrained randomization
 
-- [ ] **Constraint blocks** — relational, `inside`, implication `->`, `if/else`,
-  `foreach`, `solve … before`, `dist`, `soft`, uniqueness `unique{}`. Guarded loud,
-  each by its own message: a `constraint` block in a class, an inline `with { … }`
-  on either `randomize` form, and `constraint_mode`. The generated `$randomize` body
-  is shaped around the seam a solver drops into
-  (docs/design/constrained-randomization.md §7).
-- [x] **`rand` / `randc` and `randomize()`, unconstrained** (LRM 18.3/18.4/18.6/18.8/
-  18.11/18.12/18.14.2) — a class carrying a `rand` property grows a rand block of
-  ordinary fields (its own xoshiro256++ state, a 64-bit rand_mode mask, a 256-bit
-  cycle bitmap per `randc`), and two reserved vtable slots alongside `kCopySlot` hold
-  per-class synthesized bodies: `$randomize(this, mask)` and
-  `$randops(this, op, arg)`. The mask is a filter the body intersects with the
-  object's own mode word, so one body serves `randomize()`, `randomize(x, y)`,
-  `randomize(null)` and the recursion into a `rand` handle. Draws come from the
-  OBJECT's generator, seeded at `new` from one `$urandom` draw of the creating thread
-  (LRM 18.14.2) — which is also why no analysis pass changed: the seeding draw is an
-  ordinary `Urandom` instruction, so a process that constructs a randomizable object
-  already owns its frame state and leaves the thunk path. An unconstrained field is
-  uniform over its full range, an enum over its distinct labels, a 4-state field
-  never x or z; a `rand` handle is recursed into, never replaced, and a null one is
-  skipped. `pre_randomize` / `post_randomize`, per-property and object-level
-  `rand_mode`, `srandom`, `std::randomize` (which draws from the calling thread — no
-  object) and `randc` all land with it. Three IR tags — `ObjRandom`, `ObjRandSeed`,
-  `RandcNext` — all taking lvalue operands so the backend needs no layout knowledge,
-  plus one runtime helper, `rt_randc_next`. Guarded loud: `randc` wider than 8 bits
-  (LRM 18.6 allows the cap), `rand real`, `rand` dynamic arrays / queues /
-  associative arrays / unpacked structs, more than 64 rand properties in one chain,
-  `randomize(x)` naming a non-rand property, and `rand_mode` on a subelement. Design:
-  docs/design/constrained-randomization.md.
-- [x] **`$urandom` / `$urandom_range`** (LRM 18.13) — per-process xoshiro256++
-  RNG in the coroutine frame (thread-stable by process index), inlined draw +
-  Lemire range map. Stream intentionally not iverilog-identical (LRM
-  §18.13 leaves the algorithm unspecified). Legal anywhere: a function or task
-  runs in its caller's thread, so the state pointer is an implicit parameter of
-  the call ABI (`declare_function`) and a draw inside a subroutine continues the
-  calling process's stream.
-- [x] **`randcase`** (LRM 18.16) — weighted random branch selection: each weight
-  evaluated once, summed as unsigned at the widest weight's precision, one
-  `$urandom_range` draw picking the first branch whose cumulative weight passes
-  it. A zero-weight branch never runs and an all-zero sum runs none (the LRM's
-  warning is optional). The fixed-precision sum wraps per the literal LRM
-  reading, where verilator widens instead. Guarded loud: a
-  weight wider than 32 bits (needs the LRM's several-draw stitching).
-- [x] **Random stability across threads** (LRM 18.14.1) — a body that can outlive
-  the site that ramped it owns its generator instead of sharing the pointer: a
-  fork child, and the deferred `$strobe` / `$monitor` / action bodies. Each is
-  seeded at its ramp from one draw of the ramping thread's state, so a child's
-  stream is reproducible and independent of its siblings'. A DPI export thunk and
-  the `$monitor` ramp in `main` have no calling thread at all and use a
-  module-wide state seeded at startup.
-- [x] **`srandom` / `get_randstate` / `set_randstate`** (LRM 9.7, 18.14) — the
-  `process` methods: the thread's generator state rides its control block, so all three
-  reach a thread through a handle. `srandom` is `$urandom(seed)`'s splitmix64
-  expansion; the state renders as 64 hex digits and round-trips. A design that uses any
-  of the three gives every thread its OWN generator (the target of `p.srandom()` is not
-  statically known), gated so a `$urandom`-only design keeps the ownership
-  `build_rng_fns` computes. A foreign string is a located fatal, LRM 18.14.4 leaving it
-  undefined.
-- [ ] **Random stability & seeding, remaining** — the OBJECT-side randstate pair
-  (`obj.get_randstate()` / `obj.set_randstate()`), which shares the two `clotho.str`
-  helpers the `process` trio above now provides and stays guarded loud until it uses
-  them. The per-object RNG for class `randomize` and `obj.srandom()` landed with
-  randomization; the thread-side trio landed with `process`.
+- [ ] **Constraint blocks** — relational, `inside`, `->`, `if`/`else`, `foreach`,
+  `solve … before`, `dist`, `soft` and `unique` constraints; there is no solver.
+- [ ] **Inline constraints** — `randomize() with { … }`, on an object and on
+  `std::randomize`.
+- [ ] **`constraint_mode()`** — enabling and disabling constraint blocks.
+- [~] **`rand` / `randc` variables** — random variable shapes still refused.
+  - [ ] **`randc` wider than 8 bits** (18.6) — only up to 8 bits is accepted.
+  - [ ] **`rand real`** — a real-typed random variable.
+  - [ ] **`rand` dynamic arrays, queues, associative arrays and unpacked structs** — not
+    accepted as random variables.
+  - [ ] **More than 64 `rand` properties in one class chain** — the per-object `rand_mode`
+    mask is 64 bits.
+  - [ ] **`randomize(x)` naming a non-`rand` property** — in-line random variable control
+    over a state variable.
+  - [ ] **`rand_mode()` on a subelement** — mode control below a whole property.
+- [ ] **`randcase` weight wider than 32 bits** (18.16) — needs several 32-bit draws stitched.
+- [ ] **Object `get_randstate()` / `set_randstate()`** — the object-side randstate pair is
+  refused.
 
 ### Concurrency & synchronization
 
-- [x] **`wait fork`, `disable fork`** (LRM 9.6.1 / 9.6.3) — both landed with the
-  `process` control blocks, which is where the live-descendant set they needed came
-  from: `disable fork` is `kill` over the caller's subtree with the caller spared, and
-  `wait fork` is the one-pointer test `first_child == null`, exact because a completing
-  thread re-parents its live children (so a grandchild of a finished child still
-  counts, as 9.6.3 requires). Both stay refused inside an assertion action block,
-  which runs on the MONITOR's thread rather than one of its own.
-  Design: docs/design/process-class.md §8.
-- [x] **`std::semaphore` / `std::mailbox #(T)`** (LRM 15.3 / 15.4) — both are
-  ordinary class objects whose synthetic body carries the resource and its wait
-  queues: a signed 64-bit key count for `semaphore` (15.3.1 lets the count grow past
-  the constructor's), and for `mailbox` an UNBOUNDED queue of T plus three queues of
-  waiters (receive, send, peek). The bound is enforced in emitted IR, NOT by the
-  queue type, whose overflow silently drops the far end instead of blocking. So the
-  whole payload surface — int, string, class handle, 96-bit vector, unpacked struct
-  with a string leaf, nested queue — comes from the container element descriptor with
-  no mailbox-specific code, as does GC tracing of a handle payload.
-
-  New surface is two IR tags: `SyncWait` (parks on a queue, -> 1 when it resumed as
-  that queue's head) and `SyncCtl` (`Leave` / `WakeHead` / `WakeAll`); everything
-  else expands in the frontend into ordinary IR over the body. No runtime symbol, no
-  pool, no ABI change, no `DesignUses` gate. The waiter node is frame-resident and
-  STAYS linked across an unsatisfied retest — that is what preserves LRM 15.3.3 /
-  15.4.5 arrival order, and it is why the abort test lives inside `SyncWait`: a retry
-  loop never reaches the end of its instruction, the same shape that made a killed
-  `await` unkillable. A thread killed while blocked in `get` / `put` / `peek`
-  terminates, and a suspended one does not consume.
-
-  Head-of-line admission per 15.3.3 and Accellera's Interpretation #1: a blocked head
-  blocks a later smaller request, where Verilator 5.050 serves the later one and then
-  deadlocks the head — so those cases are pinned from the LRM text. `peek` is exempt
-  (it consumes nothing) and a `put` wakes every peeker before the receive head, which
-  is the only order that makes 15.4.7's broad unblock observable. `try_*` stay
-  availability-only (15.3.4, 15.4.4/6/8).
-
-  Guarded loud, each with a TODO: the **typeless mailbox** (15.4.9's `dynamic_type`,
-  legal SV that slang type-checks) — it needs a dynamically typed element plus a
-  run-time type identity for 15.4.5's check and 15.4.6's negative return;
-  `mailbox #(event)` (an element's construction mints an event object the copy then
-  overwrites, and event objects are never freed); deriving from either built-in
-  class; and a **negative bound**, which 15.4.1 calls illegal and which reports at
-  run time since the bound need not be constant. 22 cases in `tests/sync_test.cpp`.
-  `std::weak_reference` (LRM 8.30) keeps the std-package guard alone.
-  Design: docs/design/mailbox-and-semaphore.md.
-- [x] **`process` class** (LRM 9.7) — all nine methods: `self`, `status`, `kill`,
-  `await`, `suspend`, `resume`, `srandom`, `get_randstate`, `set_randstate`. A
-  thread's control block is native, untraced storage in two tiers -- a static slot per
-  process (no allocation, a constant address, the starting state in the initializer)
-  and a pooled record per fork child, the only unbounded tier -- and a `process`
-  handle is an ordinary class handle onto it, created lazily at the first `self()` and
-  memoized so identity is a pointer compare. Identity travels the call ABI beside
-  `rng`, because a task or function is not a thread.
-
-  `kill` is the landed `disable` abort per thread rather than per static target: mark
-  the subtree, force-wake each exactly once through the shared claim-or-flag protocol,
-  and let every activation leave through its ordinary exit -- so a thread parked behind
-  a time-consuming task call unwinds its whole frame chain, which is the case remote
-  `disable` still refuses. `suspend`/`resume` desensitise nothing (the wheel cannot
-  cancel, a static bucket cannot compact): a suspended thread replays the wake it
-  already received, which is what makes `resume` continue it in the current time step.
-
-  Everything is behind `DesignUses::process`, verified byte-identical `--emit llvm` on
-  every design that does not name it. `std::weak_reference` keeps the std-package
-  guard, now keyed by class name. 27 cases in `tests/process_test.cpp`, clean under
-  ASan/UBSan/LSan. Design: docs/design/process-class.md.
-- [~] **Clocking blocks** (LRM 14) — `clocking`/`endclocking` elaborates in a
-  module, an interface (so a modport-scoped block comes free) or a program, and
-  each block becomes one `ir::Activation::Observed` process that samples every
-  input clockvar and then toggles the block's event, in that order (LRM 14.13).
-  Putting it in Observed is what makes `@(cb)`, `@(cb.sig)` and
-  `@(posedge cb.sig)` ordinary waits: an Observed store wakes an Active process,
-  and the drain re-settles, so a waiter runs in the first Active region after
-  Observed exactly as LRM 14.10 says. A clockvar is its own storage registered
-  under the `ClockVarSymbol` in `sigmap_`, NOT an alias of the sampled signal, so
-  expression lowering is untouched. `input #1step` (the LRM 14.4 default) reads the
-  Preponed shadow the assertion sampler already maintains — one copy per variable,
-  shared (`sampled_shadow_of`) — and an explicit `input #0` reads live in Observed.
-  Synchronous drives (LRM 14.16) evaluate their RHS immediately into per-clockvar
-  pending state and are applied by a per-block `ir::Activation::ReNba` process
-  (new region, `emit_renba_run`), which is where 14.16 puts the value change and
-  the only point late enough to see a drive issued by a `@(cb)` waiter or by a
-  program's Reactive code. `##n` / `##0` (LRM 14.11) wait on the default
-  clocking's event, with an integral count only — 14.11 wants "a non-negative
-  integer value" and slang's `requireIntegral` rejects a real one, so lowering
-  keeps it as an invariant (`internal: a real cycle delay count reached lowering`)
-  rather than a gap, unlike a repeat count, which 12.7.2 admits as real.
-  `default clocking` / `global clocking` / `$global_clock`
-  supply an assertion's leading clocking event (LRM 16.16(a), 14.14). See
-  `tests/clocking_test.cpp` and docs/design/clocking-blocks.md.
-
-  Refused loudly, each with a TODO: any **input skew** other than `#1step`/`#0`
-  and any **output skew** other than `#0` (a nonzero skew samples or drives at a
-  time the edge does not name, so it needs a per-clockvar history keyed by time,
-  and an edge-based skew is a second event per block); a **net-typed output**
-  (LRM 14.16 wants a `'z`-initialized `(strong1, strong0)` driver joined to the
-  net's resolution, not a direct write); `cb.sig <= ##n expr` (one pending slot
-  per clockvar cannot hold two drives maturing in different cycles, which 14.16.2
-  requires — it needs a ring indexed by cycle offset); a **bit-select or slice**
-  drive target (the pending value is one whole-signal store); a **clocking item
-  bound to an expression** rather than a signal (LRM 14.5 slices and
-  concatenations); a non-posedge/negedge or multi-signal **clocking event**; an
-  **assertion item declared inside a block** (LRM 14.3 with 16.16(b)'s rules); and
-  a **sampled value function in procedural code** (LRM 16.9.3), which needs
-  history rings keyed to the default clocking rather than to a monitor; and a
-  **clocking event that is a program signal** (LRM 24.3 — a program port, or
-  anything a program's own code writes), because the block samples in Observed
-  while such a clock changes in Reactive, one region later. LRM 24.3.1 requires
-  the scheduler to iterate from the reactive region set back around the outer
-  loop through Observed, and clotho's loop does not close that way, so the block
-  would sample a full time slot late — silently, until now. Refused rather than
-  fixed: pointing the reactive re-settle at the Observed block hangs (it bumps no
-  oscillation counter), and re-entering Observed conditionally would step an SVA
-  monitor's automaton twice for one clocking event. A **design**-signal clock is
-  unaffected and is what LRM 24.4 asks for; see docs/design/program-blocks.md §10.
-- [~] **Program blocks** — `program`/`endprogram` elaborate and simulate. A
-  program instance goes through the ordinary instance path (own scope,
-  variables, functions, non-suspending tasks), and its `initial` procedures run
-  in the Reactive region per LRM 24.3 (`ir::Activation::Reactive`, seeded onto
-  `@clotho.reactive`). A program initial is a real process, so it may suspend on
-  `@`, `wait` or a nonzero `#delay` and resumes back into Reactive — each
-  suspend wakes in Active, re-queues onto the reactive ring and suspends again
-  (`emit_suspend`), because a waker does not know its sleeper's region. The LRM
-  24.3 implicit `$finish` (simulation ends when the last program initial
-  completes) is implemented as a countdown of live program initials. The region
-  order against an Active-region cascade is covered by
-  `tests/sva/diff_program_ref.sv` and `tests/program_test.cpp`.
-
-  Before this, `program` was accepted and silently lowered as a **module** —
-  Active-region initials, no implicit finish — a silent miscompile that
-  predated the region set. `always` in a program, nested programs,
-  anonymous-program members, a module instance in a program, a design reference
-  to a program signal and a design call of a program subroutine are all
-  rejected by slang.
-
-  Every remaining gap is scoped, with LRM quotes and code sites, in
-  docs/design/program-blocks.md. A program driver of a **multiply-driven
-  (resolved) net** — a port copy, or a hierarchical `assign` — used to be
-  refused; it now works, because such a net's resolver is **reactive-home**
-  (24.3.2: "the driving and resolution of nets on the other side of a program
-  port connection also occurs in the reactive region set"). A net has one
-  resolver, hence one resolution region, so this deliberately moves the
-  resolution of that net's *design-side* drivers into Reactive as well; the
-  clause does not distinguish which driver changed, and the alternative —
-  per-driver resolution regions — is in no sentence of the LRM. A net with no
-  program driver keeps its Active-home resolver, which is pinned by a control
-  test. `#0` inside a program does park in Re-Inactive (4.4.2.7) and is covered
-  by `tests/program_test.cpp`.
-
-  **A clocking block or concurrent assertion clocked by a program signal is
-  refused, loudly, and not fixed** — the last known gap in clause 24, and the one
-  that was still a silent wrong answer. 24.3.1: "If an assertion is clocked by
-  activity on a program object (not recommended), the scheduler will iterate from
-  the reactive region set back around the outer loop in Figure 4-1, through the
-  Observed region, where the assertion is evaluated." Clotho's loop does not:
-  `wheel.check` runs the Observed bodies and re-settles to the active drain, and
-  the reactive drain's `reactive.done` re-settle reaches the active drain or falls
-  through to Postponed — never back to `wheel.check`. So a clock written only in
-  the reactive region set (a program `initial`, a program `assign`, or an `input`
-  port copy, all reactive-home per 24.3.1) is not seen until the next slot's
-  Observed pass. It bit only when no Active-region process read the same signal,
-  since any Active reader's wake re-enters the loop and catches the edge by
-  accident. Two candidate fixes, both rejected for now and both recorded so they
-  are not re-derived: pointing `reactive.done`'s else-edge at `wheel.check` HANGS
-  (that edge pops no ring entry, so it bumps no oscillation counter and the guard
-  never trips), and a conditional Observed re-entry re-runs every Observed body in
-  the slot — survivable for a clocking block, which detects its edge against a
-  one-slot latch, but not for an SVA monitor, which detects its clock edge from
-  the Preponed shadow and would step its automaton twice for one clocking event.
-  A real fix needs a per-monitor per-step latch (clause 16 work) plus a
-  termination argument for the extra pass. A **design**-signal clock — including
-  one reached hierarchically or through an interface port — is unaffected, which
-  is what LRM 24.4 asks for anyway. Analysis in docs/design/program-blocks.md
-  §10; refusals and positives in `tests/program_test.cpp`.
-
-  **The home region belongs to the THREAD, not the body** (LRM 24.3.1: "a
-  section of sequential code anywhere in the design or testbench inherits the
-  scheduling region of the thread that calls it"; 24.5: "when a task within a
-  design module is called from a program, it shall use the reactive region set
-  for its scheduling activities"). A **suspending task called from a program**
-  used to be refused because a body lowered once could record only one home;
-  `build_shared_home_fns` now intersects the reactive-home call closure with the
-  ordinary one, and a body in both takes its home from a gated `i8 home` ramp
-  parameter beside `proc` instead of folding one. Unshared bodies still fold —
-  Reactive if only program code reaches them, Active otherwise — and a design
-  with no shared body emits the signatures it always did. `expect` (16.17) is
-  now one user of that slot rather than a special case, and inheritance is
-  transitive because each call site passes its own CURRENT home rather than its
-  lexical one. 24.5's own `module … task T; #5; endtask` example, a waiting class
-  method, two-level inheritance, a task called from both a program and a module
-  in one design, and a module-only task pinned to Active are covered in
-  `tests/program_test.cpp`. The sibling backend refusal for an assertion action
-  block sharing a body (`reject_shared_reactive_suspend`) is gone with it, and
-  was unreachable anyway: the frontend refuses any user-task call in an action
-  block because it cannot trace the body, which is a separate limit that stands.
-
-  **Ports are done** (LRM 24.3, 24.3.2). A program port is an ordinary module
-  port — 24.3: "Program port declaration syntax and semantics are the same as
-  those of modules" — carrying one extra rule: 24.3.2 puts the copy process in
-  the reactive region set, in both directions, so `wire_ports` emits its copies
-  for a program child with `Process::reactive_home` set. An interface or modport
-  port needs no copy at all (both sides canonicalize onto the interface
-  instance's signal) and `inout`/`ref` needs none either (`build_inout_aliases`
-  collapses both sides onto one signal), so those two cost nothing but tests.
-  There is no such thing as port skew, which is what the old refusal claimed.
-  Value ports both directions, interface and modport, a clocking block sampling a
-  port, `inout`, 24.3's own declaration shape, unconnected, `.*`, non-ANSI,
-  `bind` and width coercion are covered in `tests/program_test.cpp`.
-
-  **Per-program termination (24.3) and `$exit` (24.7) are done.** A program
-  instance is `Process::scope` over its `Activation::Reactive` processes, with a
-  live-`initial` counter and a static termination-root control block each
-  (`clotho.program_inst_live`, `clotho.program_root`); when an instance's counter
-  reaches zero it terminates that instance's descendant threads through the
-  `process::kill` subtree abort, and the design-wide counter then fires the
-  implicit `$finish` exactly as before. `$exit` is the same abort over the
-  instance's `initial`s as well, and counts nothing itself — each terminated
-  `initial` still passes through the program-end path exactly once. An `initial`
-  killed by `disable` or `process::kill` counts too, since 24.3 asks only that it
-  have "reached its end". Two `$exit` refusals remain, both loud: inside a
-  subroutine that no single program instance owns (24.7 answers by the calling
-  thread, and a shared body cannot name it — the thread-carried home region is
-  the mechanism that would), and inside a **function**, which has no abort exit
-  for its caller to poll.
-
-  A **continuous construct inside a program** is reactive-home per 24.3.1 ("the
-  continuous assignment `assign tclk = clk;` would also be scheduled in the
-  Reactive region"). `ir::Process::reactive_home` marks a continuously-active
-  process whose body belongs to the reactive region set: it is seeded onto
-  `@clotho.reactive`, its static subscription records a home-tagged handle so
-  every waker routes it there, and its parks are reactive-home. A flag rather
-  than a new `Activation`, which answers the orthogonal question of *when* a body
-  runs and is dispatched on everywhere. Design readers of a program-driven signal
-  therefore wake into the Active region of 24.3.2's "next iteration", the
-  ordering that clause's own example asks for. A program driver of a *resolved*
-  (multiply-driven) net takes the same route one level down: 24.3.2 puts the
-  **resolution** in the reactive region set too, so `emit_wire_resolvers` marks
-  that net's resolver reactive-home (`program_driven_nets_`, recorded at
-  `alloc_driver_slot` — the choke point every driver slot passes through — and at
-  `register_net_force_site`, since a net `force` is a resolver overlay rather
-  than a slot). One net, one resolver, one resolution region: the net's
-  design-side drivers resolve in Reactive as well, which the clause's wording
-  supports and per-driver resolution regions do not.
+- [ ] **`wait fork` / `disable fork` in an assertion action block** (9.6.1, 9.6.3) — the
+  action block runs on the monitor's thread, not one of its own.
+- [ ] **Typeless mailbox** (15.4.9) — `dynamic_type` needs a dynamically typed element and a
+  run-time type identity for the `get` check and `try_get`'s negative return.
+- [ ] **`mailbox #(event)`** — an event-typed message.
+- [ ] **Class derived from `semaphore` or `mailbox`** — extending a built-in class.
+- [ ] **`std::weak_reference`** (8.30) — the class is refused.
+- [~] **Clocking blocks** (14) — open pieces of clocking-block support.
+  - [ ] **Input skew other than `#1step`/`#0`, output skew other than `#0`** — needs a
+    per-clockvar history keyed by time; an edge skew needs a second event per block.
+  - [ ] **Net-typed clocking output** (14.16) — needs a `'z`-initialized
+    `(strong1, strong0)` driver joined to the net's resolution.
+  - [ ] **Cycle-delayed drive `cb.sig <= ##n expr`** (14.16.2) — needs pending drives in a
+    ring indexed by cycle offset.
+  - [ ] **Bit-select or slice drive target** — a synchronous drive of part of a clockvar.
+  - [ ] **Clocking item bound to an expression** (14.5) — slices and concatenations.
+  - [ ] **Clocking event other than one `posedge`/`negedge` signal** — any other edge kind
+    or a multi-signal event.
+  - [ ] **Assertion item declared inside a clocking block** (14.3, 16.16) — refused.
+  - [ ] **Sampled value function in procedural code** (16.9.3) — needs history rings keyed
+    to the default clocking.
+- [~] **Program blocks** — open pieces of program-block support.
+  - [ ] **Clocking block or concurrent assertion clocked by a program signal** (24.3.1) —
+    the scheduler does not iterate from the reactive region set back through Observed;
+    see docs/design/program-blocks.md §10.
+  - [ ] **`$exit` in a subroutine no single program instance owns** (24.7) — the exiting
+    program must come from the calling thread.
+  - [ ] **`$exit` inside a function** (24.7) — a function has no abort exit for its caller
+    to poll.
 
 ### Concurrent assertions (SVA)
 
-- [~] **Sequences & properties** — `assert`/`assume`/`cover property` compile,
-  simulate and report: `@(posedge|negedge clk)` written explicitly, inferred
-  from the enclosing procedure (LRM 16.14.6), or taken from a clocking block —
-  `default clocking` (LRM 16.16(a)), `global clocking` / `@($global_clock)`
-  (14.14), or an `@(cb)` that names one (16.14.6(c)(1)) — plus `disable iff`,
-  `|->`/`|=>`, `##n`/`##[m:n]`, `strong()`/`weak()`, and arbitrary boolean guards
-  (lowered through negation normal form, so `!` never reaches libsva). Sampled
-  values come from a Preponed region (`ir::Activation::Preponed`) that shadows
-  each assertion variable; the automaton step is emitted as ordinary IR, so there
-  is no new opcode. The region mapping is now the one LRM 4.4.2 specifies: the
-  monitor runs in Observed (`ir::Activation::Observed`) and its pass/fail action
-  block is scheduled into Reactive (`Inst::Tag::ReactivePend`), never run inline.
-  Action blocks work. The SEQUENCE layer (LRM 16.9) is COMPLETE: `##n`/`##[m:n]`,
-  `or`, `intersect`, `and`, `throughout`, `within`, `first_match`, repetition
-  `[*]`/`[=]`/`[->]`, and named `sequence`/`property`/`let` declarations all
-  lower, exercised cycle-for-cycle by the fixtures under `tests/sva/`.
-  The PROPERTY layer (LRM 16.12) is now PARTLY done:
-  implication, a bare sequence property and `strong`/`weak` around one, plus the
-  whole BOUNDED group — `nexttime`, `nexttime[n]`, `always [m:n]`,
-  `eventually [m:n]`, each with its `s_` form, `#-#`/`#=#`, property-level
-  `and`/`or`, and the `if`/`else` and `case` forms (desugared to a disjunction of
-  followed-bys, which is the shape that makes an untaken branch contribute
-  nothing instead of holding vacuously) — plus the ABORT group: `accept_on`,
-  `reject_on`, `sync_accept_on` and `sync_reject_on`, including the abort ABOVE an
-  implication, which is the shape every real use writes. Covered by
-  `tests/sva/diff_{nexttime,alwaysrange,eventuallyrange,followedby,propif,abort}.sv`,
-  plus `diff_strongprop.sv` and `diff_propcase.sv`.
-  An abort is scoped to a subtree rather than the whole monitor, so
-  `ir::AssertionMonitor` carries an abort table (root, accept-vs-reject,
-  sampled-vs-live, resolves-attempt, covers-trigger, state mask) and the emitted
-  step has arms for it. Three things worth knowing: an accept DISCHARGES an
-  attempt where `disable iff` abandons it with no verdict; the plain forms read
-  live values like `disable iff` and carry a one-bit latch so a pulse strictly
-  BETWEEN two ticks is still seen; and an abort covering a trigger resolves at
-  MATCH time, the cycle the antecedent match ends, which for `|=>` is one cycle
-  before the obligation would be seeded. Where two aborts fire on one attempt the
-  outermost wins, so the abort list is scanned backwards.
-  Remaining (each guarded loud): UNBOUNDED `always`/`eventually` and the `until`
-  family (phase 3 — the obligation has no bounded length, so the number of
-  attempts pending at once is unbounded); `not`, and with it `implies` and `iff`
-  (phase 4 — a complement needs the operand determinised and swaps the weak/strong
-  disposition); an abort covering an implication whose ANTECEDENT takes more than
-  one cycle (several attempts can be part-way through it when the condition fires,
-  each owing its own verdict, and the trigger is their union rather than a
-  per-attempt ring, so the count cannot be recovered — one-cycle antecedents are
-  exact and lower);
-  `disable iff` inside a named property, local variables and sequence match
-  items, recursive properties, a repetition with a zero lower bound (it admits
-  the empty sequence, which libsva bans), goto/non-consecutive repetition over a
-  compound sequence, multiclock or non-packed sampled variables, and an action
-  block containing a nonzero delay / event control. (A hierarchical or package
-  / `$unit` sampled variable is no longer on this list — see "Cross-scope
-  assertion sampling" below.) A plain nonblocking
-  assignment in an action block now works, committing in Re-NBA (LRM 4.4.2.8).
-  An `and` in a consequent is refused where an `intersect` is accepted, because
-  `and` runs to the later of its two ends and so needs both operands bounded;
-  the diagnostic names that. A property operator whose operand raises an
-  obligation of its own is refused too — a monitor has one trigger and nowhere to
-  put a second — except over a `nexttime[n]` or an `always [m:n]`, where libsva
-  moves the shift onto the antecedent instead. See
-  docs/design/concurrent-assertions.md and docs/design/sva-property-layer.md.
-- [x] **Sampled value functions** — `$rose`, `$fell`, `$stable`, `$changed`,
-  `$past`, `$sampled`, including `$past(v, n)` for `n > 1`. `$past` is the
-  primitive: a per-monitor history ring shifted once per CLOCK TICK at the end of
-  the monitor body, as deep as the largest constant `n` asks for; the others
-  desugar onto it. Ring entries are seeded with the variable's time-zero value,
-  NOT the type default: before enough ticks have elapsed the only value that has
-  actually been sampled is the one at time zero, and seeding the type default
-  would manufacture a change that never occurred. Covered by
-  `tests/sva/diff_past.sv` and `tests/sva/diff_valuechange.sv`. Still refused,
-  each guarded loud: a gating expression or an explicit clocking argument on
-  `$past`, an explicit clocking argument on a value change function, a
-  non-constant tick count, any of the six
-  over an expression rather than a plain variable, and any of them outside an
-  assertion expression. In a `disable iff` or asynchronous `accept_on` /
-  `reject_on` condition `$sampled` now lowers — LRM 16.9.3 blesses it there and it
-  resolves to the Preponed shadow alone, touching no history ring and no
-  per-attempt state — while the other five stay refused, because 16.9.3 infers no
-  clocking event in that position and 16.12.14 requires an explicit clock argument
-  for them, which is the gap above; slang diagnoses the unclocked
-  disable-condition spelling itself. See docs/design/concurrent-assertions.md §4.1.
-- [x] **Cross-scope assertion sampling** (LRM 16.5, 16.6) —
-  `sampled_shadow_of` used to require a shadow's own storage to live in the
-  scope LOWERING the assertion, so a hierarchical reference through a
-  directly-instantiated interface (or any deeper instance path) or a
-  package / `$unit` variable sampled by a DIFFERENT scope's assertion was
-  refused outright ("a concurrent assertion may only sample variables of
-  the instance that declares it"). This was the single highest-impact SVA
-  gap in the sv-tests regression corpus: 16/16 chapter-16 concurrent-
-  assertion hits share one shape, `assert property (@(posedge dif.clk)
-  dif.read ##1 dif.write)`, sampling through a directly-instantiated
-  interface. Fixed at the root: the shadow (and its Preponed copy) is now
-  registered in the DECLARING scope of the live signal instead, found via a
-  new `register_signal`-populated reverse map (Signal id -> declaring
-  `InstanceScope::id`) and `find_scope_node` — the same lookup
-  `alloc_assert_control` already used to attach a different piece of
-  per-assertion state to an arbitrary scope once the Collect pass has
-  frozen the scope tree. Reading the relocated shadow from the (possibly
-  different) asserting scope needed no new addressing mechanism: Signal
-  handles are flat and globally unique and every `InstanceScope` owns its
-  own LLVM global (`Anchor::state_gv`), so the backend already addresses a
-  signal by ITS OWN declaring scope regardless of which process's body
-  references it — the same machinery an ordinary hierarchical read
-  (`dif.sig` in a plain `always` block) already used. A package / `$unit`
-  live signal (itself unscoped, per `register_signal`) leaves its shadow
-  unscoped too, which is what makes it a flat root-level field
-  (`build_state_types`) instead of pulling it into whichever instance
-  happens to assert. One shadow per live signal stays shared across every
-  asserting scope (the existing `sva_shadows_` memoization, now reachable
-  for a cross-scope live signal too — pinned by a test with two different
-  asserting instances of one definition sampling one interface signal,
-  checking both the shadow count and the single Preponed process's own
-  store count), and the single per-top Preponed copy process needed no
-  change: it was already `scope = no_scope` and already copied arbitrary
-  signals directly, never relative to "the asserting scope". Depth is not
-  narrowed: `find_scope_node` walks the whole scope tree, so a second
-  hierarchy hop costs nothing extra (`module A; module B; module C;`,
-  tested). `$past`/`$rose`/`$fell`/`$stable`/`$changed` needed one more,
-  narrower fix alongside this: their "plain variable" operand check tested
-  only `ExpressionKind::NamedValue`, never `HierarchicalValue` (what slang
-  gives a dotted path like `dif.sig`), so a hierarchical reference was
-  refused a SECOND time by an unrelated guard even once `sampled_shadow_of`
-  allowed it — widened to accept both kinds, matching every other
-  hierarchical-reference site in `Lower.cpp`. `sampled_shadow_of`'s other
-  caller, a clocking block input's `#1step` skew copy (LRM 14.4), is
-  unaffected by construction (same code path, no cross-scope test exercises
-  it, so its supported scope is unchanged) — `tests/clocking_test.cpp`
-  passes unmodified. Verified against Verilator 5.050 (interface-
-  hierarchical report timing) and against sv-tests chapter-16: all 16
-  corpus hits of this shape now compile and simulate; the chapter-16 files
-  still refused hit unrelated pre-existing gaps (LRM 16.10 local variables
-  in a sequence / property, LRM 16.13 multiclock sequences, LRM 16.4 a
-  deferred assertion inside a function / task). Tests: `tests/sva_test.cpp`.
-  Still refused, loud, its own message and its own TODO: a non-packed
-  (aggregate / container / string / event) sampled variable, unchanged by
-  this work. See docs/design/concurrent-assertions.md §4.
-- [x] **Sampled-value semantics for a system function call inside a
-  property/sequence expression** (LRM 16.9.1 / 4.4.2) — fixed for LRM 20.9's
-  bit vector system functions (`$isunknown`, `$countones`, `$countbits`,
-  `$onehot`, `$onehot0`): each is a pure combinational reduction over one
-  bit-vector operand and nothing else, and clotho already lowered the
-  non-constant case of each (`lower_bit_query`) as nothing more than
-  `lower_expr` on that operand plus the reduction op — the SAME `lower_expr`
-  every plain (non-call) assertion-expression atom already goes through to
-  reach `value_lvalue`, which is what redirects a read to the Preponed shadow
-  while an atom is being lowered (`SampledScope` / `sva_sampled_`). So
-  `reject_unsampled_call`'s blanket refusal was blocking a call this
-  machinery could already sample correctly; the fix (`is_pure_bitvec_sysfn`)
-  is a narrow exemption from that refusal, not new sampling logic, and unlike
-  a sampled value FUNCTION's operand (pinned to a plain variable,
-  `lower_sampled_value`) it costs no restriction on the operand's shape — LRM
-  20.9 leaves it an arbitrary expression, so a bit-select or a hierarchical
-  reference through it samples exactly as a bare (non-call) atom already
-  does. A call still hiding inside that operand (`$isunknown(f())`) is
-  exactly as unsampleable as a bare one, so the exemption still descends into
-  it (`visitDefault`) rather than stopping the walk the way the sampled value
-  function exemption does. Confirmed against the real design this gap names
-  (`apb_if.sv`'s `psel_valid` property) and by a differential test forcing
-  the operand's live and Preponed values to disagree within one time step
-  (an NBA landing between the Preponed sample and the monitor's Observed
-  read) so a live-reading bug would visibly drop a report. Tests:
-  `tests/sva_test.cpp`. Still refused, its own message, unchanged by this
-  work: a USER function/task call (its body may read state beyond what its
-  arguments name, and clotho does not trace subroutine bodies to add that to
-  the shadow set) and every OTHER system function outside the LRM 20.9 family
-  (e.g. `$time`, which names no operand to sample at all) — narrower TODOs of
-  their own, not covered here.
-- [~] **Property layer phase 3** — DONE. Unbounded `always p`, `s_eventually p`
-  and all four `until` forms lower and simulate, tracked by a new COUNTED mode:
-  the obligation is determinised totally and each of its states carries a
-  `uint64_t` count of the attempts sitting there, so a verdict says how many
-  attempts it belongs to. `libsva/test/merge.zig` (`zig build merge`) is why it
-  is shaped that way and not as the single merged vector the design doc first
-  proposed: over every trace of 6 and 8 cycles a merged vector is unsound (a
-  two-cycle counterexample on a bounded `a ##1 b`), `first_match`'s
-  determinisation does not rescue it because it is partial and a dead attempt has
-  no state to be seen in, and only the counted total construction is exact on
-  cycle sets, counts and end-of-trace pendency at once. `tests/sva/diff_until.sv`,
-  `diff_alwaysinf.sv` and `diff_seventually.sv` carry hand-derived expectations
-  that clotho now reproduces exactly, including `diff_seventually.sv`'s six cover
-  hits where a merged vector would have scored two. The goldens in those files
-  are still `TO BE FILLED`, so the expectations there remain hand-derived.
-
-  Two refusals remain from this work, both loud and both narrower than the old
-  unbounded refusal they replace. A property mixing disciplines —
-  `always (a |=> b)` and friends — is `SVA_ERROR_MODE_MIX`, by decision: tracking
-  mode is monitor-level. And the operand of an unbounded `always`, or the LEFT
-  operand of an `until`, must match in a single cycle, because both positions are
-  universal over cycles and "p holds at every cycle of the window" is a statement
-  about overlapping attempts of p that one counter cannot carry. The fix is a
-  second subset construction over the determinised operand, where a dead
-  sub-attempt becomes a visible state; cost is exponential in the operand and
-  capped like every other blow-up. Multi-cycle operands in the EXISTENTIAL
-  positions — `s_eventually p`, an `until`'s right operand — work today.
-- [~] **Property layer phase 4** — `not` is DONE; `implies` and `iff` are
-  structurally limited. The complement is the total determinisation with two
-  masks exchanged: `last` becomes the dead (empty-subset) states, and the states
-  whose subset meets the operand's exits get a `never` guard, so nothing in
-  `Monitor` or in a backend knows a `not` was involved and `sva_report` needs no
-  new field. A complement does NOT force counted mode — the operand-matched
-  states are deleted, so the ordinary emptiness reading is restored and the ring
-  holds it. `not pending == pending` is what cost real work: ordinary
-  co-reachability pruning would resolve a pending verdict at the cycle the
-  outcome became inevitable, so `prune` gained an exemption mask, pinned by
-  `not (a ##1 (b or !b))` and by `not not p` agreeing with `p`.
-  `tests/sva/diff_not.sv` reproduces an independently hand-derived LRM
-  expectation exactly: 28 reports across seven ticks, four of them at end of
-  trace, and seven cover hits.
-
-  What is limited, and it is not conservatism: `implies` reduces to
-  `(not p) or q`, `not` inverts the strength of the operand it complements, and a
-  monitor carries ONE end-of-trace disposition — so `implies` lowers only when
-  its operand strengths DIFFER, and `iff` never lowers, since each direction
-  forces its operands opposite and the outer conjunction always sees a mixed
-  pair. Weak-implies-weak, which is the default spelling, is therefore refused.
-  Not conservative: with both operands weak, a trace where `q` definitively
-  failed while `p` is pending ends with the implication FAILING, and a trace
-  where both are pending ends with it HOLDING — one automaton, one strength bit,
-  two dispositions.
-- [ ] **Retire `MIXED_STRENGTH`** — the lift that makes `implies` and `iff`
-  usable, and the one thing standing between phase 4 and complete LRM 16.12. A
-  per-state end-of-trace disposition, OR-combined over the live vector and folded
-  conjunctively at product-construction time, replaces the single strength bit.
-  It changes what `sva_monitor_strength` means, so it is an ABI decision and not
-  a refactor. Three separate refusals point at it.
-- [ ] **Determinise the trigger** — what would restore an unbounded antecedent
-  (`b[=2] |=> c`, `(a ##[1:$] b) |-> c`), refused since the trigger began
-  counting attempts. The bound is not about counter width: the
-  trigger is a nondeterministic Glushkov automaton, so one attempt is a SET of
-  live states, "how many attempts sit in this state" is not well formed, and
-  identity is needed because two threads of one attempt can reach exits together
-  where LRM 16.9 has ONE match — set union is idempotent, addition is not.
-  Determinised, an attempt is a single state and a plain count is exact with no
-  bound at all. Reuses `Glushkov.determinise` but a trigger must keep running
-  past a match, needs its own discipline flag and tables in the C ABI, and wants
-  the subset blow-up capped under `state_limit` like `first_match`.
-- [ ] **`expect`** — blocked behind giving an assertion action block a real
-  coroutine so it can suspend and resume in the Reactive region. That one
-  scheduler change is what lifted most of the action-block whitelist (a delay, an
-  event control, `wait` and a `fork` are all allowed now); a user task call is the
-  entry still refused, since the body is not traced for what it may suspend on.
-  Not an SVA problem; see concurrent-assertions.md §9.3's whitelist.
-- [ ] **`.matched`** — needs multiclock (LRM 16.13.6). `.triggered` on a plain
-  same-clock sequence does not, and is the near-term half.
-- [x] **Assertion control** — `$asserton`/`$assertoff`/`$assertkill`, the four
-  pass/fail action tasks, `$assertnonvacuouson`/`$assertvacuousoff` and the
-  constant-argument subset of `$assertcontrol` (LRM 20.12), over concurrent
-  assertions. Per-assertion state in negative logic, addressed by scope or by
-  label with `$dumpvars` `levels` counting; `off` gates the seed alone so an
-  attempt in flight still reports, `kill` rides the `disable iff` reset, and the
-  action filters gate the pend without touching the automaton. Still open:
-  non-constant arguments (refused, and they need a run-time dispatch over every
-  assertion in scope), control over immediate/deferred/`expect` assertions
-  (refused when the design has one, since they lower inline with no state to
-  gate), and `unique`/`priority` violation control.
-
-**Deliberately deferred, recorded so it is not lost.** Each is a separate
-project with its own algorithm, not tail cleanup on the property layer:
-
-- [ ] **Multiclock sequences and properties** (LRM 16.13) — libsva's monitor has
-  exactly one clock and the automaton model is "one clock edge is one cycle", so
-  this needs a per-letter clock attribute, a rewrite of `advance`/`seed`/`satisfy`
-  and of clotho's emitted step, plus a clock-domain partition in the frontend.
-  Gates `.matched`, an explicit clocking argument on a sampled value function,
-  and `@$global_clock` beside another clock. Roughly 1.5k lines. Its
-  `default`/`global clocking` half is no longer blocked: clocking blocks landed
-  (LRM 14), and a single `default clocking` / `global clocking` / `@(cb)` clock
-  already resolves to an ordinary single-signal event, so what is left here really
-  is the per-letter clock attribute and the automaton rewrite.
-- [ ] **Local variables and sequence match items** — an attempt is a bitset of
-  automaton states and a local variable is per-thread data; the merge that makes
-  the bitset work is exactly what destroys the ability to carry a valuation.
-  Needs a register automaton (determinise-with-data) in libsva plus per-slot
-  storage in clotho's monitor state. The deepest item on the list.
-- [ ] **Recursive properties** (LRM 16.12.4) — a fixpoint over the property
-  graph, a different construction from the Glushkov lowering, not a tag. Tracked
-  again under M5 language corners.
+- [~] **Sequence and property operators** (16.9, 16.12) — open operator shapes:
+  - [ ] **Abort over a multi-cycle implication antecedent** — attempts part-way through the
+    antecedent each owe a verdict that the shared trigger cannot count.
+  - [ ] **`disable iff` inside a named property** — refused.
+  - [ ] **Repetition with a zero lower bound** — it admits the empty sequence.
+  - [ ] **Goto and non-consecutive repetition over a compound sequence** — only
+    single-expression operands lower.
+  - [ ] **Sequence `and` in a consequent** — both operands must be bounded.
+  - [ ] **Property operator over an operand that raises its own obligation** — a monitor has
+    one trigger; only `nexttime[n]` and `always [m:n]` operands lower.
+  - [ ] **Non-packed sampled variable** (16.5, 16.6) — aggregate, container, string and
+    event operands of an assertion expression are refused.
+- [~] **Sampled value functions** (16.9.3) — open pieces:
+  - [ ] **Gating expression on `$past`** — refused.
+  - [ ] **Explicit clocking argument** (16.12.14) — refused on `$past`, `$rose`, `$fell`,
+    `$stable` and `$changed`; unclocked contexts such as `disable iff` need it.
+  - [ ] **Non-constant `$past` tick count** — refused.
+  - [ ] **Operand that is an expression** — the operand must be a plain variable.
+  - [ ] **Use outside an assertion expression** — refused.
+- [~] **Function calls in assertion expressions** (16.9.1, 4.4.2) — open pieces:
+  - [ ] **User function call** — its body is not traced to add the variables it reads to the
+    sampled set.
+  - [ ] **System function outside the 20.9 bit-vector family** — e.g. `$time`.
+- [~] **Unbounded `always`, `s_eventually` and `until`** — open pieces:
+  - [ ] **Multi-cycle operand of an unbounded `always` or left operand of `until`** — needs
+    a second subset construction over the determinised operand.
+  - [ ] **Property mixing tracking disciplines** — e.g. `always (a |=> b)`; the tracking
+    mode is per monitor.
+- [~] **`implies` and `iff`** — a monitor has one end-of-trace disposition where each state
+  needs its own; see docs/design/sva-property-layer.md:
+  - [ ] **`implies` with operands of equal strength** — includes the default weak form.
+  - [ ] **`iff`** — always refused.
+- [ ] **Implication with an unbounded antecedent** — e.g. `b[=2] |=> c`; the trigger is
+  nondeterministic, so attempts cannot be counted per state.
+- [ ] **`expect` statement** — needs an action block that can suspend in Reactive.
+- [ ] **User task call in an assertion action block** — the task body is not traced for what
+  it may suspend on.
+- [~] **Sequence methods** — open pieces:
+  - [ ] **`.triggered` on a same-clock sequence** — not lowered.
+  - [ ] **`.matched`** (16.13.6) — needs multiclock sequences.
+- [~] **Assertion control tasks** (20.12) — open pieces:
+  - [ ] **Non-constant arguments** — need a run-time dispatch over every assertion in scope.
+  - [ ] **Control of immediate, deferred and `expect` assertions** — they lower inline with
+    no per-assertion state to gate.
+  - [ ] **`unique` / `priority` violation control** — not gated.
+- [ ] **Multiclock sequences and properties** (16.13) — needs a per-letter clock attribute
+  and a rewritten automaton step; also blocks `@$global_clock` beside another clock.
+- [ ] **Local variables and sequence match items** — needs a register automaton that carries
+  a valuation per attempt.
+- [ ] **Recursive properties** (16.12.4) — needs a fixpoint over the property graph, not a
+  Glushkov lowering.
 
 ### Functional coverage
 
-Designed and built in **docs/design/functional-coverage.md** — the type
-representation, the bin model, the sampling region, the coverage arithmetic, the
-report, and the phase plan. Clause 19 is four algorithms with almost no shared
-code (bin algebra; transition automaton; cross select algebra; accounting and
-report), plus cheap plumbing over mechanisms clotho already has.
-
-- [x] **P0 — type, instance, value bins, a number** — a covergroup type is a
-  nullable 64-bit HANDLE onto a runtime-owned instance record (not a
-  `Kind::Class`: LRM 19.11.3 aggregates type coverage over instances the design
-  has dropped, so an instance must outlive every reference and must not be
-  collected — which also meant not one of the seven `const ClassType*`-keyed
-  Lowerer maps had to be widened). `new` is one runtime call capturing the
-  enclosing `this` for an embedded group, so a covergroup covers the object that
-  BUILT it however sample() is later reached (19.4). Bins are static model data
-  the frontend folds and the backend emits as constants (`clotho.cover.config`,
-  mirroring src/runtime/Coverage.h), with the matcher, the counters and the 19.11
-  arithmetic in src/runtime/Coverage.cpp: explicit value bins (sets, ranges, `$`,
-  `[]` named `b[value]`, `[N]`, `default`), automatic bins including 19.5.3's enum
-  form named after the constants, `ignore_bins`, `illegal_bins` with the located
-  run-time fatal (19.5.6 precedence over every other bin), `option.at_least` /
-  `weight` / `goal` / `auto_bin_max` / `per_instance`, `sample()`,
-  `get_inst_coverage()` / `get_coverage()` in both arities, `$get_coverage`, and a
-  deterministic text report behind `--coverage <file>`.
-- [x] **P1 — the trigger** — `@(edge sig)` / `@(event)` coverage events as ONE
-  `Activation::Observed` process per covergroup type walking that type's instance
-  registry (per-instance processes would pay an unconditional coroutine round trip
-  each settled point), using the SVA monitor's `clk_now & ~clk_was` detector
-  (:17021) but latching the LIVE clock per Observed pass rather than a Preponed
-  shadow: 19.3 says a covergroup samples "the instant the clocking event takes
-  place" and samples again if the event recurs in the same time step, the opposite
-  of a clocking block's sticky latch. Plus `start()` / `stop()` and
-  `set_inst_name()`.
-- [ ] **P2 — guards, formals, cross** — `iff` at group / coverpoint / bin level;
-  `with function sample(args)` (the UVM shape: a covergroup sampled with values
-  the caller holds); `wildcard` bins; covergroup formals and, by the same
-  mechanism, non-constant bin bounds (LRM 19.5.1's `bins good = {[low:high]}`
-  makes the bin SET per-instance, so the table moves from static model data to one
-  built at construction); then cross — implicit coverpoints, auto cross bins,
-  `binsof` / `intersect` / `!` / `&&` / `||`, `with (expr) [matches N]`,
-  `cross_retain_auto_bins`, `cross_num_print_missing`.
-- [ ] **Transition bins** (P3) — `trans_list`, `[* r]` / `[-> r]` / `[= r]`,
-  `default sequence`, per-bin pending state, at-most-once-per-sample, overlapping
-  matches. A per-bin NFA over the sampled-value stream: libsva's problem SHAPE,
-  not its code (no clock, alphabet is value ranges, a match is a count).
-- [ ] **Accounting completeness** (P4) — `type_option.merge_instances`
-  union-by-bin-name and, with it, `max(at_least)` across instances (19.11.1);
-  `option.per_instance` reporting policy; `option.get_inst_coverage`;
-  `type_option.weight` / `goal` / `comment`; `option.name` / `comment`;
-  `detect_overlap` warnings. The rest of 19.11 landed in P0: the weighted
-  averages, the zero-denominator table at all three levels, per-instance and type
-  coverage, and `$get_coverage`.
-- [ ] **Coverage corners** (P5) — real-typed coverpoints and
-  `type_option.real_interval` (a second bin algebra over floats),
-  `covergroup extends` (19.4.1, needs `TransparentMemberSymbol` unwrapping —
-  slang's `membersOfType<T>()` silently returns nothing for an inherited
-  coverpoint), `type_option.strobe` (Postponed sampling; clotho has no Postponed
-  activation but `rt_strobe_pend`/`rt_strobe_pop` is the LRM's own analogy),
-  `distribute_first`, set-expression bins (19.5.1.2 / 19.6.1.4),
-  `@@(begin/end blk)` block events (no block entry/exit hook exists anywhere),
-  `detect_overlap`.
-- [ ] **The coverage database** — `$set_coverage_db_name`, `$load_coverage_db`,
-  `$coverage_merge`, `$coverage_save`, `$coverage_control`, `$coverage_get`,
-  `$coverage_get_max`. LRM 19.9 specifies no format; cross-run merge is an
-  interchange decision, not a simulation one. Refused; clotho emits a
-  deterministic text report instead.
-- [x] **A covergroup coverpoint may reference a class member declared later**
-  (LRM 8.6/19.4/19.5) — landed in slang via
-  `patches/slang-class-forward-ref.patch`; see the Classes entry above. A hard
-  prerequisite for every embedded covergroup in real UVM code.
-- [x] **`covergroup` misdiagnosis** — `lower_type` names covergroups instead of
-  falling through to `unsupported non-integral type`; see the UVM enablers entry
-  below.
-
-Oracle position, measured: **iverilog cannot parse covergroups at all**, and
-**Verilator's numbers are not LRM 19.11** — it reports pooled bins
-(2/5 = 40%) where 19.11 specifies the weighted average of per-item coverage
-(`(1/4 + 1/1)/2 = 62.5%`), names `bins hi[] = {[3:5]}` as `hi[0..2]` instead of
-19.5.1's `hi[3..5]`, names auto bins `auto_0` instead of `auto[0:1]`, and returns
-`0.0` from `cg::get_coverage()`. Verilator IS a good oracle for per-bin hit
-COUNTS (its 19.5.3 auto-bin distribution matched exactly). So percentages, bin
-names and type coverage are hand-derived from the clause text the way the SVA
-layer's `diff_not.sv` expectation was: tests/coverage_test.cpp carries 28 cases
-built that way, including 62.5%-not-40% as a NEGATIVE assertion so a refactor that
-pools bins fails the suite instead of silently agreeing with Verilator.
-
-Adjacent, exposed by this work and tracked with it: immediate `cover` counts
-nothing and does so SILENTLY (src/Lower.cpp:16064-16101 leaves the else-region
-empty), and
-`cover property`'s tally `sva.<id>.cov` (:13389) is correct, live, and read by
-nothing — reporting it needs `ir::AssertionMonitor::label`
-(src/ir/Module.h:447), declared "for a report" and never assigned.
+- [ ] **`iff` guards on covergroups, coverpoints and bins** — not lowered.
+- [ ] **`with function sample(args)`** — a covergroup sampled with caller-supplied values.
+- [ ] **`wildcard` bins** — not lowered.
+- [ ] **Covergroup formals and non-constant bin bounds** (19.5.1) — the bin set becomes
+  per-instance and must be built at construction.
+- [ ] **Cross coverage** — implicit coverpoints, automatic cross bins, `binsof` /
+  `intersect` / `!` / `&&` / `||`, `with (expr) [matches N]`, `cross_retain_auto_bins`,
+  `cross_num_print_missing`.
+- [ ] **Transition bins** — `trans_list`, `[* r]` / `[-> r]` / `[= r]`,
+  `default sequence` and overlapping matches.
+- [~] **Coverage options and accounting** — open pieces:
+  - [ ] **`type_option.merge_instances`** (19.11.1) — union by bin name, with
+    `max(at_least)` across instances.
+  - [ ] **`option.per_instance` reporting and `option.get_inst_coverage`** — not implemented.
+  - [ ] **`type_option.weight` / `goal` / `comment`, `option.name` / `comment`** — not
+    implemented.
+  - [ ] **`option.detect_overlap`** — no overlap warnings.
+- [ ] **Real coverpoints and `type_option.real_interval`** — need a second bin algebra over
+  floats.
+- [ ] **`covergroup extends`** (19.4.1) — slang hides an inherited coverpoint behind a
+  transparent member.
+- [ ] **`type_option.strobe`** — Postponed-region sampling.
+- [ ] **`distribute_first`** — not implemented.
+- [ ] **Set-expression bins** (19.5.1.2, 19.6.1.4) — not implemented.
+- [ ] **Block events `@@(begin blk)` / `@@(end blk)`** — no block entry or exit hook exists.
+- [ ] **Coverage database tasks** (19.9) — `$set_coverage_db_name`, `$load_coverage_db`,
+  `$coverage_merge`, `$coverage_save`, `$coverage_control`, `$coverage_get` and
+  `$coverage_get_max`; the LRM defines no database format.
+- [ ] **Immediate `cover` hit count** — nothing is counted or reported, and nothing is
+  refused.
+- [ ] **`cover property` hit report** — hit counts are kept but never reported, and
+  assertions carry no label to report them under.
 
 ### Foreign interface
 
-- [ ] **DPI import `output`/`inout` string** — the C writes an unbounded
-  NUL-terminated `char*` back with no size contract, so there is no safe fixed
-  copy-out buffer (frontend `fail`).
-- [ ] **DPI export `output`/`inout` string + string return** — returned-`char*`
-  lifetime / the same unbounded copy-out (frontend `fail`).
-- [ ] **DPI export open-array args** — needs open-array formals in the general SV
-  function ABI (a runtime-bounded array parameter), not just the call-site marshal.
-- [ ] **DPI open-array: packed-element dynamic-array actual + multi-dimensional** —
-  a packed dynarray element needs a runtime-sized marshal scratch (backend guard);
-  multi-dim needs `svGetArrElemPtr2/3` + a recursive descriptor. (A queue actual is
-  blocked upstream in slang as a type mismatch, not implementable here.)
-- [ ] **One c_identifier exported from several scopes** — `svSetScope` picking which
-  instance a shared C name reaches. Blocked upstream: slang's `checkDPIMethods` keeps
-  one cId->subroutine map and drops the duplicates before `getDPIExports()` is
-  visible, so Clotho cannot even see the second scope. Needs walking the instances by
-  hand, a `DpiExport` carrying a (scope, FunctionId) list, and a runtime scope-index
-  switch in the thunk.
-- [ ] **`svScope` handles for non-top instances** — a scope is registered per top, so
-  `svGetScopeFromName` cannot name a nested instance. Exports themselves bind
-  absolutely at lowering time, so this is only about the scope API's reach.
-- [~] **DPI import/export tasks** (LRM 35.8) — **T1 landed; T2 and T3 open**.
-  docs/design/dpi-c.md § "DPI tasks". The two directions are one feature — 35.8
-  makes an exported task callable only from a `context` imported task and never from
-  an imported function, so the two guards lifted together.
-  **T1 (zero-time) is done**: `import "DPI-C" [context] task` and
-  `export "DPI-C" task` both work, and an import task whose C calls a zero-time
-  exported task is byte-identical to verilator (measured, eight-line transcript in
-  the design doc). It was mostly reuse, as scoped: the export thunk is
-  `lower_task_call_inst`'s sync arm (ramp / `coro_resume` / `coro_done` / destroy)
-  against the already-global wheel and `@clotho.state`. What T1 added beyond the
-  scoping: the synthetic `int` C return both directions carry (generated, discarded);
-  **four** caller-identity globals rather than two, save/restored around the
-  import-task call because import tasks nest —
-  `clotho.dpi.caller_proc` / `caller_home` gated as `declare_task` gates those
-  params, plus `caller_rng` (an exported task runs on the calling thread, so LRM
-  18.13 makes its `$urandom` continue that thread's stream, not the module-wide one)
-  and an unconditional `in_import_task` flag (35.8's legality rule does not depend on
-  whether the design mentions `process`, which `caller_proc`'s gate does). The import
-  CALL SITE stays a plain `Call`, not a task call site: nothing on the T1 path can
-  consume time. Two latent non-task holes were fixed on the way: `compute_may_finish`
-  gave a DPI import no callees at all (it has no IR body) though its C can call back
-  into any export that `$finish`es, and `lower_call_inst`'s DPI branch emitted no
-  post-call `rt_finishing` test — so a `$finish` inside any exported subroutine did
-  not unwind its SV caller.
-  Refused loudly after T1: `pure` on an imported task (LRM 35.5.1.3, permanent —
-  slang only warns), an exported task that **suspends**
-  (`rt_dpi_export_task_suspended`, = T2), and an exported task entered with no
-  imported-task frame live (`rt_dpi_export_task_no_task_frame`, LRM 35.8). A task
-  also inherits every export-*function* refusal (35.7's argument rules), tested.
-  **T2 (suspension)** is the hard half and 35.5.1.5 states the requirement — an
-  imported task's C "can be simultaneously active in multiple execution threads" — so
-  each in-flight import-task frame needs its own machine stack. A nested drain from
-  the thunk is REJECTED with a worked counter-example: stack nesting forces LIFO
-  completion, and two processes whose exported tasks wait `#20` and `#5` must be able
-  to finish in delay order; separately, the cooperative `$finish` (`rt_finishing` +
-  `emit_finish_check`) assumes an all-JIT stack. Chosen mechanism: pooled OS threads
-  with a strict baton (exactly one runnable), because the switch happens only when
-  time advances inside a DPI call and so can never be hot, `src/` has no
-  `thread_local`, and the collector never scans a machine stack
-  (`push_frame_roots` / `push_range_roots`) — a hand-rolled context switch is a
-  measured follow-up, not a prerequisite. T2 also converts the import call site to a
-  real task call site and removes T1's suspension fatal. **T3** is the 35.9 disable
-  protocol (`svIsDisabledState` / `svAckDisabledState` plus the checks the clause
-  obliges the simulator to make, and reading the import task's `int` instead of
-  discarding it) and `svGetCallerInfo`. Oracle position, re-measured: iverilog 13
-  still cannot parse `import "DPI-C"` at all; verilator 5.050 runs a zero-time
-  exported task correctly (so it oracles T1, and does — byte-identical) but refuses a
-  timing control inside an exported task outright ("Unsupported: Timing controls
-  inside DPI-exported tasks", the same program clotho fatals on) and declares an
-  exported task `void`, not `int` — so T2 and T3 are derived from the clause text.
-- [ ] **`svGetCallerInfo` + the DPI disable API** — not provided; C calling one hits
-  an unresolved symbol. Scoped as T3 of the DPI-task entry above (LRM 35.9): the
-  disable protocol is what the `int` return of an imported/exported task exists for.
-  T1 landed that `int` on both sides but always answers 0 on export and discards it
-  on import, so the API and the remaining task work still land together.
-- [x] **DPI-C** — import (scalar/vec/chandle/string, in/out/inout, pure/context, 1-D
-  open arrays in/out/inout at any element width, dynamic-array zero-copy actuals,
-  **tasks**) and
-  export V1 (C→SV, functions **and zero-time tasks**, scalar/chandle/real/vec/string
-  args) landed, with the
-  svdpi.h accessors (bit/part-select, one scope per top, open-array). See the M1
-  Subroutines entry, the DPI-task entry above for what T1 left open, and
-  docs/design/dpi-c.md.
+- [ ] **DPI import `output` / `inout` string argument** — C writes back an unbounded
+  `char*` with no size contract.
+- [ ] **DPI export `output` / `inout` string argument and string return** — the returned
+  `char*` has no defined lifetime and the same unbounded copy-out.
+- [ ] **DPI export open-array arguments** — needs open-array formals in the general
+  subroutine ABI.
+- [ ] **DPI open-array actual of a dynamic array of packed elements** — needs a
+  runtime-sized marshal scratch.
+- [ ] **DPI multi-dimensional open arrays** — needs `svGetArrElemPtr2/3` and a recursive
+  descriptor.
+- [ ] **One `c_identifier` exported from several scopes** — slang drops the duplicate
+  exports before Clotho can see them.
+- [ ] **`svScope` handles for non-top instances** — `svGetScopeFromName` cannot name a
+  nested instance.
+- [~] **DPI import and export tasks** (35.8) — open pieces; see docs/design/dpi-c.md:
+  - [ ] **Exported task that consumes time** — each in-flight imported-task call needs its
+    own machine stack; a suspending exported task is a run-time fatal.
+  - [ ] **Disable protocol** (35.9) — `svIsDisabledState`, `svAckDisabledState` and honouring
+    the imported task's `int` return.
+  - [ ] **`svGetCallerInfo`** (35.9) — not provided; a C call to it fails to resolve.
 
 ### UVM enablers
 
-- [~] **Virtual interfaces** (LRM 25.9) — a handle is the 64-bit address of one
-  elaborated interface instance's runtime context record (the per-instance
-  descriptor module dedup already builds: state base, NBA shadow base, sched base,
-  dump-var base, wait-bucket bases). A member reached through it is the ordinary
-  signal lvalue with that base substituted — the representative's def-local field
-  index, the handle's instance — which is what a reused definition's own body
-  already emits for itself. slang resolves `vif.sig` against a cached placeholder
-  instance body, so the member symbol is matched to a real instance by
-  `InstanceBodySymbol::hasSameType` (`VifDefs`), and that representative supplies
-  every def-local constant. Declaration, `null`, `==` / `!=`, assignment from an
-  instance / another handle / `null`, modport-qualified and parameterized handles,
-  handles as class properties, constructor and task arguments and array elements,
-  member reads and blocking writes with correct wake and VCD on the bound instance,
-  interface events triggered through a handle, and `@(edge vif.sig)` /
-  `wait(vif.x)` — which park a frame-resident node on an intrusive waiter list in
-  the definition's state, the event-object list reused, so there is no bucket
-  identity or capacity to know at compile time. Signals of an interface a handle
-  can name keep the canonical type-derived shape, the `ref`-actual rule.
-  **Nonblocking writes** (`vif.d <= x`) move the *member* — every writer of it,
-  handle or direct — off the per-signal block shadow, which two handles naming twin
-  instances would collide in, onto the deferred-record path, whose record carries
-  the destination pointer resolved at statement-execution time plus the instance
-  context the replay wakes against. A **clocking block** through a handle (25.9.1 /
-  25.9.2) reads that instance's sampled storage and drives that instance's
-  `drive_pend` pair, so its own Re-NBA process performs the drive and 14.16.2's
-  last-write-wins falls out per instance. An **interface subroutine** through a
-  handle is lowered once for the definition with the handle as formal 0
-  (`Function::takes_iface_ctx`), installed body-wide by the backend, so one body
-  serves every instance; a bare sibling call passes the context on. That body-wide
-  install is why `CtxOverride` now carries an anchor and `def_relative_for` gates on
-  it — a hierarchical reference out of the interface has a different `ctx_ty`. An
-  event control on an **expression** over members is desugared into the sample /
-  park / re-evaluate shape `wait` uses, never a continuous net (which would freeze
-  onto whichever instance was bound at time zero); an `edge` / `iff` qualifier on
-  such an expression stays guarded loud. A member of an interface the design never
-  instantiates is an unconditional run-time fatal with a
-  `virtual-interface-never-bound` warning up front, not a refusal. A member in a
-  **generate block** of the interface resolves too — a generate block is not a
-  separate instance, and the representative is found by ordinal path rather than by
-  name. An `event` member is waited on through its own object, the mechanism its
-  trigger fires. An NBA inside a subroutine reached through a handle takes the
-  record path like any other handle write — including the UVM driver shape, an NBA
-  in a CLASS TASK through a property-held handle (`input_vif vif; … vif.valid <=
-  '0`), which the subroutine NBA guard used to refuse as "a class property": it
-  walked the lvalue chain past the handle access to the chain's root and named the
-  handle's storage class, a construct the statement never wrote. The walk now stops
-  at a member access whose base is a virtual interface — the target is signal
-  storage in the instance the handle names. Retargeting the handle between the
-  write's execution and the NBA region moves nothing (the record bakes destination
-  and context in at staging, LRM 10.4.2's evaluate-now-defer-the-update composed
-  with 25.9), and a blocking write to the same member in the same step loses to the
-  staged one, per-signal-shadow semantics kept. Scalar and vector members, bit and
-  part selects, an unpacked-array-member element and a modport-typed handle all
-  stage; `vif.d <= #5 x` / `<= @e x` is refused BY NAME (the intra record pool has
-  no instance-context field, so the delayed update would land in the
-  representative — see interfaces.md), no longer misdescribed by the generic
-  intra-NBA wording. The LRM 25.9 `SBusTransactor` example
-  runs verbatim. Remaining, guarded loud:
-  - [ ] A member of an interface **instantiated inside** the interface a handle
-    names (`vif.i.d`) — a separate instance with a separate context record; needs
-    the record to carry its children's. A handle taken directly to the inner
-    instance works.
-  - [ ] `virtual` handles in a **queue / dynamic / associative array** — the
-    generic container-of-handles gap below, shared with class handles.
-
-  Design: docs/design/interfaces.md.
-- [~] **String formatting** — `%p` (LRM 21.2.1.6). The four structural `shall`
-  cases the clause names beyond unpacked arrays/structs now print correctly
-  instead of falling through to a bare decimal: a tagged union as `'{tag:value}`
-  (`'{Valid:42}`, void member `'{Invalid}`), a plain union as its first declared
-  member (`'{a:-85}`), a packed struct with named elements (`'{a:-85, b:42}`),
-  and an enum as its enumeration name with a base-type fallback (`GREEN`, else
-  `3`) — nested leaves included, via the slang `Type` threaded alongside the
-  lowered `ir::Type` through the `%p` expansion. Leaves print in **decimal** at
-  their own signedness, the clause's "as they would unformatted" (21.2.1.1's
-  decimal default) — they used to be `'h<hex>`, copied from verilator, which is a
-  `shall` violation. A real leaf prints `%g`, a string (variable or literal)
-  quoted; both used to segfault or print the packed literal's decimal value.
-  Also fixed: `%%p` in a format string
-  corrupted the output (the splice did not skip `%%` escapes, so it substituted
-  inside the literal and left the real specifier for the runtime formatter to abort
-  on), and a `%p` operand was lowered twice (a call operand ran twice). Remaining:
-  - [x] **`%p` of an aggregate CALL result** (`$display("%p", g())`) — the operand
-    is expanded at lower time and needs an lvalue to walk, so a call used to be
-    refused with an assignment-target message. The call's value is the caller-side
-    out-param temp the callee wrote through, which is that lvalue; the call is
-    lowered once for the whole leaf walk, so the double-lowering bug above is not
-    reintroduced, pinned by a counter test. See the aggregate-return entry under
-    the subroutine ABI.
-  - [x] **`%p` of a class handle** (LRM 21.2.1.6) — **another implementation-defined
-    form decided deliberately.** The clause describes `%p` over aggregate VALUES and
-    a handle is not one; it says nothing about what a handle prints beyond `null` for
-    a null one. Decision: a null handle prints `null`, any other prints its CLASS
-    NAME, at **every depth** — a direct operand, a struct member, a container
-    element. The uniformity is the point: it is cycle-safe by construction, and UVM's
-    object graphs are cyclic (`uvm_component` holds `m_parent` and `m_children`), so
-    expanding properties would not terminate without a depth cap the LRM does not
-    define. Verilator 5.050 is itself inconsistent — it expands a direct operand
-    (`'{x:'h5, i:t::Inner}`) but prints the type name for a handle inside a container
-    (`'{t::C}`) — so there is no reference behaviour to match, only a choice to
-    record. iverilog is no oracle either: it cannot compile a queue of class handles
-    at all. The name is unqualified (a specialization carries its own arguments,
-    `uvm_queue#(uvm_callback)`); Verilator writes `pkg::C`. Rendered by
-    `handle_p_render` as a select over two string constants, so nothing dereferences
-    the handle. A class-handle container ELEMENT routes the container through the
-    loop render (`build_container_p_string`) rather than the flat runtime descriptor,
-    which would have printed the pointer word. Needed by uvm_queue's
-    `convert2string`, which is `%p` over a queue of handles.
-    Follow-up: expand the properties of a DIRECT operand, the one depth where a
-    cycle cannot be reached in one step, leaving nested handles as names.
-  - [x] **`%p` of a chandle / event / virtual-interface handle** (LRM 21.2.1.6) — was
-    **a refusal of a `shall`**, which is the part that makes this different from the
-    class-handle entry above. The clause names five reference types in one sentence:
-    "a chandle, class handle, interface class handle, event, or virtual interface
-    shall print its value in an implementation-dependent format, except that a null
-    handle value shall print the word **null**". So only the non-null form was ever
-    open; printing nothing at all was never an option, and every
-    `uvm_config_db#(virtual X)` in every UVM testbench hit it — `uvm_resource#(T)`'s
-    `m_value_as_string` is `$sformatf("%p", val)` (uvm_resource.svh:93) and `T` is the
-    virtual interface.
-    Decision, extending the class-handle rule rather than inventing a second one: a
-    null handle prints `null`, any other prints **the name of what it points at**, at
-    every depth. A chandle prints `chandle` and an event prints `event` — LRM 6.14 and
-    15.5 give those types no other name, the type IS the name. A virtual interface
-    prints the interface **definition's** name (`virtual some_if` → `some_if`), taken
-    from the placeholder body `vif_named_body` already resolves members against, so
-    `%p` and `vif.sig` agree about which interface it is.
-    Two more informative renderings were weighed and rejected. The interface
-    INSTANCE's hierarchical path is the most useful thing a virtual interface could
-    print, and it is what the class-name choice would look like if that choice were
-    about identity — but it is not: the class arm prints a TYPE, so a path would make
-    one of the five reference types disagree with the other four. It is also not cheap
-    here: the handle is the address of an instance's context record
-    (docs/design/interfaces.md) and there is no runtime address → path table, so a
-    path would take a compare chain over every elaborated instance of the definition,
-    emitted at every `%p`. A raw pointer value is rejected outright — informative but
-    unstable across runs, i.e. useless in a golden file, which is the same reason the
-    bug below was a bug.
-    Fixed with it, and the reason the container depth was not merely a refusal one
-    level down: `%p` of a container whose element is an EVENT printed the handle WORD
-    (`'{1, 2}` for two events — a slot index, neither `null` nor a name, and not
-    stable). The flat runtime element descriptor describes one integral / real /
-    string, and an event handle is a 64-bit integral, so it took that path silently.
-    `loop_render`'s class-handle test is now a handle test over all four kinds
-    (`elem_is_handle`), and it needs BOTH halves: a class handle is decidable from the
-    IR type, while a chandle is a plain unsigned 64-bit int there and only the AST
-    tells it apart. An event queue / dynamic array / associative array was the one
-    handle container the element type system admitted at the time this landed; a
-    chandle queue / dynamic array / associative-array value now lowers too (see the
-    container-element-type entry above), and `elem_is_handle` needed no change to
-    render one -- it was already built chandle-aware, ahead of `guard_container_element`
-    catching up. A virtual-interface element remains refused by
-    `guard_container_element`, which is the container-of-handles gap below and NOT a
-    `%p` deficiency.
-    The "doubtful SystemVerilog" reading this paragraph used to carry for a chandle
-    queue / dynamic array -- 6.14's closed list of legal uses names an associative
-    array by name but not a queue or dynamic array -- is resolved by
-    `uvm_lru_cache.svh`'s `typedef chandle optional_data[$];` (stock Accellera UVM, on
-    the DEFAULT DPI-enabled boot path of every major commercial simulator): a queue
-    element is an ordinary chandle variable in an assignment context 6.14 already
-    permits, and 6.14 singles out the associative array only for its ordering caveat,
-    not to exclude every other unpacked-array shape.
-    The RUNTIME-format path (`lower_dynamic_format`) keeps refusing a handle argument
-    and the refusal is accurate as written: `rt_arg` carries one integral / real /
-    string, and with the format unknown the frontend cannot tell which specifier the
-    argument will meet. Pre-rendering the name as a string was considered and is
-    unsound — `$display("%d", ch)` is accepted and prints the handle word, so a handle
-    genuinely may meet a numeric conversion, and a pre-rendered name would be silently
-    wrong text there.
-  - [x] **`%0p`** (LRM 21.2.1.6) — a **separate specifier**, not a width applied to
-    `%p`: the clause gives it its own sentence, "shall print aggregate expressions
-    ... in a shorter, implementation specific form". slang draws the same line
-    ("Pattern args allow the zero-pad specifier" — `%p` forbids every other width and
-    left-justify, so those never reach Clotho and its own check is a backstop). The
-    `0` reads as it does everywhere else in 21.2.1.2 — drop the `%d`-width padding on
-    the integral leaves — and Clotho's `%p` already renders every leaf minimally,
-    scalars included, so the shorter form **coincides** with the plain one. Recorded
-    because the equality is a decision: if `%p` ever adopted padded leaves, `%0p`
-    would have to keep the minimal ones. Verilator makes the two identical as well;
-    iverilog cannot `%p` an aggregate at all (`vpiMemory`), so it is no oracle. The
-    splice carries the spec's real length, since the token is 3 characters here and a
-    fixed 2 left a stray `p`. Needed by uvm_get_to_lock_dap and friends.
-  - [x] `%p` of an associative array (LRM 21.2.1.6) — renders
-    `'{key:value, ...}` over the live entries in ascending key order. The one
-    deficiency behind this was that `%p` had no ordered walk for a KEYED container:
-    the escape hatch a container with a non-flat element already used
-    (`build_container_p_string`) is driven by an index space, and a keyed table has
-    none. `build_assoc_p_string` is the same loop keyed by
-    `assoc_traverse(First/Next)` + `assoc_select`, i.e. the shape
-    `lower_foreach_assoc_dim` already uses for `foreach`, so the value renders through
-    the ORDINARY aggregate expansion and a struct / nested container / class-handle /
-    wide value works for free. Keys print by the same leaf rules, so an enum key
-    prints its name and a string key prints quoted. Ordering is asserted only for
-    integral and string keys (LRM 7.8.5 leaves it implementation-defined otherwise).
-    A direct operand takes the same path — `Assoc` is now in `expand_p_arg`'s
-    container predicate, where its absence used to send `$display("%p", a)` down the
-    singular path to die as an unrenderable handle.
-    Retired with it: `guard_container_p_element`, whose four `%p` refusals (tagged
-    union, class handle, element wider than 64 bits, nested aggregate) had all become
-    unreachable when the loop render landed — every condition it tested forces
-    `loop_render` — and whose one live caller was `guard_agg_eq_members`, i.e. an
-    aggregate `==` refusal wearing `%p` wording.
-- [ ] **Containers of handles** — queues/dynamic/associative arrays of class
-  objects, and class objects holding them.
-- [x] **Class static member initializer calling a virtual/static factory
-  method on a generic (parameterized) class, where the type parameter is
-  non-integral** — MISDIAGNOSED: `uvm_resource#(T)` itself was never the
-  problem. `class uvm_resource #(type T=int) extends uvm_resource_base;
-  static this_type my_type = get_type(); ... endclass` (`uvm_resource.svh:57`)
-  works for every real non-integral `T` a testbench actually uses — class
-  handle, virtual interface, queue, dynamic array, associative array, string
-  — confirmed by a standalone repro exercising all five as the type
-  parameter of a self-referential singleton-static generic class (the exact
-  `uvm_resource#(T)` shape), all constructing and dispatching correctly.
-  The real trigger, root-caused against the two failing designs
-  (`uvm_register_spi_bl_tb`, `uvm_tb_build_bl_tb`): a UVM register-model
-  class embeds a `covergroup cg; ... endgroup` and is itself reachable as a
-  generic-class type parameter (`uvm_resource#(T)` / `uvm_config_db#(T)`),
-  which eager static initialization (LRM 6.21) lowers whether or not
-  anything ever samples the coverage. `lower_type` had no
-  `ct.isCovergroup()` case — covergroups are simply not implemented yet (see
-  "Functional coverage" below) — so it fell through to the generic
-  `!ct.isIntegral()` refusal with the message "unsupported non-integral
-  type", which named neither covergroups nor `uvm_resource#(T)` and sent
-  investigation chasing the wrong class entirely. Fixed: `lower_type` now
-  has an explicit `ct.isCovergroup()` case reporting "covergroup type is not
-  supported" — an accurate, correctly-scoped refusal — ahead of the generic
-  fallback, which itself is annotated as unreachable for any type kind slang
-  currently defines. The underlying gap (no covergroup lowering at all) is
-  tracked once, correctly, under "Functional coverage"; this entry is
-  closed as "misdiagnosed, now accurately diagnosed", not as "covergroups
-  implemented".
-
----
+- [~] **Virtual interfaces** (25.9) — open pieces; see docs/design/interfaces.md:
+  - [ ] **Member of an interface instantiated inside the interface a handle names**
+    (`vif.i.d`) — the context record does not carry its children's.
+  - [ ] **`edge` / `iff` qualifier on an event control over an expression of members** —
+    refused.
+  - [ ] **Intra-assignment timing on a nonblocking write through a handle** — `vif.d <= #5 x`;
+    the delayed-update record has no instance context.
+  - [ ] **Virtual interface handle as a queue, dynamic array or associative array element**
+    — refused.
+- [ ] **Property expansion for a class-handle `%p` operand** (21.2.1.6) — a direct operand
+  prints only its class name.
+- [ ] **Handle argument to a runtime `$sformat` format** (21.2.1.6) — the renderer cannot
+  tell whether it meets `%p` or a numeric conversion.
 
 ## M5 — Full LRM (IEEE 1800-2023)
 
 ### Net & primitive completeness
 
-- [ ] **User-defined nettypes** (`nettype`) and resolution functions,
-  `interconnect` nets.
-- [ ] **Charge storage** — `trireg` with capacitance strengths, charge decay.
-- [ ] **Sequential UDPs** — full edge-sensitive tables including `*`/`r`/`f` notation.
+- [ ] **User-defined nettypes** — `nettype` declarations and their resolution
+  functions.
+- [ ] **Generic interconnect** — `interconnect` nets.
+- [ ] **`trireg` charge storage** — capacitance strengths and charge decay.
+- [ ] **Sequential UDP edge tables** — full edge-sensitive tables, including `*`, `r`
+  and `f` notation.
 
 ### Timing & back-annotation
 
-- [ ] **Full `specify`** — edge-sensitive paths, state-dependent paths, conditional
-  paths, `ifnone`, polarity, full timing-check set (`$recovery`, `$removal`,
-  `$recrem`, `$skew`, `$timeskew`, `$fullskew`, `$nochange`, `$setuphold` with
-  notifiers).
-- [ ] **SDF annotation** (`$sdf_annotate`) and pulse-style controls.
-- [ ] **Hierarchical / fractional timeunit & precision** — full `timeunit`/
-  `timeprecision` per scope and precision-correct fractional-delay rounding.
-- [x] **`$printtimescale` with a scope argument** (LRM §20.4 / §21.3.1.2) — the
-  optional argument names an instance anywhere in the design (upward, downward or
-  sideways), `$unit`, or `$root`; the target's timescale and hierarchical path are
-  compile-time constants, so the task still folds to a literal `$display` with no
-  IR or runtime support. A scope with no timescale now reports Clotho's unitless
-  base (`1s / 1s`, byte-identical to iverilog) instead of failing.
+- [ ] **Specify path forms** — edge-sensitive, state-dependent, conditional and
+  `ifnone` paths, and path polarity.
+- [ ] **Full timing-check set** — `$recovery`, `$removal`, `$recrem`, `$skew`,
+  `$timeskew`, `$fullskew`, `$nochange`, and `$setuphold` with notifiers.
+- [ ] **SDF annotation** — `$sdf_annotate`.
+- [ ] **Pulse-style controls** — pulse filtering control in specify blocks.
+- [ ] **Hierarchical and fractional time units** — full per-scope `timeunit` /
+  `timeprecision` and precision-correct rounding of fractional delays.
 
 ### Configuration & checkers
 
-- [ ] **Library map / `config`** — `library`/`config`/`design`/`cell`/`instance`
-  binding, `liblist`/`use`.
-- [ ] **Checkers** (`checker`/`endchecker`) — assertions, free variables,
-  instantiation.
-- [x] **`randsequence`** (LRM 18.17) — grammar-based stimulus generation, complete
-  (docs/design/randsequence.md). Each production lowers to its own `ir::Function`
-  rather than being inlined, because the clause's own `GenQueue` example is
-  left-recursive — which is exactly what verilator, whose model is to inline the
-  grammar, cannot compile. One shared signature lets any production call any
-  other: `randseq.<name>(<this>, output bit $abort[, output T $result],
-  <declared formals>, <captures>)`. `$abort` carries `break` (18.17.6) up the call
-  chain one frame per return through the backend's ordinary output copy-out;
-  `return` is the production function's own `RetVoid`; `<captures>` are the
-  enclosing subroutine frame's symbols the block reads, found with the same
-  `ForkCaptureDetector` a fork child uses and passed by reference. Rule selection
-  (18.17.1) is `lower_randcase`'s weighted ladder verbatim — one draw, unsigned
-  wrapping sum, no draw at all on a zero total — with the omitted weight folding in
-  as a 32-bit literal 1 (at the 1-bit minimum two defaults sum to zero and neither
-  alternative is ever generated). Value passing (18.17.7) writes slang's synthesized
-  rule variables at an occurrence index re-derived from `createRuleVariables`'
-  counting walk, which slang records nowhere; a slot for a production the rule did
-  not generate reads the type default rather than stale frame contents. `rand join`
-  (18.17.5) gives each interleaved production two more entry points — `plan` draws
-  its rule and reports that rule's unit count, `step` generates one numbered unit —
-  and picks between sequences with the integer weight
-  `(1024-X)*(Lmax+1-L_i) + X*L_i`, which hits the clause's three bias anchors
-  exactly (X=0 shortest-first, X=1024 longest-first, X=512 uniform) with no libm.
-  `break` now needs a real `loop_depth_` on the lowerer to tell 12.8's innermost
-  loop from 18.17.6's whole block, which also closes a latent hazard: the backend's
-  Break arm indexes `loop_targets_.back()` on the assumption slang guarantees an
-  enclosing loop, and a randsequence `break` is the counter-example. A production
-  may return any type: a container result reuses `emit_container_store`, the
-  blocking half of the three whole-container assignment paths split out so a
-  synthesized store reaches the same deep-copy rules with no AssignmentExpression to
-  hand them. An interleaved production's activation state — its declared formals and
-  its rules' implicit result variables — is hoisted into the driver's frame and
-  handed back in by reference, since `step` is entered once per unit; its arguments
-  therefore copy in and out at the ends of the ACTIVATION, so an `input` keeps what
-  the body did to it between units and an `output`/`inout` copies back exactly once.
-  A block sharing an automatic with a DETACHED fork takes the GC box handle by
-  value, a first-class root, rather than a bare interior pointer held across a
-  suspend. Two constructs stay refused, each recorded at its guard as a deliberate
-  deferral: a weight wider than 32 bits (`$urandom_range` is one 32-bit draw; LRM
-  18.16 wants several stitched, `randcase` shares the guard, and stitching shifts
-  the process stream) and a `rand join` operand that is itself a `rand join` (its
-  state is an inner interleaving cursor, not a fixed variable set the driver can
-  hoist; 18.17.5 interleaves "to depth of 1"). Landed with
-  `patches/slang-randseq-rule-pairing.patch`, which fixes two vendored-slang
-  defects that silently hand the frontend the wrong AST: `createCaseProd` pushed one
-  `ProdItem` per case LABEL but consumed one per case ITEM, so every `rs_case` item
-  after a multi-label one picked up the previous item's production (the LRM 18.17.3
-  example is exactly that shape); and the rule block created the weight clause's
-  code block once per prod, binding its statements N times and desynchronizing
-  `createRule`'s positional pairing for a rule with two or more code-block prods.
-  `cmake/ApplySlangPatch.cmake` now applies every `patches/slang-*.patch` in name
-  order. 30 cases in tests/randsequence_test.cpp.
+- [ ] **Library maps and configurations** — `library`, `config`, `design`, `cell` and
+  `instance` binding, `liblist` and `use`.
+- [ ] **Checkers** — `checker` / `endchecker` declarations, their assertions, free
+  variables and instantiation.
+- [ ] **`randsequence` weight wider than 32 bits** (18.17) — needs several 32-bit draws
+  stitched (18.16); `randcase` shares the limit.
+- [ ] **Nested `rand join`** (18.17.5) — a `rand join` operand that is itself a `rand join`.
 
 ### Language corners
 
-- [x] **Pattern matching** (LRM 12.6) — Phase 2 of tagged unions
-  (docs/design/tagged-unions.md). `case (x) matches` (`StatementKind::PatternCase`
-  → first-match if/else chain), `if (x matches pat)`, and `x matches pat ? a : b`,
-  all with `&&&` filters, over all five pattern kinds (Wildcard / Variable /
-  Constant / Tagged / Structure). `lower_pattern` returns a 1-bit predicate and
-  binds `PatternVarSymbol`s (declare_storage + store, the foreach-iterator
-  mechanism); sub-values are extracted from the flat subject by shift/resize.
-  The `?:` form single-evaluates its condition (11.4.11) across the branchless
-  and lazy select paths. unique/priority/unique0 pattern case reports the same
-  no-match / overlap violations as a plain case (LRM 12.5.3 wording).
-  casez/casex `matches` (LRM 12.6.1) wildcard the z/x label bits over
-  tag + member compares (pattern_cmp threads CaseEq/CasezEq/CasexEq through
-  lower_pattern) — which is what 12.6.1 requires rather than a literal label
-  compare. `unique` / `unique0 if (expr matches pattern)` works
-  too: it was the third `matches` guard site (the Phase 2 plan named only two, so
-  it survived undocumented and kept rejecting with `pattern matching in conditions
-  is not supported`, a `&&&` filter failing one line earlier as an unsupported
-  multi-condition `if`). Legal SV — LRM 12.4.2 attaches `unique_priority` to
-  `if (cond_predicate)` and 12.6.2 makes a pattern a `cond_predicate`; `priority if
-  (... matches ...)` already worked. `lower_unique_if` now collects each arm's whole
-  condition list and lowers it through `lower_conditions`, the helper the plain and
-  priority chains already use, evaluating every arm's predicate once up front —
-  which 12.4.2 permits for unique/unique0, since overlap detection has to continue
-  past the first true condition. Binding a non-selected arm's pattern variables is
-  harmless: each is a pure sub-value extraction, read only inside the arm its own
-  predicate guards. Same discipline as `lower_pattern_case_checked`. Follow-ups
-  (gated loud): pattern case / structure pattern over an unpacked **aggregate**
-  subject — an unpacked *tagged union* is not caught by that guard and does
-  work, since it lowers to a flat integral — and Phase 3 non-integral
-  unpacked-tagged member payloads.
-- [ ] **`let` declarations** (full, including in sequences/checkers).
-- [ ] **Recursive properties**. `global clocking` and `$global_clock` landed with
-  clocking blocks (LRM 14.14); what remains of them is `@$global_clock` beside
-  another clock, which is the multiclock item above.
-- [ ] **Full constraint language** — array reduction methods in constraints,
-  functions in constraints, `disable soft`, iterative constraints, constraint
-  inheritance.
-- [ ] **Coverage corners** — real coverpoints, type coverage, cross with `binsof`
-  expressions, coverage merge/database semantics. All five are itemized with their
-  blockers under M4 "Functional coverage" (P2, P4, P5 and the database entry) and
-  scoped in docs/design/functional-coverage.md; tracked here only so the M5 list
-  is complete.
-- [ ] **Attributes** (`(* ... *)`) — parse-through today via slang; expose where
-  semantically meaningful.
+- [~] **Pattern matching** (12.6) — subjects outside the flat integral form:
+  - [ ] **Unpacked aggregate subject** — `case ... matches` or a structure pattern over an
+    unpacked struct or array.
+  - [ ] **Non-integral tagged-union payload** — a pattern over an unpacked tagged
+    union with a `real`, `string`, unpacked aggregate or class member.
+- [ ] **`let` declarations** — full `let` support, including `let` in sequences and
+  checkers.
+- [ ] **Recursive properties** — a property that instantiates itself.
+- [ ] **Full constraint language** — array reduction methods and functions in
+  constraints, `disable soft`, iterative constraints, constraint inheritance.
+- [ ] **Coverage corners** — real coverpoints, type coverage, cross `binsof`
+  expressions, coverage merge and database; see docs/design/functional-coverage.md.
+- [ ] **Attributes** — semantic meaning for `(* ... *)` attributes beyond
+  parse-through.
 
 ### Complete system task / function library
 
-- [ ] **Remaining query functions** — `$bits` on all types.
-- [ ] **EVCD** — `$dumpports` family.
-- [ ] **`$writememh` / `$writememb`**, address-ranged `$readmem*`.
-- [ ] **PLA modeling tasks** (`$async$and$array`, `$sync$nand$plane`, …).
-- [ ] **Stochastic / queue tasks** (`$q_initialize`, `$q_add`, `$q_remove`,
-  `$q_full`, `$q_exam`).
-- [x] **Probabilistic distribution functions** (`$dist_uniform`,
-  `$dist_normal`, `$dist_exponential`, `$dist_poisson`, `$dist_chi_square`,
-  `$dist_t`, `$dist_erlang`) and seeded `$random(seed)` — the IEEE reference
-  algorithm (byte-identical to iverilog), inout-seed
-  writeback shared with `$random(seed)`.
-- [x] **`$system`** (LRM §20.17.1) — shell command execution via C `system()`,
-  task and function forms. Refused by default; gated behind an explicit
-  `--allow-system=const|full` operator opt-in with a compile-time gate plus a
-  runtime backstop (a security-motivated deviation).
-- [ ] **`$random` family completeness** and command/severity tasks (`$stop`
-  levels at `Lower.cpp:1021`). `$exit` semantics are done — LRM 24.7, see the
-  Program blocks entry above.
-- [x] **Conversion functions** — `$itor`, `$rtoi`, `$bitstoreal`, `$realtobits`,
-  `$shortrealtobits`, `$bitstoshortreal`.
+- [ ] **`$bits` over every type** — the remaining query-function operand types.
+- [ ] **Extended VCD** — the `$dumpports` family.
+- [ ] **`$writememh` / `$writememb`** — writing memory contents to a file.
+- [ ] **Address-ranged `$readmemh` / `$readmemb`** — the start and finish address
+  arguments.
+- [ ] **PLA modeling tasks** — `$async$and$array`, `$sync$nand$plane` and the rest of
+  the family.
+- [ ] **Stochastic queue tasks** — `$q_initialize`, `$q_add`, `$q_remove`, `$q_full`,
+  `$q_exam`.
+- [ ] **`$random` family completeness** — the remaining random-number system
+  functions.
+- [ ] **`$stop` diagnostic levels** — the level argument of the simulation-control
+  tasks.
 
 ### PLI / VPI
 
-- [ ] **VPI** — object-model access (`vpi_handle`/`vpi_get`/`vpi_get_value`), value
-  change and simulation-phase callbacks, `vpi_put_value`.
-- [ ] **Assertion & coverage APIs** (VPI extensions).
-- [ ] **Compiler directives** — complete `` `define `` (with args),
-  `` `ifdef``/`` `ifndef``/`` `elsif``, `` `include``, `` `line``, `` `resetall``,
-  `` `default_nettype``, `` `celldefine``, `` `pragma`` (slang preprocesses;
-  ensure each is honored semantically).
+- [ ] **VPI** — object-model access (`vpi_handle`, `vpi_get`, `vpi_get_value`),
+  value-change and start/end-of-simulation callbacks, `vpi_put_value`.
+- [ ] **Assertion and coverage APIs** — the VPI assertion and coverage extensions.
+- [ ] **Compiler directive semantics** — `` `define `` with arguments, conditionals,
+  `` `include ``, `` `line ``, `` `resetall ``, `` `default_nettype ``, `` `celldefine `` and
+  `` `pragma `` are not verified to take their semantic effect.
