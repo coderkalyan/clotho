@@ -4,9 +4,9 @@ Issues and pull requests are welcome. Clotho is alpha software; expect rough
 edges, and expect review to be strict about correctness.
 
 Two things worth knowing before you start: the IEEE 1800-2023 LRM is the
-source of truth for every semantic question, and TigerStyle
-describes the style the codebase holds itself to. `docs/TODO.md` tracks what
-is and is not implemented.
+source of truth for every semantic question, and `docs/PRINCIPLES.md`
+describes what the codebase holds itself to. `docs/TODO.md` lists what is not
+implemented yet; when a change closes a gap, delete its entry.
 
 ## Contributor License Agreement
 
