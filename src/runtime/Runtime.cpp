@@ -4004,7 +4004,7 @@ void finish_report(const char* banner, uint64_t now, int32_t arg) {
     // resource-usage line. The banner is a simulator diagnostic (not design
     // output), so it goes to stderr, keeping it out of the design's stdout data
     // stream. LRM Table 20-1 fixes the content (time + location) but not the
-    // stream; iverilog puts it on stdout, but strict equivalence
+    // stream; iverilog puts it on stdout, but per PRINCIPLES.md strict equivalence
     // on LRM-unspecified behavior is not required, and stderr keeps captured
     // $display output clean. Flush stdout first so any buffered $display text
     // is committed before the banner.

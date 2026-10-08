@@ -225,7 +225,7 @@ TEST_CASE("$cast: task form assigns") {
 
 // A `chandle` carries no type identity -- it is an opaque pointer from foreign
 // code -- so there is nothing to check a cast to one against. Loud, not silently
-// mis-lowered.
+// mis-lowered (PRINCIPLES.md).
 TEST_CASE("$cast: chandle destination rejected") {
     check_rejected(R"(
         module m;

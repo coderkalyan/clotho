@@ -19,7 +19,7 @@
 // and reports what the design says and how it ended. It does not stop, and it
 // says so -- every stop-shaped capability is absent and every stop-shaped
 // request is refused by name, with the stage that implements it. There is no
-// half-working breakpoint here, deliberately (never silently
+// half-working breakpoint here, deliberately (PRINCIPLES.md: never silently
 // accept).
 
 #include "dap/Design.h"

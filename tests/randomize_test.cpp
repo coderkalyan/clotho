@@ -703,7 +703,7 @@ TEST_CASE("a shallow copy carries the randomization state (LRM 8.12)") {
 
 // -- 7. The refusal surface --------------------------------------------------
 
-// Every constraint form is refused by its own name (never silently
+// Every constraint form is refused by its own name (PRINCIPLES.md: never silently
 // accept). A constraint block used to compile silently, which is worse than a
 // crash: the class randomized as if the constraint were not there.
 //

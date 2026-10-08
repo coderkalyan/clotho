@@ -106,7 +106,7 @@ the shape is proven and recoverable from git history.
 4. **One-shot batch, no reuse, no cache.** Fresh `Compilation` per call;
    `lower_compilation` is file-static. No object cache exists yet.
 5. **Attributes are invisible.** `(* ... *)` is parse-through only
-   (`TODO.md:958`). Synthesis pragmas are how designers steer synthesis, and
+   (`TODO.md`). Synthesis pragmas are how designers steer synthesis, and
    Clotho cannot see them. Hard prerequisite, not a nice-to-have (§6.5).
 
 ---
@@ -905,7 +905,7 @@ least interesting part; the content is the win. Beyond hover/goto/completion
 ### 6.1 X semantics remain two semantics — but that is now the feature
 
 `--x-opt` (§3.3) does not unify them; nothing can. Simulation must propagate X as
-a value (LRM; the project forbids trading compliance), synthesis must treat X as a
+a value (LRM; PRINCIPLES.md forbids trading compliance), synthesis must treat X as a
 don't-care. What `--x-opt` buys is that **both semantics are executable from one
 IR behind one flag**, so the divergence becomes measurable rather than
 theoretical, and the measurement is the product (§4).
@@ -946,7 +946,7 @@ To emit for downstream you must **pass through** attributes you do not understan
 (`(* dont_touch *)`, `(* ram_style *)`) or you silently change downstream
 behavior — which violates never-silently-accept. So: parse them, preserve them on
 a side table keyed by signal/process, re-emit verbatim, and *report* when Clotho's
-own analysis contradicts one. Today they are parse-through only (`TODO.md:958`).
+own analysis contradicts one. Today they are parse-through only (`TODO.md`).
 Also blocks §4.1's `full_case`/`parallel_case` checks, which are among the highest-
 value mismatch classes.
 
@@ -985,8 +985,8 @@ failure mode to design against is a tier-2 recompute blocking a tier-1 hover.
 
 ### 6.8 Coverage prerequisites
 
-**UDPs** unstarted (`TODO.md:338`, `:912`) — cell libraries use them. **`bind`**
-unstarted (`TODO.md:658`) — needed for §5.4. Attributes, §6.5. Good news: generate,
+**UDPs** unstarted (`TODO.md`) — cell libraries use them. **`bind`**
+unstarted (`TODO.md`) — needed for §5.4. Attributes, §6.5. Good news: generate,
 `defparam`, instance arrays, packages, interfaces and modports are done.
 
 ---

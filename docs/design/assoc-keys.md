@@ -328,7 +328,7 @@ These were pre-existing, independent of the feature:
   with a container-bearing key; the entry must not move (keys are copied values).
 - Round-trip every key type through `first`/`next` into a user variable and back
   into a lookup.
-- Keep a rejection test for whatever stays guarded.
+- Keep a rejection test for whatever stays guarded, per PRINCIPLES.md.
 
 ## 9. Performance
 

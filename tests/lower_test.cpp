@@ -1024,7 +1024,7 @@ TEST_CASE("a type parameter default sets an internal variable's width") {
 
 TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
     // Binding a type parameter to a not-yet-lowered type must hit the same loud
-    // guard as a direct declaration, not silently accept it. (`event`,
+    // guard as a direct declaration, not silently accept it (PRINCIPLES.md). (`event`,
     // `chandle`, `class`, a virtual interface, an associative array with a
     // class-handle value and one with an EVENT value, and an associative array
     // keyed by a chandle / event / virtual interface / unpacked union, were all

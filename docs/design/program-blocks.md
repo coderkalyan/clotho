@@ -105,7 +105,7 @@ to the active drain (`check`), never back to `wheel.check`.
 
 Every row below was run against `build-dbg/clotho run` while writing this
 document. "silent" means clotho accepts the source and produces a wrong
-schedule — the failure mode the project forbids.
+schedule — the failure mode PRINCIPLES.md forbids.
 
 | Shape | Result | Verdict |
 |---|---|---|

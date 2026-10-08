@@ -187,7 +187,7 @@ its properties, so this refusal throws after interning and used to leave a
 registered-but-undescribed Ref that poisoned later, unrelated lowerings of the
 same class. `InternGuard` (`src/Lower.cpp:3844`) fixed that. Any covergroup
 implementation that can fail mid-layout re-creates the hazard at a new site and
-owes the same guard discipline. Relatedly, `docs/TODO.md:3788` records that a
+owes the same guard discipline. Relatedly, `docs/TODO.md` records that a
 body whose *field layout* is unsupported is never eligible for the graceful
 `stub_unsupported_bodies_` degrade — so a half-landed covergroup type is worse
 than none.
@@ -633,7 +633,7 @@ design-visible semantics, and a reporting option must not change them.
 
 ## 10. The refusal surface
 
-Every item below fails loudly and by name, with the clause cited in
+Every item below fails loudly and by name, per PRINCIPLES.md, with the clause cited in
 the message. Grouped by when they lift.
 
 ### 10.1 Lifts in a later phase
@@ -768,7 +768,7 @@ So the verification position is:
    <6,7>` exactly in the probe above. Use it for the bin-algebra and
    transition-automaton matrices, comparing counts only.
 2. **Coverage percentages, bin names, and type coverage: hand-derived from the
-   LRM**, in the style `docs/TODO.md:4399` records for the SVA layer
+   LRM**, in the style `docs/TODO.md` records for the SVA layer
    (`tests/sva/diff_not.sv` reproducing an independently hand-derived expectation
    exactly). Every 19.11 formula, every zero-denominator case, and every naming
    rule gets a test whose expectation is computed from the clause text and stated
@@ -787,7 +787,7 @@ So the verification position is:
    same report prints.
 
 Any place Verilator and a hand-derived LRM expectation disagree, the LRM wins and
-the divergence gets recorded — the project's rule, and the 40%-vs-62.5% case above
+the divergence gets recorded — PRINCIPLES.md's rule, and the 40%-vs-62.5% case above
 is already one.
 
 **As built.** `tests/coverage_test.cpp` holds 28 cases: the LRM's own worked

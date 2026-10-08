@@ -470,8 +470,8 @@ TEST_CASE("DPI import: empty dynamic-array actual reads as size 0") {
     CHECK(run_capture(src) == "0\n");
 }
 
-// Out-of-scope constructs must fail loudly with a TODO, never silently miscompile.
-// Each is a distinct guard in build_dpi_import.
+// Out-of-scope constructs must fail loudly with a TODO, never silently miscompile
+// (PRINCIPLES.md). Each is a distinct guard in build_dpi_import.
 TEST_CASE("DPI import: unsupported forms are rejected") {
     SUBCASE("output string argument (unbounded-buffer hazard, deferred)") {
         constexpr std::string_view src = R"(

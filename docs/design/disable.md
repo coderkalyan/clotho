@@ -628,7 +628,7 @@ Ranked by how much damage a naive implementation does.
 13. **Per-activation temp cells are safe; the capture ABI is not.**
     `repeat`/`foreach` counters are per-activation frame Locals whenever
     `fn_ctx_ != nullptr` (`make_temp_cell`, `Lower.cpp:12416-12437`;
-    `docs/TODO.md:174-182`), and a fork child always has an `FnCtx`
+    `docs/TODO.md`), and a fork child always has an `FnCtx`
     (`build_fork_child:19901-19919`), so aborting one activation cannot corrupt a
     sibling's counters. The asymmetry that does bite is Hazard 10's third
     failure: a child's formals point into the *parent's* frame.

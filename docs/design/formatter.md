@@ -480,7 +480,7 @@ lower, (d) covers preprocessor-state bugs that preserve tokens but change meanin
 
 `Verbatim` fallback for unhandled syntax kinds is the right incremental strategy —
 the tool is correct from day one and gets prettier over time. But it interacts with
-the project's never-silently-accept rule, so resolve that explicitly rather than by
+PRINCIPLES.md's never-silently-accept rule, so resolve that explicitly rather than by
 omission:
 
 Declining to *reflow* a construct is a formatter's legitimate output, unlike a

@@ -71,7 +71,7 @@ the tree; only `FixedSizeUnpackedArrayType` is lowered.
 - **Element model reuses the existing plane machinery** — no new value
   representation (§3).
 - **Phased scope cuts, each behind a loud-fail guard + TODO** (never silently
-  accept): POD elements first, blocking-assign first. See §2.
+  accept, per PRINCIPLES.md): POD elements first, blocking-assign first. See §2.
 
 ## 2. Scope and phased cuts
 

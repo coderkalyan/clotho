@@ -107,7 +107,7 @@ site:
 
 That was the right call for a base — LRM 8.4 gives no `delete` for a class handle
 and a program cannot observe reclamation, so leaking is *observably correct*. It
-stops being correct enough at M4 (`TODO.md:20`, "Run a real UVM testbench"),
+stops being correct enough at M4 (`TODO.md`, "Run a real UVM testbench"),
 because a UVM run allocates a transaction object per bus transfer and never
 stops.
 
@@ -119,7 +119,7 @@ matching `emit_agg_deinit` call anywhere).
 **In scope.** Class bodies; the heap they own through managed properties; the
 `rt_event` sync objects that named-event handles will need
 (`named-events.md:208-271`); `std::mailbox` / `std::semaphore` /
-`std::weak_reference` when they land (`TODO.md:1439-1457`).
+`std::weak_reference` when they land (`TODO.md`).
 
 A `process` object (LRM 9.7) is scoped as an ordinary traced class body whose
 properties are the thread's control block — status word, activation stack, `await`
@@ -389,7 +389,7 @@ gets right for every non-class kind.
 **This was the sharpest limitation of the landed work, and it is now closed.** For one
 phase `--gc` refused a class handle inside a container outright, because the
 alternative is silently freeing an object whose only reference is a container element,
-and that has to be a located failure rather than a quiet
+and per `PRINCIPLES.md` that has to be a located failure rather than a quiet
 fallback. Worth recording why the refusal existed at all: an earlier draft of this
 document asserted the shape was already loud-guarded in the frontend, citing `TODO.md`.
 It was not — `C q[$]; q.push_back(a);` compiled and ran uncollected [in-tree],
@@ -904,7 +904,7 @@ should use this document's GC word and trace map. Two requirements follow:
    (`LlvmBackend.cpp:12646`) and must be an explicit root until it fires.
 
 **`std::weak_reference` (LRM 8.30)** becomes implementable: a weak table cleared
-after marking, before sweeping. `TODO.md:1403-1404` already notes it presupposes a
+after marking, before sweeping. `TODO.md` already notes it presupposes a
 collector.
 
 **Unchanged**: `null` is all-zero; `==` is one `icmp`; the null-deref fatal path
@@ -923,7 +923,7 @@ there are no external roots.
 | **Ravenbrook MPS** | The strongest library evaluated: mostly-copying AMC, generational, incremental, BSD-2, one 294-line TU, six-instruction allocation **[probe]**, verified collecting and forwarding. Killed by three facts: `code/mpstd.h` has no clang/MinGW-w64 platform and hard-`#error`s under MSYS2 CLANG64; it takes process-global ownership of `SIGSEGV`, `SIGXCPU`, `SIGXFSZ` for hardware barriers, against clotho's DAP loop; and it has no model for roots in heap coroutine frames (one area root per live process, each a locked arena call, all rescanned per trace — O(live processes) in a workload defined by process churn). Dormant 21 months. |
 | **LLVM statepoints** | Structurally cannot describe clotho's roots and silently miscompiles rather than failing (F2) **[probe]**. Experimental IR with no compatibility guarantee, non-integral-pointer datalayout constraints, one production user. The reusable piece is stack-map capture, ~5 lines on `RTDyldObjectLinkingLayer` — kept on the shelf. |
 | **LLVM `gc.root` / ShadowStackGC** | Single global `llvm_gc_root_chain`, no per-task head, so it cannot be swapped per coroutine; documented "high overhead per function call". §5.1 reimplements the idea as a frame-resident node with no per-call push. |
-| **Reference counting** | Cycles (§1). Removes the free-handle-store property everywhere including inside containers, needs the fifth `rt_elem_ops` lifecycle kind that class handles were admitted to avoid (`TODO.md:816-818`), and becomes atomic RMW traffic under MT. |
+| **Reference counting** | Cycles (§1). Removes the free-handle-store property everywhere including inside containers, needs the fifth `rt_elem_ops` lifecycle kind that class handles were admitted to avoid (`TODO.md`), and becomes atomic RMW traffic under MT. |
 | **Per-process heaps (Erlang model)** | SV class handles are shared mutable references by construction — a driver holds the sequencer's item; the config DB holds handles every component reads. No ownership boundary to copy across. Relevant to note *because* MT is coming: the Erlang answer to parallel GC is not available here. |
 | **Bump-allocate and reset per region** | Nothing in SV marks an object region-local; a handle escapes into a field, a container, a static, a mailbox. Viable later only where escape analysis proves a `new` cannot outlive its activation. |
 | **sgcl, Pony ORCA, Mono SGen, ZGC/Shenandoah, `tgc`/`mkirchner-gc`** | Not embeddable, not separable from their host runtime, or toys. `sgcl` additionally maps stack addresses by `address % 8 MiB`, aliasing across multiple stacks. |
@@ -987,8 +987,8 @@ quiet baremetal.
 
 ## 12. Phases
 
-Each phase is shippable and leaves no half-state. Gaps are loud-guarded.
-P0-P4 are the collector; the two tracks after it are independent and
+Each phase is shippable and leaves no half-state. Gaps are loud-guarded per
+`PRINCIPLES.md`. P0-P4 are the collector; the two tracks after it are independent and
 either may come first.
 
 **P0 — object model and heap, no collection. (landed)** Immix blocks, lines, block
@@ -1108,7 +1108,7 @@ the test that proved the off mode collected nothing.
 ## 13. Verification
 
 **There is no differential oracle.** LRM 8.4 makes collection unobservable, so
-iverilog cannot check it — the substitute strategy is stated, and
+iverilog cannot check it — per `PRINCIPLES.md`, the substitute strategy is stated, and
 it is four things:
 
 1. **Cadence identity, and it is weaker than it was.** Every existing test is
@@ -1189,8 +1189,8 @@ validate-on-trace as the canonical pair.
 1. **Cooperative `$finish` first?** §6.3 argues it is a hard prerequisite. It is
    already the highest-value follow-up in `CI.md`, so sequencing it before P1
    costs nothing and removes the registry-corruption risk entirely.
-2. **Is a hand-written collector accepted?** The project requires explicit
-   confirmation for a dependency; this asks for confirmation of *no* dependency on
+2. **Is a hand-written collector accepted?** `PRINCIPLES.md` asks a new dependency for a
+   strong justification; this asks for confirmation of *no* dependency on
    §10's evidence. The counter-proposal worth naming is MPS plus an MSYS2 CLANG64
    port and a signal-ownership negotiation with the DAP loop, which buys
    mostly-copying compaction sooner.

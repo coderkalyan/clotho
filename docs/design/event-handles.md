@@ -129,7 +129,7 @@ Three real constraints survive, all local:
    (`:8001-8003`) and deduped by the scheduled flag, so the bound still holds —
    but the invariant becomes much harder to audit by hand. **This design requires
    `ring_guard_wanted()` to include a new `design_uses_event_handles_`.** Cheap
-   insurance against the one failure mode the project forbids: a silent
+   insurance against the one failure mode PRINCIPLES.md forbids: a silent
    out-of-bounds store.
 2. **VCD aims a raw pointer at `clotho.event_trig.<name>`** at `$dumpvars` time
    (§12). Moving the tick into an object is an ABI change for that registration.
@@ -641,7 +641,7 @@ signal-creating sites" family:
   (`clotho build` exits 139). Identical to the package-scope regression recorded
   at `tests/event_test.cpp:213-221`.
 - `task automatic t(output event x)` **lints clean and runs**, silently accepted,
-  violating the project's never-silently-accept rule.
+  violating PRINCIPLES.md.
 - `static event` class properties escape the guard at `Lower.cpp:2238-2242`
   (static properties `continue` at `:2231-2236`) and die with the misleading
   `reference to unknown signal 'e'`.

@@ -168,7 +168,7 @@ per-region tables built by filtering `slots_` to class-handle words (`:5775-5804
 compile error under `--gc`** (`elem_ops_for`, `:1503-1516`).
 
 **No randstate support of any kind** — a grep for `srandom|randstate` across
-`src/` returns nothing, not even a refusal by name (`docs/TODO.md:1432-1433`).
+`src/` returns nothing, not even a refusal by name (`docs/TODO.md`).
 
 ---
 
@@ -685,7 +685,7 @@ targetable thread must own its state rather than falling back to the module-wide
 `@clotho.rng` (`:6893-6898`). Statically, the target is unknowable, so a design
 that uses any of these three methods forces `rng_own_` for every PCB-bearing body
 (`build_rng_fns`, `:6765-6887`, whose `ir_draws_rng` seed set gains the three
-tags). Per-object RNG for class `randomize` (`TODO.md:1432-1433`) is a separate
+tags). Per-object RNG for class `randomize` (`TODO.md`) is a separate
 item and is not blocked by this.
 
 ---
@@ -955,7 +955,7 @@ file's per-case oracle notes record:
 
 - **iverilog 13.0 cannot parse the class at all** — `process p;` is a syntax
   error (`Invalid module instantiation`), as is `process::self()`. So the
-  primary oracle the project prescribes is unavailable for every case in this
+  primary oracle PRINCIPLES.md prescribes is unavailable for every case in this
   document.
 - **Verilator 5.050 implements a useful subset** and is a partial oracle:
   `self()`, `status()`, `await()`, `kill()` and object identity all work
@@ -967,7 +967,7 @@ file's per-case oracle notes record:
   detaches rather than re-parents). So it cannot score §7.3 at all and cannot score
   §5.3's re-parenting rule.
 
-That needed an explicit choice, and it is **settled: score the
+Per PRINCIPLES.md that needed an explicit choice, and it is **settled: score the
 Verilator-supported subset against Verilator 5.050, and pin everything it does not
 implement from the LRM text**, with each pinned case naming the sentence it
 encodes — the approach `fork-join.md:508-511` already takes for the three cases

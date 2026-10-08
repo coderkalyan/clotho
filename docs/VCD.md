@@ -20,7 +20,7 @@ VCD is an M2 (Icarus parity) feature (`docs/TODO.md`). What ships today:
 - **Whole-design dumping**, value-change content cross-checked against iverilog.
   Signals of any width, four-state x/z, unpacked-array memories (one `$var` per
   element), reals and shortreals, and named events. Everything not covered is
-  loud-failed (never silently accept an unimplemented construct) — a
+  loud-failed (PRINCIPLES.md: never silently accept an unimplemented construct) — a
   string signal, a multidimensional array, or a `$dumpvars` scope subset stops
   the run rather than dumping a wrong or partial file.
 - **All seven dump tasks**: `$dumpfile`, `$dumpvars` (whole-design form),

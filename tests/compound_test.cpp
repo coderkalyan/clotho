@@ -141,7 +141,7 @@ TEST_CASE("compound assignment as a for-step") {
 }
 
 // Unsupported compound-assignment lvalue shapes must fail loudly, not silently
-// mis-lower (never silently accept an unimplemented construct).
+// mis-lower (PRINCIPLES.md: never silently accept an unimplemented construct).
 TEST_CASE("compound assignment to a concatenation is rejected") {
     const LowerResult r = lower_text(R"(
         module m;

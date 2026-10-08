@@ -819,7 +819,7 @@ class body.
 
 - **iverilog 13.0 cannot parse either class.** `mailbox #(int) m;` and
   `semaphore s;` are both `syntax error ... Invalid module instantiation`. Same
-  outcome as `process`: the primary oracle the project prescribes is unavailable.
+  outcome as `process`: the primary oracle PRINCIPLES.md prescribes is unavailable.
 - **Verilator 5.050 implements both**, from `verilated_std.sv:36-131`, and scores
   correctly on: a typed mailbox with a bound (blocking `put` resumed in the same time
   step after a `get` freed room — measured `put 0/put 1 @0, got 0 @10, put 2 @10,

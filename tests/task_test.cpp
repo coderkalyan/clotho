@@ -488,7 +488,7 @@ TEST_CASE("ref of an unpacked struct aliases the actual") {
     CHECK(run_capture(src) == "42 set\n");
 }
 
-// -- Guarded gaps: must fail loudly, not silently miscompile. --
+// -- Guarded gaps: must fail loudly (PRINCIPLES.md), not silently miscompile. --
 
 // An event is a 64-bit handle (docs/design/event-handles.md), so it passes like any
 // other scalar in every direction. LRM 15.5.5's own example is a task that triggers

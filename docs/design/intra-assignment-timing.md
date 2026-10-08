@@ -252,7 +252,7 @@ pointer past the end of its array (LRM 7.4.5 / 11.5.1).
   `lower_pattern_assign` / `emit_agg_store` / `emit_agg_copy`); each leaf emits its
   own `StoreNbDelay` / `StoreNbEvent`. A plain pointer rather than a leaf-emitter
   callback, so every ordinary assignment pays a null test and not an indirect call.
-- **Guards (fail loud)**: a **string** target and a whole
+- **Guards (fail loud, per PRINCIPLES.md)**: a **string** target and a whole
   **container** target (both need an owned staged handle the record has no field
   for, R-d) — `Lower.cpp:5332`, `:6057`, `:5302`, `:24556`; an `iff` qualifier
   (R-c) — `:24268`; a **conditional RHS** over a whole unpacked aggregate

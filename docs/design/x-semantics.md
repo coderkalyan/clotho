@@ -671,5 +671,5 @@ This is an honesty mechanism, not a noise or cost one.
 
 Write the X-resolution table for every LRM X-producing construct (div/mod by zero, OOB select,
 uninitialised, contention, x/z literals) and record the deviation before any of it
-lands. Every mode except `lrm` is a deliberate, gated deviation, which the project permits only
+lands. Every mode except `lrm` is a deliberate, gated deviation, which PRINCIPLES.md permits only
 behind a non-default flag — and all of these are.

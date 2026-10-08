@@ -12101,7 +12101,7 @@ private:
     // The ring-overflow guard the capacity argument above leans on: a ring holding
     // `cap` live handles cannot take another without overwriting one, and the
     // overwritten entry is a live coroutine -- corruption with no diagnostic, the
-    // one failure mode the project forbids. Report it and end the simulation instead
+    // one failure mode PRINCIPLES.md forbids. Report it and end the simulation instead
     // (docs/design/fork-join.md, "Defense in depth"). `ring` is the runtime's ring
     // selector (0 active, 1 reactive), a value rather than a constant because
     // emit_wake_push picks its ring at run time.
@@ -17693,7 +17693,7 @@ private:
                 // safepoints, where an arm-site barrier could be consumed before the
                 // store happens. So the shape is asserted away rather than trusted: if
                 // the frontend ever widens these to a class property, this fails loudly
-                // instead of silently missing a remembered-set entry.
+                // instead of silently missing a remembered-set entry (PRINCIPLES.md).
                 assert(lv.gc_owner == nullptr && "a deferred store targets a signal");
                 const Plane   rhs   = value_of(info.value);
                 llvm::Value*  ticks = cast(must_of(value_of(info.delay)), 64, false);
@@ -24805,7 +24805,7 @@ private:
     // RT_VCD_FLAG_EVENT and dumps as `$var event` (see below). A whole-design dump
     // must represent every declared signal, so an unrepresentable one (string,
     // container, aggregate, class handle, multidimensional array) loud-fails rather
-    // than being silently omitted; an unnamed compiler temporary is not
+    // than being silently omitted (PRINCIPLES.md); an unnamed compiler temporary is not
     // a declared variable and is skipped.
     void emit_vcd_var(Signal sig) {
         const SignalInfo& info = mod_.signal(sig);
@@ -26063,7 +26063,7 @@ private:
         // no handle and no way to be parked, which is exactly what phase T2 adds.
         // Refuse loudly rather than return to C with the task half-run: its outputs
         // are unwritten and its body never completes, so continuing would be a
-        // silent wrong answer.
+        // silent wrong answer (PRINCIPLES.md).
         // TODO: T2 -- hand the baton to a pooled worker stack here and take
         // lower_task_call_inst's async arm at the import-task call site instead.
         b_.SetInsertPoint(susp_bb);

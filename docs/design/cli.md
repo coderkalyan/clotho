@@ -36,7 +36,7 @@ all** -- not even a source file. An editor supplies the language server's file
 set, and the debug adapter's design arrives in the launch request's `args`,
 which are a `run` command line passed through to the design process verbatim
 (`docs/design/dap.md` §4.4). Accepting `-D` / `-y` / `-f` here and ignoring
-them would be the silent acceptance the project forbids, so both refuse every
+them would be the silent acceptance PRINCIPLES.md forbids, so both refuse every
 argument except `--help` and `--version` (`src/main.cpp`).
 
 `clotho --help` prints one option list: Clotho's options first, then slang's.
@@ -117,7 +117,7 @@ a `+` command slang gained through `--cmd-rename`.
 An option outside its command's set is a usage error naming the right command
 (`-o applies to 'build', not 'run'`; `plusarg '+foo' applies to 'run'`). The old
 surface accepted `--dpi-lib`, `--perf-jitdump`, `--jobs` and plusargs on every
-emit path and ignored them, which contradicts the project's never-silently-accept
+emit path and ignored them, which contradicts PRINCIPLES.md's never-silently-accept
 rule.
 
 A knob that would do nothing is the same error. The `--gc-*` group used to be

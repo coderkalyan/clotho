@@ -197,7 +197,7 @@ change — verify with tests (widths 8/16/32/64, signedness, `integer` stays
 
 ## Loud-fail guards
 
-Any 2-state construct not yet covered must loud-fail. Audit sites:
+Any 2-state construct not yet covered must loud-fail per PRINCIPLES.md. Audit sites:
 mixed-domain operands if the invariant is ever violated (assert→fail), 2-state in
 constructs still 4-state-only. Enumerate during implementation.
 

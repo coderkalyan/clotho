@@ -663,7 +663,7 @@ It also still asserts (`vthread.cc:3793`, `of_JOIN_DETACH`) on a detaching fork 
 automatic task, which is what already pins three of the 22 V2 cases.
 
 **Verilator 5.050** (`--binary --timing`) matches the LRM on both shapes.
-Corroboration only; the LRM text is the pin, per the project's rule on Verilator.
+Corroboration only; the LRM text is the pin, per PRINCIPLES.md's rule on Verilator.
 
 In `tests/fork_test.cpp`: parent-first ordering with a `#5` child in a function
 (`fn done n=0 / after call n=0@0 / mid n=1@1 / end n=11@11`); a spawning function

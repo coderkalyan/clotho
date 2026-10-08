@@ -287,9 +287,9 @@ thread.
 **This fixes gaps clotho already tracks**, which is the argument for doing it
 properly rather than approximating:
 
-- `docs/TODO.md:750` — deferred immediate assertions: "The observed/final
+- `docs/TODO.md` — deferred immediate assertions: "The observed/final
   distinction also needs a Reactive region to fully realize."
-- `docs/TODO.md:853` — `program`/`endprogram` and `$exit` need the reactive set.
+- `docs/TODO.md` — `program`/`endprogram` and `$exit` need the reactive set.
 - LRM 16.17 `expect` needs it too.
 
 **Immediate assertions are already correct and stay put.** LRM 16.3 immediate
@@ -298,7 +298,7 @@ process is executing. Deferred immediate (LRM 16.4) reports mature in Observed
 (`#0`) or Postponed (`final`), which is what `rt_defer_report` /
 `rt_observed_flush` / `rt_defer_flush_final` already do
 (`src/ir/LlvmBackend.cpp:6929-6939`). What changes for them is only that the
-Reactive region's existence lets clotho close the `docs/TODO.md:750` gap.
+Reactive region's existence lets clotho close the deferred-assertion gap in `docs/TODO.md`.
 
 ### 3.4 Where a monitor runs
 
@@ -1186,7 +1186,7 @@ Mitigating facts:
 ## 9. What is rejected, and how
 
 Every construct below is guarded by a loud frontend `fail()` with a `TODO:`
-naming the gap.
+naming the gap, per `PRINCIPLES.md`.
 
 ### 9.1 Must be rejected before the libsva builder is called
 
@@ -1308,7 +1308,7 @@ in an assertion expression (their reads are not in the shadow set, §4); recursi
 properties (LRM 16.12.4); a `disable iff` at the top of a named `property`
 declaration, which would have to be hoisted back out through the instantiation to
 reach `sva::Request`; `$global_clock`; end-of-simulation coverage reporting for
-`cover property` (already deferred at `docs/TODO.md:738-740`).
+`cover property` (already deferred at `docs/TODO.md`).
 
 One more, and it is a *region* refusal rather than a property-layer one, so it
 sits at the leading-clock resolution beside the posedge/negedge check: a leading
@@ -1464,8 +1464,8 @@ refuses, not an exhaustive account of the whitelist's complement:
   A user *function* is fine — LRM 13.4.4 forbids timing controls in one, so it
   cannot suspend and is safe to share between reactive and ordinary callers.
 
-Separately, the deferred-immediate-assertion action forms at
-`docs/TODO.md:741-751` are a different context and are not covered by this
+Separately, the deferred-immediate-assertion action forms listed in
+`docs/TODO.md` are a different context and are not covered by this
 whitelist.
 
 ---
@@ -1476,8 +1476,8 @@ Every phase ships something a user can run.
 
 **Phase 1 — the region set.** Preponed-equivalent sampling in Postponed, Observed
 as a region that runs bodies, and Reactive/Re-Inactive/Re-NBA as the reactive
-triad. Ships standalone value with no SVA at all: it closes `docs/TODO.md:750`
-(deferred immediate observed/final) and unblocks `program` blocks (`:853`). This
+triad. Ships standalone value with no SVA at all: it closes the `docs/TODO.md` gap
+(deferred immediate observed/final) and unblocks `program` blocks. This
 is first because §3 is the only part the rest cannot be made correct without.
 
 **Phase 2 — one assertion, end to end.**
@@ -1501,9 +1501,9 @@ translation; libsva already does the work.
 `sequence`/`property` declarations with arguments — nearly free via
 `AssertionInstanceExpression::body`.
 
-`docs/TODO.md:855-865` must be split as each phase lands, per that file's rule at
-`:3-8`. The Postponed-sampling choice (§3.3) and anything else deviating from
-the LRM still needs recording.
+`docs/TODO.md` entries are split or deleted as each phase lands. The
+Postponed-sampling choice (§3.3) and anything else deviating from the LRM still
+needs recording.
 
 ---
 
@@ -1519,7 +1519,7 @@ Neither iverilog nor Verilator serves as a general reference for this feature:
 - **Verilator 5.050** handles `assert property` with `--assert` and gives the
   correct failure cycle for `req |=> ack`. But it is **2-state**: a signal
   initialised to `1'bx` reads as `0`, so it cannot validate any of §5.2. That is
-  a stronger objection than the project's general distrust — structural
+  a stronger objection than `PRINCIPLES.md`'s general distrust — structural
   incapacity for a core part of this feature, not just lower trust.
 
 Verification therefore splits four ways, and only the last is left without a
@@ -1588,7 +1588,7 @@ substring match (`tests/fork_test.cpp:44-46`).
   (§5.3). The fix — mutually-exclusive atom pairs in libsva — is designed and
   scoped but its value is unmeasured, and no SVA workload exists to measure it on.
 - Multi-clock support (LRM 16.13), the largest gap in §9 and the one most likely
-  to be needed by a real UVM testbench (`docs/TODO.md:20-22`, M4).
+  to be needed by a real UVM testbench (`docs/TODO.md`, M4).
 - Whether two attempts whose antecedent matches end in the SAME cycle should
   each seed an obligation. clotho seeds at most one per cycle; the LRM does not
   say whether two antecedent matches completing together raise one obligation or

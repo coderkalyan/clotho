@@ -63,7 +63,7 @@ TODO item (`docs/TODO.md` M3 "Data types").
 
 Consequence: a correct, non-stubbed `foreach` can only be built, in the near
 term, over **fixed-size unpacked arrays** (single or nested dims) and `string`
-(SSO layout already exists) -- everything else must loud-fail,
+(SSO layout already exists) -- everything else must loud-fail per PRINCIPLES.md,
 not silently degrade.
 
 ## slang AST shape
@@ -94,7 +94,7 @@ does today (`Lower.cpp:1701-1703`) — not the synthetic-temp path `repeat` uses
   known constant range (i.e. `LoopDim.range` has a value for every non-skipped
   dim, and the element type chain bottoms out in a supported type), `fail(...)`
   with a `// TODO:` naming the missing array kind (dynamic/queue/assoc/packed
-  multidim), per the project's loud-fail-stub rule. This is the bulk of the
+  multidim), per PRINCIPLES.md's loud-fail-stub rule. This is the bulk of the
   correctness surface — must not let an assoc/dynamic array silently iterate
   zero times or crash.
 - For each non-skipped dim, synthesize a hidden index counter (repeat-loop
@@ -123,12 +123,12 @@ does today (`Lower.cpp:1701-1703`) — not the synthetic-temp path `repeat` uses
 - Dynamic arrays, queues, associative arrays, packed multidim arrays: blocked
   on their own IR/runtime representations landing first (separate TODO items).
   `foreach` over these should stay a loud stub until then.
-- `foreach` inside constraint blocks (`docs/TODO.md:431`) — randomization
+- `foreach` inside constraint blocks (`docs/TODO.md`) — randomization
   (M4), unrelated lowering path.
 - Zero-size dim (empty array) — LRM doesn't spell out the zero-iteration case
   explicitly in 12.7.3 but it falls out naturally from the repeat-loop-style
   bound (`left..right` empty range => 0 iterations); worth an iverilog oracle
-  check anyway before trusting the reading.
+  check anyway per PRINCIPLES.md before trusting the reading.
 
 ## Verification plan
 

@@ -573,7 +573,7 @@ TEST_CASE("unpacked union member must be integral") {
 TEST_CASE("tagged union with a non-integral member is rejected loudly (Phase 3 gap)") {
     // A non-integral member of an unpacked tagged union (here a `real` payload)
     // has no flat-bit overlay — the P1 flat-value representation cannot hold it,
-    // so it fails loudly (docs/design/tagged-unions.md Phase 3).
+    // so it fails loudly per PRINCIPLES.md (docs/design/tagged-unions.md Phase 3).
     const LowerResult r = lower_text(R"(
         module m;
             union tagged { void none; real r; } u;

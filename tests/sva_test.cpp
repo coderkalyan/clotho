@@ -636,7 +636,7 @@ endmodule
 // -- Loud refusals ----------------------------------------------------------
 //
 // Every shape libsva cannot lower, and every shape clotho has not wired up, must
-// be refused with a message rather than accepted. The project forbids silently
+// be refused with a message rather than accepted. PRINCIPLES.md forbids silently
 // accepting a construct that is not correctly lowered.
 
 namespace {

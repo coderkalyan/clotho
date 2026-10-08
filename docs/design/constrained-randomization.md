@@ -78,7 +78,7 @@ A `constraint` block is **ignored with no diagnostic**. `lower_class_type` enume
 `membersOfType<SubroutineSymbol>()` (`:2719`); a `ConstraintBlockSymbol` matches
 neither and there is no unknown-member backstop. Verified: `class C; int x;
 constraint c1 { x > 0; } endclass` compiles and runs clean (exit 0). This violates
-the project's rules today, independently of anything in this document.
+PRINCIPLES.md today, independently of anything in this document.
 
 Note that a constraint block on a class with no `rand` property is inert, so nothing
 observable is wrong yet — but the guard has to exist before rand properties are
@@ -156,7 +156,7 @@ That single fact decides §6 and §7.
 ## 4. Semantics step 1 must reproduce
 
 Oracle position: **iverilog 13 cannot run any of this** (no class randomization), so
-it is not the oracle here. Verilator 5.050 implements a useful
+per PRINCIPLES.md it is not the oracle here. Verilator 5.050 implements a useful
 subset and was used to score the cases below; anything it declines is pinned to the
 LRM text. Each row was measured, not assumed.
 

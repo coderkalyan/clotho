@@ -6,7 +6,7 @@
 // top-level modules flatten into the one Module, each prefixed by its name.
 //
 // Unsupported constructs are reported through `diagnostics` rather than
-// crashing; the rule is to never silently accept a construct Clotho does
+// crashing; see PRINCIPLES.md on never silently accepting a construct Clotho does
 // not implement.
 
 #include <memory>

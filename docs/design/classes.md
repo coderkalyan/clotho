@@ -989,7 +989,7 @@ buffers — they deep-copy on assignment. A class handle does not.
 
 ## 2. Scope and phasing
 
-Each cut keeps a loud frontend guard + TODO (never silently accept).
+Each cut keeps a loud frontend guard + TODO (PRINCIPLES.md: never silently accept).
 
 **Phase 1 — the base (this scope-out).** A single, flat (non-inheriting,
 non-virtual) class:

@@ -561,7 +561,7 @@ than a bare trailing `.` at end of line.
 
 ## 7. The trap that decides whether anyone keeps the server on
 
-Clotho's never-silently-accept rule means ~290 lowering guards
+Clotho's never-silently-accept rule (PRINCIPLES.md) means ~290 lowering guards
 report `DiagnosticOrigin::Unsupported` — "a legal construct Clotho does not
 implement" (`src/Diagnostic.h:53-55`). In a CLI that is exactly right: the run
 cannot proceed, so say so loudly. **In an editor it is hostile.** A design
@@ -874,7 +874,7 @@ corrupts a design.
 
 ### 8.9 The verification surface, filtered the same way
 
-Premise-gated on M4 (`TODO.md:828-905`). Note how the filter changes the shape of
+Premise-gated on M4 (`TODO.md`). Note how the filter changes the shape of
 each idea relative to §8.9's earlier framing:
 
 - **Constraint conflicts → diagnostic with `relatedInformation`.** An unsat core
@@ -942,7 +942,7 @@ done. Nothing here is scheduled; this is what each family waits on.
 | may-X in hover, X-mismatch diagnostics | **S5**, which needs **S3** | scoped; S3 in `x-semantics.md` |
 | Instance context, resolved-parameter hints, per-instance answers | `InstanceScope` enrichment (§8.5) | blocker, unstarted |
 | Run-stamped hover lines, assertion/test lenses | the sim worker (**L3**) | architecture only |
-| Constraint-conflict diagnostics, SVA vacuity + static SVA checks, UVM wiring hover | **M4** (`TODO.md:828-905`) | all unchecked |
+| Constraint-conflict diagnostics, SVA vacuity + static SVA checks, UVM wiring hover | **M4** (`TODO.md`) | all unchecked |
 | Unreachable FSM states (faded) | **S9** analysis half | scoped |
 
 Two observations the ledger makes obvious. First, **L3 and L4 are the real
@@ -1357,7 +1357,7 @@ Not on the list: feature-count parity with slang-server. §2(a).
    also means the worker split spawns itself through `argv[0]` with no path
    discovery. The command takes **no** arguments today: accepting `-D`/`-y`/`-f`
    and ignoring them until there is a workspace config would be exactly the
-   silent acceptance the project forbids.
+   silent acceptance PRINCIPLES.md forbids.
 6. **Workspace configuration — DEFERRED, deliberately, and here is what it
    costs.** L0 compiles the open buffer alone under `IgnoreUnknownModules`, so
    it needs no configuration at all and every self-contained file is fully

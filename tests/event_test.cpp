@@ -320,7 +320,7 @@ TEST_CASE("->> #d e schedules a detached trigger without blocking") {
     CHECK(out.find("fired=5") != std::string::npos);
 }
 
-// Tier-2 forms loud-fail rather than being silently mis-lowered.
+// Tier-2 forms loud-fail rather than being silently mis-lowered (PRINCIPLES.md).
 // A named event declared at package scope materializes its trigger state like a
 // module-scope event, so triggering/waiting it (imported or explicitly scoped)
 // works instead of dereferencing a null event slot. Regression: it used to

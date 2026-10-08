@@ -1520,7 +1520,7 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
     //    resumed exactly once and then destroyed (emit_finals_run in
     //    LlvmBackend.cpp), and no later region exists to bring it back -- so a
     //    suspension there drops everything after it without a word, which is the
-    //    one outcome the project forbids outright.
+    //    one outcome PRINCIPLES.md forbids outright.
     //
     // A nonblocking assignment and a nonblocking event trigger are the two
     // constructs that survive into the inlined copy while doing nothing there.
@@ -2848,7 +2848,7 @@ private:
                 default:
                     // Anything else (gate primitives, specify blocks, checkers,
                     // nettype aliases, ...) may carry behavior; refusing loudly
-                    // beats silently dropping it.
+                    // beats silently dropping it (see PRINCIPLES.md).
                     fail("unsupported module member kind=" + std::string(toString(m.kind)));
             }
         }
@@ -4056,7 +4056,7 @@ private:
     // generated body. `field` is its body field index, `ordinal` its bit in the mask.
     // slang has already rejected the types that are illegal for its mode
     // (Type::isValidForRand); what is refused here is the legal-but-unimplemented
-    // remainder, each loud.
+    // remainder, each loud per PRINCIPLES.md.
     RandProp admit_rand_prop(const slang::ast::ClassPropertySymbol& prop, uint32_t field, uint32_t ordinal) {
         RandProp                p{ .sym = &prop, .field = field, .ordinal = ordinal };
         const slang::ast::Type& ty = prop.getType().getCanonicalType();
@@ -10212,7 +10212,7 @@ private:
         ir::Ir body_ir = b.finish();
         // A `final` block is zero-time (LRM 9.2.3): it must not suspend. slang
         // rejects a time-consuming statement in a `final` at elaboration, so this
-        // guard is defense in depth (never silently accept an
+        // guard is defense in depth (PRINCIPLES.md: never silently accept an
         // unimplemented case) — reached only if that check ever regresses.
         if (activation == ir::Activation::Final) {
             for (size_t i = 0; i < body_ir.inst_count(); ++i) {
@@ -13243,7 +13243,7 @@ private:
     // ReactiveSafetyChecker for the case-by-case reason.
     //
     // Whitelisted, not blacklisted. A statement kind this walk does not recognize
-    // is refused -- the project forbids silently accepting a construct that is not
+    // is refused -- PRINCIPLES.md forbids silently accepting a construct that is not
     // correctly lowered, and "the walker did not recognize it" is no evidence that
     // it is safe.
     void require_reactive_safe(const Statement& action) {
@@ -14674,7 +14674,7 @@ private:
         // are sampled, and a shape libsva cannot handle is still refused -- and
         // then reports nothing, pends nothing and tallies nothing. This is the one
         // place the subsystem accepts a construct and deliberately does nothing
-        // with it; everywhere else that would be the silent drop the project
+        // with it; everywhere else that would be the silent drop PRINCIPLES.md
         // forbids.
         bool verdicts = false;
         switch (mon.kind) {
@@ -16123,7 +16123,7 @@ private:
     //
     // The fail action runs here too, but lowered inline rather than pended: Final
     // is past the last time slot's Reactive drain, so a pend would queue a body
-    // that nothing will ever resume -- exactly the silent drop the project forbids.
+    // that nothing will ever resume -- exactly the silent drop PRINCIPLES.md forbids.
     // Inlining costs the action a restriction the pended copy does not carry, and
     // require_finish_inlinable is where that is charged: a Final process is
     // resumed once and destroyed, so this copy may not suspend at all. Only the
@@ -18566,7 +18566,7 @@ private:
     // match -- Verilator 5.050 agrees.
     //
     // No oracle: iverilog 13 does not compile a string `case` at all (it dies
-    // in `draw_eval_vec4` on an assertion), so this is pinned to the
+    // in `draw_eval_vec4` on an assertion), so per PRINCIPLES.md this is pinned to the
     // LRM text above rather than to a simulator. Verilator 5.050 does accept it and
     // agrees with content equality, which is corroboration and not authority.
     //
@@ -31789,7 +31789,7 @@ private:
         const auto& clt = nc.type->getCanonicalType().as<slang::ast::ClassType>();
         if (clt.isAbstract) {
             // An abstract class cannot be instantiated (LRM 8.21). slang already
-            // rejects this; guard for defense in depth.
+            // rejects this; guard for defense in depth (PRINCIPLES.md).
             fail("cannot instantiate an abstract (virtual) class");
         }
         const ir::Ref   class_ref = lower_type(*nc.type);
@@ -32078,7 +32078,7 @@ private:
             // rather than at the type or the call site: eager static initialization
             // lowers every factory-registered class and builds every vtable body,
             // so a compile-time fail would refuse a design for merely CONTAINING
-            // such a class (all of UVM's register layer). Loud:
+            // such a class (all of UVM's register layer). Loud per PRINCIPLES.md:
             // report + terminate, never a silent unconstrained draw.
             const std::string banner = banner_at(clt.location);
             b.severity(static_cast<uint32_t>(ir::Severity::Fatal), banner, rd.unsupported, {}, l);

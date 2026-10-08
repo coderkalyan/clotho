@@ -256,7 +256,7 @@ sees arithmetic on a chandle, so the minimal representation is exact:
 This deliberately uses no `Type::Kind::CHandle`: a distinct kind would force every
 `Type::Kind` switch (layout, slot type, display) to grow a case for a type whose
 only observable behavior is that of a 64-bit 2-state value. "Simplest logic that
-is LRM-correct" wins here — slang is the guard.
+is LRM-correct" (PRINCIPLES.md) wins here — slang is the guard.
 
 **DPI marshal — `DpiCType::Chandle` ↔ C `void*` (`ptr`).** A chandle is a *scalar*
 (not a vec), so it rides the existing scalar path in every direction with two
@@ -698,7 +698,7 @@ mechanism. Teardown gets one new obligation: a worker still parked at
   refused; the synthetic `int` generated on both sides and ignored; caller-identity
   globals landed; the export thunk drives the task coroutine and takes only the sync
   arm. An exported task that *does* suspend is a **located fatal** naming the task —
-  loud, never silently wrong. This is the phase that covers
+  loud, never silently wrong, per PRINCIPLES.md. This is the phase that covers
   task-shaped hooks completing instantly. See "What T1 actually shipped".
 - **T2 — real suspension.** The baton pool, the DPI ticket in `record.parent`, the
   async arm at the import-task call site, `rt_dpi_task_enter/resume/leave`, and
@@ -1006,7 +1006,7 @@ marshal scratch), open-array *export* args (needs open-array formals in the gene
 SV function ABI), the disable API, and `svGetCallerInfo`. A queue open-array actual
 is blocked in slang (type mismatch), not deferrable here.
 
-## Restrictions — loud-fail with a TODO
+## Restrictions — loud-fail with a TODO (per PRINCIPLES.md)
 
 Supported: **import** — scalar types, packed vectors, `chandle`, `string` (input
 arg + return), `input`/`output`/`inout`, `pure`, `context`, **functions and tasks**.

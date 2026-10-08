@@ -51,7 +51,7 @@ enum class DiagnosticOrigin : uint8_t {
     // slang parse / elaboration / dataflow-analysis diagnostic.
     Frontend,
     // A Clotho lowering guard: a legal construct Clotho does not implement.
-    // Always paired with a TODO in the source.
+    // Always paired with a TODO in the source (see PRINCIPLES.md).
     Unsupported,
     // Clotho refuses the construct on purpose (a security gate, an unsupported
     // combination), as opposed to not having got to it yet.

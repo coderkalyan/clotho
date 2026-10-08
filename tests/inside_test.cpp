@@ -239,7 +239,7 @@ TEST_CASE("inside: a string left operand against string members and a range") {
     CHECK(out == "1 0 1\n");
 }
 
-// Unsupported forms fail loudly (never silently accept).
+// Unsupported forms fail loudly (PRINCIPLES.md: never silently accept).
 TEST_CASE("inside: unsupported forms are rejected") {
 
     // An associative array has no index walk to share with the ordered

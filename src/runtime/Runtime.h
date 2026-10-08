@@ -861,7 +861,7 @@ uint64_t rt_dist_erlang(int32_t seed, int32_t k, int32_t mean);
 // (splitmix64 expansion): the process index at startup, one draw of the parent's
 // stream for a spawned child, or the user seed for $urandom(seed).
 // A modern integer PRNG (not the $random LCG) is chosen for quality and speed
-// per the project's "unspecified -> pick performance and simplicity"; the stream is
+// per PRINCIPLES.md's "unspecified -> pick performance and simplicity"; the stream is
 // therefore intentionally not iverilog-identical.
 void rt_urandom_seed(uint64_t* state, uint64_t seed);
 

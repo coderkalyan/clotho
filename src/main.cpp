@@ -320,7 +320,7 @@ std::string_view command_name(Command command) {
 }
 
 // A command-specific option used under another command is an error, not a
-// silently ignored no-op (never silently accept).
+// silently ignored no-op (PRINCIPLES.md: never silently accept).
 bool check_scope(const Options& o, Command command, int& status) {
     // `-o` names the artifact, and two commands produce one, so ownership is a set
     // rather than a single command. The --gc-* group is a set for a different
@@ -493,7 +493,7 @@ int main(int argc, char** argv) {
     // `args`, which are this command line's own `run` arguments passed through
     // to the design process verbatim (docs/design/dap.md 4.4). Accepting
     // -D / -y / -f here and ignoring them would be exactly the silent
-    // acceptance the project forbids, so they are refused until they mean
+    // acceptance PRINCIPLES.md forbids, so they are refused until they mean
     // something.
     if (command == Command::Lsp || command == Command::Dap) {
         for (int i = 2; i < argc; ++i) {
@@ -599,7 +599,7 @@ int main(int argc, char** argv) {
     }
     // TODO(xsan): `xprov` is parsed and carried in SimulationConfig, but no
     // backend pass reads that bit yet, so it instruments nothing. That is
-    // the project's partial-feature exception, and it holds only where the operator
+    // PRINCIPLES.md's partial-feature exception, and it holds only where the operator
     // cannot mistake a silent check for a clean design -- so a Debug build offers
     // it (CLOTHO_XSAN) and the shipped ones reject the name outright. Both the
     // gate and this TODO disappear when the instrumentation lands. `bounds` is

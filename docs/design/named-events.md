@@ -137,7 +137,7 @@ multidimensional-array VCD guards.
    `service_event`.
 3. **`Wait` statement.** New `lower_stmt` case. For `wait(e.triggered)`: emit
    `last_trig == now ? fall-through : { register e/Any, suspend, recheck }`.
-   General `wait(expr)` over arbitrary signals (TODO.md:198) is the same
+   General `wait(expr)` over arbitrary signals (TODO.md) is the same
    mechanism (subscribe to the cond's read set, loop-recheck) and is scoped as a
    fast-follow, not required for events.
 4. **`.triggered` expression.** Detect the `Triggered` system method, lower to

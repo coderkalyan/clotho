@@ -377,7 +377,7 @@ debug-mode symbol table (§4.3) that is *not* the VCD index:
 
 `read` access type is not offerable: reads are not instrumented and
 instrumenting them would be a different order of cost. `dataBreakpointInfo`
-returns `accessTypes: ["write"]` only. This must be *declined*,
+returns `accessTypes: ["write"]` only. Per PRINCIPLES.md this must be *declined*,
 not silently ignored — an armed `read` breakpoint returns
 `verified: false` with a message.
 
@@ -390,7 +390,7 @@ D1, because "stop when this net changes" is a thing every RTL engineer wants.
 instruction` — and there is no extension point. Clotho has at least five
 meaningful advance units: expression, statement, source line, delta cycle
 (one Active→NBA→Active turn), and time step (one `rt_wheel_advance`). They do
-not fit, and pretending otherwise is the silent acceptance the project forbids.
+not fit, and pretending otherwise is the silent acceptance PRINCIPLES.md forbids.
 
 Three options were considered:
 
@@ -445,7 +445,7 @@ behaviour that makes sense and the one that falls out of §3.1.
 | Concept | Home |
 |---|---|
 | Waveform view | Not DAP. VCD already exists (`docs/VCD.md`); WCP to a viewer is an adjacent product, as `lsp.md:638-640` already notes |
-| Coverage | Not DAP. `docs/TODO.md:790-792` |
+| Coverage | Not DAP. `docs/TODO.md` |
 | `disassemble`, `readMemory`, `writeMemory`, instruction breakpoints | Declined. There is no meaningful instruction stream to show a hardware engineer, and blocker 3 means we could not annotate it |
 | `stepBack`, `reverseContinue` | The real differentiator (§7), out of scope for D0–D5 |
 | `setVariable` / `setExpression` on a signal | Deliberately deferred. Depositing a value mid-instant is `force`-shaped and has LRM semantics that must be got right, not bolted onto a debugger |
@@ -704,7 +704,7 @@ Ordering claims worth arguing over:
 3. **Stop-to-`variables` under 100 ms** on a design with 100k signals, because
    an inspector that pauses the UI is one nobody opens twice.
 4. **Every declined request declines loudly.** Zero requests that return
-   `success: true` with an empty or invented body. The project's never-silently-
+   `success: true` with an empty or invented body. PRINCIPLES.md's never-silently-
    accept rule applied to a protocol.
 5. **The differentiator, when it comes, is reverse execution.** A deterministic
    event-driven simulator with a bounded state vector can checkpoint and replay;

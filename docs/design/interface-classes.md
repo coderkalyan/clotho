@@ -525,7 +525,7 @@ display test and which LRM 8.26.5 explicitly defers to ("casting from a source
 interface class handle that is null is handled in the same manner as ... 8.16").
 
 No bloom word and no sorted id list, unlike the sketch at
-`docs/design/classes.md:218-225` and `TODO.md:1476-1478`: interface ids are minted
+`docs/design/classes.md:218-225` and `TODO.md`: interface ids are minted
 dense from 0, so a bitmap is exact, smaller for any realistic interface count, and
 needs no scan and no fallback path. It is also the only shape whose cost does not
 depend on how many interfaces the *object's* class implements.
@@ -603,7 +603,7 @@ as an independent nominal class keyed per `ClassType` in `class_type_cache_`
 
 ## 8. Refused, each loud — as built
 
-Each of these fails by its own message rather than being
+Per PRINCIPLES.md, each of these fails by its own message rather than being
 silently accepted. All were measured against the built binary:
 
 - **`rand_mode` through an interface handle** — LRM 8.26.9 makes it illegal and slang
@@ -622,7 +622,7 @@ silently accepted. All were measured against the built binary:
   (`ClassSymbols.cpp:881-885`).
 - **1800-2023 nested `interface class` inside a class** — allowed only in that
   language version (`Parser_members.cpp:1559-1562`) and adjacent to the nested-class
-  gap already tracked at `TODO.md:1458-1461`. Untouched here.
+  gap already tracked at `TODO.md`. Untouched here.
 - **An interface class deeper than the bitmap** — no such limit exists: `W` is
   computed from the design's interface count, not fixed. Recorded so nobody replaces
   it with a constant later. Verified with 70 interfaces (two words) in the suite.
@@ -803,7 +803,7 @@ the two signature stubs that turned out to be needed with them (§5.2), and the
 constraints are unimplemented design-wide, so the LRM-illegality of that particular
 receiver is not yet a distinguishable case.
 
-**Cleanup, done here:** the `TODO.md:1457` entry and the `$cast` residue note, and
+**Cleanup, done here:** the `TODO.md` entry and the `$cast` residue note, and
 the stale sketch in `docs/design/classes.md`. The three stale symbol references
 (§2.11) are corrected where this document cites them; `classes.md`'s own body still
 names `set_vtable` / `vtable_for` and is left for the next change to that file.
@@ -840,7 +840,7 @@ names `set_vtable` / `vtable_for` and is left for the next change to that file.
   (`DynamicCastConst`, §1.3(6)); it is a warning, and its `$cast` semantics are
   clotho's to define in any case.
 
-**Settlement.** Where iverilog does not cover the construct the
+**Settlement.** Per PRINCIPLES.md, where iverilog does not cover the construct the
 strategy must be named explicitly: **score the Verilator-supported subset against
 Verilator 5.050, and pin everything Verilator declines or gets wrong to the LRM
 text**, with the LRM clause quoted in the test comment.

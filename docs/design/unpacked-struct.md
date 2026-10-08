@@ -287,5 +287,5 @@ non-array case.
   gaps.
 - Frontend access + whole-object: medium, mostly mechanical field-wise
   recursion.
-- Guard everything Stage 1 excludes loudly: never silently accept a
+- Guard everything Stage 1 excludes loudly (PRINCIPLES.md): never silently accept a
   member type or an array-of-struct the backing does not yet lower.

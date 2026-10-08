@@ -568,7 +568,7 @@ TEST_CASE("an unconstructed embedded covergroup is inert (LRM 19.4)") {
 // -- The refusal surface -----------------------------------------------------
 //
 // Each of these is a real LRM 19 construct this phase does not implement. They
-// must fail loudly and by name, never sample silently: a coverage
+// must fail loudly and by name (PRINCIPLES.md), never sample silently: a coverage
 // model that quietly drops a coverpoint reports progress that was never made.
 
 TEST_CASE("cross coverage is refused by name (LRM 19.6)") {
