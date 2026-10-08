@@ -88,5 +88,8 @@ Clotho can be distributed under any terms its authors choose.
 The license covers Clotho itself. Designs and testbenches you run with Clotho,
 and the output Clotho produces from them, are yours.
 
+The patches to slang in `patches/` are licensed under the MIT License (see
+`patches/LICENSE`), the same terms as slang itself, so they can go upstream.
+
 Third-party components and their licenses are listed in
 `THIRD_PARTY_NOTICES.md`.
