@@ -453,6 +453,11 @@ int main(int argc, char** argv) {
         std::println("clotho {}", CLOTHO_GIT_HASH);
         std::println("LLVM {}", CLOTHO_LLVM_VERSION);
         std::println("slang {}", slang::VersionInfo::getVersionString());
+        std::println("Copyright (C) 2026 Kalyan Sriram");
+        std::println("License GPL-3.0-only <https://www.gnu.org/licenses/gpl-3.0.html>.");
+        std::println("The runtime linked into simulations is MPL-2.0.");
+        std::println("This is free software: you are free to change and redistribute it.");
+        std::println("There is NO WARRANTY, to the extent permitted by law.");
     };
 
     if (argc < 2) {
