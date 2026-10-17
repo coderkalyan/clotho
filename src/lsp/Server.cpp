@@ -58,7 +58,10 @@
 
 namespace clotho::lsp {
 
-namespace {
+// NOTE: Named rather than anonymous: glaze reflects the message types declared
+// here, and its field counting declares conversion operators to them that are
+// never defined. Clang rejects that for a type without linkage.
+namespace internal {
 
 // The framing layer is shared with the debug adapter (src/transport), so it
 // lives in its own namespace; these are the only names this file takes from it.
@@ -1362,10 +1365,10 @@ void Server::on_semantic_tokens_range(const Id& id, std::string_view params) {
     answer_tokens_range(id, parsed.textDocument.uri, parsed.range);
 }
 
-} // namespace
+} // namespace internal
 
 void serve(std::string_view version) {
-    Server server(version);
+    internal::Server server(version);
     server.run();
 }
 

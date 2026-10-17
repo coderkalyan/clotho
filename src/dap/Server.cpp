@@ -47,7 +47,8 @@
 
 namespace clotho::dap {
 
-namespace {
+// NOTE: Named rather than anonymous; see the same note in src/lsp/Server.cpp.
+namespace internal {
 
 // The framing layer is shared with the language server (src/transport); these
 // are the only names this file takes from it.
@@ -795,10 +796,10 @@ void Adapter::on_cancel(const Request& request) {
     ack(request);
 }
 
-} // namespace
+} // namespace internal
 
 [[noreturn]] void serve(std::string_view version, std::string_view argv0) {
-    Adapter adapter(version, argv0);
+    internal::Adapter adapter(version, argv0);
     adapter.run();
 }
 

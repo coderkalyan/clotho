@@ -35,7 +35,9 @@
 #include <unistd.h>
 #endif
 
-namespace {
+// NOTE: Named rather than anonymous, for the reason in src/lsp/Server.cpp: glaze
+// reflects these types, which clang rejects for a type without linkage.
+namespace dap_test {
 
 constexpr glz::opts kRead{ .error_on_unknown_keys = false };
 
@@ -66,7 +68,9 @@ std::string frame(std::string_view body) {
     return std::format("Content-Length: {}\r\n\r\n{}", body.size(), body);
 }
 
-} // namespace
+} // namespace dap_test
+
+using namespace dap_test;
 
 #if !defined(_WIN32)
 

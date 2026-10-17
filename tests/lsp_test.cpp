@@ -37,7 +37,9 @@
 #include <unistd.h>
 #endif
 
-namespace {
+// NOTE: Named rather than anonymous, for the reason in src/lsp/Server.cpp: glaze
+// reflects these types, which clang rejects for a type without linkage.
+namespace lsp_test {
 
 struct ResponseError {
     int32_t     code;
@@ -391,7 +393,9 @@ Published published(const Message& message) {
 
 #endif // !_WIN32
 
-} // namespace
+} // namespace lsp_test
+
+using namespace lsp_test;
 
 TEST_CASE("lsp serves the lifecycle handshake") {
     const Session session = run_session(transcript({ kInitialize, kInitialized, kShutdown, kExit }));
