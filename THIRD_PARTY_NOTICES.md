@@ -1,10 +1,18 @@
 # Third-party notices
 
-Clotho itself is licensed under GPL-3.0-only (`LICENSE.txt`), except for the
-runtime in `src/runtime/`, which is licensed under MPL-2.0
-(`src/runtime/LICENSE`). This file lists third-party code that Clotho builds
-against, links, or carries in its source tree. The full text of each license is
-in `LICENSES/`, copied verbatim from the upstream project.
+Clotho is licensed under GPL-3.0-only (`LICENSE.txt`), with these exceptions:
+
+- `src/runtime/` is licensed under MPL-2.0 (`src/runtime/LICENSE`).
+- `patches/` is licensed under MIT (`patches/LICENSE`).
+- `docs/cla/` is adapted from the Project Harmony contributor agreements
+  (HA-CLA-I and HA-CLA-E v1.0), licensed under CC BY 3.0; see each file's footer.
+- The third-party files under `tests/perf/cases/` listed below keep their own
+  licenses.
+
+This file lists third-party code that Clotho builds against, links, or carries
+in its source tree. The full text of each license is in `LICENSES/`, copied
+verbatim from the upstream project, or for BSL-1.0 and SHL-0.51 from the SPDX
+reference text.
 
 ## Linked into the `clotho` executable
 
@@ -15,13 +23,16 @@ found on the host where noted.
 |---|---|---|
 | [slang](https://github.com/MikePopoloski/slang) | MIT | `LICENSES/slang.txt` |
 | slang's bundled `boost_unordered.hpp`, `boost_concurrent.hpp`, `expected.hpp` | BSL-1.0 | `LICENSES/BSL-1.0.txt` |
-| slang's bundled `BS_thread_pool.hpp` | MIT | `LICENSES/BS_thread_pool.txt` |
+| slang's bundled `BS_thread_pool.hpp` ([thread-pool](https://github.com/bshoshany/thread-pool)) | MIT | `LICENSES/BS_thread_pool.txt` |
+| [boost.regex](https://github.com/MikePopoloski/regex) (via slang; host Boost if present) | BSL-1.0 | `LICENSES/BSL-1.0.txt` |
+| [toml++](https://github.com/marzer/tomlplusplus) (via slang; host copy if present) | MIT | `LICENSES/tomlplusplus.txt` |
 | [{fmt}](https://github.com/fmtlib/fmt) | MIT, with an object-code exception | `LICENSES/fmt.txt` |
 | [mimalloc](https://github.com/microsoft/mimalloc) (via slang; host copy if present) | MIT | `LICENSES/mimalloc.txt` |
 | [unordered_dense](https://github.com/martinus/unordered_dense) | MIT | `LICENSES/unordered_dense.txt` |
 | [glaze](https://github.com/stephenberry/glaze) | MIT | `LICENSES/glaze.txt` |
+| glaze's bundled [fast_float](https://github.com/fastfloat/fast_float) | Apache-2.0, MIT or BSL-1.0; used under MIT | `LICENSES/fast_float.txt` |
 | [LLVM](https://llvm.org) 22 (host install) | Apache-2.0 WITH LLVM-exception | `LICENSES/LLVM.txt` |
-| [libsva](https://github.com/coderkalyan/libsva) | MIT | `LICENSES/libsva.txt` |
+| [libsva](https://github.com/coderkalyan/libsva), including the [Zig](https://ziglang.org) standard library it is built with | MIT | `LICENSES/libsva.txt`, `LICENSES/zig.txt` |
 
 ## Linked into every simulation
 
