@@ -29,7 +29,8 @@ module t;
   // cycle needs per-attempt identity whose window is the antecedent's longest
   // match. libsva refuses it with SVA_ERROR_UNBOUNDED_ANTECEDENT rather than
   // under-report, which is a capability traded for a correct number -- the old
-  // lowering was right whenever no two matches ended together.
+  // lowering was right whenever no two matches ended together
+  // (docs/LRM_NOTES.md, note 24).
   //
   // The coverage moved rather than vanished: tests/sva_test.cpp asserts the
   // refusal by name, and asserts the same operator still lowers in a

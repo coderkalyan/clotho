@@ -70,7 +70,8 @@ TEST_CASE("$bits of fixed-size operands folds to the type width") {
 
 // A dynamic string is sized at call time: 8 bits per current character, 0 when
 // empty (LRM 20.6.2). iverilog returns a constant 1 for any string — a known
-// iverilog limitation; the LRM (and the byte count) makes 8*len correct.
+// iverilog limitation; the LRM (and the byte count) makes 8*len correct
+// (docs/LRM_NOTES.md, note 27).
 TEST_CASE("$bits of a dynamic string is 8 per character") {
     const std::string out = run_capture(
       prog("string s;",
@@ -263,7 +264,8 @@ TEST_CASE("$typename gives distinct anonymous types distinct names") {
 // The $dist_* routines and seeded $random are the IEEE reference algorithm
 // (mandated verbatim), so the expected values below are byte-identical to
 // iverilog (cross-checked). $urandom is a per-process xoshiro256++ whose stream
-// is intentionally NOT iverilog-identical (LRM leaves it unspecified); it is pinned to its own deterministic output and its
+// is intentionally NOT iverilog-identical, since the LRM leaves it unspecified
+// (docs/LRM_NOTES.md, note 25); it is pinned to its own deterministic output and its
 // LRM-required properties (range bounds, per-process independence, reseed).
 
 TEST_CASE("$random(seed) threads the seed and matches the reference stream") {

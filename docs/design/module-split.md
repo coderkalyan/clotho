@@ -196,7 +196,7 @@ stack-spilled/reloaded on hot paths). Marking the declarations dso_local
 (everything links into one JIT dylib) restored the direct form: wideff
 instruction bloat gone (below no-split), combchain flipped to a WIN (cycles
 +29% -> -7.5% vs no-split, taken-mispredicts 13.4M -> 3.5M), pico compile
--4%. Follow-up ("backend: fold absolute-id addend into the symbol relocation"): absid addend folded into the symbol
+-4%. Follow-up: absid addend folded into the symbol
 reference as a byte GEP — one relocated movabs per id, no add.
 
 RESIDUAL: pico split sim +4% (compile -4%; net wall ~+1%). Attribution

@@ -17,8 +17,8 @@ using namespace clotho;
 //
 // Expected values are pinned against verilator; it diverges from slang only on a
 // keyed pattern over a *descending* packed array, where slang mis-folds the
-// element order (see lower_packed_pattern NOTE) — Clotho reverses to
-// correct that, exercised by the descending cases below.
+// element order. Clotho reverses it to correct that (docs/LRM_NOTES.md, note 11),
+// exercised by the descending cases below.
 
 namespace {
 
@@ -260,7 +260,7 @@ TEST_CASE("nonblocking '{...} pattern to an unpacked array") {
 
 TEST_CASE("whole unpacked-array equality is per-element, X-propagating") {
     // Equal -> 1, one definite mismatch -> 0, an ambiguous (x) member with all
-    // others equal -> x (LRM 11.4.5).
+    // others equal -> x, per LRM 11.4.5 (docs/LRM_NOTES.md, note 13).
     CHECK(run_capture(R"(
         module m;
             logic [7:0] a [0:3];
@@ -332,7 +332,7 @@ TEST_CASE("nonblocking unpacked-array slice copy commits deferred") {
 // position is an ordinary element access and carries the clause's out-of-range
 // rule on its own. iverilog rejects unpacked-array slices outright; the two
 // deliberate choices Clotho makes here are judging each position on its own and
-// treating an x/z base as invalid.
+// treating an x/z base as invalid (docs/LRM_NOTES.md, note 5).
 // ---------------------------------------------------------------------------
 
 TEST_CASE("indexed unpacked-array slice: direction, endianness, and element order") {
@@ -418,7 +418,7 @@ TEST_CASE("an out-of-range indexed slice reads the element default per position"
     // LRM 7.4.5: an invalid index reads Table 7-1's value (x for 4-state, 0 for
     // 2-state) and writes nothing. Each POSITION is judged on its own, so a
     // partially out-of-range slice keeps its in-range positions where they are --
-    // the same rule 11.5.1 states for a packed part-select.
+    // the same rule 11.5.1 states for a packed part-select (docs/LRM_NOTES.md, note 5).
     CHECK(run_capture(R"(
         module m;
             logic [7:0] q [0:7];
@@ -449,7 +449,8 @@ TEST_CASE("an out-of-range indexed slice reads the element default per position"
 TEST_CASE("an x/z indexed slice base is an invalid index (LRM 7.4.5)") {
     // "If an index expression is out of bounds or if any bit in the index
     // expression is x or z, then the index shall be invalid." Every position of
-    // the slice inherits the unknown, so the read is all-x and the write a no-op.
+    // the slice inherits the unknown, so the read is all-x and the write a no-op
+    // (docs/LRM_NOTES.md, note 5).
     CHECK(run_capture(R"(
         module m;
             logic [7:0] q [0:7];

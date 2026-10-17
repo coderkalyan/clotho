@@ -152,7 +152,7 @@ TEST_CASE("array reduction methods (LRM 7.12.3)") {
 
 // An empty array reduces to 0 for every method, including `product` and `and`
 // whose fold identities are 1 and all-ones. LRM 7.12.3 does not say; verilator
-// also answers 0.
+// also answers 0 (docs/LRM_NOTES.md, note 8).
 TEST_CASE("array reduction of an empty array is zero") {
     constexpr std::string_view src = R"(
         module m;
@@ -189,7 +189,7 @@ TEST_CASE("array reduction propagates x") {
 
 // min/max over 4-state elements: an unknown-bearing compare is not a definite 1,
 // so an unknown element never wins. LRM 7.12.1 does not define the placement of
-// unknowns, so this pins Clotho's rule.
+// unknowns, so this pins Clotho's rule (docs/LRM_NOTES.md, note 7).
 TEST_CASE("array min/max over 4-state elements skips unknowns") {
     constexpr std::string_view src = R"(
         module m;

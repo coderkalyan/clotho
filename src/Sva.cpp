@@ -1373,8 +1373,8 @@ public:
     // equivalent rewrite -- below the implication the abort only arms once the
     // consequent starts, so it misses the attempt's own cycle. libsva carries the
     // scope instead (sva_monitor_abort_covers_trigger), and a multi-cycle antecedent
-    // under one is no longer a residue: the attempt ids count the attempts sitting
-    // part-way through it, which is what the refusal used to be about.
+    // under one lowers: the attempt ids count the attempts sitting part-way
+    // through it, and each owes its own verdict (docs/LRM_NOTES.md, note 24).
     std::optional<sva_node> abort_on(const slang::ast::AbortAssertionExpr& node,
                                      sva_strength strength, const AssertionExpr& blame) {
         const bool accept = node.action == slang::ast::AbortAssertionExpr::Accept;
@@ -1845,10 +1845,10 @@ Result lower(const Request& request) {
                             "so restructure to put the `not` above the operator";
                 break;
             case SVA_ERROR_UNSUPPORTED_ABORT_SCOPE:
-                // Two shapes share this code now. A third used to: an abort covering an
-                // implication whose antecedent takes more than one cycle to match, whose
-                // part-matched attempts a union-tracked trigger could not count. The
-                // attempt ids count them, so it lowers --
+                // Two shapes share this code. An abort covering an implication whose
+                // antecedent takes more than one cycle to match is not one of them: a
+                // union-tracked trigger cannot count its part-matched attempts, but the
+                // attempt ids do, so it lowers (docs/LRM_NOTES.md, note 24).
                 //
                 // The second is an abort under a `not`, and negation() pre-checks it so
                 // the message can name the operator. It is the ARMING that cannot
@@ -1887,7 +1887,7 @@ Result lower(const Request& request) {
                 // antecedent thread, which an unbounded antecedent has unboundedly
                 // many of. Answering with the number of matching CYCLES instead is
                 // what one bit gives, and it is short by however many attempts ended
-                // together. Refused in both tracking disciplines:
+                // together (docs/LRM_NOTES.md, note 24). Refused in both tracking disciplines:
                 // the obligation's discipline has no bearing on the antecedent.
                 //
                 // The remedy is named because the shape is legal SystemVerilog that

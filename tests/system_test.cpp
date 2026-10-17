@@ -15,8 +15,9 @@
 
 // $system shell-exec task (LRM §20.17.1). Clotho takes a deliberate, security-
 // motivated exception to LRM compliance here: $system is refused by default and
-// gated behind an explicit --allow-system=<const|full> operator opt-in. These tests pin the three access tiers, both call forms, and
-// the raw system() return convention.
+// gated behind an explicit --allow-system=<const|full> operator opt-in
+// (docs/LRM_NOTES.md, note 29). These tests pin the three access tiers, both
+// call forms, and the raw system() return convention.
 
 using namespace clotho;
 
@@ -105,7 +106,7 @@ TEST_CASE("$system function form returns the raw system() status") {
     // platform-defined. POSIX yields a wait status, so "exit 3" is WEXITSTATUS 3
     // encoded as 3<<8 = 768; the Windows CRT yields the exit code itself, 3.
     // Clotho passes the int through untouched on both, which is the LRM-literal
-    // behavior -- so the expectation, not the runtime, is
+    // behavior (docs/LRM_NOTES.md, note 29) -- so the expectation, not the runtime, is
     // what varies here. iverilog 13 has no $system support (neither task nor
     // function form), so it is not an oracle either way.
     const std::string out = run_capture(

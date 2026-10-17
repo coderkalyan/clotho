@@ -76,9 +76,9 @@ TEST_CASE("force: RHS is continuously tracked") {
 }
 
 // Re-force is last-wins (LRM 10.6.2): a second force to the same variable
-// supersedes the first, breaking its continuous relationship. iverilog 13
-// diverges here (it keeps the first force's RHS link live, so a later change to
-// that RHS leaks through) —
+// supersedes the first, breaking its continuous relationship
+// (docs/LRM_NOTES.md, note 10). iverilog 13 diverges here (it keeps the first
+// force's RHS link live, so a later change to that RHS leaks through).
 TEST_CASE("force: re-force is last-wins, old RHS link broken") {
     constexpr std::string_view src = R"(
         module m;

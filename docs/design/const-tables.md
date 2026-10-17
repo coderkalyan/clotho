@@ -1,6 +1,6 @@
 # Runtime-indexed constant tables
 
-**Status:** landed (option B, below). Line references are the tree at "Merge feat/copyclass: fork join_any and join_none" (`main`),
+**Status:** landed (option B, below). Line references are "Merge feat/copyclass: fork join_any and join_none" (`main`),
 i.e. the state of the tree before the change, file `src/Lower.cpp` unless
 stated.
 

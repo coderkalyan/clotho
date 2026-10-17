@@ -11,7 +11,7 @@
 // yet"), and a `const` unpacked array is the same value with the same element
 // semantics. The one deliberate divergence is an out-of-range read of a 2-state
 // element, which yields the element default 0 per LRM 7.4.5 + Table 7-1 rather
-// than iverilog's forced x.
+// than iverilog's forced x (docs/LRM_NOTES.md, note 4).
 
 #include <doctest/doctest.h>
 

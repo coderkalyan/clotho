@@ -1,5 +1,5 @@
 name = "str_numeric"
-description = "200k-iteration loop calling atoi/atohex/atoreal + itoa/hextoa/realtoa once each per iteration (LRM 6.16.9/6.16.11 numeric-conversion methods, landed 2026-07). Operand range keeps output independent of Clotho's documented choices (no sign-magnitude or precision divergence)."
+description = "200k-iteration loop calling atoi/atohex/atoreal + itoa/hextoa/realtoa once each per iteration (LRM 6.16.9/6.16.11 numeric-conversion methods, landed 2026-07). Operand range keeps output independent of Clotho's documented choices: no negative operands (docs/LRM_NOTES.md, note 1) and no real needing more than 6 significant digits (docs/LRM_NOTES.md, note 2)."
 top = "top"
 
 [clotho]

@@ -283,7 +283,7 @@ uint32_t dec_digits(uint64_t v) {
 // largest possible value (decimal space-padded, other radices zero-padded, %t
 // to $timeformat's min width); width 0 is the minimal form; an explicit width
 // pads on the left (spaces for d/s/c/t, zeros for h/o/b) and never truncates.
-// `-` left-justifies with trailing spaces (an extension).
+// `-` left-justifies with trailing spaces, an extension (docs/LRM_NOTES.md, note 30).
 // `dyn` non-null when the format came from a runtime string, in which case an
 // undefined conversion is a design error and not a broken invariant.
 void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spec,
@@ -377,7 +377,7 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
                 // minimal digits, then zero-pad back out to the field width
                 // (LRM §21.2.1.2 examples: %3h of 32'h5 is "005"; %0h is "a").
                 // NOTE: iverilog deviates here (prints the full natural width);
-                // the LRM table is explicit, so LRM wins.
+                // the LRM table is explicit, so LRM wins (docs/LRM_NOTES.md, note 31).
                 size_t k = 0;
                 while (k + 1 < field.size() && field[k] == '0') {
                     ++k;
@@ -1950,8 +1950,7 @@ void intra_ready_push(rt_intra_rec* rec) {
 //   - push_back puts the new element at logical len, so what gets dropped is the
 //     element just pushed, and the push has no visible effect.
 // Both fall out of "keep the first bound + 1"; neither direction is special-
-// cased below. LRM 7.10.4 does not pin the
-// choice.
+// cased below. LRM 7.10.4 does not pin the choice (docs/LRM_NOTES.md, note 6).
 static void q_apply_bound_ops(rt_queue* h, const rt_elem_ops* ops, uint64_t bound) {
     if (bound == 0 || h->len <= bound + 1) {
         return;
@@ -4163,14 +4162,13 @@ extern "C" void rt_dpi_export_task_no_task_frame(const char* name) {
 // A report produced while the Active/NBA regions settle an instant is not
 // emitted at its point of execution; it is queued here and flushed in the
 // Observed region once the instant settles (rt_observed_flush, called from the
-// sim loop between the NBA-settle and Postponed regions). This moves
-// unique/priority violation reporting to the region LRM 12.4.2 / 12.5.3 specify
-// (previously emitted immediately in the Active region).
+// sim loop between the NBA-settle and Postponed regions). unique/priority
+// violation reports use it because LRM 12.4.2 / 12.5.3 place them in that
+// region (docs/LRM_NOTES.md, note 18).
 //
-// Step 1 carries only the record — no maturation/flush-on-re-execution yet, so
-// a statement that violates transiently on multiple settle passes still queues
-// one report per pass. Deferred immediate assertions (LRM 16.4) will add the
-// per-instance maturation that gives glitch immunity, reusing this queue.
+// The queue has no flush when a statement executes again in the same instant,
+// so a statement that violates transiently on several settle passes queues one
+// report per pass.
 namespace {
 struct ObservedCaseViol {
     const char* banner; // compile-time "<file>:<line>: " prefix, static lifetime
@@ -4212,7 +4210,7 @@ extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, 
     // default failure (LRM 16.3). A simulator diagnostic, not design output, so
     // it goes to stderr like the $finish / case-violation banners; flush stdout
     // first so buffered $display text is committed before the report interleaves.
-    // The exact layout is not LRM-mandated; "<LABEL>: <file>:
+    // The exact layout is not LRM-mandated (docs/LRM_NOTES.md, note 28); "<LABEL>: <file>:
     // <line>: <message>" tracks iverilog's first report line.
     static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
     const char* const        label    = labels[level < 4 ? level : 2];
@@ -6270,7 +6268,7 @@ int32_t str_atoi_base(const rt_string* s, uint32_t base) {
 // dst = sign + magnitude of `i` in `base`, lowercase digits (LRM §6.16.11-
 // 6.16.14). std::to_chars natively formats a negative signed integer as '-'
 // followed by the magnitude in any base, matching iverilog's convention for
-// hextoa/octtoa/bintoa — not a two's-complement bit-pattern
+// hextoa/octtoa/bintoa (docs/LRM_NOTES.md, note 1) — not a two's-complement bit-pattern
 // dump.
 void str_toa_base(rt_string* dst, int32_t i, int base, const rt_alloc_site* site) {
     char       buf[36]; // sign + up to 32 binary digits

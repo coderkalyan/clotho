@@ -15,7 +15,7 @@
 // two sides cannot drift. Grammar accepted: `% [-] [width] [. precision] conv`.
 // A leading 0 in the width folds into the numeric width (`%0d` is width 0, the
 // LRM's minimal-width form); there is no zero-pad flag. The `-` left-justify
-// flag is an extension the LRM does not define.
+// flag is an extension the LRM does not define (docs/LRM_NOTES.md, note 30).
 
 namespace clotho {
 
@@ -27,8 +27,8 @@ struct FormatSpec {
     bool     has_width;
     bool     width_overflow;
     bool     has_prec;
-    // The width began with a '0'. Integer conversions ignore this (the 0 folds
-    // into the width); the real conversions honor it
+    // The width began with a '0'. Integer conversions ignore this, because the 0
+    // folds into the width (docs/LRM_NOTES.md, note 30); the real conversions honor it
     // as the C zero-pad flag (LRM §21.2.1.2 Table 21-2 grants %e/%f/%g the full
     // C formatting specification).
     bool     zero_pad;

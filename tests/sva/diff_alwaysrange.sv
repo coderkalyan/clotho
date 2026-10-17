@@ -46,8 +46,8 @@
 //
 // The two lows are three cycles apart, deliberately: with a window of width
 // three no single attempt can see both, so no attempt has two failures in it.
-// That keeps this fixture clear of the open per-obligation versus per-attempt
-// reporting question.
+// That keeps this fixture clear of the per-attempt reporting rule, under which an
+// attempt with two failures reports once (docs/LRM_NOTES.md, note 23).
 //
 // Derived from the LRM:
 //

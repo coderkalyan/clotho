@@ -12,8 +12,9 @@ using namespace clotho;
 
 // $display formatting per LRM §21.2.1: automatic sizing, field widths, x/z
 // casing, %m, empty arguments, radix task variants. Expectations are
-// cross-checked against Icarus Verilog except where noted (iverilog deviates
-// from the LRM's own examples on explicit widths for h/o/b).
+// cross-checked against Icarus Verilog except where noted. iverilog deviates
+// from the LRM's own examples on explicit widths for h/o/b; Clotho follows the
+// LRM (docs/LRM_NOTES.md, note 31).
 
 namespace {
 
@@ -137,8 +138,8 @@ TEST_CASE("signed decimal automatic sizing") {
     )") == ":  -1:\n: 100:\n:  7:\n");
 }
 
-// `-` left-justifies with trailing spaces (an extension beyond the LRM's
-// format list).
+// `-` left-justifies with trailing spaces, an extension beyond the LRM's format
+// list (docs/LRM_NOTES.md, note 30).
 TEST_CASE("left justification") {
     CHECK(run_capture(R"(
         module m;
@@ -168,8 +169,8 @@ TEST_CASE("bare-argument defaults, radix variants, and empty arguments") {
     )") == "  7\n101x0\n567\n0ef\n0ef\ne1: e2\n");
 }
 
-// Leading NUL bytes of a packed %s operand are never printed (LRM §21.2.1.7
-// and the §21.2.1.1 example; iverilog deviates).
+// Leading NUL bytes of a packed %s operand are never printed, per LRM §21.2.1.7
+// and the §21.2.1.1 example (docs/LRM_NOTES.md, note 33); iverilog deviates.
 TEST_CASE("%s drops leading NUL bytes of a packed operand") {
     CHECK(run_capture(R"(
         module m;
@@ -310,8 +311,8 @@ TEST_CASE("unsupported or invalid format specifiers are rejected") {
 
 // Operands wider than 64 bits: the rt_arg planes are multi-word, so every radix
 // renders in full (%d via a bignum divmod). Expectations cross-checked against
-// Icarus Verilog, except the explicit-width h/o/b zero-pad
-// (iverilog space-pads; the LRM says leading zeros, so Clotho zero-pads).
+// Icarus Verilog, except the explicit-width h/o/b zero-pad: iverilog space-pads,
+// the LRM says leading zeros, so Clotho zero-pads (docs/LRM_NOTES.md, note 31).
 TEST_CASE("display operands wider than 64 bits (LRM 21.2)") {
     SUBCASE("128-bit unsigned across every radix") {
         CHECK(run_capture(R"(
@@ -431,8 +432,8 @@ TEST_CASE("display operands wider than 64 bits (LRM 21.2)") {
 
 TEST_CASE("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)") {
     // `'{...}` with struct member names and decimal leaves: the clause prints a
-    // singular element "as [it] would unformatted", which 21.2.1.1 makes decimal.
-    // Verilator instead tags leaves `'h`.
+    // singular element "as [it] would unformatted", which 21.2.1.1 makes decimal
+    // (docs/LRM_NOTES.md, note 32). Verilator instead tags leaves `'h`.
     SUBCASE("fixed unpacked array") {
         CHECK(run_capture(R"(
             module m;

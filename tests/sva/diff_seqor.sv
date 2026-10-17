@@ -26,7 +26,7 @@ module t;
   // part-way through the antecedent at once, and counting the matches that end
   // in one cycle needs per-attempt identity whose window is the antecedent's
   // longest match. libsva refuses it with SVA_ERROR_UNBOUNDED_ANTECEDENT
-  // rather than under-report.
+  // rather than under-report (docs/LRM_NOTES.md, note 24).
   //
   // The coverage moved: tests/sva_test.cpp asserts the refusal by name and
   // asserts that the same operator still lowers in a CONSEQUENT on the counted

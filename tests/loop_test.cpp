@@ -863,7 +863,7 @@ TEST_CASE("a remote disable reaches one instance's block, not the definition's")
 }
 
 // LRM 16.4.4: disabling the outermost scope of a procedure DROPS its pending
-// deferred reports — "cancelled", "cleared", never reported. The
+// deferred reports — "cancelled", "cleared", never reported (docs/LRM_NOTES.md, note 22). The
 // exit carries the same generation bump an activation start does, so the queued
 // report never matures. No oracle: iverilog does not implement deferred
 // assertions.

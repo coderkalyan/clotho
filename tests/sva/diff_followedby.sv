@@ -74,8 +74,9 @@
 // ---------------------------------------------------------------------------
 //
 // Every antecedent below has at most one match point per attempt, deliberately:
-// a multi-match antecedent lands on the open per-obligation versus per-attempt
-// question and would confuse what this fixture pins.
+// a multi-match antecedent lands on the per-attempt reporting rule, one verdict
+// per attempt (docs/LRM_NOTES.md, note 23), and would confuse what this fixture
+// pins.
 //
 // Sampled values, one row per posedge (cycle N is at t = 5 + 10N):
 //

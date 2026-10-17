@@ -182,7 +182,7 @@ TEST_CASE("queue 4-state defaults to x") {
 
 // A pop from an empty 2-state queue returns the element-type default 0 (LRM
 // 7.10.2). iverilog returns x here because its `int` queue is internally
-// 4-state; Clotho is LRM-correct.
+// 4-state; Clotho is LRM-correct (docs/LRM_NOTES.md, note 4).
 TEST_CASE("queue pop from empty 2-state queue is default 0") {
     constexpr std::string_view src = R"(
         module m;
@@ -242,8 +242,8 @@ TEST_CASE("queue built in a loop") {
 
 // Queue subroutine ABI (LRM 13.5, 7.10): input copy-in (value semantics),
 // output/inout copy-out, and function return. iverilog cannot pass queue
-// arguments. The value-semantics rationale is shared with
-// dynamic arrays.
+// arguments. The value-semantics rationale (docs/LRM_NOTES.md, note 20) is shared
+// with dynamic arrays.
 TEST_CASE("queue input argument is copy-in (value semantics)") {
     constexpr std::string_view src = R"(
         module m;
@@ -827,8 +827,8 @@ TEST_CASE("%p of a queue") {
 // Whole-queue == / != (LRM 11.2.2, 11.4.5): different sizes are a definite 0;
 // same size folds a per-element compare with x-propagation for 4-state elements
 // (any definite mismatch -> 0, else x if any unknown, else 1). Verified against
-// verilator on 2-state/string; the 4-state x cases hand-derive to 11.4.5 (same
-// rule as a packed vector).
+// verilator on 2-state/string; the 4-state x cases hand-derive to 11.4.5, the
+// same rule as for a packed vector (docs/LRM_NOTES.md, note 13).
 TEST_CASE("queue equality with x-propagation") {
     constexpr std::string_view src = R"(
         module m;

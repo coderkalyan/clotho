@@ -136,8 +136,9 @@ embedded covergroup left unconstructed.
 ### 3.3 The precedent that is already silently wrong
 
 Immediate `cover (expr);` (LRM 16.3) compiles, runs, and counts nothing.
-`src/Lower.cpp:16064-16101` lowers it to one `Cond` whose false-region is opened
-and closed empty; the true region runs the user's action block if written. So:
+`lower_immediate_assertion` in `src/Lower.cpp` lowers it to one `Cond` whose
+false-region is opened and closed empty; the true region runs the user's action
+block if written. So:
 
 ```
 $ clotho run c3.sv           # cover (a) $display("imm cover hit");
@@ -147,10 +148,11 @@ imm cover hit
 ```
 
 The pass action fires, and nothing else exists — no count, no name, no report.
-The justification sits in place (`src/Lower.cpp:11631`). Unlike every other unimplemented construct,
-this one is invisible: a design full of immediate covers looks healthy. Landing a
-coverage report makes this a decision that has to be taken explicitly, not an
-oversight that persists (§10.4).
+The decision is recorded in place, in `lower_immediate_assertion` in
+`src/Lower.cpp`, and in the notes (docs/LRM_NOTES.md, note 21). Unlike every
+other unimplemented construct, this one is invisible: a design full of immediate
+covers looks healthy. Landing a coverage report makes this a decision that has
+to be taken explicitly, not an oversight that persists (§10.4).
 
 ### 3.4 Prior work, refreshed
 

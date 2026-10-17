@@ -161,7 +161,7 @@ TEST_CASE("randcase sum precision is the widest weight (LRM 18.16)") {
 // and the first branch always wins. This is the literal LRM 18.16 reading
 // ("standard addition semantics (maximum precision of all weights)"); verilator
 // (5.050) instead widens the accumulator and takes the second branch ~1/3 of the
-// time.
+// time. Clotho keeps the wrapping (docs/LRM_NOTES.md, note 26).
 TEST_CASE("randcase sum wraps at the weight precision (LRM 18.16)") {
     constexpr std::string_view src = R"(
         module m;

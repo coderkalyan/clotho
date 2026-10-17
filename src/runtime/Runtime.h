@@ -136,7 +136,7 @@ extern unsigned char rt_finishing;
 // prefix (static lifetime); `now` is the simulation time of the violation, in
 // design ticks; `kind` selects the message: 0 = no case item matched (priority
 // or unique, no default), 1 = more than one case item matched (unique /
-// unique0 overlap).
+// unique0 overlap). Pending reports are not flushed on re-execution (docs/LRM_NOTES.md, note 18).
 void rt_observed_case_violation(const char* banner, uint64_t now, int32_t kind);
 
 // Emit and clear every Observed-region report queued this instant. Called by
@@ -862,7 +862,7 @@ uint64_t rt_dist_erlang(int32_t seed, int32_t k, int32_t mean);
 // stream for a spawned child, or the user seed for $urandom(seed).
 // A modern integer PRNG (not the $random LCG) is chosen for quality and speed
 // per PRINCIPLES.md's "unspecified -> pick performance and simplicity"; the stream is
-// therefore intentionally not iverilog-identical.
+// therefore intentionally not iverilog-identical (docs/LRM_NOTES.md, note 25).
 void rt_urandom_seed(uint64_t* state, uint64_t seed);
 
 // -- randc cyclic randomization (LRM §18.6) --
@@ -1162,7 +1162,7 @@ typedef struct rt_queue {
 //   - push_back lands the new element at the tail, so the dropped one is the
 //     element just pushed: pushing onto a full bounded queue has no effect.
 // The same rule governs insert(). LRM 7.10.4 does not pin which end an
-// overflowing push sacrifices.
+// overflowing push sacrifices (docs/LRM_NOTES.md, note 6).
 //
 // q.push_back(e) / q.push_front(e): append `elem` (a `stride`-byte element slot)
 // to the tail / head, growing the ring as needed. `site` is the push's source
@@ -1241,7 +1241,7 @@ void rt_container_format_p(rt_string* out, const void* handle, int32_t is_queue,
 // order, where a width of 0 marks a `void` member, printed as its tag with no
 // `:value`, and `signs` selects a signed decimal payload. A tag that is x/z or
 // names no member has no valid element to print, so the whole flat value renders
-// as one decimal leaf instead.
+// as one decimal leaf instead (docs/LRM_NOTES.md, note 32).
 void rt_tagged_format_p(rt_string* out, const rt_arg* v, uint32_t width, uint32_t tag_bits,
                         uint32_t count, const char* const* names, const uint32_t* name_lens,
                         const uint32_t* widths, const uint32_t* signs, const rt_alloc_site* site);

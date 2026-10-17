@@ -484,8 +484,8 @@ TEST_CASE("atoreal parses a real-literal prefix per LRM 6.16.10") {
 }
 
 // itoa/hextoa/octtoa/bintoa (LRM 6.16.11-6.16.14): sign + magnitude in the
-// given base, lowercase digits — not a two's-complement bit-pattern dump.
-// x/z bits of the operand read as 0 (StrFromPacked's
+// given base, lowercase digits — not a two's-complement bit-pattern dump
+// (docs/LRM_NOTES.md, note 1). x/z bits of the operand read as 0 (StrFromPacked's
 // must-plane convention). Expectations cross-checked vs iverilog.
 TEST_CASE("itoa family formats sign + magnitude per LRM 6.16.11-6.16.14") {
     constexpr std::string_view src = R"(
@@ -507,7 +507,7 @@ TEST_CASE("itoa family formats sign + magnitude per LRM 6.16.11-6.16.14") {
 }
 
 // realtoa (LRM 6.16.15): full round-trip precision, not iverilog's 6-sig-fig
-// %g truncation (a deliberate LRM-compliant deviation).
+// %g truncation, a deliberate choice (docs/LRM_NOTES.md, note 2).
 TEST_CASE("realtoa formats at full round-trip precision") {
     constexpr std::string_view src = R"(
         module m;
@@ -1273,7 +1273,7 @@ TEST_CASE("string comparisons drive control flow") {
     CHECK(run_capture(src) == "yes\n[gogogo]\n");
 }
 
-// -- String truthiness in conditions --
+// -- String truthiness in conditions (docs/LRM_NOTES.md, note 17) --
 //
 // The LRM leaves the truth of a string undefined (§12.4 tests a "numeric
 // value"), so clotho defines it: non-empty = true, empty = false, which is what
@@ -1507,7 +1507,8 @@ void check_rejected(std::string_view source, std::string_view needle) {
 } // namespace
 
 // slang binds `!string` without diagnostic (Type::isBooleanConvertible
-// whitelists StringType) but LRM Table 11-1 makes it illegal; Clotho rejects it.
+// whitelists StringType) but LRM Table 11-1 makes it illegal; Clotho rejects it
+// (docs/LRM_NOTES.md, note 17).
 TEST_CASE("logical negation of a string is rejected") {
     check_rejected(R"(
         module m;

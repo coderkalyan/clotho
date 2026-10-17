@@ -1383,7 +1383,7 @@ struct Inst {
         // 1-bit 4-state equality of two whole unpacked aggregates (payload:
         // op_extra -> AggEqInfo; op is the left lvalue). The backend expands
         // the member walk, AND-reducing per-leaf `==` results so LRM 11.4.5
-        // X-propagation is carried exactly; `!=` is a Lnot
+        // X-propagation is carried exactly (docs/LRM_NOTES.md, note 13); `!=` is a Lnot
         // of this.
         AggEq,
 

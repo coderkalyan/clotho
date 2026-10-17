@@ -580,7 +580,7 @@ TEST_CASE("pow with a constant / mixed-domain exponent is not miscompiled") {
 // The x-producing corner of Table 11-4 (0 ** negative) is coerced to 0 when the
 // result type is 2-state (LRM 6.3.1) but kept as x in a 4-state result. iverilog
 // keeps x even for a 2-state `int` here, an inconsistency with its own plain
-// x-assignment coercion; Clotho follows the LRM.
+// x-assignment coercion; Clotho follows the LRM (docs/LRM_NOTES.md, note 15).
 TEST_CASE("0 ** negative coerces X to 0 in a 2-state result") {
     CHECK(run_capture(R"(module m; int r; integer q;
         initial begin r = 0 ** -1; $display("%0d", r); q = 0 ** -1; $display("%0d", q); end
@@ -2749,8 +2749,8 @@ TEST_CASE("$readmemh into a 2-state memory with elements wider than 64 bits") {
 
 // $fread into elements wider than 64 bits: bytes pack MSB-first across words.
 // Element 0 is full (16 bytes); element 1 reads 4 bytes then hits EOF, so its
-// unread low bytes zero-fill (Icarus shows the prior x there,
-// a documented Clotho deviation). Element 0 and the byte count match Icarus.
+// unread low bytes zero-fill (docs/LRM_NOTES.md, note 34); Icarus shows the prior
+// x there. Element 0 and the byte count match Icarus.
 TEST_CASE("$fread into a memory with elements wider than 64 bits") {
     const char*       path  = "clotho_fread_wide_test.bin";
     const std::string bytes = { '\x01', '\x23', '\x45', '\x67', '\x89', '\xab', '\xcd',

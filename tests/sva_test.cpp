@@ -2152,9 +2152,9 @@ TEST_CASE("goto and non-consecutive repetition in an antecedent are refused") {
     // give. LRM 16.14.1 owes an evaluation of the consequent per antecedent MATCH, so
     // a cycle several matches end in owes several verdicts -- and an unbounded
     // antecedent has unboundedly many attempts that could end a match there, so no
-    // fixed ring of attempt ids tells them apart. Answering with the
-    // count of matching CYCLES instead is what one bit gives and is short by however
-    // many attempts ended together, which is what clotho used to do here.
+    // fixed ring of attempt ids tells them apart (docs/LRM_NOTES.md, note 24).
+    // Answering with the count of matching CYCLES instead is what one bit gives
+    // and is short by however many attempts ended together.
     const std::string_view goto_left = R"(
 module t;
   bit clk, b, c, rst;
@@ -4573,7 +4573,7 @@ TEST_CASE("many attempts resolving in one cycle are reported once each") {
     //
     // `a` samples 1 at t=5..35 and 0 at t=45, so five attempts of `always a` -- the
     // ones opened at 5, 15, 25, 35 and 45 -- are alive and all fail in that single
-    // cycle. Reporting is per attempt, so the answer is five
+    // cycle. Reporting is per attempt (docs/LRM_NOTES.md, note 23), so the answer is five
     // reports at t=45 and not one.
     //
     // This is exactly what one merged state vector cannot do: it preserves the
@@ -4904,8 +4904,8 @@ TEST_CASE("an abort over a multi-cycle antecedent resolves every attempt in flig
     // one bit answered for the whole abort. With a longer one, several attempts can be
     // part-way through the antecedent when the condition fires, and LRM 16.12.7 resolves
     // an attempt wherever it has got to -- so each of them owes its own verdict. The
-    // attempt ids are what tells them apart, which is why this lands with the counting
-    // and not before it.
+    // attempt ids are what tells them apart, so this lowers only with the counting
+    // (docs/LRM_NOTES.md, note 24).
     //
     // `a` is high at ticks 0 and 1, so attempt A starts at 5 and B at 15. `b` never
     // rises, so at tick 1 A is part-way through `a ##[1:2] b` and B has just started:
@@ -5009,17 +5009,18 @@ endmodule
     CHECK(reports("#22 x = 1; y = 1;") == "");
 }
 
-// -- One verdict per attempt -------------------------------
+// -- One verdict per attempt (docs/LRM_NOTES.md, note 23) --------------------
 //
 // LRM 16.12.1 starts an attempt at every tick, and a ranged antecedent can match
 // more than once within ONE of them, each match seeding its own obligation.
-// Clotho used to give each obligation its own verdict; it now gives the ATTEMPT
-// one, and the fixtures below pin that.
+// Clotho gives the ATTEMPT one verdict, not each obligation, and the fixtures
+// below pin that.
 
 TEST_CASE("a twice-matching attempt reports only its first failing obligation") {
-    // The repro for the per-attempt rule, in miniature. `a ##[1:2] b` matches at tick 2 and
-    // again at tick 3 from the single `a` at tick 1, seeding obligations that
-    // check `ok` at ticks 3 and 4. Both fail, and the attempt reports once.
+    // The repro for the per-attempt rule (docs/LRM_NOTES.md, note 23), in
+    // miniature. `a ##[1:2] b` matches at tick 2 and again at tick 3 from the single
+    // `a` at tick 1, seeding obligations that check `ok` at ticks 3 and 4. Both
+    // fail, and the attempt reports once.
     //
     // Reporting per obligation reads `35 45`.
     CHECK(report_times(R"(

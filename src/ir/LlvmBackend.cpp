@@ -4918,7 +4918,8 @@ private:
         // per-definition cacheable — the merged form parked the whole group's
         // code in the always-recompiled root. Single-scope groups keep the
         // merged body inside their unit (no call overhead). Only the population
-        // that cannot otherwise leave root pays the per-member call.
+        // that cannot otherwise leave root pays the per-member call, not every comb
+        // group (docs/design/module-split.md, Partition).
         // Member cap: a cross-module member call cannot be inlined, so the
         // per-activation dispatch cost scales with member count — a 256-member
         // comb group measured 3.7x sim outlined (combchain), while the real
@@ -22739,9 +22740,9 @@ private:
 
     // Lower a unique/priority case violation report: pass the compile-time banner
     // prefix, the simulation time of the violation, and the message kind. The
-    // runtime queues it (LRM 12.4.2 / 12.5.3 defer reporting to the Observed
-    // region) rather than emitting here in the Active region,
-    // so the region continues normally.
+    // runtime queues it and reports in the Observed region, where LRM 12.4.2 /
+    // 12.5.3 place it (docs/LRM_NOTES.md, note 18), rather than emitting here in
+    // the Active region, so the region continues normally.
     void lower_case_viol(Index i) {
         const auto        info   = ir_->extra_data<CaseViolInfo>(ir_->payload(i).extra);
         const std::string banner = ir_->extra_bytes(info.banner, info.banner_len);
@@ -24398,7 +24399,7 @@ private:
     // only a predictable-not-taken load+branch per store, not a runtime call.
     // `make_args` runs inside the taken branch, so index loads (the NBA vcd
     // table, a reused instance's vcd base) stay off the inactive hot path —
-    // the point of the gate.
+    // the point of the gate (see the touch hooks in docs/VCD.md, section 8).
     // `extra` narrows the guard beyond "dumping is active" -- an event carries its
     // dump index in its object, so whether it is dumped at all is a runtime test.
     void emit_guarded_vcd_touch(llvm::FunctionCallee                                  fn,
@@ -28112,7 +28113,7 @@ private:
     // Whole-aggregate `==` (LRM 11.2.2): recursively AND-reduce per-leaf
     // logical equality over the member walk. Any definite member mismatch is
     // 0, else X if any member is unknown, else 1 — the Land reduction carries
-    // LRM 11.4.5 X-propagation exactly.
+    // LRM 11.4.5 X-propagation exactly (docs/LRM_NOTES.md, note 13).
     Plane lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         const Type& t = std::get<Type>(mod_.pool.get(type));
         if (t.kind == Type::Kind::Struct && !t.is_packed) {
@@ -31062,7 +31063,7 @@ private:
     // (a nonblocking assign that commits in the NBA region), a continuous assign
     // updates its net in the active region — visible to same-instant processes — so
     // these commit in a pre-active phase after the wheel tick (emit_active_run),
-    // ahead of the active drain. See LRM 10.3.3.
+    // ahead of the active drain. See LRM 10.3.3 (docs/LRM_NOTES.md, note 9).
     std::vector<Signal>     inertial_sigs_;
 
     // Per (signal, edge): the dense trigger id if that signal+edge fires a

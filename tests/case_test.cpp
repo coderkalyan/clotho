@@ -643,7 +643,7 @@ TEST_CASE("priority case: Observed-region report is stamped with the settled ins
         endmodule
     )";
     const std::string          err = run_capture_stderr(src);
-    // One report per violating settle pass (no maturation yet).
+    // One report per violating settle pass; pending reports are not flushed (docs/LRM_NOTES.md, note 18).
     CHECK(count_occ(err, "no condition is true") == 2);
     // Each report carries the time of its own instant, proving the deferral
     // fires at the settled instant (drain-loop Observed flush), not at t=0.

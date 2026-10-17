@@ -12,8 +12,8 @@ module t;
   end
 
   // The four ways one attempt's two obligations can land, which is what decides
-  // between "report the first", "report the last" and "one verdict per attempt".
-  // `a ##[1:2] b` matches twice from a single `a`, so each
+  // between "report the first", "report the last" and "one verdict per attempt"
+  // (docs/LRM_NOTES.md, note 23). `a ##[1:2] b` matches twice from a single `a`, so each
   // window below is ONE attempt owing ONE verdict:
   //
   //   cyc1  fail-then-pass -> FAIL at cyc3, and the later pass is not reported

@@ -1,5 +1,5 @@
 name = "nba_arr"
-description = "256 nonblocking writes to unpacked-array elements per clock, 50k cycles (12.8M element pushes): the rt_nba_arr_push path -- four heap allocations per element plus a per-timestep commit-queue walk (a known win: inline storage for bounded blobs). The register benches (regs/thunk_ff) never touch this path."
+description = "256 nonblocking writes to unpacked-array elements per clock, 50k cycles (12.8M element writes): the array-NBA record path -- an rt_nba_arr_slot call and a record store per write, then a per-record replay in the NBA region (docs/design/static-arr-nba.md). The register benches (regs/thunk_ff) never touch this path."
 top = "top"
 
 [clotho]

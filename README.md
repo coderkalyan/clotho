@@ -68,8 +68,8 @@ ctest --test-dir build -j 8                        # the whole suite, in paralle
 
 The suite is doctest-based and lives in `tests/`. `tests/perf/` is a benchmark
 harness (`perf.py`) that measures compile and simulation time per case, gates
-regressions against a checked-in baseline, and can measure the same cases under
-iverilog and Verilator for context.
+regressions against a baseline measured on the same machine, and can measure
+the same cases under iverilog and Verilator for context.
 
 ## Contributing
 

@@ -384,8 +384,8 @@ TEST_CASE("real nets, edge events, and casts slang rejects") {
     expect_reject("module m; real r; int i; initial i = signed'(r); endmodule", "");
 }
 
-// A real `case` selector is supported now (matching by IEEE-754 equality,
-// as the cases in case_test.cpp pin). What stays rejected is
+// A real `case` selector is supported: it matches by IEEE-754 equality
+// (docs/LRM_NOTES.md, note 19), as the cases in case_test.cpp pin. What stays rejected is
 // `casez` / `casex` over a real: 12.5.1's do-not-care positions are bit
 // positions, and slang's binder refuses a non-integral selector for either
 // keyword before clotho sees it. (iverilog 13 accepts it and treats it as a

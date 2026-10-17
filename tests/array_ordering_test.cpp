@@ -158,7 +158,7 @@ TEST_CASE("queue sort after push_front (wrapped head)") {
 
 // shuffle() produces a permutation (LRM 7.12.2): sorting the shuffled array
 // recovers the original, and the specific order is the process RNG's stable
-// stream (seed = process index, like $urandom). Both the exact
+// stream, seeded from the process index like $urandom (docs/LRM_NOTES.md, note 25). Both the exact
 // permutation and the sort-recovers invariant are pinned.
 TEST_CASE("dynamic array + queue shuffle is a stable permutation") {
     constexpr std::string_view src = R"(

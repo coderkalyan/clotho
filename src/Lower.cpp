@@ -6284,7 +6284,7 @@ private:
     // MSB), matching Verilator; slang mis-folds it to x..y. Clotho reverses the
     // element order for a descending packed array so the concat is LRM-correct.
     // Positional/replicated are source-ordered (first = leftmost = MSB) and
-    // already correct.
+    // already correct (docs/LRM_NOTES.md, note 11).
     ir::Index lower_packed_pattern(const Expression& expr, ir::Builder& b) {
         const ir::SourceLoc    l   = loc(expr);
         const auto*            pat = as_assignment_pattern(expr);
@@ -9682,7 +9682,7 @@ private:
     // inverts (notif) to the output; at the inactive level the output is high-Z;
     // an x/z control yields X. The LRM's weak L/H results for an x/z control
     // (0-or-z, 1-or-z) collapse to X here: Clotho has no value-strength model,
-    // matching iverilog on a plain wire.
+    // matching iverilog on a plain wire (docs/LRM_NOTES.md, note 37).
     //
     // `pass_z` is the entire difference between Table 28-5 and Table 28-6. A
     // bufif reads a z data bit as x (the Band-with-1 / Bnot clears the z plane),
@@ -11726,8 +11726,8 @@ private:
     // definitely 1, may = any bit could be 1 (Z bits read as X via `may`). This
     // also normalizes a multi-bit predicate to the 1-bit value `b.cond`/`b.select`
     // require; without it the backend emits a mismatched-width icmp.
-    // A string condition is true iff non-empty (the
-    // LRM is silent, and slang's const-eval takes it as len != 0).
+    // A string condition is true iff non-empty: the LRM is silent, and slang's
+    // const-eval takes it as len != 0 (docs/LRM_NOTES.md, note 17).
     // RedOr of the non-negative 2-state length is exactly len != 0, definite
     // 0/1, so it also satisfies the backend's definite-1 loop rule.
     ir::Index lower_predicate(const Expression& cond, ir::Builder& b) {
@@ -11776,7 +11776,7 @@ private:
     // for simulation, LRM 16.4.3) additionally run the `else` action on a false
     // condition, or emit the default failure report (error severity) when there
     // is none. `cover` has no fail action — a false condition does nothing; its
-    // coverage count/report is deliberately unimplemented.
+    // coverage count/report is deliberately unimplemented (docs/LRM_NOTES.md, note 21).
     // Emit one deferred assertion action (LRM 16.4): a single severity system
     // task ($error / $warning / $info), or the default $error when `action` is
     // null on a failing assert/assume. The report is rendered as a Severity node
@@ -13388,7 +13388,8 @@ private:
         // Entry `s` is absent (Signal{0}) for a state that cannot carry an attempt
         // into the next cycle -- see counted_carries.
         std::vector<ir::Signal> counts;
-        // Per-attempt identity, `attempt_ring_size` bits wide and
+        // Per-attempt identity, which gives an attempt one verdict
+        // (docs/LRM_NOTES.md, note 23), `attempt_ring_size` bits wide and
         // all absent when that is 0. `tid[s]` is the set of attempts whose antecedent
         // threads sit in trigger state `s`, one bit per live attempt; `oid[k]` is the
         // set of attempts that seeded obligation slot `k`, which is a SET and not one
@@ -13594,11 +13595,11 @@ private:
     // or two attempts more than one match ENDING TOGETHER:
     //
     //  - GROUPING. A ranged antecedent can match more than once within ONE attempt,
-    //    each match seeding its own obligation, and that attempt gets a
-    //    SINGLE verdict: it fails at its first failing obligation
-    //    and passes only once every one of them has passed.
+    //    each match seeding its own obligation, and that attempt gets a SINGLE
+    //    verdict (docs/LRM_NOTES.md, note 23): it fails at its first failing
+    //    obligation and passes only once every one of them has passed.
     //  - COUNTING. Attempts whose matches end in the SAME cycle raise one shared
-    //    obligation and are still owed a verdict each.
+    //    obligation and are still owed a verdict each (docs/LRM_NOTES.md, note 24).
     //
     // `mon.trigger_window` is libsva's answer to whether either can happen, and 0
     // means neither can -- so the whole mechanism folds away and the monitor keeps
@@ -13617,8 +13618,9 @@ private:
     //
     // What a counted monitor does not get is the grouping -- that needs the id to
     // survive until the obligation resolves, and a counted obligation has no bounded
-    // lifetime for a width to be derived from. So it still reports per obligation
-    // (the residue of the one-verdict rule) and uses the ids for the counting alone.
+    // lifetime for a width to be derived from. So it still reports per obligation,
+    // the residue of the one-verdict rule (docs/LRM_NOTES.md, note 23), and uses
+    // the ids for the counting alone.
     static uint32_t attempt_ring_size(const ir::AssertionMonitor& mon) {
         if (mon.trigger_window == 0) {
             return 0;
@@ -14838,8 +14840,9 @@ private:
             return { st.expect_req, st.expect_busy };
         }
 
-        // Per-attempt grouping. Width 0 switches it off and
-        // every `group` branch below folds away, leaving the per-obligation path.
+        // Per-attempt grouping: an attempt gets one verdict
+        // (docs/LRM_NOTES.md, note 23). Width 0 switches it off and every `group`
+        // branch below folds away, leaving the per-obligation path.
         const uint32_t ring  = attempt_ring_size(mon);
         const bool     group = ring != 0;
 
@@ -15186,7 +15189,7 @@ private:
             }
         }
 
-        // Per-attempt resolution. An attempt is ONE verdict over
+        // Per-attempt resolution (docs/LRM_NOTES.md, note 23). An attempt is ONE verdict over
         // every obligation its antecedent matches seeded: it fails at the first of
         // them to fail, and passes only once all of them have passed and it can
         // match no more. Ungrouped, each obligation is an attempt of its own and
@@ -15368,7 +15371,7 @@ private:
             //
             // Per ATTEMPT, not per obligation, for `cover property`: a twice-matching
             // antecedent is one cover hit, and none at all when one of its obligations
-            // failed. That is the per-attempt rule.
+            // failed (docs/LRM_NOTES.md, note 23).
             ir::Index count = load_signal(st.covered, b, l);
             for (const ir::Index bit : hits) {
                 count = b.binary(ir::Inst::Tag::Add, count, b.resize(bit, mask_type(32), l), l);
@@ -16151,7 +16154,7 @@ private:
         const ir::Index fail_ok =
           st.ctl != nullptr ? bit_not(load_signal(st.ctl->foff, b, l), b, l) : ir::Index{};
 
-        // One report per ATTEMPT here too -- and per attempt is not
+        // One report per ATTEMPT here too (docs/LRM_NOTES.md, note 23) -- and per attempt is not
         // per slot in either direction. A strong attempt still pending at the end of
         // the trace owes ONE failure however many obligations of it are unresolved, and
         // a single slot may stand for SEVERAL attempts, because attempts whose
@@ -18500,7 +18503,7 @@ private:
     // `==` exactly as it does for a string (6.16.9, the same call clotho's string
     // comparison lowering already makes). Clotho therefore matches with IEEE-754
     // equality: `-0.0` matches `0.0`, and a NaN selector matches nothing and
-    // falls to `default`. iverilog 13 agrees. casez / casex
+    // falls to `default` (docs/LRM_NOTES.md, note 19). iverilog 13 agrees. casez / casex
     // are the same comparison: their do-not-care bits are a property of a
     // 4-state vector, and iverilog treats a real casez / casex exactly as a
     // plain case.
@@ -21052,7 +21055,7 @@ private:
     // elaboration — which proves it cannot depend on any runtime input, since
     // plusargs / file contents / $random are not constant-evaluable; Full allows
     // a runtime-computed command. Default-off is a deliberate, security-motivated
-    // deviation from LRM compliance.
+    // deviation from LRM compliance (docs/LRM_NOTES.md, note 29).
     ir::Index lower_system_call(const CallExpression& call, ir::Builder& b) {
         const ir::SourceLoc l    = loc(call);
         const auto          args = call.arguments();
@@ -23109,8 +23112,8 @@ private:
         if (ct.isPackedUnion() || ct.isUnpackedUnion()) {
             // "For unions, only the first declared elements shall be printed." Every
             // member overlays the LSBs, so the first one is the low bits of the flat
-            // value. (An unpacked union lands here too: Clotho gives it the same flat
-            // representation.)
+            // value. An unpacked union lands here too, because Clotho gives it the
+            // same flat representation (docs/LRM_NOTES.md, note 3).
             for (const auto& f : union_scope(ct).membersOfType<FieldSymbol>()) {
                 const slang::ast::Type& mt = f.getType();
                 frag += "'{";
@@ -23332,7 +23335,7 @@ private:
         if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
             // `'{field:val, ...}` — LRM 21.2.1.6 requires the member names for an
             // unpacked struct ("an assignment pattern with named elements"); only the
-            // white space between them is implementation-defined.
+            // white space between them is implementation-defined (docs/LRM_NOTES.md, note 32).
             frag += "'{";
             const auto fields = module_.pool.struct_fields(t.fields_id);
             // Field order is declaration order on both sides, so the slang members
@@ -24687,7 +24690,7 @@ private:
                 // Per-element, element-order (position k of dst <- position k of
                 // the source), reading the source through a staging temp when the
                 // two may overlap. A single-memcpy deferred record for the NBA
-                // whole-array case is a perf follow-up.
+                // whole-array case is a performance gap listed in docs/TODO.md.
                 emit_agg_copy(lower_lvalue(a.left(), b), array_copy_source(a.left(), src, ty, b, loc(a)), ty, tag,
                               b, loc(a), nbt);
                 return true_const(b, loc(a));
@@ -26062,7 +26065,7 @@ private:
         }
         // An empty array reduces to 0, not to the fold's identity -- LRM 7.12.3 does
         // not say, and Verilator answers 0 for all five, including `product` and
-        // `and`.
+        // `and` (docs/LRM_NOTES.md, note 8).
         const ir::Index n     = b.unary(T::Load, bound.lv(b, l), l);
         const ir::Index empty = b.binary(T::Eq, n, b.constant(module_.pool.put_int(i32, 0), l), l);
         return b.select(empty, b.constant(module_.pool.put_int(rty, 0), l), b.unary(T::Load, acc.lv(b, l), l), l);
@@ -26761,10 +26764,11 @@ private:
 
     // One pattern member: a nested pattern/concat recurses; a plain lvalue
     // whose element type is itself an aggregate is a whole-object copy; a
-    // scalar leaf is an ordinary truncating/extending assignment. (LRM 10.9
+    // scalar leaf is an ordinary truncating/extending assignment. LRM 10.9
     // requires a member to have "the same number of bits" as its RHS element;
     // Clotho does not enforce that here, and lets a mismatch truncate or extend
-    // exactly like the plain scalar assignment this is sugar for.)
+    // exactly like the plain scalar assignment this is sugar for
+    // (docs/LRM_NOTES.md, note 12).
     void store_pattern_elem(const Expression&    member,
                             ir::Index            rhs_elem_addr,
                             ir::Ref              elem_ty,
@@ -28167,7 +28171,7 @@ private:
                 if (is_string_expr(u.operand())) {
                     // Illegal: LRM Table 11-1 restricts logical operators to
                     // integral/real/shortreal, and Table 6-9 defines no logical
-                    // operators on strings.
+                    // operators on strings (docs/LRM_NOTES.md, note 17).
                     // TODO: fix upstream in slang — Type::isBooleanConvertible
                     // whitelists StringType, so UnaryLogicalNot binds with no
                     // diagnostic and reaches us.

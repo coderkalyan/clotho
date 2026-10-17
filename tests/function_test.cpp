@@ -437,8 +437,9 @@ TEST_CASE("&& and || evaluate the right operand on an x/z left") {
 // a definite-false left makes the implication definitely true without
 // evaluating the right operand. `<->` is deliberately absent from that list
 // -- LRM 11.4.7 requires each operand "evaluated exactly once" -- so it always
-// calls the side-effecting right operand. iverilog does not implement ->'s
-// short-circuit (evaluates the right operand unconditionally).
+// calls the side-effecting right operand (docs/LRM_NOTES.md, note 14). iverilog
+// does not implement ->'s short-circuit (evaluates the right operand
+// unconditionally).
 TEST_CASE("-> short-circuits but <-> always evaluates its right operand") {
     constexpr std::string_view src = R"(
         module m;

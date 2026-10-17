@@ -448,8 +448,8 @@ TEST_CASE("gate truth tables match LRM tables 28-3 / 28-4, including X") {
 
 TEST_CASE("three-state gate truth tables match LRM table 28-5, including X/Z") {
     // Data d and control c sweep 0/1/x/z. The weak L/H results the LRM lists for
-    // an x/z control collapse to X (no strength model); every row matches
-    // iverilog on a plain wire.
+    // an x/z control collapse to X, as there is no strength model
+    // (docs/LRM_NOTES.md, note 37); every row matches iverilog on a plain wire.
     const std::string out = run_capture(R"(
         module top;
             logic d, c;
@@ -504,8 +504,8 @@ TEST_CASE("MOS switch truth tables match LRM table 28-6, including the z pass-th
     // whole DATA=z row is z. Every other cell is character-identical to Table
     // 28-5, the weak L/H results for an x/z control collapsing to X (Clotho has
     // no value-strength model). rnmos/rpmos are indistinguishable from
-    // nmos/pmos: the LRM 28.14 strength reduction is not modeled.
-    // Oracle: iverilog 13.
+    // nmos/pmos: the LRM 28.14 strength reduction is not modeled
+    // (docs/LRM_NOTES.md, note 38). Oracle: iverilog 13.
     const std::string out = run_capture(R"(
         module top;
             logic d, c;
@@ -560,7 +560,7 @@ TEST_CASE("a cmos switch drives its output from both halves independently") {
     // must survive the resolver rather than blending to x. It only does if the
     // Classify pass recorded two drivers so the net actually resolved — with one
     // recorded driver both halves take the plain-store path and stomp each other.
-    // rcmos behaves identically (no strength reduction).
+    // rcmos behaves identically: no strength reduction (docs/LRM_NOTES.md, note 38).
     // Oracle: iverilog 13.
     const std::string out = run_capture(R"(
         module top;

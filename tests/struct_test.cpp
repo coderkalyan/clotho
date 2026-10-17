@@ -617,7 +617,7 @@ TEST_CASE("%p of a tagged union whose tag is x falls back to the flat value") {
     // An uninitialized tagged union has undefined tag bits (LRM 11.9), so no member
     // is valid and there is no `tag:value` to print. LRM 21.2.1.6 does not cover
     // that, so the whole flat value renders as one integral leaf — all-x under the
-    // decimal leaf rule, rather than inventing a member name.
+    // decimal leaf rule, rather than inventing a member name (docs/LRM_NOTES.md, note 32).
     CHECK(run_capture(R"(
         module m;
             typedef union tagged packed { void Invalid; logic [15:0] Valid; } opt_t;
@@ -929,7 +929,7 @@ TEST_CASE("unpacked struct declaration initializer") {
 
 TEST_CASE("unpacked struct equality is field-wise; X makes it ambiguous (LRM 11.4.5)") {
     // == / != reduce over members; an unknown member makes the relation
-    // ambiguous, so the result is X.
+    // ambiguous, so the result is X (docs/LRM_NOTES.md, note 13).
     CHECK(run_capture(R"(
         module m;
             typedef struct { logic [7:0] a; bit [3:0] b; } s_t;
@@ -2001,7 +2001,7 @@ TEST_CASE("aggregate subroutine arguments Clotho still refuses loudly") {
 
 TEST_CASE("whole unpacked struct as a $display %p operand renders a pattern") {
     // %p expands the struct at lower time into `'{field:val, ...}` (LRM 21.2.1.6);
-    // integral leaves render as the clause's unformatted decimal.
+    // integral leaves render as the clause's unformatted decimal (docs/LRM_NOTES.md, note 32).
     CHECK(run_capture(R"(
         module m;
             typedef struct { logic [7:0] a; int b; } s_t;

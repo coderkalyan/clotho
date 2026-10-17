@@ -351,7 +351,7 @@ TEST_CASE("package-internal import does not leak without export") {
 
 // `export pkg::*;` (LRM 26.4) makes a re-exported name reachable through a
 // further `import`, when the exporting package's own body also references
-// that name somewhere. slang resolves it that way,
+// that name somewhere (docs/LRM_NOTES.md, note 36). slang resolves it that way,
 // and the fully general case has no independent confirmation.
 TEST_CASE("export re-export via a further import") {
     const std::string out = run_capture(R"(

@@ -11,15 +11,15 @@ module t;
     $display("[%0t] cyc=%0d a=%b b=%b ok=%b", $time, cyc, a, b, ok);
   end
 
-  // The repro for the per-attempt rule: `diff_firstmatch.sv`'s trace with `first_match`
-  // dropped, so the later match of each window seeds an obligation of its own
-  // instead of being suppressed.
+  // The repro for the per-attempt rule (docs/LRM_NOTES.md, note 23):
+  // `diff_firstmatch.sv`'s trace with `first_match` dropped, so the later match of
+  // each window seeds an obligation of its own instead of being suppressed.
   //
   // An attempt (LRM 16.12.1, one per tick) whose antecedent matches twice owes
   // ONE verdict, not one per obligation: it fails at the FIRST obligation to
   // fail and never reports again, and it passes only once every one of them has
-  // passed. Clotho used to report per obligation, so the cyc26 window below
-  // printed twice. Six windows, one `a` pulse each:
+  // passed. Reporting per obligation would print the cyc26 window below twice.
+  // Six windows, one `a` pulse each:
   //
   //   cyc1  both matches; the early obligation passes, the late one fails
   //   cyc7  only the early match exists, and it fails

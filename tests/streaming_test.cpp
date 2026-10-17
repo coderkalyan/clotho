@@ -240,6 +240,7 @@ TEST_CASE("stream << multi-width operands") {
 // NOTE: LRM §11.4.14.2 lists {<<2{{<<4{4'b1101}}}} as generating 'b1110, but
 // all other LRM examples match, slang's constant evaluator gives 'b0111, and
 // manual derivation gives 'b0111 — this appears to be a typo in the LRM.
+// Clotho follows the rules (docs/LRM_NOTES.md, note 16).
 TEST_CASE("stream << nested") {
     const std::string out = run_capture(R"(
         module t;

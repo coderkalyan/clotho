@@ -284,7 +284,7 @@ TEST_CASE("implicit finish waits for every program initial") {
 }
 
 // The LRM does not settle what happens when the last program initial's final
-// act is a blocking store that wakes an always block: whether
+// act is a blocking store that wakes an always block (docs/LRM_NOTES.md, note 35): whether
 // that block runs before the implicit $finish. Clotho does not run it, because
 // that is what clotho's explicit $finish already does (lower_finish empties the
 // rings) and a second, contradictory convention for the same LRM sentence would
