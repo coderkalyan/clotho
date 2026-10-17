@@ -7,8 +7,10 @@ cases/*/design.sv
 !cases/nba_arr/design.sv
 !cases/wide_mul/design.sv
 !cases/str_numeric/design.sv
-# Per-run results; only baseline.json and oracles.json are checked in.
+# Measurements are machine-specific and stay local.
 results.json
+baseline.json
+oracles.json
 # Oracle tool build artifacts (runs execute in the case directory).
 cases/*/iv.out
 cases/*/obj_dir/
