@@ -94,3 +94,10 @@ The patches to slang in `patches/` are licensed under the MIT License (see
 
 Third-party components and their licenses are listed in
 `THIRD_PARTY_NOTICES.md`.
+
+These terms apply to every revision in this repository's history, including
+revisions that predate the license files, with two exceptions. Third-party files
+listed in `THIRD_PARTY_NOTICES.md`, or whose own headers state other terms, keep
+their own licenses. `src/runtime/` is MPL-2.0 from the commit "runtime: license
+src/runtime under MPL-2.0" onward; in earlier revisions it is GPL-3.0-only like
+the rest of Clotho.
