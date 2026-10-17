@@ -11,8 +11,8 @@ Clotho is licensed under GPL-3.0-only (`LICENSE.txt`), with these exceptions:
 
 This file lists third-party code that Clotho builds against, links, or carries
 in its source tree. The full text of each license is in `LICENSES/`, copied
-verbatim from the upstream project, or for BSL-1.0 and SHL-0.51 from the SPDX
-reference text.
+verbatim from the upstream project, or for BSL-1.0, SHL-0.51 and BSD-2-Clause
+from the SPDX reference text.
 
 ## Linked into the `clotho` executable
 
@@ -58,8 +58,8 @@ is downloaded by each case's `fetch.sh` and is not stored in this repository.
 | `coremark_cv32e40p/tb/{cv32e40p_tb_subsystem,dp_ram,mm_ram,tb_top,cv32e40p_random_interrupt_generator}.sv` (modified) | [OpenHW cv32e40p](https://github.com/openhwgroup/cv32e40p) | SHL-0.51 (`LICENSES/SHL-0.51.txt`) |
 | `coremark_*/fw/port/core_portme.{c,h}` (modified) | [EEMBC CoreMark](https://github.com/eembc/coremark) `barebones/` port | Apache-2.0 (`LICENSES/Apache-2.0.txt`) |
 | `coremark_cv32e40p/fw/bsp/vectors.S` | ETH Zürich and University of Bologna | Apache-2.0 (`LICENSES/Apache-2.0.txt`) |
-| `coremark_cv32e40p/fw/bsp/crt0.S` | SiFive Inc., ETH Zürich and University of Bologna | BSD-2-Clause (FreeBSD), notice in file |
-| `coremark_cv32e40p/fw/bsp/link.ld` | Free Software Foundation; ETH Zürich and University of Bologna | permissive notice in file |
+| `coremark_cv32e40p/fw/bsp/crt0.S`; `coremark_picorv32/fw/bsp/crt0.S` (modified) | SiFive Inc., ETH Zürich and University of Bologna | BSD-2-Clause (FreeBSD) (`LICENSES/BSD-2-Clause.txt`), notice in file |
+| `coremark_cv32e40p/fw/bsp/link.ld`; `coremark_{picorv32,hazard3}/fw/bsp/link.ld` (modified) | Free Software Foundation; ETH Zürich and University of Bologna | permissive notice in file |
 | `picorv32/testbench.v`, `coremark_picorv32/testbench.v` | [YosysHQ picorv32](https://github.com/YosysHQ/picorv32) | public domain, notice in file |
 | `coremark_*/coremark.hex` | compiled from [EEMBC CoreMark](https://github.com/eembc/coremark) with the files above | Apache-2.0 (`LICENSES/Apache-2.0.txt`) |
 
