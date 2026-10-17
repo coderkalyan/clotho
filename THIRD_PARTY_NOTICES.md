@@ -39,18 +39,18 @@ unordered_dense's MIT license does not.
 ## Vendored in `tests/perf/cases/`
 
 Benchmark inputs, not part of any Clotho binary. Each file keeps its upstream
-header. Core RTL is downloaded by each case's `fetch.sh` and is not stored in
-this repository.
+header; files Clotho modified also carry a notice saying what changed. Core RTL
+is downloaded by each case's `fetch.sh` and is not stored in this repository.
 
 | Files | Origin | License |
 |---|---|---|
-| `coremark_cv32e40p/tb/{cv32e40p_tb_subsystem,dp_ram,mm_ram,tb_top}.sv` | [OpenHW cv32e40p](https://github.com/openhwgroup/cv32e40p) | SHL-0.51 (`LICENSES/SHL-0.51.txt`) |
+| `coremark_cv32e40p/tb/{cv32e40p_tb_subsystem,dp_ram,mm_ram,tb_top,cv32e40p_random_interrupt_generator}.sv` (modified) | [OpenHW cv32e40p](https://github.com/openhwgroup/cv32e40p) | SHL-0.51 (`LICENSES/SHL-0.51.txt`) |
+| `coremark_*/fw/port/core_portme.{c,h}` (modified) | [EEMBC CoreMark](https://github.com/eembc/coremark) `barebones/` port | Apache-2.0 (`LICENSES/Apache-2.0.txt`) |
 | `coremark_cv32e40p/fw/bsp/vectors.S` | ETH Zürich and University of Bologna | Apache-2.0 (`LICENSES/Apache-2.0.txt`) |
 | `coremark_cv32e40p/fw/bsp/crt0.S` | SiFive Inc., ETH Zürich and University of Bologna | BSD-2-Clause (FreeBSD), notice in file |
 | `coremark_cv32e40p/fw/bsp/link.ld` | Free Software Foundation; ETH Zürich and University of Bologna | permissive notice in file |
 | `picorv32/testbench.v`, `coremark_picorv32/testbench.v` | [YosysHQ picorv32](https://github.com/YosysHQ/picorv32) | public domain, notice in file |
-| `coremark_*/coremark.hex` | compiled from [EEMBC CoreMark](https://github.com/eembc/coremark) | Apache-2.0 (`LICENSES/Apache-2.0.txt`) |
-| `picorv32/firmware/firmware.hex` | picorv32 firmware (public domain), linking the riscv-tests suite (The Regents of the University of California) | public domain; BSD-3-Clause (`LICENSES/riscv-tests.txt`) |
+| `coremark_*/coremark.hex` | compiled from [EEMBC CoreMark](https://github.com/eembc/coremark) with the files above | Apache-2.0 (`LICENSES/Apache-2.0.txt`) |
 
 CoreMark® is a registered trademark of EEMBC. The images above are used to
 measure simulator speed; they are not CoreMark scores.
