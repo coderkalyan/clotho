@@ -376,7 +376,7 @@ def gen_combchain(depth: int, cycles: int) -> str:
     one continuous assign, wired input->output through ports. Every clock edge
     ripples one wave of DEPTH single-assign activations down the chain, so the
     bench is dominated by per-wave wake/subscription/port-copy cost -- the
-    target of comb-process fusion.
+    target of comb-process fusion (docs/design/comb-fusion.md).
     Per-activation cost measured ~4x the thunk_comb figure."""
     out = []
     out.append("module stage(input wire [31:0] in, output wire [31:0] out);")
