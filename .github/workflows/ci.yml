@@ -36,7 +36,7 @@ env:
   # nothing else records this today (§8's delivery-mechanism decision is
   # still open — this is the minimal fix, not that one).
   ZIG_VERSION: "0.16.0"
-  LIBSVA_REF: "51dbffa09b924ac3ce2e6c343c149ba59dd3a7d5"
+  LIBSVA_REF: "0f41ddad8277b1625b51610ac76b1ae25728de08"
 
 jobs:
   plan:
@@ -98,7 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Zig builds libsva (CMakeLists.txt:237-244). Windows gets it from
+      # Zig builds libsva (CLOTHO_SVA in CMakeLists.txt). Windows gets it from
       # MSYS2's own package below instead of this action, since a JS action's
       # PATH addition is not guaranteed to reach the msys2 shell every later
       # step runs in.
@@ -180,7 +180,7 @@ jobs:
           # pacboy's `:p` suffix picks the environment's package prefix, so one
           # list serves both CLANG64 and CLANGARM64. Python is slang's — its
           # CMakeLists requires an interpreter for its generated sources.
-          # zig builds libsva (CMakeLists.txt:237-244); a MSYS2 package rather
+          # zig builds libsva (CLOTHO_SVA in CMakeLists.txt); a MSYS2 package rather
           # than mlugg/setup-zig, since that action's PATH addition is not
           # guaranteed to reach the msys2 shell every later step runs in. git
           # is unprefixed (an msys package, not an arch-specific mingw one):
