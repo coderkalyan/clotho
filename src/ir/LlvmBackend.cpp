@@ -11629,7 +11629,6 @@ private:
     // what makes a multi-event wait correct without a compaction pass.
     void emit_event_wake_list(llvm::Value* obj) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
         auto* nty  = event_node_ty();
         auto* null = llvm::ConstantPointerNull::get(ptr);
         auto* fn   = b_.GetInsertBlock()->getParent();
@@ -29427,7 +29426,6 @@ private:
     // on the scheduled flag, the design's one-wake-per-thread token.
     void emit_proc_wake_waiters(llvm::Value* head) {
         auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-        auto* i32  = b_.getInt32Ty();
         auto* nty  = event_node_ty();
         auto* null = llvm::ConstantPointerNull::get(ptr);
         auto* fn   = b_.GetInsertBlock()->getParent();
@@ -29831,7 +29829,7 @@ private:
     // live children, so an empty child list means the whole subtree is done -- and the
     // wake comes from the last descendant's completion, which takes this thread's
     // waiter list when it sees the WAIT_FORK flag.
-    void lower_wait_fork(Index i) {
+    void lower_wait_fork() {
         if (pcb_ == nullptr || hdl_ == nullptr) {
             throw BackendError{ "internal: `wait fork` with no calling thread" };
         }
@@ -29957,7 +29955,7 @@ private:
         const auto info = ir_->extra_data<ProcCtlInfo>(ir_->payload(i).extra);
         const auto args = ir_->region(info.args);
         if (info.op == ProcOp::WaitFork) {
-            lower_wait_fork(i);
+            lower_wait_fork();
             return;
         }
         if (info.op != ProcOp::Await) {
@@ -30302,7 +30300,6 @@ private:
         if (args.size() != 2) {
             throw BackendError{ "internal: sync_wait takes a head and a tail word" };
         }
-        auto*        ptr   = llvm::PointerType::getUnqual(ctx_);
         llvm::Value* qhead = sync_word_ptr(args[0]);
         llvm::Value* qtail = sync_word_ptr(args[1]);
         llvm::Value* node  = sync_wait_node(info.site);

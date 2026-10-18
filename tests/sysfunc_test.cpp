@@ -48,13 +48,6 @@ std::string prog(std::string_view decls, std::string_view body) {
            "\n $finish;\n end\nendmodule\n";
 }
 
-// Confirm lowering fails loudly for an unsupported construct.
-std::string lower_error(std::string_view source) {
-    const LowerResult r = lower_text(source);
-    REQUIRE_FALSE(r.ok);
-    return r.diagnostic_text();
-}
-
 } // namespace
 
 // -- $bits ------------------------------------------------------------------

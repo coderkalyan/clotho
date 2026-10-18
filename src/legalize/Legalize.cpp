@@ -284,10 +284,10 @@ public:
       , proc_(proc_index)
       , guards_(guards)
       , notes_(notes)
-      , eval_(eval)
-      , fns_(fns)
       , honour_full_(honour_full)
-      , honour_parallel_(honour_parallel) {}
+      , honour_parallel_(honour_parallel)
+      , eval_(eval)
+      , fns_(fns) {}
 
     ProcessResult run(const ir::Ir& ir) {
         walk(ir, ir.root(), GuardId::None);

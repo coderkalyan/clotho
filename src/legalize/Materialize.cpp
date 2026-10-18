@@ -1116,7 +1116,6 @@ void emit_process(std::string&                    os,
                   const Result*                   result,
                   size_t                          k,
                   const std::vector<std::string>& sig_names,
-                  SynthConfig                     cfg,
                   Renderer&                       render,
                   std::vector<Atom>&              pool);
 
@@ -1356,7 +1355,7 @@ void emit_module_body(std::string&                    os,
     }
 
     for (const size_t k : logic) {
-        emit_process(os, m, result, k, names.sig, cfg, render, pool);
+        emit_process(os, m, result, k, names.sig, render, pool);
     }
     os += "endmodule\n\n";
 }
@@ -1388,7 +1387,6 @@ void emit_process(std::string&                    os,
                   const Result*                   result,
                   size_t                          k,
                   const std::vector<std::string>& sig_names,
-                  SynthConfig                     cfg,
                   Renderer&                       render,
                   std::vector<Atom>&              pool) {
     const ProcessResult* pr   = result != nullptr ? &result->processes[k] : nullptr;
@@ -1624,7 +1622,7 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
     }
 
     for (size_t k = 0; k < module.processes().size(); ++k) {
-        emit_process(os, module, result, k, sig_names, cfg, render, pool);
+        emit_process(os, module, result, k, sig_names, render, pool);
     }
     os += "endmodule\n";
 

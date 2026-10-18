@@ -384,8 +384,7 @@ void report_timings(const clotho::Timings& t, Command command) {
     std::println(stderr, "  {:<12}{:>12.3f}", "total", total);
 }
 
-
-// `build`: write the requested artifact. `-o -` (the default) means stdout.
+#ifdef CLOTHO_SYNTH
 // Write `text` to `out`, or to stdout for "-".
 bool write_text(std::string_view out, const std::string& text) {
     if (out == "-") {
@@ -400,7 +399,9 @@ bool write_text(std::string_view out, const std::string& text) {
     os << text;
     return true;
 }
+#endif
 
+// `build`: write the requested artifact. `-o -` (the default) means stdout.
 bool write_artifact(const clotho::LowerResult& result,
                     Emit                       emit,
                     std::string_view           out,

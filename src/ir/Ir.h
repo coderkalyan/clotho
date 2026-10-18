@@ -39,6 +39,10 @@ namespace clotho::ir {
 
 // SSA-style handle to an instruction's result / the instruction itself.
 enum class Index : uint32_t {};
+// No instruction: the initial value of a handle assigned only on some paths, so
+// a use on a path that never assigned it indexes out of range instead of reading
+// instruction 0.
+inline constexpr Index kNoIndex = static_cast<Index>(~uint32_t{ 0 });
 // Offset into the flat u32 extra side-table.
 enum class ExtraIndex : uint32_t {};
 // Opaque, frontend-defined per-instruction source location (no reserved values).

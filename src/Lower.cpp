@@ -4041,7 +4041,7 @@ private:
             return;
         }
         const ir::Ref ev = module_.pool.event_type;
-        for (const auto [edge, suffix] : { std::pair{ ir::Edge::Positive, ".pos" },
+        for (const auto& [edge, suffix] : { std::pair{ ir::Edge::Positive, ".pos" },
                                            std::pair{ ir::Edge::Negative, ".neg" },
                                            std::pair{ ir::Edge::Any, "" } }) {
             const uint32_t at = slots->second[static_cast<uint32_t>(edge)];
@@ -8081,8 +8081,7 @@ private:
     // transitions inertially and emit_wire_resolvers re-folds when any slot
     // changes. Delaying the resolved net instead would smear every driver's
     // timing together, so the delay always rides this slot store.
-    void store_driver_slot(ir::Signal        net,
-                           const Expression& left,
+    void store_driver_slot(const Expression& left,
                            ir::Signal        slot,
                            ir::Index         val,
                            const Expression* delay_expr,
@@ -8120,7 +8119,7 @@ private:
                               const Expression*           delay_expr = nullptr) {
         const ir::Index  val  = build_driver_slot_value(net, left, lower_expr(a.right(), b), b, l);
         const ir::Signal slot = alloc_driver_slot(net, l, strength);
-        store_driver_slot(net, left, slot, val, delay_expr, b, l);
+        store_driver_slot(left, slot, val, delay_expr, b, l);
         add_continuous_process(continuous_events(a), l, b);
     }
 
@@ -9770,7 +9769,7 @@ private:
                                    const Expression*          delay_expr = nullptr) {
         const ir::Index  slot_val = build_driver_slot_value(net, left, val, b, l);
         const ir::Signal slot     = alloc_driver_slot(net, l, strength);
-        store_driver_slot(net, left, slot, slot_val, delay_expr, b, l);
+        store_driver_slot(left, slot, slot_val, delay_expr, b, l);
         add_continuous_process(std::move(wait_events), l, b);
     }
 
@@ -12867,41 +12866,38 @@ private:
         using AK  = slang::ast::AssertionKind;
         using AEK = slang::ast::AssertionExprKind;
 
-        ir::AssertionKind kind;
-        switch (a.assertionKind) {
-            case AK::Assert:
-                kind = ir::AssertionKind::Assert;
-                break;
-            case AK::Assume:
-                kind = ir::AssertionKind::Assume;
-                break;
-            case AK::CoverProperty:
-            case AK::CoverSequence:
-                kind = ir::AssertionKind::Cover;
-                break;
-            case AK::Restrict:
-                // Accepted, lowered, and then deliberately silent. `restrict`
-                // constrains the input space a FORMAL tool may explore; LRM 16.12
-                // gives it no simulation verdict at all, and slang enforces that
-                // by rejecting an action block on one. Lowering it anyway is not
-                // pointless: the property is bound, its roots are sampled, and a
-                // shape libsva cannot handle is still refused here rather than
-                // waved through. What emit_monitor then skips is the verdict, the
-                // report and the action pend -- see the switch there.
-                kind = ir::AssertionKind::Restrict;
-                break;
-            case AK::Expect:
-                // LRM 16.17. A procedural, BLOCKING directive: the same property
-                // layer as an assert, plus a one-shot seed and a wait. slang binds
-                // it as a ConcurrentAssertionStatement and dispatches it as a
-                // statement, so what arrives here is indistinguishable from an
-                // `assert property` until this point -- and everything downstream of
-                // the monitor is what tells them apart (bare_seed_gate,
-                // emit_expect_step, and the wait emitted at the bottom of this
-                // function).
-                kind = ir::AssertionKind::Expect;
-                break;
-        }
+        const ir::AssertionKind kind = [&] {
+            switch (a.assertionKind) {
+                case AK::Assert:
+                    return ir::AssertionKind::Assert;
+                case AK::Assume:
+                    return ir::AssertionKind::Assume;
+                case AK::CoverProperty:
+                case AK::CoverSequence:
+                    return ir::AssertionKind::Cover;
+                case AK::Restrict:
+                    // Accepted, lowered, and then deliberately silent. `restrict`
+                    // constrains the input space a FORMAL tool may explore; LRM 16.12
+                    // gives it no simulation verdict at all, and slang enforces that
+                    // by rejecting an action block on one. Lowering it anyway is not
+                    // pointless: the property is bound, its roots are sampled, and a
+                    // shape libsva cannot handle is still refused here rather than
+                    // waved through. What emit_monitor then skips is the verdict, the
+                    // report and the action pend -- see the switch there.
+                    return ir::AssertionKind::Restrict;
+                case AK::Expect:
+                    // LRM 16.17. A procedural, BLOCKING directive: the same property
+                    // layer as an assert, plus a one-shot seed and a wait. slang binds
+                    // it as a ConcurrentAssertionStatement and dispatches it as a
+                    // statement, so what arrives here is indistinguishable from an
+                    // `assert property` until this point -- and everything downstream of
+                    // the monitor is what tells them apart (bare_seed_gate,
+                    // emit_expect_step, and the wait emitted at the bottom of this
+                    // function).
+                    return ir::AssertionKind::Expect;
+            }
+            __builtin_unreachable();
+        }();
         // `cover sequence` counts every MATCH of the sequence where `cover
         // property` counts the attempts that succeeded (LRM 16.12.6). Same
         // automaton, same SVA_COVER to libsva, so the distinction is carried
@@ -14855,7 +14851,7 @@ private:
         }
 
         // This cycle's attempt id (next_attempt_id).
-        ir::Index id_now;
+        ir::Index id_now = ir::kNoIndex;
         if (group) {
             id_now = next_attempt_id(st, ring, active, edge, b, l);
         }
@@ -14867,9 +14863,9 @@ private:
         // resolves its whole attempt, which means killing that attempt's remaining
         // antecedent threads too, and that cannot be known until the verdicts.
         ir::Index              fires = zero_mask(1, b, l);
-        ir::Index              trig_next;
-        ir::Index              fired_ids;
-        ir::Index              in_flight_ids;
+        ir::Index              trig_next     = ir::kNoIndex;
+        ir::Index              fired_ids     = ir::kNoIndex;
+        ir::Index              in_flight_ids = ir::kNoIndex;
         std::vector<ir::Index> tid_next;
         if (mon.has_trigger) {
             const uint32_t  trig  = mon.trigger.state_count;
@@ -15023,7 +15019,7 @@ private:
         // A trigger-covering abort cannot interfere: libsva admits one only over
         // an antecedent whose every match is a single cycle, which is exactly the
         // shape attempt_ring_size leaves ungrouped.
-        ir::Index seed_ids;
+        ir::Index seed_ids = ir::kNoIndex;
         if (group) {
             seed_ids = mon.overlap ? fired_ids : load_signal(st.firedid, b, l);
         }
@@ -15504,7 +15500,7 @@ private:
             covers_trigger = covers_trigger || abort.covers_trigger;
         }
 
-        ir::Index id_now;
+        ir::Index id_now = ir::kNoIndex;
         if (ids) {
             id_now = next_attempt_id(st, ring, active, edge, b, l);
         }
@@ -15529,8 +15525,8 @@ private:
         // cycle's seed before they are written for the next one, exactly as the ring
         // path orders it.
         ir::Index              fires = zero_mask(1, b, l);
-        ir::Index              fired_ids;
-        ir::Index              trig_next;
+        ir::Index              fired_ids = ir::kNoIndex;
+        ir::Index              trig_next = ir::kNoIndex;
         std::vector<ir::Index> tid_next;
         if (mon.has_trigger) {
             const uint32_t  trig  = mon.trigger.state_count;
@@ -15570,7 +15566,7 @@ private:
         // trigger states, exits included (../libsva/test/backend.c:396-420).
         std::optional<ir::Index> trigger_matched;
         std::optional<ir::Index> trigger_failed;
-        ir::Index                in_flight;
+        ir::Index                in_flight = ir::kNoIndex;
         if (mon.has_trigger) {
             // The scope an abort covering the antecedent reaches. Without ids the only
             // attempt in flight IS the match ending now, so `fires` is the whole of it
@@ -15739,7 +15735,7 @@ private:
         //
         // `seed_ids` is which attempts matched, riding the same one-cycle carry
         // `st.fired` does, and `seeding` is whether there were any.
-        ir::Index seed_ids;
+        ir::Index seed_ids = ir::kNoIndex;
         if (ids) {
             seed_ids = mon.overlap ? fired_ids : load_signal(st.firedid, b, l);
         }

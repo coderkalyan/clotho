@@ -2,11 +2,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <string_view>
 
 #include "Lower.h"
 #include "PosixIo.h"
+#include "Subprocess.h"
 #include "ir/Jit.h"
 
 using namespace clotho;
@@ -59,9 +61,9 @@ std::string report_of(std::string_view source) {
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
 
-    // tmpnam is fine here and mkstemp is not: the runtime opens the path itself,
-    // so the test must hand over a NAME, not a descriptor.
-    const std::string    path = std::string(std::tmpnam(nullptr));
+    // The runtime opens the report path itself, so the test hands over a name.
+    const std::string path =
+      (std::filesystem::temp_directory_path() / (clotho::test::detail::unique_stem() + ".cov")).string();
     ir::SimulationConfig cfg;
     cfg.coverage_report = path;
 

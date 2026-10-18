@@ -7416,7 +7416,9 @@ static void vcd_register(std::string_view ref, uint32_t width, uint32_t flags, c
 // Mirror of g_vcd.active exposed as a plain external byte (global scope so the
 // symbol matches the JIT's external reference) so the JIT can inline the "is VCD
 // dumping active?" check and skip the rt_vcd_touch call entirely when it is not.
-extern "C" unsigned char rt_vcd_active = 0;
+extern "C" {
+unsigned char rt_vcd_active = 0;
+}
 
 extern "C" void rt_vcd_var(const char* name, uint32_t name_len, uint32_t width, uint32_t flags,
                            const uint8_t* mm, const uint8_t* z) {
