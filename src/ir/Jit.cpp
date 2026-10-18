@@ -276,9 +276,9 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_vcd_close", &rt_vcd_close);
     expose("rt_alloc", &rt_alloc);
     expose("rt_free", &rt_free);
-    // Garbage collection (LRM 8.4; docs/design/garbage-collection.md). Emitted
-    // only under --gc, but exposed unconditionally: the allow-list is a property
-    // of the runtime, not of one design's config.
+    // Garbage collection (LRM 8.4; docs/design/garbage-collection.md). Every
+    // design's main calls rt_gc_init, and the allow-list is a property of the
+    // runtime, not of one design's config.
     expose("rt_gc_init", &rt_gc_init);
     expose("rt_gc_shutdown", &rt_gc_shutdown);
     expose("rt_gc_mutator_current", &rt_gc_mutator_current);
@@ -471,7 +471,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_wheel_init", &rt_wheel_init);
     expose("rt_wheel_deinit", &rt_wheel_deinit);
     expose("rt_wheel_now", &rt_wheel_now);
-    expose("rt_wheel_pending", &rt_wheel_pending);
     expose("rt_wheel_schedule", &rt_wheel_schedule);
     expose("rt_wheel_schedule_rel", &rt_wheel_schedule_rel);
     expose("rt_wheel_tick", &rt_wheel_tick);

@@ -3213,10 +3213,6 @@ extern "C" uint64_t rt_wheel_now(const rt_wheel* wheel) {
     return unwrap(wheel)->now();
 }
 
-extern "C" int rt_wheel_pending(const rt_wheel* wheel) {
-    return unwrap(wheel)->empty() ? 0 : 1;
-}
-
 extern "C" void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_timer_fn on_expire) {
     // rt_timer* and clotho::Timer* share a representation, so reinterpreting the
     // callback's first parameter is sound — the same pointer-cast the wheel

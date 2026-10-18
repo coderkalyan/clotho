@@ -35188,7 +35188,7 @@ private:
     // the walk hit them. Drained by lower_compilation.
     std::vector<Diagnostic> diags_;
     // Set once any member was abandoned. The module is still returned -- it is
-    // analysable, and that is what --emit=check wants -- but it is missing
+    // analysable, and `clotho lint` still wants it -- but it is missing
     // behaviour, so it MUST NOT reach codegen. lower_compilation turns this into
     // LowerResult::ok == false, which is the gate.
     bool poisoned_ = false;
@@ -36009,9 +36009,9 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
 
     // The module is handed back even when poisoned: it is missing the behaviour of
     // every member that failed, so it must never be simulated or emitted, but it
-    // IS analysable and that is exactly what --emit=check consumes. `ok` is the
+    // IS analysable and that is exactly what `clotho lint` consumes. `ok` is the
     // gate, and it is the only thing standing between a poisoned module and
-    // codegen — see main.cpp and run_design.
+    // codegen — see the `ok` checks in main() (src/main.cpp).
     result.module = std::move(module);
     result.ok     = !poisoned;
 
@@ -36056,10 +36056,6 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
     }
 
     return lower_compilation(comp, std::move(ctx), timings, allow_system);
-}
-
-LowerResult lower_file(std::string_view path, Timings* timings, ir::SystemAccess allow_system) {
-    return lower_files({ &path, 1 }, timings, allow_system);
 }
 
 LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,

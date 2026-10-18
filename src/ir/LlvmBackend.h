@@ -68,7 +68,7 @@ bool optimize_module(llvm::Module& m, bool o3);
 // Lower every process in `m` to an LLVM function and write textual LLVM IR to
 // `os`. Returns false (and writes the reason to llvm::errs()) if the generated
 // module fails verification; on success the IR has already been printed to `os`.
-// `config` is forwarded to build_module. If `timings` is non-null, the IR
+// `config` is forwarded to build_modules. If `timings` is non-null, the IR
 // generation + pipeline duration is accumulated into its `llvm_ms`.
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config = {},
                Timings* timings = nullptr, const LocResolver& resolve = {});

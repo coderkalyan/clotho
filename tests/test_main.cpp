@@ -21,7 +21,7 @@ namespace {
 // Single-design mode: lower and simulate one source file, then exit. This is how
 // run_design_subprocess runs a design in its own process; see Subprocess.h for
 // when that is needed. Lowers the file's *text* rather than going
-// through lower_file so the buffer is named "source", matching what the same
+// through lower_files so the buffer is named "source", matching what the same
 // design produces in-process.
 int run_design(const char* path) {
 #if defined(_WIN32)

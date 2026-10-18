@@ -26,11 +26,6 @@ class TimingControl;
 
 namespace clotho::sva {
 
-// Whether this build has the temporal engine at all. Concurrent assertions fail
-// loudly either way when they cannot be lowered; this only distinguishes "not
-// implemented yet" from "not compiled in".
-bool available();
-
 // One boolean leaf the front-end must evaluate. `expr` is the SystemVerilog
 // expression, already in the polarity the guard needs: negation-normal-form
 // lowering pushes `!` down to the leaves, so a negated leaf arrives here as the

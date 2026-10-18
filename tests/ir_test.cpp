@@ -29,7 +29,7 @@ Ref konst(InternPool& pool, uint64_t v) {
 }
 
 // The exact text `clotho build --emit ir` writes for a design: print_module with
-// the location resolver the CLI installs (main.cpp:401-412).
+// the location resolver the CLI installs (write_artifact in main.cpp).
 std::string emit_ir(std::string_view source) {
     const clotho::LowerResult r = clotho::lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());

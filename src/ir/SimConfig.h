@@ -179,7 +179,7 @@ struct SimulationConfig {
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.
     // Off by default: the listener adds per-object bookkeeping and writes the
-    // dump file. Run-only knob (build_module ignores it).
+    // dump file. Run-only knob (build_modules ignores it).
     bool perf_jitdump = false;
     // Compile the split per-definition modules concurrently: each is migrated
     // into its own LLVMContext (a bitcode round-trip; LLVMContext is not
@@ -188,11 +188,11 @@ struct SimulationConfig {
     // thread pool instead of one sequential loop. Semantics are identical
     // either way (same per-module IR, same optimize_module/verify sequence).
     // Disable for bisection / debugging, or when isolating a single-module
-    // compile-time regression. Run-only knob (build_module ignores it).
+    // compile-time regression. Run-only knob (build_modules ignores it).
     bool parallel_compile = true;
     // Worker threads for parallel_compile; 0 = llvm::hardware_concurrency().
     // Taken from slang's `-j/--threads`, so one option sizes both its parser and
-    // this pool. Run-only knob (build_module ignores it).
+    // this pool. Run-only knob (build_modules ignores it).
     unsigned compile_jobs = 0;
     // Shared libraries (`--dpi-lib <path>`, repeatable) searched to resolve
     // `import "DPI-C"` symbols at JIT link time. Each is added to the JIT

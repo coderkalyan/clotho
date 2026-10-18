@@ -49,13 +49,6 @@ LineIndex::LineIndex(std::string_view text, Encoding encoding)
     }
 }
 
-uint32_t LineIndex::line_start(uint32_t line) const {
-    if (line >= starts_.size()) {
-        return static_cast<uint32_t>(text_.size());
-    }
-    return starts_[line];
-}
-
 LineIndex::Point LineIndex::point(uint32_t offset) const {
     if (starts_.empty()) {
         return {};

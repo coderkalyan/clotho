@@ -59,12 +59,6 @@ inline StorageClass storage_class(const InternPool& pool, Ref ref) {
     }
 }
 
-inline bool is_plane(const InternPool& pool, Ref ref) {
-    return storage_class(pool, ref) == StorageClass::Plane;
-}
-inline bool is_managed(const InternPool& pool, Ref ref) {
-    return storage_class(pool, ref) == StorageClass::Managed;
-}
 inline bool is_aggregate(const InternPool& pool, Ref ref) {
     return storage_class(pool, ref) == StorageClass::Aggregate;
 }
@@ -83,21 +77,11 @@ inline bool is_queue(const InternPool& pool, Ref ref) {
 inline bool is_assoc(const InternPool& pool, Ref ref) {
     return type_of(pool, ref).kind == Type::Kind::Assoc;
 }
-inline bool is_class(const InternPool& pool, Ref ref) {
-    return type_of(pool, ref).kind == Type::Kind::Class;
-}
-inline bool is_unpacked_array(const InternPool& pool, Ref ref) {
-    return type_of(pool, ref).kind == Type::Kind::UnpackedArray;
-}
-inline bool is_unpacked_struct(const InternPool& pool, Ref ref) {
-    const Type& t = type_of(pool, ref);
-    return t.kind == Type::Kind::Struct && !t.is_packed;
-}
 
 // A heap-backed CONTAINER handle (dynamic array, queue, associative array):
 // the Managed kinds minus `string`. These share the by-pointer deep-copy
-// subroutine ABI, carry a relocation epoch (below), and hold elements described
-// by an rt_elem_ops descriptor.
+// subroutine ABI, carry a relocation epoch (docs/design/data-model.md §3.1),
+// and hold elements described by an rt_elem_ops descriptor.
 inline bool is_container(const InternPool& pool, Ref ref) {
     switch (type_of(pool, ref).kind) {
         case Type::Kind::DynArray:
@@ -107,15 +91,6 @@ inline bool is_container(const InternPool& pool, Ref ref) {
         default:
             return false;
     }
-}
-
-// Whether a place rooted inside this container's storage can be invalidated by
-// a later operation on it — i.e. whether a `ref` formed through it needs the
-// epoch guard (docs/design/data-model.md §3.1). True for every container kind:
-// a dynamic array reallocates on `new`, a queue's ring relocates on push and
-// reindexes on insert/delete, and an assoc entry's slot dies on delete.
-inline bool epoch_bearing(const InternPool& pool, Ref ref) {
-    return is_container(pool, ref);
 }
 
 // -- Recursive structure --

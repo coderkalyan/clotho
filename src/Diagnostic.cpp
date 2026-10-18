@@ -74,13 +74,4 @@ bool has_error(const std::vector<Diagnostic>& diags) {
     return false;
 }
 
-size_t count_of(const std::vector<Diagnostic>& diags, Severity severity) {
-    size_t n = 0;
-    for (const Diagnostic& d : diags) {
-        n += static_cast<size_t>(d.severity == severity);
-    }
-
-    return n;
-}
-
 } // namespace clotho

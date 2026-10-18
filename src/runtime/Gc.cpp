@@ -142,7 +142,7 @@ constexpr uint32_t kNoBlock = 0xffffffffu;
 constexpr size_t kWorklistReserve = 4096;
 
 // Floor for a nursery budget of zero, which would otherwise request a collection
-// at nearly every allocation and silently duplicate --gc=stress.
+// at nearly every allocation and silently duplicate --gc-stress.
 constexpr uint64_t kNurseryBytesFloor = RT_GC_BLOCK_BYTES;
 
 // Runaway bound for the remembered set, not a design limit -- the convention of
@@ -917,7 +917,7 @@ void charge_budget(rt_gc_mutator* mut, uint64_t bytes) {
     // The ONLY writer of the poll byte outside stress mode, and it is reached only from
     // publish_hole() and alloc_large(). That is what makes the inlined poll free on a
     // design that allocates no object: reset_mutator() zeroes `request` at rt_gc_init,
-    // these are the sole paths that would raise it, so under --gc=on every safepoint for
+    // these are the sole paths that would raise it, so outside --gc-stress every safepoint for
     // the whole run is a load, a test and a not-taken branch (Gc.h:157-161). Raising the
     // byte is ALL that happens: allocation never collects, however far over budget it
     // goes, because it runs inside a live JIT frame and only a scheduler region boundary
@@ -2260,7 +2260,7 @@ void reclaim_large() {
         // it is spared only if that collection actually marked it -- which is how a dead
         // large old object is ever freed. Freeing a live one returns a live object's
         // storage to the allocator immediately: with one large object per transaction,
-        // --gc would corrupt the first design that promoted one, on the very next
+        // the collector would corrupt the first design that promoted one, on the very next
         // collection.
         if (is_marked_now(h)) {
             g.large[keep++] = cell;  // compaction preserves the base ordering
@@ -2330,7 +2330,7 @@ void rearm_after_collection() {
     // nothing else, so leaving it set is the whole of "collect at every safepoint". It
     // cannot livelock: rt_gc_safepoint_slow() collects once and returns, and the next
     // poll is only reached when the scheduler advances to another region boundary, so
-    // re-arming buys exactly one collection per safepoint -- which is what --gc=stress
+    // re-arming buys exactly one collection per safepoint -- which is what --gc-stress
     // meant before the poll was inlined.
     g_mutator.request     = (g.cfg.stress != 0) ? 1u : 0u;
     g_mutator.budget_left = g.cfg.nursery_bytes;
@@ -2365,7 +2365,7 @@ uint64_t heap_bytes() {
 //   3. cfg.full_every is a user instruction and wins over everything below: every Nth
 //      collection is full, counting from the first. 1 means "always full", which is
 //      exactly the non-generational collector this phase generalises.
-//   4. --gc=stress with no explicit full_every behaves as full_every 2, so the young and
+//   4. --gc-stress with no explicit full_every behaves as full_every 2, so the young and
 //      full paths ALTERNATE and a stress run exercises both at every safepoint. Stress is
 //      the strongest correctness mode and a mode that only ever ran one of the two paths
 //      would be the weaker for it.
@@ -2520,7 +2520,7 @@ void check_backend_mirror(const rt_gc_config* cfg) {
 }
 
 // One summary to stderr, never stdout: §13's first acceptance criterion is
-// byte-identical stdout under every --gc setting.
+// byte-identical stdout under every --gc-* setting.
 void print_stats(uint64_t swept_at_teardown) {
     std::fflush(stdout);
     std::fprintf(stderr,
@@ -2976,7 +2976,7 @@ extern "C" void rt_gc_init(const rt_gc_config* cfg) {
     assert(g.cfg.nursery_bytes > 0 && "a zero nursery budget is a configuration bug");
     if (g.cfg.nursery_bytes < kNurseryBytesFloor) {
         // A tiny budget would request a collection at nearly every allocation and
-        // silently duplicate --gc=stress; the floor keeps the two distinguishable.
+        // silently duplicate --gc-stress; the floor keeps the two distinguishable.
         g.cfg.nursery_bytes = kNurseryBytesFloor;
     }
     // Zeroed here, and NEVER by rt_gc_shutdown: the test harness runs designs
@@ -3426,7 +3426,7 @@ extern "C" void rt_gc_collect(uint32_t reason) {
 // do not have the inlined test in front of them.
 extern "C" void rt_gc_remember(void* obj) {
     if (g.initialized == 0) {
-        return;  // --gc=off: no collector, so no remembered set and no obligation
+        return;  // No live collector (a test that never called rt_gc_init): nothing to remember.
     }
     assert(obj != nullptr && "the barrier fires on a store INTO an object");
     assert(rt_gc_find_object(obj) == obj && "the barrier logged something not a class object");

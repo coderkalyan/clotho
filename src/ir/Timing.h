@@ -2,7 +2,7 @@
 
 // Per-phase wall-clock timings for one clotho run, in milliseconds. Optionally
 // filled in by the pipeline when the --time flag is set; a zero field means that
-// phase did not run (e.g. simulation under --emit=llvm).
+// phase did not run (e.g. simulation under `clotho build`).
 
 #include <chrono>
 

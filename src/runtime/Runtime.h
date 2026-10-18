@@ -1833,10 +1833,6 @@ uint64_t rt_wheel_now(const rt_wheel* wheel);
 // Prints a FATAL naming the task and ends the simulation (never returns).
 [[noreturn]] void rt_dpi_export_task_no_task_frame(const char* name);
 
-// Non-zero iff the wheel has any timer scheduled. The design's sim loop ticks
-// the wheel until this reports empty.
-int rt_wheel_pending(const rt_wheel* wheel);
-
 // Link `timer` to fire at absolute tick `deadline` (must be > rt_wheel_now),
 // calling `on_expire(timer, ctx)` when it fires.
 void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_timer_fn on_expire);
@@ -1851,10 +1847,10 @@ void rt_wheel_schedule_rel(rt_wheel* wheel, rt_timer* timer, uint64_t delay, rt_
 // its callback runs, so a callback may re-schedule it.
 void rt_wheel_tick(rt_wheel* wheel, void* ctx);
 
-// rt_wheel_pending + rt_wheel_tick folded into one call: advance and fire if any
-// timer is scheduled and return non-zero, else return zero. Lets the sim loop
-// cross the ABI boundary once per timestep instead of twice and skips the
-// separate occupancy scan (advance already reports emptiness).
+// rt_wheel_tick plus an occupancy check folded into one call: advance and fire if
+// any timer is scheduled and return non-zero, else return zero. Lets the sim loop
+// cross the ABI boundary once per timestep and skips a separate occupancy scan
+// (advance already reports emptiness).
 int rt_wheel_advance(rt_wheel* wheel, void* ctx);
 
 // -- Deferred nonblocking intra-assignment stores (LRM 9.4.5) --

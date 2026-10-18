@@ -26,11 +26,12 @@ namespace clotho {
 // Which semantics a run judges the design under.
 //
 // A different axis from the command. `lint` names the activity -- analyse and
-// report, write nothing -- and this names what the analysis is measured against,
-// so `clotho lint --policy=synth` is the combination that asks "would a
-// synthesiser object to this?" without a synthesiser in the loop. Calling the
-// severity set a "lint policy" would conflate the two and leave the interesting
-// question (under which semantics?) unanswered.
+// report, write nothing -- and this names what the analysis is measured against.
+// TODO: a synthesis policy (no command or option selects one yet; `Sim` is the
+// only value) would let `lint` ask "would a synthesiser object to this?" without
+// a synthesiser in the loop. Calling the severity set a "lint policy" would
+// conflate the two and leave the interesting question (under which semantics?)
+// unanswered.
 //
 // Only what genuinely differs by semantics belongs here. Clotho's own hard
 // limits -- the promotions it makes because its signal model or symbol table
@@ -68,12 +69,6 @@ struct LowerResult {
 // The $system access tier is threaded through every entry point so the
 // compile-time gate can refuse (or constant-check) a shell-exec task. Defaults
 // to Off — $system is a hard error unless the caller opts in.
-
-// Lower one SystemVerilog source file at `path`. If `timings` is non-null, the
-// front-end and analysis phase durations are accumulated into it.
-LowerResult lower_file(std::string_view path,
-                       Timings*         timings      = nullptr,
-                       ir::SystemAccess allow_system = ir::SystemAccess::Off);
 
 // Lower several source files compiled together into one design. Paths are
 // parsed in order and added to a single Compilation before elaboration. No

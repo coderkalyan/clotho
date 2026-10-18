@@ -67,10 +67,6 @@ public:
     // IR dumps use.
     [[nodiscard]] std::string render(ir::SourceLoc loc) const;
 
-    // "file:line" — the coarser form the runtime bakes into $finish / severity
-    // banners, where a column would be noise.
-    [[nodiscard]] std::string render_file_line(ir::SourceLoc loc) const;
-
     // Absolute path of the file a location came from, ignoring any `` `line ``
     // directives. Empty when the location does not resolve to a file buffer.
     //

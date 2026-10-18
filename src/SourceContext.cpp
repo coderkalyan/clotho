@@ -77,15 +77,6 @@ std::string SourceContext::render(ir::SourceLoc loc) const {
     return pos.file + ":" + std::to_string(pos.line) + ":" + std::to_string(pos.column);
 }
 
-std::string SourceContext::render_file_line(ir::SourceLoc loc) const {
-    const SourcePosition pos = resolve(loc);
-    if (!pos.valid) {
-        return "<unknown>";
-    }
-
-    return pos.file + ":" + std::to_string(pos.line);
-}
-
 std::string SourceContext::full_path(ir::SourceLoc loc) const {
     if (sm_ == nullptr || loc == ir::SourceLoc{ 0 }) {
         return {};

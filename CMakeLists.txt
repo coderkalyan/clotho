@@ -47,14 +47,9 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
-# Warnings apply to clotho targets only, not fetched dependencies. The flags are
-# GCC/Clang spelling; a cl-style driver (MSVC, or clang-cl) takes the /-forms.
-# Note clotho cannot be built by MSVC proper regardless — the runtime's wide
-# arithmetic uses `unsigned __int128`, which only GCC and Clang provide — so the
-# cl-style branch exists for clang-cl.
 # Release ships stripped: CMake's Release already omits -g, and this drops the
-# symbol table too. Profiling or debugging clotho itself is what RelWithDebInfo is
-# for -- and it is the default, so reaching for it costs nothing.
+# symbol table too. Profiling or debugging clotho itself is what RelWithDebInfo
+# is for.
 #
 # This is the host binary only. The JIT'd design's optimization level is a run-time
 # decision (`-O` on the command line), and LLVM is a prebuilt library at whatever
@@ -62,6 +57,12 @@ endif()
 if(NOT MSVC)
   add_link_options($<$<CONFIG:Release>:-s>)
 endif()
+
+# Warnings apply to clotho targets only, not fetched dependencies. The flags are
+# GCC/Clang spelling; a cl-style driver (MSVC, or clang-cl) takes the /-forms.
+# Note clotho cannot be built by MSVC proper regardless — the runtime's wide
+# arithmetic uses `unsigned __int128`, which only GCC and Clang provide — so the
+# cl-style branch exists for clang-cl.
 
 add_library(clotho_warnings INTERFACE)
 if(MSVC)
@@ -529,8 +530,8 @@ if(CLOTHO_SYNTH)
   target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_legalize clotho_lsp clotho_dap clotho_warnings)
   target_compile_definitions(clotho_cli PRIVATE CLOTHO_SYNTH)
 else()
-  # Without the command there is nothing to link, which restores exactly the
-  # property S0 established: the shipped simulator contains no legalization.
+  # Without the command there is nothing to link, so the shipped simulator
+  # contains no legalization code.
   target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_lsp clotho_dap clotho_warnings)
 endif()
 if(CLOTHO_XSAN)

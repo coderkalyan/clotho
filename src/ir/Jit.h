@@ -3,7 +3,7 @@
 // JIT simulator: the primary driver behavior. Rather than emitting LLVM IR for
 // an external toolchain, build the design's module in-process, hand it to an
 // ORC LLJIT, eagerly compile it for the host, and run its `main()`. The IR
-// emission paths (emit_llvm / print_module) remain for debugging.
+// emission paths (emit_llvm / print_module, behind `clotho build`) remain for debugging.
 
 #include <span>
 #include <string_view>
@@ -19,7 +19,7 @@ namespace clotho::ir {
 // compilation failure, writes the reason to llvm::errs() and returns a negative
 // sentinel so the driver can exit non-zero. If `timings` is non-null, the LLVM
 // compile and simulation phase durations are recorded into it. `config` is
-// forwarded to build_module. `plusargs` are the command-line arguments that
+// forwarded to build_modules. `plusargs` are the command-line arguments that
 // followed a leading `+` (LRM §21.6), in source order, with the `+` itself
 // stripped; made available to $test$plusargs / $value$plusargs. `resolve`
 // decodes the source locations a sanitizer bakes into its reports and the one a

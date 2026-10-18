@@ -10,8 +10,6 @@
 // plane (canonical padding) so equality / hashing are mask-free byte compares.
 //   - 2-state (Two):  1 plane  — val.
 //   - 4-state (Four): 2 planes — val, xz (VPI: 0=(0,0) 1=(1,0) X=(1,1) Z=(0,1)).
-//   - 9-state (Nine): 4 planes — a 4-bit per-bit code, bit-sliced LSB-first.
-//     Provisional code: U=0 X=1 0=2 1=3 Z=4 W=5 L=6 H=7 '-'=8. Refined later.
 
 namespace clotho::ir {
 
@@ -251,7 +249,7 @@ std::span<const Field> InternPool::struct_fields(uint32_t fields_id) const {
 }
 
 void InternPool::set_class_name(Ref class_ref, std::string_view name) {
-    const auto* t = std::get_if<Type>(&get(class_ref));
+    [[maybe_unused]] const auto* t = std::get_if<Type>(&get(class_ref));
     assert(t != nullptr && "a class name belongs to a type");
     assert(t->kind == Type::Kind::Class && "a class name belongs to a Kind::Class type");
     const auto at = static_cast<uint32_t>(class_names_.size());

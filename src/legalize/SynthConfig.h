@@ -5,7 +5,6 @@
 // sensible thing.
 
 #include <cstdint>
-#include <string_view>
 
 namespace clotho::legalize {
 
@@ -36,16 +35,6 @@ enum class Hierarchy : uint8_t {
 struct SynthConfig {
     Target    target    = Target::SV2017;
     Hierarchy hierarchy = Hierarchy::Instances;
-
-    // Rebuild each written signal's mux tree from its guarded list and write out
-    // the arms the source left implicit. Requires a Result; without one the writer
-    // translates 1:1 whatever this says.
-    bool materialize_mux_trees = true;
-
-    // Module name to emit. Empty renders `m`.
-    std::string_view name;
-
-    uint32_t indent_width = 2;
 };
 
 } // namespace clotho::legalize

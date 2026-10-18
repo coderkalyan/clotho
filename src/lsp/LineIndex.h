@@ -43,18 +43,6 @@ public:
     // caller bug, but it must not read out of bounds.
     [[nodiscard]] Point point(uint32_t offset) const;
 
-    // Byte offset at which `line` (0-based) begins; the end of the buffer for a
-    // line past the last.
-    [[nodiscard]] uint32_t line_start(uint32_t line) const;
-
-    [[nodiscard]] uint32_t line_count() const {
-        return static_cast<uint32_t>(starts_.size());
-    }
-
-    [[nodiscard]] Encoding encoding() const {
-        return encoding_;
-    }
-
     // Code units between two byte offsets on the SAME line, in the negotiated
     // encoding. This is a token's `length` field, which LSP measures in code
     // units rather than bytes.

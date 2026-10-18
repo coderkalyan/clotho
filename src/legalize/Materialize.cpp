@@ -1554,8 +1554,7 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
     // nothing. The estimate only has to be the right order: signals dominate the
     // declarations and processes dominate the body.
     os.reserve(4096 + 64 * module.signals().size() + 512 * module.processes().size());
-    const std::string_view name    = cfg.name.empty() ? std::string_view("m") : cfg.name;
-    const auto             signals = module.signals();
+    const auto signals = module.signals();
 
     const EmittedNames              names_all = emitted_names(module, cfg);
     const std::vector<std::string>& sig_names = names_all.sig;
@@ -1599,9 +1598,7 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
     // top-level input would be illegal source. Classification is about process
     // structure, not connectivity, so every signal becomes an internal `logic` and
     // an original input simply has no driver.
-    os += "module ";
-    os += name;
-    os += ";\n";
+    os += "module m;\n";
     for (size_t i = 0; i < signals.size(); ++i) {
         // 2005 has no `logic`: a procedurally assigned signal is a reg, anything
         // else is a wire. Every continuous assign lowered to a process, so "written

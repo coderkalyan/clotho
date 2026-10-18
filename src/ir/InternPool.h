@@ -38,9 +38,6 @@ enum class Domain : uint8_t {
     Two = 1,
     // 4-state: val then xz plane, VPI 0=(0,0) 1=(1,0) X=(1,1) Z=(0,1).
     Four = 2,
-    // 9-state: a 4-bit per-bit code, bit-sliced across 4 planes (see
-    // value-encoding note in InternPool.cpp). Provisional; no type yields it yet.
-    Nine = 4,
 };
 
 // Canonical bytes of one plane for a packed value of the given width (IEEE-style

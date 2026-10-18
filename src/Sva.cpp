@@ -1731,10 +1731,6 @@ uint32_t read_root(const sva_ir* ir, sva_node node, Result& out) {
 
 } // namespace
 
-bool available() {
-    return true;
-}
-
 Result lower(const Request& request) {
     check_libsva_abi();
 
@@ -2032,10 +2028,6 @@ Result lower(const Request& request) {
 #else // !CLOTHO_HAVE_SVA
 
 namespace clotho::sva {
-
-bool available() {
-    return false;
-}
 
 Result lower(const Request&) {
     Result out;

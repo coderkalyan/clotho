@@ -109,7 +109,4 @@ struct Diagnostic {
 // True when any item would stop a module being produced.
 [[nodiscard]] bool has_error(const std::vector<Diagnostic>& diags);
 
-// Count items at exactly `severity`.
-[[nodiscard]] size_t count_of(const std::vector<Diagnostic>& diags, Severity severity);
-
 } // namespace clotho

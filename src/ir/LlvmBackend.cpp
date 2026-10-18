@@ -15008,9 +15008,6 @@ private:
     llvm::FunctionCallee randc_next_fn() {
         return rt_fn("rt_randc_next", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
     }
-    llvm::FunctionCallee wheel_pending_fn() {
-        return rt_fn("rt_wheel_pending", b_.getInt32Ty(), { raw_ptr_ty() });
-    }
     // void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
     llvm::FunctionCallee wheel_schedule_fn() {
         return rt_fn("rt_wheel_schedule", b_.getVoidTy(),
@@ -15020,10 +15017,6 @@ private:
     llvm::FunctionCallee wheel_schedule_rel_fn() {
         return rt_fn("rt_wheel_schedule_rel", b_.getVoidTy(),
                      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
-    }
-    // void rt_wheel_tick(rt_wheel*, void* ctx)
-    llvm::FunctionCallee wheel_tick_fn() {
-        return rt_fn("rt_wheel_tick", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
     }
     // int rt_wheel_advance(rt_wheel*, void* ctx)
     llvm::FunctionCallee wheel_advance_fn() {
