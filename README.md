@@ -84,7 +84,10 @@ Clotho is licensed under the GNU General Public License, version 3 only
 (`GPL-3.0-only`, see `LICENSE.txt`). The runtime in `src/runtime/`, which is
 linked into every simulation, is licensed under the Mozilla Public License 2.0
 (`MPL-2.0`, see `src/runtime/LICENSE`), so a design simulated or compiled by
-Clotho can be distributed under any terms its authors choose.
+Clotho can be distributed under any terms its authors choose. A distributed
+binary that contains the runtime must tell its recipients where to get the
+runtime's source (MPL-2.0 section 3.2); for an unmodified runtime, a link to the
+Clotho release is enough.
 
 The license covers Clotho itself. Designs and testbenches you run with Clotho,
 and the output Clotho produces from them, are yours.
