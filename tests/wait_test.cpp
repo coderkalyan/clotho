@@ -1262,6 +1262,22 @@ TEST_CASE("wait on a captured unpacked struct fails loudly") {
             initial begin t(); $finish; end
         endmodule
     )";
-    CHECK(lower_error(src).find("fork-captured automatic of a type with no change notifier") !=
+    CHECK(lower_error(src).find("fork-captured automatic 'x' of type m.st is not supported") != std::string::npos);
+}
+
+// A captured event has no notifier for `.triggered` either; the refusal names the
+// event rather than describing aggregate types it is not.
+TEST_CASE("wait on a captured event's triggered fails loudly") {
+    constexpr std::string_view src = R"(
+        module m;
+            task automatic t;
+                event e;
+                fork begin #1 -> e; end join_none
+                wait (e.triggered);
+            endtask
+            initial begin t(); $finish; end
+        endmodule
+    )";
+    CHECK(lower_error(src).find("fork-captured automatic 'e' of type event is not supported") !=
           std::string::npos);
 }

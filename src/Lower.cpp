@@ -17585,10 +17585,11 @@ private:
                     continue;
                 }
                 if (!box_can_notify(vs->getType().getCanonicalType())) {
-                    // TODO: same aggregate shapes as the property arm below.
-                    fail("wait on a fork-captured automatic of a type with no change "
-                         "notifier is not supported (an unpacked struct, union or fixed "
-                         "unpacked array cannot be waited on)");
+                    // TODO: same aggregate shapes as the property arm below, plus
+                    // `event`, whose `.triggered` a capture box cannot notify on yet.
+                    fail("wait on the fork-captured automatic '" + std::string(vs->name) + "' of type " +
+                         vs->getType().toString() +
+                         " is not supported: a capture box of this type has no change notifier");
                 }
                 boxed_reads.push_back(vs);
             }
