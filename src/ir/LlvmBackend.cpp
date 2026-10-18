@@ -29192,18 +29192,20 @@ private:
                                     { i32, i32, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr });
     }
 
-    static constexpr uint32_t kPcbCtl        = 0;
-    static constexpr uint32_t kPcbRefs       = 1;
-    static constexpr uint32_t kPcbActs       = 2;
-    static constexpr uint32_t kPcbWaiters    = 3;
-    static constexpr uint32_t kPcbRng        = 4;
-    static constexpr uint32_t kPcbJoinRec    = 5;
-    static constexpr uint32_t kPcbObj        = 6;
-    static constexpr uint32_t kPcbParent     = 7;
-    static constexpr uint32_t kPcbFirstChild = 8;
-    static constexpr uint32_t kPcbNextSib    = 9;
-    static constexpr uint32_t kPcbPrevSib    = 10;
-    static constexpr uint32_t kPcbNextMarked = 11;
+    // The full rt_proc field table (Runtime.h). Fields only the runtime touches are
+    // listed too, so the indices stay a complete map of the layout.
+    static constexpr uint32_t                  kPcbCtl        = 0;
+    [[maybe_unused]] static constexpr uint32_t kPcbRefs       = 1;
+    static constexpr uint32_t                  kPcbActs       = 2;
+    static constexpr uint32_t                  kPcbWaiters    = 3;
+    static constexpr uint32_t                  kPcbRng        = 4;
+    [[maybe_unused]] static constexpr uint32_t kPcbJoinRec    = 5;
+    static constexpr uint32_t                  kPcbObj        = 6;
+    [[maybe_unused]] static constexpr uint32_t kPcbParent     = 7;
+    static constexpr uint32_t                  kPcbFirstChild = 8;
+    [[maybe_unused]] static constexpr uint32_t kPcbNextSib    = 9;
+    [[maybe_unused]] static constexpr uint32_t kPcbPrevSib    = 10;
+    static constexpr uint32_t                  kPcbNextMarked = 11;
 
     // LRM 9.7 `process::state`, the values slang's synthesized enum assigns, plus
     // the flags that share the word (RT_PROC_* in Runtime.h).

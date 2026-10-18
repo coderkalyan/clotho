@@ -104,12 +104,10 @@ void put_hex(std::string& out, uint64_t v) {
 // sites: the caller records the length, emits, and truncates if `ok()` went false.
 class Renderer {
 public:
-    Renderer(const ir::Module&               m,
-             const std::vector<std::string>& sig_names,
+    Renderer(const std::vector<std::string>& sig_names,
              const std::vector<std::string>& fn_names,
              Target                          target)
-      : m_(m)
-      , sig_(sig_names)
+      : sig_(sig_names)
       , fn_(fn_names)
       , target_(target) {}
 
@@ -481,7 +479,6 @@ private:
         }
     }
 
-    const ir::Module&               m_;
     const std::vector<std::string>& sig_;
     const std::vector<std::string>& fn_;
     Target                          target_  = Target::SV2017;
@@ -1559,7 +1556,7 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
     const EmittedNames              names_all = emitted_names(module, cfg);
     const std::vector<std::string>& sig_names = names_all.sig;
     const std::vector<std::string>& fn_names  = names_all.fn;
-    Renderer                        render(module, sig_names, fn_names, cfg.target);
+    Renderer                        render(sig_names, fn_names, cfg.target);
     std::vector<Atom>               pool; // flat guard paths, reused per signal
 
     // Which signals any process writes -- the reg/wire question for the 2005 target.
@@ -1584,7 +1581,7 @@ std::string materialize(const ir::Module& module, const Result* result, SynthCon
         ScopeNames names;
         names.sig = names_all.sig;
         names.mod = names_all.mod;
-        Renderer          hr(module, names.sig, fn_names, cfg.target);
+        Renderer          hr(names.sig, fn_names, cfg.target);
         std::vector<Atom> hpool;
         for (const ir::InstanceScope& t : module.tops()) {
             emit_scope_tree(os, module, result, t, names, fn_names, written, cfg, hr, hpool);

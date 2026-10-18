@@ -557,6 +557,14 @@ uint64_t stamp_marked(uint64_t gcword) {
     return out;
 }
 
+// Whether the object has been promoted: it survived a collection, so a YOUNG
+// collection treats it as live without tracing into it and its lines are held by
+// line_old rather than by a mark (§7). Read only by assertions.
+[[maybe_unused]] bool is_old(void* handle) {
+    assert(handle != nullptr);
+    return (*gcword_ptr(handle) & RT_GC_FLAG_OLD) != 0;
+}
+
 // Non-asserting descriptor read: returns null when the vptr has not been stored
 // yet. Generated code stores it immediately after rt_gc_alloc returns
 // (LlvmBackend.cpp:11696) and no safepoint can intervene, so the collector never
