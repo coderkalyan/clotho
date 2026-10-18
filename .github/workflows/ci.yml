@@ -55,8 +55,8 @@ jobs:
             {"name": "linux-arm64",   "runner": "ubuntu-24.04-arm", "shell": "bash"},
             {"name": "macos-arm64",   "runner": "macos-15",        "shell": "bash"},
             {"name": "macos-x64",     "runner": "macos-15-intel",  "shell": "bash"},
-            {"name": "windows-x64",   "runner": "windows-2025",   "msystem": "CLANG64",    "shell": "msys2 {0}"},
-            {"name": "windows-arm64", "runner": "windows-11-arm",  "msystem": "CLANGARM64", "shell": "msys2 {0}", "experimental": true}
+            {"name": "windows-x64",   "runner": "windows-2025",   "msystem": "CLANG64",    "shell": "msys2 {0}", "zig": "x86_64-windows",  "zig_sha256": "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"},
+            {"name": "windows-arm64", "runner": "windows-11-arm",  "msystem": "CLANGARM64", "shell": "msys2 {0}", "zig": "aarch64-windows", "zig_sha256": "aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef", "experimental": true}
           ]
           JSON
           # A `ci/`-prefixed branch opts into the full matrix on every push.
@@ -98,10 +98,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Zig builds libsva (CLOTHO_SVA in CMakeLists.txt). Windows gets it from
-      # MSYS2's own package below instead of this action, since a JS action's
-      # PATH addition is not guaranteed to reach the msys2 shell every later
-      # step runs in.
+      # Zig builds libsva (CLOTHO_SVA in CMakeLists.txt). Windows installs it
+      # in its own step below, since a JS action's PATH addition is not
+      # guaranteed to reach the msys2 shell every later step runs in.
       - name: Install Zig (Linux/macOS)
         if: runner.os != 'Windows'
         uses: mlugg/setup-zig@v2
@@ -180,15 +179,27 @@ jobs:
           # pacboy's `:p` suffix picks the environment's package prefix, so one
           # list serves both CLANG64 and CLANGARM64. Python is slang's — its
           # CMakeLists requires an interpreter for its generated sources.
-          # zig builds libsva (CLOTHO_SVA in CMakeLists.txt); a MSYS2 package rather
-          # than mlugg/setup-zig, since that action's PATH addition is not
-          # guaranteed to reach the msys2 shell every later step runs in. git
-          # is unprefixed (an msys package, not an arch-specific mingw one):
-          # path-type stays the default `minimal`, which does not inherit
-          # Git for Windows' own PATH entry, and the libsva checkout step
-          # below needs `git` inside this shell.
+          # git, curl and unzip are unprefixed (msys packages, not arch-specific
+          # mingw ones): path-type stays the default `minimal`, which does not
+          # inherit Git for Windows' own PATH entry, and the libsva checkout and
+          # zig install steps below need them inside this shell.
           pacboy: >-
-            llvm:p clang:p cmake:p ninja:p ccache:p python:p zig:p git
+            llvm:p clang:p cmake:p ninja:p ccache:p python:p git curl unzip
+
+      # MSYS2 packages no zig for CLANG64 or CLANGARM64, so take the official
+      # release archive, checked against the hash ziglang.org publishes for it,
+      # and hand its path to CMake rather than to PATH.
+      - name: Install Zig (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -eux
+          name="zig-${{ matrix.zig }}-$ZIG_VERSION"
+          dir="$(cygpath -u "$RUNNER_TEMP")"
+          curl -fsSL -o "$dir/$name.zip" "https://ziglang.org/download/$ZIG_VERSION/$name.zip"
+          echo "${{ matrix.zig_sha256 }}  $dir/$name.zip" | sha256sum -c -
+          unzip -q "$dir/$name.zip" -d "$dir"
+          "$dir/$name/zig.exe" version
+          echo "ZIG_EXECUTABLE=$(cygpath -m "$dir/$name/zig.exe")" >> "$GITHUB_ENV"
 
       # libsva is a build-only, sibling-checkout dependency
       # (CLOTHO_LIBSVA_DIR defaults to ../libsva relative to this repo); not
@@ -228,9 +239,11 @@ jobs:
           if command -v ccache > /dev/null; then
             launcher="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           fi
+          # ZIG_EXECUTABLE is set only on Windows (the zig install step above).
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+            ${ZIG_EXECUTABLE:+-DZIG_EXECUTABLE=$ZIG_EXECUTABLE} \
             $launcher
 
       - name: Build
