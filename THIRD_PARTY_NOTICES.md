@@ -5,7 +5,8 @@ Clotho is licensed under GPL-3.0-only (`LICENSE.txt`), with these exceptions:
 - `src/runtime/` is licensed under MPL-2.0 (`src/runtime/LICENSE`).
 - `patches/` is licensed under MIT (`patches/LICENSE`).
 - `docs/cla/` is adapted from the Project Harmony contributor agreements
-  (HA-CLA-I and HA-CLA-E v1.0), licensed under CC BY 3.0; see each file's footer.
+  (HA-CLA-I and HA-CLA-E v1.0) and, like them, is licensed under CC BY 3.0; see
+  each file's footer.
 - The third-party files under `tests/perf/cases/` listed below keep their own
   licenses.
 
@@ -16,14 +17,16 @@ from the SPDX reference text.
 
 ## Linked into the `clotho` executable
 
-Fetched at configure time (see `CMakeLists.txt` for the pinned revisions), or
-found on the host where noted.
+Fetched at configure time, or found on the host where noted. Clotho's
+`CMakeLists.txt` pins slang, unordered_dense and glaze; slang's
+`external/CMakeLists.txt` pins {fmt}, boost.regex, mimalloc and toml++.
 
 | Component | License | Text |
 |---|---|---|
 | [slang](https://github.com/MikePopoloski/slang) | MIT | `LICENSES/slang.txt` |
 | slang's bundled `boost_unordered.hpp`, `boost_concurrent.hpp`, `expected.hpp` | BSL-1.0 | `LICENSES/BSL-1.0.txt` |
 | slang's bundled `BS_thread_pool.hpp` ([thread-pool](https://github.com/bshoshany/thread-pool)) | MIT | `LICENSES/BS_thread_pool.txt` |
+| slang's bundled IEEE 1800 VPI headers (`external/ieee1800/`, constants used by `$sformat`) | MIT, per slang's `REUSE.toml` | `LICENSES/slang.txt` |
 | [boost.regex](https://github.com/MikePopoloski/regex) (via slang; host Boost if present) | BSL-1.0 | `LICENSES/BSL-1.0.txt` |
 | [toml++](https://github.com/marzer/tomlplusplus) (via slang; host copy if present) | MIT | `LICENSES/tomlplusplus.txt` |
 | [{fmt}](https://github.com/fmtlib/fmt) | MIT, with an object-code exception | `LICENSES/fmt.txt` |
