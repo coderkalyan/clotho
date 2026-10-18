@@ -34,14 +34,17 @@ found on the host where noted.
 | glaze's bundled [zmij](https://github.com/vitaut/zmij) | MIT or BSL-1.0; used under BSL-1.0 | `LICENSES/BSL-1.0.txt` |
 | glaze's bundled xxh64 (Daniel Kirchner) | MIT, notice in `glaze/api/xxh64.hpp` | `LICENSES/glaze.txt` |
 | [LLVM](https://llvm.org) 22 (host install) | Apache-2.0 WITH LLVM-exception | `LICENSES/LLVM.txt` |
-| [libsva](https://github.com/coderkalyan/libsva), including the [Zig](https://ziglang.org) standard library it is built with | MIT | `LICENSES/libsva.txt`, `LICENSES/zig.txt` |
+| [libsva](https://github.com/coderkalyan/libsva), including the [Zig](https://ziglang.org) standard library and compiler-rt it is built with | MIT | `LICENSES/libsva.txt`, `LICENSES/zig.txt` |
 
 ## Linked into every simulation
 
 The Clotho runtime (`src/runtime/`, MPL-2.0) uses unordered_dense and {fmt},
 so their notices apply to any binary that contains the runtime. {fmt}'s license
 waives its notice requirement for code embedded in object form;
-unordered_dense's MIT license does not.
+unordered_dense's MIT license does not. On Windows the runtime also links LLVM's
+compiler-rt builtins, licensed Apache-2.0 WITH LLVM-exception
+(`LICENSES/LLVM.txt`), whose exception waives notice requirements for code
+embedded by compilation.
 
 ## Tests only
 
@@ -64,7 +67,7 @@ is downloaded by each case's `fetch.sh` and is not stored in this repository.
 | `coremark_cv32e40p/fw/bsp/link.ld`; `coremark_{picorv32,hazard3}/fw/bsp/link.ld` (modified) | Free Software Foundation; ETH Zürich and University of Bologna | permissive notice in file |
 | `picorv32/testbench.v`, `coremark_picorv32/testbench.v` (modified) | [YosysHQ picorv32](https://github.com/YosysHQ/picorv32) | public domain, notice in file |
 | `hazard3/tb_hazard3.sv`, `coremark_hazard3/tb_hazard3.sv` (the core instance and its port connections) | [Hazard3](https://github.com/Wren6991/Hazard3) `test/sim/tb_common/hdl/tb.v` | Apache-2.0 (`LICENSES/Apache-2.0.txt`) |
-| `coremark_*/coremark.hex` | compiled from [EEMBC CoreMark](https://github.com/eembc/coremark), the CoreMark port, `crt0.S`, `link.ld` and (cv32e40p) `vectors.S` files above, and Clotho's own `libnano.c` | Apache-2.0 (`LICENSES/Apache-2.0.txt`), BSD-2-Clause, the FSF notice, and GPL-3.0-only for `libnano.c` |
+| `coremark_*/coremark.hex` | compiled from [EEMBC CoreMark](https://github.com/eembc/coremark), the CoreMark port, `crt0.S`, `link.ld` and (cv32e40p) `vectors.S` files above, and Clotho's own `libnano.c` | Apache-2.0 (`LICENSES/Apache-2.0.txt`); BSD-2-Clause for `crt0.S`, Copyright (c) 2017 SiFive Inc. and Copyright (c) 2019 ETH Zürich and University of Bologna (`LICENSES/BSD-2-Clause.txt`); the FSF notice; and GPL-3.0-only for `libnano.c` |
 
 CoreMark® is a registered trademark of EEMBC. The images above are used to
 measure simulator speed; they are not CoreMark scores.
