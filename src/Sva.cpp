@@ -2,7 +2,7 @@
 
 #ifdef CLOTHO_HAVE_SVA
 
-#include <sva.h>
+#include <libsva/sva.h>
 
 #include <slang/ast/Expression.h>
 #include <slang/ast/TimingControl.h>

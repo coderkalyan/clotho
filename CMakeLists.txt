@@ -292,13 +292,18 @@ if(CLOTHO_SVA)
 
   set(_libsva_prefix ${CMAKE_CURRENT_BINARY_DIR}/libsva)
   set(_libsva_lib ${_libsva_prefix}/lib/libsva.a)
-  set(_libsva_include ${_libsva_prefix}/include)
+  # Clotho includes the header as <libsva/sva.h>. A bare <sva.h> resolves to
+  # src/Sva.h on a case-insensitive filesystem (macOS, Windows), because src/
+  # precedes this directory on the include path.
+  set(_libsva_include ${_libsva_prefix}/inc)
   file(GLOB _libsva_sources "${CLOTHO_LIBSVA_DIR}/src/*.zig")
 
   add_custom_command(
-    OUTPUT ${_libsva_lib} ${_libsva_include}/sva.h
+    OUTPUT ${_libsva_lib} ${_libsva_include}/libsva/sva.h
     COMMAND ${ZIG_EXECUTABLE} build --prefix ${_libsva_prefix}
             -Doptimize=${_libsva_optimize}
+    COMMAND ${CMAKE_COMMAND} -E copy ${_libsva_prefix}/include/sva.h
+            ${_libsva_include}/libsva/sva.h
     WORKING_DIRECTORY ${CLOTHO_LIBSVA_DIR}
     DEPENDS ${_libsva_sources} ${CLOTHO_LIBSVA_DIR}/build.zig
             ${CLOTHO_LIBSVA_DIR}/include/sva.h
@@ -309,7 +314,7 @@ if(CLOTHO_SVA)
 
   # The header is generated, so its directory must exist at configure time for
   # INTERFACE_INCLUDE_DIRECTORIES to validate.
-  file(MAKE_DIRECTORY ${_libsva_include})
+  file(MAKE_DIRECTORY ${_libsva_include}/libsva)
   add_library(libsva INTERFACE)
   target_link_libraries(libsva INTERFACE ${_libsva_lib})
   target_include_directories(libsva SYSTEM INTERFACE ${_libsva_include})
