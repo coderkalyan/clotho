@@ -1,5 +1,6 @@
 /build*/
 compile_commands.json
+/.cache/
 .claude
 docs/ieee-1800-2023.pdf
 

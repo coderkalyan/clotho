@@ -6,22 +6,23 @@ Bench "regs": N independent clocked NBA processes (split) vs one fused block.
   when fused. NBA-only cross reads make declaration order irrelevant
   (control for noise).
 
-Bench "thunk": isolates per-activation *coroutine* overhead (frame + resume/
-  suspend machinery) for simple non-suspending processes -- the population a
-  planned thunk lowering would run as a plain call instead of a coroutine.
-  Trivial bodies so the coroutine machinery, not the work, dominates.
+Bench "thunk": isolates per-activation overhead (coroutine frame + resume/
+  suspend machinery) for simple non-suspending processes -- the population
+  that SimulationConfig::thunk lowers to a plain call. Trivial bodies so the
+  activation machinery, not the work, dominates.
   Shape "comb": N combinational procs each with a DISTINCT sensitivity
     (always @(a_i) y_i = f(a_i)), fed by one clocked driver that toggles all
     a_i every cycle. Distinct sensitivity sets are fusion-INELIGIBLE, so the
-    default (fusion-on) count stays N -- coroutine overhead fusion cannot hide.
+    default (fusion-on) count stays N -- overhead fusion cannot hide.
     N activations + N driver writes per cycle.
   Shape "ff": N edge-triggered procs with a trivial blocking self-update
     (always @(posedge clk) if (cyc<N) q_i = q_i + k). Blocking, not NBA, so the
-    signal is coroutine overhead alone, not the NBA heap-churn path whose
+    signal is activation overhead alone, not the NBA heap-churn path whose
     allocator jitter otherwise dominates; each q_i reads only itself so it is
     race-free (the cyc guard stops updates before the settled read). Shared
-    sensitivity fuses to one coroutine by default; --no-fuse exposes the
-    N-coroutine cost (brackets the residual overhead a thunk removes on fusion).
+    sensitivity fuses to one group by default; SimulationConfig::fuse=false
+    exposes the N-process cost (brackets the residual overhead a thunk
+    removes on fusion).
 
 Bench "tri": triangular blocking-assign combinational network. Proc i is
   sensitive to (s, a1..a_{i-1}) and recomputes a_i = s + sum(a_j). All K

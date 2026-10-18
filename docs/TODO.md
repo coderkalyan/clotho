@@ -244,6 +244,8 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Concatenation or part-select output**.
 - [ ] **Bit-select gate output (performance)** — each update rewrites the whole word and
   drops thunk/fusion eligibility; needs per-bit packed-signal fusion.
+- [ ] **Compile time of long gate chains (performance)** — LLVM compile time grows
+  superlinearly with the number of chained gate instances (`examples/gates_bench.v`).
 - [ ] **Bidirectional pass switches** (28.8) — `tran`, `rtran`, `tranif0`, `tranif1`,
   `rtranif0`, `rtranif1`; conduction is a net merge the one-pass driver fold cannot express.
 - [ ] **User-defined primitives** — combinational and sequential UDPs.

@@ -104,9 +104,15 @@ def ensure_sources(case):
     subprocess.run(["sh", fetch["script"]], cwd=case["_dir"], check=True)
 
 
-def ensure_build(no_build):
+def ensure_build(args):
+    if args.clotho:
+        # A prebuilt binary (bench-diff.py, cloud/bench-remote.sh); never rebuilt.
+        clotho = Path(args.clotho).resolve()
+        if not clotho.is_file() or not os.access(clotho, os.X_OK):
+            fail(f"--clotho {clotho} is not an executable file")
+        return clotho
     clotho = BUILD_DIR / "clotho"
-    if no_build:
+    if args.no_build:
         if not clotho.is_file():
             fail(f"--no-build but {clotho} does not exist")
         return clotho
@@ -200,7 +206,7 @@ def run_meta(runs):
 
 def cmd_run(args, out_path):
     cases = load_cases(args.cases)
-    clotho = ensure_build(args.no_build)
+    clotho = ensure_build(args)
     doc = {"schema": 1, "cases": {}}
     if out_path.is_file():  # merge: a partial run keeps other cases' numbers
         with open(out_path) as f:
@@ -389,12 +395,22 @@ def main():
         sp.add_argument("--runs", type=int, default=DEFAULT_RUNS)
         sp.add_argument("--cases", nargs="+", metavar="NAME")
 
+    def add_binary(sp):
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("--no-build", action="store_true",
+                       help=f"use the existing {BUILD_DIR.name}/clotho without rebuilding")
+        g.add_argument("--clotho", metavar="BIN",
+                       help=f"benchmark this binary instead of building {BUILD_DIR.name}/clotho")
+
     sp = sub.add_parser("run", help="benchmark clotho -> results.json")
     add_common(sp)
-    sp.add_argument("--no-build", action="store_true")
+    add_binary(sp)
+    sp.add_argument("--out", metavar="JSON", default=str(RESULTS_PATH),
+                    help="results file; existing entries for other cases are kept"
+                         " (default %(default)s)")
     sp = sub.add_parser("baseline", help="benchmark clotho -> baseline.json (sign-off)")
     add_common(sp)
-    sp.add_argument("--no-build", action="store_true")
+    add_binary(sp)
     sp = sub.add_parser("compare", help="gate results.json against baseline.json")
     sp.add_argument("--results", default=str(RESULTS_PATH))
     sp.add_argument("--baseline", default=str(BASELINE_PATH))
@@ -404,7 +420,7 @@ def main():
 
     args = p.parse_args()
     if args.cmd == "run":
-        cmd_run(args, RESULTS_PATH)
+        cmd_run(args, Path(args.out))
     elif args.cmd == "baseline":
         cmd_run(args, BASELINE_PATH)
     elif args.cmd == "compare":

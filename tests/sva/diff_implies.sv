@@ -1,15 +1,15 @@
 // The `implies` and `iff` property operators.
 //
-// Clotho does NOT lower `implies` or `iff` yet. Both are phase 4 of
-// docs/design/sva-property-layer.md, and both reduce to `not` plus `or`
-// (16.12.8 against 16.12.3 and 16.12.4), which is why they land with the
-// complement or not at all; at the time this file was written Sva.cpp refused
-// them. That ordering is the whole point: every expectation below was derived
-// from the LRM before the implementation existed, so it cannot be an encoding
-// of what clotho happens to do. Until they land, `./build/clotho run
-// tests/sva/diff_implies.sv` must reach a loud refusal naming the operator the
-// source wrote -- `implies` or `iff`, not `or`, even if the lowering is a
-// desugaring into `not` and `or`.
+// Clotho lowers `implies` only where the two operand strengths differ, and
+// refuses `iff` for every pair: the monitor carries one end-of-trace
+// disposition, and `p implies q` is `(not p) or q`, whose two sides agree only
+// when the operands as written disagree (tests/sva_test.cpp, "implies lowers
+// only where the operand strengths make one disposition" and "iff is refused
+// for every pair of operand strengths"). The refusals name the operator the
+// source wrote -- `implies` or `iff`, not `or`. Every expectation below was
+// derived from the LRM before any of this was implemented, so it cannot be an
+// encoding of what clotho happens to do; see the STATUS paragraph below for
+// what `./build/clotho run tests/sva/diff_implies.sv` scores today.
 //
 // CLAUSE NUMBERING, verified against the IEEE Std 1800-2017 subclause list for
 // 16.12 rather than taken on trust: implies and iff are 16.12.8. They are NOT
@@ -189,31 +189,19 @@
 // 0, ims 2, ii 1 (attempt 9), iis 2 (attempts 7 and 8). That last one is why
 // this derivation lists reports per directive and not just per time.
 //
-// A PRE-EXISTING CLOTHO DISAGREEMENT, FOUND BY WRITING THIS FIXTURE, and it is
-// in `ic` -- the one directive here that already lowers. ic's 2 at cycle 4 is
-// two DISTINCT attempts (1 and 3) whose antecedents match at the same end
-// point. Clotho today reports ONE. Reduced:
-//
-//   q: assert property (@(posedge clk) (a ##[1:3] b) |-> c);
-//   // a high at cycles 0, 1, 2; b high at cycle 3; c low there
-//   // three attempts, three failing obligations, all at cycle 3 -> 1 report
-//
-// The LRM individuates attempts, not obligation ticks: 16.14.1 executes an
-// action "once for each ... evaluation attempt". Clotho's own bare-sequence
-// path does that -- `sq` in diff_not.sv reports twice at cycle 2 for two
-// attempts that fail there. So two clotho paths disagree with each other and
-// the ranged-antecedent implication is the one that is wrong; the plausible
-// mechanism is an obligation keyed by its tick, which is right WITHIN an
-// attempt (diff_multimatch.sv's rule: one verdict per attempt however many
-// times the antecedent matches) and wrong ACROSS attempts.
-//
-// That is not phase 4's bug and this fixture does not try to fix it. It is
-// recorded here because it is the ring discipline losing attempt identity
-// exactly where docs/design/sva-property-layer.md says it does -- which is the
-// argument for lowering a negated ranged sequence onto the COUNTED path, where
-// an attempt count per state survives the merge. The same measurement sits on
-// the counted path as `nwr` in diff_not.sv, at the same time and with the same
-// expected count of 2.
+// STATUS. Only part of this fixture runs today, and the active directives
+// reproduce their derivation. `ims` and `ic` are the two uncommented below:
+// `./build/clotho run tests/sva/diff_implies.sv` reports FAIL 15 and FAIL 45
+// for `ims` and FAIL 45 x2 for `ic`, and nothing at the end of trace -- 4
+// reports, matching the per-directive lines above. `im`, `ii` and `iis` are
+// commented out in the body because the lowering refuses them (see the note
+// there); the 19-report total above is therefore the target for when they
+// return, not what the file scores now. `ic`'s 2 at cycle 4 is two DISTINCT
+// attempts (1 and 3) whose antecedents match at the same end point, and clotho
+// reports both, as 16.14.1 requires ("once for each ... evaluation attempt").
+// That agrees with the bare-sequence path (`sq` in diff_not.sv reports twice
+// at cycle 2) and with `nwr` on the counted path. The file is a by-hand
+// fixture: nothing in the test suite runs it.
 //
 // VACUITY, in the LRM's sense, which is a different question from whether this
 // fixture is worth running. 16.14.8(z): an attempt of `property_expr1 implies

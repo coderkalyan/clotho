@@ -19,7 +19,10 @@ tests/perf/perf.py oracles            # measure iverilog/verilator -> oracles.js
 ```
 
 All subcommands take `--runs N` (default 5) and `--cases NAME...`; `run` and
-`baseline` take `--no-build`; `oracles` takes `--tools TOOL...`.
+`baseline` take `--no-build` (reuse `build-perf/clotho`) or `--clotho BIN`
+(benchmark a prebuilt binary, never rebuilt); `run` also takes `--out JSON`
+(results file, default `results.json`; used by `bench-diff.py` and
+`cloud/bench-remote.sh`); `oracles` takes `--tools TOOL...`.
 
 ## Methodology
 

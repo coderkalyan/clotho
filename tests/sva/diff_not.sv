@@ -1,13 +1,11 @@
 // The `not` property operator.
 //
-// Clotho does NOT lower this yet. `not` is phase 4 of
-// docs/design/sva-property-layer.md -- it needs the complement of an
-// obligation, which needs the total determinisation phase 3 built -- and at
-// the time this file was written Sva.cpp refused it. That ordering is the
-// whole point: every expectation below was derived from the LRM before the
-// implementation existed, so it cannot be an encoding of what clotho happens
-// to do. Until the operator lands, `./build/clotho run tests/sva/diff_not.sv`
-// must reach a loud refusal naming `not`, not a syntax error and not a crash.
+// Clotho lowers this: `not` is phase 4 of docs/design/sva-property-layer.md
+// and complements the determinised obligation built by phase 3. Every
+// expectation below was derived from the LRM before the implementation
+// existed, so it cannot be an encoding of what clotho happens to do; the
+// STATUS paragraph below records that `./build/clotho run
+// tests/sva/diff_not.sv` now reproduces it.
 //
 // CLAUSE NUMBERING, verified against the IEEE Std 1800-2017 subclause list for
 // 16.12 rather than taken on trust: negation is 16.12.3, NOT 16.12.6 or
@@ -182,19 +180,16 @@
 // depends on the swap. That last one is why this derivation lists the reports
 // per directive and not just per time: the total does not move.
 //
-// ONE PART OF THIS IS ALREADY CONFIRMED, and it is worth saying which. `sq` is
-// the only directive here that lowers today, and after the derivation above
-// was written clotho reproduced its seven reports exactly, at 25 x2, 55, 65
-// x2, 85 and 95 -- including the two same-tick pairs, which is the per-attempt
-// reporting rule (16.14.1) holding for two attempts that fail at one tick. So
-// the waveform, the scan rule and the report times are confirmed independently
-// of the negation, and what remains unconfirmed is exactly the complement and
-// the strength swap. Clotho does NOT get that multiplicity right on every
-// path: see the pre-existing ring-path disagreement written up in
-// diff_implies.sv, which is the same measurement (two attempts, one obligation
-// tick) on a ranged-antecedent implication and reports 1 where it owes 2.
-// `nwr`'s 2 at cycle 4 is that measurement on the counted path, where an
-// attempt count per state survives determinisation.
+// STATUS. Clotho lowers every directive here, and `./build/clotho run
+// tests/sva/diff_not.sv` reproduces the table above exactly: 28 reports (4 at
+// 15, 4 at 25, 6 at 45, 2 at 55, 4 at 65, 2 at 85, 2 at 95 and 4 at the
+// $finish banner) and 7 cover hits, per directive as derived. That includes
+// the two same-tick pairs of `sq`, which is the per-attempt reporting rule
+// (16.14.1) holding for two attempts that fail at one tick, and `nwr`'s 2 at
+// cycle 4, which is the same measurement on the counted path, where an
+// attempt count per state survives determinisation. diff_implies.sv's `ic`
+// is that measurement on a ranged-antecedent implication. The file is a
+// by-hand fixture: nothing in the test suite runs it.
 //
 // THE COVER, and the reason it is not redundant with `sq`. `cn` counts how
 // many attempts of nw's property SUCCEED, spelled with the strength 16.12.2
