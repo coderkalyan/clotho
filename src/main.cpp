@@ -137,17 +137,19 @@ void register_options(slang::CommandLine& cl, Options& o) {
            "<file>",
            slang::CommandLineFlags::FilePath);
     cl.add("--time", o.time, "Print how long each stage took: reading the source, compiling, simulating");
-    cl.add("-O", o.o3, "Compile the design more thoroughly: slower to start up, faster to simulate");
+    cl.add("-O",
+           o.o3,
+           "[build|run] Compile the design more thoroughly: slower to start up, faster to simulate");
     cl.add("--stat",
            o.stats,
-           "Print a compiler statistic while building, for working on clotho: dedup, dedup-sets, "
-           "comb-fuse, finish or parallel (repeatable, comma-separated)",
+           "[build|run] Print a compiler statistic while building, for working on clotho: dedup, "
+           "dedup-sets, comb-fuse, finish or parallel (repeatable, comma-separated)",
            "<name>",
            slang::CommandLineFlags::CommaList);
     cl.add("--sanitize",
            o.sanitizers,
-           "Check the design for a class of bug while it runs, reporting when one happens: bounds "
-           "(an array index outside the array)"
+           "[build|run] Check the design for a class of bug while it runs, reporting when one "
+           "happens: bounds (an array index outside the array)"
 #ifdef CLOTHO_XSAN
            ", xprov (where an x value decided something, and what made it x)"
 #endif
@@ -190,7 +192,7 @@ void register_options(slang::CommandLine& cl, Options& o) {
            "[build|run] Reclaim the whole heap on every Nth reclaim instead of only the objects "
            "created since the last one. Only a whole-heap pass frees objects that have already "
            "survived a reclaim, so this trades cheap frequent passes against how long those "
-           "linger. 0, the default, lets the runtime decide from how fast the heap is growing. "
+           "linger. 0, the default, lets the runtime decide from how fast the heap is growing",
            "<n>");
     cl.add("--allow-system",
            o.allow_system,
@@ -330,15 +332,20 @@ bool check_scope(const Options& o, Command command, int& status) {
     // `--coverage` is in that set for the same reason: the coverage model the
     // backend emits names its own destination, so the report file is a mode
     // compiled in, not something `run` can add to an artifact built without it.
+    // `-O`, `--stat` and `--sanitize` are in it because they steer code generation,
+    // which `lint` and `synth` never reach.
     struct Check {
-        bool             given;
-        std::string_view name;
-        Command          owner;
-        Command          also = Command::Build;
+        bool                   given;
+        std::string_view       name;
+        Command                owner;
+        std::optional<Command> also = std::nullopt;
     };
     const Check checks[] = {
         { o.emit.has_value(), "--emit", Command::Build },
         { o.out.has_value(), "-o", Command::Build, Command::Synth },
+        { o.o3.has_value(), "-O", Command::Build, Command::Run },
+        { !o.stats.empty(), "--stat", Command::Build, Command::Run },
+        { !o.sanitizers.empty(), "--sanitize", Command::Build, Command::Run },
         { o.gc_stress.has_value(), "--gc-stress", Command::Build, Command::Run },
         { o.gc_stats.has_value(), "--gc-stats", Command::Build, Command::Run },
         { o.gc_nursery_bytes.has_value(), "--gc-nursery", Command::Build, Command::Run },
@@ -348,17 +355,19 @@ bool check_scope(const Options& o, Command command, int& status) {
         { !o.dpi_libs.empty(), "--dpi-lib", Command::Run },
         { o.perf_jitdump.has_value(), "--perf-jitdump", Command::Run },
         { o.loose_stale_ref.has_value(), "--loose-stale-ref", Command::Run },
-        { o.sidecar.has_value(), "--sidecar", Command::Synth, Command::Synth },
-        { o.target.has_value(), "--target", Command::Synth, Command::Synth },
-        { o.hierarchy.has_value(), "--hierarchy", Command::Synth, Command::Synth },
-        { o.no_legalize.has_value(), "--no-legalize", Command::Synth, Command::Synth },
-        { o.full_case.has_value(), "--full-case", Command::Synth, Command::Synth },
-        { o.parallel_case.has_value(), "--parallel-case", Command::Synth, Command::Synth },
+        { o.sidecar.has_value(), "--sidecar", Command::Synth },
+        { o.target.has_value(), "--target", Command::Synth },
+        { o.hierarchy.has_value(), "--hierarchy", Command::Synth },
+        { o.no_legalize.has_value(), "--no-legalize", Command::Synth },
+        { o.full_case.has_value(), "--full-case", Command::Synth },
+        { o.parallel_case.has_value(), "--parallel-case", Command::Synth },
     };
     for (const Check& c : checks) {
         if (c.given && c.owner != command && c.also != command) {
-            status = usage_error(
-              std::format("{} applies to '{}', not '{}'", c.name, command_name(c.owner), command_name(command)));
+            const std::string owners = c.also.has_value()
+                                         ? std::format("'{}' or '{}'", command_name(c.owner), command_name(*c.also))
+                                         : std::format("'{}'", command_name(c.owner));
+            status = usage_error(std::format("{} applies to {}, not '{}'", c.name, owners, command_name(command)));
             return false;
         }
     }

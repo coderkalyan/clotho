@@ -638,6 +638,7 @@ set(CLOTHO_TEST_SOURCES
   tests/lsp_test.cpp
   tests/lsp_tokens_test.cpp
   tests/dap_test.cpp
+  tests/cli_test.cpp
   tests/todo_test.cpp
 )
 add_executable(clotho_test ${CLOTHO_TEST_SOURCES})

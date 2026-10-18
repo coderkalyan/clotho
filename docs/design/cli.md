@@ -1,7 +1,7 @@
 # CLI: the `clotho` driver surface
 
 Status: **landed**. Replaces the flat option list (`--emit=run|ir|llvm|opt|check`
-plus a bag of `--no-*` toggles) with four commands over a single option
+plus a bag of `--no-*` toggles) with six commands over a single option
 namespace shared with slang. `src/main.cpp` is the implementation; this document
 is the rationale and the migration record.
 
@@ -27,7 +27,12 @@ The option sets nest the same way.
 LLVM backend entirely -- `clotho_legalize` links no LLVM and no slang, and the
 simulator does not link `clotho_legalize` -- so it is a peer of `build`, not a
 stage of it. It is the only command whose artifact is source rather than
-generated code. It is required and must be `argv[1]`:
+generated code. It is unfinished, so only a Debug build has it (CMake option
+`CLOTHO_SYNTH`, on by default for Debug and off otherwise): a Release build
+rejects `synth` as an unknown command and registers none of the `[synth]`
+options below.
+
+The command word is required and must be `argv[1]`:
 `clotho design.sv` is a usage error, not an implicit `run`, because implicit
 modes are how the old surface drifted.
 
@@ -46,26 +51,27 @@ There is no second help and nothing to forward — see "One parser" below.
 
 | option | commands | effect |
 |---|---|---|
-| `--emit <target>` | build | `llvm` (default, post-coroutine-pipeline), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR) |
-| `--target <lang>` | synth | `sv` (default, IEEE 1800), `2005` (IEEE 1364-2005: `reg`/`wire`, no wildcard equality, no jump statements) |
-| `--hierarchy <mode>` | synth | `instances` (default) writes one module per instance with names as written; `flat` writes one module with paths mangled into identifiers |
-| `--sidecar <path>` | synth | Also write the JSON sidecar: the original-to-emitted name map, and each signal's inferred storage, clock and reset |
-| `--no-legalize` | synth | Translate as written instead of writing out the implied hardware: no mux trees rebuilt, no implicit branch filled in |
-| `--full-case` | synth | Believe `full_case` / `unique`; reported wherever the claim is what removed a latch |
-| `--parallel-case` | synth | Believe `parallel_case` / `unique0` |
-| `-o, --output <file>` | build | artifact path for every target; `-` (default) is stdout |
-| `--time` | both | per-phase wall-clock to stderr |
+| `--emit <target>` | build | `llvm` (default, post-coroutine-pipeline), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
+| `--target <lang>` | synth (Debug builds only) | `sv` (default, IEEE 1800), `2005` (IEEE 1364-2005: `reg`/`wire`, no wildcard equality, no jump statements) |
+| `--hierarchy <mode>` | synth (Debug builds only) | `instances` (default) writes one module per instance with names as written; `flat` writes one module with paths mangled into identifiers |
+| `--sidecar <path>` | synth (Debug builds only) | Also write the JSON sidecar: the original-to-emitted name map, and each signal's inferred storage, clock and reset |
+| `--no-legalize` | synth (Debug builds only) | Translate as written instead of writing out the implied hardware: no mux trees rebuilt, no implicit branch filled in |
+| `--full-case` | synth (Debug builds only) | Believe `full_case` / `unique`; reported wherever the claim is what removed a latch |
+| `--parallel-case` | synth (Debug builds only) | Believe `parallel_case` / `unique0` |
+| `-o, --output <file>` | build, synth | artifact path for every target; `-` (default) is stdout |
+| `--time` | build, run, lint, synth | per-phase wall-clock to stderr |
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
-| `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel` |
+| `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`. `parallel` reports only under `run` |
 | `--sanitize <list>` | both | dynamic bug checks instrumented into the emitted code, reported to stderr and non-fatal: `bounds` (an index outside what it indexes — array element, packed bit/part select, string character, queue method index, pop from an empty queue; x/z index included), `xprov` (xsan, x provenance — not yet implemented, so **Debug builds only**, `CLOTHO_XSAN`; a shipped build rejects the name). Off by default |
 | `--coverage <file>` | both | write the design's functional-coverage report here (LRM 19): which of the bins its `covergroup`s declare the run reached, and which it never did. No report by default. The destination is compiled into the artifact — the emitted coverage model names its own — so a `build` and the `run` of what it built must be given the same file |
 | `--gc-stress` | both | collect class objects at every opportunity instead of when the design has created enough of them. Slow by design: it turns an object clotho failed to keep into an immediate wrong answer rather than a rare one, so it is for working on clotho itself. **Changes the generated code** (garbage-collection.md), so a `build` and the `run` of what it built must be given the same setting |
 | `--gc-stats` | both | collection summary when the design exits: how many collections, how much was reclaimed, how long the design was paused |
 | `--gc-nursery <bytes>` | both | bytes of class objects the design may allocate between collections (default `8388608`). A plain integer — no `k`/`m`/`g` suffix, because no option on this surface has one. `0` is refused: it means `--gc-stress`, and `0` already means "no ceiling" for `--gc-heap-max` |
 | `--gc-heap-max <bytes>` | both | soft ceiling in bytes: reaching it asks for a collection at the next opportunity, and passing it anyway is reported rather than refused, since a process may allocate without ever suspending (garbage-collection.md §6.1). `0`, the default, sets no ceiling |
-| `--allow-system <const\|full>` | both | permit `$system` (LRM 20.17.1); refused by default |
-| `--loose-timescale` | both | accept a design that mixes elements declaring a time scale with elements that do not (slang's `MissingTimeScale`, LRM 3.14.2.2); the un-annotated ones take `--timescale`'s value, or `1ns/1ns`. Refused by default |
-| `-j, --threads <n>` | both | slang's own option; sizes its parser **and** the LLVM compile pool |
+| `--gc-full-every <n>` | both | collect the whole heap on every Nth collection instead of only the objects created since the last one; only a whole-heap pass frees objects that already survived a collection. `0`, the default, lets the runtime decide from how fast the heap is growing |
+| `--allow-system <const\|full>` | build, run, lint, synth | permit `$system` (LRM 20.17.1); refused by default |
+| `--loose-timescale` | build, run, lint, synth | accept a design that mixes elements declaring a time scale with elements that do not (slang's `MissingTimeScale`, LRM 3.14.2.2); the un-annotated ones take `--timescale`'s value, or `1ns/1ns`. Refused by default |
+| `-j, --threads <n>` | build, run, lint, synth | slang's own option; sizes its parser **and** the LLVM compile pool |
 | `--dpi-lib <path>` | run | DPI-C `.o`/`.a` (JIT-linked) or `.so` (dlopen'd), repeatable |
 | `--perf-jitdump` | run | perf jitdump under `$JITDUMPDIR` |
 | `--loose-stale-ref` | run | report a `ref` whose actual storage was restructured under it (data-model.md §3) once per site and keep simulating, instead of the located fatal. Fatal by default |
@@ -74,14 +80,20 @@ There is no second help and nothing to forward — see "One parser" below.
 
 Valued options take `--name value` or `--name=value`. Clotho's options sit in the
 same namespace as slang's `-D`, `-I`, `-y`,
-`-v`, `-f`, `--top`, `-G`, `--timescale`, `--std`, `-W`, `--error-limit` and
-`-j`, which are options this tool has rather than options it forwards.
+`-v`, `-f`, `--top`, `-G`, `--libmap`, `--timescale`, `--std`, `-W`, `--error-limit` and
+`-j`, which are options this tool has rather than options it forwards. `-G
+<name>=<value>` overrides a parameter of a top-level module (integer and string
+values both take effect); a name no top-level module has is not reported, so a
+typo simulates the design with its defaults. `--libmap <file>` reads library maps,
+which assign source files to libraries; `-L` sets the library priority order and a
+`config` can name its own.
 
-"both" in the table means `build` and `run`. The `--gc-*` group and `--coverage`
-are the only options in it that are *refused* elsewhere, because they are the
-ones that mean something specific to compiling and running rather than nothing
-at all: `--help` tags them `[build|run]`, and `lint`, which compiles nothing,
-rejects them.
+"both" in the table means `build` and `run`. The options in it that steer code
+generation or what the artifact does when it runs -- `-O`, `--stat`, `--sanitize`,
+`--coverage` and the `--gc-*` group -- are the *refused* ones elsewhere: `--help`
+tags them `[build|run]`, and `lint` and `synth`, which compile nothing, reject
+them. The rest of the "both" rows mean something to every command that reads
+source, and say so in their `commands` column.
 
 Sources always share one compilation unit (LRM 3.12; `Lower.cpp` forces
 `singleUnit`), so `` `define `` macros and `$unit` declarations span files.
@@ -114,13 +126,17 @@ a `+` command slang gained through `--cmd-rename`.
 
 ### Errors, not silent no-ops
 
-An option outside its command's set is a usage error naming the right command
-(`-o applies to 'build', not 'run'`; `plusarg '+foo' applies to 'run'`). The old
+An option outside its command's set is a usage error naming the right commands
+(`--dpi-lib applies to 'run', not 'build'`; `-O applies to 'build' or 'run', not
+'lint'`; `plusarg '+foo' applies to 'run'`). The old
 surface accepted `--dpi-lib`, `--perf-jitdump`, `--jobs` and plusargs on every
 emit path and ignored them, which contradicts PRINCIPLES.md's never-silently-accept
 rule.
 
-A knob that would do nothing is the same error. The `--gc-*` group used to be
+A knob that would do nothing is the same error. `lint` and `synth` compile
+nothing, so `-O`, `--stat`, `--sanitize`, `--coverage` and the `--gc-*` group are
+refused there. The one place they are still accepted without effect is
+`build --emit=ir`, which stops before code generation. The `--gc-*` group used to be
 refused without `--gc`, back when class objects were collected only on request;
 the collector is unconditional now (garbage-collection.md §12a), so every one of
 them always means something and none of them needs a companion flag.

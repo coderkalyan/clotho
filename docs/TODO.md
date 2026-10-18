@@ -227,8 +227,8 @@ Milestones, in order; lower ones unblock higher ones:
   trees are rebuilt each run; needs a content-addressed cache.
 - [ ] **Run-start reset of wait queues, observed/deferred queues and string pools** — not
   returned to power-on between designs in one process (docs/design/cooperative-finish.md).
-- [ ] **`-G` parameter overrides and `--libmap` library maps** — not exposed on the
-  command line.
+- [ ] **`-G` override naming a parameter no top-level module has** — accepted without a
+  diagnostic, so a mistyped name simulates the design with its defaults.
 - [~] **Non-literal `$sformat` / `$sformatf` format** (21.3.3) — missing pieces:
   - [ ] **`%m` and `%l`** — the scope and `library.cell` names never reach the renderer.
   - [ ] **Aggregate or container argument** — refused at compile time.
