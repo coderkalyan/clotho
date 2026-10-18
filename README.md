@@ -87,7 +87,8 @@ linked into every simulation, is licensed under the Mozilla Public License 2.0
 Clotho can be distributed under any terms its authors choose. A distributed
 binary that contains the runtime must tell its recipients where to get the
 runtime's source (MPL-2.0 section 3.2); for an unmodified runtime, a link to the
-Clotho release is enough.
+Clotho release is enough. Such a binary also carries the third-party notices the
+runtime's dependencies require; see `THIRD_PARTY_NOTICES.md`.
 
 The license covers Clotho itself. Designs and testbenches you run with Clotho,
 and the output Clotho produces from them, are yours.
