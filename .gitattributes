@@ -1,0 +1,4 @@
+# The slang patches apply to slang's LF sources, so they must stay LF even in a
+# checkout that converts line endings (GitHub's Windows runners set
+# core.autocrlf=true).
+*.patch text eol=lf
