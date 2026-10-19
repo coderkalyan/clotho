@@ -24,10 +24,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # apt.llvm.org / Homebrew track the major; the Windows tarball is pinned to an
-  # exact patch. Clotho's CMakeLists hard-requires major 22.
+  # apt.llvm.org / Homebrew track the major; Windows pins an exact MSYS2 build.
+  # Clotho's CMakeLists hard-requires major 22.
   LLVM_MAJOR: "22"
   LLVM_RELEASE: "22.1.8"
+  MSYS2_LLVM_PKGREL: "3"
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 1G
   # libsva is a Zig static library clotho's frontend links at build time
@@ -161,16 +162,16 @@ jobs:
           # Homebrew's, which has the symbol, so turn them off.
           echo "CXXFLAGS=-D_LIBCPP_DISABLE_AVAILABILITY" >> "$GITHUB_ENV"
 
-      # MSYS2's CLANG64/CLANGARM64 environments package LLVM 22.1.8 — the exact
-      # pin — as a MinGW-w64/UCRT build, so Windows uses clang with libc++ and
-      # no MSVC ABI, CRT or STL anywhere. That is not only a toolchain
-      # preference: against the MSVC-ABI release tarball this build also had to
+      # MSYS2's CLANG64/CLANGARM64 environments build LLVM as MinGW-w64/UCRT, so
+      # Windows uses clang with libc++ and no MSVC ABI, CRT or STL anywhere.
+      # That is not only a toolchain preference: against the MSVC-ABI release
+      # tarball this build also had to
       # work around a DIA SDK path baked into LLVM's exported targets, an
       # expected-lite/std::expected divergence in the MSVC STL, mimalloc
       # colliding with the CRT's allocator symbols, compiler-rt's builtins not
       # being linked, and an import library clobbering a static archive of the
       # same name. None of those exist here.
-      - name: Set up MSYS2 and LLVM (Windows)
+      - name: Set up MSYS2 (Windows)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
         with:
@@ -184,7 +185,25 @@ jobs:
           # inherit Git for Windows' own PATH entry, and the libsva checkout and
           # zig install steps below need them inside this shell.
           pacboy: >-
-            llvm:p clang:p cmake:p ninja:p ccache:p python:p git curl unzip
+            cmake:p ninja:p ccache:p python:p git curl unzip
+
+      # MSYS2 cannot pin a version and its repository has moved past LLVM 22, so
+      # install the exact LLVM_RELEASE build from MSYS2's package archive. pacman
+      # checks each package's signature; the cc-libs (libc++, libunwind) the
+      # environment already has stay current, which libc++ supports.
+      # TODO: drop this pin when Clotho moves to LLVM 23.
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -eux
+          repo="https://repo.msys2.org/mingw/${MSYSTEM,,}"
+          pkgs=
+          for p in llvm llvm-libs llvm-tools clang clang-libs lld compiler-rt; do
+            pkgs="$pkgs $repo/$MINGW_PACKAGE_PREFIX-$p-$LLVM_RELEASE-$MSYS2_LLVM_PKGREL-any.pkg.tar.zst"
+          done
+          pacman -U --noconfirm $pkgs
+          clang --version
+          llvm-config --version
 
       # MSYS2 packages no zig for CLANG64 or CLANGARM64, so take the official
       # release archive, checked against the hash ziglang.org publishes for it,
