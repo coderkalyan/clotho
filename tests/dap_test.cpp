@@ -31,8 +31,11 @@
 #include <csignal>
 #include <fcntl.h>
 #include <poll.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+extern char** environ;
 #endif
 
 // NOTE: Named rather than anonymous, for the reason in src/lsp/Server.cpp: glaze
@@ -76,9 +79,9 @@ using namespace dap_test;
 
 namespace {
 
-// fork+exec rather than the shell: the test needs both ends of the child's
-// stdio, and the exec is immediate so no JIT state of the test runner's is
-// inherited into a running child (the hazard tests/Subprocess.h documents).
+// posix_spawn rather than the shell: the test needs both ends of the child's
+// stdio. Not fork + exec: a forked child of the multithreaded test runner runs
+// inherited fork handlers before it can exec, which crashed it on macOS.
 class Session {
 public:
     Session() {
@@ -87,22 +90,21 @@ public:
         REQUIRE(::pipe(to_child) == 0);
         REQUIRE(::pipe(from_child) == 0);
 
-        pid_ = ::fork();
-        REQUIRE(pid_ >= 0);
-        if (pid_ == 0) {
-            ::dup2(to_child[0], STDIN_FILENO);
-            ::dup2(from_child[1], STDOUT_FILENO);
-            const int devnull = ::open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                ::dup2(devnull, STDERR_FILENO);
-            }
-            ::close(to_child[0]);
-            ::close(to_child[1]);
-            ::close(from_child[0]);
-            ::close(from_child[1]);
-            ::execl(CLOTHO_EXE, "clotho", "dap", static_cast<char*>(nullptr));
-            ::_exit(127);
-        }
+        posix_spawn_file_actions_t actions;
+        ::posix_spawn_file_actions_init(&actions);
+        ::posix_spawn_file_actions_adddup2(&actions, to_child[0], STDIN_FILENO);
+        ::posix_spawn_file_actions_adddup2(&actions, from_child[1], STDOUT_FILENO);
+        ::posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        ::posix_spawn_file_actions_addclose(&actions, to_child[0]);
+        ::posix_spawn_file_actions_addclose(&actions, to_child[1]);
+        ::posix_spawn_file_actions_addclose(&actions, from_child[0]);
+        ::posix_spawn_file_actions_addclose(&actions, from_child[1]);
+        char      arg0[] = "clotho";
+        char      arg1[] = "dap";
+        char*     argv[] = { arg0, arg1, nullptr };
+        const int rc     = ::posix_spawn(&pid_, CLOTHO_EXE, &actions, nullptr, argv, environ);
+        ::posix_spawn_file_actions_destroy(&actions);
+        REQUIRE(rc == 0);
         ::close(to_child[0]);
         ::close(from_child[1]);
         in_  = to_child[1];
@@ -416,6 +418,41 @@ TEST_CASE("dap runs a design and reports its output and exit status") {
     // so it arrives as an event rather than on the protocol stream. That
     // separation is the whole reason the design runs out of process.
     CHECK(session.output_text("stdout").find("hello from the design") != std::string::npos);
+}
+
+// The launch `cwd` is where the design resolves relative paths, so a file that
+// exists only there must be found.
+TEST_CASE("dap runs the design in the launch cwd") {
+    const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / clotho::test::detail::unique_stem();
+    std::filesystem::create_directory(dir);
+    std::ofstream(dir / "dap_cwd_probe.txt") << "probe\n";
+    const Design design(R"(
+module top;
+  integer fd;
+  initial begin
+    fd = $fopen("dap_cwd_probe.txt", "r");
+    if (fd != 0) $display("probe found");
+    else $display("probe missing");
+    $finish;
+  end
+endmodule
+)");
+    std::string cwd;
+    REQUIRE(!glz::write_json(dir.string(), cwd));
+    Session session;
+    session.initialize();
+
+    const int64_t launch =
+      session.request("launch", std::format(R"({{"args":{},"cwd":{},"noDebug":false}})", design.args(), cwd));
+    REQUIRE(session.response(launch).has_value());
+    const int64_t configured = session.request("configurationDone");
+    REQUIRE(session.response(configured).has_value());
+    REQUIRE(session.await("terminated").has_value());
+    CHECK(session.output_text("stdout").find("probe found") != std::string::npos);
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 TEST_CASE("dap reports a design that fails to compile rather than pretending it ran") {

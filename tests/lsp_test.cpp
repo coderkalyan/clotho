@@ -33,8 +33,11 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+extern char** environ;
 #endif
 
 // NOTE: Named rather than anonymous, for the reason in src/lsp/Server.cpp: glaze
@@ -164,9 +167,9 @@ int32_t error_code(const Message& r) {
 // analysis finishes, so a test has to be able to wait for a message rather than
 // read a finished file.
 //
-// fork+exec, not the shell: the test needs both ends of the child's stdio, and
-// the exec is immediate so none of the parent's JIT state is inherited into a
-// running child (the hazard Subprocess.h documents).
+// posix_spawn rather than the shell: the test needs both ends of the child's
+// stdio. Not fork + exec: a forked child of the multithreaded test runner runs
+// inherited fork handlers before it can exec, which crashed it on macOS.
 class LiveSession {
 public:
     LiveSession() {
@@ -175,22 +178,21 @@ public:
         REQUIRE(::pipe(to_child) == 0);
         REQUIRE(::pipe(from_child) == 0);
 
-        pid_ = ::fork();
-        REQUIRE(pid_ >= 0);
-        if (pid_ == 0) {
-            ::dup2(to_child[0], STDIN_FILENO);
-            ::dup2(from_child[1], STDOUT_FILENO);
-            const int devnull = ::open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                ::dup2(devnull, STDERR_FILENO);
-            }
-            ::close(to_child[0]);
-            ::close(to_child[1]);
-            ::close(from_child[0]);
-            ::close(from_child[1]);
-            ::execl(CLOTHO_EXE, "clotho", "lsp", static_cast<char*>(nullptr));
-            ::_exit(127);
-        }
+        posix_spawn_file_actions_t actions;
+        ::posix_spawn_file_actions_init(&actions);
+        ::posix_spawn_file_actions_adddup2(&actions, to_child[0], STDIN_FILENO);
+        ::posix_spawn_file_actions_adddup2(&actions, from_child[1], STDOUT_FILENO);
+        ::posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        ::posix_spawn_file_actions_addclose(&actions, to_child[0]);
+        ::posix_spawn_file_actions_addclose(&actions, to_child[1]);
+        ::posix_spawn_file_actions_addclose(&actions, from_child[0]);
+        ::posix_spawn_file_actions_addclose(&actions, from_child[1]);
+        char      arg0[] = "clotho";
+        char      arg1[] = "lsp";
+        char*     argv[] = { arg0, arg1, nullptr };
+        const int rc     = ::posix_spawn(&pid_, CLOTHO_EXE, &actions, nullptr, argv, environ);
+        ::posix_spawn_file_actions_destroy(&actions);
+        REQUIRE(rc == 0);
         ::close(to_child[0]);
         ::close(from_child[1]);
         in_  = to_child[1];

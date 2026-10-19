@@ -11,8 +11,11 @@
 #else
 #include <csignal>
 #include <poll.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+extern char** environ;
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
@@ -94,8 +97,6 @@ bool DesignProcess::start(const std::string& exe, const std::vector<std::string>
         return false;
     }
 
-    // Built before the fork: everything between fork and exec must be
-    // async-signal-safe, and allocating an argv there is not.
     std::vector<char*> argv;
     argv.reserve(args.size() + 3);
     std::string exe_copy = exe;
@@ -108,30 +109,31 @@ bool DesignProcess::start(const std::string& exe, const std::vector<std::string>
     }
     argv.push_back(nullptr);
 
-    const pid_t child = ::fork();
-    if (child < 0) {
-        error_ = std::format("could not start the design: {}", std::strerror(errno));
+    // posix_spawn rather than fork + exec: the adapter is multithreaded, and a
+    // forked child of a multithreaded process runs the parent's fork handlers
+    // and may call only async-signal-safe functions until it execs, which on
+    // macOS crashed the child before it reached exec.
+    posix_spawn_file_actions_t actions;
+    ::posix_spawn_file_actions_init(&actions);
+    ::posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDOUT_FILENO);
+    ::posix_spawn_file_actions_adddup2(&actions, err_pipe[1], STDERR_FILENO);
+    ::posix_spawn_file_actions_addclose(&actions, out_pipe[0]);
+    ::posix_spawn_file_actions_addclose(&actions, out_pipe[1]);
+    ::posix_spawn_file_actions_addclose(&actions, err_pipe[0]);
+    ::posix_spawn_file_actions_addclose(&actions, err_pipe[1]);
+    if (!cwd.empty()) {
+        ::posix_spawn_file_actions_addchdir_np(&actions, cwd.c_str());
+    }
+    pid_t     child = -1;
+    const int rc    = ::posix_spawn(&child, exe_copy.c_str(), &actions, nullptr, argv.data(), environ);
+    ::posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) {
+        error_ = std::format("could not start the design: {}", std::strerror(rc));
         ::close(out_pipe[0]);
         ::close(out_pipe[1]);
         ::close(err_pipe[0]);
         ::close(err_pipe[1]);
         return false;
-    }
-    if (child == 0) {
-        // The child never returns from here: any failure is an immediate
-        // _exit, because unwinding back into the adapter's own code with two
-        // copies of its state would be worse than a lost error message.
-        ::dup2(out_pipe[1], STDOUT_FILENO);
-        ::dup2(err_pipe[1], STDERR_FILENO);
-        ::close(out_pipe[0]);
-        ::close(out_pipe[1]);
-        ::close(err_pipe[0]);
-        ::close(err_pipe[1]);
-        if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) {
-            ::_exit(127);
-        }
-        ::execv(exe_copy.c_str(), argv.data());
-        ::_exit(127);
     }
 
     ::close(out_pipe[1]);
