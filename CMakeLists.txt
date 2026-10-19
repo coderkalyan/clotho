@@ -214,6 +214,12 @@ FetchContent_Declare(
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
 )
 FetchContent_MakeAvailable(slang)
+# slang builds with hidden visibility; clotho does not, and both instantiate
+# type_info for slang types (clotho inspects slang's diagnostic arguments). On
+# Apple arm64 the two visibilities compare type_info differently, so the
+# std::any_cast in slang's own diagnostic formatter threw bad_any_cast there.
+# Clotho links slang statically, so default visibility exports nothing extra.
+set_target_properties(slang_slang PROPERTIES CXX_VISIBILITY_PRESET default VISIBILITY_INLINES_HIDDEN OFF)
 
 if(WIN32)
   # slang pins its own build to C++20 while clotho is C++23. That is normally
@@ -292,7 +298,12 @@ if(CLOTHO_SVA)
   endif()
 
   set(_libsva_prefix ${CMAKE_CURRENT_BINARY_DIR}/libsva)
-  set(_libsva_lib ${_libsva_prefix}/lib/libsva.a)
+  # Zig names a static library sva.lib on Windows, whatever the ABI.
+  if(WIN32)
+    set(_libsva_lib ${_libsva_prefix}/lib/sva.lib)
+  else()
+    set(_libsva_lib ${_libsva_prefix}/lib/libsva.a)
+  endif()
   # Clotho includes the header as <libsva/sva.h>. A bare <sva.h> resolves to
   # src/Sva.h on a case-insensitive filesystem (macOS, Windows), because src/
   # precedes this directory on the include path.
