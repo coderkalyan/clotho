@@ -648,12 +648,18 @@ TEST_CASE("parameterized class: each specialization's static initializes into it
 
 // LRM 8.9's own example is `static integer fileID = $fopen("data","r")`: a
 // side-effecting SYSTEM call in the initializer, run once at time zero. The
-// wrapper counts the executions; the fd is nonzero because /dev/null opens.
+// wrapper counts the executions; the fd is nonzero because the null device opens.
 TEST_CASE("class static property: the LRM 8.9 $fopen shape runs once") {
-    constexpr std::string_view src = R"(
+#if defined(_WIN32)
+    constexpr std::string_view null_device = "NUL";
+#else
+    constexpr std::string_view null_device = "/dev/null";
+#endif
+    const std::string src = std::string(R"(
         package p;
             int n_opens = 0;
-            function int open_it(); n_opens++; return $fopen("/dev/null", "r"); endfunction
+            function int open_it(); n_opens++; return $fopen(")") +
+                            std::string(null_device) + R"(", "r"); endfunction
             class Packet; static int fileID = open_it(); endclass
         endpackage
         module top;

@@ -25,10 +25,11 @@ namespace {
 // design produces in-process.
 int run_design(const char* path) {
 #if defined(_WIN32)
-    // cmd.exe's `>` redirect hands this process a text-mode stdout, which
-    // rewrites every \n as \r\n -- so the captured output would not match what
-    // the design actually printed. Put it back to binary.
+    // cmd.exe's `>` and `2>` redirects hand this process text-mode stdout and
+    // stderr, which rewrite every \n as \r\n -- so the captured output would not
+    // match what the design actually printed. Put both back to binary.
     _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
 #endif
     const std::string         text = clotho::test::detail::read_file(path);
     const clotho::LowerResult r    = clotho::lower_text(text);

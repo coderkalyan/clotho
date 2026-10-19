@@ -19,6 +19,7 @@
 // then continuing to run code in the child without an exec, is unsupported on
 // Darwin and unavailable on Windows.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -69,8 +70,8 @@ inline std::string read_file(const std::filesystem::path& p) {
 }
 
 // Spawn the test binary in single-design mode against `source`, always
-// redirecting stdout to a temp file and stderr too when `capture_err`. `env` is
-// prepended to the command as `NAME=value ` assignments for the child only.
+// redirecting stdout to a temp file and stderr too when `capture_err`. `env`
+// holds space-separated `NAME=value` assignments that apply to the child only.
 inline DesignRun spawn_design(std::string_view source, bool capture_err, std::string_view env) {
     namespace fs = std::filesystem;
 
@@ -85,8 +86,22 @@ inline DesignRun spawn_design(std::string_view source, bool capture_err, std::st
     }
 
     const auto quote = [](const std::string& s) { return "\"" + s + "\""; };
-    std::string cmd = std::string(env) + quote(self_exe) + " " + std::string(run_design_flag) +
-                      " " + quote(src.string()) + " > " + quote(out.string());
+    std::string prefix;
+#if defined(_WIN32)
+    // cmd.exe has no `NAME=value command` form, so each assignment becomes a
+    // `set` that the command inherits.
+    for (size_t at = 0; at < env.size();) {
+        const size_t end = std::min(env.find(' ', at), env.size());
+        if (end > at) {
+            prefix += "set \"" + std::string(env.substr(at, end - at)) + "\" && ";
+        }
+        at = end + 1;
+    }
+#else
+    prefix = std::string(env);
+#endif
+    std::string cmd = prefix + quote(self_exe) + " " + std::string(run_design_flag) + " " + quote(src.string()) +
+                      " > " + quote(out.string());
     if (capture_err) {
         cmd += " 2> " + quote(err.string());
     }
