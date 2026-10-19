@@ -202,9 +202,12 @@ TEST_CASE("naming the verdict lattice leaves a ring monitor's emitted IR alone")
     // hashing tag names: inserting ir::Inst::Tag::DisableRemote mid-enum renumbered
     // every later tag and broke this digest without moving an instruction. The
     // instruction count, which is the claim that matters, did not change (125).
+    // Re-established again when Lower.cpp stopped emitting an argument list in
+    // the compiler's evaluation order: GCC and clang used to produce different
+    // digests, and both now produce this one, with the count unchanged.
     CHECK(monitor_shape(m) ==
           "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.pend0 sva.0.occ sva.0.clk "
-          "step:125:1287345960479790596 ");
+          "step:125:7609481343294756048 ");
 }
 
 TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone") {
@@ -227,7 +230,7 @@ TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone"
     REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Counted);
     CHECK(monitor_shape(m) ==
           "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.cnt1 sva.0.clk "
-          "step:117:3562075382750980208 final:18:9716285231543666394 ");
+          "step:117:2287638562261415009 final:18:15746842852522268570 ");
 }
 
 TEST_CASE("an overlapping implication differs only in when it seeds") {

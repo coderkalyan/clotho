@@ -5680,10 +5680,10 @@ private:
                  "queues, dynamic arrays or associative arrays is not supported "
                  "(LRM 11.4.11)");
         }
-        const ir::Index cmp = b.binary(module_.pool.is_float(ety) ? ir::Inst::Tag::FEq : ir::Inst::Tag::Eq,
-                                       b.unary(ir::Inst::Tag::Load, a, l),
-                                       b.unary(ir::Inst::Tag::Load, other, l),
-                                       l);
+        const ir::Index a_val     = b.unary(ir::Inst::Tag::Load, a, l);
+        const ir::Index other_val = b.unary(ir::Inst::Tag::Load, other, l);
+        const ir::Index cmp =
+          b.binary(module_.pool.is_float(ety) ? ir::Inst::Tag::FEq : ir::Inst::Tag::Eq, a_val, other_val, l);
         if (module_.pool.layout(ety).domain != ir::Domain::Four) {
             return cmp;
         }
@@ -5897,7 +5897,9 @@ private:
                     emit_agg_store(b.elem_select(lhs, idx, type, l), t.element, *elems[k % n], tag, b, l);
                     continue;
                 }
-                b.binary(ir::Inst::Tag::Store, b.elem_select(lhs, idx, type, l), lower_expr(*elems[k % n], b), l);
+                const ir::Index slot = b.elem_select(lhs, idx, type, l);
+                const ir::Index val  = lower_expr(*elems[k % n], b);
+                b.binary(ir::Inst::Tag::Store, slot, val, l);
             }
             return;
         }
@@ -6013,16 +6015,18 @@ private:
                   b.constant(module_.pool.put_int(make_int_type(32, false, true),
                                                   static_cast<uint64_t>(static_cast<int64_t>(coord))),
                              l);
-                emit_agg_copy(
-                  b.elem_select(lhs, idx, type, l), b.elem_select(rhs, idx, type, l), t.element, tag, b, l, nbt);
+                const ir::Index dst = b.elem_select(lhs, idx, type, l);
+                const ir::Index src = b.elem_select(rhs, idx, type, l);
+                emit_agg_copy(dst, src, t.element, tag, b, l, nbt);
             }
             return;
         }
         if (t.kind == ir::Type::Kind::Struct && !t.is_packed) {
             const auto fields = module_.pool.struct_fields(t.fields_id);
             for (uint32_t i = 0; i < fields.size(); ++i) {
-                emit_agg_copy(
-                  b.member_select(lhs, i, type, l), b.member_select(rhs, i, type, l), fields[i].type, tag, b, l, nbt);
+                const ir::Index dst = b.member_select(lhs, i, type, l);
+                const ir::Index src = b.member_select(rhs, i, type, l);
+                emit_agg_copy(dst, src, fields[i].type, tag, b, l, nbt);
             }
             return;
         }
@@ -6332,7 +6336,9 @@ private:
         }
         const ir::Ref sty = lower_type(*lhs.type);
         guard_agg_eq_members(sty);
-        return b.agg_eq(lower_array_operand(le, b), lower_array_operand(re, b), sty, l);
+        const ir::Index lhs_agg = lower_array_operand(le, b);
+        const ir::Index rhs_agg = lower_array_operand(re, b);
+        return b.agg_eq(lhs_agg, rhs_agg, sty, l);
     }
 
     // Reject comparable-aggregate leaf shapes the backend AggEq expansion does
@@ -6991,8 +6997,9 @@ private:
             b.assoc_reset(lhs, ty, l);
             const slang::ConstantValue& dflt = cv.map()->defaultValue;
             if (!dflt.bad()) {
-                b.binary(ir::Inst::Tag::Store, b.assoc_default(lhs, ty, l),
-                         b.constant(lower_constant(dflt, at.elementType), l), l);
+                const ir::Index slot = b.assoc_default(lhs, ty, l);
+                const ir::Index val  = b.constant(lower_constant(dflt, at.elementType), l);
+                b.binary(ir::Inst::Tag::Store, slot, val, l);
             }
             for (const auto& [key, val] : *cv.map()) {
                 // P4c (docs/design/assoc-keys.md): `lower_constant` cannot pool a
@@ -7007,9 +7014,10 @@ private:
                 // construction this function already gives queue / dynarray /
                 // assoc VALUES, applied to the key instead, if that restriction
                 // is ever lifted.
-                const ir::Index k = b.constant(lower_constant(key, *at.indexType), l);
-                b.binary(ir::Inst::Tag::Store, b.assoc_select(lhs, k, ty, l),
-                         b.constant(lower_constant(val, at.elementType), l), l);
+                const ir::Index k        = b.constant(lower_constant(key, *at.indexType), l);
+                const ir::Index slot     = b.assoc_select(lhs, k, ty, l);
+                const ir::Index elem_val = b.constant(lower_constant(val, at.elementType), l);
+                b.binary(ir::Inst::Tag::Store, slot, elem_val, l);
             }
             return;
         }
@@ -8247,7 +8255,9 @@ private:
             // times).
             const auto nd_it = net_delay_.find(net_u);
             if (nd_it != net_delay_.end()) {
-                b.store_inertial_delay(b.signal(net, l), acc, scaled_delay(*nd_it->second, b), l);
+                const ir::Index dst   = b.signal(net, l);
+                const ir::Index ticks = scaled_delay(*nd_it->second, b);
+                b.store_inertial_delay(dst, acc, ticks, l);
             } else {
                 b.binary(ir::Inst::Tag::Store, b.signal(net, l), acc, l);
             }
@@ -8647,8 +8657,9 @@ private:
 
     // `force_site === id` (CaseEq never yields x; the site is 2-state anyway).
     ir::Index site_is(ir::Signal site, uint32_t id, ir::Builder& b, ir::SourceLoc l) {
-        return b.binary(
-          ir::Inst::Tag::CaseEq, b.unary(ir::Inst::Tag::Load, b.signal(site, l), l), site_const(id, b, l), l);
+        const ir::Index cur  = b.unary(ir::Inst::Tag::Load, b.signal(site, l), l);
+        const ir::Index want = site_const(id, b, l);
+        return b.binary(ir::Inst::Tag::CaseEq, cur, want, l);
     }
 
     // `not forced` and, if an assign layer exists, `not assigned` — the predicate
@@ -8770,7 +8781,9 @@ private:
         ir::Builder     rb(module_.pool);
         const ir::Index pred = pred_fn(rb);
         rb.open_region();
-        rb.binary(ir::Inst::Tag::Store, rb.signal(v, l), lower_expr(a.right(), rb), l);
+        const ir::Index dst = rb.signal(v, l);
+        const ir::Index rhs = lower_expr(a.right(), rb);
+        rb.binary(ir::Inst::Tag::Store, dst, rhs, l);
         const ir::ExtraSlice then_r = rb.close_region();
         rb.open_region();
         const ir::ExtraSlice else_r = rb.close_region();
@@ -8810,7 +8823,9 @@ private:
                 const auto          net   = static_cast<ir::Signal>(net_u);
                 const uint32_t      net_w = module_.pool.layout(module_.signal(net).type).width;
                 const ir::Index     rhs   = lower_expr(a.right(), b);
-                b.binary(ir::Inst::Tag::Store, b.signal(site.active, l), site_const(1, b, l), l);
+                const ir::Index     flag  = b.signal(site.active, l);
+                const ir::Index     on    = site_const(1, b, l);
+                b.binary(ir::Inst::Tag::Store, flag, on, l);
                 b.binary(ir::Inst::Tag::Store, b.signal(site.val, l), rhs, l);
                 // Eager positioned apply so a same-instant read (`force n=v; if
                 // (n===v)`) sees it — the resolver would otherwise update n one delta
@@ -8835,11 +8850,15 @@ private:
             }
             // Variable force: highest priority. Apply now unconditionally, then track
             // the RHS while this site stays the active force (last-force-wins).
-            ForceInfo&       fi = *fip;
-            const uint32_t   id = ++fi.next_site;
-            const ir::Signal v  = signal_of(*sym);
-            b.binary(ir::Inst::Tag::Store, b.signal(fi.site, l), site_const(id, b, l), l);
-            b.binary(ir::Inst::Tag::Store, b.signal(v, l), lower_expr(a.right(), b), l);
+            ForceInfo&       fi      = *fip;
+            const uint32_t   id      = ++fi.next_site;
+            const ir::Signal v       = signal_of(*sym);
+            const ir::Index  site_lv = b.signal(fi.site, l);
+            const ir::Index  id_val  = site_const(id, b, l);
+            b.binary(ir::Inst::Tag::Store, site_lv, id_val, l);
+            const ir::Index dst = b.signal(v, l);
+            const ir::Index rhs = lower_expr(a.right(), b);
+            b.binary(ir::Inst::Tag::Store, dst, rhs, l);
             add_pca_reeval(a, v, l, {}, [&](ir::Builder& rb) { return site_is(fi.site, id, rb, l); });
             return;
         }
@@ -8858,20 +8877,25 @@ private:
         // writes, is itself overridden by force. assign_site was allocated by the
         // scan. Apply now while not force-overridden, then track the RHS; the
         // re-eval also wakes on force_site so `release` reestablishes this assign.
-        const uint32_t id = ++fi.next_assign;
-        b.binary(ir::Inst::Tag::Store, b.signal(fi.assign_site, l), site_const(id, b, l), l);
+        const uint32_t  id      = ++fi.next_assign;
+        const ir::Index site_lv = b.signal(fi.assign_site, l);
+        const ir::Index id_val  = site_const(id, b, l);
+        b.binary(ir::Inst::Tag::Store, site_lv, id_val, l);
         {
             const ir::Index pred = not_forced(fi, /*also_assign=*/false, b, l);
             b.open_region();
-            b.binary(ir::Inst::Tag::Store, b.signal(v, l), lower_expr(a.right(), b), l);
+            const ir::Index dst = b.signal(v, l);
+            const ir::Index rhs = lower_expr(a.right(), b);
+            b.binary(ir::Inst::Tag::Store, dst, rhs, l);
             const ir::ExtraSlice then_r = b.close_region();
             b.open_region();
             const ir::ExtraSlice else_r = b.close_region();
             b.cond(pred, then_r, else_r, l);
         }
         add_pca_reeval(a, v, l, { ir::WaitEvent{ .signal = fi.site, .edge = ir::Edge::Any } }, [&](ir::Builder& rb) {
-            return rb.binary(
-              ir::Inst::Tag::Land, site_is(fi.assign_site, id, rb, l), not_forced(fi, /*also_assign=*/false, rb, l), l);
+            const ir::Index assigned = site_is(fi.assign_site, id, rb, l);
+            const ir::Index unforced = not_forced(fi, /*also_assign=*/false, rb, l);
+            return rb.binary(ir::Inst::Tag::Land, assigned, unforced, l);
         });
     }
 
@@ -8907,11 +8931,15 @@ private:
             // Clear the force. Storing force_site services its wait queue and wakes
             // everything gated on it: a variable's active assign / continuous driver
             // reestablishes, otherwise the value holds (LRM 10.6.2).
-            b.binary(ir::Inst::Tag::Store, b.signal(fi->site, l), site_const(0, b, l), l);
+            const ir::Index site_lv = b.signal(fi->site, l);
+            const ir::Index none    = site_const(0, b, l);
+            b.binary(ir::Inst::Tag::Store, site_lv, none, l);
         } else if (fi->has_assign) {
             // deassign (LRM 10.6.1): end the procedural continuous assign; the value
             // holds. A never-assigned variable is a no-op (no assign_site).
-            b.binary(ir::Inst::Tag::Store, b.signal(fi->assign_site, l), site_const(0, b, l), l);
+            const ir::Index site_lv = b.signal(fi->assign_site, l);
+            const ir::Index none    = site_const(0, b, l);
+            b.binary(ir::Inst::Tag::Store, site_lv, none, l);
         }
     }
 
@@ -8940,7 +8968,9 @@ private:
         }
         for (const NetForceSite& site : fs->second) {
             if (site.lo >= rlo && site.hi <= rhi) {
-                b.binary(ir::Inst::Tag::Store, b.signal(site.active, l), site_const(0, b, l), l);
+                const ir::Index flag = b.signal(site.active, l);
+                const ir::Index off  = site_const(0, b, l);
+                b.binary(ir::Inst::Tag::Store, flag, off, l);
             }
         }
     }
@@ -9004,7 +9034,9 @@ private:
             const ir::Signal slot = alloc_driver_slot(signal_of(ns), l, pack_strength(ns.getDriveStrength()));
             const ir::Index  val  = b.resize(lower_expr(*init, b), lower_type(ns.getType()), l);
             if (delay != nullptr) {
-                b.store_inertial_delay(b.signal(slot, l), val, scaled_delay(delay->as<DelayControl>().expr, b), l);
+                const ir::Index dst   = b.signal(slot, l);
+                const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
+                b.store_inertial_delay(dst, val, ticks, l);
             } else {
                 b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
             }
@@ -9012,12 +9044,16 @@ private:
             return;
         }
         if (delay != nullptr) {
-            b.store_inertial_delay(
-              value_lvalue(ns, b, l), lower_expr(*init, b), scaled_delay(delay->as<DelayControl>().expr, b), l);
+            const ir::Index dst   = value_lvalue(ns, b, l);
+            const ir::Index rhs   = lower_expr(*init, b);
+            const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
+            b.store_inertial_delay(dst, rhs, ticks, l);
             add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
             return;
         }
-        b.binary(ir::Inst::Tag::Store, value_lvalue(ns, b, l), lower_expr(*init, b), l);
+        const ir::Index dst = value_lvalue(ns, b, l);
+        const ir::Index rhs = lower_expr(*init, b);
+        b.binary(ir::Inst::Tag::Store, dst, rhs, l);
         add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
     }
 
@@ -9281,8 +9317,10 @@ private:
         const ir::Signal tmp = module_.add_signal(std::move(info));
 
         ir::Builder         b(module_.pool);
-        const ir::SourceLoc l = loc(e);
-        b.binary(ir::Inst::Tag::Store, b.signal(tmp, l), b.resize(lower_expr(e, b), module_.pool.logic_type, l), l);
+        const ir::SourceLoc l   = loc(e);
+        const ir::Index     dst = b.signal(tmp, l);
+        const ir::Index     rhs = b.resize(lower_expr(e, b), module_.pool.logic_type, l);
+        b.binary(ir::Inst::Tag::Store, dst, rhs, l);
 
         std::vector<ir::WaitEvent> wait_events;
         const auto                 declare_static = [this](const slang::ast::ClassPropertySymbol& p) {
@@ -9372,7 +9410,9 @@ private:
                                        : static_cast<uint16_t>(driven << 8); // (drivenN, highz1)
         ir::Builder      b(module_.pool);
         const ir::Signal slot = alloc_driver_slot(net, l, strength);
-        b.binary(ir::Inst::Tag::Store, b.signal(slot, l), b.constant(def_constant_ref(w, up), l), l);
+        const ir::Index  dst  = b.signal(slot, l);
+        const ir::Index  val  = b.constant(def_constant_ref(w, up), l);
+        b.binary(ir::Inst::Tag::Store, dst, val, l);
         // A permanent source: self-starting, never re-evaluated (empty sensitivity).
         add_continuous_process({}, l, b);
     }
@@ -9911,8 +9951,9 @@ private:
                     // store. Port types are equivalent (LRM 23.3.3), so both sides
                     // share the recursive storage layout (a plain unpacked array is
                     // trivially copyable, so emit_port_agg_copy memcpy's it).
-                    emit_port_agg_copy(
-                      lower_lvalue(a.left(), b), b.signal(child_sig, l), lower_type(*a.left().type), b, l);
+                    const ir::Index dst = lower_lvalue(a.left(), b);
+                    const ir::Index src = b.signal(child_sig, l);
+                    emit_port_agg_copy(dst, src, lower_type(*a.left().type), b, l);
                 } else if (a.left().kind == ExpressionKind::Concatenation) {
                     // Output connected to a concatenation target `.o({a,b})`:
                     // sample the child net once and scatter it MSB-first into the
@@ -9925,8 +9966,9 @@ private:
                 } else {
                     const ir::Ref   ty  = lower_type(*a.left().type);
                     const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
-                    b.binary(
-                      ir::Inst::Tag::Store, lower_lvalue(a.left(), b), coerce(val, *a.right().type, ty, b, l), l);
+                    const ir::Index dst = lower_lvalue(a.left(), b);
+                    const ir::Index src = coerce(val, *a.right().type, ty, b, l);
+                    b.binary(ir::Inst::Tag::Store, dst, src, l);
                 }
                 sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
             } else {
@@ -9992,10 +10034,9 @@ private:
                                                                        : agg_input_actual(src, ty, b, l);
                     emit_port_agg_copy(b.signal(child_sig, l), av, ty, b, l);
                 } else {
-                    b.binary(ir::Inst::Tag::Store,
-                             b.signal(child_sig, l),
-                             coerce(lower_expr(*expr, b), *expr->type, ty, b, l),
-                             l);
+                    const ir::Index dst = b.signal(child_sig, l);
+                    const ir::Index val = coerce(lower_expr(*expr, b), *expr->type, ty, b, l);
+                    b.binary(ir::Inst::Tag::Store, dst, val, l);
                 }
                 collect_expr_reads(*expr, sens);
             }
@@ -10746,8 +10787,10 @@ private:
         const ir::Signal    tmp = declare_temp(ty, "event");
         const ir::SourceLoc l   = loc(e);
 
-        ir::Builder b(module_.pool);
-        b.binary(ir::Inst::Tag::Store, b.signal(tmp, l), b.resize(lower_expr(e, b), ty, l), l);
+        ir::Builder     b(module_.pool);
+        const ir::Index dst = b.signal(tmp, l);
+        const ir::Index rhs = b.resize(lower_expr(e, b), ty, l);
+        b.binary(ir::Inst::Tag::Store, dst, rhs, l);
         add_continuous_process(continuous_events(e), l, b);
         return tmp;
     }
@@ -10791,7 +10834,9 @@ private:
         const auto       place    = [&](ir::Builder& bb) {
             return in_frame ? bb.local(slot, ty, l) : bb.signal(tmp, l);
         };
-        b.binary(ir::Inst::Tag::Store, place(b), b.resize(lower_expr(ev.expr, b), ty, l), l);
+        const ir::Index dst = place(b);
+        const ir::Index rhs = b.resize(lower_expr(ev.expr, b), ty, l);
+        b.binary(ir::Inst::Tag::Store, dst, rhs, l);
 
         b.open_region();
         const ir::Index      lpred = true_const(b, l);
@@ -10865,7 +10910,9 @@ private:
         const ir::Index val    = b.iface_signal(handle, rec->drive_val, l);
         b.binary(ir::Inst::Tag::Store, val,
                  b.resize(lower_expr(a.right(), b), module_.signal(rec->drive_val).type, l), l);
-        b.binary(ir::Inst::Tag::Store, b.iface_signal(handle, rec->drive_pend, l), true_const(b, l), l);
+        const ir::Index pend = b.iface_signal(handle, rec->drive_pend, l);
+        const ir::Index yes  = true_const(b, l);
+        b.binary(ir::Inst::Tag::Store, pend, yes, l);
     }
 
     // Lower an intra-body event control `@(...)` to a Wait instruction. A
@@ -10976,7 +11023,9 @@ private:
                     const ir::ExtraSlice then_r = b.close_region();
                     b.open_region();
                     {
-                        b.binary(ir::Inst::Tag::Store, failed.lv(b, l), true_const(b, l), l);
+                        const ir::Index dst = failed.lv(b, l);
+                        const ir::Index yes = true_const(b, l);
+                        b.binary(ir::Inst::Tag::Store, dst, yes, l);
                         b.break_(l);
                     }
                     const ir::ExtraSlice else_r = b.close_region();
@@ -11089,11 +11138,14 @@ private:
                 // the caller's store happens immediately.
                 const ir::Ref ty =
                   rec.expr.type->isFloating() ? make_int_type(64, false, true) : lower_type(*rec.expr.type);
-                const TempCell bound   = make_temp_cell(ty, "repeat_bound");
-                const TempCell counter = make_temp_cell(ty, "repeat_count");
-                b.binary(
-                  ir::Inst::Tag::Store, bound.lv(b, l), coerce(lower_expr(rec.expr, b), *rec.expr.type, ty, b, l), l);
-                b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.constant(module_.pool.put_int(ty, 0), l), l);
+                const TempCell  bound     = make_temp_cell(ty, "repeat_bound");
+                const TempCell  counter   = make_temp_cell(ty, "repeat_count");
+                const ir::Index bound_lv  = bound.lv(b, l);
+                const ir::Index bound_val = coerce(lower_expr(rec.expr, b), *rec.expr.type, ty, b, l);
+                b.binary(ir::Inst::Tag::Store, bound_lv, bound_val, l);
+                const ir::Index counter_lv = counter.lv(b, l);
+                const ir::Index zero       = b.constant(module_.pool.put_int(ty, 0), l);
+                b.binary(ir::Inst::Tag::Store, counter_lv, zero, l);
 
                 b.open_region();
                 const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
@@ -11106,9 +11158,11 @@ private:
                 const ir::ExtraSlice body = b.close_region();
 
                 b.open_region();
-                const ir::Index sc  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
-                const ir::Index one = b.constant(module_.pool.put_int(ty, 1), l);
-                b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.binary(ir::Inst::Tag::Add, sc, one, l), l);
+                const ir::Index sc   = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
+                const ir::Index one  = b.constant(module_.pool.put_int(ty, 1), l);
+                const ir::Index slot = counter.lv(b, l);
+                const ir::Index next = b.binary(ir::Inst::Tag::Add, sc, one, l);
+                b.binary(ir::Inst::Tag::Store, slot, next, l);
                 const ir::ExtraSlice step = b.close_region();
 
                 b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -12641,18 +12695,21 @@ private:
 
     // A 1-bit control signal, written unconditionally.
     void store_control_bit(ir::Signal sig, bool set, ir::Builder& b, ir::SourceLoc l) {
-        b.binary(ir::Inst::Tag::Store, b.signal(sig, l), set ? true_const(b, l) : zero_mask(1, b, l), l);
+        const ir::Index dst = b.signal(sig, l);
+        const ir::Index val = set ? true_const(b, l) : zero_mask(1, b, l);
+        b.binary(ir::Inst::Tag::Store, dst, val, l);
     }
 
     // The same, but holding its current value while the assertion is locked
     // (LRM 20.12 Lock). A select, never a branch: this is straight-line code in
     // whatever process the task was written in.
     void store_control_locked(const MonitorControl& ctl, ir::Signal sig, bool set, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Index want = set ? true_const(b, l) : zero_mask(1, b, l);
-        b.binary(ir::Inst::Tag::Store,
-                 b.signal(sig, l),
-                 b.select(load_signal(ctl.lock, b, l), load_signal(sig, b, l), want, l),
-                 l);
+        const ir::Index want   = set ? true_const(b, l) : zero_mask(1, b, l);
+        const ir::Index dst    = b.signal(sig, l);
+        const ir::Index locked = load_signal(ctl.lock, b, l);
+        const ir::Index cur    = load_signal(sig, b, l);
+        const ir::Index val    = b.select(locked, cur, want, l);
+        b.binary(ir::Inst::Tag::Store, dst, val, l);
     }
 
     // One control task's effect on one assertion.
@@ -13212,7 +13269,9 @@ private:
         // One bit, set: the monitor's next edge consumes it and clears it. Several
         // processes storing it before that edge are one cohort and share the attempt,
         // which is exact rather than an approximation -- see the guard above.
-        b.binary(ir::Inst::Tag::Store, b.signal(ports.req, l), true_const(b, l), l);
+        const ir::Index req = b.signal(ports.req, l);
+        const ir::Index yes = true_const(b, l);
+        b.binary(ir::Inst::Tag::Store, req, yes, l);
         b.expect_wait(id, l);
     }
 
@@ -13761,10 +13820,11 @@ private:
                      uint32_t      width,
                      ir::Builder&  b,
                      ir::SourceLoc l) {
-        b.binary(ir::Inst::Tag::Store,
-                 b.signal(sig, l),
-                 b.select(edge, b.select(active, value, zero_mask(width, b, l), l), load_signal(sig, b, l), l),
-                 l);
+        const ir::Index dst     = b.signal(sig, l);
+        const ir::Index stepped = b.select(active, value, zero_mask(width, b, l), l);
+        const ir::Index cur     = load_signal(sig, b, l);
+        const ir::Index val     = b.select(edge, stepped, cur, l);
+        b.binary(ir::Inst::Tag::Store, dst, val, l);
     }
 
     // This cycle's attempt id: one bit rotating through the ids, so an id is handed
@@ -13778,7 +13838,9 @@ private:
                               ir::Builder&        b,
                               ir::SourceLoc       l) {
         const ir::Index held   = load_signal(st.idnow, b, l);
-        const ir::Index id_now = b.select(mask_any(held, b, l), held, slot_mask(0, ring, b, l), l);
+        const ir::Index have   = mask_any(held, b, l);
+        const ir::Index first  = slot_mask(0, ring, b, l);
+        const ir::Index id_now = b.select(have, held, first, l);
         store_gated(st.idnow, rotl1(id_now, ring, b, l), active, edge, ring, b, l);
 
         return id_now;
@@ -13821,16 +13883,18 @@ private:
                 if ((row[s / 64] & (uint64_t{ 1 } << (s % 64))) == 0) {
                     continue;
                 }
-                acc = b.binary(
-                  ir::Inst::Tag::Bor,
-                  acc,
-                  b.select(mask_bit(cur_t, p, trig, b, l), load_signal(st.tid[p], b, l), zero_mask(ring, b, l), l),
-                  l);
+                const ir::Index live    = mask_bit(cur_t, p, trig, b, l);
+                const ir::Index id_at   = load_signal(st.tid[p], b, l);
+                const ir::Index none    = zero_mask(ring, b, l);
+                const ir::Index carried = b.select(live, id_at, none, l);
+                acc                     = b.binary(ir::Inst::Tag::Bor, acc, carried, l);
             }
             if ((mon.trigger.first[s / 64] & (uint64_t{ 1 } << (s % 64))) != 0) {
                 acc = b.binary(ir::Inst::Tag::Bor, acc, id_now, l);
             }
-            tid_next[s] = b.select(mask_bit(next, s, trig, b, l), acc, zero_mask(ring, b, l), l);
+            const ir::Index live = mask_bit(next, s, trig, b, l);
+            const ir::Index none = zero_mask(ring, b, l);
+            tid_next[s]          = b.select(live, acc, none, l);
 
             // Whose antecedent completed a match this cycle.
             if ((mon.trigger.last[s / 64] & (uint64_t{ 1 } << (s % 64))) != 0) {
@@ -13861,10 +13925,11 @@ private:
             if (row_is_zero(row)) {
                 continue;
             }
-            const ir::Index taken =
-              b.select(mask_bit(current, s, states, b, l), b.constant(mask_const(row, states), l), zero, l);
-            next = any ? b.binary(ir::Inst::Tag::Bor, next, taken, l) : taken;
-            any  = true;
+            const ir::Index live  = mask_bit(current, s, states, b, l);
+            const ir::Index bits  = b.constant(mask_const(row, states), l);
+            const ir::Index taken = b.select(live, bits, zero, l);
+            next                  = any ? b.binary(ir::Inst::Tag::Bor, next, taken, l) : taken;
+            any                   = true;
         }
 
         return b.binary(ir::Inst::Tag::Band, next, satisfied, l);
@@ -14048,10 +14113,9 @@ private:
 
         b.open_region();
         const ir::Index step_cur = b.unary(ir::Inst::Tag::Load, rem.lv(b, l), l);
-        b.binary(ir::Inst::Tag::Store,
-                 rem.lv(b, l),
-                 b.binary(ir::Inst::Tag::Sub, step_cur, int_const(1, counter_bits, b, l), l),
-                 l);
+        const ir::Index dst      = rem.lv(b, l);
+        const ir::Index next     = b.binary(ir::Inst::Tag::Sub, step_cur, int_const(1, counter_bits, b, l), l);
+        b.binary(ir::Inst::Tag::Store, dst, next, l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body_region, step, /*bottom_test=*/false, l);
@@ -14257,7 +14321,9 @@ private:
     // Store when `when` holds, hold otherwise. store_gated's sibling for state
     // that must survive `disable iff` rather than be reset by it.
     void store_when(ir::Signal sig, ir::Index value, ir::Index when, ir::Builder& b, ir::SourceLoc l) {
-        b.binary(ir::Inst::Tag::Store, b.signal(sig, l), b.select(when, value, load_signal(sig, b, l), l), l);
+        const ir::Index dst = b.signal(sig, l);
+        const ir::Index val = b.select(when, value, load_signal(sig, b, l), l);
+        b.binary(ir::Inst::Tag::Store, dst, val, l);
     }
 
     // Advance every ring by one clock tick. Emitted at the very END of the monitor
@@ -14327,10 +14393,13 @@ private:
         // not at the near end, and at least one of the two is definite -- that
         // last conjunct is what excludes x -> x, the only remaining pair whose
         // endpoints are indistinguishable.
-        return b.binary(ir::Inst::Tag::Band,
-                        b.binary(ir::Inst::Tag::Band, bit_not(hi(old_v), b, l), bit_not(lo(new_v), b, l), l),
-                        b.binary(ir::Inst::Tag::Bor, lo(old_v), hi(new_v), l),
-                        l);
+        const ir::Index old_not_hi = bit_not(hi(old_v), b, l);
+        const ir::Index new_not_lo = bit_not(lo(new_v), b, l);
+        const ir::Index moved      = b.binary(ir::Inst::Tag::Band, old_not_hi, new_not_lo, l);
+        const ir::Index old_lo     = lo(old_v);
+        const ir::Index new_hi     = hi(new_v);
+        const ir::Index definite   = b.binary(ir::Inst::Tag::Bor, old_lo, new_hi, l);
+        return b.binary(ir::Inst::Tag::Band, moved, definite, l);
     }
 
     // One sampled value function (LRM 16.9.3). All six read SAMPLED values, so
@@ -14463,8 +14532,9 @@ private:
         // $rose / $fell are LSB-only (LRM 16.9.3), so a multi-bit operand is
         // truncated to bit 0 -- as 4-state, because the edge order below needs to
         // tell x apart from 0 and 1.
-        return edge_step(
-          b.resize(then, module_.pool.logic_type, l), b.resize(now, module_.pool.logic_type, l), name == "$rose", b, l);
+        const ir::Index old_bit = b.resize(then, module_.pool.logic_type, l);
+        const ir::Index new_bit = b.resize(now, module_.pool.logic_type, l);
+        return edge_step(old_bit, new_bit, name == "$rose", b, l);
     }
 
     // Two families are exceptions, and neither is a grudging one, because
@@ -14593,22 +14663,20 @@ private:
             // is defined only for integral operands, and a real has no x/z for
             // the 4-state rule to be about, so the match is IEEE-754 equality.
             // Both sides widen to `real` -- a shortreal widens exactly (6.12.2).
-            const ir::Ref rty = module_.pool.real_type;
-            return b.binary(ir::Inst::Tag::FEq,
-                            coerce(lower_expr(*atom.expr, b), sel, rty, b, l),
-                            coerce(lower_expr(*atom.match, b), label, rty, b, l),
-                            l);
+            const ir::Ref   rty = module_.pool.real_type;
+            const ir::Index lhs = coerce(lower_expr(*atom.expr, b), sel, rty, b, l);
+            const ir::Index rhs = coerce(lower_expr(*atom.match, b), label, rty, b, l);
+            return b.binary(ir::Inst::Tag::FEq, lhs, rhs, l);
         }
         if (!sel.isIntegral() || !label.isIntegral()) {
             fail("a case property over a non-integral selector or item label is not supported");
         }
-        const ir::Ref ty = make_int_type(std::max(sel.getBitWidth(), label.getBitWidth()),
-                                         sel.isFourState() || label.isFourState(),
-                                         sel.isSigned() && label.isSigned());
-        return b.binary(ir::Inst::Tag::CaseEq,
-                        b.resize(lower_expr(*atom.expr, b), ty, l),
-                        b.resize(lower_expr(*atom.match, b), ty, l),
-                        l);
+        const ir::Ref   ty  = make_int_type(std::max(sel.getBitWidth(), label.getBitWidth()),
+                                            sel.isFourState() || label.isFourState(),
+                                            sel.isSigned() && label.isSigned());
+        const ir::Index lhs = b.resize(lower_expr(*atom.expr, b), ty, l);
+        const ir::Index rhs = b.resize(lower_expr(*atom.match, b), ty, l);
+        return b.binary(ir::Inst::Tag::CaseEq, lhs, rhs, l);
     }
 
     // One boolean root as a definite 1-bit value, from the flat forest libsva
@@ -14626,16 +14694,16 @@ private:
                 return item.lhs != 0 ? true_const(b, l) : zero_mask(1, b, l);
             case Op::Atom:
                 return eval_atom(lowered.atoms[item.lhs], sampled, b);
-            case Op::And:
-                return b.binary(ir::Inst::Tag::Band,
-                                eval_root(lowered, item.lhs, sampled, b, l),
-                                eval_root(lowered, item.rhs, sampled, b, l),
-                                l);
-            case Op::Or:
-                return b.binary(ir::Inst::Tag::Bor,
-                                eval_root(lowered, item.lhs, sampled, b, l),
-                                eval_root(lowered, item.rhs, sampled, b, l),
-                                l);
+            case Op::And: {
+                const ir::Index lhs = eval_root(lowered, item.lhs, sampled, b, l);
+                const ir::Index rhs = eval_root(lowered, item.rhs, sampled, b, l);
+                return b.binary(ir::Inst::Tag::Band, lhs, rhs, l);
+            }
+            case Op::Or: {
+                const ir::Index lhs = eval_root(lowered, item.lhs, sampled, b, l);
+                const ir::Index rhs = eval_root(lowered, item.rhs, sampled, b, l);
+                return b.binary(ir::Inst::Tag::Bor, lhs, rhs, l);
+            }
             case Op::Not:
                 // libsva's bnot, which clotho's own lowering never produces -- an SVA
                 // boolean is three-valued, so the user's `!` is pushed to the leaves
@@ -14778,10 +14846,9 @@ private:
         if (st.ctl != nullptr) {
             const ir::Index killed = load_signal(st.ctl->kill, b, l);
             disabled               = b.binary(ir::Inst::Tag::Bor, disabled, killed, l);
-            b.binary(ir::Inst::Tag::Store,
-                     b.signal(st.ctl->kill, l),
-                     b.select(edge, zero_mask(1, b, l), killed, l),
-                     l);
+            const ir::Index dst    = b.signal(st.ctl->kill, l);
+            const ir::Index val    = b.select(edge, zero_mask(1, b, l), killed, l);
+            b.binary(ir::Inst::Tag::Store, dst, val, l);
         }
         const ir::Index active = b.binary(ir::Inst::Tag::Band, bit_not(disabled, b, l), edge, l);
 
@@ -14805,10 +14872,9 @@ private:
             // belongs to the cycle, and a cycle the assertion is disabled for
             // discards it along with everything else. So the condition is tested
             // over (previous edge, this edge], with no gap and no double count.
-            b.binary(ir::Inst::Tag::Store,
-                     b.signal(st.abort_seen[i], l),
-                     b.select(edge, zero_mask(1, b, l), abort_cond[i], l),
-                     l);
+            const ir::Index dst = b.signal(st.abort_seen[i], l);
+            const ir::Index val = b.select(edge, zero_mask(1, b, l), abort_cond[i], l);
+            b.binary(ir::Inst::Tag::Store, dst, val, l);
         }
 
         const uint32_t  obl   = mon.obligation.state_count;
@@ -14880,7 +14946,9 @@ private:
                 // first states injected here and nowhere downstream: `stepped`
                 // carries threads already part-way through a match, and the seed
                 // below is one of those threads reaching its obligation.
-                start = b.select(load_signal(st.ctl->off, b, l), zero_mask(trig, b, l), start, l);
+                const ir::Index off   = load_signal(st.ctl->off, b, l);
+                const ir::Index zeros = zero_mask(trig, b, l);
+                start                 = b.select(off, zeros, start, l);
             }
             const ir::Index stepped = automaton_advance(mon.trigger, cur_t, sat_t, b, l);
             const ir::Index next    = b.binary(ir::Inst::Tag::Bor, stepped, start, l);
@@ -14948,10 +15016,9 @@ private:
                 if (!mon.aborts[i].covers_trigger) {
                     continue;
                 }
-                const ir::Index           fire = b.binary(ir::Inst::Tag::Band,
-                                                          b.binary(ir::Inst::Tag::Band, scope, abort_cond[i], l),
-                                                          bit_not(claimed, b, l),
-                                                          l);
+                const ir::Index           hit       = b.binary(ir::Inst::Tag::Band, scope, abort_cond[i], l);
+                const ir::Index           unclaimed = bit_not(claimed, b, l);
+                const ir::Index           fire      = b.binary(ir::Inst::Tag::Band, hit, unclaimed, l);
                 std::optional<ir::Index>& into =
                   mon.aborts[i].effect == ir::AssertionAbortEffect::Accept ? trigger_matched : trigger_failed;
                 into    = into.has_value() ? b.binary(ir::Inst::Tag::Bor, *into, fire, l) : fire;
@@ -15047,7 +15114,9 @@ private:
             const ir::Index busy      = mask_bit(occupied, k, mon.depth, b, l);
             const ir::Index free_here = b.binary(ir::Inst::Tag::Band, all_taken, bit_not(busy, b, l), l);
             const ir::Index pick      = b.binary(ir::Inst::Tag::Band, seeding, free_here, l);
-            const ir::Index claim     = b.select(pick, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
+            const ir::Index slot      = slot_mask(k, mon.depth, b, l);
+            const ir::Index zeros     = zero_mask(mon.depth, b, l);
+            const ir::Index claim     = b.select(pick, slot, zeros, l);
 
             pending[k] = b.select(pick, seed, pending[k], l);
             if (group) {
@@ -15129,8 +15198,9 @@ private:
 
             // Only a match has a vector left to clear, since a failure is what an
             // empty vector means.
-            const ir::Index still =
-              b.select(v.pending, slot_mask(k, mon.depth, b, l), zero_mask(mon.depth, b, l), l);
+            const ir::Index slot  = slot_mask(k, mon.depth, b, l);
+            const ir::Index zeros = zero_mask(mon.depth, b, l);
+            const ir::Index still = b.select(v.pending, slot, zeros, l);
 
             pending[k] = b.select(matched[k], zero_mask(obl, b, l), pending[k], l);
             remaining  = b.binary(ir::Inst::Tag::Bor, remaining, still, l);
@@ -15232,15 +15302,14 @@ private:
             // a surviving attempt's, and still owes that attempt a verdict. Freeing
             // the slot on the first owner to fail loses every co-owner silently.
             for (uint32_t k = 0; k < mon.depth; ++k) {
-                const ir::Index survivors = b.binary(ir::Inst::Tag::Band, oid_next[k], finished, l);
-                const ir::Index doomed    = b.binary(ir::Inst::Tag::Band,
-                                                     mask_any(oid_next[k], b, l),
-                                                     bit_not(mask_any(survivors, b, l), b, l),
-                                                     l);
-                oid_next[k]               = survivors;
-                matched[k]                = b.binary(ir::Inst::Tag::Band, matched[k], bit_not(doomed, b, l), l);
-                pending[k]                = b.select(doomed, zero_mask(obl, b, l), pending[k], l);
-                remaining                 = b.select(
+                const ir::Index survivors    = b.binary(ir::Inst::Tag::Band, oid_next[k], finished, l);
+                const ir::Index owned        = mask_any(oid_next[k], b, l);
+                const ir::Index no_survivors = bit_not(mask_any(survivors, b, l), b, l);
+                const ir::Index doomed       = b.binary(ir::Inst::Tag::Band, owned, no_survivors, l);
+                oid_next[k]                  = survivors;
+                matched[k]                   = b.binary(ir::Inst::Tag::Band, matched[k], bit_not(doomed, b, l), l);
+                pending[k]                   = b.select(doomed, zero_mask(obl, b, l), pending[k], l);
+                remaining                    = b.select(
                   doomed,
                   b.binary(
                     ir::Inst::Tag::Band, remaining, b.unary(ir::Inst::Tag::Bnot, slot_mask(k, mon.depth, b, l), l), l),
@@ -15250,12 +15319,11 @@ private:
             fired_ids      = b.binary(ir::Inst::Tag::Band, fired_ids, finished, l);
             ir::Index kept = zero_mask(trig, b, l);
             for (uint32_t s = 0; s < trig; ++s) {
-                tid_next[s] = b.binary(ir::Inst::Tag::Band, tid_next[s], finished, l);
-                kept =
-                  b.binary(ir::Inst::Tag::Bor,
-                           kept,
-                           b.select(mask_any(tid_next[s], b, l), slot_mask(s, trig, b, l), zero_mask(trig, b, l), l),
-                           l);
+                tid_next[s]             = b.binary(ir::Inst::Tag::Band, tid_next[s], finished, l);
+                const ir::Index present = mask_any(tid_next[s], b, l);
+                const ir::Index slot    = slot_mask(s, trig, b, l);
+                const ir::Index zeros   = zero_mask(trig, b, l);
+                kept                    = b.binary(ir::Inst::Tag::Bor, kept, b.select(present, slot, zeros, l), l);
             }
             trig_next = b.binary(ir::Inst::Tag::Band, trig_next, kept, l);
 
@@ -15539,7 +15607,9 @@ private:
                 // $assertoff stops attempts STARTING and lets those already running
                 // finish (LRM 20.12), and an implication's attempt starts when its
                 // ANTECEDENT does -- so the gate belongs here and nowhere downstream.
-                start = b.select(load_signal(st.ctl->off, b, l), zero_mask(trig, b, l), start, l);
+                const ir::Index off   = load_signal(st.ctl->off, b, l);
+                const ir::Index zeros = zero_mask(trig, b, l);
+                start                 = b.select(off, zeros, start, l);
             }
             const ir::Index stepped = automaton_advance(mon.trigger, cur_t, sat_t, b, l);
             trig_next               = b.binary(ir::Inst::Tag::Bor, stepped, start, l);
@@ -15587,10 +15657,9 @@ private:
                 if (!mon.aborts[i].covers_trigger) {
                     continue;
                 }
-                const ir::Index           fire = b.binary(ir::Inst::Tag::Band,
-                                                          b.binary(ir::Inst::Tag::Band, scope, abort_cond[i], l),
-                                                          bit_not(claimed, b, l),
-                                                          l);
+                const ir::Index           hit       = b.binary(ir::Inst::Tag::Band, scope, abort_cond[i], l);
+                const ir::Index           unclaimed = bit_not(claimed, b, l);
+                const ir::Index           fire      = b.binary(ir::Inst::Tag::Band, hit, unclaimed, l);
                 std::optional<ir::Index>& into =
                   mon.aborts[i].effect == ir::AssertionAbortEffect::Accept ? trigger_matched : trigger_failed;
                 into    = into.has_value() ? b.binary(ir::Inst::Tag::Bor, *into, fire, l) : fire;
@@ -15871,10 +15940,9 @@ private:
             // an antecedent matches twice in ONE attempt, and telling those apart is
             // the grouping a counted monitor does not have -- so there is one
             // reading available and both spellings get it.
-            const ir::Index count = b.binary(ir::Inst::Tag::Add,
-                                             load_signal(st.covered, b, l),
-                                             b.resize(matches, mask_type(32), l),
-                                             l);
+            const ir::Index covered = load_signal(st.covered, b, l);
+            const ir::Index wide    = b.resize(matches, mask_type(32), l);
+            const ir::Index count   = b.binary(ir::Inst::Tag::Add, covered, wide, l);
             store_gated(st.covered, count, active, edge, 32, b, l);
         } else if (verdicts) {
             emit_counted_pends(failures, *fail_body, active, st.ctl != nullptr ? &st.ctl->foff : nullptr, b, l);
@@ -15888,8 +15956,9 @@ private:
             // attempt can be in flight, so the count can only ever be 0 or 1 -- the
             // fold is what makes that independent of the discipline rather than an
             // assumption about it.
-            const ir::Index verdict =
-              b.binary(ir::Inst::Tag::Bor, mask_any(matches, b, l), mask_any(failures, b, l), l);
+            const ir::Index any_match = mask_any(matches, b, l);
+            const ir::Index any_fail  = mask_any(failures, b, l);
+            const ir::Index verdict   = b.binary(ir::Inst::Tag::Bor, any_match, any_fail, l);
             emit_expect_step(st, id, seeding, active, verdict, b, l);
         }
 
@@ -15937,10 +16006,9 @@ private:
         // An end-of-trace failure is a fail action like any other, so LRM 20.12's
         // FailOff suppresses it too.
         if (st.ctl != nullptr) {
-            residue = b.select(bit_not(load_signal(st.ctl->foff, b, l), b, l),
-                               residue,
-                               zero_mask(counter_bits, b, l),
-                               l);
+            const ir::Index enabled = bit_not(load_signal(st.ctl->foff, b, l), b, l);
+            const ir::Index zeros   = zero_mask(counter_bits, b, l);
+            residue                 = b.select(enabled, residue, zeros, l);
         }
 
         // Inline rather than pended, for emit_monitor_finish's reason: Final is past
@@ -16072,10 +16140,11 @@ private:
         // (t=10 rather than t=15 on tests/sva/diff_expect.sv), which is the OFFSET
         // that fixture exists to measure.
         const ir::Index resolved = b.binary(ir::Inst::Tag::Band, active, verdict, l);
-        b.binary(ir::Inst::Tag::Store,
-                 b.signal(st.expect_req, l),
-                 b.select(started, zero_mask(1, b, l), load_signal(st.expect_req, b, l), l),
-                 l);
+        const ir::Index req_lv   = b.signal(st.expect_req, l);
+        const ir::Index zeros    = zero_mask(1, b, l);
+        const ir::Index req_now  = load_signal(st.expect_req, b, l);
+        const ir::Index req_next = b.select(started, zeros, req_now, l);
+        b.binary(ir::Inst::Tag::Store, req_lv, req_next, l);
 
         // Set by the edge that seeds and cleared by the one that resolves, and the
         // two can be the SAME edge: a one-cycle property is seeded and matched in
@@ -16085,13 +16154,11 @@ private:
         // Ungated by `active`, unlike the automaton's own state: both terms already
         // carry it, and a plain store keeps this readable as the two-line state
         // machine it is.
-        b.binary(ir::Inst::Tag::Store,
-                 b.signal(st.expect_busy, l),
-                 b.binary(ir::Inst::Tag::Band,
-                          b.binary(ir::Inst::Tag::Bor, load_signal(st.expect_busy, b, l), started, l),
-                          bit_not(resolved, b, l),
-                          l),
-                 l);
+        const ir::Index busy_lv    = b.signal(st.expect_busy, l);
+        const ir::Index busy_now   = b.binary(ir::Inst::Tag::Bor, load_signal(st.expect_busy, b, l), started, l);
+        const ir::Index unresolved = bit_not(resolved, b, l);
+        const ir::Index busy_next  = b.binary(ir::Inst::Tag::Band, busy_now, unresolved, l);
+        b.binary(ir::Inst::Tag::Store, busy_lv, busy_next, l);
 
         b.expect_wake(resolved, id, l);
     }
@@ -16170,13 +16237,10 @@ private:
         if (ring != 0) {
             pending_ids = zero_mask(ring, b, l);
             for (uint32_t k = 0; k < mon.depth; ++k) {
-                pending_ids = b.binary(ir::Inst::Tag::Bor,
-                                       pending_ids,
-                                       b.select(mask_bit(occupied, k, mon.depth, b, l),
-                                                load_signal(st.oid[k], b, l),
-                                                zero_mask(ring, b, l),
-                                                l),
-                                       l);
+                const ir::Index busy  = mask_bit(occupied, k, mon.depth, b, l);
+                const ir::Index ids   = load_signal(st.oid[k], b, l);
+                const ir::Index zeros = zero_mask(ring, b, l);
+                pending_ids           = b.binary(ir::Inst::Tag::Bor, pending_ids, b.select(busy, ids, zeros, l), l);
             }
         }
         const uint32_t reports = ring != 0 ? ring : mon.depth;
@@ -16428,7 +16492,9 @@ private:
             if (is_aggregate(vs.getType()) || is_unpacked_container(vs.getType())) {
                 emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
             } else {
-                b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+                const ir::Index dst = value_lvalue(vs, b, l);
+                const ir::Index rhs = lower_expr(*init, b);
+                b.binary(ir::Inst::Tag::Store, dst, rhs, l);
             }
             return;
         }
@@ -16543,7 +16609,9 @@ private:
         if (is_aggregate(vs.getType()) || is_unpacked_container(vs.getType())) {
             emit_struct_store(value_lvalue(vs, b, l), lower_type(vs.getType()), *init, ir::Inst::Tag::Store, b, l);
         } else {
-            b.binary(ir::Inst::Tag::Store, value_lvalue(vs, b, l), lower_expr(*init, b), l);
+            const ir::Index dst = value_lvalue(vs, b, l);
+            const ir::Index rhs = lower_expr(*init, b);
+            b.binary(ir::Inst::Tag::Store, dst, rhs, l);
         }
     }
 
@@ -16579,8 +16647,10 @@ private:
         }
         ir::Builder& b = *preinit_;
         for (const auto& [live, entry] : sva_history_seeds_) {
-            const ir::SourceLoc l = module_.signal(entry).loc;
-            b.binary(ir::Inst::Tag::Store, b.signal(entry, l), b.unary(ir::Inst::Tag::Load, b.signal(live, l), l), l);
+            const ir::SourceLoc l   = module_.signal(entry).loc;
+            const ir::Index     dst = b.signal(entry, l);
+            const ir::Index     val = b.unary(ir::Inst::Tag::Load, b.signal(live, l), l);
+            b.binary(ir::Inst::Tag::Store, dst, val, l);
         }
         sva_history_seeds_.clear();
     }
@@ -16760,15 +16830,19 @@ private:
         }
         ir::Builder b(module_.pool);
         for (const auto& [live, shadow] : sva_shadow_pairs_) {
-            const ir::SourceLoc l = module_.signal(shadow).loc;
-            b.binary(ir::Inst::Tag::Store, b.signal(shadow, l), b.unary(ir::Inst::Tag::Load, b.signal(live, l), l), l);
+            const ir::SourceLoc l   = module_.signal(shadow).loc;
+            const ir::Index     dst = b.signal(shadow, l);
+            const ir::Index     val = b.unary(ir::Inst::Tag::Load, b.signal(live, l), l);
+            b.binary(ir::Inst::Tag::Store, dst, val, l);
         }
         // "Did this clocking block's event occur in the current time step" (LRM
         // 14.11's `##0`, and the maturation window of a drive): set in Observed,
         // and false again from the top of the next step, which is here.
         for (const ir::Signal sig : preponed_clears_) {
-            const ir::SourceLoc l = module_.signal(sig).loc;
-            b.binary(ir::Inst::Tag::Store, b.signal(sig, l), zero_mask(1, b, l), l);
+            const ir::SourceLoc l    = module_.signal(sig).loc;
+            const ir::Index     dst  = b.signal(sig, l);
+            const ir::Index     zero = zero_mask(1, b, l);
+            b.binary(ir::Inst::Tag::Store, dst, zero, l);
         }
         module_.add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = b.finish() });
         sva_shadow_pairs_.clear();
@@ -17176,10 +17250,9 @@ private:
         // cleared from the top of the next step by the Preponed process. It is what
         // makes a drive mature at a clocking event rather than at every settled
         // point (LRM 14.16), and what `##0` tests (LRM 14.11).
-        b.binary(ir::Inst::Tag::Store,
-                 b.signal(st.fired, l),
-                 b.binary(ir::Inst::Tag::Bor, load_signal(st.fired, b, l), fired, l),
-                 l);
+        const ir::Index fired_lv  = b.signal(st.fired, l);
+        const ir::Index fired_val = b.binary(ir::Inst::Tag::Bor, load_signal(st.fired, b, l), fired, l);
+        b.binary(ir::Inst::Tag::Store, fired_lv, fired_val, l);
 
         b.open_region();
         for (const ClockVarState& cv : st.vars) {
@@ -17190,14 +17263,15 @@ private:
             // #1step reads the shadow of the step before; an explicit #0 reads the
             // live signal, here in Observed (LRM 14.4, 14.13).
             const ir::Signal src = cv.zero_skew ? live : sampled_shadow_of(live, "a clocking block");
-            b.binary(ir::Inst::Tag::Store, b.signal(cv.sampled, l), load_signal(src, b, l), l);
+            const ir::Index  dst = b.signal(cv.sampled, l);
+            const ir::Index  val = load_signal(src, b, l);
+            b.binary(ir::Inst::Tag::Store, dst, val, l);
         }
         // Last, after every sample above: LRM 14.13 guarantees a process that waits
         // for the clocking block reads the updated values.
-        b.binary(ir::Inst::Tag::Store,
-                 b.signal(st.event, l),
-                 bit_not(load_signal(st.event, b, l), b, l),
-                 l);
+        const ir::Index event_lv  = b.signal(st.event, l);
+        const ir::Index event_val = bit_not(load_signal(st.event, b, l), b, l);
+        b.binary(ir::Inst::Tag::Store, event_lv, event_val, l);
         const ir::ExtraSlice then_r = b.close_region();
         b.open_region();
         const ir::ExtraSlice else_r = b.close_region(); // empty
@@ -17255,8 +17329,12 @@ private:
             }
             const ir::Index pend = load_signal(cv.drive_pend, b, l);
             b.open_region();
-            b.binary(ir::Inst::Tag::Store, b.signal(live, l), load_signal(cv.drive_val, b, l), l);
-            b.binary(ir::Inst::Tag::Store, b.signal(cv.drive_pend, l), zero_mask(1, b, l), l);
+            const ir::Index live_lv   = b.signal(live, l);
+            const ir::Index drive_val = load_signal(cv.drive_val, b, l);
+            b.binary(ir::Inst::Tag::Store, live_lv, drive_val, l);
+            const ir::Index pend_lv = b.signal(cv.drive_pend, l);
+            const ir::Index zero    = zero_mask(1, b, l);
+            b.binary(ir::Inst::Tag::Store, pend_lv, zero, l);
             const ir::ExtraSlice drive_r = b.close_region();
             b.open_region();
             const ir::ExtraSlice skip_r = b.close_region(); // empty
@@ -17309,16 +17387,19 @@ private:
             fail("internal: a real cycle delay count reached lowering");
         }
         const std::vector<ir::WaitEdge> edges{ ir::WaitEdge{ st.event, static_cast<uint32_t>(ir::Edge::Any) } };
-        const ir::Ref                   ty      = lower_type(*cd.expr.type);
-        const TempCell                  bound   = make_temp_cell(ty, "cycle_bound");
-        const TempCell                  counter = make_temp_cell(ty, "cycle_count");
-        b.binary(ir::Inst::Tag::Store, bound.lv(b, l), b.resize(lower_expr(cd.expr, b), ty, l), l);
-        b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.constant(module_.pool.put_int(ty, 0), l), l);
+        const ir::Ref                   ty         = lower_type(*cd.expr.type);
+        const TempCell                  bound      = make_temp_cell(ty, "cycle_bound");
+        const TempCell                  counter    = make_temp_cell(ty, "cycle_count");
+        const ir::Index                 bound_lv   = bound.lv(b, l);
+        const ir::Index                 bound_init = b.resize(lower_expr(cd.expr, b), ty, l);
+        b.binary(ir::Inst::Tag::Store, bound_lv, bound_init, l);
+        const ir::Index counter_lv   = counter.lv(b, l);
+        const ir::Index counter_init = b.constant(module_.pool.put_int(ty, 0), l);
+        b.binary(ir::Inst::Tag::Store, counter_lv, counter_init, l);
 
-        const ir::Index n_is_zero = b.binary(ir::Inst::Tag::Eq,
-                                             b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l),
-                                             b.constant(module_.pool.put_int(ty, 0), l),
-                                             l);
+        const ir::Index bound_val = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
+        const ir::Index zero      = b.constant(module_.pool.put_int(ty, 0), l);
+        const ir::Index n_is_zero = b.binary(ir::Inst::Tag::Eq, bound_val, zero, l);
 
         // ##0: synchronise to this cycle's event, or continue if it already happened.
         b.open_region();
@@ -17348,9 +17429,11 @@ private:
             const ir::ExtraSlice body = b.close_region();
 
             b.open_region();
-            const ir::Index sc  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
-            const ir::Index one = b.constant(module_.pool.put_int(ty, 1), l);
-            b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.binary(ir::Inst::Tag::Add, sc, one, l), l);
+            const ir::Index sc   = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
+            const ir::Index one  = b.constant(module_.pool.put_int(ty, 1), l);
+            const ir::Index slot = counter.lv(b, l);
+            const ir::Index next = b.binary(ir::Inst::Tag::Add, sc, one, l);
+            b.binary(ir::Inst::Tag::Store, slot, next, l);
             const ir::ExtraSlice step = b.close_region();
 
             b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -17439,12 +17522,13 @@ private:
             // partial drive needs a per-bit pending mask.
             fail("a synchronous drive of a bit-select or slice of a clockvar is not supported");
         }
-        const ir::SourceLoc l = loc(a);
-        b.binary(ir::Inst::Tag::Store,
-                 b.signal(var->drive_val, l),
-                 b.resize(lower_expr(a.right(), b), module_.signal(var->drive_val).type, l),
-                 l);
-        b.binary(ir::Inst::Tag::Store, b.signal(var->drive_pend, l), true_const(b, l), l);
+        const ir::SourceLoc l        = loc(a);
+        const ir::Index     drive_lv = b.signal(var->drive_val, l);
+        const ir::Index     drive    = b.resize(lower_expr(a.right(), b), module_.signal(var->drive_val).type, l);
+        b.binary(ir::Inst::Tag::Store, drive_lv, drive, l);
+        const ir::Index pend_lv = b.signal(var->drive_pend, l);
+        const ir::Index yes     = true_const(b, l);
+        b.binary(ir::Inst::Tag::Store, pend_lv, yes, l);
     }
 
     // The lowered state of a clocking block, for a reader outside it (`@(cb)`).
@@ -17734,10 +17818,14 @@ private:
         // Both live in the enclosing region, like a for-loop's init, and both are
         // per-activation cells (a frame Local inside a subroutine) so a recursive
         // or concurrently-invoked task keeps its own count.
-        const TempCell bound   = make_temp_cell(ty, "repeat_bound");
-        const TempCell counter = make_temp_cell(ty, "repeat_count");
-        b.binary(ir::Inst::Tag::Store, bound.lv(b, l), coerce(lower_expr(r.count, b), *r.count.type, ty, b, l), l);
-        b.binary(ir::Inst::Tag::Store, counter.lv(b, l), b.constant(module_.pool.put_int(ty, 0), l), l);
+        const TempCell  bound     = make_temp_cell(ty, "repeat_bound");
+        const TempCell  counter   = make_temp_cell(ty, "repeat_count");
+        const ir::Index bound_lv  = bound.lv(b, l);
+        const ir::Index bound_val = coerce(lower_expr(r.count, b), *r.count.type, ty, b, l);
+        b.binary(ir::Inst::Tag::Store, bound_lv, bound_val, l);
+        const ir::Index counter_lv = counter.lv(b, l);
+        const ir::Index zero       = b.constant(module_.pool.put_int(ty, 0), l);
+        b.binary(ir::Inst::Tag::Store, counter_lv, zero, l);
 
         b.open_region();
         const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
@@ -17921,8 +18009,10 @@ private:
                                    ir::Index                   len,
                                    ir::Builder&                b,
                                    ir::SourceLoc               l) {
-        const TempCell bound = make_temp_cell(ty, "foreach_bound");
-        b.binary(ir::Inst::Tag::Store, bound.lv(b, l), b.resize(len, ty, l), l);
+        const TempCell  bound     = make_temp_cell(ty, "foreach_bound");
+        const ir::Index bound_lv  = bound.lv(b, l);
+        const ir::Index bound_val = b.resize(len, ty, l);
+        b.binary(ir::Inst::Tag::Store, bound_lv, bound_val, l);
         b.binary(ir::Inst::Tag::Store, iter_lv, b.constant(module_.pool.put_int(ty, 0), l), l);
 
         b.open_region();
@@ -17954,14 +18044,15 @@ private:
                                  ir::Index     iter_lv,
                                  ir::Builder&  b,
                                  ir::SourceLoc l) {
-        const ir::Ref    bit1 = make_int_type(1, false, false);
-        const ir::Ref    aty  = foreach_dim_ref(f, dim);
-        const TempCell   ok   = make_temp_cell(bit1, "foreach_ok");
-        using Step            = ir::Builder::AssocStep;
-        b.binary(ir::Inst::Tag::Store,
-                 ok.lv(b, l),
-                 b.resize(b.assoc_traverse(foreach_base_lv(f, dim, b, l), iter_lv, Step::First, aty, l), bit1, l),
-                 l);
+        const ir::Ref  bit1        = make_int_type(1, false, false);
+        const ir::Ref  aty         = foreach_dim_ref(f, dim);
+        const TempCell ok          = make_temp_cell(bit1, "foreach_ok");
+        using Step                 = ir::Builder::AssocStep;
+        const ir::Index first_lv   = ok.lv(b, l);
+        const ir::Index first_base = foreach_base_lv(f, dim, b, l);
+        const ir::Index first_hit  = b.assoc_traverse(first_base, iter_lv, Step::First, aty, l);
+        const ir::Index first_ok   = b.resize(first_hit, bit1, l);
+        b.binary(ir::Inst::Tag::Store, first_lv, first_ok, l);
 
         b.open_region();
         const ir::Index      pred = b.unary(ir::Inst::Tag::Load, ok.lv(b, l), l);
@@ -17972,10 +18063,11 @@ private:
         const ir::ExtraSlice body = b.close_region();
 
         b.open_region();
-        b.binary(ir::Inst::Tag::Store,
-                 ok.lv(b, l),
-                 b.resize(b.assoc_traverse(foreach_base_lv(f, dim, b, l), iter_lv, Step::Next, aty, l), bit1, l),
-                 l);
+        const ir::Index next_lv   = ok.lv(b, l);
+        const ir::Index next_base = foreach_base_lv(f, dim, b, l);
+        const ir::Index next_hit  = b.assoc_traverse(next_base, iter_lv, Step::Next, aty, l);
+        const ir::Index next_ok   = b.resize(next_hit, bit1, l);
+        b.binary(ir::Inst::Tag::Store, next_lv, next_ok, l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -19482,10 +19574,11 @@ private:
         const ir::Ref   u32  = make_int_type(32, false, false);
         const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
         b.open_region();
-        const ir::Index draw = b.urandom_range(
-          b.binary(ir::Inst::Tag::Sub, b.resize(sum, u32, l), b.constant(module_.pool.put_int(u32, 1), l), l),
-          b.constant(module_.pool.put_int(u32, 0), l),
-          l);
+        const ir::Index wide = b.resize(sum, u32, l);
+        const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
+        const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
+        const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
+        const ir::Index draw = b.urandom_range(top, low, l);
         lower_randcase_arm(rc, 0, zero, draw, weights, u32, b);
         const ir::ExtraSlice pick_region = b.close_region();
         b.open_region();
@@ -19890,10 +19983,9 @@ private:
         try {
             // An output formal is not seeded from the caller, so the flag starts at
             // the frame's X fill. Clear it before any call can read it back.
-            b.binary(ir::Inst::Tag::Store,
-                     b.local(ctx.randseq_abort, bit1, l),
-                     b.constant(module_.pool.put_int(bit1, 0), l),
-                     l);
+            const ir::Index dst  = b.local(ctx.randseq_abort, bit1, l);
+            const ir::Index zero = b.constant(module_.pool.put_int(bit1, 0), l);
+            b.binary(ir::Inst::Tag::Store, dst, zero, l);
             gen_production(p, rs, b);
         } catch (const LowerError& e) {
             b.rollback(body_mark);
@@ -19969,12 +20061,12 @@ private:
         std::optional<LowerError> failure;
         try {
             const auto store_plan = [&](int64_t rule_idx, uint32_t units) {
-                b.binary(ir::Inst::Tag::Store,
-                         b.local(rule_out, i32, l),
-                         b.constant(module_.pool.put_int(i32, rule_idx), l),
-                         l);
-                b.binary(
-                  ir::Inst::Tag::Store, b.local(len_out, i32, l), b.constant(module_.pool.put_int(i32, units), l), l);
+                const ir::Index rule_lv  = b.local(rule_out, i32, l);
+                const ir::Index rule_val = b.constant(module_.pool.put_int(i32, rule_idx), l);
+                b.binary(ir::Inst::Tag::Store, rule_lv, rule_val, l);
+                const ir::Index len_lv  = b.local(len_out, i32, l);
+                const ir::Index len_val = b.constant(module_.pool.put_int(i32, units), l);
+                b.binary(ir::Inst::Tag::Store, len_lv, len_val, l);
             };
             store_plan(-1, 0);
             const std::span<const RsProd::Rule> rules = p.getRules();
@@ -20087,13 +20179,9 @@ private:
             const ir::Index zero = b.constant(module_.pool.put_int(bit1, 0), l);
             b.binary(ir::Inst::Tag::Store, b.local(ctx.randseq_abort, bit1, l), zero, l);
             b.binary(ir::Inst::Tag::Store, b.local(ctx.randseq_stop, bit1, l), zero, l);
-            gen_step_rules(rs,
-                           p.getRules(),
-                           0,
-                           b.unary(ir::Inst::Tag::Load, b.local(rule_in, i32, l), l),
-                           b.local(pos_in, i32, l),
-                           i32,
-                           b);
+            const ir::Index rule_val = b.unary(ir::Inst::Tag::Load, b.local(rule_in, i32, l), l);
+            const ir::Index pos_lv   = b.local(pos_in, i32, l);
+            gen_step_rules(rs, p.getRules(), 0, rule_val, pos_lv, i32, b);
         } catch (const LowerError& e) {
             b.rollback(body_mark);
             failure = e;
@@ -20146,10 +20234,9 @@ private:
             return;
         }
         const ir::SourceLoc l    = to_source_loc(rule.ruleBlock->location);
-        const ir::Index     pred = b.binary(ir::Inst::Tag::Eq,
-                                            b.unary(ir::Inst::Tag::Load, pos_lv, l),
-                                            b.constant(module_.pool.put_int(i32, static_cast<int64_t>(u)), l),
-                                            l);
+        const ir::Index     pos  = b.unary(ir::Inst::Tag::Load, pos_lv, l);
+        const ir::Index     unit = b.constant(module_.pool.put_int(i32, static_cast<int64_t>(u)), l);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::Eq, pos, unit, l);
         b.open_region();
         // The rule's result variables are ref formals over the driver's cells, so
         // they are already declared and already initialized: map the names without
@@ -20239,10 +20326,11 @@ private:
         const ir::Ref   u32  = make_int_type(32, false, false);
         const ir::Index zero = b.constant(module_.pool.put_int(wty, 0), l);
         b.open_region();
-        const ir::Index draw = b.urandom_range(
-          b.binary(ir::Inst::Tag::Sub, b.resize(sum, u32, l), b.constant(module_.pool.put_int(u32, 1), l), l),
-          b.constant(module_.pool.put_int(u32, 0), l),
-          l);
+        const ir::Index wide = b.resize(sum, u32, l);
+        const ir::Index one  = b.constant(module_.pool.put_int(u32, 1), l);
+        const ir::Index top  = b.binary(ir::Inst::Tag::Sub, wide, one, l);
+        const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
+        const ir::Index draw = b.urandom_range(top, low, l);
         gen_rule_arm(rules, 0, zero, draw, weights, u32, b, emit);
         const ir::ExtraSlice pick_region = b.close_region();
         b.open_region();
@@ -20436,22 +20524,26 @@ private:
             } else {
                 b.call(st.plan, args, l);
             }
-            b.binary(ir::Inst::Tag::Store, op.pos.lv(b, l), kconst(0), l);
-            b.binary(ir::Inst::Tag::Store, op.stop.lv(b, l), b.constant(module_.pool.put_int(bit1, 0), l), l);
+            const ir::Index pos_lv   = op.pos.lv(b, l);
+            const ir::Index pos_init = kconst(0);
+            b.binary(ir::Inst::Tag::Store, pos_lv, pos_init, l);
+            const ir::Index stop_lv   = op.stop.lv(b, l);
+            const ir::Index stop_init = b.constant(module_.pool.put_int(bit1, 0), l);
+            b.binary(ir::Inst::Tag::Store, stop_lv, stop_init, l);
         }
 
         const ir::Index bias = rand_join_bias(rule, i32, b, l);
 
         // while (any operand has units left)
         b.open_region();
-        ir::Index any =
-          b.binary(ir::Inst::Tag::Gt, b.unary(ir::Inst::Tag::Load, ops[0].nleft.lv(b, l), l), kconst(0), l);
+        const ir::Index first_left = b.unary(ir::Inst::Tag::Load, ops[0].nleft.lv(b, l), l);
+        const ir::Index first_zero = kconst(0);
+        ir::Index       any        = b.binary(ir::Inst::Tag::Gt, first_left, first_zero, l);
         for (size_t i = 1; i < ops.size(); i++) {
-            any = b.binary(
-              ir::Inst::Tag::Bor,
-              any,
-              b.binary(ir::Inst::Tag::Gt, b.unary(ir::Inst::Tag::Load, ops[i].nleft.lv(b, l), l), kconst(0), l),
-              l);
+            const ir::Index left = b.unary(ir::Inst::Tag::Load, ops[i].nleft.lv(b, l), l);
+            const ir::Index zero = kconst(0);
+            const ir::Index busy = b.binary(ir::Inst::Tag::Gt, left, zero, l);
+            any                  = b.binary(ir::Inst::Tag::Bor, any, busy, l);
         }
         const ir::ExtraSlice cond_region = b.close_region();
 
@@ -20467,24 +20559,24 @@ private:
         std::vector<ir::Index> weights;
         weights.reserve(ops.size());
         for (const Operand& op : ops) {
-            const ir::Index left   = b.unary(ir::Inst::Tag::Load, op.nleft.lv(b, l), l);
-            const ir::Index shortw = b.binary(ir::Inst::Tag::Mul,
-                                              b.binary(ir::Inst::Tag::Sub, kmx, bias, l),
-                                              b.binary(ir::Inst::Tag::Sub, span, left, l),
-                                              l);
-            const ir::Index longw  = b.binary(ir::Inst::Tag::Mul, bias, left, l);
-            const ir::Index w      = b.binary(ir::Inst::Tag::Add, shortw, longw, l);
-            weights.push_back(
-              b.resize(b.select(b.binary(ir::Inst::Tag::Gt, left, kconst(0), l), w, kconst(0), l), u32, l));
+            const ir::Index left     = b.unary(ir::Inst::Tag::Load, op.nleft.lv(b, l), l);
+            const ir::Index inv_bias = b.binary(ir::Inst::Tag::Sub, kmx, bias, l);
+            const ir::Index gap      = b.binary(ir::Inst::Tag::Sub, span, left, l);
+            const ir::Index shortw   = b.binary(ir::Inst::Tag::Mul, inv_bias, gap, l);
+            const ir::Index longw    = b.binary(ir::Inst::Tag::Mul, bias, left, l);
+            const ir::Index w        = b.binary(ir::Inst::Tag::Add, shortw, longw, l);
+            const ir::Index has_left = b.binary(ir::Inst::Tag::Gt, left, kconst(0), l);
+            const ir::Index none     = kconst(0);
+            const ir::Index weight   = b.select(has_left, w, none, l);
+            weights.push_back(b.resize(weight, u32, l));
         }
         ir::Index sum = weights[0];
         for (size_t i = 1; i < weights.size(); i++) {
             sum = b.binary(ir::Inst::Tag::Add, sum, weights[i], l);
         }
-        const ir::Index draw =
-          b.urandom_range(b.binary(ir::Inst::Tag::Sub, sum, b.constant(module_.pool.put_int(u32, 1), l), l),
-                          b.constant(module_.pool.put_int(u32, 0), l),
-                          l);
+        const ir::Index top  = b.binary(ir::Inst::Tag::Sub, sum, b.constant(module_.pool.put_int(u32, 1), l), l);
+        const ir::Index low  = b.constant(module_.pool.put_int(u32, 0), l);
+        const ir::Index draw = b.urandom_range(top, low, l);
         gen_rand_join_arm(ops, 0, b.constant(module_.pool.put_int(u32, 0), l), draw, weights, u32, rs, vars, b, l);
         const ir::ExtraSlice body_region = b.close_region();
 
@@ -20657,18 +20749,18 @@ private:
         // Advance this sequence: one unit consumed, unless the production aborted
         // (LRM 18.17.6's `return`), in which case its remaining units are dropped
         // and the other sequences carry on.
-        b.binary(ir::Inst::Tag::Store,
-                 op.pos.lv(b, l),
-                 b.binary(ir::Inst::Tag::Add, b.unary(ir::Inst::Tag::Load, op.pos.lv(b, l), l), kconst(1), l),
-                 l);
-        const ir::Index left = b.unary(ir::Inst::Tag::Load, op.nleft.lv(b, l), l);
-        const ir::Index dec  = b.binary(ir::Inst::Tag::Sub, left, kconst(1), l);
-        b.binary(
-          ir::Inst::Tag::Store,
-          op.nleft.lv(b, l),
-          b.select(
-            b.unary(ir::Inst::Tag::RedOr, b.unary(ir::Inst::Tag::Load, op.stop.lv(b, l), l), l), kconst(0), dec, l),
-          l);
+        const ir::Index pos_lv = op.pos.lv(b, l);
+        const ir::Index cur    = b.unary(ir::Inst::Tag::Load, op.pos.lv(b, l), l);
+        const ir::Index one    = kconst(1);
+        const ir::Index next   = b.binary(ir::Inst::Tag::Add, cur, one, l);
+        b.binary(ir::Inst::Tag::Store, pos_lv, next, l);
+        const ir::Index left     = b.unary(ir::Inst::Tag::Load, op.nleft.lv(b, l), l);
+        const ir::Index dec      = b.binary(ir::Inst::Tag::Sub, left, kconst(1), l);
+        const ir::Index nleft_lv = op.nleft.lv(b, l);
+        const ir::Index stopped  = b.unary(ir::Inst::Tag::RedOr, b.unary(ir::Inst::Tag::Load, op.stop.lv(b, l), l), l);
+        const ir::Index zero     = kconst(0);
+        const ir::Index nleft    = b.select(stopped, zero, dec, l);
+        b.binary(ir::Inst::Tag::Store, nleft_lv, nleft, l);
         if (op.result) {
             // Only a production that actually returned a value wrote the slot, so
             // the rule variable is written exactly then; otherwise it keeps the type
@@ -20794,19 +20886,22 @@ private:
                 // statement itself cannot be terminated prematurely. A break statement
                 // will terminate the entire randsequence block." A negative count runs
                 // zero times; 18.17.4 requires a non-negative one.
-                const auto&         rp      = prod.as<RsProd::RepeatProd>();
-                const ir::SourceLoc el      = loc(*rp.expr);
-                const ir::Ref       ty      = lower_type(*rp.expr->type);
-                const TempCell      bound   = make_temp_cell(ty, "rs_repeat_bound");
-                const TempCell      counter = make_temp_cell(ty, "rs_repeat_count");
-                b.binary(ir::Inst::Tag::Store, bound.lv(b, el), lower_expr(*rp.expr, b), el);
-                b.binary(ir::Inst::Tag::Store, counter.lv(b, el), b.constant(module_.pool.put_int(ty, 0), el), el);
+                const auto&         rp        = prod.as<RsProd::RepeatProd>();
+                const ir::SourceLoc el        = loc(*rp.expr);
+                const ir::Ref       ty        = lower_type(*rp.expr->type);
+                const TempCell      bound     = make_temp_cell(ty, "rs_repeat_bound");
+                const TempCell      counter   = make_temp_cell(ty, "rs_repeat_count");
+                const ir::Index     bound_lv  = bound.lv(b, el);
+                const ir::Index     bound_val = lower_expr(*rp.expr, b);
+                b.binary(ir::Inst::Tag::Store, bound_lv, bound_val, el);
+                const ir::Index counter_lv = counter.lv(b, el);
+                const ir::Index zero       = b.constant(module_.pool.put_int(ty, 0), el);
+                b.binary(ir::Inst::Tag::Store, counter_lv, zero, el);
 
                 b.open_region();
-                const ir::Index      pred = b.binary(ir::Inst::Tag::Lt,
-                                                     b.unary(ir::Inst::Tag::Load, counter.lv(b, el), el),
-                                                     b.unary(ir::Inst::Tag::Load, bound.lv(b, el), el),
-                                                     el);
+                const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, el), el);
+                const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, el), el);
+                const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, el);
                 const ir::ExtraSlice cond = b.close_region();
 
                 b.open_region();
@@ -20814,13 +20909,11 @@ private:
                 const ir::ExtraSlice body = b.close_region();
 
                 b.open_region();
-                b.binary(ir::Inst::Tag::Store,
-                         counter.lv(b, el),
-                         b.binary(ir::Inst::Tag::Add,
-                                  b.unary(ir::Inst::Tag::Load, counter.lv(b, el), el),
-                                  b.constant(module_.pool.put_int(ty, 1), el),
-                                  el),
-                         el);
+                const ir::Index slot = counter.lv(b, el);
+                const ir::Index sc   = b.unary(ir::Inst::Tag::Load, counter.lv(b, el), el);
+                const ir::Index one  = b.constant(module_.pool.put_int(ty, 1), el);
+                const ir::Index next = b.binary(ir::Inst::Tag::Add, sc, one, el);
+                b.binary(ir::Inst::Tag::Store, slot, next, el);
                 const ir::ExtraSlice step = b.close_region();
 
                 b.loop(cond, pred, body, step, /*bottom_test*/ false, el);
@@ -22760,7 +22853,9 @@ private:
             return b.unary(T::StrLen, recv(), l);
         }
         if (name == "getc" && args.size() == 2) {
-            return b.binary(T::StrGetc, recv(), lower_index(*args[1], b), l);
+            const ir::Index s = recv();
+            const ir::Index i = lower_index(*args[1], b);
+            return b.binary(T::StrGetc, s, i, l);
         }
         if (name == "toupper") {
             return b.unary(T::StrUpper, recv(), l);
@@ -22769,10 +22864,14 @@ private:
             return b.unary(T::StrLower, recv(), l);
         }
         if (name == "compare" && args.size() == 2) {
-            return b.binary(T::StrCmp, recv(), lower_expr(*args[1], b), l);
+            const ir::Index s     = recv();
+            const ir::Index other = lower_expr(*args[1], b);
+            return b.binary(T::StrCmp, s, other, l);
         }
         if (name == "icompare" && args.size() == 2) {
-            return b.binary(T::StrICmp, recv(), lower_expr(*args[1], b), l);
+            const ir::Index s     = recv();
+            const ir::Index other = lower_expr(*args[1], b);
+            return b.binary(T::StrICmp, s, other, l);
         }
         if (name == "substr" && args.size() == 3) {
             const ir::Index s = recv();
@@ -23203,12 +23302,12 @@ private:
     // the reserved null object, a virtual interface because the handle is the address
     // of an instance's context record.
     ir::Index handle_p_render(ir::Index v, std::string_view name, ir::Builder& b, ir::SourceLoc l) {
-        const ir::Ref   u64  = make_int_type(64, false, false);
-        const ir::Index null = b.constant(module_.pool.put_int(u64, 0), l);
-        return b.select(b.binary(ir::Inst::Tag::Eq, v, null, l),
-                        b.constant(string_value_ref("null"), l),
-                        b.constant(string_value_ref(name), l),
-                        l);
+        const ir::Ref   u64       = make_int_type(64, false, false);
+        const ir::Index null      = b.constant(module_.pool.put_int(u64, 0), l);
+        const ir::Index is_null   = b.binary(ir::Inst::Tag::Eq, v, null, l);
+        const ir::Index null_text = b.constant(string_value_ref("null"), l);
+        const ir::Index name_text = b.constant(string_value_ref(name), l);
+        return b.select(is_null, null_text, name_text, l);
     }
 
     // A `%p` element that is already an rvalue: one of the four named singular
@@ -23446,17 +23545,25 @@ private:
         const auto              str_const = [&](std::string_view s) { return b.constant(string_value_ref(s), l); };
         const auto              append    = [&](ir::Index piece) {
             const std::array<ir::Index, 2> parts{ b.unary(T::Load, out.lv(b, l), l), piece };
-            b.binary(T::Store, out.lv(b, l), b.concat(parts, l), l);
+            const ir::Index                dst    = out.lv(b, l);
+            const ir::Index                joined = b.concat(parts, l);
+            b.binary(T::Store, dst, joined, l);
         };
 
-        b.binary(T::Store, out.lv(b, l), str_const("'{"), l);
-        b.binary(
-          T::Store, bound.lv(b, l), b.resize(is_q ? b.queue_size(lv, ty, l) : b.dyn_array_size(lv, ty, l), i32, l), l);
-        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+        const ir::Index out_lv = out.lv(b, l);
+        const ir::Index open   = str_const("'{");
+        b.binary(T::Store, out_lv, open, l);
+        const ir::Index bound_lv = bound.lv(b, l);
+        const ir::Index count    = b.resize(is_q ? b.queue_size(lv, ty, l) : b.dyn_array_size(lv, ty, l), i32, l);
+        b.binary(T::Store, bound_lv, count, l);
+        const ir::Index idx_lv   = idx.lv(b, l);
+        const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
+        b.binary(T::Store, idx_lv, idx_init, l);
 
         b.open_region();
-        const ir::Index pred =
-          b.binary(T::Lt, b.unary(T::Load, idx.lv(b, l), l), b.unary(T::Load, bound.lv(b, l), l), l);
+        const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
+        const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -23474,10 +23581,11 @@ private:
         const ir::ExtraSlice body = b.close_region();
 
         b.open_region();
-        b.binary(T::Store,
-                 idx.lv(b, l),
-                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
-                 l);
+        const ir::Index slot = idx.lv(b, l);
+        const ir::Index sc   = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index one  = b.constant(module_.pool.put_int(i32, 1), l);
+        const ir::Index next = b.binary(T::Add, sc, one, l);
+        b.binary(T::Store, slot, next, l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -23521,7 +23629,9 @@ private:
         const auto     str_const = [&](std::string_view s) { return b.constant(string_value_ref(s), l); };
         const auto     append    = [&](ir::Index piece) {
             const std::array<ir::Index, 2> parts{ b.unary(T::Load, out.lv(b, l), l), piece };
-            b.binary(T::Store, out.lv(b, l), b.concat(parts, l), l);
+            const ir::Index                dst    = out.lv(b, l);
+            const ir::Index                joined = b.concat(parts, l);
+            b.binary(T::Store, dst, joined, l);
         };
         // An aggregate key has no plane value, so it travels as an lvalue -- the same
         // split lower_assoc_key makes for `a[k]`.
@@ -23529,12 +23639,17 @@ private:
             return is_agg_abi_ref(kr) ? key.lv(b, l) : b.unary(T::Load, key.lv(b, l), l);
         };
 
-        b.binary(T::Store, out.lv(b, l), str_const("'{"), l);
+        const ir::Index out_lv = out.lv(b, l);
+        const ir::Index open   = str_const("'{");
+        b.binary(T::Store, out_lv, open, l);
         // `more` is "an entry has already been emitted", i.e. the separator flag. A
         // key walk has no index to compare against zero the way the queue loop does.
-        b.binary(T::Store, more.lv(b, l), b.constant(module_.pool.put_int(bit1, 0), l), l);
-        b.binary(
-          T::Store, ok.lv(b, l), b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::First, ty, l), bit1, l), l);
+        const ir::Index more_lv   = more.lv(b, l);
+        const ir::Index more_zero = b.constant(module_.pool.put_int(bit1, 0), l);
+        b.binary(T::Store, more_lv, more_zero, l);
+        const ir::Index ok_lv    = ok.lv(b, l);
+        const ir::Index ok_first = b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::First, ty, l), bit1, l);
+        b.binary(T::Store, ok_lv, ok_first, l);
 
         b.open_region();
         const ir::Index      pred = b.unary(T::Load, ok.lv(b, l), l);
@@ -23547,7 +23662,9 @@ private:
         b.open_region();
         const ir::ExtraSlice nosep_r = b.close_region();
         b.cond(b.unary(T::Load, more.lv(b, l), l), sep_r, nosep_r, l);
-        b.binary(T::Store, more.lv(b, l), b.constant(module_.pool.put_int(bit1, 1), l), l);
+        const ir::Index more_set_lv = more.lv(b, l);
+        const ir::Index more_one    = b.constant(module_.pool.put_int(bit1, 1), l);
+        b.binary(T::Store, more_set_lv, more_one, l);
         std::string            efrag;
         std::vector<ir::Index> eargs;
         // The key prints by the same leaf rules as any other %p element, so an enum
@@ -23576,8 +23693,9 @@ private:
         const ir::ExtraSlice body = b.close_region();
 
         b.open_region();
-        b.binary(
-          T::Store, ok.lv(b, l), b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::Next, ty, l), bit1, l), l);
+        const ir::Index ok_step_lv = ok.lv(b, l);
+        const ir::Index ok_next    = b.resize(b.assoc_traverse(lv, key.lv(b, l), Step::Next, ty, l), bit1, l);
+        b.binary(T::Store, ok_step_lv, ok_next, l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
@@ -24663,7 +24781,9 @@ private:
             }
             if (!a.isNonBlocking() && whole_lhs && is_trivially_copyable(ty) && is_whole_array_lvalue(src) &&
                 !is_assoc_element_select(a.left()) && !is_assoc_element_select(src)) {
-                b.agg_copy(lower_lvalue(a.left(), b), lower_lvalue(src, b), ty, loc(a));
+                const ir::Index dst  = lower_lvalue(a.left(), b);
+                const ir::Index from = lower_lvalue(src, b);
+                b.agg_copy(dst, from, ty, loc(a));
                 return true_const(b, loc(a));
             }
             if (as_assignment_pattern(src)) {
@@ -24688,8 +24808,9 @@ private:
                 // the source), reading the source through a staging temp when the
                 // two may overlap. A single-memcpy deferred record for the NBA
                 // whole-array case is a performance gap listed in docs/TODO.md.
-                emit_agg_copy(lower_lvalue(a.left(), b), array_copy_source(a.left(), src, ty, b, loc(a)), ty, tag,
-                              b, loc(a), nbt);
+                const ir::Index dst  = lower_lvalue(a.left(), b);
+                const ir::Index from = array_copy_source(a.left(), src, ty, b, loc(a));
+                emit_agg_copy(dst, from, ty, tag, b, loc(a), nbt);
                 return true_const(b, loc(a));
             }
             if (src.kind == ExpressionKind::Call) {
@@ -25260,7 +25381,9 @@ private:
         // comparison would then compare the left element against itself and report
         // a tie. Storing forces the value out (a string store deep-copies), which
         // is the same reason min/max and unique hold their keys in cells.
-        b.binary(T::Store, s.key_hold.lv(b, l), sort_key(s, s.pos_b, b, l), l);
+        const ir::Index hold_lv = s.key_hold.lv(b, l);
+        const ir::Index key     = sort_key(s, s.pos_b, b, l);
+        b.binary(T::Store, hold_lv, key, l);
         const ir::Index left    = sort_key(s, s.pos_a, b, l);
         const ir::Index right   = b.unary(T::Load, s.key_hold.lv(b, l), l);
         const T         ascend  = s.key_real ? T::FLt : T::Lt;
@@ -25299,31 +25422,48 @@ private:
         const auto      ord_at  = [&](ir::Index i) {
             return b.unary(T::Load, b.elem_select(s.ord, b.resize(i, s.i32, l), s.oty, l), l);
         };
-        b.binary(T::Store, s.take.lv(b, l), iconst(s.bit1, 0, b, l), l);
+        const ir::Index take_lv   = s.take.lv(b, l);
+        const ir::Index take_left = iconst(s.bit1, 0, b, l);
+        b.binary(T::Store, take_lv, take_left, l);
 
         b.open_region();
-        b.binary(T::Store, s.take.lv(b, l), iconst(s.bit1, 1, b, l), l);
+        const ir::Index done_lv    = s.take.lv(b, l);
+        const ir::Index take_right = iconst(s.bit1, 1, b, l);
+        b.binary(T::Store, done_lv, take_right, l);
         const ir::ExtraSlice left_done = b.close_region();
 
         b.open_region();
         b.open_region();
-        b.binary(T::Store, s.pos_a.lv(b, l), ord_at(load(s.li)), l);
-        b.binary(T::Store, s.pos_b.lv(b, l), ord_at(load(s.rj)), l);
-        b.binary(T::Store, s.take.lv(b, l), sort_right_wins(s, b, l), l);
+        const ir::Index pos_a_lv = s.pos_a.lv(b, l);
+        const ir::Index pos_a    = ord_at(load(s.li));
+        b.binary(T::Store, pos_a_lv, pos_a, l);
+        const ir::Index pos_b_lv = s.pos_b.lv(b, l);
+        const ir::Index pos_b    = ord_at(load(s.rj));
+        b.binary(T::Store, pos_b_lv, pos_b, l);
+        const ir::Index wins_lv = s.take.lv(b, l);
+        const ir::Index wins    = sort_right_wins(s, b, l);
+        b.binary(T::Store, wins_lv, wins, l);
         const ir::ExtraSlice compare = b.close_region();
         b.open_region();
         const ir::ExtraSlice right_done = b.close_region();
-        b.cond(b.binary(T::Lt, load(s.rj), load(s.hi), l), compare, right_done, l);
+        const ir::Index      rj         = load(s.rj);
+        const ir::Index      hi         = load(s.hi);
+        b.cond(b.binary(T::Lt, rj, hi, l), compare, right_done, l);
         const ir::ExtraSlice left_live = b.close_region();
 
-        b.cond(b.binary(T::Ge, load(s.li), load(s.mid), l), left_done, left_live, l);
+        const ir::Index li  = load(s.li);
+        const ir::Index mid = load(s.mid);
+        b.cond(b.binary(T::Ge, li, mid, l), left_done, left_live, l);
 
         const auto emit_take = [&](const TempCell& cursor) {
-            b.binary(T::Store,
-                     b.elem_select(s.buf, b.resize(load(s.out), s.i32, l), s.oty, l, /*for_write=*/true),
-                     ord_at(load(cursor)),
-                     l);
-            b.binary(T::Store, cursor.lv(b, l), b.binary(T::Add, load(cursor), iconst(s.i64, 1, b, l), l), l);
+            const ir::Index slot = b.elem_select(s.buf, b.resize(load(s.out), s.i32, l), s.oty, l, /*for_write=*/true);
+            const ir::Index val  = ord_at(load(cursor));
+            b.binary(T::Store, slot, val, l);
+            const ir::Index cursor_lv = cursor.lv(b, l);
+            const ir::Index at        = load(cursor);
+            const ir::Index inc       = iconst(s.i64, 1, b, l);
+            const ir::Index next      = b.binary(T::Add, at, inc, l);
+            b.binary(T::Store, cursor_lv, next, l);
         };
         b.open_region();
         emit_take(s.rj);
@@ -25333,7 +25473,11 @@ private:
         const ir::ExtraSlice took_left = b.close_region();
         b.cond(load(s.take), took_right, took_left, l);
 
-        b.binary(T::Store, s.out.lv(b, l), b.binary(T::Add, load(s.out), iconst(s.i64, 1, b, l), l), l);
+        const ir::Index out_lv   = s.out.lv(b, l);
+        const ir::Index out_at   = load(s.out);
+        const ir::Index out_inc  = iconst(s.i64, 1, b, l);
+        const ir::Index out_next = b.binary(T::Add, out_at, out_inc, l);
+        b.binary(T::Store, out_lv, out_next, l);
     }
 
     // One bottom-up merge pass: walk the array in runs of `w`, merge each adjacent
@@ -25343,23 +25487,48 @@ private:
     void emit_merge_pass(const SortIter& s, ir::Builder& b, ir::SourceLoc l) {
         using T            = ir::Inst::Tag;
         const auto load    = [&](const TempCell& c) { return b.unary(T::Load, c.lv(b, l), l); };
-        const auto clamped = [&](ir::Index v) { return b.select(b.binary(T::Lt, v, load(s.n), l), v, load(s.n), l); };
+        const auto clamped = [&](ir::Index v) {
+            const ir::Index limit = load(s.n);
+            const ir::Index below = b.binary(T::Lt, v, limit, l);
+            const ir::Index cap   = load(s.n);
+            return b.select(below, v, cap, l);
+        };
 
-        b.binary(T::Store, s.lo.lv(b, l), iconst(s.i64, 0, b, l), l);
+        const ir::Index lo_lv   = s.lo.lv(b, l);
+        const ir::Index lo_init = iconst(s.i64, 0, b, l);
+        b.binary(T::Store, lo_lv, lo_init, l);
 
         b.open_region();
-        const ir::Index      run_pred = b.binary(T::Lt, load(s.lo), load(s.n), l);
+        const ir::Index      lo       = load(s.lo);
+        const ir::Index      n        = load(s.n);
+        const ir::Index      run_pred = b.binary(T::Lt, lo, n, l);
         const ir::ExtraSlice run_cond = b.close_region();
 
         b.open_region();
-        b.binary(T::Store, s.mid.lv(b, l), clamped(b.binary(T::Add, load(s.lo), load(s.w), l)), l);
-        b.binary(T::Store, s.hi.lv(b, l), clamped(b.binary(T::Add, load(s.mid), load(s.w), l)), l);
-        b.binary(T::Store, s.li.lv(b, l), load(s.lo), l);
-        b.binary(T::Store, s.rj.lv(b, l), load(s.mid), l);
-        b.binary(T::Store, s.out.lv(b, l), load(s.lo), l);
+        const ir::Index mid_lv  = s.mid.lv(b, l);
+        const ir::Index lo_now  = load(s.lo);
+        const ir::Index w_now   = load(s.w);
+        const ir::Index mid_val = clamped(b.binary(T::Add, lo_now, w_now, l));
+        b.binary(T::Store, mid_lv, mid_val, l);
+        const ir::Index hi_lv   = s.hi.lv(b, l);
+        const ir::Index mid_now = load(s.mid);
+        const ir::Index w_next  = load(s.w);
+        const ir::Index hi_val  = clamped(b.binary(T::Add, mid_now, w_next, l));
+        b.binary(T::Store, hi_lv, hi_val, l);
+        const ir::Index li_lv   = s.li.lv(b, l);
+        const ir::Index li_init = load(s.lo);
+        b.binary(T::Store, li_lv, li_init, l);
+        const ir::Index rj_lv   = s.rj.lv(b, l);
+        const ir::Index rj_init = load(s.mid);
+        b.binary(T::Store, rj_lv, rj_init, l);
+        const ir::Index out_lv   = s.out.lv(b, l);
+        const ir::Index out_init = load(s.lo);
+        b.binary(T::Store, out_lv, out_init, l);
 
         b.open_region();
-        const ir::Index      step_pred = b.binary(T::Lt, load(s.out), load(s.hi), l);
+        const ir::Index      out_at    = load(s.out);
+        const ir::Index      hi_at     = load(s.hi);
+        const ir::Index      step_pred = b.binary(T::Lt, out_at, hi_at, l);
         const ir::ExtraSlice step_cond = b.close_region();
         b.open_region();
         emit_merge_step(s, b, l);
@@ -25370,7 +25539,9 @@ private:
 
         // Advance past both runs. `hi` is already the clamped end, so this also
         // terminates on the trailing partial run.
-        b.binary(T::Store, s.lo.lv(b, l), load(s.hi), l);
+        const ir::Index adv_lv = s.lo.lv(b, l);
+        const ir::Index lo_adv = load(s.hi);
+        b.binary(T::Store, adv_lv, lo_adv, l);
         const ir::ExtraSlice run_body = b.close_region();
 
         b.open_region();
@@ -25397,10 +25568,14 @@ private:
             b.dyn_array_copy(src, s.arr, s.aty, l);
         }
 
-        b.binary(T::Store, s.out.lv(b, l), iconst(s.i64, 0, b, l), l);
+        const ir::Index out_lv   = s.out.lv(b, l);
+        const ir::Index out_init = iconst(s.i64, 0, b, l);
+        b.binary(T::Store, out_lv, out_init, l);
         b.open_region();
-        const ir::Index      pred = b.binary(T::Lt, load(s.out), load(s.n), l);
-        const ir::ExtraSlice cond = b.close_region();
+        const ir::Index      out_now = load(s.out);
+        const ir::Index      n_now   = load(s.n);
+        const ir::Index      pred    = b.binary(T::Lt, out_now, n_now, l);
+        const ir::ExtraSlice cond    = b.close_region();
 
         b.open_region();
         const ir::Index k    = b.resize(load(s.out), s.i32, l);
@@ -25417,7 +25592,11 @@ private:
         const ir::ExtraSlice body = b.close_region();
 
         b.open_region();
-        b.binary(T::Store, s.out.lv(b, l), b.binary(T::Add, load(s.out), iconst(s.i64, 1, b, l), l), l);
+        const ir::Index inc_lv   = s.out.lv(b, l);
+        const ir::Index out_cur  = load(s.out);
+        const ir::Index one      = iconst(s.i64, 1, b, l);
+        const ir::Index out_next = b.binary(T::Add, out_cur, one, l);
+        b.binary(T::Store, inc_lv, out_next, l);
         const ir::ExtraSlice inc = b.close_region();
         b.loop(cond, pred, body, inc, /*bottom_test*/ false, l);
 
@@ -25496,8 +25675,10 @@ private:
         s.take  = make_temp_cell(s.bit1, "sort_take");
         s.key_hold = make_temp_cell(lower_type(kty), "sort_key");
 
-        const ir::Index size = queue ? b.queue_size(arr, s.aty, l) : b.dyn_array_size(arr, s.aty, l);
-        b.binary(T::Store, s.n.lv(b, l), b.resize(size, s.i64, l), l);
+        const ir::Index size  = queue ? b.queue_size(arr, s.aty, l) : b.dyn_array_size(arr, s.aty, l);
+        const ir::Index n_lv  = s.n.lv(b, l);
+        const ir::Index n_val = b.resize(size, s.i64, l);
+        b.binary(T::Store, n_lv, n_val, l);
         if (iter_var != nullptr) {
             declare_storage(iter_var->as<slang::ast::VariableSymbol>(), /*force_frame*/ true);
         }
@@ -25524,29 +25705,45 @@ private:
 
         // ord = identity. The sort permutes THIS, so the comparison always reads
         // the array in its original layout and `item.index` stays meaningful.
-        b.binary(T::Store, s.out.lv(b, l), iconst(s.i64, 0, b, l), l);
+        const ir::Index out_lv   = s.out.lv(b, l);
+        const ir::Index out_init = iconst(s.i64, 0, b, l);
+        b.binary(T::Store, out_lv, out_init, l);
         b.open_region();
-        const ir::Index      ipred = b.binary(T::Lt, load(s.out), load(s.n), l);
-        const ir::ExtraSlice icond = b.close_region();
+        const ir::Index      out_now = load(s.out);
+        const ir::Index      n_now   = load(s.n);
+        const ir::Index      ipred   = b.binary(T::Lt, out_now, n_now, l);
+        const ir::ExtraSlice icond   = b.close_region();
         b.open_region();
         const ir::Index k = b.resize(load(s.out), s.i32, l);
         b.binary(T::Store, b.elem_select(s.ord, k, s.oty, l, /*for_write=*/true), k, l);
         const ir::ExtraSlice ibody = b.close_region();
         b.open_region();
-        b.binary(T::Store, s.out.lv(b, l), b.binary(T::Add, load(s.out), iconst(s.i64, 1, b, l), l), l);
+        const ir::Index inc_lv   = s.out.lv(b, l);
+        const ir::Index out_cur  = load(s.out);
+        const ir::Index one      = iconst(s.i64, 1, b, l);
+        const ir::Index out_next = b.binary(T::Add, out_cur, one, l);
+        b.binary(T::Store, inc_lv, out_next, l);
         const ir::ExtraSlice iinc = b.close_region();
         b.loop(icond, ipred, ibody, iinc, /*bottom_test*/ false, l);
 
         // Bottom-up merge, run width doubling until it spans the array.
-        b.binary(T::Store, s.w.lv(b, l), iconst(s.i64, 1, b, l), l);
+        const ir::Index w_lv   = s.w.lv(b, l);
+        const ir::Index w_init = iconst(s.i64, 1, b, l);
+        b.binary(T::Store, w_lv, w_init, l);
         b.open_region();
-        const ir::Index      wpred = b.binary(T::Lt, load(s.w), load(s.n), l);
+        const ir::Index      w_now = load(s.w);
+        const ir::Index      limit = load(s.n);
+        const ir::Index      wpred = b.binary(T::Lt, w_now, limit, l);
         const ir::ExtraSlice wcond = b.close_region();
         b.open_region();
         emit_merge_pass(s, b, l);
         const ir::ExtraSlice wbody = b.close_region();
         b.open_region();
-        b.binary(T::Store, s.w.lv(b, l), b.binary(T::Add, load(s.w), load(s.w), l), l);
+        const ir::Index grow_lv = s.w.lv(b, l);
+        const ir::Index w_lo    = load(s.w);
+        const ir::Index w_hi    = load(s.w);
+        const ir::Index w_dbl   = b.binary(T::Add, w_lo, w_hi, l);
+        b.binary(T::Store, grow_lv, w_dbl, l);
         const ir::ExtraSlice winc = b.close_region();
         b.loop(wcond, wpred, wbody, winc, /*bottom_test*/ false, l);
 
@@ -25557,7 +25754,9 @@ private:
 
         b.open_region();
         const ir::ExtraSlice skip_r = b.close_region();
-        b.cond(b.binary(T::Ge, load(s.n), iconst(s.i64, 2, b, l), l), sort_r, skip_r, l);
+        const ir::Index      n_size = load(s.n);
+        const ir::Index      two    = iconst(s.i64, 2, b, l);
+        b.cond(b.binary(T::Ge, n_size, two, l), sort_r, skip_r, l);
     }
 
     // The LRM 7.12.1 array locator methods. All ten return a queue: of elements,
@@ -25700,17 +25899,20 @@ private:
                                 bool                to_mirror,
                                 ir::Builder&        b,
                                 ir::SourceLoc       l) {
-        using T            = ir::Inst::Tag;
-        const ir::Ref  er  = std::get<ir::Type>(module_.pool.get(aty)).element;
-        const bool     agg = is_agg_abi_ref(er);
-        const ir::Ref  i32 = make_int_type(32, false, true);
-        const TempCell pos = make_temp_cell(i32, "fxord_pos");
-        b.binary(T::Store, pos.lv(b, l), iconst(i32, 0, b, l), l);
+        using T                  = ir::Inst::Tag;
+        const ir::Ref   er       = std::get<ir::Type>(module_.pool.get(aty)).element;
+        const bool      agg      = is_agg_abi_ref(er);
+        const ir::Ref   i32      = make_int_type(32, false, true);
+        const TempCell  pos      = make_temp_cell(i32, "fxord_pos");
+        const ir::Index pos_lv   = pos.lv(b, l);
+        const ir::Index pos_init = iconst(i32, 0, b, l);
+        b.binary(T::Store, pos_lv, pos_init, l);
 
         b.open_region();
-        const ir::Index pred =
-          b.binary(T::Lt, b.unary(T::Load, pos.lv(b, l), l), iconst(i32, map.fixed_count, b, l), l);
-        const ir::ExtraSlice cond = b.close_region();
+        const ir::Index      at    = b.unary(T::Load, pos.lv(b, l), l);
+        const ir::Index      count = iconst(i32, map.fixed_count, b, l);
+        const ir::Index      pred  = b.binary(T::Lt, at, count, l);
+        const ir::ExtraSlice cond  = b.close_region();
 
         b.open_region();
         const ir::Index p    = b.unary(T::Load, pos.lv(b, l), l);
@@ -25734,8 +25936,11 @@ private:
         const ir::ExtraSlice body = b.close_region();
 
         b.open_region();
-        b.binary(
-          T::Store, pos.lv(b, l), b.binary(T::Add, b.unary(T::Load, pos.lv(b, l), l), iconst(i32, 1, b, l), l), l);
+        const ir::Index slot = pos.lv(b, l);
+        const ir::Index cur  = b.unary(T::Load, pos.lv(b, l), l);
+        const ir::Index one  = iconst(i32, 1, b, l);
+        const ir::Index next = b.binary(T::Add, cur, one, l);
+        b.binary(T::Store, slot, next, l);
         const ir::ExtraSlice step = b.close_region();
         b.loop(cond, pred, body, step, /*bottom_test*/ false, l);
     }
@@ -25857,7 +26062,9 @@ private:
                                   ? iconst(i32, map.fixed_count, b, l)
                                   : b.resize(queue ? b.queue_size(arr, aty, l) : b.dyn_array_size(arr, aty, l), i32, l);
         b.binary(T::Store, bound.lv(b, l), size, l);
-        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+        const ir::Index idx_lv   = idx.lv(b, l);
+        const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
+        b.binary(T::Store, idx_lv, idx_init, l);
 
         if (iter_var != nullptr) {
             declare_storage(iter_var->as<slang::ast::VariableSymbol>(), /*force_frame*/ true);
@@ -25922,9 +26129,11 @@ private:
             // The fold's identity, so a one-element array reduces to that element:
             // 0 for sum / or / xor, 1 for product, all ones for and. An EMPTY array
             // does not yield the identity though -- see the return below.
-            acc                  = make_temp_cell(rty, "arrm_acc");
-            const ir::Index seed = b.constant(module_.pool.put_int(rty, name == "product" ? 1 : 0), l);
-            b.binary(T::Store, acc.lv(b, l), name == "and" ? b.unary(T::Bnot, seed, l) : seed, l);
+            acc                      = make_temp_cell(rty, "arrm_acc");
+            const ir::Index seed     = b.constant(module_.pool.put_int(rty, name == "product" ? 1 : 0), l);
+            const ir::Index acc_lv   = acc.lv(b, l);
+            const ir::Index acc_init = name == "and" ? b.unary(T::Bnot, seed, l) : seed;
+            b.binary(T::Store, acc_lv, acc_init, l);
         } else {
             res = make_arg_temp(rty, b, l);
             b.queue_delete(res, res, /*has_idx=*/false, rty, l);
@@ -25954,16 +26163,17 @@ private:
         const ir::Index k = b.unary(T::Load, idx.lv(b, l), l);
         bind(k);
         if (is_red) {
-            const T     op = name == "sum"  ? T::Add
-                             : name == "product" ? T::Mul
-                             : name == "and"     ? T::Band
-                             : name == "or"      ? T::Bor
-                                                 : T::Bxor;
-            const ir::Index v = key_of(k);
-            b.binary(T::Store,
-                     acc.lv(b, l),
-                     b.binary(op, b.unary(T::Load, acc.lv(b, l), l), b.resize(v, rty, l), l),
-                     l);
+            const T         op      = name == "sum"       ? T::Add
+                                      : name == "product" ? T::Mul
+                                      : name == "and"     ? T::Band
+                                      : name == "or"      ? T::Bor
+                                                          : T::Bxor;
+            const ir::Index v       = key_of(k);
+            const ir::Index acc_lv  = acc.lv(b, l);
+            const ir::Index acc_now = b.unary(T::Load, acc.lv(b, l), l);
+            const ir::Index widened = b.resize(v, rty, l);
+            const ir::Index folded  = b.binary(op, acc_now, widened, l);
+            b.binary(T::Store, acc_lv, folded, l);
         } else if (minmax) {
             const ir::Index key    = key_of(k);
             const T         ord    = name == "min" ? (key_real ? T::FLt : T::Lt) : (key_real ? T::FGt : T::Gt);
@@ -25986,9 +26196,13 @@ private:
             // returned order unrelated to the array's). The scan re-evaluates the
             // clause instead of caching keys in a second heap queue: 7.12 already
             // makes a clause with side effects unpredictable.
-            b.binary(T::Store, key_cell.lv(b, l), key_of(k), l);
+            const ir::Index key_lv  = key_cell.lv(b, l);
+            const ir::Index key_val = key_of(k);
+            b.binary(T::Store, key_lv, key_val, l);
             b.binary(T::Store, dup.lv(b, l), zero1, l);
-            b.binary(T::Store, scan.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+            const ir::Index scan_lv   = scan.lv(b, l);
+            const ir::Index scan_init = b.constant(module_.pool.put_int(i32, 0), l);
+            b.binary(T::Store, scan_lv, scan_init, l);
 
             b.open_region();
             const ir::Index      at    = b.unary(T::Load, scan.lv(b, l), l);
@@ -26015,8 +26229,9 @@ private:
             const ir::ExtraSlice sbody = b.close_region();
 
             b.open_region();
-            const ir::Index next_scan =
-              b.binary(T::Add, b.unary(T::Load, scan.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l);
+            const ir::Index scan_at   = b.unary(T::Load, scan.lv(b, l), l);
+            const ir::Index scan_one  = b.constant(module_.pool.put_int(i32, 1), l);
+            const ir::Index next_scan = b.binary(T::Add, scan_at, scan_one, l);
             b.binary(T::Store, scan.lv(b, l), next_scan, l);
             const ir::ExtraSlice sstep = b.close_region();
             b.loop(scond, spred, sbody, sstep, /*bottom_test*/ false, l);
@@ -26048,10 +26263,11 @@ private:
         const ir::ExtraSlice body = b.close_region();
 
         b.open_region();
-        b.binary(T::Store,
-                 idx.lv(b, l),
-                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
-                 l);
+        const ir::Index slot = idx.lv(b, l);
+        const ir::Index sc   = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index one  = b.constant(module_.pool.put_int(i32, 1), l);
+        const ir::Index next = b.binary(T::Add, sc, one, l);
+        b.binary(T::Store, slot, next, l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, lpred, body, step, /*bottom_test*/ false, l);
@@ -26065,7 +26281,9 @@ private:
         // `and` (docs/LRM_NOTES.md, note 8).
         const ir::Index n     = b.unary(T::Load, bound.lv(b, l), l);
         const ir::Index empty = b.binary(T::Eq, n, b.constant(module_.pool.put_int(i32, 0), l), l);
-        return b.select(empty, b.constant(module_.pool.put_int(rty, 0), l), b.unary(T::Load, acc.lv(b, l), l), l);
+        const ir::Index zero  = b.constant(module_.pool.put_int(rty, 0), l);
+        const ir::Index total = b.unary(T::Load, acc.lv(b, l), l);
+        return b.select(empty, zero, total, l);
     }
 
     // Element address for a variable-size array (dynamic array or queue) index
@@ -26220,10 +26438,11 @@ private:
                 // `q[$]`'s size()-1 resolution already produces below), not
                 // `rs.left().type`: the base may itself be bare `$`
                 // (UnboundedType), which lower_type rejects outright.
-                const ir::Ref   i32  = make_int_type(32, false, true);
-                const ir::Index base = b.resize(lower_expr(rs.left(), b), i32, l);
-                const ir::Index nm1  = b.binary(ir::Inst::Tag::Sub, b.resize(lower_expr(rs.right(), b), i32, l),
-                                                b.constant(module_.pool.put_int(i32, 1), l), l);
+                const ir::Ref   i32   = make_int_type(32, false, true);
+                const ir::Index base  = b.resize(lower_expr(rs.left(), b), i32, l);
+                const ir::Index count = b.resize(lower_expr(rs.right(), b), i32, l);
+                const ir::Index one   = b.constant(module_.pool.put_int(i32, 1), l);
+                const ir::Index nm1   = b.binary(ir::Inst::Tag::Sub, count, one, l);
                 if (rs.getSelectionKind() == RangeSelectionKind::IndexedUp) {
                     lo = base;
                     hi = b.binary(ir::Inst::Tag::Add, base, nm1, l);
@@ -26497,8 +26716,9 @@ private:
             return b.queue_pop(q, name == "pop_front", qty, l);
         }
         if (name == "insert") {
-            return b.queue_insert(
-              q, lower_index(*args[1], b), lower_container_element_value(*args[2], qty, b, l), qty, l);
+            const ir::Index idx  = lower_index(*args[1], b);
+            const ir::Index elem = lower_container_element_value(*args[2], qty, b, l);
+            return b.queue_insert(q, idx, elem, qty, l);
         }
         if (name == "delete") {
             // q.delete() clears all; q.delete(i) removes one element.
@@ -27122,17 +27342,22 @@ private:
     // undefined), and each region re-emits its own leaves (see TempCell).
     template<typename Body>
     void emit_stream_elem_loop(const StreamChunk& c, ir::Builder& b, ir::SourceLoc l, Body body) {
-        using T                  = ir::Inst::Tag;
-        const ir::Ref  i32       = make_int_type(32, false, true);
-        const TempCell idx       = make_temp_cell(i32, "stream_i");
-        const TempCell bound     = make_temp_cell(i32, "stream_n");
-        const ir::Index size     = c.is_queue ? b.queue_size(c.value, c.ty, l) : b.dyn_array_size(c.value, c.ty, l);
-        b.binary(T::Store, bound.lv(b, l), b.resize(size, i32, l), l);
-        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+        using T                   = ir::Inst::Tag;
+        const ir::Ref   i32       = make_int_type(32, false, true);
+        const TempCell  idx       = make_temp_cell(i32, "stream_i");
+        const TempCell  bound     = make_temp_cell(i32, "stream_n");
+        const ir::Index size      = c.is_queue ? b.queue_size(c.value, c.ty, l) : b.dyn_array_size(c.value, c.ty, l);
+        const ir::Index bound_lv  = bound.lv(b, l);
+        const ir::Index bound_val = b.resize(size, i32, l);
+        b.binary(T::Store, bound_lv, bound_val, l);
+        const ir::Index idx_lv   = idx.lv(b, l);
+        const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
+        b.binary(T::Store, idx_lv, idx_init, l);
 
         b.open_region();
-        const ir::Index pred =
-          b.binary(T::Lt, b.unary(T::Load, idx.lv(b, l), l), b.unary(T::Load, bound.lv(b, l), l), l);
+        const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
+        const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -27140,10 +27365,11 @@ private:
         const ir::ExtraSlice body_r = b.close_region();
 
         b.open_region();
-        b.binary(T::Store,
-                 idx.lv(b, l),
-                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
-                 l);
+        const ir::Index slot = idx.lv(b, l);
+        const ir::Index sc   = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index one  = b.constant(module_.pool.put_int(i32, 1), l);
+        const ir::Index next = b.binary(T::Add, sc, one, l);
+        b.binary(T::Store, slot, next, l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body_r, step, /*bottom_test*/ false, l);
@@ -27154,17 +27380,22 @@ private:
     // byte 0 first).
     template<typename Body>
     void emit_stream_byte_loop(ir::Index str, ir::Builder& b, ir::SourceLoc l, Body body) {
-        using T                = ir::Inst::Tag;
-        const ir::Ref  i32     = make_int_type(32, false, true);
-        const ir::Ref  byte_ty = make_int_type(8, false, false);
-        const TempCell idx     = make_temp_cell(i32, "stream_bi");
-        const TempCell bound   = make_temp_cell(i32, "stream_bn");
-        b.binary(T::Store, bound.lv(b, l), b.resize(b.unary(T::StrLen, str, l), i32, l), l);
-        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+        using T                   = ir::Inst::Tag;
+        const ir::Ref   i32       = make_int_type(32, false, true);
+        const ir::Ref   byte_ty   = make_int_type(8, false, false);
+        const TempCell  idx       = make_temp_cell(i32, "stream_bi");
+        const TempCell  bound     = make_temp_cell(i32, "stream_bn");
+        const ir::Index bound_lv  = bound.lv(b, l);
+        const ir::Index bound_val = b.resize(b.unary(T::StrLen, str, l), i32, l);
+        b.binary(T::Store, bound_lv, bound_val, l);
+        const ir::Index idx_lv   = idx.lv(b, l);
+        const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
+        b.binary(T::Store, idx_lv, idx_init, l);
 
         b.open_region();
-        const ir::Index pred =
-          b.binary(T::Lt, b.unary(T::Load, idx.lv(b, l), l), b.unary(T::Load, bound.lv(b, l), l), l);
+        const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
+        const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -27172,10 +27403,11 @@ private:
         const ir::ExtraSlice body_r = b.close_region();
 
         b.open_region();
-        b.binary(T::Store,
-                 idx.lv(b, l),
-                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
-                 l);
+        const ir::Index slot = idx.lv(b, l);
+        const ir::Index sc   = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index one  = b.constant(module_.pool.put_int(i32, 1), l);
+        const ir::Index next = b.binary(T::Add, sc, one, l);
+        b.binary(T::Store, slot, next, l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body_r, step, /*bottom_test*/ false, l);
@@ -27199,12 +27431,16 @@ private:
     // what makes `s = {>>{string_q}}` the join it looks like, at one runtime call
     // per element instead of per byte.
     ir::Index stream_to_string(std::span<const StreamChunk> chunks, ir::Builder& b, ir::SourceLoc l) {
-        using T            = ir::Inst::Tag;
-        const TempCell out = make_temp_cell(module_.pool.string_type, "stream_str");
-        b.binary(T::Store, out.lv(b, l), b.constant(string_value_ref(""), l), l);
+        using T                = ir::Inst::Tag;
+        const TempCell  out    = make_temp_cell(module_.pool.string_type, "stream_str");
+        const ir::Index out_lv = out.lv(b, l);
+        const ir::Index empty  = b.constant(string_value_ref(""), l);
+        b.binary(T::Store, out_lv, empty, l);
         const auto append_str = [&](ir::Index sv) {
             const std::array<ir::Index, 2> parts{ b.unary(T::Load, out.lv(b, l), l), sv };
-            b.binary(T::Store, out.lv(b, l), b.concat(parts, l), l);
+            const ir::Index                dst    = out.lv(b, l);
+            const ir::Index                joined = b.concat(parts, l);
+            b.binary(T::Store, dst, joined, l);
         };
         const auto append_packed = [&](ir::Index v, uint32_t w) {
             check_stream_byte_multiple(w);
@@ -27314,23 +27550,24 @@ private:
                 add = b.constant(module_.pool.put_int(i32, c.width / g), l);
             } else if (c.elem_is_str) {
                 // A string per element: only the run can add the lengths up.
-                const TempCell acc = make_temp_cell(i32, "stream_cnt");
-                b.binary(T::Store, acc.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+                const TempCell  acc      = make_temp_cell(i32, "stream_cnt");
+                const ir::Index acc_lv   = acc.lv(b, l);
+                const ir::Index acc_init = b.constant(module_.pool.put_int(i32, 0), l);
+                b.binary(T::Store, acc_lv, acc_init, l);
                 emit_stream_elem_loop(c, b, l, [&](ir::Index elem) {
-                    const ir::Index len = b.resize(b.unary(T::StrLen, b.unary(T::Load, elem, l), l), i32, l);
-                    b.binary(T::Store,
-                             acc.lv(b, l),
-                             b.binary(T::Add, b.unary(T::Load, acc.lv(b, l), l), len, l),
-                             l);
+                    const ir::Index len  = b.resize(b.unary(T::StrLen, b.unary(T::Load, elem, l), l), i32, l);
+                    const ir::Index slot = acc.lv(b, l);
+                    const ir::Index cur  = b.unary(T::Load, acc.lv(b, l), l);
+                    const ir::Index next = b.binary(T::Add, cur, len, l);
+                    b.binary(T::Store, slot, next, l);
                 });
                 add = b.unary(T::Load, acc.lv(b, l), l);
             } else {
                 const ir::Index size =
                   c.is_queue ? b.queue_size(c.value, c.ty, l) : b.dyn_array_size(c.value, c.ty, l);
-                add = b.binary(T::Mul,
-                               b.resize(size, i32, l),
-                               b.constant(module_.pool.put_int(i32, c.width / g), l),
-                               l);
+                const ir::Index count = b.resize(size, i32, l);
+                const ir::Index per   = b.constant(module_.pool.put_int(i32, c.width / g), l);
+                add                   = b.binary(T::Mul, count, per, l);
             }
             total = total == ir::Index{} ? add : b.binary(T::Add, total, add, l);
         }
@@ -27363,15 +27600,17 @@ private:
         const uint32_t g  = stream_granule_width(at);
         const ir::Ref  i32 = make_int_type(32, false, true);
         b.dyn_array_new(dst, stream_granule_count(chunks, g, b, l), dst, /*has_init=*/false, aty, l);
-        const TempCell idx = make_temp_cell(i32, "stream_o");
-        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+        const TempCell  idx      = make_temp_cell(i32, "stream_o");
+        const ir::Index idx_lv   = idx.lv(b, l);
+        const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
+        b.binary(T::Store, idx_lv, idx_init, l);
         walk_stream_granules(chunks, g, at.element, b, l, [&](ir::Index v) {
             const ir::Index k = b.unary(T::Load, idx.lv(b, l), l);
             b.binary(T::Store, b.elem_select(dst, k, aty, l), v, l);
-            b.binary(T::Store,
-                     idx.lv(b, l),
-                     b.binary(T::Add, k, b.constant(module_.pool.put_int(i32, 1), l), l),
-                     l);
+            const ir::Index slot = idx.lv(b, l);
+            const ir::Index one  = b.constant(module_.pool.put_int(i32, 1), l);
+            const ir::Index next = b.binary(T::Add, k, one, l);
+            b.binary(T::Store, slot, next, l);
         });
     }
 
@@ -27481,11 +27720,15 @@ private:
         // fixed-size lower_streaming_concat above, which builds its padded
         // `raw` the same way and converts to `target_ty` only in its own
         // final `resize`.
-        const ir::Ref  acc_ty = make_int_type(tw, four, false);
-        const TempCell acc    = make_temp_cell(acc_ty, "stream_acc");
-        b.binary(T::Store, acc.lv(b, l), b.constant(module_.pool.put_int(acc_ty, 0), l), l);
-        const TempCell pos = make_temp_cell(i32, "stream_p");
-        b.binary(T::Store, pos.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+        const ir::Ref   acc_ty   = make_int_type(tw, four, false);
+        const TempCell  acc      = make_temp_cell(acc_ty, "stream_acc");
+        const ir::Index acc_lv   = acc.lv(b, l);
+        const ir::Index acc_init = b.constant(module_.pool.put_int(acc_ty, 0), l);
+        b.binary(T::Store, acc_lv, acc_init, l);
+        const TempCell  pos      = make_temp_cell(i32, "stream_p");
+        const ir::Index pos_lv   = pos.lv(b, l);
+        const ir::Index pos_init = b.constant(module_.pool.put_int(i32, 0), l);
+        b.binary(T::Store, pos_lv, pos_init, l);
 
         const ir::Ref bit_ty = make_int_type(1, four, false);
         walk_stream_granules(chunks, /*g=*/1, bit_ty, b, l, [&](ir::Index bit_v) {
@@ -27495,11 +27738,15 @@ private:
               b.binary(T::Sub, b.constant(module_.pool.put_int(i32, tw - 1), l), new_pos, l),
               make_int_type(32, false, false), l);
             const ir::Index widened = b.resize(bit_v, acc_ty, l);
-            b.binary(T::Store, acc.lv(b, l),
-                     b.binary(T::Bor, b.unary(T::Load, acc.lv(b, l), l), b.binary(T::Sll, widened, shift, l), l),
-                     l);
-            b.binary(
-              T::Store, pos.lv(b, l), b.binary(T::Add, p, b.constant(module_.pool.put_int(i32, 1), l), l), l);
+            const ir::Index acc_dst = acc.lv(b, l);
+            const ir::Index acc_cur = b.unary(T::Load, acc.lv(b, l), l);
+            const ir::Index placed  = b.binary(T::Sll, widened, shift, l);
+            const ir::Index merged  = b.binary(T::Bor, acc_cur, placed, l);
+            b.binary(T::Store, acc_dst, merged, l);
+            const ir::Index pos_dst  = pos.lv(b, l);
+            const ir::Index one      = b.constant(module_.pool.put_int(i32, 1), l);
+            const ir::Index pos_next = b.binary(T::Add, p, one, l);
+            b.binary(T::Store, pos_dst, pos_next, l);
         });
         return b.resize(b.unary(T::Load, acc.lv(b, l), l), target_ty, l);
     }
@@ -27680,11 +27927,10 @@ private:
         const ir::Ref i32 = make_int_type(32, false, true);
         b.dyn_array_new(dst, b.constant(module_.pool.put_int(i32, n), l), dst, /*has_init=*/false, cty, l);
         for (uint32_t k = 0; k < n; ++k) {
-            const ir::Index idx = b.constant(module_.pool.put_int(i32, k), l);
-            b.binary(T::Store,
-                     b.elem_select(dst, idx, cty, l),
-                     take_stream_bits(u, g, ct.element, b, l),
-                     l);
+            const ir::Index idx   = b.constant(module_.pool.put_int(i32, k), l);
+            const ir::Index slot  = b.elem_select(dst, idx, cty, l);
+            const ir::Index chunk = take_stream_bits(u, g, ct.element, b, l);
+            b.binary(T::Store, slot, chunk, l);
         }
     }
 
@@ -27904,8 +28150,9 @@ private:
                 // TODO: MUST BE REVISITED — tracked as the OPEN M3 item
                 // "Non-constant string replication count" in docs/TODO.md.
                 if (is_string_expr(expr)) {
-                    return b.binary(ir::Inst::Tag::StrRepl, lower_expr(r.concat(), b),
-                                    lower_expr(r.count(), b), l);
+                    const ir::Index text  = lower_expr(r.concat(), b);
+                    const ir::Index times = lower_expr(r.count(), b);
+                    return b.binary(ir::Inst::Tag::StrRepl, text, times, l);
                 }
                 const uint64_t count = const_uint(
                   r.count(), "a replication multiplier with a packed result (LRM 11.4.12.1: the "
@@ -28436,8 +28683,10 @@ private:
                              "(LRM 11.4.5); use === instead");
                     }
                 }
-                const ir::SourceLoc l   = loc(bin);
-                const ir::Index     acc = b.agg_eq(lower_lvalue(ule, b), lower_lvalue(re, b), sty, l);
+                const ir::SourceLoc l        = loc(bin);
+                const ir::Index     left_lv  = lower_lvalue(ule, b);
+                const ir::Index     right_lv = lower_lvalue(re, b);
+                const ir::Index     acc      = b.agg_eq(left_lv, right_lv, sty, l);
                 return (bin.op == B::Equality || bin.op == B::CaseEquality)
                        ? acc
                        : b.unary(ir::Inst::Tag::Lnot, acc, l);
@@ -28669,21 +28918,28 @@ private:
             fail("inside operator with a queue or dynamic-array member whose elements are "
                  "not singular is not supported");
         }
-        const ir::Ref   aty   = lower_type(*m.type);
-        const ir::Index arr   = lower_lvalue(m, b);
-        const ir::Ref   i32   = make_int_type(32, false, true);
-        const ir::Ref   log1  = make_int_type(1, true, false);
-        const TempCell  hit   = make_temp_cell(log1, "inside_hit");
-        const TempCell  idx   = make_temp_cell(i32, "inside_idx");
-        const TempCell  bound = make_temp_cell(i32, "inside_n");
-        const ir::Index size  = is_queue(m) ? b.queue_size(arr, aty, l) : b.dyn_array_size(arr, aty, l);
-        b.binary(T::Store, hit.lv(b, l), b.constant(module_.pool.put_int(log1, 0), l), l);
-        b.binary(T::Store, bound.lv(b, l), b.resize(size, i32, l), l);
-        b.binary(T::Store, idx.lv(b, l), b.constant(module_.pool.put_int(i32, 0), l), l);
+        const ir::Ref   aty      = lower_type(*m.type);
+        const ir::Index arr      = lower_lvalue(m, b);
+        const ir::Ref   i32      = make_int_type(32, false, true);
+        const ir::Ref   log1     = make_int_type(1, true, false);
+        const TempCell  hit      = make_temp_cell(log1, "inside_hit");
+        const TempCell  idx      = make_temp_cell(i32, "inside_idx");
+        const TempCell  bound    = make_temp_cell(i32, "inside_n");
+        const ir::Index size     = is_queue(m) ? b.queue_size(arr, aty, l) : b.dyn_array_size(arr, aty, l);
+        const ir::Index hit_lv   = hit.lv(b, l);
+        const ir::Index hit_init = b.constant(module_.pool.put_int(log1, 0), l);
+        b.binary(T::Store, hit_lv, hit_init, l);
+        const ir::Index bound_lv  = bound.lv(b, l);
+        const ir::Index bound_val = b.resize(size, i32, l);
+        b.binary(T::Store, bound_lv, bound_val, l);
+        const ir::Index idx_lv   = idx.lv(b, l);
+        const ir::Index idx_init = b.constant(module_.pool.put_int(i32, 0), l);
+        b.binary(T::Store, idx_lv, idx_init, l);
 
         b.open_region();
-        const ir::Index pred =
-          b.binary(T::Lt, b.unary(T::Load, idx.lv(b, l), l), b.unary(T::Load, bound.lv(b, l), l), l);
+        const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
+        const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         // No early exit on a match: the comparisons are side-effect-free, and
@@ -28691,18 +28947,20 @@ private:
         // the full OR reduction is the cheaper shape (no branch per element) and
         // gives the same answer, x propagation included.
         b.open_region();
-        const ir::Index elem = b.unary(T::Load, b.elem_select(arr, b.unary(T::Load, idx.lv(b, l), l), aty, l), l);
-        b.binary(T::Store,
-                 hit.lv(b, l),
-                 b.binary(T::Lor, b.unary(T::Load, hit.lv(b, l), l), inside_leaf_eq(sel, elem, et, ty, real, b, l), l),
-                 l);
+        const ir::Index elem     = b.unary(T::Load, b.elem_select(arr, b.unary(T::Load, idx.lv(b, l), l), aty, l), l);
+        const ir::Index hit_slot = hit.lv(b, l);
+        const ir::Index seen     = b.unary(T::Load, hit.lv(b, l), l);
+        const ir::Index match    = inside_leaf_eq(sel, elem, et, ty, real, b, l);
+        const ir::Index hit_any  = b.binary(T::Lor, seen, match, l);
+        b.binary(T::Store, hit_slot, hit_any, l);
         const ir::ExtraSlice body = b.close_region();
 
         b.open_region();
-        b.binary(T::Store,
-                 idx.lv(b, l),
-                 b.binary(T::Add, b.unary(T::Load, idx.lv(b, l), l), b.constant(module_.pool.put_int(i32, 1), l), l),
-                 l);
+        const ir::Index idx_slot = idx.lv(b, l);
+        const ir::Index sc       = b.unary(T::Load, idx.lv(b, l), l);
+        const ir::Index one      = b.constant(module_.pool.put_int(i32, 1), l);
+        const ir::Index next     = b.binary(T::Add, sc, one, l);
+        b.binary(T::Store, idx_slot, next, l);
         const ir::ExtraSlice step = b.close_region();
 
         b.loop(cond, pred, body, step, /*bottom_test=*/false, l);
@@ -28746,10 +29004,9 @@ private:
                         // A tolerance range needs arithmetic, which a string has none of.
                         fail("inside operator tolerance ranges are not supported");
                     }
-                    fold(b.binary(T::Land,
-                                  b.binary(T::Ge, sel, lower_expr(vr.left(), b), l),
-                                  b.binary(T::Le, sel, lower_expr(vr.right(), b), l),
-                                  l));
+                    const ir::Index above = b.binary(T::Ge, sel, lower_expr(vr.left(), b), l);
+                    const ir::Index below = b.binary(T::Le, sel, lower_expr(vr.right(), b), l);
+                    fold(b.binary(T::Land, above, below, l));
                     continue;
                 }
                 if (m->type->getCanonicalType().isUnpackedArray()) {
@@ -28795,9 +29052,11 @@ private:
                     // `sel >= lo && sel <= hi`, inclusive both ends; an inverted
                     // range is empty and matches nothing, which falls out of the
                     // conjunction (11.4.13).
-                    const ir::Index lo = coerce(lower_expr(vr.left(), b), *vr.left().type, ty, b, loc(vr.left()));
-                    const ir::Index hi = coerce(lower_expr(vr.right(), b), *vr.right().type, ty, b, loc(vr.right()));
-                    fold(b.binary(T::Land, b.binary(T::FGe, sel, lo, l), b.binary(T::FLe, sel, hi, l), l));
+                    const ir::Index lo    = coerce(lower_expr(vr.left(), b), *vr.left().type, ty, b, loc(vr.left()));
+                    const ir::Index hi    = coerce(lower_expr(vr.right(), b), *vr.right().type, ty, b, loc(vr.right()));
+                    const ir::Index above = b.binary(T::FGe, sel, lo, l);
+                    const ir::Index below = b.binary(T::FLe, sel, hi, l);
+                    fold(b.binary(T::Land, above, below, l));
                     continue;
                 }
                 ranges.push_back(b.resize(lower_expr(vr.left(), b), ty, loc(vr.left())));
@@ -30153,14 +30412,15 @@ private:
         const ir::Ref  cls   = box_class_for(vs, inner);
         const uint32_t slot  = static_cast<uint32_t>(fn_ctx_->local_types.size());
         fn_ctx_->local_types.push_back(cls);
-        b.binary(ir::Inst::Tag::Store, b.local(slot, cls, l), b.class_new(cls, l), l);
+        const ir::Index dst = b.local(slot, cls, l);
+        const ir::Index obj = b.class_new(cls, l);
+        b.binary(ir::Inst::Tag::Store, dst, obj, l);
         if (copy_in) {
             // The formal's own Local, which the backend's prologue has filled.
-            const uint32_t k = fn_local(vs);
-            b.binary(ir::Inst::Tag::Store,
-                     boxed_lvalue({ slot, cls }, b, l),
-                     b.unary(ir::Inst::Tag::Load, b.local(k, inner, l), l),
-                     l);
+            const uint32_t  k       = fn_local(vs);
+            const ir::Index box_lv  = boxed_lvalue({ slot, cls }, b, l);
+            const ir::Index arg_val = b.unary(ir::Inst::Tag::Load, b.local(k, inner, l), l);
+            b.binary(ir::Inst::Tag::Store, box_lv, arg_val, l);
         }
         // Deliberately NOT registered in localmap for a declared local: a boxed local
         // has no frame slot of its own, so lower_var_decl cannot initialize the
@@ -30198,7 +30458,9 @@ private:
                 fn_ctx_->local_types.push_back(cls);
                 fn_ctx_->boxed[&vs] = { slot, cls };
             }
-            b.binary(ir::Inst::Tag::Store, b.local(slot, cls, l), b.class_new(cls, l), l);
+            const ir::Index dst = b.local(slot, cls, l);
+            const ir::Index obj = b.class_new(cls, l);
+            b.binary(ir::Inst::Tag::Store, dst, obj, l);
             return;
         }
         const auto it = proc_fork_boxes_.find(&vs);
@@ -30210,8 +30472,10 @@ private:
             info.dir  = ir::SignalInfo::Direction::Internal;
             proc_fork_boxes_[&vs] = { register_signal(std::move(info)), cls };
         }
-        const ProcForkBox& pb = proc_fork_boxes_.at(&vs);
-        b.binary(ir::Inst::Tag::Store, b.signal(pb.sig, l), b.class_new(cls, l), l);
+        const ProcForkBox& pb  = proc_fork_boxes_.at(&vs);
+        const ir::Index    dst = b.signal(pb.sig, l);
+        const ir::Index    obj = b.class_new(cls, l);
+        b.binary(ir::Inst::Tag::Store, dst, obj, l);
     }
 
     // The box handle a fork child's formal takes, by value: an rvalue, so nothing the
@@ -30428,12 +30692,13 @@ private:
                 // A string assigns as a whole handle, never through coerce: its
                 // Resize rejects a string value outright (Resize truncates/extends
                 // planes). Mirrors emit_class_property_inits' string case.
-                pb.binary(ir::Inst::Tag::Store, pb.signal(sig, il), lower_expr(*init, pb), il);
+                const ir::Index dst = pb.signal(sig, il);
+                const ir::Index val = lower_expr(*init, pb);
+                pb.binary(ir::Inst::Tag::Store, dst, val, il);
             } else {
-                pb.binary(ir::Inst::Tag::Store,
-                          pb.signal(sig, il),
-                          coerce(lower_expr(*init, pb), *init->type, pty, pb, il),
-                          il);
+                const ir::Index dst = pb.signal(sig, il);
+                const ir::Index val = coerce(lower_expr(*init, pb), *init->type, pty, pb, il);
+                pb.binary(ir::Inst::Tag::Store, dst, val, il);
             }
         }
         return sig;
@@ -30618,11 +30883,10 @@ private:
     void lower_break(const Statement& stmt, ir::Builder& b) {
         const ir::SourceLoc l = loc(stmt);
         if (loop_depth_ == 0 && fn_ctx_ != nullptr && fn_ctx_->in_randseq) {
-            const ir::Ref bit1 = make_int_type(1, false, false);
-            b.binary(ir::Inst::Tag::Store,
-                     b.local(fn_ctx_->randseq_abort, bit1, l),
-                     b.constant(module_.pool.put_int(bit1, 1), l),
-                     l);
+            const ir::Ref   bit1 = make_int_type(1, false, false);
+            const ir::Index dst  = b.local(fn_ctx_->randseq_abort, bit1, l);
+            const ir::Index yes  = b.constant(module_.pool.put_int(bit1, 1), l);
+            b.binary(ir::Inst::Tag::Store, dst, yes, l);
             b.ret_void(l);
             return;
         }
@@ -30669,11 +30933,10 @@ private:
                 // In a `rand join` operand's step body the function IS one unit, so
                 // returning from it only ends that unit. Tell the driver the whole
                 // production aborted, so it stops advancing this sequence.
-                const ir::Ref bit1 = make_int_type(1, false, false);
-                b.binary(ir::Inst::Tag::Store,
-                         b.local(fn_ctx_->randseq_stop, bit1, l),
-                         b.constant(module_.pool.put_int(bit1, 1), l),
-                         l);
+                const ir::Ref   bit1 = make_int_type(1, false, false);
+                const ir::Index dst  = b.local(fn_ctx_->randseq_stop, bit1, l);
+                const ir::Index yes  = b.constant(module_.pool.put_int(bit1, 1), l);
+                b.binary(ir::Inst::Tag::Store, dst, yes, l);
             }
             b.ret_void(l);
             return;
@@ -31878,12 +32141,13 @@ private:
         }
         const ir::Ref   u64  = make_int_type(64, false, false);
         const ir::Index body = b.handle_deref(handle, class_ref, l);
-        b.obj_rand_seed(b.member_select(body, rd.rng_field, class_ref, l), b.resize(b.urandom(l), u64, l), l);
+        const ir::Index rng  = b.member_select(body, rd.rng_field, class_ref, l);
+        const ir::Index seed = b.resize(b.urandom(l), u64, l);
+        b.obj_rand_seed(rng, seed, l);
         // Every rand property starts enabled (LRM 18.8).
-        b.binary(ir::Inst::Tag::Store,
-                 b.member_select(body, rd.mode_field, class_ref, l),
-                 b.constant(module_.pool.put_int(u64, ~0ull), l),
-                 l);
+        const ir::Index mode = b.member_select(body, rd.mode_field, class_ref, l);
+        const ir::Index all  = b.constant(module_.pool.put_int(u64, ~0ull), l);
+        b.binary(ir::Inst::Tag::Store, mode, all, l);
     }
 
     // Lower a class shallow copy (LRM 8.12): `dst = new src`. Allocates a second
@@ -31939,13 +32203,10 @@ private:
             // Re-read the row each iteration: emit_agg_copy can intern a type and
             // reallocate the field table underneath a held span (Lower.cpp's
             // emit_agg_store documents the same hazard).
-            const ir::Ref field_ty = module_.pool.struct_fields(t.fields_id)[i].type;
-            emit_agg_copy(b.member_select(dst_body, i, class_ref, l),
-                          b.member_select(src_body, i, class_ref, l),
-                          field_ty,
-                          ir::Inst::Tag::Store,
-                          b,
-                          l);
+            const ir::Ref   field_ty  = module_.pool.struct_fields(t.fields_id)[i].type;
+            const ir::Index dst_field = b.member_select(dst_body, i, class_ref, l);
+            const ir::Index src_field = b.member_select(src_body, i, class_ref, l);
+            emit_agg_copy(dst_field, src_field, field_ty, ir::Inst::Tag::Store, b, l);
         }
     }
 
@@ -32098,23 +32359,21 @@ private:
         const ir::Index     self = b.unary(ir::Inst::Tag::Load, b.local(0, class_ref, l), l);
         emit_rand_hook(clt, "pre_randomize", self, b, l);
         if (rd.present) {
-            const ir::Index body = b.handle_deref(self, class_ref, l);
-            const ir::Index eff =
-              b.binary(ir::Inst::Tag::Band,
-                       b.unary(ir::Inst::Tag::Load, b.local(1, u64, l), l),
-                       b.unary(ir::Inst::Tag::Load, b.member_select(body, rd.mode_field, class_ref, l), l),
-                       l);
+            const ir::Index body      = b.handle_deref(self, class_ref, l);
+            const ir::Index arg_mask  = b.unary(ir::Inst::Tag::Load, b.local(1, u64, l), l);
+            const ir::Index mode_slot = b.member_select(body, rd.mode_field, class_ref, l);
+            const ir::Index mode_mask = b.unary(ir::Inst::Tag::Load, mode_slot, l);
+            const ir::Index eff       = b.binary(ir::Inst::Tag::Band, arg_mask, mode_mask, l);
             for (const RandProp& p : rd.props) {
                 b.open_region();
                 emit_rand_assign(p, rd, body, class_ref, b, l);
                 const ir::ExtraSlice then_region = b.close_region();
                 b.open_region();
                 const ir::ExtraSlice else_region = b.close_region();
-                const ir::Index      bit =
-                  b.binary(ir::Inst::Tag::Band,
-                                b.binary(ir::Inst::Tag::Srl, eff, b.constant(module_.pool.put_int(u64, p.ordinal), l), l),
-                                b.constant(module_.pool.put_int(u64, 1), l),
-                                l);
+                const ir::Index      ord         = b.constant(module_.pool.put_int(u64, p.ordinal), l);
+                const ir::Index      shifted     = b.binary(ir::Inst::Tag::Srl, eff, ord, l);
+                const ir::Index      one         = b.constant(module_.pool.put_int(u64, 1), l);
+                const ir::Index      bit         = b.binary(ir::Inst::Tag::Band, shifted, one, l);
                 b.cond(b.binary(ir::Inst::Tag::Ne, bit, b.constant(module_.pool.put_int(u64, 0), l), l),
                        then_region,
                        else_region,
@@ -32149,10 +32408,9 @@ private:
         if (p.cyclic) {
             // randc (LRM 18.6): the next value of a random permutation of the type's
             // range, tracked by this property's own 256-bit history in the object.
-            const ir::Index v = b.randc_next(b.member_select(body, p.randc_field, class_ref, l),
-                                             b.member_select(body, rd.rng_field, class_ref, l),
-                                             p.randc_vals,
-                                             l);
+            const ir::Index seen = b.member_select(body, p.randc_field, class_ref, l);
+            const ir::Index rng  = b.member_select(body, rd.rng_field, class_ref, l);
+            const ir::Index v    = b.randc_next(seen, rng, p.randc_vals, l);
             b.binary(ir::Inst::Tag::Store, lv, b.resize(v, lower_type(p.sym->getType()), l), l);
             return;
         }
@@ -32255,15 +32513,13 @@ private:
         if (values.empty()) {
             fail("internal: rand enum with no members");
         }
-        const ir::Ref   u64 = make_int_type(64, false, false);
-        const ir::Index idx = b.binary(ir::Inst::Tag::Srl,
-                                       b.binary(ir::Inst::Tag::Mul,
-                                                b.resize(draw, u64, l),
-                                                b.constant(module_.pool.put_int(u64, values.size()), l),
-                                                l),
-                                       b.constant(module_.pool.put_int(u64, 32), l),
-                                       l);
-        ir::Index       acc = b.constant(svint_to_ref(values.back(), target), l);
+        const ir::Ref   u64   = make_int_type(64, false, false);
+        const ir::Index wide  = b.resize(draw, u64, l);
+        const ir::Index count = b.constant(module_.pool.put_int(u64, values.size()), l);
+        const ir::Index prod  = b.binary(ir::Inst::Tag::Mul, wide, count, l);
+        const ir::Index shift = b.constant(module_.pool.put_int(u64, 32), l);
+        const ir::Index idx   = b.binary(ir::Inst::Tag::Srl, prod, shift, l);
+        ir::Index       acc   = b.constant(svint_to_ref(values.back(), target), l);
         for (size_t k = values.size() - 1; k-- > 0;) {
             const ir::Index eq =
               b.binary(ir::Inst::Tag::Eq, idx, b.constant(module_.pool.put_int(u64, k), l), l);
@@ -32304,16 +32560,20 @@ private:
             arm(kRandOpModeAll, [&] {
                 const ir::Index all = b.constant(module_.pool.put_int(u64, ~0ull), l);
                 const ir::Index on  = b.binary(ir::Inst::Tag::Ne, arg, zero, l);
-                b.binary(ir::Inst::Tag::Store, mode_lv(), b.select(on, all, zero, l), l);
+                const ir::Index dst = mode_lv();
+                const ir::Index val = b.select(on, all, zero, l);
+                b.binary(ir::Inst::Tag::Store, dst, val, l);
             });
             arm(kRandOpModeOne, [&] {
-                const ir::Index ord  = b.binary(ir::Inst::Tag::Srl, arg, one, l);
-                const ir::Index bit  = b.binary(ir::Inst::Tag::Sll, one, ord, l);
-                const ir::Index cur  = b.unary(ir::Inst::Tag::Load, mode_lv(), l);
-                const ir::Index on   = b.binary(ir::Inst::Tag::Ne, b.binary(ir::Inst::Tag::Band, arg, one, l), zero, l);
-                const ir::Index set  = b.binary(ir::Inst::Tag::Bor, cur, bit, l);
-                const ir::Index clr  = b.binary(ir::Inst::Tag::Band, cur, b.unary(ir::Inst::Tag::Bnot, bit, l), l);
-                b.binary(ir::Inst::Tag::Store, mode_lv(), b.select(on, set, clr, l), l);
+                const ir::Index ord = b.binary(ir::Inst::Tag::Srl, arg, one, l);
+                const ir::Index bit = b.binary(ir::Inst::Tag::Sll, one, ord, l);
+                const ir::Index cur = b.unary(ir::Inst::Tag::Load, mode_lv(), l);
+                const ir::Index on  = b.binary(ir::Inst::Tag::Ne, b.binary(ir::Inst::Tag::Band, arg, one, l), zero, l);
+                const ir::Index set = b.binary(ir::Inst::Tag::Bor, cur, bit, l);
+                const ir::Index clr = b.binary(ir::Inst::Tag::Band, cur, b.unary(ir::Inst::Tag::Bnot, bit, l), l);
+                const ir::Index dst = mode_lv();
+                const ir::Index val = b.select(on, set, clr, l);
+                b.binary(ir::Inst::Tag::Store, dst, val, l);
             });
             arm(kRandOpModeQuery, [&] {
                 const ir::Index cur = b.unary(ir::Inst::Tag::Load, mode_lv(), l);
@@ -32594,8 +32854,10 @@ private:
             // LRM 15.3.2: return the keys, then "if a process has been suspended
             // waiting for a key, that process shall execute if enough keys have been
             // returned" -- the woken head re-tests and takes them.
-            const ir::Index n = count();
-            b.binary(ir::Inst::Tag::Store, field(kSemKeys), b.binary(ir::Inst::Tag::Add, keys(), n, l), l);
+            const ir::Index n   = count();
+            const ir::Index dst = field(kSemKeys);
+            const ir::Index val = b.binary(ir::Inst::Tag::Add, keys(), n, l);
+            b.binary(ir::Inst::Tag::Store, dst, val, l);
             b.sync_ctl(ir::SyncOp::WakeHead, sync_site_seq_++, qwords(), l);
             return std::nullopt;
         }
@@ -32604,12 +32866,16 @@ private:
             // waiting queue, so 15.3.3's FIFO rule -- which is about that queue --
             // does not constrain it, and a queued waiter does not block it. Recorded
             // in the design doc §15; Verilator agrees.
-            const ir::Index n  = count();
-            const ir::Index ok = b.binary(ir::Inst::Tag::Ge, keys(), n, l);
-            b.binary(ir::Inst::Tag::Store, field(kSemKeys),
-                     b.select(ok, b.binary(ir::Inst::Tag::Sub, keys(), n, l), keys(), l), l);
-            return b.select(ok, b.constant(module_.pool.put_int(int_ty, 1), l),
-                            b.constant(module_.pool.put_int(int_ty, 0), l), l);
+            const ir::Index n     = count();
+            const ir::Index ok    = b.binary(ir::Inst::Tag::Ge, keys(), n, l);
+            const ir::Index dst   = field(kSemKeys);
+            const ir::Index taken = b.binary(ir::Inst::Tag::Sub, keys(), n, l);
+            const ir::Index kept  = keys();
+            const ir::Index val   = b.select(ok, taken, kept, l);
+            b.binary(ir::Inst::Tag::Store, dst, val, l);
+            const ir::Index granted = b.constant(module_.pool.put_int(int_ty, 1), l);
+            const ir::Index denied  = b.constant(module_.pool.put_int(int_ty, 0), l);
+            return b.select(ok, granted, denied, l);
         }
         if (sub.name == "get") {
             const uint32_t  site = sync_site_seq_++;
@@ -32617,13 +32883,15 @@ private:
             // The fast path is taken only when NOBODY is queued: LRM 15.3.3's FIFO
             // rule (and Accellera's Interpretation #1 of it) makes a blocked head
             // block later arrivals even when the keys would satisfy them.
-            const ir::Index empty =
-              b.binary(ir::Inst::Tag::Eq, b.unary(ir::Inst::Tag::Load, field(kSemQHead), l),
-                       b.constant(module_.pool.put_int(make_int_type(64, false, false), 0), l), l);
+            const ir::Index head              = b.unary(ir::Inst::Tag::Load, field(kSemQHead), l);
+            const ir::Index none              = b.constant(module_.pool.put_int(make_int_type(64, false, false), 0), l);
+            const ir::Index empty             = b.binary(ir::Inst::Tag::Eq, head, none, l);
             const std::array<ir::Index, 2> qw = qwords();
             emit_sync_park_loop(site, qw, empty, [&] { return b.binary(ir::Inst::Tag::Ge, keys(), n, l); },
                                 /*require_head=*/true, b, l);
-            b.binary(ir::Inst::Tag::Store, field(kSemKeys), b.binary(ir::Inst::Tag::Sub, keys(), n, l), l);
+            const ir::Index dst = field(kSemKeys);
+            const ir::Index val = b.binary(ir::Inst::Tag::Sub, keys(), n, l);
+            b.binary(ir::Inst::Tag::Store, dst, val, l);
             return std::nullopt;
         }
         // Every method of LRM 15.3 is handled above; a new one would arrive with a
@@ -32657,11 +32925,12 @@ private:
         const auto size  = [&] { return b.queue_size(field(kMbxFifo), fifo_ty, l); };
         const auto bound = [&] { return b.unary(ir::Inst::Tag::Load, field(kMbxBound), l); };
         const auto zero64 = [&] { return b.constant(module_.pool.put_int(i64, 0), l); };
-        const auto one32   = [&] { return b.constant(module_.pool.put_int(int_ty, 1), l); };
-        const auto zero32  = [&] { return b.constant(module_.pool.put_int(int_ty, 0), l); };
+        const auto one32  = [&] { return b.constant(module_.pool.put_int(int_ty, 1), l); };
+        const auto zero32 = [&] { return b.constant(module_.pool.put_int(int_ty, 0), l); };
         const auto qempty = [&](uint32_t head) {
-            return b.binary(ir::Inst::Tag::Eq, b.unary(ir::Inst::Tag::Load, field(head), l),
-                            b.constant(module_.pool.put_int(word, 0), l), l);
+            const ir::Index first = b.unary(ir::Inst::Tag::Load, field(head), l);
+            const ir::Index none  = b.constant(module_.pool.put_int(word, 0), l);
+            return b.binary(ir::Inst::Tag::Eq, first, none, l);
         };
         const auto qwords = [&](uint32_t head, uint32_t tail) {
             return std::array<ir::Index, 2>{ field(head), field(tail) };
@@ -32669,12 +32938,18 @@ private:
         // Room for one more message: an unbounded mailbox (bound 0) never blocks a
         // send (LRM 15.4.1 / 15.4).
         const auto has_room = [&] {
-            const ir::Index unbounded = b.binary(ir::Inst::Tag::Eq, bound(), zero64(), l);
-            const ir::Index under = b.binary(ir::Inst::Tag::Lt, b.resize(size(), i64, l), bound(), l);
+            const ir::Index limit     = bound();
+            const ir::Index none      = zero64();
+            const ir::Index unbounded = b.binary(ir::Inst::Tag::Eq, limit, none, l);
+            const ir::Index used      = b.resize(size(), i64, l);
+            const ir::Index cap       = bound();
+            const ir::Index under     = b.binary(ir::Inst::Tag::Lt, used, cap, l);
             return b.binary(ir::Inst::Tag::Lor, unbounded, under, l);
         };
         const auto has_msg = [&] {
-            return b.binary(ir::Inst::Tag::Gt, b.resize(size(), i64, l), zero64(), l);
+            const ir::Index used = b.resize(size(), i64, l);
+            const ir::Index none = zero64();
+            return b.binary(ir::Inst::Tag::Gt, used, none, l);
         };
         // The message argument of `put` / `try_put`, coerced to the element type.
         const auto message = [&]() -> ir::Index {
@@ -32743,8 +33018,11 @@ private:
             b.open_region();
             {
                 b.queue_push(field(kMbxFifo), m, /*front=*/false, fifo_ty, l);
-                emit_mbx_message_arrived(field(kMbxGetHead), field(kMbxGetTail), field(kMbxPeekHead),
-                                         field(kMbxPeekTail), b, l);
+                const ir::Index get_head  = field(kMbxGetHead);
+                const ir::Index get_tail  = field(kMbxGetTail);
+                const ir::Index peek_head = field(kMbxPeekHead);
+                const ir::Index peek_tail = field(kMbxPeekTail);
+                emit_mbx_message_arrived(get_head, get_tail, peek_head, peek_tail, b, l);
                 b.binary(ir::Inst::Tag::Store, res, one32(), l);
             }
             const ir::ExtraSlice then_r = b.close_region();
@@ -32769,8 +33047,9 @@ private:
                     // Room freed: hand off to the head of the send queue.
                     b.sync_ctl(ir::SyncOp::WakeHead, sync_site_seq_++, qwords(kMbxPutHead, kMbxPutTail), l);
                 } else {
-                    store_dest(d, b.unary(ir::Inst::Tag::Load,
-                                          b.elem_select(field(kMbxFifo), zero64(), fifo_ty, l), l));
+                    const ir::Index fifo = field(kMbxFifo);
+                    const ir::Index at0  = zero64();
+                    store_dest(d, b.unary(ir::Inst::Tag::Load, b.elem_select(fifo, at0, fifo_ty, l), l));
                 }
                 b.binary(ir::Inst::Tag::Store, res, one32(), l);
             }
@@ -32785,20 +33064,25 @@ private:
             // LRM 15.4.3: store in strict FIFO order, suspending while the mailbox
             // is full. Head-of-line like `semaphore::get`: the fast path is taken
             // only when no other sender is queued (15.4.5's arrival-order rule).
-            const uint32_t  site = sync_site_seq_++;
-            const ir::Index m    = message();
-            emit_sync_park_loop(site, qwords(kMbxPutHead, kMbxPutTail), qempty(kMbxPutHead),
-                                [&] { return has_room(); }, /*require_head=*/true, b, l);
+            const uint32_t                 site  = sync_site_seq_++;
+            const ir::Index                m     = message();
+            const std::array<ir::Index, 2> qw    = qwords(kMbxPutHead, kMbxPutTail);
+            const ir::Index                empty = qempty(kMbxPutHead);
+            emit_sync_park_loop(site, qw, empty, [&] { return has_room(); }, /*require_head=*/true, b, l);
             b.queue_push(field(kMbxFifo), m, /*front=*/false, fifo_ty, l);
-            emit_mbx_message_arrived(field(kMbxGetHead), field(kMbxGetTail), field(kMbxPeekHead),
-                                     field(kMbxPeekTail), b, l);
+            const ir::Index get_head  = field(kMbxGetHead);
+            const ir::Index get_tail  = field(kMbxGetTail);
+            const ir::Index peek_head = field(kMbxPeekHead);
+            const ir::Index peek_tail = field(kMbxPeekTail);
+            emit_mbx_message_arrived(get_head, get_tail, peek_head, peek_tail, b, l);
             return std::nullopt;
         }
         if (sub.name == "get") {
-            const uint32_t    site = sync_site_seq_++;
-            const Expression& d    = dest();
-            emit_sync_park_loop(site, qwords(kMbxGetHead, kMbxGetTail), qempty(kMbxGetHead),
-                                [&] { return has_msg(); }, /*require_head=*/true, b, l);
+            const uint32_t                 site  = sync_site_seq_++;
+            const Expression&              d     = dest();
+            const std::array<ir::Index, 2> qw    = qwords(kMbxGetHead, kMbxGetTail);
+            const ir::Index                empty = qempty(kMbxGetHead);
+            emit_sync_park_loop(site, qw, empty, [&] { return has_msg(); }, /*require_head=*/true, b, l);
             store_dest(d, b.queue_pop(field(kMbxFifo), /*front=*/true, fifo_ty, l));
             b.sync_ctl(ir::SyncOp::WakeHead, sync_site_seq_++, qwords(kMbxPutHead, kMbxPutTail), l);
             return std::nullopt;
@@ -32815,8 +33099,9 @@ private:
             const ir::Index   any  = b.constant(module_.pool.put_int(make_int_type(1, false, false), 1), l);
             emit_sync_park_loop(site, qwords(kMbxPeekHead, kMbxPeekTail), any, [&] { return has_msg(); },
                                 /*require_head=*/false, b, l);
-            store_dest(d, b.unary(ir::Inst::Tag::Load,
-                                  b.elem_select(field(kMbxFifo), zero64(), fifo_ty, l), l));
+            const ir::Index fifo = field(kMbxFifo);
+            const ir::Index at0  = zero64();
+            store_dest(d, b.unary(ir::Inst::Tag::Load, b.elem_select(fifo, at0, fifo_ty, l), l));
             return std::nullopt;
         }
         // Every method of LRM 15.4 is handled above; a new one would arrive with a
@@ -33319,15 +33604,13 @@ private:
         ir::Index     arg = b.constant(module_.pool.put_int(u64, ordinal), l);
         if (args.size() > 1) {
             // The task form: `ordinal << 1 | (on != 0)`.
-            const ir::Index on = b.binary(ir::Inst::Tag::Ne,
-                                          b.resize(lower_expr(*args[1], b), u64, l),
-                                          b.constant(module_.pool.put_int(u64, 0), l),
-                                          l);
-            op                 = b.constant(module_.pool.put_int(u64, kRandOpModeOne), l);
-            arg                = b.binary(ir::Inst::Tag::Bor,
-                            b.constant(module_.pool.put_int(u64, uint64_t{ ordinal } << 1), l),
-                            b.resize(on, u64, l),
-                            l);
+            const ir::Index raw  = b.resize(lower_expr(*args[1], b), u64, l);
+            const ir::Index zero = b.constant(module_.pool.put_int(u64, 0), l);
+            const ir::Index on   = b.binary(ir::Inst::Tag::Ne, raw, zero, l);
+            op                   = b.constant(module_.pool.put_int(u64, kRandOpModeOne), l);
+            const ir::Index tag  = b.constant(module_.pool.put_int(u64, uint64_t{ ordinal } << 1), l);
+            const ir::Index flag = b.resize(on, u64, l);
+            arg                  = b.binary(ir::Inst::Tag::Bor, tag, flag, l);
         }
         return b.resize(emit_randops_dispatch(*clt, self, op, arg, b, l), lower_type(*call.type), l);
     }
@@ -34124,11 +34407,10 @@ private:
         try {
             const ir::Index handle = b.local(0, word, l);
             if (embedded) {
-                b.binary(ir::Inst::Tag::Store,
-                         b.local(fn_ctx_->this_local, fn_ctx_->this_class, l),
-                         b.cover_query(
-                           ir::CoverOp::Ctx, { { b.unary(ir::Inst::Tag::Load, handle, l) } }, word, type_idx, 0, l),
-                         l);
+                const ir::Index dst   = b.local(fn_ctx_->this_local, fn_ctx_->this_class, l);
+                const ir::Index owner = b.cover_query(
+                  ir::CoverOp::Ctx, { { b.unary(ir::Inst::Tag::Load, handle, l) } }, word, type_idx, 0, l);
+                b.binary(ir::Inst::Tag::Store, dst, owner, l);
             }
             for (uint32_t k = 0; k < points.size(); ++k) {
                 const slang::ast::CoverpointSymbol& cp = *points[k];
@@ -34239,7 +34521,9 @@ private:
         // Walk this type's instances. A registry walk rather than a captured
         // handle: the design may build any number of instances of one covergroup
         // type, and the runtime owns them all.
-        b.binary(ir::Inst::Tag::Store, cur.lv(b, l), b.cover_query(ir::CoverOp::First, {}, word, type_idx, 0, l), l);
+        const ir::Index cur_lv = cur.lv(b, l);
+        const ir::Index first  = b.cover_query(ir::CoverOp::First, {}, word, type_idx, 0, l);
+        b.binary(ir::Inst::Tag::Store, cur_lv, first, l);
         b.open_region();
         const ir::Index      h    = b.unary(ir::Inst::Tag::Load, cur.lv(b, l), l);
         const ir::Index      pred = b.binary(ir::Inst::Tag::Ne, h, int_const(0, 64, b, l), l);
@@ -34247,8 +34531,9 @@ private:
         b.open_region();
         const ir::Index bh = b.unary(ir::Inst::Tag::Load, cur.lv(b, l), l);
         b.call(sample, { { bh } }, l);
-        b.binary(
-          ir::Inst::Tag::Store, cur.lv(b, l), b.cover_query(ir::CoverOp::Next, { { bh } }, word, type_idx, 0, l), l);
+        const ir::Index next_lv = cur.lv(b, l);
+        const ir::Index next    = b.cover_query(ir::CoverOp::Next, { { bh } }, word, type_idx, 0, l);
+        b.binary(ir::Inst::Tag::Store, next_lv, next, l);
         const ir::ExtraSlice body = b.close_region();
         b.open_region();
         const ir::ExtraSlice no_step = b.close_region();
@@ -34381,14 +34666,12 @@ private:
             if (!type_level) {
                 qargs.push_back(h);
             }
-            b.binary(ir::Inst::Tag::Store,
-                     lower_lvalue(*args[0], b, /*is_write=*/true),
-                     b.cover_query(cov, qargs, make_int_type(32, false, true), idx, 0, l),
-                     l);
-            b.binary(ir::Inst::Tag::Store,
-                     lower_lvalue(*args[1], b, /*is_write=*/true),
-                     b.cover_query(tot, qargs, make_int_type(32, false, true), idx, 0, l),
-                     l);
+            const ir::Index covered_lv = lower_lvalue(*args[0], b, /*is_write=*/true);
+            const ir::Index covered    = b.cover_query(cov, qargs, make_int_type(32, false, true), idx, 0, l);
+            b.binary(ir::Inst::Tag::Store, covered_lv, covered, l);
+            const ir::Index total_lv = lower_lvalue(*args[1], b, /*is_write=*/true);
+            const ir::Index total    = b.cover_query(tot, qargs, make_int_type(32, false, true), idx, 0, l);
+            b.binary(ir::Inst::Tag::Store, total_lv, total, l);
         }
         std::vector<ir::Index> qargs;
         if (!type_level) {
