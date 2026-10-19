@@ -37,17 +37,6 @@
 #include "runtime/Coverage.h"
 #include "runtime/svdpi.h"
 
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <cstdio>
-#include <windows.h>
-#endif
-
 #if defined(__MINGW32__)
 // The 128-bit arithmetic helpers the backend emits for wide (>64-bit) operands.
 // A dynamically linked host finds these through libgcc_s in the process symbol
@@ -527,26 +516,19 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // system DLLs load, exports the same names with its own stdio buffers and
     // heap: a DPI import of `puts` bound there printed out of order with
     // $display, and memory allocated by one runtime and freed by the other would
-    // corrupt a heap. fputs is declared dllimport, so its address is inside the
-    // runtime's DLL; a statically linked runtime leaves it in the executable,
-    // where there is no second runtime to confuse.
-    if (HMODULE crt = nullptr;
-        ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                             reinterpret_cast<LPCWSTR>(&std::fputs), &crt) &&
-        crt != ::GetModuleHandleW(nullptr)) {
-        char        path[MAX_PATH];
-        const DWORD n = ::GetModuleFileNameA(crt, path, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH) {
-            llvm::errs() << "jit: cannot name the C runtime module\n";
-            return -1;
-        }
-        auto crt_gen = llvm::orc::DynamicLibrarySearchGenerator::Load(path, (*jit)->getDataLayout().getGlobalPrefix());
-        if (!crt_gen) {
-            llvm::errs() << "jit: " << llvm::toString(crt_gen.takeError()) << "\n";
-            return -1;
-        }
-        jd.addGenerator(std::move(*crt_gen));
+    // corrupt a heap. Which runtime that is is fixed at compile time; mingw-w64
+    // defines _UCRT when it targets the Universal CRT.
+#if defined(_UCRT)
+    constexpr const char* crt_module = "ucrtbase.dll";
+#else
+    constexpr const char* crt_module = "msvcrt.dll";
+#endif
+    auto crt_gen = llvm::orc::DynamicLibrarySearchGenerator::Load(crt_module, (*jit)->getDataLayout().getGlobalPrefix());
+    if (!crt_gen) {
+        llvm::errs() << "jit: " << llvm::toString(crt_gen.takeError()) << "\n";
+        return -1;
     }
+    jd.addGenerator(std::move(*crt_gen));
 #endif
 
     // Resolve the compiler-rt/libgcc builtins the backend emits for wide
