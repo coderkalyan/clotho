@@ -329,6 +329,11 @@ if(CLOTHO_SVA)
   file(MAKE_DIRECTORY ${_libsva_include}/libsva)
   add_library(libsva INTERFACE)
   target_link_libraries(libsva INTERFACE ${_libsva_lib})
+  if(WIN32)
+    # Zig's standard library calls the native API directly (NtCreateFile,
+    # RtlQueryPerformanceCounter, ...), which only ntdll exports.
+    target_link_libraries(libsva INTERFACE ntdll)
+  endif()
   target_include_directories(libsva SYSTEM INTERFACE ${_libsva_include})
 endif()
 
