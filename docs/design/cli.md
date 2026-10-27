@@ -34,7 +34,18 @@ options below.
 
 The command word is required and must be `argv[1]`:
 `clotho design.sv` is a usage error, not an implicit `run`, because implicit
-modes are how the old surface drifted.
+modes are how the old surface drifted. The error still says what was probably
+meant, because leaving out `run` is the likeliest slip:
+
+- a first argument that is an existing file, or ends in `.sv`, `.v`, `.svh` or
+  `.vh`, gets `did you mean 'clotho run <arg>'?`;
+- otherwise the nearest command within two edits (case-folded, and fewer edits than
+  the command has letters, so a short command is not offered for noise) gets
+  `did you mean '<command>'?`, the way slang suggests a mistyped option;
+- otherwise the message lists the commands.
+
+Only commands this build has are candidates (`synth`, `lsp` and `dap` are opt-in).
+Every case exits 2.
 
 `lsp` and `dap` are servers, not pipeline stages, and take **no arguments at
 all** -- not even a source file. An editor supplies the language server's file

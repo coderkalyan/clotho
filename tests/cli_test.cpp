@@ -526,4 +526,65 @@ TEST_CASE("cli: every message names the commands this build has and no others") 
         }
     }
 }
+
+TEST_CASE("cli: an unknown command suggests the command it is closest to") {
+    const Scratch s;
+    struct Case {
+        std::string_view typed;
+        std::string_view suggested;
+    };
+    const Case cases[] = {
+        { "rnu", "run" },  { "rn", "run" },  { "biuld", "build" },  { "bild", "build" },
+        { "lnt", "lint" }, { "Run", "run" }, { "buildd", "build" },
+    };
+    for (const Case& c : cases) {
+        CAPTURE(c.typed);
+        const Result r = s.run(c.typed);
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, std::format("unknown command '{}'; did you mean '{}'?", c.typed, c.suggested)));
+        CHECK(contains(r.err, "try 'clotho --help'"));
+    }
+    SUBCASE("a word near no command gets the list instead") {
+        const Result r = s.run("frobnicate");
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, "unknown command 'frobnicate'; expected 'build', 'run'"));
+        CHECK_FALSE(contains(r.err, "did you mean"));
+    }
+    SUBCASE("a command this build lacks is never suggested") {
+        // `lsp` and `dap` are a keystroke from each other and from `lint` or `run`
+        // only if the build has them.
+        const std::vector<std::string_view> built = built_commands(s);
+        for (const std::string_view command : { "synth", "lsp", "dap" }) {
+            CAPTURE(command);
+            if (std::ranges::find(built, command) == built.end()) {
+                CHECK_FALSE(contains(s.run("synt").err, std::format("'{}'", command)));
+                CHECK_FALSE(contains(s.run("lps").err, std::format("did you mean '{}'", command)));
+                CHECK_FALSE(contains(s.run("dpa").err, std::format("did you mean '{}'", command)));
+            }
+        }
+    }
+}
+
+TEST_CASE("cli: a source file given where the command goes suggests run") {
+    const Scratch  s;
+    const fs::path file = s.write("design.txt", kParamDesign);
+    SUBCASE("a file that exists, whatever it is called") {
+        const Result r = s.run(std::format("\"{}\"", file.string()));
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, std::format("unknown command '{0}'; did you mean 'clotho run {0}'?", file.string())));
+    }
+    SUBCASE("a name that looks like source, existing or not") {
+        for (const std::string_view name : { "missing.sv", "missing.v", "missing.svh", "missing.vh" }) {
+            CAPTURE(name);
+            const Result r = s.run(name);
+            CHECK(r.code == 2);
+            CHECK(contains(r.err, std::format("unknown command '{0}'; did you mean 'clotho run {0}'?", name)));
+        }
+    }
+    SUBCASE("a file and the options after it are not run") {
+        const Result r = s.run(std::format("\"{}\" --time", file.string()));
+        CHECK(r.code == 2);
+        CHECK(r.out.empty());
+    }
+}
 #endif // !defined(_WIN32)

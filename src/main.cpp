@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -15,6 +17,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include <slang/driver/Driver.h>
+#include <slang/util/String.h>
 #include <slang/util/VersionInfo.h>
 
 #include "Lower.h"
@@ -493,6 +496,38 @@ bool is_slang_plusarg(std::string_view arg) {
     return arg.starts_with("+define+") || arg.starts_with("+incdir+") || arg.starts_with("+libext+");
 }
 
+// What to offer in place of a first argument that is not a command, or "". The
+// likeliest mistake is leaving out `run` (`clotho design.sv`), so a file that
+// exists, or one that looks like source, gets `clotho run <file>`. Otherwise a
+// command within two edits, the way slang suggests an option: always shorter
+// than the command itself, so a short command is not offered for noise.
+std::string suggest_command(std::string_view word) {
+    constexpr std::string_view source_extensions[] = { ".sv", ".v", ".svh", ".vh" };
+    constexpr int              max_distance        = 2;
+
+    std::error_code ec;
+    const bool      is_file = std::filesystem::is_regular_file(std::filesystem::path(std::string(word)), ec);
+    const bool      looks_like_source =
+      std::ranges::any_of(source_extensions, [&](std::string_view ext) { return word.ends_with(ext); });
+    if (is_file || looks_like_source) {
+        return std::format("clotho run {}", word);
+    }
+
+    std::string lowered(word);
+    std::ranges::transform(
+      lowered, lowered.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::string_view best          = "";
+    int              best_distance = max_distance + 1;
+    for (const CommandInfo& c : kCommands) {
+        const int distance = slang::editDistance(c.name, lowered, max_distance);
+        if (distance < best_distance && distance < static_cast<int>(c.name.size())) {
+            best          = c.name;
+            best_distance = distance;
+        }
+    }
+    return std::string(best);
+}
+
 // A command-specific option used under another command is an error, not a
 // silently ignored no-op (PRINCIPLES.md: never silently accept).
 bool check_scope(const Registry& registry, Command command, int& status) {
@@ -880,6 +915,10 @@ int main(int argc, char** argv) {
             print_version();
             return 0;
         } else {
+            const std::string suggestion = suggest_command(first);
+            if (!suggestion.empty()) {
+                return usage_error(std::format("unknown command '{}'; did you mean '{}'?", first, suggestion));
+            }
             return usage_error(std::format("unknown command '{}'; expected {}", first, command_list(kAny)));
         }
     }
