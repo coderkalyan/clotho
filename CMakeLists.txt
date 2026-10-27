@@ -101,6 +101,13 @@ endif()
 # plumbing.
 option(CLOTHO_SYNTH "Expose the unfinished `synth` command in the CLI" ${CLOTHO_WIP_DEFAULT})
 
+# `lsp` and `dap`: unfinished servers, offered the same way as `synth`, except
+# that the whole server is conditional, not just its CLI wiring. Off, the server
+# libraries and the JSON library behind them (glaze, and the notices it carries)
+# are neither built nor linked, and their tests are not part of the suite.
+option(CLOTHO_LSP "Build and expose the unfinished `lsp` command (language server)" ${CLOTHO_WIP_DEFAULT})
+option(CLOTHO_DAP "Build and expose the unfinished `dap` command (debug adapter)" ${CLOTHO_WIP_DEFAULT})
+
 # `--sanitize=xprov`: the flag is parsed and carried in SimulationConfig, but no
 # backend pass reads the bit yet, so it instruments nothing. An operator who
 # reaches for a sanitizer and gets silence is worse served than one told the check
@@ -258,12 +265,14 @@ FetchContent_MakeAvailable(unordered_dense)
 # protocol this wide. Chosen over nlohmann for speed (a semantic-tokens response
 # is a very large array) and over simdjson because its on-demand parser is slow
 # exactly when object keys arrive out of order, which is normal for LSP clients.
-FetchContent_Declare(
-  glaze
-  GIT_REPOSITORY https://github.com/stephenberry/glaze.git
-  GIT_TAG        be4481f4b106fc82f0b7bc85f6a92202f8c0dd59 # v8.0.0
-)
-FetchContent_MakeAvailable(glaze)
+if(CLOTHO_LSP OR CLOTHO_DAP)
+  FetchContent_Declare(
+    glaze
+    GIT_REPOSITORY https://github.com/stephenberry/glaze.git
+    GIT_TAG        be4481f4b106fc82f0b7bc85f6a92202f8c0dd59 # v8.0.0
+  )
+  FetchContent_MakeAvailable(glaze)
+endif()
 
 # libsva: the concurrent-assertion temporal engine — a Zig static library plus a
 # C header (https://github.com/coderkalyan/libsva). It builds the SVA IR, lowers
@@ -481,51 +490,57 @@ if(CLOTHO_SVA)
   target_compile_definitions(clotho PRIVATE CLOTHO_HAVE_SVA=1)
 endif()
 
-# The base-protocol framing shared by the language server and the debug
-# adapter: `Content-Length` over raw descriptors, and nothing else. Its own
-# target rather than a file inside one of them, because both consume it and
-# neither should link through the other -- clotho_lsp must stay LLVM-free
-# (below) and clotho_dap cannot be.
-add_library(clotho_transport STATIC src/transport/Transport.cpp)
-target_include_directories(clotho_transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(clotho_transport PRIVATE clotho_warnings)
+if(CLOTHO_LSP OR CLOTHO_DAP)
+  # The base-protocol framing shared by the language server and the debug
+  # adapter: `Content-Length` over raw descriptors, and nothing else. Its own
+  # target rather than a file inside one of them, because both consume it and
+  # neither should link through the other -- clotho_lsp must stay LLVM-free
+  # (below) and clotho_dap cannot be.
+  add_library(clotho_transport STATIC src/transport/Transport.cpp)
+  target_include_directories(clotho_transport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(clotho_transport PRIVATE clotho_warnings)
+  find_package(Threads REQUIRED)
+endif()
 
-# Language server: JSON-RPC over stdio, the transport threads and the request
-# dispatcher. Links the frontend and nothing below it, so like clotho_ir_core
-# this target's job is partly to make the build fail if the server ever reaches
-# for LLVM: the process an editor keeps open must stay cheap to start, and the
-# worker split in docs/design/lsp.md 4.3 depends on the router being able to
-# outlive a simulation that crashed.
-#
-# glaze is PRIVATE: no LSP header names a JSON type, so nothing that links this
-# pays for its templates.
-add_library(clotho_lsp STATIC
-  src/lsp/LineIndex.cpp
-  src/lsp/Tokens.cpp
-  src/lsp/Server.cpp
-)
-target_include_directories(clotho_lsp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(clotho_lsp PUBLIC clotho clotho_transport)
-target_link_libraries(clotho_lsp PRIVATE clotho_warnings glaze::glaze)
-find_package(Threads REQUIRED)
-target_link_libraries(clotho_lsp PUBLIC Threads::Threads)
+if(CLOTHO_LSP)
+  # Language server: JSON-RPC over stdio, the transport threads and the request
+  # dispatcher. Links the frontend and nothing below it, so like clotho_ir_core
+  # this target's job is partly to make the build fail if the server ever reaches
+  # for LLVM: the process an editor keeps open must stay cheap to start, and the
+  # worker split in docs/design/lsp.md 4.3 depends on the router being able to
+  # outlive a simulation that crashed.
+  #
+  # glaze is PRIVATE: no LSP header names a JSON type, so nothing that links this
+  # pays for its templates.
+  add_library(clotho_lsp STATIC
+    src/lsp/LineIndex.cpp
+    src/lsp/Tokens.cpp
+    src/lsp/Server.cpp
+  )
+  target_include_directories(clotho_lsp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(clotho_lsp PUBLIC clotho clotho_transport)
+  target_link_libraries(clotho_lsp PRIVATE clotho_warnings glaze::glaze)
+  target_link_libraries(clotho_lsp PUBLIC Threads::Threads)
+endif()
 
-# Debug adapter: DAP over stdio, and the design's own process (docs/design/dap.md).
-#
-# Separate from clotho_lsp, and it has to be. A debugger executes the design,
-# so this target reaches the JIT and therefore LLVM -- which is exactly what
-# the invariant above exists to forbid for the server an editor keeps open. It
-# links clotho_ir today only for that dependency's sake; the adapter itself
-# runs the design out of process, so the code here calls nothing in it yet
-# (docs/design/dap.md 4.4). glaze stays PRIVATE for the same reason it is
-# there: no DAP header names a JSON type.
-add_library(clotho_dap STATIC
-  src/dap/Server.cpp
-  src/dap/Design.cpp
-)
-target_include_directories(clotho_dap PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(clotho_dap PUBLIC clotho clotho_transport Threads::Threads)
-target_link_libraries(clotho_dap PRIVATE clotho_warnings glaze::glaze)
+if(CLOTHO_DAP)
+  # Debug adapter: DAP over stdio, and the design's own process (docs/design/dap.md).
+  #
+  # Separate from clotho_lsp, and it has to be. A debugger executes the design,
+  # so this target reaches the JIT and therefore LLVM -- which is exactly what
+  # the invariant above exists to forbid for the server an editor keeps open. It
+  # links clotho_ir today only for that dependency's sake; the adapter itself
+  # runs the design out of process, so the code here calls nothing in it yet
+  # (docs/design/dap.md 4.4). glaze stays PRIVATE for the same reason it is
+  # there: no DAP header names a JSON type.
+  add_library(clotho_dap STATIC
+    src/dap/Server.cpp
+    src/dap/Design.cpp
+  )
+  target_include_directories(clotho_dap PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(clotho_dap PUBLIC clotho clotho_transport Threads::Threads)
+  target_link_libraries(clotho_dap PRIVATE clotho_warnings glaze::glaze)
+endif()
 
 # Thin build driver. Needs the code generator explicitly now that `clotho` no
 # longer re-exports it.
@@ -542,13 +557,20 @@ if(WIN32)
 endif()
 # `clotho` links clotho_ir_core, NOT the code generator, so the CLI names
 # clotho_ir itself — it is the consumer that actually emits and JITs.
+target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_warnings)
 if(CLOTHO_SYNTH)
-  target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_legalize clotho_lsp clotho_dap clotho_warnings)
+  target_link_libraries(clotho_cli PRIVATE clotho_legalize)
   target_compile_definitions(clotho_cli PRIVATE CLOTHO_SYNTH)
-else()
-  # Without the command there is nothing to link, so the shipped simulator
-  # contains no legalization code.
-  target_link_libraries(clotho_cli PRIVATE clotho clotho_ir clotho_lsp clotho_dap clotho_warnings)
+endif()
+# Without a command there is nothing to link: the shipped simulator contains no
+# legalization code and no language server or debug adapter.
+if(CLOTHO_LSP)
+  target_link_libraries(clotho_cli PRIVATE clotho_lsp)
+  target_compile_definitions(clotho_cli PRIVATE CLOTHO_LSP)
+endif()
+if(CLOTHO_DAP)
+  target_link_libraries(clotho_cli PRIVATE clotho_dap)
+  target_compile_definitions(clotho_cli PRIVATE CLOTHO_DAP)
 endif()
 if(CLOTHO_XSAN)
   target_compile_definitions(clotho_cli PRIVATE CLOTHO_XSAN)
@@ -660,15 +682,24 @@ set(CLOTHO_TEST_SOURCES
   tests/wide_select_test.cpp
   tests/force_release_test.cpp
   tests/system_test.cpp
-  tests/lsp_test.cpp
-  tests/lsp_tokens_test.cpp
-  tests/dap_test.cpp
   tests/cli_test.cpp
   tests/todo_test.cpp
 )
+# The server tests exist only where the servers do.
+if(NOT CLOTHO_LSP)
+  list(REMOVE_ITEM CLOTHO_TEST_SOURCES tests/lsp_test.cpp tests/lsp_tokens_test.cpp)
+endif()
+if(NOT CLOTHO_DAP)
+  list(REMOVE_ITEM CLOTHO_TEST_SOURCES tests/dap_test.cpp)
+endif()
 add_executable(clotho_test ${CLOTHO_TEST_SOURCES})
-target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize clotho_lsp clotho_dap
-                                          doctest::doctest glaze::glaze clotho_warnings)
+target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize doctest::doctest clotho_warnings)
+if(CLOTHO_LSP)
+  target_link_libraries(clotho_test PRIVATE clotho_lsp glaze::glaze)
+endif()
+if(CLOTHO_DAP)
+  target_link_libraries(clotho_test PRIVATE clotho_dap glaze::glaze)
+endif()
 # The reset corpus is 28 readable .sv files rather than embedded strings: they are
 # a reference to be read and extended, and they are the same files run against
 # yosys.

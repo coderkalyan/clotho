@@ -18,11 +18,15 @@
 #include <slang/util/VersionInfo.h>
 
 #include "Lower.h"
+#ifdef CLOTHO_DAP
 #include "dap/Dap.h"
+#endif
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
+#ifdef CLOTHO_LSP
 #include "lsp/Lsp.h"
+#endif
 #ifdef CLOTHO_SYNTH
 #include "legalize/Legalize.h"
 #include "legalize/Materialize.h"
@@ -37,8 +41,8 @@
 //   clotho build [options] <source>...             emit an artifact, no execution
 //   clotho run   [options] <source>... [+arg...]   compile, then simulate
 //   clotho lint  [options] <source>...             diagnostics only
-//   clotho lsp                                     serve an editor over stdio
-//   clotho dap                                     debug a design for an editor
+//   clotho lsp                                     serve an editor over stdio (CLOTHO_LSP)
+//   clotho dap                                     debug a design for an editor (CLOTHO_DAP)
 //
 // One parser, one namespace, one --help: Clotho's options are registered on the
 // slang Driver's own CommandLine (register_options below, before
@@ -88,7 +92,14 @@ constexpr Commands kSource = bit(Command::Build) | bit(Command::Run) | bit(Comma
                              | bit(Command::Synth)
 #endif
   ;
-constexpr Commands kAny = kSource | bit(Command::Lsp) | bit(Command::Dap);
+constexpr Commands kAny = kSource
+#ifdef CLOTHO_LSP
+                          | bit(Command::Lsp)
+#endif
+#ifdef CLOTHO_DAP
+                          | bit(Command::Dap)
+#endif
+  ;
 
 // The options the artifact is compiled with and then run with, which `build` is
 // told exactly as `run` is: the --gc-* group (the backend bakes an rt_gc_config
@@ -140,8 +151,12 @@ constexpr CommandInfo kCommands[] = {
 #ifdef CLOTHO_SYNTH
     { Command::Synth, "synth", "write the design back out as synthesizable SystemVerilog", "[options] <files>..." },
 #endif
+#ifdef CLOTHO_LSP
     { Command::Lsp, "lsp", "serve the Language Server Protocol over stdin/stdout, for an editor", "" },
+#endif
+#ifdef CLOTHO_DAP
     { Command::Dap, "dap", "serve the Debug Adapter Protocol over stdin/stdout, to debug a design", "" },
+#endif
 };
 
 const CommandInfo* find_command(std::string_view name) {
@@ -877,6 +892,7 @@ int main(int argc, char** argv) {
     // -D / -y / -f here and ignoring them would be exactly the silent
     // acceptance PRINCIPLES.md forbids, so they are refused until they mean
     // something.
+#if defined(CLOTHO_LSP) || defined(CLOTHO_DAP)
     if (command == Command::Lsp || command == Command::Dap) {
         for (int i = 2; i < argc; ++i) {
             const std::string_view arg = argv[i];
@@ -890,11 +906,16 @@ int main(int argc, char** argv) {
             }
             return usage_error(std::format("'{}' takes no arguments, got '{}'", command_name(command), arg));
         }
+#ifdef CLOTHO_DAP
         if (command == Command::Dap) {
             clotho::dap::serve(kVersion, argv[0]);
         }
+#endif
+#ifdef CLOTHO_LSP
         clotho::lsp::serve(kVersion);
+#endif
     }
+#endif
 
     // Peel runtime plusargs and hand everything else to the Driver verbatim. argv
     // entries are already null-terminated, so they can be handed over directly.

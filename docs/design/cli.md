@@ -14,9 +14,9 @@ commands:
   build   compile the design and write the requested artifact
   run     compile the design and simulate it
   lint    analyse the design and report diagnostics, writing nothing
-  synth   write the design back out as synthesizable SystemVerilog
-  lsp     serve the Language Server Protocol over stdin/stdout
-  dap     serve the Debug Adapter Protocol over stdin/stdout
+  synth   write the design back out as synthesizable SystemVerilog (Debug builds)
+  lsp     serve the Language Server Protocol over stdin/stdout (CLOTHO_LSP)
+  dap     serve the Debug Adapter Protocol over stdin/stdout (CLOTHO_DAP)
 ```
 
 The command names how far down the pipeline the run goes, so the first three
@@ -42,7 +42,18 @@ set, and the debug adapter's design arrives in the launch request's `args`,
 which are a `run` command line passed through to the design process verbatim
 (`docs/design/dap.md` §4.4). Accepting `-D` / `-y` / `-f` here and ignoring
 them would be the silent acceptance PRINCIPLES.md forbids, so both refuse every
-argument except `--help` and `--version` (`src/main.cpp`).
+argument except `--help`, `--help-all` and `--version` (`src/main.cpp`).
+
+Both are unfinished too, so they are opt-in like `synth`: CMake options
+`CLOTHO_LSP` and `CLOTHO_DAP`, on by default for Debug and off otherwise. Unlike
+`synth`, where only the CLI wiring is conditional, the whole server is: with an
+option off, its library (`clotho_lsp`, `clotho_dap`), the framing library they
+share (`clotho_transport`, built when either is on), glaze (fetched and linked
+only when either is on) and its test file (`tests/lsp_test.cpp` and
+`tests/lsp_tokens_test.cpp`, `tests/dap_test.cpp`) are not built, linked or
+registered with CTest. A Release build rejects `lsp` and `dap` as unknown
+commands, and they appear in no help, no "expected ..." list and no suggestion.
+CI configures with both on so they stay tested.
 
 `clotho --help` lists the commands and the options most designs need,
 `clotho <command> --help` the options that command takes, and `clotho --help-all`

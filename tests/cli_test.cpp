@@ -375,7 +375,12 @@ TEST_CASE("cli: --version names the release and the commit it was built from") {
 }
 
 TEST_CASE("cli: lsp reports the version --version prints") {
-    const Scratch     s;
+    const Scratch s;
+    // `lsp` exists only in a build with CLOTHO_LSP.
+    if (s.run("lsp --help").code != 0) {
+        MESSAGE("this build has no lsp command");
+        return;
+    }
     const std::string version = version_string(s);
     std::string       input;
     for (const std::string_view body : { R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})",
@@ -498,4 +503,27 @@ TEST_CASE("cli: --libmap assigns sources to libraries and -L orders the lookup")
     }
 }
 
+TEST_CASE("cli: every message names the commands this build has and no others") {
+    const Scratch                       s;
+    const std::vector<std::string_view> built = built_commands(s);
+    const Result                        none  = s.run("");
+    CHECK(none.code == 2);
+    const Result unknown = s.run("frobnicate");
+    CHECK(unknown.code == 2);
+    const Result help = s.run("--help");
+    // `synth`, `lsp` and `dap` are opt-in; a build without one rejects it as an
+    // unknown command and must not mention it anywhere.
+    for (const std::string_view command : { "build", "run", "lint", "synth", "lsp", "dap" }) {
+        CAPTURE(command);
+        const bool has = std::ranges::find(built, command) != built.end();
+        CHECK(contains(none.err, std::format("'{}'", command)) == has);
+        CHECK(contains(unknown.err, std::format("'{}'", command)) == has);
+        CHECK(contains(help.out, std::format("\n  {} ", command)) == has);
+        if (!has) {
+            const Result r = s.run(std::format("{} --help", command));
+            CHECK(r.code == 2);
+            CHECK(contains(r.err, std::format("unknown command '{}'", command)));
+        }
+    }
+}
 #endif // !defined(_WIN32)

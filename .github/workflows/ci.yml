@@ -262,6 +262,7 @@ jobs:
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+            -DCLOTHO_LSP=ON -DCLOTHO_DAP=ON \
             ${ZIG_EXECUTABLE:+-DZIG_EXECUTABLE=$ZIG_EXECUTABLE} \
             $launcher
 
