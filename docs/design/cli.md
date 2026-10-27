@@ -14,9 +14,9 @@ commands:
   build   compile the design and write the requested artifact
   run     compile the design and simulate it
   lint    analyse the design and report diagnostics, writing nothing
-  synth   write the design back out as synthesizable SystemVerilog
-  lsp     serve the Language Server Protocol over stdin/stdout
-  dap     serve the Debug Adapter Protocol over stdin/stdout
+  synth   write the design back out as synthesizable SystemVerilog (Debug builds)
+  lsp     serve the Language Server Protocol over stdin/stdout (CLOTHO_LSP)
+  dap     serve the Debug Adapter Protocol over stdin/stdout (CLOTHO_DAP)
 ```
 
 The command names how far down the pipeline the run goes, so the first three
@@ -34,7 +34,18 @@ options below.
 
 The command word is required and must be `argv[1]`:
 `clotho design.sv` is a usage error, not an implicit `run`, because implicit
-modes are how the old surface drifted.
+modes are how the old surface drifted. The error still says what was probably
+meant, because leaving out `run` is the likeliest slip:
+
+- a first argument that is an existing file, or ends in `.sv`, `.v`, `.svh` or
+  `.vh`, gets `did you mean 'clotho run <arg>'?`;
+- otherwise the nearest command within two edits (case-folded, and fewer edits than
+  the command has letters, so a short command is not offered for noise) gets
+  `did you mean '<command>'?`, the way slang suggests a mistyped option;
+- otherwise the message lists the commands.
+
+Only commands this build has are candidates (`synth`, `lsp` and `dap` are opt-in).
+Every case exits 2.
 
 `lsp` and `dap` are servers, not pipeline stages, and take **no arguments at
 all** -- not even a source file. An editor supplies the language server's file
@@ -42,10 +53,23 @@ set, and the debug adapter's design arrives in the launch request's `args`,
 which are a `run` command line passed through to the design process verbatim
 (`docs/design/dap.md` §4.4). Accepting `-D` / `-y` / `-f` here and ignoring
 them would be the silent acceptance PRINCIPLES.md forbids, so both refuse every
-argument except `--help` and `--version` (`src/main.cpp`).
+argument except `--help`, `--help-all` and `--version` (`src/main.cpp`).
 
-`clotho --help` prints one option list: Clotho's options first, then slang's.
-There is no second help and nothing to forward — see "One parser" below.
+Both are unfinished too, so they are opt-in like `synth`: CMake options
+`CLOTHO_LSP` and `CLOTHO_DAP`, on by default for Debug and off otherwise. Unlike
+`synth`, where only the CLI wiring is conditional, the whole server is: with an
+option off, its library (`clotho_lsp`, `clotho_dap`), the framing library they
+share (`clotho_transport`, built when either is on), glaze (fetched and linked
+only when either is on) and its test file (`tests/lsp_test.cpp` and
+`tests/lsp_tokens_test.cpp`, `tests/dap_test.cpp`) are not built, linked or
+registered with CTest. A Release build rejects `lsp` and `dap` as unknown
+commands, and they appear in no help, no "expected ..." list and no suggestion.
+CI configures with both on so they stay tested.
+
+`clotho --help` lists the commands and the options most designs need,
+`clotho <command> --help` the options that command takes, and `clotho --help-all`
+every option (see "Help" below). There is no second help and nothing to forward --
+see "One parser".
 
 ### Options
 
@@ -58,7 +82,7 @@ There is no second help and nothing to forward — see "One parser" below.
 | `--no-legalize` | synth (Debug builds only) | Translate as written instead of writing out the implied hardware: no mux trees rebuilt, no implicit branch filled in |
 | `--full-case` | synth (Debug builds only) | Believe `full_case` / `unique`; reported wherever the claim is what removed a latch |
 | `--parallel-case` | synth (Debug builds only) | Believe `parallel_case` / `unique0` |
-| `-o, --output <file>` | build, synth | artifact path for every target; `-` (default) is stdout |
+| `-o, --output <file>` | build, synth | artifact path for every target; `-` is stdout. Without `-o`, `build` writes to stdout, but refuses when stdout is a terminal (see "The artifact and the terminal") |
 | `--time` | build, run, lint, synth | per-phase wall-clock to stderr |
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
 | `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`. `parallel` reports only under `run` |
@@ -73,9 +97,10 @@ There is no second help and nothing to forward — see "One parser" below.
 | `--loose-timescale` | build, run, lint, synth | accept a design that mixes elements declaring a time scale with elements that do not (slang's `MissingTimeScale`, LRM 3.14.2.2); the un-annotated ones take `--timescale`'s value, or `1ns/1ns`. Refused by default |
 | `-j, --threads <n>` | build, run, lint, synth | slang's own option; sizes its parser **and** the LLVM compile pool |
 | `--dpi-lib <path>` | run | DPI-C `.o`/`.a` (JIT-linked) or `.so` (dlopen'd), repeatable |
+| `--stop-time <time>` | run | stop the simulation at this simulation time: an integer and a unit with nothing between them, `fs`, `ps`, `ns`, `us`, `ms` or `s` (`100ns`, `5us`). A missing or unknown unit, zero, and a time that does not fit in 64 bits of femtoseconds (about 18446 s) are usage errors. See "Stopping a run" |
 | `--perf-jitdump` | run | perf jitdump under `$JITDUMPDIR` |
 | `--loose-stale-ref` | run | report a `ref` whose actual storage was restructured under it (data-model.md §3) once per site and keep simulating, instead of the located fatal. Fatal by default |
-| `-h, --help` / `--version` | any | help; versions (clotho git hash, LLVM, slang) |
+| `-h, --help` / `--help-all` / `--version` | any | help for the command (or for all of them when none is given); every option including all of slang's; versions (`clotho <release> (<git hash>)`, LLVM, slang) |
 | `+<text>` | run | plusarg (LRM 21.6), `+` stripped, in order |
 
 Valued options take `--name value` or `--name=value`. Clotho's options sit in the
@@ -90,7 +115,7 @@ which assign source files to libraries; `-L` sets the library priority order and
 
 "both" in the table means `build` and `run`. The options in it that steer code
 generation or what the artifact does when it runs -- `-O`, `--stat`, `--sanitize`,
-`--coverage` and the `--gc-*` group -- are the *refused* ones elsewhere: `--help`
+`--coverage` and the `--gc-*` group -- are the *refused* ones elsewhere: `--help-all`
 tags them `[build|run]`, and `lint` and `synth`, which compile nothing, reject
 them. The rest of the "both" rows mean something to every command that reads
 source, and say so in their `commands` column.
@@ -104,10 +129,11 @@ Sources always share one compilation unit (LRM 3.12; `Lower.cpp` forces
 `CommandLine` (`register_options`, called before `addStandardArgs` so they head
 the help), and the Driver parses the whole line. Consequences:
 
-- **One `--help`**, generated by `cmdLine.getHelpText`, listing both sets. A
-  `[build]` / `[run]` tag in a description marks a command-specific option and
-  `[build|run]` one two commands share, and `check_scope` enforces it after
-  parsing.
+- **One registry.** `register_options` adds each option through a `Registry`, with
+  the commands that take it, and the registry feeds the slang parser, `check_scope`
+  (which refuses the option under any other command after parsing) and the
+  per-command `--help`. A scope is declared in one place, so the help cannot list
+  an option a command then rejects.
 - **No passthrough hole.** A mistyped option gets slang's error and its "did you
   mean" hint (`--emti=ir` → `did you mean '--emit'?`, `-O3` → `did you mean
   '-O'?`) instead of being silently handed over as a source file or a slang flag.
@@ -123,6 +149,63 @@ three `+` forms slang registers
 (`+define+`, `+incdir+`, `+libext+`) is a plusarg; `--` ends plusarg
 interpretation and passes everything after it to slang as given — the escape for
 a `+` command slang gained through `--cmd-rename`.
+
+### Help
+
+`--help` is built from the same registrations, in three views:
+
+- `clotho --help`: the command list, then the options every command that reads
+  source takes (`--time`, `--allow-system`, `--loose-timescale`, `--help`,
+  `--help-all`, `--version`) and the common source options below.
+- `clotho <command> --help`: usage (`clotho <command> [options] <files>...`, plus
+  `[+plusarg...]` for `run`), then only the options that command takes, then the
+  common source options. `lsp` and `dap` take no options besides `--help`,
+  `--help-all` and `--version`, so they list no source options.
+- `clotho --help-all`, or `--help-all` after any command: every option, Clotho's
+  tagged with the commands that take them (`[build|run]`; no tag means every
+  command that reads source) and slang's all listed, the Verilog-style `+incdir` /
+  `+define` / `+libext` spellings included.
+
+The common source options are slang's `-f`, `-F`, `-I`, `-D`, `-U`, `-y`, `-Y`,
+`--libmap`, `-L`, `--top`, `-G`, `--timescale`, `--std`, `-j`, `--error-limit` and
+`--color-diagnostics` (`kCommonSourceOptions`). That list only names options: what
+each takes and says is read from slang's registration, so it cannot drift.
+`CommandLine` can print its options but not enumerate them, so the renderer reads
+them back out of `getHelpText` rather than keeping a second list. `-W` and
+`--diag-json` are left out of the curated lists on purpose: slang registers them
+and Clotho accepts them, but `-W` does not change what is reported for a design
+and nothing writes the JSON, so only `--help-all` shows them until they work.
+
+Listings are laid out for 100 columns. An option's spellings get at most 32
+columns; a longer one puts its description on the next line, and descriptions
+wrap. (slang's own listing pads every description to the longest option name,
+65 columns, and does not wrap.)
+
+### Diagnostics
+
+Design diagnostics, slang's and Clotho's alike (including `[unsupported-construct]`
+refusals), are rendered by one text client configured as the Driver's:
+`--color-diagnostics` forces colour, otherwise colour is used when stderr is a
+colour-capable terminal (slang's detection; `NO_COLOR` is not consulted).
+`--diag-source`, `--diag-column`, `--diag-location`, `--diag-option` and the other
+`--diag-*` options apply to all of them. Diagnostics served to editors are never
+coloured. When slang's Driver has already printed a failure (a missing source
+file, a bad option), Clotho does not add a second `bad-command-line` line; an
+invalid `--top` is not followed by `no top-level modules found`. The exit status is
+unchanged.
+
+### The artifact and the terminal
+
+`build` writes to stdout when `-o` is not given, which is right in a pipe or a
+redirect and almost always a forgotten `-o` on a terminal, where the generated code
+is pages of text. So `build` with no `-o` is a usage error (exit 2, before any
+source is read) when stdout is a terminal, and says to pass `-o <file>`, or `-o -`
+to print to the terminal anyway. An explicit `-o -` is honoured everywhere, and
+every `--emit` target is covered, `--emit=ir` included. The decision is the
+command (`build` only: `run` and `lint` write nothing there), whether `-o` was
+given, and `isatty` on stdout (`_isatty` on Windows); `tests/cli_test.cpp` runs the
+real process on a pseudo-terminal to cover it. `synth` keeps stdout as its
+default.
 
 ### Errors, not silent no-ops
 
@@ -145,13 +228,56 @@ them always means something and none of them needs a companion flag.
 
 | code | meaning |
 |---|---|
-| 0 | success |
-| 1 | compile, emission, or JIT-setup failure |
+| 0 | success: includes a run ended by `$finish` of any level or by `--stop-time`, and one that reported `$error`, `$warning` or a failed assertion |
+| 1 | compile, emission or JIT-setup failure; for `run`, also a `$fatal` in the design (LRM 20.10 "terminates the simulation with an error code") |
 | 2 | usage error |
-| other | `run` only: the simulated design's own status |
+| 130 | `run` only: interrupted by Ctrl-C (SIGINT) |
+
+A design can only produce 0, 1 or 130, so there is no "the design's own status"
+row.
 
 `run_jit`'s negative setup sentinel is mapped to 1 rather than returned raw (it
 used to reach the shell as 255).
+
+### Stopping a run
+
+A design that never calls `$finish` and always has another event (a free-running
+clock) simulates forever, so a run has two ways to be ended from outside.
+
+**`--stop-time <time>`** is an absolute simulation time. Every event at or before it
+runs; the run then ends exactly as if `$finish` had been called at the end of that
+time step: `final` blocks run, the dump and open files are flushed,
+`clotho: stopped at --stop-time <time>` goes to stderr, and the status is 0. A time
+finer than the design's time precision rounds up to the next tick, and the message
+reports the rounded time. A design that ends first (`$finish`, or no event left) is
+unchanged and prints nothing. The driver parses the time into
+`SimulationConfig::stop_time_fs`, in femtoseconds, and the runtime implements the
+stop; only `run` takes it, so `build`, `lint` and `synth` refuse it like the other
+run-only options. Zero is refused rather than meaning "no limit" or "stop before
+anything runs"; leaving the option out is how a run is unlimited.
+
+**Ctrl-C.** While a `run` is simulating, SIGINT stops the simulation at the end of
+the current time step. The dump and open files are flushed, `final` blocks do not
+run (the design was interrupted, not finished), `clotho: interrupted at <time>`
+goes to stderr and the status is 130. SIGINT during compilation keeps its default
+action. A second Ctrl-C before the run has stopped (a loop with no delay) ends the
+process at once. A SIGINT that was ignored when clotho started stays ignored.
+
+### Runtime messages
+
+The severity tasks print `<LABEL>: <file>:<line>: <scope> at <time>[: <message>]`,
+where `<scope>` is what `%m` prints at that point.
+
+### Version
+
+`clotho --version` starts with `clotho <release> (<git hash>)`, then the LLVM and
+slang versions and the license notice. The release is CMake's
+`project(clotho VERSION ...)` plus `CLOTHO_VERSION_SUFFIX`, a pre-release tag that
+is `alpha` until the first final release and empty after it (`0.1.0-alpha`, then
+`0.1.0`). The hash is resolved at configure time and is `unknown` outside a git
+tree. `clotho lsp` reports the same string in `serverInfo.version` and `clotho dap`
+in its console banner, so a report from an editor names the build as precisely as
+the command line does.
 
 ## What changed, and why
 

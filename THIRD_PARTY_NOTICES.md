@@ -19,7 +19,11 @@ from the SPDX reference text.
 
 Fetched at configure time, or found on the host where noted. Clotho's
 `CMakeLists.txt` pins slang, unordered_dense and glaze; slang's
-`external/CMakeLists.txt` pins {fmt}, boost.regex, mimalloc and toml++.
+`external/CMakeLists.txt` pins {fmt}, boost.regex, mimalloc and toml++. glaze is
+fetched and linked only into builds configured with `CLOTHO_LSP` or `CLOTHO_DAP`
+(on by default for Debug builds, off otherwise): the language server and debug
+adapter are its only users, so a default Release build contains it, and the
+three components bundled with it, nowhere.
 
 | Component | License | Text |
 |---|---|---|
@@ -32,10 +36,10 @@ Fetched at configure time, or found on the host where noted. Clotho's
 | [{fmt}](https://github.com/fmtlib/fmt) | MIT, with an object-code exception | `LICENSES/fmt.txt` |
 | [mimalloc](https://github.com/microsoft/mimalloc) (via slang; host copy if present) | MIT | `LICENSES/mimalloc.txt` |
 | [unordered_dense](https://github.com/martinus/unordered_dense) | MIT | `LICENSES/unordered_dense.txt` |
-| [glaze](https://github.com/stephenberry/glaze) | MIT | `LICENSES/glaze.txt` |
-| glaze's bundled [fast_float](https://github.com/fastfloat/fast_float) | Apache-2.0, MIT or BSL-1.0; used under MIT | `LICENSES/fast_float.txt` |
-| glaze's bundled [zmij](https://github.com/vitaut/zmij) | MIT or BSL-1.0; used under BSL-1.0 | `LICENSES/BSL-1.0.txt` |
-| glaze's bundled xxh64, Copyright (c) 2015 Daniel Kirchner | MIT, notice in `glaze/api/xxh64.hpp` | `LICENSES/glaze.txt` (same MIT terms) |
+| [glaze](https://github.com/stephenberry/glaze) (only with `CLOTHO_LSP` or `CLOTHO_DAP`) | MIT | `LICENSES/glaze.txt` |
+| glaze's bundled [fast_float](https://github.com/fastfloat/fast_float) (only with `CLOTHO_LSP` or `CLOTHO_DAP`) | Apache-2.0, MIT or BSL-1.0; used under MIT | `LICENSES/fast_float.txt` |
+| glaze's bundled [zmij](https://github.com/vitaut/zmij) (only with `CLOTHO_LSP` or `CLOTHO_DAP`) | MIT or BSL-1.0; used under BSL-1.0 | `LICENSES/BSL-1.0.txt` |
+| glaze's bundled xxh64, Copyright (c) 2015 Daniel Kirchner (only with `CLOTHO_LSP` or `CLOTHO_DAP`) | MIT, notice in `glaze/api/xxh64.hpp` | `LICENSES/glaze.txt` (same MIT terms) |
 | [LLVM](https://llvm.org) 22 (host install) | Apache-2.0 WITH LLVM-exception | `LICENSES/LLVM.txt` |
 | [libsva](https://github.com/coderkalyan/libsva), including the [Zig](https://ziglang.org) standard library and compiler-rt it is built with | MIT | `LICENSES/libsva.txt`, `LICENSES/zig.txt` |
 
@@ -54,6 +58,7 @@ embedded by compilation.
 | Component | License | Text |
 |---|---|---|
 | [doctest](https://github.com/doctest/doctest) | MIT | `LICENSES/doctest.txt` |
+| [glaze](https://github.com/stephenberry/glaze), for the language-server and debug-adapter tests (only with `CLOTHO_LSP` or `CLOTHO_DAP`) | MIT | `LICENSES/glaze.txt` |
 
 ## Vendored in `tests/perf/cases/`
 

@@ -19,16 +19,16 @@ Working today: Verilog-2005 RTL, the SystemVerilog data model (packed and
 unpacked aggregates, dynamic arrays, queues, associative arrays, strings,
 classes), processes and fine-grained timing control, interfaces, packages,
 generate, gates and net resolution, immediate and concurrent assertions,
-DPI-C import and export, VCD output, and language-server and debug-adapter
-front ends. See `docs/TODO.md` for what is missing and `docs/design/` for how
-the interesting parts work.
+DPI-C import and export, and VCD output. A language server and a debug adapter
+exist but are not in release builds yet (see "Building"). See `docs/TODO.md` for
+what is missing and `docs/design/` for how the interesting parts work.
 
 ## Building
 
 Requirements: a C++23 compiler (clang is what we test), CMake 3.20+, Ninja,
 LLVM 22 development libraries, and Python 3 (slang's build needs an
-interpreter). slang, doctest, unordered\_dense and glaze are fetched by CMake
-at configure time.
+interpreter). slang, doctest and unordered\_dense are fetched by CMake at
+configure time, and glaze with the `CLOTHO_LSP` and `CLOTHO_DAP` options below.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -47,14 +47,20 @@ every assertion live; use `RelWithDebInfo` or `Release` for anything you intend
 to measure. CI covers Linux x64/arm64, macOS arm64/x64 and Windows x64 under
 MSYS2 CLANG64; Windows arm64 is advisory.
 
+Unfinished features are on in Debug builds and off otherwise: `clotho synth`,
+`clotho lsp` (language server) and `clotho dap` (debug adapter) do not exist in
+a Release build. Turn one on with `-DCLOTHO_SYNTH=ON`, `-DCLOTHO_LSP=ON` or
+`-DCLOTHO_DAP=ON`. The server options also fetch and build glaze, the JSON
+library they use.
+
 ## Using it
 
 ```
 clotho build   compile the design and write the generated code, without running it
 clotho run     compile the design and simulate it
 clotho lint    check the design and report problems, without compiling or running
-clotho lsp     language server over stdio
-clotho dap     debug adapter over stdio
+clotho lsp     language server over stdio (Debug builds, or -DCLOTHO_LSP=ON)
+clotho dap     debug adapter over stdio (Debug builds, or -DCLOTHO_DAP=ON)
 ```
 
 ## Testing

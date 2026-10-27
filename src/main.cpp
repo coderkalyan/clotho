@@ -1,24 +1,43 @@
+#include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <print>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <llvm/Support/raw_ostream.h>
 
 #include <slang/driver/Driver.h>
+#include <slang/util/String.h>
 #include <slang/util/VersionInfo.h>
 
 #include "Lower.h"
+#ifdef CLOTHO_DAP
+#include "dap/Dap.h"
+#endif
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
-#include "dap/Dap.h"
+#ifdef CLOTHO_LSP
 #include "lsp/Lsp.h"
+#endif
 #ifdef CLOTHO_SYNTH
 #include "legalize/Legalize.h"
 #include "legalize/Materialize.h"
@@ -33,8 +52,8 @@
 //   clotho build [options] <source>...             emit an artifact, no execution
 //   clotho run   [options] <source>... [+arg...]   compile, then simulate
 //   clotho lint  [options] <source>...             diagnostics only
-//   clotho lsp                                     serve an editor over stdio
-//   clotho dap                                     debug a design for an editor
+//   clotho lsp                                     serve an editor over stdio (CLOTHO_LSP)
+//   clotho dap                                     debug a design for an editor (CLOTHO_DAP)
 //
 // One parser, one namespace, one --help: Clotho's options are registered on the
 // slang Driver's own CommandLine (register_options below, before
@@ -64,7 +83,211 @@ using clotho::ir::SimulationConfig;
 using clotho::ir::Stat;
 using clotho::ir::SystemAccess;
 
+// What `--version` prints after "clotho", and what the language and debug
+// servers report to their clients: the release, then the commit it was built from.
+constexpr std::string_view kVersion = CLOTHO_VERSION " (" CLOTHO_GIT_HASH ")";
+
 enum class Command : uint8_t { Build, Run, Lint, Synth, Lsp, Dap };
+
+// A set of commands, one bit per Command.
+using Commands = uint32_t;
+
+constexpr Commands bit(Command command) {
+    return Commands{ 1 } << static_cast<uint32_t>(command);
+}
+
+// The commands that read source. An option about reading it (`--time`,
+// `--allow-system`) is scoped to all of them, `lint` included.
+constexpr Commands kSource = bit(Command::Build) | bit(Command::Run) | bit(Command::Lint)
+#ifdef CLOTHO_SYNTH
+                             | bit(Command::Synth)
+#endif
+  ;
+constexpr Commands kAny = kSource
+#ifdef CLOTHO_LSP
+                          | bit(Command::Lsp)
+#endif
+#ifdef CLOTHO_DAP
+                          | bit(Command::Dap)
+#endif
+  ;
+
+// The options the artifact is compiled with and then run with, which `build` is
+// told exactly as `run` is: the --gc-* group (the backend bakes an rt_gc_config
+// into the emitted module and calls rt_gc_init from its main), `--coverage` (the
+// coverage model the backend emits names its own destination, so the report file
+// is a mode compiled in, not something `run` can add to an artifact built
+// without it), and `-O`, `--stat` and `--sanitize`, which steer code generation.
+// `lint` and `synth` never reach code generation, so they refuse all of these.
+constexpr Commands kBuildRun = bit(Command::Build) | bit(Command::Run);
+
+// `-o` names the artifact, and two commands produce one.
+constexpr Commands kArtifact = bit(Command::Build)
+#ifdef CLOTHO_SYNTH
+                               | bit(Command::Synth)
+#endif
+  ;
+
+// A command as the user types it.
+struct CommandInfo {
+    Command          command;
+    std::string_view name;
+    // One line, lowercase and unpunctuated: the command list in `--help`.
+    std::string_view summary;
+    // What follows the name on its usage line.
+    std::string_view usage;
+    // A paragraph for the command's own help, after its usage line.
+    std::string_view notes = {};
+};
+
+// Runtime plusargs (LRM 21.6) are `run`'s alone. See is_slang_plusarg.
+constexpr std::string_view kPlusargNote =
+  "An argument starting with '+' that is not an option goes to the design itself, for $test$plusargs "
+  "and $value$plusargs to read while it runs (LRM 21.6). Use '--' to stop that and pass everything "
+  "after it through as written.";
+
+// `build` writes to stdout unless given `-o`. See refuses_terminal_artifact.
+constexpr std::string_view kBuildNote =
+  "Without -o the output goes to stdout, unless that is a terminal. Pass -o <file> to write a "
+  "file, or -o - to print it to the terminal anyway.";
+
+// The commands this build has, in the order `--help` lists them. `synth` is
+// compiled out of a Release build, and a usage message that offers a command the
+// binary will then reject is worse than one that never mentions it.
+constexpr CommandInfo kCommands[] = {
+    { Command::Build,
+      "build",
+      "compile the design and write the generated code, without running it",
+      "[options] <files>...",
+      kBuildNote },
+    { Command::Run, "run", "compile the design and simulate it", "[options] <files>... [+plusarg...]", kPlusargNote },
+    { Command::Lint,
+      "lint",
+      "check the design and report problems, without compiling or running it",
+      "[options] <files>..." },
+#ifdef CLOTHO_SYNTH
+    { Command::Synth, "synth", "write the design back out as synthesizable SystemVerilog", "[options] <files>..." },
+#endif
+#ifdef CLOTHO_LSP
+    { Command::Lsp, "lsp", "serve the Language Server Protocol over stdin/stdout, for an editor", "" },
+#endif
+#ifdef CLOTHO_DAP
+    { Command::Dap, "dap", "serve the Debug Adapter Protocol over stdin/stdout, to debug a design", "" },
+#endif
+};
+
+const CommandInfo* find_command(std::string_view name) {
+    for (const CommandInfo& c : kCommands) {
+        if (c.name == name) {
+            return &c;
+        }
+    }
+    return nullptr;
+}
+
+const CommandInfo& command_info(Command command) {
+    for (const CommandInfo& c : kCommands) {
+        if (c.command == command) {
+            return c;
+        }
+    }
+    // Every Command a user can select has a row, and the dispatch only selects those.
+    std::println(stderr, "clotho: internal error: no command table row");
+    std::abort();
+}
+
+std::string_view command_name(Command command) {
+    return command_info(command).name;
+}
+
+// The names of the commands in `set`, in listing order, as a sentence lists
+// them: 'a', then 'a' or 'b', then 'a', 'b' or 'c'.
+std::string command_list(Commands set) {
+    std::vector<std::string_view> names;
+    for (const CommandInfo& c : kCommands) {
+        if ((set & bit(c.command)) != 0) {
+            names.push_back(c.name);
+        }
+    }
+    std::string text;
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) {
+            text += i + 1 == names.size() ? " or " : ", ";
+        }
+        text += std::format("'{}'", names[i]);
+    }
+    return text;
+}
+
+template<typename T>
+bool is_given(const std::optional<T>& value) {
+    return value.has_value();
+}
+
+template<typename T>
+bool is_given(const std::vector<T>& value) {
+    return !value.empty();
+}
+
+// "[build|run] ": the commands that take an option, as `--help-all` prints them in
+// front of its description. Empty when every command that reads source takes it.
+std::string scope_tag(Commands commands) {
+    if ((commands & kSource) == kSource) {
+        return {};
+    }
+    std::string tag = "[";
+    for (const CommandInfo& c : kCommands) {
+        if ((commands & bit(c.command)) != 0) {
+            tag += tag.size() > 1 ? "|" : "";
+            tag += c.name;
+        }
+    }
+    return tag + "] ";
+}
+
+// The options Clotho registers on the Driver's CommandLine, each with the
+// commands that take it. One registration feeds the parser, the check that an
+// option is not used under a command that ignores it (check_scope), and which
+// commands' help lists it, so the three cannot disagree.
+class Registry {
+public:
+    struct Entry {
+        // The first spelling, which is how diagnostics name the option.
+        std::string           name;
+        Commands              commands;
+        std::function<bool()> given;
+    };
+
+    explicit Registry(slang::CommandLine& cl)
+      : cl_(cl) {}
+
+    // `names`, `value`, `desc` and what follows are slang's CommandLine::add.
+    // The value's variable is also how the entry knows whether the command line
+    // gave the option.
+    template<typename T, typename... Rest>
+    void add(Commands commands, std::string_view names, T& value, std::string_view desc, Rest&&... rest) {
+        cl_.add(names, value, desc, std::forward<Rest>(rest)...);
+        entries_.push_back(
+          { std::string(names.substr(0, names.find(','))), commands, [&value] { return is_given(value); } });
+    }
+
+    std::span<const Entry> entries() const {
+        return entries_;
+    }
+
+    const Entry* find(std::string_view name) const {
+        for (const Entry& e : entries_) {
+            if (e.name == name) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+private:
+    slang::CommandLine& cl_;
+    std::vector<Entry>  entries_;
+};
 
 // What `build` writes.
 enum class Emit : uint8_t {
@@ -77,6 +300,7 @@ enum class Emit : uint8_t {
 // given", which is what the command-scope checks below key on.
 struct Options {
     std::optional<bool>        help;
+    std::optional<bool>        help_all;
     std::optional<bool>        version;
     std::optional<std::string> emit;
     std::optional<std::string> out;
@@ -93,6 +317,7 @@ struct Options {
     std::optional<std::string> allow_system;
     std::optional<bool>        loose_timescale;
     std::optional<bool>        loose_stale_ref;
+    std::optional<std::string> stop_time;
     std::vector<std::string>   dpi_libs;
     std::optional<bool>        perf_jitdump;
     std::optional<std::string> sidecar;
@@ -120,174 +345,165 @@ constexpr std::string_view kSanitizeList =
 // the one place implementation vocabulary belongs.
 //
 // Registered before Driver::addStandardArgs so these head the --help listing.
-// A `[build]` / `[run]` tag in a description marks a command-specific option, and
-// `[build|run]` one that two commands share (the --gc-* group, whose settings the
-// artifact is built with and then run with); check_scope enforces it after parsing.
-void register_options(slang::CommandLine& cl, Options& o) {
-    cl.add("-h,--help", o.help, "Show this help and exit");
-    cl.add("--version", o.version, "Show version information and exit");
-    cl.add("--emit",
-           o.emit,
-           "[build] What to write: llvm (LLVM IR for the design, the default), ir (Clotho's own "
-           "intermediate form), llvm-raw (LLVM IR before the coroutine passes; for working on clotho)",
-           "<target>");
-    cl.add("-o,--output",
-           o.out,
-           "[build] Write the output to this file instead of stdout",
-           "<file>",
-           slang::CommandLineFlags::FilePath);
-    cl.add("--time", o.time, "Print how long each stage took: reading the source, compiling, simulating");
-    cl.add("-O",
-           o.o3,
-           "[build|run] Compile the design more thoroughly: slower to start up, faster to simulate");
-    cl.add("--stat",
-           o.stats,
-           "[build|run] Print a compiler statistic while building, for working on clotho: dedup, "
-           "dedup-sets, comb-fuse, finish or parallel (repeatable, comma-separated)",
-           "<name>",
-           slang::CommandLineFlags::CommaList);
-    cl.add("--sanitize",
-           o.sanitizers,
-           "[build|run] Check the design for a class of bug while it runs, reporting when one "
-           "happens: bounds (an array index outside the array)"
+// The first argument of each registration is the commands that take the option;
+// check_scope refuses it under any other, and the description needs no tag of
+// its own for that.
+void register_options(Registry& r, Options& o) {
+    r.add(bit(Command::Build),
+          "--emit",
+          o.emit,
+          "What to write: llvm (LLVM IR for the design, the default), ir (Clotho's own "
+          "intermediate form), llvm-raw (LLVM IR before the coroutine passes; for working on clotho)",
+          "<target>");
+    r.add(kArtifact,
+          "-o,--output",
+          o.out,
+          "Write the output to this file instead of stdout",
+          "<file>",
+          slang::CommandLineFlags::FilePath);
+    r.add(kSource, "--time", o.time, "Print how long each stage took: reading the source, compiling, simulating");
+    r.add(kBuildRun, "-O", o.o3, "Compile the design more thoroughly: slower to start up, faster to simulate");
+    r.add(kBuildRun,
+          "--stat",
+          o.stats,
+          "Print a compiler statistic while building, for working on clotho: dedup, "
+          "dedup-sets, comb-fuse, finish or parallel (repeatable, comma-separated)",
+          "<name>",
+          slang::CommandLineFlags::CommaList);
+    r.add(kBuildRun,
+          "--sanitize",
+          o.sanitizers,
+          "Check the design for a class of bug while it runs, reporting when one "
+          "happens: bounds (an array index outside the array)"
 #ifdef CLOTHO_XSAN
-           ", xprov (where an x value decided something, and what made it x)"
+          ", xprov (where an x value decided something, and what made it x)"
 #endif
-           ". Costs simulation time (repeatable, comma-separated)",
-           "<check>",
-           slang::CommandLineFlags::CommaList);
-    cl.add("--coverage",
-           o.coverage,
-           "[build|run] Write the design's functional-coverage report here: which of the bins its "
-           "covergroups declare the run reached, and which it never did (LRM 19). No report by "
-           "default. The destination is compiled into the generated code, so a build and the run "
-           "of what it built must be given the same file",
-           "<file>",
-           slang::CommandLineFlags::FilePath);
-    cl.add("--gc-stress",
-           o.gc_stress,
-           "[build|run] Reclaim unused class objects at every opportunity instead of when the "
-           "design has created enough of them. Slow by design: it turns an object Clotho failed "
-           "to keep into an immediate wrong answer rather than a rare one, so it is for working "
-           "on clotho itself. Changes the generated code, so a build and the run of what it "
-           "built must be given the same setting");
-    cl.add("--gc-stats",
-           o.gc_stats,
-           "[build|run] Print what reclaiming class objects did when the design exits: how many "
-           "times it ran, how much it reclaimed, and how long the design was paused for it");
-    cl.add("--gc-nursery",
-           o.gc_nursery_bytes,
-           "[build|run] How many bytes of class objects the design may create between one reclaim "
-           "and the next (default 8388608). A plain number of bytes",
-           "<bytes>");
-    cl.add("--gc-heap-max",
-           o.gc_heap_bytes_max,
-           "[build|run] Size in bytes the design's class objects should stay under: reaching it "
-           "asks for a reclaim at the next opportunity, and passing it anyway is reported rather "
-           "than refused, since a design is free to create objects without ever pausing. 0, the "
-           "default, sets no limit",
-           "<bytes>");
-    cl.add("--gc-full-every",
-           o.gc_full_every,
-           "[build|run] Reclaim the whole heap on every Nth reclaim instead of only the objects "
-           "created since the last one. Only a whole-heap pass frees objects that have already "
-           "survived a reclaim, so this trades cheap frequent passes against how long those "
-           "linger. 0, the default, lets the runtime decide from how fast the heap is growing",
-           "<n>");
-    cl.add("--allow-system",
-           o.allow_system,
-           "Let the design run shell commands through $system, refused by default: 'const' allows "
-           "only commands written literally in the source, 'full' allows any command the design "
-           "builds while it runs",
-           "<tier>");
-    cl.add("--loose-timescale",
-           o.loose_timescale,
-           "Accept a design where some parts declare a time scale and others do not, refused by "
-           "default: the parts that do not take --timescale's value, or 1ns/1ns when it is not given");
-    cl.add("--loose-stale-ref",
-           o.loose_stale_ref,
-           "[run] Report and keep simulating when a ref argument no longer refers to the variable it "
-           "was bound to, which stops the run by default: growing or reordering an array or queue "
-           "while a ref refers to an element of it leaves that ref on something else entirely, so "
-           "nothing after the first one means anything. For naming every such ref in one run");
-    cl.add("--dpi-lib",
-           o.dpi_libs,
-           "[run] Library holding the C functions this design imports through DPI-C. Give a .o or .a "
-           "if C also calls back into the design; a .so is enough for imports alone",
-           "<path>",
-           slang::CommandLineFlags::FilePath);
+          ". Costs simulation time (repeatable, comma-separated)",
+          "<check>",
+          slang::CommandLineFlags::CommaList);
+    r.add(kBuildRun,
+          "--coverage",
+          o.coverage,
+          "Write the design's functional-coverage report here: which of the bins its "
+          "covergroups declare the run reached, and which it never did (LRM 19). No report by "
+          "default. The destination is compiled into the generated code, so a build and the run "
+          "of what it built must be given the same file",
+          "<file>",
+          slang::CommandLineFlags::FilePath);
+    r.add(kBuildRun,
+          "--gc-stress",
+          o.gc_stress,
+          "Reclaim unused class objects at every opportunity instead of when the "
+          "design has created enough of them. Slow by design: it turns an object Clotho failed "
+          "to keep into an immediate wrong answer rather than a rare one, so it is for working "
+          "on clotho itself. Changes the generated code, so a build and the run of what it "
+          "built must be given the same setting");
+    r.add(kBuildRun,
+          "--gc-stats",
+          o.gc_stats,
+          "Print what reclaiming class objects did when the design exits: how many "
+          "times it ran, how much it reclaimed, and how long the design was paused for it");
+    r.add(kBuildRun,
+          "--gc-nursery",
+          o.gc_nursery_bytes,
+          "How many bytes of class objects the design may create between one reclaim "
+          "and the next (default 8388608). A plain number of bytes",
+          "<bytes>");
+    r.add(kBuildRun,
+          "--gc-heap-max",
+          o.gc_heap_bytes_max,
+          "Size in bytes the design's class objects should stay under: reaching it "
+          "asks for a reclaim at the next opportunity, and passing it anyway is reported rather "
+          "than refused, since a design is free to create objects without ever pausing. 0, the "
+          "default, sets no limit",
+          "<bytes>");
+    r.add(kBuildRun,
+          "--gc-full-every",
+          o.gc_full_every,
+          "Reclaim the whole heap on every Nth reclaim instead of only the objects "
+          "created since the last one. Only a whole-heap pass frees objects that have already "
+          "survived a reclaim, so this trades cheap frequent passes against how long those "
+          "linger. 0, the default, lets the runtime decide from how fast the heap is growing",
+          "<n>");
+    r.add(kSource,
+          "--allow-system",
+          o.allow_system,
+          "Let the design run shell commands through $system, refused by default: 'const' allows "
+          "only commands written literally in the source, 'full' allows any command the design "
+          "builds while it runs",
+          "<tier>");
+    r.add(kSource,
+          "--loose-timescale",
+          o.loose_timescale,
+          "Accept a design where some parts declare a time scale and others do not, refused by "
+          "default: the parts that do not take --timescale's value, or 1ns/1ns when it is not given");
+    r.add(bit(Command::Run),
+          "--stop-time",
+          o.stop_time,
+          "Stop the simulation at this simulation time, an integer and a unit with no space between "
+          "(fs, ps, ns, us, ms or s), e.g. 100ns or 5us. Everything at or before that time runs, then the "
+          "run ends as if the design had called $finish there: final blocks run and dump files are "
+          "flushed. A time finer than the design's time precision is rounded up to the next tick",
+          "<time>");
+    r.add(bit(Command::Run),
+          "--loose-stale-ref",
+          o.loose_stale_ref,
+          "Report and keep simulating when a ref argument no longer refers to the variable it "
+          "was bound to, which stops the run by default: growing or reordering an array or queue "
+          "while a ref refers to an element of it leaves that ref on something else entirely, so "
+          "nothing after the first one means anything. For naming every such ref in one run");
+    r.add(bit(Command::Run),
+          "--dpi-lib",
+          o.dpi_libs,
+          "Library holding the C functions this design imports through DPI-C. Give a .o or .a "
+          "if C also calls back into the design; a .so is enough for imports alone",
+          "<path>",
+          slang::CommandLineFlags::FilePath);
 #ifdef CLOTHO_SYNTH
-    cl.add("--sidecar",
-           o.sidecar,
-           "[synth] Also write the JSON sidecar here: what the SystemVerilog cannot carry -- the "
-           "original-to-emitted name map every constraint file depends on, and each signal's inferred "
-           "storage, clock and reset",
-           "<path>",
-           slang::CommandLineFlags::FilePath);
-    cl.add("--target",
-           o.target,
-           "[synth] Which language to write: '2005' for IEEE 1364-2005, 'sv' for IEEE 1800 (default)",
-           "<lang>");
-    cl.add("--hierarchy",
-           o.hierarchy,
-           "[synth] How much of the instance tree to keep: 'instances' writes one module per instance "
-           "with names as written (default), 'flat' writes one module with paths mangled into names",
-           "<mode>");
-    cl.add("--no-legalize",
-           o.no_legalize,
-           "[synth] Translate the design as written instead of writing out the hardware it implies: no "
-           "mux trees rebuilt, no implicit branch filled in");
-    cl.add("--full-case",
-           o.full_case,
-           "[synth] Believe `full_case` and `unique`: a case the design says is complete stops inferring "
-           "a latch. Reported wherever the claim is what removed the latch, since simulation will still "
-           "hold the old value");
-    cl.add("--parallel-case",
-           o.parallel_case,
-           "[synth] Believe `parallel_case` and `unique0`: the arms are treated as mutually exclusive");
+    r.add(bit(Command::Synth),
+          "--sidecar",
+          o.sidecar,
+          "Also write the JSON sidecar here: what the SystemVerilog cannot carry -- the "
+          "original-to-emitted name map every constraint file depends on, and each signal's inferred "
+          "storage, clock and reset",
+          "<path>",
+          slang::CommandLineFlags::FilePath);
+    r.add(bit(Command::Synth),
+          "--target",
+          o.target,
+          "Which language to write: '2005' for IEEE 1364-2005, 'sv' for IEEE 1800 (default)",
+          "<lang>");
+    r.add(bit(Command::Synth),
+          "--hierarchy",
+          o.hierarchy,
+          "How much of the instance tree to keep: 'instances' writes one module per instance "
+          "with names as written (default), 'flat' writes one module with paths mangled into names",
+          "<mode>");
+    r.add(bit(Command::Synth),
+          "--no-legalize",
+          o.no_legalize,
+          "Translate the design as written instead of writing out the hardware it implies: no "
+          "mux trees rebuilt, no implicit branch filled in");
+    r.add(bit(Command::Synth),
+          "--full-case",
+          o.full_case,
+          "Believe `full_case` and `unique`: a case the design says is complete stops inferring "
+          "a latch. Reported wherever the claim is what removed the latch, since simulation will still "
+          "hold the old value");
+    r.add(bit(Command::Synth),
+          "--parallel-case",
+          o.parallel_case,
+          "Believe `parallel_case` and `unique0`: the arms are treated as mutually exclusive");
 #endif
-    cl.add("--perf-jitdump",
-           o.perf_jitdump,
-           "[run] Let `perf` see names for the design's compiled code (writes a jitdump under "
-           "$JITDUMPDIR); for profiling clotho");
+    r.add(bit(Command::Run),
+          "--perf-jitdump",
+          o.perf_jitdump,
+          "Let `perf` see names for the design's compiled code (writes a jitdump under "
+          "$JITDUMPDIR); for profiling clotho");
+    r.add(kAny, "-h,--help", o.help, "Show this help and exit");
+    r.add(kAny, "--help-all", o.help_all, "Show every option, slang's included, and exit");
+    r.add(kAny, "--version", o.version, "Show version information and exit");
 }
-
-constexpr std::string_view kOverview =
-  "clotho — a SystemVerilog simulator\n"
-  "\n"
-  "commands:\n"
-  "  build   compile the design and write the generated code, without running it\n"
-  "  run     compile the design and simulate it\n"
-  "  lint    check the design and report problems, without compiling or running it\n"
-  "  lsp     serve the Language Server Protocol over stdin/stdout, for an editor\n"
-  "  dap     serve the Debug Adapter Protocol over stdin/stdout, to debug a design\n"
-#ifdef CLOTHO_SYNTH
-  "  synth   write the design back out as synthesizable SystemVerilog\n"
-#endif
-  "\n"
-  "Clotho's own options come first below, then the source-reading options it shares\n"
-#ifdef CLOTHO_SYNTH
-  "with slang, the SystemVerilog front end it is built on. A [build], [run] or\n"
-  "[synth] tag marks an option only that command accepts; [build|run] one that\n"
-  "both of those accept.\n"
-#else
-  "with slang, the SystemVerilog front end it is built on. A [build] or [run] tag\n"
-  "marks an option only that command accepts; [build|run] one that both accept.\n"
-#endif
-  "\n"
-  "An argument starting with '+' that is not an option goes to the design itself,\n"
-  "for $test$plusargs and $value$plusargs to read while it runs (LRM 21.6). Use\n"
-  "'--' to stop that and pass everything after it through as written.";
-
-// The commands this build actually has. `synth` is compiled out of a Release
-// build, and a usage message that offers a command the binary will then reject is
-// worse than one that never mentions it.
-constexpr std::string_view kCommandList =
-#ifdef CLOTHO_SYNTH
-  "'build', 'run', 'lint', 'synth', 'lsp' or 'dap'";
-#else
-  "'build', 'run', 'lint', 'lsp' or 'dap'";
-#endif
 
 int usage_error(std::string_view message) {
     std::println(stderr, "clotho: {}", message);
@@ -303,75 +519,389 @@ bool is_slang_plusarg(std::string_view arg) {
     return arg.starts_with("+define+") || arg.starts_with("+incdir+") || arg.starts_with("+libext+");
 }
 
-std::string_view command_name(Command command) {
-    switch (command) {
-        case Command::Build:
-            return "build";
-        case Command::Run:
-            return "run";
-        case Command::Lint:
-            return "lint";
-        case Command::Synth:
-            return "synth";
-        case Command::Lsp:
-            return "lsp";
-        case Command::Dap:
-            return "dap";
+// What to offer in place of a first argument that is not a command, or "". The
+// likeliest mistake is leaving out `run` (`clotho design.sv`), so a file that
+// exists, or one that looks like source, gets `clotho run <file>`. Otherwise a
+// command within two edits, the way slang suggests an option: always shorter
+// than the command itself, so a short command is not offered for noise.
+std::string suggest_command(std::string_view word) {
+    constexpr std::string_view source_extensions[] = { ".sv", ".v", ".svh", ".vh" };
+    constexpr int              max_distance        = 2;
+
+    std::error_code ec;
+    const bool      is_file = std::filesystem::is_regular_file(std::filesystem::path(std::string(word)), ec);
+    const bool      looks_like_source =
+      std::ranges::any_of(source_extensions, [&](std::string_view ext) { return word.ends_with(ext); });
+    if (is_file || looks_like_source) {
+        return std::format("clotho run {}", word);
     }
-    return "";
+
+    std::string lowered(word);
+    std::ranges::transform(
+      lowered, lowered.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::string_view best          = "";
+    int              best_distance = max_distance + 1;
+    for (const CommandInfo& c : kCommands) {
+        const int distance = slang::editDistance(c.name, lowered, max_distance);
+        if (distance < best_distance && distance < static_cast<int>(c.name.size())) {
+            best          = c.name;
+            best_distance = distance;
+        }
+    }
+    return std::string(best);
+}
+
+bool stdout_is_terminal() {
+#ifdef _WIN32
+    return _isatty(_fileno(stdout)) != 0;
+#else
+    return isatty(STDOUT_FILENO) != 0;
+#endif
+}
+
+// `build` writes its artifact to stdout unless given `-o`, and a terminal is
+// where that is almost always a forgotten `-o`: the generated code is pages of
+// text nobody reads there. So the default is refused on a terminal; an explicit
+// `-o -` still asks for it by name, and a pipe or a file is not a terminal.
+bool refuses_terminal_artifact(Command command, bool out_given, bool stdout_terminal) {
+    return command == Command::Build && !out_given && stdout_terminal;
+}
+
+// A unit `--stop-time` accepts, and how many femtoseconds it is.
+struct TimeUnit {
+    std::string_view name;
+    uint64_t         femtoseconds;
+};
+
+constexpr uint64_t kFemtosecondsPerSecond = 1'000'000'000'000'000;
+
+constexpr TimeUnit kTimeUnits[] = {
+    { "fs", 1 },
+    { "ps", 1'000 },
+    { "ns", 1'000'000 },
+    { "us", 1'000'000'000 },
+    { "ms", 1'000'000'000'000 },
+    { "s", kFemtosecondsPerSecond },
+};
+
+// The units as a sentence lists them: "fs, ps, ns, us, ms or s".
+std::string time_unit_list() {
+    std::string text;
+    for (size_t i = 0; i < std::size(kTimeUnits); ++i) {
+        if (i > 0) {
+            text += i + 1 == std::size(kTimeUnits) ? " or " : ", ";
+        }
+        text += kTimeUnits[i].name;
+    }
+    return text;
+}
+
+// `--stop-time`: an integer and a unit with nothing between them, as `100ns` or
+// `5us`, in femtoseconds. Returns false and sets `error` for a missing or unknown
+// unit, a zero time, or one that does not fit in 64 bits of femtoseconds.
+bool parse_stop_time(std::string_view text, uint64_t& femtoseconds, std::string& error) {
+    const auto fail = [&](const std::string& why) {
+        error = std::format("invalid --stop-time '{}': {}", text, why);
+        return false;
+    };
+
+    uint64_t          count = 0;
+    const char* const begin = text.data();
+    const char* const end   = begin + text.size();
+    // Digits only: from_chars takes no sign and no space for an unsigned value.
+    const auto [digits_end, ec] = std::from_chars(begin, end, count);
+    if (digits_end == begin) {
+        return fail(std::format("write an integer and a unit, e.g. 100ns or 5us (units: {})", time_unit_list()));
+    }
+    const std::string_view unit_name(digits_end, end);
+    if (unit_name.empty()) {
+        return fail(std::format("the unit is missing; write e.g. {}ns (units: {})", text, time_unit_list()));
+    }
+    const auto unit = std::ranges::find(kTimeUnits, unit_name, &TimeUnit::name);
+    if (unit == std::end(kTimeUnits)) {
+        return fail(std::format("unknown unit '{}' (units: {})", unit_name, time_unit_list()));
+    }
+    // An out-of-range count is also too large, whatever the unit.
+    if (ec == std::errc::result_out_of_range || count > UINT64_MAX / unit->femtoseconds) {
+        return fail(std::format("too large; the longest time is about {} s", UINT64_MAX / kFemtosecondsPerSecond));
+    }
+    if (count == 0) {
+        return fail("must be greater than zero");
+    }
+    femtoseconds = count * unit->femtoseconds;
+    return true;
 }
 
 // A command-specific option used under another command is an error, not a
 // silently ignored no-op (PRINCIPLES.md: never silently accept).
-bool check_scope(const Options& o, Command command, int& status) {
-    // `-o` names the artifact, and two commands produce one, so ownership is a set
-    // rather than a single command. The --gc-* group is a set for a different
-    // reason: its settings are compiled in (the backend bakes an rt_gc_config into
-    // the emitted module and calls rt_gc_init from its main), so `build` is told
-    // them exactly as `run` is, and `lint`, which emits no code, refuses them.
-    // `--coverage` is in that set for the same reason: the coverage model the
-    // backend emits names its own destination, so the report file is a mode
-    // compiled in, not something `run` can add to an artifact built without it.
-    // `-O`, `--stat` and `--sanitize` are in it because they steer code generation,
-    // which `lint` and `synth` never reach.
-    struct Check {
-        bool                   given;
-        std::string_view       name;
-        Command                owner;
-        std::optional<Command> also = std::nullopt;
-    };
-    const Check checks[] = {
-        { o.emit.has_value(), "--emit", Command::Build },
-        { o.out.has_value(), "-o", Command::Build, Command::Synth },
-        { o.o3.has_value(), "-O", Command::Build, Command::Run },
-        { !o.stats.empty(), "--stat", Command::Build, Command::Run },
-        { !o.sanitizers.empty(), "--sanitize", Command::Build, Command::Run },
-        { o.gc_stress.has_value(), "--gc-stress", Command::Build, Command::Run },
-        { o.gc_stats.has_value(), "--gc-stats", Command::Build, Command::Run },
-        { o.gc_nursery_bytes.has_value(), "--gc-nursery", Command::Build, Command::Run },
-        { o.gc_heap_bytes_max.has_value(), "--gc-heap-max", Command::Build, Command::Run },
-        { o.gc_full_every.has_value(), "--gc-full-every", Command::Build, Command::Run },
-        { o.coverage.has_value(), "--coverage", Command::Build, Command::Run },
-        { !o.dpi_libs.empty(), "--dpi-lib", Command::Run },
-        { o.perf_jitdump.has_value(), "--perf-jitdump", Command::Run },
-        { o.loose_stale_ref.has_value(), "--loose-stale-ref", Command::Run },
-        { o.sidecar.has_value(), "--sidecar", Command::Synth },
-        { o.target.has_value(), "--target", Command::Synth },
-        { o.hierarchy.has_value(), "--hierarchy", Command::Synth },
-        { o.no_legalize.has_value(), "--no-legalize", Command::Synth },
-        { o.full_case.has_value(), "--full-case", Command::Synth },
-        { o.parallel_case.has_value(), "--parallel-case", Command::Synth },
-    };
-    for (const Check& c : checks) {
-        if (c.given && c.owner != command && c.also != command) {
-            const std::string owners = c.also.has_value()
-                                         ? std::format("'{}' or '{}'", command_name(c.owner), command_name(*c.also))
-                                         : std::format("'{}'", command_name(c.owner));
-            status = usage_error(std::format("{} applies to {}, not '{}'", c.name, owners, command_name(command)));
+bool check_scope(const Registry& registry, Command command, int& status) {
+    for (const Registry::Entry& e : registry.entries()) {
+        if (e.given() && (e.commands & bit(command)) == 0) {
+            status = usage_error(
+              std::format("{} applies to {}, not '{}'", e.name, command_list(e.commands), command_name(command)));
             return false;
         }
     }
     return true;
+}
+
+// Help is laid out for this many columns. An option's spelling gets at most
+// kHelpKeyMax of them; a longer one puts its description on the line below.
+constexpr size_t kHelpWidth  = 100;
+constexpr size_t kHelpIndent = 2;
+constexpr size_t kHelpGap    = 2;
+constexpr size_t kHelpKeyMax = 32;
+
+// The slang options a command's help lists beside Clotho's own: the ones most
+// designs need, in the order they are listed. `--help-all` lists the rest. This
+// only names options; slang's registration stays the one record of what each
+// takes and says. `-W` and `--diag-json` are slang options Clotho accepts without
+// effect (`-W` changes nothing about design diagnostics, nothing writes the JSON),
+// so only `--help-all` shows them until they work.
+constexpr std::string_view kCommonSourceOptions[] = {
+    "-f",
+    "-F",
+    "-I",
+    "-D",
+    "-U",
+    "-y",
+    "-Y",
+    "--libmap",
+    "-L",
+    "--top",
+    "-G",
+    "--timescale",
+    "--std",
+    "-j",
+    "--error-limit",
+    "--color-diagnostics",
+};
+
+// An option as slang's help text prints it.
+struct HelpOption {
+    std::vector<std::string> names; // "-I", "--include-directory", "+incdir"
+    std::string              value; // "<dir-pattern>[,...]"; empty for a flag
+    std::string              desc;
+
+    bool has_name(std::string_view name) const {
+        return std::ranges::find(names, name) != names.end();
+    }
+};
+
+// One line of a listing: an option's spellings, then what it does.
+struct HelpRow {
+    std::string key;
+    std::string desc;
+};
+
+struct HelpSection {
+    std::string_view     title;
+    std::vector<HelpRow> rows;
+};
+
+std::string_view trim(std::string_view text) {
+    while (!text.empty() && text.front() == ' ') {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && text.back() == ' ') {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
+// CommandLine prints its options but cannot enumerate them, so they are read back
+// out of getHelpText: one entry per option, `  <names> <value>`, at least two
+// spaces, then the description, with continuation lines indented to the same
+// column. Option names and value placeholders never hold two spaces in a row.
+std::vector<HelpOption> read_help_options(std::string_view text) {
+    std::vector<HelpOption> options;
+    bool                    listing = false;
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t           end  = std::min(text.find('\n', pos), text.size());
+        const std::string_view line = text.substr(pos, end - pos);
+        pos                         = end + 1;
+        if (!listing) {
+            listing = line == "OPTIONS:";
+        } else if (line.size() > 2 && line.starts_with("  ") && line[2] != ' ') {
+            const std::string_view body  = line.substr(2);
+            const size_t           gap   = body.find("  ");
+            const std::string_view key   = trim(body.substr(0, gap));
+            const size_t           space = key.find(' ');
+            const std::string_view names = key.substr(0, space);
+            HelpOption             option;
+            for (size_t at = 0; at <= names.size();) {
+                const size_t comma = std::min(names.find(',', at), names.size());
+                option.names.emplace_back(names.substr(at, comma - at));
+                at = comma + 1;
+            }
+            option.value = space == std::string_view::npos ? "" : trim(key.substr(space));
+            option.desc  = gap == std::string_view::npos ? "" : trim(body.substr(gap));
+            options.push_back(std::move(option));
+        } else if (!trim(line).empty() && !options.empty()) {
+            std::string& desc = options.back().desc;
+            desc += desc.empty() ? "" : " ";
+            desc += trim(line);
+        }
+    }
+    return options;
+}
+
+// Greedy word wrap. A word longer than `width` gets a line of its own.
+std::vector<std::string> wrap(std::string_view text, size_t width) {
+    std::vector<std::string> lines;
+    std::string              line;
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t           end  = std::min(text.find(' ', pos), text.size());
+        const std::string_view word = text.substr(pos, end - pos);
+        pos                         = end + 1;
+        if (word.empty()) {
+            continue;
+        }
+        if (!line.empty() && line.size() + 1 + word.size() > width) {
+            lines.push_back(std::move(line));
+            line.clear();
+        }
+        line += line.empty() ? "" : " ";
+        line += word;
+    }
+    if (!line.empty()) {
+        lines.push_back(std::move(line));
+    }
+    return lines;
+}
+
+void append_paragraph(std::string& out, std::string_view text) {
+    for (const std::string& line : wrap(text, kHelpWidth)) {
+        out += line;
+        out += '\n';
+    }
+    out += '\n';
+}
+
+// Lists the sections' rows with one description column, as wide as the widest
+// spelling that fits in kHelpKeyMax.
+void append_sections(std::string& out, const std::vector<HelpSection>& sections) {
+    size_t widest = 0;
+    for (const HelpSection& section : sections) {
+        for (const HelpRow& row : section.rows) {
+            if (row.key.size() <= kHelpKeyMax) {
+                widest = std::max(widest, row.key.size());
+            }
+        }
+    }
+    const size_t desc_col   = kHelpIndent + widest + kHelpGap;
+    const size_t desc_width = kHelpWidth - desc_col;
+    for (const HelpSection& section : sections) {
+        if (section.rows.empty()) {
+            continue;
+        }
+        out += std::format("{}:\n", section.title);
+        for (const HelpRow& row : section.rows) {
+            const std::vector<std::string> lines = wrap(row.desc, desc_width);
+            std::string                    head(kHelpIndent, ' ');
+            head += row.key;
+            size_t next = 0;
+            if (row.key.size() <= widest && !lines.empty()) {
+                head.resize(desc_col, ' ');
+                head += lines[next++];
+            }
+            out += head;
+            out += '\n';
+            for (; next < lines.size(); ++next) {
+                out += std::string(desc_col, ' ') + lines[next] + '\n';
+            }
+        }
+        out += '\n';
+    }
+}
+
+// An option's spellings and value placeholder as one listing key. The `+` forms
+// (`+incdir`, `+define`, `+libext`) are Verilog-tool spellings of the same
+// options, listed only when everything is.
+std::string help_key(const HelpOption& option, bool with_plus_forms) {
+    std::string key;
+    for (const std::string& name : option.names) {
+        if (with_plus_forms || !name.starts_with('+')) {
+            key += key.empty() ? "" : ", ";
+            key += name;
+        }
+    }
+    if (!option.value.empty()) {
+        key += ' ';
+        key += option.value;
+    }
+    return key;
+}
+
+// The help for one command, for the command list and the options most designs
+// need (`command` unset), or for every option (`all`).
+std::string render_help(const Registry&           registry,
+                        const slang::CommandLine& cmd_line,
+                        std::optional<Command>    command,
+                        bool                      all) {
+    // `--help-all` after a command lists everything too.
+    const bool scoped = command.has_value() && !all;
+
+    std::string out;
+    if (scoped) {
+        const CommandInfo& info = command_info(*command);
+        out += std::format("clotho {} — {}\n\nUsage: clotho {}", info.name, info.summary, info.name);
+        out += info.usage.empty() ? "" : " ";
+        out += info.usage;
+        out += "\n\n";
+        if (!info.notes.empty()) {
+            append_paragraph(out, info.notes);
+        }
+    } else {
+        out += "clotho — a SystemVerilog simulator\n\nUsage: clotho <command> [options] <files>...\n\n";
+        HelpSection commands{ "Commands", {} };
+        for (const CommandInfo& c : kCommands) {
+            commands.rows.push_back({ std::string(c.name), std::string(c.summary) });
+        }
+        append_sections(out, { commands });
+        if (all) {
+            append_paragraph(out,
+                             "A tag such as [build|run] names the commands that take an option; an option "
+                             "with no tag is taken by every command that reads source.");
+        }
+    }
+
+    const std::vector<HelpOption> options = read_help_options(cmd_line.getHelpText({}));
+    HelpSection                   own{ "Options", {} };
+    HelpSection                   source{ "Source options", {} };
+    for (const HelpOption& option : options) {
+        const Registry::Entry* entry = registry.find(option.names.front());
+        if (entry != nullptr) {
+            const bool listed =
+              all || (scoped ? (entry->commands & bit(*command)) != 0 : (entry->commands & kSource) == kSource);
+            if (listed) {
+                own.rows.push_back({ help_key(option, all), (all ? scope_tag(entry->commands) : "") + option.desc });
+            }
+        } else if (all) {
+            source.rows.push_back({ help_key(option, true), option.desc });
+        }
+    }
+    const bool reads_source = !scoped || (bit(*command) & kSource) != 0;
+    if (!all && reads_source) {
+        for (const std::string_view name : kCommonSourceOptions) {
+            const auto found = std::ranges::find_if(options, [&](const HelpOption& o) { return o.has_name(name); });
+            if (found != options.end()) {
+                source.rows.push_back({ help_key(*found, false), found->desc });
+            }
+        }
+    }
+    append_sections(out, { own, source });
+
+    if (all) {
+        append_paragraph(out, kPlusargNote);
+    } else if (scoped && reads_source) {
+        append_paragraph(out, "Run 'clotho --help-all' for every option, including the rest of the source options.");
+    } else if (!scoped) {
+        append_paragraph(out,
+                         "Run 'clotho <command> --help' for the options of one command, and 'clotho --help-all' for "
+                         "every option.");
+    }
+    return out;
 }
 
 // Phase timings go to stderr so stdout stays exactly the design's own output.
@@ -454,13 +984,16 @@ int main(int argc, char** argv) {
     auto                driver = std::make_unique<slang::driver::Driver>();
     Options             options;
     slang::CommandLine& cmd_line = driver->cmdLine;
-    register_options(cmd_line, options);
+    Registry            registry(cmd_line);
+    register_options(registry, options);
     driver->addStandardArgs();
     cmd_line.setProgramName("clotho <command>");
 
-    const auto print_help    = [&] { std::print("{}", cmd_line.getHelpText(kOverview)); };
+    const auto print_help = [&](std::optional<Command> command, bool all = false) {
+        std::print("{}", render_help(registry, cmd_line, command, all));
+    };
     const auto print_version = [] {
-        std::println("clotho {}", CLOTHO_GIT_HASH);
+        std::println("clotho {}", kVersion);
         std::println("LLVM {}", CLOTHO_LLVM_VERSION);
         std::println("slang {}", slang::VersionInfo::getVersionString());
         std::println("Copyright (C) 2026 Kalyan Sriram");
@@ -471,34 +1004,26 @@ int main(int argc, char** argv) {
     };
 
     if (argc < 2) {
-        return usage_error(std::format("no command; expected {}", kCommandList));
+        return usage_error(std::format("no command; expected {}", command_list(kAny)));
     }
     Command command = Command::Run;
     {
         const std::string_view first = argv[1];
-        if (first == "build") {
-            command = Command::Build;
-        } else if (first == "run") {
-            command = Command::Run;
-        } else if (first == "lint") {
-            command = Command::Lint;
-        } else if (first == "lsp") {
-            command = Command::Lsp;
-        } else if (first == "dap") {
-            command = Command::Dap;
-#ifdef CLOTHO_SYNTH
-        } else if (first == "synth") {
-            command = Command::Synth;
-#endif
-        } else if (first == "-h" || first == "--help") {
+        if (const CommandInfo* info = find_command(first)) {
+            command = info->command;
+        } else if (first == "-h" || first == "--help" || first == "--help-all") {
             // Help and version stand alone, with no command.
-            print_help();
+            print_help(std::nullopt, first == "--help-all");
             return 0;
         } else if (first == "--version") {
             print_version();
             return 0;
         } else {
-            return usage_error(std::format("unknown command '{}'; expected {}", first, kCommandList));
+            const std::string suggestion = suggest_command(first);
+            if (!suggestion.empty()) {
+                return usage_error(std::format("unknown command '{}'; did you mean '{}'?", first, suggestion));
+            }
+            return usage_error(std::format("unknown command '{}'; expected {}", first, command_list(kAny)));
         }
     }
 
@@ -510,25 +1035,30 @@ int main(int argc, char** argv) {
     // -D / -y / -f here and ignoring them would be exactly the silent
     // acceptance PRINCIPLES.md forbids, so they are refused until they mean
     // something.
+#if defined(CLOTHO_LSP) || defined(CLOTHO_DAP)
     if (command == Command::Lsp || command == Command::Dap) {
         for (int i = 2; i < argc; ++i) {
             const std::string_view arg = argv[i];
-            if (arg == "-h" || arg == "--help") {
-                print_help();
+            if (arg == "-h" || arg == "--help" || arg == "--help-all") {
+                print_help(command, arg == "--help-all");
                 return 0;
             }
             if (arg == "--version") {
                 print_version();
                 return 0;
             }
-            return usage_error(
-              std::format("'{}' takes no arguments, got '{}'", command_name(command), arg));
+            return usage_error(std::format("'{}' takes no arguments, got '{}'", command_name(command), arg));
         }
+#ifdef CLOTHO_DAP
         if (command == Command::Dap) {
-            clotho::dap::serve(CLOTHO_GIT_HASH, argv[0]);
+            clotho::dap::serve(kVersion, argv[0]);
         }
-        clotho::lsp::serve(CLOTHO_GIT_HASH);
+#endif
+#ifdef CLOTHO_LSP
+        clotho::lsp::serve(kVersion);
+#endif
     }
+#endif
 
     // Peel runtime plusargs and hand everything else to the Driver verbatim. argv
     // entries are already null-terminated, so they can be handed over directly.
@@ -555,8 +1085,8 @@ int main(int argc, char** argv) {
     if (!driver->parseCommandLine(static_cast<int>(driver_argv.size()), driver_argv.data())) {
         return 2;
     }
-    if (options.help == true) {
-        print_help();
+    if (options.help_all == true || options.help == true) {
+        print_help(command, options.help_all == true);
         return 0;
     }
     if (options.version == true) {
@@ -568,8 +1098,13 @@ int main(int argc, char** argv) {
     }
 
     int status = 0;
-    if (!check_scope(options, command, status)) {
+    if (!check_scope(registry, command, status)) {
         return status;
+    }
+
+    if (refuses_terminal_artifact(command, options.out.has_value(), stdout_is_terminal())) {
+        return usage_error("'build' writes to stdout by default, and stdout is a terminal; pass -o <file> to "
+                           "write a file, or -o - to print it here anyway");
     }
 
     Emit emit = Emit::Llvm;
@@ -595,6 +1130,14 @@ int main(int argc, char** argv) {
     // slang's -j/--threads sizes its parser; the same count sizes the LLVM
     // compile pool, so the tool has one thread knob rather than two.
     config.compile_jobs = driver->options.numThreads.value_or(0);
+    if (options.stop_time.has_value()) {
+        uint64_t    femtoseconds = 0;
+        std::string error;
+        if (!parse_stop_time(*options.stop_time, femtoseconds, error)) {
+            return usage_error(error);
+        }
+        config.stop_time_fs = femtoseconds;
+    }
     for (const std::string& name : options.stats) {
         if (name == "dedup") {
             config.stats |= static_cast<uint32_t>(Stat::Dedup);
@@ -627,8 +1170,7 @@ int main(int argc, char** argv) {
             config.sanitizers |= static_cast<uint32_t>(Sanitizer::XProv);
 #endif
         } else {
-            return usage_error(
-              std::format("unknown --sanitize check '{}'; expected {}", name, kSanitizeList));
+            return usage_error(std::format("unknown --sanitize check '{}'; expected {}", name, kSanitizeList));
         }
     }
     // Where the functional-coverage report goes (LRM 19). Compiled in rather
@@ -641,7 +1183,7 @@ int main(int argc, char** argv) {
     // the collector, and every one of these is compiled into the artifact, so a
     // `build` and the `run` of what it built must be given the same values.
     config.gc_stress = options.gc_stress == true;
-    config.gc_stats = options.gc_stats == true;
+    config.gc_stats  = options.gc_stats == true;
     // A zero nursery would make a collection due at every safepoint, which is
     // --gc-stress spelled obscurely; and 0 means "no limit" for --gc-heap-max, so
     // two adjacent byte options would read the same value opposite ways.
