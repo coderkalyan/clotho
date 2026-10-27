@@ -686,11 +686,11 @@ set(CLOTHO_TEST_SOURCES
   tests/todo_test.cpp
 )
 # The server tests exist only where the servers do.
-if(NOT CLOTHO_LSP)
-  list(REMOVE_ITEM CLOTHO_TEST_SOURCES tests/lsp_test.cpp tests/lsp_tokens_test.cpp)
+if(CLOTHO_LSP)
+  list(APPEND CLOTHO_TEST_SOURCES tests/lsp_test.cpp tests/lsp_tokens_test.cpp)
 endif()
-if(NOT CLOTHO_DAP)
-  list(REMOVE_ITEM CLOTHO_TEST_SOURCES tests/dap_test.cpp)
+if(CLOTHO_DAP)
+  list(APPEND CLOTHO_TEST_SOURCES tests/dap_test.cpp)
 endif()
 add_executable(clotho_test ${CLOTHO_TEST_SOURCES})
 target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize doctest::doctest clotho_warnings)
