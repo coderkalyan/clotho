@@ -191,6 +191,8 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Located backend refusals outside instruction lowering** — refusals from the
   program-region pre-passes, DPI and class-descriptor emission, and VCD variable
   emission name their subject but carry no source location.
+- [ ] **`-W` and `--diag-json` for design diagnostics** — both are accepted, but `-W`
+  does not change what a design reports and nothing writes the JSON.
 - [ ] **Selective VCD dump** — `$dumpvars` scope-subset and sparse selection; only a
   whole-design dump is produced.
 - [ ] **VCD of a string signal** (21.7.2) — the format has no `string` var type; needs a

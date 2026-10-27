@@ -105,8 +105,9 @@ see "One parser".
 
 Valued options take `--name value` or `--name=value`. Clotho's options sit in the
 same namespace as slang's `-D`, `-I`, `-y`,
-`-v`, `-f`, `--top`, `-G`, `--libmap`, `--timescale`, `--std`, `-W`, `--error-limit` and
-`-j`, which are options this tool has rather than options it forwards. `-G
+`-v`, `-f`, `--top`, `-G`, `--libmap`, `--timescale`, `--std`, `--error-limit` and
+`-j`, which are options this tool has rather than options it forwards (`-W` and
+`--diag-json` are registered too but do not work yet; see "Help" below). `-G
 <name>=<value>` overrides a parameter of a top-level module (integer and string
 values both take effect); a name no top-level module has is not reported, so a
 typo simulates the design with its defaults. `--libmap <file>` reads library maps,
@@ -324,7 +325,7 @@ behaviour change; docs quoting the old spellings were migrated with this commit.
 
 - **`--time`'s numbers and `perf.py`'s JSON keys are unchanged.** Only the
   labels were reworded, so previously recorded numbers stay comparable.
-- **slang's options keep their slang names** (`-j`, `--top`, `--timescale`, `-W`).
+- **slang's options keep their slang names** (`-j`, `--top`, `--timescale`).
   Registering them is not the same as renaming them; a user who knows slang
   keeps their muscle memory.
 - **Single-unit stays forced.** Documented in `--help` instead of exposed;
