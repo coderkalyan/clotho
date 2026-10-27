@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <regex>
 #include <string>
 #include <string_view>
 
@@ -84,6 +85,15 @@ bool contains(const std::string& text, std::string_view needle) {
     return text.find(needle) != std::string::npos;
 }
 
+// The first line of `--version` without its "clotho " prefix: the release and
+// the commit, which is also what the servers report.
+std::string version_string(const Scratch& s) {
+    const Result r = s.run("--version");
+    REQUIRE(r.code == 0);
+    REQUIRE(r.out.starts_with("clotho "));
+    return r.out.substr(7, r.out.find('\n') - 7);
+}
+
 } // namespace cli_test
 
 using namespace cli_test;
@@ -95,6 +105,34 @@ TEST_CASE("cli: --help shows the placeholder of every valued gc option") {
     CHECK(contains(r.out, "--gc-nursery <bytes>"));
     CHECK(contains(r.out, "--gc-heap-max <bytes>"));
     CHECK(contains(r.out, "--gc-full-every <n>"));
+}
+
+TEST_CASE("cli: --version names the release and the commit it was built from") {
+    const Scratch s;
+    const Result  r = s.run("--version");
+    CHECK(r.code == 0);
+    const std::string first = r.out.substr(0, r.out.find('\n'));
+    // `clotho <major>.<minor>.<patch>[-<pre-release>] (<git hash>)`; a tree
+    // without git reports the hash as "unknown".
+    const std::regex format(R"(clotho \d+\.\d+\.\d+(-[0-9A-Za-z.]+)? \(([0-9a-f]+|unknown)\))");
+    CHECK_MESSAGE(std::regex_match(first, format), first);
+    CHECK(contains(r.out, "\nLLVM "));
+    CHECK(contains(r.out, "\nslang "));
+}
+
+TEST_CASE("cli: lsp reports the version --version prints") {
+    const Scratch     s;
+    const std::string version = version_string(s);
+    std::string       input;
+    for (const std::string_view body : { R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})",
+                                         R"({"jsonrpc":"2.0","id":2,"method":"shutdown"})",
+                                         R"({"jsonrpc":"2.0","method":"exit"})" }) {
+        input += std::format("Content-Length: {}\r\n\r\n{}", body.size(), body);
+    }
+    const fs::path in = s.write("session.lsp", input);
+    const Result   r  = s.run(std::format("lsp < \"{}\"", in.string()));
+    CHECK(r.code == 0);
+    CHECK_MESSAGE(contains(r.out, std::format("\"version\":\"{}\"", version)), r.out);
 }
 
 TEST_CASE("cli: lint refuses every option that steers code generation") {

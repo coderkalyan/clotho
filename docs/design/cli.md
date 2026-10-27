@@ -75,7 +75,7 @@ There is no second help and nothing to forward — see "One parser" below.
 | `--dpi-lib <path>` | run | DPI-C `.o`/`.a` (JIT-linked) or `.so` (dlopen'd), repeatable |
 | `--perf-jitdump` | run | perf jitdump under `$JITDUMPDIR` |
 | `--loose-stale-ref` | run | report a `ref` whose actual storage was restructured under it (data-model.md §3) once per site and keep simulating, instead of the located fatal. Fatal by default |
-| `-h, --help` / `--version` | any | help; versions (clotho git hash, LLVM, slang) |
+| `-h, --help` / `--version` | any | help; versions (`clotho <release> (<git hash>)`, LLVM, slang) |
 | `+<text>` | run | plusarg (LRM 21.6), `+` stripped, in order |
 
 Valued options take `--name value` or `--name=value`. Clotho's options sit in the
@@ -152,6 +152,17 @@ them always means something and none of them needs a companion flag.
 
 `run_jit`'s negative setup sentinel is mapped to 1 rather than returned raw (it
 used to reach the shell as 255).
+
+### Version
+
+`clotho --version` starts with `clotho <release> (<git hash>)`, then the LLVM and
+slang versions and the license notice. The release is CMake's
+`project(clotho VERSION ...)` plus `CLOTHO_VERSION_SUFFIX`, a pre-release tag that
+is `alpha` until the first final release and empty after it (`0.1.0-alpha`, then
+`0.1.0`). The hash is resolved at configure time and is `unknown` outside a git
+tree. `clotho lsp` reports the same string in `serverInfo.version` and `clotho dap`
+in its console banner, so a report from an editor names the build as precisely as
+the command line does.
 
 ## What changed, and why
 

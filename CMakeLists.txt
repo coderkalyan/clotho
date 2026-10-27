@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(clotho C CXX)
+project(clotho VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -554,8 +554,15 @@ if(CLOTHO_XSAN)
   target_compile_definitions(clotho_cli PRIVATE CLOTHO_XSAN)
 endif()
 
-# `clotho --version`. The git hash is resolved at configure time; a source tree
-# without git (a release tarball) reports "unknown" rather than failing.
+# `clotho --version`. The release is the project version plus a pre-release
+# suffix, which a final release leaves empty. The git hash is resolved at
+# configure time; a source tree without git (a release tarball) reports
+# "unknown" rather than failing.
+set(CLOTHO_VERSION_SUFFIX "alpha")
+set(CLOTHO_VERSION "${PROJECT_VERSION}")
+if(CLOTHO_VERSION_SUFFIX)
+  string(APPEND CLOTHO_VERSION "-${CLOTHO_VERSION_SUFFIX}")
+endif()
 execute_process(
   COMMAND git rev-parse --short HEAD
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -567,6 +574,7 @@ if(NOT CLOTHO_GIT_HASH)
   set(CLOTHO_GIT_HASH "unknown")
 endif()
 target_compile_definitions(clotho_cli PRIVATE
+  CLOTHO_VERSION="${CLOTHO_VERSION}"
   CLOTHO_GIT_HASH="${CLOTHO_GIT_HASH}"
   CLOTHO_LLVM_VERSION="${LLVM_PACKAGE_VERSION}"
 )

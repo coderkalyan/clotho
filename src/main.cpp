@@ -64,6 +64,10 @@ using clotho::ir::SimulationConfig;
 using clotho::ir::Stat;
 using clotho::ir::SystemAccess;
 
+// What `--version` prints after "clotho", and what the language and debug
+// servers report to their clients: the release, then the commit it was built from.
+constexpr std::string_view kVersion = CLOTHO_VERSION " (" CLOTHO_GIT_HASH ")";
+
 enum class Command : uint8_t { Build, Run, Lint, Synth, Lsp, Dap };
 
 // What `build` writes.
@@ -460,7 +464,7 @@ int main(int argc, char** argv) {
 
     const auto print_help    = [&] { std::print("{}", cmd_line.getHelpText(kOverview)); };
     const auto print_version = [] {
-        std::println("clotho {}", CLOTHO_GIT_HASH);
+        std::println("clotho {}", kVersion);
         std::println("LLVM {}", CLOTHO_LLVM_VERSION);
         std::println("slang {}", slang::VersionInfo::getVersionString());
         std::println("Copyright (C) 2026 Kalyan Sriram");
@@ -525,9 +529,9 @@ int main(int argc, char** argv) {
               std::format("'{}' takes no arguments, got '{}'", command_name(command), arg));
         }
         if (command == Command::Dap) {
-            clotho::dap::serve(CLOTHO_GIT_HASH, argv[0]);
+            clotho::dap::serve(kVersion, argv[0]);
         }
-        clotho::lsp::serve(CLOTHO_GIT_HASH);
+        clotho::lsp::serve(kVersion);
     }
 
     // Peel runtime plusargs and hand everything else to the Driver verbatim. argv
