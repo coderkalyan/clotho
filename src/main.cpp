@@ -1,5 +1,6 @@
+#include <algorithm>
 #include <cstdint>
-#include <format>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -17,10 +18,10 @@
 #include <slang/util/VersionInfo.h>
 
 #include "Lower.h"
+#include "dap/Dap.h"
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
-#include "dap/Dap.h"
 #include "lsp/Lsp.h"
 #ifdef CLOTHO_SYNTH
 #include "legalize/Legalize.h"
@@ -113,7 +114,15 @@ struct CommandInfo {
     std::string_view summary;
     // What follows the name on its usage line.
     std::string_view usage;
+    // A paragraph for the command's own help, after its usage line.
+    std::string_view notes = {};
 };
+
+// Runtime plusargs (LRM 21.6) are `run`'s alone. See is_slang_plusarg.
+constexpr std::string_view kPlusargNote =
+  "An argument starting with '+' that is not an option goes to the design itself, for $test$plusargs "
+  "and $value$plusargs to read while it runs (LRM 21.6). Use '--' to stop that and pass everything "
+  "after it through as written.";
 
 // The commands this build has, in the order `--help` lists them. `synth` is
 // compiled out of a Release build, and a usage message that offers a command the
@@ -123,16 +132,13 @@ constexpr CommandInfo kCommands[] = {
       "build",
       "compile the design and write the generated code, without running it",
       "[options] <files>..." },
-    { Command::Run, "run", "compile the design and simulate it", "[options] <files>... [+plusarg...]" },
+    { Command::Run, "run", "compile the design and simulate it", "[options] <files>... [+plusarg...]", kPlusargNote },
     { Command::Lint,
       "lint",
       "check the design and report problems, without compiling or running it",
       "[options] <files>..." },
 #ifdef CLOTHO_SYNTH
-    { Command::Synth,
-      "synth",
-      "write the design back out as synthesizable SystemVerilog",
-      "[options] <files>..." },
+    { Command::Synth, "synth", "write the design back out as synthesizable SystemVerilog", "[options] <files>..." },
 #endif
     { Command::Lsp, "lsp", "serve the Language Server Protocol over stdin/stdout, for an editor", "" },
     { Command::Dap, "dap", "serve the Debug Adapter Protocol over stdin/stdout, to debug a design", "" },
@@ -147,13 +153,19 @@ const CommandInfo* find_command(std::string_view name) {
     return nullptr;
 }
 
-std::string_view command_name(Command command) {
+const CommandInfo& command_info(Command command) {
     for (const CommandInfo& c : kCommands) {
         if (c.command == command) {
-            return c.name;
+            return c;
         }
     }
-    return "";
+    // Every Command a user can select has a row, and the dispatch only selects those.
+    std::println(stderr, "clotho: internal error: no command table row");
+    std::abort();
+}
+
+std::string_view command_name(Command command) {
+    return command_info(command).name;
 }
 
 // The names of the commands in `set`, in listing order, as a sentence lists
@@ -185,6 +197,22 @@ bool is_given(const std::vector<T>& value) {
     return !value.empty();
 }
 
+// "[build|run] ": the commands that take an option, as `--help-all` prints them in
+// front of its description. Empty when every command that reads source takes it.
+std::string scope_tag(Commands commands) {
+    if ((commands & kSource) == kSource) {
+        return {};
+    }
+    std::string tag = "[";
+    for (const CommandInfo& c : kCommands) {
+        if ((commands & bit(c.command)) != 0) {
+            tag += tag.size() > 1 ? "|" : "";
+            tag += c.name;
+        }
+    }
+    return tag + "] ";
+}
+
 // The options Clotho registers on the Driver's CommandLine, each with the
 // commands that take it. One registration feeds the parser, the check that an
 // option is not used under a command that ignores it (check_scope), and which
@@ -206,30 +234,25 @@ public:
     // gave the option.
     template<typename T, typename... Rest>
     void add(Commands commands, std::string_view names, T& value, std::string_view desc, Rest&&... rest) {
-        cl_.add(names, value, scope_tag(commands) + std::string(desc), std::forward<Rest>(rest)...);
+        cl_.add(names, value, desc, std::forward<Rest>(rest)...);
         entries_.push_back(
           { std::string(names.substr(0, names.find(','))), commands, [&value] { return is_given(value); } });
     }
 
-    std::span<const Entry> entries() const { return entries_; }
-
-private:
-    // "[build|run] ": the commands that take an option, in front of its
-    // description. Empty when every command that reads source takes it.
-    static std::string scope_tag(Commands commands) {
-        if ((commands & kSource) == kSource) {
-            return {};
-        }
-        std::string tag = "[";
-        for (const CommandInfo& c : kCommands) {
-            if ((commands & bit(c.command)) != 0) {
-                tag += tag.size() > 1 ? "|" : "";
-                tag += c.name;
-            }
-        }
-        return tag + "] ";
+    std::span<const Entry> entries() const {
+        return entries_;
     }
 
+    const Entry* find(std::string_view name) const {
+        for (const Entry& e : entries_) {
+            if (e.name == name) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+private:
     slang::CommandLine& cl_;
     std::vector<Entry>  entries_;
 };
@@ -441,33 +464,6 @@ void register_options(Registry& r, Options& o) {
     r.add(kAny, "--version", o.version, "Show version information and exit");
 }
 
-constexpr std::string_view kOverview =
-  "clotho — a SystemVerilog simulator\n"
-  "\n"
-  "commands:\n"
-  "  build   compile the design and write the generated code, without running it\n"
-  "  run     compile the design and simulate it\n"
-  "  lint    check the design and report problems, without compiling or running it\n"
-  "  lsp     serve the Language Server Protocol over stdin/stdout, for an editor\n"
-  "  dap     serve the Debug Adapter Protocol over stdin/stdout, to debug a design\n"
-#ifdef CLOTHO_SYNTH
-  "  synth   write the design back out as synthesizable SystemVerilog\n"
-#endif
-  "\n"
-  "Clotho's own options come first below, then the source-reading options it shares\n"
-#ifdef CLOTHO_SYNTH
-  "with slang, the SystemVerilog front end it is built on. A [build], [run] or\n"
-  "[synth] tag marks an option only that command accepts; [build|run] one that\n"
-  "both of those accept.\n"
-#else
-  "with slang, the SystemVerilog front end it is built on. A [build] or [run] tag\n"
-  "marks an option only that command accepts; [build|run] one that both accept.\n"
-#endif
-  "\n"
-  "An argument starting with '+' that is not an option goes to the design itself,\n"
-  "for $test$plusargs and $value$plusargs to read while it runs (LRM 21.6). Use\n"
-  "'--' to stop that and pass everything after it through as written.";
-
 int usage_error(std::string_view message) {
     std::println(stderr, "clotho: {}", message);
     std::println(stderr, "try 'clotho --help'");
@@ -493,6 +489,264 @@ bool check_scope(const Registry& registry, Command command, int& status) {
         }
     }
     return true;
+}
+
+// Help is laid out for this many columns. An option's spelling gets at most
+// kHelpKeyMax of them; a longer one puts its description on the line below.
+constexpr size_t kHelpWidth  = 100;
+constexpr size_t kHelpIndent = 2;
+constexpr size_t kHelpGap    = 2;
+constexpr size_t kHelpKeyMax = 32;
+
+// The slang options a command's help lists beside Clotho's own: the ones most
+// designs need, in the order they are listed. `--help-all` lists the rest. This
+// only names options; slang's registration stays the one record of what each
+// takes and says.
+constexpr std::string_view kCommonSourceOptions[] = {
+    "-f",
+    "-F",
+    "-I",
+    "-D",
+    "-U",
+    "-y",
+    "-Y",
+    "--libmap",
+    "-L",
+    "--top",
+    "-G",
+    "--timescale",
+    "--std",
+    "-j",
+    "-W",
+    "--error-limit",
+    "--color-diagnostics",
+};
+
+// An option as slang's help text prints it.
+struct HelpOption {
+    std::vector<std::string> names; // "-I", "--include-directory", "+incdir"
+    std::string              value; // "<dir-pattern>[,...]"; empty for a flag
+    std::string              desc;
+
+    bool has_name(std::string_view name) const {
+        return std::ranges::find(names, name) != names.end();
+    }
+};
+
+// One line of a listing: an option's spellings, then what it does.
+struct HelpRow {
+    std::string key;
+    std::string desc;
+};
+
+struct HelpSection {
+    std::string_view     title;
+    std::vector<HelpRow> rows;
+};
+
+std::string_view trim(std::string_view text) {
+    while (!text.empty() && text.front() == ' ') {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && text.back() == ' ') {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
+// CommandLine prints its options but cannot enumerate them, so they are read back
+// out of getHelpText: one entry per option, `  <names> <value>`, at least two
+// spaces, then the description, with continuation lines indented to the same
+// column. Option names and value placeholders never hold two spaces in a row.
+std::vector<HelpOption> read_help_options(std::string_view text) {
+    std::vector<HelpOption> options;
+    bool                    listing = false;
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t           end  = std::min(text.find('\n', pos), text.size());
+        const std::string_view line = text.substr(pos, end - pos);
+        pos                         = end + 1;
+        if (!listing) {
+            listing = line == "OPTIONS:";
+        } else if (line.size() > 2 && line.starts_with("  ") && line[2] != ' ') {
+            const std::string_view body  = line.substr(2);
+            const size_t           gap   = body.find("  ");
+            const std::string_view key   = trim(body.substr(0, gap));
+            const size_t           space = key.find(' ');
+            const std::string_view names = key.substr(0, space);
+            HelpOption             option;
+            for (size_t at = 0; at <= names.size();) {
+                const size_t comma = std::min(names.find(',', at), names.size());
+                option.names.emplace_back(names.substr(at, comma - at));
+                at = comma + 1;
+            }
+            option.value = space == std::string_view::npos ? "" : trim(key.substr(space));
+            option.desc  = gap == std::string_view::npos ? "" : trim(body.substr(gap));
+            options.push_back(std::move(option));
+        } else if (!trim(line).empty() && !options.empty()) {
+            std::string& desc = options.back().desc;
+            desc += desc.empty() ? "" : " ";
+            desc += trim(line);
+        }
+    }
+    return options;
+}
+
+// Greedy word wrap. A word longer than `width` gets a line of its own.
+std::vector<std::string> wrap(std::string_view text, size_t width) {
+    std::vector<std::string> lines;
+    std::string              line;
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t           end  = std::min(text.find(' ', pos), text.size());
+        const std::string_view word = text.substr(pos, end - pos);
+        pos                         = end + 1;
+        if (word.empty()) {
+            continue;
+        }
+        if (!line.empty() && line.size() + 1 + word.size() > width) {
+            lines.push_back(std::move(line));
+            line.clear();
+        }
+        line += line.empty() ? "" : " ";
+        line += word;
+    }
+    if (!line.empty()) {
+        lines.push_back(std::move(line));
+    }
+    return lines;
+}
+
+void append_paragraph(std::string& out, std::string_view text) {
+    for (const std::string& line : wrap(text, kHelpWidth)) {
+        out += line;
+        out += '\n';
+    }
+    out += '\n';
+}
+
+// Lists the sections' rows with one description column, as wide as the widest
+// spelling that fits in kHelpKeyMax.
+void append_sections(std::string& out, const std::vector<HelpSection>& sections) {
+    size_t widest = 0;
+    for (const HelpSection& section : sections) {
+        for (const HelpRow& row : section.rows) {
+            if (row.key.size() <= kHelpKeyMax) {
+                widest = std::max(widest, row.key.size());
+            }
+        }
+    }
+    const size_t desc_col   = kHelpIndent + widest + kHelpGap;
+    const size_t desc_width = kHelpWidth - desc_col;
+    for (const HelpSection& section : sections) {
+        if (section.rows.empty()) {
+            continue;
+        }
+        out += std::format("{}:\n", section.title);
+        for (const HelpRow& row : section.rows) {
+            const std::vector<std::string> lines = wrap(row.desc, desc_width);
+            std::string                    head(kHelpIndent, ' ');
+            head += row.key;
+            size_t next = 0;
+            if (row.key.size() <= widest && !lines.empty()) {
+                head.resize(desc_col, ' ');
+                head += lines[next++];
+            }
+            out += head;
+            out += '\n';
+            for (; next < lines.size(); ++next) {
+                out += std::string(desc_col, ' ') + lines[next] + '\n';
+            }
+        }
+        out += '\n';
+    }
+}
+
+// An option's spellings and value placeholder as one listing key. The `+` forms
+// (`+incdir`, `+define`, `+libext`) are Verilog-tool spellings of the same
+// options, listed only when everything is.
+std::string help_key(const HelpOption& option, bool with_plus_forms) {
+    std::string key;
+    for (const std::string& name : option.names) {
+        if (with_plus_forms || !name.starts_with('+')) {
+            key += key.empty() ? "" : ", ";
+            key += name;
+        }
+    }
+    if (!option.value.empty()) {
+        key += ' ';
+        key += option.value;
+    }
+    return key;
+}
+
+// The help for one command, for the command list and the options most designs
+// need (`command` unset), or for every option (`all`).
+std::string render_help(const Registry&           registry,
+                        const slang::CommandLine& cmd_line,
+                        std::optional<Command>    command,
+                        bool                      all) {
+    // `--help-all` after a command lists everything too.
+    const bool scoped = command.has_value() && !all;
+
+    std::string out;
+    if (scoped) {
+        const CommandInfo& info = command_info(*command);
+        out += std::format("clotho {} — {}\n\nUsage: clotho {}", info.name, info.summary, info.name);
+        out += info.usage.empty() ? "" : " ";
+        out += info.usage;
+        out += "\n\n";
+        if (!info.notes.empty()) {
+            append_paragraph(out, info.notes);
+        }
+    } else {
+        out += "clotho — a SystemVerilog simulator\n\nUsage: clotho <command> [options] <files>...\n\n";
+        HelpSection commands{ "Commands", {} };
+        for (const CommandInfo& c : kCommands) {
+            commands.rows.push_back({ std::string(c.name), std::string(c.summary) });
+        }
+        append_sections(out, { commands });
+        if (all) {
+            append_paragraph(out,
+                             "A tag such as [build|run] names the commands that take an option; an option "
+                             "with no tag is taken by every command that reads source.");
+        }
+    }
+
+    const std::vector<HelpOption> options = read_help_options(cmd_line.getHelpText({}));
+    HelpSection                   own{ "Options", {} };
+    HelpSection                   source{ "Source options", {} };
+    for (const HelpOption& option : options) {
+        const Registry::Entry* entry = registry.find(option.names.front());
+        if (entry != nullptr) {
+            const bool listed =
+              all || (scoped ? (entry->commands & bit(*command)) != 0 : (entry->commands & kSource) == kSource);
+            if (listed) {
+                own.rows.push_back({ help_key(option, all), (all ? scope_tag(entry->commands) : "") + option.desc });
+            }
+        } else if (all) {
+            source.rows.push_back({ help_key(option, true), option.desc });
+        }
+    }
+    const bool reads_source = !scoped || (bit(*command) & kSource) != 0;
+    if (!all && reads_source) {
+        for (const std::string_view name : kCommonSourceOptions) {
+            const auto found = std::ranges::find_if(options, [&](const HelpOption& o) { return o.has_name(name); });
+            if (found != options.end()) {
+                source.rows.push_back({ help_key(*found, false), found->desc });
+            }
+        }
+    }
+    append_sections(out, { own, source });
+
+    if (all) {
+        append_paragraph(out, kPlusargNote);
+    } else if (scoped && reads_source) {
+        append_paragraph(out, "Run 'clotho --help-all' for every option, including the rest of the source options.");
+    } else if (!scoped) {
+        append_paragraph(out,
+                         "Run 'clotho <command> --help' for the options of one command, and 'clotho --help-all' for "
+                         "every option.");
+    }
+    return out;
 }
 
 // Phase timings go to stderr so stdout stays exactly the design's own output.
@@ -580,7 +834,9 @@ int main(int argc, char** argv) {
     driver->addStandardArgs();
     cmd_line.setProgramName("clotho <command>");
 
-    const auto print_help    = [&] { std::print("{}", cmd_line.getHelpText(kOverview)); };
+    const auto print_help = [&](std::optional<Command> command, bool all = false) {
+        std::print("{}", render_help(registry, cmd_line, command, all));
+    };
     const auto print_version = [] {
         std::println("clotho {}", kVersion);
         std::println("LLVM {}", CLOTHO_LLVM_VERSION);
@@ -600,9 +856,9 @@ int main(int argc, char** argv) {
         const std::string_view first = argv[1];
         if (const CommandInfo* info = find_command(first)) {
             command = info->command;
-        } else if (first == "-h" || first == "--help") {
+        } else if (first == "-h" || first == "--help" || first == "--help-all") {
             // Help and version stand alone, with no command.
-            print_help();
+            print_help(std::nullopt, first == "--help-all");
             return 0;
         } else if (first == "--version") {
             print_version();
@@ -623,16 +879,15 @@ int main(int argc, char** argv) {
     if (command == Command::Lsp || command == Command::Dap) {
         for (int i = 2; i < argc; ++i) {
             const std::string_view arg = argv[i];
-            if (arg == "-h" || arg == "--help") {
-                print_help();
+            if (arg == "-h" || arg == "--help" || arg == "--help-all") {
+                print_help(command, arg == "--help-all");
                 return 0;
             }
             if (arg == "--version") {
                 print_version();
                 return 0;
             }
-            return usage_error(
-              std::format("'{}' takes no arguments, got '{}'", command_name(command), arg));
+            return usage_error(std::format("'{}' takes no arguments, got '{}'", command_name(command), arg));
         }
         if (command == Command::Dap) {
             clotho::dap::serve(kVersion, argv[0]);
@@ -665,8 +920,8 @@ int main(int argc, char** argv) {
     if (!driver->parseCommandLine(static_cast<int>(driver_argv.size()), driver_argv.data())) {
         return 2;
     }
-    if (options.help == true) {
-        print_help();
+    if (options.help_all == true || options.help == true) {
+        print_help(command, options.help_all == true);
         return 0;
     }
     if (options.version == true) {
@@ -737,8 +992,7 @@ int main(int argc, char** argv) {
             config.sanitizers |= static_cast<uint32_t>(Sanitizer::XProv);
 #endif
         } else {
-            return usage_error(
-              std::format("unknown --sanitize check '{}'; expected {}", name, kSanitizeList));
+            return usage_error(std::format("unknown --sanitize check '{}'; expected {}", name, kSanitizeList));
         }
     }
     // Where the functional-coverage report goes (LRM 19). Compiled in rather
@@ -751,7 +1005,7 @@ int main(int argc, char** argv) {
     // the collector, and every one of these is compiled into the artifact, so a
     // `build` and the `run` of what it built must be given the same values.
     config.gc_stress = options.gc_stress == true;
-    config.gc_stats = options.gc_stats == true;
+    config.gc_stats  = options.gc_stats == true;
     // A zero nursery would make a collection due at every safepoint, which is
     // --gc-stress spelled obscurely; and 0 means "no limit" for --gc-heap-max, so
     // two adjacent byte options would read the same value opposite ways.

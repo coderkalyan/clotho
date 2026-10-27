@@ -7,13 +7,16 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "Subprocess.h"
 
@@ -35,7 +38,8 @@ struct Result {
 // test, and is removed with it.
 class Scratch {
 public:
-    Scratch() : dir_(fs::temp_directory_path() / clotho::test::detail::unique_stem()) {
+    Scratch()
+      : dir_(fs::temp_directory_path() / clotho::test::detail::unique_stem()) {
         fs::create_directories(dir_);
     }
     ~Scratch() {
@@ -45,9 +49,13 @@ public:
     Scratch(const Scratch&)            = delete;
     Scratch& operator=(const Scratch&) = delete;
 
-    const fs::path& dir() const { return dir_; }
+    const fs::path& dir() const {
+        return dir_;
+    }
 
-    fs::path path(std::string_view name) const { return dir_ / name; }
+    fs::path path(std::string_view name) const {
+        return dir_ / name;
+    }
 
     fs::path write(std::string_view name, std::string_view text) const {
         const fs::path p = path(name);
@@ -59,8 +67,8 @@ public:
 
     // Runs `clotho <args>` with `args` already shell-quoted.
     Result run(std::string_view args) const {
-        const fs::path out = path("stdout.txt");
-        const fs::path err = path("stderr.txt");
+        const fs::path    out = path("stdout.txt");
+        const fs::path    err = path("stderr.txt");
         const std::string cmd =
           std::format("\"{}\" {} > \"{}\" 2> \"{}\"", CLOTHO_EXE, args, out.string(), err.string());
         const int status = std::system(cmd.c_str());
@@ -94,17 +102,266 @@ std::string version_string(const Scratch& s) {
     return r.out.substr(7, r.out.find('\n') - 7);
 }
 
+// The first spelling of every option a help text lists. A row starts two columns
+// in with its spellings; a description's continuation line is indented further.
+std::vector<std::string> listed_options(const std::string& help) {
+    std::vector<std::string> names;
+    std::istringstream       in(help);
+    for (std::string line; std::getline(in, line);) {
+        if (line.size() > 2 && line.starts_with("  ") && (line[2] == '-' || line[2] == '+')) {
+            names.push_back(line.substr(2, line.find_first_of(" ,", 2) - 2));
+        }
+    }
+    return names;
+}
+
+bool lists(const std::string& help, std::string_view name) {
+    const std::vector<std::string> names = listed_options(help);
+    return std::ranges::find(names, name) != names.end();
+}
+
+// Terminal columns of the widest line: one per UTF-8 code point.
+size_t widest_line(const std::string& text) {
+    size_t widest = 0;
+    size_t width  = 0;
+    for (const char c : text) {
+        if (c == '\n') {
+            widest = std::max(widest, width);
+            width  = 0;
+        } else if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) {
+            ++width;
+        }
+    }
+    return std::max(widest, width);
+}
+
+// The slang options a command's help lists beside Clotho's own.
+const std::vector<std::string> kCommonSource = {
+    "-f",
+    "-F",
+    "-I",
+    "-D",
+    "-U",
+    "-y",
+    "-Y",
+    "--libmap",
+    "-L",
+    "--top",
+    "-G",
+    "--timescale",
+    "--std",
+    "-j",
+    "-W",
+    "--error-limit",
+    "--color-diagnostics",
+};
+
+// slang options a design can do without: only `--help-all` lists them.
+const std::vector<std::string> kUncommonSource = { "--depfile-trim",
+                                                   "--max-case-analysis-steps",
+                                                   "--isystem",
+                                                   "--diag-json",
+                                                   "-v" };
+
+// The commands this build has. A command a build leaves out (`synth`, `lsp` and
+// `dap` are opt-in) is an unknown command, which exits 2 whatever follows it.
+std::vector<std::string_view> built_commands(const Scratch& s) {
+    std::vector<std::string_view> commands;
+    for (const std::string_view command : { "build", "run", "lint", "synth", "lsp", "dap" }) {
+        if (s.run(std::format("{} --help", command)).code == 0) {
+            commands.push_back(command);
+        }
+    }
+    return commands;
+}
+
 } // namespace cli_test
 
 using namespace cli_test;
 
-TEST_CASE("cli: --help shows the placeholder of every valued gc option") {
+TEST_CASE("cli: --help lists the commands and the options most designs need") {
     const Scratch s;
     const Result  r = s.run("--help");
     CHECK(r.code == 0);
-    CHECK(contains(r.out, "--gc-nursery <bytes>"));
-    CHECK(contains(r.out, "--gc-heap-max <bytes>"));
-    CHECK(contains(r.out, "--gc-full-every <n>"));
+    CHECK(contains(r.out, "Usage: clotho <command> [options] <files>..."));
+    for (const std::string_view command : built_commands(s)) {
+        CAPTURE(command);
+        CHECK(contains(r.out, std::format("\n  {} ", command)));
+    }
+    for (const std::string& name : kCommonSource) {
+        CAPTURE(name);
+        CHECK(lists(r.out, name));
+    }
+    for (const std::string_view name :
+         { "--time", "--allow-system", "--loose-timescale", "-h", "--help-all", "--version" }) {
+        CAPTURE(name);
+        CHECK(lists(r.out, name));
+    }
+    // Command-specific options are one `clotho <command> --help` away, and the
+    // rest of slang's `--help-all`.
+    for (const std::string_view name : { "--emit", "-o", "-O", "--dpi-lib", "--gc-nursery", "--stat" }) {
+        CAPTURE(name);
+        CHECK_FALSE(lists(r.out, name));
+    }
+    for (const std::string& name : kUncommonSource) {
+        CAPTURE(name);
+        CHECK_FALSE(lists(r.out, name));
+    }
+    CHECK(contains(r.out, "clotho --help-all"));
+}
+
+TEST_CASE("cli: <command> --help lists only the options that command takes") {
+    const Scratch s;
+    struct Case {
+        std::string_view              command;
+        std::string_view              usage;
+        std::vector<std::string_view> takes;
+        std::vector<std::string_view> refuses;
+    };
+    const Case cases[] = {
+        { "build",
+          "Usage: clotho build [options] <files>...\n",
+          { "--emit",
+            "-o",
+            "-O",
+            "--stat",
+            "--sanitize",
+            "--coverage",
+            "--gc-stress",
+            "--gc-stats",
+            "--gc-nursery",
+            "--gc-heap-max",
+            "--gc-full-every",
+            "--time",
+            "--allow-system",
+            "--loose-timescale",
+            "-h",
+            "--help-all",
+            "--version" },
+          { "--dpi-lib", "--loose-stale-ref", "--perf-jitdump" } },
+        { "run",
+          "Usage: clotho run [options] <files>... [+plusarg...]\n",
+          { "-O",
+            "--stat",
+            "--sanitize",
+            "--coverage",
+            "--gc-stress",
+            "--gc-stats",
+            "--gc-nursery",
+            "--gc-heap-max",
+            "--gc-full-every",
+            "--time",
+            "--allow-system",
+            "--loose-timescale",
+            "--loose-stale-ref",
+            "--dpi-lib",
+            "--perf-jitdump",
+            "-h",
+            "--help-all",
+            "--version" },
+          { "--emit", "-o" } },
+        { "lint",
+          "Usage: clotho lint [options] <files>...\n",
+          { "--time", "--allow-system", "--loose-timescale", "-h", "--help-all", "--version" },
+          { "--emit",
+            "-o",
+            "-O",
+            "--stat",
+            "--sanitize",
+            "--coverage",
+            "--gc-stress",
+            "--gc-stats",
+            "--gc-nursery",
+            "--gc-heap-max",
+            "--gc-full-every",
+            "--dpi-lib",
+            "--loose-stale-ref",
+            "--perf-jitdump" } },
+    };
+    for (const Case& c : cases) {
+        CAPTURE(c.command);
+        const Result r = s.run(std::format("{} --help", c.command));
+        CHECK(r.code == 0);
+        CHECK(contains(r.out, c.usage));
+        for (const std::string_view name : c.takes) {
+            CAPTURE(name);
+            CHECK(lists(r.out, name));
+        }
+        for (const std::string_view name : c.refuses) {
+            CAPTURE(name);
+            CHECK_FALSE(lists(r.out, name));
+        }
+        for (const std::string& name : kCommonSource) {
+            CAPTURE(name);
+            CHECK(lists(r.out, name));
+        }
+        for (const std::string& name : kUncommonSource) {
+            CAPTURE(name);
+            CHECK_FALSE(lists(r.out, name));
+        }
+        CHECK(contains(r.out, "clotho --help-all"));
+    }
+    // Only `run` takes plusargs, so only its usage line and help say so.
+    CHECK(contains(s.run("run --help").out, "LRM 21.6"));
+    CHECK_FALSE(contains(s.run("build --help").out, "plusarg"));
+}
+
+TEST_CASE("cli: the servers' help lists no source options") {
+    const Scratch s;
+    for (const std::string_view command : built_commands(s)) {
+        if (command != "lsp" && command != "dap") {
+            continue;
+        }
+        CAPTURE(command);
+        const Result r = s.run(std::format("{} --help", command));
+        CHECK(r.code == 0);
+        CHECK(contains(r.out, std::format("Usage: clotho {}\n", command)));
+        CHECK(listed_options(r.out) == std::vector<std::string>{ "-h", "--help-all", "--version" });
+    }
+}
+
+TEST_CASE("cli: --help-all lists every option, tagged with the commands that take it") {
+    const Scratch s;
+    const Result  all = s.run("--help-all");
+    CHECK(all.code == 0);
+    for (const std::string& name : kCommonSource) {
+        CAPTURE(name);
+        CHECK(lists(all.out, name));
+    }
+    for (const std::string& name : kUncommonSource) {
+        CAPTURE(name);
+        CHECK(lists(all.out, name));
+    }
+    // The Verilog-style spellings are listed with the option they alias.
+    CHECK(contains(all.out, "-I, --include-directory, +incdir <dir-pattern>[,...]"));
+    CHECK(contains(all.out, "[build] What to write"));
+    CHECK(contains(all.out, "[build|run] Compile the design more thoroughly"));
+    CHECK(contains(all.out, "[run] Library holding the C functions"));
+    // Whatever a command's own help lists, `--help-all` lists too, and
+    // `--help-all` after a command is the same list.
+    const std::vector<std::string> everything = listed_options(all.out);
+    for (const std::string_view command : built_commands(s)) {
+        CAPTURE(command);
+        for (const std::string& name : listed_options(s.run(std::format("{} --help", command)).out)) {
+            CAPTURE(name);
+            CHECK(std::ranges::find(everything, name) != everything.end());
+        }
+        CHECK(s.run(std::format("{} --help-all", command)).out == all.out);
+    }
+}
+
+TEST_CASE("cli: help is laid out in 100 columns") {
+    const Scratch            s;
+    std::vector<std::string> invocations = { "--help", "--help-all" };
+    for (const std::string_view command : built_commands(s)) {
+        invocations.push_back(std::format("{} --help", command));
+    }
+    for (const std::string& args : invocations) {
+        CAPTURE(args);
+        const Result r = s.run(args);
+        CHECK(r.code == 0);
+        CHECK(widest_line(r.out) <= 100);
+    }
 }
 
 TEST_CASE("cli: --version names the release and the commit it was built from") {
@@ -230,8 +487,8 @@ TEST_CASE("cli: --libmap assigns sources to libraries and -L orders the lookup")
     s.write("la/leaf.sv", "module leaf; initial $display(\"leaf from la\"); endmodule\n");
     s.write("lb/leaf.sv", "module leaf; initial $display(\"leaf from lb\"); endmodule\n");
     const fs::path top = s.write("t.sv", "module t; leaf u(); endmodule\n");
-    const fs::path map = s.write(
-      "lib.map", std::format("library la {0}/la/*.sv;\nlibrary lb {0}/lb/*.sv;\n", s.dir().string()));
+    const fs::path map =
+      s.write("lib.map", std::format("library la {0}/la/*.sv;\nlibrary lb {0}/lb/*.sv;\n", s.dir().string()));
     SUBCASE("the first library listed wins by default") {
         const Result r = s.run(std::format("run --libmap \"{}\" \"{}\"", map.string(), top.string()));
         CHECK(r.code == 0);
