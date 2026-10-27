@@ -8,6 +8,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
@@ -22,7 +23,12 @@
 
 #if !defined(_WIN32)
 
+#include <fcntl.h>
+#include <spawn.h>
 #include <sys/wait.h>
+#include <unistd.h>
+
+extern char** environ;
 
 namespace cli_test {
 
@@ -75,6 +81,54 @@ public:
         Result    r;
         r.code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         r.out  = clotho::test::detail::read_file(out);
+        r.err  = clotho::test::detail::read_file(err);
+        return r;
+    }
+
+    // Like run, but stdout is a pseudo-terminal, so the process sees what it
+    // sees when a person runs it in a shell, and `out` is what it wrote there
+    // (with the terminal's CR LF line endings). stderr is still a file.
+    Result run_on_terminal(std::string_view args) const {
+        const int master = posix_openpt(O_RDWR | O_NOCTTY);
+        REQUIRE(master >= 0);
+        REQUIRE(grantpt(master) == 0);
+        REQUIRE(unlockpt(master) == 0);
+        const char* slave_name = ptsname(master);
+        REQUIRE(slave_name != nullptr);
+        const int slave = open(slave_name, O_RDWR | O_NOCTTY);
+        REQUIRE(slave >= 0);
+
+        const fs::path             err    = path("stderr-terminal.txt");
+        const std::string          cmd    = std::format("\"{}\" {} 2> \"{}\"", CLOTHO_EXE, args, err.string());
+        const char*                argv[] = { "sh", "-c", cmd.c_str(), nullptr };
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_adddup2(&actions, slave, STDOUT_FILENO);
+        posix_spawn_file_actions_addclose(&actions, slave);
+        posix_spawn_file_actions_addclose(&actions, master);
+        pid_t pid = 0;
+        REQUIRE(posix_spawn(&pid, "/bin/sh", &actions, nullptr, const_cast<char* const*>(argv), environ) == 0);
+        posix_spawn_file_actions_destroy(&actions);
+        // With this process's copy closed, the master reads end-of-file (EIO on
+        // Linux) when the child exits, after everything it wrote.
+        close(slave);
+
+        Result r;
+        char   buffer[4096];
+        for (;;) {
+            const ssize_t n = read(master, buffer, sizeof buffer);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0) {
+                break;
+            }
+            r.out.append(buffer, static_cast<size_t>(n));
+        }
+        close(master);
+        int status = 0;
+        REQUIRE(waitpid(pid, &status, 0) == pid);
+        r.code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         r.err  = clotho::test::detail::read_file(err);
         return r;
     }
@@ -586,5 +640,72 @@ TEST_CASE("cli: a source file given where the command goes suggests run") {
         CHECK(r.code == 2);
         CHECK(r.out.empty());
     }
+}
+
+TEST_CASE("cli: build will not write its default output to a terminal") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", kParamDesign);
+    SUBCASE("without -o it is a usage error that says how to get the output") {
+        const Result r = s.run_on_terminal(std::format("build \"{}\"", design.string()));
+        CHECK(r.code == 2);
+        CHECK(r.out.empty());
+        CHECK(contains(r.err, "'build' writes to stdout by default, and stdout is a terminal"));
+        CHECK(contains(r.err, "-o <file>"));
+        CHECK(contains(r.err, "-o -"));
+    }
+    SUBCASE("every target is refused, not only the default") {
+        for (const std::string_view emit : { "llvm", "llvm-raw", "ir" }) {
+            CAPTURE(emit);
+            const Result r = s.run_on_terminal(std::format("build --emit={} \"{}\"", emit, design.string()));
+            CHECK(r.code == 2);
+            CHECK(r.out.empty());
+        }
+    }
+    SUBCASE("-o - asks for the terminal by name") {
+        const Result r = s.run_on_terminal(std::format("build -o - \"{}\"", design.string()));
+        CHECK(r.code == 0);
+        CHECK(contains(r.out, "ModuleID"));
+    }
+    SUBCASE("-o <file> writes the file and leaves the terminal alone") {
+        const fs::path out = s.path("design.ll");
+        const Result   r   = s.run_on_terminal(std::format("build -o \"{}\" \"{}\"", out.string(), design.string()));
+        CHECK(r.code == 0);
+        CHECK(r.out.empty());
+        CHECK(contains(clotho::test::detail::read_file(out), "ModuleID"));
+    }
+    SUBCASE("only build is refused: run and lint still use the terminal") {
+        const Result run = s.run_on_terminal(std::format("run \"{}\"", design.string()));
+        CHECK(run.code == 0);
+        CHECK(contains(run.out, "W=4 S=dflt"));
+        CHECK(s.run_on_terminal(std::format("lint \"{}\"", design.string())).code == 0);
+    }
+}
+
+TEST_CASE("cli: build still writes to a pipe or a file without -o") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", kParamDesign);
+    SUBCASE("a pipe") {
+        const Result r = s.run(std::format("build \"{}\" | cat", design.string()));
+        CHECK(r.code == 0);
+        CHECK(contains(r.out, "ModuleID"));
+    }
+    SUBCASE("a file") {
+        const Result r = s.run(std::format("build \"{}\"", design.string()));
+        CHECK(r.code == 0);
+        CHECK(contains(r.out, "ModuleID"));
+    }
+    SUBCASE("an explicit -o - into a file") {
+        const Result r = s.run(std::format("build -o - \"{}\"", design.string()));
+        CHECK(r.code == 0);
+        CHECK(contains(r.out, "ModuleID"));
+    }
+}
+
+TEST_CASE("cli: build --help explains the terminal rule") {
+    const Scratch s;
+    Result        r = s.run("build --help");
+    // The note is wrapped; compare it as one line.
+    std::ranges::replace(r.out, '\n', ' ');
+    CHECK(contains(r.out, "unless that is a terminal. Pass -o <file> to write a file, or -o - to print it"));
 }
 #endif // !defined(_WIN32)

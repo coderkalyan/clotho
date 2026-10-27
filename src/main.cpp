@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -13,6 +14,12 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <llvm/Support/raw_ostream.h>
 
@@ -138,6 +145,11 @@ constexpr std::string_view kPlusargNote =
   "and $value$plusargs to read while it runs (LRM 21.6). Use '--' to stop that and pass everything "
   "after it through as written.";
 
+// `build` writes to stdout unless given `-o`. See refuses_terminal_artifact.
+constexpr std::string_view kBuildNote =
+  "Without -o the output goes to stdout, unless that is a terminal. Pass -o <file> to write a "
+  "file, or -o - to print it to the terminal anyway.";
+
 // The commands this build has, in the order `--help` lists them. `synth` is
 // compiled out of a Release build, and a usage message that offers a command the
 // binary will then reject is worse than one that never mentions it.
@@ -145,7 +157,8 @@ constexpr CommandInfo kCommands[] = {
     { Command::Build,
       "build",
       "compile the design and write the generated code, without running it",
-      "[options] <files>..." },
+      "[options] <files>...",
+      kBuildNote },
     { Command::Run, "run", "compile the design and simulate it", "[options] <files>... [+plusarg...]", kPlusargNote },
     { Command::Lint,
       "lint",
@@ -526,6 +539,22 @@ std::string suggest_command(std::string_view word) {
         }
     }
     return std::string(best);
+}
+
+bool stdout_is_terminal() {
+#ifdef _WIN32
+    return _isatty(_fileno(stdout)) != 0;
+#else
+    return isatty(STDOUT_FILENO) != 0;
+#endif
+}
+
+// `build` writes its artifact to stdout unless given `-o`, and a terminal is
+// where that is almost always a forgotten `-o`: the generated code is pages of
+// text nobody reads there. So the default is refused on a terminal; an explicit
+// `-o -` still asks for it by name, and a pipe or a file is not a terminal.
+bool refuses_terminal_artifact(Command command, bool out_given, bool stdout_terminal) {
+    return command == Command::Build && !out_given && stdout_terminal;
 }
 
 // A command-specific option used under another command is an error, not a
@@ -996,6 +1025,11 @@ int main(int argc, char** argv) {
     int status = 0;
     if (!check_scope(registry, command, status)) {
         return status;
+    }
+
+    if (refuses_terminal_artifact(command, options.out.has_value(), stdout_is_terminal())) {
+        return usage_error("'build' writes to stdout by default, and stdout is a terminal; pass -o <file> to "
+                           "write a file, or -o - to print it here anyway");
     }
 
     Emit emit = Emit::Llvm;

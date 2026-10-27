@@ -82,7 +82,7 @@ see "One parser".
 | `--no-legalize` | synth (Debug builds only) | Translate as written instead of writing out the implied hardware: no mux trees rebuilt, no implicit branch filled in |
 | `--full-case` | synth (Debug builds only) | Believe `full_case` / `unique`; reported wherever the claim is what removed a latch |
 | `--parallel-case` | synth (Debug builds only) | Believe `parallel_case` / `unique0` |
-| `-o, --output <file>` | build, synth | artifact path for every target; `-` (default) is stdout |
+| `-o, --output <file>` | build, synth | artifact path for every target; `-` is stdout. Without `-o`, `build` writes to stdout, but refuses when stdout is a terminal (see "The artifact and the terminal") |
 | `--time` | build, run, lint, synth | per-phase wall-clock to stderr |
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
 | `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`. `parallel` reports only under `run` |
@@ -192,6 +192,19 @@ coloured. When slang's Driver has already printed a failure (a missing source
 file, a bad option), Clotho does not add a second `bad-command-line` line; an
 invalid `--top` is not followed by `no top-level modules found`. The exit status is
 unchanged.
+
+### The artifact and the terminal
+
+`build` writes to stdout when `-o` is not given, which is right in a pipe or a
+redirect and almost always a forgotten `-o` on a terminal, where the generated code
+is pages of text. So `build` with no `-o` is a usage error (exit 2, before any
+source is read) when stdout is a terminal, and says to pass `-o <file>`, or `-o -`
+to print to the terminal anyway. An explicit `-o -` is honoured everywhere, and
+every `--emit` target is covered, `--emit=ir` included. The decision is the
+command (`build` only: `run` and `lint` write nothing there), whether `-o` was
+given, and `isatty` on stdout (`_isatty` on Windows); `tests/cli_test.cpp` runs the
+real process on a pseudo-terminal to cover it. `synth` keeps stdout as its
+default.
 
 ### Errors, not silent no-ops
 
