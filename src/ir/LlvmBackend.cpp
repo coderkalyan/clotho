@@ -31199,10 +31199,23 @@ private:
 void report_backend_error(const BackendError& e, const LocResolver& resolve) {
     const std::string_view code =
       e.message.starts_with("internal:") ? "internal-error" : "unsupported-construct";
+    SourceText at;
     if (e.span.valid() && resolve) {
-        llvm::errs() << resolve(e.span).where << ": ";
+        at = resolve(e.span);
+        llvm::errs() << at.where << ": ";
     }
     llvm::errs() << "error: " << e.message << " [" << code << "]\n";
+    // The source line and a caret under it, as the frontend's own errors draw them.
+    // The padding keeps the line's tabs, so the caret lines up whatever the
+    // terminal's tab width is.
+    if (!at.line.empty() && at.column >= 1 && at.column <= at.line.size() + 1) {
+        std::string pad;
+        for (uint32_t i = 0; i + 1 < at.column; ++i) {
+            pad += at.line[i] == '\t' ? '\t' : ' ';
+        }
+        const uint32_t width = at.end_column > at.column ? at.end_column - at.column : 1;
+        llvm::errs() << at.line << '\n' << pad << '^' << std::string(width - 1, '~') << '\n';
+    }
 }
 
 // Clamp every access-alignment CLAIM the pointer cannot prove down to the 8

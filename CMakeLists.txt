@@ -657,6 +657,7 @@ set(CLOTHO_TEST_SOURCES
   tests/lsp_test.cpp
   tests/lsp_tokens_test.cpp
   tests/dap_test.cpp
+  tests/diagnostic_render_test.cpp
   tests/cli_test.cpp
   tests/todo_test.cpp
 )

@@ -22,6 +22,10 @@ std::string_view severity_name(Severity s) {
 // Append one item plus its notes. `depth` indents nested notes so a chain of
 // "declared here" follow-ups reads as belonging to its parent.
 void render_one(const Diagnostic& d, const SourceContext* context, unsigned depth, std::string& out) {
+    if (d.reported) {
+        return;
+    }
+
     // The producing engine already formatted this one (slang, with a source
     // snippet and caret). Pass it through rather than producing something worse.
     if (!d.rendered.empty()) {

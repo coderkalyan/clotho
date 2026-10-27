@@ -93,11 +93,25 @@ struct Diagnostic {
     // token, which is materially better than anything worth hand-rolling here, and
     // throwing it away to gain structure would be a bad trade. So slang-origin
     // items carry their pretty text along with the structured fields, and `render`
-    // prefers it. Clotho-origin items leave this empty and `render` formats them.
+    // prefers it. Clotho's own items get the same treatment from the same engine
+    // once lowering finishes, so a refusal shows its source line and caret too;
+    // an item built outside a lowering run leaves this empty and `render` formats
+    // it.
+    //
+    // May hold terminal colour escapes, but only when the run that made it asked
+    // for them (`--color-diagnostics`, or a terminal on stderr, through the
+    // driver). An editor's buffer lowering never does.
     //
     // Consumers doing anything other than printing to a terminal should ignore
     // this field entirely and use the structured fields.
     std::string rendered;
+    // The producing engine already showed this item to the user, in its own words.
+    // The item stays in the list -- it still counts toward `has_error`, so the exit
+    // status is unchanged -- but `render` skips it. Today only the driver notices
+    // that follow a failure slang's Driver printed itself ("error: 'x.sv': No such
+    // file or directory"), which a second line saying "command-line or
+    // source-loading error" would only repeat.
+    bool reported = false;
 };
 
 // Render a list in the compiler-conventional
