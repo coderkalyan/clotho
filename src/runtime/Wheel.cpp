@@ -82,6 +82,30 @@ Timer* WheelImpl::advance() {
     return head;
 }
 
+uint64_t WheelImpl::next_tick() const {
+    // The same order advance() takes: a timer in the wheel window is always
+    // sooner than any overflow deadline.
+    if (const uint64_t k = nearest_offset(); k != 0) {
+        return now_ + k;
+    }
+    if (!overflow_.empty()) {
+        return overflow_.top().deadline;
+    }
+    return never;
+}
+
+void WheelImpl::skip_to(uint64_t tick) {
+    assert(tick >= now_ && tick < next_tick() && "a timer is due before the tick the clock skips to");
+
+    // No timer fires, so every one in a slot stays where schedule() hashed it:
+    // each deadline is above `tick` and below its old now_ + slots, hence below
+    // tick + slots, and the slot of `tick` itself stays empty. Only the overflow
+    // heap can hold timers the wheel window has now reached.
+    now_      = tick;
+    cur_word_ = occupied_ + ((now_ & mask) >> 6);
+    cascade();
+}
+
 void WheelImpl::cascade() {
     // Everything now reachable within one revolution moves out of overflow into
     // its slot. The heap yields the earliest deadlines first.

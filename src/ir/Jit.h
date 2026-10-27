@@ -14,17 +14,19 @@
 
 namespace clotho::ir {
 
-// Build, JIT-compile and execute `main()` for `m` on the host. Returns the i32
-// value `main()` returns (intended as the process exit code). On any setup or
-// compilation failure, writes the reason to llvm::errs() and returns a negative
-// sentinel so the driver can exit non-zero. If `timings` is non-null, the LLVM
-// compile and simulation phase durations are recorded into it. `config` is
-// forwarded to build_modules. `plusargs` are the command-line arguments that
-// followed a leading `+` (LRM §21.6), in source order, with the `+` itself
-// stripped; made available to $test$plusargs / $value$plusargs. `resolve`
-// decodes the source locations a sanitizer bakes into its reports and the one a
-// backend refusal points at (see build_modules); without it they read
-// "<unknown>".
+// Build, JIT-compile and execute `main()` for `m` on the host. Returns the
+// process exit code of the run: 0, unless the run ended in a `$fatal` (1, LRM
+// 20.10) or was interrupted by SIGINT (130). A `$finish` of any level, `$error`,
+// `$warning` and a failed assertion leave it 0. On any setup or compilation
+// failure, writes the reason to llvm::errs() and returns a negative sentinel so
+// the driver can exit non-zero. If `timings` is non-null, the LLVM compile and
+// simulation phase durations are recorded into it. `config` is forwarded to
+// build_modules; `config.stop_time_fs` also ends the run at that simulation time
+// (see rt_stop_time_set). `plusargs` are the command-line arguments that followed
+// a leading `+` (LRM §21.6), in source order, with the `+` itself stripped; made
+// available to $test$plusargs / $value$plusargs. `resolve` decodes the source
+// locations a sanitizer bakes into its reports and the one a backend refusal
+// points at (see build_modules); without it they read "<unknown>".
 int run_jit(const Module& m, Timings* timings = nullptr, const SimulationConfig& config = {},
            std::span<const std::string_view> plusargs = {}, const LocResolver& resolve = {});
 

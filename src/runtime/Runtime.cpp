@@ -18,6 +18,7 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <csetjmp>
+#include <csignal>
 #include <cstddef>
 #include <cmath>
 #include <cstdio>
@@ -39,6 +40,7 @@
 #include <psapi.h>
 #include <io.h>
 #else
+#include <signal.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
@@ -3232,8 +3234,52 @@ extern "C" void rt_wheel_tick(rt_wheel* wheel, void* ctx) {
     unwrap(wheel)->tick(ctx);
 }
 
+namespace {
+
+// Why rt_wheel_advance refused to start the next time step, for rt_sim_run to tell
+// the ways a run ends from outside the design apart.
+enum class Halt : uint8_t { None, StopTime, Interrupt };
+
+Halt g_halt = Halt::None;
+
+// The stop tick of "no stop time armed": a tick no time step can reach.
+constexpr uint64_t kNoStopTick = RuntimeWheel::never;
+
+// The last tick that runs once `--stop-time` has armed one (rt_stop_time_set).
+uint64_t g_stop_tick = kNoStopTick;
+
+// Set by the SIGINT handler rt_sim_run installs and read at the time-step
+// boundary. volatile sig_atomic_t is the one type the language lets a signal
+// handler write.
+volatile std::sig_atomic_t g_interrupt = 0;
+
+} // namespace
+
 extern "C" int rt_wheel_advance(rt_wheel* wheel, void* ctx) {
-    return unwrap(wheel)->advance(ctx) ? 1 : 0;
+    RuntimeWheel& w = *unwrap(wheel);
+    // The boundary between two time steps: the one that just settled is complete
+    // and sampled, and nothing of the next has run. It is the only point a run can
+    // be ended from outside the design without leaving a step half done, so it is
+    // where an interrupt and the stop time are acted on. A run that uses neither
+    // pays two predictable tests per step.
+    if (g_interrupt != 0) [[unlikely]] {
+        g_halt = Halt::Interrupt;
+        return 0;
+    }
+    if (g_stop_tick != kNoStopTick) [[unlikely]] {
+        // Every event at or before the stop tick runs. When the next one is past
+        // it, the run ends at the stop tick itself rather than at the last step
+        // that ran, so the finals and the report read the time the user asked for.
+        // An idle wheel has no next step: the design ended first, and that is
+        // not a stop.
+        const uint64_t next = w.next_tick();
+        if (next != RuntimeWheel::never && next > g_stop_tick) {
+            w.skip_to(g_stop_tick);
+            g_halt = Halt::StopTime;
+            return 0;
+        }
+    }
+    return w.advance(ctx) ? 1 : 0;
 }
 
 namespace {
@@ -4200,23 +4246,59 @@ extern "C" void rt_observed_flush() {
     g_observed_case.clear();
 }
 
+namespace {
+
+// Set by a fatal severity report: rt_sim_run folds it into the exit status.
+bool g_fatal_seen = false;
+
+// ir::Severity::Fatal, the one level that changes how the run ends.
+constexpr int32_t kSeverityFatal = 3;
+
+// The line of one severity report (LRM 20.10), newline included:
+// "<LABEL>: <banner> at <time>[: <message>]". LRM 20.10 requires the report to
+// carry the call's location, the hierarchical name of the scope it is made in and
+// the simulation time; the first two arrive in `banner`, resolved when the design
+// was lowered. The time is the current one, written as the $finish banner writes
+// it. The layout is not LRM-mandated (docs/LRM_NOTES.md, note 28).
+std::string severity_line(int32_t level, const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv) {
+    static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
+    std::string line = labels[level >= 0 && level < 4 ? level : 2];
+    line += ": ";
+    if (banner[0] != '\0') {
+        line += banner;
+        line += ' ';
+    }
+    line += "at ";
+    append_finish_time(line, rt_diag_now());
+    // A bare `$error;` has no message, and a separator with nothing after it
+    // reads as a truncated line.
+    const size_t separator = line.size();
+    line += ": ";
+    render(line, fmt, argc, argv);
+    if (line.size() == separator + 2) {
+        line.resize(separator);
+    }
+    line += '\n';
+    return line;
+}
+
+} // namespace
+
 extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc,
                             const rt_arg* argv) {
     // $info / $warning / $error / $fatal (LRM 20.10) or an immediate-assertion
     // default failure (LRM 16.3). A simulator diagnostic, not design output, so
     // it goes to stderr like the $finish / case-violation banners; flush stdout
     // first so buffered $display text is committed before the report interleaves.
-    // The exact layout is not LRM-mandated (docs/LRM_NOTES.md, note 28); "<LABEL>: <file>:
-    // <line>: <message>" tracks iverilog's first report line.
-    static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
-    const char* const        label    = labels[level < 4 ? level : 2];
     io_ensure_init();
     std::fflush(stdout);
-    std::string line = label;
-    line += ": ";
-    line += banner;
-    render(line, fmt, argc, argv);
-    line += '\n';
+    if (level == kSeverityFatal) {
+        // LRM 20.10: $fatal "terminates the simulation with an error code". The
+        // termination itself is the $finish that follows this report; the code is
+        // the run's exit status.
+        g_fatal_seen = true;
+    }
+    const std::string line = severity_line(level, banner, fmt, argc, argv);
     std::fputs(line.c_str(), stderr);
     std::fflush(stderr);
 }
@@ -5094,7 +5176,7 @@ extern "C" void rt_string_repl_invalid(int64_t count, uint32_t unknown, const rt
 // stale), so the queue never carries a report across time steps.
 namespace {
 struct DeferReport {
-    std::string     line;     // fully rendered "<LABEL>: <banner><message>\n"
+    std::string     line;     // fully rendered report line, newline included
     const uint64_t* gen;      // owning process's generation counter
     uint64_t        gen_val;  // generation at queue time
     bool            is_final; // final (Postponed) vs observed (#0, Observed)
@@ -5105,13 +5187,10 @@ std::vector<DeferReport> g_defer;
 extern "C" void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t gen_val,
                                 const char* banner, const char* fmt, uint32_t argc,
                                 const rt_arg* argv) {
-    static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
     io_ensure_init();
-    std::string line = labels[level >= 0 && level < 4 ? level : 2];
-    line += ": ";
-    line += banner;
-    render(line, fmt, argc, argv);
-    line += '\n';
+    // Rendered, and stamped with the time, now: the arguments are sampled at the
+    // point the assertion executes, and maturation is in the same instant.
+    std::string line = severity_line(level, banner, fmt, argc, argv);
     g_defer.push_back(
       { std::move(line), static_cast<const uint64_t*>(gen), gen_val, is_final != 0 });
 }
@@ -5169,6 +5248,8 @@ void sim_teardown() {
     g_defer.clear();
     rt_nba_arr_reset();
     rt_intra_reset();
+    // A stop time belongs to the run it was armed for.
+    g_stop_tick = kNoStopTick;
     // Functional coverage (LRM 19): drop the model and every instance now that
     // the report is written. The model is emitted as JIT-owned constant data, so
     // holding a pointer to it past the run would dangle the moment the host tears
@@ -5178,26 +5259,153 @@ void sim_teardown() {
     // clotho_test runs thousands.
     rt_cover_shutdown();
 }
+
+void on_sigint(int) {
+    g_interrupt = 1;
+}
+
+// Catches SIGINT for the span of one drain, so that Ctrl-C ends the run at the
+// next time-step boundary (rt_wheel_advance) instead of killing it mid-step with
+// a dump half written. The handler only sets a flag: nothing else a simulator
+// does is async-signal-safe.
+//
+// The handler is one-shot on purpose. A design that never reaches a boundary, a
+// process spinning with no timing control, would otherwise leave Ctrl-C with
+// nothing to do, so the SECOND SIGINT meets the default action and ends the
+// process at once. SA_RESETHAND gives POSIX that; the Windows C runtime resets a
+// signal() handler itself before calling it.
+//
+// The previous disposition comes back when the guard ends, because the JIT also
+// runs inside the test runner and the language server, whose handlers must not
+// be left replaced. A SIGINT that was ignored on entry (a command a
+// non-interactive shell put in the background) stays ignored.
+class InterruptGuard {
+public:
+    InterruptGuard() {
+        g_interrupt = 0;
+#if defined(_WIN32)
+        previous_ = std::signal(SIGINT, on_sigint);
+        if (previous_ == SIG_ERR) {
+            return;
+        }
+        if (previous_ == SIG_IGN) {
+            std::signal(SIGINT, SIG_IGN);
+            return;
+        }
+        installed_ = true;
+#else
+        struct sigaction current = {};
+        if (sigaction(SIGINT, nullptr, &current) != 0 || current.sa_handler == SIG_IGN) {
+            return;
+        }
+        struct sigaction act = {};
+        act.sa_handler       = on_sigint;
+        act.sa_flags         = SA_RESETHAND | SA_RESTART;
+        sigemptyset(&act.sa_mask);
+        installed_ = sigaction(SIGINT, &act, &previous_) == 0;
+#endif
+    }
+
+    ~InterruptGuard() {
+        if (!installed_) {
+            return;
+        }
+#if defined(_WIN32)
+        std::signal(SIGINT, previous_);
+#else
+        sigaction(SIGINT, &previous_, nullptr);
+#endif
+    }
+
+    InterruptGuard(const InterruptGuard&)            = delete;
+    InterruptGuard& operator=(const InterruptGuard&) = delete;
+
+private:
+#if defined(_WIN32)
+    void (*previous_)(int) = SIG_DFL;
+#else
+    struct sigaction previous_ = {};
+#endif
+    bool installed_ = false;
+};
+
+// "clotho: <what> <time>" on stderr: the simulator saying why it stopped, after
+// the design's own buffered output. The time is the one the run stopped at.
+void report_halt(const char* what) {
+    std::fflush(stdout);
+    std::string line = what;
+    append_finish_time(line, rt_diag_now());
+    line += '\n';
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
+}
+
+// The exit status of the last run (rt_run_status).
+int32_t g_run_status = 0;
+
+// The exit status of an interrupted run: 128 + SIGINT, which is what a shell
+// reports for a process that SIGINT killed.
+constexpr int32_t kInterruptedStatus = 130;
 } // namespace
+
+extern "C" void rt_stop_time_set(uint64_t stop_fs, uint64_t tick_fs) {
+    // A unitless design has no tick size to divide by: it counts in
+    // femtoseconds, as rt_timeformat_init does.
+    const uint64_t tick  = tick_fs == 0 ? 1 : tick_fs;
+    // Rounded up: a stop time between two ticks cannot run the step it falls
+    // short of, and stopping a tick early would drop events the user asked for.
+    const uint64_t ticks = stop_fs / tick + (stop_fs % tick != 0 ? 1 : 0);
+    g_stop_tick          = std::min(ticks, kNoStopTick - 1);
+}
+
+extern "C" int32_t rt_run_status(void) {
+    return g_run_status;
+}
 
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
     // Run the simulation, then the `final` blocks (LRM 9.2.3), so the finals see
-    // the settled design state on BOTH exit paths. `drain` now returns normally
-    // whether it ran out of work or a $finish stopped it, so there is one path.
+    // the settled design state on every exit path. `drain` returns normally
+    // whether it ran out of work, a $finish stopped it or the run was ended from
+    // outside the design (rt_wheel_advance), so there is one path; only an
+    // interrupt skips the finals.
     rt_finishing = 0; // a prior run in this process may have set it
+    g_halt       = Halt::None;
+    g_fatal_seen = false;
     // Publish the wheel so a cold diagnostic (an allocation failure) can report
     // the simulation time without every allocating call carrying one.
     g_diag_wheel = static_cast<const rt_wheel*>(wheel);
-    drain(state, wheel);
-    finals(state, wheel);
+    {
+        const InterruptGuard sigint;
+        drain(state, wheel);
+    }
+    // The drain stopped at a time-step boundary, so the design's state is settled
+    // and the dump has every step that ran, whichever way it ended.
+    const Halt halt = g_halt;
+    if (halt == Halt::Interrupt) {
+        // The user asked for the run to end, not for it to wrap up: no finals.
+        report_halt("clotho: interrupted at ");
+    } else {
+        if (halt == Halt::StopTime) {
+            // As a $finish at the stop time would, the finals follow the report.
+            report_halt("clotho: stopped at --stop-time ");
+        }
+        finals(state, wheel);
+    }
     // Functional coverage (LRM 19.9: the database is written "at the end of a
     // simulation run"). Here rather than from a synthesized `final` process
-    // because both exit paths -- natural drain and $finish -- pass through this
-    // one point, and because the report must not be able to observe a design that
-    // a `final` block is still changing. A design with no covergroup writes
-    // nothing: rt_cover_report returns immediately on an empty model.
+    // because every exit path -- natural drain, $finish, interrupt, stop time --
+    // passes through this one point, and because the report must not be able to
+    // observe a design that a `final` block is still changing. A design with no
+    // covergroup writes nothing: rt_cover_report returns immediately on an empty
+    // model. An interrupted run reports what it covered so far.
     rt_cover_report();
+    if (halt != Halt::None) {
+        // The dump is closed by the drain; this is every other open file, which the
+        // process would flush on exit but a host that keeps running would not.
+        std::fflush(nullptr);
+    }
+    g_run_status = halt == Halt::Interrupt ? kInterruptedStatus : (g_fatal_seen ? 1 : 0);
     g_diag_wheel = nullptr;
     sim_teardown();
 }

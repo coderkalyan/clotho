@@ -746,6 +746,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // design keep running (--loose-stale-ref).
     rt_ref_stale_warn(config.loose_stale_ref ? 1 : 0);
 
+    // Arm --stop-time. The runtime ends the run at a time-step boundary, in the
+    // design's ticks, so what crosses is femtoseconds and the tick size to round
+    // up to (see rt_stop_time_set). Cleared by the run it is armed for.
+    if (config.stop_time_fs.has_value()) {
+        rt_stop_time_set(*config.stop_time_fs, m.tick_fs);
+    }
+
     // Simulation phase: run the compiled design. A $finish no longer unwinds
     // anything here — it returns through the design's own frames and the drain
     // loop stops — so this is an ordinary call.
@@ -754,7 +761,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }
-    return rc;
+
+    // The design's main() returns 0 whichever way the run ended; a $fatal (LRM
+    // 20.10) or an interrupt is the runtime's to report.
+    return rc != 0 ? rc : rt_run_status();
 }
 
 } // namespace clotho::ir

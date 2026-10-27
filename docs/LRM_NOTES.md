@@ -245,12 +245,25 @@ Code: `src/Lower.cpp` (`lower_bit_query`). Tests: `tests/sysfunc_test.cpp` ("$bi
 
 ## 28. Severity report layout (20.10)
 
-The LRM fixes the severities but not the text of a report. `$info`, `$warning`,
-`$error`, `$fatal` and the default failure report of an immediate assertion
-(16.3) each write a single line, `<LABEL>: <file>:<line>: <message>`, to stderr after
-flushing stdout.
+The LRM requires a severity report to name the file and line of the call, the
+hierarchical name of the scope the call is made in, and the simulation time, but
+fixes neither their order nor the words around them. `$info`, `$warning`,
+`$error`, `$fatal` and the default failure report of an assertion (16.3, 16.14,
+16.17) each write a single line,
+`<LABEL>: <file>:<line>: <scope> at <time>[: <message>]`, to stderr after
+flushing stdout. `<scope>` is what `%m` prints at the same place: the instance
+path, then the enclosing task, function, named block or assertion label (23.6).
+`<time>` is written as the `$finish` banner writes it, and `: <message>` is left
+out when the call has none. The default failure of an assertion is a `$error`
+made in the assertion's own scope, so a labelled `ap: assert ...` reports
+`top.ap`; iverilog reports `top` for it.
 
-Code: `src/runtime/Runtime.cpp` (`rt_severity`). Tests: `tests/severity_test.cpp` ("severity tasks render label + formatted message to stderr").
+`$fatal` "terminates the simulation with an error code" (20.10): the run ends
+with exit status 1, after its `final` blocks, whatever its finish number.
+`$finish` of any level, `$error`, `$warning` and a failed assertion leave the
+status 0.
+
+Code: `src/runtime/Runtime.cpp` (`severity_line`, `rt_severity`), `src/Lower.cpp` (`severity_banner`). Tests: `tests/severity_test.cpp` ("severity tasks render label + formatted message to stderr", "a labelled immediate assertion's report names the label"), `tests/exit_status_test.cpp` ("exit status: $fatal ends the run with status 1, whatever its finish number").
 
 ## 29. `$system` (20.17.1)
 

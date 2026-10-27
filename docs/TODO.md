@@ -595,8 +595,7 @@ Milestones, in order; lower ones unblock higher ones:
   `$coverage_get_max`; the LRM defines no database format.
 - [ ] **Immediate `cover` hit count** — nothing is counted or reported, and nothing is
   refused.
-- [ ] **`cover property` hit report** — hit counts are kept but never reported, and
-  assertions carry no label to report them under.
+- [ ] **`cover property` hit report** — hit counts are kept but never reported.
 
 ### Foreign interface
 

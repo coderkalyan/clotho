@@ -182,3 +182,99 @@ TEST_CASE("a crowd of timers across wheel and overflow each fire once on time") 
         CHECK(a.fired_at == a.deadline);
     }
 }
+
+TEST_CASE("next_tick names the earliest timer without moving the wheel") {
+    TestWheel w;
+    CHECK(w.next_tick() == TestWheel::never);
+
+    // Only in the overflow heap: more than one revolution out.
+    Awaiter overflow{ .id = 1 };
+    w.schedule(overflow.timer, TestWheel::slots * 3 + 1, &record);
+    CHECK(w.next_tick() == TestWheel::slots * 3 + 1);
+
+    // A timer inside the wheel window is sooner than anything in overflow.
+    Awaiter in_window{ .id = 2 };
+    w.schedule(in_window.timer, 17, &record);
+    CHECK(w.next_tick() == 17);
+    CHECK(w.now() == 0);
+    CHECK_FALSE(in_window.fired);
+}
+
+TEST_CASE("next_tick follows the wheel as it fires timers") {
+    TestWheel w;
+    Context   c{ .wheel = &w };
+    Awaiter   a{ .id = 1 };
+    Awaiter   b{ .id = 2 };
+    w.schedule(a.timer, 4, &record);
+    w.schedule(b.timer, 9, &record);
+
+    CHECK(w.next_tick() == 4);
+    w.tick(c);
+    CHECK(w.next_tick() == 9);
+    w.tick(c);
+    CHECK(w.next_tick() == TestWheel::never);
+}
+
+TEST_CASE("skip_to moves the clock without firing, and later timers still fire on their ticks") {
+    TestWheel w;
+    Context   c{ .wheel = &w };
+    Awaiter   soon{ .id = 1 };
+    Awaiter   later{ .id = 2 };
+    w.schedule(soon.timer, 10, &record);
+    w.schedule(later.timer, 30, &record);
+
+    w.skip_to(7);
+    CHECK(w.now() == 7);
+    CHECK(c.order.empty());
+    CHECK(w.next_tick() == 10);
+
+    // A timer scheduled from the new now() is relative to it.
+    Awaiter fresh{ .id = 3 };
+    w.schedule(fresh.timer, w.now() + 2, &record);
+
+    w.tick(c);
+    CHECK(w.now() == 9);
+    w.tick(c);
+    CHECK(w.now() == 10);
+    w.tick(c);
+    CHECK(w.now() == 30);
+    REQUIRE(c.order.size() == 3);
+    CHECK(c.order[0] == 3);
+    CHECK(c.order[1] == 1);
+    CHECK(c.order[2] == 2);
+    CHECK(fresh.fired_at == 9);
+    CHECK(soon.fired_at == 10);
+    CHECK(later.fired_at == 30);
+}
+
+TEST_CASE("skip_to to the current tick moves nothing") {
+    TestWheel w;
+    Awaiter   a{ .id = 1 };
+    w.schedule(a.timer, 5, &record);
+    w.skip_to(0);
+    CHECK(w.now() == 0);
+    CHECK(w.next_tick() == 5);
+}
+
+TEST_CASE("skip_to brings overflow timers the clock has come within a revolution of into the wheel") {
+    TestWheel      w;
+    Context        c{ .wheel = &w };
+    Awaiter        far{ .id = 1 };
+    const uint64_t deadline = TestWheel::slots * 2 + 5; // overflow: over a revolution out
+    w.schedule(far.timer, deadline, &record);
+
+    // Skipped to within one revolution of it, the deadline is a wheel timer.
+    w.skip_to(TestWheel::slots + 10);
+    CHECK(w.next_tick() == deadline);
+
+    // A closer timer from here fires first, and the far one still fires on its tick.
+    Awaiter near{ .id = 2 };
+    w.schedule(near.timer, w.now() + 3, &record);
+    w.tick(c);
+    CHECK(w.now() == TestWheel::slots + 13);
+    w.tick(c);
+    CHECK(w.now() == deadline);
+    REQUIRE(c.order.size() == 2);
+    CHECK(c.order[0] == 2);
+    CHECK(c.order[1] == 1);
+}

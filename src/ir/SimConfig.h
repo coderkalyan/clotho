@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -229,6 +230,9 @@ struct SimulationConfig {
     // a `build` and the `run` of what it built are given the same file (LRM 19,
     // docs/design/functional-coverage.md).
     std::string coverage_report;
+    // Stop the simulation at this absolute simulation time, in femtoseconds
+    // (`--stop-time`); unset runs until $finish or until no event remains.
+    std::optional<uint64_t> stop_time_fs;
     // Collect at every safepoint (`--gc-stress`). Not a performance mode: it
     // turns a latent missing root into a deterministic failure on the first
     // collection instead of a rare corruption much later, and it is the

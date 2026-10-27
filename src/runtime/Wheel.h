@@ -100,6 +100,16 @@ public:
     // now() advances to the fired tick. The caller fires each returned timer.
     Timer* advance();
 
+    // Tick of the earliest scheduled timer, or `never` when nothing is
+    // scheduled. Moves nothing.
+    static constexpr uint64_t never = ~0ull;
+    uint64_t                  next_tick() const;
+
+    // Move now() forward to `tick` without firing anything. Only legal while no
+    // timer is due at or before `tick`, i.e. now() <= tick < next_tick(): the
+    // run is over and the clock is being set to the instant it ends at.
+    void skip_to(uint64_t tick);
+
 private:
     static constexpr uint64_t mask   = slots - 1;
     static constexpr uint64_t nwords = slots / 64;
@@ -174,6 +184,18 @@ public:
     // True iff nothing is scheduled. See WheelImpl::empty.
     bool empty() const {
         return impl_.empty();
+    }
+
+    // See WheelImpl::next_tick.
+    static constexpr uint64_t never = WheelImpl::never;
+
+    uint64_t next_tick() const {
+        return impl_.next_tick();
+    }
+
+    // See WheelImpl::skip_to.
+    void skip_to(uint64_t tick) {
+        impl_.skip_to(tick);
     }
 
     // Schedule `t` to fire at `deadline` (> now()), invoking on_expire(t, args...).
