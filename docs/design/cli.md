@@ -144,17 +144,32 @@ a `+` command slang gained through `--cmd-rename`.
   `+define` / `+libext` spellings included.
 
 The common source options are slang's `-f`, `-F`, `-I`, `-D`, `-U`, `-y`, `-Y`,
-`--libmap`, `-L`, `--top`, `-G`, `--timescale`, `--std`, `-j`, `-W`,
-`--error-limit` and `--color-diagnostics` (`kCommonSourceOptions`). That list only
-names options: what each takes and says is read from slang's registration, so
-it cannot drift. `CommandLine` can print its options but not enumerate them, so
-the renderer reads them back out of `getHelpText` rather than keeping a second
-list.
+`--libmap`, `-L`, `--top`, `-G`, `--timescale`, `--std`, `-j`, `--error-limit` and
+`--color-diagnostics` (`kCommonSourceOptions`). That list only names options: what
+each takes and says is read from slang's registration, so it cannot drift.
+`CommandLine` can print its options but not enumerate them, so the renderer reads
+them back out of `getHelpText` rather than keeping a second list. `-W` and
+`--diag-json` are left out of the curated lists on purpose: slang registers them
+and Clotho accepts them, but `-W` does not change what is reported for a design
+and nothing writes the JSON, so only `--help-all` shows them until they work.
 
 Listings are laid out for 100 columns. An option's spellings get at most 32
 columns; a longer one puts its description on the next line, and descriptions
 wrap. (slang's own listing pads every description to the longest option name,
 65 columns, and does not wrap.)
+
+### Diagnostics
+
+Design diagnostics, slang's and Clotho's alike (including `[unsupported-construct]`
+refusals), are rendered by one text client configured as the Driver's:
+`--color-diagnostics` forces colour, otherwise colour is used when stderr is a
+colour-capable terminal (slang's detection; `NO_COLOR` is not consulted).
+`--diag-source`, `--diag-column`, `--diag-location`, `--diag-option` and the other
+`--diag-*` options apply to all of them. Diagnostics served to editors are never
+coloured. When slang's Driver has already printed a failure (a missing source
+file, a bad option), Clotho does not add a second `bad-command-line` line; an
+invalid `--top` is not followed by `no top-level modules found`. The exit status is
+unchanged.
 
 ### Errors, not silent no-ops
 

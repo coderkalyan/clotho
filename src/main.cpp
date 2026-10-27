@@ -501,7 +501,9 @@ constexpr size_t kHelpKeyMax = 32;
 // The slang options a command's help lists beside Clotho's own: the ones most
 // designs need, in the order they are listed. `--help-all` lists the rest. This
 // only names options; slang's registration stays the one record of what each
-// takes and says.
+// takes and says. `-W` and `--diag-json` are slang options Clotho accepts without
+// effect (`-W` changes nothing about design diagnostics, nothing writes the JSON),
+// so only `--help-all` shows them until they work.
 constexpr std::string_view kCommonSourceOptions[] = {
     "-f",
     "-F",
@@ -517,7 +519,6 @@ constexpr std::string_view kCommonSourceOptions[] = {
     "--timescale",
     "--std",
     "-j",
-    "-W",
     "--error-limit",
     "--color-diagnostics",
 };

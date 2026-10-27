@@ -151,17 +151,14 @@ const std::vector<std::string> kCommonSource = {
     "--timescale",
     "--std",
     "-j",
-    "-W",
     "--error-limit",
     "--color-diagnostics",
 };
 
 // slang options a design can do without: only `--help-all` lists them.
-const std::vector<std::string> kUncommonSource = { "--depfile-trim",
-                                                   "--max-case-analysis-steps",
-                                                   "--isystem",
-                                                   "--diag-json",
-                                                   "-v" };
+const std::vector<std::string> kUncommonSource = {
+    "--depfile-trim", "--max-case-analysis-steps", "--isystem", "--diag-json", "-v", "-W"
+};
 
 // The commands this build has. A command a build leaves out (`synth`, `lsp` and
 // `dap` are opt-in) is an unknown command, which exits 2 whatever follows it.
