@@ -4202,6 +4202,12 @@ extern "C" void rt_observed_flush() {
 
 namespace {
 
+// Set by a fatal severity report: rt_sim_run folds it into the exit status.
+bool g_fatal_seen = false;
+
+// ir::Severity::Fatal, the one level that changes how the run ends.
+constexpr int32_t kSeverityFatal = 3;
+
 // The line of one severity report (LRM 20.10), newline included:
 // "<LABEL>: <banner> at <time>[: <message>]". LRM 20.10 requires the report to
 // carry the call's location, the hierarchical name of the scope it is made in and
@@ -4240,6 +4246,12 @@ extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, 
     // first so buffered $display text is committed before the report interleaves.
     io_ensure_init();
     std::fflush(stdout);
+    if (level == kSeverityFatal) {
+        // LRM 20.10: $fatal "terminates the simulation with an error code". The
+        // termination itself is the $finish that follows this report; the code is
+        // the run's exit status.
+        g_fatal_seen = true;
+    }
     const std::string line = severity_line(level, banner, fmt, argc, argv);
     std::fputs(line.c_str(), stderr);
     std::fflush(stderr);
@@ -5199,7 +5211,14 @@ void sim_teardown() {
     // clotho_test runs thousands.
     rt_cover_shutdown();
 }
+
+// The exit status of the last run (rt_run_status).
+int32_t g_run_status = 0;
 } // namespace
+
+extern "C" int32_t rt_run_status(void) {
+    return g_run_status;
+}
 
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
@@ -5207,6 +5226,7 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     // the settled design state on BOTH exit paths. `drain` now returns normally
     // whether it ran out of work or a $finish stopped it, so there is one path.
     rt_finishing = 0; // a prior run in this process may have set it
+    g_fatal_seen = false;
     // Publish the wheel so a cold diagnostic (an allocation failure) can report
     // the simulation time without every allocating call carrying one.
     g_diag_wheel = static_cast<const rt_wheel*>(wheel);
@@ -5219,6 +5239,7 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
     // a `final` block is still changing. A design with no covergroup writes
     // nothing: rt_cover_report returns immediately on an empty model.
     rt_cover_report();
+    g_run_status = g_fatal_seen ? 1 : 0;
     g_diag_wheel = nullptr;
     sim_teardown();
 }

@@ -154,7 +154,8 @@ void rt_observed_flush(void);
 //     <LABEL>: <banner> at <time>[: <message>]
 //
 // `level` is the ir::Severity label (0 info, 1 warning, 2 error, 3 fatal); it
-// selects LABEL. `banner` is the compile-time "<file>:<line>: <scope>" prefix:
+// selects LABEL, and a fatal also makes the run end with exit status 1
+// (rt_run_status). `banner` is the compile-time "<file>:<line>: <scope>" prefix:
 // the call's location and the hierarchical name of the scope it is made in, both
 // of which LRM 20.10 requires the report to carry (an empty banner drops the
 // prefix). `<time>` is the simulation time, written as the $finish banner writes
@@ -542,6 +543,12 @@ uint64_t rt_diag_now(void);
 // `final` blocks, LRM 9.2.3). `drain` returns normally whether it ran out of
 // work or a $finish stopped it, so the finals run on both paths.
 void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*), void (*finals)(void*, void*));
+
+// How the last rt_sim_run ended, as the process exit status: 1 after a $fatal
+// (LRM 20.10 "terminates the simulation with an error code"), otherwise 0 -- a
+// $finish of any level, $error, $warning and a failed assertion do not change
+// it. Host-side; read after the run, valid until the next rt_sim_run.
+int32_t rt_run_status(void);
 
 // -- File I/O (LRM 1800-2023 §21.3) --
 //

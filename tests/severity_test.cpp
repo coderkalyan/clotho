@@ -20,6 +20,7 @@ namespace {
 struct Captured {
     std::string out;
     std::string err;
+    int         status = 0;
 };
 
 std::string drain(std::FILE* f) {
@@ -51,7 +52,7 @@ Captured run_capture(std::string_view source) {
     dup2(fileno(out_tmp), fileno(stdout));
     dup2(fileno(err_tmp), fileno(stderr));
 
-    ir::run_jit(*r.module);
+    const int status = ir::run_jit(*r.module);
 
     std::fflush(stdout);
     std::fflush(stderr);
@@ -60,7 +61,7 @@ Captured run_capture(std::string_view source) {
     close(saved_out);
     close(saved_err);
 
-    Captured c{ drain(out_tmp), drain(err_tmp) };
+    Captured c{ drain(out_tmp), drain(err_tmp), status };
     std::fclose(out_tmp);
     std::fclose(err_tmp);
     return c;
@@ -204,6 +205,8 @@ TEST_CASE("$fatal reports then terminates like $finish") {
     CHECK(contains(c.err, "FATAL: source:2: m at 0 s: boom 7\n"));
     // $fatal ends the simulation; the trailing $display never executes.
     CHECK_FALSE(contains(c.out, "unreachable"));
+    // LRM 20.10: it ends it with an error code, which a $finish would not.
+    CHECK(c.status == 1);
 }
 
 TEST_CASE("$fatal finish-number >= 1 also prints the $finish banner") {
@@ -212,6 +215,7 @@ TEST_CASE("$fatal finish-number >= 1 also prints the $finish banner") {
                                    "end endmodule");
     CHECK(contains(c.err, "FATAL: source:2: m at 0 s: stop\n"));
     CHECK(contains(c.err, "$fatal called at"));
+    CHECK(c.status == 1);
 }
 
 // -- Immediate assertions (LRM 16.3): assert / assume --
@@ -243,6 +247,7 @@ TEST_CASE("failing immediate assert with no else emits the default error report"
     // error severity, naming its scope and the time, and non-terminating.
     CHECK(c.err == "ERROR: source:2: m at 0 s: assertion failed\n");
     CHECK(contains(c.out, "after"));
+    CHECK(c.status == 0);
 }
 
 TEST_CASE("assume checks like assert: silent when true, reports when false") {

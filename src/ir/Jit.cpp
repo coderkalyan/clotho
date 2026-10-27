@@ -754,7 +754,10 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }
-    return rc;
+
+    // The design's main() returns 0 whichever way the run ended; a $fatal (LRM
+    // 20.10) or an interrupt is the runtime's to report.
+    return rc != 0 ? rc : rt_run_status();
 }
 
 } // namespace clotho::ir
