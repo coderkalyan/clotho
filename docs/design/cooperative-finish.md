@@ -100,6 +100,32 @@ settled state to hand back.
   and reset the runtime globals. The startup compensations in `emit_active_run`
   move here, where they belong.
 
+## Ending a run from outside the design
+
+A SIGINT (Ctrl-C) ends a run without the design asking for it. It is acted on in
+`rt_wheel_advance`, the one call the drain makes between two time steps. That is
+the only point where the step that just ran is complete (its dump sample is
+taken, no process is mid-body) and the next has not started, so a run ended
+there leaves a dump that stops at a whole step. `rt_wheel_advance` returns zero
+without advancing, the drain reads that as an idle wheel and returns, and
+`rt_sim_run` sees the interrupt (`Halt`): it reports `clotho: interrupted at
+<t>` on stderr and the run's status is 130.
+
+- **The finals do not run.** Ctrl-C asks for the run to end now; wrapping up a
+  design that may be long past its useful state is not what was asked. The
+  coverage report is still written, as a record of what the run reached.
+- **The handler only sets a flag**, and exists only for the span of the drain,
+  so Ctrl-C while compiling keeps its default action. It is one-shot
+  (`SA_RESETHAND`): a process spinning with no timing control never reaches a
+  boundary, and a second Ctrl-C must still end it, which the default
+  disposition does. The previous disposition is restored afterwards because the
+  JIT also runs inside the test runner and the language server. A SIGINT that
+  was ignored on entry, as for a command a non-interactive shell put in the
+  background, stays ignored. `SA_RESTART` keeps a blocked read of stdin from
+  turning into a spurious end of file for the design.
+- **Cost.** A run that is not interrupted pays a load and a predictable branch
+  for each time step, on a path that already crosses into the runtime.
+
 ## Phases
 
 | # | scope | verified by |

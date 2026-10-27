@@ -346,6 +346,10 @@ checkpoint with only minor cleanup.
   `rt_vcd_close` (final flush + drain + fsync + close) hooks there and on the
   normal `wdone` exit. The runtime caches the wheel pointer at `open` so close
   can flush the in-progress instant's `now`.
+- **Ctrl-C.** It ends the run at a time-step boundary (`rt_wheel_advance`),
+  through the same `wdone` exit as a natural end, so the dump is closed after
+  the step that last ran and ends at a whole instant
+  (docs/design/cooperative-finish.md, "Ending a run from outside the design").
 - **Crash handler (not built).** The plan is a SIGSEGV/SIGABRT handler doing an
   async-signal-safe `write()` of any already-formatted queued buffers, then
   re-raising. The unformatted record tail is lost (formatting is not

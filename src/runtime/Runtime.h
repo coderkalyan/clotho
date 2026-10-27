@@ -542,12 +542,18 @@ uint64_t rt_diag_now(void);
 // Drive one simulation: run `drain` (the event loop), then `finals` (the
 // `final` blocks, LRM 9.2.3). `drain` returns normally whether it ran out of
 // work or a $finish stopped it, so the finals run on both paths.
+//
+// SIGINT is caught for exactly the span of the drain and ends it at the next
+// time-step boundary (rt_wheel_advance) WITHOUT running the finals: Ctrl-C asks
+// for the run to end now. The dump and every open file are flushed before this
+// returns, and the way the run ended is rt_run_status.
 void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*), void (*finals)(void*, void*));
 
 // How the last rt_sim_run ended, as the process exit status: 1 after a $fatal
-// (LRM 20.10 "terminates the simulation with an error code"), otherwise 0 -- a
-// $finish of any level, $error, $warning and a failed assertion do not change
-// it. Host-side; read after the run, valid until the next rt_sim_run.
+// (LRM 20.10 "terminates the simulation with an error code"), 130 after SIGINT,
+// otherwise 0 -- a $finish of any level, $error, $warning and a failed
+// assertion do not change it. Host-side; read after the run, valid until the
+// next rt_sim_run.
 int32_t rt_run_status(void);
 
 // -- File I/O (LRM 1800-2023 §21.3) --
@@ -1867,6 +1873,11 @@ void rt_wheel_tick(rt_wheel* wheel, void* ctx);
 // any timer is scheduled and return non-zero, else return zero. Lets the sim loop
 // cross the ABI boundary once per timestep and skips a separate occupancy scan
 // (advance already reports emptiness).
+//
+// This is also where a run ends from outside the design, because the step that
+// just settled is complete (its dump sample is taken) and the next has not
+// started. A pending SIGINT returns zero WITHOUT advancing, which the sim loop
+// reads as an idle wheel; rt_sim_run then tells the ends apart.
 int rt_wheel_advance(rt_wheel* wheel, void* ctx);
 
 // -- Deferred nonblocking intra-assignment stores (LRM 9.4.5) --

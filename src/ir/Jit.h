@@ -16,7 +16,7 @@ namespace clotho::ir {
 
 // Build, JIT-compile and execute `main()` for `m` on the host. Returns the
 // process exit code of the run: 0, unless the run ended in a `$fatal` (1, LRM
-// 20.10). A `$finish` of any level, `$error`, `$warning` and a failed assertion
+// 20.10) or was interrupted by SIGINT (130). A `$finish` of any level, `$error`, `$warning` and a failed assertion
 // leave it 0. On any setup or compilation
 // failure, writes the reason to llvm::errs() and returns a negative sentinel so
 // the driver can exit non-zero. If `timings` is non-null, the LLVM compile and
