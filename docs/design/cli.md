@@ -167,6 +167,13 @@ a `+` command slang gained through `--cmd-rename`.
   command that reads source) and slang's all listed, the Verilog-style `+incdir` /
   `+define` / `+libext` spellings included.
 
+Options for working on Clotho or tuning its internals rather than for simulating
+a design -- `--stat`, `--gc-stress`, `--gc-nursery`, `--gc-heap-max`,
+`--gc-full-every`, `--loose-stale-ref` and `--perf-jitdump` -- are registered with
+`Registry::add_developer`. They parse and are scope-checked like any other
+option, but only `--help-all` lists them, under "Developer options (for working on
+clotho)", so `run --help` stays readable.
+
 The common source options are slang's `-f`, `-F`, `-I`, `-D`, `-U`, `-y`, `-Y`,
 `--libmap`, `-L`, `--top`, `-G`, `--timescale`, `--std`, `-j`, `--error-limit` and
 `--color-diagnostics` (`kCommonSourceOptions`). That list only names options: what
@@ -357,7 +364,9 @@ behaviour change; docs quoting the old spellings were migrated with this commit.
   adding a synonym.
 - Help text and messages say what an option does for the design, never how
   Clotho implements it. The exception is an option that exists only for working
-  on Clotho (`--stat`, `--emit=llvm-raw`, `--perf-jitdump`), which says so.
+  on Clotho (`--stat`, `--emit=llvm-raw`, `--perf-jitdump`), which says so. Such
+  an option, or one that tunes Clotho's internals, is registered with
+  `add_developer`, so only `--help-all` lists it.
 
 `--coverage` is the one carve-out from the `--stat=` rule above, and the line is
 whose result it is. A `Stat` bit is a *compiler* statistic: `--stat` is

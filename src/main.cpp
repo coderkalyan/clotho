@@ -256,6 +256,8 @@ public:
         std::string           name;
         Commands              commands;
         std::function<bool()> given;
+        // For working on clotho or tuning its internals: only `--help-all` lists it.
+        bool developer = false;
     };
 
     explicit Registry(slang::CommandLine& cl)
@@ -269,6 +271,15 @@ public:
         cl_.add(names, value, desc, std::forward<Rest>(rest)...);
         entries_.push_back(
           { std::string(names.substr(0, names.find(','))), commands, [&value] { return is_given(value); } });
+    }
+
+    // An option for working on clotho or tuning its internals rather than for
+    // simulating a design. It parses and is scope-checked like any other; only
+    // `--help-all` lists it, under its own heading.
+    template<typename T, typename... Rest>
+    void add_developer(Commands commands, std::string_view names, T& value, std::string_view desc, Rest&&... rest) {
+        add(commands, names, value, desc, std::forward<Rest>(rest)...);
+        entries_.back().developer = true;
     }
 
     std::span<const Entry> entries() const {
@@ -363,13 +374,13 @@ void register_options(Registry& r, Options& o) {
           slang::CommandLineFlags::FilePath);
     r.add(kSource, "--time", o.time, "Print how long each stage took: reading the source, compiling, simulating");
     r.add(kBuildRun, "-O", o.o3, "Compile the design more thoroughly: slower to start up, faster to simulate");
-    r.add(kBuildRun,
-          "--stat",
-          o.stats,
-          "Print a compiler statistic while building, for working on clotho: dedup, "
-          "dedup-sets, comb-fuse, finish or parallel (repeatable, comma-separated)",
-          "<name>",
-          slang::CommandLineFlags::CommaList);
+    r.add_developer(kBuildRun,
+                    "--stat",
+                    o.stats,
+                    "Print a compiler statistic while building, for working on clotho: dedup, "
+                    "dedup-sets, comb-fuse, finish or parallel (repeatable, comma-separated)",
+                    "<name>",
+                    slang::CommandLineFlags::CommaList);
     r.add(kBuildRun,
           "--sanitize",
           o.sanitizers,
@@ -390,41 +401,41 @@ void register_options(Registry& r, Options& o) {
           "of what it built must be given the same file",
           "<file>",
           slang::CommandLineFlags::FilePath);
-    r.add(kBuildRun,
-          "--gc-stress",
-          o.gc_stress,
-          "Reclaim unused class objects at every opportunity instead of when the "
-          "design has created enough of them. Slow by design: it turns an object Clotho failed "
-          "to keep into an immediate wrong answer rather than a rare one, so it is for working "
-          "on clotho itself. Changes the generated code, so a build and the run of what it "
-          "built must be given the same setting");
+    r.add_developer(kBuildRun,
+                    "--gc-stress",
+                    o.gc_stress,
+                    "Reclaim unused class objects at every opportunity instead of when the "
+                    "design has created enough of them. Slow by design: it turns an object Clotho failed "
+                    "to keep into an immediate wrong answer rather than a rare one, so it is for working "
+                    "on clotho itself. Changes the generated code, so a build and the run of what it "
+                    "built must be given the same setting");
     r.add(kBuildRun,
           "--gc-stats",
           o.gc_stats,
           "Print what reclaiming class objects did when the design exits: how many "
           "times it ran, how much it reclaimed, and how long the design was paused for it");
-    r.add(kBuildRun,
-          "--gc-nursery",
-          o.gc_nursery_bytes,
-          "How many bytes of class objects the design may create between one reclaim "
-          "and the next (default 8388608). A plain number of bytes",
-          "<bytes>");
-    r.add(kBuildRun,
-          "--gc-heap-max",
-          o.gc_heap_bytes_max,
-          "Size in bytes the design's class objects should stay under: reaching it "
-          "asks for a reclaim at the next opportunity, and passing it anyway is reported rather "
-          "than refused, since a design is free to create objects without ever pausing. 0, the "
-          "default, sets no limit",
-          "<bytes>");
-    r.add(kBuildRun,
-          "--gc-full-every",
-          o.gc_full_every,
-          "Reclaim the whole heap on every Nth reclaim instead of only the objects "
-          "created since the last one. Only a whole-heap pass frees objects that have already "
-          "survived a reclaim, so this trades cheap frequent passes against how long those "
-          "linger. 0, the default, lets the runtime decide from how fast the heap is growing",
-          "<n>");
+    r.add_developer(kBuildRun,
+                    "--gc-nursery",
+                    o.gc_nursery_bytes,
+                    "How many bytes of class objects the design may create between one reclaim "
+                    "and the next (default 8388608). A plain number of bytes",
+                    "<bytes>");
+    r.add_developer(kBuildRun,
+                    "--gc-heap-max",
+                    o.gc_heap_bytes_max,
+                    "Size in bytes the design's class objects should stay under: reaching it "
+                    "asks for a reclaim at the next opportunity, and passing it anyway is reported rather "
+                    "than refused, since a design is free to create objects without ever pausing. 0, the "
+                    "default, sets no limit",
+                    "<bytes>");
+    r.add_developer(kBuildRun,
+                    "--gc-full-every",
+                    o.gc_full_every,
+                    "Reclaim the whole heap on every Nth reclaim instead of only the objects "
+                    "created since the last one. Only a whole-heap pass frees objects that have already "
+                    "survived a reclaim, so this trades cheap frequent passes against how long those "
+                    "linger. 0, the default, lets the runtime decide from how fast the heap is growing",
+                    "<n>");
     r.add(kSource,
           "--allow-system",
           o.allow_system,
@@ -445,13 +456,13 @@ void register_options(Registry& r, Options& o) {
           "run ends as if the design had called $finish there: final blocks run and dump files are "
           "flushed. A time finer than the design's time precision is rounded up to the next tick",
           "<time>");
-    r.add(bit(Command::Run),
-          "--loose-stale-ref",
-          o.loose_stale_ref,
-          "Report and keep simulating when a ref argument no longer refers to the variable it "
-          "was bound to, which stops the run by default: growing or reordering an array or queue "
-          "while a ref refers to an element of it leaves that ref on something else entirely, so "
-          "nothing after the first one means anything. For naming every such ref in one run");
+    r.add_developer(bit(Command::Run),
+                    "--loose-stale-ref",
+                    o.loose_stale_ref,
+                    "Report and keep simulating when a ref argument no longer refers to the variable it "
+                    "was bound to, which stops the run by default: growing or reordering an array or queue "
+                    "while a ref refers to an element of it leaves that ref on something else entirely, so "
+                    "nothing after the first one means anything. For naming every such ref in one run");
     r.add(bit(Command::Run),
           "--dpi-lib",
           o.dpi_libs,
@@ -495,11 +506,11 @@ void register_options(Registry& r, Options& o) {
           o.parallel_case,
           "Believe `parallel_case` and `unique0`: the arms are treated as mutually exclusive");
 #endif
-    r.add(bit(Command::Run),
-          "--perf-jitdump",
-          o.perf_jitdump,
-          "Let `perf` see names for the design's compiled code (writes a jitdump under "
-          "$JITDUMPDIR); for profiling clotho");
+    r.add_developer(bit(Command::Run),
+                    "--perf-jitdump",
+                    o.perf_jitdump,
+                    "Let `perf` see names for the design's compiled code (writes a jitdump under "
+                    "$JITDUMPDIR); for profiling clotho");
     r.add(kAny, "-h,--help", o.help, "Show this help and exit");
     r.add(kAny, "--help-all", o.help_all, "Show every option, slang's included, and exit");
     r.add(kAny, "--version", o.version, "Show version information and exit");
@@ -868,14 +879,20 @@ std::string render_help(const Registry&           registry,
 
     const std::vector<HelpOption> options = read_help_options(cmd_line.getHelpText({}));
     HelpSection                   own{ "Options", {} };
+    HelpSection                   developer{ "Developer options (for working on clotho)", {} };
     HelpSection                   source{ "Source options", {} };
     for (const HelpOption& option : options) {
         const Registry::Entry* entry = registry.find(option.names.front());
         if (entry != nullptr) {
+            if (entry->developer && !all) {
+                continue;
+            }
             const bool listed =
               all || (scoped ? (entry->commands & bit(*command)) != 0 : (entry->commands & kSource) == kSource);
             if (listed) {
-                own.rows.push_back({ help_key(option, all), (all ? scope_tag(entry->commands) : "") + option.desc });
+                HelpSection& section = entry->developer ? developer : own;
+                section.rows.push_back(
+                  { help_key(option, all), (all ? scope_tag(entry->commands) : "") + option.desc });
             }
         } else if (all) {
             source.rows.push_back({ help_key(option, true), option.desc });
@@ -890,12 +907,14 @@ std::string render_help(const Registry&           registry,
             }
         }
     }
-    append_sections(out, { own, source });
+    append_sections(out, { own, developer, source });
 
     if (all) {
         append_paragraph(out, kPlusargNote);
     } else if (scoped && reads_source) {
-        append_paragraph(out, "Run 'clotho --help-all' for every option, including the rest of the source options.");
+        append_paragraph(out,
+                         "Run 'clotho --help-all' for every option, including options for working on clotho and "
+                         "the rest of the source options.");
     } else if (!scoped) {
         append_paragraph(out,
                          "Run 'clotho <command> --help' for the options of one command, and 'clotho --help-all' for "
