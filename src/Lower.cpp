@@ -16262,7 +16262,7 @@ private:
         // is its own report -- which is the emission this used to have for every
         // monitor.
         const uint32_t ring = attempt_ring_size(mon);
-        ir::Index      pending_ids;
+        ir::Index      pending_ids = ir::kNoIndex;
         if (ring != 0) {
             pending_ids = zero_mask(ring, b, l);
             for (uint32_t k = 0; k < mon.depth; ++k) {
