@@ -4200,23 +4200,47 @@ extern "C" void rt_observed_flush() {
     g_observed_case.clear();
 }
 
+namespace {
+
+// The line of one severity report (LRM 20.10), newline included:
+// "<LABEL>: <banner> at <time>[: <message>]". LRM 20.10 requires the report to
+// carry the call's location, the hierarchical name of the scope it is made in and
+// the simulation time; the first two arrive in `banner`, resolved when the design
+// was lowered. The time is the current one, written as the $finish banner writes
+// it. The layout is not LRM-mandated (docs/LRM_NOTES.md, note 28).
+std::string severity_line(int32_t level, const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv) {
+    static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
+    std::string line = labels[level >= 0 && level < 4 ? level : 2];
+    line += ": ";
+    if (banner[0] != '\0') {
+        line += banner;
+        line += ' ';
+    }
+    line += "at ";
+    append_finish_time(line, rt_diag_now());
+    // A bare `$error;` has no message, and a separator with nothing after it
+    // reads as a truncated line.
+    const size_t separator = line.size();
+    line += ": ";
+    render(line, fmt, argc, argv);
+    if (line.size() == separator + 2) {
+        line.resize(separator);
+    }
+    line += '\n';
+    return line;
+}
+
+} // namespace
+
 extern "C" void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc,
                             const rt_arg* argv) {
     // $info / $warning / $error / $fatal (LRM 20.10) or an immediate-assertion
     // default failure (LRM 16.3). A simulator diagnostic, not design output, so
     // it goes to stderr like the $finish / case-violation banners; flush stdout
     // first so buffered $display text is committed before the report interleaves.
-    // The exact layout is not LRM-mandated (docs/LRM_NOTES.md, note 28); "<LABEL>: <file>:
-    // <line>: <message>" tracks iverilog's first report line.
-    static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
-    const char* const        label    = labels[level < 4 ? level : 2];
     io_ensure_init();
     std::fflush(stdout);
-    std::string line = label;
-    line += ": ";
-    line += banner;
-    render(line, fmt, argc, argv);
-    line += '\n';
+    const std::string line = severity_line(level, banner, fmt, argc, argv);
     std::fputs(line.c_str(), stderr);
     std::fflush(stderr);
 }
@@ -5094,7 +5118,7 @@ extern "C" void rt_string_repl_invalid(int64_t count, uint32_t unknown, const rt
 // stale), so the queue never carries a report across time steps.
 namespace {
 struct DeferReport {
-    std::string     line;     // fully rendered "<LABEL>: <banner><message>\n"
+    std::string     line;     // fully rendered report line, newline included
     const uint64_t* gen;      // owning process's generation counter
     uint64_t        gen_val;  // generation at queue time
     bool            is_final; // final (Postponed) vs observed (#0, Observed)
@@ -5105,13 +5129,10 @@ std::vector<DeferReport> g_defer;
 extern "C" void rt_defer_report(int32_t level, uint64_t is_final, const void* gen, uint64_t gen_val,
                                 const char* banner, const char* fmt, uint32_t argc,
                                 const rt_arg* argv) {
-    static const char* const labels[] = { "INFO", "WARNING", "ERROR", "FATAL" };
     io_ensure_init();
-    std::string line = labels[level >= 0 && level < 4 ? level : 2];
-    line += ": ";
-    line += banner;
-    render(line, fmt, argc, argv);
-    line += '\n';
+    // Rendered, and stamped with the time, now: the arguments are sampled at the
+    // point the assertion executes, and maturation is in the same instant.
+    std::string line = severity_line(level, banner, fmt, argc, argv);
     g_defer.push_back(
       { std::move(line), static_cast<const uint64_t*>(gen), gen_val, is_final != 0 });
 }

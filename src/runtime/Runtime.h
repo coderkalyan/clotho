@@ -148,17 +148,26 @@ void rt_observed_flush(void);
 
 // Report a severity system task ($info / $warning / $error / $fatal, LRM 20.10)
 // or an immediate-assertion default failure (LRM 16.3). Renders the $display-
-// style message (`fmt` + `argc` `argv`, empty for a bare `$error;`) and writes
-// "<LABEL>: <banner><message>\n" to stderr, then returns — non-fatal. `level` is
-// the ir::Severity label (0 info, 1 warning, 2 error, 3 fatal); it selects the
-// LABEL only. `banner` is the compile-time "<file>:<line>: " prefix. $fatal's
-// termination is a separate rt_finish the caller emits after this report.
+// style message (`fmt` + `argc` `argv`, empty for a bare `$error;`) and writes one
+// line to stderr, then returns:
+//
+//     <LABEL>: <banner> at <time>[: <message>]
+//
+// `level` is the ir::Severity label (0 info, 1 warning, 2 error, 3 fatal); it
+// selects LABEL. `banner` is the compile-time "<file>:<line>: <scope>" prefix:
+// the call's location and the hierarchical name of the scope it is made in, both
+// of which LRM 20.10 requires the report to carry (an empty banner drops the
+// prefix). `<time>` is the simulation time, written as the $finish banner writes
+// it. ": <message>" is left out when the message is empty. $fatal's termination
+// is a separate rt_finish_coop the caller emits after this report.
 void rt_severity(int32_t level, const char* banner, const char* fmt, uint32_t argc, const rt_arg* argv);
 
 // Queue a deferred immediate assertion report (LRM 16.4) for maturation in the
 // Observed (`is_final` == 0) or Postponed (`is_final` != 0) region. The message
 // is rendered now (arguments sampled at the Active-region execution point);
-// `level` is the ir::Severity label, `banner` the "<file>:<line>: " prefix.
+// `level` is the ir::Severity label, `banner` the "<file>:<line>: <scope>" prefix
+// of rt_severity, whose line this queues. The time it carries is the instant the
+// assertion executed, which is the instant it matures in.
 // `gen` is the owning process's generation-counter address and `gen_val` its
 // value at queue time: at maturation the report fires only if `*gen` still
 // equals `gen_val`, i.e. the process has not re-activated (flushed) since.

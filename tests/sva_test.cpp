@@ -223,6 +223,13 @@ TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone"
     // their own. That no INSTRUCTION was added is the digest, which only says so
     // against a number established the way the case above describes -- so if this
     // fires, re-establish it that way rather than pasting the new digest in.
+    //
+    // Re-established once when a severity report began to name its scope: the final
+    // process's default failure carries the assertion's banner, whose bytes are in
+    // the extra table, and the banner now reads "source:4: t.ap" instead of
+    // "source:4: ". Measured the way the case above describes: with the banner put
+    // back to its old text the old digest came back, so the instruction count (18)
+    // and order are untouched and the banner is the whole difference.
     LowerResult       r;
     const ir::Module& m = lower_for_monitor(counted_implication, r);
 
@@ -230,7 +237,7 @@ TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone"
     REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Counted);
     CHECK(monitor_shape(m) ==
           "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.cnt1 sva.0.clk "
-          "step:117:2287638562261415009 final:18:15746842852522268570 ");
+          "step:117:2287638562261415009 final:18:4882243356384050962 ");
 }
 
 TEST_CASE("an overlapping implication differs only in when it seeds") {

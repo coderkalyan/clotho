@@ -2216,7 +2216,7 @@ public:
     ir::Index vif_null_place(const slang::ast::Type& type, ir::Builder& b, ir::SourceLoc l) {
         const std::string banner = banner_at(cur_range_.start());
         b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-                   banner,
+                   severity_banner(cur_range_.start()),
                    "use of a null virtual interface",
                    {},
                    l);
@@ -3089,10 +3089,27 @@ private:
 
     // Compile-time "<file>:<line>: " banner prefix at a source location. The
     // runtime appends the descriptive message and the simulation time (e.g.
-    // rt_finish, rt_severity, the Observed-region case-violation report).
+    // rt_finish, the Observed-region case-violation report). A severity report
+    // takes severity_banner instead, which also names the scope.
     std::string banner_at(slang::SourceLocation sl) const {
         const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
         return std::string(sm->getFileName(sl)) + ":" + std::to_string(sm->getLineNumber(sl)) + ": ";
+    }
+
+    // Compile-time "<file>:<line>: <scope>" banner of a severity report. LRM 20.10
+    // makes the report name where the call is and the hierarchical name of the
+    // scope it is made in; the runtime adds " at <time>: <message>" (rt_severity).
+    // The scope is what `%m` prints at the same place -- the instance, the
+    // enclosing subroutine, and every named block or assertion label around the
+    // call -- and it is as static as `%m` is, so no scope is looked up at run
+    // time.
+    std::string severity_banner(slang::SourceLocation sl) const {
+        const std::string scope  = hier_name();
+        std::string       banner = banner_at(sl);
+        if (scope.empty()) {
+            banner.pop_back(); // a scope-less call keeps no dangling space
+        }
+        return banner + scope;
     }
 
     // Banner for a unique/priority case or if violation, located at the statement.
@@ -10151,7 +10168,19 @@ private:
                 fail("internal: an `expect` as a module item");
             }
             ir::Builder b(module_.pool);
+            // `ap: assert property (...)` is the statement wrapped in a block named
+            // for its label, which unwrap_blocks stepped through, so lower_stmt never
+            // opened it. Open it here: the label is part of the scope the assertion's
+            // report names (LRM 20.10, severity_banner).
+            const Symbol* const label = proc_root_block_;
+            const bool          named = label != nullptr && !label->name.empty();
+            if (named) {
+                named_blocks_.push_back({ &label->as<slang::ast::StatementBlockSymbol>(), kNoBlockLabel });
+            }
             lower_concurrent_assertion(directive, b);
+            if (named) {
+                named_blocks_.pop_back();
+            }
             return;
         }
 
@@ -11053,7 +11082,7 @@ private:
             // generates a run-time error." $error is the located, non-fatal
             // severity the LRM's wording matches.
             b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                       banner_at(s.sourceRange.start()),
+                       severity_banner(s.sourceRange.start()),
                        "wait_order: events triggered out of order", {}, l);
         }
         const ir::ExtraSlice on_fail = b.close_region();
@@ -11850,7 +11879,7 @@ private:
             // missing pass action (or cover) emits nothing.
             if (is_fail) {
                 b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                           banner_at(site),
+                           severity_banner(site),
                            "assertion failed",
                            {},
                            to_source_loc(site),
@@ -11884,7 +11913,8 @@ private:
         std::string            fmt;
         std::vector<ir::Index> args;
         build_format(call->arguments(), fmt, args, b);
-        b.severity(static_cast<uint32_t>(sev), banner_at(call->sourceRange.start()), fmt, args, loc(*call), defer_mode);
+        b.severity(static_cast<uint32_t>(sev), severity_banner(call->sourceRange.start()), fmt, args, loc(*call),
+                   defer_mode);
     }
 
     // Deferred immediate assertion (LRM 16.4): `assert/assume/cover #0` (observed,
@@ -13143,14 +13173,12 @@ private:
         monitor.clock                 = event_signal(event.expr);
         monitor.edge   = event.edge == slang::ast::EdgeKind::PosEdge ? ir::Edge::Positive : ir::Edge::Negative;
         monitor.span   = to_source_span(a.sourceRange);
-        monitor.banner = banner_at(a.sourceRange.start());
+        // A labelled assertion (`ap: assert property ...`) is lowered inside the
+        // block slang makes of its label, so its report names the label as well.
+        monitor.banner = severity_banner(a.sourceRange.start());
         // Not round-tripped through libsva, which has one cover kind: the tally
         // is clotho's own choice and this is where the choice is recorded.
         monitor.cover_matches = cover_matches;
-        // TODO: carry the statement's label (`ap: assert property ...`) so a
-        // report can name the assertion. slang models it as the name of the
-        // enclosing statement-block symbol rather than a field on the
-        // statement, and nothing reads it until the report path lands.
 
         if (kind == ir::AssertionKind::Expect) {
             expect_shape_check(monitor, disable);
@@ -13256,7 +13284,7 @@ private:
         b.open_region();
         const std::string banner = banner_at(a.sourceRange.start());
         b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-                   banner,
+                   severity_banner(a.sourceRange.start()),
                    "an `expect` whose previous attempt is still in flight is not supported",
                    {},
                    l);
@@ -16297,7 +16325,7 @@ private:
                 lower_stmt(*a.ifFalse, b);
             } else {
                 b.severity(static_cast<uint32_t>(ir::Severity::Error),
-                           banner_at(a.sourceRange.start()),
+                           severity_banner(a.sourceRange.start()),
                            "assertion failed",
                            {},
                            loc(a));
@@ -21982,7 +22010,7 @@ private:
     void emit_cast_fatal(const CallExpression& call, ir::Builder& b, ir::SourceLoc l) {
         const std::string banner = banner_at(call.sourceRange.start());
         b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
-                   banner,
+                   severity_banner(call.sourceRange.start()),
                    "$cast: the source is not assignment compatible with the destination",
                    {},
                    l);
@@ -23886,7 +23914,7 @@ private:
     // argument is the $finish verbosity level (a constant 0/1/2), the rest the
     // message; it reports, then terminates via $finish(level).
     void lower_severity_task(const CallExpression& call, std::string_view name, ir::Builder& b) {
-        const std::string banner = banner_at(call.sourceRange.start());
+        const std::string banner = severity_banner(call.sourceRange.start());
         const auto        args   = call.arguments();
         if (name == "$fatal") {
             uint32_t                           level = 1;
@@ -27669,7 +27697,7 @@ private:
         b.open_region();
         {
             const std::string banner = banner_at(sc.sourceRange.start());
-            b.severity(static_cast<uint32_t>(ir::Severity::Fatal), banner,
+            b.severity(static_cast<uint32_t>(ir::Severity::Fatal), severity_banner(sc.sourceRange.start()),
                        "streaming concatenation source is wider than its fixed-size target (LRM 11.4.14)", {},
                        l);
             b.finish(banner + "stream", 1, l);
@@ -31663,7 +31691,7 @@ private:
                e.span);
         const ir::SourceLoc el     = to_source_loc(sub.location);
         const std::string   banner = banner_at(sub.location);
-        b.severity(static_cast<uint32_t>(ir::Severity::Fatal), banner, e.message, {}, el);
+        b.severity(static_cast<uint32_t>(ir::Severity::Fatal), severity_banner(sub.location), e.message, {}, el);
         b.finish(banner + "$fatal", 1, el);
     }
 
@@ -32087,7 +32115,7 @@ private:
                 b.open_region();
                 {
                     const std::string banner = banner_at(nc.sourceRange.start());
-                    b.severity(static_cast<uint32_t>(ir::Severity::Fatal), banner,
+                    b.severity(static_cast<uint32_t>(ir::Severity::Fatal), severity_banner(nc.sourceRange.start()),
                                "mailbox bound is negative (LRM 15.4.1)", {}, l);
                     b.finish(banner + "mailbox", 1, l);
                 }
@@ -32343,7 +32371,8 @@ private:
             // such a class (all of UVM's register layer). Loud per PRINCIPLES.md:
             // report + terminate, never a silent unconstrained draw.
             const std::string banner = banner_at(clt.location);
-            b.severity(static_cast<uint32_t>(ir::Severity::Fatal), banner, rd.unsupported, {}, l);
+            b.severity(static_cast<uint32_t>(ir::Severity::Fatal), severity_banner(clt.location), rd.unsupported, {},
+                       l);
             b.finish(banner + "$fatal", 1, l);
             b.unary(ir::Inst::Tag::Ret, b.constant(module_.pool.put_int(i32, 0), l), l);
             module_.set_function(id,
@@ -33576,7 +33605,8 @@ private:
                     if (const auto rit = class_rand_.find(declaring);
                         rit != class_rand_.end() && !rit->second.unsupported.empty()) {
                         const std::string banner = banner_at(target.sourceRange.start());
-                        b.severity(static_cast<uint32_t>(ir::Severity::Fatal), banner, rit->second.unsupported, {}, l);
+                        b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
+                                   severity_banner(target.sourceRange.start()), rit->second.unsupported, {}, l);
                         b.finish(banner + "$fatal", 1, l);
                         return b.constant(module_.pool.put_int(lower_type(*call.type), 0), l);
                     }
