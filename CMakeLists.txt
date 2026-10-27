@@ -108,6 +108,13 @@ option(CLOTHO_SYNTH "Expose the unfinished `synth` command in the CLI" ${CLOTHO_
 option(CLOTHO_LSP "Build and expose the unfinished `lsp` command (language server)" ${CLOTHO_WIP_DEFAULT})
 option(CLOTHO_DAP "Build and expose the unfinished `dap` command (debug adapter)" ${CLOTHO_WIP_DEFAULT})
 
+# `build`: writes the generated code (LLVM IR, or Clotho's own IR) and no
+# executable, so nothing outside work on Clotho itself consumes it yet. Offered
+# like `synth`: only the CLI wiring is conditional, and the emission paths behind
+# it stay built and tested in every configuration.
+option(CLOTHO_BUILD_COMMAND "Expose the `build` command, which writes generated code rather than an executable"
+       ${CLOTHO_WIP_DEFAULT})
+
 # `--sanitize=xprov`: the flag is parsed and carried in SimulationConfig, but no
 # backend pass reads the bit yet, so it instruments nothing. An operator who
 # reaches for a sanitizer and gets silence is worse served than one told the check
@@ -574,6 +581,9 @@ if(CLOTHO_DAP)
 endif()
 if(CLOTHO_XSAN)
   target_compile_definitions(clotho_cli PRIVATE CLOTHO_XSAN)
+endif()
+if(CLOTHO_BUILD_COMMAND)
+  target_compile_definitions(clotho_cli PRIVATE CLOTHO_BUILD_COMMAND)
 endif()
 
 # `clotho --version`. The release is the project version plus a pre-release

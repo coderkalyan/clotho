@@ -214,8 +214,9 @@ const std::vector<std::string> kUncommonSource = {
     "--depfile-trim", "--max-case-analysis-steps", "--isystem", "--diag-json", "-v", "-W"
 };
 
-// The commands this build has. A command a build leaves out (`synth`, `lsp` and
-// `dap` are opt-in) is an unknown command, which exits 2 whatever follows it.
+// The commands this build has. A command a build leaves out (`build`, `synth`,
+// `lsp` and `dap` are opt-in) is an unknown command, which exits 2 whatever
+// follows it.
 std::vector<std::string_view> built_commands(const Scratch& s) {
     std::vector<std::string_view> commands;
     for (const std::string_view command : { "build", "run", "lint", "synth", "lsp", "dap" }) {
@@ -224,6 +225,17 @@ std::vector<std::string_view> built_commands(const Scratch& s) {
         }
     }
     return commands;
+}
+
+bool has_command(const Scratch& s, std::string_view command) {
+    return s.run(std::format("{} --help", command)).code == 0;
+}
+
+// How a scope error names the commands that take a code-generation option:
+// `build` is opt-in (CLOTHO_BUILD_COMMAND), and a message never names a command
+// the binary lacks.
+std::string build_run_scope(const Scratch& s) {
+    return has_command(s, "build") ? "'build' or 'run'" : "'run'";
 }
 
 } // namespace cli_test
@@ -337,6 +349,9 @@ TEST_CASE("cli: <command> --help lists only the options that command takes") {
     };
     for (const Case& c : cases) {
         CAPTURE(c.command);
+        if (!has_command(s, c.command)) {
+            continue;
+        }
         const Result r = s.run(std::format("{} --help", c.command));
         CHECK(r.code == 0);
         CHECK(contains(r.out, c.usage));
@@ -360,7 +375,7 @@ TEST_CASE("cli: <command> --help lists only the options that command takes") {
     }
     // Only `run` takes plusargs, so only its usage line and help say so.
     CHECK(contains(s.run("run --help").out, "LRM 21.6"));
-    CHECK_FALSE(contains(s.run("build --help").out, "plusarg"));
+    CHECK_FALSE(contains(s.run("lint --help").out, "plusarg"));
 }
 
 TEST_CASE("cli: the servers' help lists no source options") {
@@ -391,8 +406,17 @@ TEST_CASE("cli: --help-all lists every option, tagged with the commands that tak
     }
     // The Verilog-style spellings are listed with the option they alias.
     CHECK(contains(all.out, "-I, --include-directory, +incdir <dir-pattern>[,...]"));
-    CHECK(contains(all.out, "[build] What to write"));
-    CHECK(contains(all.out, "[build|run] Compile the design more thoroughly"));
+    if (has_command(s, "build")) {
+        CHECK(contains(all.out, "[build] What to write"));
+        CHECK(contains(all.out, "[build|run] Compile the design more thoroughly"));
+    } else {
+        // Without `build`, its options are not registered and no tag names it.
+        CHECK_FALSE(lists(all.out, "--emit"));
+        CHECK_FALSE(contains(all.out, "[build"));
+        CHECK_FALSE(contains(all.out, "|build"));
+        CHECK_FALSE(contains(all.out, "a build and the run"));
+        CHECK(contains(all.out, "[run] Compile the design more thoroughly"));
+    }
     CHECK(contains(all.out, "[run] Library holding the C functions"));
     // Options for working on clotho are listed only here, under their own heading,
     // after Clotho's other options and before slang's.
@@ -487,7 +511,7 @@ TEST_CASE("cli: lint refuses every option that steers code generation") {
         CAPTURE(c.flag);
         const Result r = s.run(std::format("lint {} \"{}\"", c.flag, design.string()));
         CHECK(r.code == 2);
-        CHECK(contains(r.err, std::format("{} applies to 'build' or 'run', not 'lint'", c.name)));
+        CHECK(contains(r.err, std::format("{} applies to {}, not 'lint'", c.name, build_run_scope(s))));
     }
 }
 
@@ -505,12 +529,16 @@ TEST_CASE("cli: synth refuses every option that steers code generation") {
         CAPTURE(flag);
         const Result r = s.run(std::format("synth {} \"{}\"", flag, design.string()));
         CHECK(r.code == 2);
-        CHECK(contains(r.err, "applies to 'build' or 'run', not 'synth'"));
+        CHECK(contains(r.err, std::format("applies to {}, not 'synth'", build_run_scope(s))));
     }
 }
 
 TEST_CASE("cli: build refuses the options that only mean something while simulating") {
     const Scratch  s;
+    if (!has_command(s, "build")) {
+        MESSAGE("this build has no build command");
+        return;
+    }
     const fs::path design = s.write("design.sv", kParamDesign);
     for (const std::string_view flag : { "--dpi-lib=x.o", "--perf-jitdump", "--loose-stale-ref" }) {
         CAPTURE(flag);
@@ -523,13 +551,18 @@ TEST_CASE("cli: build refuses the options that only mean something while simulat
 TEST_CASE("cli: build and run accept the code-generation options") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);
+    const bool     has_build = has_command(s, "build");
     SUBCASE("build") {
-        const Result r = s.run(std::format("build -O --sanitize=bounds --stat=dedup \"{}\"", design.string()));
-        CHECK(r.code == 0);
+        if (has_build) {
+            const Result r = s.run(std::format("build -O --sanitize=bounds --stat=dedup \"{}\"", design.string()));
+            CHECK(r.code == 0);
+        }
     }
     SUBCASE("build --emit=ir stops before code generation and takes them without effect") {
-        const Result r = s.run(std::format("build --emit=ir -O --sanitize=bounds \"{}\"", design.string()));
-        CHECK(r.code == 0);
+        if (has_build) {
+            const Result r = s.run(std::format("build --emit=ir -O --sanitize=bounds \"{}\"", design.string()));
+            CHECK(r.code == 0);
+        }
     }
     SUBCASE("run") {
         const Result r = s.run(std::format("run -O --sanitize=bounds --gc-full-every=3 \"{}\"", design.string()));
@@ -706,17 +739,24 @@ TEST_CASE("cli: an unknown command suggests the command it is closest to") {
         { "rnu", "run" },  { "rn", "run" },  { "biuld", "build" },  { "bild", "build" },
         { "lnt", "lint" }, { "Run", "run" }, { "buildd", "build" },
     };
+    const bool has_build = has_command(s, "build");
     for (const Case& c : cases) {
         CAPTURE(c.typed);
         const Result r = s.run(c.typed);
         CHECK(r.code == 2);
-        CHECK(contains(r.err, std::format("unknown command '{}'; did you mean '{}'?", c.typed, c.suggested)));
+        if (c.suggested == "build" && !has_build) {
+            CHECK_FALSE(contains(r.err, "did you mean 'build'"));
+        } else {
+            CHECK(contains(r.err, std::format("unknown command '{}'; did you mean '{}'?", c.typed, c.suggested)));
+        }
         CHECK(contains(r.err, "try 'clotho --help'"));
     }
     SUBCASE("a word near no command gets the list instead") {
         const Result r = s.run("frobnicate");
         CHECK(r.code == 2);
-        CHECK(contains(r.err, "unknown command 'frobnicate'; expected 'build', 'run'"));
+        CHECK(contains(r.err,
+                       has_build ? "unknown command 'frobnicate'; expected 'build', 'run'"
+                                 : "unknown command 'frobnicate'; expected 'run' or 'lint'"));
         CHECK_FALSE(contains(r.err, "did you mean"));
     }
     SUBCASE("a command this build lacks is never suggested") {
@@ -759,6 +799,10 @@ TEST_CASE("cli: a source file given where the command goes suggests run") {
 
 TEST_CASE("cli: build will not write its default output to a terminal") {
     const Scratch  s;
+    if (!has_command(s, "build")) {
+        MESSAGE("this build has no build command");
+        return;
+    }
     const fs::path design = s.write("design.sv", kParamDesign);
     SUBCASE("without -o it is a usage error that says how to get the output") {
         const Result r = s.run_on_terminal(std::format("build \"{}\"", design.string()));
@@ -798,6 +842,10 @@ TEST_CASE("cli: build will not write its default output to a terminal") {
 
 TEST_CASE("cli: build still writes to a pipe or a file without -o") {
     const Scratch  s;
+    if (!has_command(s, "build")) {
+        MESSAGE("this build has no build command");
+        return;
+    }
     const fs::path design = s.write("design.sv", kParamDesign);
     SUBCASE("a pipe") {
         const Result r = s.run(std::format("build \"{}\" | cat", design.string()));
@@ -818,6 +866,10 @@ TEST_CASE("cli: build still writes to a pipe or a file without -o") {
 
 TEST_CASE("cli: build --help explains the terminal rule") {
     const Scratch s;
+    if (!has_command(s, "build")) {
+        MESSAGE("this build has no build command");
+        return;
+    }
     Result        r = s.run("build --help");
     // The note is wrapped; compare it as one line.
     std::ranges::replace(r.out, '\n', ' ');

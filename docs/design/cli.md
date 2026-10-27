@@ -11,7 +11,7 @@ is the rationale and the migration record.
 clotho <command> [options] <source>... [+plusarg...]
 
 commands:
-  build   compile the design and write the requested artifact
+  build   compile the design and write the generated code (CLOTHO_BUILD_COMMAND)
   run     compile the design and simulate it
   lint    analyse the design and report diagnostics, writing nothing
   synth   write the design back out as synthesizable SystemVerilog (Debug builds)
@@ -22,6 +22,16 @@ commands:
 The command names how far down the pipeline the run goes, so the first three
 nest: `lint` is `build` without an artifact, and `run` is `build` plus execution.
 The option sets nest the same way.
+
+`build` writes the generated code -- LLVM IR, or Clotho's own IR -- and no
+executable, so nothing but work on Clotho itself consumes what it writes. Until
+it can write an executable it is opt-in like `synth`: CMake option
+`CLOTHO_BUILD_COMMAND`, on by default for Debug and off otherwise. Off, `build`
+is an unknown command, `--emit` is not registered, `-o` exists only for `synth`,
+and help text that would mention a build (the `--coverage` and `--gc-stress`
+notes on giving a build and its run the same setting) leaves the sentence out.
+Only the CLI wiring is conditional: the emission paths behind `build` are built
+and tested in every configuration, and CI configures with it on.
 
 `synth` branches rather than nests. It shares the front end and stops before the
 LLVM backend entirely -- `clotho_legalize` links no LLVM and no slang, and the
@@ -44,7 +54,8 @@ meant, because leaving out `run` is the likeliest slip:
   `did you mean '<command>'?`, the way slang suggests a mistyped option;
 - otherwise the message lists the commands.
 
-Only commands this build has are candidates (`synth`, `lsp` and `dap` are opt-in).
+Only commands this build has are candidates (`build`, `synth`, `lsp` and `dap` are
+opt-in).
 Every case exits 2.
 
 `lsp` and `dap` are servers, not pipeline stages, and take **no arguments at
@@ -75,7 +86,7 @@ see "One parser".
 
 | option | commands | effect |
 |---|---|---|
-| `--emit <target>` | build | `llvm` (default, post-coroutine-pipeline), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
+| `--emit <target>` | build (`CLOTHO_BUILD_COMMAND`) | `llvm` (default, post-coroutine-pipeline), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
 | `--target <lang>` | synth (Debug builds only) | `sv` (default, IEEE 1800), `2005` (IEEE 1364-2005: `reg`/`wire`, no wildcard equality, no jump statements) |
 | `--hierarchy <mode>` | synth (Debug builds only) | `instances` (default) writes one module per instance with names as written; `flat` writes one module with paths mangled into identifiers |
 | `--sidecar <path>` | synth (Debug builds only) | Also write the JSON sidecar: the original-to-emitted name map, and each signal's inferred storage, clock and reset |

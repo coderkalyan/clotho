@@ -259,10 +259,12 @@ jobs:
             launcher="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           fi
           # ZIG_EXECUTABLE is set only on Windows (the zig install step above).
+          # A release build leaves out `lsp`, `dap` and `build`; CI builds them so
+          # their tests run on every platform.
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
-            -DCLOTHO_LSP=ON -DCLOTHO_DAP=ON \
+            -DCLOTHO_LSP=ON -DCLOTHO_DAP=ON -DCLOTHO_BUILD_COMMAND=ON \
             ${ZIG_EXECUTABLE:+-DZIG_EXECUTABLE=$ZIG_EXECUTABLE} \
             $launcher
 

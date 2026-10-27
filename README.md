@@ -51,14 +51,16 @@ Unfinished features are on in Debug builds and off otherwise: `clotho synth`,
 `clotho lsp` (language server) and `clotho dap` (debug adapter) do not exist in
 a Release build. Turn one on with `-DCLOTHO_SYNTH=ON`, `-DCLOTHO_LSP=ON` or
 `-DCLOTHO_DAP=ON`. The server options also fetch and build glaze, the JSON
-library they use.
+library they use. `clotho build` is off the same way until it can write an
+executable: today it writes generated code (LLVM IR or Clotho's own IR), which
+is only useful when working on Clotho. Turn it on with `-DCLOTHO_BUILD_COMMAND=ON`.
 
 ## Using it
 
 ```
-clotho build   compile the design and write the generated code, without running it
 clotho run     compile the design and simulate it
 clotho lint    check the design and report problems, without compiling or running
+clotho build   write the generated code (Debug builds, or -DCLOTHO_BUILD_COMMAND=ON)
 clotho lsp     language server over stdio (Debug builds, or -DCLOTHO_LSP=ON)
 clotho dap     debug adapter over stdio (Debug builds, or -DCLOTHO_DAP=ON)
 ```
