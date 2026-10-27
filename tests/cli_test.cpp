@@ -289,7 +289,7 @@ TEST_CASE("cli: <command> --help lists only the options that command takes") {
             "-h",
             "--help-all",
             "--version" },
-          { "--dpi-lib", "--loose-stale-ref", "--perf-jitdump" } },
+          { "--stop-time", "--dpi-lib", "--loose-stale-ref", "--perf-jitdump" } },
         { "run",
           "Usage: clotho run [options] <files>... [+plusarg...]\n",
           { "-O",
@@ -304,6 +304,7 @@ TEST_CASE("cli: <command> --help lists only the options that command takes") {
             "--time",
             "--allow-system",
             "--loose-timescale",
+            "--stop-time",
             "--loose-stale-ref",
             "--dpi-lib",
             "--perf-jitdump",
@@ -325,6 +326,7 @@ TEST_CASE("cli: <command> --help lists only the options that command takes") {
             "--gc-nursery",
             "--gc-heap-max",
             "--gc-full-every",
+            "--stop-time",
             "--dpi-lib",
             "--loose-stale-ref",
             "--perf-jitdump" } },
@@ -707,5 +709,63 @@ TEST_CASE("cli: build --help explains the terminal rule") {
     // The note is wrapped; compare it as one line.
     std::ranges::replace(r.out, '\n', ' ');
     CHECK(contains(r.out, "unless that is a terminal. Pass -o <file> to write a file, or -o - to print it"));
+}
+
+TEST_CASE("cli: --stop-time takes an integer and a unit") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", kParamDesign);
+    SUBCASE("every unit, in either spelling of a valued option") {
+        for (const std::string_view time : { "1fs", "1ps", "100ns", "5us", "7ms", "2s", "18446s" }) {
+            CAPTURE(time);
+            const Result r = s.run(std::format("run --stop-time={} \"{}\"", time, design.string()));
+            CHECK(r.code == 0);
+            CHECK(r.out == "W=4 S=dflt\n");
+        }
+        const Result r = s.run(std::format("run --stop-time 100ns \"{}\"", design.string()));
+        CHECK(r.code == 0);
+    }
+    SUBCASE("a malformed time is a usage error before any source is read") {
+        struct Case {
+            std::string_view time;
+            std::string_view message;
+        };
+        const Case cases[] = {
+            { "100", "invalid --stop-time '100': the unit is missing; write e.g. 100ns" },
+            { "100xs", "unknown unit 'xs' (units: fs, ps, ns, us, ms or s)" },
+            { "100NS", "unknown unit 'NS'" },
+            { "1.5ns", "unknown unit '.5ns'" },
+            { "'100 ns'", "unknown unit ' ns'" },
+            { "ns", "write an integer and a unit, e.g. 100ns or 5us" },
+            { "-5ns", "write an integer and a unit" },
+            { "+5ns", "write an integer and a unit" },
+            { "0ns", "invalid --stop-time '0ns': must be greater than zero" },
+            { "0s", "must be greater than zero" },
+            { "18447s", "too large; the longest time is about 18446 s" },
+            { "18446744073709551ns", "too large" },
+            { "99999999999999999999999ns", "too large" },
+        };
+        for (const Case& c : cases) {
+            CAPTURE(c.time);
+            // A design that does not exist: the error must come first.
+            const Result r = s.run(std::format("run --stop-time={} missing.sv", c.time));
+            CHECK(r.code == 2);
+            CHECK(contains(r.err, c.message));
+            CHECK(r.out.empty());
+        }
+    }
+}
+
+TEST_CASE("cli: --stop-time is refused where nothing simulates") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", kParamDesign);
+    for (const std::string_view command : built_commands(s)) {
+        if (command == "run" || command == "lsp" || command == "dap") {
+            continue;
+        }
+        CAPTURE(command);
+        const Result r = s.run(std::format("{} --stop-time=100ns \"{}\"", command, design.string()));
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, std::format("--stop-time applies to 'run', not '{}'", command)));
+    }
 }
 #endif // !defined(_WIN32)

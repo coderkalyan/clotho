@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -316,6 +317,7 @@ struct Options {
     std::optional<std::string> allow_system;
     std::optional<bool>        loose_timescale;
     std::optional<bool>        loose_stale_ref;
+    std::optional<std::string> stop_time;
     std::vector<std::string>   dpi_libs;
     std::optional<bool>        perf_jitdump;
     std::optional<std::string> sidecar;
@@ -436,6 +438,14 @@ void register_options(Registry& r, Options& o) {
           "Accept a design where some parts declare a time scale and others do not, refused by "
           "default: the parts that do not take --timescale's value, or 1ns/1ns when it is not given");
     r.add(bit(Command::Run),
+          "--stop-time",
+          o.stop_time,
+          "Stop the simulation at this simulation time, an integer and a unit with no space between "
+          "(fs, ps, ns, us, ms or s), e.g. 100ns or 5us. Everything at or before that time runs, then the "
+          "run ends as if the design had called $finish there: final blocks run and dump files are "
+          "flushed. A time finer than the design's time precision is rounded up to the next tick",
+          "<time>");
+    r.add(bit(Command::Run),
           "--loose-stale-ref",
           o.loose_stale_ref,
           "Report and keep simulating when a ref argument no longer refers to the variable it "
@@ -555,6 +565,71 @@ bool stdout_is_terminal() {
 // `-o -` still asks for it by name, and a pipe or a file is not a terminal.
 bool refuses_terminal_artifact(Command command, bool out_given, bool stdout_terminal) {
     return command == Command::Build && !out_given && stdout_terminal;
+}
+
+// A unit `--stop-time` accepts, and how many femtoseconds it is.
+struct TimeUnit {
+    std::string_view name;
+    uint64_t         femtoseconds;
+};
+
+constexpr uint64_t kFemtosecondsPerSecond = 1'000'000'000'000'000;
+
+constexpr TimeUnit kTimeUnits[] = {
+    { "fs", 1 },
+    { "ps", 1'000 },
+    { "ns", 1'000'000 },
+    { "us", 1'000'000'000 },
+    { "ms", 1'000'000'000'000 },
+    { "s", kFemtosecondsPerSecond },
+};
+
+// The units as a sentence lists them: "fs, ps, ns, us, ms or s".
+std::string time_unit_list() {
+    std::string text;
+    for (size_t i = 0; i < std::size(kTimeUnits); ++i) {
+        if (i > 0) {
+            text += i + 1 == std::size(kTimeUnits) ? " or " : ", ";
+        }
+        text += kTimeUnits[i].name;
+    }
+    return text;
+}
+
+// `--stop-time`: an integer and a unit with nothing between them, as `100ns` or
+// `5us`, in femtoseconds. Returns false and sets `error` for a missing or unknown
+// unit, a zero time, or one that does not fit in 64 bits of femtoseconds.
+bool parse_stop_time(std::string_view text, uint64_t& femtoseconds, std::string& error) {
+    const auto fail = [&](const std::string& why) {
+        error = std::format("invalid --stop-time '{}': {}", text, why);
+        return false;
+    };
+
+    uint64_t          count = 0;
+    const char* const begin = text.data();
+    const char* const end   = begin + text.size();
+    // Digits only: from_chars takes no sign and no space for an unsigned value.
+    const auto [digits_end, ec] = std::from_chars(begin, end, count);
+    if (digits_end == begin) {
+        return fail(std::format("write an integer and a unit, e.g. 100ns or 5us (units: {})", time_unit_list()));
+    }
+    const std::string_view unit_name(digits_end, end);
+    if (unit_name.empty()) {
+        return fail(std::format("the unit is missing; write e.g. {}ns (units: {})", text, time_unit_list()));
+    }
+    const auto unit = std::ranges::find(kTimeUnits, unit_name, &TimeUnit::name);
+    if (unit == std::end(kTimeUnits)) {
+        return fail(std::format("unknown unit '{}' (units: {})", unit_name, time_unit_list()));
+    }
+    // An out-of-range count is also too large, whatever the unit.
+    if (ec == std::errc::result_out_of_range || count > UINT64_MAX / unit->femtoseconds) {
+        return fail(std::format("too large; the longest time is about {} s", UINT64_MAX / kFemtosecondsPerSecond));
+    }
+    if (count == 0) {
+        return fail("must be greater than zero");
+    }
+    femtoseconds = count * unit->femtoseconds;
+    return true;
 }
 
 // A command-specific option used under another command is an error, not a
@@ -1055,6 +1130,14 @@ int main(int argc, char** argv) {
     // slang's -j/--threads sizes its parser; the same count sizes the LLVM
     // compile pool, so the tool has one thread knob rather than two.
     config.compile_jobs = driver->options.numThreads.value_or(0);
+    if (options.stop_time.has_value()) {
+        uint64_t    femtoseconds = 0;
+        std::string error;
+        if (!parse_stop_time(*options.stop_time, femtoseconds, error)) {
+            return usage_error(error);
+        }
+        config.stop_time_fs = femtoseconds;
+    }
     for (const std::string& name : options.stats) {
         if (name == "dedup") {
             config.stats |= static_cast<uint32_t>(Stat::Dedup);

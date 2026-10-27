@@ -97,6 +97,7 @@ see "One parser".
 | `--loose-timescale` | build, run, lint, synth | accept a design that mixes elements declaring a time scale with elements that do not (slang's `MissingTimeScale`, LRM 3.14.2.2); the un-annotated ones take `--timescale`'s value, or `1ns/1ns`. Refused by default |
 | `-j, --threads <n>` | build, run, lint, synth | slang's own option; sizes its parser **and** the LLVM compile pool |
 | `--dpi-lib <path>` | run | DPI-C `.o`/`.a` (JIT-linked) or `.so` (dlopen'd), repeatable |
+| `--stop-time <time>` | run | stop the simulation at this simulation time: an integer and a unit with nothing between them, `fs`, `ps`, `ns`, `us`, `ms` or `s` (`100ns`, `5us`). A missing or unknown unit, zero, and a time that does not fit in 64 bits of femtoseconds (about 18446 s) are usage errors. See "Stopping a run" |
 | `--perf-jitdump` | run | perf jitdump under `$JITDUMPDIR` |
 | `--loose-stale-ref` | run | report a `ref` whose actual storage was restructured under it (data-model.md §3) once per site and keep simulating, instead of the located fatal. Fatal by default |
 | `-h, --help` / `--help-all` / `--version` | any | help for the command (or for all of them when none is given); every option including all of slang's; versions (`clotho <release> (<git hash>)`, LLVM, slang) |
@@ -227,13 +228,45 @@ them always means something and none of them needs a companion flag.
 
 | code | meaning |
 |---|---|
-| 0 | success |
-| 1 | compile, emission, or JIT-setup failure |
+| 0 | success: includes a run ended by `$finish` of any level or by `--stop-time`, and one that reported `$error`, `$warning` or a failed assertion |
+| 1 | compile, emission or JIT-setup failure; for `run`, also a `$fatal` in the design (LRM 20.10 "terminates the simulation with an error code") |
 | 2 | usage error |
-| other | `run` only: the simulated design's own status |
+| 130 | `run` only: interrupted by Ctrl-C (SIGINT) |
+
+A design can only produce 0, 1 or 130, so there is no "the design's own status"
+row.
 
 `run_jit`'s negative setup sentinel is mapped to 1 rather than returned raw (it
 used to reach the shell as 255).
+
+### Stopping a run
+
+A design that never calls `$finish` and always has another event (a free-running
+clock) simulates forever, so a run has two ways to be ended from outside.
+
+**`--stop-time <time>`** is an absolute simulation time. Every event at or before it
+runs; the run then ends exactly as if `$finish` had been called at the end of that
+time step: `final` blocks run, the dump and open files are flushed,
+`clotho: stopped at --stop-time <time>` goes to stderr, and the status is 0. A time
+finer than the design's time precision rounds up to the next tick, and the message
+reports the rounded time. A design that ends first (`$finish`, or no event left) is
+unchanged and prints nothing. The driver parses the time into
+`SimulationConfig::stop_time_fs`, in femtoseconds, and the runtime implements the
+stop; only `run` takes it, so `build`, `lint` and `synth` refuse it like the other
+run-only options. Zero is refused rather than meaning "no limit" or "stop before
+anything runs"; leaving the option out is how a run is unlimited.
+
+**Ctrl-C.** While a `run` is simulating, SIGINT stops the simulation at the end of
+the current time step. The dump and open files are flushed, `final` blocks do not
+run (the design was interrupted, not finished), `clotho: interrupted at <time>`
+goes to stderr and the status is 130. SIGINT during compilation keeps its default
+action. A second Ctrl-C before the run has stopped (a loop with no delay) ends the
+process at once. A SIGINT that was ignored when clotho started stays ignored.
+
+### Runtime messages
+
+The severity tasks print `<LABEL>: <file>:<line>: <scope> at <time>[: <message>]`,
+where `<scope>` is what `%m` prints at that point.
 
 ### Version
 
