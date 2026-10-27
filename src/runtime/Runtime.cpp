@@ -3238,9 +3238,15 @@ namespace {
 
 // Why rt_wheel_advance refused to start the next time step, for rt_sim_run to tell
 // the ways a run ends from outside the design apart.
-enum class Halt : uint8_t { None, Interrupt };
+enum class Halt : uint8_t { None, StopTime, Interrupt };
 
 Halt g_halt = Halt::None;
+
+// The stop tick of "no stop time armed": a tick no time step can reach.
+constexpr uint64_t kNoStopTick = RuntimeWheel::never;
+
+// The last tick that runs once `--stop-time` has armed one (rt_stop_time_set).
+uint64_t g_stop_tick = kNoStopTick;
 
 // Set by the SIGINT handler rt_sim_run installs and read at the time-step
 // boundary. volatile sig_atomic_t is the one type the language lets a signal
@@ -3250,16 +3256,30 @@ volatile std::sig_atomic_t g_interrupt = 0;
 } // namespace
 
 extern "C" int rt_wheel_advance(rt_wheel* wheel, void* ctx) {
+    RuntimeWheel& w = *unwrap(wheel);
     // The boundary between two time steps: the one that just settled is complete
     // and sampled, and nothing of the next has run. It is the only point a run can
     // be ended from outside the design without leaving a step half done, so it is
-    // where an interrupt is acted on. A run that is not interrupted pays one
-    // predictable test per step.
+    // where an interrupt and the stop time are acted on. A run that uses neither
+    // pays two predictable tests per step.
     if (g_interrupt != 0) [[unlikely]] {
         g_halt = Halt::Interrupt;
         return 0;
     }
-    return unwrap(wheel)->advance(ctx) ? 1 : 0;
+    if (g_stop_tick != kNoStopTick) [[unlikely]] {
+        // Every event at or before the stop tick runs. When the next one is past
+        // it, the run ends at the stop tick itself rather than at the last step
+        // that ran, so the finals and the report read the time the user asked for.
+        // An idle wheel has no next step: the design ended first, and that is
+        // not a stop.
+        const uint64_t next = w.next_tick();
+        if (next != RuntimeWheel::never && next > g_stop_tick) {
+            w.skip_to(g_stop_tick);
+            g_halt = Halt::StopTime;
+            return 0;
+        }
+    }
+    return w.advance(ctx) ? 1 : 0;
 }
 
 namespace {
@@ -5228,6 +5248,8 @@ void sim_teardown() {
     g_defer.clear();
     rt_nba_arr_reset();
     rt_intra_reset();
+    // A stop time belongs to the run it was armed for.
+    g_stop_tick = kNoStopTick;
     // Functional coverage (LRM 19): drop the model and every instance now that
     // the report is written. The model is emitted as JIT-owned constant data, so
     // holding a pointer to it past the run would dangle the moment the host tears
@@ -5326,6 +5348,16 @@ int32_t g_run_status = 0;
 constexpr int32_t kInterruptedStatus = 130;
 } // namespace
 
+extern "C" void rt_stop_time_set(uint64_t stop_fs, uint64_t tick_fs) {
+    // A unitless design has no tick size to divide by: it counts in
+    // femtoseconds, as rt_timeformat_init does.
+    const uint64_t tick  = tick_fs == 0 ? 1 : tick_fs;
+    // Rounded up: a stop time between two ticks cannot run the step it falls
+    // short of, and stopping a tick early would drop events the user asked for.
+    const uint64_t ticks = stop_fs / tick + (stop_fs % tick != 0 ? 1 : 0);
+    g_stop_tick          = std::min(ticks, kNoStopTick - 1);
+}
+
 extern "C" int32_t rt_run_status(void) {
     return g_run_status;
 }
@@ -5354,11 +5386,15 @@ extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*)
         // The user asked for the run to end, not for it to wrap up: no finals.
         report_halt("clotho: interrupted at ");
     } else {
+        if (halt == Halt::StopTime) {
+            // As a $finish at the stop time would, the finals follow the report.
+            report_halt("clotho: stopped at --stop-time ");
+        }
         finals(state, wheel);
     }
     // Functional coverage (LRM 19.9: the database is written "at the end of a
     // simulation run"). Here rather than from a synthesized `final` process
-    // because every exit path -- natural drain, $finish and interrupt --
+    // because every exit path -- natural drain, $finish, interrupt, stop time --
     // passes through this one point, and because the report must not be able to
     // observe a design that a `final` block is still changing. A design with no
     // covergroup writes nothing: rt_cover_report returns immediately on an empty

@@ -541,13 +541,25 @@ uint64_t rt_diag_now(void);
 
 // Drive one simulation: run `drain` (the event loop), then `finals` (the
 // `final` blocks, LRM 9.2.3). `drain` returns normally whether it ran out of
-// work or a $finish stopped it, so the finals run on both paths.
+// work, a $finish stopped it or the stop time was reached, so the finals run on
+// all three paths.
 //
-// SIGINT is caught for exactly the span of the drain and ends it at the next
-// time-step boundary (rt_wheel_advance) WITHOUT running the finals: Ctrl-C asks
-// for the run to end now. The dump and every open file are flushed before this
-// returns, and the way the run ended is rt_run_status.
+// Two things end the drain from outside the design, both at a time-step
+// boundary (rt_wheel_advance): the stop time rt_stop_time_set armed, which ends
+// the run as a $finish at that instant would, and SIGINT, which is caught for
+// exactly the span of the drain and which ends it WITHOUT running the finals.
+// Either way the dump and every open file are flushed before this returns, and
+// the way the run ended is rt_run_status.
 void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*), void (*finals)(void*, void*));
+
+// Stop the next rt_sim_run once every event at or before `stop_fs` femtoseconds
+// has run (`--stop-time`). The design's ticks are `tick_fs` femtoseconds, and a
+// stop time that falls between two of them rounds UP to the next tick. Prints
+// "clotho: stopped at --stop-time <time>" and runs the finals, so the run ends
+// exactly as a $finish at that instant would. Nothing is printed and nothing
+// changes when the design ends first. Host-side (not exposed to the JIT); the
+// setting does not outlive the run it was armed for.
+void rt_stop_time_set(uint64_t stop_fs, uint64_t tick_fs);
 
 // How the last rt_sim_run ended, as the process exit status: 1 after a $fatal
 // (LRM 20.10 "terminates the simulation with an error code"), 130 after SIGINT,
@@ -1876,8 +1888,9 @@ void rt_wheel_tick(rt_wheel* wheel, void* ctx);
 //
 // This is also where a run ends from outside the design, because the step that
 // just settled is complete (its dump sample is taken) and the next has not
-// started. A pending SIGINT returns zero WITHOUT advancing, which the sim loop
-// reads as an idle wheel; rt_sim_run then tells the ends apart.
+// started. A pending SIGINT, or a next step past the stop time rt_stop_time_set
+// armed, returns zero WITHOUT advancing, which the sim loop reads as an idle
+// wheel; rt_sim_run then tells the ends apart.
 int rt_wheel_advance(rt_wheel* wheel, void* ctx);
 
 // -- Deferred nonblocking intra-assignment stores (LRM 9.4.5) --

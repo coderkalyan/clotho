@@ -636,6 +636,7 @@ set(CLOTHO_TEST_SOURCES
   tests/sync_test.cpp
   tests/severity_test.cpp
   tests/exit_status_test.cpp
+  tests/stop_time_test.cpp
   tests/event_test.cpp
   tests/data_model_test.cpp
   tests/dynamic_array_test.cpp
