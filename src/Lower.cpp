@@ -60,6 +60,7 @@
 #include <slang/ast/types/Type.h>
 #include <slang/ast/types/TypePrinter.h>
 #include <slang/diagnostics/AnalysisDiags.h>
+#include <slang/diagnostics/CompilationDiags.h>
 #include <slang/diagnostics/DeclarationsDiags.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/LookupDiags.h>
@@ -35989,6 +35990,11 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         };
         // Issue each diagnostic on its own so the text client's buffer holds
         // exactly one item's pretty rendering (snippet + caret) when we harvest it.
+        // `--top` naming something that is not a module makes slang also report
+        // that the design has no top at all. That is the same mistake said twice,
+        // and the second sentence only buries the one that names the culprit.
+        const bool invalid_top = std::ranges::any_of(
+          diags, [](const slang::Diagnostic& d) { return d.code == slang::diag::InvalidTopModule; });
         // A diagnostic mapped to Ignored produces no report, hence the empty check.
         const auto harvest = [&](const slang::Diagnostic& d) {
             if (wrong_iface_cast_warning(d)) {
@@ -35996,6 +36002,9 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             }
             client->clear();
             engine.issue(d);
+            if (invalid_top && d.code == slang::diag::NoTopModules) {
+                return;
+            }
             if (client->empty()) {
                 return;
             }
@@ -36357,13 +36366,15 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
 
     LowerResult result;
     if (!dr.processOptions()) {
-        // The Driver prints the specific option / missing-file errors itself.
+        // The Driver printed the specific option / missing-file errors itself, so
+        // this notice carries the failure without saying it a second time.
         ctx->adopt_driver(std::move(driver));
         result.sources = ctx;
         result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
                                                  .origin   = DiagnosticOrigin::Driver,
                                                  .code     = "bad-command-line",
-                                                 .message  = "command-line or source-loading error" });
+                                                 .message  = "command-line or source-loading error",
+                                                 .reported = true });
         return result;
     }
 
@@ -36377,7 +36388,8 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
         result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
                                                  .origin   = DiagnosticOrigin::Driver,
                                                  .code     = "parse-failed",
-                                                 .message  = "failed to parse one or more source files" });
+                                                 .message  = "failed to parse one or more source files",
+                                                 .reported = true });
         return result;
     }
 
@@ -36420,7 +36432,8 @@ LowerResult lower_sources(std::span<const std::string_view> args, Timings* timin
         result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
                                                  .origin   = DiagnosticOrigin::Driver,
                                                  .code     = "bad-command-line",
-                                                 .message  = "command-line or source-loading error" });
+                                                 .message  = "command-line or source-loading error",
+                                                 .reported = true });
         return result;
     }
     return lower_driver(std::move(driver), timings, allow_system);
@@ -36505,3 +36518,4 @@ ir::LocResolver loc_resolver(const LowerResult& result) {
 }
 
 } // namespace clotho
+        // Likewise: parseAllSources prints each load error before it fails.

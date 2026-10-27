@@ -206,4 +206,30 @@ TEST_CASE("cli: --libmap assigns sources to libraries and -L orders the lookup")
     }
 }
 
+
+TEST_CASE("cli: a missing source file is reported once") {
+    const Scratch s;
+    const Result  r = s.run("run missing.sv");
+    CHECK(r.code == 1);
+    CHECK(contains(r.err, "error: 'missing.sv': No such file or directory"));
+    CHECK_FALSE(contains(r.err, "bad-command-line"));
+    CHECK_FALSE(contains(r.err, "command-line or source-loading error"));
+
+    SUBCASE("lint keeps the exit status too") {
+        const Result l = s.run("lint missing.sv");
+        CHECK(l.code == 1);
+        CHECK_FALSE(contains(l.err, "bad-command-line"));
+    }
+}
+
+TEST_CASE("cli: an invalid --top is not followed by a missing-top warning") {
+    const Scratch  s;
+    const fs::path design = s.write("two.sv", "module a; endmodule\nmodule b; endmodule\n");
+    const Result   r      = s.run(std::format("run \"{}\" --top c", design.string()));
+    CHECK(r.code == 1);
+    CHECK(contains(r.err, "error: 'c' is not a valid top-level module"));
+    CHECK_FALSE(contains(r.err, "missing-top"));
+    CHECK_FALSE(contains(r.err, "no top-level modules found"));
+}
+
 #endif // !defined(_WIN32)

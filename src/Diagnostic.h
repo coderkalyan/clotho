@@ -98,6 +98,13 @@ struct Diagnostic {
     // Consumers doing anything other than printing to a terminal should ignore
     // this field entirely and use the structured fields.
     std::string rendered;
+    // The producing engine already showed this item to the user, in its own words.
+    // The item stays in the list -- it still counts toward `has_error`, so the exit
+    // status is unchanged -- but `render` skips it. Today only the driver notices
+    // that follow a failure slang's Driver printed itself ("error: 'x.sv': No such
+    // file or directory"), which a second line saying "command-line or
+    // source-loading error" would only repeat.
+    bool reported = false;
 };
 
 // Render a list in the compiler-conventional
