@@ -93,7 +93,14 @@ struct Diagnostic {
     // token, which is materially better than anything worth hand-rolling here, and
     // throwing it away to gain structure would be a bad trade. So slang-origin
     // items carry their pretty text along with the structured fields, and `render`
-    // prefers it. Clotho-origin items leave this empty and `render` formats them.
+    // prefers it. Clotho's own items get the same treatment from the same engine
+    // once lowering finishes, so a refusal shows its source line and caret too;
+    // an item built outside a lowering run leaves this empty and `render` formats
+    // it.
+    //
+    // May hold terminal colour escapes, but only when the run that made it asked
+    // for them (`--color-diagnostics`, or a terminal on stderr, through the
+    // driver). An editor's buffer lowering never does.
     //
     // Consumers doing anything other than printing to a terminal should ignore
     // this field entirely and use the structured fields.

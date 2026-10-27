@@ -206,6 +206,75 @@ TEST_CASE("cli: --libmap assigns sources to libraries and -L orders the lookup")
     }
 }
 
+// A legal construct Clotho refuses (a wait on a fork-captured automatic event),
+// reported at 5:5 as an `unsupported-construct` error and by nothing else.
+constexpr std::string_view kRefusedDesign = R"(module top;
+  task automatic t;
+    event e;
+    fork begin #1 -> e; end join_none
+    wait (e.triggered);
+  endtask
+  initial t();
+endmodule
+)";
+
+constexpr std::string_view kEsc = "\x1b[";
+
+TEST_CASE("cli: a refusal shows its source line and a caret, like a slang error") {
+    const Scratch  s;
+    const fs::path design = s.write("refused.sv", kRefusedDesign);
+    const Result   r      = s.run(std::format("run \"{}\"", design.string()));
+    CHECK(r.code == 1);
+    CHECK(contains(r.err, "refused.sv:5:5: error: wait on the fork-captured automatic 'e'"));
+    CHECK(contains(r.err, "[unsupported-construct]\n    wait (e.triggered);\n    ^"));
+
+    SUBCASE("--diag-source=false leaves the headline alone") {
+        const Result q = s.run(std::format("run --diag-source=false \"{}\"", design.string()));
+        CHECK(q.code == 1);
+        CHECK(contains(q.err, "refused.sv:5:5: error: "));
+        CHECK_FALSE(contains(q.err, "wait (e.triggered);"));
+    }
+    SUBCASE("--diag-column=false drops the column from the location") {
+        const Result q = s.run(std::format("run --diag-column=false \"{}\"", design.string()));
+        CHECK(q.code == 1);
+        CHECK(contains(q.err, "refused.sv:5: error: "));
+        CHECK(contains(q.err, "wait (e.triggered);"));
+    }
+}
+
+TEST_CASE("cli: design diagnostics are coloured only when asked for, on a pipe") {
+    const Scratch  s;
+    const fs::path refused = s.write("refused.sv", kRefusedDesign);
+    const fs::path unused  = s.write("unused.sv", "module top;\n  int unused_var;\nendmodule\n");
+
+    SUBCASE("a slang warning") {
+        const Result plain = s.run(std::format("lint \"{}\"", unused.string()));
+        CHECK(plain.code == 0);
+        CHECK(contains(plain.err, "unused variable 'unused_var'"));
+        CHECK_FALSE(contains(plain.err, kEsc));
+
+        const Result colour = s.run(std::format("lint --color-diagnostics \"{}\"", unused.string()));
+        CHECK(colour.code == 0);
+        CHECK(contains(colour.err, "unused variable 'unused_var'"));
+        CHECK(contains(colour.err, kEsc));
+    }
+    SUBCASE("a refusal, which Clotho raises itself") {
+        const Result plain = s.run(std::format("lint \"{}\"", refused.string()));
+        CHECK(plain.code == 1);
+        CHECK_FALSE(contains(plain.err, kEsc));
+
+        const Result colour = s.run(std::format("lint --color-diagnostics \"{}\"", refused.string()));
+        CHECK(colour.code == 1);
+        CHECK(contains(colour.err, kEsc));
+        // The text under the colour is the plain text, nothing added or lost.
+        CHECK(contains(colour.err, "wait on the fork-captured"));
+        CHECK(contains(colour.err, "wait (e.triggered);"));
+    }
+    SUBCASE("--color-diagnostics=false is not colour either") {
+        const Result off = s.run(std::format("lint --color-diagnostics=false \"{}\"", unused.string()));
+        CHECK_FALSE(contains(off.err, kEsc));
+    }
+}
 
 TEST_CASE("cli: a missing source file is reported once") {
     const Scratch s;

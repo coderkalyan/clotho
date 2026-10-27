@@ -532,9 +532,10 @@ TEST_CASE("$value$plusargs: an integral conversion into a real is rejected") {
 // made in the BACKEND, because only it knows what storage a destination has.
 // That used to render as a bare `llvm backend error: <prose>` with no location
 // and no code: nothing to jump to and nothing to filter on. These pin the
-// repaired shape -- `file:line:col: error: <message> [<code>]`, the same form
-// Diagnostic.cpp's render gives a frontend guard -- and pin it EXACTLY, since
-// the location and the code are the whole point.
+// repaired shape -- `file:line:col: error: <message> [<code>]`, then the source
+// line with a caret under it, the form Diagnostic.cpp's render gives a frontend
+// guard -- and pin it EXACTLY, since the location and the code are the whole
+// point.
 //
 // The plumbing is general: the span is attached by lower_region for whichever
 // instruction tripped the guard, so every refusal made while lowering an
@@ -550,7 +551,9 @@ TEST_CASE("a backend refusal carries a source location and a diagnostic code") {
                                               "    end\n"
                                               "endmodule\n");
         CHECK(err == "source:4:15: error: $value$plusargs %d into a string object is not supported "
-                     "[unsupported-construct]\n");
+                     "[unsupported-construct]\n"
+                     "        void'($value$plusargs(\"X=%d\", s));\n"
+                     "              ^\n");
     }
     SUBCASE("a part-select target") {
         const std::string err = backend_error("module m;\n"
@@ -560,6 +563,8 @@ TEST_CASE("a backend refusal carries a source location and a diagnostic code") {
                                               "    end\n"
                                               "endmodule\n");
         CHECK(err == "source:4:15: error: $value$plusargs into a part-select target is not supported "
-                     "[unsupported-construct]\n");
+                     "[unsupported-construct]\n"
+                     "        void'($value$plusargs(\"X=%d\", v[7:0]));\n"
+                     "              ^\n");
     }
 }

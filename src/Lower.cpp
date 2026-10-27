@@ -35920,11 +35920,16 @@ void check_spawn_roots(const ir::Module& m, std::vector<Diagnostic>& out) {
     }
 }
 
-LowerResult lower_compilation(slang::ast::Compilation&       comp,
-                              std::shared_ptr<SourceContext> ctx,
-                              Timings*                       timings,
-                              ir::SystemAccess               allow_system,
-                              bool                           partial = false) {
+// The body of lower_compilation. `diag_engine` is null exactly when the
+// compilation has no source manager. Otherwise `client` is attached to it and
+// renders each slang item.
+LowerResult lower_design(slang::ast::Compilation&                            comp,
+                         std::shared_ptr<SourceContext>                      ctx,
+                         slang::DiagnosticEngine*                            diag_engine,
+                         const std::shared_ptr<slang::TextDiagnosticClient>& client,
+                         Timings*                                            timings,
+                         ir::SystemAccess                                    allow_system,
+                         bool                                                partial) {
     LowerResult result;
     // Attached first so EVERY return path below carries it: `sources` is documented
     // as never null, and there are a dozen early returns.
@@ -35937,7 +35942,6 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     // design hierarchy. Both are slang work.
     const auto                  t_fe      = std::chrono::steady_clock::now();
     const slang::Diagnostics&   diags     = comp.getAllDiagnostics();
-    const slang::SourceManager* sm        = comp.getSourceManager();
     bool                        has_error = false;
     // The analysis pass runs inside the diagnostics block below, but one thing it
     // produces -- the LRM 16.14.6 clock inference verdicts -- is read much later,
@@ -35955,10 +35959,8 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     IfaceIds iface_ids;
     // Design-wide virtual interface registry, shared by every Lowerer below.
     VifDefs vif_defs;
-    if (sm != nullptr) {
-        slang::DiagnosticEngine engine(*sm);
-        auto                    client = std::make_shared<slang::TextDiagnosticClient>();
-        engine.addClient(client);
+    if (diag_engine != nullptr) {
+        slang::DiagnosticEngine& engine = *diag_engine;
         apply_severity_policy(engine, DiagnosticPolicy::Sim, partial);
         // slang's "$cast will always fail" warning is WRONG in the presence of
         // interface classes. Its condition is "both are class types and neither is
@@ -35988,23 +35990,23 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
             }
             return false;
         };
-        // Issue each diagnostic on its own so the text client's buffer holds
-        // exactly one item's pretty rendering (snippet + caret) when we harvest it.
         // `--top` naming something that is not a module makes slang also report
         // that the design has no top at all. That is the same mistake said twice,
         // and the second sentence only buries the one that names the culprit.
         const bool invalid_top = std::ranges::any_of(
           diags, [](const slang::Diagnostic& d) { return d.code == slang::diag::InvalidTopModule; });
+        // Issue each diagnostic on its own so the text client's buffer holds
+        // exactly one item's pretty rendering (snippet + caret) when we harvest it.
         // A diagnostic mapped to Ignored produces no report, hence the empty check.
         const auto harvest = [&](const slang::Diagnostic& d) {
             if (wrong_iface_cast_warning(d)) {
                 return;
             }
-            client->clear();
-            engine.issue(d);
             if (invalid_top && d.code == slang::diag::NoTopModules) {
                 return;
             }
+            client->clear();
+            engine.issue(d);
             if (client->empty()) {
                 return;
             }
@@ -36310,6 +36312,147 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
     return result;
 }
 
+// How the frontend's text client is configured for one run. A default style is
+// what an editor or a test wants: plain text, every field on.
+struct DiagStyle {
+    // The client that renders every item; null makes a plain one. It must be
+    // fresh: slang binds a client to one engine for good, and the Driver's own
+    // client already belongs to the Driver's engine.
+    std::shared_ptr<slang::TextDiagnosticClient> client;
+    // Whether a Clotho item names its code, as slang names a warning's option
+    // (`--diag-option`).
+    bool show_code = true;
+};
+
+// Whether the Driver's text client colours what it formats. The decision is
+// slang's (`--color-diagnostics`, else a terminal on stderr), made inside the
+// Driver and held in a client that cannot be asked, so ask by formatting one
+// item and looking for an escape.
+bool driver_colours(slang::TextDiagnosticClient& driver_client) {
+    const slang::Diagnostic   original(slang::DiagCode{}, slang::SourceLocation::NoLocation);
+    slang::ReportedDiagnostic probe(original);
+    probe.location         = slang::SourceLocation::NoLocation;
+    probe.formattedMessage = "probe";
+    probe.severity         = slang::DiagnosticSeverity::Error;
+    driver_client.clear();
+    driver_client.report(probe);
+    const bool coloured = driver_client.getString().contains("\x1b[");
+    driver_client.clear();
+
+    return coloured;
+}
+
+// A client set up as the Driver's is: colour, then every `--diag-*` option, with
+// slang's own defaults where the option is unset. Mirrors what
+// slang::driver::Driver::processOptions applies to its client.
+DiagStyle style_of(slang::driver::Driver& dr) {
+    const slang::driver::Driver::Options& o = dr.options;
+
+    DiagStyle style;
+    style.client = std::make_shared<slang::TextDiagnosticClient>();
+    slang::TextDiagnosticClient& c = *style.client;
+    c.showColors(driver_colours(*dr.textDiagClient));
+    c.showColumn(o.diagColumn.value_or(true));
+    c.setColumnUnit(o.diagColumnUnit.value_or(slang::ColumnUnit::Display));
+    c.showLocation(o.diagLocation.value_or(true));
+    c.showSourceLine(o.diagSourceLine.value_or(true));
+    c.showOptionName(o.diagOptionName.value_or(true));
+    c.showIncludeStack(o.diagIncludeStack.value_or(true));
+    c.showMacroExpansion(o.diagMacroExpansion.value_or(true));
+    c.showAbsPaths(o.diagAbsPaths.value_or(false));
+    c.showHierarchyInstance(o.diagHierarchy.value_or(slang::ShowHierarchyPathOption::Auto));
+    style.show_code = o.diagOptionName.value_or(true);
+
+    return style;
+}
+
+slang::DiagnosticSeverity to_slang_severity(Severity s) {
+    switch (s) {
+        case Severity::Note:
+            return slang::DiagnosticSeverity::Note;
+        case Severity::Warning:
+            return slang::DiagnosticSeverity::Warning;
+        case Severity::Error:
+            return slang::DiagnosticSeverity::Error;
+    }
+
+    return slang::DiagnosticSeverity::Error;
+}
+
+// Render one Clotho-origin item, then its notes, through the same text client
+// slang's own items use, so a refusal gets the same location, source line and
+// caret, and the same colour and `--diag-*` settings, as a slang error.
+void render_through_client(const Diagnostic&           d,
+                           const slang::SourceManager& sm,
+                           slang::TextDiagnosticClient& client,
+                           bool                         show_code,
+                           std::string&                 out) {
+    std::string message = d.message;
+    if (show_code && !d.code.empty()) {
+        message += " [" + d.code + "]";
+    }
+    // A location inside a macro expansion has no line of its own; slang's text
+    // client wants the spelling site, as its engine passes for its own items.
+    slang::SourceLocation          at = slang::SourceLocation::NoLocation;
+    std::vector<slang::SourceRange> ranges;
+    if (d.span.valid()) {
+        at = sm.getFullyOriginalLoc(to_slang_location(d.span.start));
+        // The IR span's end is SourceLoc{0} for a bare point; a one-character
+        // range would underline nothing the caret does not already show.
+        if (d.span.end != ir::SourceLoc{ 0 } && d.span.end != d.span.start) {
+            const slang::SourceLocation end = sm.getFullyOriginalLoc(to_slang_location(d.span.end));
+            if (end.buffer() == at.buffer() && end.offset() > at.offset()) {
+                ranges.emplace_back(at, end);
+            }
+        }
+    }
+
+    const slang::Diagnostic     original(slang::DiagCode{}, at);
+    slang::ReportedDiagnostic   reported(original);
+    reported.location         = at;
+    reported.ranges           = ranges;
+    reported.formattedMessage = message;
+    reported.severity         = to_slang_severity(d.severity);
+    client.clear();
+    client.report(reported);
+    out += client.getString();
+    client.clear();
+
+    for (const Diagnostic& note : d.notes) {
+        render_through_client(note, sm, client, show_code, out);
+    }
+}
+
+LowerResult lower_compilation(slang::ast::Compilation&       comp,
+                              std::shared_ptr<SourceContext> ctx,
+                              Timings*                       timings,
+                              ir::SystemAccess               allow_system,
+                              bool                           partial = false,
+                              DiagStyle                      style   = {}) {
+    const slang::SourceManager* const sm = comp.getSourceManager();
+    if (sm == nullptr) {
+        return lower_design(comp, std::move(ctx), nullptr, nullptr, timings, allow_system, partial);
+    }
+
+    slang::DiagnosticEngine engine(*sm);
+    if (style.client == nullptr) {
+        style.client = std::make_shared<slang::TextDiagnosticClient>();
+    }
+    engine.addClient(style.client);
+    LowerResult result = lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial);
+
+    // slang's own items arrive rendered (lower_design harvests them one by one).
+    // What is left is Clotho's: lowering guards, post-lowering checks and the
+    // driver notices. Items the driver already printed are not rendered again.
+    for (Diagnostic& d : result.diagnostics) {
+        if (d.rendered.empty() && !d.reported) {
+            render_through_client(d, *sm, *style.client, style.show_code, d.rendered);
+        }
+    }
+
+    return result;
+}
+
 } // namespace
 
 LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings, ir::SystemAccess allow_system) {
@@ -36383,6 +36526,7 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
     // parseAllSources, which is where the SourceLoader consumes it.
     dr.options.singleUnit = true;
     if (!dr.parseAllSources()) {
+        // Likewise: parseAllSources prints each load error before it fails.
         ctx->adopt_driver(std::move(driver));
         result.sources = ctx;
         result.diagnostics.push_back(Diagnostic{ .severity = Severity::Error,
@@ -36404,13 +36548,20 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(cr, std::move(ctx), timings, allow_system);
+    // The design's diagnostics are rendered the way the Driver renders its own, so
+    // colour and `--diag-source`, `--diag-column`, `--diag-location`, ... apply to
+    // them alike.
+    return lower_compilation(cr, std::move(ctx), timings, allow_system, /*partial=*/false, style_of(dr));
 }
 
 LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings, ir::SystemAccess allow_system) {
     auto                   driver = std::make_unique<slang::driver::Driver>();
     slang::driver::Driver& dr     = *driver;
     dr.addStandardArgs();
+    // The Driver colours when stderr is a terminal. This entry point takes plain
+    // argument lists (tests, tools) and must give plain text unless the list asks
+    // for colour with `--color-diagnostics`, which parseCommandLine applies after.
+    dr.textDiagClient->showColors(false);
 
     // Driver's parseCommandLine treats argv[0] as the program name and needs
     // null-terminated C strings; copy the views and prepend a placeholder.
@@ -36518,4 +36669,3 @@ ir::LocResolver loc_resolver(const LowerResult& result) {
 }
 
 } // namespace clotho
-        // Likewise: parseAllSources prints each load error before it fails.
