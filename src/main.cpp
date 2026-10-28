@@ -319,6 +319,7 @@ enum class Emit : uint8_t {
     Ir,      // Clotho process IR
     Llvm,    // LLVM IR after the coroutine-lowering pipeline (the default)
     LlvmRaw, // LLVM IR straight from the backend, llvm.coro.* intact
+    Obj,     // a native object file for this machine
 };
 
 // Clotho's own options, as slang CommandLine targets: unset optional means "not
@@ -378,8 +379,10 @@ void register_options(Registry& r, Options& o) {
     r.add(bit(Command::Build),
           "--emit",
           o.emit,
-          "What to write: llvm (LLVM IR for the design, the default), ir (Clotho's own "
-          "intermediate form), llvm-raw (LLVM IR before the coroutine passes; for working on clotho)",
+          "What to write: llvm (LLVM IR for the design, the default), obj (an object file for this "
+          "machine, which defines clotho_main for linking against Clotho's runtime library), ir "
+          "(Clotho's own intermediate form), llvm-raw (LLVM IR before the coroutine passes; for "
+          "working on clotho)",
           "<target>");
 #endif
 #if defined(CLOTHO_BUILD_COMMAND) || defined(CLOTHO_SYNTH)
@@ -1003,6 +1006,25 @@ bool write_artifact(const clotho::LowerResult& result,
         clotho::ir::print_module(*result.module, os, resolve);
         return true;
     }
+    if (emit == Emit::Obj) {
+        auto target = clotho::ir::host_target();
+        if (!target) {
+            std::println(stderr, "clotho: cannot detect this machine's target: {}",
+                         llvm::toString(target.takeError()));
+            return false;
+        }
+        if (to_stdout) {
+            return clotho::ir::emit_object(*result.module, llvm::outs(), std::move(*target), config,
+                                           timings, resolve);
+        }
+        std::error_code      ec;
+        llvm::raw_fd_ostream os(out, ec);
+        if (ec) {
+            std::println(stderr, "clotho: cannot open '{}': {}", out, ec.message());
+            return false;
+        }
+        return clotho::ir::emit_object(*result.module, os, std::move(*target), config, timings, resolve);
+    }
     if (to_stdout) {
         return clotho::ir::emit_llvm(*result.module, llvm::outs(), config, timings, resolve);
     }
@@ -1152,10 +1174,13 @@ int main(int argc, char** argv) {
             emit = Emit::Llvm;
         } else if (target == "llvm-raw") {
             emit = Emit::LlvmRaw;
+        } else if (target == "obj") {
+            emit = Emit::Obj;
         } else if (target == "ir") {
             emit = Emit::Ir;
         } else {
-            return usage_error(std::format("unknown --emit target '{}'; expected llvm, llvm-raw or ir", target));
+            return usage_error(
+              std::format("unknown --emit target '{}'; expected llvm, obj, ir or llvm-raw", target));
         }
     }
 

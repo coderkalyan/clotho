@@ -86,4 +86,15 @@ bool optimize_module(llvm::Module& m, bool o3);
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config = {},
                Timings* timings = nullptr, const LocResolver& resolve = {});
 
+// Compile the design for `target` and write it to `os` as one relocatable
+// object file. The object defines `clotho_main`, the entry rt_run takes, and
+// every runtime symbol it references is left undefined, for a link against
+// clotho_runtime. Per-definition units are linked back into the root module
+// first, so the object holds exactly the code `run` would compile. Code
+// generation uses `config.o3` as run_jit does, and position-independent code so
+// the object links into a PIE. Returns false with the reason on llvm::errs().
+bool emit_object(const Module& m, llvm::raw_ostream& os, llvm::orc::JITTargetMachineBuilder target,
+                 const SimulationConfig& config = {}, Timings* timings = nullptr,
+                 const LocResolver& resolve = {});
+
 } // namespace clotho::ir

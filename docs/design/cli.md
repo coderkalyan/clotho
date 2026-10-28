@@ -23,9 +23,11 @@ The command names how far down the pipeline the run goes, so the first three
 nest: `lint` is `build` without an artifact, and `run` is `build` plus execution.
 The option sets nest the same way.
 
-`build` writes the generated code -- LLVM IR, or Clotho's own IR -- and no
-executable, so nothing but work on Clotho itself consumes what it writes. Until
-it can write an executable it is opt-in like `synth`: CMake option
+`build` writes the generated code -- LLVM IR, Clotho's own IR, or a native
+object file -- and no executable. The object defines `clotho_main` and needs a
+`main` of the user's own that calls the runtime's `rt_run` and a link against
+`clotho_runtime`, so nothing but work on Clotho itself consumes what it writes
+yet. Until it can write an executable it is opt-in like `synth`: CMake option
 `CLOTHO_BUILD_COMMAND`, on by default for Debug and off otherwise. Off, `build`
 is an unknown command, `--emit` is not registered, `-o` exists only for `synth`,
 and help text that would mention a build (the `--coverage` and `--gc-stress`
@@ -86,7 +88,7 @@ see "One parser".
 
 | option | commands | effect |
 |---|---|---|
-| `--emit <target>` | build (`CLOTHO_BUILD_COMMAND`) | `llvm` (default, post-coroutine-pipeline), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
+| `--emit <target>` | build (`CLOTHO_BUILD_COMMAND`) | `llvm` (default, post-coroutine-pipeline), `obj` (a relocatable object for this machine: the definition units linked back into one module, position-independent, defining `clotho_main`), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
 | `--target <lang>` | synth (Debug builds only) | `sv` (default, IEEE 1800), `2005` (IEEE 1364-2005: `reg`/`wire`, no wildcard equality, no jump statements) |
 | `--hierarchy <mode>` | synth (Debug builds only) | `instances` (default) writes one module per instance with names as written; `flat` writes one module with paths mangled into identifiers |
 | `--sidecar <path>` | synth (Debug builds only) | Also write the JSON sidecar: the original-to-emitted name map, and each signal's inferred storage, clock and reset |
@@ -391,8 +393,9 @@ compiled with.
 
 ## Out of scope
 
-- `--emit=obj` and a per-definition object cache (module-split.md): needs
-  TargetMachine emission and a cache-key design, not a CLI change.
+- A per-definition object cache (module-split.md): `--emit=obj` writes one
+  object for the whole design; caching needs a cache-key design, not a CLI
+  change.
 - `--x=` / `--x-init=` (x-semantics.md S3): semantics work; the convention above
   fixes only their spelling.
 - A `--vcd <file>` override: `$dumpfile` covers it, and the runtime default

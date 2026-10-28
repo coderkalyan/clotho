@@ -149,7 +149,8 @@ endif()
 if(TARGET LLVM)
   set(LLVM_LIBS LLVM)
 else()
-  llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native bitwriter bitreader)
+  llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native bitwriter bitreader
+                                  linker)
 endif()
 
 # slang declares fmt with `FIND_PACKAGE_ARGS 12.1`, so FetchContent silently
@@ -769,3 +770,23 @@ foreach(column IN ITEMS "bare element" "fixed unpacked array" "unpacked struct m
   add_test(NAME data_model_matrix_${name}
            COMMAND clotho_test --duration=true "-tc=data model matrix: ${column}")
 endforeach()
+
+# An object from `build --emit obj`, linked by this build's own toolchain against
+# clotho_runtime and run: the object is only useful if every platform's linker
+# takes it, which no in-process test can show. The design prints its line only
+# when its own checks pass, so the output is the whole verdict.
+if(CLOTHO_BUILD_COMMAND)
+  set(aot_object "${CMAKE_CURRENT_BINARY_DIR}/aot_design${CMAKE_CXX_OUTPUT_EXTENSION}")
+  add_custom_command(
+    OUTPUT "${aot_object}"
+    COMMAND clotho_cli build --emit obj -o "${aot_object}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/aot/design.sv"
+    DEPENDS clotho_cli tests/aot/design.sv
+    VERBATIM)
+  set_source_files_properties("${aot_object}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  add_executable(clotho_aot_test tests/aot/main.cpp "${aot_object}")
+  target_link_libraries(clotho_aot_test PRIVATE clotho_runtime)
+  add_test(NAME aot COMMAND clotho_aot_test +n=12345)
+  set_tests_properties(aot PROPERTIES PASS_REGULAR_EXPRESSION
+                                      "aot: ok 12345 000006e3924924924924924924924924")
+endif()

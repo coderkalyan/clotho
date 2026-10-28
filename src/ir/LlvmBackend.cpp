@@ -29,11 +29,13 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/ModuleSlotTracker.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -31426,6 +31428,49 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
     for (const auto& mod : built.modules) {
         mod->print(os, nullptr);
     }
+    if (timings != nullptr) {
+        timings->llvm_ms += ms_since(t_llvm);
+    }
+    return true;
+}
+
+bool emit_object(const Module& m, llvm::raw_ostream& os, llvm::orc::JITTargetMachineBuilder target,
+                 const SimulationConfig& config, Timings* timings, const LocResolver& resolve) {
+    assert(config.lower_coro && "an object needs the coroutines lowered");
+    const auto t_llvm = std::chrono::steady_clock::now();
+    target.setCodeGenOptLevel(config.o3 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::None);
+    target.setRelocationModel(llvm::Reloc::PIC_);
+    auto tm = target.createTargetMachine();
+    if (!tm) {
+        llvm::errs() << "llvm backend: " << llvm::toString(tm.takeError()) << "\n";
+        return false;
+    }
+    llvm::LLVMContext ctx;
+    auto              built = build_modules(m, ctx, **tm, config, resolve);
+    if (built.modules.empty()) {
+        return false;
+    }
+    llvm::Module& root = *built.modules.front();
+    llvm::Linker  linker(root);
+    for (size_t i = 1; i < built.modules.size(); ++i) {
+        // Reports its own diagnostic through the context's handler.
+        if (linker.linkInModule(std::move(built.modules[i]))) {
+            return false;
+        }
+    }
+
+    // Emitted into memory first: an object writer may seek back to patch
+    // headers, which a pipe on stdout cannot do.
+    llvm::SmallVector<char, 0>  object;
+    llvm::raw_svector_ostream   object_os(object);
+    llvm::legacy::PassManager   pm;
+    if ((*tm)->addPassesToEmitFile(pm, object_os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+        llvm::errs() << "llvm backend: target " << (*tm)->getTargetTriple().str()
+                     << " cannot write an object file\n";
+        return false;
+    }
+    pm.run(root);
+    os.write(object.data(), object.size());
     if (timings != nullptr) {
         timings->llvm_ms += ms_since(t_llvm);
     }

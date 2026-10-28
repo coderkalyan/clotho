@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -8,8 +9,14 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Object/ObjectFile.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/TargetParser/Host.h>
+#include <llvm/TargetParser/Triple.h>
 
 #include "Lower.h"
 #include "PosixIo.h"
@@ -4505,4 +4512,59 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     REQUIRE(nsigs.size() == 2);
     CHECK(nsigs[0] == nsigs[1]);
     CHECK(nsigs[0] == "(ptr noalias %state, ptr %rng, i128 %0, i64 %1, ptr %2)");
+}
+
+TEST_CASE("an emitted object defines clotho_main and no other name a C program could use") {
+    // Two definitions, so the per-definition units are linked back into the root.
+    const LowerResult result = lower_text(R"(
+        module child(input logic clk, output logic [7:0] q);
+            always_ff @(posedge clk) q <= q + 1;
+        endmodule
+        module top;
+            logic clk = 0;
+            logic [7:0] q;
+            child c(.clk(clk), .q(q));
+            initial begin #1 clk = 1; #1 $display("%0d", q); end
+        endmodule
+    )");
+    REQUIRE(result.ok);
+    auto target = ir::host_target();
+    REQUIRE(static_cast<bool>(target));
+    llvm::SmallVector<char, 0> bytes;
+    llvm::raw_svector_ostream  os(bytes);
+    REQUIRE(ir::emit_object(*result.module, os, std::move(*target)));
+
+    auto object = llvm::object::ObjectFile::createObjectFile(
+      llvm::MemoryBufferRef(llvm::StringRef(bytes.data(), bytes.size()), "design.o"));
+    REQUIRE(static_cast<bool>(object));
+    const llvm::Triple host(llvm::sys::getProcessTriple());
+    CHECK((*object)->isRelocatableObject());
+    CHECK((*object)->getArch() == host.getArch());
+
+    // The object links into a program the user writes, so a definition spelled
+    // as a C identifier could collide with one of theirs or their C library's.
+    // Only the entry may be one; every other definition is `clotho.*`.
+    std::vector<std::string> c_names;
+    for (const llvm::object::SymbolRef& sym : (*object)->symbols()) {
+        auto flags = sym.getFlags();
+        REQUIRE(static_cast<bool>(flags));
+        if ((*flags & llvm::object::SymbolRef::SF_Global) == 0 ||
+            (*flags & llvm::object::SymbolRef::SF_Undefined) != 0) {
+            continue;
+        }
+        auto name = sym.getName();
+        REQUIRE(static_cast<bool>(name));
+        llvm::StringRef c_name = *name;
+        if (host.isOSBinFormatMachO()) {
+            c_name.consume_front("_");
+        }
+        const bool identifier =
+          !c_name.empty() && (std::isalpha(static_cast<unsigned char>(c_name.front())) != 0 ||
+                              c_name.front() == '_') &&
+          llvm::all_of(c_name, [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; });
+        if (identifier) {
+            c_names.push_back(c_name.str());
+        }
+    }
+    CHECK(c_names == std::vector<std::string>{ "clotho_main" });
 }
