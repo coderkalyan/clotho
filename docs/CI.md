@@ -28,9 +28,9 @@ both the CMake package and the development libraries:
 
 | platform | source of LLVM 22 |
 |---|---|
-| linux-x64, linux-arm64 | `apt.llvm.org` `llvm-22-dev` (the repo publishes amd64 and arm64) |
-| macos-arm64, macos-x64 | Homebrew `llvm@22` |
-| windows-x64, windows-arm64 | MSYS2 `CLANG64` / `CLANGARM64`, whose `llvm` package is 22.1.8 |
+| linux-x64, linux-arm64 | `apt.llvm.org` `llvm-22-dev`, with `liblld-22-dev`, `libclang-rt-22-dev` and `libc++-22-dev` for `clotho build` (the repo publishes amd64 and arm64) |
+| macos-arm64, macos-x64 | Homebrew `llvm@22` and `lld` |
+| windows-x64, windows-arm64 | MSYS2 `CLANG64` / `CLANGARM64`, whose `llvm`, `lld` and `compiler-rt` packages are 22.1.8 |
 
 Windows deliberately does *not* use LLVM's own release tarball. The only
 prebuilt LLVM 22 development libraries LLVM ships for Windows are MSVC-ABI,
@@ -64,12 +64,8 @@ robust and strictly more setup; it is not worth it until the drift happens.
   as the LLVM being linked. Restoring a GCC build (valuable for a compiler
   project — a second front end catches different mistakes) needs either a
   GCC 15 image or a workaround at that call site.
-- **macOS: Homebrew LLVM's clang and its libc++**, with
-  `-D_LIBCPP_DISABLE_AVAILABILITY`. libc++ annotates declarations whose
-  implementation lives in the shared library with the macOS version that first
-  shipped them, and floating-point `std::from_chars` (which `Runtime.cpp` uses
-  to parse reals) is marked macOS 26. Those annotations describe Apple's system
-  libc++; we link Homebrew's, which has the symbol.
+- **macOS: Homebrew LLVM's clang and its libc++**, linked through `LDFLAGS` so
+  clotho uses Homebrew's libc++ rather than the SDK's.
 - **Windows: MSYS2's clang, with no MSVC anywhere.** MSVC proper cannot build
   clotho at all — the runtime's wide arithmetic uses `unsigned __int128`, which
   only GCC and Clang provide — and the MSVC *ABI* brought the whole class of

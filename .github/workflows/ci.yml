@@ -167,12 +167,6 @@ jobs:
           # CXXFLAGS at first configure.
           echo "LDFLAGS=-L$prefix/lib/c++ -L$prefix/lib/unwind -lunwind -Wl,-rpath,$prefix/lib/c++" \
             >> "$GITHUB_ENV"
-          # libc++'s headers annotate anything whose implementation lives in the
-          # shared library with the macOS version that first shipped it, and
-          # floating-point std::from_chars (Runtime.cpp's real parsing) is marked
-          # macOS 26. Those annotations describe Apple's system libc++; we link
-          # Homebrew's, which has the symbol, so turn them off.
-          echo "CXXFLAGS=-D_LIBCPP_DISABLE_AVAILABILITY" >> "$GITHUB_ENV"
 
       # MSYS2's CLANG64/CLANGARM64 environments build LLVM as MinGW-w64/UCRT, so
       # Windows uses clang with libc++ and no MSVC ABI, CRT or STL anywhere.
