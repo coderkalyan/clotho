@@ -102,13 +102,13 @@ They are deliberately not on the CLI. §4.2.
 ### 1.1 Blockers, verified
 
 1. **The simulation has no re-entrant step and cannot be driven from outside.**
-   `emit_main` (`LlvmBackend.cpp:4346`) emits `i32 @main()` which calls
+   `emit_main` (`LlvmBackend.cpp:4346`) emits `i32 @clotho_main()` which calls
    `rt_sim_run(state, wheel, drain, finals)` (`Runtime.h:364`), and
    `rt_sim_run` (`Runtime.cpp:3479-3492`) is literally
    `drain(state, wheel); finals(state, wheel); sim_teardown();`. `sim_drain` is
    one monolithic JIT'd function holding the entire LRM 4.4 region model as
    basic blocks (`emit_active_run`, `LlvmBackend.cpp:7231-7852`). The host
-   calls it through `lookup("main")` → `toPtr<int (*)()>()` → `fn()`
+   calls it through `lookup("clotho_main")` → `rt_run(&config, fn)`
    (`Jit.cpp:585,594`) and gets control back when the run is over. There is no
    scheduler callback, no step entry point, and no way to return out of the
    drain and re-enter it. **This is the largest architectural fact in the

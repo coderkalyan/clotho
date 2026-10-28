@@ -3245,7 +3245,7 @@ Halt g_halt = Halt::None;
 // The stop tick of "no stop time armed": a tick no time step can reach.
 constexpr uint64_t kNoStopTick = RuntimeWheel::never;
 
-// The last tick that runs once `--stop-time` has armed one (rt_stop_time_set).
+// The last tick that runs once `--stop-time` has armed one (rt_run).
 uint64_t g_stop_tick = kNoStopTick;
 
 // Set by the SIGINT handler rt_sim_run installs and read at the time-step
@@ -3446,14 +3446,10 @@ extern "C" void rt_fclose(int32_t desc) {
     }
 }
 
-// The $system access tier, set once by run_jit before the design runs
-// (0 = off, 1 = const, 2 = full). Default off so a JIT that somehow reaches
-// rt_system without run_jit having enabled it is refused, not run.
+// The $system access tier, set by rt_run before the design runs (0 = off,
+// 1 = const, 2 = full). Default off so a design that somehow reaches rt_system
+// without rt_run having enabled it is refused, not run.
 int g_system_access = 0;
-
-extern "C" void rt_system_set_access(int32_t tier) {
-    g_system_access = tier;
-}
 
 extern "C" int32_t rt_system(const char* cmd_buf, uint32_t cmd_len, int32_t cmd_fwd,
                              int32_t has_arg) {
@@ -4755,10 +4751,6 @@ ankerl::unordered_dense::set<const void*> g_ref_stale_seen;
 
 } // namespace
 
-extern "C" void rt_ref_stale_warn(int32_t enable) {
-    g_ref_stale_warn = enable;
-}
-
 // The design's epoch-to-name table, registered once before it runs.
 const rt_container_name* g_ref_names       = nullptr;
 uint64_t                 g_ref_names_count = 0;
@@ -5340,27 +5332,13 @@ void report_halt(const char* what) {
     std::fflush(stderr);
 }
 
-// The exit status of the last run (rt_run_status).
+// The exit status of the last run, which rt_run returns.
 int32_t g_run_status = 0;
 
 // The exit status of an interrupted run: 128 + SIGINT, which is what a shell
 // reports for a process that SIGINT killed.
 constexpr int32_t kInterruptedStatus = 130;
 } // namespace
-
-extern "C" void rt_stop_time_set(uint64_t stop_fs, uint64_t tick_fs) {
-    // A unitless design has no tick size to divide by: it counts in
-    // femtoseconds, as rt_timeformat_init does.
-    const uint64_t tick  = tick_fs == 0 ? 1 : tick_fs;
-    // Rounded up: a stop time between two ticks cannot run the step it falls
-    // short of, and stopping a tick early would drop events the user asked for.
-    const uint64_t ticks = stop_fs / tick + (stop_fs % tick != 0 ? 1 : 0);
-    g_stop_tick          = std::min(ticks, kNoStopTick - 1);
-}
-
-extern "C" int32_t rt_run_status(void) {
-    return g_run_status;
-}
 
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
@@ -6091,14 +6069,6 @@ const std::string* find_plusarg(std::string_view query) {
 }
 
 } // namespace
-
-extern "C" void rt_plusargs_init(const char* const* args, const uint32_t* lens, uint32_t n) {
-    g_plusargs.clear();
-    g_plusargs.reserve(n);
-    for (uint32_t k = 0; k < n; ++k) {
-        g_plusargs.emplace_back(args[k], lens[k]);
-    }
-}
 
 extern "C" int32_t rt_test_plusargs(const char* s, uint32_t len) {
     return find_plusarg(std::string_view(s, len)) != nullptr ? 1 : 0;
@@ -7917,4 +7887,32 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
 
 void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site* site) {
     rt_string_assign_bytes(dst, p, p != nullptr ? std::strlen(p) : 0, site);
+}
+
+// ---- Host entry ----
+
+// Defined last so every process-global it arms is in scope.
+int32_t rt_run(const rt_run_config* config, int32_t (*design_main)(void)) {
+    g_plusargs.clear();
+    g_plusargs.reserve(config->plusarg_count);
+    for (uint32_t k = 0; k < config->plusarg_count; ++k) {
+        g_plusargs.emplace_back(config->plusargs[k], config->plusarg_lens[k]);
+    }
+    g_system_access  = config->system_access;
+    g_ref_stale_warn = config->loose_stale_ref;
+    g_stop_tick      = kNoStopTick;
+    if (config->has_stop_time != 0) {
+        // A unitless design has no tick size to divide by: it counts in
+        // femtoseconds, as rt_timeformat_init does.
+        const uint64_t tick  = config->tick_fs == 0 ? 1 : config->tick_fs;
+        // Rounded up: a stop time between two ticks cannot run the step it falls
+        // short of, and stopping a tick early would drop events the user asked for.
+        const uint64_t ticks = config->stop_fs / tick + (config->stop_fs % tick != 0 ? 1 : 0);
+        g_stop_tick          = std::min(ticks, kNoStopTick - 1);
+    }
+
+    // The design's main returns 0 whichever way the run ended; a $fatal (LRM
+    // 20.10) or an interrupt is the runtime's to report.
+    const int32_t rc = design_main();
+    return rc != 0 ? rc : g_run_status;
 }

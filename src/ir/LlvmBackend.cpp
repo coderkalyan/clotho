@@ -75,7 +75,7 @@
 // instantiation); the root `%clotho.state` composes the top-level instances
 // plus the NBA shadow region. Each process takes a `ptr` to the root and
 // reaches a field through constant-index GEPs, so LLVM computes and owns all
-// offsets/padding (the module carries the host target's DataLayout).
+// offsets/padding (the module carries the target's DataLayout).
 //
 // Inferred types. The IR stores no per-instruction result type, so the backend
 // recomputes width / domain / signedness for each value by walking operands
@@ -7979,10 +7979,11 @@ private:
 
     // -- Top-level entry --
     //
-    // Emit `i32 @main()`: heap-allocate the shared state, power it up, build the
-    // timing wheel, then run every process through the active task queue and drain
-    // the wheel (advancing time, resuming delayed/woken processes) until idle,
-    // then run the `final` blocks. Returns 0.
+    // Emit `i32 @clotho_main()`, the entry rt_run calls: heap-allocate the shared
+    // state, power it up, build the timing wheel, then run every process through
+    // the active task queue and drain the wheel (advancing time, resuming
+    // delayed/woken processes) until idle, then run the `final` blocks. Returns
+    // 0. Not `main`: a linked executable has its own, which calls rt_run.
     void emit_main(const std::vector<llvm::Function*>& procs) {
         sched_anchor_ = SignalSlot::no_anchor; // startup code addresses absolutely
         auto* ptr_ty  = llvm::PointerType::getUnqual(ctx_);
@@ -8007,7 +8008,7 @@ private:
 
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
         auto* fnty = llvm::FunctionType::get(i32, false);
-        auto* main = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, "main", env_->llmod);
+        auto* main = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, "clotho_main", env_->llmod);
 
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
@@ -31330,33 +31331,27 @@ bool optimize_module(llvm::Module& m, bool o3) {
     return true;
 }
 
+llvm::Expected<llvm::orc::JITTargetMachineBuilder> host_target() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+    });
+    return llvm::orc::JITTargetMachineBuilder::detectHost();
+}
+
 BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
-                                      const SimulationConfig& config, const LocResolver& resolve) {
+                                      const llvm::TargetMachine& target, const SimulationConfig& config,
+                                      const LocResolver& resolve) {
     auto root = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
-    // Pin the modules to the host target's triple and DataLayout before any IR
-    // is built: the state/frame struct layouts, the NBA meta table's baked byte
+    // Pin the modules to the target's triple and DataLayout before any IR is
+    // built: the state/frame struct layouts, the NBA meta table's baked byte
     // offsets, and load/store alignments are all DataLayout-derived, so they
     // must be computed against the layout codegen will actually use. Unit
     // modules copy the root's triple/DataLayout at creation (unit_env).
-    {
-        static std::once_flag once;
-        std::call_once(once, [] { llvm::InitializeNativeTarget(); });
-        auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
-        if (!jtmb) {
-            llvm::errs() << "llvm backend: cannot detect host target: "
-                         << llvm::toString(jtmb.takeError()) << "\n";
-            return {};
-        }
-        auto dl = jtmb->getDefaultDataLayoutForTarget();
-        if (!dl) {
-            llvm::errs() << "llvm backend: no host data layout: " << llvm::toString(dl.takeError())
-                         << "\n";
-            return {};
-        }
-        root->setTargetTriple(jtmb->getTargetTriple());
-        root->setDataLayout(*dl);
-    }
+    root->setTargetTriple(target.getTargetTriple());
+    root->setDataLayout(target.createDataLayout());
 
     BuiltDesign built;
     try {
@@ -31387,9 +31382,9 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
     return built;
 }
 
-BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const SimulationConfig& config,
-                          const LocResolver& resolve) {
-    auto built = build_modules_unoptimized(m, ctx, config, resolve);
+BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::TargetMachine& target,
+                          const SimulationConfig& config, const LocResolver& resolve) {
+    auto built = build_modules_unoptimized(m, ctx, target, config, resolve);
     if (built.modules.empty()) {
         return {};
     }
@@ -31411,9 +31406,20 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const Simulat
 
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config,
                Timings* timings, const LocResolver& resolve) {
-    const auto        t_llvm = std::chrono::steady_clock::now();
+    const auto t_llvm = std::chrono::steady_clock::now();
+    auto       host   = host_target();
+    if (!host) {
+        llvm::errs() << "llvm backend: cannot detect host target: " << llvm::toString(host.takeError())
+                     << "\n";
+        return false;
+    }
+    auto tm = host->createTargetMachine();
+    if (!tm) {
+        llvm::errs() << "llvm backend: " << llvm::toString(tm.takeError()) << "\n";
+        return false;
+    }
     llvm::LLVMContext ctx;
-    auto              built = build_modules(m, ctx, config, resolve);
+    auto              built = build_modules(m, ctx, **tm, config, resolve);
     if (built.modules.empty()) {
         return false;
     }

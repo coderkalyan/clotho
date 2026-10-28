@@ -26,7 +26,6 @@
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/Threading.h>
 #include <llvm/Support/ThreadPool.h>
 #include <llvm/Support/raw_ostream.h>
@@ -60,27 +59,24 @@ extern "C" void ___chkstk_ms(void);
 
 namespace clotho::ir {
 
-namespace {
-
-// Native target/codegen must be initialized once before any LLJIT is built;
-// without the AsmPrinter the JIT can't lower IR to machine code for the host.
-void ensure_native_target() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        llvm::InitializeNativeTarget();
-        llvm::InitializeNativeTargetAsmPrinter();
-    });
-}
-
-} // namespace
-
 int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
            std::span<const std::string_view> plusargs, const LocResolver& resolve) {
-    ensure_native_target();
-
     // LLVM compile phase: build the module (IR gen + coroutine/opt passes), then
-    // below, JIT codegen triggered by looking up main.
+    // below, JIT codegen triggered by looking up clotho_main.
     const auto t_llvm = std::chrono::steady_clock::now();
+
+    // The one target both halves agree on: build_modules lays every struct out
+    // against its DataLayout, and the JIT generates code for it.
+    auto jtmb = host_target();
+    if (!jtmb) {
+        llvm::errs() << "jit: " << llvm::toString(jtmb.takeError()) << "\n";
+        return -1;
+    }
+    auto tm = jtmb->createTargetMachine();
+    if (!tm) {
+        llvm::errs() << "jit: " << llvm::toString(tm.takeError()) << "\n";
+        return -1;
+    }
 
     // Each run owns its context: the design modules are built into it, then
     // (parallel_compile off, or a single module) moved into ThreadSafeModules
@@ -99,7 +95,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     SimulationConfig jit_config = config;
     jit_config.lower_coro       = true;
     const bool stat             = stat_on(config.stats, Stat::Parallel);
-    auto       built            = build_modules_unoptimized(m, *ctx, jit_config, resolve);
+    auto       built            = build_modules_unoptimized(m, *ctx, **tm, jit_config, resolve);
     if (built.modules.empty()) {
         return -1; // build_modules_unoptimized already reported the reason.
     }
@@ -117,11 +113,6 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     // Machine-code generation matches the IR tier: -O0/FastISel for tier 0
     // (the backend pipeline already did the cheap cleanup; codegen quality is
     // deliberately traded for compile speed) and Aggressive under -O.
-    auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
-    if (!jtmb) {
-        llvm::errs() << "jit: " << llvm::toString(jtmb.takeError()) << "\n";
-        return -1;
-    }
     jtmb->setCodeGenOptLevel(config.o3 ? llvm::CodeGenOptLevel::Aggressive
                                        : llvm::CodeGenOptLevel::None);
 
@@ -132,7 +123,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         // round-trip), so ORC can materialize them concurrently: this makes
         // LLJIT select ConcurrentIRCompiler (a fresh TargetMachine per
         // compile call) and dispatch per-module codegen onto its own thread
-        // pool when lookup("main") transitively pulls in every unit.
+        // pool when lookup("clotho_main") transitively pulls in every unit.
         builder.setNumCompileThreads(n_jobs);
     }
 
@@ -485,18 +476,11 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("memmove", &std::memmove);
     expose("memcmp", &std::memcmp);
 #if defined(__MINGW32__)
-    // Two symbols a MinGW target emits that live in the static CRT and libgcc,
-    // where the process-symbol generator below cannot see them:
-    //
-    //   __main        — the static-constructor hook LLVM plants at the top of
-    //                   any function literally named `main`, which is what the
-    //                   design's entry point is called. A JIT'd module has no
-    //                   C++ constructors to run, and calling the host's would
-    //                   re-enter its global init, so bind a no-op.
-    //   ___chkstk_ms  — the stack-probe helper for frames larger than a page,
-    //                   which process bodies with wide state reach readily.
-    //                   x86_64 only; AArch64 Windows has no such symbol.
-    expose("__main", +[] {});
+    // Symbols a MinGW target emits that live in the static CRT and libgcc, where
+    // the process-symbol generator below cannot see them: the 128-bit division
+    // helpers, and ___chkstk_ms, the stack-probe helper for frames larger than a
+    // page, which process bodies with wide state reach readily (x86_64 only;
+    // AArch64 Windows has no such symbol).
     expose("__divti3", &__divti3);
     expose("__modti3", &__modti3);
     expose("__udivti3", &__udivti3);
@@ -704,27 +688,24 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         }
     }
 
-    // Looking up `main` materializes the root module through the compile
+    // Looking up `clotho_main` materializes the root module through the compile
     // layer; its references to the unit modules' group functions materialize
     // those in turn, i.e. eagerly compiles the whole design.
     const auto t_lookup = std::chrono::steady_clock::now();
-    auto       sym      = (*jit)->lookup("main");
+    auto       sym      = (*jit)->lookup("clotho_main");
     if (!sym) {
         llvm::errs() << "jit: " << llvm::toString(sym.takeError()) << "\n";
         return -1;
     }
     if (stat) {
-        fprintf(stderr, "PARALLEL_STAT lookup(main) [ORC codegen]: %.1f ms\n", ms_since(t_lookup));
+        fprintf(stderr, "PARALLEL_STAT lookup(clotho_main) [ORC codegen]: %.1f ms\n", ms_since(t_lookup));
     }
 
-    auto* fn = sym->toPtr<int (*)()>();
+    auto* fn = sym->toPtr<int32_t (*)()>();
     if (timings != nullptr) {
         timings->llvm_ms += ms_since(t_llvm);
     }
 
-    // Populate the plusarg list (LRM §21.6) before the design runs. A host-side
-    // call, not exposed to the JIT — $test$plusargs / $value$plusargs only read
-    // it via the rt_* calls above.
     std::vector<const char*> pa_ptrs;
     std::vector<uint32_t>    pa_lens;
     pa_ptrs.reserve(plusargs.size());
@@ -733,38 +714,26 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
         pa_ptrs.push_back(pa.data());
         pa_lens.push_back(static_cast<uint32_t>(pa.size()));
     }
-    rt_plusargs_init(pa_ptrs.data(), pa_lens.data(), static_cast<uint32_t>(pa_ptrs.size()));
+    const rt_run_config run_config = {
+        .plusargs        = pa_ptrs.data(),
+        .plusarg_lens    = pa_lens.data(),
+        .plusarg_count   = static_cast<uint32_t>(pa_ptrs.size()),
+        .system_access   = static_cast<int32_t>(config.allow_system),
+        .loose_stale_ref = config.loose_stale_ref ? 1 : 0,
+        .has_stop_time   = config.stop_time_fs.has_value() ? 1 : 0,
+        .stop_fs         = config.stop_time_fs.value_or(0),
+        .tick_fs         = m.tick_fs,
+    };
 
-    // Arm the $system access tier for the runtime backstop (rt_system). The
-    // compile-time gate in lowering is primary; this mirrors the operator's
-    // opt-in into the runtime so a bypassed gate still refuses to exec.
-    rt_system_set_access(static_cast<int32_t>(config.allow_system));
-
-    // Arm the dangling-ref reporting mode. The epoch check the backend emits is
-    // unconditional; this only selects what rt_ref_stale does when one trips --
-    // the located fatal, or a once-per-site warning that returns and lets the
-    // design keep running (--loose-stale-ref).
-    rt_ref_stale_warn(config.loose_stale_ref ? 1 : 0);
-
-    // Arm --stop-time. The runtime ends the run at a time-step boundary, in the
-    // design's ticks, so what crosses is femtoseconds and the tick size to round
-    // up to (see rt_stop_time_set). Cleared by the run it is armed for.
-    if (config.stop_time_fs.has_value()) {
-        rt_stop_time_set(*config.stop_time_fs, m.tick_fs);
-    }
-
-    // Simulation phase: run the compiled design. A $finish no longer unwinds
-    // anything here — it returns through the design's own frames and the drain
-    // loop stops — so this is an ordinary call.
-    const auto t_sim = std::chrono::steady_clock::now();
-    const int  rc    = fn();
+    // Simulation phase: run the compiled design. A $finish does not unwind
+    // anything here -- it returns through the design's own frames and the drain
+    // loop stops -- so this is an ordinary call.
+    const auto    t_sim = std::chrono::steady_clock::now();
+    const int32_t rc    = rt_run(&run_config, fn);
     if (timings != nullptr) {
         timings->sim_ms += ms_since(t_sim);
     }
-
-    // The design's main() returns 0 whichever way the run ended; a $fatal (LRM
-    // 20.10) or an interrupt is the runtime's to report.
-    return rc != 0 ? rc : rt_run_status();
+    return rc;
 }
 
 } // namespace clotho::ir
