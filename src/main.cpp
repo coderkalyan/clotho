@@ -1013,7 +1013,7 @@ bool write_artifact(const clotho::LowerResult& result,
             return false;
         }
         if (to_stdout) {
-            return clotho::ir::emit_object(*result.module, llvm::outs(), std::move(*target), config, timings, resolve);
+            return clotho::ir::emit_object(*result.module, llvm::outs(), *target, config, timings, resolve);
         }
         std::error_code      ec;
         llvm::raw_fd_ostream os(out, ec);
@@ -1021,7 +1021,7 @@ bool write_artifact(const clotho::LowerResult& result,
             std::println(stderr, "clotho: cannot open '{}': {}", out, ec.message());
             return false;
         }
-        return clotho::ir::emit_object(*result.module, os, std::move(*target), config, timings, resolve);
+        return clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve);
     }
     if (to_stdout) {
         return clotho::ir::emit_llvm(*result.module, llvm::outs(), config, timings, resolve);

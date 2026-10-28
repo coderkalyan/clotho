@@ -36,8 +36,10 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Linker/Linker.h>
+#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 
@@ -31434,23 +31436,39 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
     return true;
 }
 
-bool emit_object(const Module&                      m,
-                 llvm::raw_ostream&                 os,
-                 llvm::orc::JITTargetMachineBuilder target,
-                 const SimulationConfig&            config,
-                 Timings*                           timings,
-                 const LocResolver&                 resolve) {
+bool emit_object(const Module&                             m,
+                 llvm::raw_ostream&                        os,
+                 const llvm::orc::JITTargetMachineBuilder& target,
+                 const SimulationConfig&                   config,
+                 Timings*                                  timings,
+                 const LocResolver&                        resolve) {
     assert(config.lower_coro && "an object needs the coroutines lowered");
-    const auto t_llvm = std::chrono::steady_clock::now();
-    target.setCodeGenOptLevel(config.o3 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::None);
-    target.setRelocationModel(llvm::Reloc::PIC_);
-    auto tm = target.createTargetMachine();
-    if (!tm) {
-        llvm::errs() << "llvm backend: " << llvm::toString(tm.takeError()) << "\n";
+    const auto  t_llvm = std::chrono::steady_clock::now();
+    std::string error;
+    const auto* llvm_target = llvm::TargetRegistry::lookupTarget(target.getTargetTriple(), error);
+    if (llvm_target == nullptr) {
+        llvm::errs() << "llvm backend: " << error << "\n";
+        return false;
+    }
+    // Not target.createTargetMachine(): that asks for a JIT target machine, and
+    // on x86-64 a JIT one defaults to the large code model, whose absolute
+    // 64-bit addresses in the code are text relocations a macOS link refuses.
+    // Only the triple, CPU and features carry over; the code model and target
+    // options are the platform's defaults for ordinary compiled code.
+    const std::unique_ptr<llvm::TargetMachine> tm(
+      llvm_target->createTargetMachine(target.getTargetTriple(),
+                                       target.getCPU(),
+                                       target.getFeatures().getString(),
+                                       llvm::TargetOptions(),
+                                       llvm::Reloc::PIC_,
+                                       std::nullopt,
+                                       config.o3 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::None));
+    if (tm == nullptr) {
+        llvm::errs() << "llvm backend: cannot generate code for " << target.getTargetTriple().str() << "\n";
         return false;
     }
     llvm::LLVMContext ctx;
-    auto              built = build_modules(m, ctx, **tm, config, resolve);
+    auto              built = build_modules(m, ctx, *tm, config, resolve);
     if (built.modules.empty()) {
         return false;
     }
@@ -31468,8 +31486,8 @@ bool emit_object(const Module&                      m,
     llvm::SmallVector<char, 0> object;
     llvm::raw_svector_ostream  object_os(object);
     llvm::legacy::PassManager  pm;
-    if ((*tm)->addPassesToEmitFile(pm, object_os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
-        llvm::errs() << "llvm backend: target " << (*tm)->getTargetTriple().str() << " cannot write an object file\n";
+    if (tm->addPassesToEmitFile(pm, object_os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+        llvm::errs() << "llvm backend: target " << tm->getTargetTriple().str() << " cannot write an object file\n";
         return false;
     }
     pm.run(root);

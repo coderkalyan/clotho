@@ -4532,7 +4532,7 @@ TEST_CASE("an emitted object defines clotho_main and no other name a C program c
     REQUIRE(static_cast<bool>(target));
     llvm::SmallVector<char, 0> bytes;
     llvm::raw_svector_ostream  os(bytes);
-    REQUIRE(ir::emit_object(*result.module, os, std::move(*target)));
+    REQUIRE(ir::emit_object(*result.module, os, *target));
 
     auto object = llvm::object::ObjectFile::createObjectFile(
       llvm::MemoryBufferRef(llvm::StringRef(bytes.data(), bytes.size()), "design.o"));
