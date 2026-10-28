@@ -442,17 +442,36 @@ target_link_libraries(clotho_legalize PUBLIC clotho_ir_core)
 target_link_libraries(clotho_legalize PRIVATE clotho_warnings)
 
 add_library(clotho_ir STATIC
-  src/ir/LlvmBackend.cpp
+  src/ir/llvm/Aggregates.cpp
+  src/ir/llvm/Analyses.cpp
+  src/ir/llvm/AssocArrays.cpp
+  src/ir/llvm/Backend.cpp
+  src/ir/llvm/Containers.cpp
+  src/ir/llvm/Dedup.cpp
+  src/ir/llvm/Dpi.cpp
+  src/ir/llvm/Events.cpp
+  src/ir/llvm/GcEmit.cpp
+  src/ir/llvm/Inst.cpp
+  src/ir/llvm/LlvmBackend.cpp
+  src/ir/llvm/Ops.cpp
+  src/ir/llvm/Processes.cpp
+  src/ir/llvm/Sanitizers.cpp
+  src/ir/llvm/Scheduler.cpp
+  src/ir/llvm/StateLayout.cpp
+  src/ir/llvm/Stores.cpp
+  src/ir/llvm/Subroutines.cpp
+  src/ir/llvm/SystemTasks.cpp
+  src/ir/llvm/Vcd.cpp
   src/ir/Jit.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
 # A machine with ROCm installed has a second LLVM under /opt/rocm, and
 # find_package picks it over the system one. That copy is built without RTTI, so
-# LlvmBackend.cpp emits references to `typeinfo for llvm::CallbackVH` that nothing
+# the backend emits references to `typeinfo for llvm::CallbackVH` that nothing
 # provides -- and the only symptom is an inscrutable link failure two minutes into
 # the build, long after configure said everything was fine.
 #
-# Fail here instead, naming the fix. Clotho needs RTTI: LlvmBackend derives from
+# Fail here instead, naming the fix. Clotho needs RTTI: the backend derives from
 # LLVM types whose typeinfo has to come from the LLVM libraries.
 if(DEFINED LLVM_ENABLE_RTTI AND NOT LLVM_ENABLE_RTTI)
   message(FATAL_ERROR
