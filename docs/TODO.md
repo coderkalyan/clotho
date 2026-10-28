@@ -208,6 +208,8 @@ Milestones, in order; lower ones unblock higher ones:
   task-call record slot that only a coroutine has.
 - [ ] **`$timeformat` non-literal suffix and zero-argument reset form** — only a
   string-literal suffix is accepted.
+- [ ] **Clotho IR dump of a design that calls `$monitor`** — `clotho build --emit ir`
+  crashes with a segmentation fault partway through printing.
 
 ### Executables (`clotho build`)
 
