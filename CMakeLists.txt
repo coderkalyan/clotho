@@ -108,13 +108,6 @@ option(CLOTHO_SYNTH "Expose the unfinished `synth` command in the CLI" ${CLOTHO_
 option(CLOTHO_LSP "Build and expose the unfinished `lsp` command (language server)" ${CLOTHO_WIP_DEFAULT})
 option(CLOTHO_DAP "Build and expose the unfinished `dap` command (debug adapter)" ${CLOTHO_WIP_DEFAULT})
 
-# `build`: writes the generated code (LLVM IR, or Clotho's own IR) and no
-# executable, so nothing outside work on Clotho itself consumes it yet. Offered
-# like `synth`: only the CLI wiring is conditional, and the emission paths behind
-# it stay built and tested in every configuration.
-option(CLOTHO_BUILD_COMMAND "Expose the `build` command, which writes generated code rather than an executable"
-       ${CLOTHO_WIP_DEFAULT})
-
 # `--sanitize=xprov`: the flag is parsed and carried in SimulationConfig, but no
 # backend pass reads the bit yet, so it instruments nothing. An operator who
 # reaches for a sanitizer and gets silence is worse served than one told the check
@@ -583,9 +576,6 @@ endif()
 if(CLOTHO_XSAN)
   target_compile_definitions(clotho_cli PRIVATE CLOTHO_XSAN)
 endif()
-if(CLOTHO_BUILD_COMMAND)
-  target_compile_definitions(clotho_cli PRIVATE CLOTHO_BUILD_COMMAND)
-endif()
 
 # `clotho --version`. The release is the project version plus a pre-release
 # suffix, which a final release leaves empty. The git hash is resolved at
@@ -864,18 +854,15 @@ set(CLOTHO_TEST_SOURCES
   tests/system_test.cpp
   tests/diagnostic_render_test.cpp
   tests/cli_test.cpp
+  tests/exe_test.cpp
   tests/todo_test.cpp
 )
-# The server tests exist only where the servers do, and the executable tests
-# where `build` does.
+# The server tests exist only where the servers do.
 if(CLOTHO_LSP)
   list(APPEND CLOTHO_TEST_SOURCES tests/lsp_test.cpp tests/lsp_tokens_test.cpp)
 endif()
 if(CLOTHO_DAP)
   list(APPEND CLOTHO_TEST_SOURCES tests/dap_test.cpp)
-endif()
-if(CLOTHO_BUILD_COMMAND)
-  list(APPEND CLOTHO_TEST_SOURCES tests/exe_test.cpp)
 endif()
 add_executable(clotho_test ${CLOTHO_TEST_SOURCES})
 target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize doctest::doctest clotho_warnings)
@@ -946,47 +933,46 @@ endforeach()
 # what no in-process test can show is that every platform's link works and the
 # result runs. Each design prints its line only when its own checks pass, so the
 # output is the whole verdict.
-if(CLOTHO_BUILD_COMMAND)
-  # Build `design` into ${name}, with `--dpi-lib` for each DPI library (a path,
-  # which may be a generator expression), after the DEPENDS targets.
-  function(clotho_exe_test name design)
-    cmake_parse_arguments(PARSE_ARGV 2 arg "" "" "DPI;DEPENDS")
-    set(exe "${CMAKE_CURRENT_BINARY_DIR}/${name}${CMAKE_EXECUTABLE_SUFFIX}")
-    set(dpi "")
-    foreach(lib IN LISTS arg_DPI)
-      list(APPEND dpi --dpi-lib "${lib}")
-    endforeach()
-    add_custom_command(
-      OUTPUT "${exe}"
-      COMMAND clotho_cli build ${dpi} -o "${exe}" "${CMAKE_CURRENT_SOURCE_DIR}/${design}"
-      DEPENDS clotho_cli "${design}" ${arg_DEPENDS}
-      VERBATIM)
-    add_custom_target(${name}_build DEPENDS "${exe}")
-    # Built with the suite, so building clotho_test is enough to run all of ctest.
-    add_dependencies(clotho_test ${name}_build)
-  endfunction()
 
-  clotho_exe_test(exe tests/exe/design.sv)
-  add_test(NAME exe COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe${CMAKE_EXECUTABLE_SUFFIX}" +n=12345)
-  set_tests_properties(exe PROPERTIES PASS_REGULAR_EXPRESSION "exe: ok 12345 000006e3924924924924924924924924")
+# Build `design` into ${name}, with `--dpi-lib` for each DPI library (a path,
+# which may be a generator expression), after the DEPENDS targets.
+function(clotho_exe_test name design)
+  cmake_parse_arguments(PARSE_ARGV 2 arg "" "" "DPI;DEPENDS")
+  set(exe "${CMAKE_CURRENT_BINARY_DIR}/${name}${CMAKE_EXECUTABLE_SUFFIX}")
+  set(dpi "")
+  foreach(lib IN LISTS arg_DPI)
+    list(APPEND dpi --dpi-lib "${lib}")
+  endforeach()
+  add_custom_command(
+    OUTPUT "${exe}"
+    COMMAND clotho_cli build ${dpi} -o "${exe}" "${CMAKE_CURRENT_SOURCE_DIR}/${design}"
+    DEPENDS clotho_cli "${design}" ${arg_DEPENDS}
+    VERBATIM)
+  add_custom_target(${name}_build DEPENDS "${exe}")
+  # Built with the suite, so building clotho_test is enough to run all of ctest.
+  add_dependencies(clotho_test ${name}_build)
+endfunction()
 
-  add_library(clotho_exe_dpi_object OBJECT tests/exe/dpi.c)
-  set_target_properties(clotho_exe_dpi_object PROPERTIES POSITION_INDEPENDENT_CODE ON)
-  clotho_exe_test(exe_dpi_object tests/exe/dpi.sv DPI $<TARGET_OBJECTS:clotho_exe_dpi_object>
-                  DEPENDS clotho_exe_dpi_object)
-  add_test(NAME exe_dpi_object COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_object${CMAKE_EXECUTABLE_SUFFIX}")
-  set_tests_properties(exe_dpi_object PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
+clotho_exe_test(exe tests/exe/design.sv)
+add_test(NAME exe COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe${CMAKE_EXECUTABLE_SUFFIX}" +n=12345)
+set_tests_properties(exe PROPERTIES PASS_REGULAR_EXPRESSION "exe: ok 12345 000006e3924924924924924924924924")
 
-  # A DLL cannot call back into the executable, so Windows has no shared case.
-  if(NOT WIN32)
-    add_library(clotho_exe_dpi_shared SHARED tests/exe/dpi.c)
-    if(APPLE)
-      # sv_twice is the executable's, found when the library is loaded.
-      target_link_options(clotho_exe_dpi_shared PRIVATE "LINKER:-undefined,dynamic_lookup")
-    endif()
-    clotho_exe_test(exe_dpi_shared tests/exe/dpi.sv DPI $<TARGET_FILE:clotho_exe_dpi_shared>
-                    DEPENDS clotho_exe_dpi_shared)
-    add_test(NAME exe_dpi_shared COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_shared${CMAKE_EXECUTABLE_SUFFIX}")
-    set_tests_properties(exe_dpi_shared PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
+add_library(clotho_exe_dpi_object OBJECT tests/exe/dpi.c)
+set_target_properties(clotho_exe_dpi_object PROPERTIES POSITION_INDEPENDENT_CODE ON)
+clotho_exe_test(exe_dpi_object tests/exe/dpi.sv DPI $<TARGET_OBJECTS:clotho_exe_dpi_object>
+                DEPENDS clotho_exe_dpi_object)
+add_test(NAME exe_dpi_object COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_object${CMAKE_EXECUTABLE_SUFFIX}")
+set_tests_properties(exe_dpi_object PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
+
+# A DLL cannot call back into the executable, so Windows has no shared case.
+if(NOT WIN32)
+  add_library(clotho_exe_dpi_shared SHARED tests/exe/dpi.c)
+  if(APPLE)
+    # sv_twice is the executable's, found when the library is loaded.
+    target_link_options(clotho_exe_dpi_shared PRIVATE "LINKER:-undefined,dynamic_lookup")
   endif()
+  clotho_exe_test(exe_dpi_shared tests/exe/dpi.sv DPI $<TARGET_FILE:clotho_exe_dpi_shared>
+                  DEPENDS clotho_exe_dpi_shared)
+  add_test(NAME exe_dpi_shared COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_shared${CMAKE_EXECUTABLE_SUFFIX}")
+  set_tests_properties(exe_dpi_shared PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
 endif()

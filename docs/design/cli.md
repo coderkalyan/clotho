@@ -11,7 +11,7 @@ is the rationale and the migration record.
 clotho <command> [options] <source>... [+plusarg...]
 
 commands:
-  build   compile the design and write the generated code (CLOTHO_BUILD_COMMAND)
+  build   compile the design into an executable that simulates it without clotho
   run     compile the design and simulate it
   lint    analyse the design and report diagnostics, writing nothing
   synth   write the design back out as synthesizable SystemVerilog (Debug builds)
@@ -23,17 +23,12 @@ The command names how far down the pipeline the run goes, so the first three
 nest: `lint` is `build` without an artifact, and `run` is `build` plus execution.
 The option sets nest the same way.
 
-`build` writes the generated code -- LLVM IR, Clotho's own IR, or a native
-object file -- and no executable. The object defines `clotho_main` and needs a
-`main` of the user's own that calls the runtime's `rt_run` and a link against
-`clotho_runtime`, so nothing but work on Clotho itself consumes what it writes
-yet. Until it can write an executable it is opt-in like `synth`: CMake option
-`CLOTHO_BUILD_COMMAND`, on by default for Debug and off otherwise. Off, `build`
-is an unknown command, `--emit` is not registered, `-o` exists only for `synth`,
-and help text that would mention a build (the `--coverage` and `--gc-stress`
-notes on giving a build and its run the same setting) leaves the sentence out.
-Only the CLI wiring is conditional: the emission paths behind `build` are built
-and tested in every configuration, and CI configures with it on.
+`build` writes, by default, an executable that simulates the design without
+clotho, a compiler or a linker on the machine (docs/design/executables.md); with
+`--emit` it writes the generated code instead -- a native object file, LLVM IR, or
+Clotho's own IR. The executable takes plusargs and `--stop-time` when it runs,
+like `run`; everything else about the run is fixed by the options `build` was
+given.
 
 `synth` branches rather than nests. It shares the front end and stops before the
 LLVM backend entirely -- `clotho_legalize` links no LLVM and no slang, and the
@@ -56,8 +51,7 @@ meant, because leaving out `run` is the likeliest slip:
   `did you mean '<command>'?`, the way slang suggests a mistyped option;
 - otherwise the message lists the commands.
 
-Only commands this build has are candidates (`build`, `synth`, `lsp` and `dap` are
-opt-in).
+Only commands this build has are candidates (`synth`, `lsp` and `dap` are opt-in).
 Every case exits 2.
 
 `lsp` and `dap` are servers, not pipeline stages, and take **no arguments at
@@ -88,20 +82,21 @@ see "One parser".
 
 | option | commands | effect |
 |---|---|---|
-| `--emit <target>` | build (`CLOTHO_BUILD_COMMAND`) | `llvm` (default, post-coroutine-pipeline), `obj` (a relocatable object for this machine: the definition units linked back into one module, position-independent, defining `clotho_main`), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
+| `--emit <target>` | build | `exe` (default: an executable, docs/design/executables.md), `obj` (a relocatable object for this machine: the definition units linked back into one module, position-independent, defining `clotho_main` and `clotho_design`), `llvm` (post-coroutine-pipeline LLVM IR), `llvm-raw` (straight from the backend, `llvm.coro.*` intact), `ir` (Clotho process IR). `ir` stops before code generation, so `-O`, `--sanitize`, `--stat`, `--coverage` and the `--gc-*` group have no effect under it |
 | `--target <lang>` | synth (Debug builds only) | `sv` (default, IEEE 1800), `2005` (IEEE 1364-2005: `reg`/`wire`, no wildcard equality, no jump statements) |
 | `--hierarchy <mode>` | synth (Debug builds only) | `instances` (default) writes one module per instance with names as written; `flat` writes one module with paths mangled into identifiers |
 | `--sidecar <path>` | synth (Debug builds only) | Also write the JSON sidecar: the original-to-emitted name map, and each signal's inferred storage, clock and reset |
 | `--no-legalize` | synth (Debug builds only) | Translate as written instead of writing out the implied hardware: no mux trees rebuilt, no implicit branch filled in |
 | `--full-case` | synth (Debug builds only) | Believe `full_case` / `unique`; reported wherever the claim is what removed a latch |
 | `--parallel-case` | synth (Debug builds only) | Believe `parallel_case` / `unique0` |
-| `-o, --output <file>` | build, synth | artifact path for every target; `-` is stdout. Without `-o`, `build` writes to stdout, but refuses when stdout is a terminal (see "The artifact and the terminal") |
+| `-o, --output <file>` | build, synth | output path for every target; `-` is stdout. Without `-o`, `build` writes an executable to the current directory, named after the design's first top-level module (`.exe` added on Windows), and any other target to stdout, refusing when that is a terminal (see "The artifact and the terminal"). An executable cannot go to stdout |
+| `--cpu <name>` | build | the processor an `exe` or `obj` is compiled for: by default a baseline every machine of the kind has (`x86-64-v2`, `apple-m1` on Apple Silicon, `generic` Armv8-A on other AArch64), `native` for the machine building it, or any processor name LLVM knows for the target (an unknown one is a usage error). Refused for text targets |
 | `--time` | build, run, lint, synth | per-phase wall-clock to stderr |
 | `-O` | both | `default<O3>` plus aggressive machine codegen |
 | `--stat <list>` | both | `dedup`, `dedup-sets`, `comb-fuse`, `finish`, `parallel`. `parallel` reports only under `run` |
 | `--sanitize <list>` | both | dynamic bug checks instrumented into the emitted code, reported to stderr and non-fatal: `bounds` (an index outside what it indexes — array element, packed bit/part select, string character, queue method index, pop from an empty queue; x/z index included), `xprov` (xsan, x provenance — not yet implemented, so **Debug builds only**, `CLOTHO_XSAN`; a shipped build rejects the name). Off by default |
-| `--coverage <file>` | both | write the design's functional-coverage report here (LRM 19): which of the bins its `covergroup`s declare the run reached, and which it never did. No report by default. The destination is compiled into the artifact — the emitted coverage model names its own — so a `build` and the `run` of what it built must be given the same file |
-| `--gc-stress` | both | collect class objects at every opportunity instead of when the design has created enough of them. Slow by design: it turns an object clotho failed to keep into an immediate wrong answer rather than a rare one, so it is for working on clotho itself. **Changes the generated code** (garbage-collection.md), so a `build` and the `run` of what it built must be given the same setting |
+| `--coverage <file>` | both | write the design's functional-coverage report here (LRM 19): which of the bins its `covergroup`s declare the run reached, and which it never did. No report by default. The destination is compiled in -- the emitted coverage model names its own -- so an executable writes its report to the file `build` was given |
+| `--gc-stress` | both | collect class objects at every opportunity instead of when the design has created enough of them. Slow by design: it turns an object clotho failed to keep into an immediate wrong answer rather than a rare one, so it is for working on clotho itself. **Changes the generated code** (garbage-collection.md), so an executable keeps the setting `build` was given |
 | `--gc-stats` | both | collection summary when the design exits: how many collections, how much was reclaimed, how long the design was paused |
 | `--gc-nursery <bytes>` | both | bytes of class objects the design may allocate between collections (default `8388608`). A plain integer — no `k`/`m`/`g` suffix, because no option on this surface has one. `0` is refused: it means `--gc-stress`, and `0` already means "no ceiling" for `--gc-heap-max` |
 | `--gc-heap-max <bytes>` | both | soft ceiling in bytes: reaching it asks for a collection at the next opportunity, and passing it anyway is reported rather than refused, since a process may allocate without ever suspending (garbage-collection.md §6.1). `0`, the default, sets no ceiling |
@@ -109,7 +104,7 @@ see "One parser".
 | `--allow-system <const\|full>` | build, run, lint, synth | permit `$system` (LRM 20.17.1); refused by default |
 | `--loose-timescale` | build, run, lint, synth | accept a design that mixes elements declaring a time scale with elements that do not (slang's `MissingTimeScale`, LRM 3.14.2.2); the un-annotated ones take `--timescale`'s value, or `1ns/1ns`. Refused by default |
 | `-j, --threads <n>` | build, run, lint, synth | slang's own option; sizes its parser **and** the LLVM compile pool |
-| `--dpi-lib <path>` | run | DPI-C `.o`/`.a` (JIT-linked) or `.so` (dlopen'd), repeatable |
+| `--dpi-lib <path>` | both | DPI-C library, repeatable. `run`: `.o`/`.a` linked into the JIT, `.so` dlopen'd (imports only). `build`: linked into the executable, `.so` dynamically with an rpath and, for a design with DPI exports, the executable's symbols exported to it; refused for any target but `exe` |
 | `--stop-time <time>` | run | stop the simulation at this simulation time: an integer and a unit with nothing between them, `fs`, `ps`, `ns`, `us`, `ms` or `s` (`100ns`, `5us`). A missing or unknown unit, zero, and a time that does not fit in 64 bits of femtoseconds (about 18446 s) are usage errors. See "Stopping a run" |
 | `--perf-jitdump` | run | perf jitdump under `$JITDUMPDIR` |
 | `--loose-stale-ref` | run | report a `ref` whose actual storage was restructured under it (data-model.md §3) once per site and keep simulating, instead of the located fatal. Fatal by default |
@@ -217,21 +212,20 @@ unchanged.
 
 ### The artifact and the terminal
 
-`build` writes to stdout when `-o` is not given, which is right in a pipe or a
-redirect and almost always a forgotten `-o` on a terminal, where the generated code
-is pages of text. So `build` with no `-o` is a usage error (exit 2, before any
-source is read) when stdout is a terminal, and says to pass `-o <file>`, or `-o -`
-to print to the terminal anyway. An explicit `-o -` is honoured everywhere, and
-every `--emit` target is covered, `--emit=ir` included. The decision is the
-command (`build` only: `run` and `lint` write nothing there), whether `-o` was
-given, and `isatty` on stdout (`_isatty` on Windows); `tests/cli_test.cpp` runs the
-real process on a pseudo-terminal to cover it. `synth` keeps stdout as its
-default.
+Without `-o`, `build` writes any target but an executable to stdout, which is
+right in a pipe or a redirect and almost always a forgotten `-o` on a terminal,
+where the generated code is pages of text or binary. So that is a usage error
+(exit 2, before any source is read) when stdout is a terminal, and says to pass
+`-o <file>`, or `-o -` to print to the terminal anyway. An explicit `-o -` is
+honoured for every text and object target. The decision is the command (`build`
+only: `run` and `lint` write nothing there), the target, whether `-o` was given,
+and `isatty` on stdout (`_isatty` on Windows); `tests/cli_test.cpp` runs the real
+process on a pseudo-terminal to cover it. `synth` keeps stdout as its default.
 
 ### Errors, not silent no-ops
 
 An option outside its command's set is a usage error naming the right commands
-(`--dpi-lib applies to 'run', not 'build'`; `-O applies to 'build' or 'run', not
+(`--perf-jitdump applies to 'run', not 'build'`; `-O applies to 'build' or 'run', not
 'lint'`; `plusarg '+foo' applies to 'run'`). The old
 surface accepted `--dpi-lib`, `--perf-jitdump`, `--jobs` and plusargs on every
 emit path and ignored them, which contradicts PRINCIPLES.md's never-silently-accept
@@ -250,9 +244,9 @@ them always means something and none of them needs a companion flag.
 | code | meaning |
 |---|---|
 | 0 | success: includes a run ended by `$finish` of any level or by `--stop-time`, and one that reported `$error`, `$warning` or a failed assertion |
-| 1 | compile, emission or JIT-setup failure; for `run`, also a `$fatal` in the design (LRM 20.10 "terminates the simulation with an error code") |
-| 2 | usage error |
-| 130 | `run` only: interrupted by Ctrl-C (SIGINT) |
+| 1 | compile, emission, link or JIT-setup failure; for `run` and an executable, also a `$fatal` in the design (LRM 20.10 "terminates the simulation with an error code") |
+| 2 | usage error, of clotho or of an executable |
+| 130 | `run` and an executable: interrupted by Ctrl-C (SIGINT) |
 
 A design can only produce 0, 1 or 130, so there is no "the design's own status"
 row.
@@ -273,11 +267,11 @@ finer than the design's time precision rounds up to the next tick, and the messa
 reports the rounded time. A design that ends first (`$finish`, or no event left) is
 unchanged and prints nothing. The driver parses the time into
 `SimulationConfig::stop_time_fs`, in femtoseconds, and the runtime implements the
-stop; only `run` takes it, so `build`, `lint` and `synth` refuse it like the other
+stop; `run` takes it, as does an executable `build` wrote, so `build`, `lint` and `synth` refuse it like the other
 run-only options. Zero is refused rather than meaning "no limit" or "stop before
 anything runs"; leaving the option out is how a run is unlimited.
 
-**Ctrl-C.** While a `run` is simulating, SIGINT stops the simulation at the end of
+**Ctrl-C.** While a `run` or an executable is simulating, SIGINT stops the simulation at the end of
 the current time step. The dump and open files are flushed, `final` blocks do not
 run (the design was interrupted, not finished), `clotho: interrupted at <time>`
 goes to stderr and the status is 130. SIGINT during compilation keeps its default
@@ -365,9 +359,9 @@ behaviour change; docs quoting the old spellings were migrated with this commit.
 - Anything that only makes sense during simulation belongs to `run`, and using
   it under `build` must be an error.
 - A mode that is *compiled into* the artifact belongs to `build` **and** `run`,
-  tagged `[build|run]`, and the two must be given the same one: the `--gc-*` group
-  changes the generated code, so `run` cannot add one to what a `build` emitted
-  without it. `lint`, which compiles nothing, still refuses them.
+  tagged `[build|run]`: the `--gc-*` group changes the generated code, so an
+  executable keeps the one `build` was given and cannot be given another when it
+  runs. `lint`, which compiles nothing, still refuses them.
 - A size is a plain integer number of bytes (`--gc-nursery`, `--gc-heap-max`).
   No `k`/`m`/`g` suffix exists on this surface, and the first option that needs
   one adds it to every size option at once rather than to itself.

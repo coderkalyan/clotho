@@ -26,9 +26,11 @@ what is missing and `docs/design/` for how the interesting parts work.
 ## Building
 
 Requirements: a C++23 compiler (clang is what we test), CMake 3.20+, Ninja,
-LLVM 22 development libraries, and Python 3 (slang's build needs an
-interpreter). slang, doctest and unordered\_dense are fetched by CMake at
-configure time, and glaze with the `CLOTHO_LSP` and `CLOTHO_DAP` options below.
+LLVM 22 development libraries with lld, compiler-rt's builtins and libc++'s
+headers (on Debian or Ubuntu: `llvm-22-dev liblld-22-dev libclang-rt-22-dev
+libc++-22-dev`), and Python 3 (slang's build needs an interpreter). slang,
+doctest and unordered\_dense are fetched by CMake at configure time, and glaze
+with the `CLOTHO_LSP` and `CLOTHO_DAP` options below.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -51,19 +53,30 @@ Unfinished features are on in Debug builds and off otherwise: `clotho synth`,
 `clotho lsp` (language server) and `clotho dap` (debug adapter) do not exist in
 a Release build. Turn one on with `-DCLOTHO_SYNTH=ON`, `-DCLOTHO_LSP=ON` or
 `-DCLOTHO_DAP=ON`. The server options also fetch and build glaze, the JSON
-library they use. `clotho build` is off the same way until it can write an
-executable: today it writes generated code (LLVM IR or Clotho's own IR), which
-is only useful when working on Clotho. Turn it on with `-DCLOTHO_BUILD_COMMAND=ON`.
+library they use.
 
 ## Using it
 
 ```
 clotho run     compile the design and simulate it
+clotho build   compile the design into an executable that simulates it without clotho
 clotho lint    check the design and report problems, without compiling or running
-clotho build   write the generated code (Debug builds, or -DCLOTHO_BUILD_COMMAND=ON)
 clotho lsp     language server over stdio (Debug builds, or -DCLOTHO_LSP=ON)
 clotho dap     debug adapter over stdio (Debug builds, or -DCLOTHO_DAP=ON)
 ```
+
+An executable from `clotho build` needs neither clotho nor a compiler where it
+runs, only the C library: build it once in CI and run it as often as you like.
+It takes plusargs and `--stop-time` as `clotho run` does:
+
+```sh
+clotho build -O tb.sv rtl.sv -o sim
+./sim +seed=7 --stop-time 1ms
+```
+
+By default it is compiled for a processor every machine of its kind has; pass
+`--cpu native` for exactly the one building it. See
+`docs/design/executables.md`.
 
 ## Testing
 

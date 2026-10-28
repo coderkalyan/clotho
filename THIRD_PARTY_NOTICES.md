@@ -40,18 +40,26 @@ three components bundled with it, nowhere.
 | glaze's bundled [fast_float](https://github.com/fastfloat/fast_float) (only with `CLOTHO_LSP` or `CLOTHO_DAP`) | Apache-2.0, MIT or BSL-1.0; used under MIT | `LICENSES/fast_float.txt` |
 | glaze's bundled [zmij](https://github.com/vitaut/zmij) (only with `CLOTHO_LSP` or `CLOTHO_DAP`) | MIT or BSL-1.0; used under BSL-1.0 | `LICENSES/BSL-1.0.txt` |
 | glaze's bundled xxh64, Copyright (c) 2015 Daniel Kirchner (only with `CLOTHO_LSP` or `CLOTHO_DAP`) | MIT, notice in `glaze/api/xxh64.hpp` | `LICENSES/glaze.txt` (same MIT terms) |
-| [LLVM](https://llvm.org) 22 (host install) | Apache-2.0 WITH LLVM-exception | `LICENSES/LLVM.txt` |
+| [LLVM](https://llvm.org) 22 (host install), including lld, which `clotho build` links with | Apache-2.0 WITH LLVM-exception | `LICENSES/LLVM.txt` |
 | [libsva](https://github.com/coderkalyan/libsva), including the [Zig](https://ziglang.org) standard library and compiler-rt it is built with | MIT | `LICENSES/libsva.txt`, `LICENSES/zig.txt` |
 
 ## Linked into every simulation
 
 The Clotho runtime (`src/runtime/`, MPL-2.0) uses unordered_dense and {fmt},
-so their notices apply to any binary that contains the runtime. {fmt}'s license
-waives its notice requirement for code embedded in object form;
-unordered_dense's MIT license does not. On Windows the runtime also links LLVM's
-compiler-rt builtins, licensed Apache-2.0 WITH LLVM-exception
-(`LICENSES/LLVM.txt`), whose exception waives notice requirements for code
-embedded by compilation.
+so their notices apply to any binary that contains the runtime: `clotho` itself,
+and every executable `clotho build` writes. {fmt}'s license waives its notice
+requirement for code embedded in object form; unordered_dense's MIT license does
+not. An executable prints the runtime's license and both notices for
+`--licenses` (`src/runtime/exe-notices.txt`).
+
+`clotho` also embeds, and links into every executable, files from the toolchain
+it was built with (docs/design/executables.md):
+
+| Component | License | Notice in an executable |
+|---|---|---|
+| LLVM's compiler-rt builtins and crtbegin/crtend, and code instantiated from libc++'s headers | Apache-2.0 WITH LLVM-exception (`LICENSES/LLVM.txt`) | none required: the exception waives it for code embedded by compilation |
+| glibc's `Scrt1.o`, `crti.o`, `crtn.o` and `libc_nonshared.a` (Linux) | LGPL-2.1-or-later with glibc's exception for these files, which permits linking them into any program without restriction | none required |
+| The MinGW-w64 C runtime and import libraries (Windows) | mostly public domain, with parts under ZPL-2.1 and other permissive licenses | not yet carried (docs/TODO.md) |
 
 ## Tests only
 

@@ -56,7 +56,7 @@
 // frontend found (`lint`). Every compiler decision lives in the libraries; this
 // file is argument handling and reporting.
 //
-//   clotho build [options] <source>...             emit an artifact, no execution (CLOTHO_BUILD_COMMAND)
+//   clotho build [options] <source>...             write an executable that simulates, or generated code
 //   clotho run   [options] <source>... [+arg...]   compile, then simulate
 //   clotho lint  [options] <source>...             diagnostics only
 //   clotho lsp                                     serve an editor over stdio (CLOTHO_LSP)
@@ -119,25 +119,14 @@ constexpr Commands kAny = kSource
 #endif
   ;
 
-// The options the artifact is compiled with and then run with, which `build` is
-// told exactly as `run` is: the --gc-* group (the backend bakes an rt_gc_config
-// into the emitted module and calls rt_gc_init from its main), `--coverage` (the
-// coverage model the backend emits names its own destination, so the report file
-// is a mode compiled in, not something `run` can add to an artifact built
-// without it), and `-O`, `--stat` and `--sanitize`, which steer code generation.
-// `lint` and `synth` never reach code generation, so they refuse all of these.
+// The options the design is compiled with, which `build` is told exactly as
+// `run` is: the --gc-* group (the backend bakes an rt_gc_config into the emitted
+// module and calls rt_gc_init from its main), `--coverage` (the coverage model
+// the backend emits names its own destination, so the report file is compiled
+// in, not something an executable can be told when it runs), `--dpi-lib`, and
+// `-O`, `--stat` and `--sanitize`, which steer code generation. `lint` and
+// `synth` never reach code generation, so they refuse all of these.
 constexpr Commands kBuildRun = bit(Command::Build) | bit(Command::Run);
-
-// Help text that is about `build`, kept as a string literal so a description can
-// still be one concatenated literal. Without the command there is no build for
-// the text to talk about.
-#ifdef CLOTHO_BUILD_COMMAND
-#define CLOTHO_IF_BUILD(text)    text
-#define CLOTHO_IF_NO_BUILD(text) ""
-#else
-#define CLOTHO_IF_BUILD(text)    ""
-#define CLOTHO_IF_NO_BUILD(text) text
-#endif
 
 // `-o` names the artifact, and two commands produce one.
 constexpr Commands kArtifact = bit(Command::Build)
@@ -170,18 +159,15 @@ constexpr std::string_view kBuildNote =
   "top-level module, and any other output goes to stdout unless that is a terminal; pass -o - to "
   "print it there anyway.";
 
-// The commands this build has, in the order `--help` lists them. `build`, `synth`,
-// `lsp` and `dap` are compiled out of a Release build, and a usage message that
-// offers a command the binary will then reject is worse than one that never
-// mentions it.
+// The commands this build has, in the order `--help` lists them. `synth`, `lsp`
+// and `dap` are compiled out of a Release build, and a usage message that offers
+// a command the binary will then reject is worse than one that never mentions it.
 constexpr CommandInfo kCommands[] = {
-#ifdef CLOTHO_BUILD_COMMAND
     { Command::Build,
       "build",
       "compile the design into an executable that simulates it without clotho",
       "[options] <files>...",
       kBuildNote },
-#endif
     { Command::Run, "run", "compile the design and simulate it", "[options] <files>... [+plusarg...]", kPlusargNote },
     { Command::Lint,
       "lint",
@@ -385,7 +371,6 @@ constexpr std::string_view kSanitizeList =
 // check_scope refuses it under any other, and the description needs no tag of
 // its own for that.
 void register_options(Registry& r, Options& o) {
-#ifdef CLOTHO_BUILD_COMMAND
     r.add(bit(Command::Build),
           "--emit",
           o.emit,
@@ -401,8 +386,6 @@ void register_options(Registry& r, Options& o) {
           "kind has (x86-64-v2 on x86-64, Apple M1 on Apple Silicon, generic Armv8-A on other "
           "AArch64) by default, `native` for exactly this one, or an LLVM processor name",
           "<name>");
-#endif
-#if defined(CLOTHO_BUILD_COMMAND) || defined(CLOTHO_SYNTH)
     r.add(kArtifact,
           "-o,--output",
           o.out,
@@ -410,7 +393,6 @@ void register_options(Registry& r, Options& o) {
           "top-level module, and other output goes to stdout",
           "<file>",
           slang::CommandLineFlags::FilePath);
-#endif
     r.add(kSource, "--time", o.time, "Print how long each stage took: reading the source, compiling, simulating");
     r.add(kBuildRun, "-O", o.o3, "Compile the design more thoroughly: slower to start up, faster to simulate");
     r.add_developer(kBuildRun,
@@ -436,8 +418,7 @@ void register_options(Registry& r, Options& o) {
           o.coverage,
           "Write the design's functional-coverage report here: which of the bins its "
           "covergroups declare the run reached, and which it never did (LRM 19). No report by "
-          "default" CLOTHO_IF_BUILD(". The destination is compiled into the generated code, so a build "
-                                    "and the run of what it built must be given the same file"),
+          "default. An executable writes its report to the file `build` was given",
           "<file>",
           slang::CommandLineFlags::FilePath);
     r.add_developer(kBuildRun,
@@ -446,8 +427,7 @@ void register_options(Registry& r, Options& o) {
                     "Reclaim unused class objects at every opportunity instead of when the "
                     "design has created enough of them. Slow by design: it turns an object Clotho failed "
                     "to keep into an immediate wrong answer rather than a rare one, so it is for working "
-                    "on clotho itself" CLOTHO_IF_BUILD(". Changes the generated code, so a build and the "
-                                                       "run of what it built must be given the same setting"));
+                    "on clotho itself. An executable keeps the setting `build` was given");
     r.add(kBuildRun,
           "--gc-stats",
           o.gc_stats,
@@ -894,9 +874,8 @@ std::string render_help(const Registry&           registry,
         append_sections(out, { commands });
         if (all) {
             append_paragraph(out,
-                             "A tag such as " CLOTHO_IF_BUILD("[build|run]") CLOTHO_IF_NO_BUILD(
-                               "[run]") " names the commands that take an option; an option with no tag is taken "
-                                        "by every command that reads source.");
+                             "A tag such as [build|run] names the commands that take an option; an option "
+                             "with no tag is taken by every command that reads source.");
         }
     }
 

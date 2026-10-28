@@ -13,9 +13,7 @@ and process startup cancel exactly:
 
 The slope must be flat in n. If it is not, the two arms are not matched -- check
 `--verify`, which diffs the emitted IR block histogram and asserts the only
-delta is the mechanism under test. `--verify` reads `clotho build --emit=llvm`,
-so it needs a clotho configured with `build` (a Debug build, or
-`-DCLOTHO_BUILD_COMMAND=ON`).
+delta is the mechanism under test. `--verify` reads `clotho build --emit=llvm`.
 
 Families:
   service   a blocking store to a signal WITH static waiters vs WITHOUT.
