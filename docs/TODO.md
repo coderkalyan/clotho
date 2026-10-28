@@ -216,7 +216,6 @@ Milestones, in order; lower ones unblock higher ones:
 - [ ] **Cross-compiling an executable** — `build` writes one only for the machine it runs
   on; another target needs its executable runtime and C library startup files.
 
-
 ### File and string I/O
 
 - [ ] **`$fgets` into a part-select or non-byte-multiple target**.
