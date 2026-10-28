@@ -1351,7 +1351,14 @@ int main(int argc, char** argv) {
         if (eq == std::string::npos || eq == 0) {
             return usage_error(std::format("invalid --path-prefix-map '{}': write <dir>=<new>", entry));
         }
-        std::string dir = std::filesystem::absolute(entry.substr(0, eq)).lexically_normal().string();
+        // Resolved the way slang resolves a source's full path, symbolic links
+        // included (macOS's temporary directory is one).
+        std::error_code ec;
+        std::string     dir =
+          std::filesystem::weakly_canonical(std::filesystem::absolute(entry.substr(0, eq)), ec).string();
+        if (ec) {
+            dir = std::filesystem::absolute(entry.substr(0, eq)).lexically_normal().string();
+        }
         while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) {
             dir.pop_back();
         }

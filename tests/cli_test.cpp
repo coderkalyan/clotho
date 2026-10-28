@@ -897,11 +897,11 @@ TEST_CASE("cli: --path-prefix-map changes the source paths a simulation prints")
         CHECK(contains(r.err, "narrow/t.sv:4: $finish called at 0 s"));
     }
     SUBCASE("an executable keeps the paths build was told to show") {
-        CHECK(s.run_in(std::format("build --path-prefix-map \"{}=\" -o sim rtl/t.sv", s.dir().string())).code == 0);
+        CHECK(s.run_in(std::format("build --path-prefix-map \"{}=proj\" -o sim rtl/t.sv", s.dir().string())).code == 0);
         const std::string cmd =
           std::format("cd / && \"{}\" 2> \"{}\"", s.path("sim").string(), s.path("e.txt").string());
         CHECK(std::system(cmd.c_str()) == 0);
-        CHECK(contains(clotho::test::detail::read_file(s.path("e.txt")), "ERROR: rtl/t.sv:3: top at 0 s: boom"));
+        CHECK(contains(clotho::test::detail::read_file(s.path("e.txt")), "ERROR: proj/rtl/t.sv:3: top at 0 s: boom"));
     }
     SUBCASE("a value without = is a usage error") {
         const Result r = s.run(std::format("run --path-prefix-map nothing \"{}\"", s.path("rtl/t.sv").string()));
