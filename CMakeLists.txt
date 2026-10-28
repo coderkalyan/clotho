@@ -474,7 +474,26 @@ add_library(clotho STATIC
   src/Diagnostic.cpp
   src/SourceContext.cpp
   src/SourceMap.cpp
-  src/Lower.cpp
+  src/lower/Assertions.cpp
+  src/lower/Assign.cpp
+  src/lower/BuiltinClasses.cpp
+  src/lower/Classes.cpp
+  src/lower/Containers.cpp
+  src/lower/Coverage.cpp
+  src/lower/Expr.cpp
+  src/lower/Hierarchy.cpp
+  src/lower/Lower.cpp
+  src/lower/Lowerer.cpp
+  src/lower/Nets.cpp
+  src/lower/Random.cpp
+  src/lower/Scans.cpp
+  src/lower/Sort.cpp
+  src/lower/Statements.cpp
+  src/lower/Subroutines.cpp
+  src/lower/SvaMonitor.cpp
+  src/lower/SystemTasks.cpp
+  src/lower/Timing.cpp
+  src/lower/Types.cpp
   src/Sva.cpp
 )
 target_include_directories(clotho PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
