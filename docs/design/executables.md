@@ -74,7 +74,7 @@ extracted to a temporary directory for the link:
 
 | Platform | Embedded | Taken from the machine at link time |
 |---|---|---|
-| Linux (glibc) | runtime, compiler-rt builtins and crtbegin/crtend, glibc's `Scrt1.o`, `crti.o`, `crtn.o`, `libc_nonshared.a` | the dynamic linker, `libc.so.6` and `libm.so.6` clotho itself runs with (`dl_iterate_phdr`) |
+| Linux (glibc) | runtime, compiler-rt builtins and crtbegin/crtend, glibc's `Scrt1.o`, `crti.o`, `crtn.o`, `libc_nonshared.a` | the dynamic linker, `libc.so.6` and `libm.so.6` clotho itself runs with (`dl_iterate_phdr`); a statically linked clotho, which runs with none, takes the dynamic linker from its fixed ELF ABI path and the libraries from the first standard directory (multiarch first) that has them |
 | macOS | runtime, compiler-rt builtins | none: a libSystem stub listing exactly the symbols the inputs need, each checked against this machine's libSystem |
 | Windows (MinGW-w64) | runtime, compiler-rt builtins, `crt2.o`, crtbegin/crtend, the MinGW-w64 CRT and import libraries | none |
 
@@ -114,7 +114,6 @@ relative to the checkout.
 
 - Cross-compilation (`--target`): each target needs its executable runtime
   built for it and its C library's startup files; the link itself is the same.
-- A statically linked clotho cannot point an executable at its C library.
 - A clotho built with MSVC rather than MinGW-w64: the executable runtime's
   flags are GCC/clang's.
 - A per-definition object cache for incremental builds (module-split.md).

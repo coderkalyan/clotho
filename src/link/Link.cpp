@@ -104,6 +104,38 @@ int collect_system_libs(dl_phdr_info* info, size_t, void* data) {
     return 0;
 }
 
+// For what this process does not have loaded, as a statically linked clotho has
+// none of them: the dynamic linker at the path the architecture's ELF ABI fixes,
+// and libc.so.6 and libm.so.6 from the first standard library directory that
+// has them, multiarch first. A library of the wrong architecture is lld's to
+// refuse.
+void find_system_libs_on_disk(SystemLibs& libs) {
+#if defined(__x86_64__)
+    constexpr const char* interp    = "/lib64/ld-linux-x86-64.so.2";
+    constexpr const char* multiarch = "x86_64-linux-gnu";
+#elif defined(__aarch64__)
+    constexpr const char* interp    = "/lib/ld-linux-aarch64.so.1";
+    constexpr const char* multiarch = "aarch64-linux-gnu";
+#endif
+    if (libs.interp.empty() && llvm::sys::fs::exists(interp)) {
+        libs.interp = interp;
+    }
+    const std::string dirs[] = { std::string("/lib/") + multiarch,
+                                 std::string("/usr/lib/") + multiarch,
+                                 "/lib64",
+                                 "/usr/lib64",
+                                 "/lib",
+                                 "/usr/lib" };
+    for (const std::string& dir : dirs) {
+        if (libs.libc.empty() && llvm::sys::fs::exists(dir + "/libc.so.6")) {
+            libs.libc = dir + "/libc.so.6";
+        }
+        if (libs.libm.empty() && llvm::sys::fs::exists(dir + "/libm.so.6")) {
+            libs.libm = dir + "/libm.so.6";
+        }
+    }
+}
+
 bool link_host(const std::string&           object,
                std::span<const std::string> dpi_libs,
                bool                         exports_dpi,
@@ -118,11 +150,10 @@ bool link_host(const std::string&           object,
 #endif
     SystemLibs libs;
     dl_iterate_phdr(collect_system_libs, &libs);
+    find_system_libs_on_disk(libs);
     if (libs.interp.empty() || libs.libc.empty() || libs.libm.empty()) {
-        // TODO: a statically linked clotho has no C library to point at; it would
-        // have to search the file system for one.
-        llvm::errs() << "clotho: cannot find the dynamic linker and C library this clotho runs with, which "
-                        "an executable is linked against\n";
+        llvm::errs() << "clotho: cannot find the dynamic linker, libc.so.6 or libm.so.6 to link an executable "
+                        "against, loaded in clotho or installed where glibc puts them\n";
         return false;
     }
 
