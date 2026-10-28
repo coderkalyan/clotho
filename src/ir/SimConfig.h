@@ -13,7 +13,7 @@ namespace clotho::ir {
 // Access tier for the $system shell-exec task (LRM §20.17.1). $system runs an
 // arbitrary shell command, so it is refused by default and gated behind an
 // explicit `--allow-system=<tier>` operator opt-in. The enum values are stable
-// (passed to the runtime backstop rt_system_set_access as an int32_t).
+// (passed to the runtime backstop as rt_run_config::system_access).
 enum class SystemAccess : uint8_t {
     // Default: any $system in the source is a hard compile error; no exec code
     // is emitted at all.

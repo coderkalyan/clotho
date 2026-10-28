@@ -155,7 +155,7 @@ void rt_observed_flush(void);
 //
 // `level` is the ir::Severity label (0 info, 1 warning, 2 error, 3 fatal); it
 // selects LABEL, and a fatal also makes the run end with exit status 1
-// (rt_run_status). `banner` is the compile-time "<file>:<line>: <scope>" prefix:
+// (rt_run). `banner` is the compile-time "<file>:<line>: <scope>" prefix:
 // the call's location and the hierarchical name of the scope it is made in, both
 // of which LRM 20.10 requires the report to carry (an empty banner drops the
 // prefix). `<time>` is the simulation time, written as the $finish banner writes
@@ -409,12 +409,6 @@ void rt_ref_stale(const rt_ref_site* site, const void* epoch, uint64_t expect, u
 [[noreturn]] void rt_ref_epoch_regress(const rt_ref_site* site, const void* epoch,
                                        uint64_t expect, uint64_t actual, uint64_t now);
 
-// Select the stale-ref mode: nonzero downgrades rt_ref_stale to a once-per-site
-// warning that returns, zero (the default) leaves it fatal. Owned by the CLI's
-// --loose-stale-ref and set once before the design runs. Does not affect
-// rt_ref_epoch_regress, which aborts in either mode.
-void rt_ref_stale_warn(int32_t enable);
-
 // -- Tagged-union member access inconsistent with the current tag (LRM 11.9) --
 
 // The site of one guarded tagged-union member access, emitted by the backend as
@@ -545,28 +539,68 @@ uint64_t rt_diag_now(void);
 // all three paths.
 //
 // Two things end the drain from outside the design, both at a time-step
-// boundary (rt_wheel_advance): the stop time rt_stop_time_set armed, which ends
-// the run as a $finish at that instant would, and SIGINT, which is caught for
-// exactly the span of the drain and which ends it WITHOUT running the finals.
-// Either way the dump and every open file are flushed before this returns, and
-// the way the run ended is rt_run_status.
+// boundary (rt_wheel_advance): the stop time rt_run armed, which ends the run
+// as a $finish at that instant would, and SIGINT, which is caught for exactly
+// the span of the drain and which ends it WITHOUT running the finals. Either
+// way the dump and every open file are flushed before this returns, and rt_run
+// reports how the run ended.
 void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*), void (*finals)(void*, void*));
 
-// Stop the next rt_sim_run once every event at or before `stop_fs` femtoseconds
-// has run (`--stop-time`). The design's ticks are `tick_fs` femtoseconds, and a
-// stop time that falls between two of them rounds UP to the next tick. Prints
-// "clotho: stopped at --stop-time <time>" and runs the finals, so the run ends
-// exactly as a $finish at that instant would. Nothing is printed and nothing
-// changes when the design ends first. Host-side (not exposed to the JIT); the
-// setting does not outlive the run it was armed for.
-void rt_stop_time_set(uint64_t stop_fs, uint64_t tick_fs);
+// How the host arms a run of the design (rt_run). Read once, before the design
+// starts; nothing in it outlives that run.
+typedef struct rt_run_config {
+    // The plusargs (LRM 21.6), each without its leading `+`, in command-line
+    // order. Copied, so the strings need not outlive rt_run.
+    const char* const* plusargs;
+    const uint32_t*    plusarg_lens;
+    uint32_t           plusarg_count;
+    // The $system access tier (0 = off, 1 = const, 2 = full). The runtime
+    // backstop behind the compile-time --allow-system gate: a rt_system call
+    // reached with the tier off aborts instead of running a shell.
+    int32_t system_access;
+    // Nonzero downgrades rt_ref_stale to a once-per-site warning that returns
+    // (--loose-stale-ref); zero leaves it fatal. rt_ref_epoch_regress aborts in
+    // either mode.
+    int32_t loose_stale_ref;
+    // Nonzero stops the run once every event at or before `stop_fs`
+    // femtoseconds has run (--stop-time): it prints "clotho: stopped at
+    // --stop-time <time>" and runs the finals, exactly as a $finish at that
+    // instant would. The design's ticks are `tick_fs` femtoseconds, and a stop
+    // time between two of them rounds UP to the next tick. Nothing is printed
+    // when the design ends first.
+    int32_t  has_stop_time;
+    uint64_t stop_fs;
+    uint64_t tick_fs;
+} rt_run_config;
 
-// How the last rt_sim_run ended, as the process exit status: 1 after a $fatal
-// (LRM 20.10 "terminates the simulation with an error code"), 130 after SIGINT,
-// otherwise 0 -- a $finish of any level, $error, $warning and a failed
-// assertion do not change it. Host-side; read after the run, valid until the
-// next rt_sim_run.
-int32_t rt_run_status(void);
+// Run a compiled design: arm the runtime from `config`, call `design_main` (the
+// backend's `clotho_main`), and return the process exit status. That is 1 after
+// a $fatal (LRM 20.10 "terminates the simulation with an error code"), 130
+// after SIGINT, otherwise 0: a $finish of any level, $error, $warning and a
+// failed assertion do not change it. The one host-side entry, shared by the JIT
+// and a linked executable, so the two cannot arm a run differently.
+int32_t rt_run(const rt_run_config* config, int32_t (*design_main)(void));
+
+// Parse a --stop-time value (`len` bytes at `text`): an integer and a unit with
+// nothing between them, as `100ns` or `5us`. Returns 1 and sets *femtoseconds,
+// or returns 0 and writes "invalid --stop-time '<text>': <why>" to `error`
+// (NUL-terminated, cut to `cap` bytes) for a missing or unknown unit, a zero
+// time, or one that does not fit in 64 bits of femtoseconds. Shared by `clotho
+// run` and an executable's command line, so the two accept the same times.
+int32_t rt_parse_stop_time(const char* text, uint64_t len, uint64_t* femtoseconds, char* error, uint64_t cap);
+
+// What an executable's main needs to know about the design it runs, beyond the
+// entry: the backend emits one as the constant `clotho_design` beside
+// `clotho_main`. Settings `clotho build` was given that a run cannot change.
+typedef struct rt_design {
+    // The design's tick in femtoseconds (rt_run_config::tick_fs).
+    uint64_t tick_fs;
+    // The --allow-system tier the design was compiled with
+    // (rt_run_config::system_access).
+    int32_t system_access;
+    // The first top-level instance, for the executable's --help and --version.
+    const char* top;
+} rt_design;
 
 // -- File I/O (LRM 1800-2023 §21.3) --
 //
@@ -596,11 +630,6 @@ int32_t rt_fopen_fd(const char* name_buf, uint32_t name_len, int32_t name_fwd, c
 // $fclose(desc): close every stream the descriptor names (all set MCD channels,
 // or the one FD). The preopened standard streams are never closed.
 void rt_fclose(int32_t desc);
-
-// Set the $system access tier (0 = off, 1 = const, 2 = full) before the design
-// runs. A host-side call, not exposed to the JIT. Governs the rt_system
-// backstop below.
-void rt_system_set_access(int32_t tier);
 
 // $system(cmd): run `cmd` as a shell command via the C system(), returning its
 // raw int (a POSIX wait-status) (LRM §20.17.1). `has_arg` == 0 is the no-arg
@@ -921,11 +950,9 @@ uint32_t rt_randc_next(uint64_t* seen, uint32_t nvals, uint64_t* rng);
 // -- Plusargs (LRM §21.6) --
 //
 // Command-line arguments prefixed with `+` (everything after the leading `+`
-// dropped), in the order given on Clotho's own command line. Populated once
-// by the host before the design runs; the backing storage must outlive the
-// run. Not thread-safe (matches the single-simulator-per-process model
-// elsewhere in the runtime, e.g. $random / the file table).
-void rt_plusargs_init(const char* const* args, const uint32_t* lens, uint32_t n);
+// dropped), in the order given on the command line, as rt_run received them.
+// Not thread-safe (matches the single-simulator-per-process model elsewhere in
+// the runtime, e.g. $random / the file table).
 
 // $test$plusargs(str) (LRM §21.6): search the plusargs in order; -> nonzero
 // iff some plusarg's prefix matches every character of `s` (`len` bytes).
@@ -1888,7 +1915,7 @@ void rt_wheel_tick(rt_wheel* wheel, void* ctx);
 //
 // This is also where a run ends from outside the design, because the step that
 // just settled is complete (its dump sample is taken) and the next has not
-// started. A pending SIGINT, or a next step past the stop time rt_stop_time_set
+// started. A pending SIGINT, or a next step past the stop time rt_run
 // armed, returns zero WITHOUT advancing, which the sim loop reads as an idle
 // wheel; rt_sim_run then tells the ends apart.
 int rt_wheel_advance(rt_wheel* wheel, void* ctx);

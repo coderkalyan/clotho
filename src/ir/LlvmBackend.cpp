@@ -26,16 +26,20 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/ModuleSlotTracker.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Linker/Linker.h>
+#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 
@@ -75,7 +79,7 @@
 // instantiation); the root `%clotho.state` composes the top-level instances
 // plus the NBA shadow region. Each process takes a `ptr` to the root and
 // reaches a field through constant-index GEPs, so LLVM computes and owns all
-// offsets/padding (the module carries the host target's DataLayout).
+// offsets/padding (the module carries the target's DataLayout).
 //
 // Inferred types. The IR stores no per-instruction result type, so the backend
 // recomputes width / domain / signedness for each value by walking operands
@@ -7979,10 +7983,11 @@ private:
 
     // -- Top-level entry --
     //
-    // Emit `i32 @main()`: heap-allocate the shared state, power it up, build the
-    // timing wheel, then run every process through the active task queue and drain
-    // the wheel (advancing time, resuming delayed/woken processes) until idle,
-    // then run the `final` blocks. Returns 0.
+    // Emit `i32 @clotho_main()`, the entry rt_run calls: heap-allocate the shared
+    // state, power it up, build the timing wheel, then run every process through
+    // the active task queue and drain the wheel (advancing time, resuming
+    // delayed/woken processes) until idle, then run the `final` blocks. Returns
+    // 0. Not `main`: a linked executable has its own, which calls rt_run.
     void emit_main(const std::vector<llvm::Function*>& procs) {
         sched_anchor_ = SignalSlot::no_anchor; // startup code addresses absolutely
         auto* ptr_ty  = llvm::PointerType::getUnqual(ctx_);
@@ -8005,9 +8010,25 @@ private:
         emit_finals_run(finals->getArg(0), finals->getArg(1), procs);
         b_.CreateRetVoid();
 
+        // The constant an executable's main reads beside clotho_main: rt_design
+        // (Runtime.h), whose fields are this struct's, in order.
+        {
+            auto* top     = llvm::ConstantDataArray::getString(ctx_, mod_.top_name);
+            auto* top_var = new llvm::GlobalVariable(
+              env_->llmod, top->getType(), true, llvm::GlobalValue::PrivateLinkage, top, "clotho.design.top");
+            top_var->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+            auto* design_ty =
+              llvm::StructType::get(ctx_, { b_.getInt64Ty(), b_.getInt32Ty(), llvm::PointerType::getUnqual(ctx_) });
+            auto* design = llvm::ConstantStruct::get(
+              design_ty,
+              { b_.getInt64(mod_.tick_fs), b_.getInt32(static_cast<uint32_t>(config_.allow_system)), top_var });
+            new llvm::GlobalVariable(
+              env_->llmod, design_ty, true, llvm::GlobalValue::ExternalLinkage, design, "clotho_design");
+        }
+
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
         auto* fnty = llvm::FunctionType::get(i32, false);
-        auto* main = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, "main", env_->llmod);
+        auto* main = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, "clotho_main", env_->llmod);
 
         auto* entry = llvm::BasicBlock::Create(ctx_, "entry", main);
         b_.SetInsertPoint(entry);
@@ -31330,33 +31351,27 @@ bool optimize_module(llvm::Module& m, bool o3) {
     return true;
 }
 
+llvm::Expected<llvm::orc::JITTargetMachineBuilder> host_target() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+    });
+    return llvm::orc::JITTargetMachineBuilder::detectHost();
+}
+
 BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
-                                      const SimulationConfig& config, const LocResolver& resolve) {
+                                      const llvm::TargetMachine& target, const SimulationConfig& config,
+                                      const LocResolver& resolve) {
     auto root = std::make_unique<llvm::Module>(m.name.empty() ? "clotho" : m.name, ctx);
 
-    // Pin the modules to the host target's triple and DataLayout before any IR
-    // is built: the state/frame struct layouts, the NBA meta table's baked byte
+    // Pin the modules to the target's triple and DataLayout before any IR is
+    // built: the state/frame struct layouts, the NBA meta table's baked byte
     // offsets, and load/store alignments are all DataLayout-derived, so they
     // must be computed against the layout codegen will actually use. Unit
     // modules copy the root's triple/DataLayout at creation (unit_env).
-    {
-        static std::once_flag once;
-        std::call_once(once, [] { llvm::InitializeNativeTarget(); });
-        auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
-        if (!jtmb) {
-            llvm::errs() << "llvm backend: cannot detect host target: "
-                         << llvm::toString(jtmb.takeError()) << "\n";
-            return {};
-        }
-        auto dl = jtmb->getDefaultDataLayoutForTarget();
-        if (!dl) {
-            llvm::errs() << "llvm backend: no host data layout: " << llvm::toString(dl.takeError())
-                         << "\n";
-            return {};
-        }
-        root->setTargetTriple(jtmb->getTargetTriple());
-        root->setDataLayout(*dl);
-    }
+    root->setTargetTriple(target.getTargetTriple());
+    root->setDataLayout(target.createDataLayout());
 
     BuiltDesign built;
     try {
@@ -31387,9 +31402,9 @@ BuiltDesign build_modules_unoptimized(const Module& m, llvm::LLVMContext& ctx,
     return built;
 }
 
-BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const SimulationConfig& config,
-                          const LocResolver& resolve) {
-    auto built = build_modules_unoptimized(m, ctx, config, resolve);
+BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::TargetMachine& target,
+                          const SimulationConfig& config, const LocResolver& resolve) {
+    auto built = build_modules_unoptimized(m, ctx, target, config, resolve);
     if (built.modules.empty()) {
         return {};
     }
@@ -31411,15 +31426,88 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const Simulat
 
 bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& config,
                Timings* timings, const LocResolver& resolve) {
-    const auto        t_llvm = std::chrono::steady_clock::now();
+    const auto t_llvm = std::chrono::steady_clock::now();
+    auto       host   = host_target();
+    if (!host) {
+        llvm::errs() << "llvm backend: cannot detect host target: " << llvm::toString(host.takeError())
+                     << "\n";
+        return false;
+    }
+    auto tm = host->createTargetMachine();
+    if (!tm) {
+        llvm::errs() << "llvm backend: " << llvm::toString(tm.takeError()) << "\n";
+        return false;
+    }
     llvm::LLVMContext ctx;
-    auto              built = build_modules(m, ctx, config, resolve);
+    auto              built = build_modules(m, ctx, **tm, config, resolve);
     if (built.modules.empty()) {
         return false;
     }
     for (const auto& mod : built.modules) {
         mod->print(os, nullptr);
     }
+    if (timings != nullptr) {
+        timings->llvm_ms += ms_since(t_llvm);
+    }
+    return true;
+}
+
+bool emit_object(const Module&                             m,
+                 llvm::raw_ostream&                        os,
+                 const llvm::orc::JITTargetMachineBuilder& target,
+                 const SimulationConfig&                   config,
+                 Timings*                                  timings,
+                 const LocResolver&                        resolve) {
+    assert(config.lower_coro && "an object needs the coroutines lowered");
+    const auto  t_llvm = std::chrono::steady_clock::now();
+    std::string error;
+    const auto* llvm_target = llvm::TargetRegistry::lookupTarget(target.getTargetTriple(), error);
+    if (llvm_target == nullptr) {
+        llvm::errs() << "llvm backend: " << error << "\n";
+        return false;
+    }
+    // Not target.createTargetMachine(): that asks for a JIT target machine, and
+    // on x86-64 a JIT one defaults to the large code model, whose absolute
+    // 64-bit addresses in the code are text relocations a macOS link refuses.
+    // Only the triple, CPU and features carry over; the code model and target
+    // options are the platform's defaults for ordinary compiled code.
+    const std::unique_ptr<llvm::TargetMachine> tm(
+      llvm_target->createTargetMachine(target.getTargetTriple(),
+                                       target.getCPU(),
+                                       target.getFeatures().getString(),
+                                       llvm::TargetOptions(),
+                                       llvm::Reloc::PIC_,
+                                       std::nullopt,
+                                       config.o3 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::None));
+    if (tm == nullptr) {
+        llvm::errs() << "llvm backend: cannot generate code for " << target.getTargetTriple().str() << "\n";
+        return false;
+    }
+    llvm::LLVMContext ctx;
+    auto              built = build_modules(m, ctx, *tm, config, resolve);
+    if (built.modules.empty()) {
+        return false;
+    }
+    llvm::Module& root = *built.modules.front();
+    llvm::Linker  linker(root);
+    for (size_t i = 1; i < built.modules.size(); ++i) {
+        // Reports its own diagnostic through the context's handler.
+        if (linker.linkInModule(std::move(built.modules[i]))) {
+            return false;
+        }
+    }
+
+    // Emitted into memory first: an object writer may seek back to patch
+    // headers, which a pipe on stdout cannot do.
+    llvm::SmallVector<char, 0> object;
+    llvm::raw_svector_ostream  object_os(object);
+    llvm::legacy::PassManager  pm;
+    if (tm->addPassesToEmitFile(pm, object_os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+        llvm::errs() << "llvm backend: target " << tm->getTargetTriple().str() << " cannot write an object file\n";
+        return false;
+    }
+    pm.run(root);
+    os.write(object.data(), object.size());
     if (timings != nullptr) {
         timings->llvm_ms += ms_since(t_llvm);
     }

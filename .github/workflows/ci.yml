@@ -128,10 +128,13 @@ jobs:
           # and 15 is not available on any GitHub-hosted image. libstdc++-14-dev
           # supplies <print>, which src/main.cpp uses and GCC 13's does not have.
           # The -dev packages are what LLVM's exported CMake targets link
-          # against.
+          # against. libc++'s headers, compiler-rt's builtins and lld's libraries
+          # are what `clotho build` puts into an executable
+          # (docs/design/executables.md).
           sudo apt-get install -y --no-install-recommends \
             llvm-$LLVM_MAJOR-dev clang-$LLVM_MAJOR libstdc++-14-dev ninja-build ccache \
-            zlib1g-dev libzstd-dev libxml2-dev libncurses-dev libedit-dev
+            zlib1g-dev libzstd-dev libxml2-dev libncurses-dev libedit-dev \
+            libc++-$LLVM_MAJOR-dev libclang-rt-$LLVM_MAJOR-dev liblld-$LLVM_MAJOR-dev
           echo "LLVM_DIR=/usr/lib/llvm-$LLVM_MAJOR/lib/cmake/llvm" >> "$GITHUB_ENV"
           echo "CC=clang-$LLVM_MAJOR"    >> "$GITHUB_ENV"
           echo "CXX=clang++-$LLVM_MAJOR" >> "$GITHUB_ENV"
@@ -148,6 +151,11 @@ jobs:
           prefix=$(brew --prefix llvm@$LLVM_MAJOR 2>/dev/null || brew --prefix llvm)
           "$prefix/bin/clang++" --version
           echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
+          # lld is its own formula with its own prefix; `clotho build` links with
+          # it (docs/design/executables.md).
+          brew install lld@$LLVM_MAJOR || brew install lld
+          lld_prefix=$(brew --prefix lld@$LLVM_MAJOR 2>/dev/null || brew --prefix lld)
+          echo "LLD_DIR=$lld_prefix/lib/cmake/lld" >> "$GITHUB_ENV"
           echo "CC=$prefix/bin/clang"    >> "$GITHUB_ENV"
           echo "CXX=$prefix/bin/clang++" >> "$GITHUB_ENV"
           # Link Homebrew LLVM's own libc++, not the SDK's. CMake seeds
@@ -259,12 +267,12 @@ jobs:
             launcher="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           fi
           # ZIG_EXECUTABLE is set only on Windows (the zig install step above).
-          # A release build leaves out `lsp`, `dap` and `build`; CI builds them so
-          # their tests run on every platform.
+          # A release build leaves out `lsp` and `dap`; CI builds them so their
+          # tests run on every platform.
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
-            -DCLOTHO_LSP=ON -DCLOTHO_DAP=ON -DCLOTHO_BUILD_COMMAND=ON \
+            -DCLOTHO_LSP=ON -DCLOTHO_DAP=ON \
             ${ZIG_EXECUTABLE:+-DZIG_EXECUTABLE=$ZIG_EXECUTABLE} \
             $launcher
 

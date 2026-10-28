@@ -60,7 +60,7 @@ trivially — loads through an extern global are more opaque, not less.
 
 ## ORC side
 
-`addIRModule` per unit into the main JITDylib; `lookup("main")` pulls root and
+`addIRModule` per unit into the main JITDylib; `lookup("clotho_main")` pulls root and
 its extern refs materialize each def module. Eager, sequential, same
 semantics. Laziness is deliberately not built: the seed loop references every
 group at startup, so the whole design is always reachable. ObjectCache keys on
@@ -186,7 +186,7 @@ mispredicts 2.7M -> 13.4M (indirect flat — dispatch/stub theories dead),
 plausibly downstream of the same codegen shift moving branch layout in its
 giant root thunks. Supporting facts: post-pipeline IR byte-identical modulo
 absid immediates; addIRModule order reversal is a no-op perturbation
-(materialization order is dependency-driven from lookup("main")); miss
+(materialization order is dependency-driven from lookup("clotho_main")); miss
 counts run-stable under ASLR; --perf-jitdump inflates branch-misses ~7x
 (never attribute misses under it); compile-phase counters clean everywhere.
 

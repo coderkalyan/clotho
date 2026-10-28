@@ -329,7 +329,7 @@ via `GetForCurrentProcess`). A design with a non-empty `dpi_exports` that was gi
 sealed shared object cannot be linked into the JITDylib, so its `export` calls could
 never reach a thunk.
 
-An imported symbol that resolves to nothing surfaces as an ORC `lookup("main")`
+An imported symbol that resolves to nothing surfaces as an ORC `lookup("clotho_main")`
 failure at JIT time; wrap it to a loud, named "unresolved DPI import `<cid>`" error
 rather than a raw ORC message. No layer/mangling changes; both loaders feed the
 one main JITDylib. (Resolving DPI symbols from clotho's *own* process symbols is

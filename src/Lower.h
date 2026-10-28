@@ -93,10 +93,12 @@ LowerResult lower_sources(std::span<const std::string_view> args,
 // options on the Driver's `CommandLine`, so one parser and one `--help` cover
 // both tools' options and neither has to forward to the other. Takes ownership —
 // the returned `sources` keeps the Driver (hence its SourceManager) alive so a
-// `SourceLoc` stays resolvable.
+// `SourceLoc` stays resolvable. `path_prefix_map` changes how the simulation's
+// messages show source paths (SourceContext::shown_file).
 LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
-                         Timings*                               timings      = nullptr,
-                         ir::SystemAccess                       allow_system = ir::SystemAccess::Off);
+                         Timings*                               timings         = nullptr,
+                         ir::SystemAccess                       allow_system    = ir::SystemAccess::Off,
+                         PathPrefixMap                          path_prefix_map = {});
 
 // Lower a SystemVerilog source fragment held in memory. If `timings` is non-null,
 // the front-end and analysis phase durations are accumulated into it.

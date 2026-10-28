@@ -85,6 +85,20 @@ public:
         return r;
     }
 
+    // Like run, from inside the scratch directory, for output written beside it.
+    Result run_in(std::string_view args) const {
+        const fs::path    out = path("stdout.txt");
+        const fs::path    err = path("stderr.txt");
+        const std::string cmd = std::format(
+          "cd \"{}\" && \"{}\" {} > \"{}\" 2> \"{}\"", dir_.string(), CLOTHO_EXE, args, out.string(), err.string());
+        const int status = std::system(cmd.c_str());
+        Result    r;
+        r.code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        r.out  = clotho::test::detail::read_file(out);
+        r.err  = clotho::test::detail::read_file(err);
+        return r;
+    }
+
     // Like run, but stdout is a pseudo-terminal, so the process sees what it
     // sees when a person runs it in a shell, and `out` is what it wrote there
     // (with the terminal's CR LF line endings). stderr is still a file.
@@ -214,9 +228,8 @@ const std::vector<std::string> kUncommonSource = {
     "--depfile-trim", "--max-case-analysis-steps", "--isystem", "--diag-json", "-v", "-W"
 };
 
-// The commands this build has. A command a build leaves out (`build`, `synth`,
-// `lsp` and `dap` are opt-in) is an unknown command, which exits 2 whatever
-// follows it.
+// The commands this build has. A command a build leaves out (`synth`, `lsp` and
+// `dap` are opt-in) is an unknown command, which exits 2 whatever follows it.
 std::vector<std::string_view> built_commands(const Scratch& s) {
     std::vector<std::string_view> commands;
     for (const std::string_view command : { "build", "run", "lint", "synth", "lsp", "dap" }) {
@@ -229,13 +242,6 @@ std::vector<std::string_view> built_commands(const Scratch& s) {
 
 bool has_command(const Scratch& s, std::string_view command) {
     return s.run(std::format("{} --help", command)).code == 0;
-}
-
-// How a scope error names the commands that take a code-generation option:
-// `build` is opt-in (CLOTHO_BUILD_COMMAND), and a message never names a command
-// the binary lacks.
-std::string build_run_scope(const Scratch& s) {
-    return has_command(s, "build") ? "'build' or 'run'" : "'run'";
 }
 
 } // namespace cli_test
@@ -285,11 +291,13 @@ TEST_CASE("cli: <command> --help lists only the options that command takes") {
         { "build",
           "Usage: clotho build [options] <files>...\n",
           { "--emit",
+            "--cpu",
             "-o",
             "-O",
             "--sanitize",
             "--coverage",
             "--gc-stats",
+            "--dpi-lib",
             "--time",
             "--allow-system",
             "--loose-timescale",
@@ -297,7 +305,6 @@ TEST_CASE("cli: <command> --help lists only the options that command takes") {
             "--help-all",
             "--version" },
           { "--stop-time",
-            "--dpi-lib",
             "--loose-stale-ref",
             "--perf-jitdump",
             "--stat",
@@ -406,18 +413,9 @@ TEST_CASE("cli: --help-all lists every option, tagged with the commands that tak
     }
     // The Verilog-style spellings are listed with the option they alias.
     CHECK(contains(all.out, "-I, --include-directory, +incdir <dir-pattern>[,...]"));
-    if (has_command(s, "build")) {
-        CHECK(contains(all.out, "[build] What to write"));
-        CHECK(contains(all.out, "[build|run] Compile the design more thoroughly"));
-    } else {
-        // Without `build`, its options are not registered and no tag names it.
-        CHECK_FALSE(lists(all.out, "--emit"));
-        CHECK_FALSE(contains(all.out, "[build"));
-        CHECK_FALSE(contains(all.out, "|build"));
-        CHECK_FALSE(contains(all.out, "a build and the run"));
-        CHECK(contains(all.out, "[run] Compile the design more thoroughly"));
-    }
-    CHECK(contains(all.out, "[run] Library holding the C functions"));
+    CHECK(contains(all.out, "[build] What to write"));
+    CHECK(contains(all.out, "[build|run] Compile the design more thoroughly"));
+    CHECK(contains(all.out, "[build|run] Library holding the C functions"));
     // Options for working on clotho are listed only here, under their own heading,
     // after Clotho's other options and before slang's.
     const size_t dev_at = all.out.find("Developer options (for working on clotho):\n");
@@ -511,7 +509,7 @@ TEST_CASE("cli: lint refuses every option that steers code generation") {
         CAPTURE(c.flag);
         const Result r = s.run(std::format("lint {} \"{}\"", c.flag, design.string()));
         CHECK(r.code == 2);
-        CHECK(contains(r.err, std::format("{} applies to {}, not 'lint'", c.name, build_run_scope(s))));
+        CHECK(contains(r.err, std::format("{} applies to 'build' or 'run', not 'lint'", c.name)));
     }
 }
 
@@ -529,18 +527,14 @@ TEST_CASE("cli: synth refuses every option that steers code generation") {
         CAPTURE(flag);
         const Result r = s.run(std::format("synth {} \"{}\"", flag, design.string()));
         CHECK(r.code == 2);
-        CHECK(contains(r.err, std::format("applies to {}, not 'synth'", build_run_scope(s))));
+        CHECK(contains(r.err, "applies to 'build' or 'run', not 'synth'"));
     }
 }
 
 TEST_CASE("cli: build refuses the options that only mean something while simulating") {
     const Scratch  s;
-    if (!has_command(s, "build")) {
-        MESSAGE("this build has no build command");
-        return;
-    }
     const fs::path design = s.write("design.sv", kParamDesign);
-    for (const std::string_view flag : { "--dpi-lib=x.o", "--perf-jitdump", "--loose-stale-ref" }) {
+    for (const std::string_view flag : { "--perf-jitdump", "--loose-stale-ref", "--stop-time=1ns" }) {
         CAPTURE(flag);
         const Result r = s.run(std::format("build {} \"{}\"", flag, design.string()));
         CHECK(r.code == 2);
@@ -548,21 +542,42 @@ TEST_CASE("cli: build refuses the options that only mean something while simulat
     }
 }
 
+TEST_CASE("cli: build refuses the options its output cannot carry") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", kParamDesign);
+    SUBCASE("an executable has no stdout form") {
+        const Result r = s.run(std::format("build -o - \"{}\"", design.string()));
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, "an executable cannot be written to stdout"));
+    }
+    SUBCASE("only an executable links DPI libraries in") {
+        const Result r = s.run(std::format("build --emit obj --dpi-lib x.o -o - \"{}\"", design.string()));
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, "--dpi-lib applies to an executable"));
+    }
+    SUBCASE("only machine code has a processor") {
+        const Result r = s.run(std::format("build --emit llvm --cpu native -o - \"{}\"", design.string()));
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, "--cpu applies to an executable or object"));
+    }
+    SUBCASE("a processor LLVM does not know") {
+        const Result r = s.run(std::format("build --cpu not-a-cpu -o x \"{}\"", design.string()));
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, "unknown --cpu 'not-a-cpu'"));
+    }
+}
+
 TEST_CASE("cli: build and run accept the code-generation options") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);
-    const bool     has_build = has_command(s, "build");
     SUBCASE("build") {
-        if (has_build) {
-            const Result r = s.run(std::format("build -O --sanitize=bounds --stat=dedup \"{}\"", design.string()));
-            CHECK(r.code == 0);
-        }
+        const Result r = s.run(std::format(
+          "build -O --sanitize=bounds --stat=dedup -o \"{}\" \"{}\"", s.path("sim").string(), design.string()));
+        CHECK(r.code == 0);
     }
     SUBCASE("build --emit=ir stops before code generation and takes them without effect") {
-        if (has_build) {
-            const Result r = s.run(std::format("build --emit=ir -O --sanitize=bounds \"{}\"", design.string()));
-            CHECK(r.code == 0);
-        }
+        const Result r = s.run(std::format("build --emit=ir -O --sanitize=bounds \"{}\"", design.string()));
+        CHECK(r.code == 0);
     }
     SUBCASE("run") {
         const Result r = s.run(std::format("run -O --sanitize=bounds --gc-full-every=3 \"{}\"", design.string()));
@@ -739,24 +754,17 @@ TEST_CASE("cli: an unknown command suggests the command it is closest to") {
         { "rnu", "run" },  { "rn", "run" },  { "biuld", "build" },  { "bild", "build" },
         { "lnt", "lint" }, { "Run", "run" }, { "buildd", "build" },
     };
-    const bool has_build = has_command(s, "build");
     for (const Case& c : cases) {
         CAPTURE(c.typed);
         const Result r = s.run(c.typed);
         CHECK(r.code == 2);
-        if (c.suggested == "build" && !has_build) {
-            CHECK_FALSE(contains(r.err, "did you mean 'build'"));
-        } else {
-            CHECK(contains(r.err, std::format("unknown command '{}'; did you mean '{}'?", c.typed, c.suggested)));
-        }
+        CHECK(contains(r.err, std::format("unknown command '{}'; did you mean '{}'?", c.typed, c.suggested)));
         CHECK(contains(r.err, "try 'clotho --help'"));
     }
     SUBCASE("a word near no command gets the list instead") {
         const Result r = s.run("frobnicate");
         CHECK(r.code == 2);
-        CHECK(contains(r.err,
-                       has_build ? "unknown command 'frobnicate'; expected 'build', 'run'"
-                                 : "unknown command 'frobnicate'; expected 'run' or 'lint'"));
+        CHECK(contains(r.err, "unknown command 'frobnicate'; expected 'build', 'run'"));
         CHECK_FALSE(contains(r.err, "did you mean"));
     }
     SUBCASE("a command this build lacks is never suggested") {
@@ -797,37 +805,43 @@ TEST_CASE("cli: a source file given where the command goes suggests run") {
     }
 }
 
-TEST_CASE("cli: build will not write its default output to a terminal") {
+TEST_CASE("cli: build writes an executable named after the top module by default") {
+    const Scratch s;
+    s.write("design.sv", kParamDesign);
+    const Result built = s.run_in("build design.sv");
+    CHECK(built.code == 0);
+    CHECK(built.out.empty());
+    REQUIRE(fs::exists(s.path("top")));
+    const Result simulated = s.run_in("build -o sim design.sv");
+    CHECK(simulated.code == 0);
+    const std::string cmd = std::format("\"{}\" > \"{}\"", s.path("sim").string(), s.path("sim.txt").string());
+    CHECK(std::system(cmd.c_str()) == 0);
+    CHECK(clotho::test::detail::read_file(s.path("sim.txt")) == "W=4 S=dflt\n");
+}
+
+TEST_CASE("cli: build will not write text or an object to a terminal by default") {
     const Scratch  s;
-    if (!has_command(s, "build")) {
-        MESSAGE("this build has no build command");
-        return;
-    }
     const fs::path design = s.write("design.sv", kParamDesign);
     SUBCASE("without -o it is a usage error that says how to get the output") {
-        const Result r = s.run_on_terminal(std::format("build \"{}\"", design.string()));
-        CHECK(r.code == 2);
-        CHECK(r.out.empty());
-        CHECK(contains(r.err, "'build' writes to stdout by default, and stdout is a terminal"));
-        CHECK(contains(r.err, "-o <file>"));
-        CHECK(contains(r.err, "-o -"));
-    }
-    SUBCASE("every target is refused, not only the default") {
-        for (const std::string_view emit : { "llvm", "llvm-raw", "ir" }) {
+        for (const std::string_view emit : { "obj", "llvm", "llvm-raw", "ir" }) {
             CAPTURE(emit);
             const Result r = s.run_on_terminal(std::format("build --emit={} \"{}\"", emit, design.string()));
             CHECK(r.code == 2);
             CHECK(r.out.empty());
+            CHECK(contains(r.err, "'build' writes this to stdout by default, and stdout is a terminal"));
+            CHECK(contains(r.err, "-o <file>"));
+            CHECK(contains(r.err, "-o -"));
         }
     }
     SUBCASE("-o - asks for the terminal by name") {
-        const Result r = s.run_on_terminal(std::format("build -o - \"{}\"", design.string()));
+        const Result r = s.run_on_terminal(std::format("build --emit=llvm -o - \"{}\"", design.string()));
         CHECK(r.code == 0);
         CHECK(contains(r.out, "ModuleID"));
     }
     SUBCASE("-o <file> writes the file and leaves the terminal alone") {
         const fs::path out = s.path("design.ll");
-        const Result   r   = s.run_on_terminal(std::format("build -o \"{}\" \"{}\"", out.string(), design.string()));
+        const Result   r =
+          s.run_on_terminal(std::format("build --emit=llvm -o \"{}\" \"{}\"", out.string(), design.string()));
         CHECK(r.code == 0);
         CHECK(r.out.empty());
         CHECK(contains(clotho::test::detail::read_file(out), "ModuleID"));
@@ -840,40 +854,60 @@ TEST_CASE("cli: build will not write its default output to a terminal") {
     }
 }
 
-TEST_CASE("cli: build still writes to a pipe or a file without -o") {
+TEST_CASE("cli: build still writes text to a pipe or a file without -o") {
     const Scratch  s;
-    if (!has_command(s, "build")) {
-        MESSAGE("this build has no build command");
-        return;
-    }
     const fs::path design = s.write("design.sv", kParamDesign);
     SUBCASE("a pipe") {
-        const Result r = s.run(std::format("build \"{}\" | cat", design.string()));
+        const Result r = s.run(std::format("build --emit=llvm \"{}\" | cat", design.string()));
         CHECK(r.code == 0);
         CHECK(contains(r.out, "ModuleID"));
     }
     SUBCASE("a file") {
-        const Result r = s.run(std::format("build \"{}\"", design.string()));
+        const Result r = s.run(std::format("build --emit=llvm \"{}\"", design.string()));
         CHECK(r.code == 0);
         CHECK(contains(r.out, "ModuleID"));
     }
     SUBCASE("an explicit -o - into a file") {
-        const Result r = s.run(std::format("build -o - \"{}\"", design.string()));
+        const Result r = s.run(std::format("build --emit=llvm -o - \"{}\"", design.string()));
         CHECK(r.code == 0);
         CHECK(contains(r.out, "ModuleID"));
     }
 }
 
-TEST_CASE("cli: build --help explains the terminal rule") {
+TEST_CASE("cli: build --help explains where its output goes") {
     const Scratch s;
-    if (!has_command(s, "build")) {
-        MESSAGE("this build has no build command");
-        return;
-    }
-    Result        r = s.run("build --help");
+    Result r = s.run("build --help");
     // The note is wrapped; compare it as one line.
     std::ranges::replace(r.out, '\n', ' ');
-    CHECK(contains(r.out, "unless that is a terminal. Pass -o <file> to write a file, or -o - to print it"));
+    CHECK(contains(r.out, "named after the design's first top-level module"));
+    CHECK(contains(r.out, "unless that is a terminal; pass -o - to print it there anyway"));
+}
+
+TEST_CASE("cli: --path-prefix-map changes the source paths a simulation prints") {
+    const Scratch s;
+    s.write("rtl/t.sv", "module top;\n  initial begin\n    $error(\"boom\");\n    $finish;\n  end\nendmodule\n");
+    const std::string dir = s.path("rtl").string();
+    SUBCASE("run, and the longest matching directory wins") {
+        const Result r = s.run(std::format("run --path-prefix-map \"{}=wide\" --path-prefix-map \"{}=narrow\" \"{}\"",
+                                           s.dir().string(),
+                                           dir,
+                                           s.path("rtl/t.sv").string()));
+        CHECK(r.code == 0);
+        CHECK(contains(r.err, "ERROR: narrow/t.sv:3: top at 0 s: boom"));
+        CHECK(contains(r.err, "narrow/t.sv:4: $finish called at 0 s"));
+    }
+    SUBCASE("an executable keeps the paths build was told to show") {
+        CHECK(s.run_in(std::format("build --path-prefix-map \"{}=proj\" -o sim rtl/t.sv", s.dir().string())).code == 0);
+        const std::string cmd =
+          std::format("cd / && \"{}\" 2> \"{}\"", s.path("sim").string(), s.path("e.txt").string());
+        CHECK(std::system(cmd.c_str()) == 0);
+        CHECK(contains(clotho::test::detail::read_file(s.path("e.txt")), "ERROR: proj/rtl/t.sv:3: top at 0 s: boom"));
+    }
+    SUBCASE("a value without = is a usage error") {
+        const Result r = s.run(std::format("run --path-prefix-map nothing \"{}\"", s.path("rtl/t.sv").string()));
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, "invalid --path-prefix-map 'nothing'"));
+    }
 }
 
 TEST_CASE("cli: --stop-time takes an integer and a unit") {

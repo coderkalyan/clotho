@@ -108,13 +108,6 @@ option(CLOTHO_SYNTH "Expose the unfinished `synth` command in the CLI" ${CLOTHO_
 option(CLOTHO_LSP "Build and expose the unfinished `lsp` command (language server)" ${CLOTHO_WIP_DEFAULT})
 option(CLOTHO_DAP "Build and expose the unfinished `dap` command (debug adapter)" ${CLOTHO_WIP_DEFAULT})
 
-# `build`: writes the generated code (LLVM IR, or Clotho's own IR) and no
-# executable, so nothing outside work on Clotho itself consumes it yet. Offered
-# like `synth`: only the CLI wiring is conditional, and the emission paths behind
-# it stay built and tested in every configuration.
-option(CLOTHO_BUILD_COMMAND "Expose the `build` command, which writes generated code rather than an executable"
-       ${CLOTHO_WIP_DEFAULT})
-
 # `--sanitize=xprov`: the flag is parsed and carried in SimulationConfig, but no
 # backend pass reads the bit yet, so it instruments nothing. An operator who
 # reaches for a sanitizer and gets silence is worse served than one told the check
@@ -149,7 +142,8 @@ endif()
 if(TARGET LLVM)
   set(LLVM_LIBS LLVM)
 else()
-  llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native bitwriter bitreader)
+  llvm_map_components_to_libnames(LLVM_LIBS core support orcjit jitlink native bitwriter bitreader
+                                  linker)
 endif()
 
 # slang declares fmt with `FIND_PACKAGE_ARGS 12.1`, so FetchContent silently
@@ -582,9 +576,6 @@ endif()
 if(CLOTHO_XSAN)
   target_compile_definitions(clotho_cli PRIVATE CLOTHO_XSAN)
 endif()
-if(CLOTHO_BUILD_COMMAND)
-  target_compile_definitions(clotho_cli PRIVATE CLOTHO_BUILD_COMMAND)
-endif()
 
 # `clotho --version`. The release is the project version plus a pre-release
 # suffix, which a final release leaves empty. The git hash is resolved at
@@ -610,6 +601,173 @@ target_compile_definitions(clotho_cli PRIVATE
   CLOTHO_GIT_HASH="${CLOTHO_GIT_HASH}"
   CLOTHO_LLVM_VERSION="${LLVM_PACKAGE_VERSION}"
 )
+
+# The runtime an executable links (docs/design/executables.md): the same sources
+# as clotho_runtime plus the executable's main, compiled against libc++'s headers
+# so that nothing is left for a C++ library to supply -- no exceptions, no RTTI,
+# no extern templates, no hardening checks, {fmt} header-only without locales,
+# and operator new/delete from ExeSupport.cpp. An executable links this, the C
+# library and compiler-rt, and no C++ library.
+find_path(CLOTHO_LIBCXX_INCLUDE_DIR __config
+  PATHS ${LLVM_INCLUDE_DIRS} "${LLVM_LIBRARY_DIRS}/../include" /usr/include
+  PATH_SUFFIXES c++/v1
+  NO_DEFAULT_PATH)
+if(NOT CLOTHO_LIBCXX_INCLUDE_DIR)
+  message(FATAL_ERROR "libc++'s headers (c++/v1/__config) were not found beside LLVM or in "
+                      "/usr/include; install them (Debian/Ubuntu: libc++-${LLVM_VERSION_MAJOR}-dev), or "
+                      "pass -DCLOTHO_LIBCXX_INCLUDE_DIR=<dir>/c++/v1")
+endif()
+# __config_site is per target, beside __config or in a multiarch <triple>/c++/v1.
+file(GLOB clotho_libcxx_config_sites "${CLOTHO_LIBCXX_INCLUDE_DIR}/__config_site"
+     "${CLOTHO_LIBCXX_INCLUDE_DIR}/../../*/c++/v1/__config_site")
+if(NOT clotho_libcxx_config_sites)
+  message(FATAL_ERROR "libc++'s __config_site was not found near ${CLOTHO_LIBCXX_INCLUDE_DIR}")
+endif()
+list(GET clotho_libcxx_config_sites 0 clotho_libcxx_config_site)
+get_filename_component(clotho_libcxx_config_dir "${clotho_libcxx_config_site}" DIRECTORY)
+message(STATUS "libc++ headers for executables: ${CLOTHO_LIBCXX_INCLUDE_DIR} (${clotho_libcxx_config_dir})")
+
+# The text `<executable> --licenses` prints, as a byte array.
+set(clotho_exe_notices
+  src/runtime/exe-notices.txt src/runtime/LICENSE LICENSES/unordered_dense.txt LICENSES/fmt.txt)
+set(clotho_licenses_text "")
+foreach(notice IN LISTS clotho_exe_notices)
+  file(READ "${notice}" text)
+  string(APPEND clotho_licenses_text "${text}\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${notice}")
+endforeach()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/exe-licenses.txt" "${clotho_licenses_text}")
+file(READ "${CMAKE_CURRENT_BINARY_DIR}/exe-licenses.txt" clotho_licenses_hex HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," clotho_licenses_hex "${clotho_licenses_hex}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ExeLicenses.inc"
+     "static const unsigned char kLicenses[] = {${clotho_licenses_hex}};\n")
+
+add_library(clotho_runtime_exe STATIC
+  src/runtime/Runtime.cpp
+  src/runtime/Gc.cpp
+  src/runtime/Svdpi.cpp
+  src/runtime/Coverage.cpp
+  src/runtime/Wheel.cpp
+  src/runtime/ExeMain.cpp
+  src/runtime/ExeSupport.cpp
+)
+target_include_directories(clotho_runtime_exe SYSTEM PRIVATE
+  $<TARGET_PROPERTY:fmt::fmt,INTERFACE_INCLUDE_DIRECTORIES>
+  $<TARGET_PROPERTY:unordered_dense::unordered_dense,INTERFACE_INCLUDE_DIRECTORIES>)
+target_include_directories(clotho_runtime_exe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# libc++'s directories as flags, not include directories: CMake drops an include
+# directory that is one of the compiler's own, which libc++'s is for a clang that
+# uses it by default, and -nostdinc++ has removed it from the search.
+target_compile_options(clotho_runtime_exe PRIVATE -nostdinc++ "SHELL:-isystem \"${clotho_libcxx_config_dir}\""
+                                                  "SHELL:-isystem \"${CLOTHO_LIBCXX_INCLUDE_DIR}\""
+                                                  -fno-exceptions -fno-rtti -include
+                                                  "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/ExeConfig.h")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  # GCC flags a size libc++'s allocator computes but never passes on.
+  target_compile_options(clotho_runtime_exe PRIVATE -Wno-alloc-size-larger-than)
+endif()
+target_compile_definitions(clotho_runtime_exe PRIVATE
+  CLOTHO_VERSION="${CLOTHO_VERSION}"
+  CLOTHO_GIT_HASH="${CLOTHO_GIT_HASH}"
+  CLOTHO_LICENSES_INC="${CMAKE_CURRENT_BINARY_DIR}/ExeLicenses.inc")
+target_link_libraries(clotho_runtime_exe PRIVATE clotho_warnings)
+
+# What `clotho build` links an executable with (docs/design/executables.md): lld,
+# run in-process, and the files every executable needs, embedded in clotho so
+# that building one needs no compiler, linker or C library development files.
+# The files are this build's own: its executable runtime, compiler-rt's
+# builtins, and the C library's startup objects and static parts, found where
+# the C compiler driver would find them.
+find_package(LLD REQUIRED CONFIG HINTS "${LLVM_DIR}/../lld" "${LLVM_LIBRARY_DIRS}/cmake/lld")
+find_program(CLOTHO_CLANG NAMES clang-${LLVM_VERSION_MAJOR} clang HINTS "${LLVM_TOOLS_BINARY_DIR}" NO_DEFAULT_PATH)
+if(NOT CLOTHO_CLANG)
+  message(FATAL_ERROR "clang was not found in ${LLVM_TOOLS_BINARY_DIR}; it locates compiler-rt's builtins")
+endif()
+execute_process(COMMAND "${CLOTHO_CLANG}" --rtlib=compiler-rt -print-libgcc-file-name
+                OUTPUT_VARIABLE clotho_builtins OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT EXISTS "${clotho_builtins}")
+  message(FATAL_ERROR "compiler-rt's builtins were not found at '${clotho_builtins}'; install them "
+                      "(Debian/Ubuntu: libclang-rt-${LLVM_VERSION_MAJOR}-dev)")
+endif()
+
+# `name=path` for one embedded file, found where the C compiler driver finds it.
+function(clotho_kit_file out file)
+  execute_process(COMMAND "${CMAKE_C_COMPILER}" -print-file-name=${file}
+                  OUTPUT_VARIABLE path OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT IS_ABSOLUTE "${path}" OR NOT EXISTS "${path}")
+    message(FATAL_ERROR "${file}, which every executable links, was not found by ${CMAKE_C_COMPILER}")
+  endif()
+  set(${out} "${file}=${path}" PARENT_SCOPE)
+endfunction()
+
+set(clotho_kit "runtime.a=$<TARGET_FILE:clotho_runtime_exe>" "builtins.a=${clotho_builtins}")
+if(WIN32)
+  foreach(file crt2.o crtbegin.o crtend.o libmingw32.a libmingwex.a libmoldname.a libmsvcrt.a libadvapi32.a
+               libshell32.a libuser32.a libkernel32.a libpsapi.a)
+    clotho_kit_file(entry ${file})
+    list(APPEND clotho_kit "${entry}")
+  endforeach()
+elseif(NOT APPLE)
+  # compiler-rt's crtbegin/crtend sit beside its builtins, with the same suffix.
+  get_filename_component(clotho_builtins_dir "${clotho_builtins}" DIRECTORY)
+  get_filename_component(clotho_builtins_name "${clotho_builtins}" NAME)
+  string(REGEX REPLACE "^libclang_rt\\.builtins(.*)\\.a$" "\\1" clotho_rt_suffix "${clotho_builtins_name}")
+  foreach(part crtbegin crtend)
+    set(path "${clotho_builtins_dir}/clang_rt.${part}${clotho_rt_suffix}.o")
+    if(NOT EXISTS "${path}")
+      message(FATAL_ERROR "compiler-rt's ${part} was not found at ${path}")
+    endif()
+    list(APPEND clotho_kit "${part}.o=${path}")
+  endforeach()
+  foreach(file Scrt1.o crti.o crtn.o libc_nonshared.a)
+    clotho_kit_file(entry ${file})
+    list(APPEND clotho_kit "${entry}")
+  endforeach()
+endif()
+
+set(clotho_kit_source "#include \"link/Link.h\"\n\nnamespace clotho::link {\nnamespace {\n")
+set(clotho_kit_table "")
+set(clotho_kit_paths "")
+set(index 0)
+foreach(entry IN LISTS clotho_kit)
+  string(FIND "${entry}" "=" eq)
+  string(SUBSTRING "${entry}" 0 ${eq} name)
+  math(EXPR start "${eq} + 1")
+  string(SUBSTRING "${entry}" ${start} -1 path)
+  string(APPEND clotho_kit_source "const unsigned char kFile${index}[] = {\n#embed \"${path}\"\n};\n")
+  string(APPEND clotho_kit_table "    { \"${name}\", kFile${index}, sizeof(kFile${index}) },\n")
+  if(NOT name STREQUAL "runtime.a")
+    list(APPEND clotho_kit_paths "${path}")
+  endif()
+  math(EXPR index "${index} + 1")
+endforeach()
+string(APPEND clotho_kit_source "} // namespace\n\nconst KitFile kKitFiles[] = {\n${clotho_kit_table}};\n"
+       "const size_t kKitFileCount = ${index};\n\n} // namespace clotho::link\n")
+# Copied from the generated template on every change to an embedded file, so the
+# table recompiles with it: #embed is not a dependency the build tool sees.
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in" CONTENT "${clotho_kit_source}")
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in"
+          "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp"
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in" clotho_runtime_exe ${clotho_kit_paths}
+  VERBATIM)
+
+add_library(clotho_link STATIC src/link/Link.cpp "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp")
+target_include_directories(clotho_link PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(clotho_link SYSTEM PRIVATE ${LLD_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
+# #embed is C23; GCC takes it in C++ silently, clang as an extension.
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp" PROPERTIES
+  COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-c23-extensions>")
+if(APPLE)
+  target_link_libraries(clotho_link PRIVATE lldMachO)
+elseif(WIN32)
+  target_link_libraries(clotho_link PRIVATE lldMinGW lldCOFF)
+else()
+  target_link_libraries(clotho_link PRIVATE lldELF)
+endif()
+target_link_libraries(clotho_link PRIVATE lldCommon ${LLVM_LIBS} clotho_warnings)
+target_link_libraries(clotho_cli PRIVATE clotho_link)
 
 # Single doctest executable aggregating every tests/*.cpp.
 enable_testing()
@@ -696,6 +854,7 @@ set(CLOTHO_TEST_SOURCES
   tests/system_test.cpp
   tests/diagnostic_render_test.cpp
   tests/cli_test.cpp
+  tests/exe_test.cpp
   tests/todo_test.cpp
 )
 # The server tests exist only where the servers do.
@@ -769,3 +928,51 @@ foreach(column IN ITEMS "bare element" "fixed unpacked array" "unpacked struct m
   add_test(NAME data_model_matrix_${name}
            COMMAND clotho_test --duration=true "-tc=data model matrix: ${column}")
 endforeach()
+
+# Executables written by `clotho build`, linked by its in-process lld, and run:
+# what no in-process test can show is that every platform's link works and the
+# result runs. Each design prints its line only when its own checks pass, so the
+# output is the whole verdict.
+
+# Build `design` into ${name}, with `--dpi-lib` for each DPI library (a path,
+# which may be a generator expression), after the DEPENDS targets.
+function(clotho_exe_test name design)
+  cmake_parse_arguments(PARSE_ARGV 2 arg "" "" "DPI;DEPENDS")
+  set(exe "${CMAKE_CURRENT_BINARY_DIR}/${name}${CMAKE_EXECUTABLE_SUFFIX}")
+  set(dpi "")
+  foreach(lib IN LISTS arg_DPI)
+    list(APPEND dpi --dpi-lib "${lib}")
+  endforeach()
+  add_custom_command(
+    OUTPUT "${exe}"
+    COMMAND clotho_cli build ${dpi} -o "${exe}" "${CMAKE_CURRENT_SOURCE_DIR}/${design}"
+    DEPENDS clotho_cli "${design}" ${arg_DEPENDS}
+    VERBATIM)
+  add_custom_target(${name}_build DEPENDS "${exe}")
+  # Built with the suite, so building clotho_test is enough to run all of ctest.
+  add_dependencies(clotho_test ${name}_build)
+endfunction()
+
+clotho_exe_test(exe tests/exe/design.sv)
+add_test(NAME exe COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe${CMAKE_EXECUTABLE_SUFFIX}" +n=12345)
+set_tests_properties(exe PROPERTIES PASS_REGULAR_EXPRESSION "exe: ok 12345 000006e3924924924924924924924924")
+
+add_library(clotho_exe_dpi_object OBJECT tests/exe/dpi.c)
+set_target_properties(clotho_exe_dpi_object PROPERTIES POSITION_INDEPENDENT_CODE ON)
+clotho_exe_test(exe_dpi_object tests/exe/dpi.sv DPI $<TARGET_OBJECTS:clotho_exe_dpi_object>
+                DEPENDS clotho_exe_dpi_object)
+add_test(NAME exe_dpi_object COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_object${CMAKE_EXECUTABLE_SUFFIX}")
+set_tests_properties(exe_dpi_object PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
+
+# A DLL cannot call back into the executable, so Windows has no shared case.
+if(NOT WIN32)
+  add_library(clotho_exe_dpi_shared SHARED tests/exe/dpi.c)
+  if(APPLE)
+    # sv_twice is the executable's, found when the library is loaded.
+    target_link_options(clotho_exe_dpi_shared PRIVATE "LINKER:-undefined,dynamic_lookup")
+  endif()
+  clotho_exe_test(exe_dpi_shared tests/exe/dpi.sv DPI $<TARGET_FILE:clotho_exe_dpi_shared>
+                  DEPENDS clotho_exe_dpi_shared)
+  add_test(NAME exe_dpi_shared COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_shared${CMAKE_EXECUTABLE_SUFFIX}")
+  set_tests_properties(exe_dpi_shared PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
+endif()

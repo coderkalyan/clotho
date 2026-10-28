@@ -103,7 +103,7 @@ settled state to hand back.
 ## Ending a run from outside the design
 
 Two things end a run without the design asking for it: the stop time
-(`--stop-time`, `rt_stop_time_set`) and SIGINT. Both are acted on in
+(`--stop-time`, armed by `rt_run`) and SIGINT. Both are acted on in
 `rt_wheel_advance`, the one call the drain makes between two time steps. That is
 the only point where the step that just ran is complete (its dump sample is
 taken, no process is mid-body) and the next has not started, so a run ended

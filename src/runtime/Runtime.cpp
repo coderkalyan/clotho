@@ -16,39 +16,44 @@
 #include <cerrno>
 #include <charconv>
 #include <cinttypes>
-#include <condition_variable>
+#include <cmath>
 #include <csetjmp>
 #include <csignal>
 #include <cstddef>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <new>
 #include <queue>
 #include <random>
 #include <string>
-#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+// First, in a group of its own: psapi.h uses its types.
 #include <windows.h>
-#include <psapi.h>
+
 #include <io.h>
+#include <locale.h>
+#include <psapi.h>
 #else
+#include <locale.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <xlocale.h>
+#endif
 #endif
 
 #include <ankerl/unordered_dense.h>
 #include <fmt/color.h>
 
 #include "Format.h"
+#include "Os.h"
 #include "Wheel.h"
 
 namespace {
@@ -342,9 +347,9 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
                 const uint64_t val  = a.val[0] & mask;
                 if ((a.flags & 1u) != 0) {
                     const uint64_t sext = (w < 64 && ((val >> (w - 1)) & 1u)) ? (val | ~mask) : val;
-                    field               = std::to_string(static_cast<int64_t>(sext));
+                    field               = fmt::to_string(static_cast<int64_t>(sext));
                 } else {
-                    field = std::to_string(val);
+                    field = fmt::to_string(val);
                 }
             } else if ((a.flags & 1u) != 0 && ((a.val[(w - 1) / 64] >> ((w - 1) % 64)) & 1u) != 0) {
                 // Negative signed: print the sign and the two's-complement
@@ -452,11 +457,11 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
                 cs += '0';
             }
             if (spec.has_width) {
-                cs += std::to_string(spec.width);
+                cs += fmt::to_string(spec.width);
             }
             if (spec.has_prec) {
                 cs += '.';
-                cs += std::to_string(spec.prec);
+                cs += fmt::to_string(spec.prec);
             }
             cs += spec.conv;
             double v = 0.0;
@@ -3245,7 +3250,7 @@ Halt g_halt = Halt::None;
 // The stop tick of "no stop time armed": a tick no time step can reach.
 constexpr uint64_t kNoStopTick = RuntimeWheel::never;
 
-// The last tick that runs once `--stop-time` has armed one (rt_stop_time_set).
+// The last tick that runs once `--stop-time` has armed one (rt_run).
 uint64_t g_stop_tick = kNoStopTick;
 
 // Set by the SIGINT handler rt_sim_run installs and read at the time-step
@@ -3446,14 +3451,10 @@ extern "C" void rt_fclose(int32_t desc) {
     }
 }
 
-// The $system access tier, set once by run_jit before the design runs
-// (0 = off, 1 = const, 2 = full). Default off so a JIT that somehow reaches
-// rt_system without run_jit having enabled it is refused, not run.
+// The $system access tier, set by rt_run before the design runs (0 = off,
+// 1 = const, 2 = full). Default off so a design that somehow reaches rt_system
+// without rt_run having enabled it is refused, not run.
 int g_system_access = 0;
-
-extern "C" void rt_system_set_access(int32_t tier) {
-    g_system_access = tier;
-}
 
 extern "C" int32_t rt_system(const char* cmd_buf, uint32_t cmd_len, int32_t cmd_fwd,
                              int32_t has_arg) {
@@ -3966,7 +3967,7 @@ namespace {
 void append_finish_time(std::string& out, uint64_t now) {
     const uint64_t tick_fs = timeformat.tick_fs;
     if (tick_fs == 0) {
-        out += std::to_string(now);
+        out += fmt::to_string(now);
         return;
     }
     // Total femtoseconds; 128-bit to avoid overflow on a coarse precision.
@@ -3982,7 +3983,7 @@ void append_finish_time(std::string& out, uint64_t now) {
     const unsigned __int128 pick = fs == 0 ? tick_fs : fs;
     for (const auto& e : table) {
         if (pick % e.div == 0) {
-            out += std::to_string(static_cast<uint64_t>(fs / e.div));
+            out += fmt::to_string(static_cast<uint64_t>(fs / e.div));
             out += ' ';
             out += e.unit;
             return;
@@ -4324,20 +4325,24 @@ ankerl::unordered_dense::map<uint64_t, uint32_t> g_bounds_hits;
 // Whether a sanitizer report may use colour: a terminal that is not `dumb`,
 // with NO_COLOR unset (https://no-color.org). Escape codes in a redirected log
 // or a test's captured stderr are corruption, not decoration. Resolved once;
-// the answer cannot change while the process runs.
+// the answer cannot change while the process runs. Cached in an atomic rather
+// than a function-local static, whose thread-safe initialization would need the
+// C++ ABI library: two threads racing the first call compute the same answer.
+std::atomic<int8_t> g_diag_color{ -1 };
+
 bool diag_color() {
-    static const bool on = []
-    {
+    int8_t on = g_diag_color.load(std::memory_order_relaxed);
+    if (on < 0) {
 #if defined(_WIN32)
         const bool tty = _isatty(_fileno(stderr)) != 0;
 #else
         const bool tty = isatty(fileno(stderr)) != 0;
 #endif
         const char* term = std::getenv("TERM");
-        return tty && std::getenv("NO_COLOR") == nullptr &&
-               (term == nullptr || std::strcmp(term, "dumb") != 0);
-    }();
-    return on;
+        on = tty && std::getenv("NO_COLOR") == nullptr && (term == nullptr || std::strcmp(term, "dumb") != 0) ? 1 : 0;
+        g_diag_color.store(on, std::memory_order_relaxed);
+    }
+    return on != 0;
 }
 
 // `s` when colour is on, plain otherwise. fmt emits no escape at all for a
@@ -4372,7 +4377,7 @@ std::string snippet_text(const char* src) {
 void print_snippet(const std::string& text, int32_t line_no,
                    std::initializer_list<SnippetMark> marks, const fmt::text_style& loc,
                    const fmt::text_style& caret) {
-    const std::string number = std::to_string(line_no);
+    const std::string number = fmt::to_string(line_no);
     const std::string gutter(number.size(), ' ');
     fmt::print(stderr, loc, "{} |", number);
     fmt::print(stderr, " {}", text);
@@ -4460,7 +4465,7 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
         // whole finding, same as an empty-queue pop.
         fmt::print(stderr, head, " {}", noun);
     } else {
-        const std::string idx   = unknown ? std::string("x") : std::to_string(index);
+        const std::string idx   = unknown ? std::string("x") : fmt::to_string(index);
         const std::string subj  = site->what == RT_BOUNDS_PART
                                     ? fmt::format("index {} +: {}", idx, site->width)
                                     : fmt::format("index {}", idx);
@@ -4754,10 +4759,6 @@ int g_ref_stale_warn = 0;
 ankerl::unordered_dense::set<const void*> g_ref_stale_seen;
 
 } // namespace
-
-extern "C" void rt_ref_stale_warn(int32_t enable) {
-    g_ref_stale_warn = enable;
-}
 
 // The design's epoch-to-name table, registered once before it runs.
 const rt_container_name* g_ref_names       = nullptr;
@@ -5340,27 +5341,13 @@ void report_halt(const char* what) {
     std::fflush(stderr);
 }
 
-// The exit status of the last run (rt_run_status).
+// The exit status of the last run, which rt_run returns.
 int32_t g_run_status = 0;
 
 // The exit status of an interrupted run: 128 + SIGINT, which is what a shell
 // reports for a process that SIGINT killed.
 constexpr int32_t kInterruptedStatus = 130;
 } // namespace
-
-extern "C" void rt_stop_time_set(uint64_t stop_fs, uint64_t tick_fs) {
-    // A unitless design has no tick size to divide by: it counts in
-    // femtoseconds, as rt_timeformat_init does.
-    const uint64_t tick  = tick_fs == 0 ? 1 : tick_fs;
-    // Rounded up: a stop time between two ticks cannot run the step it falls
-    // short of, and stopping a tick early would drop events the user asked for.
-    const uint64_t ticks = stop_fs / tick + (stop_fs % tick != 0 ? 1 : 0);
-    g_stop_tick          = std::min(ticks, kNoStopTick - 1);
-}
-
-extern "C" int32_t rt_run_status(void) {
-    return g_run_status;
-}
 
 extern "C" void rt_sim_run(void* state, void* wheel, void (*drain)(void*, void*),
                            void (*finals)(void*, void*)) {
@@ -6092,14 +6079,6 @@ const std::string* find_plusarg(std::string_view query) {
 
 } // namespace
 
-extern "C" void rt_plusargs_init(const char* const* args, const uint32_t* lens, uint32_t n) {
-    g_plusargs.clear();
-    g_plusargs.reserve(n);
-    for (uint32_t k = 0; k < n; ++k) {
-        g_plusargs.emplace_back(args[k], lens[k]);
-    }
-}
-
 extern "C" int32_t rt_test_plusargs(const char* s, uint32_t len) {
     return find_plusarg(std::string_view(s, len)) != nullptr ? 1 : 0;
 }
@@ -6480,6 +6459,203 @@ void str_toa_base(rt_string* dst, int32_t i, int base, const rt_alloc_site* site
     str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf), site);
 }
 
+// The shortest decimal that reads back as `d`, laid out as std::to_chars(first,
+// last, d) lays it out (C++ [charconv.to.chars]): fixed or scientific
+// (`d.ddde+XX`), whichever has fewer characters, a tie going to fixed, and a
+// fixed integer printed exactly as %.0f would. Written out because
+// floating-point std::to_chars lives in the C++ library's compiled part, which
+// an executable's runtime does not link (docs/design/executables.md); fmt's `{}`
+// supplies the same shortest digits. Checked byte-identical to std::to_chars on
+// 26M doubles: random bit patterns, decimals, powers of two and widened floats.
+// Returns the length; `out` holds at least 32 bytes.
+size_t shortest_double(char* out, double d) {
+    char* p = out;
+    if (std::signbit(d)) {
+        *p++ = '-';
+    }
+    if (std::isnan(d) || std::isinf(d)) {
+        std::memcpy(p, std::isnan(d) ? "nan" : "inf", 3);
+        return static_cast<size_t>(p + 3 - out);
+    }
+    if (d == 0.0) {
+        *p++ = '0';
+        return static_cast<size_t>(p - out);
+    }
+    // fmt's shortest form: "0.00123", "1.5e-07", "123456.0" and so on. Only its
+    // digits and where its decimal point falls are used.
+    char         rep[40];
+    const size_t n = fmt::format_to_n(rep, sizeof(rep) - 1, "{}", std::fabs(d)).size;
+    rep[n]         = '\0';
+    char digits[32];
+    int  nd    = 0;
+    int  point = -1;
+    int  exp10 = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (rep[i] == '.') {
+            point = nd;
+        } else if (rep[i] == 'e') {
+            exp10 = std::atoi(rep + i + 1);
+            break;
+        } else {
+            digits[nd++] = rep[i];
+        }
+    }
+    if (point < 0) {
+        point = nd;
+    }
+    int lead = 0;
+    while (digits[lead] == '0') {
+        ++lead;
+    }
+    int last = nd;
+    while (digits[last - 1] == '0') {
+        --last;
+    }
+    const char* sig       = digits + lead;
+    const int   ns        = last - lead;
+    const int   e         = point + exp10 - lead - 1; // the power of ten of sig[0]
+    const int   abs_e     = e < 0 ? -e : e;
+    const int   sci_len   = 1 + (ns > 1 ? ns : 0) + 2 + (abs_e >= 100 ? 3 : 2);
+    const int   fixed_len = e >= ns - 1 ? e + 1 : e >= 0 ? ns + 1 : ns + 1 - e;
+    if (fixed_len > sci_len) {
+        *p++ = sig[0];
+        if (ns > 1) {
+            *p++ = '.';
+            std::memcpy(p, sig + 1, static_cast<size_t>(ns - 1));
+            p += ns - 1;
+        }
+        *p++ = 'e';
+        *p++ = e < 0 ? '-' : '+';
+        if (abs_e >= 100) {
+            *p++ = static_cast<char>('0' + abs_e / 100);
+        }
+        *p++ = static_cast<char>('0' + abs_e / 10 % 10);
+        *p++ = static_cast<char>('0' + abs_e % 10);
+    } else if (e >= ns - 1) {
+        p = fmt::format_to(p, "{:.0f}", std::fabs(d));
+    } else if (e >= 0) {
+        std::memcpy(p, sig, static_cast<size_t>(e + 1));
+        p += e + 1;
+        *p++ = '.';
+        std::memcpy(p, sig + e + 1, static_cast<size_t>(ns - e - 1));
+        p += ns - e - 1;
+    } else {
+        *p++ = '0';
+        *p++ = '.';
+        std::memset(p, '0', static_cast<size_t>(-e - 1));
+        p += -e - 1;
+        std::memcpy(p, sig, static_cast<size_t>(ns));
+        p += ns;
+    }
+    return static_cast<size_t>(p - out);
+}
+
+#if defined(_WIN32)
+_locale_t g_c_locale = nullptr;
+#else
+locale_t g_c_locale = nullptr;
+#endif
+
+// strtod in the "C" locale, whatever setlocale a DPI library may have called.
+double strtod_c(const char* s) {
+#if defined(_WIN32)
+    if (g_c_locale == nullptr) {
+        g_c_locale = _create_locale(LC_ALL, "C");
+    }
+    return _strtod_l(s, nullptr, g_c_locale);
+#else
+    if (g_c_locale == nullptr) {
+        g_c_locale = newlocale(LC_ALL_MASK, "C", static_cast<locale_t>(nullptr));
+    }
+    return strtod_l(s, nullptr, g_c_locale);
+#endif
+}
+
+// std::from_chars(first, last, value) for a double whose `value` starts at 0.0,
+// the contract rt_string_atoreal was written against: the longest prefix that is
+// a decimal floating literal ([-]digits[.digits][e[+-]digits], no hex, no
+// leading '+' or whitespace) or [-]inf, infinity, nan or nan(chars) in any case,
+// rounded correctly; 0.0 when there is no such prefix or its value overflows or
+// underflows to zero. Written out for the same reason as shortest_double. The
+// conversion is the C library's, given only the accepted prefix: strtod alone
+// would read "0x10" as hex, and turn "1e400" into infinity.
+double parse_double(const char* first, const char* last) {
+    const char* p = first;
+    if (p < last && *p == '-') {
+        ++p;
+    }
+    // The length of `word` (lowercase letters) at p, in any case, or 0.
+    const auto word = [&](const char* w) -> size_t {
+        size_t k = 0;
+        while (w[k] != '\0' && p + k < last && (p[k] | 0x20) == w[k]) {
+            ++k;
+        }
+        return w[k] == '\0' ? k : 0;
+    };
+    const auto  digit = [](char c) { return c >= '0' && c <= '9'; };
+    const char* end   = nullptr;
+    if (const size_t k = word("infinity"); k != 0) {
+        end = p + k;
+    } else if (const size_t k = word("inf"); k != 0) {
+        end = p + k;
+    } else if (const size_t k = word("nan"); k != 0) {
+        end = p + k;
+        if (end < last && *end == '(') {
+            const char* q = end + 1;
+            while (q < last && (digit(*q) || ((*q | 0x20) >= 'a' && (*q | 0x20) <= 'z') || *q == '_')) {
+                ++q;
+            }
+            if (q < last && *q == ')') {
+                end = q + 1;
+            }
+        }
+    } else {
+        const char* q      = p;
+        bool        digits = false;
+        while (q < last && digit(*q)) {
+            ++q;
+            digits = true;
+        }
+        if (q < last && *q == '.') {
+            ++q;
+            while (q < last && digit(*q)) {
+                ++q;
+                digits = true;
+            }
+        }
+        if (!digits) {
+            return 0.0;
+        }
+        end = q;
+        if (q < last && (*q | 0x20) == 'e') {
+            const char* x = q + 1;
+            if (x < last && (*x == '+' || *x == '-')) {
+                ++x;
+            }
+            if (x < last && digit(*x)) {
+                while (x < last && digit(*x)) {
+                    ++x;
+                }
+                end = x;
+            }
+        }
+    }
+    const size_t len = static_cast<size_t>(end - first);
+    char         small[64];
+    char*        buf = len < sizeof(small) ? small : static_cast<char*>(std::malloc(len + 1));
+    std::memcpy(buf, first, len);
+    buf[len]           = '\0';
+    errno              = 0;
+    const double v     = strtod_c(buf);
+    const bool   range = errno == ERANGE;
+    if (buf != small) {
+        std::free(buf);
+    }
+    // from_chars reports overflow, and underflow to zero, as out of range and
+    // leaves `value` alone; a subnormal result is in range.
+    return range && (v == 0.0 || std::isinf(v)) ? 0.0 : v;
+}
+
 } // namespace
 
 extern "C" int32_t rt_string_atoi(const rt_string* s) {
@@ -6499,17 +6675,15 @@ extern "C" double rt_string_atoreal(const rt_string* s) {
     const char* p   = str_data(s);
     const char* end = p + str_len(s);
     // Unlike the atoi family, atoreal accepts leading whitespace and a '+'
-    // sign (verified against iverilog); std::from_chars accepts neither, so
-    // both are skipped by hand before the real-literal parse.
+    // sign (verified against iverilog); the real-literal parse accepts neither,
+    // so both are skipped by hand first.
     while (p < end && scan_ws(static_cast<unsigned char>(*p))) {
         ++p;
     }
     if (p < end && *p == '+') {
         ++p;
     }
-    double v = 0.0; // Unmodified by from_chars on failure: "0.0 if no digits".
-    std::from_chars(p, end, v);
-    return v;
+    return parse_double(p, end);
 }
 
 extern "C" void rt_string_itoa(rt_string* dst, int32_t i, const rt_alloc_site* site) {
@@ -6526,9 +6700,9 @@ extern "C" void rt_string_bintoa(rt_string* dst, int32_t i, const rt_alloc_site*
 }
 
 extern "C" void rt_string_realtoa(rt_string* dst, double r, const rt_alloc_site* site) {
-    char       buf[32];
-    const auto res = std::to_chars(buf, buf + sizeof(buf), r);
-    str_assign(dst, buf, static_cast<uint64_t>(res.ptr - buf), site);
+    char         buf[32];
+    const size_t len = shortest_double(buf, r);
+    str_assign(dst, buf, len, site);
 }
 
 extern "C" void rt_string_from_packed(rt_string* dst, const uint8_t* val, uint32_t width_bits,
@@ -6604,14 +6778,22 @@ extern "C" void rt_string_to_packed(const rt_string* s, uint8_t* out, uint32_t w
 }
 
 // Coroutine frames may be over-aligned (16-byte plane spills) and malloc
-// guarantees only 16, so allocate with an explicit alignment. Aligned operator
-// new rather than C11 aligned_alloc: the latter is absent from the MSVC runtime
-// (which offers only the non-interchangeable _aligned_malloc/_aligned_free
-// pair). The nothrow form matters — this is called from JIT'd code across a C
-// ABI with no unwind tables, so a thrown bad_alloc could not propagate.
+// guarantees only 16, so allocate with an explicit alignment (Os.h). rt_alloc
+// returns null on failure rather than throwing: it is called from JIT'd code
+// across a C ABI with no unwind tables.
 namespace {
-constexpr std::align_val_t frame_align{64};
+constexpr size_t kFrameAlign = 64;
+
+// A process or event pool chunk. The pools have no way to hand a failed
+// allocation back to the design, so running out of memory here ends the run.
+void* alloc_pool_chunk(size_t bytes) {
+    void* chunk = clotho::rt::os_aligned_alloc(bytes, kFrameAlign);
+    if (chunk == nullptr) {
+        format_fatal(fmt::format("out of memory: the system refused {} bytes for the scheduler's pools", bytes));
+    }
+    return chunk;
 }
+} // namespace
 
 // -- Named event objects (LRM 15.5) --
 //
@@ -6645,8 +6827,7 @@ extern "C" uint64_t rt_event_new(void) {
     const uint32_t i = g_event_pooled++;
     if (i % kEventChunk == 0) {
         // A fresh chunk, zeroed: waiters / pending / next_pend all start clear.
-        g_event_chunks.push_back(
-            static_cast<rt_event*>(::operator new(sizeof(rt_event) * kEventChunk, frame_align)));
+        g_event_chunks.push_back(static_cast<rt_event*>(alloc_pool_chunk(sizeof(rt_event) * kEventChunk)));
         std::memset(g_event_chunks.back(), 0, sizeof(rt_event) * kEventChunk);
     }
     rt_event* e  = g_event_chunks[1 + (i / kEventChunk)] + (i % kEventChunk);
@@ -6682,8 +6863,7 @@ rt_proc* proc_take() {
         return p;
     }
     if (g_proc_chunks.empty() || g_proc_used == kProcChunk) {
-        g_proc_chunks.push_back(
-            static_cast<rt_proc*>(::operator new(sizeof(rt_proc) * kProcChunk, frame_align)));
+        g_proc_chunks.push_back(static_cast<rt_proc*>(alloc_pool_chunk(sizeof(rt_proc) * kProcChunk)));
         std::memset(g_proc_chunks.back(), 0, sizeof(rt_proc) * kProcChunk);
         g_proc_used = 0;
     }
@@ -6759,7 +6939,7 @@ extern "C" void rt_run_init(void* event_static_block, uint32_t event_static_coun
     // and is kept off the freelist by RT_PROC_STATIC (Runtime.h:1520-1530), so
     // every chunk here came from this pool.
     for (rt_proc* chunk : g_proc_chunks) {
-        ::operator delete(chunk, frame_align);
+        clotho::rt::os_aligned_free(chunk);
     }
     g_proc_chunks.clear();
     g_proc_used = 0;
@@ -6770,7 +6950,7 @@ extern "C" void rt_run_init(void* event_static_block, uint32_t event_static_coun
     // alone would orphan every chunk rt_event_new (:5791) had allocated, which is
     // what this pool's reset did before it moved here: freeing 1..N is a fix.
     for (size_t i = 1; i < g_event_chunks.size(); ++i) {
-        ::operator delete(g_event_chunks[i], frame_align);
+        clotho::rt::os_aligned_free(g_event_chunks[i]);
     }
     g_event_chunks.clear();
     g_event_chunks.push_back(static_cast<rt_event*>(event_static_block));
@@ -6938,11 +7118,11 @@ extern "C" void rt_proc_obj_release(void* pcb) {
 }
 
 extern "C" void* rt_alloc(uint64_t size) {
-    return ::operator new(static_cast<size_t>(size), frame_align, std::nothrow);
+    return clotho::rt::os_aligned_alloc(static_cast<size_t>(size), kFrameAlign);
 }
 
 extern "C" void rt_free(void* p) {
-    ::operator delete(p, frame_align);
+    clotho::rt::os_aligned_free(p);
 }
 
 // -- Value-change dump (VCD, LRM §21.7; design in docs/VCD.md) --
@@ -7221,7 +7401,7 @@ void vcd_emit_real(const VcdVar& v, const uint64_t* must, const uint64_t* may) {
         const double d = v.width == 32
                            ? static_cast<double>(std::bit_cast<float>(static_cast<uint32_t>(must[0])))
                            : std::bit_cast<double>(must[0]);
-        len = static_cast<size_t>(std::to_chars(buf, buf + sizeof(buf), d).ptr - buf);
+        len            = shortest_double(buf, d);
     }
     vcd_put('r');
     vcd_puts(std::string_view(buf, len));
@@ -7445,11 +7625,11 @@ void vcd_write_records(const std::vector<uint8_t>& buf) {
 constexpr size_t kVcdBuffers      = 8;             // record buffers in the pool
 constexpr size_t kVcdHandoffBytes = 64u * 1024u;   // hand off once a buffer holds this many bytes
 
-std::thread                        vcd_thread;
-std::mutex                         vcd_mu;
-std::condition_variable            vcd_cv_ready;   // writer waits for filled buffers
-std::condition_variable            vcd_cv_free;    // sim waits for a recycled buffer
-std::condition_variable            vcd_cv_idle;    // $dumpflush waits for the writer to catch up
+clotho::rt::OsThread               vcd_thread;
+clotho::rt::OsMutex                vcd_mu;
+clotho::rt::OsCond                 vcd_cv_ready;   // writer waits for filled buffers
+clotho::rt::OsCond                 vcd_cv_free;    // sim waits for a recycled buffer
+clotho::rt::OsCond                 vcd_cv_idle;    // $dumpflush waits for the writer to catch up
 std::queue<std::vector<uint8_t>>   vcd_ready;      // filled buffers awaiting write
 std::vector<std::vector<uint8_t>>  vcd_pool;       // recycled empty buffers
 size_t                             vcd_inflight = 0;  // buffers handed off but not yet written
@@ -7459,7 +7639,7 @@ void vcd_writer_loop() {
     for (;;) {
         std::vector<uint8_t> buf;
         {
-            std::unique_lock<std::mutex> lk(vcd_mu);
+            clotho::rt::OsLock lk(vcd_mu);
             vcd_cv_ready.wait(lk, [] { return !vcd_ready.empty() || vcd_stop; });
             if (vcd_ready.empty()) {
                 return;   // stop requested and nothing left to write
@@ -7469,7 +7649,7 @@ void vcd_writer_loop() {
         }
         vcd_write_records(buf);   // format + write outside the lock
         {
-            std::unique_lock<std::mutex> lk(vcd_mu);
+            clotho::rt::OsLock lk(vcd_mu);
             buf.clear();
             vcd_pool.push_back(std::move(buf));
             --vcd_inflight;
@@ -7488,7 +7668,7 @@ void vcd_handoff() {
     if (g_vcd.recbuf.empty()) {
         return;
     }
-    std::unique_lock<std::mutex> lk(vcd_mu);
+    clotho::rt::OsLock lk(vcd_mu);
     vcd_cv_free.wait(lk, [] { return !vcd_pool.empty(); });
     std::vector<uint8_t> next = std::move(vcd_pool.back());
     vcd_pool.pop_back();
@@ -7664,7 +7844,7 @@ extern "C" void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count
         // Storage index k maps to declared address left+k (ascending range) or
         // left-k (descending), matching the element-select normalization.
         const int64_t     addr = left <= right ? left + static_cast<int64_t>(k) : left - static_cast<int64_t>(k);
-        const std::string ref  = std::string(leaf) + "[" + std::to_string(addr) + "]";
+        const std::string ref  = std::string(leaf) + "[" + fmt::to_string(addr) + "]";
         const uint8_t*    mm   = mm_base + static_cast<size_t>(k) * stride;
         const uint8_t*    z    = z_base != nullptr ? z_base + static_cast<size_t>(k) * stride : nullptr;
         vcd_register(ref, width, flags, mm, z);
@@ -7703,7 +7883,9 @@ extern "C" void rt_vcd_start(void) {
         }
         vcd_stop      = false;
         vcd_inflight  = 0;
-        vcd_thread    = std::thread(vcd_writer_loop);
+        if (!vcd_thread.start(vcd_writer_loop)) {
+            format_fatal("$dumpvars: cannot start the VCD writer thread");
+        }
         g_vcd.started = true;
     }
     if (vcd_capped()) {
@@ -7846,7 +8028,7 @@ extern "C" void rt_vcd_dumpflush(void) {
     // everything, then push the file's own buffer to the OS. Waiting until the
     // writer is idle means no write is in flight, so the fflush cannot race it.
     vcd_handoff();
-    std::unique_lock<std::mutex> lk(vcd_mu);
+    clotho::rt::OsLock lk(vcd_mu);
     vcd_cv_idle.wait(lk, [] { return vcd_ready.empty() && vcd_inflight == 0; });
     vcd_flush_out();   // writer is idle -> no concurrent append into iobuf
     std::fflush(g_vcd.file);
@@ -7857,7 +8039,7 @@ extern "C" void rt_vcd_dumpflush(void) {
 static void vcd_shutdown_writer() {
     if (vcd_thread.joinable()) {
         {
-            std::unique_lock<std::mutex> lk(vcd_mu);
+            clotho::rt::OsLock lk(vcd_mu);
             vcd_stop = true;
             vcd_cv_ready.notify_all();
         }
@@ -7917,4 +8099,104 @@ void rt_dpi_unpack_logicvec(const uint32_t* in, uint32_t nchunks, uint32_t* must
 
 void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site* site) {
     rt_string_assign_bytes(dst, p, p != nullptr ? std::strlen(p) : 0, site);
+}
+
+// ---- Host entry ----
+
+// Defined last so every process-global it arms is in scope.
+int32_t rt_run(const rt_run_config* config, int32_t (*design_main)(void)) {
+    g_plusargs.clear();
+    g_plusargs.reserve(config->plusarg_count);
+    for (uint32_t k = 0; k < config->plusarg_count; ++k) {
+        g_plusargs.emplace_back(config->plusargs[k], config->plusarg_lens[k]);
+    }
+    g_system_access  = config->system_access;
+    g_ref_stale_warn = config->loose_stale_ref;
+    g_stop_tick      = kNoStopTick;
+    if (config->has_stop_time != 0) {
+        // A unitless design has no tick size to divide by: it counts in
+        // femtoseconds, as rt_timeformat_init does.
+        const uint64_t tick  = config->tick_fs == 0 ? 1 : config->tick_fs;
+        // Rounded up: a stop time between two ticks cannot run the step it falls
+        // short of, and stopping a tick early would drop events the user asked for.
+        const uint64_t ticks = config->stop_fs / tick + (config->stop_fs % tick != 0 ? 1 : 0);
+        g_stop_tick          = std::min(ticks, kNoStopTick - 1);
+    }
+
+    // The design's main returns 0 whichever way the run ended; a $fatal (LRM
+    // 20.10) or an interrupt is the runtime's to report.
+    const int32_t rc = design_main();
+    return rc != 0 ? rc : g_run_status;
+}
+
+namespace {
+
+// A unit `--stop-time` accepts, and how many femtoseconds it is.
+struct TimeUnit {
+    std::string_view name;
+    uint64_t         femtoseconds;
+};
+
+constexpr uint64_t kFemtosecondsPerSecond = 1'000'000'000'000'000;
+
+constexpr TimeUnit kTimeUnits[] = {
+    { "fs", 1 },
+    { "ps", 1'000 },
+    { "ns", 1'000'000 },
+    { "us", 1'000'000'000 },
+    { "ms", 1'000'000'000'000 },
+    { "s", kFemtosecondsPerSecond },
+};
+
+// The units as a sentence lists them.
+constexpr std::string_view kTimeUnitList = "fs, ps, ns, us, ms or s";
+
+} // namespace
+
+int32_t rt_parse_stop_time(const char* text, uint64_t len, uint64_t* femtoseconds, char* error, uint64_t cap) {
+    const std::string_view value(text, static_cast<size_t>(len));
+    const auto             fail = [&](std::string_view why) {
+        if (cap > 0) {
+            const auto end =
+              fmt::format_to_n(error, static_cast<size_t>(cap - 1), "invalid --stop-time '{}': {}", value, why);
+            *end.out = '\0';
+        }
+        return 0;
+    };
+
+    // Digits only: no sign and no space.
+    size_t   digits   = 0;
+    uint64_t count    = 0;
+    bool     overflow = false;
+    while (digits < value.size() && value[digits] >= '0' && value[digits] <= '9') {
+        const uint64_t d = static_cast<uint64_t>(value[digits] - '0');
+        overflow         = overflow || count > (UINT64_MAX - d) / 10;
+        count            = count * 10 + d;
+        ++digits;
+    }
+    if (digits == 0) {
+        return fail(fmt::format("write an integer and a unit, e.g. 100ns or 5us (units: {})", kTimeUnitList));
+    }
+    const std::string_view unit_name = value.substr(digits);
+    if (unit_name.empty()) {
+        return fail(fmt::format("the unit is missing; write e.g. {}ns (units: {})", value, kTimeUnitList));
+    }
+    const TimeUnit* unit = nullptr;
+    for (const TimeUnit& u : kTimeUnits) {
+        if (u.name == unit_name) {
+            unit = &u;
+        }
+    }
+    if (unit == nullptr) {
+        return fail(fmt::format("unknown unit '{}' (units: {})", unit_name, kTimeUnitList));
+    }
+    // An out-of-range count is also too large, whatever the unit.
+    if (overflow || count > UINT64_MAX / unit->femtoseconds) {
+        return fail(fmt::format("too large; the longest time is about {} s", UINT64_MAX / kFemtosecondsPerSecond));
+    }
+    if (count == 0) {
+        return fail("must be greater than zero");
+    }
+    *femtoseconds = count * unit->femtoseconds;
+    return 1;
 }

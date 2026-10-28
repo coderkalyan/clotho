@@ -37,6 +37,38 @@ bool SourceContext::empty() const {
     return sm_ == nullptr;
 }
 
+void SourceContext::set_path_prefix_map(PathPrefixMap map) {
+    path_prefix_map_ = std::move(map);
+}
+
+std::string SourceContext::shown_file(const slang::SourceLocation& loc) const {
+    std::string name(sm_->getFileName(loc));
+    // A `line directive's name is the design's own claim; only the buffer's file
+    // is mapped.
+    if (path_prefix_map_.empty() || name != sm_->getRawFileName(loc.buffer())) {
+        return name;
+    }
+    const std::string                full = sm_->getFullPath(loc.buffer()).string();
+    const PathPrefixMap::value_type* best = nullptr;
+    for (const auto& entry : path_prefix_map_) {
+        const std::string& dir = entry.first;
+        const bool         under =
+          full.starts_with(dir) && (full.size() == dir.size() || full[dir.size()] == '/' || full[dir.size()] == '\\');
+        if (under && (best == nullptr || dir.size() > best->first.size())) {
+            best = &entry;
+        }
+    }
+    if (best == nullptr) {
+        return name;
+    }
+    std::string rest = full.substr(best->first.size());
+    // An empty replacement leaves the path relative to the mapped directory.
+    if (best->second.empty() && !rest.empty()) {
+        rest.erase(0, 1);
+    }
+    return best->second + rest;
+}
+
 SourcePosition SourceContext::resolve(ir::SourceLoc loc) const {
     SourcePosition pos;
     if (sm_ == nullptr || loc == ir::SourceLoc{ 0 }) {
@@ -55,7 +87,7 @@ SourcePosition SourceContext::resolve(ir::SourceLoc loc) const {
         return pos;
     }
 
-    const std::string_view name = sm_->getFileName(sl);
+    const std::string name = shown_file(sl);
     if (name.empty()) {
         return pos;
     }

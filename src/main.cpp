@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <cctype>
-#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +21,13 @@
 #include <unistd.h>
 #endif
 
+#include <llvm/ADT/SmallString.h>
+#include <llvm/MC/MCSubtargetInfo.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/TargetParser/SubtargetFeature.h>
 
 #include <slang/driver/Driver.h>
 #include <slang/util/String.h>
@@ -35,6 +40,8 @@
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
+#include "link/Link.h"
+#include "runtime/Runtime.h"
 #ifdef CLOTHO_LSP
 #include "lsp/Lsp.h"
 #endif
@@ -49,7 +56,7 @@
 // frontend found (`lint`). Every compiler decision lives in the libraries; this
 // file is argument handling and reporting.
 //
-//   clotho build [options] <source>...             emit an artifact, no execution (CLOTHO_BUILD_COMMAND)
+//   clotho build [options] <source>...             write an executable that simulates, or generated code
 //   clotho run   [options] <source>... [+arg...]   compile, then simulate
 //   clotho lint  [options] <source>...             diagnostics only
 //   clotho lsp                                     serve an editor over stdio (CLOTHO_LSP)
@@ -112,25 +119,14 @@ constexpr Commands kAny = kSource
 #endif
   ;
 
-// The options the artifact is compiled with and then run with, which `build` is
-// told exactly as `run` is: the --gc-* group (the backend bakes an rt_gc_config
-// into the emitted module and calls rt_gc_init from its main), `--coverage` (the
-// coverage model the backend emits names its own destination, so the report file
-// is a mode compiled in, not something `run` can add to an artifact built
-// without it), and `-O`, `--stat` and `--sanitize`, which steer code generation.
-// `lint` and `synth` never reach code generation, so they refuse all of these.
+// The options the design is compiled with, which `build` is told exactly as
+// `run` is: the --gc-* group (the backend bakes an rt_gc_config into the emitted
+// module and calls rt_gc_init from its main), `--coverage` (the coverage model
+// the backend emits names its own destination, so the report file is compiled
+// in, not something an executable can be told when it runs), `--dpi-lib`, and
+// `-O`, `--stat` and `--sanitize`, which steer code generation. `lint` and
+// `synth` never reach code generation, so they refuse all of these.
 constexpr Commands kBuildRun = bit(Command::Build) | bit(Command::Run);
-
-// Help text that is about `build`, kept as a string literal so a description can
-// still be one concatenated literal. Without the command there is no build for
-// the text to talk about.
-#ifdef CLOTHO_BUILD_COMMAND
-#define CLOTHO_IF_BUILD(text)    text
-#define CLOTHO_IF_NO_BUILD(text) ""
-#else
-#define CLOTHO_IF_BUILD(text)    ""
-#define CLOTHO_IF_NO_BUILD(text) text
-#endif
 
 // `-o` names the artifact, and two commands produce one.
 constexpr Commands kArtifact = bit(Command::Build)
@@ -157,23 +153,21 @@ constexpr std::string_view kPlusargNote =
   "and $value$plusargs to read while it runs (LRM 21.6). Use '--' to stop that and pass everything "
   "after it through as written.";
 
-// `build` writes to stdout unless given `-o`. See refuses_terminal_artifact.
+// Where `build` writes without `-o`. See refuses_terminal_artifact.
 constexpr std::string_view kBuildNote =
-  "Without -o the output goes to stdout, unless that is a terminal. Pass -o <file> to write a "
-  "file, or -o - to print it to the terminal anyway.";
+  "Without -o an executable is written to the current directory, named after the design's first "
+  "top-level module, and any other output goes to stdout unless that is a terminal; pass -o - to "
+  "print it there anyway.";
 
-// The commands this build has, in the order `--help` lists them. `build`, `synth`,
-// `lsp` and `dap` are compiled out of a Release build, and a usage message that
-// offers a command the binary will then reject is worse than one that never
-// mentions it.
+// The commands this build has, in the order `--help` lists them. `synth`, `lsp`
+// and `dap` are compiled out of a Release build, and a usage message that offers
+// a command the binary will then reject is worse than one that never mentions it.
 constexpr CommandInfo kCommands[] = {
-#ifdef CLOTHO_BUILD_COMMAND
     { Command::Build,
       "build",
-      "compile the design and write the generated code, without running it",
+      "compile the design into an executable that simulates it without clotho",
       "[options] <files>...",
       kBuildNote },
-#endif
     { Command::Run, "run", "compile the design and simulate it", "[options] <files>... [+plusarg...]", kPlusargNote },
     { Command::Lint,
       "lint",
@@ -316,8 +310,10 @@ private:
 
 // What `build` writes.
 enum class Emit : uint8_t {
+    Exe,     // an executable for this machine (the default)
+    Obj,     // a native object file for this machine
     Ir,      // Clotho process IR
-    Llvm,    // LLVM IR after the coroutine-lowering pipeline (the default)
+    Llvm,    // LLVM IR after the coroutine-lowering pipeline
     LlvmRaw, // LLVM IR straight from the backend, llvm.coro.* intact
 };
 
@@ -329,6 +325,7 @@ struct Options {
     std::optional<bool>        version;
     std::optional<std::string> emit;
     std::optional<std::string> out;
+    std::optional<std::string> cpu;
     std::optional<bool>        time;
     std::optional<bool>        o3;
     std::vector<std::string>   stats;
@@ -344,6 +341,7 @@ struct Options {
     std::optional<bool>        loose_stale_ref;
     std::optional<std::string> stop_time;
     std::vector<std::string>   dpi_libs;
+    std::vector<std::string>   path_prefix_maps;
     std::optional<bool>        perf_jitdump;
     std::optional<std::string> sidecar;
     std::optional<std::string> target;
@@ -374,22 +372,28 @@ constexpr std::string_view kSanitizeList =
 // check_scope refuses it under any other, and the description needs no tag of
 // its own for that.
 void register_options(Registry& r, Options& o) {
-#ifdef CLOTHO_BUILD_COMMAND
     r.add(bit(Command::Build),
           "--emit",
           o.emit,
-          "What to write: llvm (LLVM IR for the design, the default), ir (Clotho's own "
-          "intermediate form), llvm-raw (LLVM IR before the coroutine passes; for working on clotho)",
+          "What to write: exe (an executable that runs the simulation without clotho, the default), "
+          "obj (an object file that defines clotho_main, for linking against Clotho's runtime "
+          "library), llvm (LLVM IR for the design), ir (Clotho's own intermediate form), llvm-raw "
+          "(LLVM IR before the coroutine passes; for working on clotho)",
           "<target>");
-#endif
-#if defined(CLOTHO_BUILD_COMMAND) || defined(CLOTHO_SYNTH)
+    r.add(bit(Command::Build),
+          "--cpu",
+          o.cpu,
+          "The processor an executable or object is compiled for: a baseline every machine of this "
+          "kind has (x86-64-v2 on x86-64, Apple M1 on Apple Silicon, generic Armv8-A on other "
+          "AArch64) by default, `native` for exactly this one, or an LLVM processor name",
+          "<name>");
     r.add(kArtifact,
           "-o,--output",
           o.out,
-          "Write the output to this file instead of stdout",
+          "Write the output to this file. Without it an executable is named after the design's first "
+          "top-level module, and other output goes to stdout",
           "<file>",
           slang::CommandLineFlags::FilePath);
-#endif
     r.add(kSource, "--time", o.time, "Print how long each stage took: reading the source, compiling, simulating");
     r.add(kBuildRun, "-O", o.o3, "Compile the design more thoroughly: slower to start up, faster to simulate");
     r.add_developer(kBuildRun,
@@ -415,8 +419,7 @@ void register_options(Registry& r, Options& o) {
           o.coverage,
           "Write the design's functional-coverage report here: which of the bins its "
           "covergroups declare the run reached, and which it never did (LRM 19). No report by "
-          "default" CLOTHO_IF_BUILD(". The destination is compiled into the generated code, so a build "
-                                    "and the run of what it built must be given the same file"),
+          "default. An executable writes its report to the file `build` was given",
           "<file>",
           slang::CommandLineFlags::FilePath);
     r.add_developer(kBuildRun,
@@ -425,8 +428,7 @@ void register_options(Registry& r, Options& o) {
                     "Reclaim unused class objects at every opportunity instead of when the "
                     "design has created enough of them. Slow by design: it turns an object Clotho failed "
                     "to keep into an immediate wrong answer rather than a rare one, so it is for working "
-                    "on clotho itself" CLOTHO_IF_BUILD(". Changes the generated code, so a build and the "
-                                                       "run of what it built must be given the same setting"));
+                    "on clotho itself. An executable keeps the setting `build` was given");
     r.add(kBuildRun,
           "--gc-stats",
           o.gc_stats,
@@ -481,13 +483,21 @@ void register_options(Registry& r, Options& o) {
                     "was bound to, which stops the run by default: growing or reordering an array or queue "
                     "while a ref refers to an element of it leaves that ref on something else entirely, so "
                     "nothing after the first one means anything. For naming every such ref in one run");
-    r.add(bit(Command::Run),
+    r.add(kBuildRun,
           "--dpi-lib",
           o.dpi_libs,
           "Library holding the C functions this design imports through DPI-C. Give a .o or .a "
           "if C also calls back into the design; a .so is enough for imports alone",
           "<path>",
           slang::CommandLineFlags::FilePath);
+    r.add(kBuildRun,
+          "--path-prefix-map",
+          o.path_prefix_maps,
+          "Show source files under <dir> in the simulation's messages as <new> followed by the rest "
+          "of their path, instead of relative to the directory clotho runs in, which an executable "
+          "keeps. Repeatable; the longest matching <dir> wins. An empty <new> shows paths relative "
+          "to <dir>",
+          "<dir>=<new>");
 #ifdef CLOTHO_SYNTH
     r.add(bit(Command::Synth),
           "--sidecar",
@@ -588,77 +598,60 @@ bool stdout_is_terminal() {
 #endif
 }
 
-// `build` writes its artifact to stdout unless given `-o`, and a terminal is
-// where that is almost always a forgotten `-o`: the generated code is pages of
-// text nobody reads there. So the default is refused on a terminal; an explicit
-// `-o -` still asks for it by name, and a pipe or a file is not a terminal.
-bool refuses_terminal_artifact(Command command, bool out_given, bool stdout_terminal) {
-    return command == Command::Build && !out_given && stdout_terminal;
+// `build` writes anything but an executable to stdout unless given `-o`, and a
+// terminal is where that is almost always a forgotten `-o`: the generated code
+// is pages of text, or binary, nobody reads there. So the default is refused on
+// a terminal; an explicit `-o -` still asks for it by name, and a pipe or a file
+// is not a terminal.
+bool refuses_terminal_artifact(Command command, Emit emit, bool out_given, bool stdout_terminal) {
+    return command == Command::Build && emit != Emit::Exe && !out_given && stdout_terminal;
 }
 
-// A unit `--stop-time` accepts, and how many femtoseconds it is.
-struct TimeUnit {
-    std::string_view name;
-    uint64_t         femtoseconds;
-};
-
-constexpr uint64_t kFemtosecondsPerSecond = 1'000'000'000'000'000;
-
-constexpr TimeUnit kTimeUnits[] = {
-    { "fs", 1 },
-    { "ps", 1'000 },
-    { "ns", 1'000'000 },
-    { "us", 1'000'000'000 },
-    { "ms", 1'000'000'000'000 },
-    { "s", kFemtosecondsPerSecond },
-};
-
-// The units as a sentence lists them: "fs, ps, ns, us, ms or s".
-std::string time_unit_list() {
-    std::string text;
-    for (size_t i = 0; i < std::size(kTimeUnits); ++i) {
-        if (i > 0) {
-            text += i + 1 == std::size(kTimeUnits) ? " or " : ", ";
-        }
-        text += kTimeUnits[i].name;
+// The target `build` compiles an object or executable for: this kind of
+// machine, at the processor --cpu names. The default is a baseline every machine
+// of the kind has, so what is built on a new machine still runs on an older one;
+// `native` is exactly this machine. Empty, with the reason in `error` and
+// `usage` set when it is the user's to fix, if there is none.
+std::optional<llvm::orc::JITTargetMachineBuilder> build_target(const std::optional<std::string>& cpu,
+                                                               std::string&                      error,
+                                                               bool&                             usage) {
+    auto host = clotho::ir::host_target();
+    if (!host) {
+        error = std::format("cannot detect this machine's target: {}", llvm::toString(host.takeError()));
+        usage = false;
+        return std::nullopt;
     }
-    return text;
-}
-
-// `--stop-time`: an integer and a unit with nothing between them, as `100ns` or
-// `5us`, in femtoseconds. Returns false and sets `error` for a missing or unknown
-// unit, a zero time, or one that does not fit in 64 bits of femtoseconds.
-bool parse_stop_time(std::string_view text, uint64_t& femtoseconds, std::string& error) {
-    const auto fail = [&](const std::string& why) {
-        error = std::format("invalid --stop-time '{}': {}", text, why);
-        return false;
-    };
-
-    uint64_t          count = 0;
-    const char* const begin = text.data();
-    const char* const end   = begin + text.size();
-    // Digits only: from_chars takes no sign and no space for an unsigned value.
-    const auto [digits_end, ec] = std::from_chars(begin, end, count);
-    if (digits_end == begin) {
-        return fail(std::format("write an integer and a unit, e.g. 100ns or 5us (units: {})", time_unit_list()));
+    if (cpu == "native") {
+        return std::move(*host);
     }
-    const std::string_view unit_name(digits_end, end);
-    if (unit_name.empty()) {
-        return fail(std::format("the unit is missing; write e.g. {}ns (units: {})", text, time_unit_list()));
+    const llvm::Triple& triple = host->getTargetTriple();
+    std::string         name;
+    if (cpu.has_value()) {
+        name = *cpu;
+    } else if (triple.getArch() == llvm::Triple::x86_64) {
+        name = "x86-64-v2";
+    } else if (triple.isAArch64()) {
+        name = triple.isOSDarwin() ? "apple-m1" : "generic";
+    } else {
+        error =
+          std::format("no baseline processor is known for {}; pass --cpu native or a processor name", triple.str());
+        usage = true;
+        return std::nullopt;
     }
-    const auto unit = std::ranges::find(kTimeUnits, unit_name, &TimeUnit::name);
-    if (unit == std::end(kTimeUnits)) {
-        return fail(std::format("unknown unit '{}' (units: {})", unit_name, time_unit_list()));
+    // Asked of a subtarget made for no processor: one made for an unknown name
+    // prints LLVM's own warning and carries on.
+    std::string                                  lookup_error;
+    const llvm::Target*                          llvm_target = llvm::TargetRegistry::lookupTarget(triple, lookup_error);
+    const std::unique_ptr<llvm::MCSubtargetInfo> subtarget(
+      llvm_target != nullptr ? llvm_target->createMCSubtargetInfo(triple, "", "") : nullptr);
+    if (subtarget == nullptr || !subtarget->isCPUStringValid(name)) {
+        error = std::format("unknown --cpu '{}': not a processor LLVM knows for {}", name, triple.str());
+        usage = true;
+        return std::nullopt;
     }
-    // An out-of-range count is also too large, whatever the unit.
-    if (ec == std::errc::result_out_of_range || count > UINT64_MAX / unit->femtoseconds) {
-        return fail(std::format("too large; the longest time is about {} s", UINT64_MAX / kFemtosecondsPerSecond));
-    }
-    if (count == 0) {
-        return fail("must be greater than zero");
-    }
-    femtoseconds = count * unit->femtoseconds;
-    return true;
+    host->setCPU(name);
+    host->getFeatures() = llvm::SubtargetFeatures();
+    return std::move(*host);
 }
 
 // A command-specific option used under another command is an error, not a
@@ -890,9 +883,8 @@ std::string render_help(const Registry&           registry,
         append_sections(out, { commands });
         if (all) {
             append_paragraph(out,
-                             "A tag such as " CLOTHO_IF_BUILD("[build|run]") CLOTHO_IF_NO_BUILD(
-                               "[run]") " names the commands that take an option; an option with no tag is taken "
-                                        "by every command that reads source.");
+                             "A tag such as [build|run] names the commands that take an option; an option "
+                             "with no tag is taken by every command that reads source.");
         }
     }
 
@@ -978,12 +970,14 @@ bool write_text(std::string_view out, const std::string& text) {
 }
 #endif
 
-// `build`: write the requested artifact. `-o -` (the default) means stdout.
-bool write_artifact(const clotho::LowerResult& result,
-                    Emit                       emit,
-                    std::string_view           out,
-                    const SimulationConfig&    config,
-                    clotho::Timings*           timings) {
+// `build`: write the requested artifact. `-o -` means stdout. `target` is the
+// build_target for an object or executable, null for anything else.
+bool write_artifact(const clotho::LowerResult&                result,
+                    Emit                                      emit,
+                    std::string_view                          out,
+                    const llvm::orc::JITTargetMachineBuilder* target,
+                    const SimulationConfig&                   config,
+                    clotho::Timings*                          timings) {
     const bool to_stdout = out == "-";
     // Locations are resolvable because lowering hands back the SourceManager. An
     // IR dump you cannot map to source is much less useful when debugging a
@@ -1002,6 +996,49 @@ bool write_artifact(const clotho::LowerResult& result,
         }
         clotho::ir::print_module(*result.module, os, resolve);
         return true;
+    }
+    if (emit == Emit::Exe) {
+        // The object and the embedded link files go in a directory of their own,
+        // removed once the executable is written.
+        llvm::SmallString<128> scratch;
+        if (const std::error_code ec = llvm::sys::fs::createUniqueDirectory("clotho-build", scratch)) {
+            std::println(stderr, "clotho: cannot create a temporary directory: {}", ec.message());
+            return false;
+        }
+        const std::string dir(scratch);
+        const struct Remove {
+            const std::string& dir;
+            ~Remove() {
+                llvm::sys::fs::remove_directories(dir);
+            }
+        } remove{ dir };
+        llvm::SmallString<128> object(scratch);
+        llvm::sys::path::append(object, "design.o");
+        {
+            std::error_code      ec;
+            llvm::raw_fd_ostream os(object, ec);
+            if (ec) {
+                std::println(stderr, "clotho: cannot open '{}': {}", std::string_view(object), ec.message());
+                return false;
+            }
+            if (!clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve)) {
+                return false;
+            }
+        }
+        return clotho::link::link_executable(
+          std::string(object), config.dpi_libs, !result.module->dpi_exports.empty(), std::string(out), dir);
+    }
+    if (emit == Emit::Obj) {
+        if (to_stdout) {
+            return clotho::ir::emit_object(*result.module, llvm::outs(), *target, config, timings, resolve);
+        }
+        std::error_code      ec;
+        llvm::raw_fd_ostream os(out, ec);
+        if (ec) {
+            std::println(stderr, "clotho: cannot open '{}': {}", out, ec.message());
+            return false;
+        }
+        return clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve);
     }
     if (to_stdout) {
         return clotho::ir::emit_llvm(*result.module, llvm::outs(), config, timings, resolve);
@@ -1140,23 +1177,49 @@ int main(int argc, char** argv) {
         return status;
     }
 
-    if (refuses_terminal_artifact(command, options.out.has_value(), stdout_is_terminal())) {
-        return usage_error("'build' writes to stdout by default, and stdout is a terminal; pass -o <file> to "
-                           "write a file, or -o - to print it here anyway");
-    }
-
-    Emit emit = Emit::Llvm;
+    Emit emit = Emit::Exe;
     if (options.emit.has_value()) {
         const std::string& target = *options.emit;
-        if (target == "llvm") {
+        if (target == "exe") {
+            emit = Emit::Exe;
+        } else if (target == "obj") {
+            emit = Emit::Obj;
+        } else if (target == "llvm") {
             emit = Emit::Llvm;
         } else if (target == "llvm-raw") {
             emit = Emit::LlvmRaw;
         } else if (target == "ir") {
             emit = Emit::Ir;
         } else {
-            return usage_error(std::format("unknown --emit target '{}'; expected llvm, llvm-raw or ir", target));
+            return usage_error(
+              std::format("unknown --emit target '{}'; expected exe, obj, llvm, ir or llvm-raw", target));
         }
+    }
+    if (refuses_terminal_artifact(command, emit, options.out.has_value(), stdout_is_terminal())) {
+        return usage_error("'build' writes this to stdout by default, and stdout is a terminal; pass -o <file> to "
+                           "write a file, or -o - to print it here anyway");
+    }
+    if (command == Command::Build && emit == Emit::Exe && options.out == "-") {
+        return usage_error("an executable cannot be written to stdout; pass -o <file>");
+    }
+    // Linked into an executable, or loaded by `run`; nothing else carries them.
+    if (command == Command::Build && emit != Emit::Exe && !options.dpi_libs.empty()) {
+        return usage_error("--dpi-lib applies to an executable (--emit exe), which links the libraries in");
+    }
+    std::optional<llvm::orc::JITTargetMachineBuilder> target;
+    if (command == Command::Build && (emit == Emit::Exe || emit == Emit::Obj)) {
+        std::string error;
+        bool        usage = false;
+        target            = build_target(options.cpu, error, usage);
+        if (!target.has_value()) {
+            if (usage) {
+                return usage_error(error);
+            }
+            std::println(stderr, "clotho: {}", error);
+            return 1;
+        }
+    } else if (options.cpu.has_value()) {
+        return usage_error("--cpu applies to an executable or object (--emit exe or obj)");
     }
 
     SimulationConfig config;
@@ -1169,9 +1232,10 @@ int main(int argc, char** argv) {
     // compile pool, so the tool has one thread knob rather than two.
     config.compile_jobs = driver->options.numThreads.value_or(0);
     if (options.stop_time.has_value()) {
-        uint64_t    femtoseconds = 0;
-        std::string error;
-        if (!parse_stop_time(*options.stop_time, femtoseconds, error)) {
+        uint64_t femtoseconds = 0;
+        char     error[512];
+        if (rt_parse_stop_time(
+              options.stop_time->data(), options.stop_time->size(), &femtoseconds, error, sizeof(error)) == 0) {
             return usage_error(error);
         }
         config.stop_time_fs = femtoseconds;
@@ -1279,7 +1343,30 @@ int main(int argc, char** argv) {
     clotho::Timings        timings;
     clotho::Timings* const tp = want_time ? &timings : nullptr;
 
-    const clotho::LowerResult result = clotho::lower_driver(std::move(driver), tp, config.allow_system);
+    // `--path-prefix-map`: directories absolute and without a trailing separator,
+    // so a prefix match is a match on whole path components.
+    clotho::PathPrefixMap path_prefix_map;
+    for (const std::string& entry : options.path_prefix_maps) {
+        const size_t eq = entry.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            return usage_error(std::format("invalid --path-prefix-map '{}': write <dir>=<new>", entry));
+        }
+        // Resolved the way slang resolves a source's full path, symbolic links
+        // included (macOS's temporary directory is one).
+        std::error_code ec;
+        std::string     dir =
+          std::filesystem::weakly_canonical(std::filesystem::absolute(entry.substr(0, eq)), ec).string();
+        if (ec) {
+            dir = std::filesystem::absolute(entry.substr(0, eq)).lexically_normal().string();
+        }
+        while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) {
+            dir.pop_back();
+        }
+        path_prefix_map.emplace_back(std::move(dir), entry.substr(eq + 1));
+    }
+
+    const clotho::LowerResult result =
+      clotho::lower_driver(std::move(driver), tp, config.allow_system, std::move(path_prefix_map));
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostic_text());
     }
@@ -1306,13 +1393,23 @@ int main(int argc, char** argv) {
         return clotho::has_error(result.diagnostics) ? 1 : 0;
     }
 
+    // An executable without -o is named after the design's first top-level
+    // module, in the current directory; anything else without -o is stdout.
+    std::string out = options.out.value_or("-");
+    if (command == Command::Build && emit == Emit::Exe && !options.out.has_value() && result.module != nullptr) {
+        out = result.module->top_name.empty() ? "simulation" : result.module->top_name;
+#if defined(_WIN32)
+        out += ".exe";
+#endif
+    }
+    const llvm::orc::JITTargetMachineBuilder* target_ptr = target.has_value() ? &*target : nullptr;
+
     // An IR dump is analysis, not execution, so it tolerates a poisoned module:
     // when a lowering guard fires, seeing what DID lower is the whole point. The
     // diagnostics are already on stderr and the exit status still reports the
     // failure, so a partial dump cannot be mistaken for a whole design.
-    const std::string_view out = options.out.has_value() ? std::string_view(*options.out) : std::string_view("-");
     if (command == Command::Build && emit == Emit::Ir && result.module != nullptr) {
-        const bool ok = write_artifact(result, emit, out, config, tp);
+        const bool ok = write_artifact(result, emit, out, target_ptr, config, tp);
         if (want_time) {
             report_timings(timings, command);
         }
@@ -1376,7 +1473,7 @@ int main(int argc, char** argv) {
         // status passes through unchanged.
         status = rc < 0 ? 1 : rc;
     } else {
-        status = write_artifact(result, emit, out, config, tp) ? 0 : 1;
+        status = write_artifact(result, emit, out, target_ptr, config, tp) ? 0 : 1;
     }
     if (want_time) {
         report_timings(timings, command);
