@@ -57,6 +57,7 @@
 // nothing never sets it, and never pays more than the load and the branch.
 #include "Gc.h"
 
+#include "Os.h"
 #include "Runtime.h"
 
 #include <algorithm>
@@ -68,6 +69,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <type_traits>
 #include <vector>
 
 #include <ankerl/unordered_dense.h>
@@ -265,9 +267,8 @@ struct Chunk {
     uint32_t   first_block;  // stable Block id of the block at `base`
 };
 
-// A large object owns its cell. `bytes` is kept because ::operator delete with an
-// alignment wants the request it matches, and because reclamation reads the extent
-// without touching the (possibly already finalized) object.
+// A large object owns its cell. `bytes` is kept because reclamation reads the
+// extent without touching the (possibly already finalized) object.
 struct LargeCell {
     uint8_t* start;
     uint64_t bytes;
@@ -779,26 +780,24 @@ void chunk_insert_sorted(const Chunk& c) {
     g.chunks.insert(pos, c);
 }
 
-// One 4 MiB chunk from the OS, or false. The aligned-`operator new` route rather
-// than aligned_alloc for the reason rt_alloc documents at Runtime.cpp:5506-5512:
-// aligned_alloc is absent from the MSVC runtime. RT_GC_BLOCK_BYTES alignment is
-// what makes every block base 32 KiB-aligned, which the index arithmetic in
-// block_of() and the grain arithmetic in block_start_of() both require.
+// One 4 MiB chunk from the OS, or false. RT_GC_BLOCK_BYTES alignment is what
+// makes every block base 32 KiB-aligned, which the index arithmetic in block_of()
+// and the grain arithmetic in block_start_of() both require.
 bool grow_heap() {
-    void* raw = ::operator new(static_cast<size_t>(kChunkBytes),
-                               std::align_val_t{ RT_GC_BLOCK_BYTES }, std::nothrow);
+    void* raw = clotho::rt::os_aligned_alloc(static_cast<size_t>(kChunkBytes), RT_GC_BLOCK_BYTES);
     if (raw == nullptr) {
         return false;
     }
-    assert(reinterpret_cast<uintptr_t>(raw) % RT_GC_BLOCK_BYTES == 0 && "aligned new honoured");
-    BlockMeta* meta = new (std::nothrow) BlockMeta[kBlocksPerChunk];
-    if (meta == nullptr) {
-        ::operator delete(raw, std::align_val_t{ RT_GC_BLOCK_BYTES });
-        return false;
-    }
+    assert(reinterpret_cast<uintptr_t>(raw) % RT_GC_BLOCK_BYTES == 0 && "aligned allocation honoured");
     // Zero is the correct initial state for all of it: kBlockFree, hole_cursor 0, no
     // marked line under either epoch, both bitmaps empty, and has_finalizable clear.
-    std::memset(meta, 0, sizeof(BlockMeta) * kBlocksPerChunk);
+    static_assert(std::is_trivially_copyable_v<BlockMeta> && std::is_trivially_destructible_v<BlockMeta>,
+                  "BlockMeta lives in calloc'd memory");
+    auto* meta = static_cast<BlockMeta*>(std::calloc(kBlocksPerChunk, sizeof(BlockMeta)));
+    if (meta == nullptr) {
+        clotho::rt::os_aligned_free(raw);
+        return false;
+    }
 
     Chunk c{ static_cast<uint8_t*>(raw), meta, static_cast<uint32_t>(g.blocks.size()) };
     for (uint32_t i = 0; i < kBlocksPerChunk; ++i) {
@@ -1153,12 +1152,11 @@ void large_insert_sorted(const LargeCell& cell) {
 uint8_t* alloc_large(rt_gc_mutator* mut, uint64_t size) {
     assert(size > kLargeObjectBytes);
     assert(size % RT_GC_ALIGN == 0);
-    void* raw =
-      ::operator new(static_cast<size_t>(size), std::align_val_t{ RT_GC_ALIGN }, std::nothrow);
+    void* raw = clotho::rt::os_aligned_alloc(static_cast<size_t>(size), RT_GC_ALIGN);
     if (raw == nullptr) {
         oom_fatal(size);
     }
-    assert(reinterpret_cast<uintptr_t>(raw) % RT_GC_ALIGN == 0 && "aligned new honoured");
+    assert(reinterpret_cast<uintptr_t>(raw) % RT_GC_ALIGN == 0 && "aligned allocation honoured");
     large_insert_sorted(LargeCell{ static_cast<uint8_t*>(raw), size });
     g.stats.bytes_allocated += size;
     g.stats.objects_allocated += 1;
@@ -2279,7 +2277,7 @@ void reclaim_large() {
         assert((*gcword_ptr(h) & RT_GC_FLAG_FINALIZE) == 0 && "a dead cell owes a finalizer");
         assert(!spared_by_age(*gcword_ptr(h)) && "a young collection reclaimed an OLD cell");
         assert((*gcword_ptr(h) & RT_GC_FLAG_PINNED) == 0 && "a pinned object would be marked");
-        ::operator delete(cell.start, std::align_val_t{ RT_GC_ALIGN });
+        clotho::rt::os_aligned_free(cell.start);
     }
     g.large.resize(keep);
 }
@@ -2291,14 +2289,14 @@ void release_heap() {
     // inside drop_hole() reads that block's start bitmap to count what it handed out.
     drop_hole(&g_mutator);
     for (const LargeCell& cell : g.large) {
-        ::operator delete(cell.start, std::align_val_t{ RT_GC_ALIGN });
+        clotho::rt::os_aligned_free(cell.start);
     }
     g.large.clear();
     for (const Chunk& c : g.chunks) {
         assert(c.base != nullptr && "a registered chunk has a payload");
         assert(c.meta != nullptr && "a registered chunk has a metadata array");
-        delete[] c.meta;
-        ::operator delete(c.base, std::align_val_t{ RT_GC_BLOCK_BYTES });
+        std::free(c.meta);
+        clotho::rt::os_aligned_free(c.base);
     }
     g.chunks.clear();
     g.blocks.clear();

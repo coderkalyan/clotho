@@ -19,7 +19,8 @@
 #include <cstring>
 #include <deque>
 #include <string>
-#include <unordered_map>
+
+#include <ankerl/unordered_dense.h>
 
 // 4-state per-bit encoding (svdpi.h): aval = value-or-X, bval = unknown.
 //   svLogic 0 = (a0,b0)   1 = (a1,b0)   Z(2) = (a0,b1)   X(3) = (a1,b1)
@@ -38,8 +39,8 @@
 
 namespace {
 struct SvScopeObj {
-    std::string                      name;
-    std::unordered_map<void*, void*> user_data;
+    std::string                                name;
+    ankerl::unordered_dense::map<void*, void*> user_data;
 };
 std::deque<SvScopeObj> g_scopes;
 void*                  g_current = nullptr;
