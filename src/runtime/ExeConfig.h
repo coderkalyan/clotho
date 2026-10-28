@@ -15,6 +15,12 @@
 // runtime and the executable's run the same code.
 #define _LIBCPP_HARDENING_MODE _LIBCPP_HARDENING_MODE_NONE
 
+// What libc++'s headers call for a broken precondition, or for an exception
+// they cannot throw without exceptions; libc++ lets this macro replace its
+// library's __libcpp_verbose_abort. ExeSupport.cpp defines the function.
+extern "C" [[noreturn]] void rt_libcxx_abort(const char* format, ...);
+#define _LIBCPP_VERBOSE_ABORT(...) ::rt_libcxx_abort(__VA_ARGS__)
+
 // {fmt} compiled in, with no std::locale.
 #define FMT_HEADER_ONLY
 #define FMT_USE_LOCALE 0

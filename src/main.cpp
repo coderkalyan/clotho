@@ -1030,7 +1030,7 @@ bool write_artifact(const clotho::LowerResult&                result,
             std::error_code      ec;
             llvm::raw_fd_ostream os(object, ec);
             if (ec) {
-                std::println(stderr, "clotho: cannot open '{}': {}", object.str(), ec.message());
+                std::println(stderr, "clotho: cannot open '{}': {}", std::string_view(object), ec.message());
                 return false;
             }
             if (!clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve)) {

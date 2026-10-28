@@ -56,10 +56,9 @@ void operator delete[](void* p, std::size_t) noexcept {
 }
 
 // Where libc++'s headers report a broken precondition, or an exception they
-// cannot throw without exceptions. libc++ documents it as the function to
-// override when its library is not linked.
-_LIBCPP_BEGIN_NAMESPACE_STD
-void __libcpp_verbose_abort(const char* format, ...) noexcept {
+// cannot throw without exceptions: ExeConfig.h points _LIBCPP_VERBOSE_ABORT
+// here instead of at libc++'s library.
+extern "C" void rt_libcxx_abort(const char* format, ...) {
     va_list args;
     va_start(args, format);
     std::vfprintf(stderr, format, args);
@@ -67,7 +66,6 @@ void __libcpp_verbose_abort(const char* format, ...) noexcept {
     std::fputc('\n', stderr);
     std::abort();
 }
-_LIBCPP_END_NAMESPACE_STD
 
 // std::string's members that libc++'s <string> declares `extern template`, for
 // its library to provide. There is no library here, so instantiate them as
