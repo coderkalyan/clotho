@@ -21,7 +21,13 @@
 #include <unistd.h>
 #endif
 
+#include <llvm/ADT/SmallString.h>
+#include <llvm/MC/MCSubtargetInfo.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/TargetParser/SubtargetFeature.h>
 
 #include <slang/driver/Driver.h>
 #include <slang/util/String.h>
@@ -34,6 +40,7 @@
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
+#include "link/Link.h"
 #include "runtime/Runtime.h"
 #ifdef CLOTHO_LSP
 #include "lsp/Lsp.h"
@@ -157,10 +164,11 @@ constexpr std::string_view kPlusargNote =
   "and $value$plusargs to read while it runs (LRM 21.6). Use '--' to stop that and pass everything "
   "after it through as written.";
 
-// `build` writes to stdout unless given `-o`. See refuses_terminal_artifact.
+// Where `build` writes without `-o`. See refuses_terminal_artifact.
 constexpr std::string_view kBuildNote =
-  "Without -o the output goes to stdout, unless that is a terminal. Pass -o <file> to write a "
-  "file, or -o - to print it to the terminal anyway.";
+  "Without -o an executable is written to the current directory, named after the design's first "
+  "top-level module, and any other output goes to stdout unless that is a terminal; pass -o - to "
+  "print it there anyway.";
 
 // The commands this build has, in the order `--help` lists them. `build`, `synth`,
 // `lsp` and `dap` are compiled out of a Release build, and a usage message that
@@ -170,7 +178,7 @@ constexpr CommandInfo kCommands[] = {
 #ifdef CLOTHO_BUILD_COMMAND
     { Command::Build,
       "build",
-      "compile the design and write the generated code, without running it",
+      "compile the design into an executable that simulates it, without clotho, on this kind of machine",
       "[options] <files>...",
       kBuildNote },
 #endif
@@ -316,10 +324,11 @@ private:
 
 // What `build` writes.
 enum class Emit : uint8_t {
-    Ir,      // Clotho process IR
-    Llvm,    // LLVM IR after the coroutine-lowering pipeline (the default)
-    LlvmRaw, // LLVM IR straight from the backend, llvm.coro.* intact
+    Exe,     // an executable for this machine (the default)
     Obj,     // a native object file for this machine
+    Ir,      // Clotho process IR
+    Llvm,    // LLVM IR after the coroutine-lowering pipeline
+    LlvmRaw, // LLVM IR straight from the backend, llvm.coro.* intact
 };
 
 // Clotho's own options, as slang CommandLine targets: unset optional means "not
@@ -330,6 +339,7 @@ struct Options {
     std::optional<bool>        version;
     std::optional<std::string> emit;
     std::optional<std::string> out;
+    std::optional<std::string> cpu;
     std::optional<bool>        time;
     std::optional<bool>        o3;
     std::vector<std::string>   stats;
@@ -379,17 +389,25 @@ void register_options(Registry& r, Options& o) {
     r.add(bit(Command::Build),
           "--emit",
           o.emit,
-          "What to write: llvm (LLVM IR for the design, the default), obj (an object file for this "
-          "machine, which defines clotho_main for linking against Clotho's runtime library), ir "
-          "(Clotho's own intermediate form), llvm-raw (LLVM IR before the coroutine passes; for "
-          "working on clotho)",
+          "What to write: exe (an executable that runs the simulation without clotho, the default), "
+          "obj (an object file that defines clotho_main, for linking against Clotho's runtime "
+          "library), llvm (LLVM IR for the design), ir (Clotho's own intermediate form), llvm-raw "
+          "(LLVM IR before the coroutine passes; for working on clotho)",
           "<target>");
+    r.add(bit(Command::Build),
+          "--cpu",
+          o.cpu,
+          "The processor an executable or object is compiled for: a baseline every machine of this "
+          "kind has (x86-64-v2 on x86-64, Apple M1 on Apple Silicon, generic Armv8-A on other "
+          "AArch64) by default, `native` for exactly this one, or an LLVM processor name",
+          "<name>");
 #endif
 #if defined(CLOTHO_BUILD_COMMAND) || defined(CLOTHO_SYNTH)
     r.add(kArtifact,
           "-o,--output",
           o.out,
-          "Write the output to this file instead of stdout",
+          "Write the output to this file. Without it an executable is named after the design's first "
+          "top-level module, and other output goes to stdout",
           "<file>",
           slang::CommandLineFlags::FilePath);
 #endif
@@ -484,7 +502,7 @@ void register_options(Registry& r, Options& o) {
                     "was bound to, which stops the run by default: growing or reordering an array or queue "
                     "while a ref refers to an element of it leaves that ref on something else entirely, so "
                     "nothing after the first one means anything. For naming every such ref in one run");
-    r.add(bit(Command::Run),
+    r.add(kBuildRun,
           "--dpi-lib",
           o.dpi_libs,
           "Library holding the C functions this design imports through DPI-C. Give a .o or .a "
@@ -591,12 +609,60 @@ bool stdout_is_terminal() {
 #endif
 }
 
-// `build` writes its artifact to stdout unless given `-o`, and a terminal is
-// where that is almost always a forgotten `-o`: the generated code is pages of
-// text nobody reads there. So the default is refused on a terminal; an explicit
-// `-o -` still asks for it by name, and a pipe or a file is not a terminal.
-bool refuses_terminal_artifact(Command command, bool out_given, bool stdout_terminal) {
-    return command == Command::Build && !out_given && stdout_terminal;
+// `build` writes anything but an executable to stdout unless given `-o`, and a
+// terminal is where that is almost always a forgotten `-o`: the generated code
+// is pages of text, or binary, nobody reads there. So the default is refused on
+// a terminal; an explicit `-o -` still asks for it by name, and a pipe or a file
+// is not a terminal.
+bool refuses_terminal_artifact(Command command, Emit emit, bool out_given, bool stdout_terminal) {
+    return command == Command::Build && emit != Emit::Exe && !out_given && stdout_terminal;
+}
+
+// The target `build` compiles an object or executable for: this kind of
+// machine, at the processor --cpu names. The default is a baseline every machine
+// of the kind has, so what is built on a new machine still runs on an older one;
+// `native` is exactly this machine. Empty, with the reason in `error` and
+// `usage` set when it is the user's to fix, if there is none.
+std::optional<llvm::orc::JITTargetMachineBuilder> build_target(const std::optional<std::string>& cpu,
+                                                               std::string&                      error,
+                                                               bool&                             usage) {
+    auto host = clotho::ir::host_target();
+    if (!host) {
+        error = std::format("cannot detect this machine's target: {}", llvm::toString(host.takeError()));
+        usage = false;
+        return std::nullopt;
+    }
+    if (cpu == "native") {
+        return std::move(*host);
+    }
+    const llvm::Triple& triple = host->getTargetTriple();
+    std::string         name;
+    if (cpu.has_value()) {
+        name = *cpu;
+    } else if (triple.getArch() == llvm::Triple::x86_64) {
+        name = "x86-64-v2";
+    } else if (triple.isAArch64()) {
+        name = triple.isOSDarwin() ? "apple-m1" : "generic";
+    } else {
+        error =
+          std::format("no baseline processor is known for {}; pass --cpu native or a processor name", triple.str());
+        usage = true;
+        return std::nullopt;
+    }
+    // Asked of a subtarget made for no processor: one made for an unknown name
+    // prints LLVM's own warning and carries on.
+    std::string                                  lookup_error;
+    const llvm::Target*                          llvm_target = llvm::TargetRegistry::lookupTarget(triple, lookup_error);
+    const std::unique_ptr<llvm::MCSubtargetInfo> subtarget(
+      llvm_target != nullptr ? llvm_target->createMCSubtargetInfo(triple, "", "") : nullptr);
+    if (subtarget == nullptr || !subtarget->isCPUStringValid(name)) {
+        error = std::format("unknown --cpu '{}': not a processor LLVM knows for {}", name, triple.str());
+        usage = true;
+        return std::nullopt;
+    }
+    host->setCPU(name);
+    host->getFeatures() = llvm::SubtargetFeatures();
+    return std::move(*host);
 }
 
 // A command-specific option used under another command is an error, not a
@@ -916,12 +982,14 @@ bool write_text(std::string_view out, const std::string& text) {
 }
 #endif
 
-// `build`: write the requested artifact. `-o -` (the default) means stdout.
-bool write_artifact(const clotho::LowerResult& result,
-                    Emit                       emit,
-                    std::string_view           out,
-                    const SimulationConfig&    config,
-                    clotho::Timings*           timings) {
+// `build`: write the requested artifact. `-o -` means stdout. `target` is the
+// build_target for an object or executable, null for anything else.
+bool write_artifact(const clotho::LowerResult&                result,
+                    Emit                                      emit,
+                    std::string_view                          out,
+                    const llvm::orc::JITTargetMachineBuilder* target,
+                    const SimulationConfig&                   config,
+                    clotho::Timings*                          timings) {
     const bool to_stdout = out == "-";
     // Locations are resolvable because lowering hands back the SourceManager. An
     // IR dump you cannot map to source is much less useful when debugging a
@@ -941,12 +1009,38 @@ bool write_artifact(const clotho::LowerResult& result,
         clotho::ir::print_module(*result.module, os, resolve);
         return true;
     }
-    if (emit == Emit::Obj) {
-        auto target = clotho::ir::host_target();
-        if (!target) {
-            std::println(stderr, "clotho: cannot detect this machine's target: {}", llvm::toString(target.takeError()));
+    if (emit == Emit::Exe) {
+        // The object and the embedded link files go in a directory of their own,
+        // removed once the executable is written.
+        llvm::SmallString<128> scratch;
+        if (const std::error_code ec = llvm::sys::fs::createUniqueDirectory("clotho-build", scratch)) {
+            std::println(stderr, "clotho: cannot create a temporary directory: {}", ec.message());
             return false;
         }
+        const std::string dir(scratch);
+        const struct Remove {
+            const std::string& dir;
+            ~Remove() {
+                llvm::sys::fs::remove_directories(dir);
+            }
+        } remove{ dir };
+        llvm::SmallString<128> object(scratch);
+        llvm::sys::path::append(object, "design.o");
+        {
+            std::error_code      ec;
+            llvm::raw_fd_ostream os(object, ec);
+            if (ec) {
+                std::println(stderr, "clotho: cannot open '{}': {}", object.str(), ec.message());
+                return false;
+            }
+            if (!clotho::ir::emit_object(*result.module, os, *target, config, timings, resolve)) {
+                return false;
+            }
+        }
+        return clotho::link::link_executable(
+          std::string(object), config.dpi_libs, !result.module->dpi_exports.empty(), std::string(out), dir);
+    }
+    if (emit == Emit::Obj) {
         if (to_stdout) {
             return clotho::ir::emit_object(*result.module, llvm::outs(), *target, config, timings, resolve);
         }
@@ -1095,25 +1189,49 @@ int main(int argc, char** argv) {
         return status;
     }
 
-    if (refuses_terminal_artifact(command, options.out.has_value(), stdout_is_terminal())) {
-        return usage_error("'build' writes to stdout by default, and stdout is a terminal; pass -o <file> to "
-                           "write a file, or -o - to print it here anyway");
-    }
-
-    Emit emit = Emit::Llvm;
+    Emit emit = Emit::Exe;
     if (options.emit.has_value()) {
         const std::string& target = *options.emit;
-        if (target == "llvm") {
+        if (target == "exe") {
+            emit = Emit::Exe;
+        } else if (target == "obj") {
+            emit = Emit::Obj;
+        } else if (target == "llvm") {
             emit = Emit::Llvm;
         } else if (target == "llvm-raw") {
             emit = Emit::LlvmRaw;
-        } else if (target == "obj") {
-            emit = Emit::Obj;
         } else if (target == "ir") {
             emit = Emit::Ir;
         } else {
-            return usage_error(std::format("unknown --emit target '{}'; expected llvm, obj, ir or llvm-raw", target));
+            return usage_error(
+              std::format("unknown --emit target '{}'; expected exe, obj, llvm, ir or llvm-raw", target));
         }
+    }
+    if (refuses_terminal_artifact(command, emit, options.out.has_value(), stdout_is_terminal())) {
+        return usage_error("'build' writes this to stdout by default, and stdout is a terminal; pass -o <file> to "
+                           "write a file, or -o - to print it here anyway");
+    }
+    if (command == Command::Build && emit == Emit::Exe && options.out == "-") {
+        return usage_error("an executable cannot be written to stdout; pass -o <file>");
+    }
+    // Linked into an executable, or loaded by `run`; nothing else carries them.
+    if (command == Command::Build && emit != Emit::Exe && !options.dpi_libs.empty()) {
+        return usage_error("--dpi-lib applies to an executable (--emit exe), which links the libraries in");
+    }
+    std::optional<llvm::orc::JITTargetMachineBuilder> target;
+    if (command == Command::Build && (emit == Emit::Exe || emit == Emit::Obj)) {
+        std::string error;
+        bool        usage = false;
+        target            = build_target(options.cpu, error, usage);
+        if (!target.has_value()) {
+            if (usage) {
+                return usage_error(error);
+            }
+            std::println(stderr, "clotho: {}", error);
+            return 1;
+        }
+    } else if (options.cpu.has_value()) {
+        return usage_error("--cpu applies to an executable or object (--emit exe or obj)");
     }
 
     SimulationConfig config;
@@ -1264,13 +1382,23 @@ int main(int argc, char** argv) {
         return clotho::has_error(result.diagnostics) ? 1 : 0;
     }
 
+    // An executable without -o is named after the design's first top-level
+    // module, in the current directory; anything else without -o is stdout.
+    std::string out = options.out.value_or("-");
+    if (command == Command::Build && emit == Emit::Exe && !options.out.has_value() && result.module != nullptr) {
+        out = result.module->top_name.empty() ? "simulation" : result.module->top_name;
+#if defined(_WIN32)
+        out += ".exe";
+#endif
+    }
+    const llvm::orc::JITTargetMachineBuilder* target_ptr = target.has_value() ? &*target : nullptr;
+
     // An IR dump is analysis, not execution, so it tolerates a poisoned module:
     // when a lowering guard fires, seeing what DID lower is the whole point. The
     // diagnostics are already on stderr and the exit status still reports the
     // failure, so a partial dump cannot be mistaken for a whole design.
-    const std::string_view out = options.out.has_value() ? std::string_view(*options.out) : std::string_view("-");
     if (command == Command::Build && emit == Emit::Ir && result.module != nullptr) {
-        const bool ok = write_artifact(result, emit, out, config, tp);
+        const bool ok = write_artifact(result, emit, out, target_ptr, config, tp);
         if (want_time) {
             report_timings(timings, command);
         }
@@ -1334,7 +1462,7 @@ int main(int argc, char** argv) {
         // status passes through unchanged.
         status = rc < 0 ? 1 : rc;
     } else {
-        status = write_artifact(result, emit, out, config, tp) ? 0 : 1;
+        status = write_artifact(result, emit, out, target_ptr, config, tp) ? 0 : 1;
     }
     if (want_time) {
         report_timings(timings, command);

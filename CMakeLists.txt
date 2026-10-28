@@ -678,6 +678,103 @@ target_compile_definitions(clotho_runtime_exe PRIVATE
   CLOTHO_LICENSES_INC="${CMAKE_CURRENT_BINARY_DIR}/ExeLicenses.inc")
 target_link_libraries(clotho_runtime_exe PRIVATE clotho_warnings)
 
+# What `clotho build` links an executable with (docs/design/executables.md): lld,
+# run in-process, and the files every executable needs, embedded in clotho so
+# that building one needs no compiler, linker or C library development files.
+# The files are this build's own: its executable runtime, compiler-rt's
+# builtins, and the C library's startup objects and static parts, found where
+# the C compiler driver would find them.
+find_package(LLD REQUIRED CONFIG HINTS "${LLVM_DIR}/../lld" "${LLVM_LIBRARY_DIRS}/cmake/lld")
+find_program(CLOTHO_CLANG NAMES clang-${LLVM_VERSION_MAJOR} clang HINTS "${LLVM_TOOLS_BINARY_DIR}" NO_DEFAULT_PATH)
+if(NOT CLOTHO_CLANG)
+  message(FATAL_ERROR "clang was not found in ${LLVM_TOOLS_BINARY_DIR}; it locates compiler-rt's builtins")
+endif()
+execute_process(COMMAND "${CLOTHO_CLANG}" --rtlib=compiler-rt -print-libgcc-file-name
+                OUTPUT_VARIABLE clotho_builtins OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT EXISTS "${clotho_builtins}")
+  message(FATAL_ERROR "compiler-rt's builtins were not found at '${clotho_builtins}'; install them "
+                      "(Debian/Ubuntu: libclang-rt-${LLVM_VERSION_MAJOR}-dev)")
+endif()
+
+# `name=path` for one embedded file, found where the C compiler driver finds it.
+function(clotho_kit_file out file)
+  execute_process(COMMAND "${CMAKE_C_COMPILER}" -print-file-name=${file}
+                  OUTPUT_VARIABLE path OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT IS_ABSOLUTE "${path}" OR NOT EXISTS "${path}")
+    message(FATAL_ERROR "${file}, which every executable links, was not found by ${CMAKE_C_COMPILER}")
+  endif()
+  set(${out} "${file}=${path}" PARENT_SCOPE)
+endfunction()
+
+set(clotho_kit "runtime.a=$<TARGET_FILE:clotho_runtime_exe>" "builtins.a=${clotho_builtins}")
+if(WIN32)
+  foreach(file crt2.o crtbegin.o crtend.o libmingw32.a libmingwex.a libmoldname.a libmsvcrt.a libadvapi32.a
+               libshell32.a libuser32.a libkernel32.a libpsapi.a)
+    clotho_kit_file(entry ${file})
+    list(APPEND clotho_kit "${entry}")
+  endforeach()
+elseif(NOT APPLE)
+  # compiler-rt's crtbegin/crtend sit beside its builtins, with the same suffix.
+  get_filename_component(clotho_builtins_dir "${clotho_builtins}" DIRECTORY)
+  get_filename_component(clotho_builtins_name "${clotho_builtins}" NAME)
+  string(REGEX REPLACE "^libclang_rt\\.builtins(.*)\\.a$" "\\1" clotho_rt_suffix "${clotho_builtins_name}")
+  foreach(part crtbegin crtend)
+    set(path "${clotho_builtins_dir}/clang_rt.${part}${clotho_rt_suffix}.o")
+    if(NOT EXISTS "${path}")
+      message(FATAL_ERROR "compiler-rt's ${part} was not found at ${path}")
+    endif()
+    list(APPEND clotho_kit "${part}.o=${path}")
+  endforeach()
+  foreach(file Scrt1.o crti.o crtn.o libc_nonshared.a)
+    clotho_kit_file(entry ${file})
+    list(APPEND clotho_kit "${entry}")
+  endforeach()
+endif()
+
+set(clotho_kit_source "#include \"link/Link.h\"\n\nnamespace clotho::link {\nnamespace {\n")
+set(clotho_kit_table "")
+set(clotho_kit_paths "")
+set(index 0)
+foreach(entry IN LISTS clotho_kit)
+  string(FIND "${entry}" "=" eq)
+  string(SUBSTRING "${entry}" 0 ${eq} name)
+  math(EXPR start "${eq} + 1")
+  string(SUBSTRING "${entry}" ${start} -1 path)
+  string(APPEND clotho_kit_source "const unsigned char kFile${index}[] = {\n#embed \"${path}\"\n};\n")
+  string(APPEND clotho_kit_table "    { \"${name}\", kFile${index}, sizeof(kFile${index}) },\n")
+  if(NOT name STREQUAL "runtime.a")
+    list(APPEND clotho_kit_paths "${path}")
+  endif()
+  math(EXPR index "${index} + 1")
+endforeach()
+string(APPEND clotho_kit_source "} // namespace\n\nconst KitFile kKitFiles[] = {\n${clotho_kit_table}};\n"
+       "const size_t kKitFileCount = ${index};\n\n} // namespace clotho::link\n")
+# Copied from the generated template on every change to an embedded file, so the
+# table recompiles with it: #embed is not a dependency the build tool sees.
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in" CONTENT "${clotho_kit_source}")
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in"
+          "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp"
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp.in" clotho_runtime_exe ${clotho_kit_paths}
+  VERBATIM)
+
+add_library(clotho_link STATIC src/link/Link.cpp "${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp")
+target_include_directories(clotho_link PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(clotho_link SYSTEM PRIVATE ${LLD_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
+# #embed is C23; GCC takes it in C++ silently, clang as an extension.
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/LinkKit.cpp" PROPERTIES
+  COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-c23-extensions>")
+if(APPLE)
+  target_link_libraries(clotho_link PRIVATE lldMachO)
+elseif(WIN32)
+  target_link_libraries(clotho_link PRIVATE lldMinGW lldCOFF)
+else()
+  target_link_libraries(clotho_link PRIVATE lldELF)
+endif()
+target_link_libraries(clotho_link PRIVATE lldCommon ${LLVM_LIBS} clotho_warnings)
+target_link_libraries(clotho_cli PRIVATE clotho_link)
+
 # Single doctest executable aggregating every tests/*.cpp.
 enable_testing()
 set(CLOTHO_TEST_SOURCES
