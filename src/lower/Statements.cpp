@@ -2210,7 +2210,7 @@ std::vector<std::vector<char>> Lowerer::case_dedup(const CaseStatement&         
 // item, so it always ends a run.
 //
 // Clean-and-constant is NOT enough on its own: casex/casez (CasexEq/
-// CasezEq, see lower_case_compare in LlvmBackend.cpp) wildcard on the
+// CasezEq, see lower_case_compare in ir/llvm/Ops.cpp) wildcard on the
 // SELECTOR's own x/z bits too ("dc = a.z | b.z" etc., operand-symmetric),
 // which no fixed compile-time switch key can express -- an x/z selector
 // must still be able to match a clean casex/casez label, but a switch's

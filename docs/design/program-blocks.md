@@ -153,7 +153,7 @@ endprogram
 clotho prints `A`, `B`, `R`. LRM-correct is `A`, `R`, `B`: the program's
 continuous assign runs in Reactive, so `dw2` changes there and `B` cannot run
 until the next Active iteration. The assign is lowered by
-`add_continuous_process` (`src/Lower.cpp:8025`) as `Activation::Always`, with no
+`add_continuous_process` (`src/lower/Nets.cpp`) as `Activation::Always`, with no
 regard for `in_program_` — module semantics, silently.
 
 Gap C, reproduced:
@@ -194,7 +194,7 @@ Gaps A and B are the same missing thing. Clotho has exactly two flavours of
 Reactive-region body today, and neither is a continuous process:
 
 - `Activation::Reactive` — a program `initial`: seeded onto the reactive ring
-  (`src/ir/LlvmBackend.cpp:11990`), **never subscribed**, one-shot.
+  (`src/ir/llvm/Scheduler.cpp, emit_active_run`), **never subscribed**, one-shot.
 - reactive *pend* thunks — an assertion action block, pushed by
   `Inst::Tag::ReactivePend`.
 
@@ -202,7 +202,7 @@ A program's port copy or continuous assign needs a third: re-armed on a
 sensitivity list like `Activation::Always`, but reactive-home. The machinery for
 the "reactive-home" half already exists and is general:
 
-- `parked_handle` (`src/ir/LlvmBackend.cpp:11434`) tags a parked coroutine handle
+- `parked_handle` (`src/ir/llvm/Scheduler.cpp`) tags a parked coroutine handle
   with `kReactiveHomeTag` when `reactive_home()` is true;
 - `emit_wake_push` (`:11478`) reads the tag back and selects the ring, so any
   waker — a static subscription scan, the wheel trampoline, a task epilogue —
@@ -249,8 +249,8 @@ would fork all of them. Concretely:
 | Site | Change |
 |---|---|
 | `ir::Process` (`src/ir/Module.h:210`) | add `bool reactive_home = false` |
-| `add_continuous_process` (`src/Lower.cpp:8025`) | set it from `in_program_` |
-| seed loop (`src/ir/LlvmBackend.cpp:11984`) | `self_start` push → `emit_reactive_push` when reactive-home, so the time-zero settle happens in slot 0's Reactive |
+| `add_continuous_process` (`src/lower/Nets.cpp`) | set it from `in_program_` |
+| seed loop (`src/ir/llvm/Scheduler.cpp, emit_active_run`) | `self_start` push → `emit_reactive_push` when reactive-home, so the time-zero settle happens in slot 0's Reactive |
 | subscribe loop (`:12013`) | unchanged predicate, but the recorded handle must be tagged — see correction 1 above |
 | `reactive_home()` (`:11399`) | include the current process's flag |
 | `compute_fusion_groups` | make the group key home-homogeneous — never fuse a reactive-home process with an Active one |
@@ -282,7 +282,7 @@ Two things the scope got wrong, both cosmetic:
 
 - there was nothing to "narrow the guard to". A3 and A4 landed in the same wave, so
   the guard has no per-kind case left at all — see A3.
-- the line reference (`src/Lower.cpp:9334`) named the comment above the `continue`,
+- the line reference (`src/lower/`) named the comment above the `continue`,
   not the `continue`.
 
 Landed: no `src/` change; `tests/program_test.cpp` "a program reads an interface
@@ -295,8 +295,8 @@ without any port. This was the load-bearing phase and it fixed a silent
 miscompile on the way. Two of §3's own claims were wrong when measured; the
 corrections are recorded there and A3 inherited them.
 
-Size: ~120 lines across `src/Lower.cpp`, `src/ir/Module.h`,
-`src/ir/LlvmBackend.cpp`, `src/ir/Analysis.cpp`; ~120 lines of tests.
+Size: ~120 lines across `src/lower/`, `src/ir/Module.h`,
+`src/ir/llvm/`, `src/ir/Analysis.cpp`; ~120 lines of tests.
 
 ### Phase A3 — value ports, single-driver (as built)
 
@@ -364,7 +364,7 @@ it. The clause text, the three region-loop block names, both candidate fixes and
 why each is rejected, and what a real fix needs are all in **§10**; nothing about
 it is repeated here, so §10 is the only copy to keep true.
 
-Landed: ~130 lines in `src/Lower.cpp`, nearly all of it comment and refusal text
+Landed: ~130 lines in `src/lower/`, nearly all of it comment and refusal text
 (the executable change is one `const bool`, three extra arguments and two `if`s);
 ~490 lines in `tests/program_test.cpp`, 17 cases covering 24.3.2's example, both
 directions, interface and modport, a clocking block sampling a port, `inout`,
@@ -387,7 +387,7 @@ message needs no program wording.
 An event port collapses the same way in every direction (LRM 15.5.5), so it is free
 for a program too, though no test covers that shape yet.
 
-Landed: comment only in `src/Lower.cpp`; `tests/program_test.cpp` "a program drives
+Landed: comment only in `src/lower/`; `tests/program_test.cpp` "a program drives
 an inout port and the design reads it" and "LRM 24.3's declaration shape lowers and
 reads in Reactive".
 
@@ -457,7 +457,7 @@ extend from one program scope to another program scope" — and it was already t
 source of A3's by-needle refusal test, so the shape was reaching clotho's guard
 all along.
 
-Landed: ~60 lines in `src/Lower.cpp`, most of it the comment at
+Landed: ~60 lines in `src/lower/`, most of it the comment at
 `emit_wire_resolvers` stating the consequence above; six cases in
 `tests/program_test.cpp` under the "Reactive net resolution" banner (both port
 directions, the hierarchical `assign`, the program-side input net, LRM 6.6's fold
@@ -470,7 +470,7 @@ These are one piece of work, because both need something clotho does not have:
 **the identity of a program instance at run time**. Today there is a single
 global counter, `clotho.program_live`, initialised to the number of
 `Activation::Reactive` processes and decremented at each body's natural end
-(`src/ir/LlvmBackend.cpp:5210-5238`, `program_live_ptr` at `:7017`).
+(`src/ir/llvm/Scheduler.cpp`, `program_live_ptr`).
 
 Required semantics:
 
@@ -480,7 +480,7 @@ Required semantics:
 - 24.7: `$exit()` from a thread originating in an `initial` of a program kills
   all of that program's `initial`s and their descendants. Called from anywhere
   else it "shall be ignored, and a warning may be issued" — so clotho's current
-  hard error on `$exit` in module code (`src/Lower.cpp:20635`, the generic
+  hard error on `$exit` in module code (`src/lower/Subroutines.cpp, lower_call`, the generic
   unsupported-system-task path) is itself non-compliant, not merely incomplete.
 
 Available machinery:
@@ -837,7 +837,7 @@ recognize:
 
 ### 10.2 The mechanism, with the three block names
 
-All three are in `emit_active_run` (`src/ir/LlvmBackend.cpp`):
+All three are in `emit_active_run` (`src/ir/llvm/Scheduler.cpp`):
 
 | Block | What it does | Where it can go |
 |---|---|---|
@@ -914,7 +914,7 @@ recommended", and 24.4 tells a testbench what to do instead —
 ### 10.4 As built
 
 One shared predicate answers the question for both constructs, because it is one
-question: `program_clock_signal` in `src/Lower.cpp`, over `is_program_signal`,
+question: `program_clock_signal` in `src/lower/Timing.cpp`, over `is_program_signal`,
 which canonicalizes (`canonical_value_symbol`) and then walks to the **first
 enclosing `InstanceBodySymbol`** and asks whether its definition kind is
 `Program`. Canonicalizing first is what keeps the recommended shape legal: a

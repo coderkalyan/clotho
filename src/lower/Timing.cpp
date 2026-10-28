@@ -1724,7 +1724,7 @@ void Lowerer::lower_wait_stmt(const WaitStatement& w, ir::Builder& b) {
         // aggregate rather than over one word: an unpacked struct or union needs
         // the store path to walk its leaves, and a fixed unpacked array needs the
         // notifier to survive the element-store descent (agg_member clears it on
-        // purpose today, see LlvmBackend.cpp).
+        // purpose today, see ir/llvm/Aggregates.cpp).
         fail("wait on a class property of a type with no change notifier is not "
              "supported (an unpacked struct, union or fixed unpacked array "
              "property cannot be waited on)");

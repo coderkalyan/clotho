@@ -363,7 +363,7 @@ public:
     // Type::Kind::Struct stores in `fields_id`. Not deduplicated against
     // existing entries (each struct/union AST symbol lowers its own field list
     // at most once — the caller is expected to cache by symbol, as
-    // Lower.cpp's lower_type does).
+    // lower/Types.cpp's lower_type does).
     uint32_t intern_struct_fields(std::vector<FieldRow> rows);
     // Reserve an empty field-table id whose rows are filled later by
     // set_struct_fields. Breaks the forward-reference cycle of a Kind::Class whose

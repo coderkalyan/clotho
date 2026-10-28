@@ -1347,7 +1347,7 @@ bool Lowerer::case_eq_matches_logical(ir::Ref type) const {
 
 // Whether a value of `type` could ever carry an x/z bit, recursing through
 // every leaf kind the P3 assoc-key canonical serializer
-// (emit_variable_agg_key_bytes, LlvmBackend.cpp) knows how to encode --
+// (emit_variable_agg_key_bytes, ir/llvm/AssocArrays.cpp) knows how to encode --
 // struct / fixed array / queue / dynamic array / associative array nesting,
 // down to a plain leaf. False for a leaf with no x/z state at all (string,
 // class handle, chandle, event, virtual interface, real/shortreal, a

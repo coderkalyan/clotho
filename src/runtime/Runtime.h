@@ -676,8 +676,8 @@ int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd, uint32_t f
 // the literal-format rule ("The only exception is $sformat, whose second
 // argument can be an expression of string data type"), so their format text may
 // first exist as an rt_string. With a literal format the frontend resolves
-// everything call-site-dependent at lower time -- Lower.cpp's
-// append_format_literal splices %m / %l, scale_to_ticks pre-scales a %t operand,
+// everything call-site-dependent at lower time -- lower/SystemTasks.cpp's
+// append_format_literal splices %m / %l, lower/Assign.cpp's scale_to_ticks pre-scales a %t operand,
 // build_format picks each argument's conversion -- and none of it reaches here.
 // A runtime format leaves all of it to the renderer, which needs these facts.
 //
@@ -686,7 +686,7 @@ int32_t rt_fgets(uint8_t* mm, uint8_t* z, uint32_t width, int32_t fd, uint32_t f
 // already conversion-matched.
 typedef struct rt_fmt_dyn {
     // Design ticks per the calling module's time unit: the multiplier
-    // Lower.cpp's scale_to_ticks would have applied to a %t operand (LRM
+    // lower/Assign.cpp's scale_to_ticks would have applied to a %t operand (LRM
     // §20.4.3). 1 when the two coincide.
     uint64_t time_mul;
     // The $sformat / $sformatf statement, so a report about the format's own
@@ -1039,7 +1039,7 @@ enum {
 
 // The four trailing fields are the GC's (docs/design/garbage-collection.md §3.3).
 // They are APPENDED, so every existing field keeps its offset and the backend's
-// mirror (`elem_ops_ty`, LlvmBackend.cpp) changes in lockstep by growing.
+// mirror (`elem_ops_ty`, ir/llvm/Containers.cpp) changes in lockstep by growing.
 //
 // `nhandles` / `handles` describe the class-handle words inside ONE element image,
 // by byte offset: a bare class-handle element is `nhandles == 1` at offset 0, an
@@ -1499,7 +1499,7 @@ void rt_string_concat(rt_string* dst, const rt_string* const* parts, uint32_t n,
 
 // dst = src repeated `count` times ({count{src}}); count == 0 yields "". The
 // count crosses the ABI SIGNED (like rt_dynarr_new's): the multiplier may be a
-// RUNTIME value under the LRM 11.4.12.1 string deviation (Lower.cpp's
+// RUNTIME value under the LRM 11.4.12.1 string deviation (lower/Expr.cpp's
 // Replication case), and a negative one must be seen as the negative the design
 // wrote, not zero-extended into a huge request. Negative is refused with
 // rt_string_repl_invalid. `site` locates the replication for the reports.
@@ -1873,7 +1873,7 @@ uint64_t rt_wheel_now(const rt_wheel* wheel);
 // Prints a FATAL diagnostic naming the buffer and ends the simulation (never
 // returns). `ring` selects the buffer -- 0 Active ring, 1 Reactive ring (LRM
 // 4.4.2), 2 inactive `#0` batch, 3 reactive inactive batch, 4 event wait queue --
-// and must stay in step with the kRing* constants in src/ir/LlvmBackend.cpp;
+// and must stay in step with the kRing* constants in src/ir/llvm/Backend.h;
 // `capacity` is that buffer's slot count. Only a miscomputed capacity can reach
 // this -- see the sizing arguments in ensure_active_queue and wait_counts.
 [[noreturn]] void rt_ring_overflow(uint32_t ring, uint32_t capacity);

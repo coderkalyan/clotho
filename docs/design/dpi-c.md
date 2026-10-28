@@ -78,9 +78,9 @@ At design time a DPI import failed loudly in `function_id`
 (`fail("DPI imported subroutines are not supported")`); `build_dpi_import` now
 replaces that stub. The implementation reused the ordinary user-subroutine call
 path: `lower_user_call`
-(`Lower.cpp:8043`) → `build_call_args` (`:8117`, per-direction marshal) → `b.call`
-→ `emit_call_copyouts` (`:8104`, output/inout copy-back). The runtime-call
-primitive is `rt_fn` (`LlvmBackend.cpp:5234`, `getOrInsertFunction` + `CreateCall`).
+(`lower/Subroutines.cpp`) → `build_call_args` (per-direction marshal) → `b.call`
+→ `emit_call_copyouts` (output/inout copy-back). The runtime-call
+primitive is `rt_fn` (`ir/llvm/Backend.cpp`, `getOrInsertFunction` + `CreateCall`).
 JIT symbol resolution injects `rt_*` by absolute address and already adds one
 `DynamicLibrarySearchGenerator` for libgcc builtins (`Jit.cpp:248-254`).
 
@@ -547,7 +547,7 @@ phasing below honest rather than a stub.
 ### What already exists (most of this is plumbing)
 
 - **A time-consuming SV task is already a standalone driveable coroutine**, not a
-  body inlined into its caller. `declare_task` (`LlvmBackend.cpp:5537`) emits
+  body inlined into its caller. `declare_task` (`ir/llvm/Subroutines.cpp`) emits
   `(state, rng, wheel, [proc], [home], args…, record)`, returns a coroutine handle,
   and calls `setPresplitCoroutine()`. An export thunk therefore has something
   callable to point at; nothing about the task ABI has to change.
@@ -625,7 +625,7 @@ independent reasons.
 - *`$finish` assumes an all-JIT stack.* The cooperative finish sets the
   `rt_finishing` global (`Runtime.cpp:3958-3964`) and every JIT frame in the
   statically-computed may-finish closure tests it after a call
-  (`emit_finish_check`, `LlvmBackend.cpp:22468-22481`), returning through its own
+  (`emit_finish_check`, `ir/llvm/SystemTasks.cpp`), returning through its own
   epilogue. A nested drain multiplies the number of C frames between the `$finish`
   site and the real drain, and none of them tests the flag.
 
@@ -708,7 +708,7 @@ mechanism. Teardown gets one new obligation: a worker still parked at
   task; the import task's `int` return is read instead of discarded;
   `svIsDisabledState` / `svAckDisabledState`; the simulator-side checks the
   clause mandates for items b), c) and d), each a fatal. Rides the existing disable
-  machinery (`design_uses_disable_`, `emit_disable_poll`, `LlvmBackend.cpp`,
+  machinery (`design_uses_disable_`, `emit_disable_poll`, `ir/llvm/Processes.cpp`,
   `docs/design/disable.md`), which already polls at every suspending tag.
   `svGetCallerInfo` belongs here too.
 
@@ -938,7 +938,7 @@ in `runtime_test.cpp`. A handle for a nested (non-top) instance is still deferre
 **Landed — open arrays (1-D, all directions, LRM 35.5.6.2).** An unsized `[]` formal
 arrives as an `svOpenArrayHandle` (an `rt_svopen` descriptor: `data`, `left`,
 `right`, `nelem`, `elem_bytes`, `elem_width`, `is_logic`) the JIT builds per call
-from the actual's array type (`build_dpi_open_array_desc` in `LlvmBackend.cpp`).
+from the actual's array type (`build_dpi_open_array_desc` in `ir/llvm/Dpi.cpp`).
 Accessors landed: `svDimensions`/`svSize`/`svLeft`/`svRight`/`svLow`/`svHigh`/
 `svIncrement`/`svSizeOfArray`, `svGetArrayPtr`/`svGetArrElemPtr1`, and the per-
 element `svGet/PutBitArrElem1VecVal`/`svGet/PutLogicArrElem1VecVal`.
@@ -950,7 +950,7 @@ Two data paths:
   descriptor points straight at the design array — no marshal, no copy. The C reads
   and (output/inout) writes it in place.
 - **Marshal in inline LLVM IR** for a packed `bit`/`logic` element, at any width
-  (`emit_dpi_oa_pack_ir` / `emit_dpi_oa_unpack_ir` in `LlvmBackend.cpp`). Because the
+  (`emit_dpi_oa_pack_ir` / `emit_dpi_oa_unpack_ir` in `ir/llvm/Dpi.cpp`). Because the
   actual is a fixed unpacked array, `N` is a compile-time constant, so this is a
   constant-trip loop that loads the native `iW` / `i2W` slot fields directly (no
   memcpy, no stride math) and lets LLVM legalize every op: `must`/`may` are

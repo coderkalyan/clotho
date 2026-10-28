@@ -29,7 +29,7 @@ LRM 9.4.2 says it must not. The run is unobservable — as-if — when:
   and
 - every write is **change-detected**: `service_wait_queue` and the NBA
   service guard the wake scan on `old != new`
-  (`emit_edge_facts`/`service_wait_queue`, LlvmBackend.cpp). Unchanged reads
+  (`emit_edge_facts`/`service_wait_queue`, ir/llvm/Events.cpp). Unchanged reads
   ⇒ recomputed values identical to the member's last run ⇒ no-change stores
   ⇒ no wakes ⇒ nothing downstream can tell.
 
@@ -62,7 +62,7 @@ group: clotho rejects them loudly at lowering.
 
 ## Phase 0: what landed
 
-- `comb_fuse_verdict` (LlvmBackend.cpp, next to `is_simple_always`):
+- `comb_fuse_verdict` (ir/Analysis.cpp, next to `is_simple_always`):
   per-process eligibility with reason codes. Purity is a **whitelist** over
   IR tags, so any future tag defaults to ineligible. Read set is collected
   from `Load` roots and verified against the sensitivity list mechanically —

@@ -411,7 +411,7 @@ void Backend::build_state_types() {
         // by type as well. Safe to override ptr_arg here because a user signal
         // becomes ptr_arg ONLY by being a ref actual — an out / inout actual is
         // passed as a compiler-materialized temp, never the variable itself
-        // (Lower.cpp's make_arg_temp), and a temp is never a ref actual.
+        // (lower/Subroutines.cpp's make_arg_temp), and a temp is never a ref actual.
         if (facts_.ref_arg[i]) {
             slot.has_z  = slot.four_state;
             slot.narrow = !slot.four_state;

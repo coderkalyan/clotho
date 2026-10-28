@@ -50,7 +50,7 @@ rule weight wider than 32 bits, which `randcase` shares and must change with, an
 
 ### 2.1 Before this work
 
-`randsequence` had no arm in `lower_stmt` (`src/Lower.cpp:10751-10917`), so it fell
+`randsequence` had no arm in `lower_stmt` (`src/lower/Statements.cpp`), so it fell
 to the catch-all `default: fail("unsupported statement")` — the only guard in the
 file that named no construct. Measured on the LRM 18.17 opening example:
 
@@ -96,14 +96,14 @@ unconditionally emits `ConstEvalRandValue` and fails.
 
 | piece | where | how it was used |
 |---|---|---|
-| weighted pick: evaluate N weights once, unsigned wrapping sum at the widest weight's precision, `sum != 0` guard, **one** `urandom_range(sum-1, 0)`, cumulative if/else ladder | `lower_randcase` / `lower_randcase_arm`, `src/Lower.cpp:18794-18870` | copied into `gen_weighted_rules` / `gen_rule_arm` for rule selection (§7) and again, in integer form, for the `rand join` step pick (§11) |
-| recursion and mutual recursion | `Module::reserve_function()`, `src/ir/Module.h:773-782`; backend declares every function up front, `src/ir/LlvmBackend.cpp:942-944`, `:5367-5369` | ids for the whole production set are reserved before any body is built |
-| the function-shaped body builder | `build_function` `src/Lower.cpp:29054`, `build_task` `:28800`, `FnCtx`, `FnScope`, `fn_local` | `build_production` is modelled on `build_fork_child` (`:28886`), the precedent for a synthetic body with no `SubroutineSymbol` |
+| weighted pick: evaluate N weights once, unsigned wrapping sum at the widest weight's precision, `sum != 0` guard, **one** `urandom_range(sum-1, 0)`, cumulative if/else ladder | `lower_randcase` / `lower_randcase_arm`, `src/lower/Random.cpp` | copied into `gen_weighted_rules` / `gen_rule_arm` for rule selection (§7) and again, in integer form, for the `rand join` step pick (§11) |
+| recursion and mutual recursion | `Module::reserve_function()`, `src/ir/Module.h:773-782`; backend declares every function up front, `src/ir/llvm/Backend.cpp, run` | ids for the whole production set are reserved before any body is built |
+| the function-shaped body builder | `build_function` / `build_task` `src/lower/Subroutines.cpp`, `FnCtx`, `FnScope`, `fn_local` | `build_production` is modelled on `build_fork_child` (`src/lower/Subroutines.cpp`), the precedent for a synthetic body with no `SubroutineSymbol` |
 | argument marshalling | `build_call_args` | its signature is `(span<const FormalArgumentSymbol* const>, span<const Expression* const>, ...)`, which is **exactly** `RandSeqProductionSymbol::arguments` and `ProdItem::args`. Reused verbatim, no adapter |
-| enclosing-frame capture detection | `ForkCaptureDetector`, `src/Lower.cpp:1424-1491` | reused verbatim, driven over the block by an explicit walk (§5) |
+| enclosing-frame capture detection | `ForkCaptureDetector`, `src/lower/Lowerer.h` | reused verbatim, driven over the block by an explicit walk (§5) |
 | `ref` argument passing | `ir::ArgDir::Ref` | the capture formals |
 | output-argument copy-out | `ir::ArgDir::Out`, `make_arg_temp`, `emit_call_copyouts` | the abort flag, the result slot, and the `rand join` step's stop flag |
-| automatic-variable default init | `lower_var_decl` / `emit_default_init`, `src/Lower.cpp:15887` | the implicit result variables (§10) |
+| automatic-variable default init | `lower_var_decl` / `emit_default_init`, `src/lower/Statements.cpp` | the implicit result variables (§10) |
 | random stability (LRM 18.14.1) | `docs/design/constrained-randomization.md` §9 | inherited for free (§12) |
 
 ---
@@ -122,7 +122,7 @@ unconditionally emits `ConstEvalRandValue` and fails.
 | rule selection | the `lower_randcase` ladder, one draw | 18.17.1 weights are the same construct as 18.16 |
 | single-rule production | no weight evaluation, no draw | draw counts are observable (§12); a weight is meaningless without alternatives (18.17.1) |
 | unspecified weight | the integer literal 1, at an integer's 32-bit self-determined precision | 18.17.1's "a weight of 1"; folding it into the common width is load-bearing — at the one-bit minimum two default weights sum to zero and neither alternative is ever generated |
-| zero total weight | no rule generated, **no draw consumed** | matches the `randcase` precedent, `src/Lower.cpp:18825-18839` |
+| zero total weight | no rule generated, **no draw consumed** | matches the `randcase` precedent, `src/lower/Random.cpp, lower_randcase` |
 | weight wider than 32 bits | loud refusal, same message shape as randcase | the LRM's multi-draw stitching scheme is not built for randcase either |
 | result variables (18.17.7) | frame locals of the production, **default-initialized**, written from a caller temp after each call, at a slot index re-derived from `createRuleVariables`' counting order | slang synthesizes the variables but records **no** occurrence→index map. The temp is needed because an `output` actual is a raw slot and an array element is a composed lvalue |
 | unwritten result variable | the type default (Table 6-7) | 18.17.7 says "undefined value"; the frame's previous contents is the only alternative and is not reproducible |
@@ -184,8 +184,7 @@ RandSequenceStatement&, ir::Builder&)`:
    production's code block cannot collide with another's.
 4. **Failure atomicity.** Each builder fills its reserved slot with a dead body
    before rethrowing, and `randseq_block` keeps building the siblings so their slots
-   are completed too — the rule stated at `src/Lower.cpp:2465-2470` and the pattern
-   at `:28929-28948`.
+   are completed too — the rule stated at `src/lower/Hierarchy.cpp, init_static_class_props`.
 5. **Emit** the entry call to `stmt.firstProduction`. `firstProduction == nullptr`
    (an empty sequence, or a failed lookup slang already diagnosed) emits nothing.
 6. **Memoize per AST node**, keyed on the statement alone: a production takes
@@ -470,7 +469,7 @@ Nothing new was needed. `randsequence` draws are `b.urandom_range`, which puts t
 enclosing body into `ir_draws_rng` automatically; the per-process xoshiro256++ state,
 the fork-child reseed, and the caller's-stream-through-ABI-arg-1 rule all apply
 unchanged (`docs/design/constrained-randomization.md` §9,
-`src/ir/LlvmBackend.cpp:5148-5153`, `:6091-6097`, `:5859-5861`). LRM 18.14.2 lists
+`src/ir/llvm/Subroutines.cpp, lower_group`). LRM 18.14.2 lists
 `randsequence` among the constructs whose selections are independent of thread
 execution order, and emitting `urandom_range` is exactly what delivers that.
 

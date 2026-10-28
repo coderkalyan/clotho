@@ -106,7 +106,7 @@ TEST_CASE("a packed struct's field table participates in interning") {
 
     // A second, independently-interned field table with the *same shape* is a
     // distinct id — the pool must not accidentally alias the two structs (each
-    // Lower.cpp call site is responsible for its own dedup via a symbol-keyed
+    // src/lower/ call site is responsible for its own dedup via a symbol-keyed
     // cache; the pool only dedups by identical fields_id).
     const uint32_t fields_b = pool.intern_struct_fields({
       { "a", pool.put(Type{ .kind = Type::Kind::PackedArray, .element = pool.logic_type, .left = 3, .right = 0 }), 8 },

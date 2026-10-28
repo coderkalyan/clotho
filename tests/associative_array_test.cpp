@@ -1557,7 +1557,7 @@ TEST_CASE("ref through an associative entry sees writes and detects both levels"
 // addresses an element as `base + i*stride`, which a keyed table cannot answer, so
 // this renders through the same frontend IR loop a queue with a non-flat element
 // already uses -- keyed by rt_assoc_first / next instead of by an index
-// (Lower.cpp's build_assoc_p_string). Ordering is asserted only for integral and
+// (lower/SystemTasks.cpp's build_assoc_p_string). Ordering is asserted only for integral and
 // string keys; LRM 7.8.5 leaves it implementation-defined otherwise
 // (docs/design/assoc-keys.md).
 TEST_CASE("%p of an associative array renders '{key:value} in key order") {

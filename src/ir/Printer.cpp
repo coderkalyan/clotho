@@ -21,7 +21,7 @@ namespace {
 // how the source writes it.
 //
 // The name is the UNQUALIFIED declared name, matching what `%p` prints for a handle
-// (Lower.cpp's handle_p_name); a specialization carries its own arguments there
+// (lower/SystemTasks.cpp's handle_p_name); a specialization carries its own arguments there
 // (`uvm_queue#(uvm_callback)`) and so carries them here. Scope qualification was
 // rejected because it would not make the label unique on its own -- one ClassType
 // lowers once per top, each Lowerer minting its own nominal Ref -- so the Ref
@@ -30,7 +30,7 @@ namespace {
 //
 // A shared name, and a class the pool has no name for at all, take the Ref:
 // `class C#19`, or `class#19` when there is no name. That is the backend's own name
-// for the class (`clotho.classdesc.<ref>`, LlvmBackend.cpp:2315), so where the dump
+// for the class (`clotho.classdesc.<ref>`, ir/llvm/GcEmit.cpp, class_desc_global), so where the dump
 // has to fall back on a number it is the number that cross-references the backend
 // output the reader is here to diagnose.
 void render_class_label(const InternPool& pool, Ref type, std::ostream& os) {

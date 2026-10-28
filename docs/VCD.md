@@ -78,7 +78,7 @@ is the *postponed* region — after the active, inactive (`#0`), and NBA regions
 have all settled for that instant.
 
 In clotho's sim loop that point is exact: `emit_active_run`
-(`src/ir/LlvmBackend.cpp`), the block reached when the active queue, the
+(`src/ir/llvm/Scheduler.cpp`), the block reached when the active queue, the
 inactive batch, and the NBA region are all drained and the wheel is about to
 advance (`wcheck`, immediately before `rt_wheel_tick`). `rt_wheel_now(wheel)`
 there is the instant that just settled. **Sample there, once per settled
@@ -97,7 +97,7 @@ equal to the shadow and emit nothing.
 
 ## 3. Value encoding → VCD character
 
-A signal's state slot is `{ i(2W) must|may, iW z }` (`LlvmBackend.cpp` header
+A signal's state slot is `{ i(2W) must|may, iW z }` (`ir/llvm/Backend.h` header
 comment): low `W` bits = must (definitely 1), high `W` = may (could be 1),
 invariant must⇒may; Z is must=0/may=1 with the z-plane bit set. A z-elided
 (never-z) signal stores no z word — treat its z plane as constant zero.

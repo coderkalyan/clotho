@@ -121,7 +121,7 @@ struct SimulationConfig {
     // time; wins simulation time on long traces (docs/design/TIERING.md).
     bool o3 = false;
     // Fuse always-processes with identical canonical sensitivity into one
-    // coroutine (see compute_fusion_groups in LlvmBackend.cpp). Disable for
+    // coroutine (see compute_fusion_groups in ir/llvm/Analyses.cpp). Disable for
     // bisection / debugging; semantics are identical either way (the fused
     // member order is one of the LRM-allowed same-instant orders).
     bool fuse = true;
@@ -135,7 +135,7 @@ struct SimulationConfig {
     // call, and no blocking write to its own sensitivity) to a plain thunk
     // called once per activation instead of an LLVM coroutine — eliding the
     // frame, the suspend state machine, and CoroSplit (see is_simple_always /
-    // the thunk path in LlvmBackend.cpp). Disable for bisection / debugging;
+    // the thunk path in src/ir/llvm/). Disable for bisection / debugging;
     // semantics are byte-identical (same sched-flag timeline, same FIFO order).
     bool thunk = true;
     // Guard each member of a fused group on its OWN sensitivity, instead of
@@ -157,7 +157,7 @@ struct SimulationConfig {
     // definition: thunk groups whose lowered functions are identical modulo
     // their instance-context symbol collapse to ONE shared body (ctx passed
     // as a parameter) plus a two-instruction musttail stub per instance
-    // (see share_twin_groups in LlvmBackend.cpp). Sharing is gated on
+    // (see share_twin_groups in ir/llvm/Dedup.cpp). Sharing is gated on
     // literal post-lowering IR identity, so semantics are byte-identical
     // either way. Disable for bisection / debugging.
     bool dedup = true;

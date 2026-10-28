@@ -443,7 +443,7 @@ ir::Index Lowerer::extend_by_source_sign(ir::Index               v,
 // to narrow (a packed struct member is always integral, LRM 7.2.1) and
 // whose loaded value a plain Resize instruction rejects outright. Needed
 // because the backend's PartSelect/BitSelect type inference
-// (LlvmBackend.cpp compute_type) inherits the base signal's domain
+// (ir/llvm/Inst.cpp compute_type) inherits the base signal's domain
 // uniformly — correct for an ordinary vector/array, wrong when the base
 // is a struct field whose own declared domain is narrower than its
 // struct's physical storage (LRM 6.11.2 forces the whole struct 4-state

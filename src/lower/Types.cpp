@@ -15,7 +15,7 @@ namespace clotho::lower {
 // through structs and fixed arrays to any depth, completing LRM 7.8.5's own
 // example (`struct { byte B; int I[*]; }`). The backend classifies the whole
 // key type as fixed or variable and picks the matching encoder
-// (LlvmBackend.cpp AssocKeyInfo::is_variable). A `real` leaf makes the index
+// (ir/llvm/Backend.h AssocKeyInfo::is_variable). A `real` leaf makes the index
 // type illegal outright ("real or shortreal data types, or a type containing
 // a real or shortreal, shall be an illegal index type").
 void Lowerer::guard_agg_key_leaves(const slang::ast::Type& kt, ir::Ref kr) {
@@ -57,7 +57,7 @@ void Lowerer::guard_agg_key_leaves(const slang::ast::Type& kt, ir::Ref kr) {
 
 // True if `type`'s normalized key span has no compile-time bound: itself a
 // string / queue / dynamic array / associative array, or (through struct /
-// fixed-array nesting) any leaf is. Mirrors LlvmBackend.cpp's
+// fixed-array nesting) any leaf is. Mirrors ir/llvm/AssocArrays.cpp's
 // key_type_is_variable exactly -- kept as a second, independent walk (like
 // agg_key_bytes / emit_agg_key_bytes / agg_key_handle_offsets already are)
 // rather than exposed across the frontend/backend boundary.
@@ -112,7 +112,7 @@ bool Lowerer::key_type_has_class_handle(ir::Ref type) const {
 }
 
 // A class handle anywhere inside a VARIABLE key is refused: the collector's
-// key-handle trace (assoc_key_handle_offsets, LlvmBackend.cpp) is a
+// key-handle trace (assoc_key_handle_offsets, ir/llvm/AssocArrays.cpp) is a
 // compile-time STATIC offset table, correct only for a FIXED key -- a
 // variable key's byte offsets depend on runtime data (a string's length, a
 // container's element count), so a handle anywhere in one could land at a
@@ -148,7 +148,7 @@ void Lowerer::guard_container_element(const slang::ast::Type& et, ir::Ref er, st
     // The two diverge in exactly one place -- whether the GC traces the word
     // -- and that fork needs no code here. `lower_type` puts a class handle in
     // Kind::Class and a chandle in a plain Kind::Int, and collect_class_handles
-    // (LlvmBackend.cpp) keys on Kind::Class alone, so a chandle element's
+    // (ir/llvm/Analyses.cpp) keys on Kind::Class alone, so a chandle element's
     // rt_elem_ops::handles table comes out empty by construction: tracing one
     // would hand the collector a foreign pointer it never allocated
     // (docs/design/garbage-collection.md §0, "Never in scope").

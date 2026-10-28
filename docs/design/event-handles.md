@@ -46,9 +46,9 @@ Three moves, in dependency order. Everything else follows.
 
 | # | Move | Replaces |
 |---|---|---|
-| **A** | An event is a **64-bit plane word** — `{ u32 slot, u32 gen }` into a runtime-owned slot table. | `lower_type(EventType) -> logic_type`, a 1-bit placeholder (`Lower.cpp:2116-2122`) |
+| **A** | An event is a **64-bit plane word** — `{ u32 slot, u32 gen }` into a runtime-owned slot table. | `lower_type(EventType) -> logic_type`, a 1-bit placeholder (`lower/Types.cpp, lower_type`) |
 | **B** | An event's waiters are an **intrusive doubly-linked list of frame-resident nodes**, unbounded. | statically-sized per-`(signal,edge)` buckets `clotho.wait.<sig>.{sta,dyn}.*` for events only |
-| **C** | The trigger is **one generated function** `clotho.event_fire(ptr obj, ptr wheel)`, called from generated code *and* from runtime callbacks. | per-event inlined `emit_event_fire` against named globals (`LlvmBackend.cpp:7685`) |
+| **C** | The trigger is **one generated function** `clotho.event_fire(ptr obj, ptr wheel)`, called from generated code *and* from runtime callbacks. | per-event inlined `emit_event_fire` against named globals (`ir/llvm/Events.cpp`) |
 
 Move A buys every storage class and the whole call ABI for free (§4). Move B
 removes the static-capacity blocker (§6). Move C keeps `clotho.active`
@@ -78,7 +78,7 @@ The precedent is not hypothetical — it is the delayed-event thunk that already
 ships:
 
 ```cpp
-// src/ir/LlvmBackend.cpp:7662-7679  (build_delay_event_thunks)
+// src/ir/llvm/  (build_delay_event_thunks)
 auto* fn = llvm::Function::Create(fnty, llvm::Function::InternalLinkage,
                                   "clotho.ev_delay." + mod_.signal(sig).name, env_->llmod);
 b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "entry", fn));
@@ -97,14 +97,14 @@ as an argument.
 ### Blocker 2 — "dynamic wait-queue capacities are computed statically, so an unbounded number of live registrations would overflow"
 
 True, and fatal for the *bucket* representation — `wait_counts()`
-(`LlvmBackend.cpp:5309-5433`) enumerates waiters over the IR at compile time, and
+(`ir/llvm/Events.cpp, wait_counts`) enumerates waiters over the IR at compile time, and
 a waiter on `evq[i]` or a `ref event` formal is not enumerable. So the design
 does not use buckets for events. It uses an intrusive list, for which the
 codebase already contains a complete worked implementation: the remote-`disable`
 activation list.
 
 ```cpp
-// src/ir/LlvmBackend.cpp:21510-21513
+// src/ir/llvm/Processes.cpp, disable_node_ty
 llvm::StructType* disable_node_ty() {
     auto* ptr = llvm::PointerType::getUnqual(ctx_);
     return llvm::StructType::get(ctx_, { ptr, ptr, ptr, ptr, ptr, b_.getInt32Ty() });
@@ -124,9 +124,9 @@ Three real constraints survive, all local:
 
 1. **The ring-overflow guard is compiled out** unless
    `ring_guard_wanted() = design_forks() || design_uses_disable_`
-   (`LlvmBackend.cpp:8112-8114`). Event waiters are parked process/task
+   (`ir/llvm/Scheduler.cpp, ring_guard_wanted`). Event waiters are parked process/task
    activations already counted in `cap = bit_ceil(nprocs + fork_ring_slots())`
-   (`:8001-8003`) and deduped by the scheduled flag, so the bound still holds —
+   and deduped by the scheduled flag, so the bound still holds —
    but the invariant becomes much harder to audit by hand. **This design requires
    `ring_guard_wanted()` to include a new `design_uses_event_handles_`.** Cheap
    insurance against the one failure mode PRINCIPLES.md forbids: a silent
@@ -135,7 +135,7 @@ Three real constraints survive, all local:
    (§12). Moving the tick into an object is an ABI change for that registration.
 3. **The wheel callback ABI is fixed at `void(rt_timer*, void* ctx)`** with `ctx`
    globally bound to the wheel by `rt_wheel_advance(wheel, wheel)`
-   (`LlvmBackend.cpp:9297`). A per-trigger payload must therefore ride the timer
+   (`ir/llvm/Scheduler.cpp, emit_active_run`). A per-trigger payload must therefore ride the timer
    node, not `ctx` (§7.3).
 
 ---
@@ -175,7 +175,7 @@ Why `{slot, gen}` and not a bare pointer:
 The generation half is what makes "strictly managed lifetimes" enforceable rather
 than aspirational. Releasing a slot bumps its generation, so every stale handle
 is *detected*. The precedent is exact: the fat `ref` ABI already carries
-`{ptr, epoch, expect}` (`RefBinding`, `LlvmBackend.cpp:678-682`) to catch a
+`{ptr, epoch, expect}` (`RefBinding`, `ir/llvm/Backend.h`) to catch a
 container reference invalidated by relocation, and `rt_null_handle`
 (`Runtime.h:312`) is the located-fatal shape to copy.
 
@@ -218,10 +218,10 @@ elaboration order (§5), so their indices are compile-time constants.
 Both fold away for a monomorphic static handle (§5). For a dynamic handle they
 are one compare each against a base/length pair the backend loads once per
 region, exactly as the container element path does with `dyn_inrange`
-(`LlvmBackend.cpp:11373-11441`). Failure calls
+(`ir/llvm/Inst.cpp, lower_inst`). Failure calls
 `rt_event_stale(const rt_null_site*, uint64_t now)` — a `[[noreturn]]` located
 fatal modelled on `rt_null_handle` (`Runtime.cpp:3711`), reusing the existing
-`rt_null_site` record and `null_site_global` emitter (`LlvmBackend.cpp:16321`).
+`rt_null_site` record and `null_site_global` emitter (`ir/llvm/Sanitizers.cpp`).
 A `null` handle triggered or waited on is **not** an error: LRM 15.5.5 makes
 `-> null` a no-op and `@(null)` block forever, so the deref path tests slot 0
 first and branches to the no-op.
@@ -239,18 +239,18 @@ exactly one cell).
 
 | Form | Gate to delete | New code needed |
 |---|---|---|
-| `event a, b; a = b;` | `Lower.cpp:17377` | none — plane store |
-| `a = null;` | `Lower.cpp:17377` | peel the `ConversionExpression` slang inserts over the `NullLiteral` |
-| `a == b`, `a == null`, `a !== b` | `Lower.cpp:18922-18929` | none — `icmp` via the generic scalar compare |
-| `event arr[4];`, `arr[i]` | `Lower.cpp:1847-1854` | none — 8-byte plane element |
-| `event q[$]`, `event d[]`, `event aa[string]` | `Lower.cpp:1828` (one predicate, three names) | `rt_elem_event` ops kind (§9) |
-| `int aa[event]` (event as key) | the key arm at `Lower.cpp:1929` | none — word key |
-| `struct { event e; }` | `Lower.cpp:1971-1977` | none — aggregate leaf slot |
-| `class C; event e;` | `Lower.cpp:2238-2242` | none — body field, `agg_member` adds the header word |
+| `event a, b; a = b;` | `lower/Assign.cpp, lower_assign` | none — plane store |
+| `a = null;` | `lower/Assign.cpp, lower_assign` | peel the `ConversionExpression` slang inserts over the `NullLiteral` |
+| `a == b`, `a == null`, `a !== b` | `lower/Expr.cpp, lower_expr` | none — `icmp` via the generic scalar compare |
+| `event arr[4];`, `arr[i]` | `lower/Types.cpp, lower_type` | none — 8-byte plane element |
+| `event q[$]`, `event d[]`, `event aa[string]` | `lower/Types.cpp, guard_container_element` (one predicate, three names) | `rt_elem_event` ops kind (§9) |
+| `int aa[event]` (event as key) | the key arm at `lower/Types.cpp, lower_type` | none — word key |
+| `struct { event e; }` | `lower/Types.cpp, lower_type` | none — aggregate leaf slot |
+| `class C; event e;` | `lower/Lowerer.h` | none — body field, `agg_member` adds the header word |
 | `class C; static event e;` | *no gate exists* — this is the misleading-error hole | route through `declare_static_prop` |
 | `task t(event x)` (in) | *no gate exists* — fails downstream as `reference to unknown signal 'x'` | none — scalar `(i128 mm, i64 z)` arg |
 | `task t(output/inout event x)` | *no gate exists* — **silently accepted and runs today** | none — `(&mm, &z)` arg |
-| `task t(ref event x)` | `Lower.cpp:21391-21395` | none — `ref_actual_ptr` returns `lv.base` for a whole plane slot |
+| `task t(ref event x)` | `src/lower/` | none — `ref_actual_ptr` returns `lv.base` for a whole plane slot |
 | `function event f()` | — | none — `fn_return_ty` `{ i128, i64 }` |
 
 The `ref` case deserves emphasis, because the current refusal says "there is
@@ -259,7 +259,7 @@ word. The fat-ref ABI comment already anticipates this:
 
 > Every storage class goes through here — a plane slot, a managed handle, an
 > aggregate image — so `ref` has one shape.
-> — `src/ir/LlvmBackend.cpp:18034-18037`
+> — `src/ir/llvm/Subroutines.cpp, lower_call_common`
 
 `ref_needs_epoch` is false for a stable place, so a `ref event` costs one pointer
 argument and no epoch words.
@@ -268,11 +268,11 @@ argument and no epoch words.
 
 Event ports are **aliasing** ports, not copying ports. `input`/`output`/`inout`
 all collapse the child's symbol onto the parent's `ir::Signal`, which is what
-`build_inout_aliases` (`Lower.cpp:3852-3884`) already does for `inout`/`ref` and
-what interface ports get from `canonical_value_symbol` (`Lower.cpp:102-126`):
+`build_inout_aliases` (`lower/Types.cpp`) already does for `inout`/`ref` and
+what interface ports get from `canonical_value_symbol` (`lower/Scans.cpp`):
 
 ```cpp
-// Lower.cpp:3925-3931 — the existing collapse, reused verbatim for events
+// lower/Types.cpp, collect_scope_signals — the existing collapse, reused verbatim for events
 if (const auto ia = inout_alias_.find(&m); ia != inout_alias_.end()) {
     sigmap_[&vs] = ia->second;
     break;
@@ -282,9 +282,9 @@ if (const auto ia = inout_alias_.find(&m); ia != inout_alias_.end()) {
 This is both correct and free: LRM 15.5.5 says a port-connected event names the
 *same* sync object, and aliasing gives that by construction. Extend
 `build_inout_aliases`' direction filter to admit `In`/`Out` when the port type is
-an event, keep its existing whole-signal requirement (`:3878-3882`), and delete
-`Lower.cpp:3974-3978`. `wire_ports` then needs no event case at all, because an
-aliased port is skipped there already (`:6395-6403`).
+an event, keep its existing whole-signal requirement, and delete
+`lower/Hierarchy.cpp`. `wire_ports` then needs no event case at all, because an
+aliased port is skipped there already.
 
 Consequence to state plainly: an event port creates **no** copy process, so
 `-> e` inside the child and `@(e)` in the parent are the same object. That is the
@@ -317,7 +317,7 @@ For a monomorphic event:
   and the generation check is **omitted** (a static slot's `gen` never bumps);
 - `-> e` is `store now, [obj+0]` then the list walk;
 - `e.triggered` is `icmp eq (load [obj+0]), rt_wheel_now()` — bit-identical to
-  today (`LlvmBackend.cpp:7702-7707`);
+  today (`ir/llvm/Events.cpp, lower_event_triggered`);
 - **no refcount traffic is emitted at all** (§9).
 
 So the delta for a design that never uses a handle form is: one indirection
@@ -341,11 +341,11 @@ Non-monomorphic events pay the full path: load the handle word, split
 ```
 
 Fields 2 and 3 are exactly `wait_elem_ty()`'s `{ ptr, ptr }`
-(`LlvmBackend.cpp:5438-5441`) — the parked coroutine handle **with its region tag
-bits intact** (`kReactiveHomeTag = 2`, `:8248`; `emit_wake_push` is what strips
-them, `:8348-8357`) and the opaque `sched_flag` pointer, which is a constant GEP
+(`ir/llvm/Events.cpp, wait_elem_ty`) — the parked coroutine handle **with its region tag
+bits intact** (`kReactiveHomeTag = 2`; `emit_wake_push` is what strips
+them) and the opaque `sched_flag` pointer, which is a constant GEP
 into `clotho.proc_sched` for a process and a frame alloca for a task
-(`:4052`) — store it raw and never interpret it.
+— store it raw and never interpret it.
 
 ### 6.2 Two node storage classes, one list
 
@@ -379,11 +379,11 @@ define internal void @clotho.event_fire(ptr %obj, ptr %wheel) {
 ```
 
 `next` is read before the wake, exactly as `lower_disable_list` does and for the
-same reason (`LlvmBackend.cpp:21378-21382`): the woken activation may unlink its
+same reason (`ir/llvm/Processes.cpp, lower_disable_list`): the woken activation may unlink its
 own node. Dynamic nodes are *not* bulk-cleared the way a dynamic bucket is
-(`*lenptr = 0`, `:8508-8510`); each waiter unlinks itself on resume, which is
+(`*lenptr = 0`); each waiter unlinks itself on resume, which is
 also what makes a multi-event `@(a or b)` wait correct without
-`emit_dynamic_remove`'s compaction loop (`:7716-7784`).
+`emit_dynamic_remove`'s compaction loop.
 
 Callable from generated code (`-> e`), from the NBA region (`->> e`), and from a
 wheel thunk (`->> #d e`) — the three forms converge here, as they converge on
@@ -401,7 +401,7 @@ For a monomorphic target this inlines to today's code plus the list walk.
 ### 7.2 `->> e` (nonblocking, LRM 15.5.4)
 
 Today the NBA region scans a compile-time set `nb_event_sigs_`
-(`LlvmBackend.cpp:2462-2481`, consumed at `:8682-8697`), which a runtime-identified
+(`ir/llvm/Stores.cpp, nba_classify_ir`), which a runtime-identified
 event cannot join. Replace with an **intrusive pending chain** through
 `rt_event::next_pend`:
 
@@ -439,7 +439,7 @@ type-uniform.
 Now expressible, and the reason it was deferred is gone. `x` is an ordinary
 *signal*, whose buckets are statically sized — so do **not** put the detached
 subscription in `x`'s bucket. Use a runtime-owned growable list keyed by the
-existing `trigger_id(sig, edge)` (`LlvmBackend.cpp:7395`), which is precisely the
+existing `trigger_id(sig, edge)` (`ir/llvm/Events.cpp`), which is precisely the
 shape of the already-shipping intra-assignment mechanism:
 
 > `rt_intra_event_register(trig_id, rec)` / `rt_intra_event_fire(trig_id)`
@@ -457,8 +457,8 @@ capacity risk, no scheduler-core change.
 ## 8. Resolving a target — one shared resolver
 
 The current asymmetry is a two-line accident: `event_signal`
-(`Lower.cpp:6877-6926`) accepts `NamedValue | HierarchicalValue`, while
-`trigger_target` (`:7079-7087`) accepts only `NamedValue`. That is why `@(s.e)`
+(`lower/Timing.cpp, event_signal`) accepts `NamedValue | HierarchicalValue`, while
+`trigger_target` accepts only `NamedValue`. That is why `@(s.e)`
 works today and `-> s.e` does not. Both end in the same `signal_of`.
 
 Replace both with **one** `EventRef resolve_event(const Expression&)` returning
@@ -475,15 +475,15 @@ or a `.triggered` receiver:
 
 plus arbitrary nesting (`obj.arr[i]`, `s.inner.e`). For every non-`NamedValue`
 kind this is an ordinary lvalue load of a plane word — the existing
-`lower_expr`/`lvalue_of` machinery, once `Lower.cpp:18922-18929` stops refusing
+`lower_expr`/`lvalue_of` machinery, once `lower/Expr.cpp` stops refusing
 to produce an event value. `.triggered` needs no change beyond that:
-`triggered_event` (`:7117-7129`) already pulls `arguments()[0]` generically for
+`triggered_event` already pulls `arguments()[0]` generically for
 every receiver shape.
 
 `wait_order(a, b, c)` (LRM 15.5.6) becomes expressible for the first time: park a
 node on all three objects, and on each wake compare the firing object against the
 expected next; a mismatch takes the `ifFalse` arm. Note it also needs the
-reactive-region walk to stop hard-rejecting it (`Lower.cpp:883-891`), so it is
+reactive-region walk to stop hard-rejecting it (`lower/Lowerer.h, ReactiveSafetyChecker`), so it is
 scoped as a follow-on (§13, Phase 5), not part of the core.
 
 ---
@@ -530,7 +530,7 @@ Two notes, stated because they are the sharp edges:
 
 Allocation goes through the **checked** family (`rt_alloc_checked`,
 `Runtime.h:467`), not the raw `rt_alloc` that `ClassNew` uses unchecked
-(`LlvmBackend.cpp:11688`), so OOM is a located fatal rather than a null deref.
+(`ir/llvm/Inst.cpp, lower_inst`), so OOM is a located fatal rather than a null deref.
 
 ---
 
@@ -539,7 +539,7 @@ Allocation goes through the **checked** family (`rt_alloc_checked`,
 All must be added to `expose()` in `src/ir/Jit.cpp:199-303` to be linkable, and
 every struct the backend mirrors must keep field order in lockstep with the C
 declaration — the convention `rt_null_site` follows
-(`LlvmBackend.cpp:16311-16313`: "Field order and types mirror the C struct
+(`ir/llvm/Sanitizers.cpp, emit_bounds_reports/null_site_ty`: "Field order and types mirror the C struct
 exactly, so the two change together").
 
 ```c
@@ -568,7 +568,7 @@ waiting stay in generated code (Move C). The runtime owns storage and
 bookkeeping only — the same division `rt_intra_event_*` already draws.
 
 Note the JITLink hazard: `native_cb_trampoline`
-(`LlvmBackend.cpp:4373-4409`) exists because materialising the *address* of a
+(`ir/llvm/Scheduler.cpp, awaiter/intra_cb_trampoline`) exists because materialising the *address* of a
 runtime symbol is mis-relocated on AArch64 COFF. Any function pointer stored into
 a timer or detached-subscription record must therefore be a **JIT-local**
 function, never an `extern "C"` runtime symbol.
@@ -588,7 +588,7 @@ function, never an `extern "C"` runtime symbol.
 `SignalInfo::is_event` (`Module.h:57`) survives only to mark that a signal's
 64-bit slot holds an event handle, for VCD (§12) and diagnostics. It stops
 gating storage allocation, so an event no longer burns a value plane it never
-reads — `build_state_types` (`LlvmBackend.cpp:2064-2263`) never tested `is_event`
+reads — `build_state_types` (`ir/llvm/StateLayout.cpp`) never tested `is_event`
 anyway.
 
 The four event tags stay on the `blocks_thunk` list (`Analysis.cpp:124-127`) and
@@ -618,7 +618,7 @@ Two constraints follow, both acceptable:
 
 1. Only **static** events are dumpable, so only immortal slots are registered and
    the pointer is stable for the run. Procedural locals are already skipped by
-   VCD (`Lower.cpp:22933` skips `loc == SourceLoc{0}`), and a container element or
+   VCD (`lower/Lower.cpp, check_vcd_scope` skips `loc == SourceLoc{0}`), and a container element or
    class property is not a `$var` in the first place.
 2. `$dumpvars` must still loud-fail on anything unrepresentable. An event handle
    is now a real 64-bit value, so the `is_event` check must be kept *ahead* of the
@@ -635,15 +635,15 @@ prerequisites; 3-5 are parallel.
 Three real defects exist today, all in the "`is_event` set at only 2 of 18
 signal-creating sites" family:
 
-- `declare_local` (`Lower.cpp:4069-4085`) and `declare_static_local`
-  (`:20779-20793`) never set `is_event`, so `event_trig_gv_` stays null and any
+- `declare_local` (`lower/Types.cpp`) and `declare_static_local`
+  never set `is_event`, so `event_trig_gv_` stays null and any
   procedural-scope event that is triggered or read **SIGSEGVs the compiler**
   (`clotho build` exits 139). Identical to the package-scope regression recorded
   at `tests/event_test.cpp:213-221`.
 - `task automatic t(output event x)` **lints clean and runs**, silently accepted,
   violating PRINCIPLES.md.
-- `static event` class properties escape the guard at `Lower.cpp:2238-2242`
-  (static properties `continue` at `:2231-2236`) and die with the misleading
+- `static event` class properties escape the guard at `lower/Classes.cpp, lower_class_type`
+  (static properties `continue` there) and die with the misleading
   `reference to unknown signal 'e'`.
 
 Also give `wait_order` a named message instead of the generic
@@ -672,11 +672,11 @@ struct members, class properties, and all four argument directions light up — 
 gate deletions, per §4.
 
 **Phase 4 — ports.** (landed) Extend `build_inout_aliases` to `In`/`Out` event ports;
-delete `Lower.cpp:3974-3978`.
+delete `lower/Types.cpp, collect_scope_signals`.
 
 **Phase 5 — the two remaining LRM forms.** (not started) `->> @(x) e` / `->> repeat(n) @(x) e`
 via `rt_event_detach_*` (§7.4), and `wait_order` (§8) including the
-reactive-region walk at `Lower.cpp:883-891`.
+reactive-region walk at `lower/Lowerer.h, ReactiveSafetyChecker`.
 
 ---
 
@@ -744,6 +744,6 @@ all. Refcount is the only sound answer once merge exists — and §5 makes it fr
 for every event that does not use merge.
 
 **A toggling 1-bit wire per event** (the model clocking blocks use,
-`Lower.cpp:12632`). Already rejected in `named-events.md:104-107` and still
+`src/lower/`). Already rejected in `named-events.md:104-107` and still
 right: it leaks a phantom wire into VCD and domain analysis, and gives no
 identity, merge, or null.

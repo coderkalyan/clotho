@@ -186,7 +186,7 @@ void Backend::lower_fork_inst(Index i) {
 
     // Ramp arguments, shared by every child: (state, wheel, one pointer per
     // captured enclosing-frame local, rec). Each capture is an ArgDir::Ref
-    // formal of every child (Lower.cpp's lower_fork), passed exactly as
+    // formal of every child (lower/Statements.cpp's lower_fork), passed exactly as
     // A capture is a GC box HANDLE by value, for every join kind
     // (docs/design/fork-join.md V4), so there is no place to bind, no relocation
     // epoch to carry and no signal-waiter snapshot to take: a handle is a handle

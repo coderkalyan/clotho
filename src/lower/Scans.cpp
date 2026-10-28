@@ -1090,7 +1090,7 @@ void ReactiveSafetyChecker::reject(std::string_view what, std::string_view why) 
 // the wake carries the handle's home region -- and a delay is now one of them:
 // a wheel timer records its target as a parked handle, so it fires into the
 // reactive ring of the slot it matures in and that slot's drain resumes it
-// there (emit_delay_timer / emit_wake_push in LlvmBackend.cpp). Never legal in
+// there (emit_delay_timer / emit_wake_push in ir/llvm/Scheduler.cpp). Never legal in
 // the inlined copy, which has no second resume at all.
 //
 // So `#0`, `#5` and a run-time `#d` are one case here rather than three. They
@@ -1135,7 +1135,7 @@ void ReactiveSafetyChecker::handle(const CallExpression& c) {
     // used to be a second, independent reason -- a body records one home region
     // and is lowered once -- and the backend refused it separately; LRM 24.3.1
     // now puts the home on the THREAD, so a shared body reads its caller's
-    // (build_shared_home_fns in LlvmBackend.cpp) and the question is settled.
+    // (build_shared_home_fns in ir/llvm/Analyses.cpp) and the question is settled.
     // What remains is only the untraced-body one.
     //
     // A user *function* needs no check at all: LRM 13.4.4 forbids a timing

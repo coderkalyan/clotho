@@ -438,7 +438,7 @@ ir::Index Lowerer::def_zero(ir::Index v, ir::Builder& b, ir::SourceLoc l) {
 // $rose / $fell (LRM 16.9.3): did the bit move UP (resp. DOWN) the 4-state
 // edge order 0 < x/z < 1? Not a plain 0 -> 1 test -- x -> 1 IS a rise -- and
 // this is the same lattice the backend applies to @(posedge) in
-// emit_edge_facts (src/ir/LlvmBackend.cpp), reused rather than reinvented so
+// emit_edge_facts (src/ir/llvm/Events.cpp), reused rather than reinvented so
 // that an assertion edge and a procedural edge can never disagree.
 //
 // emit_edge_facts computes a rise as `!old_must && new_may && (!old_may ||

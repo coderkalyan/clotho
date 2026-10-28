@@ -283,7 +283,7 @@ live keeps the one asynchronous abort channel consistent, rather than giving two
 constructs that share a granularity two different notions of "now".
 
 Mechanically the plain forms reuse `disable iff`'s live-value path exactly rather
-than adding a second one, which is what `Lower.cpp`'s `root_reads_live` names.
+than adding a second one, which is what `lower/Lowerer.cpp`'s `root_reads_live` names.
 One thing the reset path did not need: a live condition can go high and fall
 again strictly BETWEEN two ticks, and the monitor only acts on an edge, so each
 asynchronous abort carries a one-bit latch (`MonitorState::abort_seen`) set at any

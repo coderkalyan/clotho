@@ -366,7 +366,7 @@ enum class AssertionTracking : uint8_t { Ring, Counted };
 // there (concurrent-assertions.md 5.2-5.3). What libsva sets it for is its own
 // STRUCTURAL negation -- the determinisation's cell splitter partitions the valuation
 // space into `a` and not-`a` cells -- and that partition is over the collapsed
-// decision "did the guard hold", which is what keeps it total under x. See Lower.cpp's
+// decision "did the guard hold", which is what keeps it total under x. See lower/SvaMonitor.cpp's
 // automaton_satisfy.
 struct AssertionLiteral {
     uint32_t root = 0;

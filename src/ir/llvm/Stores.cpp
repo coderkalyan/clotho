@@ -1593,7 +1593,7 @@ llvm::StructType* Backend::agg_rec_ty(const SignalSlot& s) {
 // be an associative-array value, which is a deferred place: resolve it with
 // get_ptr, because passing by value only reads it and LRM 7.8.6 forbids a read
 // creating the entry. An out / inout aggregate actual is a caller temp
-// (Lower.cpp's make_canonical_agg_temp), so it never arrives deferred.
+// (lower/Subroutines.cpp's make_canonical_agg_temp), so it never arrives deferred.
 llvm::Value* Backend::agg_arg_ptr(const LValue& lv) {
     return lv.is_assoc ? agg_image_ptr(assoc_elem_lvalue(lv, /*for_write=*/false))
                        : agg_image_ptr(lv);

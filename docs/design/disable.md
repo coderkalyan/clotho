@@ -137,35 +137,35 @@ the same shape as the existing generation counter.
   `subroutineKind == Task`. Clotho needs no hierarchical-path parser: `disable
   blk;` and `disable top.u1.blk;` arrive as one node shape. Both use sites
   unwrap `.as<ArbitrarySymbolExpression>().symbol` with no null check
-  (`src/Lower.cpp:6719`, `:7353`), relying on that enforcement.
+  (`src/lower/Statements.cpp, lower_disable`), relying on that enforcement.
   `DisableForkStatement` carries no fields.
 - **Eight frontend refusal sites**, each with its own message. `lower_disable`,
-  in the order it tests: a task target (`src/Lower.cpp:6725`); `fn_ctx_ !=
-  nullptr` (`:6731`), which is one predicate covering a function body, a task
+  in the order it tests: a task target (`src/lower/Statements.cpp, lower_disable`); `fn_ctx_ !=
+  nullptr`, which is one predicate covering a function body, a task
   body, a fork child, an assertion action block, and a `$strobe`/`$monitor`
   print thunk — there is no separate fork-child test, and `FnScope`
-  (`:19154-19161`) additionally swaps `named_blocks_` empty, so the enclosing
+  additionally swaps `named_blocks_` empty, so the enclosing
   process's blocks are invisible from inside a body even if that predicate were
-  relaxed; a target absent from the named-block stack (`:6747`); a found target
-  with no label (`:6751`, unreachable today); and the 16.4.4 outermost-scope
-  flush (`:6759`). One level up in `lower_stmt`: `disable fork` (`:6696`) and
-  `wait fork` (`:6701`). Independently, `ReactiveSafetyChecker` rejects both
-  `Disable` and `DisableFork` in either copy of an assertion action block
-  (`:906`). `wait_order` is the one form in this family that still falls to the
-  generic `unsupported statement` (`:6703`).
+  relaxed; a target absent from the named-block stack; a found target
+  with no label (unreachable today); and the 16.4.4 outermost-scope
+  flush. One level up in `lower_stmt`: `disable fork` and
+  `wait fork`. Independently, `ReactiveSafetyChecker` rejects both
+  `Disable` and `DisableFork` in either copy of an assertion action block.
+  `wait_order` is the one form in this family that still falls to the
+  generic `unsupported statement`.
 - **The backend has a ninth, and it is a throw, not a diagnostic.** `block_end`
-  (`src/ir/LlvmBackend.cpp:19481-19489`) throws `BackendError{"internal: disable
+  (`src/ir/llvm/Inst.cpp`) throws `BackendError{"internal: disable
   of a block that does not enclose it"}` when a `Disable`'s label is not on
   `block_targets_`. Any V2 form that reaches codegen with an unresolvable label
   is crash-class, not a refusal — so the remote form must resolve outside
   `block_targets_` entirely, not lean on that search.
 - **The target set is design-wide and complete before any code is emitted.**
-  `scan_disable_targets` (`src/Lower.cpp:7343`) runs in `Pass::Collect`
-  (`:1265`), which walks the whole instance tree (`:1144`) before `Pass::Emit`
-  (`:1155`), and neither `disable_targets_` nor `disable_flushes_` (`:20770`,
-  `:20774`) is ever cleared. A REMOTE target is therefore already knowable when
-  its disabler is lowered — stronger than §Design assumed. The `Block` case at
-  `:6568` does an unqualified lookup, with no same-process check, so a block
+  `scan_disable_targets` (`src/lower/Assertions.cpp`) runs in `Pass::Collect`,
+  which walks the whole instance tree before `Pass::Emit`,
+  and neither `disable_targets_` nor `disable_flushes_`
+  is ever cleared. A REMOTE target is therefore already knowable when
+  its disabler is lowered — stronger than §Design assumed. The `Block` case
+  does an unqualified lookup, with no same-process check, so a block
   targeted only from another process ALREADY emits its `NamedBlock` region
   today: the remote form's end block exists, only the branch to it is missing.
 - **What the map does not record.** The value is a bare `uint32_t` label — no
@@ -190,10 +190,10 @@ the same shape as the existing generation counter.
   the raw `ptr` from `llvm.coro.begin`; `src/runtime/*` has no process struct.
   `@clotho.proc_handle` does not exist anywhere in the tree — the only
   occurrence of that name is this document. Handles live as SSA values inside
-  the seed loop (`src/ir/LlvmBackend.cpp:7966-8047`) and are then dropped; the
+  the seed loop (`src/ir/llvm/Scheduler.cpp, emit_active_run`) and are then dropped; the
   only durable copies anywhere are wait-bucket entries (`{handle, flag_ptr}`),
   field 2 of a frame-resident `awaiter`, and the `parent` field of a task or
-  fork record — all three region-tagged through `parked_handle` (`:7514`).
+  fork record — all three region-tagged through `parked_handle`.
   `fnmap_` gives the static `FunctionId` for a task target and says nothing
   about which calls are live.
 
@@ -204,9 +204,9 @@ close.
 
 1. **Cooperative exit, never an unwind.** `$finish` sets one byte and returns;
    each frame leaves through its own epilogue (`emit_finish_exit`,
-   `src/ir/LlvmBackend.cpp:14568-14595`, four shapes: process coroutine, thunk-
-   elided process, task, function). A task branches to `task_epilogue_bb_`
-   (`:3665-3692`), which runs `emit_copyout`, then `deinit_body_strings`, then
+   `src/ir/llvm/SystemTasks.cpp, emit_finish_exit/emit_finish_check`, four shapes: process coroutine, thunk-
+   elided process, task, function). A task branches to `task_epilogue_bb_`,
+   which runs `emit_copyout`, then `deinit_body_strings`, then
    either decrements the fork join count or `emit_wake_push`es the caller's
    `parent`, then falls into the final suspend. That order is load-bearing: a
    child's heap is released BEFORE the parent can be resumed. There is no
@@ -229,7 +229,7 @@ close.
    (`src/runtime/Runtime.h:1330-1336`) deschedule a pending record by bumping a
    counter (`Runtime.cpp:2271`) and dropping the record when its timer fires and
    the stamp no longer matches (`:2286`). `@clotho.defer.gen.<g>` +
-   `rt_defer_report(gen, gen_val)` (`src/ir/LlvmBackend.cpp:16014`, `:16034`;
+   `rt_defer_report(gen, gen_val)` (`src/ir/llvm/SystemTasks.cpp, defer_report_fn`;
    `src/runtime/Runtime.cpp:3802`, comparison at `:3831`) does the same for
    deferred reports and *is already* the LRM 16.4.2 flush point. Neither
    structure is ever unlinked.
@@ -243,7 +243,7 @@ close.
    `disable_epoch_ptr` pair is a near-literal transcription of that with `i32`
    → `i64` and "process index" → "target index".
 3. **A destroy edge already exists at every suspend.** `emit_suspend`
-   (`src/ir/LlvmBackend.cpp:3898-3906`) switches `coro.suspend` with case 1
+   (`src/ir/llvm/`) switches `coro.suspend` with case 1
    wired to `coro_cleanup_bb_`. It is unreachable in practice today.
 
 What is missing, exactly: **the wheel cannot cancel** (`Wheel.h`'s entire public
@@ -452,14 +452,14 @@ which this document previously conflated into one bump.
 
 **16.4.4, the deferred report queue: a one-line bump, and the granularity is
 already right.** At a disable of the *outermost* scope of a procedure, bump that
-group's `@clotho.defer.gen.<g>` (`defer_gen_ptr:16014`,
-`emit_defer_gen_bump:16034`) alongside the epoch bump. That drops exactly the
+group's `@clotho.defer.gen.<g>` (`defer_gen_ptr`,
+`emit_defer_gen_bump`) alongside the epoch bump. That drops exactly the
 disabled procedure's pending reports and nothing else, for a reason worth
 recording because it is not obvious: a process holding a deferred `Severity`
 fails `is_simple_always` (`src/ir/Analysis.cpp:1425-1432` returns false on
 `defer != 0`), identical-sensitivity fusion admits only `simple_always`
-processes (`LlvmBackend.cpp:6077-6088`), and cross-instance body sharing is
-thunk-only (`:5745-5747`). So a group with a deferred assertion always has
+processes (`ir/llvm/Analyses.cpp, compute_fusion_groups`), and cross-instance body sharing is
+thunk-only. So a group with a deferred assertion always has
 exactly one member and is never shared across instances: the counter is already
 per-process-per-instance. No new tagging is needed for this bullet.
 
@@ -473,9 +473,9 @@ reports early, out of their maturation region, as well as clearing them.
 **16.14.6.4, procedural concurrent assertions: not a queue, and the generation
 counter cannot reach it.** There is no pending-attempt queue anywhere. A
 concurrent assertion — procedural or module-item — becomes its own
-`Activation::Observed` process (`src/Lower.cpp:10243-10247`), and its in-flight
-attempts are hidden 2-state signals of that monitor (`MonitorState`,
-`:8266-8300`), not records. That monitor is a different `ir::Process` with a
+`Activation::Observed` process (`src/lower/SvaMonitor.cpp, emit_monitor`), and its in-flight
+attempts are hidden 2-state signals of that monitor (`MonitorState`),
+not records. That monitor is a different `ir::Process` with a
 different activation kind, so it is not in the procedure's fusion group and
 `defer_gen_ptr` cannot address it: bumping the generation has literally zero
 effect on an attempt. Two further facts shape the real fix:
@@ -486,11 +486,11 @@ effect on an attempt. Two further facts shape the real fix:
   cannot be found again, let alone withdrawn — which is exactly what 16.14.6.4
   asks for.
 - **The abandonment primitive already exists, and it is not an epoch.**
-  `MonitorControl::kill` (`src/Lower.cpp:7178-7186`) is `$assertkill`'s request
+  `MonitorControl::kill` (`src/lower/Lowerer.h`) is `$assertkill`'s request
   latch, held until the monitor's own clocking edge, where it joins `disable iff`
   in the reset term. The owner linkage exists too: `AssertSite::owner` is the
   enclosing `ProceduralBlockSymbol` and `AssertSite::label` the innermost named
-  block between them (`:7212-7216`), maintained by `scan_assert_control` for
+  block between them, maintained by `scan_assert_control` for
   `$assertcontrol` targeting. So a 16.14.6.4 flush is shaped like "raise `kill`
   on every monitor whose `owner` is the disabled procedure", not like a
   generation bump.
@@ -528,12 +528,12 @@ per-report tag, and is out of scope for V2.
 `ReactiveSafetyChecker` keeps rejecting `disable` inside assertion action blocks,
 but not for a region reason: a `disable` suspends nothing, so no wake is
 involved, and the checker explicitly retired the "a reactive body is resumed
-once" reason (`:728-731`, `:879-885`). What stands in the way is this document's
+once" reason. What stands in the way is this document's
 own V1 restriction — a `disable` is a lexical exit from an enclosing block of a
 *process* body, and an action block is lowered as a task body (and, for a strong
 property, again inside a `final` process), so neither copy has the block to
 leave. Note the backend's independent backstop `reject_unsupported_reactive`
-(`src/ir/LlvmBackend.cpp:4444-4490`) has NO `disable` arm — the tag never reaches
+(`src/ir/llvm/Analyses.cpp`) has NO `disable` arm — the tag never reaches
 reactive code because the frontend refuses first, so if V2 lifts the frontend
 refusal the backstop silently accepts.
 
@@ -542,16 +542,16 @@ refusal the backstop silently accepts.
 Ranked by how much damage a naive implementation does.
 
 1. **Ring overflow is guarded, but only for a design that forks.**
-   `emit_active_push` (`LlvmBackend.cpp:7340-7349`) calls `emit_ring_full_check`
-   (`:7297-7312`), which calls `rt_ring_overflow` — `FATAL: the <name> overflowed
+   `emit_active_push` (`ir/llvm/Scheduler.cpp`) calls `emit_ring_full_check`,
+   which calls `rt_ring_overflow` — `FATAL: the <name> overflowed
    at <t> (capacity N entries)` then `exit(1)`, `Runtime.cpp:3200-3231` — when
-   `tail − head >= cap`, and `emit_len_full_check` (`:7325-7337`) does the same
+   `tail − head >= cap`, and `emit_len_full_check` does the same
    for the length-counted buffers. Six push sites over five named buffers are
    covered: active ring, reactive ring, the runtime-selected ring in
    `emit_wake_push`, the inactive `#0` batch, the reactive inactive batch, and
    the dynamic wait bucket. Both guards used to open with `if (!design_forks())
    return;`, because the check cost ~40% of sim time on a wake-heavy design
-   (combchain) and ~25% of codegen time (`:7288-7295`) — so a design that
+   (combchain) and ~25% of codegen time — so a design that
    force-woke but never forked emitted NO overflow checking at all. **RESOLVED by
    V2a:** the gate is now `ring_guard_wanted()` = `design_forks() ||
    design_uses_disable_`. Sizing is unchanged —
@@ -596,13 +596,13 @@ Ranked by how much damage a naive implementation does.
    slots at once, which no static count bounds and which is unguarded in a
    non-forking design. V2's zombie re-parks land in the same buffer class.
 10. **The fork record aliases the parent frame and is reused across fork sites**
-    (`fork_record_ty:17296-17303` is `{ i32 count, ptr parent }`,
-    `fork_record_slot:17307-17314` memoizes one alloca per coroutine), legal only
+    (`fork_record_ty` is `{ i32 count, ptr parent }`,
+    `fork_record_slot` memoizes one alloca per coroutine), legal only
     because `join` serialises them. Four distinct failures follow if a child
     outlives its join: site collision on the reused record (parent woken early,
     or count skipping 0 so the parent is never woken at all), use-after-free once
     the parent's frame is released, dangling `ArgDir::Ref` capture formals that
-    point into the parent frame (`Lower.cpp:6801-6806` states the lifetime rule
+    point into the parent frame (`lower/Statements.cpp, lower_fork` states the lifetime rule
     this relies on), and a double push if two children ever observe `cnt == 0`.
     Note the third failure is a **V2** hazard, not only V3: aborting a *parent*
     with live children invalidates every child's formals.
@@ -627,9 +627,9 @@ Ranked by how much damage a naive implementation does.
     shared across instances.
 13. **Per-activation temp cells are safe; the capture ABI is not.**
     `repeat`/`foreach` counters are per-activation frame Locals whenever
-    `fn_ctx_ != nullptr` (`make_temp_cell`, `Lower.cpp:12416-12437`;
+    `fn_ctx_ != nullptr` (`make_temp_cell`, `lower/Lowerer.cpp`;
     `docs/TODO.md`), and a fork child always has an `FnCtx`
-    (`build_fork_child:19901-19919`), so aborting one activation cannot corrupt a
+    (`build_fork_child`), so aborting one activation cannot corrupt a
     sibling's counters. The asymmetry that does bite is Hazard 10's third
     failure: a child's formals point into the *parent's* frame.
 14. **Detached records still commit.** `rt_intra_rec` and `nba_arr` records are
@@ -745,7 +745,7 @@ Ranked by how much damage a naive implementation does.
   the wheel cannot cancel and a static bucket cannot compact — so a suspended thread
   stays parked, records the wake it receives, and `resume` replays it.
 
-  The type-level refusal was at `src/Lower.cpp`'s `lower_class_type`, and is now keyed
+  The type-level refusal was at `src/lower/Classes.cpp`'s `lower_class_type`, and is now keyed
   by class name: `semaphore` / `mailbox` / `weak_reference` keep it.
 
   Two things this document owes now. The per-target activation node here and the

@@ -504,7 +504,7 @@ llvm::Constant* Backend::null_object_global() {
 // word in the body.
 //
 // The flattened property table already carries every INHERITED property, deepest
-// base first (Lower.cpp:2218-2268), so a derived class's map covers the base
+// base first (lower/Classes.cpp, lower_class_type), so a derived class's map covers the base
 // prefix with no special case and a base class gets its own map covering just
 // that prefix.
 std::vector<uint32_t> Backend::class_handle_offsets(Ref class_ref) {
@@ -801,7 +801,7 @@ void Backend::emit_gc_container_roots(GcRootOp op, Ref type, llvm::Value* base, 
 //
 // STATIC CLASS PROPERTIES need no region of their own: a static property is not
 // part of any object body, it gets persistent module-signal storage through the
-// ordinary register_signal path (Lower.cpp:21109-21126), so it is already a
+// ordinary register_signal path (lower/Types.cpp), so it is already a
 // SignalSlot in the list walked here -- covered by the same tables, and a
 // missed root would be a use-after-free.
 //

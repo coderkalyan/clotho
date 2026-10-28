@@ -998,7 +998,7 @@ std::vector<bool> Backend::frame_out_targets(const Function& f) const {
             mark_packed_args(vci.func, vci.args);
         } else if (ir.tag(idx) == Inst::Tag::Fork) {
             // Every fork capture is an ArgDir::In box HANDLE of every child
-            // (Lower.cpp's lower_fork), i.e. an rvalue, not a place at all, so
+            // (lower/Statements.cpp's lower_fork), i.e. an rvalue, not a place at all, so
             // there is no frame slot to force packed. Nothing to mark.
             continue;
         }

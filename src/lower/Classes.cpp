@@ -153,7 +153,7 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
             // exactly like the ordinary (non-reentrant) return points below --
             // otherwise those ids are reserved but never module_.set_function'd,
             // and the backend segfaults on their Ref::Invalid return type the
-            // first time codegen reaches them (LlvmBackend.cpp declare_function
+            // first time codegen reaches them (ir/llvm/Subroutines.cpp declare_function
             // -> fn_return_ty -> width_of -> an invalid-Ref layout lookup).
             if (class_depth_ == 1) {
                 drain_rand_bodies();
@@ -180,7 +180,7 @@ ir::Ref Lowerer::lower_class_type(const slang::ast::ClassType& clt) {
     // valid: a structurally well-typed class with an intact field table but no
     // vtable and no descriptor, which crashes the LLVM backend as an unlocated
     // "internal: class without a descriptor" the first time codegen needs it
-    // (LlvmBackend.cpp's ClassIsA case, mod_.class_desc(dest) == nullptr).
+    // (ir/llvm/Inst.cpp's ClassIsA case, mod_.class_desc(dest) == nullptr).
     // Erase on the way out so every later reference gets its own honest,
     // located LowerError instead of inheriting a landmine planted one
     // class-lowering attempt ago. Mirrors compute_vtable's own VslotGuard for
@@ -1109,7 +1109,7 @@ void Lowerer::emit_class_body_copy(ir::Index dst, ir::Index src, ir::Ref class_r
             continue;
         }
         // Re-read the row each iteration: emit_agg_copy can intern a type and
-        // reallocate the field table underneath a held span (Lower.cpp's
+        // reallocate the field table underneath a held span (lower/Assign.cpp's
         // emit_agg_store documents the same hazard).
         const ir::Ref   field_ty  = module_.pool.struct_fields(t.fields_id)[i].type;
         const ir::Index dst_field = b.member_select(dst_body, i, class_ref, l);

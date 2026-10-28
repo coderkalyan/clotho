@@ -5,7 +5,7 @@
 #include <cstdint>
 
 // The single type-classification vocabulary shared by the frontend lowerer
-// (src/Lower.cpp) and the LLVM backend (src/ir/LlvmBackend.cpp).
+// (src/lower/) and the LLVM backend (src/ir/llvm/).
 //
 // Both sides used to carry their own near-identical predicate sets — five pairs
 // were textual clones — so a change to one silently diverged from the other.

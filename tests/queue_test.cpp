@@ -1126,7 +1126,7 @@ TEST_CASE("an event element is a distinct event per slot") {
 //
 // A chandle element needs no lifecycle either: the value IS the opaque 64-bit
 // word (LRM 6.14), so it rides the exact same POD element path a class handle
-// does -- guard_container_element (src/Lower.cpp) admits the two for the same
+// does -- guard_container_element (src/lower/Types.cpp) admits the two for the same
 // reason. SystemVerilog offers no way to MAKE a non-null chandle without DPI, so
 // libc malloc/free stand in as the no-.so probe the rest of the chandle test
 // suite already uses (display_test.cpp, dpi_test.cpp).

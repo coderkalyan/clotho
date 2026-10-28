@@ -9,7 +9,7 @@
 // Design: docs/design/functional-coverage.md. The frontend evaluates every bin
 // specification at lowering time and emits a static, read-only model of the whole
 // design's coverage — types, coverpoints, bins, inclusive value ranges, and the
-// resolved options — as LLVM constants (LlvmBackend.cpp, `cover_model_global`).
+// resolved options — as LLVM constants (ir/llvm/SystemTasks.cpp, `cover_config_global`).
 // This file owns everything that depends on run-time values: instances, hit
 // counts, bin matching, the 19.11 arithmetic, and the end-of-run report.
 //

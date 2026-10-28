@@ -138,7 +138,7 @@ void render_time(std::string& out, uint64_t ticks) {
 // it cannot do. Unlike format_fatal this is a design error, not a broken
 // invariant: LRM §21.3.3 lets $sformat / $sformatf take a format built at run
 // time, and nothing then checks its contents until here, so every rejection
-// Lower.cpp's check_specifier makes at compile time has to be made again with the
+// lower/SystemTasks.cpp's check_specifier makes at compile time has to be made again with the
 // text in hand. Reported in the ordinary located-fatal shape (headline, source
 // caret, simulation time) and defined with that block below.
 [[noreturn]] void dynfmt_fatal(const rt_fmt_dyn* dyn, const std::string& what);
@@ -551,7 +551,7 @@ int64_t sat_round_i64(double v) {
 
 // Reconcile one descriptor with the conversion a RUNTIME format asked for.
 //
-// With a compile-time format Lower.cpp's build_format has the specifier in hand
+// With a compile-time format lower/SystemTasks.cpp's build_format has the specifier in hand
 // and fixes the mismatch in the IR: it emits ItoF for an integral under %e/%f/%g,
 // FtoI for a real under %d/%h/%o/%b, scale_to_ticks for %t, and fails the
 // compile for the combinations that have no defined answer. A runtime format
@@ -658,7 +658,7 @@ const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, co
 // splices %p away before the renderer sees it, so there is nothing for the
 // specifier switch to do.
 //
-// MUST agree with Lower.cpp's expand_p_scalar, which for the same three cases
+// MUST agree with lower/SystemTasks.cpp's expand_p_scalar, which for the same three cases
 // splices exactly `%0d` (minimal decimal at the operand's own signedness), `%g`
 // for a real, and `"%s"` for a string. A constant format and a runtime format
 // that hold the same text have to render the same value identically; these are
@@ -749,7 +749,7 @@ void render(std::string& out, const char* fmt, uint32_t argc, const rt_arg* argv
         }
         if (spec.conv == 'p' || spec.conv == 'P') {
             // Only a runtime format reaches here; see render_p_scalar. An
-            // aggregate operand cannot: Lower.cpp refuses one outright against a
+            // aggregate operand cannot: src/lower/ refuses one outright against a
             // runtime format, because rt_arg has no image of it.
             render_p_scalar(out, a);
             continue;
@@ -1566,7 +1566,7 @@ extern "C" void rt_dynarr_move(rt_dynarr* dst, rt_dynarr* src, const rt_elem_ops
 namespace {
 
 // Sort-key kind for the ordering comparator; mirrors the backend descriptor
-// (LlvmBackend.cpp dynarr_sort_desc). The 4-state kinds are separate rather than
+// (ir/llvm/Containers.cpp dynarr_sort_desc). The 4-state kinds are separate rather than
 // a flag on the first two so that a 2-state element never tests a plane it does
 // not have: the comparator is chosen once per sort, outside the compare loop.
 enum : uint32_t {
@@ -1579,7 +1579,7 @@ enum : uint32_t {
 
 // One xoshiro256++ step against a thread's RNG state. Byte-for-byte the
 // same recurrence the backend inlines at each $urandom site
-// (`emit_xoshiro_next` in LlvmBackend.cpp), so a shuffle drawing from that
+// (`emit_xoshiro_next` in ir/llvm/Ops.cpp), so a shuffle drawing from that
 // state leaves the stream consistent for subsequent inlined $urandom draws.
 uint64_t xoshiro_next(uint64_t* s) {
     const auto rotl = [](uint64_t x, unsigned k) { return (x << k) | (x >> (64 - k)); };
@@ -1654,7 +1654,7 @@ bool sort_kind_four(uint32_t kind) {
 
 // One 4-state element slot decoded: the definite value (the must plane) and the
 // mask of bits that are x or z. A 4-state slot is `{ i(2W) must|may, iW z }` with
-// must in bits [0,W) and may in [W,2W) (LlvmBackend.cpp:48), so `must ^ may` is
+// must in bits [0,W) and may in [W,2W) (ir/llvm/Backend.h), so `must ^ may` is
 // the unknown mask -- the same decode rt_container_eq does, and the same bounded
 // (2W+7)/8-byte read inside the mm field. The z plane is never read: Z is encoded
 // as X in must/may with the z bit set alongside, and the ordering does not
@@ -1710,7 +1710,7 @@ int slot_cmp4(const uint8_t* a, const uint8_t* b, uint32_t kind, uint32_t width)
 // order becomes observable and reversing an ascending sort would reverse each tie
 // group. That form is therefore not lowered here at all -- it is a stable merge
 // sort emitted as IR, which orders descending directly (lower_array_sort_iter,
-// src/Lower.cpp). A 4-STATE element breaks both the same way and has its own
+// src/lower/Sort.cpp). A 4-STATE element breaks both the same way and has its own
 // driver below; this function and its comparator are reached only by the two
 // kinds above, and pay nothing for the existence of the other path.
 void sort_run(uint8_t* data, uint64_t n, uint64_t stride, uint32_t kind, uint32_t width, uint32_t rev) {
@@ -4129,7 +4129,7 @@ extern "C" void rt_ring_overflow(uint32_t ring, uint32_t capacity) {
     // global follows it, which corrupts the scheduler and surfaces as a hang or a
     // wrong answer with no diagnostic.
     //
-    // Selector order matches the kRing* constants in src/ir/LlvmBackend.cpp.
+    // Selector order matches the kRing* constants in src/ir/llvm/Backend.h.
     static constexpr const char* kNames[] = {
         "active scheduler ring", "reactive scheduler ring", "inactive (#0) batch",
         "reactive inactive (#0) batch", "event wait queue",
@@ -6024,7 +6024,7 @@ extern "C" uint32_t rt_randc_next(uint64_t* seen, uint32_t nvals, uint64_t* rng)
 
     // Lemire multiply-shift of the draw's high 32 bits onto [0, remaining) --
     // the same mapping the JIT inlines for $urandom_range (the UrandomRange arm
-    // of LlvmBackend.cpp's lower_inst), so a bounded index is produced one way
+    // of ir/llvm/Inst.cpp's lower_inst), so a bounded index is produced one way
     // across all of clotho. Exactly one draw per call, whether or not the cycle
     // restarted above.
     const uint64_t draw32 = xoshiro_next(rng) >> 32;

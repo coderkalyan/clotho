@@ -374,7 +374,7 @@ void Backend::emit_vcd_scope_tree(const InstanceScope& sc) {
 }
 
 // Why a signal's type has no $var form, or nullptr when it has one. Mirrors
-// Lower.cpp's vcd_unrepresentable, which is where a declared signal is actually
+// lower/Lower.cpp's vcd_unrepresentable, which is where a declared signal is actually
 // refused; this keeps the crash impossible if a path ever reaches codegen
 // without that check (an aggregate has no leaf slot type, so the scalar $var
 // path below would dereference null).
@@ -435,7 +435,7 @@ void Backend::emit_vcd_var(Signal sig) {
     }
     const SignalSlot& s = slot_of(sig);
     // Second line of defence behind the frontend's whole-design check
-    // (vcd_unrepresentable in Lower.cpp): a string / container / aggregate /
+    // (vcd_unrepresentable in lower/Lower.cpp): a string / container / aggregate /
     // class-handle signal has no $var form. A DECLARED one is refused; a
     // compiler-synthesized one (SourceLoc{0}: a gate input net, a materialized
     // container temp) is not design state and is simply not dumped, which is

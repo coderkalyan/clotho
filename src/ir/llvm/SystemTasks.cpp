@@ -297,7 +297,7 @@ llvm::FunctionCallee Backend::strobe_pop_fn() {
 }
 
 // Lower a `strobe_pend`: ramp the target zero-formal deferred-print task
-// (build_strobe_body / Lower.cpp) — ramp only, never resumed here — and hand
+// (build_strobe_body / lower/SystemTasks.cpp) — ramp only, never resumed here — and hand
 // its coroutine handle to the runtime's pending queue. The handle is resumed
 // once, at the Postponed region of this time step (see the strobe drain loop
 // in emit_active_run), which is where the target body actually evaluates its

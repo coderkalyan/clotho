@@ -19,7 +19,7 @@ the biggest single bucket from dispatch to NBA staging.
 ## 1. What this replaces
 
 Per activation, today (map in clock-wave.md §1; the code is `emit_active_run`,
-LlvmBackend.cpp:11360):
+ir/llvm/Scheduler.cpp, emit_active_run):
 
 - the writer's blocking store computes edge facts inline
   (`service_snapshot`:9765, `emit_edge_facts`:9824) and scans the static
@@ -141,7 +141,7 @@ instant".
 The tempting design is to sample each watched signal's previous value at
 region entry and re-derive `posedge` there — `emit_edge_facts` is pure IR
 emission on an old/new SSA pair and would work anywhere, and the frontend
-already does exactly this for SVA monitor clocks (`Lower.cpp:12221`, sample
+already does exactly this for SVA monitor clocks (`lower/Lowerer.cpp, alloc_monitor_state`, sample
 against `clkprev` at the previous Observed point).
 
 **It is wrong.** A writer that stores `clk = 1; clk = 0;` inside one instant
@@ -156,8 +156,8 @@ Keep the classification exactly where it is and change only what it writes.
 ### 3.2 The trigger word
 
 Per group, one word (`clotho.proc_trig`, parallel to `clotho.proc_sched`,
-LlvmBackend.cpp:983), one bit per entry of `group_events_[g]`
-(LlvmBackend.cpp:27737). At every site that today scans a bucket and pushes a
+ir/llvm/StateLayout.cpp, build_sched_flags), one bit per entry of `group_events_[g]`
+(ir/llvm/Backend.h, OpenNamedBlock). At every site that today scans a bucket and pushes a
 handle, `or` the entry's mask into the word alongside the push. The group body
 loads the word at entry, guards each member on `(trig & member_mask) != 0`,
 and zeroes the word at the end — the same timeline as the sched flag, which is
@@ -200,7 +200,7 @@ and it retires five of the eight `CombFuse` verdicts as fusion blockers, since
 `ReadOutsideSens` all exist only because a fused member may run when its own
 trigger did not (Analysis.h:123-146). Proof that they are guard artifacts and
 not purity requirements: identical-sensitivity fusion imposes none of them
-(LlvmBackend.cpp:9104 gates on `simple_always` alone) because its members'
+(ir/llvm/Analyses.cpp, compute_fusion_groups gates on `simple_always` alone) because its members'
 wake set equals the union by construction.
 
 `NotSimpleAlways` stays — a member must still be a suspension-free
@@ -214,9 +214,9 @@ stays: a combinational loop needs the re-wake fixpoint.
 
 Two properties, both already computed:
 
-1. `compute_subscription_order` (LlvmBackend.cpp:8049) condenses the
+1. `compute_subscription_order` (ir/llvm/Analyses.cpp) condenses the
    blocking-write wake graph and marks nontrivial SCCs (`scc_nontrivial_`,
-   LlvmBackend.cpp:27726), so an acyclic component settles in one pass in rank
+   ir/llvm/Backend.h, OpenNamedBlock), so an acyclic component settles in one pass in rank
    order.
 2. NBA cuts the sequential feedback edges — a flop's effect appears at the
    commit, not in the pass.
@@ -235,7 +235,7 @@ fixpoint over the same members.
 | P0 | this document; cost model (`bench-sched/cost_model.py`); picorv32 attribution | done | — |
 | P1 | trigger bits in the wake word (§9.1) | **landed** | the def-relative GEP stride was the one silent-corruption hazard |
 | P2 | member guards for existing groups | **landed** | monotone per §3.4; the intra-group edge of §9.2 was the one real bug |
-| P3 | admit `CombFuse::EdgeSensitive` members (relax the `CombFuse::Eligible` filter, LlvmBackend.cpp:9139); leave the other four verdicts alone | 3-5 d | med — union sensitivity now spans clock and level events, so activation count rises while body count falls; that trade is the cost model to watch |
+| P3 | admit `CombFuse::EdgeSensitive` members (relax the `CombFuse::Eligible` filter, ir/llvm/Analyses.cpp, compute_fusion_groups); leave the other four verdicts alone | 3-5 d | med — union sensitivity now spans clock and level events, so activation count rises while body count falls; that trade is the cost model to watch |
 | P4 | scalar NBA as an in-region `select` | 2-4 w | high — see below |
 
 P2 pays for itself independently of regions: it discharges the two follow-ups

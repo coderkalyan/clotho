@@ -17,7 +17,7 @@ namespace clotho::ir::backend {
 // A VARIABLE key (info.is_variable) never reaches agg_key_handle_offsets: its
 // offsets are compile-time constants only for a FIXED key, and the frontend
 // refuses a class handle anywhere inside a variable one precisely so this
-// table never has to describe a runtime-dependent offset (Lower.cpp
+// table never has to describe a runtime-dependent offset (lower/Types.cpp
 // guard_key_no_handle_in_variable).
 std::vector<uint32_t> Backend::assoc_key_handle_offsets(Ref assoc_type) {
     assert(std::get<Type>(mod_.pool.get(assoc_type)).kind == Type::Kind::Assoc &&

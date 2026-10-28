@@ -25,32 +25,32 @@ so this is a per-write constant-factor win, not an allocation win.
 
 ## Current architecture (extension points)
 
-All references `src/ir/LlvmBackend.cpp` unless noted.
+All references `src/ir/llvm/` unless noted.
 
 **Shadow model is keyed per-signal.** Each scalar NBA-target signal gets a dense
-`nba_id` (`nba_classify`, ~:816) and a shadow slot in the `clotho.nba.shadow`
+`nba_id` (`nba_classify`) and a shadow slot in the `clotho.nba.shadow`
 struct — `{ i(2W) mm, iW z?, iW dirty-mask? }`, appended to the root state
-(`build_state_types`, :687-715). Shadow is addressed by `shadow_ptr(field)`
-(:904, through the `@clotho.nba.shadow_base` global — a deliberate defense
+(`build_state_types`). Shadow is addressed by `shadow_ptr(field)`
+(through the `@clotho.nba.shadow_base` global — a deliberate defense
 against a Zen4 memory-renaming hazard). Live storage is a constant GEP via
-`storage_ptr` (:879).
+`storage_ptr`.
 
-**Block-commit** (`nba_block = !s.is_array`, :3182). A block = a straight-line
+**Block-commit** (`nba_block = !s.is_array`). A block = a straight-line
 segment delimited by `cur_seg_epoch_` (bumped at region entry/exit and at
 Delay/Wait/TaskCall). The first NBA of a segment calls the enqueue stub once
-(`block_register`, :3234); each target is gathered into `block_commits_[id].sigs`
+(`block_register`); each target is gathered into `block_commits_[id].sigs`
 as a `BlockSig{sig, mask, dynamic}`. At the NBA region the pending blocks
-musttail-chain their commit fns; `emit_block_commit_body` (:3314) copies each
+musttail-chain their commit fns; `emit_block_commit_body` copies each
 target's shadow → live (`storage_ptr`, no element index) and services its
 per-signal wait queue via `emit_nba_service` + `nba_meta` (indexed by
 `s.nba_id`).
 
 **Array record path.** Array targets are collected in `array_nba_sigs_`
-(`nba_classify_ir`, :788-802) and never marked `nba`. `emit_array_nba` (:5970)
+(`nba_classify_ir`) and never marked `nba`. `emit_array_nba`
 stores `(live element ptr, positioned value, optional mask)` into a runtime
-record. `emit_array_commit` (:6008) replays records in push order into live
+record. `emit_array_commit` replays records in push order into live
 element slots, then — if the array took any write — wakes its readers via
-`service_any_waiters(sig)` (:6089).
+`service_any_waiters(sig)`.
 
 **The never-`nba` rule has a second consumer.** An intra-assignment nonblocking
 write to an array element (`mem[i] <= #5 v`, LRM 9.4.5) uses its own deferred
@@ -69,13 +69,13 @@ per-process scheduled-flag dedup makes a redundant wake a no-op.
 
 **Constant-index detection.** When slang const-folds the selector,
 `ElemSelect.index` (`Ir.h`) is an `Inst::Tag::Constant` node
-(`Lower.cpp` ~:4849). Two detection points:
+(`src/lower/`). Two detection points:
 - IR level (in `nba_classify_ir`): `ir.tag(ElemSelect.index) == Constant`,
-  parallel to how `arr_masked` is set (:799-801).
+  parallel to how `arr_masked` is set.
 - Backend LLVM level (in staging): `lv.elem_idx` is an `llvm::ConstantInt`
   exactly when the index const-folds (all of `cast`/`Sub`/`Mul`/`Add` fold);
   `elem_idx == nullptr` means element 0. Idiom already used
-  (`is_zero_const`, :6195).
+  (`is_zero_const`).
 
 ## Design
 
@@ -86,8 +86,7 @@ Introduce an **element-NBA-target registry** parallel to the per-signal
 has_z; bool narrow; uint32_t sh_mm_field, sh_z_field; }`, plus a map
 `(sig, index) → target id` for dedup and staging lookup. Each distinct
 constant-index whole-element target gets its own shadow slot, appended to the
-`clotho.nba.shadow` field list after the per-signal slots (`build_state_types`,
-:711).
+`clotho.nba.shadow` field list after the per-signal slots (`build_state_types`).
 
 ### All-or-nothing per array (the scope decision)
 
@@ -111,7 +110,7 @@ Within a qualifying array, correctness holds:
 
 ### Staging
 
-In the `StoreNb` dispatch (:5124), before the `is_array` → `emit_array_nba`
+In the `StoreNb` dispatch, before the `is_array` → `emit_array_nba`
 branch: if the array is qualifying and `lv.elem_idx` is constant (or null),
 look up the element target id, store `rhs` into its shadow slot, and
 `block_register` it (extended `BlockSig` carrying the constant element offset /
@@ -123,7 +122,7 @@ Extend `BlockSig` with an optional element target id (or an "is-element" flag +
 constant element index). In `emit_block_commit_body`:
 - Scalar `BlockSig`: unchanged.
 - Element `BlockSig`: live address is a constant element GEP
-  (`array_base + index*stride`, the `lv_field_ptr` array form, :922), shadow is
+  (`array_base + index*stride`, the `lv_field_ptr` array form), shadow is
   the element target's `sh_mm_field`/`sh_z_field`. Copy shadow → live
   (whole-element, always the unmasked path — partial writes disqualified the
   array). Then wake the array once via `service_any_waiters(array_sig)`.
@@ -140,18 +139,18 @@ NBAs fall back to the record path), mirroring `fuse` / `thunk` for differential 
 
 ## Extension points (touch list)
 
-1. **Classification** — `nba_classify_ir` (:779-808): per array, detect
+1. **Classification** — `nba_classify_ir`: per array, detect
    disqualifiers (`lvalue_has_dynamic_select` / `lvalue_has_subselect`, existing)
    and, if clean, collect distinct constant indices (IR `ElemSelect.index ==
    Constant`). Mark the array qualifying and build the element-target registry.
-2. **`nba_block` exclusion** — `build_nba_state` (:3182): unchanged for the
+2. **`nba_block` exclusion** — `build_nba_state`: unchanged for the
    array signal itself; element targets are a separate registry, not
    `slot.nba`.
-3. **Shadow layout** — `build_state_types` (:711): append element-target shadow
+3. **Shadow layout** — `build_state_types`: append element-target shadow
    slots after the per-signal ones.
-4. **Staging** — `StoreNb` dispatch (:5124) + a new element-staging helper.
-5. **Commit** — `BlockSig` struct, `block_register` (:3234), and
-   `emit_block_commit_body` (:3314): handle element targets (constant element
+4. **Staging** — `StoreNb` dispatch + a new element-staging helper.
+5. **Commit** — `BlockSig` struct, `block_register`, and
+   `emit_block_commit_body`: handle element targets (constant element
    GEP + `service_any_waiters`).
 
 ## Verification

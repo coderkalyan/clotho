@@ -5,7 +5,7 @@
 `%p`). Phase 3 (non-integral unpacked payloads) and a few pattern corners
 remain, gated loud.
 
-Phase 1 (`src/Lower.cpp`): `lower_type` builds the flat `{tag, payload}` type
+Phase 1 (`src/lower/Types.cpp`): `lower_type` builds the flat `{tag, payload}` type
 for both packed and unpacked tagged unions; `lower_tagged_union_set` lowers the
 `TaggedUnionExpression` setter; `union_tag_bits` computes the discriminant
 width. A member write does not touch the tag — the `store_union_tag` helper that

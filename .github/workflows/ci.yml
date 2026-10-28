@@ -124,7 +124,7 @@ jobs:
           sudo apt-get update
           # clang, not GCC. Ubuntu 24.04 caps out at GCC 14, which rejects the
           # implicit capture of an enclosing-class member inside a deducing-this
-          # lambda (LlvmBackend.cpp's close_fn) — a GCC 14 defect fixed in 15,
+          # lambda (ir/llvm/Analyses.cpp's close_fn) — a GCC 14 defect fixed in 15,
           # and 15 is not available on any GitHub-hosted image. libstdc++-14-dev
           # supplies <print>, which src/main.cpp uses and GCC 13's does not have.
           # The -dev packages are what LLVM's exported CMake targets link

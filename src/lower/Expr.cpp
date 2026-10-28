@@ -218,7 +218,7 @@ ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
         }
         case ExpressionKind::MemberAccess: {
             // The backend's PartSelect/BitSelect type inference
-            // (LlvmBackend.cpp compute_type) inherits the BASE signal's
+            // (ir/llvm/Inst.cpp compute_type) inherits the BASE signal's
             // domain, since an ordinary vector/array is domain-uniform
             // throughout. A struct is the one aggregate where a field's
             // own declared domain can be narrower than the whole (mixed)
@@ -1288,7 +1288,7 @@ ir::Index Lowerer::elem_coord_const(const ir::Type& t, uint32_t pos, ir::Builder
 // leaving a partially out-of-range slice positionally correct rather than
 // shifted. `for_write` on the base-container side threads only for a dynamic
 // array: `d[i] = v` (LRM 7.5) notifies a waited-on dynamic array's mutation on
-// a for-write element select (ElemSelect::for_write, LlvmBackend.cpp); a fixed
+// a for-write element select (ElemSelect::for_write, src/ir/llvm/); a fixed
 // array has no handle to notify through, so the flag stays off there exactly
 // as it always has.
 void Lowerer::emit_indexed_slice_copy(const RangeSelectExpression& rs,

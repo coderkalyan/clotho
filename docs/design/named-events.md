@@ -25,7 +25,7 @@ subscription, coroutine suspend, and wake-on-change are LLVM coroutines plus
 module-global arrays, all keyed by a `Signal` handle:
 
 - Per-signal wait buckets `clotho.wait.<sig>.{sta,dyn}.{pos,neg,any}`
-  (`build_wait_queues`, `LlvmBackend.cpp`), entry `{ ptr handle, ptr sched_flag }`.
+  (`build_wait_queues`, `ir/llvm/Events.cpp`), entry `{ ptr handle, ptr sched_flag }`.
 - Subscribe: `emit_static_subscribe` (always @), `emit_dynamic_register`
   (intra-body @).
 - Wake: a blocking store calls `service_wait_queue(sig, old, new, …)` →
@@ -123,8 +123,8 @@ multidimensional-array VCD guards.
 
 | Construct | Location today |
 |---|---|
-| `event e;` | `lower_type` `fail("unsupported non-integral type")`, `Lower.cpp:797` (TODO already names event) |
-| `-> e`, `wait(...)` | `lower_stmt` `default: fail("unsupported statement")`, `Lower.cpp:2088` |
+| `event e;` | `lower_type` `fail("unsupported non-integral type")`, `lower/Lowerer.cpp` (TODO already names event) |
+| `-> e`, `wait(...)` | `lower_stmt` `default: fail("unsupported statement")`, `lower/Statements.cpp` |
 | `e.triggered` | never reached (type rejected) |
 
 ## Tier 1 work items

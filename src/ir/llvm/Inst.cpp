@@ -47,7 +47,7 @@ llvm::FunctionCallee Backend::str_repl_fn() {
 
 // [[noreturn]] void rt_string_repl_invalid(i64 count, i32 unknown, ptr site, i64 now)
 // — the located fatal for a negative or x/z runtime replication multiplier
-// (the LRM 11.4.12.1 string deviation; see Lower.cpp's Replication case).
+// (the LRM 11.4.12.1 string deviation; see lower/Expr.cpp's Replication case).
 llvm::FunctionCallee Backend::str_repl_invalid_fn() {
     return rt_fn("rt_string_repl_invalid", b_.getVoidTy(),
                  { b_.getInt64Ty(), b_.getInt32Ty(), raw_ptr_ty(), b_.getInt64Ty() });
@@ -2210,7 +2210,7 @@ void Backend::lower_inst(Index i) {
             return;
         case Inst::Tag::StrRepl: {
             // {count{s}} with a RUNTIME count — the deliberate LRM 11.4.12.1
-            // string deviation (see Lower.cpp's Replication case). Zero is
+            // string deviation (see lower/Expr.cpp's Replication case). Zero is
             // the clause's own legal case and yields "" in rt_string_repl;
             // a negative count is refused there (the count crosses the ABI
             // signed, like rt_dynarr_new's). An x/z count is probed HERE,

@@ -17,7 +17,7 @@
 // action block ran when.
 //
 // Clotho lowers this. It did NOT when this file was written: its reactive safety
-// check (src/Lower.cpp) whitelisted only the suspension-free action block plus two
+// check (src/lower/Lowerer.h) whitelisted only the suspension-free action block plus two
 // cases the region set already handled -- a nonblocking assignment, which commits
 // in Re-NBA, and a bare `#0`, which parks in Re-Inactive -- and refused everything
 // else because every other wake path pushed the resumed handle onto the ACTIVE

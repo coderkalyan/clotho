@@ -572,7 +572,7 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
     //    parked coroutine records the region it parked from, and every wake path
     //    -- a static subscription, the timer wheel, a join record -- pushes the
     //    handle onto the ring that handle names rather than onto the Active one
-    //    (emit_wake_push, src/ir/LlvmBackend.cpp), so a body that blocks on an
+    //    (emit_wake_push, src/ir/llvm/Scheduler.cpp), so a body that blocks on an
     //    event comes back in Reactive. LRM 24.3.1 asks for exactly that, and asks
     //    it of the THREAD rather than of the wake site -- said there of the region
     //    set's other inhabitant, a program block, which clotho already runs this
@@ -585,7 +585,7 @@ struct ReactiveSafetyChecker : ASTVisitor<ReactiveSafetyChecker, VisitFlags::All
     //    drain, so emit_monitor_finish lowers the action straight into a Final
     //    process instead of pending a body nothing would resume. That process is
     //    resumed exactly once and then destroyed (emit_finals_run in
-    //    LlvmBackend.cpp), and no later region exists to bring it back -- so a
+    //    ir/llvm/Scheduler.cpp), and no later region exists to bring it back -- so a
     //    suspension there drops everything after it without a word, which is the
     //    one outcome PRINCIPLES.md forbids outright.
     //

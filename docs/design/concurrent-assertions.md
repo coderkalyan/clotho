@@ -104,30 +104,30 @@ Every SVA construct dies in a generic `default:` arm:
 
 | Construct | slang node | Site | Message |
 |---|---|---|---|
-| `assert`/`assume`/`cover`/`restrict`/`expect property` | `ConcurrentAssertionStatement` | `src/Lower.cpp:5761` | `unsupported statement` |
-| `sequence` / `property` / `let` / `clocking` / `checker` decl | `SymbolKind::{Sequence,Property,LetDecl,ClockingBlock,Checker}` | `src/Lower.cpp:963` | `unsupported module member kind=…` |
-| checker instance array | — | `src/Lower.cpp:1033` | `unsupported instance array element kind=…` |
-| `$rose`/`$fell`/`$stable`/`$changed`/`$past`/`$sampled` | `CallExpression` | `src/Lower.cpp:9040` | `unsupported system function '$rose'` |
-| `$assertoff` family | `CallExpression` | `src/Lower.cpp:7887` | `unsupported system task '$assertoff'` |
-| named sequence/property *use* | `ExpressionKind::AssertionInstance` | `src/Lower.cpp:11025` | `unsupported expression kind=AssertionInstance` |
-| `@(posedge clk)` as an expression | `ExpressionKind::ClockingEvent` | `src/Lower.cpp:11025` | `unsupported expression kind=ClockingEvent` |
+| `assert`/`assume`/`cover`/`restrict`/`expect property` | `ConcurrentAssertionStatement` | `src/lower/Statements.cpp, lower_stmt` | `unsupported statement` |
+| `sequence` / `property` / `let` / `clocking` / `checker` decl | `SymbolKind::{Sequence,Property,LetDecl,ClockingBlock,Checker}` | `src/lower/Hierarchy.cpp, lower_members` | `unsupported module member kind=…` |
+| checker instance array | — | `src/lower/Hierarchy.cpp, lower_instance_array` | `unsupported instance array element kind=…` |
+| `$rose`/`$fell`/`$stable`/`$changed`/`$past`/`$sampled` | `CallExpression` | `src/lower/SystemTasks.cpp, lower_sysfunc` | `unsupported system function '$rose'` |
+| `$assertoff` family | `CallExpression` | `src/lower/Subroutines.cpp, lower_call` | `unsupported system task '$assertoff'` |
+| named sequence/property *use* | `ExpressionKind::AssertionInstance` | `src/lower/Expr.cpp, lower_expr` | `unsupported expression kind=AssertionInstance` |
+| `@(posedge clk)` as an expression | `ExpressionKind::ClockingEvent` | `src/lower/Expr.cpp, lower_expr` | `unsupported expression kind=ClockingEvent` |
 
 Two corrections to earlier notes, because they change where the work goes:
 
-1. **`src/Lower.cpp:5761` is the `default:` arm of `lower_stmt`, not a
+1. **`src/lower/Statements.cpp, lower_stmt` is the `default:` arm of `lower_stmt`, not a
    `case StatementKind::ConcurrentAssertion`.** That case label does not exist.
 2. **A module-item `assert property` never reaches the module-member switch.**
    slang wraps `ConcurrentAssertionMemberSyntax` in a
    `ProceduralBlockSymbol(Always, isFromAssertion = true)`
    (`build/_deps/slang-src/source/ast/symbols/BlockSymbols.cpp:433-437`), so it
-   arrives via `lower_procedural_block` (`src/Lower.cpp:5182`) → `lower_forever`
-   (`:6351`) → `lower_stmt` (`:5632`) → `:5761`. **No new module-member case is
+   arrives via `lower_procedural_block` (`src/lower/Statements.cpp`) → `lower_forever`
+   → `lower_stmt` → its `default:` arm. **No new module-member case is
    needed**; the whole structural seam is `lower_procedural_block` +
    `lower_stmt`. Clotho never reads `isFromAssertion`.
 
-`src/Lower.cpp:5963` (`only immediate assert / assume / cover are supported`) is
+`src/lower/Assertions.cpp, lower_immediate_assertion` (`only immediate assert / assume / cover are supported`) is
 on `ImmediateAssertionStatement` and is **unreachable from any concurrent form**.
-Its TODO at `:5961-5962` must be split accordingly.
+Its TODO in `lower_immediate_assertion` must be split accordingly.
 
 ### 2.1 What slang precomputes, free
 
@@ -226,7 +226,7 @@ code.
 
 There is **no region type at all.** Regions are LLVM basic blocks inside one
 JIT'd function `sim_drain`, built by `emit_active_run`
-(`src/ir/LlvmBackend.cpp`). The reactive set is complete:
+(`src/ir/llvm/Scheduler.cpp`). The reactive set is complete:
 
 | LRM region | clotho | Where |
 |---|---|---|
@@ -254,7 +254,7 @@ settled point and is already where VCD samples (`rt_vcd_flush` is documented as 
 region from the scope entirely. Two consequences to handle:
 
 - Time zero has no previous Postponed, so `emit_main` takes one initial sample
-  after `init_state()` (`src/ir/LlvmBackend.cpp:3952`). This also supplies the
+  after `init_state()` (`src/ir/llvm/StateLayout.cpp`). This also supplies the
   *default sampled value* LRM 16.5.1 requires for value-change functions called
   at or before the first clocking event.
 - LRM 4.4.2.9 forbids value changes in Postponed. Clotho's shadows are
@@ -263,7 +263,7 @@ region from the scope entirely. Two consequences to handle:
   recording as a deliberate reading rather than passing over in silence.
 
 The alternative hook, if a real Preponed region is ever wanted, is
-`sim_drain`'s `wheel.inertial` block (`src/ir/LlvmBackend.cpp:7014-7019`): it runs
+`sim_drain`'s `wheel.inertial` block (`src/ir/llvm/Scheduler.cpp, emit_active_run`): it runs
 after `rt_wheel_advance` fires timers but before any body executes, which is
 exactly the Preponed position. It is strictly more work for the same result.
 
@@ -297,15 +297,15 @@ assertions are procedural: the action block runs inline in whatever region the
 process is executing. Deferred immediate (LRM 16.4) reports mature in Observed
 (`#0`) or Postponed (`final`), which is what `rt_defer_report` /
 `rt_observed_flush` / `rt_defer_flush_final` already do
-(`src/ir/LlvmBackend.cpp:6929-6939`). What changes for them is only that the
+(`src/ir/llvm/Scheduler.cpp, emit_active_run`). What changes for them is only that the
 Reactive region's existence lets clotho close the deferred-assertion gap in `docs/TODO.md`.
 
 ### 3.4 Where a monitor runs
 
 A monitor is stepped once per clock tick. The trigger for that tick is an
 ordinary edge on the clock signal, which clotho already detects at the clock
-writer's store site (`emit_edge_facts`, `src/ir/LlvmBackend.cpp:6019`), including
-the 4-state edge lattice `0 < x/z < 1` at `:6031-6041` — so `@(posedge clk)` from
+writer's store site (`emit_edge_facts`, `src/ir/llvm/Events.cpp`), including
+the 4-state edge lattice `0 < x/z < 1` there — so `@(posedge clk)` from
 X to 1 is an edge, per LRM, for free.
 
 The monitor therefore is an `ir::Process` whose sensitivity is
@@ -416,7 +416,7 @@ Observed, needs a purity argument clotho cannot yet make, and stores per-asserti
 state where per-variable state is shared.
 
 The shadow is a third instance of a pattern clotho already has twice: the NBA
-shadow (`Anchor::shadow_ty`/`shadow_gv`, `src/ir/LlvmBackend.cpp:566-568`) and
+shadow (`Anchor::shadow_ty`/`shadow_gv`, `src/ir/llvm/Backend.h, Anchor`) and
 the VCD shadow (`VcdVar::shadow`, `src/runtime/Runtime.cpp:4350-4354`). The
 shadow set is exactly "variables referenced by some assertion expression",
 computed in the frontend, and assertion-expression lowering resolves a signal
@@ -555,7 +555,7 @@ machinery. It does not, for a structural reason worth stating precisely:
   to make a signal's *identity* scope-relative.
 - **Every `InstanceScope` occurrence gets its own LLVM global**
   (`Anchor::state_gv`, `@clotho.inst.<hier>.state`,
-  `src/ir/LlvmBackend.cpp:710-713`, built by `emit_state_global`). A `Load`/
+  `src/ir/llvm/Backend.h, Anchor`, built by `emit_state_global`). A `Load`/
   `Store` of a signal addresses it through ITS OWN declaring scope's anchor,
   looked up from the signal's own recorded home
   (`build_state_types`/`scope_type`), never from "the scope of the process
@@ -564,7 +564,7 @@ machinery. It does not, for a structural reason worth stating precisely:
   whether two structurally-identical processes across sibling instances can
   share one compiled function body, addressed through a runtime anchor
   parameter instead of a baked-in global (`Anchor::indirect`,
-  `src/ir/LlvmBackend.cpp:3833-3841`) — and an ordinary hierarchical read
+  `src/ir/llvm/StateLayout.cpp, build_state_types`) — and an ordinary hierarchical read
   already exercises exactly this path when the reading process is deduped,
   since `dif.sig` read from a deduped `always` block already had to work.
 
@@ -631,7 +631,7 @@ hop (`assert` in `A` sampling a signal inside `A.b.c`, where `b` instantiates
 `$stable`/`$changed`'s own "plain variable" operand check (§4.1) tested only
 `operand.kind == ExpressionKind::NamedValue`, never
 `ExpressionKind::HierarchicalValue` — the kind slang gives a dotted path like
-`dif.sig`, distinct from a bare name, everywhere else in `Lower.cpp` checked
+`dif.sig`, distinct from a bare name, everywhere else in `src/lower/` checked
 alongside `NamedValue` wherever a hierarchical reference is legal. Sampled-
 value functions had never needed the distinction before, because
 `sampled_shadow_of` refused any hierarchical `live` upstream regardless.
@@ -677,9 +677,9 @@ one bit — nothing is bit-blasted, and no per-bit atom is ever created. LRM 16.
 
 "Interpreted the same way as … a procedural `if`" is a direct instruction to reuse
 the existing path, and clotho's is exactly right: `lower_predicate`
-(`src/Lower.cpp:5814`) emits `ir::Inst::Tag::RedOr` over the lowered expression,
+(`src/lower/Statements.cpp, lower_predicate`) emits `ir::Inst::Tag::RedOr` over the lowered expression,
 and the backend's `Cond` tests `must_of(v) != 0`
-(`src/ir/LlvmBackend.cpp:16353-16355`, commented "must=1 holds only for a definite
+(`src/ir/llvm/Inst.cpp, lower_cond`, commented "must=1 holds only for a definite
 1 … so X/Z fall through to else automatically"). `must(RedOr(v))` is "some bit of
 `v` is definitely 1" — confirmed against iverilog: `if (4'b001x)` is taken,
 because a definite 1 bit makes the value nonzero regardless of the X.
@@ -792,16 +792,16 @@ A clock edge out of X is a real edge, because clotho's existing edge lattice
 ### 5.5 Atom identity
 
 Identity affects size, never correctness. There is no expression-identity or CSE
-map in clotho: `sigmap_` (`src/Lower.cpp:13536`) is `ValueSymbol* -> ir::Signal`
+map in clotho: `sigmap_` (`src/lower/Lowerer.h`) is `ValueSymbol* -> ir::Signal`
 only, and nothing keys on an `Expression*`. An atom is keyed by **(canonical
 expression, polarity)**:
 
 - A plain reference to a `ValueSymbol` keys on `canonical_value_symbol(sym)`
-  (`src/Lower.cpp:95`) plus polarity, reusing the canonicalization `signal_of`
+  (`src/lower/Scans.cpp, canonical_value_symbol`) plus polarity, reusing the canonicalization `signal_of`
   already performs. That covers `req`, `ack`, `valid` — the overwhelming majority,
   and it is the case where "atoms are just signals" is literally true.
 - Anything else keys on `const Expression*` pointer identity plus polarity, the
-  idiom `stmt_force_site_` already uses (`src/Lower.cpp:3969`). Two textually
+  idiom `stmt_force_site_` already uses (`src/lower/Nets.cpp, register_net_force_site`). Two textually
   identical but distinct `Expression` nodes yield two atoms; the cost is a wider
   valuation and a coarser cube.
 
@@ -978,7 +978,7 @@ translating `atom(k)` to the clotho `ir::Index` it assigned atom `k`, and
 
 Monitor runtime state is a set of **hidden 2-state signals** per assertion
 instance, not a new storage mechanism. Hidden compiler-internal signals are an
-existing idiom (`force_site`, `src/Lower.cpp:3931-3941`), inheriting storage
+existing idiom (`force_site`, `src/lower/Nets.cpp, register_net_force_site`), inheriting storage
 layout, per-instance addressing and zero-init:
 
 | Signal | Type | Purpose |
@@ -1030,7 +1030,7 @@ the second cycle of `##[1:2]`. `depth = 3` is the longest match — `ack`, fille
 
 Clotho has **no word-array bitset arithmetic**: every value is a single
 arbitrary-precision LLVM integer `iW` (`struct Plane`,
-`src/ir/LlvmBackend.cpp:111`). That is an advantage. An `N`-state mask is one
+`src/ir/llvm/Backend.h, Plane`). That is an advantage. An `N`-state mask is one
 `iN`, LLVM legalizes it, libsva's `words` stride becomes irrelevant, and every
 `follow` row, `first`/`last` mask and `guard_states` row becomes an `iN`
 **immediate constant** — so the absence of a generic constant-table emitter does
@@ -1137,13 +1137,13 @@ than the whole assertion. Raw material exists on both sides: every
 (`build/_deps/slang-src/include/slang/ast/expressions/AssertionExpr.h:123`),
 `BinaryAssertionExpr` adds `opRange` (`:486`), `SequenceConcatExpr::Element` adds
 `delayRange` (`:365`). Reporting uses `report(Severity, code, msg, span)`
-(`src/Lower.cpp:1091`) with `DiagnosticOrigin::Rejected`, not `fail()`, because
+(`src/lower/Lowerer.cpp`) with `DiagnosticOrigin::Rejected`, not `fail()`, because
 these are diagnosable properties of legal source. `cur_range_` is already stamped
-with the statement's span at `lower_stmt`'s head (`:5633`), so `fail()` inside
+with the statement's span at `lower_stmt`'s head, so `fail()` inside
 assertion lowering needs no new plumbing.
 
 Failure *reports* reuse `rt_severity` (`src/runtime/Runtime.cpp:2953`) and the
-compile-time `banner_at` prefix (`src/Lower.cpp:1197`), scheduled into Reactive
+compile-time `banner_at` prefix (`src/lower/Lowerer.cpp`), scheduled into Reactive
 per §3.
 
 ---
@@ -1393,7 +1393,7 @@ wholesale: the default failure report, severity tasks and `$display` all work
 and resumes in Reactive at the same instant (`tests/sva/diff_action_delay.sv`).
 
 What an action block may contain is a **whitelist**, `ReactiveSafetyChecker`
-(`src/Lower.cpp`), so anything not on it is refused. The walk runs once per COPY
+(`src/lower/Lowerer.h`), so anything not on it is refused. The walk runs once per COPY
 of the action block, because there are two and they can run different things:
 
 - `Lowerer::require_reactive_safe` checks the copy the verdict pends into

@@ -130,7 +130,7 @@ tags them `[build|run]`, and `lint` and `synth`, which compile nothing, reject
 them. The rest of the "both" rows mean something to every command that reads
 source, and say so in their `commands` column.
 
-Sources always share one compilation unit (LRM 3.12; `Lower.cpp` forces
+Sources always share one compilation unit (LRM 3.12; `lower/Lower.cpp` forces
 `singleUnit`), so `` `define `` macros and `$unit` declarations span files.
 
 ### One parser

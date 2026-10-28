@@ -14,9 +14,9 @@ code and reads as proposal, but matches what shipped. Reconciliation:
   oracle case at all -- internal `$low()`/`$high()` errors -- consistent with
   iverilog's other string gaps; the LRM's own text is unambiguous here, so this
   needed no deviation record).
-- **Not done** (loud-fail, `Lower.cpp` `lower_foreach_dim`): dynamic arrays,
+- **Not done** (loud-fail, `lower/Statements.cpp` `lower_foreach_dim`): dynamic arrays,
   queues, associative arrays -- moot today since declaring one of these
-  anywhere already fails at the array's own type-lowering (`Lower.cpp:665`),
+  anywhere already fails at the array's own type-lowering (`lower/Types.cpp, lower_type`),
   before a `foreach` referencing it is ever reached. The guard exists for
   defense-in-depth (and to document intent) if partial support for those
   array kinds lands first.
@@ -55,8 +55,8 @@ code and reads as proposal, but matches what shipped. Reconciliation:
 
 Only one array kind is modeled at all: fixed-size unpacked arrays
 (`ir::Type::Kind::UnpackedArray`, declared `left`/`right` range,
-`Lower.cpp:654-660`). Every other unpacked-array kind loud-fails today at
-type-lowering (`Lower.cpp:662-665`: "dynamic / queue / associative arrays are
+`lower/Types.cpp, lower_type`). Every other unpacked-array kind loud-fails today at
+type-lowering (`lower/Types.cpp, lower_type`: "dynamic / queue / associative arrays are
 not supported"). No runtime representation exists for dynamic arrays, queues,
 or associative arrays (`src/runtime`). Packed multidim arrays are also an open
 TODO item (`docs/TODO.md` M3 "Data types").
@@ -82,13 +82,13 @@ const Statement& body;
 
 `IteratorSymbol` is a real `VariableSymbol` (carries `arrayType`,
 `indexMethodName`), so it should thread through the existing
-`declare_local`/lvalue path (`Lower.cpp:939`) like `ForLoopStatement.loopVars`
-does today (`Lower.cpp:1701-1703`) — not the synthetic-temp path `repeat` uses.
+`declare_local`/lvalue path (`lower/Types.cpp`) like `ForLoopStatement.loopVars`
+does today (`lower/Statements.cpp, lower_for`) — not the synthetic-temp path `repeat` uses.
 
 ## Lowering plan (fixed-size unpacked arrays only, first cut)
 
 - Add `case StatementKind::ForeachLoop:` to `lower_stmt`'s dispatch
-  (`Lower.cpp:1545-1559`, current `default: fail("unsupported statement")` at
+  (`lower/Statements.cpp, lower_stmt`, current `default: fail("unsupported statement")` at
   1575) calling new `lower_foreach`.
 - Guard first: if `arrayRef`'s type is anything but `UnpackedArray` with a
   known constant range (i.e. `LoopDim.range` has a value for every non-skipped
@@ -112,7 +112,7 @@ does today (`Lower.cpp:1701-1703`) — not the synthetic-temp path `repeat` uses
   primitive per dim — i.e. an N-dim foreach lowers to N nested `Loop` IR
   regions, innermost containing the user's body.
 - Element access inside the body reuses `ir::ElemSelect`
-  (`Ir.h:148-158`, used at `Lower.cpp:3858`/`4305`) keyed on the live counters.
+  (`Ir.h:148-158`, used at `src/lower/`) keyed on the live counters.
 - `continue` semantics: verify it already targets the correct (innermost)
   loop region under the existing nested-`Loop` lowering — should fall out for
   free since each dim is its own IR loop, but confirm against LRM's "innermost

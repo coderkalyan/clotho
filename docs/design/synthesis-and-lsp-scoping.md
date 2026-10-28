@@ -44,7 +44,7 @@ one that carries a label, and it still binds lexically: `NamedBlock` exists only
 for a block some `disable` in the same unit names, and the label selects which
 enclosing one to leave (LRM 9.6.2, `docs/design/disable.md`). The forms that
 would break structure — a remote target, a task target, `disable fork` — stay
-rejected in `lower_disable` (`Lower.cpp`). A netlist-first design would
+rejected in `lower_disable` (`lower/Statements.cpp`). A netlist-first design would
 *recover* if/case structure from a CFG; Clotho never loses it. `Cond`/`Switch`
 are muxes already.
 
@@ -60,7 +60,7 @@ biggest cleanup opportunity and §3.1's whole subject.
 - `ZElision.cpp`, as three separate whole-module walks: `compute_may_z`
   (monotone fixpoint over storage nodes), `compute_undriven`,
   `compute_partial_undriven` (per-bit masks).
-- `LlvmBackend.cpp`, as private methods of the lowering class, none reusable:
+- `src/ir/llvm/`, as private methods of the lowering class, none reusable:
   `nba_classify_ir`, `ptr_arg_signals`, `body_writes`, `is_simple_always`,
   `comb_fuse_verdict`, `compute_subscription_order`, `compute_fusion_groups`,
   `design_uses_{strobe,monitor,observed,defer}`, `report_dedup_stat`,
@@ -92,12 +92,12 @@ the shape is proven and recoverable from git history.
    kind, no source location. A definition instantiated twice is lowered twice
    (signals *and* processes); dedup is backend-only, hash-based, with admitted
    instance-sensitivity blockers. Port connections became continuous-copy
-   processes (`Lower.cpp:4850`); inout/ref ports alias to the parent's signal with
+   processes (`lower/Hierarchy.cpp, wire_ports`); inout/ref ports alias to the parent's signal with
    no record; multi-driver nets are structurally rewritten into N synthetic slot
    signals plus a synthesized resolver process; gates are folded to expressions at
    lower time.
 2. **One error, then abort.** `~290` `fail()` sites throw `LowerError`, caught once
-   at `Lower.cpp:13443`. `LowerResult::diagnostics` is a flat rendered
+   at `src/lower/`. `LowerResult::diagnostics` is a flat rendered
    `std::string` — no codes, severities, ranges, or notes.
 3. **`SourceLoc` is write-only.** Stored on every instruction
    (`[buffer:28 | offset:36]`), but `to_slang_location` has exactly one caller in
@@ -145,7 +145,7 @@ This is where these live:
 **One real hazard.** CSE of anything reading state is illegal across a `Store`,
 an effectful `Call`, or a suspension (`Delay`/`Wait`). So hash-consing must be
 keyed on a **memory generation counter** that bumps on any of those, and pure
-computations only. `SpeculationScan` / `is_speculation_safe` (`Lower.cpp:641`)
+computations only. `SpeculationScan` / `is_speculation_safe` (`lower/Scans.cpp`)
 already exists for the adjacent question, though note its polarity: it answers
 "safe to evaluate eagerly", which is strictly stronger than "pure" (it also
 excludes the trapping reads a CSE pass may legally keep).
@@ -153,7 +153,7 @@ This is the one genuine correctness risk in the plan and it
 wants a differential test against `--no-fold` from day one.
 
 **(b) A read-only analysis producing a side table.** The established pattern —
-`compute_may_z` → `SignalSlot::has_z`/`narrow` at `LlvmBackend.cpp:1709`. Nothing
+`compute_may_z` → `SignalSlot::has_z`/`narrow` at `src/ir/llvm/`. Nothing
 in the IR is touched; the backend consults the table while lowering.
 
 Critically: **iteration to fixpoint happens in the analysis lattice, not in the
@@ -293,7 +293,7 @@ Keep the fold rules in a helper callable outside `Builder` (§2.4).
 ### 3.3 `--x-opt`: SUPERSEDED by `x-semantics.md`
 
 This section proposed a single flag defined as "X resolves to 0, drop the may
-plane", reusing `assume_clean_` / `domain_fake` (`LlvmBackend.cpp:8343`). The
+plane", reusing `assume_clean_` / `domain_fake` (`src/ir/llvm/`). The
 research pass for S3 falsified its central premise and its performance claim, so
 it is superseded in full by `docs/design/x-semantics.md`. Retained here only as a
 record of what was wrong, because two of the errors are instructive:
@@ -328,7 +328,7 @@ abort. A design containing poison cannot be simulated or synthesized; it can be
 analyzed. That is the only way an editor buffer mid-keystroke is serviceable.
 
 Then **severity policy over one engine** — but the map is smaller than it looks.
-Most of what `Lower.cpp` sets is not policy at all: `MixedVarAssigns`,
+Most of what `src/lower/` sets is not policy at all: `MixedVarAssigns`,
 `MultipleContAssigns`, `Redefinition`, `RedefinitionDifferentType` and
 `MemberImplNotFound` are promoted because Clotho's signal model and symbol table
 cannot represent the alternative, so relaxing one yields a miscompile rather than
@@ -432,20 +432,20 @@ that look like logic and are not:
 
 - **Multi-driver nets** become N synthetic slot signals plus a synthesized resolver
   process folding them through `WireRes`/`WandRes`/`WorRes`/`StrengthRes`/`NetPull`
-  (`Lower.cpp:3366`, `:3509`). Synthesis must map this back to a tristate bus or a
+  (`lower/Nets.cpp, emit_wire_resolvers`). Synthesis must map this back to a tristate bus or a
   multi-driver error — not emit a resolution network.
-- **Port connections** become continuous-copy processes (`Lower.cpp:4850`).
+- **Port connections** become continuous-copy processes (`lower/Hierarchy.cpp, wire_ports`).
   Naively synthesized, every port becomes a buffer.
 - **force/release** wraps *every* ordinary write to a forceable variable in a
-  predicated store (`gated_store`, `Lower.cpp:4005`), emitting real
+  predicated store (`gated_store`, `lower/Nets.cpp`), emitting real
   `CaseEq`/`Land`/`Cond` branches into every writer. Naively synthesized, every
   forceable signal gains a mux in hardware. This is the worst one.
-- **`PreInit`** (declaration initializers, `Lower.cpp:6036`) is a process that
+- **`PreInit`** (declaration initializers, `lower/Statements.cpp, lower_for`) is a process that
   exists in no source; it maps to power-on/register-init state or must be dropped.
-- **`synth_event_net`** (`Lower.cpp:5261`) invents signals and continuous processes
+- **`synth_event_net`** (`lower/Timing.cpp`) invents signals and continuous processes
   for `@(posedge x.f)` and `@(arr[i])`.
 - **Gate primitives** are already folded to expressions at lower time
-  (`Lower.cpp:4593`), which is fine as logic — but drive strengths are gone.
+  (`lower/Nets.cpp, lower_gate`), which is fine as logic — but drive strengths are gone.
 
 Two ways to handle this, and the second is better:
 
@@ -1062,7 +1062,7 @@ Three requirements, all cheap if designed in and expensive to retrofit:
    already unrolled them for us, so this means the emitter needs the *original*
    structure — which is an argument that §3.7's `InstanceScope`-based emit-time
    reconstruction must retain generate-block identity, currently folded away
-   (`Lower.cpp:936-939`) and surviving only as a substring in the flattened name.
+   (`src/lower/`) and surviving only as a substring in the flattened name.
 3. **Emit a name-mapping sidecar** for every rename that could not be avoided:
    `original hierarchical path -> emitted path`, bidirectional. Table stakes for
    RTL-rewriting tools, and it costs nothing here because the JSON sidecar already
@@ -1143,7 +1143,7 @@ Detail per stage:
   - Absorbed: `compute_may_z`, `compute_undriven`, `compute_partial_undriven`,
     `ptr_arg_signals`, the `body_writes` lambda, `is_simple_always`,
     `comb_fuse_verdict` (+ its `CombFuse` enum), `process_has_deferred_severity`,
-    and all four `design_uses_*`. `LlvmBackend.cpp` shrank by ~435 lines.
+    and all four `design_uses_*`. `src/ir/llvm/` shrank by ~435 lines.
   - `tag_info()` is one exhaustive switch holding the comb-fusion purity
     WHITELIST and the thunk-elision BLACKLIST. Keeping the polarities apart is
     load bearing and is what the new tests pin: purity fails closed (a new opcode
@@ -1259,7 +1259,7 @@ Detail per stage:
     and recovered failures arrive interleaved in walk order.
 
   Still owed in S4: the three severity policies (the map is still hardcoded
-  simulation-tuned at `Lower.cpp`). Still owed for S7: total attribute
+  simulation-tuned at `lower/Lower.cpp`). Still owed for S7: total attribute
   pass-through and verbatim re-emission, which needs the four key spaces (signal,
   process, **instruction** for statement pragmas, and **InstanceScope** for
   instance attributes that flattening would otherwise strand) rather than the

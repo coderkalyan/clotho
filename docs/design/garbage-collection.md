@@ -99,7 +99,7 @@ first shipping configuration will not.
 
 ## 0. Why this exists
 
-`new` allocates and nothing frees. `LlvmBackend.cpp:11681-11698` says so at the
+`new` allocates and nothing frees. `ir/llvm/Inst.cpp, lower_inst` says so at the
 site:
 
 > Lifetime is leaked in V1 (LRM 8.4 objects are GC'd; a program cannot observe a
@@ -113,7 +113,7 @@ stops.
 
 The leak is also second-order: because a class body is never freed, every
 `string`, dynamic array, queue and associative array **inside** an object leaks
-its own heap too (`emit_class_body_init`, `LlvmBackend.cpp:1847-1861`, has no
+its own heap too (`emit_class_body_init`, `ir/llvm/Aggregates.cpp`, has no
 matching `emit_agg_deinit` call anywhere).
 
 **In scope.** Class bodies; the heap they own through managed properties; the
@@ -136,7 +136,7 @@ explicitly freed. A collector is not an excuse to delete a working ownership
 discipline.
 
 **Never in scope.** `chandle`. It is a foreign pointer from DPI code
-(`Lower.cpp:2123-2128`); clotho never allocates it and must never trace or
+(`lower/Types.cpp, lower_type`); clotho never allocates it and must never trace or
 reclaim it.
 
 ---
@@ -212,7 +212,7 @@ reclaim it.
 
 - **One extra header word, at offset −8.** Below the descriptor pointer, so
   `class_header_words()` stays 1, every property GEP index stays `1 + declIndex`,
-  and `$cast`'s negative-offset display arithmetic (`LlvmBackend.cpp:11722-11745`)
+  and `$cast`'s negative-offset display arithmetic (`ir/llvm/Inst.cpp, lower_inst`)
   is untouched. This is `jl_taggedvalue_t`'s placement for the same reason.
 
 - **Finalize; do not re-own.** A collected object runs a per-class finalizer that
@@ -225,7 +225,7 @@ reclaim it.
 
 **F1 — the scheduler has real quiescent points today, and will still have them
 under MT.** One sim thread runs JIT'd `main` → `rt_sim_run` → `sim_drain`; the
-whole event loop is emitted (`emit_active_run`, `LlvmBackend.cpp:8698-9340`), and
+whole event loop is emitted (`emit_active_run`, `ir/llvm/Scheduler.cpp`), and
 at its ring-empty edges — `active.check` with `head == tail`, `wheel.check`, and
 immediately after `rt_wheel_advance` returns — the native stack is exactly
 `main → rt_sim_run → sim_drain` and every process is suspended in its frame. The
@@ -235,8 +235,8 @@ ordering are defined across the whole design, so region boundaries are rendezvou
 points in any correct parallel scheduler.
 
 **F2 — a suspended process has no stack.** Processes and blocking tasks are LLVM
-switched-resume coroutines (`setPresplitCoroutine` at `LlvmBackend.cpp:3131`,
-`:3597`); the frame is `rt_alloc(coro.size)` (`:3168-3180`) and CoroSplit chooses
+switched-resume coroutines (`setPresplitCoroutine` at `ir/llvm/Subroutines.cpp, lower_group`);
+the frame is `rt_alloc(coro.size)` and CoroSplit chooses
 its layout. Two consequences, both measured:
 
 - LLVM's `RewriteStatepointsForGC` is not merely incomplete here, it is
@@ -250,12 +250,12 @@ its layout. Two consequences, both measured:
   legitimate mechanism, and it is how a frame's base and size reach the collector.
 
 **F3 — every class object already carries a type tag.** Field 0 is the descriptor
-pointer, stored at `new` (`LlvmBackend.cpp:11696`); the descriptor
-(`clotho.classdesc.<Ref>`, `:1765-1802`) is a private constant with the ancestor
+pointer, stored at `new` (`ir/llvm/Inst.cpp, lower_inst`); the descriptor
+(`clotho.classdesc.<Ref>`) is a private constant with the ancestor
 display at negative offsets from the vptr and the vtable at positive ones. Precise
 tracing costs one load plus one indirect table read. `class_body_ty` already knows
 exact byte offsets via `getStructLayout()`, and `collect_elem_leaves`
-(`:1419-1424`) already emits an `{offset, descriptor}` table.
+already emits an `{offset, descriptor}` table.
 
 **F4 — handles are bare, aligned, untagged 64-bit words.** `ClassNew` yields
 `ptrtoint` of the body (`:11697`); `HandleDeref` does `inttoptr` (`:11700-11714`);
@@ -267,7 +267,7 @@ today only because `rt_alloc` is the coroutine-frame allocator
 object.
 
 **F5 — the call ABI already carries a uniform extra pointer, and the reason is
-documented.** `declare_function` (`LlvmBackend.cpp:3478-3491`) threads the RNG
+documented.** `declare_function` (`ir/llvm/Subroutines.cpp`) threads the RNG
 state unconditionally:
 
 > The caller's xoshiro256++ state (LRM 18.13). Unconditional rather than gated on
@@ -286,8 +286,8 @@ prerequisites for evacuation, and they are all fixable (§8):
 
 | Mechanism | Where | What breaks if bodies move |
 |---|---|---|
-| Assoc keys on class handles | `Lower.cpp:1929-1931`, `emit_key_bytes` `LlvmBackend.cpp:13766-13795`, `Runtime.cpp:2058-2065,2124` | the handle's raw bits are big-endian-encoded into the `std::string` hash key *and* drive `first`/`next` ordering |
-| `ref` into a class property | `LlvmBackend.cpp:16368-16383`, `:3495-3505` | passed as a raw interior pointer with `clotho.ref.noepoch`, a compile-time-zero epoch that can never signal invalidation |
+| Assoc keys on class handles | `lower/Types.cpp, lower_type`, `emit_key_bytes` `ir/llvm/AssocArrays.cpp`, `Runtime.cpp:2058-2065,2124` | the handle's raw bits are big-endian-encoded into the `std::string` hash key *and* drive `first`/`next` ordering |
+| `ref` into a class property | `ir/llvm/StateLayout.cpp, ref_actual_arg` | passed as a raw interior pointer with `clotho.ref.noepoch`, a compile-time-zero epoch that can never signal invalidation |
 | `rt_ref_names` | `Runtime.cpp:3791-3809` | address-keyed linear scan; safe today only because no entry aims at a class body |
 
 ---
@@ -352,7 +352,7 @@ descriptor base instead would make the offset depend on the vtable slot count.
 ### 3.3 Containers and aggregates
 
 The one genuine gap in the existing descriptor vocabulary. `elem_ops_for`
-(`LlvmBackend.cpp:1428-1487`) classifies a class-handle element as `rt_elem_pod`
+(`ir/llvm/Containers.cpp`) classifies a class-handle element as `rt_elem_pod`
 (kind 0) with no leaf table, and `Runtime.h:871-873` says so outright — "A POD
 element (plane scalar / real / packed vector / class handle) is pure bytes". A
 container of handles therefore carries **zero** type information at runtime, so
@@ -367,7 +367,7 @@ heap block per entry and `unordered_dense` relocates them on rehash
 must be traced from their encoded bytes.
 
 `rt_elem_ops` is mirrored bit-for-bit by `elem_ops_ty()`
-(`LlvmBackend.cpp:1297-1305`) under an explicit "must match the runtime struct
+(`ir/llvm/Containers.cpp, elem_ops_ty`) under an explicit "must match the runtime struct
 exactly" contract, so this is a lockstep two-file edit.
 
 And one problem that is not a descriptor problem at all, which is the real reason
@@ -440,7 +440,7 @@ both survive 39 stress collections and decode back correctly through `m.first()`
 ### 3.4 chandle disambiguation
 
 After lowering, a `chandle` and a class handle are both a 64-bit two-state plane
-(`InternPool.cpp:177-180`, `Lower.cpp:2123-2128`); the distinction survives only
+(`InternPool.cpp:177-180`, `lower/Types.cpp, lower_type`); the distinction survives only
 in slang's AST. A "this plane slot is a GC handle" bit must be threaded from
 `lower_class_type` into `FrameSlot` / `SignalSlot` / `rt_elem_ops`, or a precise
 root table would trace foreign DPI pointers.
@@ -514,7 +514,7 @@ instructions **[probe]** — allocation throughput improves before any collectio
 benefit, on any collector, purely from inlining.
 
 **OOM.** `rt_alloc` returns null on failure and the `ClassNew` site deliberately
-does not check (`LlvmBackend.cpp:11706-11712` elides null guards on a fresh
+does not check (`ir/llvm/Inst.cpp, lower_inst` elides null guards on a fresh
 handle). The Immix allocator must preserve "never returns null" by taking the
 existing located-fatal path (`alloc_bytes`, `Runtime.cpp:4104-4128`) after a
 collection fails to satisfy the request.
@@ -525,21 +525,21 @@ collection fails to satisfy the request.
 
 | Roots | Mechanism | Precision |
 |---|---|---|
-| Design state: `@clotho.state`, `@clotho.inst.<hier>.state`, package variables, static class properties | Compile-time `clotho.gcroots` table of `{ ptr base, u32 nhandles, u32 offsets[] }`, emitted where `emit_main` already walks `slots_` (`LlvmBackend.cpp:5279-5291`); statics from `declare_static_prop` (`Lower.cpp:2229-2234`) | precise |
+| Design state: `@clotho.state`, `@clotho.inst.<hier>.state`, package variables, static class properties | Compile-time `clotho.gcroots` table of `{ ptr base, u32 nhandles, u32 offsets[] }`, emitted where `emit_main` already walks `slots_` (`ir/llvm/Scheduler.cpp`); statics from `declare_static_prop` (`lower/Types.cpp`) | precise |
 | Live coroutine frames (processes, blocking tasks, fork children) | Intrusive `{ prev, next, u64 size }` node in the frame, linked at the ramp, unlinked at frame free | conservative, validated, **pinning** |
 | Managed containers reachable from the above | `rt_elem_ops` walkers (§3.3) | precise |
 | NBA / intra staging images (`rt_nba_arr_slot`, `rt_intra_alloc`), `$strobe` / `$monitor` argument images, deferred-report queues | Registered with their element descriptor | precise |
-| Detached `->> #d e` timer node (`LlvmBackend.cpp:12646`), later `rt_event` waiter lists | Explicit root registration at creation | precise |
+| Detached `->> #d e` timer node (`src/ir/llvm/`), later `rt_event` waiter lists | Explicit root registration at creation | precise |
 | Wheel timers, wait buckets, the active ring, fork/disable records | Nothing to do — they hold *frame* pointers, and frames are enumerated above | — |
 | VCD var tables, `rt_ref_names`, `chandle` | **Not roots.** VCD caches only pointers into `clotho.state`; `chandle` is foreign | — |
 
 ### 5.1 Frame registration
 
-`build_frame_layout` (`LlvmBackend.cpp:3714-3786`) already places all SV locals in
+`build_frame_layout` (`ir/llvm/Subroutines.cpp`) already places all SV locals in
 a single `frame_ty_` struct alloca positioned after `llvm.coro.begin`, which is
 why the registry node can be an alloca too: CoroSplit hoists it into the frame and
 rewrites uses to a stable frame-interior address **[probe]**. The node records the
-frame base and `llvm.coro.size`, both already materialised at `:3168-3180` for the
+frame base and `llvm.coro.size`, both already materialised for the
 `rt_alloc` call. Under MT the registry becomes per-mutator lists spliced at the
 rendezvous, so registration stays uncontended.
 
@@ -901,7 +901,7 @@ should use this document's GC word and trace map. Two requirements follow:
    not drop it as a dead SSA value at the subscribe site (the mistake
    `fork-join.md:466-470` records for child process handles).
 2. A pending `->> #d e` timer node holds an event reference with no handle anywhere
-   (`LlvmBackend.cpp:12646`) and must be an explicit root until it fires.
+   (`src/ir/llvm/`) and must be an explicit root until it fires.
 
 **`std::weak_reference` (LRM 8.30)** becomes implementable: a weak table cleared
 after marking, before sweeping. `TODO.md` already notes it presupposes a
@@ -1175,11 +1175,11 @@ validate-on-trace as the canonical pair.
   introduced has since been lifted: class handles as container elements and aggregate
   leaves (P4, §3.3), and an associative-array key containing a class handle (§3.3a).
 - Event handles, event arrays, events as class properties — already guarded
-  (`Lower.cpp:2241`); guard stays until P4, and `named-events.md` Option A should
+  (`src/lower/`); guard stays until P4, and `named-events.md` Option A should
   adopt this document's header and trace map rather than inventing a second.
 - `std::mailbox`, `std::semaphore`, `process`, `std::weak_reference` — already loud
-  (`Lower.cpp:2160-2174`).
-- Virtual interfaces (`Lower.cpp:2138`) — unrelated to GC, but another
+  (`lower/Classes.cpp, lower_class_type`).
+- Virtual interfaces (`src/lower/`) — unrelated to GC, but another
   handle-shaped family; whether it becomes GC-managed is that design's question.
 - Compaction of the large-object space; user-visible pinning; `%p` of a handle
   (which under Track A prints an id, not an address).

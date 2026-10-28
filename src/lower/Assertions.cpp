@@ -1600,7 +1600,7 @@ ir::Signal Lowerer::sampled_shadow_of(ir::Signal live, std::string_view what) {
     // where the backend already knows how to address it relative to
     // `live` itself -- the same per-instance state addressing an ordinary
     // hierarchical read of `live` already uses (Anchor,
-    // src/ir/LlvmBackend.cpp), unlocked here simply by asking
+    // src/ir/llvm/Backend.h), unlocked here simply by asking
     // register_signal to attach the shadow to the right scope rather than
     // whichever one happens to be open. A null declaring_scope (package /
     // $unit) leaves the shadow unscoped too, so it becomes a flat

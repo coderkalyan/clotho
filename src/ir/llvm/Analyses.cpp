@@ -17,7 +17,7 @@ namespace clotho::ir::backend {
 //
 // A class handle is Kind::Class here, which is precisely what keeps a `chandle`
 // out of the table: chandle lowers to a plain unsigned 64-bit integer type
-// (Lower.cpp:2129-2135) and never reaches the Class arm. Tracing one would hand
+// (lower/Types.cpp, lower_type) and never reaches the Class arm. Tracing one would hand
 // the collector a foreign DPI pointer, which it never allocated
 // (docs/design/garbage-collection.md §0, "Never in scope").
 //
@@ -133,7 +133,7 @@ bool Backend::reaches_class_handle(Ref type) {
                 // `fields_id` stashes the interned KEY type and `right` flags a
                 // wildcard, whose key type is a canonical unsigned integral
                 // placeholder and so never a handle (InternPool.h:114-122,
-                // Lower.cpp:2285-2290).
+                // lower/Types.cpp, lower_type).
                 if (t.right == 0) {
                     work.push_back(static_cast<Ref>(t.fields_id));
                 }
@@ -1829,7 +1829,7 @@ size_t Backend::fork_ring_slots() const {
 // allocas plus the SSA values live across a suspend, nothing else:
 //
 //   1. a declared local, whose alloca CoroSplit hoists into the frame;
-//   2. a formal, including a method's implicit `this` (Lower.cpp:2822-2824). The
+//   2. a formal, including a method's implicit `this` (lower/Subroutines.cpp, splice_this). The
 //      parameter copies are frame locals as well, but an output / inout / ref
 //      formal's slot holds a pointer instead of the value, so both lists are
 //      walked rather than assuming one covers the other;
@@ -1840,7 +1840,7 @@ size_t Backend::fork_ring_slots() const {
 //      back to its object precisely so it needs no epoch machinery
 //      (Gc.h:281-287). Unconditional, because the direction is caller-chosen:
 //      that includes a fork child, whose every formal is an ArgDir::Ref capture
-//      of an enclosing frame slot (Lower.cpp:22605-22632) and which may capture a
+//      of an enclosing frame slot (lower/Statements.cpp, lower_fork) and which may capture a
 //      formal that is itself a `ref` bound to an object interior;
 //   4. an SSA temporary CoroSplit spills at an offset nobody controls, which is
 //      why the last test is over VALUES and not only over declared storage;

@@ -50,7 +50,7 @@ helpers with §14 P5 and nothing else.
 
 ### 2.1 What is refused
 
-`src/Lower.cpp:2627-2630`, inside `lower_class_type`'s property-index pass, before
+`src/lower/Classes.cpp, lower_class_type`, inside `lower_class_type`'s property-index pass, before
 the property is given a field index:
 
 ```cpp
@@ -64,7 +64,7 @@ if (prop.randMode != slang::ast::RandMode::None) {
 rewrites any `MethodFlags::Randomize` subroutine into a system call
 (`build-asan/_deps/slang-src/source/ast/expressions/CallExpression.cpp:107-121`), so
 both reach the terminal `fail("unsupported system function '" + name + "'")` at
-`src/Lower.cpp:17212`, or its statement-position twin at `src/Lower.cpp:15912`. Same
+`src/lower/SystemTasks.cpp, lower_sysfunc`, or its statement-position twin at `src/lower/Subroutines.cpp, lower_call`. Same
 for the per-property `x.rand_mode(...)` and `c1.constraint_mode(...)`, which slang
 also models as system methods (`NonConstFuncs.cpp:203-240`, registered `:666-669`).
 
@@ -74,8 +74,8 @@ None of these refusals has a test. `tests/class_test.cpp` contains no `rand`,
 ### 2.2 What is silently accepted
 
 A `constraint` block is **ignored with no diagnostic**. `lower_class_type` enumerates
-`membersOfType<ClassPropertySymbol>()` (`src/Lower.cpp:2621`, `:2637`) and
-`membersOfType<SubroutineSymbol>()` (`:2719`); a `ConstraintBlockSymbol` matches
+`membersOfType<ClassPropertySymbol>()` (`src/lower/Classes.cpp, lower_class_type`) and
+`membersOfType<SubroutineSymbol>()` (`src/lower/Classes.cpp, compute_vtable`); a `ConstraintBlockSymbol` matches
 neither and there is no unknown-member backstop. Verified: `class C; int x;
 constraint c1 { x > 0; } endclass` compiles and runs clean (exit 0). This violates
 PRINCIPLES.md today, independently of anything in this document.
@@ -102,7 +102,7 @@ list that does not match the spliced call. Measured on the ASan build at "Merge 
 | `c.rand_mode(0);` | same |
 | `c.constraint_mode(0);` | same |
 | `c.set_randstate("abc");` | same |
-| `s = c.get_randstate();` | UBSan null load, `src/ir/LlvmBackend.cpp:20256`, then SIGSEGV |
+| `s = c.get_randstate();` | UBSan null load, `src/ir/llvm/`, then SIGSEGV |
 
 All five are legal SystemVerilog. Closing this is P0 (§14) and is worth landing on
 its own regardless of the rest of this design.
@@ -110,25 +110,25 @@ its own regardless of the rest of this design.
 ### 2.4 What already exists and is reusable
 
 - The RNG primitive: xoshiro256++ inlined by `emit_xoshiro_next`
-  (`src/ir/LlvmBackend.cpp:21925-21956`), and the only runtime entry point,
+  (`src/ir/llvm/Ops.cpp`), and the only runtime entry point,
   `void rt_urandom_seed(uint64_t* state, uint64_t seed)`
   (`src/runtime/Runtime.cpp:4970-4979`, exposed `src/ir/Jit.cpp:241`), a splitmix64
   expansion of one 64-bit selector into four state words. Both are reused verbatim.
 - The precedent for a body seeded from one draw of its creating context: the fork
-  child / deferred body at `src/ir/LlvmBackend.cpp:4920-4933`. The object seeding in
+  child / deferred body at `src/ir/llvm/`. The object seeding in
   §9 is byte-for-byte the same sequence.
 - The precedent for a reserved vtable slot: `kCopySlot` (`"$copy"`,
-  `src/Lower.cpp:23709`), reserved for every class at `src/Lower.cpp:2736-2739` and
-  called at `:22891`.
+  `src/lower/Lowerer.h, OpenBlock`), reserved for every class at `src/lower/Classes.cpp, compute_vtable` and
+  called through that slot.
 - The precedent for per-class synthesized code the runtime calls back into:
-  `clotho.classfini.<Ref>` (`src/ir/LlvmBackend.cpp:2186-2221`).
+  `clotho.classfini.<Ref>` (`src/ir/llvm/GcEmit.cpp, class_finalizer_fn`).
 
 ### 2.5 The constraint that shapes everything
 
 **A C++ runtime helper cannot address a class property.** The only offset channel
 from generated code to the runtime is `rt_gc_map::handles`, a `const uint32_t*` of
 byte offsets used for tracing (`src/runtime/Gc.h:86-93`, built by
-`class_handle_offsets`, `src/ir/LlvmBackend.cpp:2145-2168`); `leaves` is null in this
+`class_handle_offsets`, `src/ir/llvm/GcEmit.cpp`); `leaves` is null in this
 phase. Every field-touching operation in clotho is JIT-emitted. So `randomize()`
 cannot be `rt_randomize(handle)`; it must be generated code that knows the layout.
 That single fact decides §6 and §7.
@@ -184,7 +184,7 @@ LRM text. Each row was measured, not assumed.
 
 A class **owns a rand block** iff it, or any class in its base chain, declares at
 least one `rand`/`randc` property. The block is three kinds of ORDINARY class field,
-appended by `lower_class_type` (`src/Lower.cpp`) after every declared property:
+appended by `lower_class_type` (`src/lower/Classes.cpp`) after every declared property:
 
 | field | type | purpose |
 |---|---|---|
@@ -205,7 +205,7 @@ arithmetic (`4*depth - 64` off the vptr) depends on. Nothing above the propertie
 moves.
 
 The block holds no pointers, so `class_handle_offsets`
-(`src/ir/LlvmBackend.cpp:2145-2168`) yields the same handle list as before and the GC
+(`src/ir/llvm/GcEmit.cpp, class_handle_offsets`) yields the same handle list as before and the GC
 traces the object unchanged.
 
 Its field indices are decided and published to `class_rand_` BEFORE the second
@@ -217,7 +217,7 @@ to get.
 ### 5.2 Rand ordinals
 
 The rand ordinal space is the subsequence of `class_prop_index_`
-(`src/Lower.cpp:2619-2633`) whose `randMode != None`, in the same
+(`src/lower/Classes.cpp, lower_class_type`) whose `randMode != None`, in the same
 deepest-base-first order the property indices already use. So a derived class's
 ordinals extend the base's rather than renumbering them, and one flat `i64` mask
 covers the whole chain. More than 64 rand properties in one chain is refused loud
@@ -242,7 +242,7 @@ class descriptor — is rejected in §13.
 
 ## 6. Dispatch: two reserved vtable slots
 
-`compute_vtable` (`src/Lower.cpp:2715-2792`) already reserves `kCopySlot` for every
+`compute_vtable` (`src/lower/Classes.cpp`) already reserves `kCopySlot` for every
 class before user virtuals are numbered. Two more join it, unconditionally, so the
 slot numbers are design-wide constants:
 
@@ -264,7 +264,7 @@ property symbol and passes it as `arg` — the *ordinal* is static, only the blo
 address is not.
 
 `randomize` stays a genuine virtual, which the LRM requires. Note that
-`is_user_virtual` (`src/Lower.cpp:2654-2656`) keeps slang's built-in `randomize`
+`is_user_virtual` (`src/lower/Classes.cpp`) keeps slang's built-in `randomize`
 symbol out of ordinary slot allocation; that stays, because the slot is now reserved
 by name instead.
 
@@ -272,7 +272,7 @@ by name instead.
 
 ## 7. The generated body, and the solver seam
 
-`clotho.randomize.<Ref>` is built in `src/Lower.cpp` with the ordinary `ir::Builder`,
+`clotho.randomize.<Ref>` is built in `src/lower/` with the ordinary `ir::Builder`,
 like any other function, so it prints under `--emit ir`, is analyzed by
 `src/ir/Analysis.cpp`, and calls user hooks through the normal call ABI. Skeleton:
 
@@ -337,7 +337,7 @@ correctly randomizes the derived object it holds.
 
 Every rule consumes draws from the **object's** RNG via one primitive, `ObjRandom`
 (§10), which yields the high 32 bits of one xoshiro256++ step exactly as
-`lower_urandom` does (`src/ir/LlvmBackend.cpp:21958-21962`).
+`lower_urandom` does (`src/ir/llvm/Ops.cpp`).
 
 | field type | rule |
 |---|---|
@@ -407,7 +407,7 @@ prevent.
 
 ### 9.2 Consequence for the RNG-ownership analysis: none
 
-`ir_draws_rng` (`src/ir/LlvmBackend.cpp:7238-7263`) is the seed set that decides which
+`ir_draws_rng` (`src/ir/llvm/Analyses.cpp`) is the seed set that decides which
 bodies materialize their own frame state and which processes stay off the thunk path.
 Because the seeding draw at §9.1 is a real `Urandom` instruction in the constructing
 body, that machinery already does the right thing untouched: a process that
@@ -430,7 +430,7 @@ tag's doc comment so nobody "fixes" it later.
 
 `pre_randomize`/`post_randomize` are ordinary user functions reached by ordinary
 `Call`s, so if one of them draws `$urandom` the existing callee closure
-(`src/ir/LlvmBackend.cpp:7294-7327`, including the virtual-slot union at `:7279-7290`)
+(`src/ir/llvm/`, including the virtual-slot union)
 already charges the draw to the caller. Nothing to add.
 
 ---
@@ -461,8 +461,8 @@ Classification, per the six `-Werror=switch` sites and the two constexpr totalit
    arm; the two value-producing tags are 2-state with `val_x = 0`.
 4. `tag_name` — `src/ir/Printer.cpp:104-660`, plus the `OpExtra` render for
    `RandcNext` at `:882-1020` (that one has a silent `default:`).
-5. `compute_type` — `src/ir/LlvmBackend.cpp:12638-13045`.
-6. `lower_inst` — `src/ir/LlvmBackend.cpp:13301-15046`.
+5. `compute_type` — `src/ir/llvm/Inst.cpp`.
+6. `lower_inst` — `src/ir/llvm/Inst.cpp`.
 7. `Ir::operands` — `src/ir/Ir.cpp:143-296`: `RandcNext` needs an `if` in the
    `OpExtra` arm or its handle operand is invisible to every def-use walk. This one
    fails **silently**.
@@ -474,14 +474,14 @@ rejects anything whose `tag_info(...).synthesizable` is false, which is right �
 randomizing class is not hardware.
 
 Dedup: none of the three embeds a `Signal` or `FunctionId`, so the instance-specific
-blocker list at `src/ir/LlvmBackend.cpp:7515-7519` is unaffected.
+blocker list at `src/ir/llvm/` is unaffected.
 
 Nothing here suspends. `pre_randomize`/`post_randomize` are LRM `function`s and lower
 as atomic `Call`s, so the generated body stays a plain function and never needs the
 task ABI. If a future solver is ever allowed to consume time, its instruction has to
 be treated exactly like `TaskCall` — statement-only, coroutine-only, epoch-bracketed,
 `blocks_thunk`, and listed in both reactive backstops
-(`src/ir/LlvmBackend.cpp:5960-6013`, `:6022-6050`). Step 1 does not go there.
+(`src/ir/llvm/`). Step 1 does not go there.
 
 One new runtime symbol, `rt_randc_next`, declared in `src/runtime/Runtime.h`, defined
 `extern "C"` in `src/runtime/Runtime.cpp`, registered with one `expose(...)` line in
@@ -507,7 +507,7 @@ scope randomize and class randomize, which otherwise share
 - `arguments()[0]` of class-handle type → class randomize through an explicit handle;
 - no arguments → the enclosing scope decides (bare `randomize()` inside a class method
   resolves to the class member), and the implicit `this` comes from
-  `resolve_method_this` (`src/Lower.cpp:23204-23230`).
+  `resolve_method_this` (`src/lower/Subroutines.cpp`).
 
 Field rules are §8's, minus the class-handle and randc rows (a local cannot be
 `randc`). Return value 1.
@@ -569,14 +569,14 @@ field — a full reflection layer to avoid emitting a hundred bytes of straight-
 
 **The rand block in the object header, above the properties.** Rejected: it changes
 `class_header_words()` from 1 to 6, which moves every property GEP
-(`src/ir/LlvmBackend.cpp:2390`, and the sites at `:2208`, `:2285`), the `$cast`
+(`src/ir/llvm/`, and its call sites), the `$cast`
 display arithmetic, and the GC's assumption at `src/runtime/Gc.h:41-46` — and it taxes
 every class in the design, including the overwhelming majority with no rand property.
 
 **The rand-block offset in the class descriptor.** Rejected, though it is the closest
 call: it works, and it costs one extra load per access. But it also grows
 `%clotho.classdesc` for every class and adds a third variant to a struct whose shape
-already varies with `--gc` (`src/ir/LlvmBackend.cpp:1943-1949`). The vtable slot gets
+already varies with `--gc` (`src/ir/llvm/GcEmit.cpp, class_desc_ty`). The vtable slot gets
 the same polymorphism for free from machinery that already exists, and `randomize`
 has to be virtual anyway.
 
@@ -641,7 +641,7 @@ UVM-scale class count makes it matter.
 - **P5 — optional: the randstate codec.** `get_randstate` / `set_randstate` on an
   object: two `rt_*` helpers formatting and parsing four state words as 64 hex digits
   into a `clotho.str`, on the out-parameter convention
-  (`rt_string_itoa`, `src/ir/LlvmBackend.cpp:11720`), rejecting a foreign string with
+  (`rt_string_itoa`, `src/ir/llvm/Inst.cpp, str_itoa_fn`), rejecting a foreign string with
   a located fatal. Shared verbatim with `docs/design/process-class.md` §7.4, whichever
   lands first.
 

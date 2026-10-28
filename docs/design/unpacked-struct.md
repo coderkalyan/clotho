@@ -164,7 +164,7 @@ and drives an aggregate **net declaration assignment** (`wire p_t n = x;`) as a
 whole-object continuous copy — the same `AggCopy` (string-free memcpy) /
 per-leaf (string) path as a bare `assign a = b`, wrapped in the self-starting
 continuous process every continuous construct lowers to (`wire_ports` /
-`lower_net_initializer` in `Lower.cpp`, via `emit_port_agg_copy`). Port types
+`lower_net_initializer` in `lower/Nets.cpp`, via `emit_port_agg_copy`). Port types
 are equivalent (LRM 23.3.3), so both sides share the recursive storage layout
 and the memcpy is byte-valid.
 
@@ -216,7 +216,7 @@ needs no change beyond possibly a new access op (see §Frontend).
 
 ## The backend obstacle: SignalSlot is single-leaf
 
-`SignalSlot` (LlvmBackend.cpp) models one signal as **one homogeneous leaf
+`SignalSlot` (ir/llvm/Backend.h) models one signal as **one homogeneous leaf
 slot** `{ i(2W), iW }`, optionally arrayed to `[N x slot]` for a memory. Every
 consumer — `storage_ty`, `state_initializer`/`const_for_path`, `init_state`,
 the NBA shadow region, wait queues, `ElemSelect` stride math
@@ -241,7 +241,7 @@ slots. The GEP-path machinery already recurses `StructType` in
 naturally once the storage tree exists; `init_state`'s array/string special
 cases must be driven per-leaf over the tree instead of per top-level signal.
 
-### Frontend (Lower.cpp)
+### Frontend (src/lower/)
 
 1. `lower_type`: drop the unpacked `fail`; build `Kind::Struct is_packed=false`
    (field table already built for both paths).

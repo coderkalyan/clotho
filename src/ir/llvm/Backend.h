@@ -864,7 +864,7 @@ struct BackendError {
     std::string message;
     // Source extent of the offending construct. Filled in by lower_region for
     // any guard tripped while lowering an instruction, so the ~50 refusals under
-    // it need not thread a location by hand -- the same trick Lower.cpp's
+    // it need not thread a location by hand -- the same trick lower/Lowerer.h's
     // cur_range_ plays for the frontend's own ~290 lowering guards. Stays
     // invalid for a whole-design guard (an instance-hierarchy or DPI-signature
     // check), which has no construct to point at.

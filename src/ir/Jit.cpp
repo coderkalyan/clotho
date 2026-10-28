@@ -283,7 +283,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_gc_frame_link", &rt_gc_frame_link);
     expose("rt_gc_frame_unlink", &rt_gc_frame_unlink);
     // The safepoint's SLOW half only. Generated code polls rt_gc_mutator::request
-    // inline and names this on the taken edge alone (LlvmBackend.cpp
+    // inline and names this on the taken edge alone (ir/llvm/GcEmit.cpp
     // emit_gc_safepoint), so rt_gc_safepoint itself is no longer reachable from a
     // JIT'd module -- it stays in the ABI for the runtime's own call sites and the
     // tests, which link against it directly (Gc.h:242-245).

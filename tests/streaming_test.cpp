@@ -292,7 +292,7 @@ TEST_CASE("stream << x propagation") {
 
 // A dynamically sized stream reaching a FIXED packed target (LRM 11.4.14):
 // the runtime bit count decides fit/pad/overflow, so the stream is walked bit
-// by bit (stream_to_fixed in Lower.cpp) rather than concatenated at compile
+// by bit (stream_to_fixed in lower/Containers.cpp) rather than concatenated at compile
 // time. `s` is 5 bytes = 40 bits, exactly filling the 40-bit target, so this
 // case does not exercise padding -- see "narrower/wider/exact" below for that.
 TEST_CASE("stream a dynamically-sized string operand into a packed target (LRM 11.4.14)") {
@@ -548,7 +548,7 @@ TEST_CASE("streaming shapes that need bit-level realignment are rejected") {
 // LRM 11.4.14 (assignment target, non-streaming-concat case): "the stream ...
 // shall first be widened ... to left-align it in the target ... filling with
 // zero bits on the right" -- unconditionally, not just for `<<`. Clotho's own
-// already-tested FIXED-size lower_streaming_concat (Lower.cpp) implements
+// already-tested FIXED-size lower_streaming_concat (lower/Containers.cpp) implements
 // exactly that (concat the stream with a zero pad, then resize), regardless of
 // direction, and `rev` below matches it: 0xAA -> 0xAA000000.
 //
