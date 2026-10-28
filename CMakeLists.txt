@@ -465,6 +465,10 @@ add_library(clotho_ir STATIC
   src/ir/Jit.cpp
 )
 target_include_directories(clotho_ir PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${LLVM_INCLUDE_DIRS})
+# Every src/ir/llvm/ file opens with the internal Backend.h, which pulls in most of
+# LLVM; precompiling it once spares each file parsing LLVM again.
+target_precompile_headers(clotho_ir PRIVATE src/ir/llvm/Backend.h)
+set_source_files_properties(src/ir/Jit.cpp TARGET_DIRECTORY clotho_ir PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 # A machine with ROCm installed has a second LLVM under /opt/rocm, and
 # find_package picks it over the system one. That copy is built without RTTI, so
 # the backend emits references to `typeinfo for llvm::CallbackVH` that nothing
@@ -516,6 +520,18 @@ add_library(clotho STATIC
   src/Sva.cpp
 )
 target_include_directories(clotho PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Every src/lower/ file opens with the internal Lowerer.h, which pulls in most of
+# slang's AST; precompiling it once spares each file parsing slang again.
+target_precompile_headers(clotho PRIVATE src/lower/Lowerer.h)
+set_source_files_properties(src/Diagnostic.cpp src/SourceContext.cpp src/SourceMap.cpp src/Sva.cpp
+  TARGET_DIRECTORY clotho PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+# ccache caches a file compiled against a Clang PCH only when the PCH carries no
+# timestamp (https://ccache.dev/manual/4.7.4.html#_precompiled_headers); CI sets
+# the matching CCACHE_SLOPPINESS.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(clotho_ir PRIVATE "SHELL:-Xclang -fno-pch-timestamp")
+  target_compile_options(clotho PRIVATE "SHELL:-Xclang -fno-pch-timestamp")
+endif()
 target_link_libraries(clotho PUBLIC clotho_ir_core slang::slang)
 target_link_libraries(clotho PRIVATE clotho_warnings)
 

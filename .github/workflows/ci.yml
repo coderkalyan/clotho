@@ -31,6 +31,10 @@ env:
   MSYS2_LLVM_PKGREL: "3"
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 1G
+  # The frontend and backend precompile their internal headers; ccache only
+  # caches files built against a PCH with this sloppiness
+  # (https://ccache.dev/manual/4.7.4.html#_precompiled_headers).
+  CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
   # libsva is a Zig static library clotho's frontend links at build time
   # (docs/design/concurrent-assertions.md §1); pin the commit CI builds
   # against rather than floating on whatever main happens to be, since
