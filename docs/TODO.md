@@ -215,8 +215,7 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Cross-compiling an executable** — `build` writes one only for the machine it runs
   on; another target needs its executable runtime and C library startup files.
-- [ ] **Executables from a statically linked clotho** — it has no C library of its own to
-  link an executable against, and refuses.
+
 
 ### File and string I/O
 
