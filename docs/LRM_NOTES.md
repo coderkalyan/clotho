@@ -26,7 +26,7 @@ union one flat value as wide as its widest member, with every member overlaying
 the least significant bits: a member select is a low part-select, and a write to
 a narrower member leaves the bits above it untouched. Members must be integral.
 
-Code: `src/Lower.cpp` (`lower_type`, `expand_p_packed`). Tests: `tests/struct_test.cpp` ("unpacked union overlays members at the LSB (flat value, LRM 7.3)", "unpacked union: whole-union copy and nesting in an unpacked struct").
+Code: `src/lower/Types.cpp` (`lower_type`), `src/lower/SystemTasks.cpp` (`expand_p_packed`). Tests: `tests/struct_test.cpp` ("unpacked union overlays members at the LSB (flat value, LRM 7.3)", "unpacked union: whole-union copy and nesting in an unpacked struct").
 
 ## 4. Reading an element that does not exist (7.4.5, 7.10.2, Table 7-1)
 
@@ -34,7 +34,7 @@ An out-of-range or x/z-indexed array read, and `pop_front` or `pop_back` on an
 empty queue, yield the value Table 7-1 gives the element type: 0 for a 2-state
 element and x for a 4-state one. A 2-state element never reads as x.
 
-Code: `src/ir/LlvmBackend.cpp` (`slot_default_const`). Tests: `tests/memory_bounds_test.cpp` ("out-of-range read from a fixed-size unpacked array yields the element default", "an unknown (x) index into a fixed-size unpacked array is out of range"), `tests/queue_test.cpp` ("queue pop from empty 2-state queue is default 0", "queue 4-state defaults to x").
+Code: `src/ir/llvm/StateLayout.cpp` (`slot_default_const`). Tests: `tests/memory_bounds_test.cpp` ("out-of-range read from a fixed-size unpacked array yields the element default", "an unknown (x) index into a fixed-size unpacked array is out of range"), `tests/queue_test.cpp` ("queue pop from empty 2-state queue is default 0", "queue 4-state defaults to x").
 
 ## 5. Out-of-range positions of an indexed array slice (7.4.5)
 
@@ -44,7 +44,7 @@ part-select: a position outside the array reads the element default and drops
 its write, while in-range positions are unaffected. An x or z bit in `i` makes
 every position invalid, so the read is all default and the write does nothing.
 
-Code: `src/Lower.cpp` (`emit_indexed_slice_copy`, `materialize_indexed_slice`). Tests: `tests/assign_pattern_test.cpp` ("an out-of-range indexed slice reads the element default per position", "an x/z indexed slice base is an invalid index (LRM 7.4.5)").
+Code: `src/lower/Expr.cpp` (`emit_indexed_slice_copy`, `materialize_indexed_slice`). Tests: `tests/assign_pattern_test.cpp` ("an out-of-range indexed slice reads the element default per position", "an x/z indexed slice base is an invalid index (LRM 7.4.5)").
 
 ## 6. Overflowing a bounded queue (7.10.4)
 
@@ -61,7 +61,7 @@ seeds the result and a later one replaces it only when its comparison with the
 result is a definite 1, so a later element with unknown bits never replaces the
 result, and a tie keeps the earlier element.
 
-Code: `src/Lower.cpp` (`lower_array_iter_method`). Tests: `tests/array_locator_test.cpp` ("array min/max over 4-state elements skips unknowns").
+Code: `src/lower/Containers.cpp` (`lower_array_iter_method`). Tests: `tests/array_locator_test.cpp` ("array min/max over 4-state elements skips unknowns").
 
 ## 8. Reduction of an empty array (7.12.3)
 
@@ -69,7 +69,7 @@ Code: `src/Lower.cpp` (`lower_array_iter_method`). Tests: `tests/array_locator_t
 `product`, `and`, `or`, `xor`) of an empty array returns 0, not the operator's
 identity, so `product` and `and` give 0 as well.
 
-Code: `src/Lower.cpp` (`lower_array_iter_method`). Tests: `tests/array_locator_test.cpp` ("array reduction of an empty array is zero").
+Code: `src/lower/Containers.cpp` (`lower_array_iter_method`). Tests: `tests/array_locator_test.cpp` ("array reduction of an empty array is zero").
 
 ## 9. Inertial continuous-assignment delay (10.3.3)
 
@@ -78,7 +78,7 @@ NBA region where a procedural `<= #d` commits. Clotho commits the delayed value
 when the timing wheel reaches that time step, before any Active-region process
 runs, so every process in that time step reads the new value.
 
-Code: `src/ir/LlvmBackend.cpp` (`inertial_sigs_`, `emit_active_run`). Tests: `tests/continuous_assign_delay_test.cpp` ("inertial CA delay: pulse rejection and no-restart on same-value change").
+Code: `src/ir/llvm/Backend.h` (`inertial_sigs_`), `src/ir/llvm/Scheduler.cpp` (`emit_active_run`). Tests: `tests/continuous_assign_delay_test.cpp` ("inertial CA delay: pulse rejection and no-restart on same-value change").
 
 ## 10. Re-forcing a forced variable (10.6.2)
 
@@ -86,7 +86,7 @@ A second `force` on a variable supersedes the first, so a later change to the
 first force's right-hand side does not reach the variable. Each textual force
 site has its own id, and only the site whose id is current drives the variable.
 
-Code: `src/Lower.cpp` (`ForceInfo`). Tests: `tests/force_release_test.cpp` ("force: re-force is last-wins, old RHS link broken"). Design: `docs/design/force-release.md` (Model).
+Code: `src/lower/Lowerer.h` (`ForceInfo`). Tests: `tests/force_release_test.cpp` ("force: re-force is last-wins, old RHS link broken"). Design: `docs/design/force-release.md` (Model).
 
 ## 11. Keyed assignment pattern over a descending packed array (10.9)
 
@@ -96,7 +96,7 @@ ascending index and puts the lowest at the most significant end, which is wrong
 for a descending array, so Clotho reverses the element order there. Positional
 and replicated patterns stay in source order.
 
-Code: `src/Lower.cpp` (`lower_packed_pattern`). Tests: `tests/assign_pattern_test.cpp` ("packed array pattern: keyed, descending reverses (slang-bug workaround)").
+Code: `src/lower/Assign.cpp` (`lower_packed_pattern`). Tests: `tests/assign_pattern_test.cpp` ("packed array pattern: keyed, descending reverses (slang-bug workaround)").
 
 ## 12. Assignment-pattern lvalue member widths (10.9)
 
@@ -105,7 +105,7 @@ of bits as its right-hand element. Deviation: Clotho does not enforce that, and 
 mismatched member truncates or extends exactly as the plain assignment the
 pattern stands for. Not gated.
 
-Code: `src/Lower.cpp` (`store_pattern_elem`). Tests: `tests/assign_pattern_test.cpp` ("assignment-pattern lvalue: per-element width truncates like an ordinary assignment").
+Code: `src/lower/Assign.cpp` (`store_pattern_elem`). Tests: `tests/assign_pattern_test.cpp` ("assignment-pattern lvalue: per-element width truncates like an ordinary assignment").
 
 ## 13. Equality of unpacked aggregates with unknown members (11.2.2, 11.4.5)
 
@@ -114,7 +114,7 @@ per-member logical equality: a definite mismatch in any member gives 0,
 otherwise an unknown member gives x, otherwise 1. Queues of different sizes
 compare as a definite 0.
 
-Code: `src/ir/Ir.h` (`AggEq`), `src/ir/LlvmBackend.cpp` (`lower_agg_eq`). Tests: `tests/struct_test.cpp` ("unpacked struct equality is field-wise; X makes it ambiguous (LRM 11.4.5)"), `tests/assign_pattern_test.cpp` ("whole unpacked-array equality is per-element, X-propagating"), `tests/queue_test.cpp` ("queue equality with x-propagation").
+Code: `src/ir/Ir.h` (`AggEq`), `src/ir/llvm/Ops.cpp` (`lower_agg_eq`). Tests: `tests/struct_test.cpp` ("unpacked struct equality is field-wise; X makes it ambiguous (LRM 11.4.5)"), `tests/assign_pattern_test.cpp` ("whole unpacked-array equality is per-element, X-propagating"), `tests/queue_test.cpp` ("queue equality with x-propagation").
 
 ## 14. Short-circuit of `->` (11.3.5)
 
@@ -122,7 +122,7 @@ Code: `src/ir/Ir.h` (`AggEq`), `src/ir/LlvmBackend.cpp` (`lower_agg_eq`). Tests:
 `b` when `a` is a definite 0. `<->` is not on that list and 11.4.7 evaluates each
 of its operands exactly once, so its right operand always runs.
 
-Code: `src/Lower.cpp` (`lower_short_circuit`). Tests: `tests/function_test.cpp` ("-> short-circuits but <-> always evaluates its right operand").
+Code: `src/lower/Expr.cpp` (`lower_short_circuit`). Tests: `tests/function_test.cpp` ("-> short-circuits but <-> always evaluates its right operand").
 
 ## 15. `0 ** <negative>` in a 2-state result (11.4.3, 6.3.1)
 
@@ -130,7 +130,7 @@ Table 11-4 gives x for `0 ** n` with a negative `n`. A 2-state result converts
 that x to 0 as 6.3.1 does for any 4-state value, and a 4-state result keeps the
 x.
 
-Code: `src/ir/LlvmBackend.cpp` (`lower_pow`). Tests: `tests/llvm_backend_test.cpp` ("0 ** negative coerces X to 0 in a 2-state result").
+Code: `src/ir/llvm/Ops.cpp` (`lower_pow`). Tests: `tests/llvm_backend_test.cpp` ("0 ** negative coerces X to 0 in a 2-state result").
 
 ## 16. Nested streaming example (11.4.14.2)
 
@@ -147,7 +147,7 @@ The LRM does not define the truth of a string. The condition of an `if`,
 rejected, because Table 11-1 allows logical operators only on integral and real
 operands.
 
-Code: `src/Lower.cpp` (`lower_predicate`, `lower_unary`). Tests: `tests/string_test.cpp` ("if on a string tests emptiness", "ternary with a string condition selects by emptiness", "logical negation of a string is rejected").
+Code: `src/lower/Statements.cpp` (`lower_predicate`), `src/lower/Expr.cpp` (`lower_unary`). Tests: `tests/string_test.cpp` ("if on a string tests emptiness", "ternary with a string condition selects by emptiness", "logical negation of a string is rejected").
 
 ## 18. `unique` and `priority` violation reports (12.4.2, 12.5.3)
 
@@ -158,7 +158,7 @@ clear pending reports at flush points, so a statement that violates on several
 settle passes of one time step reports once per pass. Not gated; the gap is
 listed in `docs/TODO.md`.
 
-Code: `src/ir/LlvmBackend.cpp` (`lower_case_viol`), `src/runtime/Runtime.cpp` (`rt_observed_case_violation`, `rt_observed_flush`). Tests: `tests/case_test.cpp` ("priority case: Observed-region report is stamped with the settled instant"). Design: `docs/design/x-semantics.md` (Free wins needing no new semantics).
+Code: `src/ir/llvm/SystemTasks.cpp` (`lower_case_viol`), `src/runtime/Runtime.cpp` (`rt_observed_case_violation`, `rt_observed_flush`). Tests: `tests/case_test.cpp` ("priority case: Observed-region report is stamped with the settled instant"). Design: `docs/design/x-semantics.md` (Free wins needing no new semantics).
 
 ## 19. `case` with a real selector (12.5)
 
@@ -168,7 +168,7 @@ matches a real selector with each label by IEEE-754 equality: `-0.0` matches
 `0.0` and a NaN matches no label. slang rejects `casez` and `casex` over a real
 selector, and Clotho keeps that rejection.
 
-Code: `src/Lower.cpp` (`real_case_label_pred`). Tests: `tests/case_test.cpp` ("case with a real selector compares by value", "a real case stops the search at the first match"), `tests/real_test.cpp` ("casez / casex over a real is rejected").
+Code: `src/lower/Statements.cpp` (`real_case_label_pred`). Tests: `tests/case_test.cpp` ("case with a real selector compares by value", "a real case stops the search at the first match"), `tests/real_test.cpp` ("casez / casex over a real is rejected").
 
 ## 20. Dynamic arrays, queues and associative arrays as inputs (13.5)
 
@@ -176,7 +176,7 @@ These containers are values, so an `input` formal of one of their types gets a
 deep copy at the call, and the callee's writes, resizes and deletes never reach
 the caller's container.
 
-Code: `src/ir/LlvmBackend.cpp` (`emit_copyin`, `emit_handle_assign`). Tests: `tests/dynamic_array_test.cpp` ("dynamic array input argument is copy-in (value semantics)"), `tests/queue_test.cpp` ("queue input argument is copy-in (value semantics)"), `tests/associative_array_test.cpp` ("assoc input argument is copy-in").
+Code: `src/ir/llvm/Subroutines.cpp` (`emit_copyin`), `src/ir/llvm/Containers.cpp` (`emit_handle_assign`). Tests: `tests/dynamic_array_test.cpp` ("dynamic array input argument is copy-in (value semantics)"), `tests/queue_test.cpp` ("queue input argument is copy-in (value semantics)"), `tests/associative_array_test.cpp` ("assoc input argument is copy-in").
 
 ## 21. Immediate `cover` (16.3)
 
@@ -184,7 +184,7 @@ An immediate `cover` runs its pass action when its expression is true and does
 nothing when it is false. Deviation: Clotho keeps no hit count and prints no
 coverage report for it. Not gated.
 
-Code: `src/Lower.cpp` (`lower_immediate_assertion`). Tests: `tests/severity_test.cpp` ("immediate cover runs the pass action when true", "immediate cover does nothing when false: no pass action, no report"). Design: `docs/design/functional-coverage.md` (The precedent that is already silently wrong).
+Code: `src/lower/Assertions.cpp` (`lower_immediate_assertion`). Tests: `tests/severity_test.cpp` ("immediate cover runs the pass action when true", "immediate cover does nothing when false: no pass action, no report"). Design: `docs/design/functional-coverage.md` (The precedent that is already silently wrong).
 
 ## 22. `disable` of a procedure's outermost block (16.4.4)
 
@@ -204,7 +204,7 @@ and `cover property` counts attempts, not obligations. A monitor on the counted
 discipline still reports per obligation, because a counted obligation has no
 bounded lifetime to carry an attempt id through.
 
-Code: `src/Lower.cpp` (`attempt_ring_size`). Tests: `tests/sva_test.cpp` ("a twice-matching attempt reports only its first failing obligation", "a cover of an implication counts a twice-matching attempt once"), `tests/sva/diff_attemptverdict.sv`, `tests/sva/diff_multimatch.sv`. Design: `docs/design/concurrent-assertions.md` (What this document does not establish).
+Code: `src/lower/Lowerer.cpp` (`attempt_ring_size`). Tests: `tests/sva_test.cpp` ("a twice-matching attempt reports only its first failing obligation", "a cover of an implication counts a twice-matching attempt once"), `tests/sva/diff_attemptverdict.sv`, `tests/sva/diff_multimatch.sv`. Design: `docs/design/concurrent-assertions.md` (What this document does not establish).
 
 ## 24. Attempts that share an obligation (16.14.1)
 
@@ -215,7 +215,7 @@ the counted discipline, and reports each. An antecedent with no bounded longest
 match is refused rather than under-reported, and an abort over a multi-cycle
 antecedent resolves every attempt in flight.
 
-Code: `src/Lower.cpp` (`attempt_ring_size`, `emit_counted_step`), `src/Sva.cpp` (`abort_on`). Tests: `tests/sva_test.cpp` ("many attempts resolving in one cycle are reported once each", "goto and non-consecutive repetition in an antecedent are refused", "an abort over a multi-cycle antecedent resolves every attempt in flight"). Design: `docs/design/sva-property-layer.md` (Why Tier B needs a different discipline, and what it is).
+Code: `src/lower/Lowerer.cpp` (`attempt_ring_size`), `src/lower/SvaMonitor.cpp` (`emit_counted_step`), `src/Sva.cpp` (`abort_on`). Tests: `tests/sva_test.cpp` ("many attempts resolving in one cycle are reported once each", "goto and non-consecutive repetition in an antecedent are refused", "an abort over a multi-cycle antecedent resolves every attempt in flight"). Design: `docs/design/sva-property-layer.md` (Why Tier B needs a different discipline, and what it is).
 
 ## 25. `$urandom` generator (18.13)
 
@@ -234,14 +234,14 @@ precision. Clotho applies that literally, so a sum that does not fit wraps
 (`8'd200 + 8'd100` is 44 in 8 bits, and the first branch always wins), and an
 all-zero sum takes no branch.
 
-Code: `src/Lower.cpp` (`lower_randcase`). Tests: `tests/randcase_test.cpp` ("randcase sum precision is the widest weight (LRM 18.16)", "randcase sum wraps at the weight precision (LRM 18.16)").
+Code: `src/lower/Random.cpp` (`lower_randcase`). Tests: `tests/randcase_test.cpp` ("randcase sum precision is the widest weight (LRM 18.16)", "randcase sum wraps at the weight precision (LRM 18.16)").
 
 ## 27. `$bits` of a string (20.6.2)
 
 `$bits` of a `string` is evaluated at run time as 8 bits per current character,
 so the empty string gives 0.
 
-Code: `src/Lower.cpp` (`lower_bit_query`). Tests: `tests/sysfunc_test.cpp` ("$bits of a dynamic string is 8 per character").
+Code: `src/lower/SystemTasks.cpp` (`lower_bit_query`). Tests: `tests/sysfunc_test.cpp` ("$bits of a dynamic string is 8 per character").
 
 ## 28. Severity report layout (20.10)
 
@@ -263,7 +263,7 @@ with exit status 1, after its `final` blocks, whatever its finish number.
 `$finish` of any level, `$error`, `$warning` and a failed assertion leave the
 status 0.
 
-Code: `src/runtime/Runtime.cpp` (`severity_line`, `rt_severity`), `src/Lower.cpp` (`severity_banner`). Tests: `tests/severity_test.cpp` ("severity tasks render label + formatted message to stderr", "a labelled immediate assertion's report names the label"), `tests/exit_status_test.cpp` ("exit status: $fatal ends the run with status 1, whatever its finish number").
+Code: `src/runtime/Runtime.cpp` (`severity_line`, `rt_severity`), `src/lower/Lowerer.cpp` (`severity_banner`). Tests: `tests/severity_test.cpp` ("severity tasks render label + formatted message to stderr", "a labelled immediate assertion's report names the label"), `tests/exit_status_test.cpp` ("exit status: $fatal ends the run with status 1, whatever its finish number").
 
 ## 29. `$system` (20.17.1)
 
@@ -272,7 +272,7 @@ default. `--allow-system const` admits a command that folds to a constant at
 elaboration and `--allow-system full` admits any command. The function form
 returns the `system()` value unchanged, so its encoding is the C library's.
 
-Code: `src/Lower.cpp` (`lower_system_call`). Tests: `tests/system_test.cpp` ("$system is refused at compile time without --allow-system", "$system const tier requires a constant command string", "$system function form returns the raw system() status"). Design: `docs/design/cli.md` (Options).
+Code: `src/lower/SystemTasks.cpp` (`lower_system_call`). Tests: `tests/system_test.cpp` ("$system is refused at compile time without --allow-system", "$system const tier requires a constant command string", "$system function form returns the raw system() status"). Design: `docs/design/cli.md` (Options).
 
 ## 30. `-` flag and leading `0` in a format specification (21.2.1.2)
 
@@ -300,7 +300,7 @@ the implementation's, and Clotho separates them with `, `. A tagged union whose
 tag is x, z or names no member has no valid member, so its whole value prints as
 one decimal leaf.
 
-Code: `src/Lower.cpp` (`expand_p_lvalue`, `expand_p_packed`), `src/runtime/Runtime.cpp` (`rt_tagged_format_p`). Tests: `tests/display_test.cpp` ("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"), `tests/struct_test.cpp` ("whole unpacked struct as a $display %p operand renders a pattern", "%p of a tagged union whose tag is x falls back to the flat value"). Design: `docs/design/tagged-unions.md` (`%p` (LRM 21.2.1.6)).
+Code: `src/lower/SystemTasks.cpp` (`expand_p_lvalue`, `expand_p_packed`), `src/runtime/Runtime.cpp` (`rt_tagged_format_p`). Tests: `tests/display_test.cpp` ("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"), `tests/struct_test.cpp` ("whole unpacked struct as a $display %p operand renders a pattern", "%p of a tagged union whose tag is x falls back to the flat value"). Design: `docs/design/tagged-unions.md` (`%p` (LRM 21.2.1.6)).
 
 ## 33. Leading NUL bytes under `%s` (21.2.1.7)
 
@@ -324,7 +324,7 @@ an `always` block sensitive to a variable it stored, runs before the implicit
 `$finish`. Clotho stops at once and empties the run queues exactly as an explicit
 `$finish` does, so that work does not run.
 
-Code: `src/ir/LlvmBackend.cpp` (`emit_program_end`, `lower_finish`). Tests: `tests/program_test.cpp` ("implicit finish does not drain work the last program initial woke").
+Code: `src/ir/llvm/Scheduler.cpp` (`emit_program_end`), `src/ir/llvm/SystemTasks.cpp` (`lower_finish`). Tests: `tests/program_test.cpp` ("implicit finish does not drain work the last program initial woke").
 
 ## 36. Re-export through `export p::*` (26.4)
 
@@ -341,7 +341,7 @@ Tables 28-5 and 28-6 give L (0 or z) or H (1 or z) for an x or z control.
 Deviation: Clotho has no strength model, so these results are x. Not gated. A MOS
 switch still passes a z data bit through as z.
 
-Code: `src/Lower.cpp` (`gate_tristate_value`). Tests: `tests/gate_test.cpp` ("three-state gate truth tables match LRM table 28-5, including X/Z", "MOS switch truth tables match LRM table 28-6, including the z pass-through").
+Code: `src/lower/Nets.cpp` (`gate_tristate_value`). Tests: `tests/gate_test.cpp` ("three-state gate truth tables match LRM table 28-5, including X/Z", "MOS switch truth tables match LRM table 28-6, including the z pass-through").
 
 ## 38. Resistive switches (28.14)
 
@@ -349,4 +349,4 @@ Deviation: with no strength model there is nothing for the strength reduction of
 28.14 to act on, so `rnmos`, `rpmos` and `rcmos` behave exactly as `nmos`, `pmos`
 and `cmos`. Not gated.
 
-Code: `src/Lower.cpp` (`mos_switch_of`, `lower_cmos_switch`). Tests: `tests/gate_test.cpp` ("MOS switch truth tables match LRM table 28-6, including the z pass-through", "a cmos switch drives its output from both halves independently").
+Code: `src/lower/Nets.cpp` (`mos_switch_of`, `lower_cmos_switch`). Tests: `tests/gate_test.cpp` ("MOS switch truth tables match LRM table 28-6, including the z pass-through", "a cmos switch drives its output from both halves independently").

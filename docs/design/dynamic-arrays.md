@@ -95,7 +95,7 @@ First cut restrictions, each keeping a guard and a documented TODO:
   destination, per-bit for a fixed one** (LRM 11.4.14, added with pack/unpack
   into containers; the fixed-target pack direction added later). A queue,
   dynamic array or string on either side of `{>>{...}}` has no lower-time
-  width, so the stream stays a list of chunks (`StreamChunk` in `Lower.cpp`).
+  width, so the stream stays a list of chunks (`StreamChunk` in `lower/Lowerer.h`).
   Three of the four destinations consume it granule by granule: one element
   per element width for a queue/dynamic array, one byte per byte for a string.
   Everything whose chunk boundaries do not line up with the destination's
@@ -133,7 +133,7 @@ First cut restrictions, each keeping a guard and a documented TODO:
 ## 3. Element value model
 
 An element is exactly the backend's existing per-element slot (`slot_type()` in
-`src/ir/LlvmBackend.cpp`):
+`src/ir/llvm/StateLayout.cpp`):
 
 - `{ i(2W) }` — 4-state, never-z (must in low W bits, may/unknown in high W),
 - `{ i(2W), iW }` — 4-state with z plane,
@@ -312,7 +312,7 @@ for scalars; arrays of handles get a runtime init loop like string arrays).
   cached sorted index). Every op is a runtime call.
 
 Lifecycle mirrors strings (`emit_string_slot_op`, `deinit_body_strings`,
-teardown loop at `LlvmBackend.cpp:2029-2036`): `init` (empty, no alloc),
+teardown loop at `src/ir/llvm/`): `init` (empty, no alloc),
 `deinit` (free buffer/map), `assign` (deep copy), and copy-in/out for
 subroutine args. Body temporaries and function-frame locals are bracketed by
 init/deinit at body exits exactly as string temps are. State teardown deinits
@@ -377,12 +377,12 @@ Associative (any key kind — key passed as a normalized byte span, §4a):
 - **IR + type pool** (`src/ir/Ir.h`): `DynArray` / `Queue` `Type::Kind` landed;
   add `Assoc` carrying an `element` type ref plus a `key` ref. Replaces the
   `fail("associative arrays are not supported")` that used to sit at the
-  `isUnpackedArray()` guard in `src/Lower.cpp` (that guard is gone: all four
+  `isUnpackedArray()` guard in `src/lower/` (that guard is gone: all four
   unpacked-array kinds are matched by type above it).
 - **`SignalSlot`**: `is_dynarr` / `is_queue` / `is_assoc` flags; `slot_ty` = the
   handle blob; power-on constant = empty handle.
 - **`LValue` extension**: today `LValue.base` is always a state GEP
-  (`LlvmBackend.cpp:254-290`). Add a "base pointer loaded from a handle field"
+  (`ir/llvm/Backend.h`). Add a "base pointer loaded from a handle field"
   form. `ElemSelect` on a dynarr/queue loads `data`/`base` from the handle and
   computes the element address inline (reusing `lv_field_ptr` for the plane
   load/store); on an assoc it calls `rt_assoc_get_ptr` (read) or
@@ -437,7 +437,7 @@ A whole-queue `q <= rhs` landed (`QueueCopyNb`; see queue-nba-and-nonpod.md §1)
 Active region deep-copies the RHS into a staged handle in a per-queue runtime buffer
 and the NBA region `rt_queue_move`s it into the live handle, which is
 managed-element safe. A dynamic-array or associative-array target still loud-fails,
-for the reason this section gave: the scalar block-commit shadow (`LlvmBackend.cpp`
+for the reason this section gave: the scalar block-commit shadow (`src/ir/llvm/`
 shadow region) stages into a fixed state slot and cannot hold a heap handle, and the
 array-element NBA path (`rt_nba_arr_*`) is keyed to fixed unpacked arrays. Both take
 the queue's shape when they land. An NBA to an ELEMENT of any of the three is

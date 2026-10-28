@@ -515,7 +515,7 @@ TEST_CASE("?: evaluates one arm on a definite condition, both on x") {
 // an increment), so every one of these read like a pure expression, was evaluated on
 // both arms, and killed the simulation from the arm the condition had ruled out. The
 // predicate is a whitelist now, so an unlisted shape merely takes the branching path
-// (Lower.cpp's SpeculationScan).
+// (lower/Lowerer.h's SpeculationScan).
 TEST_CASE("?: does not evaluate a trapping arm the condition rules out") {
     SUBCASE("null class-handle property") {
         constexpr std::string_view src = R"##(

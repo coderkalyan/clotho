@@ -21,7 +21,7 @@ proposal — they are accurate as the design that shipped):
 
 `bit` is nominally 2-state (`InternPool` `Domain::Two`) but the backend lowers it
 identically to `logic` minus the z plane: `slot_type` emits `{ i(2W) }` (the
-packed must|may word, `LlvmBackend.cpp:445`) and every operator runs the branchy
+packed must|may word, `ir/llvm/StateLayout.cpp, slot_type`) and every operator runs the branchy
 4-state path (`lower_arith` etc.). Two costs:
 
 1. **Storage**: a `bit [W]` slot is `i(2W)`, double the needed width. The high W
@@ -37,7 +37,7 @@ violating LRM 6.3.1 (x/z → 0 on assignment to a 2-state target).
 
 A 2-state value is a single `iW` LLVM value. Reuse `Plane` with a narrowed
 contract, disambiguated by the value's `ValType.four_state` (already recomputed
-per-instruction by walking operands, `LlvmBackend.cpp:65`):
+per-instruction by walking operands, `ir/llvm/Backend.h, ValType`):
 
 | domain | `Plane.mm` | `Plane.z` |
 |--------|-----------|-----------|

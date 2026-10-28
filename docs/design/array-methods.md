@@ -157,7 +157,7 @@ Three semantics this fixes, none of which the clause states:
 On the GC: a container payload is `malloc`'d rather than GC-heap (`Gc.h:333`), so
 no collector relocates it; allocation only sets `mutator->request`
 (`Gc.cpp:1855`) and the sole poll site in emitted code is the drain loop's
-quiescent edge (`LlvmBackend.cpp:11850`). A 400-element sort whose key allocates a
+quiescent edge (`ir/llvm/Scheduler.cpp, emit_active_run`). A 400-element sort whose key allocates a
 string per evaluation reports one collection under `--gc-stress`, none of it
 inside the sort.
 
@@ -308,7 +308,7 @@ worked.
 
 **Where it is implemented.** Two comparators, because there are two paths:
 
-- **The IR keyed comparator** (`sort_right_wins`, `src/Lower.cpp`) — a `with`
+- **The IR keyed comparator** (`sort_right_wins`, `src/lower/Sort.cpp`) — a `with`
   clause, a string element, or an element wider than 64 bits. A key is unknown iff
   its unknown plane is nonzero, which is exactly the `IsUnknown` node ($isunknown,
   LRM 20.9) and works at any width. Ascending, the right candidate wins iff

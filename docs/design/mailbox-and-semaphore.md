@@ -18,24 +18,24 @@ a design-wide gate, **these two classes need none of that**. Every part except t
 park/wake primitive already exists and is tested:
 
 - a **parameterized class** is already an ordinary nominal class, one `ir::Ref` per
-  specialization (`src/Lower.cpp:2578-2585`; four green tests at
+  specialization (`src/lower/Classes.cpp, lower_class_type`; four green tests at
   `tests/class_test.cpp:910`, `:934`, `:951`, `:971`), so `mailbox #(T)` needs no
   type machinery whatsoever;
 - an **unbounded queue of T** already carries every payload the LRM admits, with a
   runtime that is element-type agnostic (`rt_elem_ops`, `src/runtime/Runtime.h`
   `[gc]`:947-958) and a frontend admission gate that already enumerates the legal
-  element set (`guard_container_element`, `src/Lower.cpp:2180-2220`);
+  element set (`guard_container_element`, `src/lower/Types.cpp`);
 - a **class-property container is already traced precisely** by the collector
   through its owning object's map, and a class handle inside a queue is
   supported, not refused (`class_elem_leaves` / `clotho.classgc.<Ref>`,
-  `src/ir/LlvmBackend.cpp` `[gc]`:2580-2695; `tests/gc_test.cpp` `[gc]`:1022);
+  `src/ir/llvm/GcEmit.cpp`; `tests/gc_test.cpp` `[gc]`:1022);
 - an **intrusive waiter list rooted in a heap object**, with frame-resident nodes, a
   scheduled-flag dedupe and self-unlink on resume, is the landed named-event
   machinery (`emit_event_link` / `emit_event_unlink` / `emit_event_wake_list`,
-  `src/ir/LlvmBackend.cpp:8691-8800`);
+  `src/ir/llvm/Events.cpp, emit_event_wake_list/emit_event_unlink`);
 - a **bodyless built-in method** already has an interception seam in the frontend
-  (`lower_process_method` reached from `lower_user_call`, `src/Lower.cpp:23212-23219`)
-  and a synthetic class body already has one (`lower_process_class`, `:2679-2692`).
+  (`lower_process_method` reached from `lower_user_call`, `src/lower/Subroutines.cpp`)
+  and a synthetic class body already has one (`lower_process_class`).
 
 So the work is: two synthetic class bodies, one new frame-resident node shape with
 three small emitters, two IR tags, and the frontend expansion of ten methods. No new
@@ -125,9 +125,9 @@ first cut (§10, hazard 9).
 
 Facts, all established against the code, in the order the design needs them.
 
-**The refusal.** `lower_class_type` (`src/Lower.cpp:2544`) fires, immediately after
+**The refusal.** `lower_class_type` (`src/lower/Classes.cpp`) fires, immediately after
 the cache probe, on any class whose parent scope is package `std`, with `process`
-now diverted (`:2565-2571`):
+now diverted:
 
 ```cpp
 if (const slang::ast::Scope* parent = clt.getParentScope();
@@ -144,7 +144,7 @@ on a declaration, on a class property, and on a task formal (`:1239-1243`).
 **Parameterized classes are done.** slang monomorphizes each `C#(args)` into a
 distinct fully substituted `ClassType`; clotho lowers each as an independent nominal
 class keyed by symbol pointer in `class_type_cache_`, with its own `fields_id`, own
-`FunctionId`s and own statics (`src/Lower.cpp:2578-2585`). So `mailbox #(int)` and
+`FunctionId`s and own statics (`src/lower/Classes.cpp, lower_class_type`). So `mailbox #(int)` and
 `mailbox #(pkt)` are already two unrelated types with two class descriptors, and
 `$cast` between them already fails (`tests/class_test.cpp:1739`).
 
@@ -153,11 +153,11 @@ class keyed by symbol pointer in `class_type_cache_`, with its own `fields_id`, 
 (`src/runtime/Runtime.h` `[gc]`:1083-1097) embedded directly in design state, a frame
 slot, or a class body; it owns one `malloc`'d ring, and every element operation goes
 through one `const rt_elem_ops*` descriptor the backend materializes
-(`elem_ops_for`, `src/ir/LlvmBackend.cpp:1464`). Seven element kinds exist (pod,
+(`elem_ops_for`, `src/ir/llvm/Containers.cpp`). Seven element kinds exist (pod,
 string, dynarr, queue, aggregate, assoc, event). `rt_queue_push_back` /
 `rt_queue_pop_front` already relocate a managed element into and out of the ring, and
 `q[0]` is inline ring math, not a call. The frontend gate that decides the legal
-element set is `guard_container_element` (`src/Lower.cpp:2180-2220`), whose only
+element set is `guard_container_element` (`src/lower/Types.cpp`), whose only
 failure is `"<what> element type is not supported"`; it admits integral, real,
 string, class handle, `chandle`, unpacked struct / fixed unpacked array,
 nested queue / dynamic array / associative array, and event.
@@ -174,9 +174,9 @@ in emitted code (§6.2).
 object is `{ last_trig, waiters, pending, vcd, next_pend }`
 (`src/runtime/Runtime.h:1405-1411`), its waiter node is the frame-resident
 `event_node_ty` = `{ next, prev, handle, flag, owner }`
-(`src/ir/LlvmBackend.cpp:6047`, field constants `:6062-6070`), and the three
-emitters are `emit_event_wake_list` (`:8691`), `emit_event_link` (`:8738`) and
-`emit_event_unlink` (`:8772`). The disciplines that matter, all already paid for:
+(`src/ir/llvm/Events.cpp, wait_counts`), and the three
+emitters are `emit_event_wake_list`, `emit_event_link` and
+`emit_event_unlink`. The disciplines that matter, all already paid for:
 
 - the node is an alloca placed right after `coro.begin` so CoroSplit spills it into
   the coroutine frame (`event_wait_node`, `:22848`);
@@ -191,8 +191,8 @@ emitters are `emit_event_wake_list` (`:8691`), `emit_event_link` (`:8738`) and
 
 **`process` supplies the abort and suspend contracts, and one of them is unpaid.**
 The abort poll is emitted by `lower_region` after each suspending op
-(`src/ir/LlvmBackend.cpp:11806-11816`), gated on `design_uses_disable_` /
-`design_uses_process_` and on `tag_suspends(t)` (`:23022-23033`). There is **no
+(`src/ir/llvm/Inst.cpp, lower_region`), gated on `design_uses_disable_` /
+`design_uses_process_` and on `tag_suspends(t)`. There is **no
 general "unlink me from whatever I am waiting on" hook**: cleanup is per-mechanism,
 and correctness rests on the poll being emitted *after* the parking op's own
 resume-side unlink. `tag_suspends` today lists only `Delay`, `Wait`, `TaskCall`,
@@ -202,8 +202,8 @@ defect in the landed process work (§16).
 **The collector already traces a container inside a class body.** `[gc]` A class
 property container is deliberately *not* a container root; it is reached through the
 owning object's `clotho.classgc.<Ref>` leaf table (`class_elem_leaves`,
-`src/ir/LlvmBackend.cpp` `[gc]`:2580-2602, rationale `:2554-2579`), and
-`clotho.classfini.<Ref>` releases it when the object dies (`:2620-2657`, with the
+`src/ir/llvm/GcEmit.cpp`), and
+`clotho.classfini.<Ref>` releases it when the object dies (with the
 hard constraint that a finalizer runs during a collection and must not allocate).
 `rt_elem_ops` carries `nhandles`/`handles` so the queue walker marks handle payloads
 (`walk_queue`, ring-wraparound aware, `src/runtime/Gc.cpp` `[gc]`:1467-1487).
@@ -213,7 +213,7 @@ hard constraint that a finalizer runs during a collection and must not allocate)
 wait-queue node shape (the event node has no tail pointer and is push-front, LRM
 4.7 leaving event wake order arbitrary), and no frontend expansion of a bodyless
 built-in method that needs *control flow* — every arm of `lower_process_method`
-(`src/Lower.cpp:23142-23204`) is a single op with a fixed operand array, and none
+(`src/lower/BuiltinClasses.cpp, lower_process_method / src/lower/Subroutines.cpp, lower_user_call`) is a single op with a fixed operand array, and none
 takes a `ref` formal.
 
 ---
@@ -282,17 +282,17 @@ restriction the LRM does not impose, and it is recorded in §15.
 ### 4.3 Construction
 
 `new` is a bodyless `MethodFlags::Constructor`, so it cannot go through
-`emit_ctor_call` (`src/Lower.cpp:22927`), which would call `function_id(*ctor)` →
+`emit_ctor_call` (`src/lower/Classes.cpp`), which would call `function_id(*ctor)` →
 `build_function` → `lower_stmt` on a prototype and die on an out-of-range formal
-index — the documented failure mode at `:2548-2564`. `lower_new_class`
-(`:22902`) therefore gains one intercept before that call:
+index — the failure mode documented in `lower_class_type`. `lower_new_class`
+therefore gains one intercept before that call:
 
 1. `ClassNew` allocates and power-on-inits the body — all-zero is exactly the right
    image (`keys = 0`, empty queue handle, null queue heads);
 2. store the constructor argument: `keys` from `keyCount`, or `bound` from `bound`.
    slang materializes a defaulted actual, so `new` and `new(0)` are the same lowering;
    the arm asserts arity rather than assuming it, because `ExpressionKind::EmptyArgument`
-   placeholders do occur elsewhere (`src/Lower.cpp:11099`, `:16770-16772`);
+   placeholders do occur elsewhere (`src/lower/`);
 3. `m = new;` with no parentheses has a null `constructorCall()`; the arm uses the
    LRM default (0) rather than reading `arguments()`;
 4. a **negative** `bound` (15.4.1) or a negative `keyCount` is a **located fatal**,
@@ -316,7 +316,7 @@ An object's body holds one managed property, the FIFO, so `[gc]`:
   has zero handle offsets — tracing one costs a map lookup.
 
 Under `--gc off`, both leak, bounded by the number of `new`s, exactly as every class
-body already does (`LlvmBackend.cpp:12965-12968`'s recorded trade). The FIFO's ring
+body already does (`ir/llvm/Inst.cpp, lower_inst`'s recorded trade). The FIFO's ring
 leaks with the body, which is a real per-transaction leak for a design that allocates
 mailboxes in a loop; it is the same trade, and it is stated in the TODO entry.
 
@@ -340,7 +340,7 @@ from under its own wait queue.
 }
 ```
 
-Six words, versus the event node's five (`LlvmBackend.cpp:6047`). `handle` and
+Six words, versus the event node's five (`ir/llvm/Events.cpp, wait_counts`). `handle` and
 `flag` are the same two words as `wait_elem_ty`, for the same reasons. `q_head` /
 `q_tail` replace `kNodeOwner`: they serve the identical purpose (unlink correctly
 after the *variable* naming the object was reassigned mid-park) and additionally let
@@ -423,7 +423,7 @@ thread is the only one that knows the queue changed.
 A `put` of fewer keys than the head needs still wakes the head, which retests and
 re-parks — one wasted activation per `put`, deduped by the scheduled flag and
 bounded by the oscillation counter like any other wake (`kOscillationLimit`,
-`LlvmBackend.cpp:10925` region). Waking only a satisfiable head would need the
+`ir/llvm/Scheduler.cpp, emit_active_run` region). Waking only a satisfiable head would need the
 `need` value in the node; that is a pure optimization, deferred with a note.
 
 ### 6.2 `mailbox #(T)`
@@ -546,7 +546,7 @@ branch is `unlink` + `WakeHead`, the same pair `Leave` emits, and it is pinned b
 | `process::status()` of a blocked waiter | `WAITING` | `emit_suspend` maintains RUNNING↔WAITING (`:4958-4966`) |
 | `wait fork` over children blocked on a mailbox | unaffected | the PCB tree is orthogonal |
 | `$finish` while waiters are parked | waiters stay linked and are never resumed | rings are emptied, nothing is freed, no collection follows (`lower_finish`) |
-| a blocked `get` inside an assertion action block | **refused in the first cut**, loud | an action block runs on the monitor's thread and the reactive-safety checker already refuses `wait fork` / `disable fork` there on identity grounds (`src/Lower.cpp:889-897`, `:928-938`), with a backend backstop at `reject_unsupported_reactive`. The `try_*` forms stay legal. Lifting it is the same work as `expect`'s. |
+| a blocked `get` inside an assertion action block | **refused in the first cut**, loud | an action block runs on the monitor's thread and the reactive-safety checker already refuses `wait fork` / `disable fork` there on identity grounds (`src/lower/Lowerer.h, ReactiveSafetyChecker`), with a backend backstop at `reject_unsupported_reactive`. The `try_*` forms stay legal. Lifting it is the same work as `expect`'s. |
 | a blocked `get` in a task called from a `program` block | works, and blocks in the REACTIVE region set | LRM 24.3.1 / 24.5: the task inherits the calling thread's home, so its park is reactive-home (`build_shared_home_fns`, `docs/design/program-blocks.md` §6.1). `emit_suspend`'s old refusal for this shape is gone. |
 | deadlock (all threads blocked) | the drain quiesces and simulation ends | no event is left to run; no deadlock detection is in scope |
 
@@ -648,7 +648,7 @@ actually touched:
 | 8 | `ValueSweep::sweep` | `SyncWait`'s i1 is definite 2-state |
 | 9 | `compute_type` | i1 for `SyncWait`, statement shape for `SyncCtl` |
 | 10 | `lower_inst` dispatch | `lower_sync_wait` / `lower_sync_ctl` |
-| 11 | **`tag_suspends`** (`LlvmBackend.cpp:23022-23033`) | **`SyncWait` MUST be added** — see §16 |
+| 11 | **`tag_suspends`** (`ir/llvm/Processes.cpp`) | **`SyncWait` MUST be added** — see §16 |
 | 12 | reactive legality | frontend checker + `reject_unsupported_reactive` backstop, kept in agreement |
 
 No `DesignUses` arm and no `Structural::walk` change: nothing is emitted design-wide.
@@ -661,7 +661,7 @@ No `DesignUses` arm and no `Structural::walk` change: nothing is emitted design-
   refuses a *derived* class — `class my_mbx extends mailbox#(int)` — because the
   synthetic body has no vtable story; loud, with a TODO). `weak_reference` keeps
   the generic message.
-- `is_sync_method(sub)` beside `is_process_method` (`src/Lower.cpp:2697-2710`):
+- `is_sync_method(sub)` beside `is_process_method` (`src/lower/BuiltinClasses.cpp`):
   `MethodFlags::BuiltIn`, owner is a `ClassType` named `semaphore` or `mailbox`,
   owner's parent is package `std`. Keyed on symbols, not on a remembered `Ref`,
   because a method call can be lowered before any variable of the type is declared.
@@ -731,7 +731,7 @@ Ranked by how much damage a naive implementation does.
 ## 12. Rejected alternatives
 
 - **A runtime-owned object with a `{slot, gen}` handle** (the `rt_event` model, and
-  the shape `Lower.cpp:2554-2556`'s comment originally imagined). Rejected on a
+  the shape `src/lower/`'s comment originally imagined). Rejected on a
   specific, measured ground: a runtime-owned object that itself holds an `rt_queue`
   is **invisible to the collector**. The one existing instance of that shape — the
   whole-container NBA staging record in `rt_nba_arr_slot`'s pool — is not scanned,
@@ -765,9 +765,9 @@ Ranked by how much damage a naive implementation does.
   it needs `wait (expr)` on a class property to work, and it does not: a class
   property is not in `sigmap_`, so a store to it services no wait queue, and
   `wait (m_queue.size() > 0)` parks forever (`LValue::is_signal`,
-  `LlvmBackend.cpp:340-343`: "its store services wait queues"; the sensitivity
+  `ir/llvm/Backend.h, LValue`: "its store services wait queues"; the sensitivity
   collector's `record_read` bails on a symbol absent from `sigmap`,
-  `Lower.cpp:481-489`).
+  `lower/Scans.cpp, record_read`).
   Verilator gets away with it because its `--timing` model re-evaluates `wait`
   conditions differently. Fixing that to ship an `.sv` implementation would be a
   strictly larger change than this document, in a hotter path.
@@ -805,8 +805,8 @@ keeps the ungated IR byte-identical for designs that do not use the feature.
 **Should this be one task or two?** One branch, phased as above. The two classes
 share P0 entirely — the guard, the node shape, the emitters, both IR tags, the
 constructor intercept — so splitting them into parallel branches duplicates the
-substrate and collides in the same three files (`Lower.cpp`'s std arm, `Ir.h`'s tag
-enum, `LlvmBackend.cpp`'s `tag_suspends`). Once P0 is in, P1 and P2 are genuinely
+substrate and collides in the same three files (`src/lower/`'s std arm, `Ir.h`'s tag
+enum, `ir/llvm/Processes.cpp`'s `tag_suspends`). Once P0 is in, P1 and P2 are genuinely
 independent and can run in parallel; P3 depends on P1 having proved the wait loop.
 P4 is a separate task with its own design and no dependency on P1-P3 beyond the
 class body.
@@ -920,7 +920,7 @@ Both are in landed or nearly-landed work, both are one-line-ish, and both are
 recorded here because this design's correctness leans on them.
 
 1. **`ProcWait` is missing from `tag_suspends`**
-   (`src/ir/LlvmBackend.cpp:23022-23033`), although `process-class.md:479` and
+   (`src/ir/llvm/Processes.cpp, tag_suspends`), although `process-class.md:479` and
    `:556-557` both state it must be there. Consequence: a thread killed while parked
    in `p.await()` or `wait fork` is force-woken, unlinks its waiter node, retests,
    and **re-parks** — neither retry loop tests `kProcAbort`, and
@@ -931,9 +931,8 @@ recorded here because this design's correctness leans on them.
 2. **`process-class.md:165-166` and `:729-733` are stale.** They state that "a class
    handle inside a queue / dynamic array / associative array is still a compile error
    under `--gc` (`elem_ops_for`, `:1503-1516`)", and derive from it that `process
-   q[$]` is refused. `elem_ops_for` contains no refusal in either worktree (read raw
-   end-to-end at `:1464` here and at `[gc]`:1905 in the main worktree); the element
-   admission gate is `guard_container_element` (`src/Lower.cpp:2180-2220`), which
+   q[$]` is refused. `elem_ops_for` contains no refusal in either worktree; the element
+   admission gate is `guard_container_element` (`src/lower/Types.cpp`), which
    admits a class handle unconditionally with no `gc_on()` test, and the collector
    traces container payloads precisely (`rt_elem_ops.nhandles`, `walk_queue`). So
    `process q[$]` is admitted today, and this document's `mailbox #(handle)` claim

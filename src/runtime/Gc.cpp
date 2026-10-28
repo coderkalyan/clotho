@@ -460,7 +460,7 @@ rt_gc_mutator g_mutator{ .cursor       = nullptr,
 }
 
 // rt_gc_alloc must never return null: the ClassNew site elides the null guard on a
-// fresh handle (LlvmBackend.cpp:11706-11712), so a null return would be a silent
+// fresh handle (ir/llvm/Inst.cpp, lower_inst), so a null return would be a silent
 // wrong-code bug rather than a diagnosable one (Gc.h:189-192, design §4.3).
 [[noreturn]] void oom_fatal(uint64_t size) {
     char head[192];
@@ -568,7 +568,7 @@ uint64_t stamp_marked(uint64_t gcword) {
 
 // Non-asserting descriptor read: returns null when the vptr has not been stored
 // yet. Generated code stores it immediately after rt_gc_alloc returns
-// (LlvmBackend.cpp:11696) and no safepoint can intervene, so the collector never
+// (ir/llvm/Inst.cpp, lower_inst) and no safepoint can intervene, so the collector never
 // sees this -- but rt_gc_find_object is also the conservative-scan validator and
 // must not dereference through a zero word to find that out.
 const rt_gc_map* map_probe(void* handle) {
@@ -1195,7 +1195,7 @@ void* alloc_object(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map) {
 
     // Validate-on-allocate, the pair half of the assertion in mark_and_push(). It is the
     // bitmap resolution rather than the full rt_gc_find_object because generated code
-    // stores the vptr only after this returns (LlvmBackend.cpp:11696), so the map half of
+    // stores the vptr only after this returns (ir/llvm/Inst.cpp, lower_inst), so the map half of
     // the pair is asserted at trace time instead.
     assert(object_start_of(reinterpret_cast<uintptr_t>(handle)) == start);
     assert(object_start_of(reinterpret_cast<uintptr_t>(start)) == start);
@@ -1292,11 +1292,11 @@ void mark_and_push_forced(void* handle) {
 // A third store shape stores no handle into a heap object at all: a class handle written
 // into a CONTAINER owned by an old object lands in the container's malloc'd payload. Since
 // P4 that shape is real -- a class handle CAN be a container element, or a handle inside
-// an associative KEY, bare or one leaf of an aggregate key (LlvmBackend.cpp:2612-2615, the
-// elem_ops_for door at :11693-11703) -- so it is covered in two halves rather than assumed
+// an associative KEY, bare or one leaf of an aggregate key (ir/llvm/Containers.cpp, elem_handle_offsets, the
+// elem_ops_for door) -- so it is covered in two halves rather than assumed
 // away. The backend logs the OWNING object at every container write helper: push_back /
 // push_front / insert, whole-container assign, `new[n](src)`, slice append, and the put_ptr
-// that writes a key whose table is non-empty (assoc_key_is_class_handle, :1853-1857). And
+// that writes a key whose table is non-empty (assoc_key_is_class_handle). And
 // the runtime traces a remembered object through the ORDINARY path -- push_remembered_roots
 // marks it onto the same worklist every other object uses, so trace_one walks its handle
 // offsets AND pushes its container leaves for the element walkers (§3.3). That is not
@@ -1310,7 +1310,7 @@ void mark_and_push_forced(void* handle) {
 // relog_conservative_roots() carries the obligation forward exactly as for a `ref` to a
 // handle property. A `ref` to a NESTED container element -- `obj.qq[3]` where qq is a
 // queue of queues -- is a pointer into the outer container's malloc'd payload
-// (LlvmBackend.cpp:16421), which rt_gc_find_object correctly rejects as not-in-a-block, so
+// (ir/llvm/StateLayout.cpp, ref_actual_ptr), which rt_gc_find_object correctly rejects as not-in-a-block, so
 // nothing re-logs the owner and a callee that suspends and only then pushes is outside both
 // mechanisms. The collector cannot close that from here: a payload-interior pointer is
 // indistinguishable from an integer, and re-logging the owner needs the call site's
@@ -1363,7 +1363,7 @@ void assert_elem_ops([[maybe_unused]] const rt_elem_ops* ops) {
     // The key table and its count are one fact stated twice (Runtime.h:919-927), and
     // `nkeyhandles != 0` is the SINGLE source of truth for "this array's keys carry a
     // handle" -- the same question the backend's barrier answers off the same table
-    // (LlvmBackend.cpp:1849-1857), so the barrier and the tracer cannot disagree.
+    // (ir/llvm/AssocArrays.cpp, assoc_key_handle_offsets), so the barrier and the tracer cannot disagree.
     assert((ops->nkeyhandles == 0) == (ops->keyhandles == nullptr) &&
            "nkeyhandles implies a key table, and a key table implies a count");
     assert((ops->nkeyhandles == 0 || ops->kind == rt_elem_assoc) &&
@@ -1414,7 +1414,7 @@ void mark_container_handle(void* child) {
 //
 // `handles` covers every handle reachable without leaving the image
 // (Runtime.h:913-916). For an aggregate that includes the handles of any nested
-// aggregate, because collect_elem_leaves (LlvmBackend.cpp:1542-1567) flattens the
+// aggregate, because collect_elem_leaves (ir/llvm/Containers.cpp) flattens the
 // leaf table through nested aggregates and emits only terminal leaves -- so no leaf
 // is itself an aggregate and one pass over `leaves` is complete.
 void visit_elem_image(uint8_t* image, const rt_elem_ops* ops) {
@@ -1493,7 +1493,7 @@ void walk_queue(const rt_queue* h, const rt_elem_ops* cops) {
 //
 // The ONE place the key byte order is undone. emit_key_bytes writes byte 0 as the most
 // significant and applies no sign flip, a class handle being unsigned
-// (LlvmBackend.cpp:1805-1810, docs/design/assoc-keys.md:85), so the word is reassembled
+// (ir/llvm/AssocArrays.cpp, docs/design/assoc-keys.md:85), so the word is reassembled
 // MSB-first -- a memcpy would read it byte-reversed on this host and trace an address
 // that is not an object.
 //
@@ -1531,7 +1531,7 @@ struct AssocWalk {
 // TABLE rather than a flag, because an aggregate key is serialized leaf by leaf and a
 // struct can carry several handles at offsets no flag could name (Runtime.h:919-927). A
 // bare `int m[C]` is the ONE-ENTRY case of this same loop, `{ 0 }`, and not a path of
-// its own (LlvmBackend.cpp:1817-1821).
+// its own (ir/llvm/AssocArrays.cpp, assoc_key_handle_offsets).
 void assoc_visit_image(void* elem, const uint8_t* key, uint32_t klen, void* ctx) {
     assert(elem != nullptr && "a visited element image has an address");
     assert(ctx != nullptr && "the associative walk carries its descriptor");
@@ -1546,9 +1546,9 @@ void assoc_visit_image(void* elem, const uint8_t* key, uint32_t klen, void* ctx)
     for (uint32_t i = 0; i < cops->nkeyhandles; ++i) {
         const uint32_t off = cops->keyhandles[i];
         // Strictly ascending and disjoint -- the runtime half of the emitter's
-        // `is_sorted` (LlvmBackend.cpp:1838): the offsets come from a walk of the span in
-        // serialization order in which every class leaf consumes exactly 8 bytes
-        // (:1805-1810), so no two can overlap. Alignment is deliberately NOT asserted
+        // `is_sorted` (ir/llvm/AssocArrays.cpp, assoc_key_handle_offsets): the offsets come from a walk of the span in
+        // serialization order in which every class leaf consumes exactly 8 bytes,
+        // so no two can overlap. Alignment is deliberately NOT asserted
         // (decode_key_handle). This is also what bounds the loop: with the in-span check
         // in the decode, nkeyhandles <= klen / 8 follows.
         assert((i == 0 || off >= prev + sizeof(uint64_t)) &&
@@ -1899,8 +1899,7 @@ void push_remembered_roots() {
 // The barrier is emitted at the store, except for a store through a raw interior pointer
 // whose owner is not statically known -- a `ref` formal bound to a class property, or an
 // output/inout formal whose actual is one -- where it is emitted at the CALL SITE, the
-// last place the owner handle is in hand (LlvmBackend.cpp:21145-21149, :22240-22244,
-// :5706-5708, :21170-21174). A non-blocking call cannot span a safepoint, so for a
+// last place the owner handle is in hand (ir/llvm/Subroutines.cpp, lower_call_common). A non-blocking call cannot span a safepoint, so for a
 // function the call-site entry is still in the set when the callee's store lands. A
 // blocking TASK can suspend across a collection, which consumes that entry; the store
 // then lands on an OLD object whose LOGGED bit is clear with nothing left to log it, and
@@ -2605,7 +2604,7 @@ bool object_lines_protected(void* h, uint64_t size) {
 // a young collection cannot see -- the use-after-free this phase exists to avoid.
 //
 // BOTH halves of the object are checked, the inline handle fields and the container leaves,
-// because since P4 a class handle can be a container element (LlvmBackend.cpp:2612-2615) and
+// because since P4 a class handle can be a container element (ir/llvm/Containers.cpp, elem_handle_offsets) and
 // so `old.q.push_back(fresh)` is an old-to-young edge exactly as `old.f = fresh` is. The
 // leaves go through push_container, which under g.verifying asserts is_marked_now on every
 // element instead of marking it (mark_container_handle), and rt_gc_verify drains them once.
@@ -3293,7 +3292,7 @@ static_assert(sizeof(rt_gc_mutator) ==
                 offsetof(rt_gc_mutator, frames_head) + sizeof(struct rt_gc_frame*),
               "frames_head is the last field: the mirror knows every one of them");
 // The numbers those expressions come to on the LP64 host the backend targets, spelled
-// out so a reader can check the mirror by eye against LlvmBackend.cpp's gc_mutator_ty
+// out so a reader can check the mirror by eye against ir/llvm/GcEmit.cpp's gc_mutator_ty
 // without evaluating nine offsetof chains.
 static_assert(offsetof(rt_gc_mutator, cursor) == 0 && offsetof(rt_gc_mutator, limit) == 8 &&
                 offsetof(rt_gc_mutator, budget_left) == 16 &&
@@ -3499,7 +3498,7 @@ extern "C" void* rt_gc_find_object(const void* addr) {
     const rt_gc_map* map = map_probe(h);
     if (map == nullptr) {
         // (5a) The vptr is not stored yet. Only reachable between rt_gc_alloc
-        // returning and the store at LlvmBackend.cpp:11696, where no safepoint can
+        // returning and the store at ir/llvm/Inst.cpp, lower_inst, where no safepoint can
         // intervene -- but a conservative candidate must not be believed on the
         // strength of a start bit alone, so this is a rejection and not an assert.
         return nullptr;

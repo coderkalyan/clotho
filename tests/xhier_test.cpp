@@ -290,7 +290,7 @@ TEST_CASE("xhier: bind-inserted module drives an interface member via upward nam
 // variable -- LRM 6.5 / 10.3.2 make that a flat error regardless of scope,
 // with no wired resolution to fall back on the way a `wire`/`tri` net has
 // (LRM 6.6). slang raises MultipleContAssigns for exactly this (promoted to
-// Error in apply_severity_policy, Lower.cpp), before Lower.cpp's own
+// Error in apply_severity_policy, lower/Lower.cpp), before lower/Lower.cpp's own
 // net-driver tracking -- which is net-kind-only via canonical_value_symbol's
 // `SymbolKind::Net` gate and never sees a `logic` symbol -- is even reached.
 // Confirmed against the real design this mirrors: uvm_tb_build_ss_tb's

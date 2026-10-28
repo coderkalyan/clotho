@@ -103,10 +103,10 @@ Four distinct refusals, all loud, all correct as far as they go:
 
 | shape | site | message |
 |---|---|---|
-| `covergroup` as a **module member** | `src/Lower.cpp:2837` / `:2844` | `unsupported module member kind=CovergroupType` |
-| a **covergroup-typed value** (instance variable, class property, generic type parameter) | `src/Lower.cpp:3599` | `covergroup type is not supported` |
-| `$get_coverage`, `$coverage_get`, `$coverage_get_max` | `src/Lower.cpp:22592` | `unsupported system function '$get_coverage'` |
-| `$set_coverage_db_name`, `$load_coverage_db`, `$coverage_control`, `$coverage_merge`, `$coverage_save` | `src/Lower.cpp:21159` | `unsupported system task '$set_coverage_db_name'` |
+| `covergroup` as a **module member** | `src/lower/Hierarchy.cpp, lower_members` | `unsupported module member kind=CovergroupType` |
+| a **covergroup-typed value** (instance variable, class property, generic type parameter) | `src/lower/Types.cpp, lower_type` | `covergroup type is not supported` |
+| `$get_coverage`, `$coverage_get`, `$coverage_get_max` | `src/lower/SystemTasks.cpp, lower_sysfunc` | `unsupported system function '$get_coverage'` |
+| `$set_coverage_db_name`, `$load_coverage_db`, `$coverage_control`, `$coverage_merge`, `$coverage_save` | `src/lower/Subroutines.cpp, lower_call` | `unsupported system task '$set_coverage_db_name'` |
 
 ### 3.2 One hole, now closed by construction
 
@@ -136,7 +136,7 @@ embedded covergroup left unconstructed.
 ### 3.3 The precedent that is already silently wrong
 
 Immediate `cover (expr);` (LRM 16.3) compiles, runs, and counts nothing.
-`lower_immediate_assertion` in `src/Lower.cpp` lowers it to one `Cond` whose
+`lower_immediate_assertion` in `src/lower/Assertions.cpp` lowers it to one `Cond` whose
 false-region is opened and closed empty; the true region runs the user's action
 block if written. So:
 
@@ -149,7 +149,7 @@ imm cover hit
 
 The pass action fires, and nothing else exists — no count, no name, no report.
 The decision is recorded in place, in `lower_immediate_assertion` in
-`src/Lower.cpp`, and in the notes (docs/LRM_NOTES.md, note 21). Unlike every
+`src/lower/Assertions.cpp`, and in the notes (docs/LRM_NOTES.md, note 21). Unlike every
 other unimplemented construct, this one is invisible: a design full of immediate
 covers looks healthy. Landing a coverage report makes this a decision that has
 to be taken explicitly, not an oversight that persists (§10.4).
@@ -180,14 +180,14 @@ root-caused to covergroups: a register-model class embeds a `covergroup`, is
 reachable as a generic-class type parameter, and eager static initialization
 (LRM 6.21) lowers it whether or not anything samples. `lower_type` had no
 covergroup case, so it fell through to `unsupported non-integral type`, naming
-neither covergroups nor the actual class. Now `src/Lower.cpp:3599` names
+neither covergroups nor the actual class. Now `src/lower/Types.cpp, lower_type` names
 covergroups explicitly, ahead of a fallback the comment argues is unreachable.
 
 *Status for this work: a diagnostic-accuracy fix, plus a trap to remember.*
 `lower_class_type` interns a class in `class_type_cache_` **before** laying out
 its properties, so this refusal throws after interning and used to leave a
 registered-but-undescribed Ref that poisoned later, unrelated lowerings of the
-same class. `InternGuard` (`src/Lower.cpp:3844`) fixed that. Any covergroup
+same class. `InternGuard` (`src/lower/Classes.cpp`) fixed that. Any covergroup
 implementation that can fail mid-layout re-creates the hazard at a new site and
 owes the same guard discipline. Relatedly, `docs/TODO.md` records that a
 body whose *field layout* is unsupported is never eligible for the graceful
@@ -198,20 +198,20 @@ than none.
 
 | need | existing mechanism | site |
 |---|---|---|
-| a nominal, handle-valued, GC-traced type with a hand-built field table and natively implemented methods | `lower_process_class` / `lower_semaphore_class` / `lower_mailbox_class` | `src/Lower.cpp:4162`, `:4193`, `:4257` |
-| containers (bin tables, counters) inside a synthetic body, traced and finalized with **no new GC code** | `class_elem_leaves` + `class_finalizer_fn` | `src/ir/LlvmBackend.cpp:2947`, `:2986` |
-| a bodyless built-in constructor intercepted at `new` | `lower_new_class`'s `is_sync_class` arm | `src/Lower.cpp:31436`, `:31448` |
-| a declaration-level `@(posedge clk)` realized without a subscription | SVA monitor / clocking-block edge detector + `Activation::Observed` | `src/Lower.cpp:17021`, `:15263`; `src/ir/Module.h:136` |
-| an `iff` guard around a synthesized body | `emit_guarded_body` | `src/Lower.cpp:10876` |
-| hidden per-instance state addressed like a signal | `new_monitor_state` → `register_signal` | `src/Lower.cpp:13312`, `:7167` |
-| an end-of-run hook that fires on both natural drain and `$finish` | `Activation::Final`, as used by `emit_monitor_finish` | `src/Lower.cpp:15985`; `src/runtime/Runtime.cpp:5042` |
-| hierarchical instance naming for a report | `instance_path()`, `hier_name()`, `ir::InstanceScope` | `src/Lower.cpp:22683`, `:22699`; `src/ir/Module.h:81` |
-| a design-wide id mint shared across Lowerers | `ClassIds` | `src/Lower.cpp:1804` |
+| a nominal, handle-valued, GC-traced type with a hand-built field table and natively implemented methods | `lower_process_class` / `lower_semaphore_class` / `lower_mailbox_class` | `src/lower/BuiltinClasses.cpp` |
+| containers (bin tables, counters) inside a synthetic body, traced and finalized with **no new GC code** | `class_elem_leaves` + `class_finalizer_fn` | `src/ir/llvm/GcEmit.cpp` |
+| a bodyless built-in constructor intercepted at `new` | `lower_new_class`'s `is_sync_class` arm | `src/lower/BuiltinClasses.cpp` |
+| a declaration-level `@(posedge clk)` realized without a subscription | SVA monitor / clocking-block edge detector + `Activation::Observed` | `src/lower/Timing.cpp, lower_clocking_block`; `src/ir/Module.h:136` |
+| an `iff` guard around a synthesized body | `emit_guarded_body` | `src/lower/Timing.cpp` |
+| hidden per-instance state addressed like a signal | `new_monitor_state` → `register_signal` | `src/lower/Types.cpp` |
+| an end-of-run hook that fires on both natural drain and `$finish` | `Activation::Final`, as used by `emit_monitor_finish` | `src/lower/SvaMonitor.cpp`; `src/runtime/Runtime.cpp:5042` |
+| hierarchical instance naming for a report | `instance_path()`, `hier_name()`, `ir::InstanceScope` | `src/lower/SystemTasks.cpp`; `src/ir/Module.h:81` |
+| a design-wide id mint shared across Lowerers | `ClassIds` | `src/lower/Lowerer.h` |
 
 And what does not exist anywhere: any coverage runtime (`grep rt_cover
 src/runtime` is empty), any end-of-simulation report of any *design* construct
 (`--gc-stats` reports the collector), and any read of the one coverage counter
-clotho already keeps — `sva.<id>.cov` (`src/Lower.cpp:13389`) is write-only state.
+clotho already keeps — `sva.<id>.cov` (`src/lower/Lowerer.cpp, alloc_monitor_state`) is write-only state.
 
 ---
 
@@ -268,7 +268,7 @@ builtins (`CoverageFuncs.cpp:91-110`).
    (`CoverSymbols.cpp:222`); the user-visible name lives on the emitted
    `ClassPropertySymbol`. Any mangling keyed on the type name collides across
    every embedded covergroup in the design, i.e. across exactly the UVM shape
-   that trips `Lower.cpp:3599` today.
+   that trips `lower/Types.cpp, lower_type` today.
 3. **`membersOfType<T>()` does not unwrap `TransparentMemberSymbol`.** A derived
    covergroup (`covergroup extends g1;`) exposes every inherited coverpoint,
    cross, bin *and* `sample` as a wrapper, so a naive walk silently returns
@@ -302,13 +302,13 @@ be sampled multiple times."
 That sentence settles three things at once:
 
 - **Values are read live, not sampled.** A covergroup is *not* SVA. There is no
-  Preponed snapshot, and `sampled_shadow_of` (`src/Lower.cpp:16465`) is
+  Preponed snapshot, and `sampled_shadow_of` (`src/lower/Assertions.cpp`) is
   deliberately **not** reused. The existence of `type_option.strobe`, whose whole
   purpose is to move sampling to Postponed and thereby filter multiple events
   per slot, is the LRM's own confirmation that the default does neither.
 - **Multiple events in one slot mean multiple samples.** So the trigger must not
   be idempotent-per-slot. This is the opposite of a clocking block's sticky
-  `fired` latch (`src/Lower.cpp:16814` records why a clocking block wants one and
+  `fired` latch (`src/lower/Timing.cpp, is_program_signal` records why a clocking block wants one and
   a monitor does not); a covergroup is the monitor case, and a double step here
   is a double count.
 
@@ -324,19 +324,19 @@ That sentence settles three things at once:
 - **The `iff` guard reads live too**, for consistency with the coverpoint
   expression it guards. LRM 19.5 does not say so as loudly as 16.15 does for
   `disable iff`, and clotho's own precedents are split (`always @(ev iff C)`
-  evaluates the guard live in the body's scope, `src/Lower.cpp:10876`, while every
+  evaluates the guard live in the body's scope, `src/lower/Timing.cpp, emit_guarded_body`, while every
   SVA root but the reset reads a shadow). Recorded as a decision, with the LRM
   reading above as its justification.
 
 **Decision: a clocked covergroup samples from an `Activation::Observed` process**
 (`src/ir/Module.h:136`), using the eight-line `clk_now & ~clk_was` edge detector
 that the SVA monitor and the clocking block already duplicate between them
-(`src/Lower.cpp:17021`). Observed is the only activation that runs once per
+(`src/lower/Timing.cpp, lower_clocking_block`). Observed is the only activation that runs once per
 settled point, sits after NBA has committed, and needs no subscription — its
-`wait_events` are documentation, not a wake (`src/ir/LlvmBackend.cpp:12746`).
+`wait_events` are documentation, not a wake (`src/ir/llvm/Scheduler.cpp, emit_active_run`).
 `Preponed` is wrong (before the step, and its stores are silent), `ReNba` is too
 late and must be idempotent, and Postponed is not an activation at all — it is a
-hard-coded straight line (`src/ir/LlvmBackend.cpp:13234-13322`).
+hard-coded straight line (`src/ir/llvm/Scheduler.cpp, emit_active_run`).
 
 ```mermaid
 flowchart LR
@@ -352,13 +352,13 @@ flowchart LR
 Three consequences, each a real cost:
 
 1. **An Observed body may not suspend or fork** — `reject_resume_once`
-   (`src/ir/LlvmBackend.cpp:7893`) rejects a delay, a `wait` or a `fork` even one
+   (`src/ir/llvm/Analyses.cpp, reject_resume_once`) rejects a delay, a `wait` or a `fork` even one
    call deep. A coverpoint expression may contain a function call (LRM 19.5
    already requires those to be automatic and side-effect free), so this is
    compatible; but an `option.*` setter or a user `sample()` override that reaches
    timing control is not, and must refuse.
 2. **Observed stores are ordinary design writes** (`src/ir/Module.h:133`), and the
-   drain re-settles the active set after Observed (`src/ir/LlvmBackend.cpp:13022`).
+   drain re-settles the active set after Observed (`src/ir/llvm/Scheduler.cpp, emit_active_run`).
    Bin counters must therefore be state nothing waits on — which is how monitor
    state gets away with it today. A user reading a counter from an `always` block
    would re-enter the drain; `get_coverage()` reads through a function call, not a
@@ -384,7 +384,7 @@ needed, and none exists to Observed anyway (`ReactivePend` targets Reactive).
 ### 6.1 The type is a handle, not a class
 
 **As built: `lower_type` returns `make_int_type(64, false, false)` for a
-`CovergroupType`** (`src/Lower.cpp:3599`) — the chandle shape. A covergroup
+`CovergroupType`** (`src/lower/Types.cpp, lower_type`) — the chandle shape. A covergroup
 variable holds the address of an `rt_cover_inst` the coverage runtime owns.
 Assignment, `== null`, the all-zero power-on default, storing a handle in a class
 property, a queue or an associative array all come out of the ordinary scalar
@@ -402,7 +402,7 @@ null-handle fatal — and a covergroup wants none of them:
 - **It has no nominal identity to carry.** There is no `$cast`, no inheritance
   (`covergroup extends` is refused), and no virtual dispatch, so the descriptor,
   the ancestor display and the vtable would all be dead weight — and
-  `class_desc_global` (`src/ir/LlvmBackend.cpp:2603`) makes registering one
+  `class_desc_global` (`src/ir/llvm/GcEmit.cpp`) makes registering one
   mandatory for any `Kind::Class` Ref the backend reaches.
 - **The obstacle it created was self-inflicted.** Seven Lowerer maps and
   `ClassIds` are keyed on `const ClassType*` and a `CovergroupType` is not one;
@@ -417,7 +417,7 @@ diagnosed. That is a real gap, recorded in §14.
 ### 6.2 The instance is one runtime call
 
 `cg c = new;` lowers to a single `CoverQuery` with `CoverOp::New`
-(`src/Lower.cpp`'s `lower_new_covergroup`), which the backend turns into
+(`src/lower/Coverage.cpp`'s `lower_new_covergroup`), which the backend turns into
 `rt_cover_new(type_idx, ctx)`. There is no synthesized constructor, because the
 bin table is static model data (§6.3) rather than per-instance state to compute:
 the only thing construction has to capture is `ctx`.
@@ -464,7 +464,7 @@ than a cosmetic difference.
 
 The whole model — types, coverpoints, bins, ranges, resolved options, banners —
 is emitted as read-only LLVM constants (`cover_config_global`,
-`src/ir/LlvmBackend.cpp`) mirroring `src/runtime/Coverage.h` field for field,
+`src/ir/llvm/SystemTasks.cpp`) mirroring `src/runtime/Coverage.h` field for field,
 with the four struct sizes cross-checked at `rt_cover_init` the way `rt_gc_init`
 checks its one offset. One consequence found while building: that data belongs to
 the JIT and dies with it, while instances do not, so `rt_cover_init` deep-copies
@@ -507,9 +507,9 @@ type**, surviving instance death, reachable through `cg::get_coverage()` and
 bins across instances, matched by bin name*.
 
 Clotho has no tier for this. Static class properties (`declare_static_prop`,
-`src/Lower.cpp:30046`) give a per-type *slot* in per-instance-scope design state,
+`src/lower/Types.cpp, declare_static_prop`) give a per-type *slot* in per-instance-scope design state,
 not a design-wide record, and not an *iterable set of live instances*. `ClassIds`
-(`:1804`) is a compile-time id mint with no runtime side. `rt_gc_roots` regions
+(`src/lower/Lowerer.h`) is a compile-time id mint with no runtime side. `rt_gc_roots` regions
 are precise root tables, not enumerable object sets.
 
 **As built: a runtime coverage registry**, `src/runtime/Coverage.h` /
@@ -524,10 +524,10 @@ and what the report iterates.
 Three consequences, all as predicted:
 
 - **This is a deliberate departure.** Every other per-construct state in clotho is
-  design state (`src/Lower.cpp:13312` and the whole assertion-control block at
-  `:12356`); the runtime keeps no per-construct counters at all. Type coverage
+  design state (`src/lower/SvaMonitor.cpp, new_monitor_state` and the whole assertion-control block);
+  the runtime keeps no per-construct counters at all. Type coverage
   cannot follow that pattern because it must be shared across instance scopes and
-  across two Lowerers that intern the same type twice (`src/Lower.cpp:1800`).
+  across two Lowerers that intern the same type twice (`src/lower/`).
 - **Covergroup instances are immortal within a run**, rooted from the registry —
   semantically required by 19.11.3, not a leak. They are released at
   `sim_teardown` (`rt_cover_shutdown`), which is also what keeps a second design
@@ -560,7 +560,7 @@ consequence yet.
 `cg.sample()` is **not** a system call. slang models all six methods as real
 `SubroutineSymbol`s with `MethodFlags::BuiltIn` and no body
 (`CoverSymbols.cpp:129-155`, `:247`), so they arrive at
-`lower_user_call` (`src/Lower.cpp:32542`). A design that planned to extend the
+`lower_user_call` (`src/lower/Subroutines.cpp`). A design that planned to extend the
 `$`-name chain would be wrong for exactly the methods that matter.
 
 Decision: one predicate beside `is_process_method` / `is_sync_method`,
@@ -653,7 +653,7 @@ bounds (P2); transition bins and `default sequence` (P3);
   covergroup and its base are separate types for `get_coverage()`".
 - **`type_option.strobe`** — sampling in Postponed. clotho has no Postponed
   activation (it is a hard-coded straight line,
-  `src/ir/LlvmBackend.cpp:13234-13322`), but it does have exactly the right
+  `src/ir/llvm/Scheduler.cpp, emit_active_run`), but it does have exactly the right
   mechanism in `rt_strobe_pend` / `rt_strobe_pop` (`src/runtime/Runtime.h:61`),
   whose semantics the LRM itself invokes ("like the `$strobe` system task").
 - **`type_option.distribute_first`** — reorders distribution against `with`
@@ -680,7 +680,7 @@ A `ref` actual whose storage does not outlive the covergroup instance (§6.2).
   exists, leaving it silent is a decision; record it at the site and in TODO.md
   rather than leaving the current ambiguity.
 - **`cover property` has a tally nothing reads.** `sva.<id>.cov`
-  (`src/Lower.cpp:13389`) is correct and live. Reporting it needs
+  (`src/lower/SvaMonitor.cpp, emit_monitor`) is correct and live. Reporting it needs
   `ir::AssertionMonitor::label` (`src/ir/Module.h:447`), a field declared "for a
   report" and never assigned, blocked on slang modelling a statement label as the
   enclosing block symbol's name. There is also no attempt *denominator*, so

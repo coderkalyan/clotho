@@ -47,7 +47,7 @@ structurally (same field order/types), not by pointer, so GEP offsets
 
 Symbols are module-owned, unlike types: a `GlobalVariable*`/`Function*` used
 from another module must become an external declaration. `Backend::sym()`
-(LlvmBackend.cpp) is that funnel: identity while the definition is local, a
+(ir/llvm/Backend.cpp) is that funnel: identity while the definition is local, a
 memoized extern declaration otherwise (`ModuleEnv::decls`). Internal constants
 with non-unique names (rt_elem_ops descriptors, string sink) duplicate per
 module instead (`ModuleEnv::elem_ops` / `str_sink`).

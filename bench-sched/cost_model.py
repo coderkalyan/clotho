@@ -17,7 +17,7 @@ delta is the mechanism under test. `--verify` reads `clotho build --emit=llvm`.
 
 Families:
   service   a blocking store to a signal WITH static waiters vs WITHOUT.
-            `service_snapshot` (LlvmBackend.cpp:9734) emits nothing when
+            `service_snapshot` (ir/llvm/Events.cpp) emits nothing when
             `signal_has_waiters` is false, so the same store is measured with
             and without [pre-store load + emit_edge_facts + per-bucket branch +
             emit_static_scan_rt]. The producer is edge-sensitive so neither

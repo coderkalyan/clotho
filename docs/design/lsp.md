@@ -43,17 +43,17 @@ in." `clotho` links `clotho_ir_core` + `slang::slang`, no LLVM
 (`src/Diagnostic.h:70-101`) carries `{severity, origin, code, message,
 ir::SourceSpan span, vector<Diagnostic> notes, rendered}`. Spans are real
 `[start,end)` ranges, preferring slang's `d.ranges.front()` and degenerating to
-a point only when slang gave no range (`Lower.cpp:13705-13711`). slang's
+a point only when slang gave no range (`lower/Lower.cpp, from_slang`). slang's
 elaboration diagnostics, slang's dataflow analysis, Clotho's ~290 lowering
 guards and Clotho's own analysis findings all arrive in **one ordered vector**
 (`Lower.h:56-58`). `notes` maps to `relatedInformation`; `origin` is the field
 policy keys on; `rendered` is the one field an LSP must ignore
 (`src/Diagnostic.h:98-99` says so).
 
-**Error recovery landed.** `Lowerer::recover` (`Lower.cpp:1134-1155`) reports
+**Error recovery landed.** `Lowerer::recover` (`lower/Lowerer.h`) reports
 every failing behavioural member instead of the first, sets `poisoned_`, and a
-poisoned module is still **returned** for analysis with `ok = false`
-(`:13985-13987`). `lint` deliberately runs ahead of the `ok` gate
+poisoned module is still **returned** for analysis with `ok = false`.
+`lint` deliberately runs ahead of the `ok` gate
 (`main.cpp:441-455`) — which is exactly the broken-editor-buffer case.
 
 **Locations survive lowering.** `LowerResult::sources` is a
@@ -62,8 +62,8 @@ never-null (`Lower.h:59-62`), and resolves a `SourceLoc` to file:line:col
 (`SourceContext.cpp:39-67`).
 
 **Lowering is reentrant.** Zero `thread_local`, zero namespace-scope mutable
-statics, zero mutexes in `Lower.cpp` / `Builder.cpp` / `InternPool.cpp` /
-`Ir.cpp` / `Analysis.cpp`; every `static` in `Lower.cpp` is a static member
+statics, zero mutexes in `src/lower/` / `Builder.cpp` / `InternPool.cpp` /
+`Ir.cpp` / `Analysis.cpp`; every `static` in `src/lower/` is a static member
 function. Two `lower_files`/`lower_driver` calls can run concurrently. The one
 exception is `lower_text` (below).
 
@@ -76,14 +76,14 @@ design is 18,500 ms. §5.3 draws the consequence.
 ### 1.1 Blockers, verified
 
 1. **~~No named in-memory buffer entry point~~ — FIXED.** `lower_buffer(path,
-   text)` (`Lower.cpp`) assigns the text to a `SourceManager` it owns, so the
+   text)` (`lower/Lower.cpp`) assigns the text to a `SourceManager` it owns, so the
    buffer carries the client's path, nothing leaks into slang's process-wide
    static, and the call is reentrant — `lower_text` was the one lowering path
    that was not. A manager per revision rather than a reused one, per §4.1
    option 1: slang's manager is append-only, and there is only ever one buffer
    in it, so the lost file cache costs nothing.
 2. **The caller cannot supply a `Compilation`.** `lower_compilation`
-   (`Lower.cpp:13796`) is inside the anonymous namespace spanning `71`-`13992`.
+   (`lower/Lower.cpp`) is inside the anonymous namespace spanning `71`-`13992`.
    `SourceContext::comp_`/`driver_` are private with no accessor
    (`SourceContext.h:101-103`) and `adopt_compilation` is a sink, not a source.
    So a server cannot elaborate once and then serve both slang-only features
@@ -153,7 +153,7 @@ design is 18,500 ms. §5.3 draws the consequence.
    tier, which §7 needs.
 9. **Severity policy is unreachable from a caller.** `DiagnosticPolicy` has
    exactly one enumerator (`Lower.h:40-44`) and `apply_severity_policy` is
-   called with a hardcoded `Sim` (`Lower.cpp:13818`).
+   called with a hardcoded `Sim` (`lower/Lower.cpp, lower_design`).
 
 ---
 
@@ -272,7 +272,7 @@ fallback if (4) is declined, and (1) is what makes the v1 not block on it.
 
 ### 4.2 Uninstantiated modules must become analyzable
 
-`root.topInstances` (`Lower.cpp:13915`) is the correct scope for a simulator
+`root.topInstances` (`lower/Lower.cpp, lower_design`) is the correct scope for a simulator
 and the wrong one for an editor. Fix shape, in ascending cost:
 
 - **Ad-hoc top.** For the open document, elaborate with the file's own module
@@ -296,7 +296,7 @@ trust. See §7.
 ### 4.3 Cancellation is a process, not a token
 
 Neither slang nor Clotho can abort work in flight (§1.1 #4), and retrofitting a
-cancellation token through `Lower.cpp`'s ~14k lines and slang's lazy elaboration
+cancellation token through `src/lower/`'s ~14k lines and slang's lazy elaboration
 is not a realistic ask. The answer is that **the cancellable unit is an OS
 process.**
 
@@ -349,9 +349,9 @@ What is missing between it and `textDocument/publishDiagnostics`:
 That is the whole of a useful v1, and the diagnostics it publishes contain
 findings **specific to Clotho's analysis**: `full-case-not-full` and
 `parallel-case-overlap` from the landed case-pragma checks
-(`Lower.cpp:6771,6780`), judged by the *synthesis* fullness rule rather than the
+(`lower/Statements.cpp, check_case_pragmas`), judged by the *synthesis* fullness rule rather than the
 simulation one, plus Clotho's inferred-latch/comb policy and its unused/shadow
-findings with unused-parameter measured-and-silenced (`Lower.cpp:13771-13780`).
+findings with unused-parameter measured-and-silenced (`lower/Lower.cpp, apply_severity_policy`).
 
 ### 5.2 Cheap, and unclaimed by the incumbent
 
@@ -582,7 +582,7 @@ So:
   not lowered; design-level features degraded here"). They must never be
   `Error` in an editor.
 - This needs the Information/Hint tier `Severity` lacks (§1.1 #8) and the
-  third severity policy S4 still owes (`Lower.cpp:13818`). It is the concrete
+  third severity policy S4 still owes (`lower/Lower.cpp, lower_design`). It is the concrete
   consumer that makes `DiagnosticPolicy`'s second enumerator real, which S4
   correctly declined to add speculatively.
 

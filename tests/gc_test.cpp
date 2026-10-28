@@ -160,7 +160,7 @@ rt_gc_stats run_stats(std::string_view source, const std::string& expected, bool
 // Construction, inheritance, virtual dispatch through a base handle, a handle
 // returned out of a subroutine and passed into another, and a down-cast that
 // reads the object's own class from field 0 (LRM 8.4/8.20, $cast at
-// LlvmBackend.cpp:11722-11745). The GC word sits BELOW the vptr precisely so
+// ir/llvm/Inst.cpp, lower_inst). The GC word sits BELOW the vptr precisely so
 // none of this arithmetic moves (Gc.h:41-46) -- if it did, `who()` would
 // dispatch through the header and $cast would read the wrong display.
 TEST_CASE("gc: identity - construction, inheritance, virtual dispatch, $cast") {
@@ -297,7 +297,7 @@ TEST_CASE("gc: identity - allocation across suspensions in a process and a task"
 //     AddressSanitizer heap-use-after-free rather than a text diff.
 
 // A static class property is ONE slot with module-signal storage
-// (declare_static_prop, Lower.cpp:2246-2251) and reaches the collector through
+// (declare_static_prop, lower/Types.cpp) and reaches the collector through
 // the emitted clotho.gcroots table (garbage-collection.md §5). The object is
 // allocated inside a static METHOD and never touched by the process, so no
 // coroutine frame ever holds the handle -- the precise root table is the only
@@ -433,7 +433,7 @@ TEST_CASE("gc: an object reachable only from a process suspended on posedge surv
 }
 
 // A blocking task is its own coroutine with its own frame (setPresplitCoroutine
-// at LlvmBackend.cpp:3597), so its locals are a SECOND frame that must be in the
+// at ir/llvm/Subroutines.cpp, declare_task), so its locals are a SECOND frame that must be in the
 // registry while the caller's frame is suspended in the call. A registry that
 // only links process ramps and not task ramps passes the case above and fails
 // this one. The suspension is a #delay rather than an edge, covering the other
@@ -469,12 +469,12 @@ TEST_CASE("gc: an object reachable only from a suspended blocking task survives"
 }
 
 // The frame-registration predicate, adversarially. `frame_may_hold_gc_ref`
-// (LlvmBackend.cpp) decides whether a coroutine registers its frame at all: a
+// (ir/llvm/Analyses.cpp) decides whether a coroutine registers its frame at all: a
 // process that provably cannot hold a reference pays nothing, which is what keeps
 // the collector off the critical path of class-free RTL now that every run has
 // one. That makes the predicate soundness-critical in the worst way -- a missed
 // door frees a live object -- so each of its five doors
-// (LlvmBackend.cpp:11799-11829) gets a shape here that reaches a handle WITHOUT
+// (ir/llvm/Analyses.cpp, frame_may_hold_gc_ref) gets a shape here that reaches a handle WITHOUT
 // the obvious one (a plainly class-typed declared local assigned from `new`):
 //
 //   r1  the handle arrives only as a function's return value
@@ -615,7 +615,7 @@ TEST_CASE("gc: an object reachable only through a deep handle chain survives") {
 
 // A `ref` formal bound to a class property is a raw INTERIOR pointer into the
 // object body, carrying clotho.ref.noepoch -- a compile-time-zero epoch that can
-// never signal invalidation (F6, LlvmBackend.cpp:16368-16383). The task nulls
+// never signal invalidation (F6, ir/llvm/StateLayout.cpp, ref_actual_arg). The task nulls
 // the only precise root before suspending, so across the #20 the object is
 // designated by nothing but that interior pointer, and keeping it alive is
 // exactly rt_gc_find_object's interior resolution (Gc.h:244-250): a validator
@@ -695,11 +695,11 @@ TEST_CASE("gc: an object reachable only through a ref into a class property surv
 //
 // One clotho-specific fact decides which row a declared local lands in, and it is
 // not the `automatic` keyword: declare_local gives every procedural local static,
-// signal-like storage (Lower.cpp:4470-4477), and a process has no frame at all --
+// signal-like storage (lower/Types.cpp), and a process has no frame at all --
 // "frame_slots_.clear(); // a process has no frame; deinit sees only temps"
-// (LlvmBackend.cpp:3884). So a container declared in an `always` block is a
+// (ir/llvm/Subroutines.cpp, lower_group). So a container declared in an `always` block is a
 // SignalSlot in the first row, and only a task's or function's locals, which do get
-// real frame slots (build_frame_layout, LlvmBackend.cpp:4708-4710), take the
+// real frame slots (build_frame_layout, ir/llvm/Subroutines.cpp), take the
 // second.
 //
 // Both directions of getting that wrong are bugs, and they fail differently. A
@@ -869,7 +869,7 @@ TEST_CASE("gc: objects reachable only from an associative array in design state 
 
 // The other root storage class: a STATIC class property, which is its own storage
 // block rather than the design state buffer (declare_static_prop,
-// Lower.cpp:2246-2251) and reaches the collector through its own table entry. A
+// lower/Classes.cpp, lower_class_type) and reaches the collector through its own table entry. A
 // container-root table emitted only for @clotho.state passes the three cases above
 // and frees everything the UVM factory holds, which is exactly this shape.
 TEST_CASE("gc: objects reachable only from a container in a static class property survive") {
@@ -984,7 +984,7 @@ TEST_CASE("gc: objects reachable only from a queue local to a suspended process 
 }
 
 // A blocking task is its own coroutine (setPresplitCoroutine at
-// LlvmBackend.cpp:3597) and its locals DO get real frame slots, so `Cell q[$]`
+// ir/llvm/Subroutines.cpp, declare_task) and its locals DO get real frame slots, so `Cell q[$]`
 // here is the shape rt_gc_container_add / _remove exists for (Gc.h:265-268): the
 // frame holds only a pointer to a malloc'd ring, which rt_gc_find_object rejects
 // because it is not in a block, so scanning the frame conservatively cannot help
@@ -1210,7 +1210,7 @@ TEST_CASE("gc: the queue walker follows ring wraparound") {
 // An associative array KEYED by a class handle (LRM 7.8.3). The key is a strong
 // reference and the collector has to decode it out of the normalized key bytes,
 // where the handle's 64 bits were big-endian-encoded (emit_key_bytes,
-// LlvmBackend.cpp:17253-17295). This is the ONE-ENTRY case of the key-handle offset
+// ir/llvm/AssocArrays.cpp, emit_agg_key_bytes/normalize_agg_key). This is the ONE-ENTRY case of the key-handle offset
 // table: `nkeyhandles == 1` at offset 0 (Runtime.h:937-946). It is the only shape the
 // deleted RT_ELEM_FLAG_KEY_HANDLE bit could express, so keeping it here is what pins
 // that generalizing one flag into a table did not cost the degenerate case. Here the
@@ -1566,7 +1566,7 @@ TEST_CASE("gc: a dropped UVM-shaped tree of assoc children is reclaimed") {
 // `keyhandles`, each naming 8 big-endian bytes inside one normalized key span
 // (Runtime.h:937-957) -- so a handle at any offset, and several handles per key, are
 // describable. Lowering always admitted the shape (a class handle's value_cat is
-// `scalar`, Lower.cpp:2160) and guard_agg_key_leaves (Lower.cpp:2139) still refuses
+// `scalar`, lower/Types.cpp) and guard_agg_key_leaves (lower/Types.cpp) still refuses
 // only the leaves with no fixed width, so the refusal that used to stand here is
 // replaced by survival cases rather than deleted: the alternative to the guard was
 // freeing an object whose only reference is inside a key.
@@ -1578,10 +1578,10 @@ TEST_CASE("gc: a dropped UVM-shaped tree of assoc children is reclaimed") {
 //     nonzero-offset and several-handles cases fail on it; the bare handle-key case
 //     in §3 still passes, which is why that one alone proves nothing here.
 //   - reusing the STORAGE offsets. An unpacked struct's storage is an LLVM struct
-//     GEP'd by field index (agg_member, LlvmBackend.cpp:2981), so a handle member is
+//     GEP'd by field index (agg_member, ir/llvm/Aggregates.cpp), so a handle member is
 //     8-byte aligned and its predecessors are padded; the serialized span is
 //     `ceil(W/8)` per leaf with no padding at all (assoc-keys.md §2, agg_key_bytes at
-//     LlvmBackend.cpp:17175). The two agree only by accident, and the mixed-width
+//     ir/llvm/AssocArrays.cpp, agg_key_bytes). The two agree only by accident, and the mixed-width
 //     case exists to make them disagree by three bytes.
 //
 // Every case holds its objects ONLY in key bytes and runs the Junk filler, so an
@@ -1821,7 +1821,7 @@ TEST_CASE("gc: several objects held only in the SAME struct assoc KEY survive") 
 // the span is pre[0], pre[1], pre[2], in.c, in.tail, so the handle is at serialized
 // offset 3. Nothing about that offset is guessable from the type's shape -- it is
 // three `byte` leaves of an array, which the offset walk has to enter and stride
-// through at 1 byte per element (agg_key_handle_offsets, LlvmBackend.cpp:1797-1802).
+// through at 1 byte per element (agg_key_handle_offsets, ir/llvm/GcEmit.cpp).
 // Storage puts `pre` in bytes 0..2 and then aligns `in` to 8, so a storage-offset
 // walk starts on byte 8 of a 15-byte span -- inside it, past the handle, and running
 // one byte off the end.
@@ -1908,7 +1908,7 @@ TEST_CASE("gc: a handle nested under an array and a struct inside an assoc KEY s
 // The other nesting direction: a fixed unpacked array OF HANDLES, inside a nested
 // struct, behind an int. The span is lead, in.pair[0], in.pair[1], in.tag_id, so the
 // table has two entries at 4 and 12 and the walk has to stride the array by 8
-// (agg_key_handle_offsets, LlvmBackend.cpp:1797-1802) rather than by the element's
+// (agg_key_handle_offsets, ir/llvm/GcEmit.cpp) rather than by the element's
 // storage size. Storage would say 8 and 16.
 TEST_CASE("gc: an assoc KEY holding a fixed array of handles keeps every element") {
     constexpr std::string_view src = R"(
@@ -1997,7 +1997,7 @@ TEST_CASE("gc: an assoc KEY holding a fixed array of handles keeps every element
 //   Cell c         64            8                   5                 8
 //
 // `ceil(W/8)` per leaf with no padding (assoc-keys.md §2) puts the handle at 5; the
-// LLVM struct layout agg_member GEPs (LlvmBackend.cpp:2981) puts the member at 8,
+// LLVM struct layout agg_member GEPs (ir/llvm/Aggregates.cpp) puts the member at 8,
 // three bytes later, because `shortint` is 2-aligned and the handle is 8-aligned.
 // A walk reusing the storage offsets reads bytes 8..15 of a 13-byte span: the tail of
 // the handle plus three bytes off the end, which marks nothing and frees the object.
@@ -2258,7 +2258,7 @@ TEST_CASE("gc: the nursery budget path bounds the live set") {
 
 // The documented second-order leak: because a class body is never freed today,
 // every string, queue, dynamic array and associative array INSIDE an object
-// leaks its own heap too -- emit_class_body_init (LlvmBackend.cpp:1847-1861) has
+// leaks its own heap too -- emit_class_body_init (ir/llvm/Aggregates.cpp) has
 // no matching emit_agg_deinit call anywhere (garbage-collection.md §0). The fix
 // is the per-class finalizer at Gc.h:91, which is that same deinit walk run at
 // sweep, and `finalized` counts the objects it ran for.
@@ -2649,7 +2649,7 @@ TEST_CASE("gc: an object held only as an assoc KEY inside a promoted object surv
 // at once, and each fails differently. The write barrier has to log `bag` at a store
 // that writes no handle anywhere -- one is HASHED into the key span -- which is why
 // the barrier hangs off the assoc lvalue's `assoc_key_handle` on the entry-CREATING
-// put_ptr path (LlvmBackend.cpp:17450) rather than off any handle store -- and then the
+// put_ptr path (ir/llvm/AssocArrays.cpp, assoc_elem_lvalue) rather than off any handle store -- and then the
 // young collection's re-walk of that single remembered owner has to decode the handle
 // back out of the span at the offset the table names. A barrier keyed on handle
 // stores never logs the owner; a barrier that fires paired with a walk that reads
@@ -2735,7 +2735,7 @@ TEST_CASE("gc: a struct assoc KEY holding a handle inside a promoted object surv
     CHECK(yg.promoted > 0u);
     // The narrow one: `b.keyed[k] = int` stores no handle and `bag.name` is written
     // once before any promotion, so the only barrier emission that can log this owner
-    // is the entry-creating put_ptr's (LlvmBackend.cpp:17450).
+    // is the entry-creating put_ptr's (ir/llvm/AssocArrays.cpp, assoc_elem_lvalue).
     CHECK(yg.remembered > 0u);
     const rt_gc_stats st = run_stats(src, expected, cadence_stress);
     CHECK(st.collections > 0u);
@@ -2744,7 +2744,7 @@ TEST_CASE("gc: a struct assoc KEY holding a handle inside a promoted object surv
 
 // The store site that is not a store: `first(k)` WRITES the found key into `k`
 // through denormalize_assoc_key, which reaches lower_store directly and never
-// passes through the ordinary handle-store path (LlvmBackend.cpp:17518). So when
+// passes through the ordinary handle-store path (src/ir/llvm/). So when
 // the readback target is a class PROPERTY -- a cursor that is a class member, which
 // is what UVM writes -- a class handle lands inside a possibly-promoted object
 // through a path the barrier has to be taught about separately.
@@ -2763,7 +2763,7 @@ TEST_CASE("gc: a struct assoc KEY holding a handle inside a promoted object surv
 //
 // `cursor` must stay declared as `Cell`: the member selection keeps the owner only
 // for a member whose type transitively reaches a class handle (agg_member,
-// LlvmBackend.cpp:2945), so a cursor "simplified" to an int or a string clears the
+// ir/llvm/Aggregates.cpp, is_leaf_type), so a cursor "simplified" to an int or a string clears the
 // owner and the barrier can never fire however OLD `bag` is. The value check is
 // what covers that -- a vacuous version of this case fails on the $display rather
 // than passing quietly -- but this is the line not to touch.

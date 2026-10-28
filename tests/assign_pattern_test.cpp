@@ -640,7 +640,7 @@ TEST_CASE("assignment-pattern lvalue: nonblocking commits deferred") {
 
 TEST_CASE("assignment-pattern lvalue: keyed pattern is rejected as an lvalue") {
     // slang itself rejects a keyed pattern as an lvalue at binding time
-    // ("expression is not assignable"), ahead of Lower.cpp's own guard for
+    // ("expression is not assignable"), ahead of lower/Assign.cpp's own guard for
     // the same rule (kept as defense in depth for any shape slang doesn't
     // catch first).
     CHECK_FALSE(reject(R"(
@@ -654,7 +654,7 @@ TEST_CASE("assignment-pattern lvalue: keyed pattern is rejected as an lvalue") {
 
 TEST_CASE("assignment-pattern lvalue: compound assignment is rejected") {
     // Also caught by slang at binding time ("invalid operands to binary
-    // expression") ahead of Lower.cpp's own guard.
+    // expression") ahead of lower/Assign.cpp's own guard.
     CHECK_FALSE(reject(R"(
         module m;
             int a, b;
@@ -666,7 +666,7 @@ TEST_CASE("assignment-pattern lvalue: compound assignment is rejected") {
 
 TEST_CASE("assignment-pattern lvalue: queue right-hand side is rejected") {
     // slang rejects this at binding time ("lvalue assignment patterns cannot
-    // be assigned from dynamic arrays"), ahead of Lower.cpp's own guard (kept
+    // be assigned from dynamic arrays"), ahead of lower/Assign.cpp's own guard (kept
     // as defense in depth).
     CHECK_FALSE(reject(R"(
         module m;
@@ -682,7 +682,7 @@ TEST_CASE("assignment-pattern lvalue: queue right-hand side is rejected") {
 
 TEST_CASE("assignment-pattern lvalue: element count mismatch is rejected") {
     // slang rejects this at binding time ("requires 4 elements but 3 were
-    // provided"), ahead of Lower.cpp's own guard (kept as defense in depth).
+    // provided"), ahead of lower/Assign.cpp's own guard (kept as defense in depth).
     CHECK_FALSE(reject(R"(
         module m;
             int a, b, c;

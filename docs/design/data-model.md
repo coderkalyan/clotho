@@ -22,8 +22,8 @@ different vocabularies, at ~40 separate `fail()` sites.
 
 Three concrete symptoms, all measured (see §9 for the evidence):
 
-1. **Two type vocabularies.** `src/Lower.cpp` had 9 `ir::Ref` predicates and
-   `src/ir/LlvmBackend.cpp` had 11, of which 5 pairs were textual clones
+1. **Two type vocabularies.** `src/lower/` had 9 `ir::Ref` predicates and
+   `src/ir/llvm/` had 11, of which 5 pairs were textual clones
    (`is_agg_abi`/`is_agg_abi_ref`, `contains_struct`/`contains_struct_ref`,
    `is_string_type`/`is_string_ref`, `is_leaf_type`/`is_leaf_ref`,
    `is_handle_type`/`is_handle_ref`). Nothing in `clotho_ir_core` exported a

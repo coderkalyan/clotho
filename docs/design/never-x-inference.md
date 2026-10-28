@@ -119,7 +119,7 @@ Seed #2 is what limits coverage. Two shapes:
 
 Small, because the 2-state machinery already exists:
 
-- **Storage** (`build_state_layout`, ~`LlvmBackend.cpp:626`): today
+- **Storage** (`build_state_layout`, ~`src/ir/llvm/`): today
   `slot.four_state = (domain == Four)`. Change to
   `slot.four_state = (domain == Four) && (may_x[sig] || may_z[sig])`, so a
   proven-clean `logic` slot becomes narrow (`{iW}`). The store into it already

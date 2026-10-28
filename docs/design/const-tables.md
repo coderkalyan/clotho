@@ -1,7 +1,7 @@
 # Runtime-indexed constant tables
 
 **Status:** landed (option B, below). Line references are "Merge feat/copyclass: fork join_any and join_none" (`main`),
-i.e. the state of the tree before the change, file `src/Lower.cpp` unless
+i.e. the state of the tree before the change, file `src/lower/` unless
 stated.
 
 ## Problem
@@ -90,12 +90,12 @@ than at `signal_of`.
   `finalize_preinit` :11315), element addressing and LRM 7.4.6 out-of-range
   behavior for free.
 - **Backend read-only globals**: `agg_proto_global`
-  (`src/ir/LlvmBackend.cpp:1257`), `elem_ops_global` (:1290, memoized by element
+  (`src/ir/llvm/Containers.cpp`), `elem_ops_global` (memoized by element
   type), `vtable_global`, the enum name/value tables — all
   `isConstant=true` `InternalLinkage` globals. None of them holds user design
   data today.
 - **Element addressing is storage-agnostic**: the `ElemSelect` lvalue case
-  (`src/ir/LlvmBackend.cpp:10338`) consumes only `LValue::base` / `elem_idx` /
+  (`src/ir/llvm/Inst.cpp, lower_inst`) consumes only `LValue::base` / `elem_idx` /
   `array_ty`, never `storage_ptr` directly, so a table addressed out of a
   constant global reuses the whole bounds/normalization path unchanged.
 
@@ -107,20 +107,20 @@ than at `signal_of`.
    it to every inferred sensitivity list that reads it. Harmless at runtime
    (`PreInit` stores service no wait queue) but it inflates wait queues and
    breaks the documented rule; `record_read` must skip const-table signals.
-2. **VCD.** `vcd_index_signal` (`src/ir/LlvmBackend.cpp:16146`) dumps every
+2. **VCD.** `vcd_index_signal` (`src/ir/llvm/Vcd.cpp`) dumps every
    named signal of a scope. A materialized table would appear as a design
    variable. This is already a live bug for the packed spill — dumping the
    existing hazard3-shaped case emits `$var reg 8 # __taskarg0 $end`. One
    `hidden` flag on `SignalInfo` fixes both.
 3. **Per-instance values.** slang gives each instance distinct `ValueSymbol`s
-   (`lower_instance`, :1044), and `emit_state_global`
-   (`src/ir/LlvmBackend.cpp:2388`) creates one state global per anchor with no
+   (`lower_instance`), and `emit_state_global`
+   (`src/ir/llvm/StateLayout.cpp, emit_state_global`) creates one state global per anchor with no
    dedup, so naive signal storage duplicates the table bytes and its
    initialization once per instance.
 4. **Layout is a backend decision.** `lower_constant` has no aggregate branch;
    `InternPool::put_value` takes a flat byte blob, while the actual element slot
    layout (may-z narrowing, 2-state vs 4-state planes) is computed in
-   `build_state_types` (`src/ir/LlvmBackend.cpp:1797`). A baked image must
+   `build_state_types` (`src/ir/llvm/StateLayout.cpp`). A baked image must
    therefore be assembled backend-side from a canonical pooled blob, not
    pre-laid-out in the frontend.
 5. **Signal creation order.** The `Pass` model (:1038) says only Collect
@@ -163,11 +163,11 @@ carrying a pooled constant image.
   lands.
 - **B — baked static initializer.** `SignalInfo` gains `const_data` (a pooled
   blob `Ref`); the backend builds the state field's initializer from it in
-  `slot_const` (`src/ir/LlvmBackend.cpp:9335`) and skips the X/0 runtime fill in
-  `emit_array_init` (:9406). Zero init instructions, zero runtime cost, data
+  `slot_const` (`src/ir/llvm/Aggregates.cpp`) and skips the X/0 runtime fill in
+  `emit_array_init`. Zero init instructions, zero runtime cost, data
   still duplicated per instance in `.data`.
 - **C — `.rodata`-backed storage.** The signal gets no state field;
-  `storage_ptr` (`src/ir/LlvmBackend.cpp:2297`) returns an `isConstant=true`
+  `storage_ptr` (`src/ir/llvm/StateLayout.cpp`) returns an `isConstant=true`
   global memoized by the pooled blob `Ref`, so every instance sharing a
   parameterization shares one copy. Element addressing is unchanged (see
   above). Needs a `storage_ptr` / `build_state_types` branch and a
@@ -182,7 +182,7 @@ duplication, and its emission code would be thrown away.
 ## What landed
 
 Two materialization modes, chosen per type by whether the value has a static
-image. `const_table_signal` (`src/Lower.cpp`) is the single entry: it registers
+image. `const_table_signal` (`src/lower/Types.cpp`) is the single entry: it registers
 one signal per parameter symbol, memoized in `sigmap_`, and either bakes or
 seeds it.
 

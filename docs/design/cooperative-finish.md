@@ -50,7 +50,7 @@ it at or near zero:
    call site keeps the same shape.
 
 2. **Only *may-finish* call sites pay.** A memoized transitive closure over the
-   call graph — the same shape as `close_fn` (LlvmBackend.cpp:4397) — marks a
+   call graph — the same shape as `close_fn` (ir/llvm/Analyses.cpp) — marks a
    function or task may-finish if its own IR contains `Finish` (or `$fatal`, or
    the oscillation abort) or if it calls a may-finish callee. Only those call
    sites get a post-call test. In typical RTL `$finish` sits in one testbench

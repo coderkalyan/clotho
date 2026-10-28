@@ -202,7 +202,7 @@ TEST_CASE("naming the verdict lattice leaves a ring monitor's emitted IR alone")
     // hashing tag names: inserting ir::Inst::Tag::DisableRemote mid-enum renumbered
     // every later tag and broke this digest without moving an instruction. The
     // instruction count, which is the claim that matters, did not change (125).
-    // Re-established again when Lower.cpp stopped emitting an argument list in
+    // Re-established again when src/lower/ stopped emitting an argument list in
     // the compiler's evaluation order: GCC and clang used to produce different
     // digests, and both now produce this one, with the count unchanged.
     CHECK(monitor_shape(m) ==

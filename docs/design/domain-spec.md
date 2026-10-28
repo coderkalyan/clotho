@@ -17,7 +17,7 @@ not need a second body are static never-x inference
 
 The rest of this document is kept as the record: the mechanism, the
 eligibility rules, and the measurements. It describes code that no longer
-exists; `git log -- src/ir/LlvmBackend.cpp` has it.
+exists; `git log -- src/ir/` has it.
 
 ## Problem
 

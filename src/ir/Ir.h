@@ -513,8 +513,8 @@ enum class ForkKind : uint32_t {
 // child reads or writes -- a fork inside a task or a function, where a child's
 // references to the enclosing formals and automatics cannot resolve to module
 // signals. Each is passed to EVERY child as an ArgDir::In formal, in this order,
-// so formal k of each child holds the box for args[k]'s variable (Lower.cpp's
-// lower_fork / build_fork_child). They are rvalues, not places: the shared
+// so formal k of each child holds the box for args[k]'s variable (lower/Statements.cpp's
+// lower_fork / lower/Subroutines.cpp's build_fork_child). They are rvalues, not places: the shared
 // variable lives in the box, which the GC keeps alive off each child's own frame,
 // so a child may outlive the activation that declared the variable. That holds for
 // every join kind, `join` included -- see docs/design/fork-join.md V4 for why the
@@ -975,7 +975,7 @@ struct SformatInfo {
     // where `fmt` / `fmt_len` carry the text instead. Never both.
     Index fmt_value;
     // Only read with `fmt_value`: with a constant format the frontend has already
-    // scaled every %t operand (Lower.cpp scale_to_ticks).
+    // scaled every %t operand (lower/Assign.cpp scale_to_ticks).
     TickScale tick_scale;
 };
 
@@ -1026,7 +1026,7 @@ struct FreadMemInfo {
 
 // Extra payload for `test_plusargs`: $test$plusargs(str) (LRM §21.6). `str` is
 // the packed query-string bytes (a compile-time-literal argument; a runtime
-// string operand is a documented gap, see Lower.cpp).
+// string operand is a documented gap, see lower/SystemTasks.cpp).
 struct TestPlusArgsInfo {
     // First extra word of the packed query-string bytes.
     ExtraIndex str;
@@ -1556,7 +1556,7 @@ struct Inst {
         // agree keep the value, a 0-vs-1 (or any x) conflict is x, all-z is z.
         // Associative + commutative, so K drivers fold left through this.
         // Result is always 4-state at the operand width (payload: binary).
-        // Emitted only by the multi-driver-net resolver (Lower.cpp
+        // Emitted only by the multi-driver-net resolver (lower/Nets.cpp
         // emit_wire_resolvers); single-driver nets never use it.
         WireRes,
         // Wired-AND / wired-OR multi-driver resolution (LRM 6.6.2 / 6.6.3) for
@@ -1595,7 +1595,7 @@ struct Inst {
         // count. Result is a definite (2-state) 32-bit count. Used to lower the
         // one-hot `case (1'b1)` reverse-case idiom to a jump table: the winning
         // arm is the lowest (ascending source order) or highest (descending) set
-        // bit index. See Lower.cpp build_onehot_plan.
+        // bit index. See lower/Statements.cpp build_onehot_plan.
         Ctz,
         Clz,
 

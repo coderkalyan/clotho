@@ -3,7 +3,7 @@
 Target: SystemVerilog interfaces — interface instantiation, interface ports,
 modport views, and signals / tasks / functions declared in interfaces. TODO.md
 M3 item ("Interfaces & modports"); all forms loud-fail today at
-`wire_ports` (`Lower.cpp`, `"interface/modport port connections are not
+`wire_ports` (`lower/Hierarchy.cpp`, `"interface/modport port connections are not
 supported"`).
 
 Status: **Phase 1 landed** — interface instances, plain interface ports,
@@ -74,7 +74,7 @@ the shared-storage path already used for cross-hierarchy references
 (`top.u1.sig`, LRM 23.6): one `ir::Signal` in the interface instance's scope,
 every reference resolving to it.
 
-## Phase 1 changes (`src/Lower.cpp`)
+## Phase 1 changes (`src/lower/`)
 
 The two-pass `Collect` → `Emit` lowering already guarantees every signal is
 registered before any body emits, so an interface instance declared anywhere in

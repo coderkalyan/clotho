@@ -8,7 +8,7 @@ need the same runtime structure and were refused for exactly that reason,
 Status: **landed, all nine methods plus both fork statements.** Phases P0-P4 below
 are done in four commits; §13 records what each cost against what it predicted. The
 `std`-package refusal is now keyed by class name, so `semaphore` / `mailbox` /
-`weak_reference` keep theirs (`src/Lower.cpp`, `lower_class_type`).
+`weak_reference` keep theirs (`src/lower/Classes.cpp`, `lower_class_type`).
 
 This is an M4 feature, not a nice-to-have: a UVM testbench stores a `process`
 handle in a class property, calls `process::self()` inside a forked thread and
@@ -59,7 +59,7 @@ The rules that shape the design, in the order they constrain it:
 
 - **A process object is not user-constructible.** `isAbstract` makes slang reject
   `new`, which clotho already reports (`cannot instantiate an abstract (virtual)
-  class`, `src/Lower.cpp:22102`). Objects come into existence because a process
+  class`, `src/lower/Classes.cpp, lower_new_class`). Objects come into existence because a process
   exists, so their lifetime is tied to a thread, not to a `new`.
 - **Identity is per *process*, not per object.** `self()` called twice in one
   thread must compare equal. Clotho's `==` on class handles is a bare `icmp` on the
@@ -104,12 +104,12 @@ The rules that shape the design, in the order they constrain it:
 Facts, all established against the code, in the order the design needs them.
 
 **Nothing names a process.** A handle is `llvm::Value* hdl_` from
-`llvm.coro.begin` (`src/ir/LlvmBackend.cpp:3547-3548`); the seed loop keeps
+`llvm.coro.begin` (`src/ir/llvm/Subroutines.cpp, lower_group`); the seed loop keeps
 handles in a *codegen-time* `std::vector<llvm::Value*>` and drops them after the
-subscribe pass (`:9873`, `:9944-9957`). The only durable copies anywhere are a
-wait-bucket entry `{ptr handle, ptr flag}` (`wait_elem_ty`, `:6038-6041`), field 2
-of the frame-resident `awaiter` (`:4735-4741`), and the `parent` field of a task or
-fork record — all region-tagged through `parked_handle` (`:9406-9430`).
+subscribe pass. The only durable copies anywhere are a
+wait-bucket entry `{ptr handle, ptr flag}` (`wait_elem_ty`), field 2
+of the frame-resident `awaiter`, and the `parent` field of a task or
+fork record — all region-tagged through `parked_handle`.
 `src/runtime/*` has no process struct at all.
 
 **A fork child cannot be named after it is spawned.** `lower_fork_inst`
@@ -178,7 +178,7 @@ compile error under `--gc`** (`elem_ops_for`, `:1503-1516`).
 |---|---|---|
 | **A** | **Split the control block from the object.** A thread's control block (status word, activation stack, `await` waiters, RNG pointer, tree links) is **native, untraced** storage: a `[nproc x %clotho.pcb]` array in module state for statically created processes — no allocation at all — and a chunked runtime pool with a freelist for fork children, the only genuinely dynamic tier. The `process` **object** is a small GC class object whose single property is a `chandle` to a control block, created **lazily at the first `self()`** and memoized weakly in the block. | Processes are static, so their control blocks are static; only fork children are unbounded (§4.0). Allocation then scales with `self()` calls, not with threads spawned, and the tree/park state the scheduler walks never touches the collector. |
 | **B** | **Identity travels the call ABI**, as argument 2 beside `rng`, gated on `DesignUses::process`; the argument is the control-block pointer, not a handle. | `rng` proves the pattern. A "current process" global would need a store at every resume site, and a missed site is a *silent* wrong identity (Verilator pays exactly this: `t_currentp`, `verilated_types.h:315`). |
-| **C** | Each parking activation links a **frame-resident node onto its thread's PCB stack**, innermost first, reusing `disable_node_ty` verbatim. | Gives kill a claimable park for a thread parked *behind a task call or a fork* — the case remote `disable` refuses today (`hard_park`, `src/Lower.cpp:8463-8501`). |
+| **C** | Each parking activation links a **frame-resident node onto its thread's PCB stack**, innermost first, reusing `disable_node_ty` verbatim. | Gives kill a claimable park for a thread parked *behind a task call or a fork* — the case remote `disable` refuses today (`hard_park`, `src/lower/Assertions.cpp`). |
 | **D** | **`kill` = the landed `disable` abort, per thread instead of per target**: mark, force-wake once, poll after each park, leave through the ordinary epilogue. Nothing is destroyed from outside. | It is the only shape that unwinds a nested frame chain and releases frame-owned heap. §12 rejects the alternatives. |
 | **E** | The tree **re-parents live grandchildren on a thread's completion**, so `first_child == null` means "no live descendants". | LRM 9.6.3 requires descendants of already-terminated children; the invariant then makes `wait fork` a one-word test rather than a walk. Verilator does *not* do this (`verilated_types.h:338-343` detaches in the destructor), which is a spec deviation to avoid inheriting. |
 | **F** | `suspend`/`resume` are a **status word plus a pending-wake bit**, checked at the same poll point as the abort. No desensitisation, no queue surgery. | Nothing can be removed from the wheel or from a static bucket; the LRM's own resume wording (§1) is satisfied exactly by "the wake already happened, replay it". |
@@ -192,7 +192,7 @@ compile error under `--gc`** (`elem_ops_for`, `:1503-1516`).
 
 A process is static: `mod_.processes()` is a compile-time span
 (`src/ir/Module.h:707-709`) and the process index already keys `proc_sched`
-(`sched_flag_ptr`, `LlvmBackend.cpp:889-895`). So a statically created process needs
+(`sched_flag_ptr`, `ir/llvm/StateLayout.cpp`). So a statically created process needs
 **no allocation whatsoever** — its control block is one element of a module-state
 array at a constant address, exactly like its scheduled flag. An earlier draft of
 this document allocated one per thread uniformly; that was wrong, and the three
@@ -309,7 +309,7 @@ half exists to catch cannot arise.
 
 **`--gc off`**: the finalizer never runs, so a `process` object leaks and its
 block's count never drops — identity stays stable and nothing is recycled. That is
-the same trade every class body already makes (`LlvmBackend.cpp:12965-12968`: "With
+the same trade every class body already makes (`ir/llvm/Inst.cpp, lower_inst`: "With
 --gc off the lifetime is leaked, which LRM 8.4 makes observably correct"), and it is
 bounded by the number of distinct threads that called `self()`.
 
@@ -438,9 +438,9 @@ RUNNING/WAITING for the whole run, which is correct: only `kill`, `disable`, or
 
 Two stores per park, in a gated design only. `status()` is `load ctl` masked to
 three bits; `.name()` on the result goes through the existing enum-name path
-(`lower_enum_method`, `src/Lower.cpp:15687`) because slang's synthesized
+(`lower_enum_method`, `src/lower/SystemTasks.cpp`) because slang's synthesized
 `EnumType` is an ordinary enum to clotho (`lower_type` has no enum arm — it
-lowers as a 32-bit signed 2-state int, `:2145-2151`).
+lowers as a 32-bit signed 2-state int).
 
 The LRM has no READY state, so a thread that is queued on a ring but not yet
 resumed reads **RUNNING** ("not in a blocking statement"). Recorded as an
@@ -494,12 +494,12 @@ kill(p):
   if p is the running thread: branch to this frame's abort exit
 ```
 
-`force_wake(q)` is `lower_disable_list`'s inner block sequence (`:22750-22817`)
+`force_wake(q)` is `lower_disable_list`'s inner block sequence
 with the target read from `q->acts` instead of a per-target list node: claim the
 park record's `state` if one is live, else push iff the scheduled flag is clear,
 then set the flag. Deleting the "am I my own node" test in favour of an explicit
-self branch mirrors `DisableAbort` (`src/Lower.cpp:7669-7671`,
-`LlvmBackend.cpp:13907-13912`).
+self branch mirrors `DisableAbort` (`src/lower/`,
+`ir/llvm/Inst.cpp, lower_inst`).
 
 The subtree walk is an explicit pointer-chasing DFS using `parent` to backtrack —
 O(1) extra space, no recursion in emitted code, and safe against the walk's own
@@ -703,8 +703,8 @@ Both become small, and neither needs anything beyond §4-§7:
   additionally checks its parent's `WAIT_FORK` and wakes it when the parent's
   `first_child` has gone null. One pointer test, because of the invariant.
 
-The two frontend refusals (`src/Lower.cpp:7614-7623`) and the independent
-`ReactiveSafetyChecker` rejections (`:889-895`, `:926-930`) are then narrowed to
+The two frontend refusals (`src/lower/`) and the independent
+`ReactiveSafetyChecker` rejections are then narrowed to
 the cases that remain refused, if any.
 
 This also **lifts, rather than works around, two of `disable`'s refusals**: with the
@@ -734,7 +734,7 @@ its tree is these control blocks (`docs/design/program-blocks.md` §5):
 - 24.3's implicit descendant termination sets it in the backend rather than the
   analysis, at the one site that already folds design-wide questions into the flag:
   `design_uses_process_ = facts_.uses.process || (has_program_initial() && design_forks())`
-  (`src/ir/LlvmBackend.cpp`, `run()`). Narrowed by `design_forks()` deliberately —
+  (`src/ir/llvm/Backend.cpp`, `run()`). Narrowed by `design_forks()` deliberately —
   with no fork in the design a program `initial` has no descendant thread, so the
   walk is provably empty and a program-only design keeps paying nothing.
 
@@ -1020,7 +1020,7 @@ citing them rather than the summary line:
   `tests/fork_test.cpp`, 39 cases, reports **384 bytes in 6 allocations and no pool
   chunk at all**, which is also the check that the V4 capture boxes are collected:
   a per-capture leak would show up there first.
-  Class bodies still leak on this branch by direction (`LlvmBackend.cpp`,
+  Class bodies still leak on this branch by direction (`ir/llvm/Inst.cpp`,
   `ClassNew`: "with --gc off the lifetime is leaked, which LRM 8.4 makes observably
   correct"), and a `process` object is a class body.
 - **The freelist demonstrably works.** 2000 spawn / `disable fork` cycles whose

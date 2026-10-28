@@ -72,7 +72,7 @@ propagates down, so polymorphism is uniform across a hierarchy. Design:
   index + `class_header_words`, applied in the single member-GEP chokepoint
   (`agg_member`) and `emit_class_body_init`. Every class carries the word — see
   Runtime type identity below for why it cannot be conditioned on polymorphism.
-- **Slots.** `compute_vtable` (Lower.cpp) keys slots by method **name** per
+- **Slots.** `compute_vtable` (lower/Classes.cpp) keys slots by method **name** per
   hierarchy (`class_vslot_`): base virtuals take 0..k-1, an override — implicit, or
   of a pure prototype — reuses the base slot of the same name, a new virtual
   appends. Name-keying (rather than an override-chain / `getOverride()` identity) is
@@ -240,7 +240,7 @@ tests:
   makes an id a position in a global order: it needs the whole forest before it
   can emit the first descriptor, and inserting one class renumbers everything
   after it. A display entry needs nothing but the class's own ancestor chain, so
-  ids are unique and nothing more (`ClassIds` in Lower.cpp, minted on demand) and
+  ids are unique and nothing more (`ClassIds` in lower/Lowerer.h, minted on demand) and
   a future granular/incremental compilation has no whole-design barrier to clear.
   Id 0 is reserved for "no class": it is the display padding past a class's own
   depth, and what a zeroed word reads as, so both fail closed.
@@ -267,7 +267,7 @@ tests:
   only "when the source and destination types are not cast compatible", a
   qualification that would be redundant if every run-time null failed. iverilog
   does not implement `$cast` at all, so it is no oracle here; Verilator answers 1.
-  Recorded at `lower_cast` in Lower.cpp.
+  Recorded at `lower_cast` in lower/SystemTasks.cpp.
 - **The task form of a failed cast is a run-time error** (LRM 6.24.2), reported
   through the same `severity` + `finish` pair `$fatal` uses. This closes the same
   gap for an enum destination.
@@ -383,7 +383,7 @@ escaping construct sits; otherwise the walk-up is unchanged. This is a
 single, minimal, precisely-scoped patch that transparently covers all three
 constructs (and any depth of statement-block nesting inside any of them),
 because they all bottom out in this one function, and it does NOT need (or
-touch) anything in clotho's own `src/Lower.cpp` — the defect and the fix
+touch) anything in clotho's own `src/lower/` — the defect and the fix
 are both entirely in name resolution, upstream of anything clotho lowers.
 Two boundaries fall out of the fix by construction, not by a separate
 special case: escaping the class scope itself, to its enclosing
@@ -962,13 +962,13 @@ buffers — they deep-copy on assignment. A class handle does not.
 - **Reference semantics, not value.** `h1 = h2` copies the *pointer* (one store);
   `h1 == h2` / `h == null` is pointer identity; passing a handle to a subroutine
   passes the pointer by value (no copy). This is the one hard divergence from the
-  dynarr/queue handle family (`is_handle_ref`, `Lower.cpp:1346`, deep-copies) —
+  dynarr/queue handle family (`is_handle_ref`, `lower/Lowerer.cpp`, deep-copies) —
   classes need a parallel predicate with copy-pointer behavior.
 - **The object *body* reuses the struct aggregate storage.** An object is a heap
   block whose layout is `agg_storage_ty` over the property table
-  (`LlvmBackend.cpp:774`). Field access is an aggregate lvalue **rooted at the
+  (`ir/llvm/Aggregates.cpp`). Field access is an aggregate lvalue **rooted at the
   loaded handle pointer** instead of the inline state base
-  (`signal_lvalue`, `LlvmBackend.cpp:7482`, roots `lv.base`/`lv.root_ty`
+  (`signal_lvalue`, `ir/llvm/Inst.cpp`, roots `lv.base`/`lv.root_ty`
   generically) — the `MemberSelect` → `agg_path` → `lv_field_ptr` chain is
   untouched. This is the "lowering looks roughly the same as struct" the task
   named, and it is the whole reason class field access is cheap.
@@ -1047,7 +1047,7 @@ type-layer decision and the easiest to get silently wrong (an empty-class
 collision would type-pun two unrelated handles).
 
 Cache per slang symbol as structs already do (`struct_type_cache_`,
-`Lower.cpp:908`) — a `class_type_cache_` keyed on the `ClassType*`.
+`lower/Types.cpp, lower_type`) — a `class_type_cache_` keyed on the `ClassType*`.
 
 ### Recursive / self-referential types
 
@@ -1061,7 +1061,7 @@ semantics is what makes this trivial — a real advantage of the handle model.)
 ## 4. Storage model
 
 - **Handle slot** — a bare `ptr` (wrap as `{ ptr }` for GEP/array-of-handle
-  uniformity, matching the string/dynarr slot convention, `LlvmBackend.cpp:610`).
+  uniformity, matching the string/dynarr slot convention, `src/ir/llvm/`).
   Powers on as `null` (the state global's `zeroinitializer` gives it for free —
   no init call). A class-typed signal / frame local is one pointer.
 - **Object body** — a heap block: `[ i64 type-id header ] ++ agg_storage_ty(properties)`.
@@ -1073,11 +1073,11 @@ semantics is what makes this trivial — a real advantage of the handle model.)
 
 ## 5. Frontend lowering (reuses the struct path)
 
-1. `lower_type`: drop the class fall-through at `Lower.cpp:963`; build
+1. `lower_type`: drop the class fall-through at `lower/Types.cpp`; build
    `Kind::Class` (intern-first for recursion), walk `membersOfType<ClassPropertySymbol>`
    for the field table and register methods (§5.1).
-2. **Member access**: `lower_member_lvalue` (`Lower.cpp:7486`) currently
-   `fail`s on a non-`FieldSymbol` member (`:7489`) — extend it: a class
+2. **Member access**: `lower_member_lvalue` (`lower/Expr.cpp`) currently
+   `fail`s on a non-`FieldSymbol` member — extend it: a class
    property emits the same `member_select` as an unpacked-struct field,
    rooted at the handle deref.
 3. **Handle ops**: assignment = plain pointer store (a new leaf case, *not*
@@ -1098,23 +1098,23 @@ two threading points, so methods reuse the whole existing subroutine machinery
 - `SubroutineSymbol::thisVar` (`const VariableSymbol*`) — the implicit `this`
   inside the method body (slang synthesizes it; `ClassType` carries one too).
 - `CallExpression::thisClass()` (`const Expression*`) — the object handle at the
-  call site, null for a free function (the existing guard, `Lower.cpp:8209`).
+  call site, null for a free function (the existing guard, `lower/Subroutines.cpp, lower_user_call`).
 
-**Definition** (`build_function` / `build_task`, `Lower.cpp:8131` / `8053`).
+**Definition** (`build_function` / `build_task`, `lower/Subroutines.cpp`).
 Today formals become frame Locals, formal k == Local k. For a method, *before*
 the real formals: if `sub.thisVar != nullptr`, `fn_local(*sub.thisVar)` first, so
 **Local 0 = `this`**, `param_types[0]` = the class-handle `Ref`,
 `arg_dirs[0] = In`. Inside the body, slang lowers both `this.f` and bare `f` as
 accesses rooted at `thisVar`; `lvalue_root`/`value_lvalue` already consult
-`fn_ctx_->localmap` (`Lower.cpp:7737`), so they find `thisVar` → Local 0 → load
+`fn_ctx_->localmap` (`src/lower/`), so they find `thisVar` → Local 0 → load
 the handle → aggregate lvalue rooted at that loaded pointer (§4). No new access
 code — the struct `MemberSelect` path with a different root. `this` alone is
 Local 0 loaded (a bare handle value).
 
-**Call** (`lower_user_call` / `lower_task_call`, `Lower.cpp:8205` / `8245`).
+**Call** (`lower_user_call` / `lower_task_call`, `lower/Subroutines.cpp`).
 Replace the `fail`: when `call.thisClass() != nullptr`, lower that object
 expression to its handle and **prepend it as arg 0**, then `build_call_args`
-(`:8228`) for the explicit args unchanged, then `b.call(id, {this, ...args})`.
+for the explicit args unchanged, then `b.call(id, {this, ...args})`.
 copy-out for output/inout formals, ref aliasing, and return are reused verbatim.
 
 **The one subtlety.** `this` is an `In` pointer passed **by value** (reference

@@ -59,7 +59,7 @@ robust and strictly more setup; it is not worth it until the drift happens.
 
 - **Linux: clang, not GCC.** Ubuntu 24.04 caps out at GCC 14, which rejects the
   implicit capture of an enclosing-class member inside a deducing-`this` lambda
-  (`LlvmBackend.cpp`'s `close_fn`) — a GCC 14 defect fixed in 15, and no
+  (`ir/llvm/Analyses.cpp`'s `close_fn`) — a GCC 14 defect fixed in 15, and no
   GitHub-hosted image carries 15. `clang-22` comes from the same apt repository
   as the LLVM being linked. Restoring a GCC build (valuable for a compiler
   project — a second front end catches different mistakes) needs either a

@@ -2428,7 +2428,7 @@ TEST_CASE("class vtable: a virtual call reached before its class is numbered") {
 // (uvm_sequence.svh:47), reachable from nothing more than `class C extends
 // uvm_sequence;`. Checked here at the IR level (no JIT): every class the design
 // registered must have every ancestor in its own display chain ALSO registered,
-// which is exactly what LlvmBackend.cpp's class_desc_global assumes when it walks
+// which is exactly what ir/llvm/GcEmit.cpp's class_desc_global assumes when it walks
 // that chain.
 void check_every_class_desc_complete(const ir::Module& m) {
     const auto check_chain = [&](ir::Ref start) {
@@ -2448,7 +2448,7 @@ void check_every_class_desc_complete(const ir::Module& m) {
         }
     }
     // And every ancestor of every registered class, matching class_desc_global's
-    // (LlvmBackend.cpp) own display-building walk.
+    // (ir/llvm/GcEmit.cpp) own display-building walk.
     for (const ir::ClassDesc& cd : m.class_descs()) {
         check_chain(cd.class_ref);
     }
@@ -2496,7 +2496,7 @@ TEST_CASE("class registration: a base's property cycling back to its own derived
 // vtable and no descriptor. That is exactly the shape that crashed a real
 // `uvm_component_registry#(T,Tname)::create`'s `$cast(create, obj)`
 // (uvm_registry.svh:116) as an unlocated "internal: class without a descriptor"
-// in LlvmBackend.cpp's ClassIsA case. Fixed the same way as the base-recursion
+// in ir/llvm/Inst.cpp's ClassIsA case. Fixed the same way as the base-recursion
 // case: lower_class_type now un-interns on the way out if anything after
 // bind_class_type throws, so the SECOND reference gets its own honest,
 // stub-eligible LowerError instead of silently inheriting a landmine.
@@ -3431,7 +3431,7 @@ TEST_CASE("an inherited scalar property's notifier keeps the base's field index"
 // 4-state (or any >=128-bit) slot. x86-64 lowers a wide equality compare of such
 // loads to an ALIGNED vector move (vmovdqa, #GP on a misaligned address), so the
 // over-claim was a silent SIGSEGV, first hit by UVM's waited-on wide properties.
-// clamp_unproven_align (LlvmBackend.cpp) now clamps every claim the pointer
+// clamp_unproven_align (ir/llvm/LlvmBackend.cpp) now clamps every claim the pointer
 // cannot prove. Both cases assert the VALUE, not just survival.
 
 // The UVM shape: a store to a waited-on `logic [63:0]` property emits the

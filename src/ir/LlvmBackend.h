@@ -4,7 +4,7 @@
 // and emits textual LLVM IR. This is the first consumer of clotho_ir that turns
 // the IR into something compilable; the library is no longer "just IR".
 //
-// Model (see LlvmBackend.cpp for the full rationale):
+// Model (see ir/llvm/Backend.h for the full rationale):
 //   * One shared state struct holds a slot per module signal: a packed must|may
 //     word plus a z word — the z word elided when the may-z analysis
 //     (Analysis.h) proves the signal never carries z.

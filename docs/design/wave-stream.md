@@ -296,8 +296,8 @@ End
 **The header is complete before the first `Time`.** This is a protocol
 invariant, not an accident: `$dumpvars` registers the whole design in one burst
 inside an `initial` block, then calls `rt_vcd_start`
-(`src/ir/LlvmBackend.cpp:14395-14411`), and only whole-design `$dumpvars` is
-accepted (`src/Lower.cpp:11258-11302`). A consumer may therefore build its
+(`src/ir/llvm/Vcd.cpp, lower_dump_limit/lower_dump_vars`), and only whole-design `$dumpvars` is
+accepted (`src/lower/SystemTasks.cpp, lower_dumpvars`). A consumer may therefore build its
 hierarchy once and never grow it. Incremental declaration after `HeaderEnd` is
 reserved for a future `proto` and is a protocol violation in v1.
 
@@ -435,10 +435,10 @@ New flags on `clotho run`:
 `--wave-stream` implies `--dump --dump-format=none` unless `--dump` is also
 given, in which case both sinks run.
 
-**The gating problem.** `design_uses_vcd()` (`src/ir/LlvmBackend.cpp:14144-14173`)
+**The gating problem.** `design_uses_vcd()` (`src/ir/llvm/Vcd.cpp`)
 is a whole-design scan for `$dump*`; when it is false the backend emits no touch
-hooks (`:7183`, `:14318`, `:14350`), no flush call (`:7750-7751`) and no close
-call (`:7847-7848`), so no amount of runtime configuration can produce a record.
+hooks, no flush call and no close
+call, so no amount of runtime configuration can produce a record.
 The predicate must become `design_uses_vcd() || cfg.dump_forced`, with
 `dump_forced` set from the CLI and threaded through `ir::SimulationConfig`
 (`src/ir/SimConfig.h:95` — the type is `SimulationConfig`; there is no
@@ -447,13 +447,13 @@ backend.
 
 Enabling dumping from the CLI must also synthesize the `$dumpfile`/`$dumpvars`
 call sequence at time 0. The cleanest place is the same lowering that handles the
-tasks (`src/Lower.cpp:11200-11302`): when `dump_forced` is set and the design
+tasks (`src/lower/SystemTasks.cpp, lower_dumpvars`): when `dump_forced` is set and the design
 contains no `$dumpvars`, emit the whole-design form into an implicit initial
 process. Note there is nothing to reuse in the frontend: `lower_dumpvars`
-(`src/Lower.cpp:11258-11302`) only *validates* and emits a bare
-`b.dump_vars(loc(call))` at `:11301`. The whole-design enumeration lives in the
+(`src/lower/SystemTasks.cpp`) only *validates* and emits a bare
+`b.dump_vars(loc(call))`. The whole-design enumeration lives in the
 backend — `lower_dump_vars` walking `mod_.tops()` through `emit_vcd_scope_tree`
-and `emit_vcd_var` (`src/ir/LlvmBackend.cpp:14395-14427`, `:14437+`), exactly as
+and `emit_vcd_var` (`src/ir/llvm/Vcd.cpp`), exactly as
 `docs/VCD.md` §9 describes — and it is reached unchanged.
 
 ### 4.4 Composable sinks
@@ -521,7 +521,7 @@ one compare per settled instant when not streaming.
 ### 4.7 Signal classes clotho refuses
 
 `emit_vcd_var` throws `BackendError` for events, strings and multidimensional
-arrays (`src/ir/LlvmBackend.cpp:14444-14476`), which **fails the whole
+arrays (`src/ir/llvm/Vcd.cpp, emit_vcd_var`), which **fails the whole
 compilation**. Today that is tolerable because dumping is opt-in in the source.
 With `--dump`/`--wave-stream` it becomes a trap: a user asks for waves and their
 design stops building.
@@ -659,8 +659,8 @@ Riptide will eventually want to start, stop, step and restart the simulation.
 Recording the constraints here so this document does not get retrofitted:
 
 - **Clotho has no run control today.** The simulation is one monolithic JIT'd
-  `sim_drain` called once (created at `src/ir/LlvmBackend.cpp:4351-4359`, body
-  emitted by `emit_active_run` at `:7231-7852`, invoked via `rt_sim_run`,
+  `sim_drain` called once (created at `src/ir/llvm/Scheduler.cpp, emit_main`, body
+  emitted by `emit_active_run`, invoked via `rt_sim_run`,
   `src/runtime/Runtime.cpp:3480`; looked up at `src/ir/Jit.cpp:586` and entered
   by the single `fn()` call at `:622`). There is no re-entrant step entry point
   and no way to return from the drain and re-enter.

@@ -19,7 +19,7 @@ scoping (§7).
 One scope boundary beyond the original plan: a class handle anywhere inside a
 VARIABLE key (a key containing a string / queue / dynamic-array / associative-
 array component) is refused loudly (`guard_key_no_handle_in_variable`,
-Lower.cpp). The collector's key-handle trace is a compile-time STATIC offset
+lower/Types.cpp). The collector's key-handle trace is a compile-time STATIC offset
 table, correct only for a FIXED key; a variable key's byte offsets depend on
 runtime data, so a handle inside one could land at a different offset per
 entry. A runtime decode walk the collector could use instead was not built.
@@ -73,28 +73,28 @@ arbitrary". That frees the encoding for everything hard.
 
 ## 2. What exists today
 
-### Frontend — `src/Lower.cpp`
+### Frontend — `src/lower/`
 
-- Admit list, `lower_type`'s `AssociativeArrayType` arm (`Lower.cpp:1907`):
+- Admit list, `lower_type`'s `AssociativeArrayType` arm (`lower/Types.cpp`):
   `kt.isClass() || kt.isIntegral() || kt.isString() || is_agg_abi_type(kt)`.
   Anything else gets one message naming the admitted set.
-- `is_agg_abi_type` (`Lower.cpp:2497`) is `isUnpackedStruct() ||
+- `is_agg_abi_type` (`lower/Lowerer.cpp`) is `isUnpackedStruct() ||
   as_if<FixedSizeUnpackedArrayType>()` — note it **excludes an unpacked union**,
   which `lower_type` is otherwise happy to lower to `Kind::Struct`.
-- `guard_agg_key_leaves` (`Lower.cpp:1739-1766`) walks an aggregate key's leaves
+- `guard_agg_key_leaves` (`lower/Types.cpp`) walks an aggregate key's leaves
   and admits **integral leaves only**. It emits the two messages the conformance
   suite is hitting: `... with a string member is not supported` and `... with a
   queue / dynamic-array member is not supported`. Its `is_float` arm is dead —
   slang rejects a real-bearing index type first (`index type cannot be or contain
   floating point types`).
 - The type pool encodes the key on the `Assoc` type: `t.fields_id` = the key type
-  ref, `t.right` = the `[*]` wildcard flag (`Lower.cpp:1890-1921`).
+  ref, `t.right` = the `[*]` wildcard flag (`lower/Types.cpp, lower_type`).
 - `lower_assoc_key` is the single frontend entry that lowers a key expression;
-  two paths bypass it (`emit_assoc_literal_init` at `Lower.cpp:2936`,
-  `const_table_signal` at `Lower.cpp:3749`) — latent, see §7.
+  two paths bypass it (`emit_assoc_literal_init` at `lower/Assign.cpp`,
+  `const_table_signal` at `lower/Types.cpp`) — latent, see §7.
 - The frontend does **nothing** about x/z indices.
 
-### Backend — `src/ir/LlvmBackend.cpp:13396-13697`
+### Backend — `src/ir/llvm/AssocArrays.cpp`
 
 A key crosses the ABI as a normalized span `{const u8* ptr, u32 len}` built
 inline by the JIT. Four normalizers:
@@ -300,7 +300,7 @@ These were pre-existing, independent of the feature:
   `const_table_signal`'s own bypass (seeding a parameter-typed assoc constant)
   remains unreachable, gated by an independent, still-standing "only integral,
   real, string and null constant parameters" restriction unrelated to this
-  feature; documented in place (`Lower.cpp`, `emit_const_seed`) for if that
+  feature; documented in place (`lower/Types.cpp`, `emit_const_seed`) for if that
   restriction is ever lifted.
 - **P4d — `%p` of an assoc with an unpacked-struct / fixed-array key crashed**
   (a slang assertion, casting the key's unpacked struct type as packed) --

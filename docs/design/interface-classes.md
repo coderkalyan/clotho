@@ -24,23 +24,23 @@ descriptor region and one slot-numbering space already exists and is tested:
 - The **class descriptor** hangs off every object body at field 0, and the object
   header points at vtable slot 0, so anything prepended to the descriptor sits at a
   design-wide **constant negative offset** from the handle
-  (`src/ir/LlvmBackend.cpp:2213-2239`). That is exactly the shape an interface test
+  (`src/ir/llvm/GcEmit.cpp, class_body_ty/class_desc_ty`). That is exactly the shape an interface test
   needs, and it is the shape `$cast`'s ancestor display already uses
-  (`LlvmBackend.cpp:15091-15115`; ten green cases at `tests/class_test.cpp:1527-1826`).
+  (`ir/llvm/Inst.cpp, lower_inst`; ten green cases at `tests/class_test.cpp:1527-1826`).
 - **Name-keyed vtable slots.** `compute_vtable` keys slots by method *name* per
   hierarchy, which is what already lets a `MethodPrototypeSymbol` share a slot with
   its concrete overrides even though slang links them not at all
-  (`src/Lower.cpp:3077-3136`). LRM 8.26.6.1 requires a single implementation to
+  (`src/lower/Classes.cpp, compute_vtable`). LRM 8.26.6.1 requires a single implementation to
   satisfy every same-named prototype of every implemented interface — name keying
   *is* that rule.
 - **Prototype-built stubs.** `build_pure_stub` rebuilds a callable signature from a
   `MethodPrototypeSymbol` alone — function or task, scalar or aggregate return
-  (`src/Lower.cpp:3199-3277`). An interface-class prototype is the same symbol kind,
+  (`src/lower/Classes.cpp, compute_vtable/build_pure_stub`). An interface-class prototype is the same symbol kind,
   so it needs no new stub machinery.
 - **Reserved descriptor slots by name.** `$copy`, `$randomize` and `$randops`
   already occupy vtable slots keyed by names no SV identifier can spell
-  (`src/Lower.cpp:3118-3135`), and every consumer looks them up *by name*
-  (`ensure_vtable(clt).at(kCopySlot)`, `src/Lower.cpp:23435`) — so renumbering them
+  (`src/lower/Classes.cpp, compute_vtable`), and every consumer looks them up *by name*
+  (`ensure_vtable(clt).at(kCopySlot)`, `src/lower/Classes.cpp`) — so renumbering them
   costs nothing.
 - **Specialization identity.** slang monomorphizes `C#(args)` into a distinct fully
   substituted `ClassType`, memoized on the argument tuple
@@ -54,7 +54,7 @@ that is a handle type with no object (`lower_class_type`'s interface path), one
 design-wide numbering space for interface method names plus one for interface ids
 (`IfaceIds`), two constant-offset descriptor regions (`class_desc_ty`), one new IR op
 (`ClassImplements`), one `uint32_t` on `VirtualCallInfo`, and eight frontend
-branches. Measured: +730 / -86 lines of source across `src/Lower.cpp` and
+branches. Measured: +730 / -86 lines of source across `src/lower/` and
 `src/ir/` (Ir.h, Module.h, Builder, Printer, Analysis, LlvmBackend), plus 535 lines
 of tests. No runtime change, no ABI change, no allocator change: `src/runtime/` is
 untouched.
@@ -113,7 +113,7 @@ Verified in the vendored tree; clotho may assume all of it and need not re-check
 
 Consequence worth stating plainly: because slang requires the implementing method to
 be declared `virtual` (`ClassSymbols.cpp:858-865`, `diag::IfaceMethodNotVirtual`),
-`is_user_virtual` (`src/Lower.cpp:3024-3026`) is **already true** for every
+`is_user_virtual` (`src/lower/Classes.cpp`) is **already true** for every
 interface-implementing method, and each already gets an ordinary name-keyed vtable
 slot in its own hierarchy today.
 
@@ -179,7 +179,7 @@ records what each of them became.
 
 1. **The refusal fires at the interface-typed *entity*, not at the interface
    declaration.** `lower_class_type` is reached from `lower_type`
-   (`src/Lower.cpp:2511-2513`) and an interface class satisfies `isClass()`, so the
+   (`src/lower/Types.cpp, lower_type`) and an interface class satisfies `isClass()`, so the
    guard trips the first time a variable, formal, property, return type or `$cast`
    destination of interface type is lowered. Measured, six probes, every diagnostic
    pointing at the interface-typed *declaration*:
@@ -210,36 +210,36 @@ records what each of them became.
    exists anywhere in the class implementation**, which rules out any interface
    design needing an adjusted `this` (§12).
 4. **The descriptor is `{ptr map, [16 x i32] display, [N x ptr] slots}`** and the
-   object header points at `slots[0]` (`LlvmBackend.cpp:2235-2239`, `:2306-2311`).
-   Two offset facts the design must respect, both stated in the source at
-   `:2224-2234`: the trace-map pointer is *prepended* so its vptr-relative offset
+   object header points at `slots[0]` (`ir/llvm/GcEmit.cpp, class_desc_ty`).
+   Two offset facts the design must respect, both stated in the source:
+   the trace-map pointer is *prepended* so its vptr-relative offset
    (`-72`) is independent of the slot count and is cross-checked against the runtime
-   at startup (`gc_map_vptr_offset()` at `:2247-2254`, `rt_gc_map_vptr_offset()` at
+   at startup (`gc_map_vptr_offset()`, `rt_gc_map_vptr_offset()` at
    `src/runtime/Gc.cpp:2960-2965`, `gc_fatal` on mismatch at `:2492-2497`); and the
    display must end exactly where slot 0 begins, because `ClassIsA` computes
-   `4*class_depth(dest) - 4*kMaxClassDepth` (`LlvmBackend.cpp:15111`).
+   `4*class_depth(dest) - 4*kMaxClassDepth` (`ir/llvm/GcEmit.cpp`).
 5. **Vtable slot numbers are per single-inheritance hierarchy, first-come by name**
-   (`src/Lower.cpp:3098-3136`), and `VirtualCallInfo::slot` is a compile-time
+   (`src/lower/Classes.cpp, compute_vtable`), and `VirtualCallInfo::slot` is a compile-time
    `uint32_t` used as a fixed GEP index (`src/ir/Ir.h:451-452`,
-   `LlvmBackend.cpp:21666`). Two unrelated classes implementing the same interface
+   `ir/llvm/Subroutines.cpp, load_vtable_callee`). Two unrelated classes implementing the same interface
    therefore assign that interface's method **different** slot numbers. This is the
    one genuine design problem (§5).
 6. **`class_type_id` mints ids on demand from a design-wide counter starting at 1**
-   (`src/Lower.cpp:1039-1046`, `:3039-3057`), and enforces
+   (`src/lower/Classes.cpp`), and enforces
    `depth < kMaxClassDepth = 16`. Ids are "unique and nothing more — no order, no
    density", deliberately, so minting needs no view of the design.
 7. **`lower_cast`'s always-fails arm assumes single inheritance, in writing**
-   (`src/Lower.cpp:17040-17049`): *"Single inheritance is what makes this conclusive --
+   (`src/lower/SystemTasks.cpp, lower_cast`): *"Single inheritance is what makes this conclusive --
    with two bases a common descendant could satisfy both."* An interface destination
    or source invalidates it (§6.3).
 8. **Two whole-design analyses key on the raw slot index across every descriptor** —
    the `ref`-formal epoch ABI union (`src/ir/Analysis.cpp:1724-1755`) and the RNG
-   materialization union (`LlvmBackend.cpp:8058-8090`). A second numbering space
+   materialization union (`ir/llvm/Analyses.cpp, build_rng_fns`). A second numbering space
    needs its own pass over these, or virtual `ref` formals and `$urandom` state get
    computed against the wrong function set.
-9. **`find_pure_proto` walks only the base chain** (`src/Lower.cpp:3062-3074`), and
-   `compute_vtable` fails loudly on an unfilled slot in a non-abstract class
-   (`:3187-3189`). Both need the interface closure once prototypes can arrive from
+9. **`find_pure_proto` walks only the base chain** (`src/lower/Classes.cpp`), and
+   `compute_vtable` fails loudly on an unfilled slot in a non-abstract class.
+   Both need the interface closure once prototypes can arrive from
    an interface.
 10. **`Module::ClassDesc` has no interface state**: `{class_ref, slots, type_id}`
     (`src/ir/Module.h:631-640`), and `Module::class_desc` is a linear scan
@@ -249,8 +249,8 @@ records what each of them became.
     to be fixed when this lands: `set_vtable` (`classes.md:119`) and
     `vtable_for` (`:99`) do not exist — the API is `Module::set_class_desc` /
     `Module::class_desc`; the descriptor sketch at `:151-160` omits the trace-map
-    pointer that is now field 0; and `is_handle_ref` is at `Lower.cpp:4235`, not
-    `:1346`, and means *container* handle, never class handle.
+    pointer that is now field 0; and `is_handle_ref` is in `lower/Lowerer.cpp`
+    and means *container* handle, never class handle.
 
 ---
 
@@ -275,8 +275,8 @@ records what each of them became.
 
 ### 4.1 The `Ref`
 
-`lower_class_type` (`src/Lower.cpp:2568`) loses the refusal and gains an early
-interface path, before the property-chain construction at `:2643`:
+`lower_class_type` (`src/lower/Classes.cpp`) loses the refusal and gains an early
+interface path, before the property-chain construction:
 
 - Intern `Kind::Class` with a freshly reserved `fields_id` (nominal identity, never
   deduped — `src/ir/InternPool.h:126-135`), `element = Ref::Invalid` (an interface
@@ -297,7 +297,7 @@ Everything else about an interface-typed value follows for free: `layout` report
 the same 64-bit two-state handle (`src/ir/InternPool.cpp:177-182`), so a variable, a
 formal, a property, a queue element and a mailbox message of interface type reuse
 the entire scalar path; `coerce` routes a class-to-interface assignment to
-`b.resize` (`src/Lower.cpp:4285-4298`), which is a no-op between two width-64 refs;
+`b.resize` (`src/lower/Lowerer.cpp, coerce`), which is a no-op between two width-64 refs;
 and the GC traces an interface-typed word because it is `Kind::Class`, with the
 concrete object's own trace map applying at the other end.
 
@@ -311,7 +311,7 @@ name, at the built-in interception point.
 
 ### 4.3 The two new descriptor regions
 
-`class_desc_ty` (`src/ir/LlvmBackend.cpp:2235-2239`) gains two regions, both **only
+`class_desc_ty` (`src/ir/llvm/GcEmit.cpp`) gains two regions, both **only
 in a design that declares an interface class**:
 
 ```
@@ -329,12 +329,12 @@ Three properties make this the right placement, and each is load-bearing:
 - **The trace-map offset does not move.** `map` still has exactly one pointer and
   one display between it and slot 0, so `gc_map_vptr_offset()` computes `-72` as
   before; only its two hardcoded element indices change (`0`/`2` → `2`/`4`,
-  `LlvmBackend.cpp:2250-2251`). The runtime's independent computation
+  `src/ir/llvm/`). The runtime's independent computation
   (`rt_gc_map_vptr_offset()`, `src/runtime/Gc.cpp:2960-2965`) and the startup
   cross-check (`:2492-2497`) are untouched, in both descriptor shapes.
 - **`$cast`'s display arithmetic does not move.** The display still ends where slot
-  0 begins, which is the invariant `LlvmBackend.cpp:2230-2234` states and
-  `ClassIsA` depends on (`:15111`).
+  0 begins, which is the invariant `ir/llvm/GcEmit.cpp, class_body_ty` states and
+  `ClassIsA` depends on.
 - **Both new regions are at design-wide constant negative offsets** —
   `implemented` at `-72-8W`, `islots` at `-72-8W-8M` — because `W` and `M` are
   design-wide constants *by the time descriptors are emitted*. Descriptor globals
@@ -377,10 +377,10 @@ that makes the display test branch-free.
 
 A call site knows the *interface* statically and the receiver's class not at all.
 Slot numbers are allocated per hierarchy, first-come by name
-(`src/Lower.cpp:3098-3136`), so `Fifo::put` and `Stack::put` — both implementing
+(`src/lower/Classes.cpp, compute_vtable`), so `Fifo::put` and `Stack::put` — both implementing
 `PutImp::put` — routinely land at different indices. `VirtualCallInfo::slot` is a
 compile-time constant GEP index (`src/ir/Ir.h:451-452`,
-`LlvmBackend.cpp:21666`), so one number cannot serve both receivers. Something has
+`ir/llvm/Subroutines.cpp, load_vtable_callee`), so one number cannot serve both receivers. Something has
 to be uniform across *implementers of an interface*, which the per-hierarchy
 numbering is not.
 
@@ -388,7 +388,7 @@ numbering is not.
 
 **One design-wide index per interface method *name*.** `IfaceSlots` mints
 `std::string_view -> uint32_t` on demand, in encounter order, exactly as `ClassIds`
-mints type ids and with the same justification (`src/Lower.cpp:1035-1046`): an index
+mints type ids and with the same justification (`src/lower/Lowerer.h, ClassIds`): an index
 is unique and nothing more, so minting one needs no view of the design.
 
 Name keying is not a shortcut, it is the LRM rule. 8.26.6.1 requires a single
@@ -418,7 +418,7 @@ reason.
    8.26.2's inherited-implementation case falls out with no extra code.
 3. For a `virtual class` that re-declares a prototype instead of implementing it
    (LRM 8.26.7), the entry takes the prototype stub `build_pure_stub` already
-   builds for abstract classes (`src/Lower.cpp:3181-3195`).
+   builds for abstract classes (`src/lower/Classes.cpp`).
 4. Every other index in `islots` is unreachable and holds one shared never-executed
    body. Never called if the design is right; diagnosable if it is not.
 
@@ -449,14 +449,14 @@ planned:
 ### 5.3 The call sequence
 
 Frontend, at the two existing virtual-call decision points
-(`lower_user_call:24381,24405-24408`, `lower_task_call:24439,24457-24460`): when
+(`lower_user_call`, `lower_task_call`): when
 `declaring_class(sub).isInterface`, the call is interface-dispatched.
 `declaring_class` already returns the interface `ClassType` for a call bound through
-an interface handle (`:3322-3328`), and slang hands the call a bodyless stub
+an interface handle, and slang hands the call a bodyless stub
 subroutine carrying `MethodFlags::Pure` with a non-null `getPrototype()`
 (`SubroutineSymbols.cpp:1177`, `Lookup.cpp:1988-1992`) — that triple is the
 detection, and `virtual_sig_id` already routes a `Pure` callee to a prototype-built
-stub for its signature (`src/Lower.cpp:3337-3345`).
+stub for its signature (`src/lower/Classes.cpp, virtual_sig_id`).
 
 `VirtualCallInfo` (`src/ir/Ir.h:445-458`) grows one field:
 
@@ -469,7 +469,7 @@ uint32_t iface_index;
 A `uint32_t` keeps the payload trivially copyable, u32-sized and padding-free, which
 is what `ExtraPayload` requires; a `bool` would not. `ir::kNoIface = UINT32_MAX`.
 
-Backend: `load_vtable_callee` (`LlvmBackend.cpp:21659-21668`) branches on
+Backend: `load_vtable_callee` (`ir/llvm/Subroutines.cpp`) branches on
 `iface_index` and, when set, replaces its constant-index GEP off the vptr with a
 constant *negative* offset GEP into `islots`:
 
@@ -490,7 +490,7 @@ handshake with no new machinery (`docs/design/classes.md:106-114`).
 ### 5.4 The whole-design unions
 
 The `ref`-formal epoch union (`src/ir/Analysis.cpp:1724-1755`) and the RNG
-materialization union (`LlvmBackend.cpp:8058-8090`) both index by raw slot number
+materialization union (`ir/llvm/Analyses.cpp, build_rng_fns`) both index by raw slot number
 across every `ClassDesc`. Interface indices are a **second numbering space**: each
 pass needs a parallel loop over `ClassDesc::islots` keyed by `iface_index`, and a
 `CallVirtual` with `iface_index != kNoIface` must consult that table rather than the
@@ -507,7 +507,7 @@ RNG state.
 `ClassImplements` — one new IR op, `{handle, interface Ref}` → 1-bit value, the same
 payload shape and value facts as `ClassIsA` (`src/ir/Ir.h:1219-1225`,
 `Analysis.cpp:1046-1050`). Codegen mirrors `ClassIsA`
-(`LlvmBackend.cpp:15091-15115`) and is branch-free for the same reason:
+(`ir/llvm/Inst.cpp, lower_inst`) and is branch-free for the same reason:
 
 ```
 isnull = handle == 0
@@ -545,7 +545,7 @@ chain (`Type.cpp:646-661`, `:741-760`), and `coerce`'s `Resize` is a no-op.
 
 ### 6.3 The static-fail arm must not run on an interface operand
 
-`lower_cast` (`src/Lower.cpp:17040-17049`) currently answers a constant 0 whenever
+`lower_cast` (`src/lower/SystemTasks.cpp`) currently answers a constant 0 whenever
 neither static type is assignment-compatible with the other, and says why in the
 source: single inheritance makes that conclusive. With an interface on either side
 it is not. `$cast(base_ref, iface_ref)` where some `Derived extends Base implements I`
@@ -714,10 +714,10 @@ Ranked by how much damage a naive implementation does.
    that use both features.
 5. **`compute_vtable`'s concrete-class check firing on a legal abstract class.**
    `if (!clt.isAbstract) fail("concrete class has an unimplemented pure virtual method")`
-   (`src/Lower.cpp:3187-3189`) is right for the base chain; a `virtual class` that
+   (`src/lower/Classes.cpp, compute_vtable`) is right for the base chain; a `virtual class` that
    re-declares an interface prototype (LRM 8.26.7) must reach the stub path, and a
    *concrete* class can never get there because slang already required the
-   implementation. Keep the check, route `find_pure_proto` (`:3062-3074`) through the
+   implementation. Keep the check, route `find_pure_proto` through the
    interface closure.
 6. **A cyclic interface `extends`.** slang does not check it (§1.3(7)); an unvisited
    closure walk hangs the compiler. A visited set, and a loud failure rather than a
@@ -755,7 +755,7 @@ Ranked by how much damage a naive implementation does.
   derived classes (prefix property), so seeding has to happen before *any* class is
   numbered, which requires a whole-design pre-pass over every interface class before
   the first descriptor — the property `ClassIds` was deliberately designed not to
-  need (`src/Lower.cpp:1035-1038`, `classes.md:169-176`) — and it pads every class in
+  need (`src/lower/Lowerer.h, ClassIds`, `classes.md:169-176`) — and it pads every class in
   the design, not only implementers.
 - **A sorted id list plus a bloom word for the implements test**, as sketched at
   `classes.md:218-225`. Rejected in favour of the bitmap: ids are minted dense, so
@@ -932,7 +932,7 @@ through an interface handle; the `rand_mode` refusal; `%p` of an interface handl
 - **An unrelated static type pair is no longer conclusive.** LRM 8.26 lets a common
   implementer relate two otherwise unrelated types, so the always-fails fold is
   restricted to pairs where neither side is an interface class
-  (`src/Lower.cpp:17040-17049` gains that condition, and its comment gains the
+  (`src/lower/SystemTasks.cpp, lower_cast` gains that condition, and its comment gains the
   reason).
 - **`rand_mode` / `constraint_mode` through an interface handle is refused, not
   guessed.** LRM 8.26.9 says they "shall not be legal"; slang installs the built-ins

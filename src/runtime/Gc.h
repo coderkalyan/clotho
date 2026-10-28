@@ -14,7 +14,7 @@
 // policy change rather than a redesign.
 //
 // Everything here is part of the JIT-callable C ABI, so the struct layouts below
-// are mirrored bit-for-bit by the backend (LlvmBackend.cpp, `gc_map_ty` /
+// are mirrored bit-for-bit by the backend (ir/llvm/GcEmit.cpp, `gc_map_ty` /
 // `gc_roots_ty` / `gc_frame_ty`) exactly as rt_elem_ops is. Any change is a
 // lockstep two-file edit; rt_gc_init cross-checks the one offset the backend
 // computes independently.
@@ -183,7 +183,7 @@ typedef struct rt_gc_roots {
 //
 // A suspended SV process has no stack: it is an LLVM switched-resume coroutine
 // whose live handles are in a heap frame with a CoroSplit-chosen layout
-// (LlvmBackend.cpp:3176-3200). The node is an alloca inside the coroutine, which
+// (ir/llvm/Subroutines.cpp, lower_group). The node is an alloca inside the coroutine, which
 // CoroSplit hoists into that frame, so linking it at the ramp makes the frame's
 // base and size reachable while the process is suspended. The frame is then
 // scanned word-wise and every hit validated and pinned.
@@ -299,7 +299,7 @@ rt_gc_mutator* rt_gc_mutator_current(void);
 // the GC word, and records the object as finalizable when map->finalize is
 // non-null. Never returns null: an unsatisfiable request takes the runtime's
 // located-fatal path, matching rt_alloc's contract at the ClassNew site
-// (LlvmBackend.cpp elides the null guard on a fresh handle).
+// (ir/llvm/Inst.cpp elides the null guard on a fresh handle).
 //
 // Generated code INLINES the bump-and-mark sequence against the mutator fields
 // above and reaches the runtime only when the current hole cannot satisfy the
@@ -464,7 +464,7 @@ void rt_gc_get_stats(rt_gc_stats* out);
 // a live block, be RT_GC_ALIGN-aligned once walked back, and have its
 // object-start bit set. Also resolves interior pointers, which is what makes a
 // `ref` into a class property (a raw interior pointer carrying
-// clotho.ref.noepoch, LlvmBackend.cpp:16368-16383) safe with no epoch machinery.
+// clotho.ref.noepoch, ir/llvm/StateLayout.cpp, ref_actual_arg) safe with no epoch machinery.
 void* rt_gc_find_object(const void* addr);
 
 // Walk the heap asserting every live object's descriptor, size and handle fields

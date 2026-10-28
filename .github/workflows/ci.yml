@@ -31,6 +31,10 @@ env:
   MSYS2_LLVM_PKGREL: "3"
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 1G
+  # The frontend and backend precompile their internal headers; ccache only
+  # caches files built against a PCH with this sloppiness
+  # (https://ccache.dev/manual/4.7.4.html#_precompiled_headers).
+  CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
   # libsva is a Zig static library clotho's frontend links at build time
   # (docs/design/concurrent-assertions.md §1); pin the commit CI builds
   # against rather than floating on whatever main happens to be, since
@@ -124,7 +128,7 @@ jobs:
           sudo apt-get update
           # clang, not GCC. Ubuntu 24.04 caps out at GCC 14, which rejects the
           # implicit capture of an enclosing-class member inside a deducing-this
-          # lambda (LlvmBackend.cpp's close_fn) — a GCC 14 defect fixed in 15,
+          # lambda (ir/llvm/Analyses.cpp's close_fn) — a GCC 14 defect fixed in 15,
           # and 15 is not available on any GitHub-hosted image. libstdc++-14-dev
           # supplies <print>, which src/main.cpp uses and GCC 13's does not have.
           # The -dev packages are what LLVM's exported CMake targets link

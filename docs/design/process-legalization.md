@@ -106,7 +106,7 @@ Two mitigating facts, both important for us:
 - It exists **solely to group arms into `$pmux` vs chained `$mux`** — a QoR decision,
   not a correctness one. Clotho may approximate or skip it.
 
-Clotho's existing `full_case` coverage check (landed in `Lower.cpp`) already takes a
+Clotho's existing `full_case` coverage check (landed in `lower/Statements.cpp`) already takes a
 different approach: direct enumeration of the value space, capped at 16 bits. That
 is O(2^W) *memory* but linear in covered values, with a hard predictable ceiling
 rather than an unpredictable cube explosion. Widening it is §7.

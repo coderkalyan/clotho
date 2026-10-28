@@ -1654,7 +1654,7 @@ TEST_CASE("a non-whole-signal inout program port connection is rejected") {
 // So the region is NOT a property of the body. A body only program code reaches
 // folds Reactive, a body only ordinary code reaches folds Active, and a body BOTH
 // reach carries its caller's answer in its coroutine frame
-// (build_shared_home_fns / home_ptr in LlvmBackend.cpp). Every case below is an
+// (build_shared_home_fns / home_ptr in ir/llvm/Scheduler.cpp). Every case below is an
 // ordering observable, since that is the only way the region shows.
 
 // 24.5's own example, as close to the clause's text as clotho's tests get:
@@ -1740,7 +1740,7 @@ TEST_CASE("one suspending task called from both a program and a module keeps two
 // shared. `inner`'s region therefore cannot come from either declaration -- it
 // comes from `outer`'s frame, which came from `outer`'s caller. Each call site
 // passes the home it is currently running under rather than its lexical one
-// (callee_home in LlvmBackend.cpp), so this holds at any depth.
+// (callee_home in ir/llvm/Scheduler.cpp), so this holds at any depth.
 //
 // Same slot-15 arrangement and same Active cascade as the case above.
 TEST_CASE("a task called from a program passes its region to the task it calls") {

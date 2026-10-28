@@ -56,8 +56,8 @@ listed under "Verification" below.
 
 ## Motivation & current state
 
-`ref` on any subroutine is rejected (`Lower.cpp:5543`); functions reject
-`output`/`inout`/`ref` (`:5548`). Tasks support `output`/`inout` via
+`ref` on any subroutine is rejected (`src/lower/`); functions reject
+`output`/`inout`/`ref`. Tasks support `output`/`inout` via
 copy-in/copy-out through plane pointers.
 
 `ref` (LRM 13.5.2) binds the formal to the *actual's storage* — the callee reads
@@ -70,7 +70,7 @@ live-pointer is the correct one. Both therefore unify on live-pointer.
 ## Mechanism — the indirect formal
 
 Today a formal becomes a frame `Local` with its own storage: a function copies
-`Arg → Local` at entry (`Lower.cpp:5651`); a task copies in/out per direction
+`Arg → Local` at entry (`lower/Expr.cpp, packed_bit_index`); a task copies in/out per direction
 (`emit_task_copyin`/`emit_task_copyout`). A `ref` formal instead **is** the
 passed pointer: it is passed as `(ptr mm, ptr z)` aimed at the *actual's* live
 storage, and every load/store of the formal dereferences those pointers. No
@@ -88,40 +88,38 @@ functions too.
    `Ref` dir (writeback legality is enforced by slang; the backend passes the
    pointer either way).
 
-2. **`Lower.cpp` `function_id` guards (`:5539-5556`)** — allow `Ref` when the
+2. **`lower/Subroutines.cpp` `function_id` guards** — allow `Ref` when the
    formal type is a packed scalar/vector (integral, `width == store width`);
    keep the loud-fail for array / struct / string / real ref (this chunk).
    Keep the function `output`/`inout` rejection (separate chunk). Keep string
    out/inout task rejection.
 
-3. **`Lower.cpp` `build_function` (`:5645-5652`) and `build_task`
-   (`:5604-5608`)** — populate `arg_dirs` for **both** (functions currently
+3. **`lower/Subroutines.cpp` `build_function` and `build_task`** — populate `arg_dirs` for **both** (functions currently
    leave it empty). For a `Ref` formal in `build_function`, **skip** the
    `Store(Local(k), Arg(pos))` prologue copy — the local is indirect. Still
    allocate the Local (so formal k == Local k holds; the backend gives it no
    frame slot).
 
-4. **`Lower.cpp` call sites** — `lower_user_call` (function) and
-   `lower_task_call` (`:5643`+): for a `Ref` actual, pass the actual's storage
+4. **`lower/Subroutines.cpp` call sites** — `lower_user_call` (function) and
+   `lower_task_call`: for a `Ref` actual, pass the actual's storage
    **pointers** (`lv_mm_ptr`/`lv_z_ptr` of the actual lvalue), like a task
    out/inout temp but pointing at the actual itself. The actual must be an
    lvalue (slang enforces). This chunk: require a whole-variable scalar/vector
    lvalue (whole slot); guard bit/part-select / array-element ref actuals.
 
-5. **`LlvmBackend.cpp` `declare_function` (`:1251`) / `declare_task`
-   (`:1294`)** — a `Ref` formal contributes `(ptr mm, ptr z)` params (like task
-   out/inout). `param_indices` (`:1329`) already strides 2 for non-string; a
+5. **`ir/llvm/Subroutines.cpp` `declare_function` / `declare_task`** — a `Ref` formal contributes `(ptr mm, ptr z)` params (like task
+   out/inout). `param_indices` already strides 2 for non-string; a
    ref formal is 2 params, so it composes.
 
-6. **`LlvmBackend.cpp` frame setup (`:1358-1420`) + Local addressing** — a
+6. **`src/ir/llvm/` frame setup + Local addressing** — a
    `Ref` local gets **no** frame-struct field; instead record its `(mm, z)` arg
    pointers (a `frame_ref_ptr_[localidx] = {mm_param, z_param}` map, filled in
-   the callee prologue). The Local lvalue resolution (`Tag::Local`, ~`:2422`)
+   the callee prologue). The Local lvalue resolution (`Tag::Local`)
    for a ref local returns those pointers as `lv.base`/mm-ptr/z-ptr instead of a
    frame GEP. `frame_out_targets` stays packed for ref locals (they are accessed
    through the packed-word pointer ABI, never narrow).
 
-7. **`LlvmBackend.cpp` call sites `lower_call_inst` / `lower_task_call_inst`** —
+7. **`ir/llvm/Subroutines.cpp` call sites `lower_call_inst` / `lower_task_call_inst`** —
    for a `Ref` arg, push the actual lvalue's `lv_mm_ptr`/`lv_z_ptr` (the actual's
    own storage), not `(pl.mm, pl.z)` and not a caller temp.
 

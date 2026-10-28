@@ -1503,7 +1503,7 @@ struct ValueSweep {
 
                 case Inst::Tag::Fork: {
                     // A fork child receives each capture as a GC box HANDLE by value
-                    // (Lower.cpp's lower_fork), so an arg is an ordinary In scalar and
+                    // (lower/Statements.cpp's lower_fork), so an arg is an ordinary In scalar and
                     // is treated exactly like a Call's In actual. The shared variable's
                     // own x/z does not travel here at all: it lives in the box's single
                     // field, and a child's write to it is an ordinary store through a

@@ -17,7 +17,7 @@
 //
 // Clotho lowers this. It did NOT when this file was written -- `expect` needed a
 // blocking wait whose resume lands in the reactive region set, which is a
-// scheduler change rather than a lowering one, and src/Lower.cpp still carried the
+// scheduler change rather than a lowering one, and src/lower/ still carried the
 // TODO saying so -- and that ordering is the whole point: every expectation below
 // EXCEPT the fourth expect was derived from the LRM before the implementation
 // existed, so it cannot be an encoding of what clotho happens to do. The one

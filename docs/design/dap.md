@@ -102,12 +102,12 @@ They are deliberately not on the CLI. §4.2.
 ### 1.1 Blockers, verified
 
 1. **The simulation has no re-entrant step and cannot be driven from outside.**
-   `emit_main` (`LlvmBackend.cpp:4346`) emits `i32 @clotho_main()` which calls
+   `emit_main` (`ir/llvm/Scheduler.cpp`) emits `i32 @clotho_main()` which calls
    `rt_sim_run(state, wheel, drain, finals)` (`Runtime.h:364`), and
    `rt_sim_run` (`Runtime.cpp:3479-3492`) is literally
    `drain(state, wheel); finals(state, wheel); sim_teardown();`. `sim_drain` is
    one monolithic JIT'd function holding the entire LRM 4.4 region model as
-   basic blocks (`emit_active_run`, `LlvmBackend.cpp:7231-7852`). The host
+   basic blocks (`emit_active_run`, `ir/llvm/Scheduler.cpp`). The host
    calls it through `lookup("clotho_main")` → `rt_run(&config, fn)`
    (`Jit.cpp:585,594`) and gets control back when the run is over. There is no
    scheduler callback, no step entry point, and no way to return out of the
@@ -116,13 +116,13 @@ They are deliberately not on the CLI. §4.2.
 
 2. **Between two suspension points, a process body is straight-line native
    code with zero polls.** The only suspension mechanism is
-   `emit_suspend` (`LlvmBackend.cpp:3796`) wrapping `llvm.coro.suspend`,
-   and the complete set of sites is: initial suspend (`:2827`), the always-loop
-   wait (`:2868`), `@`/`wait` (`:3980`), `#delay` and `#0` (`:3854`, `:6922`),
-   a blocking task call (`:15576`), and `fork`/`join` (`:15476`). The one flag
+   `emit_suspend` (`ir/llvm/Scheduler.cpp`) wrapping `llvm.coro.suspend`,
+   and the complete set of sites is: initial suspend, the always-loop
+   wait, `@`/`wait`, `#delay` and `#0`,
+   a blocking task call, and `fork`/`join`. The one flag
    generated code tests to leave the loop is `rt_finishing` (`Runtime.h:124`),
    checked **only on the queue-empty edge** of the Active and Reactive drains
-   (`:7430-7436`, `:7609-7611`) — deliberately: the comment at `:7419-7424`
+   (`ir/llvm/Scheduler.cpp, emit_active_run`) — deliberately: the comment there
    records that testing it after each resume measured +2.2% on picorv32. So
    the runtime cannot be halted between statements today.
 
@@ -130,8 +130,8 @@ They are deliberately not on the CLI. §4.2.
    greps for `DIBuilder|DILocation|DISubprogram|setDebugLoc|DebugLoc|llvm.dbg`
    return zero matches. There is not even a `"Debug Info Version"` module flag.
    Locations reach machine code only as baked C string constants at four report
-   sites (`loc_text`, `LlvmBackend.cpp:13018`; `clotho.bounds.site` `:13085`;
-   `clotho.null.site` `:13287`; severity/`$finish` banners `:12949`, `:13373`).
+   sites (`loc_text`, `ir/llvm/Backend.cpp`; `clotho.bounds.site`;
+   `clotho.null.site`; severity/`$finish` banners).
 
 4. **JIT'd frames carry no unwind data.** Stated in `Runtime.h:116-117` —
    it is why `$finish` was converted from `longjmp` to a cooperative return. So
@@ -141,37 +141,36 @@ They are deliberately not on the CLI. §4.2.
    build.
 
 5. **No runtime process registry, id, or name.** A process is an LLVM
-   coroutine (`coro.id`/`coro.begin`, `LlvmBackend.cpp:2754-2773`) whose frame
+   coroutine (`coro.id`/`coro.begin`, `ir/llvm/Subroutines.cpp, lower_group`) whose frame
    comes from `rt_alloc` (`Runtime.h:1098`); the only runtime handle is the
    opaque `ptr` the ramp returns, living in the active ring
-   (`@clotho.active`, a bare `[cap x ptr]`, `:6802-6807`), a wait queue
-   (`:4706-4708`), a wheel timer, or a join record. Worse, process↔runnable is
+   (`@clotho.active`, a bare `[cap x ptr]`), a wait queue,
+   a wheel timer, or a join record. Worse, process↔runnable is
    not 1:1 — fusion merges several `Process`es into one coroutine
-   (`compute_fusion_groups`, `:5775`), thunk elision makes some processes
-   frameless tagged function pointers (`:7319-7325`), twin dedup shares one
+   (`compute_fusion_groups`), thunk elision makes some processes
+   frameless tagged function pointers, twin dedup shares one
    body across instances, and `Preponed`/`Observed`/`Final` processes are
-   ramped→resumed→destroyed inline with no persistent identity at all
-   (`:4002-4004`).
+   ramped→resumed→destroyed inline with no persistent identity at all.
 
 6. **No runtime name→signal map.** Hierarchical names exist at compile time
    (`SignalInfo::name`, `Module.h:36`; `InstanceScope`, `Module.h:69-83`) and
    transiently as `rt_vcd_scope`/`rt_vcd_var` argument strings, but
    `vcd_register` (`Runtime.cpp:5087-5116`) writes the name into the VCD file
-   and **does not retain it**. `vcd_index_` (`LlvmBackend.cpp:14230`) is
+   and **does not retain it**. `vcd_index_` (`ir/llvm/Backend.h`) is
    compile-time and forward-only. DPI has exactly one flat scope
    (`Svdpi.cpp:21-30`).
 
 7. **Change detection is conditionally emitted.** `service_after_write`
-   (`LlvmBackend.cpp:6469`) is emitted only when `signal_has_waiters(sig)`
-   (`:6457`) or the signal has a VCD index, and VCD indices are assigned only
-   when the design source contains `$dumpvars` (`:14226-14229`). A signal
+   (`ir/llvm/Events.cpp`) is emitted only when `signal_has_waiters(sig)`
+   or the signal has a VCD index, and VCD indices are assigned only
+   when the design source contains `$dumpvars`. A signal
    nobody waits on and nobody dumps has no change detection emitted at all.
 
 8. **Frame locals have no names.** `Function::local_types` is
    `std::vector<Ref>` — types only (`Module.h:402`) — and the backend already
    reports the consequence: `bounds_name` returns the literal `"<local>"` for
-   anything that is not a signal (`LlvmBackend.cpp:13091-13093`).
-   `fn_local()` (`Lower.cpp:~14699`) pushes a type and drops the slang symbol.
+   anything that is not a signal (`ir/llvm/Sanitizers.cpp`).
+   `fn_local()` (`lower/Lowerer.cpp`) pushes a type and drops the slang symbol.
 
 9. **Three paths `std::exit` past every possible hook**:
    `rt_oscillation_abort` (`Runtime.cpp:2897`), `rt_null_handle`
@@ -253,7 +252,7 @@ needs a single `clotho.dbg.cur_proc` global stored on entry to each process
 body and restored on exit — one store per activation, in debug mode only.
 
 **Processes that are not threads.** `Preponed`, `Observed` and `Final`
-processes are ramped, resumed and destroyed inline (`LlvmBackend.cpp:4002-4004`)
+processes are ramped, resumed and destroyed inline (`src/ir/llvm/`)
 and have no persistent identity. They get a thread id while running and
 disappear from `threads` afterwards, which is exactly how DAP models
 short-lived threads (`thread` event, `reason: started|exited`).
@@ -272,9 +271,9 @@ kinds of frame and they are wildly different in cost:
 
 The last row is the hard one. Functions lower to real LLVM calls and tasks to
 real coroutines (`Module.h:383-385`; `lower_task_call_inst`,
-`LlvmBackend.cpp:15509-15600`), so a logical chain exists — but a blocked task
-stores only *its caller's own handle* in a heap record for resumption
-(`:15590-15593`), which is a single parent pointer, not a walkable stack. Add
+`ir/llvm/Processes.cpp, lower_fork_inst / ir/llvm/Subroutines.cpp, lower_task_call_inst`), so a logical chain exists — but a blocked task
+stores only *its caller's own handle* in a heap record for resumption,
+which is a single parent pointer, not a walkable stack. Add
 blockers 3 and 4: no debug info, no unwind data. Across a suspension the
 caller's native frame is gone entirely. **A task/function call stack must be an
 explicit shadow stack that Clotho maintains itself**, pushed and popped by
@@ -307,11 +306,11 @@ void rt_finish_coop(const char* banner, uint64_t now, int32_t arg);   /* Runtime
 ```
 
 Everything reportable routes through them: `$info`/`$warning`/`$error`/`$fatal`
-(`Lower.cpp:12025-12048`), immediate assertion failure — which lowers to
-`severity(Error, banner_at(site), "assertion failed", …)` (`Lower.cpp:6258`,
-`:8247`) — deferred immediate assertions (`Lower.cpp:6269-6293`), concurrent
+(`lower/SystemTasks.cpp, lower_severity_task`), immediate assertion failure — which lowers to
+`severity(Error, banner_at(site), "assertion failed", …)` (`lower/Lowerer.cpp`)
+— deferred immediate assertions (`lower/Assertions.cpp, lower_deferred_assertion`), concurrent
 assertion action blocks, `unique`/`priority` case violations
-(`LlvmBackend.cpp:13002`), and `$finish`/`$stop` (`:12943`).
+(`ir/llvm/SystemTasks.cpp, lower_case_viol`), and `$finish`/`$stop`.
 
 Proposed filter set, with defaults:
 
@@ -327,7 +326,7 @@ Proposed filter set, with defaults:
 | `bounds` | Out-of-range index | `rt_bounds_report` (`Runtime.h:256`) | off |
 
 Two things this needs beyond the hooks. First, the banner is a *pre-rendered*
-`"<file>:<line>: "` string (`banner_at`, `Lower.cpp:1512`); a `stopped` event
+`"<file>:<line>: "` string (`banner_at`, `lower/Lowerer.cpp`); a `stopped` event
 needs structured `(path, line, column)`. The fix is the pattern the codebase
 already uses for exactly this: a constant site record beside the call, modelled
 on `struct rt_bounds_site` (`Runtime.h:190-224`) which already carries `where`,
@@ -349,7 +348,7 @@ arms them. A hierarchical signal path is a legal `dataId`, so the protocol side
 is trivial. The mechanism is where the work is, and the template already exists:
 
 ```cpp
-// src/ir/LlvmBackend.cpp:14108 -- expands to `if (<gate byte>) { call fn(args...) }`,
+// src/ir/llvm/Vcd.cpp, emit_guarded_vcd_touch -- expands to `if (<gate byte>) { call fn(args...) }`,
 // with make_args() run inside the taken branch so index math stays off the cold path.
 void emit_guarded_vcd_touch(llvm::FunctionCallee fn,
                             llvm::function_ref<llvm::SmallVector<llvm::Value*, 2>()> make_args);
@@ -373,7 +372,7 @@ debug-mode symbol table (§4.3) that is *not* the VCD index:
   Postponed flush. A watchpoint must stop *at the store*, and DAP wants the old
   and new value in the `stopped` description, so the callout takes the slot
   address and the pre-write snapshot — which `service_snapshot`
-  (`LlvmBackend.cpp:6456`) already computes.
+  (`ir/llvm/Events.cpp`) already computes.
 
 `read` access type is not offerable: reads are not instrumented and
 instrumenting them would be a different order of cost. `dataBreakpointInfo`
@@ -522,7 +521,7 @@ Five transforms are on by default and each breaks a debugger assumption:
 processes merged), `thunk` (suspension-free process → a frameless function
 pointer), `dedup` (one body shared across twin instances), `outline`
 (fused group split across definition units). Above them, `inline` runs even at
-tier 0 (`LlvmBackend.cpp:18029`), and `sroa`/`instcombine`/`dce` destroy frame
+tier 0 (`ir/llvm/LlvmBackend.cpp, optimize_module`), and `sroa`/`instcombine`/`dce` destroy frame
 locals.
 
 So: **`clotho dap` compiles the design in a debug mode.** `SimConfig` gains
@@ -551,7 +550,7 @@ the machine level is better than a typical JIT to begin with.
 
 Blocker 6. `variables`, `dataBreakpointInfo` and any name-based `evaluate` all
 need name → storage at runtime, and the only existing registration is VCD's,
-which is `$dumpvars`-gated, leaf-name-only (`LlvmBackend.cpp:14435-14438`) and
+which is `$dumpvars`-gated, leaf-name-only (`src/ir/llvm/`) and
 throws the name away after writing the header (`Runtime.cpp:5087-5116`).
 
 The answer is a **static debug symbol table emitted as constant data**, not a
@@ -561,19 +560,19 @@ per variable `{hierarchical name, decl SourceLoc, width, flags (four-state,
 signed, narrow, array…), plane pointers}`. Plane pointers into the state buffer
 are stable for the run — `Runtime.h:527-531` says so about the VCD ones for
 exactly this reason. One `rt_dbg_register(...)` call at startup, and the
-existing `SignalSlot` (`LlvmBackend.cpp:414-520`) already holds every field.
+existing `SignalSlot` (`ir/llvm/Backend.h`) already holds every field.
 
 Two dependent pieces:
 
 - **A plane→SystemVerilog-literal formatter.** Values are plane pairs
-  `{ i(2W) must|may, iW z }` (`LlvmBackend.cpp:46-66`) with `z_elision` and
+  `{ i(2W) must|may, iW z }` (`ir/llvm/Backend.h`) with `z_elision` and
   `narrow` variants. `rt_container_format_p` (`Runtime.h:882`) formats
   containers only; there is no scalar formatter. `vcd_read_planes`
   (`Runtime.cpp:4753`) is the existing plane-assembly code to build on. DAP
   `variables` also wants a `type` string, which the interned IR type gives.
 - **Frame locals stay out.** Blocker 8 plus `sroa` means a task's automatics
   have neither a name nor a stable address. Both are fixable — retain the
-  symbol name in `fn_local` (`Lower.cpp:~14699`), keep frame slots in memory
+  symbol name in `fn_local` (`lower/Lowerer.cpp`), keep frame slots in memory
   under debug mode — and both are D5.
 
 This table subsumes VCD's registration, and unifying them later is a cleanup,

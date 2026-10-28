@@ -56,7 +56,7 @@ capture requires each spawn to see its own `i`.
 
 ## The process model this builds on
 
-(From the scheduler map — `src/ir/LlvmBackend.cpp`.)
+(From the scheduler map — `src/ir/llvm/`.)
 
 A process/task is an LLVM switched-resume coroutine. "Create a process" and
 "wake a process" are the same op (`coro.resume`): the ramp builds the frame,
@@ -508,7 +508,7 @@ relaxed and nothing else changed: `int y = spawn();` ran its child at time 1;
 `final begin void'(spawn()); end` printed `n=0` with the fork record and the child
 frame leaked (LeakSanitizer, 96 + 24 bytes).
 
-**Mechanism: `check_spawn_roots` in the frontend** (`src/Lower.cpp`, beside
+**Mechanism: `check_spawn_roots` in the frontend** (`src/lower/Lower.cpp`, beside
 `check_vcd_scope`), run once after every top has lowered. `build_spawn_graph` marks
 every body that holds a `Fork` and relaxes that over `Call` / `TaskCall` /
 `CallVirtual` / `TaskCallVirtual` edges to a fixpoint — tasks included, because a
@@ -694,10 +694,10 @@ would have to defeat the held-sched-flag argument, which requires a combinationa
 cycle *inside* one fused group. `compute_fusion_groups` blocks that independently,
 by two facts that compose:
 
-- Candidacy (`LlvmBackend.cpp:8989-9000`): a body holding `Call` / `CallVirtual` /
+- Candidacy (`src/ir/llvm/`): a body holding `Call` / `CallVirtual` /
   `TaskCall` / `TaskCallVirtual` / `Fork` is never `CombFuse::Eligible` (it scores
   `HasCall` or `ImpureOp`), so the SOURCE of a hidden edge is never a group member.
-- The interior guard (`LlvmBackend.cpp:9001-9038`): a candidate merges only when its
+- The interior guard (`src/ir/llvm/`): a candidate merges only when its
   ENTIRE sensitivity set is written by another candidate. Group members are therefore
   triggered only by candidates, whose writes are all direct `Store`s and hence all
   visible in the graph.

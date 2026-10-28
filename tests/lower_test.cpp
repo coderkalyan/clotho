@@ -1032,7 +1032,7 @@ TEST_CASE("a type parameter bound to an unsupported type fails loudly") {
     // T = event stands in as the still-unsupported type, reached THROUGH the type
     // parameter rather than written directly: an event ELEMENT's construction
     // mints a new sync object (LRM Table 6-7), which mailbox's copy-in would
-    // overwrite and leak (Lower.cpp:4148).
+    // overwrite and leak (lower/BuiltinClasses.cpp, lower_mailbox_class).
     const LowerResult r = lower_text(R"(
         module m #(parameter type T = int);
             mailbox #(T) v;
