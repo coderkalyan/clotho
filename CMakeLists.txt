@@ -661,12 +661,16 @@ add_library(clotho_runtime_exe STATIC
   src/runtime/ExeMain.cpp
   src/runtime/ExeSupport.cpp
 )
-target_include_directories(clotho_runtime_exe SYSTEM BEFORE PRIVATE
-  "${clotho_libcxx_config_dir}" "${CLOTHO_LIBCXX_INCLUDE_DIR}"
+target_include_directories(clotho_runtime_exe SYSTEM PRIVATE
   $<TARGET_PROPERTY:fmt::fmt,INTERFACE_INCLUDE_DIRECTORIES>
   $<TARGET_PROPERTY:unordered_dense::unordered_dense,INTERFACE_INCLUDE_DIRECTORIES>)
 target_include_directories(clotho_runtime_exe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_options(clotho_runtime_exe PRIVATE -nostdinc++ -fno-exceptions -fno-rtti -include
+# libc++'s directories as flags, not include directories: CMake drops an include
+# directory that is one of the compiler's own, which libc++'s is for a clang that
+# uses it by default, and -nostdinc++ has removed it from the search.
+target_compile_options(clotho_runtime_exe PRIVATE -nostdinc++ "SHELL:-isystem \"${clotho_libcxx_config_dir}\""
+                                                  "SHELL:-isystem \"${CLOTHO_LIBCXX_INCLUDE_DIR}\""
+                                                  -fno-exceptions -fno-rtti -include
                                                   "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/ExeConfig.h")
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   # GCC flags a size libc++'s allocator computes but never passes on.
@@ -862,12 +866,16 @@ set(CLOTHO_TEST_SOURCES
   tests/cli_test.cpp
   tests/todo_test.cpp
 )
-# The server tests exist only where the servers do.
+# The server tests exist only where the servers do, and the executable tests
+# where `build` does.
 if(CLOTHO_LSP)
   list(APPEND CLOTHO_TEST_SOURCES tests/lsp_test.cpp tests/lsp_tokens_test.cpp)
 endif()
 if(CLOTHO_DAP)
   list(APPEND CLOTHO_TEST_SOURCES tests/dap_test.cpp)
+endif()
+if(CLOTHO_BUILD_COMMAND)
+  list(APPEND CLOTHO_TEST_SOURCES tests/exe_test.cpp)
 endif()
 add_executable(clotho_test ${CLOTHO_TEST_SOURCES})
 target_link_libraries(clotho_test PRIVATE clotho clotho_ir clotho_legalize doctest::doctest clotho_warnings)
@@ -934,32 +942,51 @@ foreach(column IN ITEMS "bare element" "fixed unpacked array" "unpacked struct m
            COMMAND clotho_test --duration=true "-tc=data model matrix: ${column}")
 endforeach()
 
-# An object from `build --emit obj`, linked against clotho_runtime_exe by this
-# build's C compiler driver -- so with no C++ library on the line -- and run: the
-# object is only useful if every platform's linker takes it, which no in-process
-# test can show. The design prints its line only when its own checks pass, so
-# the output is the whole verdict.
+# Executables written by `clotho build`, linked by its in-process lld, and run:
+# what no in-process test can show is that every platform's link works and the
+# result runs. Each design prints its line only when its own checks pass, so the
+# output is the whole verdict.
 if(CLOTHO_BUILD_COMMAND)
-  set(aot_object "${CMAKE_CURRENT_BINARY_DIR}/aot_design${CMAKE_CXX_OUTPUT_EXTENSION}")
-  add_custom_command(
-    OUTPUT "${aot_object}"
-    COMMAND clotho_cli build --emit obj -o "${aot_object}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/aot/design.sv"
-    DEPENDS clotho_cli tests/aot/design.sv
-    VERBATIM)
-  set_source_files_properties("${aot_object}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-  find_package(Threads REQUIRED)
-  add_executable(clotho_aot_test "${aot_object}")
-  set_target_properties(clotho_aot_test PROPERTIES LINKER_LANGUAGE C)
-  target_link_libraries(clotho_aot_test PRIVATE clotho_runtime_exe Threads::Threads)
-  if(WIN32)
-    target_link_libraries(clotho_aot_test PRIVATE psapi)
-  else()
-    target_link_libraries(clotho_aot_test PRIVATE m)
+  # Build `design` into ${name}, with `--dpi-lib` for each DPI library (a path,
+  # which may be a generator expression), after the DEPENDS targets.
+  function(clotho_exe_test name design)
+    cmake_parse_arguments(PARSE_ARGV 2 arg "" "" "DPI;DEPENDS")
+    set(exe "${CMAKE_CURRENT_BINARY_DIR}/${name}${CMAKE_EXECUTABLE_SUFFIX}")
+    set(dpi "")
+    foreach(lib IN LISTS arg_DPI)
+      list(APPEND dpi --dpi-lib "${lib}")
+    endforeach()
+    add_custom_command(
+      OUTPUT "${exe}"
+      COMMAND clotho_cli build ${dpi} -o "${exe}" "${CMAKE_CURRENT_SOURCE_DIR}/${design}"
+      DEPENDS clotho_cli "${design}" ${arg_DEPENDS}
+      VERBATIM)
+    add_custom_target(${name}_build DEPENDS "${exe}")
+    # Built with the suite, so building clotho_test is enough to run all of ctest.
+    add_dependencies(clotho_test ${name}_build)
+  endfunction()
+
+  clotho_exe_test(exe tests/exe/design.sv)
+  add_test(NAME exe COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe${CMAKE_EXECUTABLE_SUFFIX}" +n=12345)
+  set_tests_properties(exe PROPERTIES PASS_REGULAR_EXPRESSION "exe: ok 12345 000006e3924924924924924924924924")
+
+  add_library(clotho_exe_dpi_object OBJECT tests/exe/dpi.c)
+  set_target_properties(clotho_exe_dpi_object PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  clotho_exe_test(exe_dpi_object tests/exe/dpi.sv DPI $<TARGET_OBJECTS:clotho_exe_dpi_object>
+                  DEPENDS clotho_exe_dpi_object)
+  add_test(NAME exe_dpi_object COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_object${CMAKE_EXECUTABLE_SUFFIX}")
+  set_tests_properties(exe_dpi_object PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
+
+  # A DLL cannot call back into the executable, so Windows has no shared case.
+  if(NOT WIN32)
+    add_library(clotho_exe_dpi_shared SHARED tests/exe/dpi.c)
+    if(APPLE)
+      # sv_twice is the executable's, found when the library is loaded.
+      target_link_options(clotho_exe_dpi_shared PRIVATE "LINKER:-undefined,dynamic_lookup")
+    endif()
+    clotho_exe_test(exe_dpi_shared tests/exe/dpi.sv DPI $<TARGET_FILE:clotho_exe_dpi_shared>
+                    DEPENDS clotho_exe_dpi_shared)
+    add_test(NAME exe_dpi_shared COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_shared${CMAKE_EXECUTABLE_SUFFIX}")
+    set_tests_properties(exe_dpi_shared PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
   endif()
-  # Built with the suite, so building clotho_test is enough to run all of ctest.
-  add_dependencies(clotho_test clotho_aot_test)
-  add_test(NAME aot COMMAND clotho_aot_test +n=12345)
-  set_tests_properties(aot PROPERTIES PASS_REGULAR_EXPRESSION
-                                      "aot: ok 12345 000006e3924924924924924924924924")
 endif()

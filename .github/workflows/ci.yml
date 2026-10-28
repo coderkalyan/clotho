@@ -151,6 +151,11 @@ jobs:
           prefix=$(brew --prefix llvm@$LLVM_MAJOR 2>/dev/null || brew --prefix llvm)
           "$prefix/bin/clang++" --version
           echo "LLVM_DIR=$prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
+          # lld is its own formula with its own prefix; `clotho build` links with
+          # it (docs/design/executables.md).
+          brew install lld@$LLVM_MAJOR || brew install lld
+          lld_prefix=$(brew --prefix lld@$LLVM_MAJOR 2>/dev/null || brew --prefix lld)
+          echo "LLD_DIR=$lld_prefix/lib/cmake/lld" >> "$GITHUB_ENV"
           echo "CC=$prefix/bin/clang"    >> "$GITHUB_ENV"
           echo "CXX=$prefix/bin/clang++" >> "$GITHUB_ENV"
           # Link Homebrew LLVM's own libc++, not the SDK's. CMake seeds

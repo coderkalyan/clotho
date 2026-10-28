@@ -178,7 +178,7 @@ constexpr CommandInfo kCommands[] = {
 #ifdef CLOTHO_BUILD_COMMAND
     { Command::Build,
       "build",
-      "compile the design into an executable that simulates it, without clotho, on this kind of machine",
+      "compile the design into an executable that simulates it without clotho",
       "[options] <files>...",
       kBuildNote },
 #endif

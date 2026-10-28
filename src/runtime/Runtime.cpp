@@ -33,10 +33,12 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+// First, in a group of its own: psapi.h uses its types.
+#include <windows.h>
+
 #include <io.h>
 #include <locale.h>
 #include <psapi.h>
-#include <windows.h>
 #else
 #include <locale.h>
 #include <signal.h>

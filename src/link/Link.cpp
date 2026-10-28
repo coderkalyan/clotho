@@ -331,10 +331,20 @@ bool link_host(const std::string&           object,
         object,
     };
     for (const std::string& lib : dpi_libs) {
+        // A DLL resolves its imports when it is built, so it cannot call a
+        // function the executable defines; an import library stands in for one.
+        const bool dll = lib.ends_with(".dll") || lib.ends_with(".dll.a");
+        if (dll && exports_dpi) {
+            llvm::errs() << "clotho: '" << lib
+                         << "' is a DLL, but this design has export \"DPI-C\" functions, which a DLL cannot "
+                            "call; give --dpi-lib an object or a static archive\n";
+            return false;
+        }
+        if (lib.ends_with(".dll")) {
+            llvm::errs() << "clotho: '" << lib << "' is a DLL; give --dpi-lib its import library (.dll.a)\n";
+            return false;
+        }
         args.push_back(lib);
-    }
-    if (exports_dpi) {
-        args.push_back("--export-all-symbols");
     }
     for (const char* name : { "runtime.a",
                               "libmingw32.a",
