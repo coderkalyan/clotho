@@ -22,10 +22,13 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "ir/Ir.h"
 
 namespace slang {
+class SourceLocation;
 class SourceManager;
 namespace ast {
 class Compilation;
@@ -37,10 +40,15 @@ class Driver;
 
 namespace clotho {
 
+// `--path-prefix-map`: (absolute directory, what to show in its place) pairs for
+// the source paths a simulation prints.
+using PathPrefixMap = std::vector<std::pair<std::string, std::string>>;
+
 // A resolved source position. Line and column are 1-based, matching compiler and
 // editor convention; the LSP's 0-based positions are the server's conversion.
 struct SourcePosition {
-    // File name as slang reports it, honoring any `` `line `` directives.
+    // File name as the simulation shows it (shown_file): slang's, honoring any
+    // `` `line `` directives, unless the path prefix map rewrites it.
     std::string file;
     uint32_t    line   = 0;
     uint32_t    column = 0;
@@ -105,6 +113,15 @@ public:
     // context is empty; this lets a consumer skip location work entirely.
     [[nodiscard]] bool empty() const;
 
+    // The file name a simulation shows for a location: slang's, relative to the
+    // working directory and honoring `` `line ``, unless the file lies under a
+    // directory of the path prefix map, which is then shown as its replacement
+    // (the longest matching directory wins). A `` `line `` name is never mapped.
+    [[nodiscard]] std::string shown_file(const slang::SourceLocation& loc) const;
+
+    // Set the path prefix map shown_file applies. Directories are absolute.
+    void set_path_prefix_map(PathPrefixMap map);
+
     // -- Frontend-internal construction. --
     // Each entry point has a different ownership shape (a bare SourceManager, a
     // Driver that owns one, a Compilation created from either), so the pieces are
@@ -130,6 +147,7 @@ private:
     // The manager every resolve goes through: either owned_sm_, or one borrowed
     // from driver_ / a slang static.
     const slang::SourceManager* sm_ = nullptr;
+    PathPrefixMap               path_prefix_map_;
 };
 
 } // namespace clotho

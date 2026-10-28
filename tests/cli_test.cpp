@@ -883,6 +883,33 @@ TEST_CASE("cli: build --help explains where its output goes") {
     CHECK(contains(r.out, "unless that is a terminal; pass -o - to print it there anyway"));
 }
 
+TEST_CASE("cli: --path-prefix-map changes the source paths a simulation prints") {
+    const Scratch s;
+    s.write("rtl/t.sv", "module top;\n  initial begin\n    $error(\"boom\");\n    $finish;\n  end\nendmodule\n");
+    const std::string dir = s.path("rtl").string();
+    SUBCASE("run, and the longest matching directory wins") {
+        const Result r = s.run(std::format("run --path-prefix-map \"{}=wide\" --path-prefix-map \"{}=narrow\" \"{}\"",
+                                           s.dir().string(),
+                                           dir,
+                                           s.path("rtl/t.sv").string()));
+        CHECK(r.code == 0);
+        CHECK(contains(r.err, "ERROR: narrow/t.sv:3: top at 0 s: boom"));
+        CHECK(contains(r.err, "narrow/t.sv:4: $finish called at 0 s"));
+    }
+    SUBCASE("an executable keeps the paths build was told to show") {
+        CHECK(s.run_in(std::format("build --path-prefix-map \"{}=\" -o sim rtl/t.sv", s.dir().string())).code == 0);
+        const std::string cmd =
+          std::format("cd / && \"{}\" 2> \"{}\"", s.path("sim").string(), s.path("e.txt").string());
+        CHECK(std::system(cmd.c_str()) == 0);
+        CHECK(contains(clotho::test::detail::read_file(s.path("e.txt")), "ERROR: rtl/t.sv:3: top at 0 s: boom"));
+    }
+    SUBCASE("a value without = is a usage error") {
+        const Result r = s.run(std::format("run --path-prefix-map nothing \"{}\"", s.path("rtl/t.sv").string()));
+        CHECK(r.code == 2);
+        CHECK(contains(r.err, "invalid --path-prefix-map 'nothing'"));
+    }
+}
+
 TEST_CASE("cli: --stop-time takes an integer and a unit") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);

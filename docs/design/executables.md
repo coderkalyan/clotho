@@ -104,7 +104,11 @@ imports when it is built, so `build` refuses a DLL for a design with exports.
 
 Messages carry source locations as the compiler rendered them: relative to the
 directory `build` ran in. Run an executable from that directory, or build from
-the one it will run in, for paths that resolve.
+the one it will run in, for paths that resolve. `--path-prefix-map <dir>=<new>`
+shows files under `<dir>` as `<new>` plus the rest of their path instead
+(SourceContext::shown_file), so a CI build can name sources the same way
+whatever directory the checkout is in: `--path-prefix-map "$PWD="` shows them
+relative to the checkout.
 
 ## Not built
 

@@ -1887,10 +1887,15 @@ class Lowerer {
 public:
     // `tick_fs` is the femtoseconds-per-wheel-tick (design-wide smallest time
     // unit), or 0 when no design unit set a timescale (unitless ticks).
-    Lowerer(ir::Module& module, uint64_t tick_fs, ir::SystemAccess allow_system = ir::SystemAccess::Off)
+    // `sources` shows the file names the simulation's banners print.
+    Lowerer(ir::Module&          module,
+            const SourceContext& sources,
+            uint64_t             tick_fs,
+            ir::SystemAccess     allow_system = ir::SystemAccess::Off)
       : module_(module)
       , tick_fs_(tick_fs)
-      , allow_system_(allow_system) {}
+      , allow_system_(allow_system)
+      , sources_(sources) {}
 
     // Lowering runs the instance hierarchy twice. Signal registration must
     // precede body lowering across the *whole* design, not just up the tree:
@@ -3084,8 +3089,7 @@ private:
     std::string finish_banner(const Expression& call, std::string_view task) const {
         const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
         const slang::SourceLocation sl = call.sourceRange.start();
-        return std::string(sm->getFileName(sl)) + ":" + std::to_string(sm->getLineNumber(sl)) + ": " +
-               std::string(task);
+        return sources_.shown_file(sl) + ":" + std::to_string(sm->getLineNumber(sl)) + ": " + std::string(task);
     }
 
     // Compile-time "<file>:<line>: " banner prefix at a source location. The
@@ -3094,7 +3098,7 @@ private:
     // takes severity_banner instead, which also names the scope.
     std::string banner_at(slang::SourceLocation sl) const {
         const slang::SourceManager* sm = scope_->getCompilation().getSourceManager();
-        return std::string(sm->getFileName(sl)) + ":" + std::to_string(sm->getLineNumber(sl)) + ": ";
+        return sources_.shown_file(sl) + ":" + std::to_string(sm->getLineNumber(sl)) + ": ";
     }
 
     // Compile-time "<file>:<line>: <scope>" banner of a severity report. LRM 20.10
@@ -35251,6 +35255,7 @@ private:
     // compile time; Const requires a constant-folding command string; Full
     // allows a runtime-computed command. See lower_call / the $system branch.
     ir::SystemAccess allow_system_ = ir::SystemAccess::Off;
+    const SourceContext& sources_;
     // Time-unit multiplier of the scope whose code is currently being lowered: a
     // delay is scaled up by this into ticks; $time is scaled (rounded) down by
     // it. Always 1 when unitless. Saved / restored around child-instance
@@ -36228,7 +36233,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
     wait_prop_scan.out = &waited_props;
     root.visit(wait_prop_scan);
     try {
-        Lowerer globals(*module, tick_fs, allow_system);
+        Lowerer globals(*module, *result.sources, tick_fs, allow_system);
         globals.set_events_merge(events_merge);
         globals.set_class_ids(&class_ids);
         globals.set_iface_ids(&iface_ids);
@@ -36238,7 +36243,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
 
         for (const InstanceSymbol* top : root.topInstances) {
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
-            Lowerer           lw(*module, tick_fs, allow_system);
+            Lowerer           lw(*module, *result.sources, tick_fs, allow_system);
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.set_class_ids(&class_ids);
@@ -36525,7 +36530,8 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
 
 LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
                          Timings*                               timings,
-                         ir::SystemAccess                       allow_system) {
+                         ir::SystemAccess                       allow_system,
+                         PathPrefixMap                          path_prefix_map) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // The Driver owns source loading (incl. `-f` command files, `-y`/`-v`
@@ -36534,7 +36540,8 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
     // lower_compilation. Both the Driver (which owns the
     // SourceManager) and the Compilation are handed to the SourceContext so
     // locations stay resolvable after this call returns.
-    auto                   ctx = std::make_shared<SourceContext>();
+    auto ctx = std::make_shared<SourceContext>();
+    ctx->set_path_prefix_map(std::move(path_prefix_map));
     slang::driver::Driver& dr  = *driver;
 
     LowerResult result;

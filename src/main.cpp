@@ -341,6 +341,7 @@ struct Options {
     std::optional<bool>        loose_stale_ref;
     std::optional<std::string> stop_time;
     std::vector<std::string>   dpi_libs;
+    std::vector<std::string>   path_prefix_maps;
     std::optional<bool>        perf_jitdump;
     std::optional<std::string> sidecar;
     std::optional<std::string> target;
@@ -489,6 +490,14 @@ void register_options(Registry& r, Options& o) {
           "if C also calls back into the design; a .so is enough for imports alone",
           "<path>",
           slang::CommandLineFlags::FilePath);
+    r.add(kBuildRun,
+          "--path-prefix-map",
+          o.path_prefix_maps,
+          "Show source files under <dir> in the simulation's messages as <new> followed by the rest "
+          "of their path, instead of relative to the directory clotho runs in, which an executable "
+          "keeps. Repeatable; the longest matching <dir> wins. An empty <new> shows paths relative "
+          "to <dir>",
+          "<dir>=<new>");
 #ifdef CLOTHO_SYNTH
     r.add(bit(Command::Synth),
           "--sidecar",
@@ -1334,7 +1343,23 @@ int main(int argc, char** argv) {
     clotho::Timings        timings;
     clotho::Timings* const tp = want_time ? &timings : nullptr;
 
-    const clotho::LowerResult result = clotho::lower_driver(std::move(driver), tp, config.allow_system);
+    // `--path-prefix-map`: directories absolute and without a trailing separator,
+    // so a prefix match is a match on whole path components.
+    clotho::PathPrefixMap path_prefix_map;
+    for (const std::string& entry : options.path_prefix_maps) {
+        const size_t eq = entry.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            return usage_error(std::format("invalid --path-prefix-map '{}': write <dir>=<new>", entry));
+        }
+        std::string dir = std::filesystem::absolute(entry.substr(0, eq)).lexically_normal().string();
+        while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) {
+            dir.pop_back();
+        }
+        path_prefix_map.emplace_back(std::move(dir), entry.substr(eq + 1));
+    }
+
+    const clotho::LowerResult result =
+      clotho::lower_driver(std::move(driver), tp, config.allow_system, std::move(path_prefix_map));
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostic_text());
     }
