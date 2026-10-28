@@ -1,0 +1,15 @@
+This program is a SystemVerilog simulation compiled by Clotho
+(https://github.com/coderkalyan/clotho). Besides the code compiled from the
+design, it contains:
+
+- The Clotho runtime (src/runtime/ in the Clotho repository), licensed under
+  the Mozilla Public License 2.0, reproduced in full below. Its source code is
+  available from https://github.com/coderkalyan/clotho, at the commit this
+  program's --version names.
+- unordered_dense (https://github.com/martinus/unordered_dense), licensed
+  under the MIT license below.
+- {fmt} (https://github.com/fmtlib/fmt), licensed under the MIT license with
+  the object-code exception below.
+- Code from LLVM's libc++ headers and compiler-rt (https://llvm.org), licensed
+  under Apache-2.0 WITH LLVM-exception, whose exception waives the notice
+  requirements for code embedded in a program by compiling it.

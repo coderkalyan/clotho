@@ -8010,6 +8010,22 @@ private:
         emit_finals_run(finals->getArg(0), finals->getArg(1), procs);
         b_.CreateRetVoid();
 
+        // The constant an executable's main reads beside clotho_main: rt_design
+        // (Runtime.h), whose fields are this struct's, in order.
+        {
+            auto* top     = llvm::ConstantDataArray::getString(ctx_, mod_.top_name);
+            auto* top_var = new llvm::GlobalVariable(
+              env_->llmod, top->getType(), true, llvm::GlobalValue::PrivateLinkage, top, "clotho.design.top");
+            top_var->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+            auto* design_ty =
+              llvm::StructType::get(ctx_, { b_.getInt64Ty(), b_.getInt32Ty(), llvm::PointerType::getUnqual(ctx_) });
+            auto* design = llvm::ConstantStruct::get(
+              design_ty,
+              { b_.getInt64(mod_.tick_fs), b_.getInt32(static_cast<uint32_t>(config_.allow_system)), top_var });
+            new llvm::GlobalVariable(
+              env_->llmod, design_ty, true, llvm::GlobalValue::ExternalLinkage, design, "clotho_design");
+        }
+
         auto* i32  = llvm::Type::getInt32Ty(ctx_);
         auto* fnty = llvm::FunctionType::get(i32, false);
         auto* main = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, "clotho_main", env_->llmod);

@@ -4514,7 +4514,7 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     CHECK(nsigs[0] == "(ptr noalias %state, ptr %rng, i128 %0, i64 %1, ptr %2)");
 }
 
-TEST_CASE("an emitted object defines clotho_main and no other name a C program could use") {
+TEST_CASE("an emitted object defines clotho_main and clotho_design and no other name a C program could use") {
     // Two definitions, so the per-definition units are linked back into the root.
     const LowerResult result = lower_text(R"(
         module child(input logic clk, output logic [7:0] q);
@@ -4543,7 +4543,7 @@ TEST_CASE("an emitted object defines clotho_main and no other name a C program c
 
     // The object links into a program the user writes, so a definition spelled
     // as a C identifier could collide with one of theirs or their C library's.
-    // Only the entry may be one; every other definition is `clotho.*`.
+    // Only the entry and its rt_design may be; every other definition is `clotho.*`.
     std::vector<std::string> c_names;
     for (const llvm::object::SymbolRef& sym : (*object)->symbols()) {
         auto flags = sym.getFlags();
@@ -4565,5 +4565,6 @@ TEST_CASE("an emitted object defines clotho_main and no other name a C program c
             c_names.push_back(c_name.str());
         }
     }
-    CHECK(c_names == std::vector<std::string>{ "clotho_main" });
+    std::ranges::sort(c_names);
+    CHECK(c_names == std::vector<std::string>{ "clotho_design", "clotho_main" });
 }

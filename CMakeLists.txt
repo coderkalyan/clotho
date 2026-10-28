@@ -612,6 +612,72 @@ target_compile_definitions(clotho_cli PRIVATE
   CLOTHO_LLVM_VERSION="${LLVM_PACKAGE_VERSION}"
 )
 
+# The runtime an executable links (docs/design/executables.md): the same sources
+# as clotho_runtime plus the executable's main, compiled against libc++'s headers
+# so that nothing is left for a C++ library to supply -- no exceptions, no RTTI,
+# no extern templates, no hardening checks, {fmt} header-only without locales,
+# and operator new/delete from ExeSupport.cpp. An executable links this, the C
+# library and compiler-rt, and no C++ library.
+find_path(CLOTHO_LIBCXX_INCLUDE_DIR __config
+  PATHS ${LLVM_INCLUDE_DIRS} "${LLVM_LIBRARY_DIRS}/../include" /usr/include
+  PATH_SUFFIXES c++/v1
+  NO_DEFAULT_PATH)
+if(NOT CLOTHO_LIBCXX_INCLUDE_DIR)
+  message(FATAL_ERROR "libc++'s headers (c++/v1/__config) were not found beside LLVM or in "
+                      "/usr/include; install them (Debian/Ubuntu: libc++-${LLVM_VERSION_MAJOR}-dev), or "
+                      "pass -DCLOTHO_LIBCXX_INCLUDE_DIR=<dir>/c++/v1")
+endif()
+# __config_site is per target, beside __config or in a multiarch <triple>/c++/v1.
+file(GLOB clotho_libcxx_config_sites "${CLOTHO_LIBCXX_INCLUDE_DIR}/__config_site"
+     "${CLOTHO_LIBCXX_INCLUDE_DIR}/../../*/c++/v1/__config_site")
+if(NOT clotho_libcxx_config_sites)
+  message(FATAL_ERROR "libc++'s __config_site was not found near ${CLOTHO_LIBCXX_INCLUDE_DIR}")
+endif()
+list(GET clotho_libcxx_config_sites 0 clotho_libcxx_config_site)
+get_filename_component(clotho_libcxx_config_dir "${clotho_libcxx_config_site}" DIRECTORY)
+message(STATUS "libc++ headers for executables: ${CLOTHO_LIBCXX_INCLUDE_DIR} (${clotho_libcxx_config_dir})")
+
+# The text `<executable> --licenses` prints, as a byte array.
+set(clotho_exe_notices
+  src/runtime/exe-notices.txt src/runtime/LICENSE LICENSES/unordered_dense.txt LICENSES/fmt.txt)
+set(clotho_licenses_text "")
+foreach(notice IN LISTS clotho_exe_notices)
+  file(READ "${notice}" text)
+  string(APPEND clotho_licenses_text "${text}\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${notice}")
+endforeach()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/exe-licenses.txt" "${clotho_licenses_text}")
+file(READ "${CMAKE_CURRENT_BINARY_DIR}/exe-licenses.txt" clotho_licenses_hex HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," clotho_licenses_hex "${clotho_licenses_hex}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ExeLicenses.inc"
+     "static const unsigned char kLicenses[] = {${clotho_licenses_hex}};\n")
+
+add_library(clotho_runtime_exe STATIC
+  src/runtime/Runtime.cpp
+  src/runtime/Gc.cpp
+  src/runtime/Svdpi.cpp
+  src/runtime/Coverage.cpp
+  src/runtime/Wheel.cpp
+  src/runtime/ExeMain.cpp
+  src/runtime/ExeSupport.cpp
+)
+target_include_directories(clotho_runtime_exe SYSTEM BEFORE PRIVATE
+  "${clotho_libcxx_config_dir}" "${CLOTHO_LIBCXX_INCLUDE_DIR}"
+  $<TARGET_PROPERTY:fmt::fmt,INTERFACE_INCLUDE_DIRECTORIES>
+  $<TARGET_PROPERTY:unordered_dense::unordered_dense,INTERFACE_INCLUDE_DIRECTORIES>)
+target_include_directories(clotho_runtime_exe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(clotho_runtime_exe PRIVATE -nostdinc++ -fno-exceptions -fno-rtti -include
+                                                  "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/ExeConfig.h")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  # GCC flags a size libc++'s allocator computes but never passes on.
+  target_compile_options(clotho_runtime_exe PRIVATE -Wno-alloc-size-larger-than)
+endif()
+target_compile_definitions(clotho_runtime_exe PRIVATE
+  CLOTHO_VERSION="${CLOTHO_VERSION}"
+  CLOTHO_GIT_HASH="${CLOTHO_GIT_HASH}"
+  CLOTHO_LICENSES_INC="${CMAKE_CURRENT_BINARY_DIR}/ExeLicenses.inc")
+target_link_libraries(clotho_runtime_exe PRIVATE clotho_warnings)
+
 # Single doctest executable aggregating every tests/*.cpp.
 enable_testing()
 set(CLOTHO_TEST_SOURCES
@@ -771,10 +837,11 @@ foreach(column IN ITEMS "bare element" "fixed unpacked array" "unpacked struct m
            COMMAND clotho_test --duration=true "-tc=data model matrix: ${column}")
 endforeach()
 
-# An object from `build --emit obj`, linked by this build's own toolchain against
-# clotho_runtime and run: the object is only useful if every platform's linker
-# takes it, which no in-process test can show. The design prints its line only
-# when its own checks pass, so the output is the whole verdict.
+# An object from `build --emit obj`, linked against clotho_runtime_exe by this
+# build's C compiler driver -- so with no C++ library on the line -- and run: the
+# object is only useful if every platform's linker takes it, which no in-process
+# test can show. The design prints its line only when its own checks pass, so
+# the output is the whole verdict.
 if(CLOTHO_BUILD_COMMAND)
   set(aot_object "${CMAKE_CURRENT_BINARY_DIR}/aot_design${CMAKE_CXX_OUTPUT_EXTENSION}")
   add_custom_command(
@@ -784,8 +851,15 @@ if(CLOTHO_BUILD_COMMAND)
     DEPENDS clotho_cli tests/aot/design.sv
     VERBATIM)
   set_source_files_properties("${aot_object}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-  add_executable(clotho_aot_test tests/aot/main.cpp "${aot_object}")
-  target_link_libraries(clotho_aot_test PRIVATE clotho_runtime)
+  find_package(Threads REQUIRED)
+  add_executable(clotho_aot_test "${aot_object}")
+  set_target_properties(clotho_aot_test PROPERTIES LINKER_LANGUAGE C)
+  target_link_libraries(clotho_aot_test PRIVATE clotho_runtime_exe Threads::Threads)
+  if(WIN32)
+    target_link_libraries(clotho_aot_test PRIVATE psapi)
+  else()
+    target_link_libraries(clotho_aot_test PRIVATE m)
+  endif()
   # Built with the suite, so building clotho_test is enough to run all of ctest.
   add_dependencies(clotho_test clotho_aot_test)
   add_test(NAME aot COMMAND clotho_aot_test +n=12345)

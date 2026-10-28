@@ -581,6 +581,27 @@ typedef struct rt_run_config {
 // and a linked executable, so the two cannot arm a run differently.
 int32_t rt_run(const rt_run_config* config, int32_t (*design_main)(void));
 
+// Parse a --stop-time value (`len` bytes at `text`): an integer and a unit with
+// nothing between them, as `100ns` or `5us`. Returns 1 and sets *femtoseconds,
+// or returns 0 and writes "invalid --stop-time '<text>': <why>" to `error`
+// (NUL-terminated, cut to `cap` bytes) for a missing or unknown unit, a zero
+// time, or one that does not fit in 64 bits of femtoseconds. Shared by `clotho
+// run` and an executable's command line, so the two accept the same times.
+int32_t rt_parse_stop_time(const char* text, uint64_t len, uint64_t* femtoseconds, char* error, uint64_t cap);
+
+// What an executable's main needs to know about the design it runs, beyond the
+// entry: the backend emits one as the constant `clotho_design` beside
+// `clotho_main`. Settings `clotho build` was given that a run cannot change.
+typedef struct rt_design {
+    // The design's tick in femtoseconds (rt_run_config::tick_fs).
+    uint64_t tick_fs;
+    // The --allow-system tier the design was compiled with
+    // (rt_run_config::system_access).
+    int32_t system_access;
+    // The first top-level instance, for the executable's --help and --version.
+    const char* top;
+} rt_design;
+
 // -- File I/O (LRM 1800-2023 §21.3) --
 //
 // A file descriptor is a 32-bit integer the design stores in its own variables.

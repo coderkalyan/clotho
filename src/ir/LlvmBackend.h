@@ -88,9 +88,10 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
 
 // Compile the design for `target`'s triple, CPU and features and write it to
 // `os` as one relocatable object file. The object defines `clotho_main`, the
-// entry rt_run takes, and every runtime symbol it references is left undefined,
-// for a link against clotho_runtime. Per-definition units are linked back into
-// the root module first, so the object holds exactly the code `run` would
+// entry rt_run takes, and `clotho_design`, the rt_design an executable's main
+// reads; every runtime symbol it references is left undefined, for a link
+// against the runtime. Per-definition units are linked back into the root
+// module first, so the object holds exactly the code `run` would
 // compile. Code generation uses `config.o3` as run_jit does, the platform's
 // default code model and position-independent code, so the object links into a
 // PIE. Returns false with the reason on llvm::errs().

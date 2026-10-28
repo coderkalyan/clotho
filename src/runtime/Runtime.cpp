@@ -345,9 +345,9 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
                 const uint64_t val  = a.val[0] & mask;
                 if ((a.flags & 1u) != 0) {
                     const uint64_t sext = (w < 64 && ((val >> (w - 1)) & 1u)) ? (val | ~mask) : val;
-                    field               = std::to_string(static_cast<int64_t>(sext));
+                    field               = fmt::to_string(static_cast<int64_t>(sext));
                 } else {
-                    field = std::to_string(val);
+                    field = fmt::to_string(val);
                 }
             } else if ((a.flags & 1u) != 0 && ((a.val[(w - 1) / 64] >> ((w - 1) % 64)) & 1u) != 0) {
                 // Negative signed: print the sign and the two's-complement
@@ -455,11 +455,11 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
                 cs += '0';
             }
             if (spec.has_width) {
-                cs += std::to_string(spec.width);
+                cs += fmt::to_string(spec.width);
             }
             if (spec.has_prec) {
                 cs += '.';
-                cs += std::to_string(spec.prec);
+                cs += fmt::to_string(spec.prec);
             }
             cs += spec.conv;
             double v = 0.0;
@@ -3965,7 +3965,7 @@ namespace {
 void append_finish_time(std::string& out, uint64_t now) {
     const uint64_t tick_fs = timeformat.tick_fs;
     if (tick_fs == 0) {
-        out += std::to_string(now);
+        out += fmt::to_string(now);
         return;
     }
     // Total femtoseconds; 128-bit to avoid overflow on a coarse precision.
@@ -3981,7 +3981,7 @@ void append_finish_time(std::string& out, uint64_t now) {
     const unsigned __int128 pick = fs == 0 ? tick_fs : fs;
     for (const auto& e : table) {
         if (pick % e.div == 0) {
-            out += std::to_string(static_cast<uint64_t>(fs / e.div));
+            out += fmt::to_string(static_cast<uint64_t>(fs / e.div));
             out += ' ';
             out += e.unit;
             return;
@@ -4375,7 +4375,7 @@ std::string snippet_text(const char* src) {
 void print_snippet(const std::string& text, int32_t line_no,
                    std::initializer_list<SnippetMark> marks, const fmt::text_style& loc,
                    const fmt::text_style& caret) {
-    const std::string number = std::to_string(line_no);
+    const std::string number = fmt::to_string(line_no);
     const std::string gutter(number.size(), ' ');
     fmt::print(stderr, loc, "{} |", number);
     fmt::print(stderr, " {}", text);
@@ -4463,7 +4463,7 @@ extern "C" void rt_bounds_report(const rt_bounds_site* site, int64_t index, int6
         // whole finding, same as an empty-queue pop.
         fmt::print(stderr, head, " {}", noun);
     } else {
-        const std::string idx   = unknown ? std::string("x") : std::to_string(index);
+        const std::string idx   = unknown ? std::string("x") : fmt::to_string(index);
         const std::string subj  = site->what == RT_BOUNDS_PART
                                     ? fmt::format("index {} +: {}", idx, site->width)
                                     : fmt::format("index {}", idx);
@@ -7842,7 +7842,7 @@ extern "C" void rt_vcd_array(const char* name, uint32_t name_len, uint32_t count
         // Storage index k maps to declared address left+k (ascending range) or
         // left-k (descending), matching the element-select normalization.
         const int64_t     addr = left <= right ? left + static_cast<int64_t>(k) : left - static_cast<int64_t>(k);
-        const std::string ref  = std::string(leaf) + "[" + std::to_string(addr) + "]";
+        const std::string ref  = std::string(leaf) + "[" + fmt::to_string(addr) + "]";
         const uint8_t*    mm   = mm_base + static_cast<size_t>(k) * stride;
         const uint8_t*    z    = z_base != nullptr ? z_base + static_cast<size_t>(k) * stride : nullptr;
         vcd_register(ref, width, flags, mm, z);
@@ -8125,4 +8125,76 @@ int32_t rt_run(const rt_run_config* config, int32_t (*design_main)(void)) {
     // 20.10) or an interrupt is the runtime's to report.
     const int32_t rc = design_main();
     return rc != 0 ? rc : g_run_status;
+}
+
+namespace {
+
+// A unit `--stop-time` accepts, and how many femtoseconds it is.
+struct TimeUnit {
+    std::string_view name;
+    uint64_t         femtoseconds;
+};
+
+constexpr uint64_t kFemtosecondsPerSecond = 1'000'000'000'000'000;
+
+constexpr TimeUnit kTimeUnits[] = {
+    { "fs", 1 },
+    { "ps", 1'000 },
+    { "ns", 1'000'000 },
+    { "us", 1'000'000'000 },
+    { "ms", 1'000'000'000'000 },
+    { "s", kFemtosecondsPerSecond },
+};
+
+// The units as a sentence lists them.
+constexpr std::string_view kTimeUnitList = "fs, ps, ns, us, ms or s";
+
+} // namespace
+
+int32_t rt_parse_stop_time(const char* text, uint64_t len, uint64_t* femtoseconds, char* error, uint64_t cap) {
+    const std::string_view value(text, static_cast<size_t>(len));
+    const auto             fail = [&](std::string_view why) {
+        if (cap > 0) {
+            const auto end =
+              fmt::format_to_n(error, static_cast<size_t>(cap - 1), "invalid --stop-time '{}': {}", value, why);
+            *end.out = '\0';
+        }
+        return 0;
+    };
+
+    // Digits only: no sign and no space.
+    size_t   digits   = 0;
+    uint64_t count    = 0;
+    bool     overflow = false;
+    while (digits < value.size() && value[digits] >= '0' && value[digits] <= '9') {
+        const uint64_t d = static_cast<uint64_t>(value[digits] - '0');
+        overflow         = overflow || count > (UINT64_MAX - d) / 10;
+        count            = count * 10 + d;
+        ++digits;
+    }
+    if (digits == 0) {
+        return fail(fmt::format("write an integer and a unit, e.g. 100ns or 5us (units: {})", kTimeUnitList));
+    }
+    const std::string_view unit_name = value.substr(digits);
+    if (unit_name.empty()) {
+        return fail(fmt::format("the unit is missing; write e.g. {}ns (units: {})", value, kTimeUnitList));
+    }
+    const TimeUnit* unit = nullptr;
+    for (const TimeUnit& u : kTimeUnits) {
+        if (u.name == unit_name) {
+            unit = &u;
+        }
+    }
+    if (unit == nullptr) {
+        return fail(fmt::format("unknown unit '{}' (units: {})", unit_name, kTimeUnitList));
+    }
+    // An out-of-range count is also too large, whatever the unit.
+    if (overflow || count > UINT64_MAX / unit->femtoseconds) {
+        return fail(fmt::format("too large; the longest time is about {} s", UINT64_MAX / kFemtosecondsPerSecond));
+    }
+    if (count == 0) {
+        return fail("must be greater than zero");
+    }
+    *femtoseconds = count * unit->femtoseconds;
+    return 1;
 }
