@@ -1009,13 +1009,11 @@ bool write_artifact(const clotho::LowerResult& result,
     if (emit == Emit::Obj) {
         auto target = clotho::ir::host_target();
         if (!target) {
-            std::println(stderr, "clotho: cannot detect this machine's target: {}",
-                         llvm::toString(target.takeError()));
+            std::println(stderr, "clotho: cannot detect this machine's target: {}", llvm::toString(target.takeError()));
             return false;
         }
         if (to_stdout) {
-            return clotho::ir::emit_object(*result.module, llvm::outs(), std::move(*target), config,
-                                           timings, resolve);
+            return clotho::ir::emit_object(*result.module, llvm::outs(), std::move(*target), config, timings, resolve);
         }
         std::error_code      ec;
         llvm::raw_fd_ostream os(out, ec);
@@ -1179,8 +1177,7 @@ int main(int argc, char** argv) {
         } else if (target == "ir") {
             emit = Emit::Ir;
         } else {
-            return usage_error(
-              std::format("unknown --emit target '{}'; expected llvm, obj, ir or llvm-raw", target));
+            return usage_error(std::format("unknown --emit target '{}'; expected llvm, obj, ir or llvm-raw", target));
         }
     }
 

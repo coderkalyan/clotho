@@ -786,6 +786,8 @@ if(CLOTHO_BUILD_COMMAND)
   set_source_files_properties("${aot_object}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
   add_executable(clotho_aot_test tests/aot/main.cpp "${aot_object}")
   target_link_libraries(clotho_aot_test PRIVATE clotho_runtime)
+  # Built with the suite, so building clotho_test is enough to run all of ctest.
+  add_dependencies(clotho_test clotho_aot_test)
   add_test(NAME aot COMMAND clotho_aot_test +n=12345)
   set_tests_properties(aot PROPERTIES PASS_REGULAR_EXPRESSION
                                       "aot: ok 12345 000006e3924924924924924924924924")

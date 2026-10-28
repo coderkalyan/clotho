@@ -26,8 +26,8 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/MDBuilder.h>
@@ -31434,8 +31434,12 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
     return true;
 }
 
-bool emit_object(const Module& m, llvm::raw_ostream& os, llvm::orc::JITTargetMachineBuilder target,
-                 const SimulationConfig& config, Timings* timings, const LocResolver& resolve) {
+bool emit_object(const Module&                      m,
+                 llvm::raw_ostream&                 os,
+                 llvm::orc::JITTargetMachineBuilder target,
+                 const SimulationConfig&            config,
+                 Timings*                           timings,
+                 const LocResolver&                 resolve) {
     assert(config.lower_coro && "an object needs the coroutines lowered");
     const auto t_llvm = std::chrono::steady_clock::now();
     target.setCodeGenOptLevel(config.o3 ? llvm::CodeGenOptLevel::Aggressive : llvm::CodeGenOptLevel::None);
@@ -31461,12 +31465,11 @@ bool emit_object(const Module& m, llvm::raw_ostream& os, llvm::orc::JITTargetMac
 
     // Emitted into memory first: an object writer may seek back to patch
     // headers, which a pipe on stdout cannot do.
-    llvm::SmallVector<char, 0>  object;
-    llvm::raw_svector_ostream   object_os(object);
-    llvm::legacy::PassManager   pm;
+    llvm::SmallVector<char, 0> object;
+    llvm::raw_svector_ostream  object_os(object);
+    llvm::legacy::PassManager  pm;
     if ((*tm)->addPassesToEmitFile(pm, object_os, nullptr, llvm::CodeGenFileType::ObjectFile)) {
-        llvm::errs() << "llvm backend: target " << (*tm)->getTargetTriple().str()
-                     << " cannot write an object file\n";
+        llvm::errs() << "llvm backend: target " << (*tm)->getTargetTriple().str() << " cannot write an object file\n";
         return false;
     }
     pm.run(root);

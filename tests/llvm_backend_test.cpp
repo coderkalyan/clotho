@@ -4559,8 +4559,7 @@ TEST_CASE("an emitted object defines clotho_main and no other name a C program c
             c_name.consume_front("_");
         }
         const bool identifier =
-          !c_name.empty() && (std::isalpha(static_cast<unsigned char>(c_name.front())) != 0 ||
-                              c_name.front() == '_') &&
+          !c_name.empty() && (std::isalpha(static_cast<unsigned char>(c_name.front())) != 0 || c_name.front() == '_') &&
           llvm::all_of(c_name, [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; });
         if (identifier) {
             c_names.push_back(c_name.str());

@@ -93,8 +93,11 @@ bool emit_llvm(const Module& m, llvm::raw_ostream& os, const SimulationConfig& c
 // first, so the object holds exactly the code `run` would compile. Code
 // generation uses `config.o3` as run_jit does, and position-independent code so
 // the object links into a PIE. Returns false with the reason on llvm::errs().
-bool emit_object(const Module& m, llvm::raw_ostream& os, llvm::orc::JITTargetMachineBuilder target,
-                 const SimulationConfig& config = {}, Timings* timings = nullptr,
-                 const LocResolver& resolve = {});
+bool emit_object(const Module&                      m,
+                 llvm::raw_ostream&                 os,
+                 llvm::orc::JITTargetMachineBuilder target,
+                 const SimulationConfig&            config  = {},
+                 Timings*                           timings = nullptr,
+                 const LocResolver&                 resolve = {});
 
 } // namespace clotho::ir
