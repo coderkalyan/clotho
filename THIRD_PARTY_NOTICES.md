@@ -59,7 +59,7 @@ it was built with (docs/design/executables.md):
 |---|---|---|
 | LLVM's compiler-rt builtins and crtbegin/crtend, and code instantiated from libc++'s headers | Apache-2.0 WITH LLVM-exception (`LICENSES/LLVM.txt`) | none required: the exception waives it for code embedded by compilation |
 | glibc's `Scrt1.o`, `crti.o`, `crtn.o` and `libc_nonshared.a` (Linux) | LGPL-2.1-or-later with glibc's exception for these files, which permits linking them into any program without restriction | none required |
-| The MinGW-w64 C runtime and import libraries (Windows) | mostly public domain, with parts under ZPL-2.1 and other permissive licenses | not yet carried (docs/TODO.md) |
+| The MinGW-w64 C runtime and import libraries (Windows) | mostly public domain, with parts under ZPL-2.1 and other permissive licenses (`LICENSES/MinGW-w64-runtime.txt`) | the MinGW-w64 runtime's notices, printed by `--licenses` after the others |
 
 ## Tests only
 
