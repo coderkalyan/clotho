@@ -627,9 +627,14 @@ list(GET clotho_libcxx_config_sites 0 clotho_libcxx_config_site)
 get_filename_component(clotho_libcxx_config_dir "${clotho_libcxx_config_site}" DIRECTORY)
 message(STATUS "libc++ headers for executables: ${CLOTHO_LIBCXX_INCLUDE_DIR} (${clotho_libcxx_config_dir})")
 
-# The text `<executable> --licenses` prints, as a byte array.
+# The text `<executable> --licenses` prints, as a byte array. A Windows
+# executable links the MinGW-w64 runtime statically, whose ZPL-2.1 parts require
+# its notices in a binary; its notice file says so itself.
 set(clotho_exe_notices
   src/runtime/exe-notices.txt src/runtime/LICENSE LICENSES/unordered_dense.txt LICENSES/fmt.txt)
+if(WIN32)
+  list(APPEND clotho_exe_notices LICENSES/MinGW-w64-runtime.txt)
+endif()
 set(clotho_licenses_text "")
 foreach(notice IN LISTS clotho_exe_notices)
   file(READ "${notice}" text)
@@ -956,6 +961,14 @@ endfunction()
 clotho_exe_test(exe tests/exe/design.sv)
 add_test(NAME exe COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe${CMAKE_EXECUTABLE_SUFFIX}" +n=12345)
 set_tests_properties(exe PROPERTIES PASS_REGULAR_EXPRESSION "exe: ok 12345 000006e3924924924924924924924924")
+# What an executable says it contains: the MinGW-w64 runtime's notices too on
+# Windows, which links it in.
+add_test(NAME exe_licenses COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe${CMAKE_EXECUTABLE_SUFFIX}" --licenses)
+if(WIN32)
+  set_tests_properties(exe_licenses PROPERTIES PASS_REGULAR_EXPRESSION "MinGW-w64 runtime licensing")
+else()
+  set_tests_properties(exe_licenses PROPERTIES PASS_REGULAR_EXPRESSION "Mozilla Public License Version 2.0")
+endif()
 
 add_library(clotho_exe_dpi_object OBJECT tests/exe/dpi.c)
 set_target_properties(clotho_exe_dpi_object PROPERTIES POSITION_INDEPENDENT_CODE ON)

@@ -213,8 +213,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 - [ ] **Cross-compiling an executable** — `build` writes one only for the machine it runs
   on; another target needs its executable runtime and C library startup files.
-- [ ] **MinGW-w64 runtime notices in a Windows executable** — `--licenses` omits the
-  ZPL-2.1 notices of the MinGW-w64 runtime it links.
 - [ ] **Executables from a statically linked clotho** — it has no C library of its own to
   link an executable against, and refuses.
 
