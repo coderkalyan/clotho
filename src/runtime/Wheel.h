@@ -163,17 +163,17 @@ private:
     std::priority_queue<Overflow, std::vector<Overflow>, EarliestFirst> overflow_;
 };
 
-// Typed front-end. The template arguments are the extra parameters forwarded to
-// each fired timer's callback, fixed at the wheel's type. tick(args...) advances
-// to the next non-empty tick and invokes every fired timer as
-// on_expire(timer, args...), in list order.
-template<class... Args>
+// Typed front-end. `Node` is the timer type each fired callback receives: Timer,
+// or a layout-compatible mirror such as the runtime's C-ABI rt_timer, so every
+// callback is called through its own function type. The remaining template
+// arguments are the extra parameters forwarded to each fired timer's callback,
+// fixed at the wheel's type. tick(args...) advances to the next non-empty tick and
+// invokes every fired timer as on_expire(timer, args...), in list order.
+template<class Node, class... Args>
 class Wheel {
 public:
-    using Timer = clotho::Timer;
-    // Pointer (not reference) parameter so the runtime's C-ABI mirror callback
-    // type is token-identical and the cross-ABI cast stays warning-free.
-    using Callback = void (*)(Timer*, Args...);
+    using Timer    = clotho::Timer;
+    using Callback = void (*)(Node*, Args...);
 
     static constexpr uint64_t slots = WheelImpl::slots;
 
@@ -218,7 +218,7 @@ public:
         do {
             Timer* next = t->next;
             t->next     = nullptr;
-            reinterpret_cast<Callback>(t->on_expire)(t, args...);
+            reinterpret_cast<Callback>(t->on_expire)(reinterpret_cast<Node*>(t), args...);
             t = next;
         } while (t != nullptr);
         return true;

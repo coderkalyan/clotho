@@ -63,9 +63,10 @@
 
 namespace rt_internal {
 
-// The runtime's monomorphization: every fired timer is handed the single opaque
-// context pointer the design threads through rt_wheel_tick.
-using RuntimeWheel = clotho::Wheel<void*>;
+// The runtime's monomorphization: every fired timer is handed back as the C-ABI
+// rt_timer its callback was declared with, plus the single opaque context pointer
+// the design threads through rt_wheel_tick.
+using RuntimeWheel = clotho::Wheel<rt_timer, void*>;
 
 // rt_timer is a layout-compatible mirror of clotho::Timer, so a node can cross
 // the C ABI by pointer cast rather than a copy. Keep the two in lockstep.

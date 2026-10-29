@@ -13,7 +13,7 @@ namespace {
 struct Context;
 // The wheel forwards a shared Context& to every fire callback, so non-capturing
 // function pointers can still reach test state and the wheel itself.
-using TestWheel = Wheel<Context&>;
+using TestWheel = Wheel<Timer, Context&>;
 
 struct Context {
     TestWheel*       wheel = nullptr;
