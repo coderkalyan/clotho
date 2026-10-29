@@ -485,7 +485,7 @@ aggregate case). The IR side is a `HandleCopyNb` variant carrying
 plain old data: a record that never commits can be dropped. An owned-handle record
 cannot — dropping it leaks. Three drop paths must free it: a descheduled inertial
 record (the `epoch` stamp path), a `$finish` with records still armed, and
-`rt_run_init`'s pool reset (`Runtime.cpp:6437`, which already returns the
+`rt_run_init`'s pool reset (`runtime/Scheduler.cpp`, which already returns the
 intra-assignment queues to power-on). That obligation is what makes this the
 largest single item in the remainder, and it is also what closes the standing
 `q <= #2 r` entry.

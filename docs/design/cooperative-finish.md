@@ -26,7 +26,7 @@ process on the stack. Consequences:
   mid-update stays that way. `emit_active_run` already compensates at *startup*
   — `nba_arr_reset`, `intra_reset`, both commented "a prior `$finish`" — which
   is the wrong end of the problem. Those two now also run from `rt_run_init`
-  (`src/runtime/Runtime.cpp:5899`), the general run-start seam emitted at the
+  (`src/runtime/Scheduler.cpp`), the general run-start seam emitted at the
   top of the design's main, which additionally returns the process control-block
   pool, the event pool, the detached `->> @(x) e` table, the file-descriptor
   tables and the `$random` seed to power-on. That widens the compensation and

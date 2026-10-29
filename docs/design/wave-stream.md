@@ -28,8 +28,8 @@ not pay:
   `docs/VCD.md` §4.1 already identifies formatting as the expensive stage.
 - **The file.** A minute of a busy design is gigabytes on disk that nobody keeps.
 - **Latency.** Nothing appears until clotho's 1 MiB output buffer fills
-  (`g_vcd.iobuf`, `src/runtime/Runtime.cpp:4647`; the `FILE` itself is
-  deliberately unbuffered, `:5142-5144`), and the reader has no way to know a new
+  (`g_vcd.iobuf`, `src/runtime/Vcd.cpp`; the `FILE` itself is
+  deliberately unbuffered, `rt_vcd_begin`), and the reader has no way to know a new
   instant landed except by polling file size and re-parsing a tail it cannot
   frame without rescanning.
 
@@ -121,7 +121,7 @@ version bump.
 ### 3.1 Byte order and alignment
 
 - **Little-endian, always.** Today's in-process records are host-endian
-  (`memcpy` of raw `uint64_t`, `src/runtime/Runtime.cpp:4935-4951`), which is
+  (`memcpy` of raw `uint64_t`, `src/runtime/Vcd.cpp, vcd_rec_change`), which is
   correct in-process and unspecified on the wire. The stream sink pins LE and
   asserts it: `static_assert(std::endian::native == std::endian::little)`. No
   big-endian target is supported; if one ever is, the sink byteswaps and the
@@ -129,7 +129,7 @@ version bump.
 - **Byte-packed, unaligned.** Records have no padding and no alignment
   guarantee, exactly as in-process. A reader `memcpy`s scalars out — which
   `vcd_write_records` already does into `vcd_writer_scratch`
-  (`src/runtime/Runtime.cpp:5028-5032`), so this is not a new burden.
+  (`src/runtime/Vcd.cpp`), so this is not a new burden.
 - Sizes below are exact. `u16`/`u32`/`u64`/`i64` are LE two's complement.
 
 ### 3.2 Ring header
@@ -182,8 +182,8 @@ Invariants a consumer may rely on:
 
 1. **An instant never splits a batch.** This already holds in-process: buffers
    are sized to hold a full handoff batch plus one more whole instant
-   (`src/runtime/Runtime.cpp:5277-5294`) and handoff happens only at instant
-   boundaries (`:5372`). A consumer that stops decoding at `write_seq` therefore
+   (`src/runtime/Vcd.cpp, rt_vcd_start`) and handoff happens only at instant
+   boundaries (`rt_vcd_flush`). A consumer that stops decoding at `write_seq` therefore
    always stops at a consistent point.
 2. **A record never wraps.** When the tail of the ring cannot hold the next
    record whole, the producer emits a `Pad` record (§3.5 tag 7) covering the
@@ -207,7 +207,7 @@ Two policies, selected by `--wave-stream-overflow`:
 simulation. This is the correct default for a debugging tool: the waveform is
 complete, and a paused viewer is usually a deliberate act. This is also exactly
 today's in-process policy (`vcd_cv_free.wait`,
-`src/runtime/Runtime.cpp:5095`) and `docs/VCD.md` §6's stated principle: *"fixed
+`src/runtime/Vcd.cpp, vcd_handoff`) and `docs/VCD.md` §6's stated principle: *"fixed
 capacity + backpressure, never grow."*
 
 > **Detach on disconnect.** Blocking forever on a *dead* consumer would hang the
@@ -260,21 +260,21 @@ receives no metadata out of band.
   (`src/runtime/Runtime.h:537-540`): bit 0 four-state, bit 1 net, bit 2 narrow
   (2-state slot), bit 3 real.
 - `Change.nwords` is `ceil(width/64)` (`vcd_nwords`,
-  `src/runtime/Runtime.cpp:4580`) and is carried per record so a consumer can
+  `src/runtime/Vcd.cpp`) and is carried per record so a consumer can
   frame the stream without the variable table.
 - Plane order is **must, may, z**, each `nwords` LE `u64`, low word first. The
-  contract is the encoder `vcd_rec_change` (`src/runtime/Runtime.cpp:4944-4951`)
+  contract is the encoder `vcd_rec_change` (`src/runtime/Vcd.cpp`)
   over the layout `vcd_read_planes` produces (`must = out`, `may = out + nw`,
-  `z = out + 2*nw`, `:4790-4794`); the record-stream comment at `:4611-4617` and
-  the word order at `:4587` corroborate it. For a *narrow* (2-state) variable the
+  `z = out + 2*nw`); the record-stream comment before `VcdEngine` and
+  the word order on `VcdVar` corroborate it. For a *narrow* (2-state) variable the
   producer still emits three planes with `may == must` and `z == 0`
-  (`:4769-4777` scalar, `:4797-4803` multi-word) — the wire is uniform, the slot
+  (`vcd_read_planes`, scalar and multi-word paths) — the wire is uniform, the slot
   is not.
 - Per-bit decode is `docs/VCD.md` §3, unchanged: `z=1 → z`, else `may=0 → 0`,
   else `must=1 → 1`, else `x`.
 - For a `real`/`shortreal` variable (`flags` bit 3) `must[0]` is the IEEE-754 bit
   pattern; `must[0] != may[0]` is the all-`x` `$dumpoff` checkpoint, which the
-  VCD sink prints as `NaN` (`:4832-4835`).
+  VCD sink prints as `NaN` (`vcd_emit_real`).
 - `End.reason`: 0 `finish` ($finish or normal end), 1 `error` (a runtime fatal),
   2 `detached` (consumer gone, §3.4), 3 `limit` ($dumplimit reached).
 - Unknown tags are a **fatal protocol error** for the consumer, not something to
@@ -336,16 +336,15 @@ These already exist and already produce records; the stream just needs the
 consumer to interpret them correctly.
 
 - `$dumpoff` emits an **all-`x` checkpoint for every variable**, then deactivates
-  (checkpoint `src/runtime/Runtime.cpp:5313-5329`, deactivation `:5331-5332`,
-  forced handoff `:5333`). Those are real value records, not a control frame, and
-  a consumer must ingest them as data. Tag 8 follows so the consumer knows the
-  burst was a checkpoint rather than the design going unknown.
-- `$dumpon` (`rt_vcd_on`, `:5383-5389`) and `$dumpall` (`rt_vcd_all`,
-  `:5391-5395`) set `force_all`, so the next instant re-emits every variable.
-  Tags 9 and 10 mark them. `$dumpvars` arms the same flag through `rt_vcd_start`
-  (`:5304`).
+  (checkpoint, deactivation and forced handoff all in
+  `src/runtime/Vcd.cpp, rt_vcd_flush`). Those are real value records, not a
+  control frame, and a consumer must ingest them as data. Tag 8 follows so the
+  consumer knows the burst was a checkpoint rather than the design going unknown.
+- `$dumpon` (`rt_vcd_on`) and `$dumpall` (`rt_vcd_all`) set `force_all`, so the
+  next instant re-emits every variable. Tags 9 and 10 mark them.
+  `$dumpvars` arms the same flag through `rt_vcd_start`.
 - Shadows are deliberately left stale across `$dumpoff` (`v.seen = true` with an
-  un-updated shadow, `:5324-5328`); correctness depends on `$dumpon` forcing
+  un-updated shadow, `rt_vcd_flush`); correctness depends on `$dumpon` forcing
   all. A consumer must not assume the value it last saw is still the shadow.
 
 ---
@@ -365,12 +364,12 @@ is the regression gate: it must pass unmodified, byte for byte.
 
 `docs/VCD.md` §4.2 specifies an `rt_dump_sink` vtable and an
 `rt_vcd_vartable`. **Neither exists** — the sink is `vcd_write_records` calling
-`vcd_emit` directly (`src/runtime/Runtime.cpp:5008-5036`), and `VcdVar` stores
-no name, no scope path and no net bit (`:4588-4609`); registration writes
+`vcd_emit` directly (`src/runtime/Vcd.cpp`), and `VcdVar` stores
+no name, no scope path and no net bit; registration writes
 `$scope`/`$var` lines straight into the output buffer and retains **no name and
-no scope path** (`vcd_register`, `:5173-5208`; it does keep width, flags, plane
-pointers, shadow and idcode, and folds the net bit into the `$var` keyword at
-`:5195-5197` before discarding it).
+no scope path** (`vcd_register`; it does keep width, flags, plane
+pointers, shadow and idcode, and folds the net bit into the `$var` keyword
+before discarding it).
 
 Build what the doc already specifies, extended with the registration calls the
 doc's version omitted:
@@ -458,7 +457,7 @@ and `emit_vcd_var` (`src/ir/llvm/Vcd.cpp`), exactly as
 
 ### 4.4 Composable sinks
 
-`vcd_writer_loop` currently formats each batch to text (`:5061-5085`). It
+`vcd_writer_loop` currently formats each batch to text. It
 becomes: for each attached sink, `sink->records(buf, len)`. The VCD sink formats;
 the stream sink copies into the ring. Two sinks means one extra pass over the
 record bytes, which is a `memcpy`-bound walk over data already in L2 — cheap
@@ -471,7 +470,7 @@ batches in the same order, and they share no state.
 ### 4.5 Publish cadence — the latency floor
 
 Handoff fires at `recbuf.size() >= kVcdHandoffBytes` (64 KiB,
-`src/runtime/Runtime.cpp:5372`) or at `$dumpflush`/close. **For a file that is
+`src/runtime/Vcd.cpp, rt_vcd_flush`) or at `$dumpflush`/close. **For a file that is
 correct; for a live viewer it is an unbounded latency floor** — a quiet design
 can hold records for seconds.
 
@@ -569,7 +568,7 @@ written from this document alone:
 **Reference consumer.** `tools/wave-stream-dump` (new — there is no `tools/`
 directory today) attaches to a stream and writes a VCD. It links `clotho_runtime`
 (`CMakeLists.txt:284`) **and requires W0 first**: today every sink entity lives
-inside the anonymous namespace spanning `src/runtime/Runtime.cpp:4577-5121`, so
+inside the anonymous namespace of `src/runtime/Vcd.cpp`, so
 `vcd_write_records`, `vcd_emit` and the engine have internal linkage and are
 unreachable from another translation unit. The only exported surface is the
 `extern "C" rt_vcd_*` functions, which consume live plane pointers, not records.
@@ -661,7 +660,7 @@ Recording the constraints here so this document does not get retrofitted:
 - **Clotho has no run control today.** The simulation is one monolithic JIT'd
   `sim_drain` called once (created at `src/ir/llvm/Scheduler.cpp, emit_main`, body
   emitted by `emit_active_run`, invoked via `rt_sim_run`,
-  `src/runtime/Runtime.cpp:3480`; looked up at `src/ir/Jit.cpp:586` and entered
+  `src/runtime/Scheduler.cpp`; looked up at `src/ir/Jit.cpp:586` and entered
   by the single `fn()` call at `:622`). There is no re-entrant step entry point
   and no way to return from the drain and re-enter.
 - **`docs/design/dap.md` §4.1 already settled the topology**: inversion — the
@@ -734,15 +733,15 @@ well is a proxy, not a rewrite.
    design.** `tick_fs` defaults to 1 ("1 when unitless") and `timeformat_units`
    to 0 (`src/ir/Module.h:480-485`), i.e. 1 fs and 10⁰ s — contradictory. Worse,
    `timeformat_units` is **discarded**: `rt_vcd_begin` opens with `(void)units;`
-   (`src/runtime/Runtime.cpp:5128`) and derives the `$timescale` from `tick_fs`
-   alone (`:5149`), so `Runtime.h:548-549`'s claim that both "set the timescale"
+   (`src/runtime/Vcd.cpp`) and derives the `$timescale` from `tick_fs`
+   alone, so `Runtime.h:548-549`'s claim that both "set the timescale"
    is wrong and no consumer has ever exercised the value. The wire carries
    `tick_fs` as authoritative and `timescale_units` as advisory (§3.2), which is
    correct either way — but a consumer rendering a time axis should ignore the
    latter until clotho validates it. Separately, the power-of-ten assumption is
-   asserted only in a code comment (`:4712-4713`), and
-   `vcd_write_timescale`'s raw-femtosecond fallback (`:4734-4736`) is
-   **unreachable**: the unit table ends in `{1, "fs"}` (`:4721`) and
+   asserted only in a code comment (before `vcd_write_timescale`), and
+   `vcd_write_timescale`'s raw-femtosecond fallback is
+   **unreachable**: the unit table ends in `{1, "fs"}` and
    `tick_fs % 1 == 0` always holds.
 3. **AOT.** `run` is JIT-only and `rt_vcd_*` is exposed through
    `llvm::orc::SymbolMap` (declared `src/ir/Jit.cpp:171`, `rt_vcd_*` entries
@@ -751,8 +750,8 @@ well is a proxy, not a rewrite.
    `clotho build --emit llvm` + external link can reach the stream sink is
    unresolved and does not block phase 1.
 4. **`g_vcd.always` is dead.** Both registration sites pass `always_scan = false`
-   (`src/runtime/Runtime.cpp:5220`, `:5260`), yet the flush's hot loop loads it
-   every instant (`:5355-5362`). Unrelated to streaming, but the sink refactor
+   (`src/runtime/Vcd.cpp, rt_vcd_var`, `rt_vcd_array`), yet the flush's hot loop
+   loads it every instant (`rt_vcd_flush`). Unrelated to streaming, but the sink refactor
    touches that code and it should be deleted or revived while it is open.
 5. **Multiple viewers.** One consumer is enforced (§4.6). If two viewers ever
    matter, the answer is a fan-out recorder process, not a multi-consumer ring.

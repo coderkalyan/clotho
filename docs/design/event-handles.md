@@ -220,7 +220,7 @@ are one compare each against a base/length pair the backend loads once per
 region, exactly as the container element path does with `dyn_inrange`
 (`ir/llvm/Inst.cpp, lower_inst`). Failure calls
 `rt_event_stale(const rt_null_site*, uint64_t now)` — a `[[noreturn]]` located
-fatal modelled on `rt_null_handle` (`Runtime.cpp:3711`), reusing the existing
+fatal modelled on `rt_null_handle` (`runtime/Reports.cpp`), reusing the existing
 `rt_null_site` record and `null_site_global` emitter (`ir/llvm/Sanitizers.cpp`).
 A `null` handle triggered or waited on is **not** an error: LRM 15.5.5 makes
 `-> null` a no-op and `@(null)` block forever, so the deref path tests slot 0
@@ -443,7 +443,7 @@ existing `trigger_id(sig, edge)` (`ir/llvm/Events.cpp`), which is precisely the
 shape of the already-shipping intra-assignment mechanism:
 
 > `rt_intra_event_register(trig_id, rec)` / `rt_intra_event_fire(trig_id)`
-> (`Runtime.cpp:2496-2516`) — a `std::vector<void*>` per trigger id, compacted in
+> (`runtime/Scheduler.cpp`) — a `std::vector<void*>` per trigger id, compacted in
 > place.
 
 Add `rt_event_detach_register(trig_id, handle, count)` and have
@@ -602,11 +602,11 @@ effect and `.triggered` reads out-of-model state.
 Today the VCD layer aims a raw pointer at the trigger tick and diffs it:
 
 - `vcd_register` takes the event branch with `mm_bytes = 8`, `seen = true` and a
-  `0xFF`-seeded shadow (`Runtime.cpp:6017-6025`);
+  `0xFF`-seeded shadow (`runtime/Vcd.cpp`);
 - `VcdVar::mm` points at `clotho.event_trig.<name>` and "the ordinary shadow diff
-  detects a trigger" (`Runtime.cpp:5416-5420`);
-- the change emits the bare pulse `1<id>` (`Runtime.cpp:5687-5697`);
-- the declaration is `$var event 1` (`:6039`).
+  detects a trigger" (`runtime/Vcd.cpp, VcdVar`);
+- the change emits the bare pulse `1<id>` (`runtime/Vcd.cpp, vcd_emit`);
+- the declaration is `$var event 1` (`vcd_register`).
 
 This survives with one substitution: register `&g_events[slot].last_trig` instead
 of the named global. That is why `last_trig` is field 0 of `rt_event` — the

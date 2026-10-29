@@ -169,7 +169,7 @@ jobs:
             >> "$GITHUB_ENV"
           # libc++'s headers annotate anything whose implementation lives in the
           # shared library with the macOS version that first shipped it, and
-          # floating-point std::from_chars (Runtime.cpp's real parsing) is marked
+          # floating-point std::from_chars (the real parsing in src/runtime/) is marked
           # macOS 26. Those annotations describe Apple's system libc++; we link
           # Homebrew's, which has the symbol, so turn them off.
           echo "CXXFLAGS=-D_LIBCPP_DISABLE_AVAILABILITY" >> "$GITHUB_ENV"

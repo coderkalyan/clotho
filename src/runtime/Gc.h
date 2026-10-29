@@ -29,7 +29,7 @@ extern "C" {
 
 // rt_elem_leaf, from Runtime.h. Declared incomplete here so this header does not
 // depend on the whole runtime ABI; the GC only ever passes these to the
-// element-lifecycle walkers, which live in Runtime.cpp.
+// element-lifecycle walkers, which live in runtime/Containers.cpp.
 struct rt_elem_leaf;
 struct rt_elem_ops;
 
@@ -38,7 +38,7 @@ struct rt_elem_ops;
 // Immix's experimentally-selected sizes (Blackburn & McKinley, PLDI 2008 §5): a
 // 128-byte line and a 32 KiB block. RT_GC_ALIGN is the object alignment: 16, not
 // the 64 rt_alloc gives, because rt_alloc's 64 exists for over-aligned coroutine
-// frame plane spills (Runtime.cpp:5364-5371) and would waste 62% of a 24-byte
+// frame plane spills (runtime/Scheduler.cpp, rt_alloc) and would waste 62% of a 24-byte
 // transaction object.
 #define RT_GC_BLOCK_BYTES     32768u
 #define RT_GC_LINE_BYTES      128u

@@ -166,7 +166,7 @@ nested queue / dynamic array / associative array, and event.
 a property of the *interned Queue type*, not of the push site (`QueueArg`,
 `src/ir/Ir.h:350-360`), and an overflowing push on a bounded queue **silently drops
 the element from the opposite end** (`Ir.h:1237-1239`; `q_apply_bound_ops`,
-`src/runtime/Runtime.cpp` `[gc]`:1556-1565). A mailbox bound is a *blocking*
+`src/runtime/Containers.cpp`). A mailbox bound is a *blocking*
 condition, so the FIFO must be an **unbounded** queue type with the bound enforced
 in emitted code (§6.2).
 
@@ -700,8 +700,8 @@ Ranked by how much damage a naive implementation does.
 5. **`mailbox #(event)` mints and abandons an object per `put`.** `rt_queue_push_back`
    calls `rt_elem_init` before `rt_elem_copy`, and for `rt_elem_event` init is *not*
    a proto copy — it calls `rt_event_new()` (LRM Table 6-7's "a new event",
-   `Runtime.cpp` `[gc]`:1048-1056) — then copy overwrites the handle
-   (`:1105-1109`). Since event objects are never freed
+   `runtime/Containers.cpp, rt_elem_init`) — then copy overwrites the handle
+   (`rt_elem_copy`). Since event objects are never freed
    (`Runtime.h:1399-1404`), every `put` leaks one. Either refuse
    `mailbox #(event)` loudly in the first cut, or add an init-skipping push path;
    refusing is the first cut's answer, with the TODO naming this hazard.

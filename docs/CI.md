@@ -67,7 +67,7 @@ robust and strictly more setup; it is not worth it until the drift happens.
 - **macOS: Homebrew LLVM's clang and its libc++**, with
   `-D_LIBCPP_DISABLE_AVAILABILITY`. libc++ annotates declarations whose
   implementation lives in the shared library with the macOS version that first
-  shipped them, and floating-point `std::from_chars` (which `Runtime.cpp` uses
+  shipped them, and floating-point `std::from_chars` (which `src/runtime/` uses
   to parse reals) is marked macOS 26. Those annotations describe Apple's system
   libc++; we link Homebrew's, which has the symbol.
 - **Windows: MSYS2's clang, with no MSVC anywhere.** MSVC proper cannot build

@@ -669,7 +669,7 @@ extern "C" void rt_cover_report(void) {
     }
     std::FILE* f = std::fopen(g_config->report_path, "wb");
     if (f == nullptr) {
-        // rt_vcd_begin's soft failure (Runtime.cpp:7201-7203): one diagnostic to
+        // rt_vcd_begin's soft failure (runtime/Vcd.cpp): one diagnostic to
         // stderr and carry on. A report that cannot be written is not a reason to
         // fail a simulation that has already finished running.
         std::fprintf(stderr, "--coverage: cannot open '%s'\n", g_config->report_path);

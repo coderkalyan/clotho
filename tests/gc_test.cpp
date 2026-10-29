@@ -817,7 +817,7 @@ TEST_CASE("gc: objects reachable only from a dynamic array in design state survi
 
 // And through an associative array, which is the one the other two walkers cannot
 // be reused for: element payloads are one SlotVec heap block per entry and
-// unordered_dense relocates them on rehash (Runtime.cpp:2093-2110), so the walk
+// unordered_dense relocates them on rehash (runtime/Containers.cpp, AssocMap), so the walk
 // has to go through rt_assoc_visit (Runtime.h:939-941) rather than over a
 // contiguous span. A walker that treats the map as an array of stride-sized slots
 // reads freed or unrelated memory and marks nothing that is here.
@@ -1137,10 +1137,10 @@ TEST_CASE("gc: the container of a dead object keeps nothing alive") {
 }
 
 // Ring wraparound, which is the queue walker's one arithmetic obligation: the
-// live elements occupy physical slots (head + i) mod cap (Runtime.cpp:1467-1470)
-// and pop_front advances head rather than shifting (Runtime.cpp:1629). The design
+// live elements occupy physical slots (head + i) mod cap (runtime/Containers.cpp, q_elem)
+// and pop_front advances head rather than shifting (rt_queue_pop_front). The design
 // forces the wrap rather than hoping for it: 16 pushes settle cap at 16 with
-// head == 0 (growth linearises, Runtime.cpp:1479-1490), 12 pop_fronts move head to
+// head == 0 (growth linearises, q_reserve), 12 pop_fronts move head to
 // 12 without dropping capacity, and the next 12 pushes fit without a grow -- so
 // they land in physical slots 0..11 while the four survivors sit at 12..15.
 //

@@ -707,7 +707,7 @@ llvm::FunctionCallee Backend::defer_flush_final_fn() {
 
 // void rt_sim_run(ptr state, ptr wheel, ptr drain, ptr finals) — wraps the
 // drain in the $finish catch (a setjmp target) so a $finish returns here with
-// state live, then runs the final blocks (LRM 9.2.3). See runtime/Runtime.cpp.
+// state live, then runs the final blocks (LRM 9.2.3). See runtime/Scheduler.cpp.
 llvm::FunctionCallee Backend::sim_run_fn() {
     auto* ptr = raw_ptr_ty();
     return rt_fn("rt_sim_run", b_.getVoidTy(), { ptr, ptr, ptr, ptr });

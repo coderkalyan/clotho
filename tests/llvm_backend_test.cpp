@@ -1704,10 +1704,10 @@ TEST_CASE("$random yields the deterministic signed-32 stream") {
 
 // The unseeded global $random stream restarts from power-on for EVERY design, not
 // merely the first one in the process. rt_random mutates the seed in place
-// (Runtime.cpp:4937) and nothing else writes it, so before the run-start seam
-// existed the determinism Runtime.cpp:4904-4906 claims held only for whichever
-// design happened to draw first in a clotho_test process -- and the pinned stream
-// above was silently order-dependent. Two designs in one TEST_CASE because that
+// (runtime/Random.cpp) and nothing else writes it, so before the run-start seam
+// existed the determinism g_random_seed's comment (runtime/RuntimeInternal.h)
+// claims held only for whichever design happened to draw first in a clotho_test
+// process -- and the pinned stream above was silently order-dependent. Two designs in one TEST_CASE because that
 // is the whole property: run_jit builds a fresh LLJIT per design, but the seed is
 // a runtime global that outlives it.
 TEST_CASE("the unseeded $random stream restarts at power-on for every design") {
@@ -2912,7 +2912,7 @@ TEST_CASE("$fdisplay to a combined MCD writes both files") {
 
 // The MCD channel space is 30 wide and process-global, so a design that leaks its
 // channels must not spend the next design's. rt_run_init closes whatever a run
-// left open at the START of the following run (Runtime.cpp:5940-5959) -- the only
+// left open at the START of the following run (runtime/Scheduler.cpp) -- the only
 // seam that also covers a design ending in $finish or a fatal exit, neither of
 // which reaches rt_sim_run's tail. Two designs in one TEST_CASE because that is
 // the whole property: the file tables outlive the LLJIT that used them.

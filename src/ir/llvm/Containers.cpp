@@ -174,7 +174,7 @@ llvm::StructType* Backend::elem_leaf_ty() {
 //
 // The order is a runtime contract, not a convenience: rt_elem_copy deep-assigns
 // each leaf and then raw-copies the POD gaps *between* consecutive leaves
-// (Runtime.cpp), so an unsorted table would copy a leaf's bytes as if they were
+// (runtime/Containers.cpp), so an unsorted table would copy a leaf's bytes as if they were
 // POD -- shallow-copying a string handle into a slot that then double-frees.
 // The walk is in declaration / index order, which IS ascending offset for both
 // an LLVM struct (fields laid out in order) and an array.

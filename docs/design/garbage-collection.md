@@ -263,7 +263,7 @@ already emits an `{offset, descriptor}` table.
 naturally-aligned 64-bit store is atomic on every target in the matrix, so even
 under MT the collector never observes a torn handle. Bodies are 64-byte aligned
 today only because `rt_alloc` is the coroutine-frame allocator
-(`Runtime.cpp:5364-5376`, `frame_align{64}`) — 62% waste on a 24-byte transaction
+(`runtime/Scheduler.cpp`, `frame_align{64}`) — 62% waste on a 24-byte transaction
 object.
 
 **F5 — the call ABI already carries a uniform extra pointer, and the reason is
@@ -286,9 +286,9 @@ prerequisites for evacuation, and they are all fixable (§8):
 
 | Mechanism | Where | What breaks if bodies move |
 |---|---|---|
-| Assoc keys on class handles | `lower/Types.cpp, lower_type`, `emit_key_bytes` `ir/llvm/AssocArrays.cpp`, `Runtime.cpp:2058-2065,2124` | the handle's raw bits are big-endian-encoded into the `std::string` hash key *and* drive `first`/`next` ordering |
+| Assoc keys on class handles | `lower/Types.cpp, lower_type`, `emit_key_bytes` `ir/llvm/AssocArrays.cpp`, `runtime/Containers.cpp, AssocKeyLess`, `AssocMap` | the handle's raw bits are big-endian-encoded into the `std::string` hash key *and* drive `first`/`next` ordering |
 | `ref` into a class property | `ir/llvm/StateLayout.cpp, ref_actual_arg` | passed as a raw interior pointer with `clotho.ref.noepoch`, a compile-time-zero epoch that can never signal invalidation |
-| `rt_ref_names` | `Runtime.cpp:3791-3809` | address-keyed linear scan; safe today only because no entry aims at a class body |
+| `rt_ref_names` | `runtime/Reports.cpp` | address-keyed linear scan; safe today only because no entry aims at a class body |
 
 ---
 
@@ -363,7 +363,7 @@ Required: a handle-bearing element kind, handle offsets in the leaf table, and
 must respect ring wraparound (`base + ((head+i) % cap) * stride`); the assoc
 walker must iterate the C++ `AssocMap`, because element payloads are one `SlotVec`
 heap block per entry and `unordered_dense` relocates them on rehash
-(`Runtime.cpp:2093-2110`). Handle-valued assoc **keys** are strong references and
+(`runtime/Containers.cpp`). Handle-valued assoc **keys** are strong references and
 must be traced from their encoded bytes.
 
 `rt_elem_ops` is mirrored bit-for-bit by `elem_ops_ty()`
@@ -380,7 +380,7 @@ has. So P4 needs live handle-bearing containers to be **root providers in their 
 right**: registered when they first acquire a handle element and deregistered at
 deinit, walked precisely at every collection. The hook exists — containers already
 have an element lifecycle through `rt_elem_ops` (`rt_elem_init` / `rt_elem_deinit`,
-`Runtime.cpp:1049-1110`) — and `rt_gc_range_add` already establishes the pattern
+`runtime/Containers.cpp`) — and `rt_gc_range_add` already establishes the pattern
 for a runtime-owned region the collector must scan. The alternative, making
 container payloads GC-allocated, was rejected: it would drag strings, dynamic
 arrays and queues out of the ownership discipline that `data-model.md` §8 already
@@ -464,7 +464,7 @@ root table would trace foreign DPI pointers.
   interior pointers to object starts, heap parsability for the verify mode, and
   the sweep cursor.
 - **Alignment 16, not 64.** The 64-byte guarantee exists for coroutine frame plane
-  spills (`Runtime.cpp:5364-5371`) and is waste for objects. Frames keep
+  spills (`runtime/Scheduler.cpp, rt_alloc`) and is waste for objects. Frames keep
   `rt_alloc`; objects get the Immix allocator.
 - **Large objects** (larger than a line, or larger than some fraction of a block)
   go to a separate large-object space with the same GC word, never evacuated.
@@ -516,7 +516,7 @@ benefit, on any collector, purely from inlining.
 **OOM.** `rt_alloc` returns null on failure and the `ClassNew` site deliberately
 does not check (`ir/llvm/Inst.cpp, lower_inst` elides null guards on a fresh
 handle). The Immix allocator must preserve "never returns null" by taking the
-existing located-fatal path (`alloc_bytes`, `Runtime.cpp:4104-4128`) after a
+existing located-fatal path (`alloc_bytes`, `runtime/Reports.cpp`) after a
 collection fails to satisfy the request.
 
 ---
@@ -840,7 +840,7 @@ exhausted. It is a policy knob over the same heap, with 2.5% headroom.
    or pass base + offset and re-derive. The same treatment covers a container
    epoch pointer that aims into a class body.
 3. **`rt_ref_names`** must never be extended to class-owned containers while it is
-   address-keyed (`Runtime.cpp:3791-3809`).
+   address-keyed (`runtime/Reports.cpp`).
 4. **`data-model.md` §8 and `:165-167`** must be amended in the same change:
    "class bodies never move and are never freed" becomes a statement about pinned
    and un-pinned objects.
@@ -969,7 +969,7 @@ single-mutator builds the mutator context pointer folds to a constant.
 
 **The gate's blind spot must be closed first.** The harness records only
 wall/compile/sim milliseconds. `FinishStats { peak_rss_kb, cpu_seconds }`
-(`Runtime.cpp:3273-3311`) is already computed for `$finish(2)` and every perf case
+(`runtime/Scheduler.cpp`) is already computed for `$finish(2)` and every perf case
 runs to `$finish`, so `perf.py` can gate a `peak_rss_kb` metric with no new
 instrumentation.
 

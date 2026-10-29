@@ -112,7 +112,7 @@ its own regardless of the rest of this design.
 - The RNG primitive: xoshiro256++ inlined by `emit_xoshiro_next`
   (`src/ir/llvm/Ops.cpp`), and the only runtime entry point,
   `void rt_urandom_seed(uint64_t* state, uint64_t seed)`
-  (`src/runtime/Runtime.cpp:4970-4979`, exposed `src/ir/Jit.cpp:241`), a splitmix64
+  (`src/runtime/Random.cpp`, exposed `src/ir/Jit.cpp:241`), a splitmix64
   expansion of one 64-bit selector into four state words. Both are reused verbatim.
 - The precedent for a body seeded from one draw of its creating context: the fork
   child / deferred body at `src/ir/llvm/`. The object seeding in
@@ -484,7 +484,7 @@ be treated exactly like `TaskCall` — statement-only, coroutine-only, epoch-bra
 (`src/ir/llvm/`). Step 1 does not go there.
 
 One new runtime symbol, `rt_randc_next`, declared in `src/runtime/Runtime.h`, defined
-`extern "C"` in `src/runtime/Runtime.cpp`, registered with one `expose(...)` line in
+`extern "C"` in `src/runtime/Random.cpp`, registered with one `expose(...)` line in
 `src/ir/Jit.cpp:183-300`.
 
 ---

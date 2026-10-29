@@ -279,7 +279,7 @@ It is neither a scalar nor a vec — it is the `rt_string` handle — so it gets
 `DpiCType::String` and its own arm in `lower_dpi_call`, always passed as `ptr`.
 
 **Enabled by the `rt_string` NUL invariant** (`byte[len] == 0` — see the SSO block
-in `runtime/Runtime.cpp`). Because `rt_string_data()` is now a valid C string:
+in `runtime/RuntimeInternal.h`). Because `rt_string_data()` is now a valid C string:
 
 - **Input string is zero-copy**: `argv.push_back(rt_string_data(str_of(a)))` — pass
   the pointer directly, no arena, no copy. The C reads it during the call and must
@@ -567,7 +567,7 @@ phasing below honest rather than a stub.
   needs promoting** — the "main-local alloca" premise of the original deferral was
   never true.
 - **C driving JIT code that resumes a coroutine already happens.**
-  `rt_sim_run(state, wheel, drain, finals)` (`Runtime.cpp:5052-5071`) is genuine C
+  `rt_sim_run(state, wheel, drain, finals)` (`runtime/Scheduler.cpp`) is genuine C
   calling JIT function pointers, and `sim_finals` resumes `final`-block coroutines.
   It is a precedent for the *shape* only: a `final` block cannot suspend (LRM
   9.2.3), so that edge never advances time.
@@ -623,7 +623,7 @@ independent reasons.
   nesting forces LIFO completion, and LRM 35.5.1.5 explicitly blesses the
   non-LIFO case ("simultaneously active in multiple execution threads").
 - *`$finish` assumes an all-JIT stack.* The cooperative finish sets the
-  `rt_finishing` global (`Runtime.cpp:3958-3964`) and every JIT frame in the
+  `rt_finishing` global (`runtime/Scheduler.cpp`) and every JIT frame in the
   statically-computed may-finish closure tests it after a call
   (`emit_finish_check`, `ir/llvm/SystemTasks.cpp`), returning through its own
   epilogue. A nested drain multiplies the number of C frames between the `$finish`
