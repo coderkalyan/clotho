@@ -353,7 +353,7 @@ jobs:
           path: clotho-bin
 
       # The binary's shared libraries come from the same packages the build job
-      # installs. Verilator supplies the VPI headers the UVM DPI object includes.
+      # installs.
       - name: Install runtime libraries and headers
         run: |
           set -euxo pipefail
@@ -365,7 +365,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             llvm-$LLVM_MAJOR-dev liblld-$LLVM_MAJOR-dev libc++-$LLVM_MAJOR-dev \
-            libclang-rt-$LLVM_MAJOR-dev verilator
+            libclang-rt-$LLVM_MAJOR-dev
           chmod +x clotho-bin/clotho
           clotho-bin/clotho --version
 
@@ -386,6 +386,14 @@ jobs:
             third_party/tests third_party/cores third_party/tools/yosys
           git submodule update --init --depth 1 third_party/tools/icarus
           pip install -r conf/requirements.txt
+          # The UVM DPI object includes the IEEE VPI and PLI headers. Ubuntu's
+          # Verilator (5.020) predates veriuser.h, so take Verilator's copies at
+          # a pinned tag; clotho supplies svdpi.h.
+          mkdir -p "$RUNNER_TEMP/vltstd"
+          for h in vpi_user.h sv_vpi_user.h veriuser.h; do
+            curl -fsSL -o "$RUNNER_TEMP/vltstd/$h" \
+              "https://raw.githubusercontent.com/verilator/verilator/v5.050/include/vltstd/$h"
+          done
 
       - name: Run sv-tests
         working-directory: sv-tests
@@ -394,7 +402,7 @@ jobs:
         run: |
           set -eux
           make clotho-uvm-dpi CLOTHO_SVDPI_DIR="$GITHUB_WORKSPACE/src/runtime" \
-            VPI_INC_DIR=/usr/share/verilator/include/vltstd
+            VPI_INC_DIR="$RUNNER_TEMP/vltstd"
           make generate-tests -j "$(nproc)"
           make -j "$(nproc)" RUNNERS_FILTER=clotho report
 
