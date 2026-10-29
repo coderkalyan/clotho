@@ -54,14 +54,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # `cmake` carries extra configure flags. linux-x64, the job every push
+          # runs, adds the checks too slow to ship; every other platform tests
+          # the shipped configuration. linux-x64-sanitize adds ASan and UBSan.
           cat > all.json <<'JSON'
           [
-            {"name": "linux-x64",     "runner": "ubuntu-24.04",    "shell": "bash"},
+            {"name": "linux-x64",     "runner": "ubuntu-24.04",    "shell": "bash", "cmake": "-DCLOTHO_EXPENSIVE_CHECKS=ON"},
             {"name": "linux-arm64",   "runner": "ubuntu-24.04-arm", "shell": "bash"},
             {"name": "macos-arm64",   "runner": "macos-15",        "shell": "bash"},
             {"name": "macos-x64",     "runner": "macos-15-intel",  "shell": "bash"},
             {"name": "windows-x64",   "runner": "windows-2025",   "msystem": "CLANG64",    "shell": "msys2 {0}", "zig": "x86_64-windows",  "zig_sha256": "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"},
-            {"name": "windows-arm64", "runner": "windows-11-arm",  "msystem": "CLANGARM64", "shell": "msys2 {0}", "zig": "aarch64-windows", "zig_sha256": "aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef", "experimental": true}
+            {"name": "windows-arm64", "runner": "windows-11-arm",  "msystem": "CLANGARM64", "shell": "msys2 {0}", "zig": "aarch64-windows", "zig_sha256": "aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef", "experimental": true},
+            {"name": "linux-x64-sanitize", "runner": "ubuntu-24.04", "shell": "bash", "cmake": "-DCLOTHO_EXPENSIVE_CHECKS=ON -DCLOTHO_SANITIZE=ON"}
           ]
           JSON
           # A `ci/`-prefixed branch opts into the full matrix on every push.
@@ -278,12 +282,17 @@ jobs:
             -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
             -DCLOTHO_LSP=ON -DCLOTHO_DAP=ON \
             ${ZIG_EXECUTABLE:+-DZIG_EXECUTABLE=$ZIG_EXECUTABLE} \
-            $launcher
+            $launcher ${{ matrix.cmake }}
 
       - name: Build
         run: cmake --build build --target clotho_test clotho_cli
 
       - name: Test
+        env:
+          # Read only by the sanitizer build. A simulation that ends leaves its
+          # suspended processes' memory allocated, which the in-process suite
+          # reports as leaks (docs/TODO.md); every other finding still fails.
+          ASAN_OPTIONS: detect_leaks=0
         run: |
           set -eu
           # One CTest entry per test file (CMakeLists.txt), run in parallel. Each

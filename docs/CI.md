@@ -14,11 +14,19 @@ where a platform regression would otherwise escape:
 | trigger | platforms |
 |---|---|
 | push to a feature branch, pull request | linux-x64 |
-| push to `main`, push to a `ci/*` branch, nightly (07:00 UTC), `workflow_dispatch` | all six |
+| push to `main`, push to a `ci/*` branch, nightly (07:00 UTC), `workflow_dispatch` | all six, plus linux-x64-sanitize |
 
 `ci/*` exists because GitHub only offers `workflow_dispatch` for workflows that
 already exist on the default branch — without it there is no way to exercise the
 slower platforms while iterating on CI itself.
+
+## Configurations
+
+Every job builds Release, which keeps `assert()` live as shipped builds do.
+linux-x64 adds `CLOTHO_EXPENSIVE_CHECKS`, the checks too slow to ship, so every
+push runs them; the other platforms test the shipped configuration.
+linux-x64-sanitize adds `CLOTHO_SANITIZE` (ASan and UBSan) on top of the
+expensive checks.
 
 ## The LLVM dependency
 
