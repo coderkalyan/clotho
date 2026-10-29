@@ -351,7 +351,15 @@ endif()
 # LLVM and no slang — plain native code, so it stays linkable on its own. The
 # timing wheel is part of this surface: the runtime exposes it behind a C ABI.
 add_library(clotho_runtime STATIC
-  src/runtime/Runtime.cpp
+  src/runtime/Containers.cpp
+  src/runtime/Format.cpp
+  src/runtime/Io.cpp
+  src/runtime/Random.cpp
+  src/runtime/Reports.cpp
+  src/runtime/Scheduler.cpp
+  src/runtime/Strings.cpp
+  src/runtime/Values.cpp
+  src/runtime/Vcd.cpp
   src/runtime/Gc.cpp
   src/runtime/Svdpi.cpp
   src/runtime/Coverage.cpp
@@ -702,7 +710,15 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ExeLicenses.inc"
      "static const unsigned char kLicenses[] = {${clotho_licenses_hex}};\n")
 
 add_library(clotho_runtime_exe STATIC
-  src/runtime/Runtime.cpp
+  src/runtime/Containers.cpp
+  src/runtime/Format.cpp
+  src/runtime/Io.cpp
+  src/runtime/Random.cpp
+  src/runtime/Reports.cpp
+  src/runtime/Scheduler.cpp
+  src/runtime/Strings.cpp
+  src/runtime/Values.cpp
+  src/runtime/Vcd.cpp
   src/runtime/Gc.cpp
   src/runtime/Svdpi.cpp
   src/runtime/Coverage.cpp
