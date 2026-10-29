@@ -252,10 +252,11 @@ ir::Index Lowerer::saturating_ticks(ir::Index scaled, uint64_t tick_mul, ir::Bui
 }
 
 // Lower a #delay amount, scaled from the module's time unit to wheel ticks.
-// The unit multiplier is a compile-time constant; widen to 64 bits and
-// multiply so a large unit (e.g. seconds against fs precision) cannot
-// overflow the amount's declared width. An integer delay times the unit is
-// always an exact multiple of the tick (LRM §3.14), so no rounding is needed.
+// The unit multiplier is a compile-time constant; the amount is widened to 64
+// bits first and then multiplied, so a large unit (e.g. seconds against fs
+// precision) cannot overflow the amount's declared width. An integer delay times
+// the unit is always an exact multiple of the tick (LRM §3.14), so no rounding is
+// needed. The result is always a 64-bit unsigned tick count for an integral amount.
 ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     const ir::SourceLoc l   = loc(amount);
     const ir::Ref       u64 = make_int_type(64, false, false);
@@ -282,13 +283,20 @@ ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
         return saturating_ticks(scaled, prec_over_tick_, b, l);
     }
 
-    const ir::Index v = lower_expr(amount, b);
+    // LRM 9.4.1: a delay that evaluates to a negative value "shall be interpreted
+    // as a two's-complement unsigned integer of the same size as a time variable",
+    // which is 64 bits. An amount narrower than that therefore extends by its OWN
+    // signedness, as in an assignment (coerce, LRM 11.8.3): `int d = -1` is
+    // 2**64 - 1, not 2**32 - 1. An unsigned amount zero-extends and a wider one
+    // truncates. The backend consumes the count as is, so this is the one place
+    // the extension is decided.
+    const ir::Index ticks = coerce(lower_expr(amount, b), *amount.type, u64, b, l);
     if (time_mul_ <= 1) {
-        return v;
+        return ticks;
     }
     const ir::Index mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
 
-    return b.binary(ir::Inst::Tag::Mul, b.resize(v, u64, l), mul, l);
+    return b.binary(ir::Inst::Tag::Mul, ticks, mul, l);
 }
 
 // Lower a string-valued system-task argument (a $fopen filename / mode, a

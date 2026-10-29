@@ -1443,6 +1443,59 @@ TEST_CASE("timescale scales delays into the global precision and $time back to t
     CHECK(out == "top 4000\nsub 5\n");
 }
 
+// LRM 9.4.1: a delay that "evaluates to a negative value ... shall be interpreted
+// as a two's-complement unsigned integer of the same size as a time variable", so
+// `int d = -1` is 2**64 - 1, not 2**32 - 1: a signed amount narrower than 64 bits
+// sign-extends. Each negative amount below used to be zero-extended and fired at
+// its own width's maximum (4294967295, 65535, 255, 15), before the 2**32 finish;
+// now none fires before it. An unsigned 32-bit all-ones amount is not negative and
+// still fires at 4294967295. Oracle: iverilog 13 (`int d = -1; #(d)` fires at
+// 18446744073709551615); the run ends at 2**32 so the test does not depend on
+// what an event at the end of time does.
+TEST_CASE("a negative delay narrower than 64 bits sign-extends instead of firing early") {
+    const std::string out = run_capture(R"(
+        module m;
+          int i;
+          shortint si;
+          byte by;
+          integer ig;
+          logic signed [3:0] l4;
+          bit [31:0] u;
+          initial begin i = -1;   #(i)     $display("FAIL: int fired at %0d", $time); end
+          initial begin si = -1;  #(si)    $display("FAIL: shortint fired at %0d", $time); end
+          initial begin by = -1;  #(by)    $display("FAIL: byte fired at %0d", $time); end
+          initial begin ig = -1;  #(ig)    $display("FAIL: integer fired at %0d", $time); end
+          initial begin l4 = -1;  #(l4)    $display("FAIL: logic signed [3:0] fired at %0d", $time); end
+          initial begin i = -2;   #(i + 1) $display("FAIL: int expression fired at %0d", $time); end
+          initial begin           #(-1)    $display("FAIL: literal fired at %0d", $time); end
+          initial begin u = 32'hFFFF_FFFF; #(u) $display("u32 at %0d", $time); end
+          initial begin #(64'd4294967296) $display("t=2**32"); $finish; end
+        endmodule
+    )");
+    CHECK(out == "u32 at 4294967295\nt=2**32\n");
+}
+
+// The same through the unit multiplier: the amount is widened before it is
+// multiplied by the module's ticks per unit, so the extension must already be right
+// there. A real delay in the module drops the design tick to its 1ps precision (an
+// integer-only design counts in its unit), so each ns is 1000 ticks; the unsigned
+// amount fires at 4294967295 ns.
+TEST_CASE("a negative delay sign-extends before the time unit multiplier") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+          int i;
+          byte by;
+          bit [31:0] u;
+          initial #0.001 ;
+          initial begin i = -1;  #(i)  $display("FAIL: int fired at %0d", $time); end
+          initial begin by = -1; #(by) $display("FAIL: byte fired at %0d", $time); end
+          initial begin u = 32'hFFFF_FFFF; #(u) $display("u32 at %0d", $time); end
+          initial begin #(64'd4294967296) $display("t=2**32"); $finish; end
+        endmodule
+    )");
+    CHECK(out == "u32 at 4294967295\nt=2**32\n");
+}
+
 TEST_CASE("$time rounds the scaled clock to the nearest module time unit") {
     // Global precision is 1ns. fine's #15 lands the wheel on tick 15; top's unit
     // is 10ns, so $time = round(15 / 10) = 2 (1.5 rounds up, LRM §20.3.1).
