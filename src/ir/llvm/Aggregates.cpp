@@ -746,7 +746,7 @@ llvm::Constant* Backend::agg_copy_proto(Ref type, const LValue& slv) {
     }
     const SignalSlot& ss   = slot_of(slv.sig);
     auto*             arr  = llvm::ArrayType::get(ss.slot_ty, array_leaf_count(type));
-    llvm::Constant*   leaf = slot_default_const(ss.slot_ty, ss.width, ss.narrow, ss.has_z);
+    llvm::Constant*   leaf = slot_default_const(ss.slot_ty, ss.width, ss.narrow, ss.four_state, ss.has_z);
     auto*             init = llvm::ConstantArray::get(
       arr, std::vector<llvm::Constant*>(arr->getNumElements(), leaf));
     return new llvm::GlobalVariable(env_->llmod, arr, /*isConstant=*/true,

@@ -26,13 +26,16 @@
 
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "Lower.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
+#include "runtime/Runtime.h"
 
 using namespace clotho;
 
@@ -335,4 +338,234 @@ TEST_CASE("the wide and inline select paths agree across the threshold") {
     const std::string wide = with_width("4104"); // runtime word-indexed path
     CHECK(inl == "deadbeef\nx0\nxx\nxx\nff\n");
     CHECK(wide == inl);
+}
+
+TEST_CASE("a nested select of a very wide vector with an invalid outer index reads x and writes nothing") {
+    // LRM 11.5.1: every level of a nested select is an address that can be
+    // invalid, and an invalid one makes the whole access read x (0 for 2-state)
+    // and write nothing. The outer index here is one past the end, negative
+    // (which used to address storage before the vector and crash), or x; the
+    // inner one is in range. Oracle: the flattened `w[i*128 + j]`, which
+    // iverilog accepts, reads x and writes nothing for all three.
+    const std::string out = run_capture(R"(
+        module m;
+            logic [63:0][127:0] w;
+            bit   [63:0][127:0] bw;
+            logic [6:0]         wx;
+            int                 i, j;
+            initial begin
+                w = '0; bw = '0; j = 5;
+                i = 64;     $display("%b %b %b %b", w[i][j], w[i][j +: 2], bw[i][j], bw[i][j +: 2]);
+                i = -1;     $display("%b %b %b %b", w[i][j], w[i][j +: 2], bw[i][j], bw[i][j +: 2]);
+                wx = 7'bx;  $display("%b %b %b %b", w[wx][j], w[wx][j +: 2], bw[wx][j], bw[wx][j +: 2]);
+                i = 64; w[i][j] = 1'b1; w[i][j +: 2] = 2'b11; bw[i][j] = 1'b1; bw[i][j +: 2] = 2'b11;
+                i = -1; w[i][j] = 1'b1; w[i][j +: 2] = 2'b11; bw[i][j] = 1'b1; bw[i][j +: 2] = 2'b11;
+                wx = 7'bx; w[wx][j] = 1'b1; w[wx][j +: 2] = 2'b11; bw[wx][j] = 1'b1; bw[wx][j +: 2] = 2'b11;
+                $display("%b %b", w === '0, bw === '0);
+                i = 64; w[i][j] <= 1'b1; bw[i][j +: 2] <= 2'b11;
+                i = -1; w[i][j] <= 1'b1; bw[i][j +: 2] <= 2'b11;
+                wx = 7'bx; w[wx][j] <= 1'b1; bw[wx][j +: 2] <= 2'b11;
+                #1 $display("%b %b", w === '0, bw === '0);
+                // Valid outer indices, including the last element, still land.
+                i = 63; j = 127; w[i][j] = 1'b1;
+                i = 3;  j = 5;   w[i][j] = 1'b1;
+                $display("%b %b %b", w[63][127], w[3][5], w[0][0]);
+            end
+        endmodule
+    )");
+    CHECK(out ==
+          "x xx 0 00\n"
+          "x xx 0 00\n"
+          "x xx 0 00\n"
+          "1 1\n"
+          "1 1\n"
+          "1 1 0\n");
+}
+
+TEST_CASE("a constant part-select hanging over a very wide vector reads x outside and writes only inside") {
+    // LRM 11.5.1: the bits of a constant part-select that are out of range read x
+    // (0 for 2-state) and are not written, whichever end of the vector they hang
+    // over, on a vector too wide to shift inline as on a narrow one.
+    const std::string out = run_capture(R"(
+        module m;
+            reg [8191:0] a;
+            bit [8191:0] b;
+            initial begin
+                a = '1; b = '1;
+                $display("%b %b", a[8195:8190], b[8195:8190]);
+                $display("%b %b", a[3:-2], b[3:-2]);
+                a = 0; a[8195:8190] = 6'b101101;
+                $display("%b", a[8191:8188]);
+                a = 0; a[3:-2] = 6'b110011;
+                $display("%h", a[3:0]);
+                a = 0; a[8200:8195] = 6'h3f;
+                $display("%b %b", a === 8192'b0, a[8200:8195]);
+                a = 0; a[8195:8190] <= 6'b101101;
+                #1 $display("%b", a[8191:8188]);
+                a = 0; a[8195:8190] <= #1 6'b101101;
+                #2 $display("%b", a[8191:8188]);
+            end
+        endmodule
+    )");
+    CHECK(out ==
+          "xxxx11 000011\n"
+          "1111xx 111100\n"
+          "0100\n"
+          "c\n"
+          "1 xxxxxx\n"
+          "0100\n"
+          "0100\n");
+}
+
+namespace {
+
+// One plane of storage with guard words before and after it, so a kernel that
+// strays outside its vector disturbs something the test can see.
+struct Guarded {
+    static constexpr size_t   kGuard     = 2;
+    static constexpr uint64_t kGuardWord = ~uint64_t{ 0 };
+
+    std::vector<uint64_t> words;
+
+    Guarded(uint32_t bits, uint64_t seed) : words(kGuard + (bits + 63) / 64 + kGuard, kGuardWord) {
+        // The vector's own words, padding bits included, get a fixed pattern.
+        for (size_t k = kGuard; k < words.size() - kGuard; ++k) {
+            seed     = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            words[k] = seed;
+        }
+    }
+
+    uint64_t* data() { return words.data() + kGuard; }
+
+    bool bit(uint64_t i) const { return ((words[kGuard + (i >> 6)] >> (i & 63)) & 1) != 0; }
+
+    void set(uint64_t i, bool v) {
+        const uint64_t m = uint64_t{ 1 } << (i & 63);
+        v ? words[kGuard + (i >> 6)] |= m : words[kGuard + (i >> 6)] &= ~m;
+    }
+};
+
+// A selection plane of `n` bits as a word buffer.
+std::vector<uint64_t> sel_plane(uint32_t n, uint64_t seed) {
+    std::vector<uint64_t> p((n + 63) / 64, 0);
+    for (uint64_t& w : p) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        w    = seed;
+    }
+    return p;
+}
+
+bool plane_bit(const std::vector<uint64_t>& p, uint32_t k) {
+    return ((p[k >> 6] >> (k & 63)) & 1) != 0;
+}
+
+struct KernelCase {
+    int64_t  base;
+    uint32_t cwidth;
+    int64_t  off;
+    uint32_t n;
+};
+
+} // namespace
+
+TEST_CASE("the wide select kernels touch only bits inside the vector, whatever container and offset") {
+    // The contract under the SV tests above: a nested select whose outer select
+    // is out of range hands the kernels a container that lies outside the vector,
+    // and an offset is any i32. Neither may make them read or write a bit outside
+    // [0, width), nor outside the container; every other bit reads x (2-state: 0)
+    // and is not written. LRM 11.5.1, checked bit by bit against that statement.
+    constexpr uint32_t kWidth = 200; // the last word of a plane is partly padding
+    const KernelCase   cases[] = {
+        { 0, 200, 10, 70 },                        // inside
+        { 0, 200, 180, 40 },                       // straddles the top
+        { 0, 200, -20, 40 },                       // straddles the bottom
+        { -64, 600, -40, 150 },                    // container wider than the vector at both ends
+        { 200, 128, 200, 128 },                    // the element just past the end
+        { -128, 128, -128, 128 },                  // the element just before the start
+        { -1000, 100, -1000, 64 },                 // far below
+        { 5000, 300, 5100, 90 },                   // far above
+        { INT32_MIN, UINT32_MAX, INT32_MIN, 130 }, // the most extreme container and offset
+        { INT32_MIN, UINT32_MAX, INT32_MAX - 20, 70 },
+        { 0, 200, 0, 200 },                        // the whole vector
+    };
+
+    for (const KernelCase& c : cases) {
+        for (uint32_t four = 0; four <= 1; ++four) {
+            for (uint32_t has_z = 0; has_z <= four; ++has_z) {
+                for (uint32_t unknown = 0; unknown <= 1; ++unknown) {
+                    CAPTURE(c.base);
+                    CAPTURE(c.cwidth);
+                    CAPTURE(c.off);
+                    CAPTURE(c.n);
+                    CAPTURE(four);
+                    CAPTURE(has_z);
+                    CAPTURE(unknown);
+
+                    const auto in_range = [&](int64_t i) {
+                        return unknown == 0 && i >= 0 && i < static_cast<int64_t>(kWidth) &&
+                               i >= c.base && i < c.base + static_cast<int64_t>(c.cwidth);
+                    };
+
+                    // Read.
+                    Guarded mm(four != 0 ? 2 * kWidth : kWidth, 1);
+                    Guarded z(kWidth, 2);
+                    const Guarded mm_before = mm;
+                    const Guarded z_before  = z;
+                    const uint32_t words    = (c.n + 63) / 64;
+                    std::vector<uint64_t> got_must(words, ~uint64_t{ 0 }), got_may(words, ~uint64_t{ 0 }),
+                      got_z(words, ~uint64_t{ 0 });
+                    rt_wide_sel(mm.data(), has_z != 0 ? z.data() : nullptr, kWidth, c.base, c.cwidth,
+                                c.off, c.n, four, has_z, unknown, got_must.data(), got_may.data(),
+                                got_z.data());
+                    std::vector<uint64_t> want_must(words, 0), want_may(words, 0), want_z(words, 0);
+                    for (uint32_t k = 0; k < c.n; ++k) {
+                        const int64_t i = c.off + static_cast<int64_t>(k);
+                        const auto    put = [&](std::vector<uint64_t>& p, bool v) {
+                            if (v) {
+                                p[k >> 6] |= uint64_t{ 1 } << (k & 63);
+                            }
+                        };
+                        if (in_range(i)) {
+                            put(want_must, mm.bit(static_cast<uint64_t>(i)));
+                            put(want_may, four != 0 && mm.bit(kWidth + static_cast<uint64_t>(i)));
+                            put(want_z, four != 0 && has_z != 0 && z.bit(static_cast<uint64_t>(i)));
+                        } else {
+                            put(want_may, four != 0); // x for a 4-state slot, 0 for 2-state
+                        }
+                    }
+                    CHECK(got_must == want_must);
+                    CHECK(got_may == want_may);
+                    CHECK(got_z == want_z);
+                    CHECK(mm.words == mm_before.words); // a read changes nothing
+                    CHECK(z.words == z_before.words);
+
+                    // Write.
+                    const std::vector<uint64_t> in_must = sel_plane(c.n, 3);
+                    const std::vector<uint64_t> in_may  = sel_plane(c.n, 4);
+                    const std::vector<uint64_t> in_z    = sel_plane(c.n, 5);
+                    Guarded                     want_mm = mm;
+                    Guarded                     want_zz = z;
+                    for (uint32_t k = 0; k < c.n; ++k) {
+                        const int64_t i = c.off + static_cast<int64_t>(k);
+                        if (!in_range(i)) {
+                            continue;
+                        }
+                        const auto u = static_cast<uint64_t>(i);
+                        want_mm.set(u, plane_bit(in_must, k));
+                        if (four != 0) {
+                            want_mm.set(kWidth + u, plane_bit(in_may, k));
+                            if (has_z != 0) {
+                                want_zz.set(u, plane_bit(in_z, k));
+                            }
+                        }
+                    }
+                    rt_wide_ins(mm.data(), has_z != 0 ? z.data() : nullptr, kWidth, c.base, c.cwidth,
+                                c.off, c.n, four, has_z, unknown, in_must.data(), in_may.data(),
+                                in_z.data());
+                    CHECK(mm.words == want_mm.words); // guards and padding included
+                    CHECK(z.words == want_zz.words);
+                }
+            }
+        }
+    }
 }

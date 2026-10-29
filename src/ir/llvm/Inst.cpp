@@ -801,7 +801,7 @@ void Backend::lower_inst(Index i) {
             const Plane        idxp   = value_of(p.binary.r);
             llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
             const uint32_t     cwidth = lv.width;
-            llvm::Value*       idx    = cast(must_of(idxp), 32, false);
+            llvm::Value*       idx    = select_index(idxp, type_of(p.binary.r));
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, idx) : idx;
             lv.width   = 1;
             const SelectVerdict sv = set_select_bounds(lv, cbase, cwidth, 1, any_unknown(idxp));
@@ -810,10 +810,29 @@ void Backend::lower_inst(Index i) {
             return;
         }
         case Inst::Tag::PartSelect: {
-            LValue     lv = lvalue_of(p.op_extra.op);
-            const auto ps = ir_->extra_data<PartSelect>(p.op_extra.extra);
-            lv.bit_off    = b_.CreateAdd(lv.bit_off, b_.getInt32(ps.lsb));
-            lv.width      = ps.msb - ps.lsb + 1;
+            LValue             lv          = lvalue_of(p.op_extra.op);
+            const auto         ps          = ir_->extra_data<PartSelect>(p.op_extra.extra);
+            llvm::Value* const cbase       = lv.bit_off;
+            const uint32_t     outer_width = lv.width;
+            lv.bit_off                     = b_.CreateAdd(lv.bit_off, b_.getInt32(ps.lsb));
+            lv.width                       = ps.msb - ps.lsb + 1;
+            // A constant window that hangs over the vector it selects from (`v[11:8]`
+            // of 8 bits, `v[1:-2]`, the element `a[5]` of `a[3:0]`) is out of range
+            // in the bits outside it: they read x (0 for 2-state) and are not written
+            // (LRM 11.5.1). It takes the bounds machinery of a dynamic select; the
+            // window is a constant, so the mask folds and costs nothing at run time.
+            // `lsb` is the i32 the frontend wrapped into a uint32.
+            const auto first = static_cast<int64_t>(static_cast<int32_t>(ps.lsb));
+            if (first < 0 || first + lv.width > outer_width) {
+                // A base that already goes through the runtime kernels keeps them.
+                const bool constant_window = llvm::isa<llvm::ConstantInt>(cbase) && !lv.wide_dyn;
+                set_select_bounds(lv, cbase, outer_width, lv.width, b_.getFalse(), constant_window);
+            } else if (lv.range_mask != nullptr && lv.width != outer_width) {
+                // Stacked on a bounds-checked dynamic select (`a[i][3:0]`, `sa[i].lo`):
+                // the inherited mask still covers the whole outer window, which a
+                // write must narrow (store_mask).
+                lv.range_mask_outer = true;
+            }
             set_lvalue(i, lv);
             return;
         }
@@ -829,7 +848,7 @@ void Backend::lower_inst(Index i) {
             const Plane        offp   = value_of(dps.offset);
             llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
             const uint32_t     cwidth = lv.width;
-            llvm::Value*       off    = cast(must_of(offp), 32, false);
+            llvm::Value*       off    = select_index(offp, type_of(dps.offset));
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, off) : off;
             lv.width   = dps.width;
             const SelectVerdict sv =
@@ -895,11 +914,11 @@ void Backend::lower_inst(Index i) {
                 // LRM 7.4.5 covers "an unpacked array of any kind": an x/z
                 // index is invalid exactly like one past the end, so the
                 // unknown term belongs in the gate and not only in the report.
-                const Plane  idxp    = value_of(es.index);
-                llvm::Value* idx64   = cast(must_of(idxp), 64, false);
-                llvm::Value* unknown = any_unknown(idxp);
-                llvm::Value* inrange =
-                  b_.CreateAnd(b_.CreateICmpULT(idx64, len), b_.CreateNot(unknown));
+                const Plane     idxp    = value_of(es.index);
+                const ElemBelow ei      = elem_index_below(idxp, type_of(es.index), len);
+                llvm::Value*    idx64   = ei.idx64;
+                llvm::Value*    unknown = any_unknown(idxp);
+                llvm::Value*    inrange = b_.CreateAnd(ei.below, b_.CreateNot(unknown));
                 if (e.is_string) {
                     // String element: an rt_string handle slot in the heap
                     // buffer. Bounds ride lv_string_ptr's sink redirect.
@@ -975,11 +994,11 @@ void Backend::lower_inst(Index i) {
                   queue_slot_ty(), handle, handle_epoch_field(es.array_type));
                 // An x/z index is invalid for an unpacked array of any kind
                 // (LRM 7.4.5), so it gates the access, not just the report.
-                const Plane  idxp    = value_of(es.index);
-                llvm::Value* idx64   = cast(must_of(idxp), 64, false);
-                llvm::Value* unknown = any_unknown(idxp);
-                llvm::Value* inrange =
-                  b_.CreateAnd(b_.CreateICmpULT(idx64, len), b_.CreateNot(unknown));
+                const Plane     idxp    = value_of(es.index);
+                const ElemBelow ei      = elem_index_below(idxp, type_of(es.index), len);
+                llvm::Value*    idx64   = ei.idx64;
+                llvm::Value*    unknown = any_unknown(idxp);
+                llvm::Value*    inrange = b_.CreateAnd(ei.below, b_.CreateNot(unknown));
                 llvm::Value* safe_cap =
                   b_.CreateSelect(b_.CreateICmpEQ(cap, b_.getInt64(0)), b_.getInt64(1), cap);
                 llvm::Value* phys = b_.CreateURem(b_.CreateAdd(head, idx64), safe_cap);
@@ -1039,17 +1058,13 @@ void Backend::lower_inst(Index i) {
             // Normalize to a 0-based position and gate the element with the
             // same dyn_inrange machinery a dynamic-array/queue element uses:
             // out-of-range read yields the element default, write is a
-            // no-op, the storage itself is never addressed out-of-bounds. An
-            // unsigned compare also catches a normalized index that went
-            // negative (wrapped to a huge unsigned value).
-            const Plane  idxp = value_of(es.index);
-            llvm::Value* idx  = cast(must_of(idxp), 32, false);
-            // Normalize the declared-range coordinate to a 0-based position.
-            llvm::Value* norm = at.left <= at.right ? b_.CreateSub(idx, b_.getInt32(at.left))
-                                                    : b_.CreateSub(b_.getInt32(at.left), idx);
-            const uint32_t count = (at.left <= at.right ? at.right - at.left : at.left - at.right) + 1;
-            llvm::Value*   inrange =
-                b_.CreateAnd(b_.CreateICmpULT(norm, b_.getInt32(count)), b_.CreateNot(any_unknown(idxp)));
+            // no-op, the storage itself is never addressed out-of-bounds. The
+            // index is compared at its own width and signedness, not as its
+            // low 32 bits zero-extended (fixed_elem_pos).
+            const Plane   idxp    = value_of(es.index);
+            const ElemPos pos     = fixed_elem_pos(idxp, type_of(es.index), at.left, at.right);
+            llvm::Value*  norm    = pos.pos;
+            llvm::Value*  inrange = b_.CreateAnd(pos.in_range, b_.CreateNot(any_unknown(idxp)));
             lv.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, inrange)
                                                        : inrange;
             add_elem_bounds_check(lv, i, lv, es.index, inrange, any_unknown(idxp), nullptr,
@@ -1551,7 +1566,7 @@ void Backend::lower_inst(Index i) {
             // index defers a memcpy record; everything else (a plain signal,
             // scalar select, or aggregate static leaf) uses the block shadow.
             const bool agg_partial =
-              lv.is_agg && lv.agg_leaf && (lv.width != lv.store_width || !is_zero_const(lv.bit_off));
+              lv.is_agg && lv.agg_leaf && !selects_whole(lv);
             if (lv.is_signal && (slot_of(lv.sig).is_array || slot_of(lv.sig).vif_rec)) {
                 emit_array_nba(lv, rhs);
             } else if (lv.is_agg && (!lv.agg_static || agg_partial)) {
@@ -2984,7 +2999,7 @@ Plane Backend::lower_load(const LValue& lv) {
     // Narrow 2-state slot: the stored word IS the iW value.
     if (lv.narrow) {
         llvm::Value* v = b_.CreateLoad(int_ty(w), lv_mm_ptr(lv));
-        if (lv.width == w && is_zero_const(lv.bit_off)) {
+        if (selects_whole(lv)) {
             return two_val(v);
         }
         // A bounds-checked select aligns poison-free and reads 0 outside range
@@ -3001,7 +3016,7 @@ Plane Backend::lower_load(const LValue& lv) {
     llvm::Value*   mm = b_.CreateLoad(int_ty(2 * w), lv_mm_ptr(lv));
     // A never-z slot stores no z word; its z plane is a constant zero.
     llvm::Value* z = lv.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(w), lv_z_ptr(lv))) : zero(w);
-    if (lv.width == w && is_zero_const(lv.bit_off)) {
+    if (selects_whole(lv)) {
         return { mm, z };
     }
     const Plane full = { mm, z };

@@ -3436,6 +3436,8 @@ private:
 
     ir::Index scaled_delay(const Expression& amount, ir::Builder& b);
 
+    ir::Index saturating_ticks(ir::Index scaled, uint64_t tick_mul, ir::Builder& b, ir::SourceLoc l);
+
     ir::Index lower_string_arg(const Expression& expr, ir::Builder& b);
 
     std::vector<char> scan_conversion_chars(std::string_view fmt);
@@ -4312,6 +4314,13 @@ private:
                                   ir::Builder&         b,
                                   ir::SourceLoc        l,
                                   uint32_t             stride = 1);
+
+    // The same offset for an index whose arithmetic a 32-bit offset could wrap.
+    ir::Index lower_wide_packed_offset(const Expression& idx,
+                                       bool              descending,
+                                       int64_t           adj,
+                                       ir::Builder&      b,
+                                       uint32_t          stride);
 
     ir::Index packed_bit_index(const ElementSelectExpression& es, ir::Builder& b, ir::SourceLoc l);
 

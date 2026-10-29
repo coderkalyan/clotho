@@ -398,22 +398,25 @@ void render_unformatted(std::string& out, const rt_arg& a, bool four_state) {
     }
 }
 
-// Round half away from zero and saturate into a signed 64-bit, the exact pair the
-// backend's lower_ftoi emits for Inst::Tag::FtoI (llvm.round then fptosi.sat):
-// LRM §6.12.1's real-to-integer conversion, with the out-of-range and NaN cases
-// the LRM leaves undefined pinned to the same saturating answer.
+// Round half away from zero into a signed 64-bit, the pair the backend's
+// lower_ftoi emits for Inst::Tag::FtoI: LRM 6.12.1's real-to-integer conversion,
+// the integer then cut to 64 bits (10.7), so a finite magnitude of 2**63 or more
+// keeps its low 64 bits. NaN and infinity have no integer value and saturate, as
+// in the backend.
 int64_t sat_round_i64(double v) {
     if (std::isnan(v)) {
         return 0;
     }
     const double r = std::round(v);
-    if (r <= -9223372036854775808.0) {
-        return INT64_MIN;
+    if (std::isinf(r)) {
+        return r < 0 ? INT64_MIN : INT64_MAX;
     }
-    if (r >= 9223372036854775808.0) {
-        return INT64_MAX;
+    if (r > -9223372036854775808.0 && r < 9223372036854775808.0) {
+        return static_cast<int64_t>(r);
     }
-    return static_cast<int64_t>(r);
+    // fmod is exact, and the magnitude's remainder below 2**64 is an integer.
+    const auto low = static_cast<uint64_t>(std::fmod(std::fabs(r), 18446744073709551616.0));
+    return static_cast<int64_t>(r < 0 ? uint64_t{ 0 } - low : low);
 }
 
 // Reconcile one descriptor with the conversion a RUNTIME format asked for.

@@ -907,13 +907,15 @@ LValue Backend::assoc_elem_lvalue(const LValue& lv, bool for_write) {
     // a packed-struct or packed-union member of the value element lowers to a
     // PartSelect -- and its offset, width and in-range mask all live here.
     // Zeroing bit_off silently read the value's low bits instead of the member.
-    el.bit_off     = lv.bit_off;
-    el.width       = lv.width;
-    el.range_mask  = lv.range_mask;
-    el.wide_dyn    = lv.wide_dyn;
-    el.sel_base    = lv.sel_base;
-    el.sel_cwidth  = lv.sel_cwidth;
-    el.sel_unknown = lv.sel_unknown;
+    el.bit_off          = lv.bit_off;
+    el.width            = lv.width;
+    el.range_mask       = lv.range_mask;
+    el.range_mask_outer = lv.range_mask_outer;
+    el.nest_valid       = lv.nest_valid;
+    el.wide_dyn         = lv.wide_dyn;
+    el.sel_base         = lv.sel_base;
+    el.sel_cwidth       = lv.sel_cwidth;
+    el.sel_unknown      = lv.sel_unknown;
     return el;
 }
 

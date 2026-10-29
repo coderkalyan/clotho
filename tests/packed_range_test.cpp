@@ -276,6 +276,282 @@ TEST_CASE("multi-dim packed array: element/range/nested selects (LRM 7.4.5/7.4.6
           "asc 11 44 2233\n");
 }
 
+// LRM 11.5.1: a write through a select "shall only affect the bits that are in
+// range", so a constant part-select or packed-struct member stacked on a
+// dynamic element select writes its own bits and leaves the rest of the element
+// alone, blocking, nonblocking and in a function local alike. Oracle: the flat
+// bit layout (element k of width W occupies bits [k*W+W-1:k*W]); iverilog
+// rejects the nested spelling, and its flattened equivalent (`a[i*8 +: 4] = 0`)
+// agrees on every line.
+TEST_CASE("a constant part-select under a dynamic select writes only its bits (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            typedef struct packed { logic [3:0] hi; logic [3:0] lo; } s_t;
+            typedef struct packed { bit [3:0] hi; bit [3:0] lo; } bs_t;
+            logic [3:0][7:0] a;
+            bit   [3:0][7:0] b;
+            logic [1:0][7:0] m [2];
+            s_t   [3:0]      sa;
+            bs_t  [3:0]      bsa;
+            int i, k;
+            function automatic logic [31:0] f(int k);
+                logic [3:0][7:0] loc;
+                loc = '1;
+                loc[k][3:0] = 4'h0;
+                return loc;
+            endfunction
+            function automatic bit [31:0] g(int k);
+                bit [3:0][7:0] loc;
+                loc = '1;
+                loc[k][7:4] = 4'h0;
+                return loc;
+            endfunction
+            initial begin
+                a = '1;   i = 1; a[i][3:0] = 4'h0;   $display("%h %h", a, a[i][3:0]);
+                a = '1;   i = 2; a[i][6:5] = 2'b00;  $display("%h", a);
+                b = '1;   i = 3; b[i][7:4] = 4'h5;   $display("%h", b);
+                sa = '1;  i = 2; sa[i].lo = 4'h0;    $display("%h", sa);
+                bsa = '1; i = 0; bsa[i].hi = 4'h0;   $display("%h", bsa);
+                $display("%h %h", f(2), g(1));
+                a = '1; b = '1; i = 1;
+                a[i][3:0] <= 4'h0;
+                b[i][7:4] <= 4'h0;
+                #1 $display("%h %h", a, b);
+                // An element of a memory, and a delayed nonblocking write.
+                m[0] = '1; m[1] = '1; k = 1; i = 0;
+                m[k][i][3:0] = 4'h0;
+                $display("%h %h", m[0], m[1]);
+                m[0] = '1; m[1] = '1;
+                m[k][i][7:4] <= 4'h0;
+                #1 $display("%h %h", m[0], m[1]);
+                a = '1; i = 1;
+                a[i][3:0] <= #1 4'h0;
+                #2 $display("%h", a);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "fffff0ff 0\n"
+          "ff9fffff\n"
+          "5fffffff\n"
+          "fff0ffff\n"
+          "ffffff0f\n"
+          "fff0ffff ffff0fff\n"
+          "fffff0ff ffff0fff\n"
+          "ffff fff0\n"
+          "ffff ff0f\n"
+          "fffff0ff\n");
+}
+
+// LRM 11.5.1: a select is invalid when its address is out of bounds or has an x
+// or z bit, and then reads x (0 for 2-state) and writes nothing. In a nested
+// select `a[i][j]` every level is such an address, so an invalid OUTER index
+// invalidates the whole access, whatever the inner index is. Oracle: the
+// flattened spelling `a[i*8 + j]`, which iverilog accepts: for an x, a high or a
+// negative `i` it reads x / xx and writes nothing, and for a valid one it sets
+// bit 19 (00080000).
+TEST_CASE("a nested select with an invalid outer index reads x and writes nothing (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [3:0][7:0]      a;
+            bit   [3:0][7:0]      b;
+            logic [1:0][3:0][1:0] c;
+            logic [1:0] ix;
+            int i, j, ii, jj, kk;
+            initial begin
+                // An x outer index.
+                a = 32'h5A5A5A5A; b = 32'h5A5A5A5A; ix = 2'bx; j = 3;
+                $display("%b %b %b %b", a[ix][j], a[ix][j +: 2], b[ix][j], b[ix][j +: 2]);
+                a[ix][j] = 1'b0;  a[ix][j +: 2] = 2'b00;
+                b[ix][j] = 1'b1;  b[ix][j +: 2] = 2'b11;
+                $display("%h %h", a, b);
+                a[ix][j] <= 1'b0;  a[ix][j +: 2] <= 2'b00;
+                b[ix][j] <= 1'b1;  b[ix][j +: 2] <= 2'b11;
+                #1 $display("%h %h", a, b);
+                // An outer index past either end.
+                a = 32'hFFFFFFFF; b = 32'h0;
+                i = 4;  $display("%b %b %b", a[i][j], a[i][j +: 2], b[i][j]);
+                i = -1; $display("%b %b %b", a[i][j], a[i][j +: 2], b[i][j]);
+                i = 4;  a[i][j] = 1'b0; b[i][j] = 1'b1;
+                i = -1; a[i][j] = 1'b0; b[i][j] = 1'b1;
+                $display("%h %h", a, b);
+                // A valid outer index is unaffected.
+                a = 0; i = 2; a[i][j] = 1'b1;
+                $display("%h %b %b", a, a[i][j], a[i][j +: 2]);
+                // Three levels: the outermost one is the invalid one.
+                c = '1; ii = 2; jj = 1; kk = 0;
+                $display("%b", c[ii][jj][kk]);
+                c[ii][jj][kk] = 1'b0;
+                $display("%h", c);
+                ii = 1; c[ii][jj][kk] = 1'b0;
+                $display("%h", c);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "x xx 0 00\n"
+          "5a5a5a5a 5a5a5a5a\n"
+          "5a5a5a5a 5a5a5a5a\n"
+          "x xx 0\n"
+          "x xx 0\n"
+          "ffffffff 00000000\n"
+          "00080000 1 01\n"
+          "x\n"
+          "ffff\n"
+          "fbff\n");
+}
+
+// LRM 11.5.1: an out-of-bounds index reads x (0 for 2-state) and writes nothing,
+// so what is compared is the index VALUE, at its own width and signedness: a
+// 64-bit index of 2**32 + 1 is not bit 1, and neither is one whose offset
+// arithmetic (`i * 8`, `u - right`) lands in range only by wrapping 32 bits. A
+// window that straddles the container keeps the bits that are in range. Oracle:
+// the LRM text (iverilog truncates the index to 32 bits and wraps the stride, as
+// Clotho did).
+TEST_CASE("a packed select index is compared at its own width, not truncated or wrapped (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [7:0]      v;
+            bit   [7:0]      bv;
+            logic [15:8]     mid;
+            logic [3:0][7:0] a;
+            logic [-1:-8]    neg;
+            longint unsigned lu;
+            longint          ls;
+            int              i;
+            int unsigned     u;
+            initial begin
+                // A 64-bit index: 2**32 + 1 and -(2**32 - 1) are both 1 modulo 2**32.
+                v = 8'hFF; bv = 8'hFF; lu = 64'h1_0000_0001; ls = -64'sd4294967295;
+                $display("%b %b %b %b", v[lu], bv[lu], v[ls], bv[ls]);
+                v[lu] = 1'b0; bv[ls] = 1'b0; v[ls +: 4] = 4'h0; bv[lu +: 4] = 4'h0;
+                $display("%h %h", v, bv);
+                $display("%b %b", v[lu +: 4], bv[ls +: 4]);
+                v[lu] <= 1'b0; bv[ls +: 2] <= 2'b00;
+                #1 $display("%h %h", v, bv);
+                // In range through a 64-bit index, and windows that straddle or miss [15:8].
+                lu = 4; ls = 14; mid = 8'hA5;
+                $display("%b %b", v[lu], mid[ls]);
+                ls = 6;  $display("%b", mid[ls +: 4]);
+                ls = 8;  $display("%b", mid[ls +: 4]);
+                ls = -1; $display("%b %b", mid[ls], mid[ls +: 4]);
+                // 2**29 + 1 elements of 8 bits is 2**32 + 8 bits: not element 1.
+                a = 32'hDDCCBBAA; i = 536870913;
+                $display("%h", a[i]);
+                a[i] = 8'h00; a[i] <= 8'h00;
+                #1 $display("%h", a);
+                // 4294967289 is not in [-1:-8], though 4294967289 + 8 wraps to 1.
+                neg = 8'h5A; u = 32'hFFFF_FFF9;
+                $display("%b", neg[u]);
+                neg[u] = 1'b0;
+                $display("%h", neg);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "x 0 x 0\n"
+          "ff ff\n"
+          "xxxx 0000\n"
+          "ff ff\n"
+          "1 0\n"
+          "01xx\n"
+          "0101\n"
+          "x xxxx\n"
+          "xx\n"
+          "ddccbbaa\n"
+          "x\n"
+          "5a\n");
+}
+
+// LRM 11.5.1: a part-select that is partially out of range "shall, when read,
+// return x for the bits that are out of range and shall, when written, only
+// affect the bits that are in range"; a wholly out-of-range one reads x and
+// changes nothing. 2-state reads give 0 for the missing bits. A constant window
+// is checked against the vector it selects from, the element for `a[i][11:8]`.
+// Oracle: the LRM text and the flat bit layout; iverilog accepts the vector
+// forms and agrees on the reads (xxxx xx11 11xx) and on the writes (ff, bf, fd).
+TEST_CASE("a constant part-select outside its vector reads x and writes only the bits inside (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [7:0]      v;
+            bit   [7:0]      bv;
+            logic [3:0][7:0] a;
+            int              i;
+            function automatic logic [7:0] f();
+                logic [7:0] loc;
+                loc = 8'hFF; loc[9:6] = 4'b1010;
+                return loc;
+            endfunction
+            initial begin
+                v = 8'hFF; bv = 8'hFF;
+                $display("%b %b %b", v[11:8], v[9:6], v[1:-2]);
+                $display("%b %b %b", bv[11:8], bv[9:6], bv[1:-2]);
+                v[11:8] = 4'h0;
+                $display("%h", v);
+                v[9:6] = 4'b1010;
+                $display("%h", v);
+                v = 8'hFF; v[1:-2] = 4'b0110;
+                $display("%h", v);
+                bv[11:8] = 4'h0; bv[9:6] = 4'b1010;
+                $display("%h", bv);
+                v = 8'hFF; v[9:6] <= 4'b1010; v[11:8] <= 4'h0;
+                #1 $display("%h", v);
+                $display("%h", f());
+                // An element index past the end, and a window past the end of its element.
+                a = '1; i = 1;
+                $display("%b %b", a[5], a[i][11:8]);
+                a[5] = 8'h00; a[i][11:8] = 4'h0;
+                $display("%h", a);
+                a[i][9:6] = 4'b1010;
+                $display("%h", a);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "xxxx xx11 11xx\n"
+          "0000 0011 1100\n"
+          "ff\n"
+          "bf\n"
+          "fd\n"
+          "bf\n"
+          "bf\n"
+          "bf\n"
+          "xxxxxxxx xxxx\n"
+          "ffffffff\n"
+          "ffffbfff\n");
+}
+
+// LRM 11.5.1: a bit-select whose address has an x or z bit is invalid: it reads
+// x (0 for 2-state) and writes nothing, also on a vector one bit wide, where the
+// select covers the whole storage. Oracle: iverilog (x, no-op).
+TEST_CASE("a constant x index into a one-bit vector reads x and writes nothing (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            localparam PX = 1'bx;
+            localparam PZ = 1'bz;
+            logic [0:0] v1;
+            bit   [0:0] b1;
+            logic [7:0] v8;
+            initial begin
+                v1 = 1'b1; b1 = 1'b1; v8 = 8'hFF;
+                $display("%b %b %b %b", v1[PX], v1[PZ], b1[PX], v8[PX]);
+                v1[PX] = 1'b0; b1[PZ] = 1'b0; v8[PX] = 1'b0;
+                $display("%b %b %h", v1, b1, v8);
+                v1[PX] <= 1'b0; b1[PX] <= 1'b0;
+                #1 $display("%b %b", v1, b1);
+                $display("%b %b", v1[0], b1[0]);
+                v1[0] = 1'b0; $display("%b", v1);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "x x 0 x\n"
+          "1 1 ff\n"
+          "1 1\n"
+          "1 1\n"
+          "0\n");
+}
+
 TEST_CASE("array query functions (LRM 20.7): $size/$dimensions/$left/... fold to constants") {
     // All eight are constant type/bounds queries for a fixed-size operand, so
     // slang folds them; every string below matches iverilog v13 exactly (it

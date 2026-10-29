@@ -1250,3 +1250,34 @@ TEST_CASE("dynamic array overlapping slice-to-slice assignment reads pre-assignm
     )";
     CHECK(run_capture(src) == "2 3 4 4\n");
 }
+
+// LRM 7.4.5 / 7.5.1: the index value is compared with the size at its own width
+// and signedness, so a 2-bit signed -1 is out of range (it is not 3) and so is a
+// 128-bit index of 2**64 + 1 (it is not 1). Out of range reads the Table 7-1
+// default (x, or 0 for a 2-state element) and writes nothing. Oracle: the LRM
+// text; iverilog agrees on the signed index.
+TEST_CASE("a signed narrow or very wide index into a dynamic array is compared at its own width") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] d[];
+            bit   [7:0] bd[];
+            logic signed [1:0] s2;
+            logic [127:0]      w;
+            initial begin
+                d = new[4]; bd = new[4];
+                foreach (d[k]) begin d[k] = 8'h20 + k; bd[k] = 8'h20 + k; end
+                s2 = -1;
+                $display("%h %h", d[s2], bd[s2]);
+                d[s2] = 8'hee; bd[s2] = 8'hee;
+                $display("%h %h", d[3], bd[3]);
+                w = 128'h1_0000_0000_0000_0001;
+                $display("%h %h", d[w], bd[w]);
+                d[w] = 8'hee; bd[w] = 8'hee;
+                $display("%h %h", d[1], bd[1]);
+                s2 = 1; w = 2;
+                $display("%h %h", d[s2], bd[w]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx 00\n23 23\nxx 00\n21 21\n21 22\n");
+}

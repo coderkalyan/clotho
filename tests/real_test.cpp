@@ -119,6 +119,48 @@ TEST_CASE("real to integral conversion rounds half away from zero") {
     CHECK(out == "3\n-2\n35\n254\n9\n");
 }
 
+TEST_CASE("real to integral conversion is exact at the target's width and signedness (LRM 6.12.1)") {
+    // The real is rounded to the nearest integer, ties away from zero, and that
+    // integer is assigned to the target: a value the target holds is exact (an
+    // unsigned 64-bit above 2**63, an 80-bit signed), and one it does not keeps
+    // its low bits (10.7). Expected values are the exact integers (iverilog gives
+    // the same for the in-range ones).
+    const std::string out = run_capture(R"(
+        module t;
+            real                r;
+            longint unsigned    u64;
+            longint             s64;
+            logic [63:0]        l64;
+            logic [79:0]        l80;
+            logic signed [79:0] s80;
+            integer             i32;
+            initial begin
+                r = 1.5e19;  u64 = r;  $display("%0d", u64);
+                r = 9223372036854775808.0; u64 = r; $display("%0d", u64);
+                r = 1e20;    l64 = r;  $display("%0d", l64);
+                l80 = r;               $display("%0d", l80);
+                r = -1e20;   s80 = r;  $display("%0d", s80);
+                l80 = r;               $display("%0d", l80);
+                r = -1e19;   s64 = r;  $display("%0d", s64);
+                i32 = $rtoi(r * 10.0); $display("%0d", i32);
+                r = 2.5;     s64 = r;  $display("%0d", s64);
+                r = -2.5;    s80 = r;  $display("%0d", s80);
+            end
+        endmodule
+    )");
+    CHECK(out ==
+          "15000000000000000000\n"
+          "9223372036854775808\n"
+          "7766279631452241920\n"
+          "100000000000000000000\n"
+          "-100000000000000000000\n"
+          "1208825819614629174706176\n"
+          "8446744073709551616\n"
+          "-1661992960\n"
+          "3\n"
+          "-3\n");
+}
+
 TEST_CASE("real comparisons and logical contexts are definite") {
     const std::string out = run_capture(R"(
         module t;
@@ -466,6 +508,71 @@ TEST_CASE("real delay in a submodule, integer-only parent") {
         endmodule
     )");
     CHECK(out == "sub 1.5000\ntop 3.0000\n");
+}
+
+// A real delay (or %t time) whose tick count does not fit a 64-bit time cannot be
+// represented, and the LRM does not say what it means. Clotho saturates it, so a
+// huge delay never wraps into a small or negative one and fires early: a delay of
+// 2**64 ns is 2**64 * 1000 ps, whose low 64 bits are 0, so it used to fire at
+// once. Oracle: none; the expected output follows from that decision (no event
+// fires before the finite ones at 15 and 35, and every unrepresentable time
+// prints as the same saturated time, a representable one does not).
+TEST_CASE("a real delay beyond 2**63 ticks saturates instead of wrapping into an early event") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module m;
+          real big, neg, inf, zero, mid;
+          string s1, s2, s3, s4;
+          initial begin
+            zero = 0.0;
+            big  = 18446744073709551616.0;
+            neg  = -18446744073709551616.0;
+            inf  = 1.0 / zero;
+            #5;
+            fork
+              begin #(big) $display("FAIL: delay 2**64 ns fired at %0t", $time); end
+              begin #(neg) $display("FAIL: delay -2**64 ns fired at %0t", $time); end
+              begin #(inf) $display("FAIL: delay +inf fired at %0t", $time); end
+            join_none
+            #10 $display("t=15");
+            #20 $display("t=35");
+            mid = 1.0e6;
+            s1 = $sformatf("%0t", 1.0e30);
+            s2 = $sformatf("%0t", big);
+            s3 = $sformatf("%0t", neg);
+            s4 = $sformatf("%0t", mid);
+            $display("%0d %0d %0d", s1 == s2, s2 == s3, s4 == s1);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "t=15\nt=35\n1 1 0\n");
+}
+
+// The same when the design tick is finer than the delaying module's precision:
+// a delay of N ps is N * 1000 fs, and N = 18446744073709552 makes that
+// 2**64 + 384, which wrapped to a delay of 384 fs. The count that saturates is the
+// final one, not the real before the multiply.
+TEST_CASE("a real delay saturates after the precision-to-tick multiply, not before it") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module sub;
+          real r;
+          initial begin
+            r = 18446744073709.552;
+            #(r) $display("FAIL: sub delay fired");
+          end
+        endmodule
+        `timescale 1fs/1fs
+        module m;
+          sub s();
+          initial begin
+            #1000 $display("t=1000 fs");
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "t=1000 fs\n");
 }
 
 TEST_CASE("%c of a real is still rejected loudly") {

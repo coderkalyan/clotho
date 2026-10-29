@@ -56,6 +56,13 @@ llvm::Value* Backend::smax(llvm::Value* a, llvm::Value* b) {
 // whole slot for a direct select, the inner select's span for a nested one).
 // An x/z index (`idx_unknown`) makes every bit out of range.
 //
+// A nested select (`a[i][j]`) is invalid when any level is, and `lv` still
+// holds the enclosing select's state. An enclosing select is always one whole
+// element (slang rejects a select after a range select), so an x/z or
+// out-of-range `i` leaves nothing of its window in range, and `lv.nest_valid`
+// says so in one bit. Without it `j` alone decided, and `a[i][j]` read and
+// wrote a bit for an `i` that is x.
+//
 // Returns the verdict --sanitize=bounds reports on. It is read off the
 // UNCLAMPED offsets rather than by counting mask bits, so it is three
 // compares and cannot disagree with the mask the access then uses.
@@ -63,7 +70,8 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
                                                   llvm::Value* cbase,
                                                   uint32_t     cwidth,
                                                   uint32_t     selw,
-                                                  llvm::Value* idx_unknown) {
+                                                  llvm::Value* idx_unknown,
+                                                  bool         constant_window) {
     const uint32_t sw    = lv.store_width;
     auto*          i64t  = int_ty(64);
     llvm::Value*   base  = b_.CreateSExt(cbase, i64t);
@@ -74,31 +82,91 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
     SelectVerdict v;
     v.fully = b_.CreateAnd(b_.CreateAnd(b_.CreateICmpSGE(off, base), b_.CreateICmpSLE(top, end)),
                            b_.CreateNot(idx_unknown));
+    // Whether the access is invalid outright: this level's index is x/z, or an
+    // enclosing level is invalid. A null `nest_valid` is a direct select, which
+    // adds no IR here; `v.fully` already is its validity.
+    llvm::Value* bad = idx_unknown;
+    if (lv.nest_valid != nullptr) {
+        bad           = b_.CreateOr(bad, b_.CreateNot(lv.nest_valid));
+        lv.nest_valid = b_.CreateAnd(lv.nest_valid, v.fully);
+    } else {
+        lv.nest_valid = v.fully;
+    }
     // Storage too wide to shift inline: hand the container to the runtime helper
     // (which clamps per bit) instead of building an sw-bit mask, whose own
-    // construction is the O(sw^2) legalization this path exists to avoid.
-    if (wide_dyn_storage(sw)) {
+    // construction is the O(sw^2) legalization this path exists to avoid. A
+    // constant window has no variable shift to legalize: its mask is a constant.
+    if (wide_dyn_storage(sw) && !constant_window) {
         lv.wide_dyn    = true;
         lv.sel_base    = base;
         lv.sel_cwidth  = cwidth;
-        lv.sel_unknown = idx_unknown;
+        lv.sel_unknown = bad;
         // Some bit landed inside: compares only, no mask to count.
         v.partial = selw == 1 ? nullptr
                               : b_.CreateAnd(b_.CreateNot(v.fully),
                                              b_.CreateAnd(b_.CreateAnd(b_.CreateICmpSLT(off, end),
                                                                        b_.CreateICmpSGT(top, base)),
-                                                          b_.CreateNot(idx_unknown)));
+                                                          b_.CreateNot(bad)));
         return v;
     }
     llvm::Value* lo   = smax(smin(off, end), base);
     llvm::Value* hi   = smax(smin(top, end), base);
     llvm::Value* mask = range_bits(sw, b_.CreateTrunc(lo, int_ty(32)), b_.CreateTrunc(hi, int_ty(32)));
-    lv.range_mask     = b_.CreateSelect(idx_unknown, zero(sw), mask);
+    lv.range_mask       = b_.CreateSelect(bad, zero(sw), mask);
+    lv.range_mask_outer = false;
 
     v.partial =
       selw == 1 ? nullptr
                 : b_.CreateAnd(b_.CreateNot(v.fully), b_.CreateICmpNE(lv.range_mask, zero(sw)));
     return v;
+}
+
+// A bit / part-select index operand as the i32 that is added to a bit offset.
+// LRM 11.5.1 compares the index VALUE, so a narrower operand extends by its own
+// signedness, and a wider one is narrowed by saturation: every value an i32
+// holds passes, and a larger one (a 64-bit index of 2**32 + 1, which its low 32
+// bits would turn into bit 1) becomes INT32_MAX or INT32_MIN, which no container
+// reaches. The frontend hands over an operand wider than 32 bits only when a
+// 32-bit offset could not hold its arithmetic.
+llvm::Value* Backend::select_index(Plane idx, ValType t) {
+    llvm::Value* m = must_of(idx);
+    if (t.width <= 32) {
+        return cast(m, 32, t.is_signed);
+    }
+    llvm::Value* hi = llvm::ConstantInt::get(m->getType(), INT32_MAX);
+    if (!t.is_signed) {
+        return cast(b_.CreateSelect(b_.CreateICmpULT(m, hi), m, hi), 32, false);
+    }
+    return cast(smax(smin(m, hi), llvm::ConstantInt::getSigned(m->getType(), INT32_MIN)), 32, false);
+}
+
+// The 0-based position of a fixed-size unpacked array element and whether the
+// index is inside the declared range (LRM 7.4.5). The index is normalized in a
+// type wide enough that neither its extension nor the subtraction of a bound can
+// wrap, so an index of 2**32 + 1 or a signed -1 is out of range instead of
+// aliasing a low element; LLVM narrows it again for the usual `int` index.
+Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValType t, uint32_t left, uint32_t right) {
+    const bool     ascending = left <= right;
+    const uint32_t count     = (ascending ? right - left : left - right) + 1;
+    const uint32_t ew        = std::max(64u, t.width + 2);
+    llvm::Value*   v         = cast(must_of(idx), ew, t.is_signed);
+    llvm::Value*   bound     = llvm::ConstantInt::getSigned(int_ty(ew), static_cast<int32_t>(left));
+    llvm::Value*   norm      = ascending ? b_.CreateSub(v, bound) : b_.CreateSub(bound, v);
+    // An unsigned compare also rejects a normalized index that went negative.
+    return { cast(norm, 32, false), b_.CreateICmpULT(norm, llvm::ConstantInt::get(int_ty(ew), count)) };
+}
+
+// `idx < len` for a dynamic array or queue (LRM 7.4.5), the index compared at its
+// own width and signedness. A negative index is a huge unsigned one, so a single
+// compare covers both ends.
+Backend::ElemBelow Backend::elem_index_below(Plane idx, ValType t, llvm::Value* len) {
+    llvm::Value* m = must_of(idx);
+    if (t.width <= 64) {
+        llvm::Value* idx64 = cast(m, 64, t.is_signed);
+        return { idx64, b_.CreateICmpULT(idx64, len) };
+    }
+    // Wider than the length: compare there, so the dropped high bits count.
+    return { cast(m, 64, false), b_.CreateICmpULT(m, cast(len, t.width, false)) };
 }
 
 // Whether a runtime-offset select into `sw`-bit storage takes the runtime
@@ -124,6 +192,12 @@ bool Backend::wide_dyn_storage(uint32_t sw) {
 // this wide -- building one is the O(width^2) legalization that path avoids.
 llvm::Value* Backend::store_mask(const LValue& lv, uint32_t sw) {
     if (lv.range_mask != nullptr) {
+        if (lv.range_mask_outer) {
+            // A constant part-select inside a dynamic select's window writes
+            // only its own in-range bits (LRM 11.5.1). place_val is poison-free,
+            // which matters when the outer index is out of range.
+            return b_.CreateAnd(lv.range_mask, place_val(lv, ones(lv.width), sw));
+        }
         return lv.range_mask;
     }
     return b_.CreateShl(cast(ones(lv.width), sw, false), cast(lv.bit_off, sw, false));
@@ -149,6 +223,25 @@ llvm::Value* Backend::merge_sel(llvm::Value*  old,
                                 llvm::Value*  mask) {
     llvm::Value* placed = b_.CreateAnd(place_val(lv, ins_iw, sw), mask);
     return b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), placed);
+}
+
+// Whether the lvalue is its whole storage and every bit of it is valid, so a
+// load / store needs no select arithmetic. A bit-select of a one-bit vector has
+// the whole storage's width and offset 0 whatever its index is, so the mask
+// decides: a constant x index (`v1[PX]`) leaves it zero and the access is
+// invalid (LRM 11.5.1), while a constant in-range index folds to all ones.
+bool Backend::selects_whole(const LValue& lv) {
+    if (lv.width != lv.store_width || !is_zero_const(lv.bit_off)) {
+        return false;
+    }
+    if (lv.wide_dyn) {
+        return false;
+    }
+    if (lv.range_mask == nullptr) {
+        return true;
+    }
+    const auto* m = llvm::dyn_cast<llvm::ConstantInt>(lv.range_mask);
+    return m != nullptr && m->isMinusOne();
 }
 
 bool Backend::is_zero_const(llvm::Value* v) {
@@ -358,18 +451,56 @@ Plane Backend::lower_real_compare(Inst::Tag tag, Plane a, Plane b) {
 
 // Float -> integral. FtoI rounds half away from zero (LRM 6.12.1, the
 // assignment / cast conversion); FtoITrunc truncates toward zero ($rtoi,
-// LRM 20.5). Both go through a saturating signed 64-bit intermediate:
-// fptosi.sat avoids poison on out-of-range / NaN inputs (behavior the LRM
-// leaves undefined), and the final width cast wraps like an integer
-// assignment.
+// LRM 20.5). The rounded real is an integer, and what the target gets is that
+// integer cut to its width (LRM 10.7: the MSBs are discarded) and read in its
+// signedness, so a value above 2**63 is exact in a 64-bit unsigned or an 80-bit
+// target and keeps its low bits in a narrower one.
+//
+// |r| < 2**63 (and NaN / infinity, which have no integer value and keep the
+// saturating i64 answer) goes through fptosi.sat, which avoids poison on
+// out-of-range / NaN input; only a finite larger magnitude takes the cold block
+// below, which shifts the 53-bit mantissa by the exponent in the target's width.
 Plane Backend::lower_ftoi(Inst::Tag tag, Plane v, ValType to) {
     llvm::Value* f = fp_of(v);
     if (tag == Inst::Tag::FtoI) {
         f = b_.CreateUnaryIntrinsic(llvm::Intrinsic::round, f);
     }
-    llvm::Value* wide = b_.CreateIntrinsic(llvm::Intrinsic::fptosi_sat, { int_ty(64), f->getType() }, { f });
-    llvm::Value* r    = cast(wide, to.width, true);
-    return packed(r, r, zero(to.width));
+    llvm::Value* sat  = b_.CreateIntrinsic(llvm::Intrinsic::fptosi_sat, { int_ty(64), f->getType() }, { f });
+    llvm::Value* fast = cast(sat, to.width, true);
+
+    llvm::Value* mag   = b_.CreateUnaryIntrinsic(llvm::Intrinsic::fabs, f);
+    llvm::Value* limit = llvm::ConstantFP::get(f->getType(), 9223372036854775808.0);
+    llvm::Value* inf   = llvm::ConstantFP::getInfinity(f->getType());
+    llvm::Value* big   = b_.CreateAnd(b_.CreateFCmpOGE(mag, limit), b_.CreateFCmpOLT(mag, inf));
+
+    auto* fn     = b_.GetInsertBlock()->getParent();
+    auto* entry  = b_.GetInsertBlock();
+    auto* bigbb  = llvm::BasicBlock::Create(ctx_, "ftoi.big", fn);
+    auto* contbb = llvm::BasicBlock::Create(ctx_, "ftoi.cont", fn);
+    b_.CreateCondBr(big, bigbb, contbb);
+
+    b_.SetInsertPoint(bigbb);
+    // r = (-1)^sign * mant * 2^e with mant < 2**53 and e >= 11 here.
+    llvm::Value* d     = f->getType()->isDoubleTy() ? f : b_.CreateFPExt(f, b_.getDoubleTy());
+    llvm::Value* bits  = b_.CreateBitCast(d, b_.getInt64Ty());
+    llvm::Value* expo  = b_.CreateAnd(b_.CreateLShr(bits, 52), b_.getInt64(0x7ff));
+    llvm::Value* mant  = b_.CreateOr(b_.CreateAnd(bits, b_.getInt64((uint64_t{ 1 } << 52) - 1)),
+                                     b_.getInt64(uint64_t{ 1 } << 52));
+    llvm::Value* e     = b_.CreateSub(expo, b_.getInt64(1075));
+    const uint32_t wc  = std::max(to.width, 64u);
+    llvm::Value* ovf   = b_.CreateICmpUGE(e, b_.getInt64(wc)); // every bit shifted out
+    llvm::Value* samt  = cast(b_.CreateSelect(ovf, b_.getInt64(0), e), wc, false);
+    llvm::Value* mag_i = b_.CreateSelect(ovf, zero(wc), b_.CreateShl(cast(mant, wc, false), samt));
+    llvm::Value* neg   = b_.CreateICmpSLT(bits, b_.getInt64(0));
+    llvm::Value* exact = b_.CreateSelect(neg, b_.CreateNeg(mag_i), mag_i);
+    llvm::Value* bigv  = cast(exact, to.width, false);
+    b_.CreateBr(contbb);
+
+    b_.SetInsertPoint(contbb);
+    auto* phi = b_.CreatePHI(int_ty(to.width), 2);
+    phi->addIncoming(fast, entry);
+    phi->addIncoming(bigv, bigbb);
+    return packed(phi, phi, zero(to.width));
 }
 
 // Mux with real alternatives. Definite condition selects normally; an

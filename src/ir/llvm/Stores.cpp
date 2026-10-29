@@ -1076,7 +1076,7 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
     // itself). No z word.
     if (lv.narrow) {
         llvm::Value* v = must_of(rhs);
-        if (lv.width == s_width && is_zero_const(lv.bit_off)) {
+        if (selects_whole(lv)) {
             b_.CreateStore(v, mp);
             return;
         }
@@ -1093,7 +1093,7 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
     // width (via an inserted Resize), so rhs already matches the storage width
     // and the planes store directly. A never-z slot drops the RHS z plane —
     // the may-z analysis proved it zero here.
-    if (lv.width == s_width && is_zero_const(lv.bit_off)) {
+    if (selects_whole(lv)) {
         b_.CreateStore(rhs.mm, mp);
         if (lv.has_z) {
             b_.CreateStore(rhs.z, lv_z_ptr(lv));
@@ -1230,15 +1230,20 @@ void Backend::wide_dyn_stage_mask(const LValue& lv, const SignalSlot& s) {
 }
 
 // Compile-time mask (signal-width APInt) of the bits this static site writes:
-// all-ones for a whole-signal site, else the constant [lsb, lsb+width) range.
+// all-ones for a whole-signal site, else the constant [lsb, lsb+width) range, cut
+// to the signal: a constant select that hangs over it writes only the bits inside
+// (LRM 11.5.1). `lsb` is signed, below zero for `v[1:-2]`.
 // Precondition: the site is static (constant bit_off), i.e. the signal is not
 // nba_dyn.
 llvm::APInt Backend::site_const_mask(const LValue& lv, const SignalSlot& s) const {
     if (lv.width == s.width && is_zero_const(lv.bit_off)) {
         return llvm::APInt::getAllOnes(s.width);
     }
-    const uint64_t lsb = llvm::cast<llvm::ConstantInt>(lv.bit_off)->getZExtValue();
-    return llvm::APInt::getBitsSet(s.width, lsb, lsb + lv.width);
+    const int64_t lsb = llvm::cast<llvm::ConstantInt>(lv.bit_off)->getSExtValue();
+    const int64_t lo  = std::max<int64_t>(lsb, 0);
+    const int64_t hi  = std::min<int64_t>(lsb + lv.width, s.width);
+    return lo < hi ? llvm::APInt::getBitsSet(s.width, static_cast<unsigned>(lo), static_cast<unsigned>(hi))
+                   : llvm::APInt(s.width, 0);
 }
 
 // Index of the aggregate static leaf whose constant field path equals `fpath`

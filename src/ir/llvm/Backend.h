@@ -334,16 +334,30 @@ struct LValue {
     // Selected width in bits (== store_width for a whole-storage target).
     uint32_t width = 0;
     // Storage-width in-range mask for a bounds-checked dynamic bit/part select
-    // (LRM 11.5.1): 1 for each selected bit that is in range. Null when no bounds
-    // check applies (whole storage, or a constant in-range select). A read forces
-    // x/0 outside it and a write is restricted to it.
+    // (LRM 11.5.1): 1 for each selected bit that is in range, at every level of a
+    // nested select. Null when no bounds check applies (whole storage, or a
+    // constant in-range select). A read forces x/0 outside it and a write is
+    // restricted to it.
     llvm::Value* range_mask = nullptr;
+    // `range_mask` was set by an enclosing dynamic select and this lvalue is a
+    // constant part-select inside that select's window (`a[i][3:0]`, `sa[i].lo`),
+    // so the mask still covers the whole enclosing window. A read only looks at
+    // the selected bits and uses it as is; a write has to narrow it to its own
+    // bits (store_mask), or it would clear the rest of the window (LRM 11.5.1).
+    bool range_mask_outer = false;
+    // i1: every dynamic select on the way to here (`a[i][j]`, `sa[i].f[j]`) has a
+    // known index and a window inside its container. A select nested in an invalid
+    // one is invalid, so set_select_bounds folds this into its own verdict. Null
+    // when no dynamic select has been applied yet.
+    llvm::Value* nest_valid = nullptr;
     // A runtime-offset select on storage too wide to shift inline: the load / store
     // goes through rt_wide_sel / rt_wide_ins, which index the containing 64-bit word.
     // `sel_base` / `sel_cwidth` are the container the selection is clamped to (the
     // whole slot for a direct select, the inner select's span for a nested one) and
-    // `sel_unknown` is the i1 "the index has an x/z bit" flag. Set instead of
-    // `range_mask`, whose construction is itself O(storage width).
+    // `sel_unknown` is the i1 "wholly invalid" flag: an index has an x/z bit, at
+    // this select or at one it is nested in, or an enclosing select is out of
+    // range. Set instead of `range_mask`, whose construction is itself O(storage
+    // width).
     bool         wide_dyn    = false;
     llvm::Value* sel_base    = nullptr;
     uint32_t     sel_cwidth  = 0;
@@ -1377,7 +1391,7 @@ private:
 
     llvm::Value* lv_field_ptr(const LValue& lv, uint32_t field);
     llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool narrow,
-                                       bool has_z);
+                                       bool four_state, bool has_z);
 
     RefBinding ref_actual_arg(const LValue& raw);
 
@@ -2819,10 +2833,40 @@ private:
         llvm::Value* partial = nullptr;
     };
 
+    // `constant_window`: the select is a compile-time window at a constant offset
+    // (a constant part-select hanging over its vector), so its mask folds to a
+    // constant and needs no runtime kernel even on storage too wide to shift.
     SelectVerdict set_select_bounds(LValue& lv, llvm::Value* cbase, uint32_t cwidth, uint32_t selw,
-                                    llvm::Value* idx_unknown);
+                                    llvm::Value* idx_unknown, bool constant_window = false);
 
     static bool wide_dyn_storage(uint32_t sw);
+
+    // -- Select indexes at their own width and signedness (LRM 7.4.5, 11.5.1) --
+    //
+    // An index is compared as the VALUE it holds, not as its low 32 bits or
+    // zero-extended: a 2-bit signed -1 is -1, and 2**32 + 1 is not 1.
+
+    // A bit / part-select index operand as the i32 added to a bit offset; a value
+    // an i32 cannot hold saturates, which lands out of range in any container.
+    llvm::Value* select_index(Plane idx, ValType t);
+
+    // An unpacked-array element: `pos` is its 0-based position (meaningful only
+    // when `in_range`), `in_range` the verdict without the x/z term.
+    struct ElemPos {
+        llvm::Value* pos      = nullptr;
+        llvm::Value* in_range = nullptr;
+    };
+
+    ElemPos fixed_elem_pos(Plane idx, ValType t, uint32_t left, uint32_t right);
+
+    // A dynamic-array / queue index `idx < len`; `idx64` addresses the element
+    // only when `below`.
+    struct ElemBelow {
+        llvm::Value* idx64 = nullptr;
+        llvm::Value* below = nullptr;
+    };
+
+    ElemBelow elem_index_below(Plane idx, ValType t, llvm::Value* len);
 
     llvm::Value* store_mask(const LValue& lv, uint32_t sw);
 
@@ -2832,6 +2876,8 @@ private:
                            llvm::Value* mask);
 
     static bool is_zero_const(llvm::Value* v);
+
+    static bool selects_whole(const LValue& lv);
 
     // -- System tasks --
 
