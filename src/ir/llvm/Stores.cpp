@@ -1076,7 +1076,7 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
     // itself). No z word.
     if (lv.narrow) {
         llvm::Value* v = must_of(rhs);
-        if (lv.width == s_width && is_zero_const(lv.bit_off)) {
+        if (selects_whole(lv)) {
             b_.CreateStore(v, mp);
             return;
         }
@@ -1093,7 +1093,7 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
     // width (via an inserted Resize), so rhs already matches the storage width
     // and the planes store directly. A never-z slot drops the RHS z plane —
     // the may-z analysis proved it zero here.
-    if (lv.width == s_width && is_zero_const(lv.bit_off)) {
+    if (selects_whole(lv)) {
         b_.CreateStore(rhs.mm, mp);
         if (lv.has_z) {
             b_.CreateStore(rhs.z, lv_z_ptr(lv));

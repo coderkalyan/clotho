@@ -225,6 +225,25 @@ llvm::Value* Backend::merge_sel(llvm::Value*  old,
     return b_.CreateOr(b_.CreateAnd(old, b_.CreateNot(mask)), placed);
 }
 
+// Whether the lvalue is its whole storage and every bit of it is valid, so a
+// load / store needs no select arithmetic. A bit-select of a one-bit vector has
+// the whole storage's width and offset 0 whatever its index is, so the mask
+// decides: a constant x index (`v1[PX]`) leaves it zero and the access is
+// invalid (LRM 11.5.1), while a constant in-range index folds to all ones.
+bool Backend::selects_whole(const LValue& lv) {
+    if (lv.width != lv.store_width || !is_zero_const(lv.bit_off)) {
+        return false;
+    }
+    if (lv.wide_dyn) {
+        return false;
+    }
+    if (lv.range_mask == nullptr) {
+        return true;
+    }
+    const auto* m = llvm::dyn_cast<llvm::ConstantInt>(lv.range_mask);
+    return m != nullptr && m->isMinusOne();
+}
+
 bool Backend::is_zero_const(llvm::Value* v) {
     auto* c = llvm::dyn_cast<llvm::ConstantInt>(v);
     return c != nullptr && c->isZero();

@@ -2877,6 +2877,8 @@ private:
 
     static bool is_zero_const(llvm::Value* v);
 
+    static bool selects_whole(const LValue& lv);
+
     // -- System tasks --
 
     void lower_timeformat(Index i);

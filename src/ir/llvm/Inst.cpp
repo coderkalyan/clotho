@@ -1566,7 +1566,7 @@ void Backend::lower_inst(Index i) {
             // index defers a memcpy record; everything else (a plain signal,
             // scalar select, or aggregate static leaf) uses the block shadow.
             const bool agg_partial =
-              lv.is_agg && lv.agg_leaf && (lv.width != lv.store_width || !is_zero_const(lv.bit_off));
+              lv.is_agg && lv.agg_leaf && !selects_whole(lv);
             if (lv.is_signal && (slot_of(lv.sig).is_array || slot_of(lv.sig).vif_rec)) {
                 emit_array_nba(lv, rhs);
             } else if (lv.is_agg && (!lv.agg_static || agg_partial)) {
@@ -2999,7 +2999,7 @@ Plane Backend::lower_load(const LValue& lv) {
     // Narrow 2-state slot: the stored word IS the iW value.
     if (lv.narrow) {
         llvm::Value* v = b_.CreateLoad(int_ty(w), lv_mm_ptr(lv));
-        if (lv.width == w && is_zero_const(lv.bit_off)) {
+        if (selects_whole(lv)) {
             return two_val(v);
         }
         // A bounds-checked select aligns poison-free and reads 0 outside range
@@ -3016,7 +3016,7 @@ Plane Backend::lower_load(const LValue& lv) {
     llvm::Value*   mm = b_.CreateLoad(int_ty(2 * w), lv_mm_ptr(lv));
     // A never-z slot stores no z word; its z plane is a constant zero.
     llvm::Value* z = lv.has_z ? static_cast<llvm::Value*>(b_.CreateLoad(int_ty(w), lv_z_ptr(lv))) : zero(w);
-    if (lv.width == w && is_zero_const(lv.bit_off)) {
+    if (selects_whole(lv)) {
         return { mm, z };
     }
     const Plane full = { mm, z };

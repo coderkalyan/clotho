@@ -521,6 +521,37 @@ TEST_CASE("a constant part-select outside its vector reads x and writes only the
           "ffffbfff\n");
 }
 
+// LRM 11.5.1: a bit-select whose address has an x or z bit is invalid: it reads
+// x (0 for 2-state) and writes nothing, also on a vector one bit wide, where the
+// select covers the whole storage. Oracle: iverilog (x, no-op).
+TEST_CASE("a constant x index into a one-bit vector reads x and writes nothing (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            localparam PX = 1'bx;
+            localparam PZ = 1'bz;
+            logic [0:0] v1;
+            bit   [0:0] b1;
+            logic [7:0] v8;
+            initial begin
+                v1 = 1'b1; b1 = 1'b1; v8 = 8'hFF;
+                $display("%b %b %b %b", v1[PX], v1[PZ], b1[PX], v8[PX]);
+                v1[PX] = 1'b0; b1[PZ] = 1'b0; v8[PX] = 1'b0;
+                $display("%b %b %h", v1, b1, v8);
+                v1[PX] <= 1'b0; b1[PX] <= 1'b0;
+                #1 $display("%b %b", v1, b1);
+                $display("%b %b", v1[0], b1[0]);
+                v1[0] = 1'b0; $display("%b", v1);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "x x 0 x\n"
+          "1 1 ff\n"
+          "1 1\n"
+          "1 1\n"
+          "0\n");
+}
+
 TEST_CASE("array query functions (LRM 20.7): $size/$dimensions/$left/... fold to constants") {
     // All eight are constant type/bounds queries for a fixed-size operand, so
     // slang folds them; every string below matches iverilog v13 exactly (it
