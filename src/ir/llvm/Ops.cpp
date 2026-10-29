@@ -70,7 +70,8 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
                                                   llvm::Value* cbase,
                                                   uint32_t     cwidth,
                                                   uint32_t     selw,
-                                                  llvm::Value* idx_unknown) {
+                                                  llvm::Value* idx_unknown,
+                                                  bool         constant_window) {
     const uint32_t sw    = lv.store_width;
     auto*          i64t  = int_ty(64);
     llvm::Value*   base  = b_.CreateSExt(cbase, i64t);
@@ -93,8 +94,9 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
     }
     // Storage too wide to shift inline: hand the container to the runtime helper
     // (which clamps per bit) instead of building an sw-bit mask, whose own
-    // construction is the O(sw^2) legalization this path exists to avoid.
-    if (wide_dyn_storage(sw)) {
+    // construction is the O(sw^2) legalization this path exists to avoid. A
+    // constant window has no variable shift to legalize: its mask is a constant.
+    if (wide_dyn_storage(sw) && !constant_window) {
         lv.wide_dyn    = true;
         lv.sel_base    = base;
         lv.sel_cwidth  = cwidth;

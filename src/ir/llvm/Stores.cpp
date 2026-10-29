@@ -1230,15 +1230,20 @@ void Backend::wide_dyn_stage_mask(const LValue& lv, const SignalSlot& s) {
 }
 
 // Compile-time mask (signal-width APInt) of the bits this static site writes:
-// all-ones for a whole-signal site, else the constant [lsb, lsb+width) range.
+// all-ones for a whole-signal site, else the constant [lsb, lsb+width) range, cut
+// to the signal: a constant select that hangs over it writes only the bits inside
+// (LRM 11.5.1). `lsb` is signed, below zero for `v[1:-2]`.
 // Precondition: the site is static (constant bit_off), i.e. the signal is not
 // nba_dyn.
 llvm::APInt Backend::site_const_mask(const LValue& lv, const SignalSlot& s) const {
     if (lv.width == s.width && is_zero_const(lv.bit_off)) {
         return llvm::APInt::getAllOnes(s.width);
     }
-    const uint64_t lsb = llvm::cast<llvm::ConstantInt>(lv.bit_off)->getZExtValue();
-    return llvm::APInt::getBitsSet(s.width, lsb, lsb + lv.width);
+    const int64_t lsb = llvm::cast<llvm::ConstantInt>(lv.bit_off)->getSExtValue();
+    const int64_t lo  = std::max<int64_t>(lsb, 0);
+    const int64_t hi  = std::min<int64_t>(lsb + lv.width, s.width);
+    return lo < hi ? llvm::APInt::getBitsSet(s.width, static_cast<unsigned>(lo), static_cast<unsigned>(hi))
+                   : llvm::APInt(s.width, 0);
 }
 
 // Index of the aggregate static leaf whose constant field path equals `fpath`

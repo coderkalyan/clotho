@@ -382,6 +382,41 @@ TEST_CASE("a nested select of a very wide vector with an invalid outer index rea
           "1 1 0\n");
 }
 
+TEST_CASE("a constant part-select hanging over a very wide vector reads x outside and writes only inside") {
+    // LRM 11.5.1: the bits of a constant part-select that are out of range read x
+    // (0 for 2-state) and are not written, whichever end of the vector they hang
+    // over, on a vector too wide to shift inline as on a narrow one.
+    const std::string out = run_capture(R"(
+        module m;
+            reg [8191:0] a;
+            bit [8191:0] b;
+            initial begin
+                a = '1; b = '1;
+                $display("%b %b", a[8195:8190], b[8195:8190]);
+                $display("%b %b", a[3:-2], b[3:-2]);
+                a = 0; a[8195:8190] = 6'b101101;
+                $display("%b", a[8191:8188]);
+                a = 0; a[3:-2] = 6'b110011;
+                $display("%h", a[3:0]);
+                a = 0; a[8200:8195] = 6'h3f;
+                $display("%b %b", a === 8192'b0, a[8200:8195]);
+                a = 0; a[8195:8190] <= 6'b101101;
+                #1 $display("%b", a[8191:8188]);
+                a = 0; a[8195:8190] <= #1 6'b101101;
+                #2 $display("%b", a[8191:8188]);
+            end
+        endmodule
+    )");
+    CHECK(out ==
+          "xxxx11 000011\n"
+          "1111xx 111100\n"
+          "0100\n"
+          "c\n"
+          "1 xxxxxx\n"
+          "0100\n"
+          "0100\n");
+}
+
 namespace {
 
 // One plane of storage with guard words before and after it, so a kernel that

@@ -463,6 +463,64 @@ TEST_CASE("a packed select index is compared at its own width, not truncated or 
           "5a\n");
 }
 
+// LRM 11.5.1: a part-select that is partially out of range "shall, when read,
+// return x for the bits that are out of range and shall, when written, only
+// affect the bits that are in range"; a wholly out-of-range one reads x and
+// changes nothing. 2-state reads give 0 for the missing bits. A constant window
+// is checked against the vector it selects from, the element for `a[i][11:8]`.
+// Oracle: the LRM text and the flat bit layout; iverilog accepts the vector
+// forms and agrees on the reads (xxxx xx11 11xx) and on the writes (ff, bf, fd).
+TEST_CASE("a constant part-select outside its vector reads x and writes only the bits inside (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [7:0]      v;
+            bit   [7:0]      bv;
+            logic [3:0][7:0] a;
+            int              i;
+            function automatic logic [7:0] f();
+                logic [7:0] loc;
+                loc = 8'hFF; loc[9:6] = 4'b1010;
+                return loc;
+            endfunction
+            initial begin
+                v = 8'hFF; bv = 8'hFF;
+                $display("%b %b %b", v[11:8], v[9:6], v[1:-2]);
+                $display("%b %b %b", bv[11:8], bv[9:6], bv[1:-2]);
+                v[11:8] = 4'h0;
+                $display("%h", v);
+                v[9:6] = 4'b1010;
+                $display("%h", v);
+                v = 8'hFF; v[1:-2] = 4'b0110;
+                $display("%h", v);
+                bv[11:8] = 4'h0; bv[9:6] = 4'b1010;
+                $display("%h", bv);
+                v = 8'hFF; v[9:6] <= 4'b1010; v[11:8] <= 4'h0;
+                #1 $display("%h", v);
+                $display("%h", f());
+                // An element index past the end, and a window past the end of its element.
+                a = '1; i = 1;
+                $display("%b %b", a[5], a[i][11:8]);
+                a[5] = 8'h00; a[i][11:8] = 4'h0;
+                $display("%h", a);
+                a[i][9:6] = 4'b1010;
+                $display("%h", a);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "xxxx xx11 11xx\n"
+          "0000 0011 1100\n"
+          "ff\n"
+          "bf\n"
+          "fd\n"
+          "bf\n"
+          "bf\n"
+          "bf\n"
+          "xxxxxxxx xxxx\n"
+          "ffffffff\n"
+          "ffffbfff\n");
+}
+
 TEST_CASE("array query functions (LRM 20.7): $size/$dimensions/$left/... fold to constants") {
     // All eight are constant type/bounds queries for a fixed-size operand, so
     // slang folds them; every string below matches iverilog v13 exactly (it

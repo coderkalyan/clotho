@@ -2833,8 +2833,11 @@ private:
         llvm::Value* partial = nullptr;
     };
 
+    // `constant_window`: the select is a compile-time window at a constant offset
+    // (a constant part-select hanging over its vector), so its mask folds to a
+    // constant and needs no runtime kernel even on storage too wide to shift.
     SelectVerdict set_select_bounds(LValue& lv, llvm::Value* cbase, uint32_t cwidth, uint32_t selw,
-                                    llvm::Value* idx_unknown);
+                                    llvm::Value* idx_unknown, bool constant_window = false);
 
     static bool wide_dyn_storage(uint32_t sw);
 
