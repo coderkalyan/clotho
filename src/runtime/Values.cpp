@@ -43,12 +43,42 @@ void plane_bit_set(uint64_t* p, uint64_t i, uint64_t v) {
     }
 }
 
+// The bits a select can address: its container [base, base+cwidth) intersected
+// with the vector [0, width).
+//
+// The container is the whole slot for a direct select but the enclosing select's
+// window for a nested one (`w[i][j]`), and when `i` is out of range that window
+// lies outside the vector, or hangs over its end. Without the intersection a bit
+// inside the container but outside the vector is read from, or written to,
+// whatever sits next to the slot (a negative `i` made the offset negative and the
+// word index a huge unsigned). LRM 11.5.1 makes such a bit out of range: x when
+// read, untouched when written.
+//
+// `base` and the offsets are sign-extended i32 values (the backend carries a bit
+// offset as an i32), so no sum below can overflow an i64. An empty intersection
+// is [0, 0).
+struct Span {
+    int64_t lo;
+    int64_t hi;
+};
+
+Span storage_span(uint32_t width, int64_t base, uint32_t cwidth) {
+    assert(base >= INT32_MIN && base <= INT32_MAX && "a container base is an i32");
+    const int64_t lo = std::max<int64_t>(base, 0);
+    const int64_t hi = std::min<int64_t>(base + static_cast<int64_t>(cwidth), static_cast<int64_t>(width));
+    if (hi <= lo) {
+        return { 0, 0 };
+    }
+    assert(lo >= 0 && hi <= static_cast<int64_t>(width) && "the span lies inside the vector");
+    return { lo, hi };
+}
+
 } // namespace
 
 // Read the `n` bits at storage bit offset `off` of a `width`-bit slot, clamped to
-// the container [base, base+cwidth) the select sits in. `unknown` marks an x/z
-// index, which LRM 11.5.1 makes wholly out of range. Bits outside the container
-// read x (must 0, may 1) for a 4-state slot and 0 for a 2-state one.
+// the container [base, base+cwidth) the select sits in and to the vector itself.
+// `unknown` marks an x/z index, which LRM 11.5.1 makes wholly out of range. Bits
+// outside read x (must 0, may 1) for a 4-state slot and 0 for a 2-state one.
 //
 // The three out-params are little-endian word buffers of ceil(n/64) words each --
 // the same layout as the value planes, so the backend loads each one straight back
@@ -57,20 +87,23 @@ extern "C" void rt_wide_sel(const void* mmp, const void* zpp, uint32_t width, in
                             uint32_t cwidth, int64_t off, uint32_t n, uint32_t four,
                             uint32_t has_z, uint32_t unknown, uint64_t* out_must,
                             uint64_t* out_may, uint64_t* out_z) {
+    assert(off >= INT32_MIN && off <= INT32_MAX && "a select offset is an i32");
     const auto*    mm    = static_cast<const uint64_t*>(mmp);
     const auto*    zp    = static_cast<const uint64_t*>(zpp);
     const uint32_t words = (n + 63) / 64;
+    const Span     span  = storage_span(width, base, cwidth);
     std::memset(out_must, 0, words * sizeof(uint64_t));
     std::memset(out_may, 0, words * sizeof(uint64_t));
     std::memset(out_z, 0, words * sizeof(uint64_t));
     for (uint32_t k = 0; k < n; ++k) {
         const int64_t i = off + static_cast<int64_t>(k);
-        if (unknown != 0 || i < base || i >= base + static_cast<int64_t>(cwidth)) {
+        if (unknown != 0 || i < span.lo || i >= span.hi) {
             if (four != 0) {
                 plane_bit_set(out_may, k, 1); // x: must 0, may 1
             }
             continue;
         }
+        assert(i >= 0 && i < static_cast<int64_t>(width) && "an in-span bit is inside the vector");
         const auto u = static_cast<uint64_t>(i);
         plane_bit_set(out_must, k, plane_bit(mm, u));
         if (four != 0) {
@@ -83,23 +116,26 @@ extern "C" void rt_wide_sel(const void* mmp, const void* zpp, uint32_t width, in
 }
 
 // Write the `n` bits of `must` / `may` / `z` at storage bit offset `off`, skipping
-// every bit outside the container (LRM 11.5.1: an out-of-range write "shall only
-// affect the bits that are in range"; a wholly out-of-range or x/z index writes
-// nothing). Params match rt_wide_sel, value planes included.
+// every bit outside the container and the vector (LRM 11.5.1: an out-of-range
+// write "shall only affect the bits that are in range"; a wholly out-of-range or
+// x/z index writes nothing). Params match rt_wide_sel, value planes included.
 extern "C" void rt_wide_ins(void* mmp, void* zpp, uint32_t width, int64_t base, uint32_t cwidth,
                             int64_t off, uint32_t n, uint32_t four, uint32_t has_z,
                             uint32_t unknown, const uint64_t* must, const uint64_t* may,
                             const uint64_t* z) {
+    assert(off >= INT32_MIN && off <= INT32_MAX && "a select offset is an i32");
     if (unknown != 0) {
         return;
     }
-    auto* mm = static_cast<uint64_t*>(mmp);
-    auto* zp = static_cast<uint64_t*>(zpp);
+    auto*      mm   = static_cast<uint64_t*>(mmp);
+    auto*      zp   = static_cast<uint64_t*>(zpp);
+    const Span span = storage_span(width, base, cwidth);
     for (uint32_t k = 0; k < n; ++k) {
         const int64_t i = off + static_cast<int64_t>(k);
-        if (i < base || i >= base + static_cast<int64_t>(cwidth)) {
+        if (i < span.lo || i >= span.hi) {
             continue;
         }
+        assert(i >= 0 && i < static_cast<int64_t>(width) && "an in-span bit is inside the vector");
         const auto u = static_cast<uint64_t>(i);
         plane_bit_set(mm, u, plane_bit(must, k));
         if (four != 0) {

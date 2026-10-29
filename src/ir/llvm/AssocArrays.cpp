@@ -911,6 +911,7 @@ LValue Backend::assoc_elem_lvalue(const LValue& lv, bool for_write) {
     el.width            = lv.width;
     el.range_mask       = lv.range_mask;
     el.range_mask_outer = lv.range_mask_outer;
+    el.nest_valid       = lv.nest_valid;
     el.wide_dyn         = lv.wide_dyn;
     el.sel_base         = lv.sel_base;
     el.sel_cwidth       = lv.sel_cwidth;

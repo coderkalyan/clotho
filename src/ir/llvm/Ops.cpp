@@ -56,6 +56,13 @@ llvm::Value* Backend::smax(llvm::Value* a, llvm::Value* b) {
 // whole slot for a direct select, the inner select's span for a nested one).
 // An x/z index (`idx_unknown`) makes every bit out of range.
 //
+// A nested select (`a[i][j]`) is invalid when any level is, and `lv` still
+// holds the enclosing select's state. An enclosing select is always one whole
+// element (slang rejects a select after a range select), so an x/z or
+// out-of-range `i` leaves nothing of its window in range, and `lv.nest_valid`
+// says so in one bit. Without it `j` alone decided, and `a[i][j]` read and
+// wrote a bit for an `i` that is x.
+//
 // Returns the verdict --sanitize=bounds reports on. It is read off the
 // UNCLAMPED offsets rather than by counting mask bits, so it is three
 // compares and cannot disagree with the mask the access then uses.
@@ -74,6 +81,16 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
     SelectVerdict v;
     v.fully = b_.CreateAnd(b_.CreateAnd(b_.CreateICmpSGE(off, base), b_.CreateICmpSLE(top, end)),
                            b_.CreateNot(idx_unknown));
+    // Whether the access is invalid outright: this level's index is x/z, or an
+    // enclosing level is invalid. A null `nest_valid` is a direct select, which
+    // adds no IR here; `v.fully` already is its validity.
+    llvm::Value* bad = idx_unknown;
+    if (lv.nest_valid != nullptr) {
+        bad           = b_.CreateOr(bad, b_.CreateNot(lv.nest_valid));
+        lv.nest_valid = b_.CreateAnd(lv.nest_valid, v.fully);
+    } else {
+        lv.nest_valid = v.fully;
+    }
     // Storage too wide to shift inline: hand the container to the runtime helper
     // (which clamps per bit) instead of building an sw-bit mask, whose own
     // construction is the O(sw^2) legalization this path exists to avoid.
@@ -81,19 +98,19 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
         lv.wide_dyn    = true;
         lv.sel_base    = base;
         lv.sel_cwidth  = cwidth;
-        lv.sel_unknown = idx_unknown;
+        lv.sel_unknown = bad;
         // Some bit landed inside: compares only, no mask to count.
         v.partial = selw == 1 ? nullptr
                               : b_.CreateAnd(b_.CreateNot(v.fully),
                                              b_.CreateAnd(b_.CreateAnd(b_.CreateICmpSLT(off, end),
                                                                        b_.CreateICmpSGT(top, base)),
-                                                          b_.CreateNot(idx_unknown)));
+                                                          b_.CreateNot(bad)));
         return v;
     }
     llvm::Value* lo   = smax(smin(off, end), base);
     llvm::Value* hi   = smax(smin(top, end), base);
     llvm::Value* mask = range_bits(sw, b_.CreateTrunc(lo, int_ty(32)), b_.CreateTrunc(hi, int_ty(32)));
-    lv.range_mask       = b_.CreateSelect(idx_unknown, zero(sw), mask);
+    lv.range_mask       = b_.CreateSelect(bad, zero(sw), mask);
     lv.range_mask_outer = false;
 
     v.partial =

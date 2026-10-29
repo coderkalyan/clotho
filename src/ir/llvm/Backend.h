@@ -334,9 +334,10 @@ struct LValue {
     // Selected width in bits (== store_width for a whole-storage target).
     uint32_t width = 0;
     // Storage-width in-range mask for a bounds-checked dynamic bit/part select
-    // (LRM 11.5.1): 1 for each selected bit that is in range. Null when no bounds
-    // check applies (whole storage, or a constant in-range select). A read forces
-    // x/0 outside it and a write is restricted to it.
+    // (LRM 11.5.1): 1 for each selected bit that is in range, at every level of a
+    // nested select. Null when no bounds check applies (whole storage, or a
+    // constant in-range select). A read forces x/0 outside it and a write is
+    // restricted to it.
     llvm::Value* range_mask = nullptr;
     // `range_mask` was set by an enclosing dynamic select and this lvalue is a
     // constant part-select inside that select's window (`a[i][3:0]`, `sa[i].lo`),
@@ -344,12 +345,19 @@ struct LValue {
     // the selected bits and uses it as is; a write has to narrow it to its own
     // bits (store_mask), or it would clear the rest of the window (LRM 11.5.1).
     bool range_mask_outer = false;
+    // i1: every dynamic select on the way to here (`a[i][j]`, `sa[i].f[j]`) has a
+    // known index and a window inside its container. A select nested in an invalid
+    // one is invalid, so set_select_bounds folds this into its own verdict. Null
+    // when no dynamic select has been applied yet.
+    llvm::Value* nest_valid = nullptr;
     // A runtime-offset select on storage too wide to shift inline: the load / store
     // goes through rt_wide_sel / rt_wide_ins, which index the containing 64-bit word.
     // `sel_base` / `sel_cwidth` are the container the selection is clamped to (the
     // whole slot for a direct select, the inner select's span for a nested one) and
-    // `sel_unknown` is the i1 "the index has an x/z bit" flag. Set instead of
-    // `range_mask`, whose construction is itself O(storage width).
+    // `sel_unknown` is the i1 "wholly invalid" flag: an index has an x/z bit, at
+    // this select or at one it is nested in, or an enclosing select is out of
+    // range. Set instead of `range_mask`, whose construction is itself O(storage
+    // width).
     bool         wide_dyn    = false;
     llvm::Value* sel_base    = nullptr;
     uint32_t     sel_cwidth  = 0;

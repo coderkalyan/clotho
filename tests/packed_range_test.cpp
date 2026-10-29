@@ -343,6 +343,64 @@ TEST_CASE("a constant part-select under a dynamic select writes only its bits (L
           "fffff0ff\n");
 }
 
+// LRM 11.5.1: a select is invalid when its address is out of bounds or has an x
+// or z bit, and then reads x (0 for 2-state) and writes nothing. In a nested
+// select `a[i][j]` every level is such an address, so an invalid OUTER index
+// invalidates the whole access, whatever the inner index is. Oracle: the
+// flattened spelling `a[i*8 + j]`, which iverilog accepts; it gives x / xx and a
+// no-op for the x, high and negative outer index below, and 00080000 for the
+// valid one.
+TEST_CASE("a nested select with an invalid outer index reads x and writes nothing (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [3:0][7:0]      a;
+            bit   [3:0][7:0]      b;
+            logic [1:0][3:0][1:0] c;
+            logic [1:0] ix;
+            int i, j, ii, jj, kk;
+            initial begin
+                // An x outer index.
+                a = 32'h5A5A5A5A; b = 32'h5A5A5A5A; ix = 2'bx; j = 3;
+                $display("%b %b %b %b", a[ix][j], a[ix][j +: 2], b[ix][j], b[ix][j +: 2]);
+                a[ix][j] = 1'b0;  a[ix][j +: 2] = 2'b00;
+                b[ix][j] = 1'b1;  b[ix][j +: 2] = 2'b11;
+                $display("%h %h", a, b);
+                a[ix][j] <= 1'b0;  a[ix][j +: 2] <= 2'b00;
+                b[ix][j] <= 1'b1;  b[ix][j +: 2] <= 2'b11;
+                #1 $display("%h %h", a, b);
+                // An outer index past either end.
+                a = 32'hFFFFFFFF; b = 32'h0;
+                i = 4;  $display("%b %b %b", a[i][j], a[i][j +: 2], b[i][j]);
+                i = -1; $display("%b %b %b", a[i][j], a[i][j +: 2], b[i][j]);
+                i = 4;  a[i][j] = 1'b0; b[i][j] = 1'b1;
+                i = -1; a[i][j] = 1'b0; b[i][j] = 1'b1;
+                $display("%h %h", a, b);
+                // A valid outer index is unaffected.
+                a = 0; i = 2; a[i][j] = 1'b1;
+                $display("%h %b %b", a, a[i][j], a[i][j +: 2]);
+                // Three levels: the outermost one is the invalid one.
+                c = '1; ii = 2; jj = 1; kk = 0;
+                $display("%b", c[ii][jj][kk]);
+                c[ii][jj][kk] = 1'b0;
+                $display("%h", c);
+                ii = 1; c[ii][jj][kk] = 1'b0;
+                $display("%h", c);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "x xx 0 00\n"
+          "5a5a5a5a 5a5a5a5a\n"
+          "5a5a5a5a 5a5a5a5a\n"
+          "x xx 0\n"
+          "x xx 0\n"
+          "ffffffff 00000000\n"
+          "00080000 1 01\n"
+          "x\n"
+          "ffff\n"
+          "fbff\n");
+}
+
 TEST_CASE("array query functions (LRM 20.7): $size/$dimensions/$left/... fold to constants") {
     // All eight are constant type/bounds queries for a fixed-size operand, so
     // slang folds them; every string below matches iverilog v13 exactly (it
