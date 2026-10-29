@@ -24,7 +24,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Debug is for iterating on the compiler, so only the frontend is unoptimized; the
 # runtime is not part of that loop and -O0 there would distort every profile. Every
 # build type keeps assert() live (below); Debug also turns on
-# CLOTHO_EXPENSIVE_CHECKS.
+# CLOTHO_EXTRA_ASSERTS.
 #
 # The cost of that default, measured on hazard3 (21 files, 1418 processes):
 #
@@ -54,7 +54,7 @@ endif()
 # than run-to-run noise; a microbenchmark that is mostly garbage collection runs
 # 1.35x the instructions, from the collector's per-object field assertions. Checks
 # too slow to ship -- heap lookups and whole-structure verifiers such as the GC's
-# heap verify, 2.3x on that microbenchmark -- are behind CLOTHO_EXPENSIVE_CHECKS
+# heap verify, 2.3x on that microbenchmark -- are behind CLOTHO_EXTRA_ASSERTS
 # instead. CMake's defaults put NDEBUG in the flags of every non-Debug type, so it
 # is removed there; a normal variable shadows the cache entry for this project and
 # every dependency it fetches.
@@ -67,14 +67,14 @@ endforeach()
 # Checks too slow for a shipped build. On by default in Debug; CI also runs the
 # suite with them on.
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-  set(clotho_expensive_checks_default ON)
+  set(clotho_extra_asserts_default ON)
 else()
-  set(clotho_expensive_checks_default OFF)
+  set(clotho_extra_asserts_default OFF)
 endif()
-option(CLOTHO_EXPENSIVE_CHECKS "Build in checks too slow for a shipped build (GC heap verify)"
-       ${clotho_expensive_checks_default})
-if(CLOTHO_EXPENSIVE_CHECKS)
-  add_compile_definitions(CLOTHO_EXPENSIVE_CHECKS)
+option(CLOTHO_EXTRA_ASSERTS "Build in checks too slow for a shipped build (GC heap verify)"
+       ${clotho_extra_asserts_default})
+if(CLOTHO_EXTRA_ASSERTS)
+  add_compile_definitions(CLOTHO_EXTRA_ASSERTS)
 endif()
 
 # Release ships stripped: CMake's Release already omits -g, and this drops the

@@ -43,9 +43,9 @@ VCD, not only what a test prints.
 
 - **Assertions.** Invariants are asserted, and `assert()` is live in every
   build, shipped ones included. Checks too slow to ship, such as whole-structure
-  verifiers, are behind `CLOTHO_EXPENSIVE_CHECKS`, which Debug and CI turn on.
+  verifiers, are behind `CLOTHO_EXTRA_ASSERTS`, which Debug and CI turn on.
 - **Verifiers.** The LLVM verifier runs on every module before and after
-  optimization. An IR verifier runs after lowering as an expensive check.
+  optimization. An IR verifier runs after lowering as an extra assert.
 - **Internal errors.** A crash or failed assertion reports itself as a bug in
   Clotho and says where to report it, never as a bare abort.
 - **Sanitizers.** ASan and UBSan over the full suite and test corpus.

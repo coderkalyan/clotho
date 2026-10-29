@@ -77,8 +77,8 @@
 // An assertion that resolves a pointer through the heap's metadata (a bitmap scan or
 // a large-object lookup) rather than testing a field. On the allocation, marking and
 // barrier paths those lookups add 21% to the instructions of a collection-bound
-// design, so they are expensive checks; field tests stay live in every build.
-#ifdef CLOTHO_EXPENSIVE_CHECKS
+// design, so they are extra asserts; field tests stay live in every build.
+#ifdef CLOTHO_EXTRA_ASSERTS
 #define assert_resolves(expr) assert(expr)
 #else
 #define assert_resolves(expr) ((void)0)
@@ -2080,7 +2080,7 @@ uint64_t sweep_finalizable(bool spare_live) {
             // The negative space of publish_hole's conservative flag, and the only thing
             // standing between a bit GENERATED code set in a block the runtime never
             // flagged and a finalizer that silently never runs.
-#ifdef CLOTHO_EXPENSIVE_CHECKS
+#ifdef CLOTHO_EXTRA_ASSERTS
             for (uint32_t i = 0; i < kBitmapBytes; ++i) {
                 assert(blk.meta->fin_bits[i] == 0 && "a finalizable object in a skipped block");
             }
@@ -2568,10 +2568,10 @@ void print_stats(uint64_t swept_at_teardown) {
 
 // -- Verification -------------------------------------------------------------
 //
-// Everything below is CLOTHO_EXPENSIVE_CHECKS only: §13's heap-verify mode, which is
+// Everything below is CLOTHO_EXTRA_ASSERTS only: §13's heap-verify mode, which is
 // pair-assertion discipline (TigerStyle) applied to the whole heap rather than to one
 // function. A whole-heap walk per collection is too slow to ship.
-#ifdef CLOTHO_EXPENSIVE_CHECKS
+#ifdef CLOTHO_EXTRA_ASSERTS
 
 // What one rt_gc_verify() pass accumulates. A struct rather than a growing list of
 // out-parameters because every one of these serves a claim that is heap-WIDE -- the live
@@ -2964,7 +2964,7 @@ void verify_totals(const VerifyTally& tally) {
     assert(g.blocks.size() == g.stats.blocks_total && "block ids are dense and stable");
 }
 
-#endif // CLOTHO_EXPENSIVE_CHECKS
+#endif // CLOTHO_EXTRA_ASSERTS
 
 }  // namespace
 
@@ -3525,7 +3525,7 @@ extern "C" void* rt_gc_find_object(const void* addr) {
 }
 
 extern "C" void rt_gc_verify(void) {
-#ifdef CLOTHO_EXPENSIVE_CHECKS
+#ifdef CLOTHO_EXTRA_ASSERTS
     if (g.initialized == 0) {
         return;
     }

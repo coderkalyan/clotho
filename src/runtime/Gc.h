@@ -470,7 +470,7 @@ void* rt_gc_find_object(const void* addr);
 // Walk the heap asserting every live object's descriptor, size and handle fields
 // are self-consistent. The verify mode from
 // docs/design/garbage-collection.md §13; a no-op unless built with
-// CLOTHO_EXPENSIVE_CHECKS.
+// CLOTHO_EXTRA_ASSERTS.
 void rt_gc_verify(void);
 
 #ifdef __cplusplus

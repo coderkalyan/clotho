@@ -23,10 +23,10 @@ slower platforms while iterating on CI itself.
 ## Configurations
 
 Every job builds Release, which keeps `assert()` live as shipped builds do.
-linux-x64 adds `CLOTHO_EXPENSIVE_CHECKS`, the checks too slow to ship, so every
+linux-x64 adds `CLOTHO_EXTRA_ASSERTS`, the checks too slow to ship, so every
 push runs them; the other platforms test the shipped configuration.
 linux-x64-sanitize adds `CLOTHO_SANITIZE` (ASan and UBSan) on top of the
-expensive checks.
+extra asserts.
 
 ## The LLVM dependency
 
