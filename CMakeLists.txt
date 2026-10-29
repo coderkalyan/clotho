@@ -353,10 +353,14 @@ if(CLOTHO_SVA)
   set(_libsva_include ${_libsva_prefix}/inc)
   file(GLOB _libsva_sources "${CLOTHO_LIBSVA_DIR}/src/*.zig")
 
+  # -Dcpu=baseline: Zig otherwise targets the build machine's CPU, and the
+  # compiler_rt it bundles into libsva supplies clotho's memcpy and memset, so a
+  # binary built on a machine with newer vector extensions died with SIGILL at
+  # startup on an older one.
   add_custom_command(
     OUTPUT ${_libsva_lib} ${_libsva_include}/libsva/sva.h
     COMMAND ${ZIG_EXECUTABLE} build --prefix ${_libsva_prefix}
-            -Doptimize=${_libsva_optimize}
+            -Doptimize=${_libsva_optimize} -Dcpu=baseline
     COMMAND ${CMAKE_COMMAND} -E copy ${_libsva_prefix}/include/sva.h
             ${_libsva_include}/libsva/sva.h
     WORKING_DIRECTORY ${CLOTHO_LIBSVA_DIR}
