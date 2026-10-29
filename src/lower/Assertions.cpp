@@ -564,34 +564,92 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
     }
     for (const std::vector<const Symbol*>* set : { &v.lexical, &v.remote }) {
         for (const Symbol* t : *set) {
-            const bool is_task = t->kind == SymbolKind::Subroutine;
-            if (!is_task && t->kind != SymbolKind::StatementBlock) {
-                continue; // slang admits nothing else as a target
-            }
-            // Design-unique, not per-Lowerer: a multi-top design gives every
-            // top its own Lowerer sharing one Module, so the id has to come
-            // from the module the way a scope id does.
-            if (disable_targets_.try_emplace(t, module_.disable_targets).second) {
-                ++module_.disable_targets;
-                module_.disable_target_is_task.push_back(is_task ? 1 : 0);
-            }
-            if (is_task) {
-                // A task target is always "remote" in the sense that matters: it
-                // ends every activation, never just the one running. Its parks
-                // are checked against the task's own body.
-                const auto& sub = t->as<SubroutineSymbol>();
-                disable_remote_.insert(t);
-                if (hard_park(sub.getBody())) {
-                    disable_hard_.insert(t);
-                }
+            register_disable_target(t, set == &v.remote);
+        }
+    }
+}
+
+// Give a named block or task its `disable` target id (a block is lowered as an
+// ir::NamedBlock only if it has one), and mark it remote when some `disable`
+// names it from outside.
+void Lowerer::register_disable_target(const Symbol* t, bool remote) {
+    const bool is_task = t->kind == SymbolKind::Subroutine;
+    if (!is_task && t->kind != SymbolKind::StatementBlock) {
+        return; // slang admits nothing else as a target
+    }
+    // Design-unique, not per-Lowerer: a multi-top design gives every top its
+    // own Lowerer sharing one Module, so the id has to come from the module
+    // the way a scope id does.
+    if (disable_targets_.try_emplace(t, module_.disable_targets).second) {
+        ++module_.disable_targets;
+        module_.disable_target_is_task.push_back(is_task ? 1 : 0);
+        owners_->attribution.disable_target_names.push_back(import_name(*t));
+    }
+    if (is_task) {
+        // A task target is always "remote" in the sense that matters: it ends
+        // every activation, never just the one running. Its parks are checked
+        // against the task's own body.
+        const auto& sub = t->as<SubroutineSymbol>();
+        disable_remote_.insert(t);
+        if (hard_park(sub.getBody())) {
+            disable_hard_.insert(t);
+        }
+        return;
+    }
+    // A block with a `fork` inside needs the occupant bookkeeping too, even when
+    // only its own body disables it: the forked children are activations of it,
+    // and the lexical exit alone would leave them running.
+    if (remote || disable_forked_.contains(t)) {
+        disable_remote_.insert(t);
+    }
+}
+
+// Whether a block or task is a `disable` target is a fact its context imposes
+// on its specialization, and the instances of one specialization share their
+// code, so it is joined over all of them: a block some `disable` names from
+// outside its instance is lowered as a target in every instance of its
+// specialization, with the occupant bookkeeping the remote form needs. Each
+// instance's block keeps a target id of its own, so a `disable` of one still
+// ends only that instance's activations (LRM 9.6.2).
+//
+// The join runs after Collect has registered every instance and before any
+// instance is emitted. It is whole-top state today, and moves to a codegen-time
+// summary of the unit (docs/design/modular-compilation.md, "Inbound facts")
+// once units are compiled one by one. It covers the instances of the top being
+// lowered only: a `disable` cannot name a block of another top (Emit refuses
+// it), and a specialization both tops instantiate keeps one unit per shape.
+void Lowerer::join_disable_targets() {
+    // In id order: registering a twin grows disable_remote_.
+    std::vector<std::pair<uint32_t, const Symbol*>> remote;
+    remote.reserve(disable_remote_.size());
+    for (const Symbol* t : disable_remote_) {
+        remote.emplace_back(disable_targets_.at(t), t);
+    }
+    std::ranges::sort(remote);
+    for (const auto& [id, t] : remote) {
+        const Scope* s = t->getParentScope();
+        while (s != nullptr && s->asSymbol().kind != SymbolKind::InstanceBody) {
+            s = s->asSymbol().getParentScope();
+        }
+        if (s == nullptr) {
+            continue; // a package, `$unit` or class member: one instance
+        }
+        const auto& body  = s->asSymbol().as<slang::ast::InstanceBodySymbol>();
+        const auto  owner = owners_->scopes.find(&body);
+        if (owner == owners_->scopes.end()) {
+            fail("internal: a disable target's instance was not collected");
+        }
+        const uint32_t              spec = owners_->scope_specs.at(owner->second.owner.index).spec;
+        const std::vector<uint32_t> path = member_ordinal_path(*t, body);
+        for (const slang::ast::InstanceBodySymbol* other : spec_bodies_[spec]) {
+            if (other == &body) {
                 continue;
             }
-            // A block with a `fork` inside needs the occupant bookkeeping too, even
-            // when only its own body disables it: the forked children are
-            // activations of it, and the lexical exit alone would leave them running.
-            if (set == &v.remote || disable_forked_.contains(t)) {
-                disable_remote_.insert(t);
+            const Symbol* twin = symbol_at_path(*other, path);
+            if (twin == nullptr || twin->kind != t->kind || twin->name != t->name) {
+                fail("internal: an instance of a specialization lacks a disable target's twin");
             }
+            register_disable_target(twin, /*remote=*/true);
         }
     }
 }
@@ -1699,7 +1757,13 @@ ir::Signal Lowerer::sampled_shadow_of(ir::Signal live, std::string_view what) {
     }
 
     ir::SignalInfo info;
-    info.name = "sva.shadow." + live_info.name;
+    // Named under the declaring instance, like every signal it holds: the
+    // instance prefix, then the live signal's name within the instance.
+    const std::string&     prefix = declaring_scope != nullptr ? scope_prefix_.at(declaring_scope->id) : std::string();
+    const std::string_view local  = std::string_view(live_info.name).starts_with(prefix)
+                                      ? std::string_view(live_info.name).substr(prefix.size())
+                                      : std::string_view(live_info.name);
+    info.name                     = prefix + "sva.shadow." + std::string(local);
     info.loc  = live_info.loc;
     info.type = live_info.type;
     // Left a variable (is_net stays false): nothing drives a shadow but the
@@ -1825,7 +1889,7 @@ void Lowerer::finalize_preponed() {
         const ir::Index     zero = zero_mask(1, b, l);
         b.binary(ir::Inst::Tag::Store, dst, zero, l);
     }
-    module_.add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = b.finish() });
+    add_process(ir::Process{ .activation = ir::Activation::Preponed, .ir = b.finish() });
     sva_shadow_pairs_.clear();
     preponed_clears_.clear();
 }

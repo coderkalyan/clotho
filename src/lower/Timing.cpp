@@ -1376,16 +1376,16 @@ void Lowerer::lower_clocking_block(const ClockingBlockSymbol& cb) {
     const ir::ExtraSlice else_r = b.close_region(); // empty
     b.cond(fired, then_r, else_r, l);
 
-    module_.add_process(ir::Process{ .activation = ir::Activation::Observed,
-                                     // Not a subscription: an Observed process is resumed once per
-                                     // time slot, never woken by a net event. Kept as the record of
-                                     // which event steps this block, which is what the edge
-                                     // detection above is derived from.
-                                     .wait_events = { ir::WaitEvent{ .signal = clock, .edge = edge } },
-                                     .self_start  = false,
-                                     .span        = ir::SourceSpan{ l, l },
-                                     .ir          = b.finish(),
-                                     .scope       = cur_scope_id() });
+    add_process(ir::Process{ .activation = ir::Activation::Observed,
+                             // Not a subscription: an Observed process is resumed once per
+                             // time slot, never woken by a net event. Kept as the record of
+                             // which event steps this block, which is what the edge
+                             // detection above is derived from.
+                             .wait_events = { ir::WaitEvent{ .signal = clock, .edge = edge } },
+                             .self_start  = false,
+                             .span        = ir::SourceSpan{ l, l },
+                             .ir          = b.finish(),
+                             .scope       = cur_scope_id() });
 }
 
 // Emit: the block's Re-NBA process, which performs the synchronous drives that
@@ -1444,11 +1444,11 @@ void Lowerer::lower_clocking_drives(const ClockingBlockSymbol& cb) {
     const ir::ExtraSlice else_r = b.close_region(); // empty
     b.cond(fired, then_r, else_r, l);
 
-    module_.add_process(ir::Process{ .activation = ir::Activation::ReNba,
-                                     .self_start = false,
-                                     .span       = ir::SourceSpan{ l, l },
-                                     .ir         = b.finish(),
-                                     .scope      = cur_scope_id() });
+    add_process(ir::Process{ .activation = ir::Activation::ReNba,
+                             .self_start = false,
+                             .span       = ir::SourceSpan{ l, l },
+                             .ir         = b.finish(),
+                             .scope      = cur_scope_id() });
 }
 
 // The `default clocking` in scope (LRM 14.12), which is what a cycle delay

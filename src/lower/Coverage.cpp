@@ -575,6 +575,7 @@ ir::FunctionId Lowerer::build_cover_sample(const slang::ast::CovergroupType&    
                                            uint32_t                                                type_idx,
                                            const std::vector<const slang::ast::CoverpointSymbol*>& points) {
     const ir::FunctionId id   = module_.reserve_function(module_.pool.void_type);
+    own_function(id, cgt, ".sample");
     const ir::Ref        word = make_int_type(64, false);
     const ir::SourceLoc  l    = to_source_loc(cgt.location);
 
@@ -739,15 +740,15 @@ void Lowerer::cover_event_process(const slang::ast::CovergroupType& cgt, uint32_
     const ir::ExtraSlice no_else = b.close_region();
     b.cond(fired, then_region, no_else, l);
 
-    module_.add_process(ir::Process{ .activation = ir::Activation::Observed,
-                                     // Not a subscription -- an Observed process is resumed once per settled
-                                     // point, never woken by a net event. Kept as the record of which event
-                                     // delimits this covergroup's sampling.
-                                     .wait_events = { ir::WaitEvent{ .signal = clock, .edge = edge } },
-                                     .self_start  = false,
-                                     .span        = { l, l },
-                                     .ir          = b.finish(),
-                                     .scope       = cur_scope_id() });
+    add_process(ir::Process{ .activation = ir::Activation::Observed,
+                             // Not a subscription -- an Observed process is resumed once per settled
+                             // point, never woken by a net event. Kept as the record of which event
+                             // delimits this covergroup's sampling.
+                             .wait_events = { ir::WaitEvent{ .signal = clock, .edge = edge } },
+                             .self_start  = false,
+                             .span        = { l, l },
+                             .ir          = b.finish(),
+                             .scope       = cur_scope_id() });
 }
 
 // `covergroup_type ident = new;` (LRM 19.3).

@@ -1426,6 +1426,7 @@ ir::FunctionId Lowerer::rand_body_id(const slang::ast::ClassType& clt,
     }
     const ir::FunctionId id = module_.reserve_function(return_type);
     map[&clt]               = id;
+    own_function(id, clt, &map == &randomize_fn_ ? ".randomize" : ".randops");
     if (randomize_fn_.contains(&clt) && randops_fn_.contains(&clt)) {
         rand_pending_.emplace_back(&clt, class_ref);
     }

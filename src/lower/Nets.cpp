@@ -250,7 +250,10 @@ void Lowerer::record_net_driver(const Expression& lhs) {
         // Non-net or shapes rejected by lower_lvalue: nothing to track.
         return;
     }
-    record_net_driver_region(*root, net_region_of(lhs, *root));
+    // A contribution through an aliasing port is full width (contribute), so
+    // it overlaps every other driver of the net, and a net with one is resolved
+    // the moment it has a second driver, disjoint or not.
+    record_net_driver_region(*root, contribution_port(lhs) != nullptr ? kWholeNet : net_region_of(lhs, *root));
 }
 
 // Compute the driven region of a rooted continuous-assign lvalue: an
@@ -489,6 +492,10 @@ uint16_t Lowerer::pack_strength(
 // -- false, since a program can only be instantiated in a design scope. The
 // same split, for the same reason, as add_continuous_process.
 ir::Signal Lowerer::alloc_driver_slot(ir::Signal net, ir::SourceLoc l, uint16_t strength, bool program_driver) {
+    return alloc_slot_in(cur_scope_id(), net, l, strength, program_driver);
+}
+
+ir::Signal Lowerer::alloc_slot_in(uint32_t scope, ir::Signal net, ir::SourceLoc l, uint16_t strength, bool program_driver) {
     const auto net_u        = static_cast<uint32_t>(net);
     const auto existing     = resolved_scope_.find(net_u);
     const bool first_driver = existing == resolved_scope_.end();
@@ -503,34 +510,174 @@ ir::Signal Lowerer::alloc_driver_slot(ir::Signal net, ir::SourceLoc l, uint16_t 
     // shared interface net whose header port is bound from the parent AND
     // separately driven by a bind-inserted module reaching it through an
     // upward hierarchical reference). Every driver SLOT is a design-wide
-    // ir::Signal regardless of which scope discovers it (register_signal
-    // only records it under scope_stack_ for VCD grouping of that ONE slot;
-    // the slot's storage and every load/store of it address it by its flat
-    // signal id, unaffected by scope) -- so the fold in emit_wire_resolvers
-    // needs nothing new to reach a cross-scope slot. What genuinely has no
-    // single right answer is which ONE scope the RESOLVER process (the
-    // thing that reads every slot and writes the net) should be attributed
-    // to for VCD grouping, once it folds slots contributed by more than one
-    // scope: no_scope is the existing, already-supported answer for exactly
-    // this shape (a process belonging to no single instance, like a per-top
-    // PreInit pass) rather than an arbitrary pick of one driver's scope.
-    const bool cross_scope =
-      !first_driver && existing->second != ir::Process::no_scope && existing->second != cur_scope_id();
-    auto&          slots = resolved_slots_[net_u];
+    // ir::Signal regardless of which scope discovers it (the scope it is
+    // registered under is only where its unit stores it; every load/store of
+    // it addresses it by its flat signal id) -- so the fold in
+    // emit_wire_resolvers needs nothing new to reach a cross-scope slot. What
+    // genuinely has no single right answer is which ONE scope the RESOLVER
+    // process (the thing that reads every slot and writes the net) should be
+    // attributed to, once its slots belong to more than one scope: no_scope
+    // is the existing, already-supported answer for exactly this shape (a
+    // process belonging to no single instance, like a per-top PreInit pass)
+    // rather than an arbitrary pick of one driver's scope. A net whose slots
+    // all belong to one instance -- every contribution through an aliasing
+    // port is in its owner's -- resolves in that instance.
+    const bool cross_scope = !first_driver && existing->second != ir::Process::no_scope && existing->second != scope;
+    auto&      slots       = resolved_slots_[net_u];
     ir::SignalInfo info;
-    info.name             = std::string(module_.signal(net).name) + "$drv" + std::to_string(slots.size());
-    info.type             = module_.signal(net).type;
-    info.dir              = ir::SignalInfo::Direction::Internal;
-    const ir::Signal slot = register_signal(std::move(info));
+    // Named as the owning instance sees the net, and numbered per instance, so
+    // every instance of one definition names its slots alike.
+    const std::string& net_name = module_.signal(net).name;
+    const auto         pre      = scope_prefix_.find(scope);
+    const std::string& prefix   = pre != scope_prefix_.end() ? pre->second : std::string();
+    const std::string  seen_as  = net_name.starts_with(prefix) ? net_name : prefix + net_name;
+    const uint32_t     ordinal  = scope_slots_[(static_cast<uint64_t>(scope) << 32) | net_u]++;
+    info.name                   = seen_as + "$drv" + std::to_string(ordinal);
+    info.type                   = module_.signal(net).type;
+    info.dir                    = ir::SignalInfo::Direction::Internal;
+    ir::InstanceScope* node     = scope == ir::Process::no_scope ? nullptr : scope_node(scope);
+    const ir::Signal   slot     = node != nullptr ? register_signal_in(*node, std::move(info)) : register_signal(std::move(info));
     slots.push_back(slot);
     resolved_strengths_[net_u].push_back(strength); // parallel to slots
     if (cross_scope) {
         resolved_scope_[net_u] = ir::Process::no_scope;
     } else if (first_driver) {
-        resolved_scope_[net_u] = cur_scope_id();
+        resolved_scope_[net_u] = scope;
     } // else: same scope as before, or already no_scope -- leave it.
     resolved_loc_[net_u] = l;
     return slot;
+}
+
+// The node of instance `id` in the scope tree: an ancestor of the instance
+// being lowered in the common case, so the path is searched first.
+ir::InstanceScope* Lowerer::scope_node(uint32_t id) {
+    for (auto it = scope_stack_.rbegin(); it != scope_stack_.rend(); ++it) {
+        if ((*it)->id == id) {
+            return *it;
+        }
+    }
+    ir::InstanceScope* node = find_scope_node(top_scope_, id);
+    if (node == nullptr) {
+        fail("internal: an instance scope is missing from the scope tree");
+    }
+    return node;
+}
+
+ir::Signal Lowerer::register_signal_in(ir::InstanceScope& node, ir::SignalInfo info) {
+    const ir::Signal sig = module_.add_signal(std::move(info));
+    node.signals.push_back(sig);
+    signal_scope_[static_cast<uint32_t>(sig)] = node.id;
+    return sig;
+}
+
+const Lowerer::AliasSymbol* Lowerer::contribution_port(const ValueSymbol& net) {
+    const ValueSymbol& sym = canonical_value_symbol(net);
+    if (sym.kind != SymbolKind::Net) {
+        return nullptr;
+    }
+    const auto it = alias_syms_.find(&sym);
+    if (it == alias_syms_.end() || it->second.scope != cur_scope_id() ||
+        !sym.getType().getCanonicalType().isIntegral()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+// The aliasing port a continuous driver of the current instance drives
+// through, if `left` is one it can contribute to: a whole integral net, or a
+// constant packed range of one, that the instance reaches through an inout
+// port (build_inout_aliases). Any other shape keeps its direct store through
+// the port, which fails loudly if the net resolves.
+const Lowerer::AliasSymbol* Lowerer::contribution_port(const Expression& left) {
+    const ValueSymbol* root = lvalue_root(left);
+    if (root == nullptr) {
+        return nullptr;
+    }
+    const AliasSymbol* port = contribution_port(*root);
+    if (port == nullptr || is_whole_net_lvalue(left)) {
+        return port;
+    }
+    const ValueSymbol& sym   = canonical_value_symbol(*root);
+    const NetRegion    reg   = net_region_of(left, sym);
+    const uint32_t     net_w = module_.pool.layout(module_.signal(signal_of(sym)).type).width;
+    const bool         packed_const =
+      reg.elem_lo == 0 && reg.elem_hi == 0 && reg.bit_hi != UINT32_MAX && reg.bit_lo <= reg.bit_hi && reg.bit_hi < net_w;
+    return packed_const ? port : nullptr;
+}
+
+std::optional<ir::Signal> Lowerer::driver_net_of(const Expression& left) {
+    if (contribution_port(left) != nullptr) {
+        return signal_of(canonical_value_symbol(*lvalue_root(left)));
+    }
+    return resolved_net_of(left);
+}
+
+ir::Signal Lowerer::driver_slot(ir::Signal        net,
+                                const Expression& left,
+                                ir::SourceLoc     l,
+                                uint16_t          strength,
+                                bool              program_driver) {
+    return driver_slot_via(contribution_port(left), net, l, strength, program_driver);
+}
+
+ir::Signal Lowerer::driver_slot_via(
+  const AliasSymbol* port, ir::Signal net, ir::SourceLoc l, uint16_t strength, bool program_driver) {
+    if (port != nullptr) {
+        return contribute(scope_stack_.size() - 1, port->port, net, l, strength, program_driver);
+    }
+    return alloc_driver_slot(net, l, strength, program_driver);
+}
+
+// A driver through an aliasing port stores into a contribution of its own
+// instance, a bound port its parent binds (ir::Attribution::Contribution), so
+// the body is the same whether the net has this one driver or many. The store
+// is full width -- a partial driver carries Z in the bits it does not drive --
+// so a contribution bound to the net itself, which only happens when it is the
+// net's sole driver (a contribution overlaps every other driver, see
+// record_net_driver), leaves the other bits z exactly as undriven bits are.
+//
+// Where the parent binds it depends on what the parent is. A parent that
+// aliases the net through a port of its own re-exports the contribution as one
+// of its own, so no ancestor names a descendant's; anything else -- the
+// net's owner, or a parent that reaches the net by a hierarchical name -- binds
+// it to the net when it does not resolve and to a fresh slot of the net's owner
+// when it does, which is where the resolver lives too.
+ir::Signal Lowerer::contribute(size_t             depth,
+                               const std::string& port,
+                               ir::Signal         net,
+                               ir::SourceLoc      l,
+                               uint16_t           strength,
+                               bool               program_driver) {
+    ir::InstanceScope& node  = *scope_stack_[depth];
+    const uint32_t     scope = node.id;
+    const uint32_t ordinal = contribution_ordinals_[std::to_string(scope) + "|" + port]++;
+    const std::string name = port + "$drv" + std::to_string(ordinal);
+    const auto        pre  = scope_prefix_.find(scope);
+    ir::SignalInfo    info;
+    info.name = (pre != scope_prefix_.end() ? pre->second : std::string()) + name;
+    info.type = module_.signal(net).type;
+    info.dir  = ir::SignalInfo::Direction::Internal;
+    const ir::Signal signal = register_signal_in(node, std::move(info));
+
+    const auto net_u  = static_cast<uint32_t>(net);
+    ir::Signal target = net;
+    const std::string* up = nullptr;
+    if (depth > 0) {
+        if (const auto ports = alias_ports_.find(scope_stack_[depth - 1]->id); ports != alias_ports_.end()) {
+            if (const auto it = ports->second.find(net_u); it != ports->second.end()) {
+                up = &it->second;
+            }
+        }
+    }
+    if (up != nullptr) {
+        target = contribute(depth - 1, *up, net, l, strength, program_driver);
+    } else if (resolved_nets_.contains(net_u)) {
+        const auto owner = signal_scope_.find(net_u);
+        target = alloc_slot_in(owner != signal_scope_.end() ? owner->second : cur_scope_id(), net, l, strength, program_driver);
+    }
+    owners_->attribution.contributions.push_back(
+      ir::Attribution::Contribution{ .scope = scope, .name = name, .signal = signal, .target = target });
+    return signal;
 }
 
 // A definite (2-state, z-free) all-0 or all-1 constant of `width` bits, in the
@@ -676,7 +823,7 @@ void Lowerer::emit_resolved_driver(ir::Signal                  net,
                                    uint16_t                    strength,
                                    const Expression*           delay_expr) {
     const ir::Index  val  = build_driver_slot_value(net, left, lower_expr(a.right(), b), b, l);
-    const ir::Signal slot = alloc_driver_slot(net, l, strength);
+    const ir::Signal slot = driver_slot(net, left, l, strength);
     store_driver_slot(left, slot, val, delay_expr, b, l);
     add_continuous_process(continuous_events(a), l, b);
 }
@@ -937,8 +1084,23 @@ void Lowerer::emit_wire_resolvers() {
             // process just calls it.
             b.ret_void(l);
             const ir::FunctionId fid = net_resolver_fn(net_u);
+            // The function is held by the unit that holds the resolver process, and
+            // named as that unit names the net, so every instance of the unit names
+            // it alike; a `release` in another unit reaches it through that name.
+            const ir::Owner owner = scope == ir::Process::no_scope
+                                      ? process_owner_
+                                      : ir::Owner{ .kind = ir::Owner::Kind::Scope, .index = scope };
+            std::string     name  = module_.signal(net).name;
+            if (owner.kind == ir::Owner::Kind::Scope) {
+                if (const auto pre = scope_prefix_.find(owner.index);
+                    pre != scope_prefix_.end() && name.starts_with(pre->second)) {
+                    name.erase(0, pre->second.size());
+                }
+            }
+            name += "$resolve";
+            record_function(fid, owner, name);
             module_.set_function(fid,
-                                 ir::Function{ .name        = module_.signal(net).name + "$resolve",
+                                 ir::Function{ .name        = std::move(name),
                                                .return_type = module_.pool.void_type,
                                                .param_types = {},
                                                .arg_dirs    = {},
@@ -949,13 +1111,13 @@ void Lowerer::emit_wire_resolvers() {
             pb.call(fid, {}, l);
             body = pb.finish();
         }
-        module_.add_process(ir::Process{ .activation    = ir::Activation::Always,
-                                         .wait_events   = std::move(wait_events),
-                                         .self_start    = true,
-                                         .reactive_home = reactive_home,
-                                         .span          = ir::SourceSpan{ l, l },
-                                         .ir            = std::move(body),
-                                         .scope         = scope });
+        add_process(ir::Process{ .activation    = ir::Activation::Always,
+                                 .wait_events   = std::move(wait_events),
+                                 .self_start    = true,
+                                 .reactive_home = reactive_home,
+                                 .span          = ir::SourceSpan{ l, l },
+                                 .ir            = std::move(body),
+                                 .scope         = scope });
     }
 }
 
@@ -999,7 +1161,7 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
 
     ir::Builder         b(module_);
     const ir::SourceLoc l = to_source_loc(sym.location);
-    if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
+    if (const std::optional<ir::Signal> net = driver_net_of(left)) {
         // Multiply-driven net: this driver stages its value into its own
         // slot; the resolver folds every driver's slot (emit_wire_resolvers).
         // An `assign #d` here is a PER-DRIVER inertial delay (LRM 10.3.3) — it
@@ -1103,13 +1265,13 @@ void Lowerer::add_continuous_process(std::vector<ir::WaitEvent> wait_events,
                                      ir::SourceLoc              l,
                                      ir::Builder&               b,
                                      bool                       reactive_home) {
-    module_.add_process(ir::Process{ .activation    = ir::Activation::Always,
-                                     .wait_events   = std::move(wait_events),
-                                     .self_start    = true,
-                                     .reactive_home = reactive_home || in_program_,
-                                     .span          = ir::SourceSpan{ l, l },
-                                     .ir            = b.finish(),
-                                     .scope         = cur_scope_id() });
+    add_process(ir::Process{ .activation    = ir::Activation::Always,
+                             .wait_events   = std::move(wait_events),
+                             .self_start    = true,
+                             .reactive_home = reactive_home || in_program_,
+                             .span          = ir::SourceSpan{ l, l },
+                             .ir            = b.finish(),
+                             .scope         = cur_scope_id() });
 }
 
 // The whole-scalar force/release target an lvalue names (variable or net), or
@@ -2023,12 +2185,12 @@ Lowerer::GateInput Lowerer::lower_gate_input(const Expression& e, std::string_vi
     for (const ir::Signal s : c.reads) {
         wait_events.push_back(ir::WaitEvent{ .signal = s, .edge = ir::Edge::Any });
     }
-    module_.add_process(ir::Process{ .activation  = ir::Activation::Always,
-                                     .wait_events = std::move(wait_events),
-                                     .self_start  = true,
-                                     .span        = ir::SourceSpan{ l, l },
-                                     .ir          = b.finish(),
-                                     .scope       = cur_scope_id() });
+    add_process(ir::Process{ .activation  = ir::Activation::Always,
+                             .wait_events = std::move(wait_events),
+                             .self_start  = true,
+                             .span        = ir::SourceSpan{ l, l },
+                             .ir          = b.finish(),
+                             .scope       = cur_scope_id() });
 
     return GateInput{ .sig = tmp, .bit = 0 };
 }
@@ -2111,7 +2273,9 @@ void Lowerer::emit_pull_driver(const ValueSymbol& sym, bool up, uint8_t level, i
     // (highz0, level1) for a pull up, (level0, highz1) for a pull down.
     const uint16_t   strength = up ? static_cast<uint16_t>(level) : static_cast<uint16_t>(level << 8);
     ir::Builder      b(module_);
-    const ir::Signal slot = alloc_driver_slot(net, l, strength, program_driver);
+    // A pull on a net the instance reaches through an inout port drives it through
+    // a contribution, like any other driver of such a net (contribute).
+    const ir::Signal slot = driver_slot_via(contribution_port(sym), net, l, strength, program_driver);
     const ir::Index  dst  = b.signal(slot, l);
     const ir::Index  val  = b.constant(def_constant_ref(w, up), l);
     b.binary(ir::Inst::Tag::Store, dst, val, l);
@@ -2177,7 +2341,7 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
         // representation for. A single #d is lowered onto each half below.
         fail("gate rise/fall/turn-off delays (#(a,b,c)) are not supported");
     }
-    const std::optional<ir::Signal> net = resolved_net_of(left);
+    const std::optional<ir::Signal> net = driver_net_of(left);
     if (!net) {
         // Classify records two drivers for every cmos rooted at a net, so a
         // net output is resolved by construction. Anything else (a variable
@@ -2535,7 +2699,7 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
                 : gate_folded_value(*op, inputs, wait_events, b, loc);
         const ir::Index val = gate_output_value(left, folded, b, loc);
 
-        if (const std::optional<ir::Signal> net = resolved_net_of(left)) {
+        if (const std::optional<ir::Signal> net = driver_net_of(left)) {
             // A gate delay on a driver of a resolved net is PER DRIVER (LRM
             // 28.16): this gate's own contribution transitions inertially and
             // the resolver re-runs when the slot lands, so it rides the slot
@@ -2755,7 +2919,7 @@ void Lowerer::emit_gate_resolved_driver(const Expression&          left,
                                         uint16_t                   strength,
                                         const Expression*          delay_expr) {
     const ir::Index  slot_val = build_driver_slot_value(net, left, val, b, l);
-    const ir::Signal slot     = alloc_driver_slot(net, l, strength);
+    const ir::Signal slot     = driver_slot(net, left, l, strength);
     store_driver_slot(left, slot, slot_val, delay_expr, b, l);
     add_continuous_process(std::move(wait_events), l, b);
 }

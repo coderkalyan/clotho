@@ -69,6 +69,8 @@ struct SourceSpan {
     [[nodiscard]] bool valid() const {
         return start != SourceLoc{ 0 };
     }
+
+    bool operator==(const SourceSpan&) const = default;
 };
 
 // What a resolver can say about a source construct: enough to print a location,
@@ -666,6 +668,34 @@ struct CoverInfo {
     CoverOp  op    = CoverOp::New;
 };
 
+// Whether `op` names its covergroup type through CoverInfo::type_idx. The other
+// ops reach the type through the instance handle, or need none, and leave the
+// index unset -- so only these have a type for Ir::rebased to map.
+constexpr bool cover_op_names_type(CoverOp op) {
+    switch (op) {
+        case CoverOp::New:
+        case CoverOp::First:
+        case CoverOp::TypeCoverage:
+        case CoverOp::TypeCovered:
+        case CoverOp::TypeTotal:
+            return true;
+        case CoverOp::Ctx:
+        case CoverOp::Next:
+        case CoverOp::InstCoverage:
+        case CoverOp::InstCovered:
+        case CoverOp::InstTotal:
+        case CoverOp::PointCoverage:
+        case CoverOp::PointCovered:
+        case CoverOp::PointTotal:
+        case CoverOp::DesignCoverage:
+        case CoverOp::Hit:
+        case CoverOp::Start:
+        case CoverOp::SetName:
+            return false;
+    }
+    return false;
+}
+
 // Which wait-queue primitive a SyncWait / SyncCtl instruction performs, for the
 // built-in `semaphore` (LRM 15.3) and `mailbox #(T)` (LRM 15.4). Split across two
 // tags for the reason the `process` family is split across three: suspension is a
@@ -696,9 +726,10 @@ struct SyncInfo {
     // lvalue. Both are ordinary members of the object's synthetic body, so the
     // backend needs no layout knowledge -- the frontend selects the field.
     ExtraSlice args;
-    // Wait SITE identity, unique design-wide. A `Park` and the `Leave` that
+    // Wait SITE identity within its body. A `Park` and the `Leave` that
     // discharges it carry the same site, which is how they share one
-    // frame-resident node (the backend allocates one per site per body).
+    // frame-resident node (the backend allocates one per site per body), so a
+    // site means nothing outside the body that holds it.
     uint32_t site = 0;
     SyncOp   op   = SyncOp::Park;
 };
@@ -3127,6 +3158,37 @@ struct IrView {
     }
 };
 
+// A family of cross-table handles an IR body carries (Ir::rebased).
+enum class HandleFamily : uint8_t {
+    // Signal, wherever a body names one for its storage.
+    Signal,
+    // Signal that names only a layout: some instance's member, standing for
+    // that member of whichever instance a virtual interface handle supplies
+    // (IfaceMember::signal, Function::ctx_member; LRM 25.9).
+    Layout,
+    // FunctionId: callees, fork children, deferred bodies.
+    Function,
+    // IfaceInst::scope: an interface instance an IfaceRef names.
+    IfaceScope,
+    // Assertion monitor index (ExpectInfo, ExpectWake).
+    Monitor,
+    // Covergroup type index (CoverInfo::type_idx).
+    CoverType,
+    // `disable` target id; kNoDisableTarget is never mapped.
+    DisableTarget,
+};
+
+// Maps the cross-table handles of a body onto another set of tables. A unit's
+// bodies (Design.h) name the unit's own tables: flatten maps them onto the flat
+// module's, and partition maps a flat module's onto a unit's, creating extern
+// declarations as it goes -- hence non-const.
+class HandleMapper {
+public:
+    virtual ~HandleMapper() = default;
+
+    virtual uint32_t map(HandleFamily family, uint32_t handle) = 0;
+};
+
 // Immutable, finished process IR: a structure of arrays (parallel tag / payload
 // / location columns indexed by Index) plus a flat extra side-table. The body
 // is the root region. Constructed by Builder::finish(); default construction
@@ -3151,6 +3213,17 @@ public:
     size_t inst_count() const {
         return tags_.size();
     }
+
+    // A copy of this body with every cross-table handle (HandleFamily) mapped
+    // through `m`. Instruction indices, constants and types are unchanged, so
+    // the copy shares this body's pool. A default-constructed body (a slot never
+    // built) copies as one.
+    Ir rebased(HandleMapper& m) const;
+
+    // Whether two bodies are the same instruction for instruction, handles,
+    // locations and side tables included, over one pool. Payloads compare as
+    // bytes, which Builder keeps fully initialized.
+    bool operator==(const Ir& other) const;
 
     // End of the source construct an instruction came from, exclusive, or
     // SourceLoc{0} when unrecorded. Sparse on purpose: a 16-byte SourceSpan per

@@ -1059,15 +1059,27 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
         const ValueSymbol& parent = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
         const ir::Signal   target = signal_of(parent);
         // Two ports bound to one internal net (`module m(a, a)`, LRM 23.2.2.1) connected
-        // to one parent net share that net's alias target; connected to different nets
-        // they would make those one net, which the one target cannot express.
+        // to one parent net share that net's alias target, and the first port's bound
+        // port (below) stands for both; connected to different nets they would make those
+        // one net, which the one target cannot express.
         // TODO: two connected inout/ref ports bound to one net, connected to different
         // nets: the nets they connect become one net.
-        if (const auto prior = inout_alias_.find(p.internalSymbol);
-            prior != inout_alias_.end() && prior->second != target) {
-            fail("two inout/ref ports bound to one net, connected to different nets, are not supported");
+        if (const auto prior = inout_alias_.find(p.internalSymbol); prior != inout_alias_.end()) {
+            if (prior->second != target) {
+                fail("two inout/ref ports bound to one net, connected to different nets, are not supported");
+            }
+            continue;
         }
         inout_alias_[p.internalSymbol] = target;
+        // The child holds no storage for the port; partition binds it to the
+        // parent's signal (ir::Attribution::port_aliases).
+        const uint32_t scope = cur_scope_id();
+        owners_->attribution.port_aliases.push_back(
+          { .scope = scope, .port = std::string(p.internalSymbol->name), .target = target });
+        alias_ports_[scope].try_emplace(static_cast<uint32_t>(target), std::string(p.internalSymbol->name));
+        if (p.internalSymbol->kind == SymbolKind::Net) {
+            alias_syms_.try_emplace(p.internalSymbol, AliasSymbol{ scope, std::string(p.internalSymbol->name) });
+        }
     }
 }
 
@@ -1491,9 +1503,22 @@ ir::Signal Lowerer::register_signal(ir::SignalInfo info) {
     if (!scope_stack_.empty()) {
         scope_stack_.back()->signals.push_back(sig);
         signal_scope_[static_cast<uint32_t>(sig)] = scope_stack_.back()->id;
+    } else {
+        // Package / $unit state, and the statics reached through it: the
+        // static unit of the scope being lowered (partition).
+        own_signal(sig, owner_in(scope_).owner);
     }
 
     return sig;
+}
+
+void Lowerer::own_signal(ir::Signal sig, ir::Owner owner) {
+    std::vector<ir::Owner>& owners = owners_->attribution.signals;
+    const auto              i      = static_cast<uint32_t>(sig);
+    if (owners.size() <= i) {
+        owners.resize(i + 1);
+    }
+    owners[i] = owner;
 }
 
 ir::Signal Lowerer::signal_of(const ValueSymbol& sym) {
@@ -1610,6 +1635,7 @@ ir::Signal Lowerer::const_table_signal(const ValueSymbol& vs) {
 
     const ir::Signal sig = module_.add_signal(std::move(info));
     sigmap_[&vs]         = sig;
+    own_signal(sig, owner_in(vs.getParentScope()).owner);
 
     if (seeded) {
         // The handles this value needs only exist at run time, so the table is
@@ -1680,9 +1706,15 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
         sigmap_.emplace(&prop, sig);
         return sig;
     }
+    // The class's own rendering, which carries a specialization's arguments
+    // (bind_class_type): each specialization has its own statics (LRM 8.25), and
+    // their signals need distinct names to be imported by name.
     std::string cls;
     if (const slang::ast::Scope* sc = prop.getParentScope()) {
-        cls = std::string(sc->asSymbol().name) + "::";
+        const slang::ast::Symbol& owner = sc->asSymbol();
+        cls = (owner.kind == SymbolKind::ClassType ? owner.as<slang::ast::ClassType>().toString()
+                                                   : std::string(owner.name)) +
+              "::";
     }
     const ir::Ref  pty = lower_type(prop.getType());
     ir::SignalInfo info;

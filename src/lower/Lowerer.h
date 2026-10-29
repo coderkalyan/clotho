@@ -82,6 +82,7 @@
 #include "SourceMap.h"
 #include "Sva.h"
 #include "ir/Builder.h"
+#include "ir/Partition.h"
 #include "ir/TypeModel.h"
 #include "runtime/Format.h"
 
@@ -870,6 +871,40 @@ struct IfaceIds {
     ankerl::unordered_dense::map<std::string_view, uint32_t>             slots;
 };
 
+// Which unit declares what, for partition (ir/Partition.h). Shared by every
+// Lowerer of one design, like ClassIds: the globals Lowerer registers the static
+// units, each top's Collect pass registers its instance bodies, and every
+// Lowerer attributes the functions and unscoped signals it creates.
+struct UnitOwners {
+    ir::Attribution attribution;
+    // An instance body, package or compilation unit, and the hierarchical-path
+    // prefix its members' import names drop ("top.u." for an instance; nothing
+    // for a package, whose members keep their `pkg::` qualification).
+    struct Entry {
+        ir::Owner   owner;
+        std::string strip;
+    };
+    ankerl::unordered_dense::map<const slang::ast::Scope*, Entry> scopes;
+    // Import names already given, keyed "<owner kind>:<owner index>:<name>",
+    // with how many times (own_function).
+    ankerl::unordered_dense::map<std::string, uint32_t> names;
+    // Specializations (note_specialization). Dense ids, minted per canonical
+    // body; an instance scope records its id and whether its body is a
+    // duplicate slang did not visit; a (parent specialization, child ordinal)
+    // pair names the specialization of that child.
+    struct Spec {
+        uint32_t spec      = 0;
+        bool     duplicate = false;
+    };
+    ankerl::unordered_dense::map<const slang::ast::InstanceBodySymbol*, uint32_t> body_specs;
+    ankerl::unordered_dense::map<uint32_t, Spec>                                  scope_specs;
+    ankerl::unordered_dense::map<uint64_t, uint32_t>                              child_specs;
+
+    uint32_t body_spec(const slang::ast::InstanceBodySymbol& body) {
+        return body_specs.try_emplace(&body, static_cast<uint32_t>(body_specs.size())).first->second;
+    }
+};
+
 // Design-wide registry backing virtual interfaces (LRM 25.9).
 //
 // slang resolves `vif.sig` against a PLACEHOLDER instance body it caches once per
@@ -1051,6 +1086,16 @@ public:
     // one interface method name one index, whichever Lowerer sees it first.
     void set_iface_ids(IfaceIds* ids) {
         iface_ids_ = ids;
+    }
+
+    // Point this Lowerer at the design-wide unit ownership record (UnitOwners).
+    void set_unit_owners(UnitOwners* owners) {
+        owners_ = owners;
+    }
+
+    // The record, for lower_design to hand to partition.
+    const UnitOwners& unit_owners() const {
+        return *owners_;
     }
 
     // Point this Lowerer at the design-wide virtual interface registry. `defs`
@@ -1733,6 +1778,62 @@ private:
                                  uint16_t      strength       = 0x0303,
                                  bool          program_driver = false);
 
+    // The net symbol of each aliasing inout port -> the instance that declares
+    // the port and the port's name there (alias_syms_).
+    struct AliasSymbol {
+        uint32_t    scope = 0;
+        std::string port;
+    };
+
+    // A driver of `net` that goes through an aliasing port of the current
+    // instance: the port, or null when the lvalue is anything else. Only a
+    // whole integral net or a constant packed range of one qualifies; the
+    // other shapes keep storing through the port directly (and fail loudly if
+    // the net resolves, as they always have).
+    const AliasSymbol* contribution_port(const Expression& left);
+
+    // The aliasing port of the current instance that `net` is reached through, if
+    // the whole net is one a driver can contribute to (a whole integral net).
+    const AliasSymbol* contribution_port(const ValueSymbol& net);
+
+    // The net a driver stages through a slot or a contribution: the resolved
+    // net of `left`, or the net behind its aliasing port.
+    std::optional<ir::Signal> driver_net_of(const Expression& left);
+
+    // The signal one driver of `net` stores into: a contribution of the
+    // current instance when `left` goes through an aliasing port, else a
+    // fresh driver slot (alloc_driver_slot).
+    ir::Signal driver_slot(ir::Signal        net,
+                           const Expression& left,
+                           ir::SourceLoc     l,
+                           uint16_t          strength       = 0x0303,
+                           bool              program_driver = false);
+
+    // driver_slot for a driver already known to go through `port` (null: a fresh
+    // slot).
+    ir::Signal driver_slot_via(const AliasSymbol* port,
+                               ir::Signal         net,
+                               ir::SourceLoc      l,
+                               uint16_t           strength       = 0x0303,
+                               bool               program_driver = false);
+
+    // Make a contribution of the instance `depth` levels down scope_stack_,
+    // bound as Attribution::Contribution says, and return the signal its body
+    // stores through.
+    ir::Signal contribute(size_t            depth,
+                          const std::string& port,
+                          ir::Signal        net,
+                          ir::SourceLoc     l,
+                          uint16_t          strength,
+                          bool              program_driver);
+
+    // alloc_driver_slot for a slot that belongs to instance `scope`.
+    ir::Signal alloc_slot_in(uint32_t scope, ir::Signal net, ir::SourceLoc l, uint16_t strength, bool program_driver);
+
+    ir::InstanceScope* scope_node(uint32_t id);
+
+    ir::Signal register_signal_in(ir::InstanceScope& node, ir::SignalInfo info);
+
     ir::Ref def_constant_ref(uint32_t width, bool one);
 
     ir::Ref z_constant_ref(uint32_t width);
@@ -2287,6 +2388,10 @@ private:
     void scan_assert_control(const ProceduralBlockSymbol& blk);
 
     void scan_disable_targets(const ProceduralBlockSymbol& blk);
+
+    void register_disable_target(const Symbol* t, bool remote);
+
+    void join_disable_targets();
 
     bool hard_park(const Statement& body, bool forked_children_are_occupants = false);
 
@@ -4809,6 +4914,30 @@ private:
 
     ir::FunctionId vif_function_id(const SubroutineSymbol& ph_sub);
 
+    // Register the unit an instance body, package or compilation unit declares,
+    // with the path prefix its members' import names drop (UnitOwners).
+    void own_scope(const slang::ast::Scope& scope, ir::Owner owner, std::string strip);
+    // Record the specialization `inst` elaborates (UnitOwners::Spec), from
+    // Collect, once its scope is numbered and before it joins its parent.
+    void note_specialization(const slang::ast::InstanceSymbol& inst, uint32_t scope);
+    // The unit a symbol declared in `scope` belongs to: the nearest enclosing
+    // registered scope's, else the glue unit's.
+    const UnitOwners::Entry& owner_in(const slang::ast::Scope* scope) const;
+    // `decl`'s hierarchical path relative to the unit declaring it: the name
+    // another unit imports it by.
+    std::string import_name(const slang::ast::Symbol& decl) const;
+    // Attribute function `id` to the unit declaring `decl`, importable as
+    // `decl`'s path relative to that unit followed by `suffix`.
+    void own_function(ir::FunctionId id, const slang::ast::Symbol& decl, std::string_view suffix = {});
+    // Attribute function `id` to `owner`, importable as `name`.
+    void record_function(ir::FunctionId id, ir::Owner owner, std::string name);
+    // Attribute an unscoped signal to a unit (UnitOwners).
+    void own_signal(ir::Signal sig, ir::Owner owner);
+
+    // Append a process to the module, attributing a scope-less one to the unit
+    // of the top this Lowerer lowers (UnitOwners).
+    void add_process(ir::Process p);
+
     ir::FunctionId function_id(const SubroutineSymbol& sub);
 
     // The return type `sub`'s function is reserved with: void for a task and a void
@@ -5225,6 +5354,29 @@ private:
     // beside the live signal it shadows, wherever that actually is, rather
     // than wherever the asserting scope happens to be.
     ankerl::unordered_dense::map<uint32_t, uint32_t> signal_scope_;
+    // InstanceScope::id -> the flat signal-name prefix of that instance.
+    ankerl::unordered_dense::map<uint32_t, std::string> scope_prefix_;
+    // InstanceScope::id -> each aliasing port's target signal -> the port's
+    // name in that instance (build_inout_aliases), for a contribution to find
+    // the port of its parent that re-exports it (contribute).
+    ankerl::unordered_dense::map<uint32_t, ankerl::unordered_dense::map<uint32_t, std::string>> alias_ports_;
+    // A continuous driver naming such a symbol from its own instance drives
+    // through the port (contribute).
+    ankerl::unordered_dense::map<const Symbol*, AliasSymbol> alias_syms_;
+    // "<InstanceScope::id>|<port>" -> contributions that instance has made
+    // through the port (contribute).
+    ankerl::unordered_dense::map<std::string, uint32_t> contribution_ordinals_;
+    // (InstanceScope::id << 32 | net) -> driver slots that instance has made for
+    // the net (alloc_driver_slot).
+    ankerl::unordered_dense::map<uint64_t, uint32_t> scope_slots_;
+    // Interface ports bound to an interface instance, as Collect meets them;
+    // lower_top resolves each instance to its scope (ir::Attribution::iface_ports).
+    struct PendingIfacePort {
+        uint32_t                              scope = 0;
+        std::string                           port;
+        const slang::ast::InstanceBodySymbol* body = nullptr;
+    };
+    std::vector<PendingIfacePort> iface_ports_;
 
     // Scope id of the instance currently being lowered, for Process::scope;
     // no_scope outside any instance (the package/$unit Lowerer).
@@ -5284,6 +5436,10 @@ private:
     // module get L0 and L1) — the remote form needs no separate instance
     // dimension.
     ankerl::unordered_dense::map<const Symbol*, uint32_t> disable_targets_;
+    // The instance bodies of each specialization this Lowerer collected, in
+    // collection order (note_specialization); join_disable_targets finds a
+    // target's twins in them.
+    ankerl::unordered_dense::map<uint32_t, std::vector<const slang::ast::InstanceBodySymbol*>> spec_bodies_;
     // The subset some `disable` names from OUTSIDE the target — a sibling block or
     // another process. Only these carry the occupant bookkeeping the remote form
     // needs, so a V1-shaped design pays exactly what it did before.
@@ -5591,6 +5747,14 @@ private:
     // lower_compilation shares one registry across every top, like ClassIds.
     IfaceIds  own_iface_ids_;
     IfaceIds* iface_ids_ = &own_iface_ids_;
+    // Unit ownership (UnitOwners). Owned so a standalone Lowerer works;
+    // lower_compilation shares one across every Lowerer.
+    UnitOwners  own_owners_;
+    UnitOwners* owners_ = &own_owners_;
+    // The unit a scope-less process this Lowerer creates belongs to: its top's,
+    // once Collect has numbered the top scope; the glue unit's for the globals
+    // Lowerer.
+    ir::Owner process_owner_{ .kind = ir::Owner::Kind::Glue };
     // Design-wide virtual interface registry (see VifDefs). Owned here so a
     // standalone Lowerer works; lower_compilation shares one across every top.
     VifDefs  own_vif_defs_;

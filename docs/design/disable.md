@@ -280,6 +280,13 @@ that `Symbol*` identity does not distinguish instances was wrong, and load-beari
 it is why the design reached for the per-instance anchored-array shape `proc_sched`
 uses. Nothing anchored is needed.
 
+Whether a block is a remote target is joined over its specialization
+(`join_disable_targets`): if a `disable` names it from outside its instance,
+the same block in every instance of that specialization gets an id and the
+occupant bookkeeping too, because instances share code and so must share its
+shape. Each instance's id is still its own, so `disable u1.blk` leaves `u2.blk`
+alone; the other instances only pay for the bookkeeping they never use.
+
 One flat array indexed by target id does it: `@clotho.disable.head[t]`, the head of
 the list of activations currently inside that block, or currently running that task.
 An activation links a frame-resident node when it enters the target and unlinks it

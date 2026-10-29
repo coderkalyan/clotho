@@ -506,6 +506,8 @@ target_compile_options(clotho_runtime PRIVATE
 add_library(clotho_ir_core STATIC
   src/ir/InternPool.cpp
   src/ir/Ir.cpp
+  src/ir/Design.cpp
+  src/ir/Partition.cpp
   src/ir/Builder.cpp
   src/ir/Printer.cpp
   src/ir/Typing.cpp
@@ -1028,6 +1030,7 @@ set(CLOTHO_TEST_SOURCES
   tests/coverage_test.cpp
   tests/ir_test.cpp
   tests/verify_test.cpp
+  tests/design_test.cpp
   tests/operands_test.cpp
   tests/sourcemap_test.cpp
   tests/lower_test.cpp

@@ -43,6 +43,9 @@ enum class Stat : uint32_t {
     // Parallel compile: per-module optimize time, the serial sum, and the
     // speedup ceiling. `run` only.
     Parallel = 1u << 4,
+    // Frontend units: how many instances each specialization has, and which
+    // specializations' instances do not yet lower to identical unit IR.
+    Units = 1u << 5,
 };
 
 [[nodiscard]] inline bool stat_on(uint32_t stats, Stat s) {

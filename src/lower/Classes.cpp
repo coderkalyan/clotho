@@ -779,6 +779,7 @@ ir::FunctionId Lowerer::pure_stub_id(const slang::ast::MethodPrototypeSymbol& pr
       proto.getReturnType().isVoid() ? module_.pool.void_type : lower_type(proto.getReturnType());
     const ir::FunctionId id = module_.reserve_function(return_type);
     pure_stub_[&proto]      = id;
+    own_function(id, proto, ".pure");
     build_pure_stub(proto, id);
     return id;
 }
@@ -1131,6 +1132,7 @@ ir::FunctionId Lowerer::copy_thunk_id(const slang::ast::ClassType& clt, ir::Ref 
     }
     const ir::FunctionId id = module_.reserve_function(class_ref);
     copy_thunk_[&clt]       = id;
+    own_function(id, clt, ".copy");
     build_copy_thunk(clt, class_ref, id);
     return id;
 }

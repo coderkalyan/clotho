@@ -6,14 +6,15 @@
 // handles to names / types and holds the lowered processes together.
 //
 // Ownership: a Module owns the InternPool shared by every process it holds, so
-// each Process's `Ir.pool()` stays valid for the module's lifetime. The pool
-// (and thus the Module) is non-movable, so a Module is the owning root,
+// each Process's `Ir.pool()` stays valid for the module's lifetime. The pool is
+// heap-held and the Module non-movable, so a Module is the owning root,
 // typically held behind a unique_ptr by the front-end.
 
 #include <array>
 #include <cassert>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -71,6 +72,8 @@ struct SignalInfo {
     // bytes into its state field's static initializer and skips the power-on
     // fill, so materializing a table costs no instructions at any point.
     Ref const_data = Ref::Invalid;
+
+    bool operator==(const SignalInfo&) const = default;
 };
 
 // One elaborated instance in the design hierarchy. The frontend flattens every
@@ -204,6 +207,8 @@ struct WaitEvent {
     // naming which member -- and this says which instance is actually waited on.
     // kNoWaitHandle otherwise. Mutually exclusive with `handle`.
     Index inst = kNoWaitHandle;
+
+    bool operator==(const WaitEvent&) const = default;
 };
 
 // One lowered process plus the metadata the IR body itself does not carry: how
@@ -289,6 +294,8 @@ struct Process {
     // instance (a per-top PreInit pass, package/$unit lowering).
     static constexpr uint32_t no_scope = ~0u;
     uint32_t scope = no_scope;
+
+    bool operator==(const Process&) const = default;
 };
 
 
@@ -664,6 +671,8 @@ struct Function {
     SourceSpan span;
     // The lowered body.
     Ir ir;
+
+    bool operator==(const Function&) const = default;
 };
 
 // An `export "DPI-C"` directive (LRM 35.5 / 35.8): a SystemVerilog function or
@@ -826,10 +835,23 @@ struct ChangeNotify {
 };
 
 class Module {
+    // Owner of `pool`. Declared first so it is constructed before the reference.
+    std::unique_ptr<InternPool> pool_owner_;
+
 public:
+    Module()
+      : Module(std::make_unique<InternPool>()) {}
+    // Adopt the pool an already-built IR references (flatten hands over its
+    // Design's).
+    explicit Module(std::unique_ptr<InternPool> pool)
+      : pool_owner_(std::move(pool))
+      , pool(*pool_owner_) {}
+    Module(const Module&)            = delete;
+    Module& operator=(const Module&) = delete;
+
     // Shared intern pool backing every process's constant / type handles. Owned
     // here so all processes outlive their pool reference.
-    InternPool pool;
+    InternPool& pool;
     // DPI-C exports (LRM 35.5): SV functions exposed as C-callable thunks.
     std::vector<DpiExport> dpi_exports;
     // Compiled concurrent assertions (LRM 16). Indexed by the monitor id a
@@ -1066,6 +1088,27 @@ public:
             }
         }
         return nullptr;
+    }
+
+    // Every interface class bitmap bit, in registration order.
+    [[nodiscard]] std::span<const std::pair<Ref, uint32_t>> iface_type_ids() const {
+        return iface_type_ids_;
+    }
+
+    // Every Ref registered as the built-in `process` class, in registration order.
+    [[nodiscard]] std::span<const Ref> process_classes() const {
+        return process_classes_;
+    }
+
+    // Every waited-on class property's notifiers.
+    [[nodiscard]] std::span<const ChangeNotify> change_notifies() const {
+        return change_notifies_;
+    }
+
+    // Hand the pool to a new owner, as partition does once it has copied every
+    // body out. The module must not be used afterwards except to be destroyed.
+    [[nodiscard]] std::unique_ptr<InternPool> release_pool() {
+        return std::move(pool_owner_);
     }
 
 private:

@@ -1187,3 +1187,71 @@ TEST_CASE("virtual interface: struct-member and whole-queue writes to twin insta
     )");
     CHECK(out == "b0 7 1 b1 8 1\n");
 }
+
+// Instances of one definition bound to different interface instances, nets and
+// events, through a parent's own port too: each instance reaches what its own
+// parent binds (LRM 23.3.3, 25.3), however many instances share the body.
+TEST_CASE("ports: instances of one definition reach what their own parents bind") {
+    const std::string out = run_capture(R"(
+        interface bus_if;
+            logic [7:0] data;
+            logic       valid;
+            modport s(input data, input valid);
+            task automatic put(input logic [7:0] d);
+                data  = d;
+                valid = 1;
+            endtask
+        endinterface
+        module consumer(bus_if.s b, output logic [7:0] seen);
+            always @(b.data) seen = b.data + 1;
+        endmodule
+        module producer(bus_if b, input logic [7:0] base);
+            virtual bus_if vb;
+            initial begin
+                vb = b;
+                #1 b.put(base);
+                #1 vb.data = base + 8'd2;
+            end
+        endmodule
+        module pair(bus_if b, input logic [7:0] base, output logic [7:0] seen);
+            producer p(.b(b), .base(base));
+            consumer c(.b(b), .seen(seen));
+        endmodule
+        module leafio(inout wire [7:0] io, input logic [7:0] v, input logic en);
+            assign io = en ? v : 8'bz;
+        endmodule
+        module midio(inout wire [7:0] io, input logic [7:0] v, input logic en);
+            leafio l(.io(io), .v(v), .en(en));
+        endmodule
+        module evp(ref event e, output int n);
+            initial n = 0;
+            always @(e) n = n + 1;
+        endmodule
+        module top;
+            bus_if b0();
+            bus_if b1();
+            logic [7:0] s0, s1;
+            pair p0(.b(b0), .base(8'd10), .seen(s0));
+            pair p1(.b(b1), .base(8'd40), .seen(s1));
+            wire [7:0] w0, w1;
+            logic e0 = 1, e1 = 0;
+            midio m0(.io(w0), .v(8'd5), .en(e0));
+            midio m1(.io(w1), .v(8'd6), .en(e1));
+            midio m2(.io(w1), .v(8'd7), .en(e0));
+            event x0, x1;
+            int n0, n1;
+            evp v0(.e(x0), .n(n0));
+            evp v1(.e(x1), .n(n1));
+            initial begin
+                #3;
+                $display("s0=%0d s1=%0d b0=%0d/%0b b1=%0d/%0b", s0, s1, b0.data, b0.valid, b1.data, b1.valid);
+                $display("w0=%0d w1=%0d", w0, w1);
+                ->x0;
+                #1 ->x0;
+                ->x1;
+                #1 $display("n0=%0d n1=%0d", n0, n1);
+            end
+        endmodule
+    )");
+    CHECK(out == "s0=13 s1=43 b0=12/1 b1=42/1\nw0=5 w1=7\nn0=2 n1=1\n");
+}

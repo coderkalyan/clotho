@@ -862,6 +862,34 @@ TEST_CASE("a remote disable reaches one instance's block, not the definition's")
     )") == "m.u1 after at 5\nm.u2.blk never\nm.u2 after at 100\n");
 }
 
+// LRM 9.6.2: `disable u1.blk` ends the activity of that block in u1 at once and
+// leaves u2's copy of the same block running. Both instances share one body, so
+// both lower the block as a target; only u1's id is disabled. A second disable
+// later stops u2 on its own.
+TEST_CASE("disabling a block of one instance leaves the other instance's copy running") {
+    CHECK(run_capture(R"(
+        module counter(output int n);
+            initial n = 0;
+            initial begin : blk
+                repeat (6) begin
+                    #10 n = n + 1;
+                end
+            end
+        endmodule
+        module top;
+            int n0, n1;
+            counter u1(n0);
+            counter u2(n1);
+            initial begin
+                #25 disable u1.blk;
+                #10 $display("t=%0t n0=%0d n1=%0d", $time, n0, n1);
+                #10 disable u2.blk;
+                #50 $display("t=%0t n0=%0d n1=%0d", $time, n0, n1);
+            end
+        endmodule
+    )") == "t=35 n0=2 n1=3\nt=95 n0=2 n1=4\n");
+}
+
 // LRM 16.4.4: disabling the outermost scope of a procedure DROPS its pending
 // deferred reports — "cancelled", "cleared", never reported (docs/LRM_NOTES.md, note 22). The
 // exit carries the same generation bump an activation start does, so the queued

@@ -287,7 +287,7 @@ Index Builder::member_select(Index base, uint32_t field_index, Ref struct_type, 
 Index Builder::iface_ref(uint32_t scope, SourceLoc loc) {
     const ExtraIndex extra = add_extra(IfaceInst{ scope });
 
-    return emit({ Inst::Tag::IfaceRef, Inst::Payload{ .extra = extra } }, loc);
+    return emit({ Inst::Tag::IfaceRef, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
 Index Builder::iface_signal(Index handle, Signal rep, SourceLoc loc) {
@@ -297,7 +297,7 @@ Index Builder::iface_signal(Index handle, Signal rep, SourceLoc loc) {
 }
 
 Index Builder::class_new(Ref class_type, SourceLoc loc) {
-    return emit({ Inst::Tag::ClassNew, Inst::Payload{ .ref = class_type } }, loc);
+    return emit({ Inst::Tag::ClassNew, pay(&Inst::Payload::ref, class_type) }, loc);
 }
 
 Index Builder::handle_deref(Index handle, Ref class_type, SourceLoc loc) {
@@ -590,11 +590,11 @@ Index Builder::defer_flush(uint32_t target, SourceLoc loc) {
 }
 
 Index Builder::disable_abort(SourceLoc loc) {
-    return emit({ Inst::Tag::DisableAbort, Inst::Payload{ .none = 0 } }, loc);
+    return emit({ Inst::Tag::DisableAbort, pay(&Inst::Payload::none, 0u) }, loc);
 }
 
 Index Builder::program_exit(SourceLoc loc) {
-    return emit({ Inst::Tag::ProgramExit, Inst::Payload{ .none = 0 } }, loc);
+    return emit({ Inst::Tag::ProgramExit, pay(&Inst::Payload::none, 0u) }, loc);
 }
 
 Index Builder::str_putc(Index str, Index index, Index ch, SourceLoc loc) {

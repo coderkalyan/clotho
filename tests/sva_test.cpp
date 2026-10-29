@@ -1275,7 +1275,7 @@ endmodule
 )", r);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     const ir::Process& p = monitor_process(m);
-    CHECK(touches(m, p, "sva.shadow.dif.v"));
+    CHECK(touches(m, p, "dif.sva.shadow.v"));
     CHECK_FALSE(touches(m, p, "dif.v"));
 }
 
@@ -1759,13 +1759,18 @@ namespace {
 size_t shadow_count(const ir::Module& m) {
     size_t n = 0;
     for (const ir::SignalInfo& s : m.signals()) {
-        n += s.name.starts_with("sva.shadow.") ? 1 : 0;
+        n += s.name.find("sva.shadow.") != std::string::npos ? 1 : 0;
     }
     return n;
 }
 
+// A shadow is named under the instance declaring the variable it samples:
+// `s.a` is shadowed by `s.sva.shadow.a`.
 bool has_shadow(const ir::Module& m, std::string_view live) {
-    const std::string want = "sva.shadow." + std::string(live);
+    const size_t      dot  = live.rfind('.');
+    const std::string want = dot == std::string_view::npos ? "sva.shadow." + std::string(live)
+                                                           : std::string(live.substr(0, dot + 1)) + "sva.shadow." +
+                                                               std::string(live.substr(dot + 1));
     for (const ir::SignalInfo& s : m.signals()) {
         if (s.name == want) {
             return true;

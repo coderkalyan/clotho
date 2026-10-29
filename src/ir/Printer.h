@@ -9,6 +9,7 @@
 #include <ostream>
 #include <string>
 
+#include "Design.h"
 #include "Ir.h"
 #include "Module.h"
 
@@ -33,5 +34,11 @@ void print_module(const Module& m, std::ostream& os, const LocResolver& resolve 
 
 // Render a module to a string.
 std::string toString(const Module& m);
+
+// Render one unit of a design: its imports, interface-instance references,
+// child slots, signal, target, function and process tables. Handles print as
+// the unit's own (`s<n>` is the unit's signal n), so two instances of one
+// specialization print identically once their units are identical.
+void print_unit(const Design& d, UnitId id, std::ostream& os);
 
 } // namespace clotho::ir

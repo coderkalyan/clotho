@@ -939,11 +939,20 @@ ir::FunctionId Lowerer::vif_function_id(const SubroutineSymbol& ph_sub) {
         for (const auto& [sym, sig] : inst.syms) {
             sigmap_.emplace(sym, sig);
         }
+
         const Restore<std::optional<ir::Signal>> ctx(vif_build_ctx_, inst.syms.begin()->second);
         const Restore<const Scope*> scope(scope_, inst.body);
         const auto&                 rep = rep_sym->as<SubroutineSymbol>();
         const ir::FunctionId                     id  = module_.reserve_function(subroutine_return_type(rep));
         vif_fnmap_[&ph_sub]                          = id;
+        // A second body of the representative's subroutine, beside the one its
+        // own direct calls use. It serves every instance through the handle,
+        // so it belongs to no one instance's unit: the glue unit holds it,
+        // under the subroutine's full path.
+        // TODO: the interface's unit, reaching members through Representative
+        // imports, once units are compiled on their own (modular-compilation.md
+        // step 3).
+        record_function(id, ir::Owner{ .kind = ir::Owner::Kind::Glue }, rep_sym->getHierarchicalPath() + ".vif");
         if (rep.subroutineKind == SubroutineKind::Task) {
             build_task(rep, id);
         } else {
@@ -980,6 +989,7 @@ ir::FunctionId Lowerer::function_id(const SubroutineSymbol& sub) {
     if (sub.flags.has(MethodFlags::DPIImport)) {
         const ir::FunctionId id = module_.reserve_function(subroutine_return_type(sub));
         fnmap_[&sub]            = id;
+        own_function(id, sub);
         build_dpi_import(sub, id);
         return id;
     }
@@ -993,6 +1003,7 @@ ir::FunctionId Lowerer::function_id(const SubroutineSymbol& sub) {
 
     const ir::FunctionId id = module_.reserve_function(subroutine_return_type(sub));
     fnmap_[&sub]            = id;
+    own_function(id, sub);
     if (defer_bodies_) {
         // Reserved, not built: we are inside lowering a TYPE (compute_vtable), and
         // a body reaches arbitrary code -- another class still laying itself out,
