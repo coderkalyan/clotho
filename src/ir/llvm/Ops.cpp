@@ -451,18 +451,56 @@ Plane Backend::lower_real_compare(Inst::Tag tag, Plane a, Plane b) {
 
 // Float -> integral. FtoI rounds half away from zero (LRM 6.12.1, the
 // assignment / cast conversion); FtoITrunc truncates toward zero ($rtoi,
-// LRM 20.5). Both go through a saturating signed 64-bit intermediate:
-// fptosi.sat avoids poison on out-of-range / NaN inputs (behavior the LRM
-// leaves undefined), and the final width cast wraps like an integer
-// assignment.
+// LRM 20.5). The rounded real is an integer, and what the target gets is that
+// integer cut to its width (LRM 10.7: the MSBs are discarded) and read in its
+// signedness, so a value above 2**63 is exact in a 64-bit unsigned or an 80-bit
+// target and keeps its low bits in a narrower one.
+//
+// |r| < 2**63 (and NaN / infinity, which have no integer value and keep the
+// saturating i64 answer) goes through fptosi.sat, which avoids poison on
+// out-of-range / NaN input; only a finite larger magnitude takes the cold block
+// below, which shifts the 53-bit mantissa by the exponent in the target's width.
 Plane Backend::lower_ftoi(Inst::Tag tag, Plane v, ValType to) {
     llvm::Value* f = fp_of(v);
     if (tag == Inst::Tag::FtoI) {
         f = b_.CreateUnaryIntrinsic(llvm::Intrinsic::round, f);
     }
-    llvm::Value* wide = b_.CreateIntrinsic(llvm::Intrinsic::fptosi_sat, { int_ty(64), f->getType() }, { f });
-    llvm::Value* r    = cast(wide, to.width, true);
-    return packed(r, r, zero(to.width));
+    llvm::Value* sat  = b_.CreateIntrinsic(llvm::Intrinsic::fptosi_sat, { int_ty(64), f->getType() }, { f });
+    llvm::Value* fast = cast(sat, to.width, true);
+
+    llvm::Value* mag   = b_.CreateUnaryIntrinsic(llvm::Intrinsic::fabs, f);
+    llvm::Value* limit = llvm::ConstantFP::get(f->getType(), 9223372036854775808.0);
+    llvm::Value* inf   = llvm::ConstantFP::getInfinity(f->getType());
+    llvm::Value* big   = b_.CreateAnd(b_.CreateFCmpOGE(mag, limit), b_.CreateFCmpOLT(mag, inf));
+
+    auto* fn     = b_.GetInsertBlock()->getParent();
+    auto* entry  = b_.GetInsertBlock();
+    auto* bigbb  = llvm::BasicBlock::Create(ctx_, "ftoi.big", fn);
+    auto* contbb = llvm::BasicBlock::Create(ctx_, "ftoi.cont", fn);
+    b_.CreateCondBr(big, bigbb, contbb);
+
+    b_.SetInsertPoint(bigbb);
+    // r = (-1)^sign * mant * 2^e with mant < 2**53 and e >= 11 here.
+    llvm::Value* d     = f->getType()->isDoubleTy() ? f : b_.CreateFPExt(f, b_.getDoubleTy());
+    llvm::Value* bits  = b_.CreateBitCast(d, b_.getInt64Ty());
+    llvm::Value* expo  = b_.CreateAnd(b_.CreateLShr(bits, 52), b_.getInt64(0x7ff));
+    llvm::Value* mant  = b_.CreateOr(b_.CreateAnd(bits, b_.getInt64((uint64_t{ 1 } << 52) - 1)),
+                                     b_.getInt64(uint64_t{ 1 } << 52));
+    llvm::Value* e     = b_.CreateSub(expo, b_.getInt64(1075));
+    const uint32_t wc  = std::max(to.width, 64u);
+    llvm::Value* ovf   = b_.CreateICmpUGE(e, b_.getInt64(wc)); // every bit shifted out
+    llvm::Value* samt  = cast(b_.CreateSelect(ovf, b_.getInt64(0), e), wc, false);
+    llvm::Value* mag_i = b_.CreateSelect(ovf, zero(wc), b_.CreateShl(cast(mant, wc, false), samt));
+    llvm::Value* neg   = b_.CreateICmpSLT(bits, b_.getInt64(0));
+    llvm::Value* exact = b_.CreateSelect(neg, b_.CreateNeg(mag_i), mag_i);
+    llvm::Value* bigv  = cast(exact, to.width, false);
+    b_.CreateBr(contbb);
+
+    b_.SetInsertPoint(contbb);
+    auto* phi = b_.CreatePHI(int_ty(to.width), 2);
+    phi->addIncoming(fast, entry);
+    phi->addIncoming(bigv, bigbb);
+    return packed(phi, phi, zero(to.width));
 }
 
 // Mux with real alternatives. Definite condition selects normally; an

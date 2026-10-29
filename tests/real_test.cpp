@@ -119,6 +119,48 @@ TEST_CASE("real to integral conversion rounds half away from zero") {
     CHECK(out == "3\n-2\n35\n254\n9\n");
 }
 
+TEST_CASE("real to integral conversion is exact at the target's width and signedness (LRM 6.12.1)") {
+    // The real is rounded to the nearest integer, ties away from zero, and that
+    // integer is assigned to the target: a value the target holds is exact (an
+    // unsigned 64-bit above 2**63, an 80-bit signed), and one it does not keeps
+    // its low bits (10.7). Expected values are the exact integers (iverilog gives
+    // the same for the in-range ones).
+    const std::string out = run_capture(R"(
+        module t;
+            real                r;
+            longint unsigned    u64;
+            longint             s64;
+            logic [63:0]        l64;
+            logic [79:0]        l80;
+            logic signed [79:0] s80;
+            integer             i32;
+            initial begin
+                r = 1.5e19;  u64 = r;  $display("%0d", u64);
+                r = 9223372036854775808.0; u64 = r; $display("%0d", u64);
+                r = 1e20;    l64 = r;  $display("%0d", l64);
+                l80 = r;               $display("%0d", l80);
+                r = -1e20;   s80 = r;  $display("%0d", s80);
+                l80 = r;               $display("%0d", l80);
+                r = -1e19;   s64 = r;  $display("%0d", s64);
+                i32 = $rtoi(r * 10.0); $display("%0d", i32);
+                r = 2.5;     s64 = r;  $display("%0d", s64);
+                r = -2.5;    s80 = r;  $display("%0d", s80);
+            end
+        endmodule
+    )");
+    CHECK(out ==
+          "15000000000000000000\n"
+          "9223372036854775808\n"
+          "7766279631452241920\n"
+          "100000000000000000000\n"
+          "-100000000000000000000\n"
+          "1208825819614629174706176\n"
+          "8446744073709551616\n"
+          "-1661992960\n"
+          "3\n"
+          "-3\n");
+}
+
 TEST_CASE("real comparisons and logical contexts are definite") {
     const std::string out = run_capture(R"(
         module t;
