@@ -12,6 +12,8 @@ using namespace rt_internal;
 
 namespace rt_internal {
 
+TimeFormat timeformat;
+
 // Render a tick-valued time `ticks` per the current $timeformat, appending the
 // unpadded number + suffix to `out` (LRM §20.4.3). The tick value scales to
 // femtoseconds, then to the display unit (10^units s); since fs = 10^-15 s, a

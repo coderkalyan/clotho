@@ -101,7 +101,11 @@ struct TimeFormat {
     std::string suffix;
 };
 
-inline TimeFormat timeformat;
+// NOTE: Globals with a non-trivial destructor are declared `extern` here and
+// defined in one .cpp. As `inline` variables, clang guards their initialization
+// with __cxa_guard_acquire, which an executable's runtime does not link (no C++
+// library; docs/design/executables.md).
+extern TimeFormat timeformat;
 
 void render_time(std::string& out, uint64_t ticks);
 
@@ -181,7 +185,7 @@ inline std::array<std::FILE*, 31> mcd_channels{};
 
 // FD streams indexed by (descriptor & ~kFdBit); [0]/[1]/[2] are stdin/stdout/
 // stderr. A closed slot holds nullptr and is reused before the vector grows.
-inline std::vector<std::FILE*> fd_streams;
+extern std::vector<std::FILE*> fd_streams;
 
 void io_ensure_init();
 
@@ -313,13 +317,13 @@ struct MonitorState {
     bool        primed  = false;
     std::string last;
 };
-inline MonitorState g_monitor;
+extern MonitorState g_monitor;
 
 // FIFO queue of ramped-but-not-yet-resumed $strobe coroutine handles for the
 // current time step (LRM 21.2.2). One growable buffer reused across
 // instants: rt_strobe_pop advances a read cursor and only clears (never
 // deallocates) once fully drained, so steady-state $strobe use allocates once.
-inline std::vector<void*> g_strobe_queue;
+extern std::vector<void*> g_strobe_queue;
 inline size_t             g_strobe_read = 0;
 
 inline bool scan_ws(int c) {
@@ -345,7 +349,7 @@ struct ObservedCaseViol {
     uint64_t    now;    // instant the violation occurred (== Observed flush time)
     int32_t     kind;   // 0 = no match, 1 = overlap
 };
-inline std::vector<ObservedCaseViol> g_observed_case;
+extern std::vector<ObservedCaseViol> g_observed_case;
 
 // Set by a fatal severity report: rt_sim_run folds it into the exit status.
 inline bool g_fatal_seen = false;
@@ -357,7 +361,7 @@ std::string severity_line(int32_t level, const char* banner, const char* fmt, ui
 // with the read/write direction folded in, so a read and a write on the same
 // line are counted apart. Scaled rather than bit-packed because a string
 // constant carries no alignment guarantee.
-inline ankerl::unordered_dense::map<uint64_t, uint32_t> g_bounds_hits;
+extern ankerl::unordered_dense::map<uint64_t, uint32_t> g_bounds_hits;
 
 // Whether a sanitizer report may use colour: a terminal that is not `dumb`,
 // with NO_COLOR unset (https://no-color.org). Escape codes in a redirected log
@@ -408,7 +412,7 @@ inline int g_ref_stale_warn = 0;
 // lines buries both the first report and the design's own output. Keyed on the
 // rt_ref_site global's address: the backend emits one per guarded dereference
 // and it is stable for the run. Only ever reached under --loose-stale-ref.
-inline ankerl::unordered_dense::set<const void*> g_ref_stale_seen;
+extern ankerl::unordered_dense::set<const void*> g_ref_stale_seen;
 
 // ---- Checked heap allocation ----
 
@@ -441,7 +445,7 @@ inline uint32_t g_random_seed = 0;
 // The command-line plusarg list (LRM §21.6), threaded from the host before
 // the design runs. Process-global, like g_random_seed above — matches the
 // single-simulator-per-process model.
-inline std::vector<std::string> g_plusargs;
+extern std::vector<std::string> g_plusargs;
 
 size_t shortest_double(char* out, double d);
 
