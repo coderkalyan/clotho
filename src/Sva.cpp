@@ -41,8 +41,8 @@ using slang::ast::ExpressionKind;
 // touch libsva anyway -- rather than at load time in every invocation that never
 // sees one. The function-local static makes that one relaxed load afterwards.
 //
-// Not an assert() either: NDEBUG is set in Release, and a release build silently
-// reading tables through a mismatched ABI is exactly the failure being removed.
+// Not an assert() either: a mismatch is a user-facing build error with its own
+// message, and it must hold even in a build that defines NDEBUG.
 void check_libsva_abi() {
     static const bool ok = [] {
         const uint32_t linked = sva_abi_version();

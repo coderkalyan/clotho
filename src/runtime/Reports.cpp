@@ -93,6 +93,10 @@ constexpr int32_t kSeverityFatal = 3;
 } // namespace
 namespace rt_internal {
 
+std::vector<ObservedCaseViol>                    g_observed_case;
+ankerl::unordered_dense::map<uint64_t, uint32_t> g_bounds_hits;
+ankerl::unordered_dense::set<const void*>        g_ref_stale_seen;
+
 // The line of one severity report (LRM 20.10), newline included:
 // "<LABEL>: <banner> at <time>[: <message>]". LRM 20.10 requires the report to
 // carry the call's location, the hierarchical name of the scope it is made in and

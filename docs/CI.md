@@ -14,11 +14,29 @@ where a platform regression would otherwise escape:
 | trigger | platforms |
 |---|---|
 | push to a feature branch, pull request | linux-x64 |
-| push to `main`, push to a `ci/*` branch, nightly (07:00 UTC), `workflow_dispatch` | all six |
+| push to `main`, push to a `ci/*` branch, nightly (07:00 UTC), `workflow_dispatch` | all six, plus linux-x64-sanitize |
 
 `ci/*` exists because GitHub only offers `workflow_dispatch` for workflows that
 already exist on the default branch — without it there is no way to exercise the
 slower platforms while iterating on CI itself.
+
+## Configurations
+
+Every job builds Release, which keeps `assert()` live as shipped builds do.
+linux-x64 adds `CLOTHO_EXTRA_ASSERTS`, the checks too slow to ship, so every
+push runs them; the other platforms test the shipped configuration.
+linux-x64-sanitize adds `CLOTHO_SANITIZE` (ASan and UBSan) on top of the
+extra asserts.
+
+## sv-tests
+
+Nightly, and on `workflow_dispatch` with `sv_tests` set, the `sv-tests` job runs
+the linux-x64 binary over [sv-tests](https://github.com/chipsalliance/sv-tests)
+with the clotho runner from the `coderkalyan/sv-tests` fork, pinned by
+`SV_TESTS_REF`. `.github/scripts/sv-tests-summary.py` classifies each test as
+pass, crash, timeout, ran (exit 0 but failed: a wrong result or an accepted
+invalid design) or rejected, and fails the job on any crash. The report and
+logs are uploaded as the `sv-tests-report` artifact.
 
 ## The LLVM dependency
 

@@ -210,6 +210,8 @@ Milestones, in order; lower ones unblock higher ones:
   string-literal suffix is accepted.
 - [ ] **Clotho IR dump of a design that calls `$monitor`** — `clotho build --emit ir`
   crashes with a segmentation fault partway through printing.
+- [ ] **Freeing a finished simulation** — frames, events and allocations of processes still
+  suspended when a simulation ends are not freed, so a host running several leaks them.
 
 ### Executables (`clotho build`)
 

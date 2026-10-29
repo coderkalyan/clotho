@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -81,7 +82,8 @@
 //
 // Exit status: 0 success; 1 compile / emission / JIT failure (or, for `lint`, a
 // diagnostic that reached Error); 2 usage error; under `run`, otherwise the
-// simulated design's own status.
+// simulated design's own status. An internal error prints kInternalError and
+// ends the process by its signal.
 
 namespace {
 
@@ -93,6 +95,53 @@ using clotho::ir::SystemAccess;
 // What `--version` prints after "clotho", and what the language and debug
 // servers report to their clients: the release, then the commit it was built from.
 constexpr std::string_view kVersion = CLOTHO_VERSION " (" CLOTHO_GIT_HASH ")";
+
+// A failed assertion, an uncaught exception or a crash anywhere in the process
+// (the compiler, the runtime, or generated code) is a bug in Clotho, never in the
+// design. The user is told so, and where to report it, instead of seeing a bare
+// abort or segfault.
+constexpr std::string_view kInternalError =
+  "\nclotho " CLOTHO_VERSION " (" CLOTHO_GIT_HASH "): internal error.\n"
+  "This is a bug in Clotho, not in your design. Please report it, with the\n"
+  "design that triggered it, at https://github.com/coderkalyan/clotho/issues\n";
+
+// Runs in signal context, so it only writes a fixed string. The handler is
+// installed one-shot, so re-raising ends the process with the original signal and
+// the exit status still names it. A fault re-executes its instruction on return
+// and terminates the same way.
+void print_internal_error(int sig) {
+#ifdef _WIN32
+    _write(2, kInternalError.data(), static_cast<unsigned>(kInternalError.size()));
+    std::signal(sig, SIG_DFL);
+#else
+    (void)!write(STDERR_FILENO, kInternalError.data(), kInternalError.size());
+#endif
+    std::raise(sig);
+}
+
+void install_internal_error_banner() {
+#ifdef _WIN32
+    constexpr int kSignals[] = { SIGABRT, SIGSEGV, SIGILL, SIGFPE };
+    for (int sig : kSignals) {
+        std::signal(sig, print_internal_error);
+    }
+#else
+    constexpr int kSignals[] = { SIGABRT, SIGSEGV, SIGILL, SIGFPE, SIGBUS, SIGTRAP };
+    // A separate stack, so a stack overflow still reaches the handler.
+    static char alt_stack[64 * 1024];
+    stack_t     ss = {};
+    ss.ss_sp       = alt_stack;
+    ss.ss_size     = sizeof(alt_stack);
+    sigaltstack(&ss, nullptr);
+    struct sigaction act = {};
+    act.sa_handler       = print_internal_error;
+    act.sa_flags         = SA_RESETHAND | SA_ONSTACK;
+    sigemptyset(&act.sa_mask);
+    for (int sig : kSignals) {
+        sigaction(sig, &act, nullptr);
+    }
+#endif
+}
 
 enum class Command : uint8_t { Build, Run, Lint, Synth, Lsp, Dap };
 
@@ -1055,6 +1104,8 @@ bool write_artifact(const clotho::LowerResult&                result,
 } // namespace
 
 int main(int argc, char** argv) {
+    install_internal_error_banner();
+
     // Build the option set first: Clotho's, then slang's, on one CommandLine.
     auto                driver = std::make_unique<slang::driver::Driver>();
     Options             options;

@@ -18,6 +18,10 @@ on:
         type: choice
         options: [all, linux-only]
         default: all
+      sv_tests:
+        description: Also run sv-tests (otherwise nightly only)
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -42,6 +46,10 @@ env:
   # still open — this is the minimal fix, not that one).
   ZIG_VERSION: "0.16.0"
   LIBSVA_REF: "0f41ddad8277b1625b51610ac76b1ae25728de08"
+  # sv-tests with the clotho runner, from the coderkalyan/sv-tests fork until
+  # the runner is upstream.
+  SV_TESTS_REPO: "https://github.com/coderkalyan/sv-tests.git"
+  SV_TESTS_REF: "f419de23f5893ca23c06068ca4e1dda2b6e30c0d"
 
 jobs:
   plan:
@@ -54,14 +62,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # `cmake` carries extra configure flags. linux-x64, the job every push
+          # runs, adds the checks too slow to ship; every other platform tests
+          # the shipped configuration. linux-x64-sanitize adds ASan and UBSan.
           cat > all.json <<'JSON'
           [
-            {"name": "linux-x64",     "runner": "ubuntu-24.04",    "shell": "bash"},
+            {"name": "linux-x64",     "runner": "ubuntu-24.04",    "shell": "bash", "cmake": "-DCLOTHO_EXTRA_ASSERTS=ON"},
             {"name": "linux-arm64",   "runner": "ubuntu-24.04-arm", "shell": "bash"},
             {"name": "macos-arm64",   "runner": "macos-15",        "shell": "bash"},
             {"name": "macos-x64",     "runner": "macos-15-intel",  "shell": "bash"},
             {"name": "windows-x64",   "runner": "windows-2025",   "msystem": "CLANG64",    "shell": "msys2 {0}", "zig": "x86_64-windows",  "zig_sha256": "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"},
-            {"name": "windows-arm64", "runner": "windows-11-arm",  "msystem": "CLANGARM64", "shell": "msys2 {0}", "zig": "aarch64-windows", "zig_sha256": "aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef", "experimental": true}
+            {"name": "windows-arm64", "runner": "windows-11-arm",  "msystem": "CLANGARM64", "shell": "msys2 {0}", "zig": "aarch64-windows", "zig_sha256": "aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef", "experimental": true},
+            {"name": "linux-x64-sanitize", "runner": "ubuntu-24.04", "shell": "bash", "cmake": "-DCLOTHO_EXTRA_ASSERTS=ON -DCLOTHO_SANITIZE=ON"}
           ]
           JSON
           # A `ci/`-prefixed branch opts into the full matrix on every push.
@@ -278,12 +290,17 @@ jobs:
             -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
             -DCLOTHO_LSP=ON -DCLOTHO_DAP=ON \
             ${ZIG_EXECUTABLE:+-DZIG_EXECUTABLE=$ZIG_EXECUTABLE} \
-            $launcher
+            $launcher ${{ matrix.cmake }}
 
       - name: Build
         run: cmake --build build --target clotho_test clotho_cli
 
       - name: Test
+        env:
+          # Read only by the sanitizer build. A simulation that ends leaves its
+          # suspended processes' memory allocated, which the in-process suite
+          # reports as leaks (docs/TODO.md); every other finding still fails.
+          ASAN_OPTIONS: detect_leaks=0
         run: |
           set -eu
           # One CTest entry per test file (CMakeLists.txt), run in parallel. Each
@@ -302,6 +319,105 @@ jobs:
           echo "$out"
           [ "$out" = "Hello, world!" ]
 
+      # The sv-tests job below runs this binary rather than building its own.
+      - name: Upload the CLI for sv-tests
+        if: matrix.name == 'linux-x64' && (github.event_name == 'schedule' || inputs.sv_tests)
+        uses: actions/upload-artifact@v4
+        with:
+          name: clotho-linux-x64
+          path: build/clotho
+          retention-days: 1
+
       - name: ccache statistics
         if: always()
         run: ccache --show-stats
+
+  # sv-tests (https://github.com/chipsalliance/sv-tests) against the linux-x64
+  # binary, nightly. Any crash fails the job (docs/VERIFICATION.md); the
+  # summary classifies every other outcome, and the report and logs are kept.
+  sv-tests:
+    name: sv-tests
+    needs: build
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.sv_tests) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: clotho-linux-x64
+          path: clotho-bin
+
+      # The binary's shared libraries come from the same packages the build job
+      # installs. The VeeR generator's configuration script needs the two Perl
+      # modules.
+      - name: Install runtime libraries and headers
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          . /etc/os-release
+          echo "deb http://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME-$LLVM_MAJOR main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-$LLVM_MAJOR-dev liblld-$LLVM_MAJOR-dev libc++-$LLVM_MAJOR-dev \
+            libclang-rt-$LLVM_MAJOR-dev libbit-vector-perl libjson-perl
+          chmod +x clotho-bin/clotho
+          clotho-bin/clotho --version
+
+      - uses: actions/setup-python@v5
+        with:
+          # sv-tests' own CI runs 3.10; its pinned requirements build there.
+          python-version: "3.10"
+
+      - name: Check out sv-tests
+        run: |
+          set -eux
+          git clone "$SV_TESTS_REPO" sv-tests
+          cd sv-tests
+          git checkout "$SV_TESTS_REF"
+          # Test sources only: the tests, the cores, and the two tool
+          # submodules whose test suites generators import.
+          git submodule update --init --recursive --depth 1 \
+            third_party/tests third_party/cores third_party/tools/yosys
+          git submodule update --init --depth 1 third_party/tools/icarus
+          pip install -r conf/requirements.txt
+          # The UVM DPI object includes the IEEE VPI and PLI headers. Ubuntu's
+          # Verilator (5.020) predates veriuser.h, so take Verilator's copies at
+          # a pinned tag; clotho supplies svdpi.h.
+          mkdir -p "$RUNNER_TEMP/vltstd"
+          for h in vpi_user.h sv_vpi_user.h veriuser.h; do
+            curl -fsSL -o "$RUNNER_TEMP/vltstd/$h" \
+              "https://raw.githubusercontent.com/verilator/verilator/v5.050/include/vltstd/$h"
+          done
+
+      - name: Run sv-tests
+        working-directory: sv-tests
+        env:
+          CLOTHO_BIN: ${{ github.workspace }}/clotho-bin/clotho
+        run: |
+          set -eux
+          make clotho-uvm-dpi CLOTHO_SVDPI_DIR="$GITHUB_WORKSPACE/src/runtime" \
+            VPI_INC_DIR="$RUNNER_TEMP/vltstd"
+          make generate-tests -j "$(nproc)"
+          make -j "$(nproc)" RUNNERS_FILTER=clotho report
+
+      - name: Summarize
+        run: |
+          set -o pipefail
+          python3 .github/scripts/sv-tests-summary.py sv-tests/out/report/report.csv \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sv-tests-report
+          path: |
+            sv-tests/out/report/report.csv
+            sv-tests/out/logs/clotho/

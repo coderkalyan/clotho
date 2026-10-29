@@ -74,6 +74,16 @@
 
 #include <ankerl/unordered_dense.h>
 
+// An assertion that resolves a pointer through the heap's metadata (a bitmap scan or
+// a large-object lookup) rather than testing a field. On the allocation, marking and
+// barrier paths those lookups add 21% to the instructions of a collection-bound
+// design, so they are extra asserts; field tests stay live in every build.
+#ifdef CLOTHO_EXTRA_ASSERTS
+#define assert_resolves(expr) assert(expr)
+#else
+#define assert_resolves(expr) ((void)0)
+#endif
+
 namespace {
 
 // -- Geometry -----------------------------------------------------------------
@@ -581,8 +591,8 @@ const rt_gc_map* map_probe(void* handle) {
     return *reinterpret_cast<const rt_gc_map* const*>(slot);
 }
 
-// Split assertions over one map (TigerStyle). Compiles to nothing under
-// NDEBUG, so it is called freely from the marking path.
+// Split assertions over one map (TigerStyle). Field tests only, so they stay live in
+// every build and the marking path calls this freely.
 void assert_map([[maybe_unused]] const rt_gc_map* map) {
     assert(map != nullptr && "every class emits a clotho.classgc constant");
     assert(map->size >= RT_GC_HEADER_BYTES + sizeof(void*) && "header plus vptr at minimum");
@@ -751,8 +761,8 @@ void mark_lines(void* handle, uint64_t size) {
     if (!block_of(reinterpret_cast<uintptr_t>(start), &hit)) {
         // A large object owns its cell and has no line marks; its liveness is the
         // gcword alone and reclaim_large() sweeps it per object.
-        assert(large_start_of(reinterpret_cast<uintptr_t>(start)) == start &&
-               "an object is either block-resident or a large cell");
+        assert_resolves(large_start_of(reinterpret_cast<uintptr_t>(start)) == start &&
+                        "an object is either block-resident or a large cell");
         return;
     }
     const uint64_t off = static_cast<uint64_t>(start - hit.base);
@@ -1197,8 +1207,8 @@ void* alloc_object(rt_gc_mutator* mut, uint64_t size, const rt_gc_map* map) {
     // bitmap resolution rather than the full rt_gc_find_object because generated code
     // stores the vptr only after this returns (ir/llvm/Inst.cpp, lower_inst), so the map half of
     // the pair is asserted at trace time instead.
-    assert(object_start_of(reinterpret_cast<uintptr_t>(handle)) == start);
-    assert(object_start_of(reinterpret_cast<uintptr_t>(start)) == start);
+    assert_resolves(object_start_of(reinterpret_cast<uintptr_t>(handle)) == start);
+    assert_resolves(object_start_of(reinterpret_cast<uintptr_t>(start)) == start);
     return handle;
 }
 
@@ -1230,7 +1240,7 @@ void mark_and_push_forced(void* handle) {
     assert(handle != nullptr);
     // Pair half of the validate-on-allocate assertion in rt_gc_alloc: every handle
     // the marker follows must resolve through the heap's own metadata.
-    assert(rt_gc_find_object(handle) == handle && "traced a handle the heap does not own");
+    assert_resolves(rt_gc_find_object(handle) == handle && "traced a handle the heap does not own");
     uint64_t* w = gcword_ptr(handle);
     // Dedup on "already stamped by THIS collection", which is is_marked_word() minus its
     // spared_by_age() term -- and dropping that term is the whole point of the forced
@@ -1352,7 +1362,7 @@ bool is_container_kind(uint32_t kind) {
 }
 
 // Split assertions over one element descriptor, in the shape assert_map() uses for a
-// trace map. Compiles to nothing under NDEBUG, so the walkers call it freely.
+// trace map. Field tests only, so the walkers call it freely.
 void assert_elem_ops([[maybe_unused]] const rt_elem_ops* ops) {
     assert(ops != nullptr && "every traced element has a descriptor");
     assert(ops->stride > 0 && "an element slot is at least one byte");
@@ -2070,7 +2080,7 @@ uint64_t sweep_finalizable(bool spare_live) {
             // The negative space of publish_hole's conservative flag, and the only thing
             // standing between a bit GENERATED code set in a block the runtime never
             // flagged and a finalizer that silently never runs.
-#ifndef NDEBUG
+#ifdef CLOTHO_EXTRA_ASSERTS
             for (uint32_t i = 0; i < kBitmapBytes; ++i) {
                 assert(blk.meta->fin_bits[i] == 0 && "a finalizable object in a skipped block");
             }
@@ -2558,10 +2568,10 @@ void print_stats(uint64_t swept_at_teardown) {
 
 // -- Verification -------------------------------------------------------------
 //
-// Everything below is debug-only: §13's heap-verify mode, which is pair-assertion
-// discipline (TigerStyle) applied to the whole heap rather than to one
-// function.
-#ifndef NDEBUG
+// Everything below is CLOTHO_EXTRA_ASSERTS only: §13's heap-verify mode, which is
+// pair-assertion discipline (TigerStyle) applied to the whole heap rather than to one
+// function. A whole-heap walk per collection is too slow to ship.
+#ifdef CLOTHO_EXTRA_ASSERTS
 
 // What one rt_gc_verify() pass accumulates. A struct rather than a growing list of
 // out-parameters because every one of these serves a claim that is heap-WIDE -- the live
@@ -2954,7 +2964,7 @@ void verify_totals(const VerifyTally& tally) {
     assert(g.blocks.size() == g.stats.blocks_total && "block ids are dense and stable");
 }
 
-#endif  // NDEBUG
+#endif // CLOTHO_EXTRA_ASSERTS
 
 }  // namespace
 
@@ -3221,8 +3231,8 @@ extern "C" void rt_gc_container_add(void* handle, uint32_t kind, const rt_elem_o
     [[maybe_unused]] const bool inserted =
       g.containers.try_emplace(handle, ContainerReg{ kind, ops, owner, 1 }).second;
     assert(inserted && "the find above said this container is not registered");
-    assert((owner == nullptr || rt_gc_find_object(owner) == owner) &&
-           "a resolved container owner is a class object");
+    assert_resolves((owner == nullptr || rt_gc_find_object(owner) == owner) &&
+                    "a resolved container owner is a class object");
 }
 
 extern "C" void rt_gc_container_remove(void* handle) {
@@ -3434,7 +3444,7 @@ extern "C" void rt_gc_remember(void* obj) {
         return;  // No live collector (a test that never called rt_gc_init): nothing to remember.
     }
     assert(obj != nullptr && "the barrier fires on a store INTO an object");
-    assert(rt_gc_find_object(obj) == obj && "the barrier logged something not a class object");
+    assert_resolves(rt_gc_find_object(obj) == obj && "the barrier logged something not a class object");
     if ((*gcword_ptr(obj) & RT_GC_FLAG_OLD) == 0) {
         return;
     }
@@ -3515,7 +3525,7 @@ extern "C" void* rt_gc_find_object(const void* addr) {
 }
 
 extern "C" void rt_gc_verify(void) {
-#ifndef NDEBUG
+#ifdef CLOTHO_EXTRA_ASSERTS
     if (g.initialized == 0) {
         return;
     }

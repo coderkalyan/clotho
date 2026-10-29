@@ -10,6 +10,15 @@
 
 using namespace rt_internal;
 
+namespace rt_internal {
+
+std::vector<std::FILE*>  fd_streams;
+MonitorState             g_monitor;
+std::vector<void*>       g_strobe_queue;
+std::vector<std::string> g_plusargs;
+
+} // namespace rt_internal
+
 namespace {
 
 // -- File I/O descriptor tables (LRM §21.3) --

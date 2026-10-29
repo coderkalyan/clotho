@@ -22,9 +22,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #   Release           Release, stripped         Release, stripped
 #
 # Debug is for iterating on the compiler, so only the frontend is unoptimized; the
-# runtime is not part of that loop and -O0 there would distort every profile. What
-# Debug guarantees everywhere is that NDEBUG is unset, so every assert() is live in
-# both columns.
+# runtime is not part of that loop and -O0 there would distort every profile. Every
+# build type keeps assert() live (below); Debug also turns on
+# CLOTHO_EXTRA_ASSERTS.
 #
 # The cost of that default, measured on hazard3 (21 files, 1418 processes):
 #
@@ -45,6 +45,36 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to Debug")
   set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
+
+# Every build type keeps assert() live, shipped builds included: a violated
+# invariant stops the program and reports where (docs/PRINCIPLES.md), and an
+# assertion compiled out of the binary users run cannot. Measured against
+# -DNDEBUG (clang 22, -O3): every tests/perf case and a UVM compile moved by less
+# than run-to-run noise; a microbenchmark that is mostly garbage collection runs
+# 1.35x the instructions, from the collector's per-object field assertions. Checks
+# too slow to ship -- heap lookups and whole-structure verifiers such as the GC's
+# heap verify, 2.3x on that microbenchmark -- are behind CLOTHO_EXTRA_ASSERTS
+# instead. CMake's defaults put NDEBUG in the flags of every non-Debug type, so it
+# is removed there; a normal variable shadows the cache entry for this project and
+# every dependency it fetches.
+foreach(lang C CXX)
+  foreach(config RELEASE RELWITHDEBINFO MINSIZEREL)
+    string(REGEX REPLACE "[-/]DNDEBUG" "" CMAKE_${lang}_FLAGS_${config} "${CMAKE_${lang}_FLAGS_${config}}")
+  endforeach()
+endforeach()
+
+# Checks too slow for a shipped build. On by default in Debug; CI also runs the
+# suite with them on.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(clotho_extra_asserts_default ON)
+else()
+  set(clotho_extra_asserts_default OFF)
+endif()
+option(CLOTHO_EXTRA_ASSERTS "Build in checks too slow for a shipped build (GC heap verify)"
+       ${clotho_extra_asserts_default})
+if(CLOTHO_EXTRA_ASSERTS)
+  add_compile_definitions(CLOTHO_EXTRA_ASSERTS)
 endif()
 
 # Release ships stripped: CMake's Release already omits -g, and this drops the
@@ -119,8 +149,11 @@ if(CLOTHO_SANITIZE)
   if(MSVC)
     message(FATAL_ERROR "CLOTHO_SANITIZE requires a GCC/Clang driver")
   endif()
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
-  add_link_options(-fsanitize=address,undefined)
+  # UBSan only prints and continues by default, which leaves the exit status of a
+  # test that hit undefined behavior unchanged; make every finding stop the run.
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=undefined
+                      -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined -fno-sanitize-recover=undefined)
 endif()
 
 include(FetchContent)
@@ -320,10 +353,14 @@ if(CLOTHO_SVA)
   set(_libsva_include ${_libsva_prefix}/inc)
   file(GLOB _libsva_sources "${CLOTHO_LIBSVA_DIR}/src/*.zig")
 
+  # -Dcpu=baseline: Zig otherwise targets the build machine's CPU, and the
+  # compiler_rt it bundles into libsva supplies clotho's memcpy and memset, so a
+  # binary built on a machine with newer vector extensions died with SIGILL at
+  # startup on an older one.
   add_custom_command(
     OUTPUT ${_libsva_lib} ${_libsva_include}/libsva/sva.h
     COMMAND ${ZIG_EXECUTABLE} build --prefix ${_libsva_prefix}
-            -Doptimize=${_libsva_optimize}
+            -Doptimize=${_libsva_optimize} -Dcpu=baseline
     COMMAND ${CMAKE_COMMAND} -E copy ${_libsva_prefix}/include/sva.h
             ${_libsva_include}/libsva/sva.h
     WORKING_DIRECTORY ${CLOTHO_LIBSVA_DIR}
@@ -406,12 +443,8 @@ endif()
 # `perf` profile lies about where the time went.
 #
 # So Debug gets -O2 -g here: optimized like RelWithDebInfo and still walkable in a
-# debugger. It deliberately stops short of RelWithDebInfo's NDEBUG -- the reason to
-# optimize this target is that -O0 distorts profiles and slows simulation, and
-# neither argument says anything about disabling checks. Debug is precisely where
-# you want Wheel.cpp's `deadline must be in the future` to fire, since scheduling an
-# event into the past is the bug it exists to catch. Release and RelWithDebInfo
-# already supply the right flags, so the genex leaves them alone.
+# debugger, with every check still live. Release and RelWithDebInfo already supply
+# the right flags, so the genex leaves them alone.
 target_compile_options(clotho_runtime PRIVATE
   $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O2>
   $<$<AND:$<CONFIG:Debug>,$<BOOL:${MSVC}>>:/O2>
@@ -1059,4 +1092,16 @@ if(NOT WIN32)
                   DEPENDS clotho_exe_dpi_shared)
   add_test(NAME exe_dpi_shared COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_shared${CMAKE_EXECUTABLE_SUFFIX}")
   set_tests_properties(exe_dpi_shared PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
+endif()
+
+# What `clotho build` links into an executable is not sanitized: the executable
+# carries no sanitizer runtime (docs/design/executables.md), so instrumented code
+# there could neither link nor load. The compiler that builds it is sanitized.
+if(CLOTHO_SANITIZE)
+  foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared)
+    if(TARGET ${target})
+      target_compile_options(${target} PRIVATE -fno-sanitize=all)
+      target_link_options(${target} PRIVATE -fno-sanitize=all)
+    endif()
+  endforeach()
 endif()
