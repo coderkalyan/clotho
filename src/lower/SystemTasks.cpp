@@ -216,6 +216,41 @@ void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
     b.display(text, /*newline=*/true, {}, loc(call));
 }
 
+// A real count of ticks as the unsigned 64-bit one the wheel takes, times
+// `tick_mul` (1 when the real is already in ticks).
+//
+// What a count that does not fit a 64-bit time means is not defined by the LRM.
+// Converting it as an integer would keep its low 64 bits, and a delay of 2**64
+// ticks would become 0 and fire at once, so it saturates instead: a huge delay
+// never wraps into an early event. The ceiling is INT64_MAX, the largest signed
+// count, because the wheel adds a delay to the current time in 64 bits
+// (rt_wheel_schedule_rel), and a delay below 2**63 cannot wrap that sum before
+// the simulation itself has run past 2**63 ticks.
+//
+// The test is on the real, against the largest value whose product with
+// `tick_mul` stays within the ceiling, so the multiply cannot wrap either. Both
+// signs saturate, and so does an infinity; NaN compares false and keeps the
+// conversion's own answer, zero. A negative count inside the ceiling is left
+// alone: LRM 9.4.1 reads a negative delay as a two's-complement unsigned
+// integer, which is what the conversion's cast already gives.
+ir::Index Lowerer::saturating_ticks(ir::Index scaled, uint64_t tick_mul, ir::Builder& b, ir::SourceLoc l) {
+    using T                    = ir::Inst::Tag;
+    const ir::Ref      u64     = make_int_type(64, false, false);
+    constexpr uint64_t ceiling = INT64_MAX;
+    const uint64_t     mul     = std::max<uint64_t>(tick_mul, 1);
+    const double       bound   = static_cast<double>(ceiling / mul);
+    const ir::Ref      real_ty = module_.pool.real_type;
+
+    ir::Index ticks = b.float_cvt(T::FtoI, scaled, u64, l);
+    if (mul > 1) {
+        ticks = b.binary(T::Mul, ticks, b.constant(module_.pool.put_int(u64, mul), l), l);
+    }
+    const ir::Index above = b.binary(T::FGe, scaled, b.constant(module_.pool.put_real(real_ty, bound), l), l);
+    const ir::Index below = b.binary(T::FLe, scaled, b.constant(module_.pool.put_real(real_ty, -bound), l), l);
+    const ir::Index huge  = b.binary(T::Lor, above, below, l);
+    return b.select(huge, b.constant(module_.pool.put_int(u64, ceiling), l), ticks, l);
+}
+
 // Lower a #delay amount, scaled from the module's time unit to wheel ticks.
 // The unit multiplier is a compile-time constant; widen to 64 bits and
 // multiply so a large unit (e.g. seconds against fs precision) cannot
@@ -232,8 +267,9 @@ ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     // grid represents the rounded value exactly. Constant-fold below collapses
     // a literal `#1.5` to a single tick constant; a runtime real delay costs
     // one round (FtoI, half away from zero — LRM 6.12.1) and an integer
-    // multiply. time_mul_ == unit/precision * prec_over_tick_, so recover the
-    // unit/precision factor by division.
+    // multiply, and a count beyond what 64-bit time holds saturates
+    // (saturating_ticks). time_mul_ == unit/precision * prec_over_tick_, so
+    // recover the unit/precision factor by division.
     if (amount.type->isFloating()) {
         const ir::Index rv             = lower_expr(amount, b);
         const uint64_t  unit_over_prec = prec_over_tick_ != 0 ? time_mul_ / prec_over_tick_ : 1;
@@ -243,12 +279,7 @@ ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
               b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(unit_over_prec)), l);
             scaled = b.binary(ir::Inst::Tag::FMul, rv, m, l);
         }
-        ir::Index ticks = b.float_cvt(ir::Inst::Tag::FtoI, scaled, u64, l);
-        if (prec_over_tick_ > 1) {
-            const ir::Index m = b.constant(module_.pool.put_int(u64, prec_over_tick_), l);
-            ticks             = b.binary(ir::Inst::Tag::Mul, ticks, m, l);
-        }
-        return ticks;
+        return saturating_ticks(scaled, prec_over_tick_, b, l);
     }
 
     const ir::Index v = lower_expr(amount, b);

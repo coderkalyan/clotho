@@ -1388,14 +1388,15 @@ ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builde
         // A real (realtime) argument scales in the real domain, then rounds
         // to the nearest tick (FtoI rounds half away from zero); only
         // sub-tick fraction is lost, which the tick-based %t renderer
-        // cannot represent anyway.
+        // cannot represent anyway. A time beyond what 64-bit ticks hold
+        // prints as the largest one, not as its low 64 bits (saturating_ticks).
         ir::Index scaled = v;
         if (time_mul_ > 1) {
             const ir::Index mul =
               b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(time_mul_)), l);
             scaled = b.binary(ir::Inst::Tag::FMul, v, mul, l);
         }
-        return b.float_cvt(ir::Inst::Tag::FtoI, scaled, u64, l);
+        return saturating_ticks(scaled, 1, b, l);
     }
     const ir::Index w = b.resize(v, u64, l);
     if (time_mul_ <= 1) {

@@ -3436,6 +3436,8 @@ private:
 
     ir::Index scaled_delay(const Expression& amount, ir::Builder& b);
 
+    ir::Index saturating_ticks(ir::Index scaled, uint64_t tick_mul, ir::Builder& b, ir::SourceLoc l);
+
     ir::Index lower_string_arg(const Expression& expr, ir::Builder& b);
 
     std::vector<char> scan_conversion_chars(std::string_view fmt);

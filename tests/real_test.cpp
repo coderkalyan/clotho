@@ -510,6 +510,71 @@ TEST_CASE("real delay in a submodule, integer-only parent") {
     CHECK(out == "sub 1.5000\ntop 3.0000\n");
 }
 
+// A real delay (or %t time) whose tick count does not fit a 64-bit time cannot be
+// represented, and the LRM does not say what it means. Clotho saturates it, so a
+// huge delay never wraps into a small or negative one and fires early: a delay of
+// 2**64 ns is 2**64 * 1000 ps, whose low 64 bits are 0, so it used to fire at
+// once. Oracle: none; the expected output follows from that decision (no event
+// fires before the finite ones at 15 and 35, and every unrepresentable time
+// prints as the same saturated time, a representable one does not).
+TEST_CASE("a real delay beyond 2**63 ticks saturates instead of wrapping into an early event") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module m;
+          real big, neg, inf, zero, mid;
+          string s1, s2, s3, s4;
+          initial begin
+            zero = 0.0;
+            big  = 18446744073709551616.0;
+            neg  = -18446744073709551616.0;
+            inf  = 1.0 / zero;
+            #5;
+            fork
+              begin #(big) $display("FAIL: delay 2**64 ns fired at %0t", $time); end
+              begin #(neg) $display("FAIL: delay -2**64 ns fired at %0t", $time); end
+              begin #(inf) $display("FAIL: delay +inf fired at %0t", $time); end
+            join_none
+            #10 $display("t=15");
+            #20 $display("t=35");
+            mid = 1.0e6;
+            s1 = $sformatf("%0t", 1.0e30);
+            s2 = $sformatf("%0t", big);
+            s3 = $sformatf("%0t", neg);
+            s4 = $sformatf("%0t", mid);
+            $display("%0d %0d %0d", s1 == s2, s2 == s3, s4 == s1);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "t=15\nt=35\n1 1 0\n");
+}
+
+// The same when the design tick is finer than the delaying module's precision:
+// a delay of N ps is N * 1000 fs, and N = 18446744073709552 makes that
+// 2**64 + 384, which wrapped to a delay of 384 fs. The count that saturates is the
+// final one, not the real before the multiply.
+TEST_CASE("a real delay saturates after the precision-to-tick multiply, not before it") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module sub;
+          real r;
+          initial begin
+            r = 18446744073709.552;
+            #(r) $display("FAIL: sub delay fired");
+          end
+        endmodule
+        `timescale 1fs/1fs
+        module m;
+          sub s();
+          initial begin
+            #1000 $display("t=1000 fs");
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "t=1000 fs\n");
+}
+
 TEST_CASE("%c of a real is still rejected loudly") {
     // %h/%o/%b/%x of a real now round-and-format (see the base-conversion case
     // above), but %c has no defined real operand conversion in Table 21-1, so
