@@ -810,10 +810,17 @@ void Backend::lower_inst(Index i) {
             return;
         }
         case Inst::Tag::PartSelect: {
-            LValue     lv = lvalue_of(p.op_extra.op);
-            const auto ps = ir_->extra_data<PartSelect>(p.op_extra.extra);
-            lv.bit_off    = b_.CreateAdd(lv.bit_off, b_.getInt32(ps.lsb));
-            lv.width      = ps.msb - ps.lsb + 1;
+            LValue         lv          = lvalue_of(p.op_extra.op);
+            const auto     ps          = ir_->extra_data<PartSelect>(p.op_extra.extra);
+            const uint32_t outer_width = lv.width;
+            lv.bit_off                 = b_.CreateAdd(lv.bit_off, b_.getInt32(ps.lsb));
+            lv.width                   = ps.msb - ps.lsb + 1;
+            // Stacked on a bounds-checked dynamic select (`a[i][3:0]`, `sa[i].lo`):
+            // the inherited mask still covers the whole outer window, which a
+            // write must narrow (store_mask).
+            if (lv.range_mask != nullptr && lv.width != outer_width) {
+                lv.range_mask_outer = true;
+            }
             set_lvalue(i, lv);
             return;
         }

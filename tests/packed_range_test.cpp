@@ -276,6 +276,73 @@ TEST_CASE("multi-dim packed array: element/range/nested selects (LRM 7.4.5/7.4.6
           "asc 11 44 2233\n");
 }
 
+// LRM 11.5.1: a write through a select "shall only affect the bits that are in
+// range", so a constant part-select or packed-struct member stacked on a
+// dynamic element select writes its own bits and leaves the rest of the element
+// alone, blocking, nonblocking and in a function local alike. Oracle: the flat
+// bit layout (element k of width W occupies bits [k*W+W-1:k*W]); iverilog
+// rejects the nested spelling, and its flattened equivalent (`a[i*8 +: 4] = 0`)
+// agrees on every line.
+TEST_CASE("a constant part-select under a dynamic select writes only its bits (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            typedef struct packed { logic [3:0] hi; logic [3:0] lo; } s_t;
+            typedef struct packed { bit [3:0] hi; bit [3:0] lo; } bs_t;
+            logic [3:0][7:0] a;
+            bit   [3:0][7:0] b;
+            logic [1:0][7:0] m [2];
+            s_t   [3:0]      sa;
+            bs_t  [3:0]      bsa;
+            int i, k;
+            function automatic logic [31:0] f(int k);
+                logic [3:0][7:0] loc;
+                loc = '1;
+                loc[k][3:0] = 4'h0;
+                return loc;
+            endfunction
+            function automatic bit [31:0] g(int k);
+                bit [3:0][7:0] loc;
+                loc = '1;
+                loc[k][7:4] = 4'h0;
+                return loc;
+            endfunction
+            initial begin
+                a = '1;   i = 1; a[i][3:0] = 4'h0;   $display("%h %h", a, a[i][3:0]);
+                a = '1;   i = 2; a[i][6:5] = 2'b00;  $display("%h", a);
+                b = '1;   i = 3; b[i][7:4] = 4'h5;   $display("%h", b);
+                sa = '1;  i = 2; sa[i].lo = 4'h0;    $display("%h", sa);
+                bsa = '1; i = 0; bsa[i].hi = 4'h0;   $display("%h", bsa);
+                $display("%h %h", f(2), g(1));
+                a = '1; b = '1; i = 1;
+                a[i][3:0] <= 4'h0;
+                b[i][7:4] <= 4'h0;
+                #1 $display("%h %h", a, b);
+                // An element of a memory, and a delayed nonblocking write.
+                m[0] = '1; m[1] = '1; k = 1; i = 0;
+                m[k][i][3:0] = 4'h0;
+                $display("%h %h", m[0], m[1]);
+                m[0] = '1; m[1] = '1;
+                m[k][i][7:4] <= 4'h0;
+                #1 $display("%h %h", m[0], m[1]);
+                a = '1; i = 1;
+                a[i][3:0] <= #1 4'h0;
+                #2 $display("%h", a);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "fffff0ff 0\n"
+          "ff9fffff\n"
+          "5fffffff\n"
+          "fff0ffff\n"
+          "ffffff0f\n"
+          "fff0ffff ffff0fff\n"
+          "fffff0ff ffff0fff\n"
+          "ffff fff0\n"
+          "ffff ff0f\n"
+          "fffff0ff\n");
+}
+
 TEST_CASE("array query functions (LRM 20.7): $size/$dimensions/$left/... fold to constants") {
     // All eight are constant type/bounds queries for a fixed-size operand, so
     // slang folds them; every string below matches iverilog v13 exactly (it

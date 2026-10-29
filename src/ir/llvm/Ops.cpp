@@ -93,7 +93,8 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
     llvm::Value* lo   = smax(smin(off, end), base);
     llvm::Value* hi   = smax(smin(top, end), base);
     llvm::Value* mask = range_bits(sw, b_.CreateTrunc(lo, int_ty(32)), b_.CreateTrunc(hi, int_ty(32)));
-    lv.range_mask     = b_.CreateSelect(idx_unknown, zero(sw), mask);
+    lv.range_mask       = b_.CreateSelect(idx_unknown, zero(sw), mask);
+    lv.range_mask_outer = false;
 
     v.partial =
       selw == 1 ? nullptr
@@ -124,6 +125,12 @@ bool Backend::wide_dyn_storage(uint32_t sw) {
 // this wide -- building one is the O(width^2) legalization that path avoids.
 llvm::Value* Backend::store_mask(const LValue& lv, uint32_t sw) {
     if (lv.range_mask != nullptr) {
+        if (lv.range_mask_outer) {
+            // A constant part-select inside a dynamic select's window writes
+            // only its own in-range bits (LRM 11.5.1). place_val is poison-free,
+            // which matters when the outer index is out of range.
+            return b_.CreateAnd(lv.range_mask, place_val(lv, ones(lv.width), sw));
+        }
         return lv.range_mask;
     }
     return b_.CreateShl(cast(ones(lv.width), sw, false), cast(lv.bit_off, sw, false));

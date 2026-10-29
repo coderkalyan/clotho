@@ -338,6 +338,12 @@ struct LValue {
     // check applies (whole storage, or a constant in-range select). A read forces
     // x/0 outside it and a write is restricted to it.
     llvm::Value* range_mask = nullptr;
+    // `range_mask` was set by an enclosing dynamic select and this lvalue is a
+    // constant part-select inside that select's window (`a[i][3:0]`, `sa[i].lo`),
+    // so the mask still covers the whole enclosing window. A read only looks at
+    // the selected bits and uses it as is; a write has to narrow it to its own
+    // bits (store_mask), or it would clear the rest of the window (LRM 11.5.1).
+    bool range_mask_outer = false;
     // A runtime-offset select on storage too wide to shift inline: the load / store
     // goes through rt_wide_sel / rt_wide_ins, which index the containing 64-bit word.
     // `sel_base` / `sel_cwidth` are the container the selection is clamped to (the
