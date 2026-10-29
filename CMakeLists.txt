@@ -149,8 +149,11 @@ if(CLOTHO_SANITIZE)
   if(MSVC)
     message(FATAL_ERROR "CLOTHO_SANITIZE requires a GCC/Clang driver")
   endif()
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
-  add_link_options(-fsanitize=address,undefined)
+  # UBSan only prints and continues by default, which leaves the exit status of a
+  # test that hit undefined behavior unchanged; make every finding stop the run.
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=undefined
+                      -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined -fno-sanitize-recover=undefined)
 endif()
 
 include(FetchContent)
@@ -1084,4 +1087,16 @@ if(NOT WIN32)
                   DEPENDS clotho_exe_dpi_shared)
   add_test(NAME exe_dpi_shared COMMAND "${CMAKE_CURRENT_BINARY_DIR}/exe_dpi_shared${CMAKE_EXECUTABLE_SUFFIX}")
   set_tests_properties(exe_dpi_shared PROPERTIES PASS_REGULAR_EXPRESSION "dpi: ok")
+endif()
+
+# What `clotho build` links into an executable is not sanitized: the executable
+# carries no sanitizer runtime (docs/design/executables.md), so instrumented code
+# there could neither link nor load. The compiler that builds it is sanitized.
+if(CLOTHO_SANITIZE)
+  foreach(target clotho_runtime_exe clotho_exe_dpi_object clotho_exe_dpi_shared)
+    if(TARGET ${target})
+      target_compile_options(${target} PRIVATE -fno-sanitize=all)
+      target_link_options(${target} PRIVATE -fno-sanitize=all)
+    endif()
+  endforeach()
 endif()
