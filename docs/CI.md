@@ -28,6 +28,16 @@ push runs them; the other platforms test the shipped configuration.
 linux-x64-sanitize adds `CLOTHO_SANITIZE` (ASan and UBSan) on top of the
 extra asserts.
 
+## sv-tests
+
+Nightly, and on `workflow_dispatch` with `sv_tests` set, the `sv-tests` job runs
+the linux-x64 binary over [sv-tests](https://github.com/chipsalliance/sv-tests)
+with the clotho runner from the `coderkalyan/sv-tests` fork, pinned by
+`SV_TESTS_REF`. `.github/scripts/sv-tests-summary.py` classifies each test as
+pass, crash, timeout, ran (exit 0 but failed: a wrong result or an accepted
+invalid design) or rejected, and fails the job on any crash. The report and
+logs are uploaded as the `sv-tests-report` artifact.
+
 ## The LLVM dependency
 
 LLVM is never built in CI. A source build is tens of minutes and the pin moves

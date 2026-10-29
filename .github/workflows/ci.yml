@@ -18,6 +18,10 @@ on:
         type: choice
         options: [all, linux-only]
         default: all
+      sv_tests:
+        description: Also run sv-tests (otherwise nightly only)
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -42,6 +46,10 @@ env:
   # still open — this is the minimal fix, not that one).
   ZIG_VERSION: "0.16.0"
   LIBSVA_REF: "0f41ddad8277b1625b51610ac76b1ae25728de08"
+  # sv-tests with the clotho runner, from the coderkalyan/sv-tests fork until
+  # the runner is upstream.
+  SV_TESTS_REPO: "https://github.com/coderkalyan/sv-tests.git"
+  SV_TESTS_REF: "f419de23f5893ca23c06068ca4e1dda2b6e30c0d"
 
 jobs:
   plan:
@@ -311,6 +319,96 @@ jobs:
           echo "$out"
           [ "$out" = "Hello, world!" ]
 
+      # The sv-tests job below runs this binary rather than building its own.
+      - name: Upload the CLI for sv-tests
+        if: matrix.name == 'linux-x64' && (github.event_name == 'schedule' || inputs.sv_tests)
+        uses: actions/upload-artifact@v4
+        with:
+          name: clotho-linux-x64
+          path: build/clotho
+          retention-days: 1
+
       - name: ccache statistics
         if: always()
         run: ccache --show-stats
+
+  # sv-tests (https://github.com/chipsalliance/sv-tests) against the linux-x64
+  # binary, nightly. Any crash fails the job (docs/VERIFICATION.md); the
+  # summary classifies every other outcome, and the report and logs are kept.
+  sv-tests:
+    name: sv-tests
+    needs: build
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.sv_tests) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: clotho-linux-x64
+          path: clotho-bin
+
+      # The binary's shared libraries come from the same packages the build job
+      # installs. Verilator supplies the VPI headers the UVM DPI object includes.
+      - name: Install runtime libraries and headers
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          . /etc/os-release
+          echo "deb http://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME-$LLVM_MAJOR main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-$LLVM_MAJOR-dev liblld-$LLVM_MAJOR-dev libc++-$LLVM_MAJOR-dev \
+            libclang-rt-$LLVM_MAJOR-dev verilator
+          chmod +x clotho-bin/clotho
+          clotho-bin/clotho --version
+
+      - uses: actions/setup-python@v5
+        with:
+          # sv-tests' own CI runs 3.10; its pinned requirements build there.
+          python-version: "3.10"
+
+      - name: Check out sv-tests
+        run: |
+          set -eux
+          git clone "$SV_TESTS_REPO" sv-tests
+          cd sv-tests
+          git checkout "$SV_TESTS_REF"
+          # Test sources only: the tests, the cores, and the two tool
+          # submodules whose test suites generators import.
+          git submodule update --init --recursive --depth 1 \
+            third_party/tests third_party/cores third_party/tools/yosys
+          git submodule update --init --depth 1 third_party/tools/icarus
+          pip install -r conf/requirements.txt
+
+      - name: Run sv-tests
+        working-directory: sv-tests
+        env:
+          CLOTHO_BIN: ${{ github.workspace }}/clotho-bin/clotho
+        run: |
+          set -eux
+          make clotho-uvm-dpi CLOTHO_SVDPI_DIR="$GITHUB_WORKSPACE/src/runtime" \
+            VPI_INC_DIR=/usr/share/verilator/include/vltstd
+          make generate-tests -j "$(nproc)"
+          make -j "$(nproc)" RUNNERS_FILTER=clotho report
+
+      - name: Summarize
+        run: |
+          set -o pipefail
+          python3 .github/scripts/sv-tests-summary.py sv-tests/out/report/report.csv \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sv-tests-report
+          path: |
+            sv-tests/out/report/report.csv
+            sv-tests/out/logs/clotho/
