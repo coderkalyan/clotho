@@ -272,9 +272,13 @@ ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     // (saturating_ticks). time_mul_ == unit/precision * prec_over_tick_, so
     // recover the unit/precision factor by division.
     if (amount.type->isFloating()) {
-        const ir::Index rv             = lower_expr(amount, b);
-        const uint64_t  unit_over_prec = prec_over_tick_ != 0 ? time_mul_ / prec_over_tick_ : 1;
-        ir::Index       scaled         = rv;
+        // A shortreal widens exactly (LRM 6.12.2). Everything below, the unit
+        // multiplier and saturating_ticks' range test, is in `real`: a float
+        // operand against those double constants fails the LLVM verifier.
+        const ir::Index rv =
+          coerce(lower_expr(amount, b), *amount.type, module_.pool.real_type, b, l);
+        const uint64_t unit_over_prec = prec_over_tick_ != 0 ? time_mul_ / prec_over_tick_ : 1;
+        ir::Index      scaled         = rv;
         if (unit_over_prec > 1) {
             const ir::Index m =
               b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(unit_over_prec)), l);

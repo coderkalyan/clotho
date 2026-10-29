@@ -575,6 +575,49 @@ TEST_CASE("a real delay saturates after the precision-to-tick multiply, not befo
     CHECK(out == "t=1000 fs\n");
 }
 
+// A shortreal delay (and a shortreal %t operand) used to fail the LLVM verifier:
+// the real-to-ticks path scaled and range-tested a float against double constants
+// (`fmul float, double`, `fcmp oge float, double`). A shortreal widens exactly to
+// real (LRM 6.12.2), so the amount is converted first and then follows the real
+// path. 1ns/1ps takes the unit-over-precision multiply; 1ns/1ns does not.
+// Cross-checked against iverilog 13.
+TEST_CASE("a shortreal delay and %t operand widen to real before scaling to ticks") {
+    const std::string out = run_capture(R"(
+        `timescale 1ns/1ps
+        module m;
+          shortreal s;
+          logic [7:0] q;
+          initial begin
+            s = 1.5;
+            #(s) $display("%0.4f", $realtime);
+            s = 0.25;
+            #(s) $display("%0.4f", $realtime);
+            s = 2.5;
+            $display("%0t", s);
+            q = 8'hAA;
+            s = 0.5;
+            q <= #(s) 8'h55;
+            #0.25 $display("q=%h @%0.4f", q, $realtime);
+            #0.5  $display("q=%h @%0.4f", q, $realtime);
+          end
+        endmodule
+    )");
+    CHECK(out == "1.5000\n1.7500\n2500\nq=aa @2.0000\nq=55 @2.5000\n");
+
+    const std::string same_unit = run_capture(R"(
+        `timescale 1ns/1ns
+        module m;
+          shortreal s;
+          initial begin
+            s = 3.0;
+            #(s) $display("%0.4f", $realtime);
+            $display("%0t", s);
+          end
+        endmodule
+    )");
+    CHECK(same_unit == "3.0000\n3\n");
+}
+
 TEST_CASE("%c of a real is still rejected loudly") {
     // %h/%o/%b/%x of a real now round-and-format (see the base-conversion case
     // above), but %c has no defined real operand conversion in Table 21-1, so
