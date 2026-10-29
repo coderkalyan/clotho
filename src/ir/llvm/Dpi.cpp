@@ -10,23 +10,6 @@ uint32_t Backend::dpi_nchunks(uint32_t w) {
     return (w + 31) / 32;
 }
 
-llvm::FunctionCallee Backend::dpi_pack_logicvec_fn() {
-    auto* p = raw_ptr_ty();
-    return rt_fn("rt_dpi_pack_logicvec", b_.getVoidTy(), { p, p, p, b_.getInt32Ty(), p });
-}
-
-llvm::FunctionCallee Backend::dpi_unpack_logicvec_fn() {
-    auto* p = raw_ptr_ty();
-    return rt_fn("rt_dpi_unpack_logicvec", b_.getVoidTy(), { p, b_.getInt32Ty(), p, p, p });
-}
-
-// void rt_dpi_str_out(rt_string* dst, const char* p, const rt_alloc_site*) — copy a
-// returned C string.
-llvm::FunctionCallee Backend::dpi_str_out_fn() {
-    auto* p = raw_ptr_ty();
-    return rt_fn("rt_dpi_str_out", b_.getVoidTy(), { p, p, p });
-}
-
 // Spill an iW plane into a fresh entry-block buffer of `nchunks` 32-bit words
 // (zero-extended above W), returned as a pointer the runtime reads as uint32*.
 llvm::Value* Backend::dpi_spill_words(llvm::Value* plane, uint32_t nchunks) {
@@ -74,18 +57,6 @@ Plane Backend::dpi_vec_copyout(DpiCType ct, llvm::Value* scratch, uint32_t w) {
     b_.CreateCall(dpi_unpack_logicvec_fn(), { scratch, b_.getInt32(nc), must, may, zv });
     return packed(dpi_load_words(must, nc, w), dpi_load_words(may, nc, w),
                   dpi_load_words(zv, nc, w));
-}
-
-// The LLVM struct mirroring the runtime rt_svopen descriptor (Runtime.h):
-// { ptr data, i32 left, i32 right, i32 nelem, i32 elem_bytes, i32 elem_width,
-// i32 is_logic }. Memoized; must match the C layout exactly.
-llvm::StructType* Backend::rt_svopen_ty() {
-    if (rt_svopen_ty_ == nullptr) {
-        auto* i32 = b_.getInt32Ty();
-        rt_svopen_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), i32, i32, i32, i32, i32, i32 }, "clotho.svopen");
-    }
-    return rt_svopen_ty_;
 }
 
 // Element GEP into a marshalled svVecVal buffer: `[N*nch x elem]` where elem is

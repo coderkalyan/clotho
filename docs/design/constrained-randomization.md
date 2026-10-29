@@ -641,7 +641,7 @@ UVM-scale class count makes it matter.
 - **P5 — optional: the randstate codec.** `get_randstate` / `set_randstate` on an
   object: two `rt_*` helpers formatting and parsing four state words as 64 hex digits
   into a `clotho.str`, on the out-parameter convention
-  (`rt_string_itoa`, `src/ir/llvm/Inst.cpp, str_itoa_fn`), rejecting a foreign string with
+  (`rt_string_itoa`, `src/ir/llvm/RuntimeAbi.cpp, str_itoa_fn`), rejecting a foreign string with
   a located fatal. Shared verbatim with `docs/design/process-class.md` §7.4, whichever
   lands first.
 

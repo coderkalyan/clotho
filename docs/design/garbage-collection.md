@@ -367,7 +367,7 @@ heap block per entry and `unordered_dense` relocates them on rehash
 must be traced from their encoded bytes.
 
 `rt_elem_ops` is mirrored bit-for-bit by `elem_ops_ty()`
-(`ir/llvm/Containers.cpp, elem_ops_ty`) under an explicit "must match the runtime struct
+(`ir/llvm/RuntimeAbi.cpp, elem_ops_ty`) under an explicit "must match the runtime struct
 exactly" contract, so this is a lockstep two-file edit.
 
 And one problem that is not a descriptor problem at all, which is the real reason

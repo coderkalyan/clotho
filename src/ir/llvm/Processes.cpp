@@ -662,30 +662,6 @@ llvm::Value* Backend::program_root_pcb(uint32_t inst) {
     return b_.CreateInBoundsGEP(program_root_arr_ty_, sym(program_root_gv_), { b_.getInt32(0), b_.getInt32(inst) });
 }
 
-llvm::FunctionCallee Backend::proc_alloc_fn() {
-    return rt_fn("rt_proc_alloc", raw_ptr_ty(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::proc_complete_fn() {
-    return rt_fn("rt_proc_complete", raw_ptr_ty(), { raw_ptr_ty(), raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::proc_mark_kill_fn() {
-    return rt_fn("rt_proc_mark_kill", raw_ptr_ty(), { raw_ptr_ty(), b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::proc_adopt_fn() {
-    return rt_fn("rt_proc_adopt", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::proc_thread_done_fn() {
-    return rt_fn("rt_proc_thread_done", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::proc_obj_retain_fn() {
-    return rt_fn("rt_proc_obj_retain", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
 // Move this thread's LRM 9.7 state from `from` to `to`, preserving the flag bits
 // that share the word and leaving any OTHER state alone. Conditional, and that is
 // load-bearing rather than defensive: the park/resume pair below maintains
@@ -1010,10 +986,6 @@ llvm::Value* Backend::proc_wait_node() {
     return ab.CreateAlloca(event_node_ty(), nullptr, "await_node");
 }
 
-llvm::FunctionCallee Backend::proc_await_self_fn() {
-    return rt_fn("rt_proc_await_self", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
-}
-
 // `process::self()`, `p.status()`, `p.get_randstate()` (LRM 9.7).
 void Backend::lower_proc_query(Index i) {
     const auto  info = ir_->extra_data<ProcCtlInfo>(ir_->payload(i).extra);
@@ -1229,16 +1201,6 @@ void Backend::emit_proc_publish_rng() {
         return;
     }
     b_.CreateStore(rng_slot_, pcb_field(pcb_, kPcbRng));
-}
-
-llvm::FunctionCallee Backend::proc_randstate_get_fn() {
-    return rt_fn("rt_proc_randstate_get", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::proc_randstate_set_fn() {
-    return rt_fn("rt_proc_randstate_set", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
 }
 
 // The generator state of the thread `pcb` names. Non-null in a design that uses

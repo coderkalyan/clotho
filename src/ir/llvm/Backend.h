@@ -969,10 +969,6 @@ private:
 
     llvm::Constant* str_empty_const();
 
-    llvm::StructType* dynarr_slot_ty();
-
-    llvm::StructType* assoc_slot_ty();
-
     uint32_t handle_epoch_field(Ref type) const;
 
     bool is_dynarr_type(Ref type) const;
@@ -1021,13 +1017,12 @@ private:
     };
     ContainerFmt container_fmt(Ref container_type);
 
-    llvm::StructType* elem_ops_ty();
-
     // -- Garbage collection: the rt_gc_* ABI mirrors -----------------------------
     //
     // src/runtime/Gc.h declares these as part of the JIT-callable C ABI, so each
-    // type below must match its C struct BIT FOR BIT -- the same "must match the
-    // runtime struct exactly" contract elem_ops_ty carries above, and the same
+    // gc_*_ty mirror (declared with the runtime ABI below) must match its C struct
+    // BIT FOR BIT -- the same "must match the runtime struct exactly" contract
+    // elem_ops_ty carries, and the same
     // lockstep two-file edit. The two things that cannot be checked structurally,
     // the vptr-to-map offset and the offset of the request flag generated code
     // polls, are cross-checked at run time by rt_gc_init against
@@ -1047,14 +1042,6 @@ private:
     // long-lived objects and no churn should pay a not-taken branch per wheel advance
     // and nothing per activation (docs/design/garbage-collection.md §5.2).
 
-    llvm::StructType* gc_map_ty();
-
-    llvm::StructType* gc_roots_ty();
-
-    llvm::StructType* gc_container_ty();
-
-    llvm::StructType* gc_container_table_ty();
-
     // rt_gc_frame (Gc.h:137-142): { ptr prev, ptr next, ptr base, i64 bytes }.
     //
     // Field indices, named for the same reason GcMutField's are: emit_gc_frame_link
@@ -1066,7 +1053,6 @@ private:
     static constexpr unsigned kGcFrameNext  = 1;
     static constexpr unsigned kGcFrameBase  = 2;
     static constexpr unsigned kGcFrameBytes = 3;
-    llvm::StructType* gc_frame_ty();
 
     uint32_t gc_frame_off(unsigned field);
 
@@ -1087,8 +1073,6 @@ private:
         FramesHead  = 8,
     };
 
-    llvm::StructType* gc_mutator_ty();
-
     int32_t gc_mutator_bytes();
 
     uint32_t gc_mut_off(GcMutField f);
@@ -1097,15 +1081,11 @@ private:
 
     int32_t gc_mutator_request_offset();
 
-    llvm::StructType* gc_config_ty();
-
     llvm::Constant* agg_proto_const(Ref type, llvm::Type* storage);
 
     llvm::GlobalVariable* agg_proto_global(Ref type);
 
     llvm::Constant* elem_proto_const(const DynElem& e);
-
-    llvm::StructType* elem_leaf_ty();
 
     void collect_elem_leaves(Ref type, uint64_t base, llvm::Type* storage, std::vector<llvm::Constant*>& out);
 
@@ -1136,8 +1116,6 @@ private:
         uint32_t width;
     };
     SortDesc dynarr_sort_desc(Ref array_type) const;
-
-    llvm::StructType* queue_slot_ty();
 
     bool is_queue_type(Ref type) const;
 
@@ -1614,12 +1592,6 @@ private:
                                          uint32_t                        index);
 
     llvm::Constant* gc_config_global();
-
-    llvm::StructType* cover_range_ty();
-    llvm::StructType* cover_bin_ty();
-    llvm::StructType* cover_point_ty();
-    llvm::StructType* cover_type_ty();
-    llvm::StructType* cover_config_ty();
 
     llvm::Constant* cover_array(llvm::StructType*                   row_ty,
                                 const std::vector<llvm::Constant*>& rows,
@@ -2101,19 +2073,269 @@ private:
 
     llvm::Function* coro_intr(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::Type*> tys = {});
 
-    // -- Runtime ABI (runtime/Runtime.h C ABI) --
+    // -- Runtime ABI (runtime/Runtime.h, Gc.h, Coverage.h C ABI; RuntimeAbi.cpp) --
     //
     // rt_fn declares (or fetches) one runtime entry point; each *_fn helper
     // below pins one C signature. Every pointer parameter is an opaque ptr, so
     // the LLVM-side signature is the C one with pointers erased; a helper
-    // carries a comment only where the C signature is not obvious from it.
+    // carries a comment only where the C signature is not obvious from it. Each
+    // *_ty below mirrors a runtime C struct and must match it field for field.
 
     llvm::FunctionCallee rt_fn(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params);
     llvm::Type* raw_ptr_ty();
 
+    llvm::StructType* arg_struct_ty();
+    llvm::FunctionCallee fwrite_fn();
+
+    llvm::FunctionCallee strobe_pend_fn();
+    llvm::FunctionCallee strobe_pop_fn();
+
+    llvm::FunctionCallee monitor_emit_fn();
+    llvm::FunctionCallee monitor_set_fn();
+    llvm::FunctionCallee monitor_enable_fn();
+    llvm::FunctionCallee monitor_active_ramp_fn();
+
+    llvm::FunctionCallee timeformat_init_fn();
+    llvm::FunctionCallee timeformat_set_fn();
+
+    llvm::FunctionCallee finish_coop_fn();
+    llvm::FunctionCallee observed_case_violation_fn();
+    llvm::FunctionCallee observed_flush_fn();
+    llvm::FunctionCallee severity_fn();
+    llvm::FunctionCallee defer_report_fn();
+    llvm::FunctionCallee defer_flush_observed_fn();
+    llvm::FunctionCallee defer_flush_final_fn();
+    llvm::StructType* bounds_site_ty();
+    llvm::FunctionCallee bounds_report_fn();
+
+    llvm::FunctionCallee wide_sel_fn();
+    llvm::FunctionCallee wide_ins_fn();
+
+    llvm::StructType* null_site_ty();
+    llvm::FunctionCallee null_handle_fn();
+
+    llvm::StructType* ref_site_ty();
+    llvm::FunctionCallee ref_stale_fn();
+    llvm::FunctionCallee ref_epoch_regress_fn();
+    llvm::StructType* ref_name_ty();
+
+    llvm::StructType* tagged_site_ty();
+    llvm::FunctionCallee tagged_access_fn();
+
+    llvm::StructType* alloc_site_ty();
+    llvm::FunctionCallee sim_run_fn();
+
+    llvm::FunctionCallee fopen_mcd_fn();
+    llvm::FunctionCallee fopen_fd_fn();
+    llvm::FunctionCallee fclose_fn();
+    llvm::FunctionCallee system_fn();
+    llvm::FunctionCallee fflush_fn();
+    llvm::FunctionCallee fgets_fn();
+    llvm::FunctionCallee fgets_str_fn();
+    llvm::FunctionCallee sformat_fn();
+    llvm::FunctionCallee sformat_str_fn();
+    llvm::StructType* fmt_dyn_struct_ty();
+    llvm::FunctionCallee ferror_fn();
+    llvm::FunctionCallee ferror_str_fn();
+    llvm::StructType* scan_arg_struct_ty();
+    llvm::FunctionCallee fscanf_fn();
+    llvm::FunctionCallee sscanf_fn();
+    llvm::FunctionCallee readmem_fn();
+    llvm::FunctionCallee fread_fn();
+
+    llvm::FunctionCallee vcd_open_fn();
+    llvm::FunctionCallee vcd_begin_fn();
+    llvm::FunctionCallee vcd_scope_fn();
+    llvm::FunctionCallee vcd_upscope_fn();
+    llvm::FunctionCallee vcd_var_fn();
+    llvm::FunctionCallee vcd_array_fn();
+    llvm::FunctionCallee vcd_start_fn();
+    llvm::FunctionCallee vcd_limit_fn();
+    llvm::FunctionCallee vcd_touch_fn();
+    llvm::FunctionCallee vcd_flush_fn();
+    llvm::FunctionCallee vcd_close_fn();
+    llvm::FunctionCallee vcd_nullary_fn(const char* name);
+    llvm::FunctionCallee vcd_touch_range_fn();
+
+    llvm::FunctionCallee random_fn();
+
+    llvm::FunctionCallee dist_fn(const char* name, unsigned nparam);
+
+    llvm::FunctionCallee urandom_seed_fn();
+
+    llvm::FunctionCallee randc_next_fn();
+
+    llvm::FunctionCallee test_plusargs_fn();
+    llvm::FunctionCallee value_plusargs_fn();
+    llvm::FunctionCallee value_plusargs_str_fn();
+
+    llvm::FunctionCallee nba_arr_slot_fn();
+    llvm::FunctionCallee nba_arr_base_fn();
+    llvm::FunctionCallee nba_arr_count_fn();
+    llvm::FunctionCallee nba_arr_any_fn();
+    llvm::FunctionCallee nba_arr_reset_fn();
+
+    llvm::StructType* elem_ops_ty();
+    llvm::StructType* elem_leaf_ty();
+
+    llvm::StructType* dynarr_slot_ty();
+    llvm::FunctionCallee dynarr_new_fn();
+    llvm::FunctionCallee dynarr_new_copy_fn();
+    llvm::FunctionCallee dynarr_delete_fn();
+    llvm::FunctionCallee dynarr_assign_fn();
+    llvm::FunctionCallee dynarr_move_fn();
+
+    llvm::FunctionCallee dynarr_reverse_fn();
+    llvm::FunctionCallee dynarr_sort_fn();
+    llvm::FunctionCallee dynarr_shuffle_fn();
+
+    llvm::StructType* queue_slot_ty();
+    llvm::FunctionCallee dynarr_assign_queue_fn();
+    llvm::FunctionCallee queue_push_fn(bool front);
+    llvm::FunctionCallee queue_pop_fn(bool front);
+    llvm::FunctionCallee queue_insert_fn();
+    llvm::FunctionCallee queue_delete_idx_fn();
+    llvm::FunctionCallee queue_delete_all_fn();
+    llvm::FunctionCallee queue_assign_dynarr_fn();
+    llvm::FunctionCallee queue_assign_fn();
+    llvm::FunctionCallee queue_move_fn();
+    llvm::FunctionCallee queue_append_range_fn();
+    llvm::FunctionCallee queue_reverse_fn();
+    llvm::FunctionCallee queue_sort_fn();
+    llvm::FunctionCallee queue_shuffle_fn();
+    llvm::FunctionCallee container_fmt_p_fn();
+    llvm::FunctionCallee tagged_fmt_p_fn();
+    llvm::FunctionCallee container_eq_fn();
+
+    llvm::FunctionCallee keybuf_begin_fn();
+    llvm::FunctionCallee keybuf_append_fn();
+    llvm::FunctionCallee keybuf_span_fn();
+    llvm::FunctionCallee keybuf_end_fn();
+    llvm::FunctionCallee key_span_eq_fn();
+
+    llvm::StructType* assoc_slot_ty();
+    llvm::FunctionCallee assoc_get_ptr_fn();
+    llvm::FunctionCallee assoc_put_ptr_fn();
+    llvm::FunctionCallee assoc_exists_fn();
+    llvm::FunctionCallee assoc_delete_key_fn();
+    llvm::FunctionCallee assoc_delete_all_fn();
+    llvm::FunctionCallee assoc_default_ptr_fn();
+    llvm::FunctionCallee assoc_reset_fn();
+    llvm::FunctionCallee assoc_num_fn();
+    llvm::FunctionCallee assoc_end_fn(bool last);
+    llvm::FunctionCallee assoc_step_fn(bool prev);
+    llvm::FunctionCallee assoc_assign_fn();
+    llvm::FunctionCallee assoc_move_fn();
+
+    llvm::FunctionCallee str_init_fn();
+    llvm::FunctionCallee str_deinit_fn();
+    llvm::FunctionCallee str_assign_fn();
+    llvm::FunctionCallee str_move_fn();
+    llvm::FunctionCallee str_assign_bytes_fn();
+    llvm::FunctionCallee str_len_fn();
+    llvm::FunctionCallee str_data_fn();
+    llvm::FunctionCallee str_concat_fn();
+    llvm::FunctionCallee str_repl_fn();
+    llvm::FunctionCallee str_repl_invalid_fn();
+    llvm::FunctionCallee str_cmp_fn();
+    llvm::FunctionCallee str_icmp_fn();
+    llvm::FunctionCallee str_substr_fn();
+    llvm::FunctionCallee str_upper_fn();
+    llvm::FunctionCallee enum_name_fn();
+    llvm::FunctionCallee str_lower_fn();
+    llvm::FunctionCallee str_putc_fn();
+    llvm::FunctionCallee str_getc_fn();
+    llvm::FunctionCallee str_from_packed_fn();
+    llvm::FunctionCallee str_append_packed_fn();
+    llvm::FunctionCallee str_to_packed_fn();
+    llvm::FunctionCallee str_atoi_fn();
+    llvm::FunctionCallee str_atohex_fn();
+    llvm::FunctionCallee str_atooct_fn();
+    llvm::FunctionCallee str_atobin_fn();
+    llvm::FunctionCallee str_atoreal_fn();
+    llvm::FunctionCallee str_itoa_fn();
+    llvm::FunctionCallee str_hextoa_fn();
+    llvm::FunctionCallee str_octtoa_fn();
+    llvm::FunctionCallee str_bintoa_fn();
+    llvm::FunctionCallee str_realtoa_fn();
+
     llvm::FunctionCallee alloc_fn();
     llvm::FunctionCallee free_fn();
 
+    llvm::FunctionCallee event_detach_register_fn();
+    llvm::FunctionCallee event_detach_fire_fn();
+    llvm::FunctionCallee event_detach_ready_fn();
+    llvm::FunctionCallee event_new_fn();
+    llvm::FunctionCallee event_ptr_fn();
+    llvm::FunctionCallee run_init_fn();
+
+    llvm::FunctionCallee proc_alloc_fn();
+    llvm::FunctionCallee proc_complete_fn();
+    llvm::FunctionCallee proc_mark_kill_fn();
+    llvm::FunctionCallee proc_adopt_fn();
+    llvm::FunctionCallee proc_thread_done_fn();
+    llvm::FunctionCallee proc_obj_retain_fn();
+    llvm::FunctionCallee proc_await_self_fn();
+    llvm::FunctionCallee proc_randstate_get_fn();
+    llvm::FunctionCallee proc_randstate_set_fn();
+
+    llvm::FunctionCallee wheel_init_fn();
+    llvm::FunctionCallee wheel_deinit_fn();
+    llvm::FunctionCallee oscillation_abort_fn();
+    llvm::FunctionCallee ring_overflow_fn();
+    llvm::FunctionCallee dpi_export_task_suspended_fn();
+    llvm::FunctionCallee dpi_export_task_no_task_frame_fn();
+    llvm::FunctionCallee wheel_now_fn();
+    llvm::FunctionCallee wheel_schedule_fn();
+    llvm::FunctionCallee wheel_schedule_rel_fn();
+    llvm::FunctionCallee wheel_advance_fn();
+
+    llvm::FunctionCallee intra_alloc_fn();
+    llvm::FunctionCallee intra_cb_fn();
+    llvm::FunctionCallee intra_ready_base_fn();
+    llvm::FunctionCallee intra_ready_count_fn();
+    llvm::FunctionCallee intra_any_fn();
+    llvm::FunctionCallee intra_release_fn();
+    llvm::FunctionCallee intra_reset_fn();
+
+    llvm::FunctionCallee inertial_buf_fn();
+    llvm::FunctionCallee inertial_decide_fn();
+    llvm::FunctionCallee inertial_cb_fn();
+
+    llvm::FunctionCallee intra_event_register_fn();
+    llvm::FunctionCallee intra_event_register_group_fn();
+    llvm::FunctionCallee intra_event_fire_fn();
+
+    llvm::FunctionCallee dpi_pack_logicvec_fn();
+    llvm::FunctionCallee dpi_unpack_logicvec_fn();
+    llvm::FunctionCallee dpi_str_out_fn();
+
+    llvm::StructType* rt_svopen_ty();
+
+    llvm::StructType* gc_map_ty();
+    llvm::StructType* gc_roots_ty();
+    llvm::StructType* gc_container_ty();
+    llvm::StructType* gc_container_table_ty();
+    llvm::StructType* gc_frame_ty();
+    llvm::StructType* gc_mutator_ty();
+    llvm::StructType* gc_config_ty();
+    llvm::FunctionCallee gc_init_fn();
+    llvm::FunctionCallee gc_shutdown_fn();
+    llvm::FunctionCallee gc_mutator_fn();
+    llvm::FunctionCallee gc_alloc_fn();
+    llvm::FunctionCallee gc_roots_add_fn();
+    llvm::FunctionCallee gc_containers_add_fn();
+    llvm::FunctionCallee gc_container_add_fn();
+    llvm::FunctionCallee gc_container_remove_fn();
+    llvm::FunctionCallee gc_alloc_slow_fn();
+    llvm::FunctionCallee gc_safepoint_slow_fn();
+    llvm::FunctionCallee gc_remember_fn();
+
+    llvm::StructType* cover_range_ty();
+    llvm::StructType* cover_bin_ty();
+    llvm::StructType* cover_point_ty();
+    llvm::StructType* cover_type_ty();
+    llvm::StructType* cover_config_ty();
     llvm::FunctionCallee cover_init_fn();
     llvm::FunctionCallee cover_new_fn();
     llvm::FunctionCallee cover_ctx_fn();
@@ -2126,18 +2348,6 @@ private:
     llvm::FunctionCallee cover_point_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_type_query_fn(const char* name, llvm::Type* ret);
     llvm::FunctionCallee cover_design_coverage_fn();
-
-    llvm::FunctionCallee gc_init_fn();
-    llvm::FunctionCallee gc_shutdown_fn();
-    llvm::FunctionCallee gc_mutator_fn();
-    llvm::FunctionCallee gc_alloc_fn();
-    llvm::FunctionCallee gc_roots_add_fn();
-    llvm::FunctionCallee gc_containers_add_fn();
-    llvm::FunctionCallee gc_container_add_fn();
-    llvm::FunctionCallee gc_container_remove_fn();
-    llvm::FunctionCallee gc_alloc_slow_fn();
-    llvm::FunctionCallee gc_safepoint_slow_fn();
-    llvm::FunctionCallee gc_remember_fn();
 
     // -- Coroutine frame registry (docs/design/garbage-collection.md §2, F2) -----
 
@@ -2176,26 +2386,6 @@ private:
 
     llvm::Value* emit_gc_ref_container_add(const LValue& lv);
 
-    llvm::FunctionCallee nba_arr_slot_fn();
-    llvm::FunctionCallee nba_arr_base_fn();
-    llvm::FunctionCallee nba_arr_count_fn();
-    llvm::FunctionCallee nba_arr_any_fn();
-    llvm::FunctionCallee nba_arr_reset_fn();
-
-    llvm::FunctionCallee intra_alloc_fn();
-    llvm::FunctionCallee intra_cb_fn();
-    llvm::FunctionCallee inertial_buf_fn();
-    llvm::FunctionCallee inertial_decide_fn();
-    llvm::FunctionCallee inertial_cb_fn();
-    llvm::FunctionCallee intra_ready_base_fn();
-    llvm::FunctionCallee intra_ready_count_fn();
-    llvm::FunctionCallee intra_any_fn();
-    llvm::FunctionCallee intra_release_fn();
-    llvm::FunctionCallee intra_reset_fn();
-    llvm::FunctionCallee intra_event_register_fn();
-    llvm::FunctionCallee intra_event_register_group_fn();
-    llvm::FunctionCallee intra_event_fire_fn();
-
     uint32_t intra_idx(Signal sig) const;
     llvm::StructType* intra_rec_ty(const SignalSlot& s);
     uint32_t intra_rec_mask(const SignalSlot& s) const;
@@ -2211,109 +2401,9 @@ private:
     uint32_t arr_rec_mask(const SignalSlot& s) const;
     uint32_t arr_rec_ctx(const SignalSlot& s) const;
 
-    llvm::FunctionCallee dynarr_new_fn();
-    llvm::FunctionCallee dynarr_new_copy_fn();
-    llvm::FunctionCallee dynarr_delete_fn();
-    llvm::FunctionCallee dynarr_assign_fn();
-    llvm::FunctionCallee dynarr_assign_queue_fn();
-    llvm::FunctionCallee dynarr_move_fn();
-    llvm::FunctionCallee dynarr_reverse_fn();
-    llvm::FunctionCallee dynarr_sort_fn();
-    llvm::FunctionCallee dynarr_shuffle_fn();
-
-    llvm::FunctionCallee queue_push_fn(bool front);
-    llvm::FunctionCallee queue_pop_fn(bool front);
-    llvm::FunctionCallee queue_insert_fn();
-    llvm::FunctionCallee queue_delete_idx_fn();
-    llvm::FunctionCallee queue_delete_all_fn();
-    llvm::FunctionCallee queue_assign_dynarr_fn();
-
-    llvm::FunctionCallee queue_assign_fn();
-    llvm::FunctionCallee queue_move_fn();
-    llvm::FunctionCallee queue_append_range_fn();
-    llvm::FunctionCallee queue_reverse_fn();
-    llvm::FunctionCallee queue_sort_fn();
-    llvm::FunctionCallee queue_shuffle_fn();
-
-    llvm::FunctionCallee assoc_get_ptr_fn();
-    llvm::FunctionCallee assoc_put_ptr_fn();
-    llvm::FunctionCallee assoc_exists_fn();
-    llvm::FunctionCallee assoc_delete_key_fn();
-    llvm::FunctionCallee assoc_delete_all_fn();
-    llvm::FunctionCallee assoc_default_ptr_fn();
-    llvm::FunctionCallee assoc_reset_fn();
-    llvm::FunctionCallee assoc_num_fn();
-    llvm::FunctionCallee assoc_end_fn(bool last);
-    llvm::FunctionCallee assoc_step_fn(bool prev);
-    llvm::FunctionCallee assoc_assign_fn();
-    llvm::FunctionCallee assoc_move_fn();
-
-    llvm::FunctionCallee keybuf_begin_fn();
-    llvm::FunctionCallee keybuf_append_fn();
-    llvm::FunctionCallee keybuf_span_fn();
-    llvm::FunctionCallee keybuf_end_fn();
-    llvm::FunctionCallee key_span_eq_fn();
-
-    llvm::FunctionCallee str_init_fn();
-    llvm::FunctionCallee str_deinit_fn();
-    llvm::FunctionCallee str_assign_fn();
-    llvm::FunctionCallee str_move_fn();
-    llvm::FunctionCallee str_assign_bytes_fn();
-    llvm::FunctionCallee str_len_fn();
-    llvm::FunctionCallee str_data_fn();
-    llvm::FunctionCallee str_concat_fn();
-    llvm::FunctionCallee str_repl_fn();
-    llvm::FunctionCallee str_repl_invalid_fn();
-    llvm::FunctionCallee str_cmp_fn();
-    llvm::FunctionCallee str_icmp_fn();
-    llvm::FunctionCallee str_substr_fn();
-    llvm::FunctionCallee str_upper_fn();
-    llvm::FunctionCallee enum_name_fn();
-    llvm::FunctionCallee container_fmt_p_fn();
-    llvm::FunctionCallee tagged_fmt_p_fn();
-    llvm::FunctionCallee container_eq_fn();
-    llvm::FunctionCallee str_lower_fn();
-    llvm::FunctionCallee str_putc_fn();
-    llvm::FunctionCallee str_getc_fn();
-    llvm::FunctionCallee str_from_packed_fn();
-    llvm::FunctionCallee str_append_packed_fn();
-    llvm::FunctionCallee str_to_packed_fn();
-    llvm::FunctionCallee str_atoi_fn();
-    llvm::FunctionCallee str_atohex_fn();
-    llvm::FunctionCallee str_atooct_fn();
-    llvm::FunctionCallee str_atobin_fn();
-    llvm::FunctionCallee str_atoreal_fn();
-    llvm::FunctionCallee str_itoa_fn();
-    llvm::FunctionCallee str_hextoa_fn();
-    llvm::FunctionCallee str_octtoa_fn();
-    llvm::FunctionCallee str_bintoa_fn();
-    llvm::FunctionCallee str_realtoa_fn();
-
-    llvm::FunctionCallee wheel_init_fn();
-    llvm::FunctionCallee wheel_deinit_fn();
-    llvm::FunctionCallee oscillation_abort_fn();
-    llvm::FunctionCallee ring_overflow_fn();
-    llvm::FunctionCallee dpi_export_task_suspended_fn();
-    llvm::FunctionCallee dpi_export_task_no_task_frame_fn();
-
     void build_wheel_global();
 
-    llvm::FunctionCallee event_detach_register_fn();
-    llvm::FunctionCallee event_detach_fire_fn();
-    llvm::FunctionCallee event_detach_ready_fn();
-
-    llvm::FunctionCallee event_new_fn();
-    llvm::FunctionCallee event_ptr_fn();
-    llvm::FunctionCallee run_init_fn();
-    llvm::FunctionCallee wheel_now_fn();
-    llvm::FunctionCallee random_fn();
-    llvm::FunctionCallee dist_fn(const char* name, unsigned nparam);
     static const char* dist_symbol(uint32_t fn);
-    llvm::FunctionCallee urandom_seed_fn();
-    llvm::FunctionCallee randc_next_fn();
-    llvm::FunctionCallee wheel_schedule_fn();
-    llvm::FunctionCallee wheel_schedule_rel_fn();
-    llvm::FunctionCallee wheel_advance_fn();
 
     void init_state();
 
@@ -2745,26 +2835,7 @@ private:
 
     // -- System tasks --
 
-    llvm::StructType* arg_struct_ty();
-
-    llvm::FunctionCallee fwrite_fn();
-
-    llvm::FunctionCallee fopen_mcd_fn();
-
-    llvm::FunctionCallee fopen_fd_fn();
-
-    llvm::FunctionCallee fclose_fn();
-
-    llvm::FunctionCallee system_fn();
-
-    llvm::FunctionCallee timeformat_init_fn();
-
-    llvm::FunctionCallee timeformat_set_fn();
-
     void lower_timeformat(Index i);
-
-    llvm::FunctionCallee strobe_pend_fn();
-    llvm::FunctionCallee strobe_pop_fn();
 
     void lower_strobe_pend(Index i);
 
@@ -2778,8 +2849,6 @@ private:
 
     llvm::Value* reactive_record_slot();
 
-    llvm::FunctionCallee finish_coop_fn();
-
     void emit_finish_exit();
 
     void emit_finish_check(bool callee_may_finish);
@@ -2789,10 +2858,6 @@ private:
     bool virtual_call_may_finish() const;
 
     void lower_finish(Index i);
-
-    llvm::FunctionCallee observed_case_violation_fn();
-
-    llvm::FunctionCallee observed_flush_fn();
 
     void lower_case_viol(Index i);
 
@@ -2811,18 +2876,11 @@ private:
         AssocKey  = 6,
     };
 
-    llvm::StructType* bounds_site_ty();
-
     llvm::Constant* bounds_site_global(const SourceText& idx, const SourceText& acc,
                                        const std::string& name, BoundsWhat what, int32_t left,
                                        int32_t right, int32_t width = 1);
 
     std::string bounds_name(const LValue& lv) const;
-
-    llvm::FunctionCallee bounds_report_fn();
-    llvm::FunctionCallee wide_sel_fn();
-
-    llvm::FunctionCallee wide_ins_fn();
 
     void add_elem_bounds_check(LValue& target, Index at, const LValue& named, Index idx_expr,
                                llvm::Value* inrange, llvm::Value* unknown, llvm::Value* extent,
@@ -2852,53 +2910,25 @@ private:
     // for a class, 25.9 for a virtual interface). Mirrors rt_null_kind.
     enum class NullKind : int32_t { Class = 0, Iface = 1 };
 
-    llvm::StructType* null_site_ty();
-
     llvm::Constant* null_site_global(const SourceText& at, NullKind kind);
-
-    llvm::FunctionCallee null_handle_fn();
 
     void emit_null_handle_check(llvm::Value* handle, Index at, NullKind kind = NullKind::Class);
 
     llvm::Constant* no_epoch_global();
 
-    llvm::StructType* ref_site_ty();
-
     llvm::Constant* ref_site_global(const SourceText& at, std::string_view formal);
-
-    llvm::FunctionCallee ref_stale_fn();
-
-    llvm::FunctionCallee ref_epoch_regress_fn();
 
     void emit_ref_name_table();
 
-    llvm::StructType* ref_name_ty();
-
     void emit_ref_epoch_check(const RefBinding& rb);
-
-    llvm::StructType* tagged_site_ty();
-
-    llvm::FunctionCallee tagged_access_fn();
 
     void lower_tagged_check(Index i);
 
     llvm::Constant* tagged_site_global(const SourceText& at, const TaggedCheckInfo& info);
 
-    llvm::StructType* alloc_site_ty();
-
     llvm::Constant* alloc_site_global(const SourceText& at, std::string_view what);
 
-    llvm::FunctionCallee severity_fn();
-
     void lower_severity(Index i);
-
-    llvm::FunctionCallee defer_report_fn();
-    llvm::FunctionCallee defer_flush_observed_fn();
-    llvm::FunctionCallee defer_flush_final_fn();
-
-    llvm::FunctionCallee sim_run_fn();
-
-    llvm::FunctionCallee fflush_fn();
 
     void lower_fflush(Index i);
 
@@ -2920,19 +2950,9 @@ private:
 
     void lower_fseek(Index i);
 
-    llvm::FunctionCallee fgets_fn();
-
-    llvm::FunctionCallee fgets_str_fn();
-
     void lower_fgets(Index i);
 
     std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> string_dest(Index dst, const char* who);
-
-    llvm::FunctionCallee sformat_fn();
-
-    llvm::FunctionCallee sformat_str_fn();
-
-    llvm::StructType* fmt_dyn_struct_ty();
 
     // The format string and the rt_fmt_dyn context of a $sformat / $sformatf.
     //
@@ -2959,27 +2979,11 @@ private:
 
     void lower_sformatf(Index i);
 
-    llvm::FunctionCallee ferror_fn();
-
-    llvm::FunctionCallee ferror_str_fn();
-
     void lower_ferror(Index i);
-
-    llvm::StructType* scan_arg_struct_ty();
-
-    llvm::FunctionCallee fscanf_fn();
-
-    llvm::FunctionCallee sscanf_fn();
 
     void lower_scanf(Index i);
 
-    llvm::FunctionCallee test_plusargs_fn();
-
     void lower_test_plusargs(Index i);
-
-    llvm::FunctionCallee value_plusargs_fn();
-
-    llvm::FunctionCallee value_plusargs_str_fn();
 
     void lower_value_plusargs(Index i);
 
@@ -2997,10 +3001,6 @@ private:
     };
     AsciiArg spill_ascii_arg(Index v, const char* name);
 
-    llvm::FunctionCallee readmem_fn();
-
-    llvm::FunctionCallee fread_fn();
-
     void lower_fread_word(Index i);
 
     void lower_fread_mem(Index i);
@@ -3010,15 +3010,6 @@ private:
     // -- Value-change dump (VCD, LRM §21.7; runtime in src/runtime/Vcd.cpp,
     //    design in docs/VCD.md) --
 
-    llvm::FunctionCallee vcd_open_fn();
-    llvm::FunctionCallee vcd_begin_fn();
-    llvm::FunctionCallee vcd_scope_fn();
-    llvm::FunctionCallee vcd_upscope_fn();
-    llvm::FunctionCallee vcd_var_fn();
-    llvm::FunctionCallee vcd_array_fn();
-    llvm::FunctionCallee vcd_start_fn();
-    llvm::FunctionCallee vcd_limit_fn();
-    llvm::FunctionCallee vcd_touch_fn();
     bool design_has_finish();
 
     llvm::Constant* finishing_gv();
@@ -3027,9 +3018,6 @@ private:
     void emit_guarded_vcd_touch(llvm::FunctionCallee                                  fn,
                                 llvm::function_ref<llvm::SmallVector<llvm::Value*, 2>()> make_args,
                                 llvm::Value* extra = nullptr);
-    llvm::FunctionCallee vcd_flush_fn();
-    llvm::FunctionCallee vcd_close_fn();
-    llvm::FunctionCallee vcd_nullary_fn(const char* name);
 
     bool design_uses_vcd() const;
 
@@ -3066,8 +3054,6 @@ private:
     void vcd_index_scope(const InstanceScope& sc, uint32_t& next);
 
     void vcd_index_signal(Signal sig, uint32_t& next);
-
-    llvm::FunctionCallee vcd_touch_range_fn();
 
     llvm::Value* vcd_index_value(Signal sig, int32_t base);
 
@@ -3112,10 +3098,6 @@ private:
 
     static uint32_t dpi_nchunks(uint32_t w);
 
-    llvm::FunctionCallee dpi_pack_logicvec_fn();
-    llvm::FunctionCallee dpi_unpack_logicvec_fn();
-    llvm::FunctionCallee dpi_str_out_fn();
-
     llvm::Value* dpi_spill_words(llvm::Value* plane, uint32_t nchunks);
     llvm::Value* dpi_load_words(llvm::Value* buf, uint32_t nchunks, uint32_t w);
 
@@ -3125,7 +3107,6 @@ private:
 
     Plane dpi_vec_copyout(DpiCType ct, llvm::Value* scratch, uint32_t w);
 
-    llvm::StructType* rt_svopen_ty();
     llvm::StructType* rt_svopen_ty_ = nullptr;
 
     // A marshalled open-array output/inout argument to unpack back after the call
@@ -3240,11 +3221,6 @@ private:
     void emit_display(const DisplayInfo& info, llvm::Value* desc);
 
     void emit_display_to(const DisplayInfo& info, llvm::Value* desc, llvm::FunctionCallee sink);
-
-    llvm::FunctionCallee monitor_emit_fn();
-    llvm::FunctionCallee monitor_set_fn();
-    llvm::FunctionCallee monitor_enable_fn();
-    llvm::FunctionCallee monitor_active_ramp_fn();
 
     void store_field(llvm::StructType* sty, llvm::Value* elt, unsigned idx, llvm::Value* v);
 
@@ -3533,13 +3509,6 @@ private:
 
     llvm::Value* program_root_pcb(uint32_t inst);
 
-    llvm::FunctionCallee proc_alloc_fn();
-    llvm::FunctionCallee proc_complete_fn();
-    llvm::FunctionCallee proc_mark_kill_fn();
-    llvm::FunctionCallee proc_adopt_fn();
-    llvm::FunctionCallee proc_thread_done_fn();
-    llvm::FunctionCallee proc_obj_retain_fn();
-
     void emit_proc_state(uint32_t from, uint32_t to);
 
     llvm::Value* emit_proc_object(llvm::Value* pcb, Ref class_ref);
@@ -3564,8 +3533,6 @@ private:
 
     llvm::Value* proc_wait_node();
 
-    llvm::FunctionCallee proc_await_self_fn();
-
     void lower_proc_query(Index i);
 
     void emit_proc_park_while_suspended();
@@ -3577,9 +3544,6 @@ private:
     void lower_wait_fork();
 
     void emit_proc_publish_rng();
-
-    llvm::FunctionCallee proc_randstate_get_fn();
-    llvm::FunctionCallee proc_randstate_set_fn();
 
     llvm::Value* proc_rng_of(llvm::Value* pcb);
 

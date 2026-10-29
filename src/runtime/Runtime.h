@@ -1039,7 +1039,7 @@ enum {
 
 // The four trailing fields are the GC's (docs/design/garbage-collection.md §3.3).
 // They are APPENDED, so every existing field keeps its offset and the backend's
-// mirror (`elem_ops_ty`, ir/llvm/Containers.cpp) changes in lockstep by growing.
+// mirror (`elem_ops_ty`, ir/llvm/RuntimeAbi.cpp) changes in lockstep by growing.
 //
 // `nhandles` / `handles` describe the class-handle words inside ONE element image,
 // by byte offset: a bare class-handle element is `nhandles == 1` at offset 0, an

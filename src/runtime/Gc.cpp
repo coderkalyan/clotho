@@ -3292,7 +3292,7 @@ static_assert(sizeof(rt_gc_mutator) ==
                 offsetof(rt_gc_mutator, frames_head) + sizeof(struct rt_gc_frame*),
               "frames_head is the last field: the mirror knows every one of them");
 // The numbers those expressions come to on the LP64 host the backend targets, spelled
-// out so a reader can check the mirror by eye against ir/llvm/GcEmit.cpp's gc_mutator_ty
+// out so a reader can check the mirror by eye against ir/llvm/RuntimeAbi.cpp's gc_mutator_ty
 // without evaluating nine offsetof chains.
 static_assert(offsetof(rt_gc_mutator, cursor) == 0 && offsetof(rt_gc_mutator, limit) == 8 &&
                 offsetof(rt_gc_mutator, budget_left) == 16 &&

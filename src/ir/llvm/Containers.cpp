@@ -70,25 +70,6 @@ Backend::ContainerFmt Backend::container_fmt(Ref container_type) {
     return cf;
 }
 
-// The rt_elem_ops mirror type (Runtime.h:947-958):
-// { i32 kind, i32 nleaves, i64 stride, ptr proto, ptr inner, ptr leaves,
-//   i32 nhandles, i32 nkeyhandles, ptr handles, ptr keyhandles }.
-// Must match the runtime struct exactly.
-//
-// The last four fields are the collector's (docs/design/garbage-collection.md
-// §3.3) and are APPENDED, so every field that predates them keeps its offset and
-// this mirror grows in lockstep by growing (Runtime.h:909-911).
-llvm::StructType* Backend::elem_ops_ty() {
-    if (elem_ops_ty_ == nullptr) {
-        elem_ops_ty_ = llvm::StructType::create(
-          ctx_,
-          { b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty(),
-            raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty() },
-          "clotho.elemops");
-    }
-    return elem_ops_ty_;
-}
-
 // The element power-on byte image as a typed constant: X planes for a
 // 4-state scalar, zero for 2-state / real, the empty inline handle for a
 // string, the null handle for a nested container.
@@ -159,14 +140,6 @@ llvm::Constant* Backend::elem_proto_const(const DynElem& e) {
         fields.push_back(zero(e.width));
     }
     return llvm::ConstantStruct::get(e.slot_ty, fields);
-}
-
-// The rt_elem_leaf mirror type: { i64 offset, ptr ops }.
-llvm::StructType* Backend::elem_leaf_ty() {
-    if (elem_leaf_ty_ == nullptr) {
-        elem_leaf_ty_ = llvm::StructType::create(ctx_, { b_.getInt64Ty(), raw_ptr_ty() }, "clotho.elemleaf");
-    }
-    return elem_leaf_ty_;
 }
 
 // The heap-owning leaves of an aggregate element type as { byte offset, ops }
@@ -326,21 +299,6 @@ Backend::SortDesc Backend::dynarr_sort_desc(Ref array_type) const {
         return { vt.is_signed ? 4u : 3u, vt.width };
     }
     return { vt.is_signed ? 1u : 0u, vt.width };
-}
-
-// The opaque rt_queue ring handle slot type
-// (`%clotho.queue = { ptr, i64, i64, i64, i64 }`), memoized. Must mirror the
-// runtime rt_queue layout
-// ({ void* base, u64 head, u64 len, u64 cap, u64 epoch }).
-llvm::StructType* Backend::queue_slot_ty() {
-    if (queue_slot_ty_ == nullptr) {
-        queue_slot_ty_ = llvm::StructType::create(ctx_,
-                                                  { raw_ptr_ty(), b_.getInt64Ty(),
-                                                    b_.getInt64Ty(), b_.getInt64Ty(),
-                                                    b_.getInt64Ty() },
-                                                  "clotho.queue");
-    }
-    return queue_slot_ty_;
 }
 
 // Whether a type is a queue (LRM 7.10).
@@ -599,143 +557,6 @@ void Backend::str_chg_after(const LValue& lv, llvm::Value* snap) {
     b_.CreateBr(cont);
     b_.SetInsertPoint(cont);
     b_.CreateCall(str_deinit_fn(), { snap });
-}
-
-// String runtime (rt_string_*); every ptr is an rt_string handle except
-// where noted.
-// -- Dynamic array runtime (rt_dynarr_*, LRM 7.5) --
-// void rt_dynarr_new(rt_dynarr*, i64 stride, i64 n, const void* proto)
-// void rt_dynarr_new(rt_dynarr*, const rt_elem_ops*, i64 n, const rt_alloc_site*)
-llvm::FunctionCallee Backend::dynarr_new_fn() {
-    return rt_fn("rt_dynarr_new", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
-}
-
-// void rt_dynarr_new_copy(rt_dynarr*, i64 stride, i64 n, const void* proto, const rt_dynarr* src)
-// void rt_dynarr_new_copy(rt_dynarr*, const rt_elem_ops*, i64 n, const rt_dynarr* src,
-//                         const rt_alloc_site*)
-llvm::FunctionCallee Backend::dynarr_new_copy_fn() {
-    return rt_fn("rt_dynarr_new_copy", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_dynarr_delete(rt_dynarr*, const rt_elem_ops*)
-llvm::FunctionCallee Backend::dynarr_delete_fn() {
-    return rt_fn("rt_dynarr_delete", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_dynarr_assign(rt_dynarr*, const rt_dynarr*, const rt_elem_ops*, const rt_alloc_site*)
-llvm::FunctionCallee Backend::dynarr_assign_fn() {
-    return rt_fn("rt_dynarr_assign", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_dynarr_assign_queue(rt_dynarr*, const rt_queue*, const rt_elem_ops*, const rt_alloc_site*)
-llvm::FunctionCallee Backend::dynarr_assign_queue_fn() {
-    return rt_fn("rt_dynarr_assign_queue", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_dynarr_move(rt_dynarr* dst, rt_dynarr* src, const rt_elem_ops*)
-llvm::FunctionCallee Backend::dynarr_move_fn() {
-    return rt_fn("rt_dynarr_move", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_dynarr_reverse(rt_dynarr*, const rt_elem_ops*)  (LRM 7.12.2)
-llvm::FunctionCallee Backend::dynarr_reverse_fn() {
-    return rt_fn("rt_dynarr_reverse", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_dynarr_sort(rt_dynarr*, const rt_elem_ops*, i32 kind, i32 width, i32 rev)
-llvm::FunctionCallee Backend::dynarr_sort_fn() {
-    return rt_fn("rt_dynarr_sort", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-                   b_.getInt32Ty() });
-}
-
-// void rt_dynarr_shuffle(rt_dynarr*, const rt_elem_ops*, i64* rng)  (LRM 7.12.2)
-llvm::FunctionCallee Backend::dynarr_shuffle_fn() {
-    return rt_fn("rt_dynarr_shuffle", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// -- Queue runtime (rt_queue_*, LRM 7.10) --
-// void rt_queue_push_{back,front}(rt_queue*, const rt_elem_ops*, u64 bound, const void* elem,
-//                                 const rt_alloc_site*)
-llvm::FunctionCallee Backend::queue_push_fn(bool front) {
-    return rt_fn(front ? "rt_queue_push_front" : "rt_queue_push_back", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_queue_pop_{back,front}(rt_queue*, const rt_elem_ops*, void* out)
-llvm::FunctionCallee Backend::queue_pop_fn(bool front) {
-    return rt_fn(front ? "rt_queue_pop_front" : "rt_queue_pop_back", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_queue_insert(rt_queue*, const rt_elem_ops*, u64 bound, u64 i, const void* elem,
-//                      const rt_alloc_site*)
-llvm::FunctionCallee Backend::queue_insert_fn() {
-    return rt_fn("rt_queue_insert", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), raw_ptr_ty(),
-                   raw_ptr_ty() });
-}
-
-// void rt_queue_delete_idx(rt_queue*, const rt_elem_ops*, u64 i)
-llvm::FunctionCallee Backend::queue_delete_idx_fn() {
-    return rt_fn("rt_queue_delete_idx", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() });
-}
-
-// void rt_queue_delete_all(rt_queue*, const rt_elem_ops*)
-llvm::FunctionCallee Backend::queue_delete_all_fn() {
-    return rt_fn("rt_queue_delete_all", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_queue_assign_dynarr(rt_queue*, const rt_dynarr*, const rt_elem_ops*,
-//                             const rt_alloc_site*)
-llvm::FunctionCallee Backend::queue_assign_dynarr_fn() {
-    return rt_fn("rt_queue_assign_dynarr", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_queue_assign(rt_queue*, const rt_queue*, const rt_elem_ops*, const rt_alloc_site*)
-llvm::FunctionCallee Backend::queue_assign_fn() {
-    return rt_fn("rt_queue_assign", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_queue_move(rt_queue* dst, rt_queue* src, const rt_elem_ops*)
-llvm::FunctionCallee Backend::queue_move_fn() {
-    return rt_fn("rt_queue_move", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_queue_append_range(rt_queue* dst, const rt_queue* src,
-//                            const rt_elem_ops*, u64 bound, i64 lo, i64 hi,
-//                            const rt_alloc_site*)
-llvm::FunctionCallee Backend::queue_append_range_fn() {
-    return rt_fn("rt_queue_append_range", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(),
-                   b_.getInt64Ty(), raw_ptr_ty() });
-}
-
-// void rt_queue_reverse(rt_queue*, const rt_elem_ops*)  (LRM 7.12.2)
-llvm::FunctionCallee Backend::queue_reverse_fn() {
-    return rt_fn("rt_queue_reverse", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_queue_sort(rt_queue*, const rt_elem_ops*, i32 kind, i32 width, i32 rev)
-llvm::FunctionCallee Backend::queue_sort_fn() {
-    return rt_fn("rt_queue_sort", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-                   b_.getInt32Ty() });
-}
-
-// void rt_queue_shuffle(rt_queue*, const rt_elem_ops*, i64* rng)  (LRM 7.12.2)
-llvm::FunctionCallee Backend::queue_shuffle_fn() {
-    return rt_fn("rt_queue_shuffle", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
 // Alloca an empty result handle for each dynamic-array-returning call in the

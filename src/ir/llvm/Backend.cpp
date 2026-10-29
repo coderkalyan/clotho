@@ -405,23 +405,6 @@ llvm::Function* Backend::coro_intr(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::
     return llvm::Intrinsic::getOrInsertDeclaration(&env_->llmod, id, tys);
 }
 
-llvm::FunctionCallee Backend::rt_fn(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> params) {
-    return env_->llmod.getOrInsertFunction(name, llvm::FunctionType::get(ret, params, false));
-}
-
-llvm::Type* Backend::raw_ptr_ty() {
-    return llvm::PointerType::getUnqual(ctx_);
-}
-
-// Coroutine frame allocation, sim-owned: ptr rt_alloc(i64) / void rt_free(ptr).
-llvm::FunctionCallee Backend::alloc_fn() {
-    return rt_fn("rt_alloc", raw_ptr_ty(), { b_.getInt64Ty() });
-}
-
-llvm::FunctionCallee Backend::free_fn() {
-    return rt_fn("rt_free", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
 // An alloca placed at the top of the current function's entry block (not the
 // current insert point), so a scratch buffer used inside a loop body is
 // allocated once per activation rather than growing the stack per iteration.

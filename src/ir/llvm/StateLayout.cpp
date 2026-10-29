@@ -142,28 +142,6 @@ llvm::Constant* Backend::str_empty_const() {
     return llvm::ConstantStruct::get(str_slot_ty(), { b_.getInt64(0), llvm::ConstantDataArray::get(ctx_, bytes) });
 }
 
-// The opaque rt_dynarr handle slot type
-// (`%clotho.dynarr = { ptr, i64, i64 }`), memoized. Must mirror the runtime
-// rt_dynarr layout ({ void* data, u64 len, u64 epoch }).
-llvm::StructType* Backend::dynarr_slot_ty() {
-    if (dynarr_slot_ty_ == nullptr) {
-        dynarr_slot_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty() }, "clotho.dynarr");
-    }
-    return dynarr_slot_ty_;
-}
-
-// The opaque rt_assoc handle slot type (`%clotho.assoc = { ptr, i64 }`),
-// memoized. Must mirror the runtime rt_assoc layout
-// ({ void* impl, u64 epoch }).
-llvm::StructType* Backend::assoc_slot_ty() {
-    if (assoc_slot_ty_ == nullptr) {
-        assoc_slot_ty_ =
-          llvm::StructType::create(ctx_, { raw_ptr_ty(), b_.getInt64Ty() }, "clotho.assoc");
-    }
-    return assoc_slot_ty_;
-}
-
 // Field index of the relocation epoch inside each container's handle slot
 // (docs/design/data-model.md §3.1). A `ref` formed through a place rooted in
 // one of these carries `&handle[epoch_field]` so the callee can detect a
