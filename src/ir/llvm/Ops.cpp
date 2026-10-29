@@ -119,6 +119,54 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
     return v;
 }
 
+// A bit / part-select index operand as the i32 that is added to a bit offset.
+// LRM 11.5.1 compares the index VALUE, so a narrower operand extends by its own
+// signedness, and a wider one is narrowed by saturation: every value an i32
+// holds passes, and a larger one (a 64-bit index of 2**32 + 1, which its low 32
+// bits would turn into bit 1) becomes INT32_MAX or INT32_MIN, which no container
+// reaches. The frontend hands over an operand wider than 32 bits only when a
+// 32-bit offset could not hold its arithmetic.
+llvm::Value* Backend::select_index(Plane idx, ValType t) {
+    llvm::Value* m = must_of(idx);
+    if (t.width <= 32) {
+        return cast(m, 32, t.is_signed);
+    }
+    llvm::Value* hi = llvm::ConstantInt::get(m->getType(), INT32_MAX);
+    if (!t.is_signed) {
+        return cast(b_.CreateSelect(b_.CreateICmpULT(m, hi), m, hi), 32, false);
+    }
+    return cast(smax(smin(m, hi), llvm::ConstantInt::getSigned(m->getType(), INT32_MIN)), 32, false);
+}
+
+// The 0-based position of a fixed-size unpacked array element and whether the
+// index is inside the declared range (LRM 7.4.5). The index is normalized in a
+// type wide enough that neither its extension nor the subtraction of a bound can
+// wrap, so an index of 2**32 + 1 or a signed -1 is out of range instead of
+// aliasing a low element; LLVM narrows it again for the usual `int` index.
+Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValType t, uint32_t left, uint32_t right) {
+    const bool     ascending = left <= right;
+    const uint32_t count     = (ascending ? right - left : left - right) + 1;
+    const uint32_t ew        = std::max(64u, t.width + 2);
+    llvm::Value*   v         = cast(must_of(idx), ew, t.is_signed);
+    llvm::Value*   bound     = llvm::ConstantInt::getSigned(int_ty(ew), static_cast<int32_t>(left));
+    llvm::Value*   norm      = ascending ? b_.CreateSub(v, bound) : b_.CreateSub(bound, v);
+    // An unsigned compare also rejects a normalized index that went negative.
+    return { cast(norm, 32, false), b_.CreateICmpULT(norm, llvm::ConstantInt::get(int_ty(ew), count)) };
+}
+
+// `idx < len` for a dynamic array or queue (LRM 7.4.5), the index compared at its
+// own width and signedness. A negative index is a huge unsigned one, so a single
+// compare covers both ends.
+Backend::ElemBelow Backend::elem_index_below(Plane idx, ValType t, llvm::Value* len) {
+    llvm::Value* m = must_of(idx);
+    if (t.width <= 64) {
+        llvm::Value* idx64 = cast(m, 64, t.is_signed);
+        return { idx64, b_.CreateICmpULT(idx64, len) };
+    }
+    // Wider than the length: compare there, so the dropped high bits count.
+    return { cast(m, 64, false), b_.CreateICmpULT(m, cast(len, t.width, false)) };
+}
+
 // Whether a runtime-offset select into `sw`-bit storage takes the runtime
 // word-indexed path rather than shifting the whole value inline.
 //

@@ -801,7 +801,7 @@ void Backend::lower_inst(Index i) {
             const Plane        idxp   = value_of(p.binary.r);
             llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
             const uint32_t     cwidth = lv.width;
-            llvm::Value*       idx    = cast(must_of(idxp), 32, false);
+            llvm::Value*       idx    = select_index(idxp, type_of(p.binary.r));
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, idx) : idx;
             lv.width   = 1;
             const SelectVerdict sv = set_select_bounds(lv, cbase, cwidth, 1, any_unknown(idxp));
@@ -836,7 +836,7 @@ void Backend::lower_inst(Index i) {
             const Plane        offp   = value_of(dps.offset);
             llvm::Value* const cbase  = lv.bit_off != nullptr ? lv.bit_off : b_.getInt32(0);
             const uint32_t     cwidth = lv.width;
-            llvm::Value*       off    = cast(must_of(offp), 32, false);
+            llvm::Value*       off    = select_index(offp, type_of(dps.offset));
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, off) : off;
             lv.width   = dps.width;
             const SelectVerdict sv =
@@ -902,11 +902,11 @@ void Backend::lower_inst(Index i) {
                 // LRM 7.4.5 covers "an unpacked array of any kind": an x/z
                 // index is invalid exactly like one past the end, so the
                 // unknown term belongs in the gate and not only in the report.
-                const Plane  idxp    = value_of(es.index);
-                llvm::Value* idx64   = cast(must_of(idxp), 64, false);
-                llvm::Value* unknown = any_unknown(idxp);
-                llvm::Value* inrange =
-                  b_.CreateAnd(b_.CreateICmpULT(idx64, len), b_.CreateNot(unknown));
+                const Plane     idxp    = value_of(es.index);
+                const ElemBelow ei      = elem_index_below(idxp, type_of(es.index), len);
+                llvm::Value*    idx64   = ei.idx64;
+                llvm::Value*    unknown = any_unknown(idxp);
+                llvm::Value*    inrange = b_.CreateAnd(ei.below, b_.CreateNot(unknown));
                 if (e.is_string) {
                     // String element: an rt_string handle slot in the heap
                     // buffer. Bounds ride lv_string_ptr's sink redirect.
@@ -982,11 +982,11 @@ void Backend::lower_inst(Index i) {
                   queue_slot_ty(), handle, handle_epoch_field(es.array_type));
                 // An x/z index is invalid for an unpacked array of any kind
                 // (LRM 7.4.5), so it gates the access, not just the report.
-                const Plane  idxp    = value_of(es.index);
-                llvm::Value* idx64   = cast(must_of(idxp), 64, false);
-                llvm::Value* unknown = any_unknown(idxp);
-                llvm::Value* inrange =
-                  b_.CreateAnd(b_.CreateICmpULT(idx64, len), b_.CreateNot(unknown));
+                const Plane     idxp    = value_of(es.index);
+                const ElemBelow ei      = elem_index_below(idxp, type_of(es.index), len);
+                llvm::Value*    idx64   = ei.idx64;
+                llvm::Value*    unknown = any_unknown(idxp);
+                llvm::Value*    inrange = b_.CreateAnd(ei.below, b_.CreateNot(unknown));
                 llvm::Value* safe_cap =
                   b_.CreateSelect(b_.CreateICmpEQ(cap, b_.getInt64(0)), b_.getInt64(1), cap);
                 llvm::Value* phys = b_.CreateURem(b_.CreateAdd(head, idx64), safe_cap);
@@ -1046,17 +1046,13 @@ void Backend::lower_inst(Index i) {
             // Normalize to a 0-based position and gate the element with the
             // same dyn_inrange machinery a dynamic-array/queue element uses:
             // out-of-range read yields the element default, write is a
-            // no-op, the storage itself is never addressed out-of-bounds. An
-            // unsigned compare also catches a normalized index that went
-            // negative (wrapped to a huge unsigned value).
-            const Plane  idxp = value_of(es.index);
-            llvm::Value* idx  = cast(must_of(idxp), 32, false);
-            // Normalize the declared-range coordinate to a 0-based position.
-            llvm::Value* norm = at.left <= at.right ? b_.CreateSub(idx, b_.getInt32(at.left))
-                                                    : b_.CreateSub(b_.getInt32(at.left), idx);
-            const uint32_t count = (at.left <= at.right ? at.right - at.left : at.left - at.right) + 1;
-            llvm::Value*   inrange =
-                b_.CreateAnd(b_.CreateICmpULT(norm, b_.getInt32(count)), b_.CreateNot(any_unknown(idxp)));
+            // no-op, the storage itself is never addressed out-of-bounds. The
+            // index is compared at its own width and signedness, not as its
+            // low 32 bits zero-extended (fixed_elem_pos).
+            const Plane   idxp    = value_of(es.index);
+            const ElemPos pos     = fixed_elem_pos(idxp, type_of(es.index), at.left, at.right);
+            llvm::Value*  norm    = pos.pos;
+            llvm::Value*  inrange = b_.CreateAnd(pos.in_range, b_.CreateNot(any_unknown(idxp)));
             lv.dyn_inrange = lv.dyn_inrange != nullptr ? b_.CreateAnd(lv.dyn_inrange, inrange)
                                                        : inrange;
             add_elem_bounds_check(lv, i, lv, es.index, inrange, any_unknown(idxp), nullptr,

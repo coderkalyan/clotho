@@ -4313,6 +4313,13 @@ private:
                                   ir::SourceLoc        l,
                                   uint32_t             stride = 1);
 
+    // The same offset for an index whose arithmetic a 32-bit offset could wrap.
+    ir::Index lower_wide_packed_offset(const Expression& idx,
+                                       bool              descending,
+                                       int64_t           adj,
+                                       ir::Builder&      b,
+                                       uint32_t          stride);
+
     ir::Index packed_bit_index(const ElementSelectExpression& es, ir::Builder& b, ir::SourceLoc l);
 
     // -- Functions --

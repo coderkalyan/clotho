@@ -1325,9 +1325,16 @@ void Lowerer::emit_indexed_slice_copy(const RangeSelectExpression& rs,
         idx_ty = make_int_type(32, false, true);
         base   = b.constant(module_.pool.put_int(idx_ty, static_cast<uint64_t>(static_cast<int64_t>(*lo))), il);
     } else {
-        n      = static_cast<uint32_t>(const_uint(rs.right(), "an indexed part-select width (LRM 11.5.1)"));
-        idx_ty = make_int_type(32, rs.left().type->isFourState(), rs.left().type->isSigned());
-        base   = b.resize(lower_expr(rs.left(), b), idx_ty, il);
+        n = static_cast<uint32_t>(const_uint(rs.right(), "an indexed part-select width (LRM 11.5.1)"));
+        // LRM 7.4.5 compares the base index as the VALUE it holds, so it keeps
+        // its own width: it extends by its own signedness, then is retyped
+        // signed two bits wider, where adding a position's delta cannot wrap
+        // (a 64-bit base of 2**32 + 1 is not 1, nor 2**32 - 1 plus one 0).
+        const auto    w        = std::max(static_cast<uint32_t>(rs.left().type->getBitWidth()), 32u) + 2;
+        const bool    four     = rs.left().type->isFourState();
+        const ir::Ref extended = make_int_type(w, four, rs.left().type->isSigned());
+        idx_ty                 = make_int_type(w, four, true);
+        base                   = b.resize(b.resize(lower_expr(rs.left(), b), extended, il), idx_ty, il);
     }
     const bool down = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
     const bool asc  = dynarr || at.left <= at.right;
@@ -1339,11 +1346,10 @@ void Lowerer::emit_indexed_slice_copy(const RangeSelectExpression& rs,
             delta            = asc ? (down ? delta - last : delta) : (down ? -delta : last - delta);
         }
         if (delta != 0) {
-            idx = b.binary(
-              ir::Inst::Tag::Add,
-              base,
-              b.constant(module_.pool.put_int(idx_ty, static_cast<uint64_t>(static_cast<int64_t>(delta))), il),
-              il);
+            // put_int zero-extends past 64 bits, so a negative delta is subtracted.
+            const auto step = static_cast<uint64_t>(delta > 0 ? int64_t{ delta } : -int64_t{ delta });
+            idx             = b.binary(delta > 0 ? ir::Inst::Tag::Add : ir::Inst::Tag::Sub, base,
+                                       b.constant(module_.pool.put_int(idx_ty, step), il), il);
         }
         b.set_end(idx, to_source_loc(rs.left().sourceRange.end()));
         const ir::Index sel = b.elem_select(arr_lv, idx, arr_ty, l, /*for_write=*/dynarr && into_slice);
@@ -2016,6 +2022,29 @@ slang::ConstantRange Lowerer::packed_range_of(const Expression& value) {
     return value.type->getCanonicalType().getFixedRange();
 }
 
+// Whether the offset arithmetic of lower_packed_offset, `(v - adj) * stride` for a
+// descending range and `(adj - v) * stride` for an ascending one, is exact in 32
+// bits for every value `v` of a `width`-bit index of the given signedness. Where
+// nothing is computed (stride 1, adj 0, descending) the index only has to be
+// reinterpreted as an i32: a value that does not fit, a 32-bit unsigned one
+// included, turns negative, which no container contains.
+static bool packed_offset_fits_i32(uint32_t width, bool is_signed, bool descending, int64_t adj, uint32_t stride) {
+    if (width > 32) {
+        return false;
+    }
+    if (descending && adj == 0 && stride == 1) {
+        return true;
+    }
+    if (stride > (uint32_t{ 1 } << 24)) {
+        return false; // keeps the products below inside an i64
+    }
+    const int64_t vmin = is_signed ? -(int64_t{ 1 } << (width - 1)) : 0;
+    const int64_t vmax = is_signed ? (int64_t{ 1 } << (width - 1)) - 1 : (int64_t{ 1 } << width) - 1;
+    const int64_t lo   = (descending ? vmin - adj : adj - vmax) * stride;
+    const int64_t hi   = (descending ? vmax - adj : adj - vmin) * stride;
+    return lo >= INT32_MIN && hi <= INT32_MAX;
+}
+
 // Lower a packed-select index to its 32-bit zero-based LSB offset, minus
 // `bias` (0 for a bit select; width-1 when an indexed part-select's low
 // bit sits below the translated base), then scaled by `stride` (the element
@@ -2027,6 +2056,11 @@ slang::ConstantRange Lowerer::packed_range_of(const Expression& value) {
 // value. The stride multiply is built in `off_ty` so it shares the offset's
 // domain (a 4-state offset is physically wider than a 2-state constant, so a
 // mismatched-domain Mul operand would be an invalid instruction).
+//
+// LRM 11.5.1 compares the index VALUE against the vector, so a 32-bit offset is
+// only used where it cannot wrap (packed_offset_fits_i32): an `int` index into
+// `[3:0][7:0]` or an unsigned one into a negative range can, and a 64-bit one
+// never fits, and those take lower_wide_packed_offset.
 ir::Index Lowerer::lower_packed_offset(const Expression&    idx,
                                        slang::ConstantRange range,
                                        int32_t              bias,
@@ -2036,6 +2070,12 @@ ir::Index Lowerer::lower_packed_offset(const Expression&    idx,
     if (const std::optional<int32_t> c = try_const_int(idx)) {
         const auto off = static_cast<uint32_t>((range.translateIndex(*c) - bias) * static_cast<int32_t>(stride));
         return b.constant(module_.pool.put_int(make_int_type(32, false, false), off), l);
+    }
+    const bool    descending = range.isDescending();
+    const int64_t adj        = descending ? int64_t{ range.right } + bias : int64_t{ range.right } - bias;
+    if (!packed_offset_fits_i32(static_cast<uint32_t>(idx.type->getBitWidth()), idx.type->isSigned(), descending,
+                                adj, stride)) {
+        return lower_wide_packed_offset(idx, descending, adj, b, stride);
     }
     // The normalization arithmetic is attributed to the index expression, not
     // to the select `l` sits on: this offset IS the index as far as everything
@@ -2065,6 +2105,45 @@ ir::Index Lowerer::lower_packed_offset(const Expression&    idx,
     const ir::Index result =
       stride == 1 ? off
                   : b.binary(ir::Inst::Tag::Mul, off, b.constant(module_.pool.put_int(off_ty, stride), il), il);
+    b.set_end(result, to_source_loc(idx.sourceRange.end()));
+    return result;
+}
+
+// lower_packed_offset for an index whose 32-bit arithmetic could wrap. The
+// offset is computed in a signed type wide enough that nothing does, so the
+// backend sees the true value and (select_index) decides it is out of range,
+// or keeps it exact when it only straddles the vector.
+ir::Index Lowerer::lower_wide_packed_offset(const Expression& idx,
+                                            bool              descending,
+                                            int64_t           adj,
+                                            ir::Builder&      b,
+                                            uint32_t          stride) {
+    using T = ir::Inst::Tag;
+    const ir::SourceLoc il   = loc(idx);
+    const auto          w    = static_cast<uint32_t>(idx.type->getBitWidth());
+    const bool          four = idx.type->isFourState();
+    // |index - adj| < 2^(max(w, 32) + 1) and the stride scales it by less than
+    // 2^bit_width(stride); one more bit is the sign.
+    const uint32_t ew = std::max(64u, std::max(w, 32u) + 2 + static_cast<uint32_t>(std::bit_width(stride)));
+    // The index extends by its own signedness, then is retyped signed (same
+    // width, so no code): the offset is a signed quantity whatever the index is.
+    const ir::Ref   off_ty = make_int_type(ew, four, true);
+    const ir::Index v =
+      b.resize(b.resize(lower_expr(idx, b), make_int_type(ew, four, idx.type->isSigned()), il), off_ty, il);
+    // put_int zero-extends past 64 bits, so only non-negative constants are built.
+    const auto constant = [&](uint64_t n) { return b.constant(module_.pool.put_int(off_ty, n), il); };
+    ir::Index  off;
+    if (descending) {
+        // off = v - adj
+        off = adj == 0 ? v
+              : adj > 0 ? b.binary(T::Sub, v, constant(static_cast<uint64_t>(adj)), il)
+                        : b.binary(T::Add, v, constant(static_cast<uint64_t>(-adj)), il);
+    } else {
+        // off = adj - v
+        off = adj >= 0 ? b.binary(T::Sub, constant(static_cast<uint64_t>(adj)), v, il)
+                       : b.binary(T::Sub, constant(0), b.binary(T::Add, v, constant(static_cast<uint64_t>(-adj)), il), il);
+    }
+    const ir::Index result = stride == 1 ? off : b.binary(T::Mul, off, constant(stride), il);
     b.set_end(result, to_source_loc(idx.sourceRange.end()));
     return result;
 }

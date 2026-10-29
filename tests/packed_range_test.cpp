@@ -347,9 +347,9 @@ TEST_CASE("a constant part-select under a dynamic select writes only its bits (L
 // or z bit, and then reads x (0 for 2-state) and writes nothing. In a nested
 // select `a[i][j]` every level is such an address, so an invalid OUTER index
 // invalidates the whole access, whatever the inner index is. Oracle: the
-// flattened spelling `a[i*8 + j]`, which iverilog accepts; it gives x / xx and a
-// no-op for the x, high and negative outer index below, and 00080000 for the
-// valid one.
+// flattened spelling `a[i*8 + j]`, which iverilog accepts: for an x, a high or a
+// negative `i` it reads x / xx and writes nothing, and for a valid one it sets
+// bit 19 (00080000).
 TEST_CASE("a nested select with an invalid outer index reads x and writes nothing (LRM 11.5.1)") {
     constexpr std::string_view src = R"(
         module t;
@@ -399,6 +399,68 @@ TEST_CASE("a nested select with an invalid outer index reads x and writes nothin
           "x\n"
           "ffff\n"
           "fbff\n");
+}
+
+// LRM 11.5.1: an out-of-bounds index reads x (0 for 2-state) and writes nothing,
+// so what is compared is the index VALUE, at its own width and signedness: a
+// 64-bit index of 2**32 + 1 is not bit 1, and neither is one whose offset
+// arithmetic (`i * 8`, `u - right`) lands in range only by wrapping 32 bits. A
+// window that straddles the container keeps the bits that are in range. Oracle:
+// the LRM text (iverilog truncates the index to 32 bits and wraps the stride, as
+// Clotho did).
+TEST_CASE("a packed select index is compared at its own width, not truncated or wrapped (LRM 11.5.1)") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [7:0]      v;
+            bit   [7:0]      bv;
+            logic [15:8]     mid;
+            logic [3:0][7:0] a;
+            logic [-1:-8]    neg;
+            longint unsigned lu;
+            longint          ls;
+            int              i;
+            int unsigned     u;
+            initial begin
+                // A 64-bit index: 2**32 + 1 and -(2**32 - 1) are both 1 modulo 2**32.
+                v = 8'hFF; bv = 8'hFF; lu = 64'h1_0000_0001; ls = -64'sd4294967295;
+                $display("%b %b %b %b", v[lu], bv[lu], v[ls], bv[ls]);
+                v[lu] = 1'b0; bv[ls] = 1'b0; v[ls +: 4] = 4'h0; bv[lu +: 4] = 4'h0;
+                $display("%h %h", v, bv);
+                $display("%b %b", v[lu +: 4], bv[ls +: 4]);
+                v[lu] <= 1'b0; bv[ls +: 2] <= 2'b00;
+                #1 $display("%h %h", v, bv);
+                // In range through a 64-bit index, and windows that straddle or miss [15:8].
+                lu = 4; ls = 14; mid = 8'hA5;
+                $display("%b %b", v[lu], mid[ls]);
+                ls = 6;  $display("%b", mid[ls +: 4]);
+                ls = 8;  $display("%b", mid[ls +: 4]);
+                ls = -1; $display("%b %b", mid[ls], mid[ls +: 4]);
+                // 2**29 + 1 elements of 8 bits is 2**32 + 8 bits: not element 1.
+                a = 32'hDDCCBBAA; i = 536870913;
+                $display("%h", a[i]);
+                a[i] = 8'h00; a[i] <= 8'h00;
+                #1 $display("%h", a);
+                // 4294967289 is not in [-1:-8], though 4294967289 + 8 wraps to 1.
+                neg = 8'h5A; u = 32'hFFFF_FFF9;
+                $display("%b", neg[u]);
+                neg[u] = 1'b0;
+                $display("%h", neg);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "x 0 x 0\n"
+          "ff ff\n"
+          "xxxx 0000\n"
+          "ff ff\n"
+          "1 0\n"
+          "01xx\n"
+          "0101\n"
+          "x xxxx\n"
+          "xx\n"
+          "ddccbbaa\n"
+          "x\n"
+          "5a\n");
 }
 
 TEST_CASE("array query functions (LRM 20.7): $size/$dimensions/$left/... fold to constants") {

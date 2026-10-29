@@ -1965,3 +1965,34 @@ TEST_CASE("a keyless locator over an aggregate element is refused") {
     )",
                 "needs a `with` clause");
 }
+
+// LRM 7.4.5 / 7.10: the index value is compared with the size at its own width
+// and signedness, so a 2-bit signed -1 is out of range (it is not 3) and so is a
+// 128-bit index of 2**64 + 1 (it is not 1). Out of range reads the Table 7-1
+// default (x, or 0 for a 2-state element) and writes nothing. Oracle: the LRM
+// text; iverilog agrees on the signed index.
+TEST_CASE("a signed narrow or very wide index into a queue is compared at its own width") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [7:0] q[$];
+            bit   [7:0] bq[$];
+            logic signed [1:0] s2;
+            logic [127:0]      w;
+            initial begin
+                for (int k = 0; k < 4; k++) begin q.push_back(8'h30 + k); bq.push_back(8'h30 + k); end
+                q.pop_front(); bq.pop_front(); q.push_back(8'h34); bq.push_back(8'h34); // a wrapped ring
+                s2 = -1;
+                $display("%h %h", q[s2], bq[s2]);
+                q[s2] = 8'hee; bq[s2] = 8'hee;
+                $display("%h %h", q[3], bq[3]);
+                w = 128'h1_0000_0000_0000_0001;
+                $display("%h %h", q[w], bq[w]);
+                q[w] = 8'hee; bq[w] = 8'hee;
+                $display("%h %h", q[1], bq[1]);
+                s2 = 1; w = 2;
+                $display("%h %h", q[s2], bq[w]);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "xx 00\n34 34\nxx 00\n32 32\n32 33\n");
+}

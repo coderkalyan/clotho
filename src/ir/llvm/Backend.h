@@ -2838,6 +2838,33 @@ private:
 
     static bool wide_dyn_storage(uint32_t sw);
 
+    // -- Select indexes at their own width and signedness (LRM 7.4.5, 11.5.1) --
+    //
+    // An index is compared as the VALUE it holds, not as its low 32 bits or
+    // zero-extended: a 2-bit signed -1 is -1, and 2**32 + 1 is not 1.
+
+    // A bit / part-select index operand as the i32 added to a bit offset; a value
+    // an i32 cannot hold saturates, which lands out of range in any container.
+    llvm::Value* select_index(Plane idx, ValType t);
+
+    // An unpacked-array element: `pos` is its 0-based position (meaningful only
+    // when `in_range`), `in_range` the verdict without the x/z term.
+    struct ElemPos {
+        llvm::Value* pos      = nullptr;
+        llvm::Value* in_range = nullptr;
+    };
+
+    ElemPos fixed_elem_pos(Plane idx, ValType t, uint32_t left, uint32_t right);
+
+    // A dynamic-array / queue index `idx < len`; `idx64` addresses the element
+    // only when `below`.
+    struct ElemBelow {
+        llvm::Value* idx64 = nullptr;
+        llvm::Value* below = nullptr;
+    };
+
+    ElemBelow elem_index_below(Plane idx, ValType t, llvm::Value* len);
+
     llvm::Value* store_mask(const LValue& lv, uint32_t sw);
 
     llvm::Value* place_val(const LValue& lv, llvm::Value* v_iw, uint32_t sw);
