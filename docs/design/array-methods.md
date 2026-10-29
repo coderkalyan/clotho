@@ -320,7 +320,7 @@ worked.
   compare it emitted before** — the domain is decided at lower time
   (`SortIter::key_four`), not by a runtime test.
 - **The runtime scalar comparator** (`slot_cmp4` / `sort_run4`,
-  `src/runtime/Runtime.cpp`) — the bare form on a 4-state integral of width ≤ 64,
+  `src/runtime/Containers.cpp`) — the bare form on a 4-state integral of width ≤ 64,
   which is where `time` lands. The 4-state slot is `{ i(2W) must|may, iW z }` with
   must in bits [0,W) and may in [W,2W), so `must ^ may` is the unknown mask and
   `must` is the value — the same decode `rt_container_eq` already does, and the z

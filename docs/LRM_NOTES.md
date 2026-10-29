@@ -9,7 +9,7 @@ negative argument. Clotho writes `-` followed by the magnitude in the method's
 base, so `hextoa(-256)` is `-100`, and never the two's-complement bit pattern.
 An x or z bit of the argument reads as 0.
 
-Code: `src/runtime/Runtime.cpp` (`str_toa_base`). Tests: `tests/string_test.cpp` ("itoa family formats sign + magnitude per LRM 6.16.11-6.16.14").
+Code: `src/runtime/Strings.cpp` (`str_toa_base`). Tests: `tests/string_test.cpp` ("itoa family formats sign + magnitude per LRM 6.16.11-6.16.14").
 
 ## 2. `realtoa` precision (6.16.15)
 
@@ -17,7 +17,7 @@ The clause names no precision or format. Clotho prints at full round-trip
 precision (`std::to_chars` with no precision argument) rather than at a fixed
 number of significant digits.
 
-Code: `src/runtime/Runtime.cpp` (`rt_string_realtoa`). Tests: `tests/string_test.cpp` ("realtoa formats at full round-trip precision").
+Code: `src/runtime/Strings.cpp` (`rt_string_realtoa`). Tests: `tests/string_test.cpp` ("realtoa formats at full round-trip precision").
 
 ## 3. Unpacked union layout (7.3)
 
@@ -52,7 +52,7 @@ Code: `src/lower/Expr.cpp` (`emit_indexed_slice_copy`, `materialize_indexed_slic
 the first `bound + 1` elements, so `push_front` drops the old tail, `push_back`
 onto a full queue has no effect, and `insert` follows the same rule.
 
-Code: `src/runtime/Runtime.cpp` (`q_apply_bound_ops`). Tests: `tests/queue_test.cpp` ("queue bounded push drops excess", "queue slice/concat into a bounded queue drops the tail").
+Code: `src/runtime/Containers.cpp` (`q_apply_bound_ops`). Tests: `tests/queue_test.cpp` ("queue bounded push drops excess", "queue slice/concat into a bounded queue drops the tail").
 
 ## 7. Unknown elements in `min` and `max` (7.12.1)
 
@@ -158,7 +158,7 @@ clear pending reports at flush points, so a statement that violates on several
 settle passes of one time step reports once per pass. Not gated; the gap is
 listed in `docs/TODO.md`.
 
-Code: `src/ir/llvm/SystemTasks.cpp` (`lower_case_viol`), `src/runtime/Runtime.cpp` (`rt_observed_case_violation`, `rt_observed_flush`). Tests: `tests/case_test.cpp` ("priority case: Observed-region report is stamped with the settled instant"). Design: `docs/design/x-semantics.md` (Free wins needing no new semantics).
+Code: `src/ir/llvm/SystemTasks.cpp` (`lower_case_viol`), `src/runtime/Reports.cpp` (`rt_observed_case_violation`, `rt_observed_flush`). Tests: `tests/case_test.cpp` ("priority case: Observed-region report is stamped with the settled instant"). Design: `docs/design/x-semantics.md` (Free wins needing no new semantics).
 
 ## 19. `case` with a real selector (12.5)
 
@@ -225,7 +225,7 @@ through splitmix64 from its process index, a draw of its parent's stream, or the
 `$urandom(seed)` argument. A function or task draws from its caller's state, and
 `shuffle` draws from the process's stream.
 
-Code: `src/runtime/Runtime.cpp` (`rt_urandom_seed`). Tests: `tests/sysfunc_test.cpp` ("$urandom is a deterministic per-process stream (pinned)", "two processes each get an independent $urandom stream"), `tests/array_ordering_test.cpp` ("dynamic array + queue shuffle is a stable permutation").
+Code: `src/runtime/Random.cpp` (`rt_urandom_seed`). Tests: `tests/sysfunc_test.cpp` ("$urandom is a deterministic per-process stream (pinned)", "two processes each get an independent $urandom stream"), `tests/array_ordering_test.cpp` ("dynamic array + queue shuffle is a stable permutation").
 
 ## 26. `randcase` weight sum (18.16)
 
@@ -263,7 +263,7 @@ with exit status 1, after its `final` blocks, whatever its finish number.
 `$finish` of any level, `$error`, `$warning` and a failed assertion leave the
 status 0.
 
-Code: `src/runtime/Runtime.cpp` (`severity_line`, `rt_severity`), `src/lower/Lowerer.cpp` (`severity_banner`). Tests: `tests/severity_test.cpp` ("severity tasks render label + formatted message to stderr", "a labelled immediate assertion's report names the label"), `tests/exit_status_test.cpp` ("exit status: $fatal ends the run with status 1, whatever its finish number").
+Code: `src/runtime/Reports.cpp` (`severity_line`, `rt_severity`), `src/lower/Lowerer.cpp` (`severity_banner`). Tests: `tests/severity_test.cpp` ("severity tasks render label + formatted message to stderr", "a labelled immediate assertion's report names the label"), `tests/exit_status_test.cpp` ("exit status: $fatal ends the run with status 1, whatever its finish number").
 
 ## 29. `$system` (20.17.1)
 
@@ -282,7 +282,7 @@ flag. Not gated. A leading `0` belongs to the width (`%0d` is the minimal form),
 so the integer conversions have no zero-pad flag, while the real conversions read
 it as C's zero-pad flag.
 
-Code: `src/runtime/Format.h` (`parse_format_spec`, `FormatSpec`), `src/runtime/Runtime.cpp` (`render_arg`). Tests: `tests/display_test.cpp` ("left justification").
+Code: `src/runtime/Format.h` (`parse_format_spec`, `FormatSpec`), `src/runtime/Format.cpp` (`render_arg`). Tests: `tests/display_test.cpp` ("left justification").
 
 ## 31. Explicit field width on `%h`, `%o` and `%b` (21.2.1.2)
 
@@ -290,7 +290,7 @@ In the clause's examples, `%3h` of `32'h5` prints `005`. A width given in the
 format overrides the automatic sizing: Clotho reduces the value to its minimal digits, zero-pads it
 to the width, and never truncates.
 
-Code: `src/runtime/Runtime.cpp` (`render_arg`). Tests: `tests/display_test.cpp` ("explicit field widths pad and expand per LRM 21.2.1.2", "display operands wider than 64 bits (LRM 21.2)").
+Code: `src/runtime/Format.cpp` (`render_arg`). Tests: `tests/display_test.cpp` ("explicit field widths pad and expand per LRM 21.2.1.2", "display operands wider than 64 bits (LRM 21.2)").
 
 ## 32. `%p` output (21.2.1.6)
 
@@ -300,14 +300,14 @@ the implementation's, and Clotho separates them with `, `. A tagged union whose
 tag is x, z or names no member has no valid member, so its whole value prints as
 one decimal leaf.
 
-Code: `src/lower/SystemTasks.cpp` (`expand_p_lvalue`, `expand_p_packed`), `src/runtime/Runtime.cpp` (`rt_tagged_format_p`). Tests: `tests/display_test.cpp` ("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"), `tests/struct_test.cpp` ("whole unpacked struct as a $display %p operand renders a pattern", "%p of a tagged union whose tag is x falls back to the flat value"). Design: `docs/design/tagged-unions.md` (`%p` (LRM 21.2.1.6)).
+Code: `src/lower/SystemTasks.cpp` (`expand_p_lvalue`, `expand_p_packed`), `src/runtime/Containers.cpp` (`rt_tagged_format_p`). Tests: `tests/display_test.cpp` ("%p renders unpacked aggregates as assignment patterns (LRM 21.2.1.6)"), `tests/struct_test.cpp` ("whole unpacked struct as a $display %p operand renders a pattern", "%p of a tagged union whose tag is x falls back to the flat value"). Design: `docs/design/tagged-unions.md` (`%p` (LRM 21.2.1.6)).
 
 ## 33. Leading NUL bytes under `%s` (21.2.1.7)
 
 A packed `%s` operand drops its leading 0x00 bytes, as the clause's text and the
 21.2.1.1 example require. A 0x00 byte after the first non-zero byte prints as a space.
 
-Code: `src/runtime/Runtime.cpp` (`render_arg`). Tests: `tests/display_test.cpp` ("%s drops leading NUL bytes of a packed operand").
+Code: `src/runtime/Format.cpp` (`render_arg`). Tests: `tests/display_test.cpp` ("%s drops leading NUL bytes of a packed operand").
 
 ## 34. `$fread` reaching end of file inside an element (21.3.4)
 
@@ -315,7 +315,7 @@ The clause does not say what the unread bytes of a partly read element hold.
 Clotho packs the bytes it read into the high end of the element and zero-fills
 the rest; the return value counts the bytes read.
 
-Code: `src/runtime/Runtime.cpp` (`rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$fread into a memory with elements wider than 64 bits").
+Code: `src/runtime/Io.cpp` (`rt_fread`). Tests: `tests/llvm_backend_test.cpp` ("$fread into a memory with elements wider than 64 bits").
 
 ## 35. Program implicit `$finish` with woken work pending (24.3)
 

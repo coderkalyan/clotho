@@ -217,7 +217,7 @@ Hence two tiers for the block and a third, lazy tier for the object. This is the
 shape `event-handles.md` already ships for `rt_event`: a codegen-owned static block
 registered as the runtime pool's first chunk, one address space, one resolver. Both
 pools are re-registered at run start by `rt_run_init`
-(`src/runtime/Runtime.cpp:5899`), emitted at the top of the design's main.
+(`src/runtime/Scheduler.cpp`), emitted at the top of the design's main.
 
 ### 4.1 The control block (native, untraced)
 
@@ -673,7 +673,7 @@ the Reactive ring, not the Active one. That is why the node stores
 
 `pcb->rng` points at the thread's xoshiro256++ state. `srandom(seed)` is the
 existing `rt_urandom_seed` splitmix64 expansion
-(`src/runtime/Runtime.cpp:4952-4958`), already used by `$urandom(seed)`.
+(`src/runtime/Random.cpp`), already used by `$urandom(seed)`.
 `get_randstate` / `set_randstate` need two new runtime helpers that format and
 parse the four state words (64 hex digits) into a `clotho.str`, exposed through
 `expose()` (`src/ir/Jit.cpp:199-303`). A string that did not come from

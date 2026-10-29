@@ -1072,7 +1072,7 @@ struct rt_elem_ops {
 // Visit every live element image of an associative array, in unspecified order,
 // passing the normalized key bytes alongside. Exported for exactly one caller --
 // the collector's precise walk -- because the map itself (an unordered_dense of
-// per-entry SlotVec blocks, Runtime.cpp:2093-2110) is internal to Runtime.cpp and
+// per-entry SlotVec blocks, AssocMap) is internal to runtime/Containers.cpp and
 // its payloads relocate on rehash, so no external code can iterate it by address.
 void rt_assoc_visit(const struct rt_assoc* h,
                     void (*visit)(void* elem, const uint8_t* key, uint32_t klen, void* ctx),
@@ -1106,7 +1106,7 @@ void rt_assoc_visit(const struct rt_assoc* h,
 // backend (`clotho.ref.noepoch`) rather than exported from here.
 
 // NOTE: the element lifecycle helpers (init / deinit / copy over an
-// rt_elem_ops descriptor) are internal to Runtime.cpp — the backend inlines
+// rt_elem_ops descriptor) are internal to runtime/Containers.cpp — the backend inlines
 // the element ops at call sites and never calls them, so they have internal
 // linkage and no declaration here.
 
@@ -1454,7 +1454,7 @@ typedef struct rt_string {
 // byte[len] can always hold the NUL terminator (rt_string_data is a valid C
 // string). Shared with the backend, which materializes the power-on empty-string
 // constant — the two MUST agree or that constant corrupts. See the SSO block in
-// Runtime.cpp.
+// runtime/RuntimeInternal.h.
 constexpr uint64_t rt_string_inline_cap = 30;
 
 // Construct the empty string "" in caller-owned storage. Never allocates.
@@ -1831,14 +1831,14 @@ void rt_proc_randstate_set(void* rng, const rt_string* s, const rt_null_site* si
 // Opaque inline storage for a wheel, owned by the caller. The design declares an
 // rt_wheel (typically on the stack), hands it to rt_wheel_init, and tears it down
 // with rt_wheel_deinit — no heap allocation. The byte block is sized and aligned to
-// hold the concrete clotho::Wheel (both checked in Runtime.cpp); the design never
+// hold the concrete clotho::Wheel (both checked in runtime/RuntimeInternal.h); the design never
 // inspects it.
 typedef struct rt_wheel {
     alignas(8) unsigned char storage[9216];
 } rt_wheel;
 
 // Intrusive timer node the design embeds inside an owning awaiter and recovers
-// via offsetof. Layout mirrors clotho::Timer (asserted in Runtime.cpp); the
+// via offsetof. Layout mirrors clotho::Timer (asserted in runtime/RuntimeInternal.h); the
 // design never reads these fields, it only hands the node back to the wheel.
 typedef struct rt_timer {
     // Intrusive slot-list link. Unspecified unless linked into a slot.

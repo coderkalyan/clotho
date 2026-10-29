@@ -225,14 +225,15 @@ close.
    the epilogue from there under an epoch test. The poll point is not a
    stylistic preference — it is the only edge that exists.
 2. **Epoch filtering instead of removal.** `InertialState::epoch`
-   (`src/runtime/Runtime.cpp:1442-1448`) + `rt_intra_rec::epoch`
+   (`src/runtime/Scheduler.cpp`) + `rt_intra_rec::epoch`
    (`src/runtime/Runtime.h:1330-1336`) deschedule a pending record by bumping a
-   counter (`Runtime.cpp:2271`) and dropping the record when its timer fires and
-   the stamp no longer matches (`:2286`). `@clotho.defer.gen.<g>` +
+   counter (`runtime/Scheduler.cpp, rt_inertial_decide`) and dropping the
+   record when its timer fires and the stamp no longer matches
+   (`rt_inertial_cb`). `@clotho.defer.gen.<g>` +
    `rt_defer_report(gen, gen_val)` (`src/ir/llvm/SystemTasks.cpp, defer_report_fn`;
-   `src/runtime/Runtime.cpp:3802`, comparison at `:3831`) does the same for
-   deferred reports and *is already* the LRM 16.4.2 flush point. Neither
-   structure is ever unlinked.
+   `src/runtime/Scheduler.cpp, rt_defer_report`, comparison in `defer_mature`)
+   does the same for deferred reports and *is already* the LRM 16.4.2 flush
+   point. Neither structure is ever unlinked.
 
    The two are different shapes, and V2 wants the second: `defer.gen` is a flat
    per-group `i64` global with no anchor, whereas the per-instance anchored
@@ -465,7 +466,7 @@ per-process-per-instance. No new tagging is needed for this bullet.
 
 Do **not** call `rt_defer_flush_observed`/`_final`. The reason is not the one
 stated here before: those are not merely a drop. `defer_mature`
-(`src/runtime/Runtime.cpp:3819-3840`) FIRES every same-mode report whose
+(`src/runtime/Scheduler.cpp`) FIRES every same-mode report whose
 generation is still current and removes every same-mode entry from the queue, so
 calling one from a `disable` in the Active region would emit other processes'
 reports early, out of their maturation region, as well as clearing them.
@@ -517,7 +518,7 @@ still matures — which `tests/loop_test.cpp:787-819` pins in both directions.
 One case needs machinery that does not exist at all: a `disable` naming one
 deferred assertion LABEL (16.4.4's first bullet). Two deferred assertions in one
 process share one counter, so a bump cancels both, and `DeferReport`
-(`src/runtime/Runtime.cpp:3792-3798`) carries `{line, gen, gen_val, is_final}` —
+(`src/runtime/Scheduler.cpp`) carries `{line, gen, gen_val, is_final}` —
 no statement identity whatsoever, with `line` already rendered at queue time.
 A statement label on an `assert #0` is also never pushed onto `named_blocks_`
 (only `StatementKind::Block` with a `blockSymbol` is, `:6570`), so such a
@@ -544,7 +545,7 @@ Ranked by how much damage a naive implementation does.
 1. **Ring overflow is guarded, but only for a design that forks.**
    `emit_active_push` (`ir/llvm/Scheduler.cpp`) calls `emit_ring_full_check`,
    which calls `rt_ring_overflow` — `FATAL: the <name> overflowed
-   at <t> (capacity N entries)` then `exit(1)`, `Runtime.cpp:3200-3231` — when
+   at <t> (capacity N entries)` then `exit(1)`, `runtime/Scheduler.cpp` — when
    `tail − head >= cap`, and `emit_len_full_check` does the same
    for the length-counted buffers. Six push sites over five named buffers are
    covered: active ring, reactive ring, the runtime-selected ring in

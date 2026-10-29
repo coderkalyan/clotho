@@ -417,7 +417,7 @@ state where per-variable state is shared.
 
 The shadow is a third instance of a pattern clotho already has twice: the NBA
 shadow (`Anchor::shadow_ty`/`shadow_gv`, `src/ir/llvm/Backend.h, Anchor`) and
-the VCD shadow (`VcdVar::shadow`, `src/runtime/Runtime.cpp:4350-4354`). The
+the VCD shadow (`VcdVar::shadow`, `src/runtime/Vcd.cpp`). The
 shadow set is exactly "variables referenced by some assertion expression",
 computed in the frontend, and assertion-expression lowering resolves a signal
 through a `Signal -> Signal` shadow map rather than reading the live slot.
@@ -1142,7 +1142,7 @@ these are diagnosable properties of legal source. `cur_range_` is already stampe
 with the statement's span at `lower_stmt`'s head, so `fail()` inside
 assertion lowering needs no new plumbing.
 
-Failure *reports* reuse `rt_severity` (`src/runtime/Runtime.cpp:2953`) and the
+Failure *reports* reuse `rt_severity` (`src/runtime/Reports.cpp`) and the
 compile-time `banner_at` prefix (`src/lower/Lowerer.cpp`), scheduled into Reactive
 per §3.
 

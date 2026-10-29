@@ -115,21 +115,21 @@ x/z never reaches the span: only the must plane is serialized, and the may/z
 planes fold into a separate `i1` validity predicate carried on `dyn_inrange`
 (`AssocKeySpan::valid`).
 
-### Runtime — `src/runtime/Runtime.cpp:2050-2432`, `Runtime.h:1133-1213`
+### Runtime — `src/runtime/Containers.cpp, rt_assoc_*`, `Runtime.h:1133-1213`
 
 **The runtime is already key-kind-agnostic and already variable-length.**
 
-- `AssocMap` (`Runtime.cpp:2122`) is
+- `AssocMap` (`runtime/Containers.cpp`) is
   `ankerl::unordered_dense::map<std::string, SlotVec>` plus a lazily built
   `std::vector<const std::string*> sorted`.
 - Keys are **owned, per-entry `std::string`** — copied from the caller's span on
   insert. There is no key-width field anywhere on `rt_assoc` or `AssocMap`.
-- Ordering is `AssocKeyLess` (`Runtime.cpp:2058`): `memcmp` over the common
+- Ordering is `AssocKeyLess` (`runtime/Containers.cpp`): `memcmp` over the common
   prefix, tie-break **shorter-is-less**.
 - Equality is `memcmp`; the hash is over the raw span. No per-key-type ops
   descriptor exists (`rt_elem_ops`, `Runtime.h:897`, has copy/deinit/init for
   VALUES but no compare and no hash).
-- `assoc_set_span` (`Runtime.cpp:2192`) hands `k->data(), k->size()` back for
+- `assoc_set_span` (`runtime/Containers.cpp`) hands `k->data(), k->size()` back for
   `first`/`last`/`next`/`prev`.
 
 So the map layer needs **no change** for variable-length keys. Every restriction
@@ -224,8 +224,9 @@ void     rt_keybuf_end(uint32_t mark);                           // pops to mark
 
 Mark/pop rather than a single buffer because key construction **nests**: building
 an assoc-bearing key iterates a map whose own keys are spans. The map copies the
-span into its own `std::string` on insert (`Runtime.cpp:2215`), so the scratch
-never has to outlive the call — that ownership property already holds and is what
+span into its own `std::string` on insert
+(`runtime/Containers.cpp, rt_assoc_put_ptr`), so the scratch never has to
+outlive the call — that ownership property already holds and is what
 makes this safe.
 
 ### Backend

@@ -51,7 +51,7 @@ for both builds: the VCD writer's thread, mutex and condition variables are
 pthreads or Win32 (Os.h); aligned allocation is `posix_memalign` or
 `_aligned_malloc`; floating-point `std::to_chars` and `std::from_chars`, which
 live in the C++ library's compiled part, are `shortest_double` and
-`parse_double` (Runtime.cpp), checked byte-identical to libstdc++'s on 26M
+`parse_double` (runtime/Strings.cpp), checked byte-identical to libstdc++'s on 26M
 doubles and 6M strings; `std::unordered_map` is ankerl's map; one guarded
 static is an atomic.
 

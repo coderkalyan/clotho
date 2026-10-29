@@ -11,7 +11,7 @@
 
 // Shared $display format-specifier parser (LRM §21.2.1). Both the frontend
 // (specifier validation and argument typing in lower/SystemTasks.cpp) and the runtime
-// renderer (Runtime.cpp) parse specifiers through this one function, so the
+// renderer (runtime/Format.cpp) parse specifiers through this one function, so the
 // two sides cannot drift. Grammar accepted: `% [-] [width] [. precision] conv`.
 // A leading 0 in the width folds into the numeric width (`%0d` is width 0, the
 // LRM's minimal-width form); there is no zero-pad flag. The `-` left-justify

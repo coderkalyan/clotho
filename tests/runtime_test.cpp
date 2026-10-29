@@ -144,7 +144,7 @@ TEST_CASE("rt_nba_arr slot buffer: distinct slots, counts, reset keeps capacity"
     // immediately after it is reserved: rt_nba_arr_slot may resize (and thus
     // reallocate) the buffer, invalidating pointers from earlier calls, so the
     // backend contract is write-then-advance — a later grow resize-copies the
-    // already-written records forward (Runtime.cpp).
+    // already-written records forward (runtime/Scheduler.cpp).
     void* a0 = rt_nba_arr_slot(0, stride);
     static_cast<uint64_t*>(a0)[0] = 0xAAAA;
     void* a1 = rt_nba_arr_slot(0, stride);

@@ -79,7 +79,7 @@ the member select is about to use, so nothing is re-evaluated.
 Shape: a new `TaggedCheck` IR node carrying an all-compile-time site record (the
 member name, its expected `fieldIndex`, the member-name table in tag order, and
 the location), plus a new runtime fatal `rt_tagged_access`
-(`src/runtime/Runtime.cpp`) modelled on the existing `rt_null_handle` null-handle
+(`src/runtime/Reports.cpp`) modelled on the existing `rt_null_handle` null-handle
 fatal. The cost on the hot path is one 4-state equality compare of the tag
 against the member's `fieldIndex` and one branch weighted toward the
 fall-through, with the report in a cold `noreturn` block. The report is a located

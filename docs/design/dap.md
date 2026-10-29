@@ -104,7 +104,7 @@ They are deliberately not on the CLI. §4.2.
 1. **The simulation has no re-entrant step and cannot be driven from outside.**
    `emit_main` (`ir/llvm/Scheduler.cpp`) emits `i32 @clotho_main()` which calls
    `rt_sim_run(state, wheel, drain, finals)` (`Runtime.h:364`), and
-   `rt_sim_run` (`Runtime.cpp:3479-3492`) is literally
+   `rt_sim_run` (`runtime/Scheduler.cpp`) is literally
    `drain(state, wheel); finals(state, wheel); sim_teardown();`. `sim_drain` is
    one monolithic JIT'd function holding the entire LRM 4.4 region model as
    basic blocks (`emit_active_run`, `ir/llvm/Scheduler.cpp`). The host
@@ -155,7 +155,7 @@ They are deliberately not on the CLI. §4.2.
 6. **No runtime name→signal map.** Hierarchical names exist at compile time
    (`SignalInfo::name`, `Module.h:36`; `InstanceScope`, `Module.h:69-83`) and
    transiently as `rt_vcd_scope`/`rt_vcd_var` argument strings, but
-   `vcd_register` (`Runtime.cpp:5087-5116`) writes the name into the VCD file
+   `vcd_register` (`runtime/Vcd.cpp`) writes the name into the VCD file
    and **does not retain it**. `vcd_index_` (`ir/llvm/Backend.h`) is
    compile-time and forward-only. DPI has exactly one flat scope
    (`Svdpi.cpp:21-30`).
@@ -173,9 +173,9 @@ They are deliberately not on the CLI. §4.2.
    `fn_local()` (`lower/Lowerer.cpp`) pushes a type and drops the slang symbol.
 
 9. **Three paths `std::exit` past every possible hook**:
-   `rt_oscillation_abort` (`Runtime.cpp:2897`), `rt_null_handle`
-   (`Runtime.cpp:3202`, and `[[noreturn]]` in the header, `Runtime.h:288`), and
-   allocation failure (`Runtime.cpp:3311`).
+   `rt_oscillation_abort` (`runtime/Scheduler.cpp`), `rt_null_handle`
+   (`runtime/Reports.cpp`, and `[[noreturn]]` in the header, `Runtime.h:288`), and
+   allocation failure (`runtime/Reports.cpp, alloc_fatal`).
 
 10. **There is no project model to hand a session.** `lsp.md` §11.6 records it:
     Clotho has no config file and no project concept; file sets and include
@@ -496,7 +496,7 @@ paths, which fire exactly when a design is most worth debugging. D0 does not
 have to choose, because it reads no state at all.
 
 There is an in-tree precedent for the in-process shape — the VCD writer thread
-and its condvar handshake (`Runtime.cpp:4981-5027`) — and D0 itself is the
+and its condvar handshake (`runtime/Vcd.cpp, vcd_writer_loop`) — and D0 itself is the
 precedent for the other.
 
 Consequences worth stating plainly:
@@ -551,7 +551,7 @@ the machine level is better than a typical JIT to begin with.
 Blocker 6. `variables`, `dataBreakpointInfo` and any name-based `evaluate` all
 need name → storage at runtime, and the only existing registration is VCD's,
 which is `$dumpvars`-gated, leaf-name-only (`src/ir/llvm/`) and
-throws the name away after writing the header (`Runtime.cpp:5087-5116`).
+throws the name away after writing the header (`runtime/Vcd.cpp, vcd_register`).
 
 The answer is a **static debug symbol table emitted as constant data**, not a
 runtime-built one: in debug mode, `clotho.dbg.scopes` and `clotho.dbg.vars`,
@@ -568,7 +568,7 @@ Two dependent pieces:
   `{ i(2W) must|may, iW z }` (`ir/llvm/Backend.h`) with `z_elision` and
   `narrow` variants. `rt_container_format_p` (`Runtime.h:882`) formats
   containers only; there is no scalar formatter. `vcd_read_planes`
-  (`Runtime.cpp:4753`) is the existing plane-assembly code to build on. DAP
+  (`runtime/Vcd.cpp`) is the existing plane-assembly code to build on. DAP
   `variables` also wants a `type` string, which the interned IR type gives.
 - **Frame locals stay out.** Blocker 8 plus `sroa` means a task's automatics
   have neither a name nor a stable address. Both are fixable — retain the

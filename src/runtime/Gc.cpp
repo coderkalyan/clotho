@@ -436,7 +436,7 @@ rt_gc_mutator g_mutator{ .cursor       = nullptr,
 
 // -- Loud failure -------------------------------------------------------------
 
-// The shape of alloc_fatal (Runtime.cpp:4116-4155) without its fmt styling and
+// The shape of alloc_fatal (runtime/Reports.cpp) without its fmt styling and
 // without a source location: rt_gc_alloc carries no rt_alloc_site, so there is no
 // statement to name and no caret to draw. Everything else matches, including the
 // exit path, because the failure mode is the same one.
@@ -453,7 +453,7 @@ rt_gc_mutator g_mutator{ .cursor       = nullptr,
 
     rt_vcd_close();
     rt_finishing = 1;
-    // Same reasoning as alloc_fatal (Runtime.cpp:4152-4154): there is no defined
+    // Same reasoning as alloc_fatal (runtime/Reports.cpp): there is no defined
     // state to hand back mid-instant, and a nonzero status distinguishes this from
     // a clean run.
     std::exit(1);

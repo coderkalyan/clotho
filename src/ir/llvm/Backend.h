@@ -1940,7 +1940,7 @@ private:
     void ensure_inactive_queue();
 
     // Buffer selectors for rt_ring_overflow's diagnostic. Kept in step with the
-    // names the runtime prints (src/runtime/Runtime.cpp).
+    // names the runtime prints (src/runtime/Scheduler.cpp).
     static constexpr uint32_t kRingActive      = 0;
     static constexpr uint32_t kRingReactive    = 1;
     static constexpr uint32_t kRingInactive    = 2;
@@ -3007,7 +3007,7 @@ private:
 
     void lower_readmem(Index i);
 
-    // -- Value-change dump (VCD, LRM §21.7; runtime in src/runtime/Runtime.cpp,
+    // -- Value-change dump (VCD, LRM §21.7; runtime in src/runtime/Vcd.cpp,
     //    design in docs/VCD.md) --
 
     llvm::FunctionCallee vcd_open_fn();

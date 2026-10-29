@@ -314,11 +314,11 @@ appears when a non-`Join` fork does.
 A genuinely unbounded version is still possible and is worth doing if a real design
 hits the ceiling: keep the static array as the fast path and turn the *already
 emitted* cold block of `emit_ring_full_check` into a spill onto a runtime-owned
-growable buffer (`$strobe`'s Postponed queue, `Runtime.cpp:2479-2497`, is the working
-precedent), refilling from it at the drain's empty edge the way the inactive→active
-promote already copies. The push fast path — static array, constant base, constant
-mask — would not change at all, so no existing construct would pay. The wait bucket
-is the hard half of that work, not the ring.
+growable buffer (`$strobe`'s Postponed queue, `runtime/Io.cpp, rt_strobe_pop`,
+is the working precedent), refilling from it at the drain's empty edge the way
+the inactive→active promote already copies. The push fast path — static array,
+constant base, constant mask — would not change at all, so no existing construct
+would pay. The wait bucket is the hard half of that work, not the ring.
 
 ### V2.4 Smaller edges (**landed**)
 

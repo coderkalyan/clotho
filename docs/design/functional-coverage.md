@@ -204,7 +204,7 @@ than none.
 | a declaration-level `@(posedge clk)` realized without a subscription | SVA monitor / clocking-block edge detector + `Activation::Observed` | `src/lower/Timing.cpp, lower_clocking_block`; `src/ir/Module.h:136` |
 | an `iff` guard around a synthesized body | `emit_guarded_body` | `src/lower/Timing.cpp` |
 | hidden per-instance state addressed like a signal | `new_monitor_state` → `register_signal` | `src/lower/Types.cpp` |
-| an end-of-run hook that fires on both natural drain and `$finish` | `Activation::Final`, as used by `emit_monitor_finish` | `src/lower/SvaMonitor.cpp`; `src/runtime/Runtime.cpp:5042` |
+| an end-of-run hook that fires on both natural drain and `$finish` | `Activation::Final`, as used by `emit_monitor_finish` | `src/lower/SvaMonitor.cpp`; `src/runtime/Scheduler.cpp, rt_sim_run` |
 | hierarchical instance naming for a report | `instance_path()`, `hier_name()`, `ir::InstanceScope` | `src/lower/SystemTasks.cpp`; `src/ir/Module.h:81` |
 | a design-wide id mint shared across Lowerers | `ClassIds` | `src/lower/Lowerer.h` |
 
@@ -600,7 +600,7 @@ of its own.
 database tasks.** Specifically:
 
 - Written from `rt_cover_report()`, called by `rt_sim_run` after the `final`
-  blocks (`src/runtime/Runtime.cpp`), so it fires on both the natural-drain and
+  blocks (`src/runtime/Scheduler.cpp`), so it fires on both the natural-drain and
   `$finish` paths. The plan proposed a synthesized `Activation::Final` process
   instead; the runtime seam is strictly better — one call site instead of one
   process per covergroup type, no `require_finish_inlinable` restriction to

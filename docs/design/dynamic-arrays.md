@@ -144,7 +144,7 @@ An element is exactly the backend's existing per-element slot (`slot_type()` in
 free (the slot is a wide `iW`). The runtime containers are byte/stride-generic
 — exactly like the NBA `ArrQueue` record buffer, which already stores
 backend-defined records in a `std::vector<uint8_t>`
-(`src/runtime/Runtime.cpp:848-897`). The JIT monomorphizes element load/store
+(`src/runtime/Scheduler.cpp`). The JIT monomorphizes element load/store
 by reusing `lv_field_ptr`, with the base pointer taken from the handle instead
 of a state GEP (§7).
 
