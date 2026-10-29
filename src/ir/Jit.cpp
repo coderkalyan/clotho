@@ -16,18 +16,22 @@
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/MapperJITLinkMemoryManager.h>
+#include <llvm/ExecutionEngine/Orc/MemoryMapper.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
-#include <llvm/ExecutionEngine/SectionMemoryManager.h>
+#include <llvm/ExecutionEngine/Orc/SelfExecutorProcessControl.h>
 #include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
+#include <llvm/ExecutionEngine/Orc/TaskDispatch.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/Threading.h>
 #include <llvm/Support/ThreadPool.h>
+#include <llvm/Support/Threading.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include "LlvmBackend.h"
@@ -118,14 +122,40 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
 
     llvm::orc::LLJITBuilder builder;
     builder.setJITTargetMachineBuilder(std::move(*jtmb));
-    if (parallel) {
-        // Each unit module is migrated to its own LLVMContext below (bitcode
-        // round-trip), so ORC can materialize them concurrently: this makes
-        // LLJIT select ConcurrentIRCompiler (a fresh TargetMachine per
-        // compile call) and dispatch per-module codegen onto its own thread
-        // pool when lookup("clotho_main") transitively pulls in every unit.
-        builder.setNumCompileThreads(n_jobs);
+
+    // Every unit's code and data in one reservation. Generated code reaches the
+    // globals of other units PC-relatively (Backend::sym marks them dso_local),
+    // which needs all of them within 2 GiB of each other. The default memory
+    // manager maps each unit separately, and under ASan's allocator those mappings
+    // landed far apart and failed to link ("out of range of Delta32 fixup"). The
+    // reservation is address space only. A design whose code and data outgrow it
+    // gets a second reservation, which may land out of range and fail that way.
+    // RTDyld targets (COFF) do not use this memory manager.
+    constexpr size_t kJitReservationBytes = size_t{ 1 } << 30;
+    auto             mem_mgr =
+      llvm::orc::MapperJITLinkMemoryManager::CreateWithMapper<llvm::orc::InProcessMemoryMapper>(kJitReservationBytes);
+    if (!mem_mgr) {
+        llvm::errs() << "jit: " << llvm::toString(mem_mgr.takeError()) << "\n";
+        return -1;
     }
+    // Parallel compile needs ORC to materialize the unit modules concurrently: each
+    // is migrated to its own LLVMContext below (bitcode round-trip), so
+    // ConcurrentIRCompiler (a fresh TargetMachine per compile call) can dispatch
+    // per-module codegen onto the thread pool when lookup("clotho_main")
+    // transitively pulls in every unit.
+    std::unique_ptr<llvm::orc::TaskDispatcher> dispatcher;
+    if (parallel) {
+        dispatcher = std::make_unique<llvm::orc::DynamicThreadPoolTaskDispatcher>(n_jobs);
+    } else {
+        dispatcher = std::make_unique<llvm::orc::InPlaceTaskDispatcher>();
+    }
+    auto epc = llvm::orc::SelfExecutorProcessControl::Create(nullptr, std::move(dispatcher), std::move(*mem_mgr));
+    if (!epc) {
+        llvm::errs() << "jit: " << llvm::toString(epc.takeError()) << "\n";
+        return -1;
+    }
+    builder.setExecutorProcessControl(std::move(*epc));
+    builder.setSupportConcurrentCompilation(parallel);
 
     // Register the perf jitdump listener on the object-linking layer. The
     // default LLJIT layer is RTDyldObjectLinkingLayer; supply our own so we can
