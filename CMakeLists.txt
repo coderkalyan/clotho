@@ -22,9 +22,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 #   Release           Release, stripped         Release, stripped
 #
 # Debug is for iterating on the compiler, so only the frontend is unoptimized; the
-# runtime is not part of that loop and -O0 there would distort every profile. What
-# Debug guarantees everywhere is that NDEBUG is unset, so every assert() is live in
-# both columns.
+# runtime is not part of that loop and -O0 there would distort every profile. Every
+# build type keeps assert() live (below); Debug also turns on
+# CLOTHO_EXPENSIVE_CHECKS.
 #
 # The cost of that default, measured on hazard3 (21 files, 1418 processes):
 #
@@ -45,6 +45,36 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to Debug")
   set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
+
+# Every build type keeps assert() live, shipped builds included: a violated
+# invariant stops the program and reports where (docs/PRINCIPLES.md), and an
+# assertion compiled out of the binary users run cannot. Measured against
+# -DNDEBUG (clang 22, -O3): every tests/perf case and a UVM compile moved by less
+# than run-to-run noise; a microbenchmark that is mostly garbage collection runs
+# 1.35x the instructions, from the collector's per-object field assertions. Checks
+# too slow to ship -- heap lookups and whole-structure verifiers such as the GC's
+# heap verify, 2.3x on that microbenchmark -- are behind CLOTHO_EXPENSIVE_CHECKS
+# instead. CMake's defaults put NDEBUG in the flags of every non-Debug type, so it
+# is removed there; a normal variable shadows the cache entry for this project and
+# every dependency it fetches.
+foreach(lang C CXX)
+  foreach(config RELEASE RELWITHDEBINFO MINSIZEREL)
+    string(REGEX REPLACE "[-/]DNDEBUG" "" CMAKE_${lang}_FLAGS_${config} "${CMAKE_${lang}_FLAGS_${config}}")
+  endforeach()
+endforeach()
+
+# Checks too slow for a shipped build. On by default in Debug; CI also runs the
+# suite with them on.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(clotho_expensive_checks_default ON)
+else()
+  set(clotho_expensive_checks_default OFF)
+endif()
+option(CLOTHO_EXPENSIVE_CHECKS "Build in checks too slow for a shipped build (GC heap verify)"
+       ${clotho_expensive_checks_default})
+if(CLOTHO_EXPENSIVE_CHECKS)
+  add_compile_definitions(CLOTHO_EXPENSIVE_CHECKS)
 endif()
 
 # Release ships stripped: CMake's Release already omits -g, and this drops the
@@ -406,12 +436,8 @@ endif()
 # `perf` profile lies about where the time went.
 #
 # So Debug gets -O2 -g here: optimized like RelWithDebInfo and still walkable in a
-# debugger. It deliberately stops short of RelWithDebInfo's NDEBUG -- the reason to
-# optimize this target is that -O0 distorts profiles and slows simulation, and
-# neither argument says anything about disabling checks. Debug is precisely where
-# you want Wheel.cpp's `deadline must be in the future` to fire, since scheduling an
-# event into the past is the bug it exists to catch. Release and RelWithDebInfo
-# already supply the right flags, so the genex leaves them alone.
+# debugger, with every check still live. Release and RelWithDebInfo already supply
+# the right flags, so the genex leaves them alone.
 target_compile_options(clotho_runtime PRIVATE
   $<$<AND:$<CONFIG:Debug>,$<NOT:$<BOOL:${MSVC}>>>:-O2>
   $<$<AND:$<CONFIG:Debug>,$<BOOL:${MSVC}>>:/O2>

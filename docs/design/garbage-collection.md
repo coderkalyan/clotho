@@ -1151,7 +1151,10 @@ it is four things:
   and assert each live object's descriptor is a known `clotho.classdesc`, its size
   matches its type, its line marks are consistent, and every handle field points at
   an allocated object start. Pair-assertion discipline
-  (TigerStyle) applied to the heap.
+  (TigerStyle) applied to the heap. It walks the whole heap after every collection,
+  2.3x slower on an allocation-heavy design, so it is built only with
+  `CLOTHO_EXPENSIVE_CHECKS` (Debug and CI); shipped builds keep the per-object
+  assertions and leave out the walk.
 - **Root cross-check** — scan frames precisely *and* conservatively, diff the live
   sets. The conservative set must be a superset; anything live precisely but dead
   conservatively is a bug in validation, and the size of the difference is §5.2's
