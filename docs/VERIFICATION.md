@@ -41,10 +41,13 @@ VCD, not only what a test prints.
 
 ## Detectors
 
-- **Assertions.** Invariants are asserted, and every tested build keeps
-  assertions on. Shipped builds keep them where the measured cost allows.
-- **Verifiers.** An IR verifier runs after lowering, and the LLVM verifier
-  before and after optimization, in assertion builds.
+- **Assertions.** Invariants are asserted, and `assert()` is live in every
+  build, shipped ones included. Checks too slow to ship, such as whole-structure
+  verifiers, are behind `CLOTHO_EXPENSIVE_CHECKS`, which Debug and CI turn on.
+- **Verifiers.** The LLVM verifier runs on every module before and after
+  optimization. An IR verifier runs after lowering as an expensive check.
+- **Internal errors.** A crash or failed assertion reports itself as a bug in
+  Clotho and says where to report it, never as a bare abort.
 - **Sanitizers.** ASan and UBSan over the full suite and test corpus.
 - **sv-tests.** Outcomes are classified as pass, refused, crash or fail; the
   crash count is zero. A pass there means only that nothing failed, not that
