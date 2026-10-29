@@ -782,8 +782,12 @@ llvm::Value* Backend::lv_field_ptr(const LValue& lv, uint32_t field) {
 
 // The power-on image of one leaf slot: what an out-of-range read of it must
 // yield (LRM 7.4.5 / Table 7-1 -- x for a 4-state element, 0 for 2-state).
-llvm::Constant* Backend::slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool narrow, bool has_z) {
-    std::vector<llvm::Constant*> fields{ narrow ? zero(width) : x_mm(width) };
+// The element's domain decides, not the slot's shape: a 2-state element kept in
+// the packed must|may layout (it is fed from something that can be z) still
+// defaults to 0, so its image is all zero planes, as in init_state.
+llvm::Constant* Backend::slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool narrow,
+                                            bool four_state, bool has_z) {
+    std::vector<llvm::Constant*> fields{ narrow ? zero(width) : (four_state ? x_mm(width) : zero(2 * width)) };
     if (has_z) {
         fields.push_back(zero(width));
     }
@@ -877,7 +881,7 @@ llvm::Value* Backend::ref_actual_ptr(const LValue& lv) {
     // this is the reading of it that keeps both halves of 7.4.5 true; the
     // alternative (aliasing real storage) is memory corruption.
     auto* sink = entry_alloca(lv.slot_ty, "ref.sink");
-    b_.CreateStore(slot_default_const(lv.slot_ty, lv.store_width, lv.narrow, lv.has_z), sink);
+    b_.CreateStore(slot_default_const(lv.slot_ty, lv.store_width, lv.narrow, /*four_state=*/!lv.narrow, lv.has_z), sink);
     emit_bounds_reports(lv, /*is_write=*/true);
     return b_.CreateSelect(lv.dyn_inrange, ptr, sink);
 }

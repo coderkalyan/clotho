@@ -169,3 +169,35 @@ TEST_CASE("a signed narrow or 64-bit index into a fixed-size array is compared a
           "10 11 12 13\n"
           "11 12 13 11\n");
 }
+
+// LRM 7.4.5 / Table 7-1: an out-of-range read of an unpacked array of a 2-state
+// element yields 0 in every element, so it compares equal to zeros. Feeding an
+// element from a 4-state source that is z makes the compiler keep the array in
+// the packed (must/may) layout; the default image must follow the element's
+// domain and not that layout. Oracle: the LRM clause and Table 7-1.
+TEST_CASE("a whole-element read past a 2-state array yields zeros even when its slots are packed") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef bit [7:0] arr_t [4];
+            logic [7:0] zsrc;
+            bit   [7:0] g [3][4];
+            arr_t       k, zeros;
+            int         i;
+            initial begin
+                zsrc = 8'bz;
+                g[0][0] = zsrc;
+                zeros = '{0, 0, 0, 0};
+                i = 7;
+                k = g[i];
+                $display("%b %b", k == zeros, k != zeros);
+                i = -1;
+                k = g[i];
+                $display("%b %b", k == zeros, k != zeros);
+                i = 1;
+                k = g[i];
+                $display("%b", k == zeros);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 0\n1 0\n1\n");
+}

@@ -1391,7 +1391,7 @@ private:
 
     llvm::Value* lv_field_ptr(const LValue& lv, uint32_t field);
     llvm::Constant* slot_default_const(llvm::StructType* slot_ty, uint32_t width, bool narrow,
-                                       bool has_z);
+                                       bool four_state, bool has_z);
 
     RefBinding ref_actual_arg(const LValue& raw);
 
