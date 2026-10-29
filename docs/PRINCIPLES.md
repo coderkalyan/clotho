@@ -42,7 +42,7 @@ where needed, and naming follows the conventions of each language.
 
 | Tier | Scope | Review |
 |---|---|---|
-| 1 Kernel | Value representation and its operations; memory layout of state, frames and aggregates; stores; the GC and sanitizer fast paths in generated code and the runtime. | Every line, by the maintainer. |
+| 1 Kernel | Value representation and its operations; memory layout of state, frames and aggregates; stores; the GC and sanitizer fast paths in generated code and the runtime. | Every line, by the maintainer, against the decisions in `docs/design/kernel.md`. |
 | 2 Architecture | The IR; analyses and transforms; containers, strings and built-in classes; the GC collector; sanitizer and coverage infrastructure; the LLVM pipeline. | The design matches the maintainer's intent. |
 | 3 Frontend | Lowering from slang, system tasks, VCD, DPI, the CLI, LSP, DAP and diagnostics. | Tests, fuzzing and comparison against the LRM. |
 | Rewrite | Scheduling, concurrent assertions, constrained randomization. | None; these are being rewritten. |
