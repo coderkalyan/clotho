@@ -12,69 +12,6 @@ namespace clotho::ir::backend {
 // struct sizes computed here against the runtime's own, so a layout
 // divergence fails loudly instead of reading garbage -- the same discipline
 // rt_gc_init applies to its one offset.
-llvm::StructType* Backend::cover_range_ty() {
-    if (cover_range_ty_ == nullptr) {
-        cover_range_ty_ = llvm::StructType::create(ctx_, { b_.getInt64Ty(), b_.getInt64Ty() }, "clotho.coverrange");
-    }
-    return cover_range_ty_;
-}
-
-llvm::StructType* Backend::cover_bin_ty() {
-    if (cover_bin_ty_ == nullptr) {
-        cover_bin_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() }, "clotho.coverbin");
-    }
-    return cover_bin_ty_;
-}
-
-llvm::StructType* Backend::cover_point_ty() {
-    if (cover_point_ty_ == nullptr) {
-        cover_point_ty_ = llvm::StructType::create(ctx_,
-                                                   { raw_ptr_ty(),
-                                                     raw_ptr_ty(),
-                                                     b_.getInt32Ty(),
-                                                     raw_ptr_ty(),
-                                                     b_.getInt32Ty(),
-                                                     b_.getInt32Ty(),
-                                                     b_.getInt32Ty(),
-                                                     b_.getInt32Ty(),
-                                                     b_.getInt32Ty(),
-                                                     b_.getInt32Ty() },
-                                                   "clotho.coverpoint");
-    }
-    return cover_point_ty_;
-}
-
-llvm::StructType* Backend::cover_type_ty() {
-    if (cover_type_ty_ == nullptr) {
-        cover_type_ty_ = llvm::StructType::create(ctx_,
-                                                  { raw_ptr_ty(),
-                                                    raw_ptr_ty(),
-                                                    b_.getInt32Ty(),
-                                                    raw_ptr_ty(),
-                                                    b_.getInt32Ty(),
-                                                    b_.getInt32Ty(),
-                                                    b_.getInt32Ty(),
-                                                    raw_ptr_ty() },
-                                                  "clotho.covertype");
-    }
-    return cover_type_ty_;
-}
-
-llvm::StructType* Backend::cover_config_ty() {
-    if (cover_config_ty_ == nullptr) {
-        cover_config_ty_ = llvm::StructType::create(ctx_,
-                                                    { raw_ptr_ty(),
-                                                      b_.getInt32Ty(),
-                                                      b_.getInt32Ty(),
-                                                      b_.getInt32Ty(),
-                                                      b_.getInt32Ty(),
-                                                      b_.getInt32Ty(),
-                                                      raw_ptr_ty() },
-                                                    "clotho.coverconfig");
-    }
-    return cover_config_ty_;
-}
 
 // A private constant array of `rows`, or a null pointer when empty: the
 // runtime pairs a zero count with a null pointer everywhere, so an empty
@@ -165,109 +102,6 @@ llvm::Constant* Backend::cover_config_global() {
                                     "clotho.cover.config");
 }
 
-// -- Functional coverage entry points (src/runtime/Coverage.h) --------------
-// Declared on demand like the collector's, so a design with no covergroup
-// carries none of them and rt_cover_init is never called.
-llvm::FunctionCallee Backend::cover_init_fn() {
-    return rt_fn("rt_cover_init", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::cover_new_fn() {
-    return rt_fn("rt_cover_new", b_.getInt64Ty(), { b_.getInt32Ty(), b_.getInt64Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_ctx_fn() {
-    return rt_fn("rt_cover_ctx", b_.getInt64Ty(), { b_.getInt64Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_first_fn() {
-    return rt_fn("rt_cover_first", b_.getInt64Ty(), { b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_next_fn() {
-    return rt_fn("rt_cover_next", b_.getInt64Ty(), { b_.getInt64Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_hit_fn() {
-    return rt_fn("rt_cover_hit", b_.getVoidTy(),
-                 { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_start_fn() {
-    return rt_fn("rt_cover_start", b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_set_name_fn() {
-    return rt_fn("rt_cover_set_inst_name", b_.getVoidTy(),
-                 { b_.getInt64Ty(), raw_ptr_ty(), b_.getInt64Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_inst_query_fn(const char* name, llvm::Type* ret) {
-    return rt_fn(name, ret, { b_.getInt64Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_point_query_fn(const char* name, llvm::Type* ret) {
-    return rt_fn(name, ret, { b_.getInt64Ty(), b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_type_query_fn(const char* name, llvm::Type* ret) {
-    return rt_fn(name, ret, { b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::cover_design_coverage_fn() {
-    return rt_fn("rt_cover_design_coverage", b_.getDoubleTy(), {});
-}
-
-// The runtime argument descriptor, mirroring `rt_arg` in runtime/Runtime.h:
-//   { i32 width, i32 flags, ptr val, ptr xz, ptr z }
-// Each plane is a pointer to a ceil(width/64)-word little-endian buffer
-// (built in build_rt_args), so operands of any width are carried in full.
-llvm::StructType* Backend::arg_struct_ty() {
-    return llvm::StructType::get(
-      ctx_, { b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_fwrite(i32 desc, const char* fmt, i32 argc, const rt_arg* argv)
-llvm::FunctionCallee Backend::fwrite_fn() {
-    auto* i32 = b_.getInt32Ty();
-    return rt_fn("rt_fwrite", b_.getVoidTy(), { i32, raw_ptr_ty(), i32, raw_ptr_ty() });
-}
-
-// i32 rt_fopen_mcd(const char* name, i32 name_len)
-llvm::FunctionCallee Backend::fopen_mcd_fn() {
-    auto* i32 = b_.getInt32Ty();
-    return rt_fn("rt_fopen_mcd", i32, { raw_ptr_ty(), i32, i32 });
-}
-
-// i32 rt_fopen_fd(const char* name, i32 name_len, i32 name_fwd,
-//                 const char* mode, i32 mode_len, i32 mode_fwd)
-llvm::FunctionCallee Backend::fopen_fd_fn() {
-    auto* i32 = b_.getInt32Ty();
-    return rt_fn("rt_fopen_fd", i32, { raw_ptr_ty(), i32, i32, raw_ptr_ty(), i32, i32 });
-}
-
-// void rt_fclose(i32 desc)
-llvm::FunctionCallee Backend::fclose_fn() {
-    return rt_fn("rt_fclose", b_.getVoidTy(), { b_.getInt32Ty() });
-}
-
-// i32 rt_system(const char* cmd, i32 cmd_len, i32 cmd_fwd, i32 has_arg)
-llvm::FunctionCallee Backend::system_fn() {
-    auto* i32 = b_.getInt32Ty();
-    return rt_fn("rt_system", i32, { raw_ptr_ty(), i32, i32, i32 });
-}
-
-// void rt_timeformat_init(i64 tick_fs, i32 default_units)
-llvm::FunctionCallee Backend::timeformat_init_fn() {
-    return rt_fn("rt_timeformat_init", b_.getVoidTy(), { b_.getInt64Ty(), b_.getInt32Ty() });
-}
-
-// void rt_timeformat_set(i32 units, i32 precision, const char* suffix, i32 suffix_len, i32 min_width)
-llvm::FunctionCallee Backend::timeformat_set_fn() {
-    auto* i32 = b_.getInt32Ty();
-    return rt_fn("rt_timeformat_set", b_.getVoidTy(), { i32, i32, raw_ptr_ty(), i32, i32 });
-}
-
 // Lower a $timeformat: evaluate the units / precision / min_width operands and
 // hand them, plus the literal suffix, to the runtime setter. The operands were
 // lowered earlier in this region, so their values are available.
@@ -281,19 +115,6 @@ void Backend::lower_timeformat(Index i) {
     llvm::Value*      sfx_ptr = b_.CreateGlobalString(suffix);
     b_.CreateCall(timeformat_set_fn(),
                   { units, prec, sfx_ptr, b_.getInt32(static_cast<uint32_t>(suffix.size())), width });
-}
-
-// void rt_strobe_pend(ptr handle) — queue one $strobe invocation's ramped
-// (not yet resumed) coroutine handle to run in the Postponed region of the
-// current time step (LRM 21.2.2).
-llvm::FunctionCallee Backend::strobe_pend_fn() {
-    return rt_fn("rt_strobe_pend", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-// ptr rt_strobe_pop(void) — pop and return the next queued handle (FIFO —
-// same-instant $strobe calls print in call order), or null when empty.
-llvm::FunctionCallee Backend::strobe_pop_fn() {
-    return rt_fn("rt_strobe_pop", raw_ptr_ty(), {});
 }
 
 // Lower a `strobe_pend`: ramp the target zero-formal deferred-print task
@@ -496,15 +317,6 @@ llvm::Value* Backend::reactive_record_slot() {
     return sym(reactive_record_gv_);
 }
 
-// void rt_finish_coop(ptr banner, i64 now, i32 arg) — the cooperative form.
-// Deliberately NOT noreturn: it prints the banner, sets rt_finishing, and
-// returns so the caller can leave through its own epilogue and free its
-// frame (docs/design/cooperative-finish.md).
-llvm::FunctionCallee Backend::finish_coop_fn() {
-    return rt_fn("rt_finish_coop", b_.getVoidTy(),
-                 { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
-}
-
 // Leave the body being lowered the way a $finish must: through its own
 // epilogue, so its frame is released and its resumer sees an ordinary
 // completion. One shape per kind of body.
@@ -612,20 +424,6 @@ void Backend::lower_finish(Index i) {
     b_.SetInsertPoint(dead);
 }
 
-// void rt_observed_case_violation(ptr banner, i64 now, i32 kind) — queues the
-// report for the Observed region (rt_observed_flush emits it). kind selects
-// the message (0 = no match, 1 = overlap).
-llvm::FunctionCallee Backend::observed_case_violation_fn() {
-    return rt_fn("rt_observed_case_violation", b_.getVoidTy(),
-                 { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
-}
-
-// void rt_observed_flush() — emit + clear every Observed-region report queued
-// this instant.
-llvm::FunctionCallee Backend::observed_flush_fn() {
-    return rt_fn("rt_observed_flush", b_.getVoidTy(), {});
-}
-
 // Lower a unique/priority case violation report: pass the compile-time banner
 // prefix, the simulation time of the violation, and the message kind. The
 // runtime queues it and reports in the Observed region, where LRM 12.4.2 /
@@ -637,14 +435,6 @@ void Backend::lower_case_viol(Index i) {
     llvm::Value*      now    = b_.CreateCall(wheel_now_fn(), { wheel_ });
     b_.CreateCall(observed_case_violation_fn(),
                   { b_.CreateGlobalString(banner), now, b_.getInt32(info.kind) });
-}
-
-// void rt_severity(i32 level, ptr banner, ptr fmt, i32 argc, ptr argv) —
-// renders the message and writes the labelled diagnostic to stderr, then
-// returns (non-fatal).
-llvm::FunctionCallee Backend::severity_fn() {
-    return rt_fn("rt_severity", b_.getVoidTy(),
-                 { b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
 }
 
 // Lower a severity report ($info / $warning / $error / $fatal, or an
@@ -685,37 +475,6 @@ void Backend::lower_severity(Index i) {
                     b_.getInt64(info.defer == 2 ? 1 : 0), gen_arg, gen_val,
                     b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
                     b_.getInt32(static_cast<uint32_t>(args.size())), arr });
-}
-
-// void rt_defer_report(i32 level, i64 is_final, ptr gen, i64 gen_val, ptr
-// banner, ptr fmt, i32 argc, ptr argv) — queue a deferred assertion report.
-llvm::FunctionCallee Backend::defer_report_fn() {
-    return rt_fn("rt_defer_report", b_.getVoidTy(),
-                 { b_.getInt32Ty(), b_.getInt64Ty(), raw_ptr_ty(), b_.getInt64Ty(),
-                   raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
-}
-
-// void rt_defer_flush_observed() / rt_defer_flush_final() — mature the queued
-// observed (#0) / final deferred reports.
-llvm::FunctionCallee Backend::defer_flush_observed_fn() {
-    return rt_fn("rt_defer_flush_observed", b_.getVoidTy(), {});
-}
-
-llvm::FunctionCallee Backend::defer_flush_final_fn() {
-    return rt_fn("rt_defer_flush_final", b_.getVoidTy(), {});
-}
-
-// void rt_sim_run(ptr state, ptr wheel, ptr drain, ptr finals) — wraps the
-// drain in the $finish catch (a setjmp target) so a $finish returns here with
-// state live, then runs the final blocks (LRM 9.2.3). See runtime/Scheduler.cpp.
-llvm::FunctionCallee Backend::sim_run_fn() {
-    auto* ptr = raw_ptr_ty();
-    return rt_fn("rt_sim_run", b_.getVoidTy(), { ptr, ptr, ptr, ptr });
-}
-
-// void rt_fflush(i32 desc) — flush a descriptor's output buffers (0 => all).
-llvm::FunctionCallee Backend::fflush_fn() {
-    return rt_fn("rt_fflush", b_.getVoidTy(), { b_.getInt32Ty() });
 }
 
 // Lower a $fflush: flush the descriptor operand's buffers (a constant 0 for the
@@ -923,22 +682,6 @@ void Backend::lower_fseek(Index i) {
     set_value(i, packed(r, r, zero(32)));
 }
 
-// i32 rt_fgets(i8* mm, i8* z, i32 width, i32 fd, i32 flags)
-llvm::FunctionCallee Backend::fgets_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* i32  = b_.getInt32Ty();
-    auto* fnty = llvm::FunctionType::get(i32, { ptr, ptr, i32, i32, i32 }, false);
-    return env_->llmod.getOrInsertFunction("rt_fgets", fnty);
-}
-
-// i32 rt_fgets_str(rt_string* dst, i32 fd, const rt_alloc_site*)
-llvm::FunctionCallee Backend::fgets_str_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* i32  = b_.getInt32Ty();
-    auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, ptr }, false);
-    return env_->llmod.getOrInsertFunction("rt_fgets_str", fnty);
-}
-
 // Lower a $fgets: a string-object destination goes straight to the runtime's
 // rt_string handle (no fixed width, no wait-queue plane snapshot -- mirrors
 // lower_sformat's string branch). A packed-vector destination hands the
@@ -995,29 +738,6 @@ std::tuple<llvm::Value*, llvm::Value*, uint32_t, uint32_t> Backend::string_dest(
     return { mm, z, lv.store_width, lv.narrow ? 1u : 0u };
 }
 
-// void rt_sformat(i8* mm, i8* z, i32 width, const char* fmt, i32 argc, const rt_arg* argv,
-//                 i32 flags, const rt_fmt_dyn* dyn)
-llvm::FunctionCallee Backend::sformat_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* i32  = b_.getInt32Ty();
-    auto* fnty = llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, i32, ptr, i32, ptr, i32, ptr }, false);
-    return env_->llmod.getOrInsertFunction("rt_sformat", fnty);
-}
-
-// void rt_sformat_str(rt_string* dst, const char* fmt, i32 argc, const rt_arg* argv,
-//                     const rt_alloc_site*, const rt_fmt_dyn* dyn)
-llvm::FunctionCallee Backend::sformat_str_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* fnty =
-      llvm::FunctionType::get(b_.getVoidTy(), { ptr, ptr, b_.getInt32Ty(), ptr, ptr, ptr }, false);
-    return env_->llmod.getOrInsertFunction("rt_sformat_str", fnty);
-}
-
-// { i64 time_mul, ptr site } — mirrors rt_fmt_dyn in runtime/Runtime.h.
-llvm::StructType* Backend::fmt_dyn_struct_ty() {
-    return llvm::StructType::get(ctx_, { b_.getInt64Ty(), raw_ptr_ty() });
-}
-
 Backend::FormatArg Backend::format_arg(Index i, Index fmt_value, ExtraIndex fmt, uint32_t fmt_len, TickScale scale) {
     if (fmt_value == kNoFormatValue) {
         return { b_.CreateGlobalString(ir_->extra_bytes(fmt, fmt_len)),
@@ -1067,22 +787,6 @@ void Backend::lower_sformatf(Index i) {
                     alloc_site_global(loc_text(i), "string"), f.dyn });
 }
 
-// i32 rt_ferror(i32 fd, i8* mm, i8* z, i32 width, i32 flags)
-llvm::FunctionCallee Backend::ferror_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* i32  = b_.getInt32Ty();
-    auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, ptr, i32, i32 }, false);
-    return env_->llmod.getOrInsertFunction("rt_ferror", fnty);
-}
-
-// i32 rt_ferror_str(i32 fd, rt_string* dst, const rt_alloc_site*)
-llvm::FunctionCallee Backend::ferror_str_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* i32  = b_.getInt32Ty();
-    auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, ptr }, false);
-    return env_->llmod.getOrInsertFunction("rt_ferror_str", fnty);
-}
-
 // Lower a $ferror: a string-object destination goes straight to the runtime's
 // rt_string handle (mirrors lower_fgets's string branch); a packed-vector
 // destination passes the descriptor plus the destination's planes. Either way
@@ -1104,31 +808,6 @@ void Backend::lower_ferror(Index i) {
     llvm::Value* r = b_.CreateCall(ferror_fn(), { fd, mm, z, b_.getInt32(width), b_.getInt32(flags) });
     service_after_write(lv, old);
     set_value(i, packed(r, r, zero(32)));
-}
-
-// { ptr mm, ptr z, i32 width, i32 flags, ptr str, ptr site } — mirrors
-// rt_scan_arg in runtime/Runtime.h.
-llvm::StructType* Backend::scan_arg_struct_ty() {
-    auto* ptr = llvm::PointerType::getUnqual(ctx_);
-    return llvm::StructType::get(
-      ctx_, { ptr, ptr, b_.getInt32Ty(), b_.getInt32Ty(), ptr, ptr });
-}
-
-// i32 rt_fscanf(i32 fd, const char* fmt, i32 argc, const rt_scan_arg* args)
-llvm::FunctionCallee Backend::fscanf_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* i32  = b_.getInt32Ty();
-    auto* fnty = llvm::FunctionType::get(i32, { i32, ptr, i32, ptr }, false);
-    return env_->llmod.getOrInsertFunction("rt_fscanf", fnty);
-}
-
-// i32 rt_sscanf(const char* buf, i32 len, i32 fwd, const char* fmt, i32 argc,
-//               const rt_scan_arg* args)
-llvm::FunctionCallee Backend::sscanf_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* i32  = b_.getInt32Ty();
-    auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, i32, ptr, i32, ptr }, false);
-    return env_->llmod.getOrInsertFunction("rt_sscanf", fnty);
 }
 
 // Lower a $fscanf / $sscanf: build the rt_scan_arg[] descriptor array from the
@@ -1206,14 +885,6 @@ void Backend::lower_scanf(Index i) {
     set_value(i, packed(r, r, zero(32)));
 }
 
-// i32 rt_test_plusargs(const char* s, i32 len)
-llvm::FunctionCallee Backend::test_plusargs_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* i32  = b_.getInt32Ty();
-    auto* fnty = llvm::FunctionType::get(i32, { ptr, i32 }, false);
-    return env_->llmod.getOrInsertFunction("rt_test_plusargs", fnty);
-}
-
 // Lower $test$plusargs(str): the query string is a compile-time literal
 // (frontend-checked), so its bytes go straight to the runtime scan.
 void Backend::lower_test_plusargs(Index i) {
@@ -1223,22 +894,6 @@ void Backend::lower_test_plusargs(Index i) {
     llvm::Value*       r       = b_.CreateCall(
       test_plusargs_fn(), { str_ptr, b_.getInt32(static_cast<uint32_t>(str.size())) });
     set_value(i, packed(r, r, zero(32)));
-}
-
-// i32 rt_value_plusargs(const char* prefix, i32 prefix_len, i32 conv, const rt_scan_arg* arg)
-llvm::FunctionCallee Backend::value_plusargs_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* i32  = b_.getInt32Ty();
-    auto* fnty = llvm::FunctionType::get(i32, { ptr, i32, i32, ptr }, false);
-    return env_->llmod.getOrInsertFunction("rt_value_plusargs", fnty);
-}
-
-// i32 rt_value_plusargs_str(const char* prefix, i32 prefix_len, rt_string* dst,
-//                           const rt_alloc_site*)
-llvm::FunctionCallee Backend::value_plusargs_str_fn() {
-    auto* ptr  = llvm::PointerType::getUnqual(ctx_);
-    auto* fnty = llvm::FunctionType::get(b_.getInt32Ty(), { ptr, b_.getInt32Ty(), ptr, ptr }, false);
-    return env_->llmod.getOrInsertFunction("rt_value_plusargs_str", fnty);
 }
 
 // Lower $value$plusargs(user_string, var) (LRM §21.6).
@@ -1323,25 +978,6 @@ Backend::AsciiArg Backend::spill_ascii_arg(Index v, const char* name) {
     }
     const auto [ptr, len] = spill_ascii(v, name);
     return { ptr, b_.getInt32(len), b_.getInt32(0) };
-}
-
-// void rt_readmem(const char* path, i32 path_len, i8* mm_base, i8* z_base,
-//                 i32 stride, i32 count, i32 width, i64 decl_left, i64 decl_right,
-//                 i64 start, i64 finish, i32 flags)
-llvm::FunctionCallee Backend::readmem_fn() {
-    auto* ptr = raw_ptr_ty();
-    auto* i32 = b_.getInt32Ty();
-    auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_readmem", b_.getVoidTy(), { ptr, i32, ptr, ptr, i32, i32, i32, i64, i64, i64, i64, i32 });
-}
-
-// i32 rt_fread(i32 fd, i8* mm, i8* z, i32 stride, i32 count, i32 width, i32 four,
-//              i64 decl_left, i64 decl_right, i64 start, i64 max_count, i32 flags)
-llvm::FunctionCallee Backend::fread_fn() {
-    auto* ptr = raw_ptr_ty();
-    auto* i32 = b_.getInt32Ty();
-    auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_fread", i32, { i32, ptr, ptr, i32, i32, i32, i32, i64, i64, i64, i64, i32 });
 }
 
 // Lower a $fread into a single vector: one element, no addressing. The runtime
@@ -1573,30 +1209,6 @@ void Backend::emit_display_to(const DisplayInfo& info, llvm::Value* desc, llvm::
     llvm::Value*                 arr     = build_rt_args(args, "$display / $write");
     llvm::Value*                 fmt_ptr = b_.CreateGlobalString(fmt);
     b_.CreateCall(sink, { desc, fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
-}
-
-// rt_monitor_emit(i32 desc, ptr fmt, i32 argc, ptr argv) — like rt_fwrite but
-// prints only when the rendered output differs from the last (LRM 21.2.2).
-llvm::FunctionCallee Backend::monitor_emit_fn() {
-    auto* i32 = b_.getInt32Ty();
-    return rt_fn("rt_monitor_emit", b_.getVoidTy(), { i32, raw_ptr_ty(), i32, raw_ptr_ty() });
-}
-
-// rt_monitor_set(ptr ramp) — register the monitor body's ramp function pointer
-// as the single active monitor (enabled, output-primed reset).
-llvm::FunctionCallee Backend::monitor_set_fn() {
-    return rt_fn("rt_monitor_set", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-// rt_monitor_enable(i32 on) — $monitoron / $monitoroff.
-llvm::FunctionCallee Backend::monitor_enable_fn() {
-    return rt_fn("rt_monitor_enable", b_.getVoidTy(), { b_.getInt32Ty() });
-}
-
-// ptr rt_monitor_active_ramp(void) — the registered ramp fn ptr if a monitor is
-// active and enabled, else null (drives the Postponed-region per-instant run).
-llvm::FunctionCallee Backend::monitor_active_ramp_fn() {
-    return rt_fn("rt_monitor_active_ramp", raw_ptr_ty(), {});
 }
 
 } // namespace clotho::ir::backend

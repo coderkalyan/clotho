@@ -14,7 +14,7 @@
 // policy change rather than a redesign.
 //
 // Everything here is part of the JIT-callable C ABI, so the struct layouts below
-// are mirrored bit-for-bit by the backend (ir/llvm/GcEmit.cpp, `gc_map_ty` /
+// are mirrored bit-for-bit by the backend (ir/llvm/RuntimeAbi.cpp, `gc_map_ty` /
 // `gc_roots_ty` / `gc_frame_ty`) exactly as rt_elem_ops is. Any change is a
 // lockstep two-file edit; rt_gc_init cross-checks the one offset the backend
 // computes independently.

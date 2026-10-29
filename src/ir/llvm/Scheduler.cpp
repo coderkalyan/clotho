@@ -2143,33 +2143,6 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     }
 }
 
-// Timing wheel (rt_wheel_*); the ptr parameter is the rt_wheel.
-llvm::FunctionCallee Backend::wheel_init_fn() {
-    return rt_fn("rt_wheel_init", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::wheel_deinit_fn() {
-    return rt_fn("rt_wheel_deinit", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::oscillation_abort_fn() {
-    return rt_fn("rt_oscillation_abort", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::ring_overflow_fn() {
-    return rt_fn("rt_ring_overflow", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
-}
-
-// The two DPI export-task fatals (LRM 35.8). Both take the exported task's
-// c_identifier and never return; the thunk follows each with `unreachable`.
-llvm::FunctionCallee Backend::dpi_export_task_suspended_fn() {
-    return rt_fn("rt_dpi_export_task_suspended", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::dpi_export_task_no_task_frame_fn() {
-    return rt_fn("rt_dpi_export_task_no_task_frame", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
 // The timing wheel's storage, as a module global rather than main's alloca.
 // Created before any body is lowered, because a function body binds `wheel_` to
 // it: a function's ABI carries state and rng but no wheel, and every event op
@@ -2181,46 +2154,6 @@ void Backend::build_wheel_global() {
                                               llvm::ConstantAggregateZero::get(wheel_ty),
                                               "clotho.wheel");
     wheel_gv_->setAlignment(llvm::Align(alignof(rt_wheel)));
-}
-
-llvm::FunctionCallee Backend::event_detach_register_fn() {
-    return rt_fn("rt_event_detach_register", b_.getVoidTy(),
-                 { b_.getInt32Ty(), b_.getInt64Ty(), b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::event_detach_fire_fn() {
-    return rt_fn("rt_event_detach_fire", b_.getInt32Ty(), { b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::event_detach_ready_fn() {
-    return rt_fn("rt_event_detach_ready", b_.getInt64Ty(), { b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::event_new_fn() {
-    return rt_fn("rt_event_new", b_.getInt64Ty(), {});
-}
-
-llvm::FunctionCallee Backend::event_ptr_fn() {
-    return rt_fn("rt_event_ptr", raw_ptr_ty(), { b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::run_init_fn() {
-    return rt_fn("rt_run_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::wheel_now_fn() {
-    return rt_fn("rt_wheel_now", b_.getInt64Ty(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::random_fn() {
-    return rt_fn("rt_random", b_.getInt32Ty(), {});
-}
-
-// rt_dist_<op>(i32 seed, i32 params...) -> i64 {seed:32, draw:32}. `nparam`
-// is the count of distribution parameters after the seed (1 or 2).
-llvm::FunctionCallee Backend::dist_fn(const char* name, unsigned nparam) {
-    std::vector<llvm::Type*> params(nparam + 1, b_.getInt32Ty());
-    return rt_fn(name, b_.getInt64Ty(), params);
 }
 
 // Reference-routine symbol for a distribution selector (LRM §20.15.2).
@@ -2242,37 +2175,6 @@ const char* Backend::dist_symbol(uint32_t fn) {
             return "rt_dist_erlang";
     }
     throw BackendError{ "internal: unknown dist op" };
-}
-
-// void rt_urandom_seed(i64* state, i64 seed): splitmix64 expansion of a
-// 64-bit selector into the process's xoshiro256++ frame state.
-llvm::FunctionCallee Backend::urandom_seed_fn() {
-    return rt_fn("rt_urandom_seed", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
-}
-
-// i32 rt_randc_next(i64* seen, i32 nvals, i64* rng): one cyclic draw for a
-// randc property (LRM §18.6), against that property's remaining-value bitmap
-// and the object's own RNG state. Both are passed as raw pointers to class
-// properties, so the runtime needs no knowledge of the class layout.
-llvm::FunctionCallee Backend::randc_next_fn() {
-    return rt_fn("rt_randc_next", b_.getInt32Ty(), { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
-}
-
-// void rt_wheel_schedule(rt_wheel*, rt_timer*, i64 deadline, rt_timer_fn)
-llvm::FunctionCallee Backend::wheel_schedule_fn() {
-    return rt_fn("rt_wheel_schedule", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
-}
-
-// void rt_wheel_schedule_rel(rt_wheel*, rt_timer*, i64 delay, rt_timer_fn)
-llvm::FunctionCallee Backend::wheel_schedule_rel_fn() {
-    return rt_fn("rt_wheel_schedule_rel", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
-}
-
-// int rt_wheel_advance(rt_wheel*, void* ctx)
-llvm::FunctionCallee Backend::wheel_advance_fn() {
-    return rt_fn("rt_wheel_advance", b_.getInt32Ty(), { raw_ptr_ty(), raw_ptr_ty() });
 }
 
 } // namespace clotho::ir::backend

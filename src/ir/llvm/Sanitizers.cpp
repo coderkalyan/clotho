@@ -12,17 +12,6 @@ llvm::Value* Backend::bounds_index(Index idx_expr) {
     return cast(must_of(value_of(idx_expr)), 64, type_of(idx_expr).is_signed);
 }
 
-// The rt_bounds_site record (Runtime.h): { ptr where, ptr line, ptr name,
-// i32 line_no, i32 column, i32 end_column, i32 acc_line_no, i32 acc_column,
-// i32 acc_end_column, i32 what, i32 left, i32 right, i32 width }. Field
-// order and types mirror the C struct exactly, so the two change together.
-llvm::StructType* Backend::bounds_site_ty() {
-    auto* i32 = b_.getInt32Ty();
-    auto* ptr = raw_ptr_ty();
-    return llvm::StructType::get(
-      ctx_, { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32 });
-}
-
 // One constant rt_bounds_site per instrumented access. Everything the report
 // knows at compile time lives here instead of in the argument list, which
 // keeps the call to the values that are genuinely dynamic. `left`/`right`
@@ -66,37 +55,6 @@ llvm::Constant* Backend::bounds_site_global(const SourceText&  idx,
 // in the backend (frame slots carry no name), so it says what it is.
 std::string Backend::bounds_name(const LValue& lv) const {
     return lv.is_signal ? mod_.signal(lv.sig).name : std::string("<local>");
-}
-
-// void rt_bounds_report(ptr site, i64 index, i64 extent, i32 flags, i64 now)
-// — writes one warning to stderr and returns; see Runtime.h for the flag
-// bits and the extent convention.
-llvm::FunctionCallee Backend::bounds_report_fn() {
-    auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_bounds_report", b_.getVoidTy(),
-                 { raw_ptr_ty(), i64, i64, b_.getInt32Ty(), i64 });
-}
-
-// void rt_wide_sel(const void* mm, const void* z, u32 width, i64 base, u32 cwidth,
-//                  i64 off, u32 n, u32 four, u32 has_z, u32 unknown,
-//                  u64* must, u64* may, u64* z_out)
-llvm::FunctionCallee Backend::wide_sel_fn() {
-    auto* i32 = b_.getInt32Ty();
-    auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_wide_sel", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), i32, i64, i32, i64, i32, i32, i32, i32,
-                   raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
-}
-
-// void rt_wide_ins(void* mm, void* z, u32 width, i64 base, u32 cwidth, i64 off,
-//                  u32 n, u32 four, u32 has_z, u32 unknown, const u64* must,
-//                  const u64* may, const u64* z)
-llvm::FunctionCallee Backend::wide_ins_fn() {
-    auto* i32 = b_.getInt32Ty();
-    auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_wide_ins", b_.getVoidTy(),
-                 { raw_ptr_ty(), raw_ptr_ty(), i32, i64, i32, i64, i32, i32, i32, i32,
-                   raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
 // Record an array-element check on `target` (the lvalue the select produces)
@@ -301,11 +259,6 @@ void Backend::emit_bounds_reports(const LValue& lv, bool is_write) {
     }
 }
 
-llvm::StructType* Backend::null_site_ty() {
-    auto* i32 = b_.getInt32Ty();
-    return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, i32 });
-}
-
 // One constant rt_null_site per guarded dereference. Everything the fatal
 // knows is compile-time, so only the simulation time travels as an argument.
 llvm::Constant* Backend::null_site_global(const SourceText& at, NullKind kind) {
@@ -320,12 +273,6 @@ llvm::Constant* Backend::null_site_global(const SourceText& at, NullKind kind) {
     return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
                                     llvm::GlobalValue::PrivateLinkage, init,
                                     "clotho.null.site");
-}
-
-// void rt_null_handle(ptr site, i64 now) — prints the located fatal and ends
-// the simulation; never returns (see Runtime.h).
-llvm::FunctionCallee Backend::null_handle_fn() {
-    return rt_fn("rt_null_handle", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
 }
 
 // Guard a class-handle dereference against null (LRM 8.4). The handle is raw
@@ -371,15 +318,6 @@ llvm::Constant* Backend::no_epoch_global() {
     return env_->no_epoch;
 }
 
-// The rt_ref_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
-// i32 column, i32 end_column, ptr formal, ptr container }. Field order and
-// types mirror the C struct exactly, so the two change together.
-llvm::StructType* Backend::ref_site_ty() {
-    auto* i32 = b_.getInt32Ty();
-    return llvm::StructType::get(
-      ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32, raw_ptr_ty() });
-}
-
 // The site record for one dereference of a ref formal, built in the CALLEE:
 // where the stale access is, and the callee's name for the formal. The
 // container's name is not here — the runtime resolves it from the epoch pointer
@@ -396,34 +334,6 @@ llvm::Constant* Backend::ref_site_global(const SourceText& at, std::string_view 
     return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
                                     llvm::GlobalValue::PrivateLinkage, init,
                                     "clotho.ref.site");
-}
-
-// void rt_ref_stale(ptr site, i64 expect, i64 actual, i64 now) — reports the
-// dangling ref; fatal by default, a once-per-site warning under
-// --loose-stale-ref, so it CAN return (see Runtime.h).
-//
-// Declared as touching only memory the design cannot reach (it writes a
-// diagnostic and a per-site suppression set, both runtime-private). Without
-// that, GVN has to assume the call on the FAILING path clobbers the epoch, and
-// refuses to CSE the epoch load of a second dereference in the same block — so
-// N accesses through one ref formal paid N loads and N compares instead of one.
-llvm::FunctionCallee Backend::ref_stale_fn() {
-    auto callee =
-      rt_fn("rt_ref_stale", b_.getVoidTy(),
-            { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
-    if (auto* fn = llvm::dyn_cast<llvm::Function>(callee.getCallee())) {
-        fn->setMemoryEffects(llvm::MemoryEffects::inaccessibleMemOnly());
-        fn->setDoesNotThrow();
-    }
-    return callee;
-}
-
-// void rt_ref_epoch_regress(ptr site, ptr epoch, i64 expect, i64 actual, i64 now)
-// — an epoch that went backwards is a Clotho bug; aborts unconditionally.
-llvm::FunctionCallee Backend::ref_epoch_regress_fn() {
-    return rt_fn(
-      "rt_ref_epoch_regress", b_.getVoidTy(),
-      { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt64Ty() });
 }
 
 // Register the design's epoch-to-name table before any process runs
@@ -467,11 +377,6 @@ void Backend::emit_ref_name_table() {
                                llvm::ConstantArray::get(arr, rows), "clotho.ref.names");
     b_.CreateCall(rt_fn("rt_ref_names", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() }),
                   { gv, b_.getInt64(rows.size()) });
-}
-
-// { ptr epoch, ptr name } -- must match rt_container_name in Runtime.h.
-llvm::StructType* Backend::ref_name_ty() {
-    return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty() });
 }
 
 // Guard one dereference of a `ref` formal against its actual's container
@@ -542,23 +447,6 @@ void Backend::emit_ref_epoch_check(const RefBinding& rb) {
         b_.CreateBr(done);
         b_.SetInsertPoint(done);
     }
-}
-
-// The rt_tagged_site record (Runtime.h): { ptr where, ptr line, i32 line_no,
-// i32 column, i32 end_column, ptr member, ptr names, ptr name_lens, i32 count,
-// i32 is_write }. Field order and types mirror the C struct exactly, so the two
-// change together.
-llvm::StructType* Backend::tagged_site_ty() {
-    auto* i32 = b_.getInt32Ty();
-    return llvm::StructType::get(ctx_, { raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32,
-                                         raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32 });
-}
-
-// void rt_tagged_access(ptr site, i64 tag, i32 tag_unknown, i64 now) — prints
-// the located fatal and ends the simulation; never returns (see Runtime.h).
-llvm::FunctionCallee Backend::tagged_access_fn() {
-    return rt_fn("rt_tagged_access", b_.getVoidTy(),
-                 { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt64Ty() });
 }
 
 // Guard one tagged-union member access against the union's current tag (LRM
@@ -642,15 +530,6 @@ llvm::Constant* Backend::tagged_site_global(const SourceText& at, const TaggedCh
     return new llvm::GlobalVariable(env_->llmod, rec, /*isConstant=*/true,
                                     llvm::GlobalValue::PrivateLinkage, init,
                                     "clotho.tagged.site");
-}
-
-// The rt_alloc_site record (Runtime.h): { ptr where, ptr line, ptr what,
-// i32 line_no, i32 column, i32 end_column }. Field order and types mirror
-// the C struct exactly, so the two change together.
-llvm::StructType* Backend::alloc_site_ty() {
-    auto* i32 = b_.getInt32Ty();
-    return llvm::StructType::get(ctx_,
-                                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), i32, i32, i32 });
 }
 
 // One constant rt_alloc_site per allocating call. Everything the fatal knows

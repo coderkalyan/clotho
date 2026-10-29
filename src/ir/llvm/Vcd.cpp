@@ -4,51 +4,6 @@
 
 namespace clotho::ir::backend {
 
-llvm::FunctionCallee Backend::vcd_open_fn() {
-    return rt_fn("rt_vcd_open", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty() });
-}
-
-// void rt_vcd_begin(rt_wheel*, i64 tick_fs, i32 units)
-llvm::FunctionCallee Backend::vcd_begin_fn() {
-    return rt_fn("rt_vcd_begin", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::vcd_scope_fn() {
-    return rt_fn("rt_vcd_scope", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
-}
-
-llvm::FunctionCallee Backend::vcd_upscope_fn() {
-    return rt_fn("rt_vcd_upscope", b_.getVoidTy(), {});
-}
-
-// void rt_vcd_var(i8* name, i32 len, i32 width, i32 flags, i8* mm, i8* z)
-llvm::FunctionCallee Backend::vcd_var_fn() {
-    auto* ptr = raw_ptr_ty();
-    auto* i32 = b_.getInt32Ty();
-    return rt_fn("rt_vcd_var", b_.getVoidTy(), { ptr, i32, i32, i32, ptr, ptr });
-}
-
-// void rt_vcd_array(i8* name, i32 len, i32 count, i32 width, i32 flags, i8* mm_base,
-//                   i8* z_base, i32 stride, i64 left, i64 right)
-llvm::FunctionCallee Backend::vcd_array_fn() {
-    auto* ptr = raw_ptr_ty();
-    auto* i32 = b_.getInt32Ty();
-    auto* i64 = b_.getInt64Ty();
-    return rt_fn("rt_vcd_array", b_.getVoidTy(), { ptr, i32, i32, i32, i32, ptr, ptr, i32, i64, i64 });
-}
-
-llvm::FunctionCallee Backend::vcd_start_fn() {
-    return rt_fn("rt_vcd_start", b_.getVoidTy(), {});
-}
-
-llvm::FunctionCallee Backend::vcd_limit_fn() {
-    return rt_fn("rt_vcd_limit", b_.getVoidTy(), { b_.getInt64Ty() });
-}
-
-llvm::FunctionCallee Backend::vcd_touch_fn() {
-    return rt_fn("rt_vcd_touch", b_.getVoidTy(), { b_.getInt32Ty() });
-}
-
 // The runtime rt_vcd_active byte, non-zero only while VCD dumping is live.
 llvm::Constant* Backend::vcd_active_gv() {
     return env_->llmod.getOrInsertGlobal("rt_vcd_active", b_.getInt8Ty());
@@ -78,18 +33,6 @@ void Backend::emit_guarded_vcd_touch(llvm::FunctionCallee                       
     b_.CreateCall(fn, make_args());
     b_.CreateBr(cont);
     b_.SetInsertPoint(cont);
-}
-
-llvm::FunctionCallee Backend::vcd_flush_fn() {
-    return rt_fn("rt_vcd_flush", b_.getVoidTy(), { b_.getInt64Ty() });
-}
-
-llvm::FunctionCallee Backend::vcd_close_fn() {
-    return rt_fn("rt_vcd_close", b_.getVoidTy(), {});
-}
-
-llvm::FunctionCallee Backend::vcd_nullary_fn(const char* name) {
-    return rt_fn(name, b_.getVoidTy(), {});
 }
 
 // Any Dump* instruction anywhere in the design? Gates the per-instant flush and
@@ -189,10 +132,6 @@ void Backend::vcd_index_signal(Signal sig, uint32_t& next) {
         return;
     }
     vcd_index_[static_cast<uint32_t>(sig)] = static_cast<int32_t>(next++);
-}
-
-llvm::FunctionCallee Backend::vcd_touch_range_fn() {
-    return rt_fn("rt_vcd_touch_range", b_.getVoidTy(), { b_.getInt32Ty(), b_.getInt32Ty() });
 }
 
 // The rt_vcd_touch index of a dumped signal: def-relative (instance vcd base

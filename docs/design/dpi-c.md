@@ -80,7 +80,7 @@ replaces that stub. The implementation reused the ordinary user-subroutine call
 path: `lower_user_call`
 (`lower/Subroutines.cpp`) → `build_call_args` (per-direction marshal) → `b.call`
 → `emit_call_copyouts` (output/inout copy-back). The runtime-call
-primitive is `rt_fn` (`ir/llvm/Backend.cpp`, `getOrInsertFunction` + `CreateCall`).
+primitive is `rt_fn` (`ir/llvm/RuntimeAbi.cpp`, `getOrInsertFunction` + `CreateCall`).
 JIT symbol resolution injects `rt_*` by absolute address and already adds one
 `DynamicLibrarySearchGenerator` for libgcc builtins (`Jit.cpp:248-254`).
 

@@ -4,63 +4,6 @@
 
 namespace clotho::ir::backend {
 
-// rt_gc_map (Gc.h:85-92):
-// { i64 size, i32 nhandles, i32 nleaves, ptr handles, ptr leaves, ptr finalize }.
-llvm::StructType* Backend::gc_map_ty() {
-    if (gc_map_ty_ == nullptr) {
-        gc_map_ty_ = llvm::StructType::create(
-          ctx_,
-          { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty(), raw_ptr_ty(),
-            raw_ptr_ty() },
-          "clotho.gcmap");
-    }
-    return gc_map_ty_;
-}
-
-// rt_gc_roots (Gc.h:100-105): { ptr base, i32 nhandles, i32 reserved, ptr offsets }.
-llvm::StructType* Backend::gc_roots_ty() {
-    if (gc_roots_ty_ == nullptr) {
-        gc_roots_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() },
-          "clotho.gcroots");
-    }
-    return gc_roots_ty_;
-}
-
-// rt_gc_container (Gc.h:249-254): { i64 offset, i32 kind, i32 reserved, ptr ops }.
-// `ops` is the container's OWN descriptor (kind 2 / 3 / 5), so ops->kind equals
-// `kind` and ops->inner describes the element -- the convention nested container
-// elements already use, which is what lets the collector treat a root entry, a
-// class-map leaf and a nested element as one shape.
-llvm::StructType* Backend::gc_container_ty() {
-    if (gc_container_ty_ == nullptr) {
-        gc_container_ty_ = llvm::StructType::create(
-          ctx_, { b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() },
-          "clotho.gccontainer");
-    }
-    return gc_container_ty_;
-}
-
-// rt_gc_container_table (Gc.h:256-261):
-// { ptr base, i32 count, i32 reserved, ptr entries }.
-llvm::StructType* Backend::gc_container_table_ty() {
-    if (gc_container_table_ty_ == nullptr) {
-        gc_container_table_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), b_.getInt32Ty(), b_.getInt32Ty(), raw_ptr_ty() },
-          "clotho.gccontainers");
-    }
-    return gc_container_table_ty_;
-}
-
-llvm::StructType* Backend::gc_frame_ty() {
-    if (gc_frame_ty_ == nullptr) {
-        gc_frame_ty_ = llvm::StructType::create(
-          ctx_, { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty() },
-          "clotho.gcframe");
-    }
-    return gc_frame_ty_;
-}
-
 // The byte offset of one gc_frame_ty() field, from the DataLayout rather than a
 // literal. Used both to address `next` off a possibly-null `prev` and to assert
 // the `prev`-at-offset-0 identity the two emitters rely on.
@@ -68,37 +11,6 @@ uint32_t Backend::gc_frame_off(unsigned field) {
     assert(field < gc_frame_ty()->getNumElements() && "a frame field index is in range");
     const auto* sl = env_->llmod.getDataLayout().getStructLayout(gc_frame_ty());
     return static_cast<uint32_t>(sl->getElementOffset(field));
-}
-
-// rt_gc_mutator (Gc.h:163-182): { ptr cursor, ptr limit, i64 budget_left,
-// i32 block_index, i32 request, ptr block_base, ptr start_bitmap,
-// ptr fin_bitmap, ptr frames_head }.
-//
-// Mirrored because this one is an ADDRESSING contract, not just an argument
-// type, and since P2 it is the widest one in the file: generated code reads AND
-// WRITES these fields directly. `request` at every safepoint
-// (emit_gc_safepoint); `cursor` / `limit` / `block_base` / `start_bitmap` /
-// `fin_bitmap` at every inlined allocation (emit_gc_alloc_fast); `frames_head` at
-// every coroutine ramp and cleanup (emit_gc_frame_link / emit_gc_frame_unlink).
-// So a field added, widened or reordered ahead of any of them silently moves the
-// bytes generated code touches -- and unlike the poll, the allocator's stores
-// would corrupt the heap rather than merely misread a flag.
-//
-// rt_gc_init catches exactly that: gc_mutator_request_offset() and
-// gc_mutator_bytes() below are handed over in rt_gc_config and compared against
-// the runtime's own offsetof and sizeof (Gc.h:196-203). The size check is what
-// makes the other eight offsets trustworthy: this mirror and the C struct are
-// both padding-free LP64 layouts, so agreeing on the total is agreeing on every
-// field boundary.
-llvm::StructType* Backend::gc_mutator_ty() {
-    if (gc_mutator_ty_ == nullptr) {
-        gc_mutator_ty_ = llvm::StructType::create(
-          ctx_,
-          { raw_ptr_ty(), raw_ptr_ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-            raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() },
-          "clotho.gcmutator");
-    }
-    return gc_mutator_ty_;
 }
 
 // sizeof(rt_gc_mutator) as our mirror computes it, handed to the runtime in
@@ -156,27 +68,6 @@ int32_t Backend::gc_mutator_request_offset() {
     const uint32_t off = gc_mut_off(GcMutField::Request);
     assert(off % sizeof(uint32_t) == 0 && "the request flag is a naturally aligned i32");
     return static_cast<int32_t>(off);
-}
-
-// rt_gc_config (Gc.h:233-246): { i64 nursery_bytes, i64 heap_bytes_max,
-// i32 stress, i32 stats, i32 map_vptr_offset, i32 request_offset,
-// i32 mutator_bytes, i32 full_every, i32 reserved }.
-//
-// `full_every` is the generational policy knob (Gc.h:241-245): one full
-// collection per that many collections, 0 leaving the choice to the runtime's
-// heap-growth heuristic. It is a config field rather than a mode because a young
-// collection reclaims no old garbage, so how often the collector re-derives which
-// lines hold old survivors is a tuning question, not a compile-time one.
-llvm::StructType* Backend::gc_config_ty() {
-    if (gc_config_ty_ == nullptr) {
-        gc_config_ty_ = llvm::StructType::create(
-          ctx_,
-          { b_.getInt64Ty(), b_.getInt64Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-            b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(), b_.getInt32Ty(),
-            b_.getInt32Ty() },
-          "clotho.gcconfig");
-    }
-    return gc_config_ty_;
 }
 
 // A private `[N x i32]` byte-offset constant for the handle tables the collector
@@ -984,75 +875,6 @@ llvm::Constant* Backend::gc_config_global() {
                                     llvm::GlobalValue::PrivateLinkage,
                                     init,
                                     "clotho.gc.config");
-}
-
-// -- Garbage collection entry points (src/runtime/Gc.h) ----------------------
-// rt_fn declares on demand, so each of these lands in the module only if some
-// emitter actually calls it: a design that never allocates carries no
-// rt_gc_alloc declaration, and one whose every frame is unregistered carries no
-// rt_gc_frame_link.
-llvm::FunctionCallee Backend::gc_init_fn() {
-    return rt_fn("rt_gc_init", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::gc_shutdown_fn() {
-    return rt_fn("rt_gc_shutdown", b_.getVoidTy(), {});
-}
-
-llvm::FunctionCallee Backend::gc_mutator_fn() {
-    return rt_fn("rt_gc_mutator_current", raw_ptr_ty(), {});
-}
-
-llvm::FunctionCallee Backend::gc_alloc_fn() {
-    return rt_fn("rt_gc_alloc", raw_ptr_ty(), { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::gc_roots_add_fn() {
-    return rt_fn("rt_gc_roots_add", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-// The container-root ABI (Gc.h:263-268). rt_gc_containers_add takes a constant
-// rt_gc_container_table for state-resident storage; the add / remove pair takes a
-// live rt_dynarr / rt_queue / rt_assoc address for a frame local or a body
-// temporary.
-llvm::FunctionCallee Backend::gc_containers_add_fn() {
-    return rt_fn("rt_gc_containers_add", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::gc_container_add_fn() {
-    return rt_fn("rt_gc_container_add", b_.getVoidTy(),
-                 { raw_ptr_ty(), b_.getInt32Ty(), raw_ptr_ty() });
-}
-
-llvm::FunctionCallee Backend::gc_container_remove_fn() {
-    return rt_fn("rt_gc_container_remove", b_.getVoidTy(), { raw_ptr_ty() });
-}
-
-// The out-of-line half of the inlined allocation fast path (Gc.h:243-253): the
-// current hole cannot satisfy the request, so the runtime refills and allocates,
-// and refreshes cursor / limit / block_base / start_bitmap / fin_bitmap. Reached
-// only on the cold edge emit_gc_alloc_fast branches to.
-llvm::FunctionCallee Backend::gc_alloc_slow_fn() {
-    return rt_fn("rt_gc_alloc_slow", raw_ptr_ty(),
-                 { raw_ptr_ty(), b_.getInt64Ty(), raw_ptr_ty() });
-}
-
-// Only the slow half is ever emitted: generated code polls
-// rt_gc_mutator::request inline (emit_gc_safepoint) and calls this exactly on
-// the taken edge, so reaching it means a collection is due. rt_gc_safepoint,
-// the polling wrapper, stays in the ABI for the runtime's own call sites and
-// the tests (Gc.h:235-245) and is no longer named by any emitted module.
-llvm::FunctionCallee Backend::gc_safepoint_slow_fn() {
-    return rt_fn("rt_gc_safepoint_slow", b_.getVoidTy(), {});
-}
-
-// The out-of-line half of the inlined write barrier (Gc.h:98-108). Generated code
-// tests `(gcword & (OLD|LOGGED)) == OLD` inline and calls this only on the taken
-// edge, so reaching it means an OLD object has just acquired a reference a young
-// collection would otherwise never look at. Idempotent -- it sets LOGGED -- so a
-// hot object costs the call once per collection cycle, not once per store.
-llvm::FunctionCallee Backend::gc_remember_fn() {
-    return rt_fn("rt_gc_remember", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
 // Register this coroutine's frame with the collector, at the ramp, immediately

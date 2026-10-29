@@ -463,6 +463,7 @@ add_library(clotho_ir STATIC
   src/ir/llvm/LlvmBackend.cpp
   src/ir/llvm/Ops.cpp
   src/ir/llvm/Processes.cpp
+  src/ir/llvm/RuntimeAbi.cpp
   src/ir/llvm/Sanitizers.cpp
   src/ir/llvm/Scheduler.cpp
   src/ir/llvm/StateLayout.cpp

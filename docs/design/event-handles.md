@@ -539,7 +539,7 @@ Allocation goes through the **checked** family (`rt_alloc_checked`,
 All must be added to `expose()` in `src/ir/Jit.cpp:199-303` to be linkable, and
 every struct the backend mirrors must keep field order in lockstep with the C
 declaration — the convention `rt_null_site` follows
-(`ir/llvm/Sanitizers.cpp, emit_bounds_reports/null_site_ty`: "Field order and types mirror the C struct
+(`ir/llvm/RuntimeAbi.cpp, null_site_ty`: "Field order and types mirror the C struct
 exactly, so the two change together").
 
 ```c

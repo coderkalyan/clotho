@@ -230,7 +230,7 @@ close.
    counter (`runtime/Scheduler.cpp, rt_inertial_decide`) and dropping the
    record when its timer fires and the stamp no longer matches
    (`rt_inertial_cb`). `@clotho.defer.gen.<g>` +
-   `rt_defer_report(gen, gen_val)` (`src/ir/llvm/SystemTasks.cpp, defer_report_fn`;
+   `rt_defer_report(gen, gen_val)` (`src/ir/llvm/RuntimeAbi.cpp, defer_report_fn`;
    `src/runtime/Scheduler.cpp, rt_defer_report`, comparison in `defer_mature`)
    does the same for deferred reports and *is already* the LRM 16.4.2 flush
    point. Neither structure is ever unlinked.
