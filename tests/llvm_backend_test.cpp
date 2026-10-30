@@ -4257,12 +4257,12 @@ TEST_CASE("real bitcasts and integral conversions") {
     const ir::Index back = b.float_cvt(ir::Inst::Tag::FBitcast, bits, m.pool.real_type, kLoc);
     display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, back, i32, kLoc)); // 1
 
-    // ItoF reads x/z bits as 0 (LRM 6.12.1): 8'b1x1x -> 8'b1010 -> 10.0.
+    // UItoF reads x/z bits as 0 (LRM 6.12.1): 8'b1x1x -> 8'b1010 -> 10.0.
     const ir::Ref                logic8 = m.pool.put(
       ir::Type{ .kind = ir::Type::Kind::PackedArray, .element = m.pool.logic_type, .left = 7, .right = 0 });
     const std::array<uint8_t, 2> vbytes{ 0b1111, 0b0101 }; // val, xz planes
     const ir::Index              vx = b.constant(m.pool.put_value(logic8, vbytes), kLoc);
-    const ir::Index              fv = b.float_cvt(ir::Inst::Tag::ItoF, vx, m.pool.real_type, kLoc);
+    const ir::Index              fv = b.float_cvt(ir::Inst::Tag::UItoF, vx, m.pool.real_type, kLoc);
     display_int(b, b.float_cvt(ir::Inst::Tag::FtoI, fv, i32, kLoc)); // 10
 
     // real <-> shortreal: FResize keeps the value for exactly-representable

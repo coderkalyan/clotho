@@ -145,8 +145,8 @@ ir::Index Lowerer::sort_right_wins(const SortIter& s, ir::Builder& b, ir::Source
     b.binary(T::Store, hold_lv, key, l);
     const ir::Index left    = sort_key(s, s.pos_a, b, l);
     const ir::Index right   = b.unary(T::Load, s.key_hold.lv(b, l), l);
-    const T         ascend  = s.key_real ? T::FLt : T::Lt;
-    const T         descend = s.key_real ? T::FGt : T::Gt;
+    const T         ascend  = s.key_real ? T::FLt : (s.key_signed ? T::SLt : T::ULt);
+    const T         descend = s.key_real ? T::FGt : (s.key_signed ? T::SGt : T::UGt);
     const ir::Index cmp     = b.binary(s.desc ? descend : ascend, right, left, l);
     if (!s.key_four) {
         return cmp;
@@ -207,12 +207,12 @@ void Lowerer::emit_merge_step(const SortIter& s, ir::Builder& b, ir::SourceLoc l
     const ir::ExtraSlice right_done = b.close_region();
     const ir::Index      rj         = load(s.rj);
     const ir::Index      hi         = load(s.hi);
-    b.cond(b.binary(T::Lt, rj, hi, l), compare, right_done, l);
+    b.cond(b.binary(T::SLt, rj, hi, l), compare, right_done, l);
     const ir::ExtraSlice left_live = b.close_region();
 
     const ir::Index li  = load(s.li);
     const ir::Index mid = load(s.mid);
-    b.cond(b.binary(T::Ge, li, mid, l), left_done, left_live, l);
+    b.cond(b.binary(T::SGe, li, mid, l), left_done, left_live, l);
 
     const auto emit_take = [&](const TempCell& cursor) {
         const ir::Index slot = b.elem_select(s.buf, b.resize(load(s.out), s.i32, l), s.oty, l, /*for_write=*/true);
@@ -248,7 +248,7 @@ void Lowerer::emit_merge_pass(const SortIter& s, ir::Builder& b, ir::SourceLoc l
     const auto load    = [&](const TempCell& c) { return b.unary(T::Load, c.lv(b, l), l); };
     const auto clamped = [&](ir::Index v) {
         const ir::Index limit = load(s.n);
-        const ir::Index below = b.binary(T::Lt, v, limit, l);
+        const ir::Index below = b.binary(T::SLt, v, limit, l);
         const ir::Index cap   = load(s.n);
         return b.select(below, v, cap, l);
     };
@@ -260,7 +260,7 @@ void Lowerer::emit_merge_pass(const SortIter& s, ir::Builder& b, ir::SourceLoc l
     b.open_region();
     const ir::Index      lo       = load(s.lo);
     const ir::Index      n        = load(s.n);
-    const ir::Index      run_pred = b.binary(T::Lt, lo, n, l);
+    const ir::Index      run_pred = b.binary(T::SLt, lo, n, l);
     const ir::ExtraSlice run_cond = b.close_region();
 
     b.open_region();
@@ -287,7 +287,7 @@ void Lowerer::emit_merge_pass(const SortIter& s, ir::Builder& b, ir::SourceLoc l
     b.open_region();
     const ir::Index      out_at    = load(s.out);
     const ir::Index      hi_at     = load(s.hi);
-    const ir::Index      step_pred = b.binary(T::Lt, out_at, hi_at, l);
+    const ir::Index      step_pred = b.binary(T::SLt, out_at, hi_at, l);
     const ir::ExtraSlice step_cond = b.close_region();
     b.open_region();
     emit_merge_step(s, b, l);
@@ -333,7 +333,7 @@ void Lowerer::emit_sort_permute(const SortIter& s, bool queue, ir::Builder& b, i
     b.open_region();
     const ir::Index      out_now = load(s.out);
     const ir::Index      n_now   = load(s.n);
-    const ir::Index      pred    = b.binary(T::Lt, out_now, n_now, l);
+    const ir::Index      pred    = b.binary(T::SLt, out_now, n_now, l);
     const ir::ExtraSlice cond    = b.close_region();
 
     b.open_region();
@@ -413,7 +413,8 @@ ir::Index Lowerer::lower_array_sort_iter(std::string_view      name,
     s.desc      = name == "rsort";
     const slang::ast::Type& kty =
       iter_expr != nullptr ? *iter_expr->type : *recv.type->getArrayElementType();
-    s.key_real = kty.isFloating();
+    s.key_real   = kty.isFloating();
+    s.key_signed = kty.isSigned();
     s.key_four = kty.getCanonicalType().isIntegral() && kty.getCanonicalType().isFourState();
 
     ir::Type ot;
@@ -470,7 +471,7 @@ void Lowerer::emit_sort_body(const SortIter& s, bool queue, ir::Builder& b, ir::
     b.open_region();
     const ir::Index      out_now = load(s.out);
     const ir::Index      n_now   = load(s.n);
-    const ir::Index      ipred   = b.binary(T::Lt, out_now, n_now, l);
+    const ir::Index      ipred   = b.binary(T::SLt, out_now, n_now, l);
     const ir::ExtraSlice icond   = b.close_region();
     b.open_region();
     const ir::Index k = b.resize(load(s.out), s.i32, l);
@@ -492,7 +493,7 @@ void Lowerer::emit_sort_body(const SortIter& s, bool queue, ir::Builder& b, ir::
     b.open_region();
     const ir::Index      w_now = load(s.w);
     const ir::Index      limit = load(s.n);
-    const ir::Index      wpred = b.binary(T::Lt, w_now, limit, l);
+    const ir::Index      wpred = b.binary(T::SLt, w_now, limit, l);
     const ir::ExtraSlice wcond = b.close_region();
     b.open_region();
     emit_merge_pass(s, b, l);
@@ -515,7 +516,7 @@ void Lowerer::emit_sort_body(const SortIter& s, bool queue, ir::Builder& b, ir::
     const ir::ExtraSlice skip_r = b.close_region();
     const ir::Index      n_size = load(s.n);
     const ir::Index      two    = iconst(s.i64, 2, b, l);
-    b.cond(b.binary(T::Ge, n_size, two, l), sort_r, skip_r, l);
+    b.cond(b.binary(T::SGe, n_size, two, l), sort_r, skip_r, l);
 }
 
 } // namespace clotho::lower

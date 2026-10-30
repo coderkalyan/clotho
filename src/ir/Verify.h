@@ -42,10 +42,13 @@ enum class Rule : uint8_t {
     // lower_divmod and lower_bitwise promote the 2-state side (to_four);
     // lower_compare, lower_case_compare and lower_wildeq lift both sides.
     OperandDomain,
-    // Ordered compares (Lt Le Gt Ge), Div, Mod and the InsideSet ranges: both
-    // operands have the same signedness. Backend reads only the LEFT operand's
-    // (type_of(l).is_signed in lower_compare / lower_divmod / lower_inside_set).
+    // Ordered compares, Div, Mod and the InsideSet ranges: both operands have the
+    // same signedness (the opcode picks one reading for both).
     OperandSign,
+    // The signedness an opcode asserts (UDiv/SDiv, ULt/SLt, Sra, UItoF/SItoF, Pow's
+    // and InsideSet's flags) differs from its operand's type. A check on the
+    // frontend's choice of opcode, in force while the IR's types still carry a sign.
+    OpSign,
     // Add Sub Mul Band Bor Bxor Bxnor: operand signedness agrees, because the
     // result's signedness is the LEFT operand's (compute_type).
     ResultSign,

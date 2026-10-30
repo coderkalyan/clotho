@@ -1558,8 +1558,11 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_event(const Assign
             t.count = coerce(t.count, *rec.expr.type, cty, b, l);
         }
         if (!folded) {
-            ir::Index nonpos =
-              b.binary(ir::Inst::Tag::Lt, t.count, b.constant(module_.pool.put_int(cty, 1), l), l);
+            ir::Index nonpos = b.binary(rec.expr.type->isFloating() || rec.expr.type->isSigned() ? ir::Inst::Tag::SLt
+                                                                                                 : ir::Inst::Tag::ULt,
+                                        t.count,
+                                        b.constant(module_.pool.put_int(cty, 1), l),
+                                        l);
             if (rec.expr.type->isFourState()) {
                 // An x/z count makes the comparison ambiguous; narrow it to the
                 // definite bit so the rule is "clamp only when the count is

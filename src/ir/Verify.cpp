@@ -71,20 +71,32 @@ private:
                 check_integer_pair(i, p.binary.l, p.binary.r);
                 check_result_sign(i, p.binary.l, p.binary.r);
                 return;
-            case Tag::Div:
-            case Tag::Mod:
+            case Tag::UDiv:
+            case Tag::SDiv:
+            case Tag::UMod:
+            case Tag::SMod:
                 check_integer_pair(i, p.binary.l, p.binary.r);
                 check_sign_pair(i, p.binary.l, p.binary.r);
                 check_forced_four_state(i, p.binary.l, p.binary.r);
+                check_op_sign(i, p.binary.l, signed_tag(ir_.tag(i)));
                 return;
-            case Tag::Pow:
-                check_forced_four_state(i, p.binary.l, p.binary.r);
+            case Tag::Pow: {
+                const auto info = ir_.extra_data<PowInfo>(p.op_extra.extra);
+                check_forced_four_state(i, p.op_extra.op, info.exp);
+                check_op_sign(i, p.op_extra.op, info.base_signed != 0);
+                check_op_sign(i, info.exp, info.exp_signed != 0);
                 return;
-            case Tag::Lt:
-            case Tag::Le:
-            case Tag::Gt:
-            case Tag::Ge:
+            }
+            case Tag::ULt:
+            case Tag::SLt:
+            case Tag::ULe:
+            case Tag::SLe:
+            case Tag::UGt:
+            case Tag::SGt:
+            case Tag::UGe:
+            case Tag::SGe:
                 check_compare(i, p.binary.l, p.binary.r, /*ordered=*/true);
+                check_op_sign(i, p.binary.l, signed_tag(ir_.tag(i)));
                 return;
             case Tag::Eq:
             case Tag::Ne:
@@ -100,6 +112,13 @@ private:
             case Tag::Srl:
             case Tag::Sra:
                 check_shift(i, p.binary.l, p.binary.r);
+                if (ir_.tag(i) == Tag::Sra) {
+                    check_op_sign(i, p.binary.l, true);
+                }
+                return;
+            case Tag::UItoF:
+            case Tag::SItoF:
+                check_op_sign(i, p.op_type.op, signed_tag(ir_.tag(i)));
                 return;
             case Tag::FAdd:
             case Tag::FSub:
@@ -162,6 +181,24 @@ private:
                 return;
             default:
                 return;
+        }
+    }
+
+    // -- Opcode signedness --
+
+    // The opcodes that read their operands as signed numbers.
+    static bool signed_tag(Tag t) {
+        return t == Tag::SDiv || t == Tag::SMod || t == Tag::SLt || t == Tag::SLe || t == Tag::SGt || t == Tag::SGe ||
+               t == Tag::SItoF || t == Tag::Sra;
+    }
+
+    // The signedness an opcode asserts about `operand`, against the operand's type.
+    // Types carry a sign until the IR goes signless; until then this is what shows
+    // the frontend's choice of opcode agrees with the language's types.
+    void check_op_sign(Index i, Index operand, bool asserted_signed) {
+        const ValueType a = ty(operand);
+        if (is_scalar(a) && a.is_signed != asserted_signed) {
+            report(Rule::OpSign, i, a);
         }
     }
 
@@ -255,6 +292,9 @@ private:
         for (const Index v : ir_.region(info.ranges)) {
             check_integer_pair(i, p.op_extra.op, v);
             check_sign_pair(i, p.op_extra.op, v);
+        }
+        if (!ir_.region(info.ranges).empty()) {
+            check_op_sign(i, p.op_extra.op, info.ranges_signed != 0);
         }
     }
 
@@ -487,6 +527,8 @@ const char* rule_name(Rule rule) {
             return "operand-domain";
         case Rule::OperandSign:
             return "operand-sign";
+        case Rule::OpSign:
+            return "op-sign";
         case Rule::ResultSign:
             return "result-sign";
         case Rule::ResultDomain:

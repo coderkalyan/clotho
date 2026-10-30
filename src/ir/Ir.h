@@ -339,6 +339,22 @@ struct InsideSetInfo {
     ExtraSlice values;
     // [lo, hi] range operand pairs, two indices per range.
     ExtraSlice ranges;
+    // Nonzero when the ranges compare as signed numbers: the selector's type decides
+    // (LRM 11.4.13 tests `sel >= lo && sel <= hi`, LRM 11.8.1). Chosen by the
+    // frontend; equality against the singular members does not depend on it.
+    uint32_t ranges_signed;
+};
+
+// Extra payload for `pow`: the exponent and the signedness of both operands, which
+// decide Table 11-4's negative-operand corners. The base is the instruction's op;
+// the exponent is self-determined and may differ in width and domain.
+struct PowInfo {
+    // The exponent value.
+    Index exp;
+    // Nonzero when the base is signed.
+    uint32_t base_signed;
+    // Nonzero when the exponent is signed.
+    uint32_t exp_signed;
 };
 
 // Extra payload for `agg_eq`: whole-aggregate equality of two unpacked
@@ -1563,12 +1579,19 @@ struct Inst {
         AssocNext,
         AssocPrev,
 
-        // -- Arithmetic (payload: binary) --
+        // -- Arithmetic (payload: binary, except Pow) --
+        // Add / Sub / Mul are the same bits whatever the operands' signedness.
         Add,
         Sub,
         Mul,
-        Div,
-        Mod,
+        // Division and remainder of unsigned / signed operands (LRM 11.4.3). The
+        // frontend picks the opcode from the operation's signedness (LRM 11.8.1).
+        UDiv,
+        SDiv,
+        UMod,
+        SMod,
+        // Power (payload: op_extra -> PowInfo; op is the base). The base's and the
+        // self-determined exponent's signedness are instruction data.
         Pow,
 
         // -- Bitwise (payload: binary, except Bnot) --
@@ -1634,16 +1657,24 @@ struct Inst {
         Sll,
         // Shift right logical.
         Srl,
-        // Shift right arithmetic.
+        // Shift right arithmetic: replicates the sign bit. The frontend emits it
+        // only for `>>>` of a signed operand (LRM 11.4.10); an unsigned `>>>` is Srl.
         Sra,
 
         // -- Comparisons, -> 1-bit (payload: binary) --
+        // Equality does not depend on signedness; the ordered compares come in an
+        // unsigned and a signed form, picked by the frontend from the operands'
+        // common type (LRM 11.4.4, 11.8.1).
         Eq,
         Ne,
-        Lt,
-        Le,
-        Gt,
-        Ge,
+        ULt,
+        ULe,
+        UGt,
+        UGe,
+        SLt,
+        SLe,
+        SGt,
+        SGe,
 
         // -- Case-equality, -> definite 1-bit (payload: binary) --
         // Unlike Eq, these never yield X: they compare the 4-state planes
@@ -1688,9 +1719,10 @@ struct Inst {
         FGt,
         FGe,
         // Conversions (payload: op_type = operand + target type).
-        // Integral -> float. Source signedness comes from the operand type;
-        // x/z bits read as 0 (LRM 6.12.1).
-        ItoF,
+        // Integral -> float, of an unsigned / signed operand; x/z bits read as 0
+        // (LRM 6.12.1).
+        UItoF,
+        SItoF,
         // Float -> integral, rounding half away from zero (LRM 6.12.1) — the
         // assignment / cast conversion.
         FtoI,
@@ -2551,9 +2583,10 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Add:
         case T::Sub:
         case T::Mul:
-        case T::Div:
-        case T::Mod:
-        case T::Pow:
+        case T::UDiv:
+        case T::SDiv:
+        case T::UMod:
+        case T::SMod:
         case T::Band:
         case T::Bor:
         case T::Bxor:
@@ -2566,10 +2599,14 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::Sra:
         case T::Eq:
         case T::Ne:
-        case T::Lt:
-        case T::Le:
-        case T::Gt:
-        case T::Ge:
+        case T::ULt:
+        case T::ULe:
+        case T::UGt:
+        case T::UGe:
+        case T::SLt:
+        case T::SLe:
+        case T::SGt:
+        case T::SGe:
         case T::CaseEq:
         case T::CasezEq:
         case T::CasexEq:
@@ -2617,7 +2654,8 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
 
         case T::Resize:
         case T::StrToPacked:
-        case T::ItoF:
+        case T::UItoF:
+        case T::SItoF:
         case T::FtoI:
         case T::FtoITrunc:
         case T::FBitcast:
@@ -2784,6 +2822,7 @@ constexpr Inst::PayloadKind payload_kind(Inst::Tag tag) {
         case T::DistUnary:
         case T::DistBinary:
         case T::InsideSet:
+        case T::Pow:
         case T::FreadMem:
         case T::ReadMem:
         case T::StrPutc:

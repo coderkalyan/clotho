@@ -754,9 +754,10 @@ Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
 // Divide and modulo. LRM 1800-2023 §11.4.3: integer division truncates toward
 // zero, modulo takes the sign of the dividend, and a zero divisor or any X/Z
 // bit in either operand makes the whole result X.
-Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b, bool sign) {
+Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b) {
     const uint32_t w      = width_of(a);
-    const bool     is_div = tag == Inst::Tag::Div;
+    const bool     is_div = tag == Inst::Tag::UDiv || tag == Inst::Tag::SDiv;
+    const bool     sign   = tag == Inst::Tag::SDiv || tag == Inst::Tag::SMod;
 
     // 2-state: divide/modulo by zero is x, which collapses to 0 in a 2-state
     // result (verified against iverilog: `int`/`bit` div/mod by 0 -> 0). Guard
@@ -1228,7 +1229,7 @@ Plane Backend::lower_clog2(Plane a) {
     return packed(must, may, zero(32));
 }
 
-Plane Backend::lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
+Plane Backend::lower_shift(Inst::Tag tag, Plane a, Plane amt) {
     const uint32_t w  = width_of(a);
     const uint32_t aw = width_of(amt);
 
@@ -1236,7 +1237,7 @@ Plane Backend::lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
     // x/z in the (self-determined) amount makes the result x, which collapses
     // to 0 in a 2-state result.
     if (a.two) {
-        const bool     arith = tag == Inst::Tag::Sra && sign;
+        const bool     arith = tag == Inst::Tag::Sra;
         const uint32_t cw    = std::max(aw, w);
         llvm::Value*   av    = must_of(amt);
         llvm::Value*   oob   = b_.CreateICmpUGE(cast(av, cw, false), llvm::ConstantInt::get(int_ty(cw), w));
@@ -1274,7 +1275,7 @@ Plane Backend::lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign) {
     llvm::Value* sh   = cast(must_of(amt), w, false);
     llvm::Value* safe = b_.CreateSelect(oob, llvm::ConstantInt::get(int_ty(w), w == 0 ? 0 : w - 1), sh);
 
-    const bool   arith = tag == Inst::Tag::Sra && sign;
+    const bool   arith = tag == Inst::Tag::Sra;
     llvm::Value* must;
     llvm::Value* may;
     llvm::Value* z;
@@ -1430,24 +1431,32 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         return lower_real_compare(Inst::Tag::FEq, real_plane(planes_to_real(pa, vt.width)),
                                   real_plane(planes_to_real(pb, vt.width)));
     }
-    return lower_compare(Inst::Tag::Eq, pa, pb, vt.is_signed);
+    return lower_compare(Inst::Tag::Eq, pa, pb);
 }
 
-Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
+Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b) {
     const auto predicate = [&] {
         switch (tag) {
             case Inst::Tag::Eq:
                 return llvm::CmpInst::ICMP_EQ;
             case Inst::Tag::Ne:
                 return llvm::CmpInst::ICMP_NE;
-            case Inst::Tag::Lt:
-                return sign ? llvm::CmpInst::ICMP_SLT : llvm::CmpInst::ICMP_ULT;
-            case Inst::Tag::Le:
-                return sign ? llvm::CmpInst::ICMP_SLE : llvm::CmpInst::ICMP_ULE;
-            case Inst::Tag::Gt:
-                return sign ? llvm::CmpInst::ICMP_SGT : llvm::CmpInst::ICMP_UGT;
+            case Inst::Tag::ULt:
+                return llvm::CmpInst::ICMP_ULT;
+            case Inst::Tag::ULe:
+                return llvm::CmpInst::ICMP_ULE;
+            case Inst::Tag::UGt:
+                return llvm::CmpInst::ICMP_UGT;
+            case Inst::Tag::UGe:
+                return llvm::CmpInst::ICMP_UGE;
+            case Inst::Tag::SLt:
+                return llvm::CmpInst::ICMP_SLT;
+            case Inst::Tag::SLe:
+                return llvm::CmpInst::ICMP_SLE;
+            case Inst::Tag::SGt:
+                return llvm::CmpInst::ICMP_SGT;
             default:
-                return sign ? llvm::CmpInst::ICMP_SGE : llvm::CmpInst::ICMP_UGE;
+                return llvm::CmpInst::ICMP_SGE;
         }
     };
     // 2-state operands carry no x or z, so the result is a definite bit from one
@@ -1560,7 +1569,7 @@ Plane Backend::lower_inside_set(Index i) {
     const auto& p    = ir_->payload(i).op_extra;
     const auto  info = ir_->extra_data<InsideSetInfo>(p.extra);
     const Plane sel  = value_of(p.op);
-    const bool  sign = type_of(p.op).is_signed;
+    const bool  sign = info.ranges_signed != 0;
 
     std::optional<Plane> acc;
     const auto add = [&](Plane pred) {
@@ -1571,8 +1580,8 @@ Plane Backend::lower_inside_set(Index i) {
     }
     const std::span<const Index> rngs = ir_->region(info.ranges);
     for (size_t k = 0; k + 1 < rngs.size(); k += 2) {
-        const Plane ge = lower_compare(Inst::Tag::Ge, sel, value_of(rngs[k]), sign);
-        const Plane le = lower_compare(Inst::Tag::Le, sel, value_of(rngs[k + 1]), sign);
+        const Plane ge = lower_compare(sign ? Inst::Tag::SGe : Inst::Tag::UGe, sel, value_of(rngs[k]));
+        const Plane le = lower_compare(sign ? Inst::Tag::SLe : Inst::Tag::ULe, sel, value_of(rngs[k + 1]));
         add(lower_logical(Inst::Tag::Land, ge, le));
     }
     return *acc;
@@ -1594,7 +1603,7 @@ Plane Backend::lower_wildeq(Plane a, Plane b) {
                                        b_.CreateShl(b_.CreateZExt(keep, wide), w));
     Plane ma = { b_.CreateAnd(a.mm, keepW), b_.CreateAnd(a.z, keep) };
     Plane mb = { b_.CreateAnd(b.mm, keepW), b_.CreateAnd(b.z, keep) };
-    return lower_compare(Inst::Tag::Eq, ma, mb, false);
+    return lower_compare(Inst::Tag::Eq, ma, mb);
 }
 
 Backend::Truth Backend::truth_of(Plane a) {

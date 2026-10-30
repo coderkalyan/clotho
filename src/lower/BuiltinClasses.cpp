@@ -318,7 +318,7 @@ std::optional<ir::Index> Lowerer::lower_sync_method(const CallExpression&   call
         // does not constrain it, and a queued waiter does not block it. Recorded
         // in the design doc §15; Verilator agrees.
         const ir::Index n     = count();
-        const ir::Index ok    = b.binary(ir::Inst::Tag::Ge, keys(), n, l);
+        const ir::Index ok    = b.binary(ir::Inst::Tag::SGe, keys(), n, l);
         const ir::Index dst   = field(kSemKeys);
         const ir::Index taken = b.binary(ir::Inst::Tag::Sub, keys(), n, l);
         const ir::Index kept  = keys();
@@ -338,8 +338,14 @@ std::optional<ir::Index> Lowerer::lower_sync_method(const CallExpression&   call
         const ir::Index none              = b.constant(module_.pool.put_int(make_int_type(64, false, false), 0), l);
         const ir::Index empty             = b.binary(ir::Inst::Tag::Eq, head, none, l);
         const std::array<ir::Index, 2> qw = qwords();
-        emit_sync_park_loop(site, qw, empty, [&] { return b.binary(ir::Inst::Tag::Ge, keys(), n, l); },
-                            /*require_head=*/true, b, l);
+        emit_sync_park_loop(
+          site,
+          qw,
+          empty,
+          [&] { return b.binary(ir::Inst::Tag::SGe, keys(), n, l); },
+          /*require_head=*/true,
+          b,
+          l);
         const ir::Index dst = field(kSemKeys);
         const ir::Index val = b.binary(ir::Inst::Tag::Sub, keys(), n, l);
         b.binary(ir::Inst::Tag::Store, dst, val, l);
@@ -394,13 +400,13 @@ std::optional<ir::Index> Lowerer::lower_mailbox_method(const CallExpression&   c
         const ir::Index unbounded = b.binary(ir::Inst::Tag::Eq, limit, none, l);
         const ir::Index used      = b.resize(size(), i64, l);
         const ir::Index cap       = bound();
-        const ir::Index under     = b.binary(ir::Inst::Tag::Lt, used, cap, l);
+        const ir::Index under     = b.binary(ir::Inst::Tag::SLt, used, cap, l);
         return b.binary(ir::Inst::Tag::Lor, unbounded, under, l);
     };
     const auto has_msg = [&] {
         const ir::Index used = b.resize(size(), i64, l);
         const ir::Index none = zero64();
-        return b.binary(ir::Inst::Tag::Gt, used, none, l);
+        return b.binary(ir::Inst::Tag::SGt, used, none, l);
     };
     // The message argument of `put` / `try_put`, coerced to the element type.
     const auto message = [&]() -> ir::Index {

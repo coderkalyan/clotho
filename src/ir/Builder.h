@@ -359,10 +359,19 @@ public:
     Index count_bits(Index op, uint32_t mask, SourceLoc loc);
 
     // `sel inside { ... }` (LRM 11.4.13): `values` are the singular members
-    // (wildcard-equality tests), `ranges` back-to-back [lo, hi] operand pairs.
-    // All must already be resized to the selector type. Yields a 1-bit 4-state
-    // value.
-    Index inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges, SourceLoc loc);
+    // (wildcard-equality tests), `ranges` back-to-back [lo, hi] operand pairs, which
+    // compare as signed numbers when `ranges_signed`. All must already be converted
+    // to the selector type. Yields a 1-bit value, 4-state when the selector is.
+    Index inside_set(Index                  sel,
+                     std::span<const Index> values,
+                     std::span<const Index> ranges,
+                     bool                   ranges_signed,
+                     SourceLoc              loc);
+
+    // `base ** exp` of integral operands (LRM 11.4.3). The base and the
+    // self-determined exponent are signed or unsigned as stated; Table 11-4's
+    // negative-operand corners depend on both.
+    Index pow(Index base, Index exp, bool base_signed, bool exp_signed, SourceLoc loc);
 
     // -- Timing --
     // Event wait `@(a or posedge b ...)`: suspend until ANY listed (signal, edge)

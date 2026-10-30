@@ -3378,7 +3378,7 @@ private:
 
     Plane lower_arith(Inst::Tag tag, Plane a, Plane b);
 
-    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b, bool sign);
+    Plane lower_divmod(Inst::Tag tag, Plane a, Plane b);
 
     Plane lower_pow(Plane a, Plane b, bool base_signed, bool exp_signed);
 
@@ -3409,7 +3409,7 @@ private:
 
     // -- Shifts: X/Z in the count makes the whole result X; value planes shift. --
 
-    Plane lower_shift(Inst::Tag tag, Plane a, Plane amt, bool sign);
+    Plane lower_shift(Inst::Tag tag, Plane a, Plane amt);
 
     // -- Comparisons -> 1-bit. X rules differ per operator class (see
     // lower_compare): ==/!= are X only when genuinely ambiguous (LRM 11.4.5),
@@ -3457,7 +3457,7 @@ private:
 
     Plane lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type);
 
-    Plane lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign);
+    Plane lower_compare(Inst::Tag tag, Plane a, Plane b);
 
     Plane lower_case_compare(Inst::Tag tag, Plane a, Plane b);
 

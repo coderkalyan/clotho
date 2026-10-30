@@ -2879,6 +2879,7 @@ private:
         ir::Ref  ty;
         uint32_t width;
         bool     four;
+        bool     is_signed;
     };
 
     uint32_t case_pragma_bits(const CaseStatement& c) const;
@@ -2891,14 +2892,23 @@ private:
 
     CaseCompareType common_inside_type(const CaseStatement& c);
 
-    ir::Index lower_inside_label_pred(const Expression& label, ir::Index sel, ir::Ref ty, ir::Builder& b);
+    ir::Index lower_inside_label_pred(const Expression& label,
+                                      ir::Index         sel,
+                                      ir::Ref           ty,
+                                      bool              is_signed,
+                                      ir::Builder&      b);
 
-    ir::Index lower_inside_item_pred(const CaseStatement::ItemGroup& item, ir::Index sel, ir::Ref ty, ir::Builder& b);
+    ir::Index lower_inside_item_pred(const CaseStatement::ItemGroup& item,
+                                     ir::Index                       sel,
+                                     ir::Ref                         ty,
+                                     bool                            is_signed,
+                                     ir::Builder&                    b);
 
     void lower_case_inside_item(const CaseStatement&                  c,
                                 size_t                                k,
                                 ir::Index                             sel,
                                 ir::Ref                               ty,
+                                bool                                  is_signed,
                                 uint32_t                              width,
                                 uint32_t                              key_width,
                                 const std::vector<std::vector<char>>& keep,
@@ -2909,6 +2919,7 @@ private:
     void lower_case_inside_unique(const CaseStatement&          c,
                                   ir::Index                     sel,
                                   ir::Ref                       ty,
+                                  bool                          is_signed,
                                   uint32_t                      width,
                                   uint32_t                      key_width,
                                   const slang::ast::ASTContext& astCtx,
@@ -3265,7 +3276,7 @@ private:
         }
         const ir::SourceLoc l    = to_source_loc(rules[k].ruleBlock->location);
         const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-        const ir::Index     pred = b.binary(ir::Inst::Tag::Lt, draw, b.resize(next, u32, l), l);
+        const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.resize(next, u32, l), l);
 
         b.open_region();
         emit(k, b);
@@ -3314,7 +3325,7 @@ private:
             return;
         }
         const ir::Index next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-        const ir::Index pred = b.binary(ir::Inst::Tag::Lt, draw, next, l);
+        const ir::Index pred = b.binary(ir::Inst::Tag::ULt, draw, next, l);
 
         b.open_region();
         gen_rand_join_step(ops[k], rs, vars, b, l);
@@ -3669,6 +3680,8 @@ private:
         const slang::ast::ValueSymbol* iter_var  = nullptr;
         bool                           agg_elem  = false;
         bool                           key_real  = false;
+        // An integral key compares as a signed number.
+        bool key_signed = false;
         // A 4-state key, hence one that can be unknown and needs the total order
         // sort_right_wins defines. Decided at lower time, so a 2-state key emits
         // exactly the compare it did before.
@@ -3928,7 +3941,7 @@ private:
         b.open_region();
         const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
         const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
-        const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
+        const ir::Index      pred = b.binary(T::SLt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();
@@ -3966,7 +3979,7 @@ private:
         b.open_region();
         const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
         const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
-        const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
+        const ir::Index      pred = b.binary(T::SLt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();

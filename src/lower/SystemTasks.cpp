@@ -307,7 +307,7 @@ ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     // module is 2**61 * 1000 ticks, whose low 64 bits are 0, and a negative amount
     // is 2**64 - 1 units. Neither may fire early. A constant amount folds away.
     const ir::Index limit = b.constant(module_.pool.put_int(u64, UINT64_MAX / time_mul_), l);
-    const ir::Index huge  = b.binary(ir::Inst::Tag::Gt, ticks, limit, l);
+    const ir::Index huge  = b.binary(ir::Inst::Tag::UGt, ticks, limit, l);
     return b.select(huge, b.constant(module_.pool.put_int(u64, UINT64_MAX), l),
                     b.binary(ir::Inst::Tag::Mul, ticks, mul, l), l);
 }
@@ -1455,7 +1455,10 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
             return b.float_cvt(ir::Inst::Tag::FtoITrunc, v, lower_type(*call.type), l);
         }
         if (name == "$itor") {
-            return b.float_cvt(ir::Inst::Tag::ItoF, v, lower_type(*call.type), l);
+            return b.float_cvt(call.arguments()[0]->type->isSigned() ? ir::Inst::Tag::SItoF : ir::Inst::Tag::UItoF,
+                               v,
+                               lower_type(*call.type),
+                               l);
         }
         // The four bit-pattern reinterpretations.
         return b.float_cvt(ir::Inst::Tag::FBitcast, v, lower_type(*call.type), l);
@@ -1500,7 +1503,8 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
     // by the unit multiplier so the fractional part below the module time
     // unit survives ($time's round-to-unit does not apply).
     if (name == "$realtime") {
-        const ir::Index ticks = b.float_cvt(ir::Inst::Tag::ItoF, b.sim_time(1, l), module_.pool.real_type, l);
+        // The tick count is an unsigned 64-bit value.
+        const ir::Index ticks = b.float_cvt(ir::Inst::Tag::UItoF, b.sim_time(1, l), module_.pool.real_type, l);
         if (time_mul_ <= 1) {
             return ticks;
         }
@@ -2242,7 +2246,7 @@ ir::Index Lowerer::build_container_p_string(ir::Index               lv,
     b.open_region();
     const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
     const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
-    const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
+    const ir::Index      pred = b.binary(T::SLt, cur, lim, l);
     const ir::ExtraSlice cond = b.close_region();
 
     b.open_region();
@@ -2515,7 +2519,8 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
             } else if (!fl && real_conv) {
                 // An integral argument under %e/%f/%g converts to real
                 // (LRM 6.12.1) so the runtime formats one representation.
-                v = b.float_cvt(ir::Inst::Tag::ItoF, v, module_.pool.real_type, al);
+                v = b.float_cvt(
+                  arg->type->isSigned() ? ir::Inst::Tag::SItoF : ir::Inst::Tag::UItoF, v, module_.pool.real_type, al);
             }
             if (conv == 't') {
                 v = scale_to_ticks(*arg, v, b);

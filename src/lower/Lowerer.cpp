@@ -394,7 +394,7 @@ ir::Index Lowerer::coerce(ir::Index               v,
         return b.float_cvt(ir::Inst::Tag::FResize, v, to, l);
     }
     if (to_f) {
-        return b.float_cvt(ir::Inst::Tag::ItoF, v, to, l);
+        return b.float_cvt(from.isSigned() ? ir::Inst::Tag::SItoF : ir::Inst::Tag::UItoF, v, to, l);
     }
     if (from_f) {
         return b.float_cvt(ir::Inst::Tag::FtoI, v, to, l);

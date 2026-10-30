@@ -854,7 +854,11 @@ void Lowerer::lower_intra_timing(const TimingControl& tc, ir::Builder& b, ir::So
             b.open_region();
             const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
             const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
-            const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+            const ir::Index      pred = b.binary(
+              rec.expr.type->isFloating() || rec.expr.type->isSigned() ? ir::Inst::Tag::SLt : ir::Inst::Tag::ULt,
+              cur,
+              lim,
+              l);
             const ir::ExtraSlice cond = b.close_region();
 
             b.open_region();
@@ -1517,7 +1521,8 @@ void Lowerer::lower_cycle_delay(const CycleDelayControl& cd, ir::Builder& b, ir:
         b.open_region();
         const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
         const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
-        const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+        const ir::Index      pred =
+          b.binary(cd.expr.type->isSigned() ? ir::Inst::Tag::SLt : ir::Inst::Tag::ULt, cur, lim, l);
         const ir::ExtraSlice cond = b.close_region();
 
         b.open_region();

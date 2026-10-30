@@ -654,12 +654,22 @@ Index Builder::count_bits(Index op, uint32_t mask, SourceLoc loc) {
     return emit({ Inst::Tag::CountBits, Inst::Payload{ .op_extra = { op, extra } } }, loc);
 }
 
-Index Builder::inside_set(Index sel, std::span<const Index> values, std::span<const Index> ranges, SourceLoc loc) {
+Index Builder::inside_set(Index                  sel,
+                          std::span<const Index> values,
+                          std::span<const Index> ranges,
+                          bool                   ranges_signed,
+                          SourceLoc              loc) {
     const ExtraSlice vals  = add_slice(values);
     const ExtraSlice rngs  = add_slice(ranges);
-    const ExtraIndex extra = add_extra(InsideSetInfo{ vals, rngs });
+    const ExtraIndex extra = add_extra(InsideSetInfo{ vals, rngs, ranges_signed ? 1u : 0u });
 
     return emit({ Inst::Tag::InsideSet, Inst::Payload{ .op_extra = { sel, extra } } }, loc);
+}
+
+Index Builder::pow(Index base, Index exp, bool base_signed, bool exp_signed, SourceLoc loc) {
+    const ExtraIndex extra = add_extra(PowInfo{ exp, base_signed ? 1u : 0u, exp_signed ? 1u : 0u });
+
+    return emit({ Inst::Tag::Pow, Inst::Payload{ .op_extra = { base, extra } } }, loc);
 }
 
 Index Builder::wait(std::span<const WaitEdge> events, SourceLoc loc) {

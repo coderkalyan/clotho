@@ -260,10 +260,14 @@ const char* tag_name(Inst::Tag tag) {
             return "sub";
         case T::Mul:
             return "mul";
-        case T::Div:
-            return "div";
-        case T::Mod:
-            return "mod";
+        case T::UDiv:
+            return "udiv";
+        case T::SDiv:
+            return "sdiv";
+        case T::UMod:
+            return "umod";
+        case T::SMod:
+            return "smod";
         case T::Pow:
             return "pow";
         case T::Band:
@@ -302,14 +306,22 @@ const char* tag_name(Inst::Tag tag) {
             return "eq";
         case T::Ne:
             return "ne";
-        case T::Lt:
-            return "lt";
-        case T::Le:
-            return "le";
-        case T::Gt:
-            return "gt";
-        case T::Ge:
-            return "ge";
+        case T::ULt:
+            return "ult";
+        case T::ULe:
+            return "ule";
+        case T::UGt:
+            return "ugt";
+        case T::UGe:
+            return "uge";
+        case T::SLt:
+            return "slt";
+        case T::SLe:
+            return "sle";
+        case T::SGt:
+            return "sgt";
+        case T::SGe:
+            return "sge";
         case T::CaseEq:
             return "case_eq";
         case T::CasezEq:
@@ -606,8 +618,10 @@ const char* tag_name(Inst::Tag tag) {
             return "fgt";
         case T::FGe:
             return "fge";
-        case T::ItoF:
-            return "itof";
+        case T::UItoF:
+            return "uitof";
+        case T::SItoF:
+            return "sitof";
         case T::FtoI:
             return "ftoi";
         case T::FtoITrunc:
@@ -1090,6 +1104,37 @@ private:
                 os_ << ", ";
                 ref(info.rng);
                 os_ << ", " << info.nvals << ")\n";
+                break;
+            }
+            case Inst::Tag::Pow: {
+                const auto info = ir_.extra_data<PowInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << ", ";
+                ref(info.exp);
+                os_ << ", " << (info.base_signed != 0 ? "signed" : "unsigned") << " base, "
+                    << (info.exp_signed != 0 ? "signed" : "unsigned") << " exp)\n";
+                break;
+            }
+            case Inst::Tag::InsideSet: {
+                const auto info = ir_.extra_data<InsideSetInfo>(p.op_extra.extra);
+                ref(p.op_extra.op);
+                os_ << " inside {";
+                bool first = true;
+                for (const Index v : ir_.region(info.values)) {
+                    os_ << (first ? "" : ", ");
+                    ref(v);
+                    first = false;
+                }
+                const auto ranges = ir_.region(info.ranges);
+                for (size_t k = 0; k + 1 < ranges.size(); k += 2) {
+                    os_ << (first ? "[" : ", [");
+                    ref(ranges[k]);
+                    os_ << ":";
+                    ref(ranges[k + 1]);
+                    os_ << "]";
+                    first = false;
+                }
+                os_ << "}" << (info.ranges_signed != 0 ? " signed" : "") << ")\n";
                 break;
             }
             default:

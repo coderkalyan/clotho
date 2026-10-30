@@ -175,9 +175,11 @@ public:
 
             case ir::Inst::Tag::Mul:
                 return binary(out, " * ", kMulDiv, ir, p, prec);
-            case ir::Inst::Tag::Div:
+            case ir::Inst::Tag::UDiv:
+            case ir::Inst::Tag::SDiv:
                 return binary(out, " / ", kMulDiv, ir, p, prec);
-            case ir::Inst::Tag::Mod:
+            case ir::Inst::Tag::UMod:
+            case ir::Inst::Tag::SMod:
                 return binary(out, " % ", kMulDiv, ir, p, prec);
             case ir::Inst::Tag::Add:
                 return binary(out, " + ", kAddSub, ir, p, prec);
@@ -189,13 +191,17 @@ public:
                 return binary(out, " >> ", kShift, ir, p, prec);
             case ir::Inst::Tag::Sra:
                 return binary(out, " >>> ", kShift, ir, p, prec);
-            case ir::Inst::Tag::Lt:
+            case ir::Inst::Tag::ULt:
+            case ir::Inst::Tag::SLt:
                 return binary(out, " < ", kRel, ir, p, prec);
-            case ir::Inst::Tag::Le:
+            case ir::Inst::Tag::ULe:
+            case ir::Inst::Tag::SLe:
                 return binary(out, " <= ", kRel, ir, p, prec);
-            case ir::Inst::Tag::Gt:
+            case ir::Inst::Tag::UGt:
+            case ir::Inst::Tag::SGt:
                 return binary(out, " > ", kRel, ir, p, prec);
-            case ir::Inst::Tag::Ge:
+            case ir::Inst::Tag::UGe:
+            case ir::Inst::Tag::SGe:
                 return binary(out, " >= ", kRel, ir, p, prec);
             case ir::Inst::Tag::Eq:
                 return binary(out, " == ", kEq, ir, p, prec);

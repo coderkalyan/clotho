@@ -779,13 +779,13 @@ ir::Index Lowerer::lower_binary(const BinaryExpression& bin, ir::Builder& b) {
             case B::CaseInequality:
                 return b.binary(T::Ne, lhs, rhs, l);
             case B::LessThan:
-                return b.binary(T::Lt, lhs, rhs, l);
+                return b.binary(T::ULt, lhs, rhs, l);
             case B::LessThanEqual:
-                return b.binary(T::Le, lhs, rhs, l);
+                return b.binary(T::ULe, lhs, rhs, l);
             case B::GreaterThan:
-                return b.binary(T::Gt, lhs, rhs, l);
+                return b.binary(T::UGt, lhs, rhs, l);
             case B::GreaterThanEqual:
-                return b.binary(T::Ge, lhs, rhs, l);
+                return b.binary(T::UGe, lhs, rhs, l);
             default:
                 // Only comparison, concatenation and replication apply to a
                 // string (LRM 6.16); slang rejects the rest upstream.
@@ -797,6 +797,10 @@ ir::Index Lowerer::lower_binary(const BinaryExpression& bin, ir::Builder& b) {
         return lower_real_binary(bin, lhs, rhs, b);
     }
 
+    // The operands of an ordered compare, a division, a remainder and a shift share
+    // one type (LRM 11.8.1; slang converts them), and its signedness picks the
+    // opcode. The exponent of `**` is self-determined and has its own.
+    const bool left_signed = bin.left().type->isSigned();
     switch (bin.op) {
         case B::Add:
             return b.binary(T::Add, lhs, rhs, l);
@@ -805,11 +809,11 @@ ir::Index Lowerer::lower_binary(const BinaryExpression& bin, ir::Builder& b) {
         case B::Multiply:
             return b.binary(T::Mul, lhs, rhs, l);
         case B::Divide:
-            return b.binary(T::Div, lhs, rhs, l);
+            return b.binary(left_signed ? T::SDiv : T::UDiv, lhs, rhs, l);
         case B::Mod:
-            return b.binary(T::Mod, lhs, rhs, l);
+            return b.binary(left_signed ? T::SMod : T::UMod, lhs, rhs, l);
         case B::Power:
-            return b.binary(T::Pow, lhs, rhs, l);
+            return b.pow(lhs, rhs, left_signed, bin.right().type->isSigned(), l);
         case B::BinaryAnd:
             return b.binary(T::Band, lhs, rhs, l);
         case B::BinaryOr:
@@ -839,20 +843,21 @@ ir::Index Lowerer::lower_binary(const BinaryExpression& bin, ir::Builder& b) {
             // operands are already the eagerly lowered lhs/rhs.
             return b.binary(T::Lequiv, lhs, rhs, l);
         case B::GreaterThanEqual:
-            return b.binary(T::Ge, lhs, rhs, l);
+            return b.binary(left_signed ? T::SGe : T::UGe, lhs, rhs, l);
         case B::GreaterThan:
-            return b.binary(T::Gt, lhs, rhs, l);
+            return b.binary(left_signed ? T::SGt : T::UGt, lhs, rhs, l);
         case B::LessThanEqual:
-            return b.binary(T::Le, lhs, rhs, l);
+            return b.binary(left_signed ? T::SLe : T::ULe, lhs, rhs, l);
         case B::LessThan:
-            return b.binary(T::Lt, lhs, rhs, l);
+            return b.binary(left_signed ? T::SLt : T::ULt, lhs, rhs, l);
         case B::LogicalShiftLeft:
         case B::ArithmeticShiftLeft:
             return b.binary(T::Sll, lhs, rhs, l);
         case B::LogicalShiftRight:
             return b.binary(T::Srl, lhs, rhs, l);
         case B::ArithmeticShiftRight:
-            return b.binary(T::Sra, lhs, rhs, l);
+            // `>>>` replicates the sign bit only of a signed operand (LRM 11.4.10).
+            return b.binary(left_signed ? T::Sra : T::Srl, lhs, rhs, l);
         default:
             // The three short-circuit operators returned at the top of this
             // function, and the other 25 BinaryOperator enumerators each have an
@@ -956,7 +961,7 @@ ir::Index Lowerer::inside_container_pred(const Expression& m,
     b.open_region();
     const ir::Index      cur  = b.unary(T::Load, idx.lv(b, l), l);
     const ir::Index      lim  = b.unary(T::Load, bound.lv(b, l), l);
-    const ir::Index      pred = b.binary(T::Lt, cur, lim, l);
+    const ir::Index      pred = b.binary(T::SLt, cur, lim, l);
     const ir::ExtraSlice cond = b.close_region();
 
     // No early exit on a match: the comparisons are side-effect-free, and
@@ -1021,8 +1026,8 @@ ir::Index Lowerer::lower_inside(const InsideExpression& e, ir::Builder& b) {
                     // A tolerance range needs arithmetic, which a string has none of.
                     fail("inside operator tolerance ranges are not supported");
                 }
-                const ir::Index above = b.binary(T::Ge, sel, lower_expr(vr.left(), b), l);
-                const ir::Index below = b.binary(T::Le, sel, lower_expr(vr.right(), b), l);
+                const ir::Index above = b.binary(T::UGe, sel, lower_expr(vr.left(), b), l);
+                const ir::Index below = b.binary(T::ULe, sel, lower_expr(vr.right(), b), l);
                 fold(b.binary(T::Land, above, below, l));
                 continue;
             }
@@ -1098,7 +1103,7 @@ ir::Index Lowerer::lower_inside(const InsideExpression& e, ir::Builder& b) {
         values.push_back(b.resize(lower_expr(*m, b), ty, loc(*m)));
     }
     if (!values.empty() || !ranges.empty()) {
-        fold(b.inside_set(sel, values, ranges, l));
+        fold(b.inside_set(sel, values, ranges, e.left().type->isSigned(), l));
     }
     if (!have_acc) {
         // A range_list has at least one value_range (A.8.3), and every shape of

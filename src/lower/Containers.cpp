@@ -436,7 +436,7 @@ void Lowerer::emit_fixed_mirror_copy(ir::Index           arr,
     b.open_region();
     const ir::Index      at    = b.unary(T::Load, pos.lv(b, l), l);
     const ir::Index      count = iconst(i32, map.fixed_count, b, l);
-    const ir::Index      pred  = b.binary(T::Lt, at, count, l);
+    const ir::Index      pred  = b.binary(T::SLt, at, count, l);
     const ir::ExtraSlice cond  = b.close_region();
 
     b.open_region();
@@ -667,7 +667,7 @@ ir::Index Lowerer::lower_array_iter_method(std::string_view      name,
 
     b.open_region();
     const ir::Index      cur   = b.unary(T::Load, idx.lv(b, l), l);
-    const ir::Index      lpred = b.binary(T::Lt, cur, b.unary(T::Load, bound.lv(b, l), l), l);
+    const ir::Index      lpred = b.binary(T::SLt, cur, b.unary(T::Load, bound.lv(b, l), l), l);
     const ir::ExtraSlice cond  = b.close_region();
 
     b.open_region();
@@ -687,7 +687,9 @@ ir::Index Lowerer::lower_array_iter_method(std::string_view      name,
         b.binary(T::Store, acc_lv, folded, l);
     } else if (minmax) {
         const ir::Index key    = key_of(k);
-        const T         ord    = name == "min" ? (key_real ? T::FLt : T::Lt) : (key_real ? T::FGt : T::Gt);
+        const bool      key_signed = kty.isSigned();
+        const T         ord        = name == "min" ? (key_real ? T::FLt : (key_signed ? T::SLt : T::ULt))
+                                                   : (key_real ? T::FGt : (key_signed ? T::SGt : T::UGt));
         const ir::Index better = b.binary(ord, key, b.unary(T::Load, best.lv(b, l), l), l);
         const ir::Index first  = b.unary(T::Lnot, b.unary(T::Load, have.lv(b, l), l), l);
         // A tie keeps the earlier element: 7.12.1 returns just one of them, and
@@ -717,7 +719,7 @@ ir::Index Lowerer::lower_array_iter_method(std::string_view      name,
 
         b.open_region();
         const ir::Index      at    = b.unary(T::Load, scan.lv(b, l), l);
-        const ir::Index      spred = b.binary(T::Lt, at, b.unary(T::Load, idx.lv(b, l), l), l);
+        const ir::Index      spred = b.binary(T::SLt, at, b.unary(T::Load, idx.lv(b, l), l), l);
         const ir::ExtraSlice scond = b.close_region();
 
         b.open_region();
@@ -1772,8 +1774,8 @@ ir::Index Lowerer::stream_reorder_pos(ir::Index     p,
     // starting there (LRM 11.4.14.2) -- then which block `p` falls in and
     // its offset within that block.
     const ir::Index d   = b.binary(T::Sub, b.binary(T::Sub, w, one, l), p, l);
-    const ir::Index blk = b.binary(T::Div, d, s, l);
-    const ir::Index r   = b.binary(T::Mod, d, s, l);
+    const ir::Index blk      = b.binary(T::SDiv, d, s, l);
+    const ir::Index r        = b.binary(T::SMod, d, s, l);
     const ir::Index blk_size = b.select(b.binary(T::Eq, blk, nfull, l), leftover, s, l);
     const ir::Index offset  = b.binary(T::Sub, b.binary(T::Sub, blk_size, one, l), r, l);
     // Preceding (lower-index) blocks are always full-size `s`, partial or
@@ -1797,7 +1799,7 @@ void Lowerer::check_stream_fits_fixed(ir::Index                               w,
                                       ir::SourceLoc                           l) {
     using T             = ir::Inst::Tag;
     const ir::Ref   i32 = make_int_type(32, false, true);
-    const ir::Index bad = b.binary(T::Gt, w, b.constant(module_.pool.put_int(i32, tw), l), l);
+    const ir::Index bad = b.binary(T::SGt, w, b.constant(module_.pool.put_int(i32, tw), l), l);
     b.open_region();
     {
         const std::string banner = banner_at(sc.sourceRange.start());
@@ -1839,8 +1841,8 @@ ir::Index Lowerer::stream_to_fixed(std::span<const StreamChunk>            chunk
     ir::Index leftover{};
     if (slice > 0) {
         const ir::Index s = b.constant(module_.pool.put_int(i32, slice), l);
-        nfull              = b.binary(T::Div, w, s, l);
-        leftover           = b.binary(T::Mod, w, s, l);
+        nfull             = b.binary(T::SDiv, w, s, l);
+        leftover          = b.binary(T::SMod, w, s, l);
     }
 
     // Accumulate in an explicitly UNSIGNED width-`tw` type: `target_ty`

@@ -1153,7 +1153,8 @@ void Lowerer::lower_repeat(const RepeatLoopStatement& r, ir::Builder& b) {
     b.open_region();
     const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, l), l);
     const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
-    const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+    const ir::Index      pred = b.binary(
+      r.count.type->isFloating() || r.count.type->isSigned() ? ir::Inst::Tag::SLt : ir::Inst::Tag::ULt, cur, lim, l);
     const ir::ExtraSlice cond = b.close_region();
 
     b.open_region();
@@ -1302,7 +1303,12 @@ void Lowerer::lower_foreach_dim(const ForeachLoopStatement& f, size_t dim, ir::B
     const ir::Index cur = b.unary(ir::Inst::Tag::Load, iter_lv, l);
     const ir::Index lim =
       b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(static_cast<uint32_t>(r.right))), l);
-    const ir::Index      pred = b.binary(ascending ? ir::Inst::Tag::Le : ir::Inst::Tag::Ge, cur, lim, l);
+    const bool           loop_signed = d.loopVar->getType().isSigned();
+    const ir::Index      pred        = b.binary(ascending ? (loop_signed ? ir::Inst::Tag::SLe : ir::Inst::Tag::ULe)
+                                                          : (loop_signed ? ir::Inst::Tag::SGe : ir::Inst::Tag::UGe),
+                                                cur,
+                                                lim,
+                                                l);
     const ir::ExtraSlice cond = b.close_region();
 
     b.open_region();
@@ -1332,6 +1338,7 @@ void Lowerer::lower_foreach_runtime_dim(const ForeachLoopStatement& f,
                                         ir::Index                   len,
                                         ir::Builder&                b,
                                         ir::SourceLoc               l) {
+    const ForeachLoopStatement::LoopDim& d         = f.loopDims[dim];
     const TempCell  bound     = make_temp_cell(ty, "foreach_bound");
     const ir::Index bound_lv  = bound.lv(b, l);
     const ir::Index bound_val = b.resize(len, ty, l);
@@ -1341,7 +1348,8 @@ void Lowerer::lower_foreach_runtime_dim(const ForeachLoopStatement& f,
     b.open_region();
     const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, iter_lv, l);
     const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, l), l);
-    const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, l);
+    const bool           loop_signed = d.loopVar->getType().isSigned();
+    const ir::Index      pred        = b.binary(loop_signed ? ir::Inst::Tag::SLt : ir::Inst::Tag::ULt, cur, lim, l);
     const ir::ExtraSlice cond = b.close_region();
 
     b.open_region();
@@ -1628,7 +1636,7 @@ Lowerer::CaseCompareType Lowerer::common_case_type(const CaseStatement& c) {
         }
     }
 
-    return { make_int_type(width, four, signd), width, four };
+    return { make_int_type(width, four, signd), width, four, signd };
 }
 
 // Whether a range bound is (possibly conversion-wrapped) the `$` literal.
@@ -1678,7 +1686,7 @@ Lowerer::CaseCompareType Lowerer::common_inside_type(const CaseStatement& c) {
             fold(vr.right());
         }
     }
-    return { make_int_type(width, four, signd), width, four };
+    return { make_int_type(width, four, signd), width, four, signd };
 }
 
 // Predicate for one case-inside range_list member (LRM 11.4.13 / 12.5.4).
@@ -1688,13 +1696,17 @@ Lowerer::CaseCompareType Lowerer::common_inside_type(const CaseStatement& c) {
 // tests inclusive membership with Ge/Le, ANDed -- an x/z bound or selector
 // makes the comparison ambiguous, which Land propagates as x rather than a
 // match, and b.cond already branches to else on anything but a definite 1.
-ir::Index Lowerer::lower_inside_label_pred(const Expression& label, ir::Index sel, ir::Ref ty, ir::Builder& b) {
+ir::Index Lowerer::lower_inside_label_pred(const Expression& label,
+                                           ir::Index         sel,
+                                           ir::Ref           ty,
+                                           bool              is_signed,
+                                           ir::Builder&      b) {
     if (label.kind == ExpressionKind::ValueRange) {
         const auto&     vr = label.as<ValueRangeExpression>();
         const ir::Index lo = b.resize(lower_expr(vr.left(), b), ty, loc(vr.left()));
         const ir::Index hi = b.resize(lower_expr(vr.right(), b), ty, loc(vr.right()));
-        const ir::Index ge = b.binary(ir::Inst::Tag::Ge, sel, lo, loc(label));
-        const ir::Index le = b.binary(ir::Inst::Tag::Le, sel, hi, loc(label));
+        const ir::Index ge = b.binary(is_signed ? ir::Inst::Tag::SGe : ir::Inst::Tag::UGe, sel, lo, loc(label));
+        const ir::Index le = b.binary(is_signed ? ir::Inst::Tag::SLe : ir::Inst::Tag::ULe, sel, hi, loc(label));
         return b.binary(ir::Inst::Tag::Land, ge, le, loc(label));
     }
     const ir::Index val = b.resize(lower_expr(label, b), ty, loc(label));
@@ -1708,11 +1720,12 @@ ir::Index Lowerer::lower_inside_label_pred(const Expression& label, ir::Index se
 ir::Index Lowerer::lower_inside_item_pred(const CaseStatement::ItemGroup& item,
                                           ir::Index                       sel,
                                           ir::Ref                         ty,
+                                          bool                            is_signed,
                                           ir::Builder&                    b) {
-    ir::Index pred = lower_inside_label_pred(*item.expressions[0], sel, ty, b);
+    ir::Index pred = lower_inside_label_pred(*item.expressions[0], sel, ty, is_signed, b);
     for (size_t j = 1; j < item.expressions.size(); j++) {
         const Expression* e   = item.expressions[j];
-        const ir::Index   one = lower_inside_label_pred(*e, sel, ty, b);
+        const ir::Index   one = lower_inside_label_pred(*e, sel, ty, is_signed, b);
         pred                  = b.binary(ir::Inst::Tag::Lor, pred, one, loc(*e));
     }
     return pred;
@@ -1730,6 +1743,7 @@ void Lowerer::lower_case_inside_item(const CaseStatement&                  c,
                                      size_t                                k,
                                      ir::Index                             sel,
                                      ir::Ref                               ty,
+                                     bool                                  is_signed,
                                      uint32_t                              width,
                                      uint32_t                              key_width,
                                      const std::vector<std::vector<char>>& keep,
@@ -1747,12 +1761,12 @@ void Lowerer::lower_case_inside_item(const CaseStatement&                  c,
 
     if (std::optional<SwitchRun> run = find_switch_run(c, k, width, key_width, &keep, astCtx)) {
         if (run->arms.empty()) {
-            lower_case_inside_item(c, k + run->len, sel, ty, width, key_width, keep, astCtx, report_viol, b);
+            lower_case_inside_item(c, k + run->len, sel, ty, is_signed, width, key_width, keep, astCtx, report_viol, b);
             return;
         }
         const std::vector<ir::Builder::SwitchArmBuild> arms = lower_switch_arm_bodies(run->arms, b);
         b.open_region();
-        lower_case_inside_item(c, k + run->len, sel, ty, width, key_width, keep, astCtx, report_viol, b);
+        lower_case_inside_item(c, k + run->len, sel, ty, is_signed, width, key_width, keep, astCtx, report_viol, b);
         const ir::ExtraSlice default_region = b.close_region();
         // four-state is exactly `key_width != width`: the key encoding doubles
         // only for a 4-state selector.
@@ -1760,14 +1774,14 @@ void Lowerer::lower_case_inside_item(const CaseStatement&                  c,
         return;
     }
 
-    const ir::Index pred = lower_inside_item_pred(c.items[k], sel, ty, b);
+    const ir::Index pred = lower_inside_item_pred(c.items[k], sel, ty, is_signed, b);
 
     b.open_region();
     lower_stmt(*c.items[k].stmt, b);
     const ir::ExtraSlice then_region = b.close_region();
 
     b.open_region();
-    lower_case_inside_item(c, k + 1, sel, ty, width, key_width, keep, astCtx, report_viol, b);
+    lower_case_inside_item(c, k + 1, sel, ty, is_signed, width, key_width, keep, astCtx, report_viol, b);
     const ir::ExtraSlice else_region = b.close_region();
 
     b.cond(pred, then_region, else_region, loc(*c.items[k].stmt));
@@ -1779,6 +1793,7 @@ void Lowerer::lower_case_inside_item(const CaseStatement&                  c,
 void Lowerer::lower_case_inside_unique(const CaseStatement&          c,
                                        ir::Index                     sel,
                                        ir::Ref                       ty,
+                                       bool                          is_signed,
                                        uint32_t                      width,
                                        uint32_t                      key_width,
                                        const slang::ast::ASTContext& astCtx,
@@ -1787,7 +1802,7 @@ void Lowerer::lower_case_inside_unique(const CaseStatement&          c,
     std::vector<ir::Index> preds;
     preds.reserve(c.items.size());
     for (const CaseStatement::ItemGroup& item : c.items) {
-        preds.push_back(lower_inside_item_pred(item, sel, ty, b));
+        preds.push_back(lower_inside_item_pred(item, sel, ty, is_signed, b));
     }
     emit_overlap_check(preds, case_banner(c), loc(c), b);
     dispatch_preds(c, 0, sel, width, key_width, astCtx, preds, no_match_report, b);
@@ -1811,11 +1826,11 @@ void Lowerer::lower_case_inside(const CaseStatement& c, ir::Builder& b) {
     slang::ast::ASTContext astCtx(*scope_, slang::ast::LookupLocation::max);
 
     if (needs_overlap) {
-        lower_case_inside_unique(c, sel, ty, ct.width, key_width, astCtx, no_match_report, b);
+        lower_case_inside_unique(c, sel, ty, ct.is_signed, ct.width, key_width, astCtx, no_match_report, b);
         return;
     }
     const std::vector<std::vector<char>> keep = case_dedup(c, ct.width, astCtx);
-    lower_case_inside_item(c, 0, sel, ty, ct.width, key_width, keep, astCtx, no_match_report, b);
+    lower_case_inside_item(c, 0, sel, ty, ct.is_signed, ct.width, key_width, keep, astCtx, no_match_report, b);
 }
 
 // Whether any operand of a case statement -- the selector, an item label, or
@@ -2608,7 +2623,7 @@ void Lowerer::emit_overlap_check(const std::vector<ir::Index>& preds,
         sum = b.binary(ir::Inst::Tag::Add, sum, b.resize(preds[k], sumty, rloc), rloc);
     }
     const ir::Index one_c   = b.constant(module_.pool.put_int(sumty, 1), rloc);
-    const ir::Index overlap = b.binary(ir::Inst::Tag::Gt, sum, one_c, rloc);
+    const ir::Index overlap = b.binary(ir::Inst::Tag::UGt, sum, one_c, rloc);
 
     b.open_region();
     b.case_violation(banner, 1, rloc);

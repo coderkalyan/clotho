@@ -1360,21 +1360,20 @@ void Backend::lower_inst(Index i) {
             set_value(i, lower_arith(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
             return;
 
-        case Inst::Tag::Div:
-        case Inst::Tag::Mod: {
-            const ValueType lt = type_of(p.binary.l);
+        case Inst::Tag::UDiv:
+        case Inst::Tag::SDiv:
+        case Inst::Tag::UMod:
+        case Inst::Tag::SMod:
             // Wide operands legalize to the 128-bit __udivti3 / __umodti3 (and signed
             // siblings) libcalls, resolved from compiler-rt/libgcc in the JIT (see run_jit).
-            set_value(i, lower_divmod(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), lt.is_signed));
+            set_value(i, lower_divmod(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
             return;
-        }
 
         case Inst::Tag::Pow: {
-            // Result signedness follows the base (op1); the exponent (op2) is
-            // self-determined. Both flags feed Table 11-4's signed corners.
-            const ValueType lt = type_of(p.binary.l);
-            const ValueType rt = type_of(p.binary.r);
-            set_value(i, lower_pow(value_of(p.binary.l), value_of(p.binary.r), lt.is_signed, rt.is_signed));
+            // The exponent is self-determined; both signs feed Table 11-4's signed corners.
+            const auto info = ir_->extra_data<PowInfo>(p.op_extra.extra);
+            set_value(
+              i, lower_pow(value_of(p.op_extra.op), value_of(info.exp), info.base_signed != 0, info.exp_signed != 0));
             return;
         }
 
@@ -1432,24 +1431,24 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::Sll:
         case Inst::Tag::Srl:
         case Inst::Tag::Sra:
-            set_value(
-              i,
-              lower_shift(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), type_of(p.binary.l).is_signed));
+            set_value(i, lower_shift(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
             return;
 
         case Inst::Tag::Eq:
         case Inst::Tag::Ne:
-        case Inst::Tag::Lt:
-        case Inst::Tag::Le:
-        case Inst::Tag::Gt:
-        case Inst::Tag::Ge:
+        case Inst::Tag::ULt:
+        case Inst::Tag::ULe:
+        case Inst::Tag::UGt:
+        case Inst::Tag::UGe:
+        case Inst::Tag::SLt:
+        case Inst::Tag::SLe:
+        case Inst::Tag::SGt:
+        case Inst::Tag::SGe:
             if (type_of(p.binary.l).is_string) {
                 set_value(i, lower_string_relation(ir_->tag(i), p.binary.l, p.binary.r));
                 return;
             }
-            set_value(i,
-                      lower_compare(
-                        ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r), type_of(p.binary.l).is_signed));
+            set_value(i, lower_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
             return;
 
         case Inst::Tag::CaseEq:
@@ -1491,14 +1490,14 @@ void Backend::lower_inst(Index i) {
             set_value(i, lower_real_compare(ir_->tag(i), value_of(p.binary.l), value_of(p.binary.r)));
             return;
 
-        case Inst::Tag::ItoF: {
-            // The must half reads x/z bits as 0 (LRM 6.12.1); signedness
-            // comes from the source operand type.
-            const ValueType st = type_of(p.op_type.op);
+        case Inst::Tag::UItoF:
+        case Inst::Tag::SItoF: {
+            // The must half reads x/z bits as 0 (LRM 6.12.1); the opcode says
+            // whether the integer is signed.
             const ValueType dt = value_type_of(mod_.pool, p.op_type.type);
-            llvm::Value*  iv = must_of(value_of(p.op_type.op));
-            llvm::Value*  fv =
-              st.is_signed ? b_.CreateSIToFP(iv, fp_ty(dt.width)) : b_.CreateUIToFP(iv, fp_ty(dt.width));
+            llvm::Value*    iv = must_of(value_of(p.op_type.op));
+            llvm::Value*    fv = ir_->tag(i) == Inst::Tag::SItoF ? b_.CreateSIToFP(iv, fp_ty(dt.width))
+                                                                 : b_.CreateUIToFP(iv, fp_ty(dt.width));
             set_value(i, real_plane(fv));
             return;
         }
@@ -2429,10 +2428,23 @@ Plane Backend::lower_string_relation(Inst::Tag tag, Index l, Index r) {
     switch (tag) {
         case Inst::Tag::Eq: pred = llvm::CmpInst::ICMP_EQ; break;
         case Inst::Tag::Ne: pred = llvm::CmpInst::ICMP_NE; break;
-        case Inst::Tag::Lt: pred = llvm::CmpInst::ICMP_SLT; break;
-        case Inst::Tag::Le: pred = llvm::CmpInst::ICMP_SLE; break;
-        case Inst::Tag::Gt: pred = llvm::CmpInst::ICMP_SGT; break;
-        default:            pred = llvm::CmpInst::ICMP_SGE; break;
+        // strcmp-style result: a signed int, whichever of the two opcode families the
+        // frontend used (a string compares by content, not by sign).
+        case Inst::Tag::ULt:
+        case Inst::Tag::SLt:
+            pred = llvm::CmpInst::ICMP_SLT;
+            break;
+        case Inst::Tag::ULe:
+        case Inst::Tag::SLe:
+            pred = llvm::CmpInst::ICMP_SLE;
+            break;
+        case Inst::Tag::UGt:
+        case Inst::Tag::SGt:
+            pred = llvm::CmpInst::ICMP_SGT;
+            break;
+        default:
+            pred = llvm::CmpInst::ICMP_SGE;
+            break;
     }
     llvm::Value* bit = b_.CreateICmp(pred, c, b_.getInt32(0));
     return bit_plane(bit, bit);

@@ -90,7 +90,7 @@ TEST_CASE("verify: a well-typed binary operator is clean") {
     Body      t;
     const Ref u8 = t.bits(8);
     t.b.binary(Inst::Tag::Add, t.konst(u8), t.konst(u8), kLoc);
-    t.b.binary(Inst::Tag::Lt, t.konst(u8), t.konst(u8), kLoc);
+    t.b.binary(Inst::Tag::ULt, t.konst(u8), t.konst(u8), kLoc);
     t.b.binary(Inst::Tag::CaseEq, t.konst(u8), t.konst(u8), kLoc);
     CHECK(t.verified().empty());
 }
@@ -122,8 +122,8 @@ TEST_CASE("verify: operand signedness of ordered compares, div and mod; equality
     Body      t;
     const Ref s8 = t.bits(8, true);
     const Ref u8 = t.bits(8);
-    t.b.binary(Inst::Tag::Lt, t.konst(s8), t.konst(u8), kLoc);
-    t.b.binary(Inst::Tag::Mod, t.konst(t.logic(8, true)), t.konst(t.logic(8)), kLoc);
+    t.b.binary(Inst::Tag::SLt, t.konst(s8), t.konst(u8), kLoc);
+    t.b.binary(Inst::Tag::SMod, t.konst(t.logic(8, true)), t.konst(t.logic(8)), kLoc);
     t.b.binary(Inst::Tag::Eq, t.konst(s8), t.konst(u8), kLoc);
     const auto v = t.verified();
     CHECK(count(v, Rule::OperandSign) == 2);
@@ -139,8 +139,8 @@ TEST_CASE("verify: the result of an add is the left operand's signedness") {
 TEST_CASE("verify: div, mod and pow are 4-state in the LRM") {
     Body      t;
     const Ref u8 = t.bits(8);
-    t.b.binary(Inst::Tag::Div, t.konst(u8), t.konst(u8), kLoc);
-    t.b.binary(Inst::Tag::Pow, t.konst(u8), t.konst(t.bits(3)), kLoc);
+    t.b.binary(Inst::Tag::UDiv, t.konst(u8), t.konst(u8), kLoc);
+    t.b.pow(t.konst(u8), t.konst(t.bits(3)), false, false, kLoc);
     const auto v = t.verified();
     CHECK(count(v, Rule::ResultDomain) == 2);
     CHECK(v.size() == 2);
@@ -148,8 +148,8 @@ TEST_CASE("verify: div, mod and pow are 4-state in the LRM") {
 
     Body      ok;
     const Ref l8 = ok.logic(8);
-    ok.b.binary(Inst::Tag::Div, ok.konst(l8), ok.konst(l8), kLoc);
-    ok.b.binary(Inst::Tag::Pow, ok.konst(l8), ok.konst(ok.bits(3)), kLoc);
+    ok.b.binary(Inst::Tag::UDiv, ok.konst(l8), ok.konst(l8), kLoc);
+    ok.b.pow(ok.konst(l8), ok.konst(ok.bits(3)), false, false, kLoc);
     CHECK(ok.verified().empty());
 }
 
@@ -429,4 +429,38 @@ TEST_CASE("typing: rolling back the builder drops the types of the discarded ins
     const Index c2 = t.konst(t.logic(8), 1);
     CHECK(c2 == c1);
     CHECK(t.b.type_of(c2) == ValueType{ 8, true, false });
+}
+
+// The opcode names the signedness it reads its operands with; while the IR's types
+// still carry one, the frontend's choice has to agree with them.
+TEST_CASE("verify: an opcode's signedness agrees with its operands' types") {
+    Body      t;
+    const Ref s8 = t.logic(8, true);
+    const Ref u8 = t.logic(8);
+    t.b.binary(Inst::Tag::SLt, t.konst(s8), t.konst(s8), kLoc);
+    t.b.binary(Inst::Tag::UGe, t.konst(u8), t.konst(u8), kLoc);
+    t.b.binary(Inst::Tag::SDiv, t.konst(s8), t.konst(s8), kLoc);
+    t.b.binary(Inst::Tag::Sra, t.konst(s8), t.konst(u8), kLoc);
+    t.b.pow(t.konst(s8), t.konst(u8), /*base_signed=*/true, /*exp_signed=*/false, kLoc);
+    const std::array<Index, 2> range{ t.konst(s8), t.konst(s8) };
+    t.b.inside_set(t.konst(s8), {}, range, /*ranges_signed=*/true, kLoc);
+    t.b.float_cvt(Inst::Tag::UItoF, t.konst(u8), t.m.pool.real_type, kLoc);
+    CHECK(t.verified().empty());
+}
+
+TEST_CASE("verify: an opcode that reads its operands with the wrong signedness is reported") {
+    Body      t;
+    const Ref s8 = t.logic(8, true);
+    const Ref u8 = t.logic(8);
+    t.b.binary(Inst::Tag::ULt, t.konst(s8), t.konst(s8), kLoc);
+    t.b.binary(Inst::Tag::SMod, t.konst(u8), t.konst(u8), kLoc);
+    t.b.binary(Inst::Tag::Sra, t.konst(u8), t.konst(u8), kLoc);
+    t.b.pow(t.konst(u8), t.konst(s8), /*base_signed=*/true, /*exp_signed=*/true, kLoc);
+    const std::array<Index, 2> range{ t.konst(u8), t.konst(u8) };
+    t.b.inside_set(t.konst(u8), {}, range, /*ranges_signed=*/true, kLoc);
+    t.b.float_cvt(Inst::Tag::SItoF, t.konst(u8), t.m.pool.real_type, kLoc);
+    const auto v = t.verified();
+    // One per instruction: pow's base is the unsigned one, its exponent agrees.
+    CHECK(count(v, Rule::OpSign) == 6);
+    CHECK(v.size() == 6);
 }

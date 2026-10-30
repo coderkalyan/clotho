@@ -168,7 +168,7 @@ void Lowerer::lower_randcase_arm(const slang::ast::RandCaseStatement& rc,
     }
     const ir::SourceLoc l    = loc(*rc.items[k].stmt);
     const ir::Index     next = b.binary(ir::Inst::Tag::Add, acc, weights[k], l);
-    const ir::Index     pred = b.binary(ir::Inst::Tag::Lt, draw, b.resize(next, u32, l), l);
+    const ir::Index     pred = b.binary(ir::Inst::Tag::ULt, draw, b.resize(next, u32, l), l);
 
     b.open_region();
     lower_stmt(*rc.items[k].stmt, b);
@@ -901,11 +901,11 @@ void Lowerer::gen_rand_join(const RsProd::Rule&    rule,
     b.open_region();
     const ir::Index first_left = b.unary(ir::Inst::Tag::Load, ops[0].nleft.lv(b, l), l);
     const ir::Index first_zero = kconst(0);
-    ir::Index       any        = b.binary(ir::Inst::Tag::Gt, first_left, first_zero, l);
+    ir::Index       any        = b.binary(ir::Inst::Tag::SGt, first_left, first_zero, l);
     for (size_t i = 1; i < ops.size(); i++) {
         const ir::Index left = b.unary(ir::Inst::Tag::Load, ops[i].nleft.lv(b, l), l);
         const ir::Index zero = kconst(0);
-        const ir::Index busy = b.binary(ir::Inst::Tag::Gt, left, zero, l);
+        const ir::Index busy = b.binary(ir::Inst::Tag::SGt, left, zero, l);
         any                  = b.binary(ir::Inst::Tag::Bor, any, busy, l);
     }
     const ir::ExtraSlice cond_region = b.close_region();
@@ -915,7 +915,7 @@ void Lowerer::gen_rand_join(const RsProd::Rule&    rule,
     ir::Index lmax = b.unary(ir::Inst::Tag::Load, ops[0].nleft.lv(b, l), l);
     for (size_t i = 1; i < ops.size(); i++) {
         const ir::Index cur = b.unary(ir::Inst::Tag::Load, ops[i].nleft.lv(b, l), l);
-        lmax                = b.select(b.binary(ir::Inst::Tag::Gt, cur, lmax, l), cur, lmax, l);
+        lmax                = b.select(b.binary(ir::Inst::Tag::SGt, cur, lmax, l), cur, lmax, l);
     }
     const ir::Index        span = b.binary(ir::Inst::Tag::Add, lmax, kconst(1), l);
     const ir::Index        kmx  = kconst(kRandJoinScale);
@@ -928,7 +928,7 @@ void Lowerer::gen_rand_join(const RsProd::Rule&    rule,
         const ir::Index shortw   = b.binary(ir::Inst::Tag::Mul, inv_bias, gap, l);
         const ir::Index longw    = b.binary(ir::Inst::Tag::Mul, bias, left, l);
         const ir::Index w        = b.binary(ir::Inst::Tag::Add, shortw, longw, l);
-        const ir::Index has_left = b.binary(ir::Inst::Tag::Gt, left, kconst(0), l);
+        const ir::Index has_left = b.binary(ir::Inst::Tag::SGt, left, kconst(0), l);
         const ir::Index none     = kconst(0);
         const ir::Index weight   = b.select(has_left, w, none, l);
         weights.push_back(b.resize(weight, u32, l));
@@ -1042,8 +1042,8 @@ ir::Index Lowerer::rand_join_bias(const RsProd::Rule& rule, ir::Ref i32, ir::Bui
     // An out-of-range expression is not diagnosed by slang (it only requires a
     // numeric type), and 18.17.5 gives no behaviour for one; clamping keeps the
     // weights non-negative, which the ladder needs.
-    const ir::Index c1 = b.select(b.binary(ir::Inst::Tag::Lt, q, lo, el), lo, q, el);
-    return b.select(b.binary(ir::Inst::Tag::Gt, c1, hi, el), hi, c1, el);
+    const ir::Index c1 = b.select(b.binary(ir::Inst::Tag::SLt, q, lo, el), lo, q, el);
+    return b.select(b.binary(ir::Inst::Tag::SGt, c1, hi, el), hi, c1, el);
 }
 
 // Replays createRuleVariables' counting walk (slang's MemberSymbols.cpp) to
@@ -1168,7 +1168,8 @@ void Lowerer::gen_prod(const RsProdBase& prod, const RandSeqCtx& rs, const RandS
             b.open_region();
             const ir::Index      cur  = b.unary(ir::Inst::Tag::Load, counter.lv(b, el), el);
             const ir::Index      lim  = b.unary(ir::Inst::Tag::Load, bound.lv(b, el), el);
-            const ir::Index      pred = b.binary(ir::Inst::Tag::Lt, cur, lim, el);
+            const ir::Index      pred =
+              b.binary(rp.expr->type->isSigned() ? ir::Inst::Tag::SLt : ir::Inst::Tag::ULt, cur, lim, el);
             const ir::ExtraSlice cond = b.close_region();
 
             b.open_region();

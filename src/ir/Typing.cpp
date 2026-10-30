@@ -246,11 +246,10 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::Add:
         case Inst::Tag::Sub:
         case Inst::Tag::Mul:
-        case Inst::Tag::Div:
-        case Inst::Tag::Mod:
-        // Power's result shares the left operand's type; the exponent is
-        // self-determined and does not widen the result.
-        case Inst::Tag::Pow:
+        case Inst::Tag::UDiv:
+        case Inst::Tag::SDiv:
+        case Inst::Tag::UMod:
+        case Inst::Tag::SMod:
         case Inst::Tag::Band:
         case Inst::Tag::Bor:
         case Inst::Tag::Bxor:
@@ -259,6 +258,10 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::Srl:
         case Inst::Tag::Sra:
             return ty(p.binary.l);
+        // Power's result shares the base's type; the exponent is self-determined
+        // and does not widen the result.
+        case Inst::Tag::Pow:
+            return ty(p.op_extra.op);
         case Inst::Tag::WireRes:
         case Inst::Tag::WandRes:
         case Inst::Tag::WorRes: {
@@ -305,7 +308,8 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::FGt:
         case Inst::Tag::FGe:
             return { 1, false, false };
-        case Inst::Tag::ItoF:
+        case Inst::Tag::UItoF:
+        case Inst::Tag::SItoF:
         case Inst::Tag::FtoI:
         case Inst::Tag::FtoITrunc:
         case Inst::Tag::FBitcast:
@@ -345,10 +349,14 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         // so their widths and domains are independent; the others pair equal ones.
         case Inst::Tag::Eq:
         case Inst::Tag::Ne:
-        case Inst::Tag::Lt:
-        case Inst::Tag::Le:
-        case Inst::Tag::Gt:
-        case Inst::Tag::Ge:
+        case Inst::Tag::ULt:
+        case Inst::Tag::SLt:
+        case Inst::Tag::ULe:
+        case Inst::Tag::SLe:
+        case Inst::Tag::UGt:
+        case Inst::Tag::SGt:
+        case Inst::Tag::UGe:
+        case Inst::Tag::SGe:
         case Inst::Tag::WildEq:
         case Inst::Tag::Land:
         case Inst::Tag::Lor:

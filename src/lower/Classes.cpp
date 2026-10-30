@@ -992,8 +992,7 @@ ir::Index Lowerer::lower_new_class(const slang::ast::NewClassExpression& nc, ir:
             // implementations can issue a warning." Clotho never silently
             // accepts, so it reports -- at run time, because the argument need
             // not be constant.
-            const ir::Index bad = b.binary(ir::Inst::Tag::Lt, arg,
-                                           b.constant(module_.pool.put_int(i64, 0), l), l);
+            const ir::Index bad = b.binary(ir::Inst::Tag::SLt, arg, b.constant(module_.pool.put_int(i64, 0), l), l);
             b.open_region();
             {
                 const std::string banner = banner_at(nc.sourceRange.start());
