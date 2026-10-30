@@ -2336,6 +2336,15 @@ void Backend::lower_task_call_inst(Index i) {
     argv.push_back(record);
 
     llvm::Value* task_hdl = b_.CreateCall(fnty, cf, argv);
+    // The callee runs INLINE, with this body on the stack and its scheduled flag clear. A
+    // `disable` of a block this body is an occupant of, or a `kill` of this thread, issued
+    // by the callee would force-wake it -- push its handle while it is running -- and the
+    // drain would resume it a second time. Hold the flag set, as a fork's inline run does
+    // (lower_fork_inst): the wake stands down, only the mark lands, and the poll after the
+    // call takes the exit. Every later park re-arms it before it suspends.
+    if (park_claim_wanted() && sched_ptr_ != nullptr) {
+        b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
+    }
     b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { task_hdl });
     llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { task_hdl });
 

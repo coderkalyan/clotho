@@ -1733,6 +1733,41 @@ TEST_CASE("disable of a block that may fork through a virtual call or a randsequ
     CHECK_MESSAGE(quiet.ok, quiet.diagnostic_text());
 }
 
+// The same inline-run hazard at a task call: the callee runs with the caller on the
+// stack and its scheduled flag clear, so a callee that disables a block the caller is in
+// force-woke the running caller, and the drain resumed it a second time. Oracle: iverilog
+// 13 on both.
+TEST_CASE("a task that disables its caller's block ends the block without waking the caller twice") {
+    CHECK(run_capture_finish(R"(
+        module t;
+          task tk; disable t.B; endtask
+          initial begin
+            begin : B
+              tk();
+              $display("FAILED: not reached");
+            end
+            $display("after B %0t", $time);
+          end
+          initial #10 $display("end %0t", $time);
+        endmodule
+    )") == "after B 0\nend 10\n");
+    CHECK(run_capture_finish(R"(
+        module t;
+          task automatic tk; disable t.B; endtask
+          initial begin
+            #1;
+            begin : B
+              tk();
+              $display("FAILED: not reached");
+            end
+            $display("after B %0t", $time);
+            #20 $display("again %0t", $time);
+          end
+          initial #10 $display("end %0t", $time);
+        endmodule
+    )") == "after B 1\nend 10\nagain 21\n");
+}
+
 // An assertion action block is an ordinary body to the remote form: it marks the
 // target's activations and pushes their handles, which needs no coroutine of its
 // own and no region correction. The failing attempt at the first posedge ends the
