@@ -2348,7 +2348,8 @@ void Backend::lower_inst(Index i) {
 
         case Inst::Tag::Arg: {
             // A function / task parameter, located via the per-signature index
-            // table (a string formal is one ptr, others two params).
+            // table (a string formal is one ptr, a 2-state scalar one iW, a
+            // 4-state one two params).
             const uint32_t k    = p.arg.position;
             const uint32_t base = param_llvm_index_[k];
             if (is_string_type(cur_fn_->param_types[k])) {
@@ -2356,7 +2357,8 @@ void Backend::lower_inst(Index i) {
                 return;
             }
             const ValueType t = value_type_of(mod_.pool, p.arg.type);
-            Plane         v{ fn_->getArg(base), fn_->getArg(base + 1) };
+            Plane         v   = t.four_state ? Plane{ fn_->getArg(base), fn_->getArg(base + 1) }
+                                             : two_val(fn_->getArg(base));
             if (t.is_real) {
                 v = real_plane(planes_to_real(v, t.width));
             }

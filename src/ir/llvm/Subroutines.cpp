@@ -609,12 +609,51 @@ bool Backend::is_void(Ref type) const {
     return type == mod_.pool.void_type;
 }
 
-// The LLVM type a function returns: void, or the `{ i(2W), iW }` result planes.
+// Whether a scalar formal or result of IR type `type` crosses a call in the
+// 4-state form, the (i(2W), iW) plane pair. A 2-state one is one native iW
+// (docs/design/kernel.md, Calls and the runtime boundary); the IR type decides
+// and nothing about the value does.
+bool Backend::abi_four_state(Ref type) const {
+    return mod_.pool.layout(type).domain == Domain::Four;
+}
+
+// An `In` scalar actual as ABI words: the iW value of a 2-state formal, the
+// (must|may, z) planes of a 4-state one. ir::verify's call-arg-domain rule makes
+// the actual's domain its formal's, so nothing is converted here. A real
+// travels as its bit pattern, a 2-state word.
+void Backend::push_scalar_arg(std::vector<llvm::Value*>& argv, Plane pl, bool four) {
+    if (pl.fp != nullptr) {
+        pl = real_to_planes(fp_of(pl));
+    }
+    assert(pl.two == !four && "an actual crosses a call in its formal's domain (ir::verify: call-arg-domain)");
+    argv.push_back(pl.mm);
+    if (four) {
+        argv.push_back(pl.z);
+    }
+}
+
+// An `Out` or `Inout` scalar actual's temp as ABI words: a pointer to the value
+// word of its slot the callee writes through, then a pointer to its z word when
+// the formal is 4-state. The temp is a whole cell of the formal's own type, so its
+// slot is the one its domain gives it.
+void Backend::push_scalar_out_arg(std::vector<llvm::Value*>& argv, const LValue& lv, bool four) {
+    assert(lv.narrow == !four && "an out / inout temp is the native slot of its domain");
+    argv.push_back(lv_mm_ptr(lv));
+    if (four) {
+        argv.push_back(lv_z_ptr(lv));
+    }
+}
+
+// The LLVM type a function returns: void, one iW for a 2-state result, or the
+// `{ i(2W), iW }` result planes of a 4-state one.
 llvm::Type* Backend::fn_return_ty(Ref return_type) {
     if (is_void(return_type)) {
         return b_.getVoidTy();
     }
     const uint32_t w = width_of(return_type);
+    if (!abi_four_state(return_type)) {
+        return int_ty(w);
+    }
     return llvm::StructType::get(ctx_, { int_ty(2 * w), int_ty(w) });
 }
 
@@ -741,10 +780,6 @@ llvm::Function* Backend::declare_function(FunctionId id) {
     if (design_uses_home_arg_) {
         params.push_back(llvm::Type::getInt8Ty(ctx_)); // home
     }
-    // TODO: pass a 2-state formal as a single iW param (and a 2-state result as
-    // a bare iW) instead of the packed (mm, z) pair. The wire is packed today —
-    // a 2-state arg lifts to must==may with a constant-0 z, which LLVM folds —
-    // so this is a call-ABI size micro-opt, not a correctness gap.
     for (size_t k = 0; k < f.param_types.size(); ++k) {
         const Ref     pt  = f.param_types[k];
         const ArgDir dir = f.arg_dirs.empty() ? ArgDir::In : f.arg_dirs[k];
@@ -767,8 +802,10 @@ llvm::Function* Backend::declare_function(FunctionId id) {
             continue;
         }
         if ((dir == ArgDir::Out || dir == ArgDir::Inout) && !is_agg_abi(pt) && !is_string_type(pt)) {
-            params.push_back(ptr); // &caller_temp.mm
-            params.push_back(ptr); // &caller_temp.z (copy-out at each return)
+            params.push_back(ptr); // &caller_temp's value word
+            if (abi_four_state(pt)) {
+                params.push_back(ptr); // &caller_temp.z (copy-out at each return)
+            }
             continue;
         }
         if (is_string_type(pt) || is_agg_abi(pt)) {
@@ -780,9 +817,12 @@ llvm::Function* Backend::declare_function(FunctionId id) {
             params.push_back(ptr);
             continue;
         }
-        const uint32_t w = width_of(pt);
-        params.push_back(int_ty(2 * w)); // must|may
-        params.push_back(int_ty(w));     // z
+        const uint32_t w    = width_of(pt);
+        const bool     four = abi_four_state(pt);
+        params.push_back(int_ty(four ? 2 * w : w)); // the value, or must|may
+        if (four) {
+            params.push_back(int_ty(w)); // z
+        }
     }
     // A string, aggregate, dynamic-array, or queue result returns through a
     // trailing out-param the caller owns (its call-site temp) — no plane form.
@@ -802,10 +842,10 @@ llvm::Function* Backend::declare_function(FunctionId id) {
 // A task is a switched-resume coroutine. Its signature is:
 //   ptr @<mod>.task.<name>(ptr noalias state, ptr rng, ptr wheel,
 //                          [ptr proc,] [i8 home,] <per formal>, ptr record)
-// where each input formal contributes (i(2W) mm, iW z) value planes, each
-// output / inout formal contributes (ptr mm_ptr, ptr z_ptr) into a caller temp,
-// and an unpacked aggregate formal contributes ONE storage pointer in every
-// direction (like a function's, see declare_function).
+// where each 2-state input formal contributes one iW and each 4-state one an
+// (i(2W) mm, iW z) pair, each output / inout formal one pointer to its caller
+// temp's slot (two, mm and z, when 4-state), and an unpacked aggregate formal
+// ONE storage pointer in every direction (like a function's, see declare_function).
 // `record` is a { ptr parent } slot: the body stores the completing coroutine's
 // continuation there (see lower_task / lower_task_call_inst). It returns the
 // coroutine handle, like a process.
@@ -852,12 +892,17 @@ llvm::Function* Backend::declare_task(FunctionId id) {
             // the frame slot back through it in the completion epilogue.
             params.push_back(ptr);
         } else if (f.arg_dirs[k] == ArgDir::In) {
-            const uint32_t w = width_of(f.param_types[k]);
-            params.push_back(int_ty(2 * w)); // must|may
-            params.push_back(int_ty(w));     // z
+            const uint32_t w    = width_of(f.param_types[k]);
+            const bool     four = abi_four_state(f.param_types[k]);
+            params.push_back(int_ty(four ? 2 * w : w)); // the value, or must|may
+            if (four) {
+                params.push_back(int_ty(w)); // z
+            }
         } else {
-            params.push_back(ptr); // &caller_temp.mm
-            params.push_back(ptr); // &caller_temp.z
+            params.push_back(ptr); // &caller_temp's value word
+            if (abi_four_state(f.param_types[k])) {
+                params.push_back(ptr); // &caller_temp.z
+            }
         }
     }
     params.push_back(ptr); // record { ptr parent }
@@ -871,10 +916,11 @@ llvm::Function* Backend::declare_task(FunctionId id) {
 
 // How many LLVM parameters formal k occupies:
 //   4 — a `ref` fat pointer { &storage, &epoch, expect, site }
-//   1 — an aggregate storage pointer, a container handle pointer, or a string
-//       handle (each one pointer in every direction)
-//   2 — everything else: the (must|may, z) plane pair, or the
-//       (&mm, &z) out / inout pointer pair
+//   1 — an aggregate storage pointer, a container handle pointer, a string
+//       handle (each one pointer in every direction), or a 2-state scalar (one
+//       iW, or the one pointer to its slot for an out / inout)
+//   2 — a 4-state scalar: the (must|may, z) plane pair, or the (&mm, &z)
+//       out / inout pointer pair
 // How many relocation-epoch witness PAIRS ref formal k of `f` carries: one per
 // container level some call site nests its actual inside, 0 for a ref to a
 // variable, a fixed-array element, a struct member, a class property or a whole
@@ -911,7 +957,7 @@ uint32_t Backend::formal_param_count(const Function& f, size_t k) const {
     if (is_string_type(f.param_types[k])) {
         return 1;
     }
-    return 2;
+    return abi_four_state(f.param_types[k]) ? 2 : 1;
 }
 
 // LLVM arg index of the gated `home` parameter (declare_function /
@@ -953,63 +999,10 @@ uint32_t Backend::task_record_param(const Function& f) const {
 
 // Build a function's frame struct: one slot field per local, in Local-handle
 // order (a Local's index is its GEP field index).
-// Locals that cannot use the narrow iW slot (they stay packed `{ i(2W), iW }`):
-// a local passed as a task-call output / inout argument, because the callee
-// writes it back through the packed-word (&mm, &z) pointer ABI.
-//
-// A `ref` actual is deliberately NOT marked. A ref formal's own slot takes the
-// canonical type-derived shape (narrow for 2-state, packed for 4-state), the
-// same rule an aggregate leaf follows, so forcing the actual packed would
-// instead GUARANTEE a mismatch — which is what a fixed-array element ref
-// actual hit: the callee wrote an i64 through a narrow i32 element slot and
-// overran into its neighbour. Matching by type on both sides is the invariant;
-// see docs/design/data-model.md §3.
-std::vector<bool> Backend::frame_out_targets(const Function& f) const {
-    std::vector<bool> out(f.local_types.size(), false);
-    const Ir&         ir = f.ir;
-    const auto        mark_packed_args = [&](FunctionId fid, ExtraSlice argslice) {
-        const Function& callee = mod_.function(fid);
-        const auto      args   = ir.region(argslice);
-        for (size_t a = 0; a < args.size(); ++a) {
-            if (callee.arg_dirs.empty() || callee.arg_dirs[a] == ArgDir::In ||
-                callee.arg_dirs[a] == ArgDir::Ref) {
-                continue;
-            }
-            const Index root = lvalue_root(ir, args[a]).root;
-            if (ir.tag(root) == Inst::Tag::Local) {
-                out[ir.payload(root).local.index] = true;
-            }
-        }
-    };
-    for (size_t k = 0; k < ir.inst_count(); ++k) {
-        const auto idx = static_cast<Index>(k);
-        if (ir.tag(idx) == Inst::Tag::TaskCall) {
-            const auto ti = ir.extra_data<TaskCallInfo>(ir.payload(idx).extra);
-            mark_packed_args(ti.func, ti.args);
-        } else if (ir.tag(idx) == Inst::Tag::TaskCallVirtual) {
-            const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
-            mark_packed_args(vci.func, vci.args);
-        } else if (ir.tag(idx) == Inst::Tag::Call) {
-            const auto ci = ir.extra_data<CallInfo>(ir.payload(idx).extra);
-            mark_packed_args(ci.func, ci.args);
-        } else if (ir.tag(idx) == Inst::Tag::CallVirtual) {
-            const auto vci = ir.extra_data<VirtualCallInfo>(ir.payload(idx).extra);
-            mark_packed_args(vci.func, vci.args);
-        } else if (ir.tag(idx) == Inst::Tag::Fork) {
-            // Every fork capture is an ArgDir::In box HANDLE of every child
-            // (lower/Statements.cpp's lower_fork), i.e. an rvalue, not a place at all, so
-            // there is no frame slot to force packed. Nothing to mark.
-            continue;
-        }
-    }
-    return out;
-}
-
 void Backend::build_frame_layout(const Function& f) {
     const size_t n = f.local_types.size();
     frame_slots_.assign(n, FrameSlot{});
     ref_ptr_.assign(n, RefBinding{});
-    const std::vector<bool>  out_target = frame_out_targets(f);
     std::vector<llvm::Type*> fields(n);
     for (uint32_t i = 0; i < n; ++i) {
         const Layout lay           = mod_.pool.layout(f.local_types[i]);
@@ -1057,24 +1050,17 @@ void Backend::build_frame_layout(const Function& f) {
             fields[i]                   = frame_slots_[i].slot_ty;
             continue;
         }
-        // A 2-state local uses the genuine iW slot; the packed-word ABI wire is
-        // bridged by copy-in/out. A 4-state local keeps its z field (the ABI and
-        // copy-in/out use it; LLVM folds the zero-z traffic on its own). A local
-        // passed as a task out/inout target stays packed — the callee writes it
-        // back through the (mm, z) pointer ABI.
-        //
-        // A ref formal takes the CANONICAL type-derived shape, i.e. exactly what
-        // an aggregate leaf of the same type gets (agg_leaf_slot_ty). That is the
-        // one rule that makes both sides of an alias agree without either side
-        // knowing the other: the actual is forced to the same shape (see
-        // DesignFacts::ref_arg and frame_out_targets).
-        frame_slots_[i].narrow = !frame_slots_[i].four_state && !out_target[i];
-        // A non-narrow slot keeps its z field: a 4-state local needs it, and a
-        // packed 2-state out-target local is written back through the (mm, z)
-        // pointer ABI. A narrow local has no z.
+        // A local is the slot its domain gives it: a 2-state one the native iW, a
+        // 4-state one the packed word plus its z field. That is also what an
+        // out / inout pointer ABI addresses, and what a ref formal takes: the
+        // CANONICAL type-derived shape, exactly what an aggregate leaf of the same
+        // type gets (agg_leaf_slot_ty), the one rule that makes both sides of an
+        // alias agree without either side knowing the other (the actual is forced
+        // to the same shape, see DesignFacts::ref_arg).
+        frame_slots_[i].narrow  = !frame_slots_[i].four_state;
         frame_slots_[i].slot_ty = slot_type(frame_slots_[i].width, frame_slots_[i].four_state,
-                                            !frame_slots_[i].narrow, frame_slots_[i].narrow);
-        fields[i]                  = frame_slots_[i].slot_ty;
+                                            frame_slots_[i].four_state, frame_slots_[i].narrow);
+        fields[i]               = frame_slots_[i].slot_ty;
     }
     frame_ty_ = llvm::StructType::create(ctx_, fields, mod_.name + ".fn." + f.name + ".frame");
 }
@@ -1285,7 +1271,7 @@ void Backend::lower_function(FunctionId id) {
         if (fn_->getReturnType()->isVoidTy()) {
             b_.CreateRetVoid();
         } else {
-            b_.CreateRet(llvm::ConstantAggregateZero::get(fn_->getReturnType()));
+            b_.CreateRet(llvm::Constant::getNullValue(fn_->getReturnType()));
         }
     }
 
@@ -1734,12 +1720,18 @@ void Backend::emit_copyin(const Function& f) {
             }
             continue;
         }
+        const bool four = abi_four_state(f.param_types[k]);
         if (f.arg_dirs[k] == ArgDir::In) {
-            lower_store(local_lvalue(k), Plane{ fn_->getArg(base), fn_->getArg(base + 1) });
+            lower_store(local_lvalue(k),
+                        four ? Plane{ fn_->getArg(base), fn_->getArg(base + 1) } : two_val(fn_->getArg(base)));
         } else if (f.arg_dirs[k] == ArgDir::Inout) {
-            llvm::Value* mm = b_.CreateLoad(int_ty(2 * w), fn_->getArg(base));
-            llvm::Value* z  = b_.CreateLoad(int_ty(w), fn_->getArg(base + 1));
-            lower_store(local_lvalue(k), Plane{ mm, z });
+            if (four) {
+                llvm::Value* mm = b_.CreateLoad(int_ty(2 * w), fn_->getArg(base));
+                llvm::Value* z  = b_.CreateLoad(int_ty(w), fn_->getArg(base + 1));
+                lower_store(local_lvalue(k), Plane{ mm, z });
+            } else {
+                lower_store(local_lvalue(k), two_val(b_.CreateLoad(int_ty(w), fn_->getArg(base))));
+            }
         }
     }
 }
@@ -1782,10 +1774,11 @@ void Backend::emit_copyout(const Function& f) {
             b_.CreateCall(str_move_fn(), { fn_->getArg(base), b_.CreateStructGEP(frame_ty_, frame_, k) });
             continue;
         }
-        // The caller's out-target is still the packed word; lift a narrow local.
-        const Plane    v    = to_four(lower_load(local_lvalue(k)));
+        const Plane v = lower_load(local_lvalue(k));
         b_.CreateStore(v.mm, fn_->getArg(base));
-        b_.CreateStore(v.z, fn_->getArg(base + 1));
+        if (abi_four_state(f.param_types[k])) {
+            b_.CreateStore(v.z, fn_->getArg(base + 1));
+        }
     }
 }
 
@@ -1804,9 +1797,9 @@ void Backend::lower_ret_void() {
 
 // Lower a non-void function `return`: a real `ret`, so it terminates the
 // block and any instructions after it in the region are unreachable
-// (lower_region stops). The result is packed into the `{ i(2W), iW }` return
-// struct (string / aggregate / handle results copy out through the trailing
-// out-param instead).
+// (lower_region stops). A 2-state result returns as one iW, a 4-state one packed
+// into the `{ i(2W), iW }` return struct (string / aggregate / handle results
+// copy out through the trailing out-param instead).
 void Backend::lower_ret(Index value) {
     // A function copies output / inout formals back through their pointers at
     // each return point (LRM 13.5), before releasing the body and returning.
@@ -1841,10 +1834,20 @@ void Backend::lower_ret(Index value) {
         b_.CreateRetVoid();
         return;
     }
-    // The return ABI is the packed (must|may, z) pair; lift a 2-state result
-    // (a real result returns as its bit-pattern planes).
+    // A scalar result crosses by domain: one iW for a 2-state value, the
+    // `{ i(2W), iW }` struct for a 4-state one (a real returns as its bit
+    // pattern, a 2-state word).
     Plane pl = value_of(value);
-    pl       = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
+    if (pl.fp != nullptr) {
+        pl = real_to_planes(fp_of(pl));
+    }
+    if (!abi_four_state(cur_fn_->return_type)) {
+        assert(pl.two && "a 2-state result is returned in its domain (ir::verify: ret-domain)");
+        deinit_body_strings();
+        b_.CreateRet(pl.mm);
+        return;
+    }
+    assert(!pl.two && "a 4-state result is returned in its domain (ir::verify: ret-domain)");
     auto* rty = llvm::cast<llvm::StructType>(fn_->getReturnType());
     llvm::Value* agg = llvm::UndefValue::get(rty);
     agg              = b_.CreateInsertValue(agg, pl.mm, { 0 });
@@ -1853,9 +1856,9 @@ void Backend::lower_ret(Index value) {
     b_.CreateRet(agg);
 }
 
-// Lower a `call`: pass the state pointer plus each argument as its (must|may,
-// z) plane pair (the frontend has resized each to its parameter width), then
-// unpack the returned struct into a Plane. A void callee yields no value.
+// Lower a `call`: pass the state pointer plus each scalar argument in its
+// formal's domain (the frontend has resized each to its parameter width), then
+// unpack the result into a Plane. A void callee yields no value.
 void Backend::lower_call_inst(Index i) {
     const auto      ci = ir_->extra_data<CallInfo>(ir_->payload(i).extra);
     const Function& f  = mod_.function(ci.func);
@@ -1917,9 +1920,9 @@ void Backend::lower_virtual_call_inst(Index i) {
 
 // Shared marshaling + result handling for a direct or a virtual method call
 // (they differ only in how the callee is obtained). Passes the state and RNG
-// pointers plus each argument as its (must|may, z) plane pair (the frontend has
+// pointers plus each scalar argument in its formal's domain (the frontend has
 // resized each to its parameter width), calls `callee` with `fnty`, and unpacks
-// the returned struct into a Plane. A void callee yields no value.
+// the result into a Plane. A void callee yields no value.
 void Backend::lower_call_common(Index               i,
                                 const Function&     f,
                                 llvm::FunctionType* fnty,
@@ -2019,13 +2022,11 @@ void Backend::lower_call_common(Index               i,
             // caller's storage acquires no reference through this write.
             argv.push_back(dir == ArgDir::In ? str_of(a) : lv_string_ptr(lvalue_of(a), StringUse::Place));
         } else if ((dir == ArgDir::Out || dir == ArgDir::Inout) && !is_agg_abi(f.param_types[k])) {
-            // An output / inout scalar temp: pass pointers to its mm and z
-            // planes; the callee copies out through them (the caller copies the
-            // temp back to the actual after the call — frontend
-            // emit_call_copyouts).
-            const LValue& lv = lvalue_of(a);
-            argv.push_back(lv_mm_ptr(lv));
-            argv.push_back(lv_z_ptr(lv));
+            // An output / inout scalar temp: pass the pointer to its value word,
+            // and to its z word when 4-state; the callee copies out through them
+            // (the caller copies the temp back to the actual after the call —
+            // frontend emit_call_copyouts).
+            push_scalar_out_arg(argv, lvalue_of(a), abi_four_state(f.param_types[k]));
         } else if (is_agg_abi(f.param_types[k])) {
             // An aggregate actual passes its storage pointer, one per formal in
             // every direction (the frontend emitted it as an lvalue): In copies
@@ -2040,10 +2041,7 @@ void Backend::lower_call_common(Index               i,
                 emit_gc_barrier_for(lvalue_of(a));
             }
         } else {
-            Plane pl = value_of(a);
-            pl       = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
-            argv.push_back(pl.mm);
-            argv.push_back(pl.z);
+            push_scalar_arg(argv, value_of(a), abi_four_state(f.param_types[k]));
         }
         ++k;
     }
@@ -2103,8 +2101,9 @@ void Backend::lower_call_common(Index               i,
         service_after_write(lv, snap);
     }
     if (f.return_type != mod_.pool.void_type) {
-        Plane         pl{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
-        const ValueType t = value_type_of(mod_.pool, f.return_type);
+        const ValueType t  = value_type_of(mod_.pool, f.return_type);
+        Plane           pl = t.four_state ? Plane{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) }
+                                          : two_val(r);
         if (t.is_real) {
             pl = real_plane(planes_to_real(pl, t.width));
         }
@@ -2273,15 +2272,11 @@ void Backend::lower_task_call_inst(Index i) {
             argv.push_back(tf.arg_dirs[k] == ArgDir::In ? str_of(args[k])
                                                         : lv_string_ptr(lvalue_of(args[k]), StringUse::Place));
         } else if (tf.arg_dirs[k] == ArgDir::In) {
-            Plane pl = value_of(args[k]);
-            pl       = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
-            argv.push_back(pl.mm);
-            argv.push_back(pl.z);
+            push_scalar_arg(argv, value_of(args[k]), abi_four_state(tf.param_types[k]));
         } else {
-            // An output / inout temp: pass pointers to its mm and z planes.
-            const LValue& lv = lvalue_of(args[k]);
-            argv.push_back(lv_mm_ptr(lv));
-            argv.push_back(lv_z_ptr(lv));
+            // An output / inout temp: pass the pointer to its value word, and to
+            // its z word when 4-state.
+            push_scalar_out_arg(argv, lvalue_of(args[k]), abi_four_state(tf.param_types[k]));
         }
     }
     argv.push_back(record);

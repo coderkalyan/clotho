@@ -465,3 +465,165 @@ TEST_CASE("arithmetic/bitwise ops mix a 4-state left operand with a 2-state righ
     )");
     CHECK(out == "2 3 1 21 20\n");
 }
+
+// The call ABI is by domain (docs/design/kernel.md, Calls and the runtime
+// boundary): a 2-state scalar formal or result is one native iW, an out / inout
+// formal one pointer to an iW slot, and a 4-state scalar keeps the plane pair
+// ((ptr, ptr) for an out / inout). Checked on unoptimized IR, where the
+// declaration is the one the backend wrote.
+TEST_CASE("a 2-state formal and result cross a call as one native iW") {
+    const std::string ir = emit(R"(
+        module m;
+            bit [7:0] r8;
+            logic [3:0] rl;
+            function automatic bit [7:0] f2(input bit [7:0] a, input int b, output bit [3:0] o, inout bit [15:0] io);
+                o  = a[3:0];
+                io = io + 1;
+                return a + b[7:0];
+            endfunction
+            function automatic logic [3:0] f4(input logic [3:0] a, output logic [3:0] o, inout bit [7:0] io);
+                o = a;
+                return ~a;
+            endfunction
+            initial begin
+                bit [3:0] o2;
+                bit [15:0] io2 = 16'd4;
+                logic [3:0] o4;
+                bit [7:0] io4 = 8'd9;
+                r8 = f2(8'd1, 32'd2, o2, io2);
+                rl = f4(4'b01xz, o4, io4);
+            end
+        endmodule
+    )");
+    // a: i8, b: i32, o: one pointer, io: one pointer; the result is a bare i8.
+    CHECK(ir.find("i8 @m.fn.f2(ptr noalias %state, ptr %rng, i8 %0, i32 %1, ptr %2, ptr %3)") !=
+          std::string::npos);
+    // A 4-state formal is the i8 plane pair (i4 -> i8 packed, i4 z), an output its
+    // (ptr, ptr), the 2-state inout one pointer; the result is the plane struct.
+    CHECK(ir.find("{ i8, i4 } @m.fn.f4(ptr noalias %state, ptr %rng, i8 %0, i4 %1, ptr %2, ptr %3, ptr %4)") !=
+          std::string::npos);
+}
+
+TEST_CASE("scalar formals and results of every domain cross calls intact") {
+    // Function and task callers (frame-local temps) and a process caller (module
+    // signal temps), value results of every width class, real, enum, 4-state, a
+    // task that suspends between its inputs and its outputs, and a virtual method
+    // with an output. Every line was cross-checked by hand; iverilog rejects
+    // output arguments of a function, so it cannot be the oracle here.
+    const std::string out = run_capture(R"(
+        module top;
+            typedef enum bit [2:0] { A, B, C } e_t;
+            bit         b1;
+            bit [7:0]   b8;
+            int         i32;
+            longint     i64;
+            bit [64:0]  w65;
+            byte        by;
+            real        r;
+            e_t         en;
+            logic [7:0] l8;
+
+            function automatic bit f1(input bit a, input bit b);            return a ^ b;  endfunction
+            function automatic bit [7:0] f8(input bit [7:0] a);             return a + 8'd3; endfunction
+            function automatic int fi(input int a, input int b);            return a * b - 1; endfunction
+            function automatic longint fl(input longint a);                 return a << 3; endfunction
+            function automatic bit [64:0] fw(input bit [64:0] a);           return {a[0], a[64:1]}; endfunction
+            function automatic byte fy(input byte a);                       return -a; endfunction
+            function automatic real fr(input real x, input int n);          return x * n; endfunction
+            function automatic e_t fe(input e_t a);                         return (a == C) ? A : e_t'(a + 1); endfunction
+            function automatic logic [7:0] fz(input logic [7:0] a);         return a | 8'h01; endfunction
+
+            function automatic void outs(input int x, output int y, output bit [7:0] z, inout longint w,
+                                         output bit q, inout real rr, output e_t e, output logic [3:0] lz);
+                y  = x + 1;
+                z  = x[7:0] ^ 8'hff;
+                w  = w + 5;
+                q  = x > 3;
+                rr = rr * 2.0;
+                e  = B;
+                lz = 4'bz1x0;
+            endfunction
+
+            task automatic touts(input bit [15:0] x, output bit [15:0] y, inout int n, output bit p);
+                #3;
+                y = ~x;
+                n = n - 1;
+                #2 p = ^x;
+            endtask
+
+            function automatic int nested(input int x);
+                int t;
+                bit [7:0] u;
+                longint w;
+                bit q;
+                real rr;
+                e_t e;
+                logic [3:0] lz;
+                w = 10;
+                rr = 1.5;
+                outs(x, t, u, w, q, rr, e, lz);
+                return t + u + int'(w) + q + int'(rr) + e + (lz === 4'bz1x0);
+            endfunction
+
+            task automatic nested_t(input bit [15:0] x, output bit [15:0] y);
+                int n;
+                bit p;
+                n = 7;
+                touts(x, y, n, p);
+                y = y + n + p;
+            endtask
+
+            class C0;
+                virtual function int vf(input bit [7:0] a, output int o);
+                    o = a + 1;
+                    return a * 2;
+                endfunction
+            endclass
+            class C1 extends C0;
+                virtual function int vf(input bit [7:0] a, output int o);
+                    o = a + 100;
+                    return a * 3;
+                endfunction
+            endclass
+
+            initial begin
+                int yy; bit [7:0] zz; longint ww; bit qq; real rrr; e_t ee; logic [3:0] lzz;
+                bit [15:0] y16, y17; int n; bit p; int ov;
+                C0 c;
+                b1  = f1(1, 0);
+                b8  = f8(8'hfe);
+                i32 = fi(-7, 6);
+                i64 = fl(64'h1234_5678_9abc_def0);
+                w65 = fw(65'h1_0000_0000_0000_0001);
+                by  = fy(8'sd100);
+                r   = fr(1.25, 6);
+                en  = fe(C);
+                l8  = fz(8'b1010_x0z0);
+                $display("%b %0h %0d %0h %0h %0d %f %0d %b", b1, b8, i32, i64, w65, by, r, en, l8);
+                ww = 100;
+                rrr = 2.5;
+                outs(10, yy, zz, ww, qq, rrr, ee, lzz);
+                $display("%0d %0h %0d %b %f %0d %b", yy, zz, ww, qq, rrr, ee, lzz);
+                n = 20;
+                touts(16'h0f0f, y16, n, p);
+                $display("%0h %0d %b", y16, n, p);
+                nested_t(16'h00ff, y17);
+                $display("%0h %0d", y17, nested(9));
+                c = new;
+                $display("%0d %0d", c.vf(8'd5, ov), ov);
+                begin
+                    C1 d = new;
+                    c = d;
+                end
+                $display("%0d %0d", c.vf(8'd5, ov), ov);
+            end
+        endmodule
+    )");
+    CHECK(out ==
+          "1 1 -43 91a2b3c4d5e6f780 18000000000000000 -100 7.500000 0 1010x0x1\n"
+          "11 f5 105 1 5.000000 1 z1x0\n"
+          "f0f0 19 0\n"
+          "ff06 277\n"
+          "10 6\n"
+          "15 105\n");
+}

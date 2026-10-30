@@ -603,15 +603,6 @@ llvm::Type* Backend::dpi_export_c_param_ty(DpiCType ct, ArgDir dir) {
     return dpi_c_llvm_ty(ct);
 }
 
-// Convert a Plane (a value the C side provided) into the SV function's input
-// formal ABI — the packed (mm, z) pair, appended to argv (real via
-// real_to_planes). Shared by scalar and vec input args.
-void Backend::dpi_push_plane_arg(std::vector<llvm::Value*>& argv, Plane pl) {
-    const Plane four = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
-    argv.push_back(four.mm);
-    argv.push_back(four.z);
-}
-
 // Copy every output / inout cell back to its C pointer and release the input
 // string temporaries. Shared by the function and task arms of emit_dpi_export:
 // a task reaches it only on the completed path, so it has exactly one caller
@@ -619,7 +610,8 @@ void Backend::dpi_push_plane_arg(std::vector<llvm::Value*>& argv, Plane pl) {
 // chunking, x/z) that a second copy would be a standing correctness hazard.
 void Backend::emit_dpi_export_copyout(const std::vector<ExpOut>& outs, const std::vector<llvm::Value*>& str_temps) {
     for (const ExpOut& o : outs) {
-        Plane pl{ b_.CreateLoad(int_ty(2 * o.w), o.mm_ptr), b_.CreateLoad(int_ty(o.w), o.z_ptr) };
+        Plane pl = o.four ? Plane{ b_.CreateLoad(int_ty(2 * o.w), o.mm_ptr), b_.CreateLoad(int_ty(o.w), o.z_ptr) }
+                          : two_val(b_.CreateLoad(int_ty(o.w), o.mm_ptr));
         if (is_dpi_vec(o.ct)) {
             dpi_vec_copyin(o.ct, pl, o.w, o.c_ptr); // plane -> C svVecVal
         } else {
@@ -730,6 +722,7 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
         const DpiCType ct     = ex.arg_ctypes[k];
         const ArgDir   dir    = ex.arg_dirs[k];
         const uint32_t w      = width_of(f.param_types[k]);
+        const bool     four   = abi_four_state(f.param_types[k]);
         llvm::Value*   cparam = thunk->getArg(k);
 
         if (ct == DpiCType::String) { // input only (guarded)
@@ -748,23 +741,31 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
             // the C value directly.
             const Plane pl = is_dpi_vec(ct) ? dpi_vec_copyout(ct, cparam, w)
                                             : dpi_c_to_plane(ct, cparam);
-            dpi_push_plane_arg(argv, pl);
+            push_scalar_arg(argv, pl, four);
         } else {
-            // output / inout: the SV ABI is two pointers to (i(2W) mm, iW z)
-            // cells the callee writes. inout copies the C value in first.
-            llvm::Value* mm_ptr = entry_alloca(int_ty(2 * w), "dpi.exp.mm");
-            llvm::Value* z_ptr  = entry_alloca(int_ty(w), "dpi.exp.z");
+            // output / inout: the SV ABI is a pointer to the formal's cell, and one
+            // to its z cell when 4-state, which the callee writes. inout copies the
+            // C value in first.
+            llvm::Value* mm_ptr = entry_alloca(int_ty(four ? 2 * w : w), "dpi.exp.mm");
+            llvm::Value* z_ptr  = four ? entry_alloca(int_ty(w), "dpi.exp.z") : nullptr;
             if (dir == ArgDir::Inout) {
-                const Plane pl = is_dpi_vec(ct)
-                                   ? dpi_vec_copyout(ct, cparam, w)
-                                   : dpi_c_to_plane(ct, b_.CreateLoad(dpi_c_llvm_ty(ct), cparam));
-                const Plane four = pl.fp != nullptr ? real_to_planes(fp_of(pl)) : to_four(pl);
-                b_.CreateStore(four.mm, mm_ptr);
-                b_.CreateStore(four.z, z_ptr);
+                Plane pl = is_dpi_vec(ct)
+                             ? dpi_vec_copyout(ct, cparam, w)
+                             : dpi_c_to_plane(ct, b_.CreateLoad(dpi_c_llvm_ty(ct), cparam));
+                if (pl.fp != nullptr) {
+                    pl = real_to_planes(fp_of(pl));
+                }
+                assert(pl.two == !four && "a C value arrives in its formal's domain");
+                b_.CreateStore(pl.mm, mm_ptr);
+                if (four) {
+                    b_.CreateStore(pl.z, z_ptr);
+                }
             }
             argv.push_back(mm_ptr);
-            argv.push_back(z_ptr);
-            outs.push_back({ cparam, mm_ptr, z_ptr, ct, w });
+            if (four) {
+                argv.push_back(z_ptr);
+            }
+            outs.push_back({ cparam, mm_ptr, z_ptr, ct, w, four });
         }
     }
 
@@ -775,9 +776,11 @@ void Backend::emit_dpi_export(const DpiExport& ex) {
             b_.CreateRetVoid();
             return;
         }
-        // Unpack the SV {mm, z} return struct into a Plane, then marshal to C.
-        Plane         rp{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) };
-        const ValueType t = value_type_of(mod_.pool, f.return_type);
+        // Unpack the SV result (one iW, or the {mm, z} struct) into a Plane, then
+        // marshal to C.
+        const ValueType t  = value_type_of(mod_.pool, f.return_type);
+        Plane           rp = t.four_state ? Plane{ b_.CreateExtractValue(r, { 0 }), b_.CreateExtractValue(r, { 1 }) }
+                                          : two_val(r);
         if (t.is_real) {
             rp = real_plane(planes_to_real(rp, t.width));
         }

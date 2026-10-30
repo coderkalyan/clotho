@@ -4779,14 +4779,15 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
         endmodule
     )";
     const std::string          ir  = emit_raw(src);
-    // Both bodies take the SAME parameter list: state, the object handle pair, then
-    // the three ref words. Compared as lists rather than as whole symbol names --
-    // LLVM's uniquing suffix on the second `g` shifts as the module gains unrelated
-    // functions, and that is not what this case is about.
+    // Both bodies take the SAME parameter list: state, rng, the object handle (one
+    // i64: a 2-state scalar crosses as one word), then the three ref words.
+    // Compared as lists rather than as whole symbol names -- LLVM's uniquing suffix
+    // on the second `g` shifts as the module gains unrelated functions, and that is
+    // not what this case is about.
     const std::vector<std::string> sigs = define_params(ir, "fn.g");
     REQUIRE(sigs.size() == 2);
     CHECK(sigs[0] == sigs[1]);
-    CHECK(sigs[0] == "(ptr noalias %state, ptr %rng, i128 %0, i64 %1, ptr %2, ptr %3, i64 %4)");
+    CHECK(sigs[0] == "(ptr noalias %state, ptr %rng, i64 %0, ptr %1, ptr %2, i64 %3)");
     CHECK(run_capture(src) == "2 7\n");
 
     // And with no heap-rooted actual at either site, the whole slot narrows.
@@ -4806,7 +4807,7 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     const std::vector<std::string> nsigs = define_params(narrow, "fn.g");
     REQUIRE(nsigs.size() == 2);
     CHECK(nsigs[0] == nsigs[1]);
-    CHECK(nsigs[0] == "(ptr noalias %state, ptr %rng, i128 %0, i64 %1, ptr %2)");
+    CHECK(nsigs[0] == "(ptr noalias %state, ptr %rng, i64 %0, ptr %1)");
 }
 
 TEST_CASE("an emitted object defines clotho_main and clotho_design and no other name a C program could use") {

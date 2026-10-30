@@ -245,8 +245,9 @@ void Backend::build_state_types() {
     nba_classify();
 
     // A slot keeps its z word when the may-z analysis cannot prove it z-free
-    // or the task ABI needs z storage behind it. The analysis owns every source
-    // of z, a constant table's image included (ir/Analysis.cpp).
+    // or a pointer ABI (out / inout / ref) needs z storage behind it. The
+    // analysis owns every source of z, a constant table's image included
+    // (ir/Analysis.cpp).
     const std::vector<bool> may_z =
       config_.z_elision ? facts_.may_z : std::vector<bool>(sigs.size(), true);
     const std::vector<bool>& ptr_arg = facts_.ptr_arg;
@@ -342,23 +343,25 @@ void Backend::build_state_types() {
         if (!slot.init_z && slot.four_state && !slot.is_array && !pmask.empty()) {
             slot.undriven_mask.assign(pmask.begin(), pmask.end());
         }
-        slot.has_z = may_z[i] || ptr_arg[i] || slot.init_z || !slot.undriven_mask.empty();
+        slot.has_z = may_z[i] || slot.init_z || !slot.undriven_mask.empty();
         // A 2-state signal drops the packed must|may word for a genuine iW slot
         // (or `[N x { iW }]` memory). The only requirement is never-z: a 2-state
-        // value carries no z, and has_z is forced only by a task out/inout target
-        // (the packed pointer ABI) or a may-z analysis result — both of which
-        // keep the packed word. Every other 2-state path (scalar/array NBA
+        // value carries no z, and has_z is forced only by a may-z analysis result,
+        // which keeps the packed word. Every other 2-state path (scalar/array NBA
         // shadow + commit, $readmem via rt_readmem) is width-driven off `narrow`.
         slot.narrow = !slot.four_state && !slot.has_z;
-        // A `ref` actual overrides all of that with the CANONICAL type-derived
-        // shape: a ref formal ALIASES this storage rather than copying through
-        // it, and the formal's own shape is fixed by its type (the same rule an
-        // aggregate leaf follows), so the two only agree if the actual is shaped
-        // by type as well. Safe to override ptr_arg here because a user signal
-        // becomes ptr_arg ONLY by being a ref actual — an out / inout actual is
-        // passed as a compiler-materialized temp, never the variable itself
-        // (lower/Subroutines.cpp's make_arg_temp), and a temp is never a ref actual.
-        if (facts_.ref_arg[i]) {
+        // An actual a callee reaches through a pointer -- a `ref` actual, or the
+        // out / inout temp of a call -- takes the CANONICAL type-derived shape,
+        // whatever the may-z analysis proved about it: a `ref` formal ALIASES this
+        // storage rather than copying through it, and an out / inout formal writes
+        // through a pointer into it, and either way the callee addresses the slot
+        // by its formal's type alone (the same rule an aggregate leaf follows): a
+        // 2-state formal is the native iW, a 4-state one the packed word and its z
+        // cell. The two sides only agree if the actual is shaped by type as well. A
+        // user signal is ptr_arg only by being a ref actual -- an out / inout actual
+        // is passed as a compiler-materialized temp, never the variable itself
+        // (lower/Subroutines.cpp's make_arg_temp).
+        if (ptr_arg[i]) {
             slot.has_z  = slot.four_state;
             slot.narrow = !slot.four_state;
         }

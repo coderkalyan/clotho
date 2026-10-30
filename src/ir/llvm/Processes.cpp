@@ -212,12 +212,10 @@ void Backend::lower_fork_inst(Index i) {
     if (design_uses_home_arg_) {
         argv.push_back(callee_home());
     }
-    // An `In` scalar formal is two params, must|may and z, exactly as an ordinary
-    // call marshals one (lower_task_call_inst's last arm).
+    // An `In` scalar formal crosses in its domain, exactly as an ordinary call
+    // marshals one (lower_task_call_inst's In arm).
     for (const Index cap : caps) {
-        const Plane pl = to_four(value_of(cap));
-        argv.push_back(pl.mm);
-        argv.push_back(pl.z);
+        push_scalar_arg(argv, value_of(cap), type_of(cap).four_state);
     }
     argv.push_back(rec);
 

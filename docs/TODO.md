@@ -297,8 +297,6 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Data types
 
-- [ ] **2-state formal in the call ABI (performance)** — a 2-state formal is still passed as a
-  4-state (mm, z) plane pair whose z plane is constant 0.
 - [ ] **Nonblocking assignment to a string character** (10.4.2) — `s[i] <= c` is refused; it needs
   a masked character record rather than a whole-string one.
 - [ ] **NBA to a class property** — `c.x <= v`, of any type including `string`, is refused; NBA

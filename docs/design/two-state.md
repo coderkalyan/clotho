@@ -8,11 +8,11 @@ proposal — they are accurate as the design that shipped):
   signals / scalar NBA targets / frame locals / plain memories / array-NBA /
   `$readmem` / file-io ABI, native operators (add/sub/mul, bitwise, shifts,
   div/mod, mux, reductions, selects, conversions), LRM 6.3.1 x/z→0 conversion,
-  sized-int signedness. iverilog-verified. `bit[7:0] a+b` → one `add i8`.
-- **Residual (perf follow-up, not correctness)**: the function/task call ABI
-  passes a 2-state formal/return as the packed `{i(2W), iW}` pair with a
-  constant-0 z (LLVM folds the z but still moves 2W); `**` uses the 4-state
-  inline loop; comparisons/reductions/logicals emit a 4-state 1-bit result that
+  sized-int signedness, and the call ABI (a 2-state formal or result is one `iW`,
+  an out / inout formal a pointer to an `iW` slot). iverilog-verified.
+  `bit[7:0] a+b` → one `add i8`.
+- **Residual (perf follow-up, not correctness)**: `**` uses the 4-state inline
+  loop; comparisons/reductions/logicals emit a 4-state 1-bit result that
   instcombine folds to native.
 - **Extending the win to 4-state `logic` RTL** (which this path does not touch)
   is never-X inference — scoped in `never-x-inference.md`.

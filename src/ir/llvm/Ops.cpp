@@ -387,11 +387,10 @@ llvm::Value* Backend::fp_of(Plane a) {
     return a.fp;
 }
 
-// Bit pattern -> storage planes (must = may = pattern, z = 0).
+// A real's bit pattern as a value: the 2-state word its storage and its ABI hold.
 Plane Backend::real_to_planes(llvm::Value* fp) {
-    const uint32_t w   = fp->getType()->isDoubleTy() ? 64 : 32;
-    llvm::Value*   pat = b_.CreateBitCast(fp, int_ty(w));
-    return packed(pat, pat, zero(w));
+    const uint32_t w = fp->getType()->isDoubleTy() ? 64 : 32;
+    return two_val(b_.CreateBitCast(fp, int_ty(w)));
 }
 
 // Storage planes -> float value (the must half is the bit pattern).
