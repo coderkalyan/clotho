@@ -162,14 +162,15 @@ bool Backend::is_assoc_type(Ref type) const {
     return types::is_assoc(mod_.pool, type);
 }
 
-// Build one instance scope's state struct: its own signals' slots (field k
-// == scope signal k). Children are NOT nested as fields — each scope owns
-// its own state global, so a child scope recurses into its own anchor and
-// struct. Assigns every covered signal's scope-relative GEP path ({k}).
-// Struct types are deduplicated per module definition — instances of one
-// definition (same parameterization) produce identical field lists and
-// share one identified type. Each call is one scope occurrence and records
-// one Anchor; storage_ptr addresses signals anchor-relative.
+// Build one instance scope's state struct: the slots of every signal the
+// instance defines (its unit's locals, or the scope's signals for a module
+// built without units), in that order. Children are NOT nested as fields —
+// each scope owns its own state global, so a child scope recurses into its own
+// anchor and struct. Assigns every covered signal's scope-relative GEP path
+// ({k}). Struct types are deduplicated per module definition: the instances of
+// one unit produce identical field lists (join_twin_slots) and share one
+// identified type. Each call is one scope occurrence and records one Anchor;
+// storage_ptr addresses signals anchor-relative.
 void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed, const std::string& hier) {
     const auto aid = static_cast<uint32_t>(anchors_.size());
     anchors_.push_back(Anchor{ .name = hier });
@@ -177,9 +178,10 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
         anchor_of_scope_.resize(scope.id + 1, SignalSlot::no_anchor);
     }
     anchor_of_scope_[scope.id] = aid;
-    std::vector<llvm::Type*> fields;
-    for (uint32_t k = 0; k < scope.signals.size(); ++k) {
-        const auto si = static_cast<uint32_t>(scope.signals[k]);
+    const std::vector<Signal>& defined = scope.unit == InstanceScope::no_unit ? scope.signals : scope.locals;
+    std::vector<llvm::Type*>   fields;
+    for (uint32_t k = 0; k < defined.size(); ++k) {
+        const auto si = static_cast<uint32_t>(defined[k]);
         if (si >= slots_.size() || claimed[si]) {
             throw BackendError{ "malformed instance hierarchy: signal claimed twice" };
         }
@@ -195,8 +197,8 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
     // waited on, shaped like an event object so the intrusive list primitives
     // serve both without a second engine.
     anchors_[aid].vif_head_base = static_cast<uint32_t>(fields.size());
-    for (uint32_t k = 0; k < scope.signals.size(); ++k) {
-        const auto si = static_cast<uint32_t>(scope.signals[k]);
+    for (const Signal sig : defined) {
+        const auto si = static_cast<uint32_t>(sig);
         for (uint32_t e = 0; e < 3; ++e) {
             if (vif_wait_[si][e]) {
                 vif_head_ord_[si][e] = static_cast<uint32_t>(fields.size()) -
@@ -220,6 +222,67 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
     anchors_[aid].ty = ty;
 }
 
+// Group the instances of every unit with more than one, and list for each of
+// the unit's signals the flat signal every instance holds for it.
+void Backend::collect_unit_twins() {
+    ankerl::unordered_dense::map<uint32_t, std::vector<const InstanceScope*>> by_unit;
+    std::vector<const InstanceScope*>                                         work;
+    for (const InstanceScope& top : mod_.tops()) {
+        work.push_back(&top);
+    }
+    while (!work.empty()) {
+        const InstanceScope* s = work.back();
+        work.pop_back();
+        if (s->unit != InstanceScope::no_unit) {
+            by_unit[s->unit].push_back(s);
+        }
+        for (const InstanceScope& c : s->children) {
+            work.push_back(&c);
+        }
+    }
+    unit_twins_.clear();
+    for (const auto& [unit, scopes] : by_unit) {
+        if (scopes.size() < 2) {
+            continue;
+        }
+        const size_t n = scopes.front()->locals.size();
+        for (size_t k = 0; k < n; ++k) {
+            std::vector<Signal>& set = unit_twins_.emplace_back();
+            for (const InstanceScope* s : scopes) {
+                assert(s->locals.size() == n && "instances of one unit define different signals");
+                set.push_back(s->locals[k]);
+            }
+        }
+    }
+}
+
+// Give every instance of a unit the same slot shape for each of its signals.
+// z storage is a may-property, so the join is an OR: an instance whose writers
+// cannot produce z pays the z word its twin needs. A canonical shape (a `ref`
+// actual, a member a virtual interface reaches) is a must, and the slot loop
+// already gives it the z word of a 4-state signal, so the OR imposes it on all
+// the instances. A 2-state signal is the native word in every one. Power-on
+// values (init_z, undriven_mask) stay per instance: they are initializer data,
+// not layout.
+void Backend::join_twin_slots() {
+    for (const std::vector<Signal>& set : unit_twins_) {
+        bool has_z = false;
+        for (const Signal sig : set) {
+            has_z = has_z || slots_[static_cast<uint32_t>(sig)].has_z;
+        }
+        for (const Signal sig : set) {
+            SignalSlot& s = slots_[static_cast<uint32_t>(sig)];
+            if (s.slot_ty == nullptr || s.is_string || s.is_agg || s.is_dynarr || s.is_queue || s.is_assoc) {
+                continue;
+            }
+            s.has_z      = s.four_state && has_z;
+            s.slot_ty    = slot_type(s.width, s.four_state, s.has_z);
+            s.storage_ty = s.is_array ? static_cast<llvm::Type*>(llvm::ArrayType::get(s.slot_ty, s.elem_count))
+                                      : s.slot_ty;
+        }
+    }
+}
+
 // Build the design's state types: per-signal slot / storage types, one
 // struct per module definition (own signals only — every instance scope
 // owns a separate state global, children own theirs), and the root
@@ -232,6 +295,7 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
 void Backend::build_state_types() {
     const auto sigs = mod_.signals();
     slots_.resize(sigs.size());
+    collect_unit_twins();
     // Before classification: which members a handle nonblocking-writes decides
     // their staging path, and every writer of such a member must agree on it.
     collect_vif_nba();
@@ -365,6 +429,7 @@ void Backend::build_state_types() {
             slot.storage_ty = slot.slot_ty;
         }
     }
+    join_twin_slots();
 
     std::vector<llvm::Type*> root_fields;
     std::vector<bool>        claimed(sigs.size(), false);

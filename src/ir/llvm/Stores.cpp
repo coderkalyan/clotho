@@ -408,6 +408,26 @@ void Backend::nba_classify() {
     for (uint32_t i = 0; i < mod_.function_count(); ++i) {
         classify_ordered_plain(mod_.function(static_cast<FunctionId>(i)).ir);
     }
+    // The shadow is layout: every instance of a unit stages the same fields,
+    // so a signal one instance nonblocking-writes from outside (a hierarchical
+    // NBA) gets a shadow in all of them (join_twin_slots).
+    for (const std::vector<Signal>& set : unit_twins_) {
+        bool nba = false, partial = false, dyn = false, agg = false;
+        for (const Signal sig : set) {
+            const SignalSlot& s = slots_[static_cast<uint32_t>(sig)];
+            nba                 = nba || s.nba;
+            partial             = partial || s.nba_partial;
+            dyn                 = dyn || s.nba_dyn;
+            agg                 = agg || s.nba_agg;
+        }
+        for (const Signal sig : set) {
+            SignalSlot& s = slots_[static_cast<uint32_t>(sig)];
+            s.nba         = nba;
+            s.nba_partial = partial;
+            s.nba_dyn     = dyn;
+            s.nba_agg     = agg;
+        }
+    }
     n_nba_          = 0;
     const auto sigs = mod_.signals();
     for (uint32_t i = 0; i < sigs.size(); ++i) {

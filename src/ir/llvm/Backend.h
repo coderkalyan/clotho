@@ -1516,6 +1516,10 @@ private:
 
     void scope_type(const InstanceScope& scope, std::vector<bool>& claimed, const std::string& hier);
 
+    void collect_unit_twins();
+
+    void join_twin_slots();
+
     void compute_vif_reachable();
 
     void collect_vif_nba();
@@ -4233,6 +4237,11 @@ private:
     // Instances of one definition share the type; a same-named definition with
     // different fields (different parameterization) gets its own entry.
     std::vector<std::tuple<std::string, std::vector<llvm::Type*>, llvm::StructType*>> def_types_;
+    // One entry per signal of a unit that has several instances: the flat
+    // signal each instance holds for it (InstanceScope::unit / locals). Every
+    // instance of a unit shares one layout, so slot facts are joined over
+    // these sets (docs/design/modular-compilation.md, invariant 4).
+    std::vector<std::vector<Signal>> unit_twins_;
     std::vector<SignalSlot> slots_;
     // Instance-scope anchors, one per scope occurrence (see Anchor); filled by
     // scope_type, symbols created by emit_state_global.
