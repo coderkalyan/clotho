@@ -417,11 +417,13 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_assoc_assign", &rt_assoc_assign);
     expose("rt_assoc_move", &rt_assoc_move);
     expose("rt_intra_alloc", &rt_intra_alloc);
+    expose("rt_intra_alloc_rooted", &rt_intra_alloc_rooted);
     expose("rt_intra_cb", &rt_intra_cb);
     expose("rt_intra_ready_base", &rt_intra_ready_base);
     expose("rt_intra_ready_count", &rt_intra_ready_count);
     expose("rt_intra_any", &rt_intra_any);
     expose("rt_intra_release", &rt_intra_release);
+    expose("rt_intra_release_rooted", &rt_intra_release_rooted);
     expose("rt_intra_reset", &rt_intra_reset);
     expose("rt_intra_event_register", &rt_intra_event_register);
     expose("rt_intra_event_register_group", &rt_intra_event_register_group);

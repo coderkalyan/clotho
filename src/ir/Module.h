@@ -996,6 +996,23 @@ public:
         return std::nullopt;
     }
 
+    // Record that `class_ref` is the built-in `process` class (LRM 9.7). Its object
+    // names a native control block, which the object's finalizer releases
+    // (docs/design/process-class.md §4.2). Keyed on the interned Ref, like
+    // set_iface_type_id, so each Lowerer that interns `std::process` registers its own.
+    void set_process_class(Ref class_ref) {
+        process_classes_.push_back(class_ref);
+    }
+
+    bool is_process_class(Ref class_ref) const {
+        for (const Ref r : process_classes_) {
+            if (r == class_ref) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // The descriptor of a class type, or null when the type has not been lowered
     // as a class (every lowered class registers one).
     const ClassDesc* class_desc(Ref class_ref) const {
@@ -1066,6 +1083,9 @@ private:
     // Interned interface class Ref -> bitmap bit (LRM 8.26). One entry per Ref, so
     // an interface reached through two Lowerers appears twice with one id.
     std::vector<std::pair<Ref, uint32_t>> iface_type_ids_;
+    // Interned Refs of the built-in `process` class (LRM 9.7), one per Lowerer that
+    // lowered it.
+    std::vector<Ref> process_classes_;
     // Change notifiers of waited-on class properties (LRM 9.4.2), one entry per
     // (class Ref, property field). Empty in a design that waits on no property,
     // which is what change_notify's early-out keys on.

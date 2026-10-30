@@ -1916,14 +1916,17 @@ bool Backend::frame_may_hold_gc_ref(const Process& p) {
 // Door 4: does any instruction of this body produce or consume a value that is,
 // or points into, a class object?
 //
-// Every class-typed value in a body traces back to one of four producers, so
+// Every class-typed value in a body traces back to one of five producers, so
 // testing those plus the class-specific consumers covers every temporary
 // CoroSplit could spill:
 //   * `new` (ClassNew);
 //   * a read of class-typed module storage (Signal -- a module-scope handle
 //     variable, or a static class property block);
 //   * a call whose return type is a handle (Call), or any virtual dispatch;
-//   * a reference to a formal or a declared local of handle type (Arg / Local).
+//   * a reference to a formal or a declared local of handle type (Arg / Local);
+//   * `process::self()` (ProcQuery), which reads no storage and calls nothing: its
+//     object is a collected class body (docs/design/process-class.md §4.2) that only
+//     a handle in a frame word may keep alive across a suspend.
 // Everything else -- HandleDeref, ClassIsA, a store, a `$cast`, passing an
 // argument -- can only forward a handle one of those already produced. TaskCall
 // needs no case of its own: a task returns nothing (LRM 13.3) and writes its
@@ -1973,6 +1976,13 @@ bool Backend::ir_may_hold_gc_ref(const Ir& ir) {
                 }
                 break;
             }
+            case Inst::Tag::ProcQuery:
+                // Only `self()` yields a handle; `status()` is a state number and
+                // `get_randstate()` a string.
+                if (ir.extra_data<ProcCtlInfo>(p.extra).op == ProcOp::Self) {
+                    return true;
+                }
+                break;
             default:
                 break;
         }
