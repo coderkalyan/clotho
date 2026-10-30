@@ -1,0 +1,50 @@
+diff --git a/source/ast/expressions/ConversionExpression.cpp b/source/ast/expressions/ConversionExpression.cpp
+index 3e1f4b11a..f791af0bd 100644
+--- a/source/ast/expressions/ConversionExpression.cpp
++++ b/source/ast/expressions/ConversionExpression.cpp
+@@ -380,11 +380,15 @@ Expression& ConversionExpression::fromSyntax(Compilation& comp, const CastExpres
+             << *operand->type << targetExpr.sourceRange << operand->sourceRange;
+     }
+ 
+-    if (type->isAssignmentCompatible(*operand->type)) {
++    // [10.8] says that a static cast is an assignment-like context, as if to a variable of
++    // the target type. That holds for a numeric operand even when it isn't assignment
++    // compatible with the target, which is the case when casting to an enum.
++    const bool isNumericCast = type->isNumeric() && operand->type->isNumeric();
++    if (isNumericCast || type->isAssignmentCompatible(*operand->type)) {
+         // The type we propagate should use the sign of the operand, just like it
+         // would if we were doing an implicit conversion via an assignment expression.
+         auto propagatedType = type;
+-        if (type->isNumeric() && operand->type->isNumeric()) {
++        if (isNumericCast) {
+             propagatedType = OpInfo::binaryType(comp, type, operand->type, false,
+                                                 /* signednessFromRt */ true);
+         }
+diff --git a/tests/unittests/ast/EvalTests.cpp b/tests/unittests/ast/EvalTests.cpp
+index c6f31e53c..b6d22f686 100644
+--- a/tests/unittests/ast/EvalTests.cpp
++++ b/tests/unittests/ast/EvalTests.cpp
+@@ -3015,6 +3015,23 @@ TEST_CASE("Eval static cast type propagation") {
+     NO_SESSION_ERRORS;
+ }
+ 
++TEST_CASE("Eval static cast to enum type propagation") {
++    ScriptSession session;
++    session.eval("typedef enum logic [2:0] { A, B, C } enum_t;");
++    session.eval("typedef enum { D, E } int_enum_t;");
++    session.eval("logic [1:0] x = 2'd3;");
++
++    CHECK(session.eval("enum_t'('1)").integer() == 7);
++    CHECK(session.eval("enum_t'(x + 2'd1)").integer() == 4);
++    CHECK(session.eval("enum_t'(1'b1 << 2)").integer() == 4);
++    CHECK(session.eval("enum_t'(4'd9)").integer() == 1);
++    CHECK(session.eval("enum_t'(E)").integer() == 1);
++    CHECK(session.eval("int_enum_t'(C)").integer() == 2);
++    CHECK(session.eval("int_enum_t'(2'sb11)").integer() == -1);
++
++    NO_SESSION_ERRORS;
++}
++
+ TEST_CASE("Package eval regress -- GH #1410") {
+     ScriptSession session;
+     session.eval(R"(

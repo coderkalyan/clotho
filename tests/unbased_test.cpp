@@ -263,3 +263,26 @@ TEST_CASE("unsized based x/z literal extends in elaboration-time constants") {
            "sub1 xxxxxxxxxxxxxxxxxxxxxxxx5\n"
            "sub2 zzzzzzzzzzzzzzzzzzzzzzzzz\n");
 }
+
+// A cast to an enum "shall cause a conversion of the expression to its base type"
+// (LRM 6.19.4), and a static cast returns "the value that a variable of the
+// casting type would hold after being assigned the expression" (6.24.1), so the
+// operand is sized by the base type like any assignment's right-hand side: an
+// unsized x or z literal fills it (5.7.1), `'1` fills it, a sum keeps its carry,
+// and a wider value truncates. slang did that for every cast but one to an enum
+// (patches/slang-enum-cast-context.patch). Icarus Verilog 13 agrees.
+TEST_CASE("a cast to an enum sizes its operand by the enum's base type") {
+    CHECK(run_capture(R"(
+        module m;
+            typedef enum logic [39:0] { E0, E1 } e40_t;
+            typedef enum logic [2:0] { A, B, C } e3_t;
+            typedef logic [39:0] l40_t;
+            logic [1:0] x = 2'd3;
+            initial begin
+                $display("%h %h %h", e40_t'('hx), e40_t'('hz3), l40_t'('hx));
+                $display("%0d %0d %0d", e3_t'('1), e3_t'(x + 2'd1), e3_t'(4'd9));
+            end
+        endmodule
+    )") == "xxxxxxxxxx zzzzzzzzz3 xxxxxxxxxx\n"
+           "7 4 1\n");
+}

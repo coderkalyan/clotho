@@ -252,6 +252,17 @@ FetchContent_Declare(
   # desynchronized createRule's positional pairing for a rule with two or more
   # code-block prods. See docs/design/randsequence.md §13.
   #
+  # slang-enum-cast-context: LRM 6.19.4 says "Casting to an enum type shall cause
+  # a conversion of the expression to its base type", and 6.24.1 that a static
+  # cast returns "the value that a variable of the casting type would hold after
+  # being assigned the expression". So the operand is sized by the cast's base
+  # type, as in any assignment. slang only pushed the target's width into the
+  # operand when the operand was assignment compatible with the target, which an
+  # enum never is, so `e_t'('hx)` (40-bit base) was `00xxxxxxxx`, `e_t'('1)` was 1
+  # and `e_t'(x + 2'd1)` lost its carry. This is upstream slang commit 15f633ba6
+  # verbatim; it must apply before slang-unsized-xz-extend, which extends the
+  # same operand, and it sorts first. Drop it on the first bump past that commit.
+  #
   # slang-unsized-xz-extend: LRM 5.7.1 says an unsized unsigned literal whose
   # high-order bit is x or z "shall be extended to the size of the expression
   # containing the literal constant", with x or z. slang only zero-extended, so
