@@ -15,14 +15,14 @@ when it does.
   plane. AND, OR and NOT need no masking.
 - In SSA the two planes are one 2W-bit integer; the z plane is a separate W-bit
   value.
-- A 2-state value is a native W-bit integer. Its domain comes from its IR type,
-  the single source of truth; the backend asserts at every instruction that the
-  value's plane encoding agrees. A producer that reads storage or an ABI converts
-  at that boundary (`in_type_domain`), because the encoding there is the
-  storage's choice, not the type's: a 2-state signal is stored packed when a
-  task's pointer ABI or the may-z analysis gives it a z word. **Not yet:** each
-  value also carries its own encoding tag (`Plane::two`), which operators read
-  instead of the type.
+- A 2-state value is a native W-bit integer, and its domain comes from its IR
+  type alone: one source of truth, no per-value flag to keep in agreement. A
+  2-state variable's storage, and the call ABI, use the native form too, so no
+  boundary ever holds a 2-state value in the packed form. **Not yet:** the code
+  generator tracks each value's encoding in a flag (`Plane::two`) that it asserts
+  against the type, because a 2-state variable is still stored packed when a
+  task's output argument or the may-z analysis gives it a z word (see the call
+  ABI and storage decisions below).
 - An IR integer type is a width and a domain; it has no sign. Domains, signedness
   and extension are decided by the language, through slang's legalized AST, and the
   IR carries them explicitly: signed and unsigned opcodes (`SDiv`/`UDiv`,
