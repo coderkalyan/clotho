@@ -62,6 +62,30 @@ TEST_CASE("net delay: single driver update lands 5 units after it changes (LRM 2
     CHECK(run_capture_finish(src) == "t=1 w=x\nt=7 w=1\n");
 }
 
+// LRM 9.4.1: a delay that evaluates to an unknown value "shall be interpreted as
+// zero delay". 28.16 does not repeat it for a net delay, which takes the same
+// delay_value (see scaled_delay), so any x or z bit zeroes it: `wire #D w` with
+// `D = 4'b1x01` waited 9 and now behaves as the same net with no delay, whose
+// default is zero (28.16). iverilog 13 implements no net delay, so the expected
+// output is that of the undelayed net (net 0 at t=1, then 1 at t=2).
+TEST_CASE("net delay: a delay with an x or z bit is a zero delay") {
+    constexpr std::string_view src = R"(
+        module m;
+            localparam logic [3:0] D = 4'b1x01;
+            logic a;
+            wire #D w;
+            assign w = a;
+            initial begin
+                a = 0;
+                #1 $display("t=%0t w=%b", $time, w);
+                a = 1;
+                #1 $display("t=%0t w=%b", $time, w);
+                #30 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=1 w=0\nt=2 w=1\n");
+}
+
 // A driver's own delay and the net's declared delay are independent stages
 // and add: LRM 10.3.3's "shall not be added to the delay of other drivers"
 // applies only to a delay embedded IN the net declaration's own assignment

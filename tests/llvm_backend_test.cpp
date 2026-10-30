@@ -1496,6 +1496,69 @@ TEST_CASE("a negative delay sign-extends before the time unit multiplier") {
     CHECK(out == "u32 at 4294967295\nt=2**32\n");
 }
 
+// LRM 9.4.1: a delay that "evaluates to an unknown or high-impedance value ...
+// shall be interpreted as zero delay", and 9.4.5's intra-assignment delay is the
+// same delay control. Any x or z bit makes the value unknown (scaled_delay), so
+// `#(4'b1x01)` waits 0, not the 9 that its known bits spell: each delay below used
+// to wait nine units (a z-only `4'bzzzz` waited 0 already, its known bits being
+// zero). A compile-time unknown nonblocking delay also stays a plain `<=` for
+// ordering (LRM 10.4.2): `a <= #(1'bx) 1; a <= 2` ends at 2, as it did not when
+// only the delay's time was right. Oracle: iverilog 13, byte for byte.
+TEST_CASE("a delay with an x or z bit is a zero delay") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        module m;
+          localparam logic [3:0] D = 4'b1x01;
+          logic [3:0] dx = 4'b1x01, dz = 4'bzzzz, dp = 4'b1z01;
+          logic       qb, qn, qd, qv;
+          logic [7:0] a, b;
+          initial begin
+            #10;
+            #(4'b1x01) $display("literal x at %0t", $time);
+            #(D)       $display("parameter x at %0t", $time);
+            #(dx)      $display("variable x at %0t", $time);
+            #(dz)      $display("variable z at %0t", $time);
+            #(dp)      $display("variable z bit at %0t", $time);
+            qb = #(dx) 1'b1;
+            $display("blocking intra-assignment at %0t qb=%b", $time, qb);
+            qn <= #(4'b1x01) 1'b1;
+            qd <= #(dx)      1'b1;
+            qv <= #(dz)      1'b1;
+            #1 $display("nonblocking intra-assignment at %0t qn=%b qd=%b qv=%b", $time, qn, qd, qv);
+            a = 0; a <= #(1'bx) 1; a <= 2;
+            b = 0; b <= #0 1;      b <= 2;
+            #1 $display("ordering a=%0d b=%0d", a, b);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "literal x at 10\n"
+                 "parameter x at 10\n"
+                 "variable x at 10\n"
+                 "variable z at 10\n"
+                 "variable z bit at 10\n"
+                 "blocking intra-assignment at 10 qb=1\n"
+                 "nonblocking intra-assignment at 11 qn=1 qd=1 qv=1\n"
+                 "ordering a=2 b=2\n");
+}
+
+// The same through the unit multiplier: the unknown amount is zeroed before it is
+// multiplied by the module's ticks per unit, in a module whose unit is 1000 ticks.
+TEST_CASE("an unknown delay is zero before the time unit multiplier") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+          logic [3:0] dx = 4'b1x01;
+          initial #0.001 ;
+          initial begin
+            #10;
+            #(dx)      $display("variable x at %0d", $time);
+            #(4'bzz01) $display("literal z bit at %0d", $time);
+            $finish;
+          end
+        endmodule
+    )");
+    CHECK(out == "variable x at 10\nliteral z bit at 10\n");
+}
+
 TEST_CASE("$time rounds the scaled clock to the nearest module time unit") {
     // Global precision is 1ns. fine's #15 lands the wheel on tick 15; top's unit
     // is 10ns, so $time = round(15 / 10) = 2 (1.5 rounds up, LRM §20.3.1).

@@ -259,7 +259,8 @@ ir::Index Lowerer::saturating_ticks(ir::Index scaled, uint64_t tick_mul, ir::Bui
 // bits first and then multiplied, so a large unit (e.g. seconds against fs
 // precision) cannot overflow the amount's declared width. An integer delay times
 // the unit is always an exact multiple of the tick (LRM §3.14), so no rounding is
-// needed. The result is always a 64-bit unsigned tick count for an integral amount.
+// needed. The result is always a 64-bit unsigned tick count for an integral amount,
+// and 0 for one with an unknown bit (LRM 9.4.1, below).
 ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     const ir::SourceLoc l   = loc(amount);
     const ir::Ref       u64 = make_int_type(64, false, false);
@@ -297,7 +298,24 @@ ir::Index Lowerer::scaled_delay(const Expression& amount, ir::Builder& b) {
     // 2**64 - 1, not 2**32 - 1. An unsigned amount zero-extends and a wider one
     // truncates. The backend consumes the count as is, so this is the one place
     // the extension is decided.
-    const ir::Index ticks = coerce(lower_expr(amount, b), *amount.type, u64, b, l);
+    //
+    // LRM 9.4.1: "If the delay expression evaluates to an unknown or high-impedance
+    // value, it shall be interpreted as zero delay." The clause does not say whether
+    // a value with only some bits x or z is unknown. Any such bit makes it so, as in
+    // 11.4.4 ("contains an unknown (x) or high-impedance (z) value"), and as iverilog
+    // reads it: `#(4'b1x01)` waits 0, not the 9 that the 4-state to 2-state
+    // conversion below would keep from its known bits. 9.4.5 and 15.5.1 take their
+    // delay from this same delay control. 10.3.3 and 28.16 do not repeat the rule
+    // for a continuous-assignment, gate or net delay, but those take the same
+    // `delay_value` / `mintypmax_expression` (A.2.2.3, A.6.5), so they follow it
+    // (iverilog agrees for the first two and implements no net delay;
+    // docs/LRM_NOTES.md, note 39).
+    const ir::Index amt   = lower_expr(amount, b);
+    ir::Index       ticks = coerce(amt, *amount.type, u64, b, l);
+    if (amount.type->isFourState()) {
+        ticks =
+          b.select(b.unary(ir::Inst::Tag::IsUnknown, amt, l), b.constant(module_.pool.put_int(u64, 0), l), ticks, l);
+    }
     if (time_mul_ <= 1) {
         return ticks;
     }

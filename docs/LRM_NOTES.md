@@ -350,3 +350,18 @@ Deviation: with no strength model there is nothing for the strength reduction of
 and `cmos`. Not gated.
 
 Code: `src/lower/Nets.cpp` (`mos_switch_of`, `lower_cmos_switch`). Tests: `tests/gate_test.cpp` ("MOS switch truth tables match LRM table 28-6, including the z pass-through", "a cmos switch drives its output from both halves independently").
+
+## 39. Delay with an unknown bit (9.4.1)
+
+9.4.1 reads a delay that "evaluates to an unknown or high-impedance value" as a
+zero delay, and does not say whether a value with only some bits x or z is
+unknown. Clotho reads any x or z bit as making it so, as 11.4.4 does for an
+operand that "contains an unknown (x) or high-impedance (z) value", so
+`#(4'b1x01)` waits 0 and not the 9 its known bits spell. The rule covers every
+delay form, though only the procedural delay control states it: the
+intra-assignment delay (9.4.5) and the `->>` delay (15.5.1) are that control,
+and the continuous-assignment, gate and net delays (10.3.3, 28.16) take the same
+`delay_value` without restating it. A compile-time unknown nonblocking
+intra-assignment delay is a plain `<=`, as a compile-time `#0` is.
+
+Code: `src/lower/SystemTasks.cpp` (`scaled_delay`), `src/lower/Assign.cpp` (`intra_nb_delay_is_const_zero`). Tests: `tests/llvm_backend_test.cpp` ("a delay with an x or z bit is a zero delay", "an unknown delay is zero before the time unit multiplier"), `tests/event_test.cpp` ("->> #(x) e: a delay with an x or z bit is a zero delay"), `tests/continuous_assign_delay_test.cpp`, `tests/gate_test.cpp` and `tests/net_delay_test.cpp` (one case each). Oracle: iverilog 13 for the procedural, intra-assignment, `assign` and gate forms; it implements no net delay and no `->>`.

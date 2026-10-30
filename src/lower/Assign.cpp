@@ -1624,7 +1624,8 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_timing(const Assig
     return t;
 }
 
-// Whether an intra-assignment `#d` is a COMPILE-TIME zero. Such a store lands
+// Whether an intra-assignment `#d` is a COMPILE-TIME zero, a delay that is 0 or
+// has an x or z bit (LRM 9.4.1, see scaled_delay). Such a store lands
 // in the current instant's NBA region either way, so it is lowered as a plain
 // `<=`: that keeps its ordering against the same signal's other NBAs by
 // statement-execution order (LRM 10.4.2) through the one block-commit path,
@@ -1636,6 +1637,9 @@ bool Lowerer::intra_nb_delay_is_const_zero(const Expression& delay_expr) {
     const slang::ConstantValue cv = delay_expr.eval(ev);
     if (!cv.isInteger()) {
         return false;
+    }
+    if (cv.integer().hasUnknown()) {
+        return true;
     }
     const auto v = cv.integer().as<uint64_t>();
     return v && *v == 0;

@@ -366,6 +366,33 @@ TEST_CASE("->> #0 e triggers in the current slot's NBA region") {
           "inactive t=1\ne woke t=1\nf joined t=2\ng joined t=3\n");
 }
 
+// LRM 9.4.1: a delay that evaluates to an unknown value "shall be interpreted as
+// zero delay", and `->> [delay_or_event_control]` (15.5.1) takes its delay control
+// from the same production, so with an x or z bit `->> #(x) e` is `->> #0 e`: each
+// trigger below waited 9 units and now wakes its waiter in the NBA region of the
+// instant it ran in, after the `#0` continuation (LRM 4.4.2.3, 4.4.2.4). The
+// literal delay is zero at lowering time and the variable one at run time.
+// iverilog implements no `->>`, so this is pinned to the LRM.
+TEST_CASE("->> #(x) e: a delay with an x or z bit is a zero delay") {
+    const std::string out = run_capture(R"(
+        module top;
+          event e, f;
+          logic [3:0] dx = 4'b1x01;
+          initial begin
+            #1;
+            ->> #(4'b1x01) e;
+            #0 $display("inactive t=%0t", $time);
+            #1;
+            ->> #(dx) f;
+            #0 $display("inactive t=%0t", $time);
+          end
+          initial begin @(e); $display("e woke t=%0t", $time); end
+          initial begin @(f); $display("f woke t=%0t", $time); end
+        endmodule
+    )");
+    CHECK(out == "inactive t=1\ne woke t=1\ninactive t=2\nf woke t=2\n");
+}
+
 // Tier-2 forms loud-fail rather than being silently mis-lowered (PRINCIPLES.md).
 // A named event declared at package scope materializes its trigger state like a
 // module-scope event, so triggering/waiting it (imported or explicitly scoped)
