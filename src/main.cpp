@@ -41,6 +41,7 @@
 #include "ir/Jit.h"
 #include "ir/LlvmBackend.h"
 #include "ir/Printer.h"
+#include "ir/Verify.h"
 #include "link/Link.h"
 #include "runtime/Runtime.h"
 #ifdef CLOTHO_LSP
@@ -378,6 +379,7 @@ struct Options {
     std::optional<bool>        time;
     std::optional<bool>        o3;
     std::vector<std::string>   stats;
+    std::optional<bool>        verify_ir;
     std::vector<std::string>   sanitizers;
     std::optional<std::string> coverage;
     std::optional<bool>        gc_stress;
@@ -452,6 +454,11 @@ void register_options(Registry& r, Options& o) {
                     "dedup-sets, comb-fuse, finish or parallel (repeatable, comma-separated)",
                     "<name>",
                     slang::CommandLineFlags::CommaList);
+    r.add_developer(kBuildRun,
+                    "--verify-ir",
+                    o.verify_ir,
+                    "Check the lowered design against the IR typing rules (docs/design/kernel.md) and print "
+                    "each violation to stderr, for working on clotho; never fails the build");
     r.add(kBuildRun,
           "--sanitize",
           o.sanitizers,
@@ -1420,6 +1427,16 @@ int main(int argc, char** argv) {
       clotho::lower_driver(std::move(driver), tp, config.allow_system, std::move(path_prefix_map));
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostic_text());
+    }
+    // `--verify-ir`: report only. A violation is a finding about the frontend's
+    // output, and the exit status is still the design's own.
+    if (options.verify_ir == true && result.module != nullptr) {
+        const clotho::ir::LocResolver resolve = clotho::loc_resolver(result);
+        const auto                    found   = clotho::ir::verify(*result.module);
+        for (const clotho::ir::Violation& v : found) {
+            std::println(stderr, "{}", clotho::ir::format(*result.module, v, resolve));
+        }
+        std::println(stderr, "ir-verify: {} violation{}", found.size(), found.size() == 1 ? "" : "s");
     }
 
     // `lint`: the diagnostics ARE the artifact, so stop here.
