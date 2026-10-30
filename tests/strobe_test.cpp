@@ -312,3 +312,27 @@ TEST_CASE("$strobe pended by a process that finishes in the same time step") {
     )") == "top.m0\ntop.m1\ntop.m0.a v=00000012\ntop.m0.b v=00000012\ntop.m1.a v=00000012\n"
            "top.m1.b v=00000012\n");
 }
+
+// %m names the scope that invokes the task (LRM 21.2.1.3): a deferred print and a
+// fork child are not scopes of their own, so the named block or task around them
+// is what %m reports. Icarus Verilog 13 prints the same four lines.
+TEST_CASE("%m in $strobe, $monitor and a fork child names the invoking scope") {
+    CHECK(run_capture(R"(
+        module leaf;
+          task automatic t;
+            $strobe("strobe-in-task %m");
+          endtask
+          initial begin : blk
+            $strobe("strobe %m");
+            fork
+              $display("fork %m");
+            join
+            t();
+          end
+          initial $monitor("monitor %m");
+        endmodule
+        module top;
+          leaf a();
+        endmodule
+    )") == "fork top.a.blk\nstrobe top.a.blk\nstrobe-in-task top.a.t\nmonitor top.a\n");
+}

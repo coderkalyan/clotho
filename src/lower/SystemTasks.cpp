@@ -1629,29 +1629,34 @@ std::string Lowerer::instance_path() const {
 // instances are flattened per-instance and subroutine bodies are lowered
 // per defining instance.
 std::string Lowerer::hier_name() const {
-    std::string path = instance_path();
-    if (path.empty() && scope_ != nullptr) {
-        // A package / $unit subroutine sits under no instance, so the instance
-        // path is empty; %m still owes the scope chain (LRM 21.2.1.3, Verilator
-        // renders `pkg.fn`). UVM's uvm_instance_scope (base/uvm_misc.svh) scans
-        // %m backwards for a '.' / ':' separated prefix and reports SCPSTR --
-        // 128 times, then a BUILDERR fatal -- when there is none, so the
-        // package segment is load-bearing, not cosmetic.
-        for (const Scope* s = scope_; s != nullptr; s = s->asSymbol().getParentScope()) {
-            const Symbol& sym = s->asSymbol();
-            if (sym.kind == SymbolKind::Package) {
-                path = std::string(sym.name);
-                break;
-            }
-            if (sym.kind == SymbolKind::CompilationUnit) {
-                path = "$unit";
-                break;
+    std::string path;
+    if (fn_ctx_ != nullptr && fn_ctx_->invoking_scope) {
+        path = *fn_ctx_->invoking_scope;
+    } else {
+        path = instance_path();
+        if (path.empty() && scope_ != nullptr) {
+            // A package / $unit subroutine sits under no instance, so the instance
+            // path is empty; %m still owes the scope chain (LRM 21.2.1.3, Verilator
+            // renders `pkg.fn`). UVM's uvm_instance_scope (base/uvm_misc.svh) scans
+            // %m backwards for a '.' / ':' separated prefix and reports SCPSTR --
+            // 128 times, then a BUILDERR fatal -- when there is none, so the
+            // package segment is load-bearing, not cosmetic.
+            for (const Scope* s = scope_; s != nullptr; s = s->asSymbol().getParentScope()) {
+                const Symbol& sym = s->asSymbol();
+                if (sym.kind == SymbolKind::Package) {
+                    path = std::string(sym.name);
+                    break;
+                }
+                if (sym.kind == SymbolKind::CompilationUnit) {
+                    path = "$unit";
+                    break;
+                }
             }
         }
-    }
-    if (fn_ctx_ != nullptr && !fn_ctx_->name_prefix.empty()) {
-        path += '.';
-        path.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
+        if (fn_ctx_ != nullptr && !fn_ctx_->name_prefix.empty()) {
+            path += '.';
+            path.append(fn_ctx_->name_prefix, 0, fn_ctx_->name_prefix.size() - 1);
+        }
     }
     for (const OpenBlock& nb : named_blocks_) {
         path += '.';

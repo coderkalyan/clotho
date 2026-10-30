@@ -4348,6 +4348,11 @@ private:
         // Name qualifier (e.g. "f.") prepended to a static local's signal name so
         // same-named statics in different functions stay distinct.
         std::string name_prefix;
+        // %m of a synthetic body that is not a scope of its own -- a fork child, a
+        // $strobe or $monitor print -- is that of the statement that created it
+        // (LRM 21.2.1.3: the scope that invokes the task). Unset for a subroutine,
+        // whose own name is part of its %m.
+        std::optional<std::string> invoking_scope;
         // True while lowering a task body (a coroutine): unlike a function, timing
         // controls and $time are allowed.
         bool is_task = false;

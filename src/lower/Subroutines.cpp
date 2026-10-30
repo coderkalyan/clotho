@@ -1321,6 +1321,7 @@ ir::FunctionId Lowerer::build_fork_child(const Statement&                    bod
 
     FnCtx ctx;
     ctx.name_prefix = "fork.child.";
+    ctx.invoking_scope = hier_name();
     ctx.is_task     = true;
     const FnScope fn_scope(*this, &ctx);
 
@@ -1422,6 +1423,7 @@ ir::FunctionId Lowerer::build_deferred_body(std::span<const Expression* const> a
 
     FnCtx ctx;
     ctx.name_prefix = monitor ? "monitor." : "strobe.";
+    ctx.invoking_scope = hier_name();
     ctx.is_task     = true;
     const FnScope fn_scope(*this, &ctx);
 
