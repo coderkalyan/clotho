@@ -309,7 +309,8 @@ between instances:
 - one binding per extern declaration: the address of an imported signal, the
   record of an imported function's instance, the record of an instance an
   interface port or `inst_refs` entry names;
-- descriptors of wake buckets the instance's signals own (base and capacity).
+- descriptors of wake buckets the instance's signals own (base, subscriber
+  count and trigger bits), and the trigger masks of the guarded groups it runs.
 
 Today's per-definition `@clotho.inst.<hier>.ctx` (StateLayout.cpp) is the
 seed of it; the `abs_id` / `idval` relocations and constant anchors in unit
@@ -387,7 +388,16 @@ code go.
      ring mask is a root global, NBA and trigger ids are record base plus
      unit-local ordinal, and block commit functions live in the writer's unit.
      Facts other units impose (a signal is waited on, forced, may carry z)
-     stay joined per unit and part of its codegen key until step 4.
+     stay joined per unit and part of its codegen key until step 4. Landed so
+     far: an owner's scan reads its buckets' subscriber count and trigger bits
+     from the record, and trigger colours (design-global, first-fit) are data
+     wherever unit code needs them, never an immediate: a guarded group's
+     member and group masks are record fields filled at startup, a writer of
+     another instance's signal reads that instance's record, a signal of no
+     instance has a trigger global per bucket, and the NBA meta table carries
+     each committed signal's bits. What a park or self-start stores into the
+     scheduled flag is every trigger bit whether or not the design guards a
+     group, so no unit's code depends on that.
    - **3e, root as link glue.** Instance records, the scheduling plan, the
      seed loop, NBA, VCD and covergroup tables are built from the instance
      table; flatten stops copying bodies and becomes the link step's instance

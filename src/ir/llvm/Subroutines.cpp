@@ -94,6 +94,20 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         lower_region(ir_->root());
         runs_once_ = false;
     };
+    // A trigger mask the code being lowered tests the wake word against. An
+    // instance's own code (own_anchor_ set) loads it from its record, where
+    // main stored it at startup with the design-global colours, so no colour
+    // reaches unit code; code that addresses absolutely (the dispatcher of a
+    // group spanning instances, an unscoped group) bakes it, which is root
+    // glue. `field` is the record's array (ctx_mmask_base / ctx_gmask_base)
+    // and `m` the process whose def-local ordinal indexes it.
+    const auto mask_value = [&](uint64_t baked, uint32_t Anchor::*field, uint32_t m) -> llvm::Value* {
+        if (own_anchor_ == SignalSlot::no_anchor) {
+            return b_.getInt64(baked);
+        }
+        Anchor& a = anchors_[own_anchor_];
+        return ctx_field(a, a.*field + proc_sched_ord_[m], b_.getInt64Ty());
+    };
     // Open the guarded region of a group: returns true when its members are
     // guarded, having ensured the wake word carries at least one of the
     // group's bits.
@@ -108,7 +122,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         if (!group_guarded_[g]) {
             return false;
         }
-        auto* mask = b_.getInt64(group_trig_mask_[g]);
+        auto* mask = mask_value(group_trig_mask_[g], &Anchor::ctx_gmask_base, members.front());
         auto* w    = b_.CreateLoad(sched_word_ty(), sched_ptr_);
         auto* none = b_.CreateICmpEQ(b_.CreateAnd(w, mask), b_.getInt64(0));
         auto* set  = llvm::BasicBlock::Create(ctx_, "trig.all", fn_);
@@ -120,7 +134,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         b_.SetInsertPoint(go);
         return true;
     };
-    // Open one member's guard: run it only if one of ITS OWN events has
+    // Open member `i`'s guard: run it only if one of ITS OWN events has
     // fired. Returns the join block to branch to once the body is emitted
     // (null when the group is unguarded).
     //
@@ -134,15 +148,18 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // (comb-fusion.md's "the downstream member runs later in the same
     // activation with final values" -- with guards, that sentence is
     // load-bearing, not an aside).
-    auto open_guard = [&](bool guarded, uint64_t mask, uint64_t group_mask) -> llvm::BasicBlock* {
+    auto open_guard = [&](bool guarded, uint32_t g, size_t i) -> llvm::BasicBlock* {
         // A member sensitive to everything the group is sensitive to runs on
         // every activation, so its guard can only ever be true: emit none.
-        if (!guarded || mask == group_mask) {
+        // Only decidable while the masks are baked; a mask read from a record
+        // may be anything.
+        if (!guarded || (own_anchor_ == SignalSlot::no_anchor && member_mask(g, i) == group_trig_mask_[g])) {
             return nullptr;
         }
         auto* run  = llvm::BasicBlock::Create(ctx_, "mem.run", fn_);
         auto* join = llvm::BasicBlock::Create(ctx_, "mem.skip", fn_);
-        auto* bits = b_.CreateAnd(b_.CreateLoad(sched_word_ty(), sched_ptr_), b_.getInt64(mask));
+        auto* mask = mask_value(member_mask(g, i), &Anchor::ctx_mmask_base, members[i]);
+        auto* bits = b_.CreateAnd(b_.CreateLoad(sched_word_ty(), sched_ptr_), mask);
         b_.CreateCondBr(b_.CreateICmpNE(bits, b_.getInt64(0)), run, join);
         b_.SetInsertPoint(run);
         return join;
@@ -285,7 +302,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             const uint32_t    aid = proc_sched_anchor_[members[i]];
             llvm::Value*      rec = aid != ~0u ? static_cast<llvm::Value*>(ensure_ctx(anchors_[aid]))
                                                : llvm::ConstantPointerNull::get(ptr_ty);
-            llvm::BasicBlock* join = open_guard(guarded, member_mask(g_, i), group_trig_mask_[g_]);
+            llvm::BasicBlock* join = open_guard(guarded, g_, i);
             b_.CreateCall(fnty, sym(member_fns[i]), { rec, wheel_ });
             close_guard(join);
         }
@@ -322,7 +339,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             build_str_temps();
             build_dynarr_temps();
             build_agg_elem_temps();
-            llvm::BasicBlock* join = open_guard(guarded, member_mask(g_, i), group_trig_mask_[g_]);
+            llvm::BasicBlock* join = open_guard(guarded, g_, i);
             lower_member_body(members[i]);
             deinit_body_strings();
             close_guard(join);
@@ -585,7 +602,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             str_vals_     = member_strs[i];
             dynarr_ret_   = member_dynarr[i];
             agg_elem_ret_ = member_agg_elem[i];
-            llvm::BasicBlock* join = open_guard(guarded, member_mask(g_, i), group_trig_mask_[g_]);
+            llvm::BasicBlock* join = open_guard(guarded, g_, i);
             lower_region(ir_->root());              // member body (per trigger)
             close_guard(join);
         }

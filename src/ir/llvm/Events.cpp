@@ -697,6 +697,7 @@ void Backend::build_wait_queues() {
     wait_dyn_ty_.assign(sigs.size(), { nullptr, nullptr, nullptr });
     wait_dyn_len_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
     sta_next_.assign(sigs.size(), { 0, 0, 0 });
+    wait_sta_trig_gv_.assign(sigs.size(), { nullptr, nullptr, nullptr });
 
     // Event objects. Slots were numbered by assign_event_slots (it has to run
     // before emit_state_global, because a declared event's power-on value IS its
@@ -773,6 +774,14 @@ void Backend::build_wait_queues() {
                 wait_sta_gv_[i][e]  = new llvm::GlobalVariable(
                   env_->llmod, arr, false, llvm::GlobalValue::InternalLinkage,
                   llvm::ConstantAggregateZero::get(arr), base + "sta." + edge_suffix(e));
+                if (slots_[i].anchor == SignalSlot::no_anchor) {
+                    // No record describes this bucket (a package variable's): its
+                    // trigger bits live in a global of their own, which writers in
+                    // any unit read (static_trig_bits).
+                    wait_sta_trig_gv_[i][e] = new llvm::GlobalVariable(
+                      env_->llmod, b_.getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
+                      llvm::ConstantInt::get(b_.getInt64Ty(), 0), base + "sta." + edge_suffix(e) + ".trig");
+                }
             }
             if (c.dyn[i][e] > 0) {
                 auto* arr          = llvm::ArrayType::get(elem, c.dyn[i][e]);
@@ -1352,13 +1361,6 @@ void Backend::emit_trigger_fire(llvm::Value* trig_id) {
     b_.SetInsertPoint(done);
 }
 
-// Static sub-queue scan (one edge bucket): a fixed-trip loop over the
-// persistent subscriptions for this (signal, edge). The bucket's edge already
-// matched the transition (the caller guarded the whole scan), so there is no
-// per-entry edge check. Emitted via the generic runtime scan with a constant
-// non-null base and constant cap: simplifycfg (lower_coroutines) folds the
-// dead null guard and the constant trip count still lets the optimizer
-// unroll. Membership never changes — no compaction, no length.
 // Body-side base pointer of a wait bucket: loaded from the owning
 // instance's wait-pointer table when its definition is reused (def-local
 // slot constant — twin bodies stay identical), the absolute queue global
@@ -1371,24 +1373,54 @@ llvm::Value* Backend::wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig)
     return ctx_field(a, a.ctx_wait_base + slot, llvm::PointerType::getUnqual(ctx_));
 }
 
-// A static bucket scan. The owner's own code reads the bucket's subscriber
-// count and trigger bits from its instance record, the exact count of that
-// instance, so the scan needs no padding; any other writer bakes the
-// per-definition maximum (null-checked when twins differ) and the bits.
+// The trigger bits a wake of (sig, edge) ORs into a subscriber's wake word, as
+// data: they are design-global colours (compute_trigger_masks), so no unit's
+// code may hold them as an immediate. The owner's code finds them in its own
+// record; any other writer reads the owner's record global (a design symbol,
+// like the bucket it scans), and a signal of no instance has a global of its
+// own per bucket.
+llvm::Value* Backend::static_trig_bits(Signal sig, uint32_t edge) {
+    const auto     i   = static_cast<uint32_t>(sig);
+    const uint32_t ord = wait_sta_ord_[i][edge];
+    if (ord != no_wait_slot && def_relative_for(slots_[i])) {
+        Anchor& a = anchors_[slots_[i].anchor];
+        return ctx_field(a, a.ctx_trig_base + ord, b_.getInt64Ty());
+    }
+    if (ord != no_wait_slot) {
+        Anchor& a   = anchors_[slots_[i].anchor];
+        auto*   gep = llvm::ConstantExpr::getInBoundsGetElementPtr(
+          a.ctx_ty, ensure_ctx(a), llvm::ArrayRef<llvm::Constant*>{ b_.getInt32(0), b_.getInt32(a.ctx_trig_base + ord) });
+        return b_.CreateLoad(b_.getInt64Ty(), gep);
+    }
+    if (wait_sta_trig_gv_[i][edge] != nullptr) {
+        return b_.CreateLoad(b_.getInt64Ty(), sym(wait_sta_trig_gv_[i][edge]));
+    }
+    return b_.getInt64(trig_bits(sig, edge));
+}
+
+// Static sub-queue scan (one edge bucket): a loop over the persistent
+// subscriptions for this (signal, edge). The bucket's edge already matched the
+// transition (the caller guarded the whole scan), so there is no per-entry
+// edge check. Emitted via the generic runtime scan with a non-null base:
+// simplifycfg (lower_coroutines) folds a dead null guard, and a constant cap
+// still lets the optimizer unroll. Membership never changes — no compaction,
+// no length.
+//
+// The owner's own code reads the bucket's subscriber count from its instance
+// record, the exact count of that instance, so the scan needs no padding; any
+// other writer bakes the per-definition maximum (null-checked when twins
+// differ). The trigger bits are data for every writer (static_trig_bits).
 void Backend::service_static_queue(Signal sig, uint32_t edge) {
     const auto     i    = static_cast<uint32_t>(sig);
     const uint32_t ord  = wait_sta_ord_[i][edge];
     llvm::Value*   base = wait_base(wait_slot_sta_[i][edge], wait_sta_gv_[i][edge], i);
     if (ord != no_wait_slot && def_relative_for(slots_[i])) {
         Anchor& a = anchors_[slots_[i].anchor];
-        emit_static_scan_rt(base,
-                            ctx_field(a, a.ctx_cap_base + ord, b_.getInt32Ty()),
-                            false,
-                            ctx_field(a, a.ctx_trig_base + ord, b_.getInt64Ty()));
+        emit_static_scan_rt(base, ctx_field(a, a.ctx_cap_base + ord, b_.getInt32Ty()), false, static_trig_bits(sig, edge));
         return;
     }
-    emit_static_scan_rt(
-      base, b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0, b_.getInt64(trig_bits(sig, edge)));
+    emit_static_scan_rt(base, b_.getInt32(wait_sta_cap_[i][edge]), wait_sta_padded_[i][edge] != 0,
+                        static_trig_bits(sig, edge));
 }
 
 // Dynamic sub-queue scan (one edge bucket): a straight loop over the live

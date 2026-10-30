@@ -439,14 +439,18 @@ void Backend::nba_classify() {
 
 // Build the nonblocking-assignment update state: a constant per-signal metadata
 // table (live/shadow/mask offsets plus the wait-queue base/cap/len pointers the
-// block commit services from). Must run after build_state_layout (slot offsets,
-// nba flags) and build_wait_queues (queue globals).
+// block commit services from, and each bucket's trigger bits: design-global
+// colours, so data in this root-side constant table rather than immediates in
+// the committing unit's code). Must run after build_state_layout (slot offsets,
+// nba flags), build_wait_queues (queue globals) and compute_trigger_masks.
 void Backend::build_nba_state() {
     auto* i32   = llvm::Type::getInt32Ty(ctx_);
+    auto* i64   = llvm::Type::getInt64Ty(ctx_);
     auto* ptr   = llvm::PointerType::getUnqual(ctx_);
     auto* arr3p = llvm::ArrayType::get(ptr, 3);
     auto* arr3i = llvm::ArrayType::get(i32, 3);
-    nba_meta_ty_ = llvm::StructType::get(ctx_, { arr3p, arr3i, arr3p, arr3p });
+    auto* arr3l = llvm::ArrayType::get(i64, 3);
+    nba_meta_ty_ = llvm::StructType::get(ctx_, { arr3p, arr3i, arr3p, arr3p, arr3l });
 
     const auto sigs = mod_.signals();
 
@@ -478,16 +482,18 @@ void Backend::build_nba_state() {
         // not a dumped scalar. The commit loop reads it to mark the signal dirty.
         nba_vcd.push_back(llvm::ConstantInt::get(
           i32, static_cast<uint64_t>(static_cast<int64_t>(design_uses_vcd_ ? vcd_index_[i] : -1))));
-        std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{};
+        std::array<llvm::Constant*, 3> sb{}, sc{}, db{}, dl{}, tg{};
         for (uint32_t e = 0; e < 3; ++e) {
             sb[e] = wait_sta_gv_[i][e] ? llvm::cast<llvm::Constant>(sym(wait_sta_gv_[i][e])) : nullp;
             sc[e] = llvm::ConstantInt::get(i32, wait_sta_true_[i][e]);
             db[e] = wait_dyn_gv_[i][e] ? llvm::cast<llvm::Constant>(sym(wait_dyn_gv_[i][e])) : nullp;
             dl[e] = wait_dyn_len_gv_[i][e] ? llvm::cast<llvm::Constant>(sym(wait_dyn_len_gv_[i][e])) : nullp;
+            tg[e] = llvm::ConstantInt::get(i64, trig_bits(static_cast<Signal>(i), e));
         }
         metas.push_back(llvm::ConstantStruct::get(
           nba_meta_ty_, { llvm::ConstantArray::get(arr3p, sb), llvm::ConstantArray::get(arr3i, sc),
-                          llvm::ConstantArray::get(arr3p, db), llvm::ConstantArray::get(arr3p, dl) }));
+                          llvm::ConstantArray::get(arr3p, db), llvm::ConstantArray::get(arr3p, dl),
+                          llvm::ConstantArray::get(arr3l, tg) }));
     }
     if (metas.empty()) {
         metas.push_back(llvm::ConstantAggregateZero::get(nba_meta_ty_));
@@ -845,7 +851,7 @@ void Backend::emit_nba_service(Signal       sig,
         b_.SetInsertPoint(body);
         auto* ptr = raw_ptr_ty();
         auto* i32 = b_.getInt32Ty();
-        emit_static_scan_rt(meta_at(meta, 0, e, ptr), meta_at(meta, 1, e, i32), false, b_.getInt64(trig_bits(sig, e)));
+        emit_static_scan_rt(meta_at(meta, 0, e, ptr), meta_at(meta, 1, e, i32), false, meta_at(meta, 4, e, b_.getInt64Ty()));
         emit_dynamic_scan_rt(meta_at(meta, 2, e, ptr), meta_at(meta, 3, e, ptr));
         if (vif_wait_[static_cast<uint32_t>(sig)][e]) {
             // Waiters that reached this member through a virtual interface. The

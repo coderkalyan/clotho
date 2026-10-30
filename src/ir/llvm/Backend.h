@@ -987,9 +987,18 @@ struct Anchor {
     //   ctx_cap_base  i32  each static bucket's subscriber count, in the
     //                      instance's static-bucket order (wait_sta_ord_)
     //   ctx_trig_base i64  each static bucket's trigger bits, same order
+    //   ctx_mmask_base i64 one per owned process, at its def-local ordinal: the
+    //                      trigger bits of the process's own events, which its
+    //                      member guard tests (0 unless it is a member of a
+    //                      guarded group; absent when the design has none)
+    //   ctx_gmask_base i64 same indexing: for the front process of a guarded
+    //                      group, the union of its members' bits, which the
+    //                      group's fail-safe tests
     // A writer in the instance's own code reads a bucket's base, count and
-    // trigger bits here, so none of them is baked into unit code: they depend
-    // on who subscribes, which is other units' business.
+    // trigger bits here, and a guarded group its masks, so none of them is
+    // baked into unit code: the buckets depend on who subscribes and the bits
+    // on the design-global colours (compute_trigger_masks), which are other
+    // units' business.
     // ctx_ty is shared across instances of one definition; the global is
     // created lazily by the first def-relative use.
     llvm::StructType*     ctx_ty        = nullptr;
@@ -998,8 +1007,12 @@ struct Anchor {
     uint32_t              ctx_wait_base = 0;
     uint32_t              ctx_cap_base  = 0;
     uint32_t              ctx_trig_base = 0;
-    // Def-local count of owned processes (sizes the blk fields).
-    uint32_t n_blk = 0;
+    uint32_t              ctx_mmask_base = 0;
+    uint32_t              ctx_gmask_base = 0;
+    // Def-local count of owned processes (sizes the blk fields), and the length
+    // of each mask array (the same, or 0 when no group of the design is guarded).
+    uint32_t n_blk  = 0;
+    uint32_t n_mask = 0;
     // The Design unit the scope expands (InstanceScope::unit).
     uint32_t unit = InstanceScope::no_unit;
 };
@@ -2134,6 +2147,8 @@ private:
     llvm::Value* wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig);
 
     void service_static_queue(Signal sig, uint32_t edge);
+
+    llvm::Value* static_trig_bits(Signal sig, uint32_t edge);
 
     void service_dynamic_queue(Signal sig, uint32_t edge);
 
@@ -4690,8 +4705,9 @@ private:
     // and the seed/drain dispatch, kept as one table so all three agree.
     std::vector<bool>                   thunk_group_;
     // Per-(signal, edge) trigger colour: the wake word bit a wake of that pair
-    // sets, or 0 for "no guarded group waits on it". Design-global so the mask
-    // is a constant at the scan site (compute_trigger_masks).
+    // sets, or 0 for "no guarded group waits on it". Design-global, so it is
+    // data wherever unit code needs it (the owner's record, a bucket's trigger
+    // global, the NBA meta table), never an immediate (compute_trigger_masks).
     std::vector<std::array<uint8_t, 3>> trig_colour_;
     // Per-group: guard each member on its own sensitivity, the per-member masks
     // in member order, and the union of those masks. Empty / false / 0 for a
@@ -4700,9 +4716,8 @@ private:
     std::vector<bool>                   group_guarded_;
     std::vector<std::vector<uint64_t>>  group_member_mask_;
     std::vector<uint64_t>               group_trig_mask_;
-    // Any group guarded at all. Gates whether an unclassified wake has to set
-    // every trigger bit, so a design with no guarded group emits the wake sites
-    // it always did.
+    // Any group guarded at all. Sizes the record's mask arrays and, with no
+    // guarded group, spares the main-side fills.
     bool                                any_guarded_     = false;
     uint32_t                            trig_collisions_ = 0;
     // Per-signal wait queues, indexed by Signal handle and then by edge bucket
@@ -4720,6 +4735,9 @@ private:
     // is padded past them to the definition maximum (see build_wait_queues).
     std::vector<std::array<uint32_t, 3>> wait_sta_true_;
     std::vector<std::array<uint8_t, 3>>  wait_sta_padded_;
+    // A signal of no instance has no record to hold its buckets' trigger bits:
+    // each static bucket gets a global of its own, filled at startup.
+    std::vector<std::array<llvm::GlobalVariable*, 3>> wait_sta_trig_gv_;
     // Def-local wait-table slots per (signal, edge): ctx field ordinal (past
     // ctx_wait_base) in the owning instance's context, or ~0 when the signal's
     // owner is not a reused definition (body-side code then uses the absolute

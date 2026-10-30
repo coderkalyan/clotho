@@ -68,10 +68,13 @@ llvm::IntegerType* Backend::sched_word_ty() {
 }
 
 // Bits a wake site sets when it cannot name the (signal, edge) it fired
-// for: every trigger bit, so every guard in the woken group passes. Zero
-// when no group is guarded, which keeps the unguarded emission identical.
+// for: every trigger bit, so every guard in the woken group passes. Always
+// every bit, whether or not the design guards a group: that is a fact about
+// the whole design, and unit code (a park's claim of its own flag) must not
+// change when another unit gains the first guarded group. Bit 0 stays the
+// only one anything else reads, so the extra bits cost an immediate.
 uint64_t Backend::unclassified_trig_bits() const {
-    return any_guarded_ ? ~1ull : 0ull;
+    return ~1ull;
 }
 
 // Trigger bits of member `i` of group `g`: the bits of its OWN events. Zero
@@ -974,9 +977,10 @@ llvm::Value* Backend::lv_z_ptr(const LValue& lv) {
 
 // Compute each instance context's type (see Anchor): shared per definition,
 // fields sized from the instance's process count (one block-id field per
-// owned process) and wait-bucket slots. Runs after fusion grouping, wait-queue
-// sizing and build_sched_flags (the process ordinals), before lowering.
-// Also attributes each fusion group to its scope anchor and, for a
+// owned process, and when some group is guarded two trigger-mask fields
+// each) and wait-bucket slots. Runs after fusion grouping, trigger colouring,
+// wait-queue sizing and build_sched_flags (the process ordinals), before
+// lowering. Also attributes each fusion group to its scope anchor and, for a
 // single-scope group, to its unit's dense group ordinal.
 //
 // The block-id field of a function (a single-scope group, or a member of a
@@ -1027,6 +1031,7 @@ void Backend::build_instance_ctx_layout() {
     ankerl::unordered_dense::map<llvm::StructType*, llvm::StructType*> def_ctx;
     for (Anchor& a : anchors_) {
         a.n_blk        = def_blk[a.ty];
+        a.n_mask       = any_guarded_ ? a.n_blk : 0;
         a.ctx_blk_base = 4;
         uint32_t nwait = 0;
         uint32_t nsta  = 0;
@@ -1041,9 +1046,11 @@ void Backend::build_instance_ctx_layout() {
                 nsta += wait_slot_sta_[si][e] != no_wait_slot ? 1 : 0;
             }
         }
-        a.ctx_wait_base = a.ctx_blk_base + a.n_blk;
+        a.ctx_wait_base        = a.ctx_blk_base + a.n_blk;
         a.ctx_cap_base         = a.ctx_wait_base + nwait;
         a.ctx_trig_base        = a.ctx_cap_base + nsta;
+        a.ctx_mmask_base       = a.ctx_trig_base + nsta;
+        a.ctx_gmask_base       = a.ctx_mmask_base + a.n_mask;
         const auto [it, fresh] = def_ctx.try_emplace(a.ty, nullptr);
         if (fresh) {
             std::vector<llvm::Type*> f{ ptr, ptr, ptr, i32 };
@@ -1051,6 +1058,7 @@ void Backend::build_instance_ctx_layout() {
             f.insert(f.end(), nwait, ptr);
             f.insert(f.end(), nsta, i32);
             f.insert(f.end(), nsta, b_.getInt64Ty());
+            f.insert(f.end(), 2 * a.n_mask, b_.getInt64Ty());
             it->second = llvm::StructType::create(
               ctx_, f, a.ty->getName().str() + ".ctx");
         }

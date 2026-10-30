@@ -875,6 +875,31 @@ void Backend::emit_main(const std::vector<llvm::Function*>& procs) {
     for (const auto& [aid, field, first_id] : ctx_blk_fills_) {
         b_.CreateStore(b_.getInt32(first_id), ctx_ptr(anchors_[aid], field));
     }
+    // Trigger masks of the guarded groups an instance owns: the design-global
+    // colours, so data in its record rather than immediates in its code. A
+    // group spanning instances is guarded by its root-side dispatcher, which
+    // bakes them.
+    for (uint32_t g = 0; g < groups_.size(); ++g) {
+        if (!group_guarded_[g] || group_anchor_of_[g] == SignalSlot::no_anchor) {
+            continue;
+        }
+        Anchor& a = anchors_[group_anchor_of_[g]];
+        b_.CreateStore(b_.getInt64(group_trig_mask_[g]),
+                       ctx_ptr(a, a.ctx_gmask_base + proc_sched_ord_[groups_[g].front()]));
+        for (size_t i = 0; i < groups_[g].size(); ++i) {
+            b_.CreateStore(b_.getInt64(member_mask(g, i)),
+                           ctx_ptr(a, a.ctx_mmask_base + proc_sched_ord_[groups_[g][i]]));
+        }
+    }
+    // The trigger bits of a static bucket no record describes (a signal of no
+    // instance), which any unit's writer reads.
+    for (uint32_t si = 0; si < wait_sta_trig_gv_.size(); ++si) {
+        for (uint32_t e = 0; e < 3; ++e) {
+            if (wait_sta_trig_gv_[si][e] != nullptr) {
+                b_.CreateStore(b_.getInt64(trig_bits(static_cast<Signal>(si), e)), sym(wait_sta_trig_gv_[si][e]));
+            }
+        }
+    }
     init_state();
     // Shadow bases fill only when some shadow access loaded them (lazy):
     // the root base covers unscoped targets, the per-instance bases each
