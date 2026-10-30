@@ -503,3 +503,14 @@ written for this declaration, so `P` is 32 bits of ones. slang folds the
 parameter the same way. iverilog and Verilator make `P` one bit wide.
 
 Code: slang's parameter elaboration (no Clotho code). Tests: `tests/unbased_test.cpp` ("an untyped parameter set to '1 is at least 32 bits of ones").
+
+## 46. `disable` of a block a process has already left (9.6.2, 12.8)
+
+A process that leaves a named block by `break`, `continue` or `return` is no
+longer in it. A later `disable` of that block terminates nothing: 9.6.2 ends "the
+activity of a task or a named block", and the block has none. The process keeps
+running where it is. iverilog 13 still counts the process as inside the block,
+aborts whatever it is waiting on, and resumes it after the block, so a loop left by
+`break` runs again. Clotho follows the LRM.
+
+Code: `src/ir/llvm/Inst.cpp` (`leave_blocks`). Tests: `tests/loop_test.cpp` ("an exit that skips a block's end takes the activation off its list", subcase "a `break` out of a block that a later disable names"). Oracle: iverilog 13 disagrees, as above.
