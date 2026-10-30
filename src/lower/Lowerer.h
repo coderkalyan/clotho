@@ -2696,6 +2696,8 @@ private:
 
     void lower_var_initializer(const VariableSymbol& vs);
 
+    const Expression* declaration_initializer(const VariableSymbol& vs) const;
+
     void finalize_preinit();
 
     void finalize_sva_history();
@@ -5034,6 +5036,11 @@ private:
     // of allocating fresh storage. Both sides then read/write one signal and
     // multi-driver resolution folds competing drivers.
     ankerl::unordered_dense::map<const Symbol*, ir::Signal> inout_alias_;
+    // The variable output ports (LRM 23.2.2.2) whose declaration carries an
+    // initializer, by the variable each declares. slang keeps that initializer on
+    // the PortSymbol and not on the variable, so declaration_initializer finds it
+    // here. Filled by collect_signals for every instance body.
+    ankerl::unordered_dense::map<const Symbol*, const PortSymbol*> port_initializers_;
     // Continuous-driver coverage per net signal: the closed regions already
     // driven, checked for overlap by record_net_driver_region (NetRegion defined
     // in the net-driver-tracking section).

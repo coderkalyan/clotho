@@ -1024,6 +1024,12 @@ void Lowerer::collect_signals(const InstanceBodySymbol& body) {
             const PortSymbol& p = m.as<PortSymbol>();
             if (p.internalSymbol) {
                 port_dir[p.internalSymbol] = direction_of(p.direction);
+                // Only a variable output port may carry an initializer; an input's
+                // is its default connection (LRM 23.2.2.4), which slang already
+                // substitutes into the port connection.
+                if (p.direction == slang::ast::ArgumentDirection::Out && p.hasInitializer()) {
+                    port_initializers_.emplace(p.internalSymbol, &p);
+                }
             }
         }
     }

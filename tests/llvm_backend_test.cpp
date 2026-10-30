@@ -2858,6 +2858,53 @@ TEST_CASE("declaration initializers propagate to continuous consumers at time ze
     CHECK(out == "y=0 dvalid=0\n");
 }
 
+// An initializer on a variable output port (`output logic x = 1`, ANSI or
+// non-ANSI) is the declaration initializer of the variable the port declares:
+// LRM 23.2.2.2 (Syntax 23-4, footnote 2) forbids it only on a port that is not a
+// variable output port, and 6.8 sets it before any procedure starts. The port
+// connection then carries the value out. Expected values from the LRM; iverilog
+// 13 prints the same (it leaves a net array connected to the array port at x, so
+// the unpacked array is read inside the child).
+TEST_CASE("an output variable port's initializer sets the variable at time zero") {
+    const std::string out = run_capture(R"(
+        module a_logic(output logic [7:0] x = 8'd1);
+            initial $display("inside x=%0d", x);
+        endmodule
+        module a_reg(output reg r = 1'b1);
+        endmodule
+        module a_int(output int i = 7);
+        endmodule
+        module a_list(output reg [31:0] p = 1, q = 2);
+        endmodule
+        module a_arr(output logic [3:0] arr [0:1] = '{4'h3, 4'h5});
+        endmodule
+        module n_reg(x);
+            output reg [7:0] x = 8'd7;
+        endmodule
+        module top;
+            wire [7:0] w1;
+            wire       w2;
+            int        v3;
+            wire [31:0] w4, w5;
+            wire [7:0] w6;
+            logic [3:0] parr [0:1];
+            a_logic u1(w1);
+            a_reg   u2(w2);
+            a_int   u3(v3);
+            a_list  u4(w4, w5);
+            a_arr   u5(parr);
+            n_reg   u6(w6);
+            initial #1 begin
+                $display("w1=%0d w2=%b v3=%0d u2.r=%b", w1, w2, v3, u2.r);
+                $display("w4=%0d w5=%0d u5.arr=%0d,%0d w6=%0d", w4, w5, u5.arr[0], u5.arr[1], w6);
+            end
+        endmodule
+    )");
+    CHECK(out == "inside x=1\n"
+                 "w1=1 w2=1 v3=7 u2.r=1\n"
+                 "w4=1 w5=2 u5.arr=3,5 w6=7\n");
+}
+
 // `always @*` sensitivity includes signals both read and written by the block
 // (LRM 9.4.2.2 excludes only identifiers appearing solely as lvalues), unlike
 // always_comb's written-exclusion (9.2.2.2.1 b, legal there only because of the

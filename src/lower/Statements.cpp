@@ -980,6 +980,18 @@ void Lowerer::emit_default_init(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::So
     b.binary(ir::Inst::Tag::Store, lv, b.constant(dv, l), l);
 }
 
+// The initializer a variable's declaration carries (LRM 6.8). The variable a
+// variable output port declares (`output logic x = 1`, ANSI or non-ANSI, LRM
+// 23.2.2.2) is initialized by that port declaration, and slang keeps the
+// initializer on the port rather than on the variable.
+const Expression* Lowerer::declaration_initializer(const VariableSymbol& vs) const {
+    if (const Expression* init = vs.getInitializer()) {
+        return init;
+    }
+    const auto it = port_initializers_.find(&vs);
+    return it != port_initializers_.end() ? it->second->getInitializer() : nullptr;
+}
+
 // Apply a module-level (static) variable's declaration initializer (LRM 6.8)
 // as a store in the run-once pre-init process. The store services no wait queue
 // (the backend suppresses servicing for a PreInit process), so initialization
@@ -988,7 +1000,7 @@ void Lowerer::emit_default_init(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::So
 // its own, and whose struct type has no field-level defaults either, keeps
 // its power-on default (X / 0), set by the backend's init_state.
 void Lowerer::lower_var_initializer(const VariableSymbol& vs) {
-    const Expression* init = vs.getInitializer();
+    const Expression* init = declaration_initializer(vs);
     if (init == nullptr) {
         if (aggregate_has_field_defaults(vs.getType())) {
             if (!preinit_) {
