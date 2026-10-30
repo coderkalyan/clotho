@@ -2080,8 +2080,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // re-drain. rt_wheel_advance folds the pending-check into the tick — one ABI
     // crossing per timestep, no separate occupancy scan — and returns non-zero
     // iff it fired something (an idle wheel ends the sim). The tick ctx is the
-    // wheel: coroutine-timer trampolines ignore it, but a detached `->> #d e`
-    // on-expiry thunk reads the current time from it (event_delay_thunk).
+    // wheel; the generated on-expiry callbacks do not read it.
     llvm::Value* ticked = b_.CreateCall(wheel_advance_fn(), { wheel, wheel });
     // THE safepoint (docs/design/garbage-collection.md §2, F1). This is the
     // drain loop's quiescent edge: the active ring, the inactive queue, the
