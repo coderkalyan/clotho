@@ -44,9 +44,7 @@ ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
             // (LRM 5.9); as an integral rvalue it is that packed value. slang
             // folds it to an SVInt of the literal's 8*N-bit type; the
             // surrounding conversion resizes it to the assignment context.
-            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-            slang::ast::EvalContext    ectx(actx);
-            const slang::ConstantValue cv = expr.eval(ectx);
+            const slang::ConstantValue cv = fold_const(expr, Fold::Required);
             if (!cv.isInteger()) {
                 fail("non-integral string literal");
             }
@@ -1155,7 +1153,7 @@ ir::Index Lowerer::lower_range_select(const RangeSelectExpression& rs,
             // pre-advance is a flat-storage elem_idx step.
             fail("slice of an unpacked array with aggregate elements is not supported");
         }
-        const std::optional<int32_t> lo = try_const_int(rs.left());
+        const std::optional<int32_t> lo = try_const_int(rs.left(), Fold::Required);
         if (!lo) {
             fail("expected constant unpacked-array slice bounds");
         }
@@ -1177,8 +1175,8 @@ ir::Index Lowerer::lower_range_select(const RangeSelectExpression& rs,
     const uint32_t             w     = pa != nullptr ? static_cast<uint32_t>(pa->elementType.getBitWidth()) : 1;
     const slang::ConstantRange range = packed_range_of(rs.value());
     if (rs.getSelectionKind() == RangeSelectionKind::Simple) {
-        const std::optional<int32_t> left  = try_const_int(rs.left());
-        const std::optional<int32_t> right = try_const_int(rs.right());
+        const std::optional<int32_t> left  = try_const_int(rs.left(), Fold::Required);
+        const std::optional<int32_t> right = try_const_int(rs.right(), Fold::Required);
         if (!left || !right) {
             fail("expected constant part-select bounds");
         }
@@ -1315,8 +1313,8 @@ void Lowerer::emit_indexed_slice_copy(const RangeSelectExpression& rs,
     ir::Ref   idx_ty;
     ir::Index base;
     if (simple) {
-        const std::optional<int32_t> lo = try_const_int(rs.left());
-        const std::optional<int32_t> hi = try_const_int(rs.right());
+        const std::optional<int32_t> lo = try_const_int(rs.left(), Fold::Required);
+        const std::optional<int32_t> hi = try_const_int(rs.right(), Fold::Required);
         if (!lo || !hi) {
             fail("expected constant dynamic-array slice bounds (LRM 7.5.1: `$` and a "
                  "runtime bound there are queue-only)");
@@ -1994,21 +1992,31 @@ ir::Index Lowerer::lower_lvalue(const Expression& expr, ir::Builder& b, bool is_
 // `what` names the construct whose grammar demands the constant, so the
 // refusal reads as a language rule, not a parse error.
 uint64_t Lowerer::const_uint(const Expression& e, std::string_view what) {
-    slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    evalCtx(astCtx);
-    const slang::ConstantValue cv = e.eval(evalCtx);
+    const slang::ConstantValue cv = fold_const(e, Fold::Required);
     if (!cv.isInteger()) {
         fail(std::string(what) + " must be a constant integer expression");
     }
     return cv.integer().as<uint64_t>().value_or(0);
 }
 
+// Fold an expression with slang. See Fold for what each mode allows.
+slang::ConstantValue Lowerer::fold_const(const Expression& e, Fold mode, const slang::ast::ASTContext& astCtx) {
+    if (mode == Fold::Runtime && has_user_call(e)) {
+        return nullptr;
+    }
+    slang::ast::EvalContext evalCtx(astCtx);
+    return e.eval(evalCtx);
+}
+
+slang::ConstantValue Lowerer::fold_const(const Expression& e, Fold mode) {
+    const slang::ast::ASTContext astCtx(*scope_, slang::ast::LookupLocation::max);
+    return fold_const(e, mode, astCtx);
+}
+
 // Constant-fold an integer expression against the current scope; nullopt
 // when it is non-constant (a runtime index) or holds X/Z bits.
-std::optional<int32_t> Lowerer::try_const_int(const Expression& e) {
-    slang::ast::ASTContext     astCtx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    evalCtx(astCtx);
-    const slang::ConstantValue cv = e.eval(evalCtx);
+std::optional<int32_t> Lowerer::try_const_int(const Expression& e, Fold mode) {
+    const slang::ConstantValue cv = fold_const(e, mode);
     if (!cv.isInteger()) {
         return std::nullopt;
     }

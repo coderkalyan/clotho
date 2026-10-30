@@ -10,9 +10,7 @@ namespace clotho::lower {
 // (below), so everything that reaches here must fold, and one that does not is
 // named rather than approximated.
 int64_t Lowerer::cover_const(const Expression& e, const char* what) {
-    slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    ectx(actx);
-    const slang::ConstantValue cv = e.eval(ectx);
+    const slang::ConstantValue cv = fold_const(e, Fold::Required);
     if (!cv.isInteger()) {
         // TODO: a non-constant bin bound or coverage option (LRM 19.5.1's
         // `bins good = {[low:high]}` over covergroup formals). It needs the bin

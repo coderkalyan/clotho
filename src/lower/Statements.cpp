@@ -1518,12 +1518,11 @@ void Lowerer::check_case_pragmas(const CaseStatement& c) {
     // Per value: how many items match it. Saturated at 2 -- the only
     // questions are "none" (not full) and "more than one" (not parallel).
     std::vector<uint8_t>    hits(space, 0);
-    slang::ast::ASTContext  actx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext ectx(actx);
+    const slang::ast::ASTContext actx(*scope_, slang::ast::LookupLocation::max);
 
     for (const CaseStatement::ItemGroup& item : c.items) {
         for (const Expression* e : item.expressions) {
-            const slang::ConstantValue cv = e->eval(ectx);
+            const slang::ConstantValue cv = fold_const(*e, Fold::Runtime, actx);
             if (cv.bad() || !cv.isInteger()) {
                 return; // Not decidable; say nothing.
             }
@@ -2167,8 +2166,7 @@ std::vector<std::vector<char>> Lowerer::case_dedup(const CaseStatement&         
             if (e.kind == ExpressionKind::ValueRange) {
                 continue;
             }
-            slang::ast::EvalContext    ev(astCtx);
-            const slang::ConstantValue cv = e.eval(ev);
+            const slang::ConstantValue cv = fold_const(e, Fold::Runtime, astCtx);
             if (!cv.isInteger()) {
                 continue;
             }
@@ -2269,8 +2267,7 @@ std::optional<Lowerer::SwitchRun> Lowerer::find_switch_run(const CaseStatement& 
             if (keep != nullptr && !(*keep)[i][j]) {
                 continue; // already proven dead by the whole-statement case_dedup.
             }
-            slang::ast::EvalContext    ev(astCtx);
-            const slang::ConstantValue cv = e->eval(ev);
+            const slang::ConstantValue cv = fold_const(*e, Fold::Runtime, astCtx);
             if (!cv.isInteger() || cv.integer().hasUnknown()) {
                 eligible = false;
                 break;
@@ -2279,16 +2276,19 @@ std::optional<Lowerer::SwitchRun> Lowerer::find_switch_run(const CaseStatement& 
             if (v.getBitWidth() < width) {
                 v = v.extend(width, e->type->isSigned());
             }
-            const std::optional<uint64_t> u = v.as<uint64_t>();
-            if (!u) {
-                eligible = false;
-                break;
-            }
+            // The key is the label's `width` bits as the selector's plane holds
+            // them, not its numeric value: SVInt::as would sign-extend a negative
+            // signed label to 64 bits, which the backend truncates to the key
+            // width (2 * width for a 4-state selector), so the label's sign bits
+            // would land in the unknown half of the key and never match.
+            // key_width <= 64 bounds `width` to one word, which SVInt keeps with
+            // its unused high bits clear.
+            const uint64_t key = v.getRawPtr()[0];
             if (keep != nullptr) {
                 // case_dedup already guarantees this key is unique statement-wide.
-                keys.push_back(*u);
-            } else if (local_seen.insert(*u).second) {
-                keys.push_back(*u);
+                keys.push_back(key);
+            } else if (local_seen.insert(key).second) {
+                keys.push_back(key);
             }
         }
         if (!eligible) {
@@ -2344,9 +2344,7 @@ std::optional<Lowerer::OneHotPlan> Lowerer::build_onehot_plan(const CaseStatemen
     }
     // Selector must be exactly the 1-bit constant 1.
     {
-        slang::ast::ASTContext     ctx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ev(ctx);
-        const slang::ConstantValue cv = c.expr.eval(ev);
+        const slang::ConstantValue cv = fold_const(c.expr, Fold::Runtime);
         if (!cv.isInteger() || cv.integer().getBitWidth() != 1 || cv.integer().hasUnknown() ||
             cv.integer().as<uint64_t>().value_or(0) != 1) {
             return std::nullopt;
@@ -2862,10 +2860,10 @@ void Lowerer::lower_return(const ReturnStatement& r, ir::Builder& b) {
         // an aggregate / whole array / dynamic array yields its lvalue (copied
         // out by the backend), else the loaded value.
         if (is_agg_abi_ref(fn_ctx_->ret_type)) {
-            b.unary(ir::Inst::Tag::Ret, ret_var_ref(*fn_ctx_, l, b), l);
+            b.unary(ir::Inst::Tag::Ret, implicit_return_ref(*fn_ctx_, l, b), l);
             return;
         }
-        const ir::Index rv = ret_var_ref(*fn_ctx_, l, b);
+        const ir::Index rv = implicit_return_ref(*fn_ctx_, l, b);
         b.unary(ir::Inst::Tag::Ret, is_handle_ref(fn_ctx_->ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, l), l);
     } else {
         b.ret_void(l);

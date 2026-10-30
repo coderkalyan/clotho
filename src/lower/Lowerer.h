@@ -438,6 +438,37 @@ struct SpeculationScan : ASTVisitor<SpeculationScan, VisitFlags::Expressions> {
 
 bool is_speculation_safe(const slang::ast::Expression& e);
 
+// Whether an expression calls a user subroutine -- a function, a task or a class
+// method, anything but a system function -- anywhere in its tree. The call's
+// callee body is not part of the expression, so it is not walked.
+struct UserCallScan : ASTVisitor<UserCallScan, VisitFlags::Expressions> {
+    bool found = false;
+
+    void handle(const CallExpression& call) {
+        if (!call.isSystemCall()) {
+            found = true;
+            return;
+        }
+        visitDefault(call);
+    }
+};
+
+bool has_user_call(const slang::ast::Expression& e);
+
+// The module instance a scope depends on (its body, or the root for a scope outside
+// every instance and package), or null for a package or `$unit` scope. See Scans.cpp.
+const slang::ast::Scope* enclosing_instance_scope(const slang::ast::Scope* s);
+
+// Whether the implicit return variable of a STATIC function (LRM 13.4.1, 13.4.2)
+// has to be persistent storage. It keeps its value from call to call, but that is
+// only observable if some call can see the value an earlier one left: the body
+// reads it, or returns it, on a path that has not overwritten it first, or the
+// function can be re-entered through its own body, where a nested call's value is
+// what the outer one finds. A function that overwrites it on every path before
+// any read, and cannot re-enter, behaves the same with a fresh cell per call, which
+// costs nothing. Anything the analysis does not model counts as observable.
+bool static_return_needs_storage(const slang::ast::SubroutineSymbol& sub);
+
 // Detects whether an expression reads any symbol in a given set (used to find
 // frame-local / formal-argument references in an event operand).
 struct LocalRefDetector : ASTVisitor<LocalRefDetector, VisitFlags::AllGood> {
@@ -949,6 +980,13 @@ public:
     void finalize_globals();
 
     void init_static_class_props(const Scope& scope);
+
+    // The same for the package / `$unit` generics `top` specializes with a class one
+    // of its modules declares: those belong to the module (is_global_scope), so the
+    // globals pass skips them and this one runs them on the top that owns them.
+    void init_local_class_specializations(const InstanceSymbol& top);
+
+    void init_static_props_of(const std::vector<const ClassType*>& classes);
 
     const ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>& sigmap() const {
         return sigmap_;
@@ -1497,6 +1535,27 @@ private:
 
     ir::Ref make_int_type(uint32_t width, bool is_four, bool is_signed);
 
+    // Whether an expression slang can fold is allowed to be folded, which depends
+    // on what the site does with it.
+    //
+    // Required: the grammar demands a constant expression here (a part-select
+    // bound, a replication count, a bin bound, a `$past` tick count, ...), so
+    // slang has already diagnosed anything else, and a constant function call is
+    // legal in it. LRM 13.4.3: "The execution of a constant function call has no
+    // effect on the initial values of the variables used either at simulation
+    // time or among multiple invocations of a function at elaboration time", so
+    // slang's evaluation, every call on fresh variables, is the right one.
+    //
+    // Runtime: an ordinary run-time expression the lowering tries to specialize
+    // when it happens to fold (a case label, a delay, a selector, a gate input).
+    // A call to a user subroutine in it has to run each time the expression is
+    // evaluated: it may read and write static variables, including its own
+    // implicit return variable (LRM 13.4.2), and write module state. slang's
+    // evaluator gives every call fresh variables and ignores the side effects,
+    // so such an expression is never folded, and the site takes its run-time
+    // path.
+    enum class Fold : uint8_t { Required, Runtime };
+
     // Which operand's signedness picks the fill bits of an integral WIDENING.
     // The LRM gives two different answers and the IR's Resize instruction
     // implements the second one: it extends according to the signedness of its
@@ -1857,9 +1916,12 @@ private:
 
     std::optional<ir::Signal> gate_select_base(const Expression& value);
 
-    std::optional<uint32_t> gate_select_bit(const Expression& value, const Expression& index);
+    std::optional<uint32_t> gate_select_bit(const Expression& value, const Expression& index, Fold mode);
 
-    std::optional<GateTerm> gate_static_term(const Expression& e);
+    // `mode` is how a bit-select index is folded: Required for an output terminal
+    // (a net_lvalue takes a constant_select, LRM A.8.5), Runtime for an input,
+    // which is any expression. A part-select bound is always Required.
+    std::optional<GateTerm> gate_static_term(const Expression& e, Fold mode);
 
     GateInput lower_gate_input(const Expression& e, std::string_view inst_name, uint32_t input_index);
 
@@ -4314,7 +4376,15 @@ private:
 
     uint64_t const_uint(const Expression& e, std::string_view what);
 
-    std::optional<int32_t> try_const_int(const Expression& e);
+    // The one place Clotho asks slang to evaluate an expression. A bad value when
+    // `e` is not constant, or when `mode` forbids folding it. The overload without
+    // a context evaluates against the current scope; a caller folding many
+    // expressions in one scope passes its own.
+    slang::ConstantValue fold_const(const Expression& e, Fold mode);
+
+    slang::ConstantValue fold_const(const Expression& e, Fold mode, const slang::ast::ASTContext& astCtx);
+
+    std::optional<int32_t> try_const_int(const Expression& e, Fold mode = Fold::Runtime);
 
     // -- Packed-select index normalization --
     //
@@ -4359,10 +4429,19 @@ private:
         ankerl::unordered_dense::map<const ValueSymbol*, uint32_t> localmap;
         // Storage type per Local index.
         std::vector<ir::Ref> local_types;
-        // The return variable's Local index / type (valid iff has_ret_local).
-        uint32_t ret_local     = 0;
-        ir::Ref  ret_type      = ir::Ref::Invalid;
-        bool     has_ret_local = false;
+        // The return slot's Local index / type (valid iff has_ret_local): the
+        // frame cell a `return` hands the caller its value through. For an
+        // automatic function it is also the implicit return variable (LRM 13.4.1).
+        // For a static one the implicit variable is ret_static instead and this
+        // cell is only scratch, made on first use (ret_var_ref).
+        uint32_t ret_local       = 0;
+        ir::Ref  ret_type        = ir::Ref::Invalid;
+        bool     has_ret_local   = false;
+        bool     ret_local_ready = false;
+        // The implicit return variable of a STATIC function: persistent
+        // module-signal storage shared by every call (LRM 13.4.2). Unset for an
+        // automatic function.
+        std::optional<ir::Signal> ret_static;
         // Name qualifier (e.g. "f.") prepended to a static local's signal name so
         // same-named statics in different functions stay distinct.
         std::string name_prefix;
@@ -4546,6 +4625,8 @@ private:
 
     ir::Signal declare_static_local(const ValueSymbol& vs);
 
+    ir::Signal declare_static_return(const SubroutineSymbol& sub);
+
     ir::Signal declare_static_prop(const slang::ast::ClassPropertySymbol& prop);
 
     bool is_static_local(const VariableSymbol& vs, bool force_frame) const;
@@ -4562,6 +4643,8 @@ private:
 
     static bool is_global_subroutine(const SubroutineSymbol& sub);
 
+    static bool is_global_scope(const Scope* scope);
+
     static std::optional<ir::DpiCType> dpi_ctype(const slang::ast::Type& type);
 
     void build_dpi_import(const SubroutineSymbol& sub, ir::FunctionId id);
@@ -4572,6 +4655,8 @@ private:
                                   std::vector<ir::ArgDir>&            arg_dirs,
                                   std::vector<ir::DpiCType>&          arg_cts,
                                   std::vector<ir::DpiCType>&          arg_elem_cts);
+
+    static const InstanceSymbol* owning_top(const Scope* scope);
 
     static const InstanceSymbol* owning_top(const SubroutineSymbol& sub);
 
@@ -4662,7 +4747,12 @@ private:
                                        bool                               fd_arg,
                                        bool                               monitor);
 
+    // The frame cell a `return expr` stages an aggregate in and hands the caller.
     ir::Index ret_var_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b);
+
+    // The function's implicit return variable (LRM 13.4.1): what a bare `return;`
+    // and the end of the body hand the caller.
+    ir::Index implicit_return_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b);
 
     void build_function(const SubroutineSymbol& sub, ir::FunctionId id);
 

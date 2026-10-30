@@ -1621,9 +1621,7 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_event(const Assign
         // arming instant, while an unsigned variable holding -3 waits.
         const ir::Ref cty =
           rec.expr.type->isFloating() ? make_int_type(64, false, true) : lower_type(*rec.expr.type);
-        slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
-        slang::ast::EvalContext    ev(ectx);
-        const slang::ConstantValue cv = rec.expr.eval(ev);
+        const slang::ConstantValue cv = fold_const(rec.expr, Fold::Runtime);
         std::optional<bool>        folded;
         if (cv.isInteger() && !cv.integer().hasUnknown()) {
             folded = rec.expr.type->isSigned() ? cv.integer().as<int64_t>().value_or(1) <= 0
@@ -1721,9 +1719,7 @@ std::optional<Lowerer::IntraNbTiming> Lowerer::lower_intra_nb_timing(const Assig
 Lowerer::IntraNbTiming Lowerer::lower_intra_nb_delay(const Expression& delay_expr, ir::Builder& b) {
     IntraNbTiming t;
     t.delay = scaled_delay(delay_expr, b);
-    slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    ev(ectx);
-    const slang::ConstantValue cv = delay_expr.eval(ev);
+    const slang::ConstantValue cv = fold_const(delay_expr, Fold::Runtime);
     const bool                 nonzero_const =
       cv.isInteger() && !cv.integer().hasUnknown() && cv.integer().as<uint64_t>().value_or(0) != 0;
     if (!nonzero_const) {
@@ -1742,9 +1738,7 @@ Lowerer::IntraNbTiming Lowerer::lower_intra_nb_delay(const Expression& delay_exp
 // instead of splitting the signal across block-commit and the deferred record
 // path, whose commit order is fixed rather than execution order.
 bool Lowerer::intra_nb_delay_is_const_zero(const Expression& delay_expr) {
-    slang::ast::ASTContext     ectx(*scope_, slang::ast::LookupLocation::max);
-    slang::ast::EvalContext    ev(ectx);
-    const slang::ConstantValue cv = delay_expr.eval(ev);
+    const slang::ConstantValue cv = fold_const(delay_expr, Fold::Runtime);
     if (!cv.isInteger()) {
         return false;
     }

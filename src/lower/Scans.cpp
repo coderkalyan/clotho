@@ -910,6 +910,332 @@ bool is_speculation_safe(const slang::ast::Expression& e) {
     return !s.unsafe;
 }
 
+bool has_user_call(const slang::ast::Expression& e) {
+    UserCallScan s;
+    e.visit(s);
+    return s.found;
+}
+
+// The module instance a scope depends on, or null when it depends on none: a
+// package or `$unit` scope. A class specialization depends on every type it is
+// specialized with, so a `$unit` generic named with a module's own class
+// (`Factory#(Packet)`) belongs to that module, not to the package scope it is
+// declared in, and so does a class nested in one. Returns the instance's body, or
+// the root for a scope outside every instance and package.
+const Scope* enclosing_instance_scope(const Scope* s);
+
+// The same for a type: the instance body of the first type it is built from that
+// a module declares (a class, an enum, a struct, a union, through any array or
+// queue of them), else null. Packed integer types depend on no instance: a
+// `logic [W-1:0]` is the same type wherever the same width comes from.
+static const Scope* instance_scope_of_type(const slang::ast::Type& t) {
+    const slang::ast::Type& ct = t.getCanonicalType();
+    if (const auto* cls = ct.as_if<ClassType>()) {
+        return enclosing_instance_scope(cls);
+    }
+    if (ct.isEnum() || ct.isStruct() || ct.isUnion()) {
+        return enclosing_instance_scope(ct.getParentScope());
+    }
+    if (const auto* aa = ct.as_if<slang::ast::AssociativeArrayType>()) {
+        if (const Scope* s = instance_scope_of_type(*aa->indexType)) {
+            return s;
+        }
+    }
+    if (ct.isUnpackedArray() || ct.isPackedArray()) {
+        return instance_scope_of_type(*ct.getArrayElementType());
+    }
+    return nullptr;
+}
+
+const Scope* enclosing_instance_scope(const Scope* s) {
+    while (s != nullptr) {
+        const Symbol& sym = s->asSymbol();
+        switch (sym.kind) {
+            case SymbolKind::Package:
+            case SymbolKind::CompilationUnit:
+                return nullptr;
+            case SymbolKind::InstanceBody:
+            case SymbolKind::Root:
+                return s;
+            case SymbolKind::ClassType:
+                if (sym.as<ClassType>().genericClass != nullptr) {
+                    for (const auto& tp : sym.as<ClassType>().membersOfType<TypeParameterSymbol>()) {
+                        if (const Scope* local = instance_scope_of_type(tp.targetType.getType())) {
+                            return local;
+                        }
+                    }
+                }
+                s = sym.getParentScope();
+                break;
+            default:
+                s = sym.getParentScope();
+                break;
+        }
+    }
+    return nullptr;
+}
+
+namespace {
+
+// Whether an expression names the variable other than as the whole target of a
+// plain assignment. A compound assignment, a select or member of it, and an
+// increment all read it first, so they count.
+struct VarMention : ASTVisitor<VarMention, VisitFlags::Expressions> {
+    const ValueSymbol& var;
+    bool               found = false;
+
+    explicit VarMention(const ValueSymbol& v)
+      : var(v) {}
+
+    static bool is_whole(const ValueSymbol& var, const Expression& e) {
+        return e.kind == ExpressionKind::NamedValue && &e.as<NamedValueExpression>().symbol == &var;
+    }
+
+    void handle(const NamedValueExpression& nv) {
+        if (&nv.symbol == &var) {
+            found = true;
+        }
+    }
+
+    void handle(const AssignmentExpression& a) {
+        a.right().visit(*this);
+        if (a.isCompound() || !is_whole(var, a.left())) {
+            a.left().visit(*this);
+        }
+    }
+};
+
+// Flow analysis of one function body for its implicit return variable: whether
+// the value the variable holds on entry can be observed. `written` is true when
+// every path reaching a statement has overwritten the whole variable, and each
+// visit returns the same for the paths that leave the statement by falling off
+// its end. A path that does not fall through (`return`, `break`) carries no value
+// to what follows, so it counts as written. A loop body may run zero times, so
+// nothing it writes counts afterwards. A pattern, a nested assignment, a fork and
+// every statement kind not modeled count as observed: wrongly persisting only
+// costs time, wrongly resetting changes the result.
+struct EntryValueFlow {
+    const ValueSymbol& var;
+    bool               observed = false;
+
+    explicit EntryValueFlow(const ValueSymbol& v)
+      : var(v) {}
+
+    void reads(const Expression& e, bool written) {
+        if (written || observed) {
+            return;
+        }
+        VarMention m(var);
+        e.visit(m);
+        observed = m.found;
+    }
+
+    bool expr_stmt(const Expression& e, bool written) {
+        if (e.kind != ExpressionKind::Assignment) {
+            reads(e, written);
+            return written;
+        }
+        const auto& a = e.as<AssignmentExpression>();
+        reads(a.right(), written);
+        if (!a.isCompound() && VarMention::is_whole(var, a.left())) {
+            return true;
+        }
+        reads(a.left(), written);
+        return written;
+    }
+
+    bool stmt(const Statement& s, bool written) {
+        switch (s.kind) {
+            case StatementKind::Empty:
+                return written;
+            case StatementKind::List:
+                for (const Statement* c : s.as<StatementList>().list) {
+                    written = stmt(*c, written);
+                }
+                return written;
+            case StatementKind::Block:
+                // A fork's branches run concurrently, so no order of writes and reads is known.
+                if (s.as<BlockStatement>().blockKind != StatementBlockKind::Sequential) {
+                    observed = true;
+                    return true;
+                }
+                return stmt(s.as<BlockStatement>().body, written);
+            case StatementKind::VariableDeclaration:
+                if (const Expression* init = s.as<VariableDeclStatement>().symbol.getInitializer()) {
+                    reads(*init, written);
+                }
+                return written;
+            case StatementKind::ExpressionStatement:
+                return expr_stmt(s.as<ExpressionStatement>().expr, written);
+            case StatementKind::Return: {
+                const Expression* value = s.as<ReturnStatement>().expr;
+                if (value != nullptr) {
+                    // LRM 13.4.1: the returned expression overrides the variable.
+                    reads(*value, written);
+                } else if (!written) {
+                    observed = true; // `return;` hands the caller the variable.
+                }
+                return true;
+            }
+            case StatementKind::Continue:
+            case StatementKind::Break:
+                return true;
+            case StatementKind::Conditional: {
+                const auto& c = s.as<ConditionalStatement>();
+                for (const auto& cond : c.conditions) {
+                    reads(*cond.expr, written);
+                    observed = observed || cond.pattern != nullptr;
+                }
+                const bool t = stmt(c.ifTrue, written);
+                const bool f = c.ifFalse != nullptr ? stmt(*c.ifFalse, written) : written;
+                return t && f;
+            }
+            case StatementKind::Case: {
+                const auto& c = s.as<CaseStatement>();
+                reads(c.expr, written);
+                bool all = true;
+                for (const auto& item : c.items) {
+                    for (const Expression* label : item.expressions) {
+                        reads(*label, written);
+                    }
+                    all = stmt(*item.stmt, written) && all;
+                }
+                // No item taken: the default, or nothing at all.
+                const bool rest = c.defaultCase != nullptr ? stmt(*c.defaultCase, written) : written;
+                return all && rest;
+            }
+            case StatementKind::ForLoop: {
+                const auto& f = s.as<ForLoopStatement>();
+                for (const Expression* init : f.initializers) {
+                    written = expr_stmt(*init, written);
+                }
+                for (const VariableSymbol* v : f.loopVars) {
+                    if (const Expression* init = v->getInitializer()) {
+                        reads(*init, written);
+                    }
+                }
+                if (f.stopExpr != nullptr) {
+                    reads(*f.stopExpr, written);
+                }
+                stmt(f.body, written);
+                for (const Expression* step : f.steps) {
+                    reads(*step, written);
+                }
+                return written;
+            }
+            case StatementKind::RepeatLoop:
+                reads(s.as<RepeatLoopStatement>().count, written);
+                stmt(s.as<RepeatLoopStatement>().body, written);
+                return written;
+            case StatementKind::ForeachLoop:
+                reads(s.as<ForeachLoopStatement>().arrayRef, written);
+                stmt(s.as<ForeachLoopStatement>().body, written);
+                return written;
+            case StatementKind::WhileLoop:
+                reads(s.as<WhileLoopStatement>().cond, written);
+                stmt(s.as<WhileLoopStatement>().body, written);
+                return written;
+            case StatementKind::DoWhileLoop: {
+                const bool after = stmt(s.as<DoWhileLoopStatement>().body, written);
+                reads(s.as<DoWhileLoopStatement>().cond, after);
+                return after;
+            }
+            case StatementKind::ForeverLoop:
+                stmt(s.as<ForeverLoopStatement>().body, written);
+                return written;
+            case StatementKind::ImmediateAssertion: {
+                const auto& a = s.as<ImmediateAssertionStatement>();
+                reads(a.cond, written);
+                const bool t = a.ifTrue != nullptr ? stmt(*a.ifTrue, written) : written;
+                const bool f = a.ifFalse != nullptr ? stmt(*a.ifFalse, written) : written;
+                return t && f;
+            }
+            case StatementKind::Invalid:
+            case StatementKind::Disable:
+            case StatementKind::PatternCase:
+            case StatementKind::Timed:
+            case StatementKind::ConcurrentAssertion:
+            case StatementKind::DisableFork:
+            case StatementKind::Wait:
+            case StatementKind::WaitFork:
+            case StatementKind::WaitOrder:
+            case StatementKind::EventTrigger:
+            case StatementKind::ProceduralAssign:
+            case StatementKind::ProceduralDeassign:
+            case StatementKind::RandCase:
+            case StatementKind::RandSequence:
+            case StatementKind::ProceduralChecker:
+                observed = true;
+                return true;
+        }
+        observed = true;
+        return true;
+    }
+};
+
+// Every user subroutine a body calls directly, and whether it also does something
+// that can run code the call graph does not show: a virtual or imported call, or a
+// randomize() that runs the class's pre/post hooks.
+struct CalleeScan : ASTVisitor<CalleeScan, VisitFlags::AllGood> {
+    std::vector<const SubroutineSymbol*> callees;
+    bool                                 opaque = false;
+
+    void handle(const CallExpression& call) {
+        if (call.isSystemCall()) {
+            opaque = opaque || call.getSubroutineName() == "randomize";
+        } else {
+            const SubroutineSymbol& callee = *std::get<0>(call.subroutine);
+            constexpr auto hidden = MethodFlags::Virtual | MethodFlags::Pure | MethodFlags::DPIImport |
+                                    MethodFlags::BuiltIn | MethodFlags::InterfaceExtern | MethodFlags::ModportImport;
+            opaque                = opaque || callee.flags.has(hidden);
+            callees.push_back(&callee);
+        }
+        visitDefault(call);
+    }
+};
+
+// Whether `sub` can be executing again, through its own body, while a call to it
+// is still running. A search of the call graph below `sub`, bounded: past the
+// bound, or on anything opaque, the answer is yes.
+bool function_may_reenter(const SubroutineSymbol& sub) {
+    constexpr size_t                            limit = 256;
+    std::vector<const SubroutineSymbol*>        work{ &sub };
+    ankerl::unordered_dense::set<const Symbol*> seen;
+    seen.insert(&sub);
+    while (!work.empty()) {
+        const SubroutineSymbol* s = work.back();
+        work.pop_back();
+        CalleeScan scan;
+        s->getBody().visit(scan);
+        if (scan.opaque) {
+            return true;
+        }
+        for (const SubroutineSymbol* callee : scan.callees) {
+            if (callee == &sub) {
+                return true;
+            }
+            if (seen.insert(callee).second) {
+                if (seen.size() > limit) {
+                    return true;
+                }
+                work.push_back(callee);
+            }
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+bool static_return_needs_storage(const SubroutineSymbol& sub) {
+    EntryValueFlow flow(*sub.returnValVar);
+    const bool     written_at_end = flow.stmt(sub.getBody(), false);
+    if (flow.observed || !written_at_end) {
+        return true;
+    }
+    return function_may_reenter(sub);
+}
+
 void LocalRefDetector::check(const slang::ast::ValueSymbol& sym) {
     if (locals->contains(&sym)) {
         found = true;

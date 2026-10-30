@@ -109,9 +109,7 @@ void Lowerer::lower_call(const CallExpression& call, ir::Builder& b) {
         // level >= 1.
         uint32_t level = 1;
         if (!call.arguments().empty()) {
-            slang::ast::ASTContext     actx(*scope_, slang::ast::LookupLocation::max);
-            slang::ast::EvalContext    ectx(actx);
-            const slang::ConstantValue cv = call.arguments()[0]->eval(ectx);
+            const slang::ConstantValue cv = fold_const(*call.arguments()[0], Fold::Required);
             if (cv.isInteger()) {
                 level = cv.integer().as<uint32_t>().value_or(1);
             }
@@ -561,25 +559,19 @@ std::vector<const ValueSymbol*> Lowerer::body_automatics(const SubroutineSymbol&
     return std::move(sc.out);
 }
 
-// True for a subroutine declared directly in a package or `$unit` scope
-// (LRM 6.8's "no instance multiplicity" applies to these exactly as it
-// does to a variable): walks up from the subroutine's declaring scope,
-// stopping at the first Package/CompilationUnit (global) or InstanceBody
-// (module-scope, possibly through an intervening generate block).
+// True for a scope that depends on no module instance: inside a package or
+// `$unit`, so it has no instance multiplicity (LRM 8.9, 6.21: one static property,
+// one set of function statics). A class declared in a module is not, and neither
+// is a `$unit` or package generic specialized with one (enclosing_instance_scope).
+bool Lowerer::is_global_scope(const Scope* s) {
+    return s != nullptr && enclosing_instance_scope(s) == nullptr;
+}
+
+// True for a subroutine declared directly in a package or `$unit` scope, or in a
+// class declared there that is not specialized with a module's own type: its
+// static storage has no instance multiplicity (LRM 8.9, 6.21), as for a variable.
 bool Lowerer::is_global_subroutine(const SubroutineSymbol& sub) {
-    const Scope* s = sub.getParentScope();
-    while (s != nullptr) {
-        switch (s->asSymbol().kind) {
-            case SymbolKind::Package:
-            case SymbolKind::CompilationUnit:
-                return true;
-            case SymbolKind::InstanceBody:
-                return false;
-            default:
-                s = s->asSymbol().getParentScope();
-        }
-    }
-    return false;
+    return is_global_scope(sub.getParentScope());
 }
 
 // Resolve a subroutine (function or task) to a FunctionId, lowering its body
@@ -795,14 +787,13 @@ void Lowerer::build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa,
     arg_elem_cts.push_back(*ec);
 }
 
-// The root (top-level) instance whose hierarchy ultimately contains `sub`, or
-// null when the subroutine sits in no elaborated instance. A module's members
-// hang off an InstanceBodySymbol whose own parent scope is the *declaration*
-// site, so climbing a level steps across the body/InstanceSymbol pair through
+// The root (top-level) instance whose hierarchy ultimately contains `scope`, or
+// null when it sits in no elaborated instance. A module's members hang off an
+// InstanceBodySymbol whose own parent scope is the *declaration* site, so
+// climbing a level steps across the body/InstanceSymbol pair through
 // parentInstance — the same walk control_depth uses.
-const InstanceSymbol* Lowerer::owning_top(const SubroutineSymbol& sub) {
-    const InstanceSymbol* top   = nullptr;
-    const Scope*          scope = sub.getParentScope();
+const InstanceSymbol* Lowerer::owning_top(const Scope* scope) {
+    const InstanceSymbol* top = nullptr;
     while (scope != nullptr) {
         const Symbol& sym = scope->asSymbol();
         if (sym.kind != SymbolKind::InstanceBody) {
@@ -817,6 +808,10 @@ const InstanceSymbol* Lowerer::owning_top(const SubroutineSymbol& sub) {
         scope = parent->getParentScope();
     }
     return top;
+}
+
+const InstanceSymbol* Lowerer::owning_top(const SubroutineSymbol& sub) {
+    return owning_top(sub.getParentScope());
 }
 
 void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp,
@@ -1468,9 +1463,69 @@ ir::FunctionId Lowerer::build_deferred_body(std::span<const Expression* const> a
     return id;
 }
 
-// The return variable's lvalue: the per-call frame Local (fresh each call).
+// The frame cell a `return` hands the caller its value through. For an
+// automatic function that cell is the implicit return variable and exists from
+// entry. For a static one the implicit variable is the persistent signal and
+// this cell only stages an aggregate `return expr` that has no storage of its
+// own (agg_return_operand), so it is made when first asked for and a function
+// that never stages pays nothing for it.
 ir::Index Lowerer::ret_var_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b) {
+    if (!ctx.ret_local_ready) {
+        ctx.ret_local       = anon_local(ctx.ret_type);
+        ctx.ret_local_ready = true;
+    }
     return b.local(ctx.ret_local, ctx.ret_type, l);
+}
+
+ir::Index Lowerer::implicit_return_ref(FnCtx& ctx, ir::SourceLoc l, ir::Builder& b) {
+    return ctx.ret_static ? b.signal(*ctx.ret_static, l) : ret_var_ref(ctx, l, b);
+}
+
+// The implicit return variable of a static function (LRM 13.4.1, 13.4.2).
+//
+// NOTE: "The function definition shall implicitly declare a variable, internal
+// to the function, with the same name as the function" (13.4.1), and "Functions
+// defined within a module, interface, program, or package default to being
+// static, with all declared items being statically allocated. These items shall
+// be shared across all uses of the function executing concurrently" (13.4.2).
+// A static variable "exist[s] for the whole simulation" (6.21) and "shall store a
+// value from one assignment to the next" (6.8); only an automatic variable is
+// "initialized on each entry to the call" (6.21). So the implicit variable of a
+// static function starts at its type's default and keeps its value from call
+// to call: `function int g(int x); g = g + x; endfunction` returns 5 and then 10
+// for two calls with 5. A class method is always automatic (8.6), so its
+// implicit variable is too and is fresh on every call.
+//
+// The LRM never says that `return expr;` writes the implicit variable, only that
+// it "shall override any value assigned to the function name" (13.4.1), so it
+// does not: it hands `expr` to the caller and leaves the variable alone. The
+// variable is what a bare `return;` and the end of the body return. This
+// differs from iverilog and Verilator, which reset the variable on every call.
+//
+// The variable only needs storage that outlives the call when some call can see
+// what an earlier one left (static_return_needs_storage): a function that
+// overwrites it on every path before it reads it, and cannot re-enter itself, is
+// indistinguishable with a fresh cell per call, and that cell is free where a
+// design-state signal costs a store and a load per call (3.5% more instructions
+// on a write-only 2-state function called 16 times per cycle).
+//
+// It is compiler-generated, so it carries no source location: a whole-design
+// $dumpvars neither refuses it for an unrepresentable type (a queue) nor is
+// it asked to explain it.
+ir::Signal Lowerer::declare_static_return(const SubroutineSymbol& sub) {
+    const ValueSymbol& rv = *sub.returnValVar;
+    const auto         it = sigmap_.find(&rv);
+    if (it != sigmap_.end()) {
+        return it->second;
+    }
+    ir::SignalInfo info;
+    info.name            = prefix_ + fn_ctx_->name_prefix + std::string(rv.name);
+    info.type            = lower_type(rv.getType());
+    info.dir             = ir::SignalInfo::Direction::Internal;
+    const ir::Signal sig = register_signal(std::move(info));
+    sigmap_[&rv]         = sig;
+
+    return sig;
 }
 
 // Lower one function body into the reserved slot. (Ir has no default ctor and
@@ -1524,14 +1579,12 @@ void Lowerer::build_function(const SubroutineSymbol& sub, ir::FunctionId id) {
     if (!is_void) {
         ctx.has_ret_local = true;
         ctx.ret_type      = return_type;
-        // The implicit return variable is fresh per call even for a static
-        // (non-automatic) function: an unassigned return path yields X (LRM
-        // 13.4.2 makes a static function's *named* locals persist, but iverilog
-        // resets the function-name return variable each call -- a scalar
-        // returns X, a handle returns an empty container). A frame Local gets
-        // exactly that (init_frame X-fills scalars / empties handles per call);
-        // persisting it would leak the prior call's value on the unwritten path.
-        ctx.ret_local = fn_local(*sub.returnValVar);
+        if (sub.defaultLifetime == slang::ast::VariableLifetime::Static && static_return_needs_storage(sub)) {
+            ctx.ret_static = declare_static_return(sub);
+        } else {
+            ctx.ret_local       = fn_local(*sub.returnValVar);
+            ctx.ret_local_ready = true;
+        }
     }
 
     const ir::Builder::Mark body_mark = b.mark();
@@ -1568,13 +1621,13 @@ void Lowerer::build_function(const SubroutineSymbol& sub, ir::FunctionId id) {
     if (is_void) {
         b.ret_void(el);
     } else if (is_agg_abi_type(sub.returnValVar->getType())) {
-        b.unary(ir::Inst::Tag::Ret, ret_var_ref(ctx, el, b), el);
+        b.unary(ir::Inst::Tag::Ret, implicit_return_ref(ctx, el, b), el);
     } else {
         // A dynamic-array/queue/assoc result is returned as its handle lvalue
         // (the backend deep-copies it out); mirrors the explicit-`return;` path
         // in lower_return. Without this a queue return lowers to Ret(Load(handle)),
         // an uninitialized-lvalue read that SIGSEGVs in emit_handle_assign.
-        const ir::Index rv = ret_var_ref(ctx, el, b);
+        const ir::Index rv = implicit_return_ref(ctx, el, b);
         b.unary(ir::Inst::Tag::Ret, is_handle_ref(ctx.ret_type) ? rv : b.unary(ir::Inst::Tag::Load, rv, el), el);
     }
 

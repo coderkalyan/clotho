@@ -533,7 +533,7 @@ ir::Index Lowerer::lower_sampled_value(std::string_view      name,
             gate = args[2];
         }
         if (args.size() > 1 && args[1]->kind != ExpressionKind::EmptyArgument) {
-            const std::optional<int32_t> n = try_const_int(*args[1]);
+            const std::optional<int32_t> n = try_const_int(*args[1], Fold::Required);
             if (!n.has_value() || *n < 1) {
                 // The ring is sized at compile time, so the tick count has to
                 // be one too. slang diagnoses a constant below 1 on its own;
