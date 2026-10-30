@@ -1443,6 +1443,59 @@ TEST_CASE("timescale scales delays into the global precision and $time back to t
     CHECK(out == "top 4000\nsub 5\n");
 }
 
+// LRM 9.4.1: a delay that "evaluates to a negative value ... shall be interpreted
+// as a two's-complement unsigned integer of the same size as a time variable", so
+// `int d = -1` is 2**64 - 1, not 2**32 - 1: a signed amount narrower than 64 bits
+// sign-extends. Each negative amount below used to be zero-extended and fired at
+// its own width's maximum (4294967295, 65535, 255, 15), before the 2**32 finish;
+// now none fires before it. An unsigned 32-bit all-ones amount is not negative and
+// still fires at 4294967295. Oracle: iverilog 13 (`int d = -1; #(d)` fires at
+// 18446744073709551615); the run ends at 2**32 so the test does not depend on
+// what an event at the end of time does.
+TEST_CASE("a negative delay narrower than 64 bits sign-extends instead of firing early") {
+    const std::string out = run_capture(R"(
+        module m;
+          int i;
+          shortint si;
+          byte by;
+          integer ig;
+          logic signed [3:0] l4;
+          bit [31:0] u;
+          initial begin i = -1;   #(i)     $display("FAIL: int fired at %0d", $time); end
+          initial begin si = -1;  #(si)    $display("FAIL: shortint fired at %0d", $time); end
+          initial begin by = -1;  #(by)    $display("FAIL: byte fired at %0d", $time); end
+          initial begin ig = -1;  #(ig)    $display("FAIL: integer fired at %0d", $time); end
+          initial begin l4 = -1;  #(l4)    $display("FAIL: logic signed [3:0] fired at %0d", $time); end
+          initial begin i = -2;   #(i + 1) $display("FAIL: int expression fired at %0d", $time); end
+          initial begin           #(-1)    $display("FAIL: literal fired at %0d", $time); end
+          initial begin u = 32'hFFFF_FFFF; #(u) $display("u32 at %0d", $time); end
+          initial begin #(64'd4294967296) $display("t=2**32"); $finish; end
+        endmodule
+    )");
+    CHECK(out == "u32 at 4294967295\nt=2**32\n");
+}
+
+// The same through the unit multiplier: the amount is widened before it is
+// multiplied by the module's ticks per unit, so the extension must already be right
+// there. A real delay in the module drops the design tick to its 1ps precision (an
+// integer-only design counts in its unit), so each ns is 1000 ticks; the unsigned
+// amount fires at 4294967295 ns.
+TEST_CASE("a negative delay sign-extends before the time unit multiplier") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+          int i;
+          byte by;
+          bit [31:0] u;
+          initial #0.001 ;
+          initial begin i = -1;  #(i)  $display("FAIL: int fired at %0d", $time); end
+          initial begin by = -1; #(by) $display("FAIL: byte fired at %0d", $time); end
+          initial begin u = 32'hFFFF_FFFF; #(u) $display("u32 at %0d", $time); end
+          initial begin #(64'd4294967296) $display("t=2**32"); $finish; end
+        endmodule
+    )");
+    CHECK(out == "u32 at 4294967295\nt=2**32\n");
+}
+
 TEST_CASE("$time rounds the scaled clock to the nearest module time unit") {
     // Global precision is 1ns. fine's #15 lands the wheel on tick 15; top's unit
     // is 10ns, so $time = round(15 / 10) = 2 (1.5 rounds up, LRM §20.3.1).
@@ -4568,3 +4621,95 @@ TEST_CASE("an emitted object defines clotho_main and clotho_design and no other 
     std::ranges::sort(c_names);
     CHECK(c_names == std::vector<std::string>{ "clotho_design", "clotho_main" });
 }
+// A delay that would land past the end of time (2**64 - 1 ticks) is not wrapped
+// into the past: at time 5 the wheel used to compute 5 + (2**64 - 1) = 4 and fire
+// the event there (here it was hashed into a slot and fired at 1028, the next time
+// the wheel came round to that slot). It saturates to the last instant instead and
+// fires there, after everything else. A deadline of exactly the last instant fired
+// nowhere: the clock jumped to it and the timer stayed in the overflow heap. A
+// further delay from the last instant has no later time to go to, so it never fires.
+// Oracle: none for the saturating cases, since the LRM does not say what a time past
+// the end means (iverilog wraps and fires at 4); iverilog 13 fires the exact one at
+// 18446744073709551615.
+TEST_CASE("a delay past the end of time saturates to the last instant instead of wrapping") {
+    const std::string out = run_capture(R"(
+        module m;
+          initial begin
+            #5;
+            #(64'hFFFF_FFFF_FFFF_FFFF) $display("saturated at %0d", $time);
+            #1 $display("FAIL: a delay past the last instant fired at %0d", $time);
+          end
+          initial #10 $display("t=10");
+          initial begin
+            #6;
+            #(64'hFFFF_FFFF_FFFF_FFFF - 6) $display("exact at %0d", $time);
+          end
+        endmodule
+    )");
+    // The two events at the last instant run in the same time step, in no order
+    // the LRM defines, so the output is compared as a set of lines.
+    CHECK((out == "t=10\nsaturated at 18446744073709551615\nexact at 18446744073709551615\n" ||
+           out == "t=10\nexact at 18446744073709551615\nsaturated at 18446744073709551615\n"));
+}
+
+// The delays that arm the wheel from generated code rather than through a process
+// body's #delay: a nonblocking intra-assignment, an inertial continuous assignment
+// and a delayed event trigger each computed `now + delay` inline and wrapped too.
+TEST_CASE("intra-assignment and continuous-assignment and event delays saturate too") {
+    const std::string out = run_capture(R"(
+        module m;
+          logic [7:0] q = 8'h00;
+          logic [7:0] a = 8'h00;
+          wire  [7:0] w;
+          event e;
+          localparam longint unsigned BIG = 64'hFFFF_FFFF_FFFF_FFFF;
+          assign #BIG w = a;
+          initial begin
+            #5;
+            q <= #(64'hFFFF_FFFF_FFFF_FFFF) 8'h55;
+            a = 8'h77;
+            ->> #(64'hFFFF_FFFF_FFFF_FFFF) e;
+          end
+          initial @(e) $display("e at %0d", $time);
+          initial #10 $display("t=10 q=%h w=%h", q, w);
+          final $display("final at %0d q=%h w=%h", $time, q, w);
+        endmodule
+    )");
+    CHECK(out == "t=10 q=00 w=xx\ne at 18446744073709551615\nfinal at 18446744073709551615 q=55 w=77\n");
+}
+
+// An integral delay times the module's time unit saturates instead of wrapping,
+// like a real delay's: in a 1ns/1ps module (with a real delay, so the tick is 1ps)
+// `2**61 + 1` ns is (2**61 + 1) * 1000 ps, whose low 64 bits are 1000, so it fired
+// at 1 ns. A negative amount is 2**64 - 1 ns. Neither may fire before the finish at
+// 5 ns.
+TEST_CASE("an integral delay saturates through the time unit multiplier instead of wrapping early") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+          longint unsigned d;
+          int i;
+          initial #0.001 ;
+          initial begin d = 64'h2000_0000_0000_0001; #(d) $display("FAIL: wrapped delay fired at %0t", $time); end
+          initial begin i = -1; #(i) $display("FAIL: negative delay fired at %0t", $time); end
+          initial begin #5 $display("t=5"); $finish; end
+        endmodule
+    )");
+    CHECK(out == "t=5\n");
+}
+
+// `--stop-time` ends the run at the stop tick even when the only timer left is at
+// the last instant. next_tick reports that as `never`, which is also what an idle
+// wheel reports, so the stop check used to take it for an idle wheel and ran the
+// event at 2**64 - 1 instead of stopping.
+TEST_CASE("--stop-time stops before a timer at the last instant") {
+    ir::SimulationConfig config;
+    config.stop_time_fs = 100'000'000; // 100 ns, 100 ticks of the 1ns design
+    const std::string out = run_capture(R"(`timescale 1ns/1ns
+        module m;
+          initial #(64'hFFFF_FFFF_FFFF_FFFF) $display("FAIL: ran past the stop time at %0d", $time);
+          final $display("final at %0d", $time);
+        endmodule
+    )", config);
+    CHECK(out == "final at 100\n");
+}
+

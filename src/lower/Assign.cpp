@@ -1390,11 +1390,13 @@ ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builde
         // sub-tick fraction is lost, which the tick-based %t renderer
         // cannot represent anyway. A time beyond what 64-bit ticks hold
         // prints as the largest one, not as its low 64 bits (saturating_ticks).
-        ir::Index scaled = v;
+        // A shortreal operand widens exactly first (LRM 6.12.2): the multiply and
+        // saturating_ticks' range test are against `real` constants.
+        ir::Index scaled = coerce(v, *arg.type, module_.pool.real_type, b, l);
         if (time_mul_ > 1) {
             const ir::Index mul =
               b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(time_mul_)), l);
-            scaled = b.binary(ir::Inst::Tag::FMul, v, mul, l);
+            scaled = b.binary(ir::Inst::Tag::FMul, scaled, mul, l);
         }
         return saturating_ticks(scaled, 1, b, l);
     }

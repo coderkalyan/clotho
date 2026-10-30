@@ -129,7 +129,8 @@ when a per-signal freelist must grow:
 
 - **freelist → scheduled** (at `t`, statement execution): pull a free record for
   the target signal's dense `idx`, fill the captured value planes + the resolved
-  live destination pointer, then `rt_wheel_schedule(&rec->timer, t+d, rt_intra_cb)`.
+  live destination pointer, then `rt_wheel_schedule_rel(&rec->timer, d, rt_intra_cb)` (the runtime adds
+  `d` to `t`, saturating at the last instant).
   The `rt_timer` node is embedded in the record, so arming is a link, not an
   allocation.
 - **scheduled → ready** (at `t+d`, `rt_wheel_advance` fires): `rt_intra_cb`

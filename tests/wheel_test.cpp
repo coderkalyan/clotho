@@ -113,6 +113,31 @@ TEST_CASE("an empty wheel jumps straight to the earliest overflow deadline") {
     CHECK(c.order[0] == 7);
 }
 
+// The last instant is a time like any other. A deadline at 2**64 - 1 waits in the
+// overflow heap, and the cascade's reach (now + one revolution) used to wrap past
+// it, which stranded the timer for ever with the clock already at the last instant.
+TEST_CASE("a timer at the last instant fires, and one within a revolution of it cascades in") {
+    TestWheel      w;
+    Context        c{ .wheel = &w };
+    const uint64_t last = ~uint64_t{ 0 };
+    Awaiter        a{ .id = 1 };
+    Awaiter        b{ .id = 2 };
+    w.schedule(a.timer, last - 100, &record);
+    w.schedule(b.timer, last, &record);
+
+    w.tick(c);
+    CHECK(w.now() == last - 100);
+    CHECK(a.fired);
+    CHECK_FALSE(b.fired);
+    CHECK(w.next_tick() == last);
+    CHECK_FALSE(w.empty());
+
+    w.tick(c);
+    CHECK(w.now() == last);
+    CHECK(b.fired_at == last);
+    CHECK(w.empty());
+}
+
 TEST_CASE("tick on an idle wheel is a no-op") {
     TestWheel w;
     Context   c{ .wheel = &w };

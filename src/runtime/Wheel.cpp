@@ -108,9 +108,12 @@ void WheelImpl::skip_to(uint64_t tick) {
 
 void WheelImpl::cascade() {
     // Everything now reachable within one revolution moves out of overflow into
-    // its slot. The heap yields the earliest deadlines first.
-    const uint64_t horizon = now_ + (slots - 1);
-    while (!overflow_.empty() && overflow_.top().deadline <= horizon) {
+    // its slot. The heap yields the earliest deadlines first. Reachable is a
+    // distance, not `deadline <= now_ + slots - 1`: that sum wraps within one
+    // revolution of the last instant, which would strand a timer there for ever.
+    // The subtraction cannot wrap, since no overflow deadline is behind now_ (a
+    // timer is cascaded before now_ can reach it).
+    while (!overflow_.empty() && overflow_.top().deadline - now_ < slots) {
         const Overflow e = overflow_.top();
         overflow_.pop();
 

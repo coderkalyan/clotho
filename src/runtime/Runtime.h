@@ -1215,6 +1215,17 @@ typedef struct rt_queue {
     uint64_t epoch;
 } rt_queue;
 
+// Physical ring slot of logical position `i`: head + i, less cap when that reaches
+// it. Requires i < cap and head < cap (so head + i < 2 * cap), which every caller
+// has: i < len <= cap for a live element, and one past the tail only after the
+// ring has been made big enough for it. A conditional subtract, as in Rust's
+// VecDeque, instead of a remainder, which is a 64-bit division on every element
+// access. The backend emits the same sequence (Backend::queue_ring_slot).
+static inline uint64_t rt_queue_slot(const rt_queue* h, uint64_t i) {
+    const uint64_t s = h->head + i;
+    return s >= h->cap ? s - h->cap : s;
+}
+
 // Bounded-queue max size argument for the push helpers: `bound` is the `[$:N]`
 // maximum index (max size N+1); 0 means unbounded (LRM §7.10.4).
 //
@@ -1904,6 +1915,8 @@ void rt_wheel_schedule(rt_wheel* wheel, rt_timer* timer, uint64_t deadline, rt_t
 // Like rt_wheel_schedule but the deadline is `rt_wheel_now + delay`, computed
 // runtime-side so a #delay crosses the C ABI once instead of twice. `delay`
 // must be > 0 (a #0 never reaches the wheel — it parks in the inactive queue).
+// The sum saturates at the last instant, 2**64 - 1, so a delay past the end of
+// time is never wrapped into the past; at the last instant itself it arms nothing.
 void rt_wheel_schedule_rel(rt_wheel* wheel, rt_timer* timer, uint64_t delay, rt_timer_fn on_expire);
 
 // Jump to the next non-empty tick and fire its timers in list order, passing

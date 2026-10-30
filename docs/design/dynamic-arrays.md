@@ -169,7 +169,10 @@ slicing. `std::deque` is the poor stdlib container here and, being segmented,
 would force every `q[i]` and every iteration step through a runtime call. A
 growable ring buffer over a raw `malloc`'d region — `{ base, head, len, cap }` —
 gives O(1) push/pop at both ends and keeps storage contiguous, so `q[i]` stays
-an inline address computation `base + ((head + i) % cap) * stride`. It is ~30
+an inline address computation `base + ((head + i) mod cap) * stride`. The mod is
+a conditional subtract, `head + i`, less `cap` when that reaches it: `i < len <=
+cap` and `head < cap` make one subtraction enough, and a 64-bit remainder on
+every element access is what it replaced. It is ~30
 lines and beats `std::deque` on both axes; not meaningfully "reinventing
 `std::vector`."
 

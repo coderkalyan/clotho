@@ -1102,9 +1102,22 @@ std::pair<llvm::Value*, llvm::Value*> Backend::container_len_base(llvm::Value* h
              b_.CreateLoad(raw_ptr_ty(), b_.CreateStructGEP(dynarr_slot_ty(), handle, 0)) };
 }
 
+// The physical ring slot of logical queue position `idx`: head + idx, less cap
+// when that reaches it. This is rt_queue_slot (Runtime.h), which has the
+// reasoning: it needs idx < cap and head < cap, so head + idx < 2 * cap and one
+// subtraction wraps it. Every caller gates the element access on idx < len <= cap,
+// so for any other idx the slot is never addressed; it is still a defined integer,
+// since the add, the compare and the subtract carry no nuw / nsw and nothing here
+// can become poison. There is no clamp for a zero capacity either: an empty queue
+// has len == 0, so every idx is out of range.
+llvm::Value* Backend::queue_ring_slot(llvm::Value* head, llvm::Value* idx, llvm::Value* cap) {
+    llvm::Value* sum = b_.CreateAdd(head, idx);
+    return b_.CreateSelect(b_.CreateICmpUGE(sum, cap), b_.CreateSub(sum, cap), sum);
+}
+
 // The lvalue of logical element `idx` of a container, with no bounds predicate:
 // for callers that already walk within the live length. A queue's logical index
-// wraps through its ring (head + i) mod cap.
+// wraps through its ring (queue_ring_slot).
 LValue Backend::container_elem_lvalue(llvm::Value*   handle,
                                       llvm::Value*   data,
                                       Ref            type,
@@ -1114,8 +1127,7 @@ LValue Backend::container_elem_lvalue(llvm::Value*   handle,
     if (is_queue_type(type)) {
         llvm::Value* head = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 1));
         llvm::Value* cap  = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(queue_slot_ty(), handle, 3));
-        llvm::Value* safe = b_.CreateSelect(b_.CreateICmpEQ(cap, b_.getInt64(0)), b_.getInt64(1), cap);
-        phys              = b_.CreateURem(b_.CreateAdd(head, idx), safe);
+        phys              = queue_ring_slot(head, idx, cap);
     }
     if (e.is_agg || e.is_handle) {
         return dyn_agg_elem_lvalue(LValue{}, e, data, phys, /*inrange=*/nullptr);

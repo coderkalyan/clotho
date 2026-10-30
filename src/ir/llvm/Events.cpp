@@ -836,6 +836,13 @@ bool Backend::signal_has_level_waiters(Signal sig) const {
     return wait_sta_gv_[i][e] != nullptr || wait_dyn_gv_[i][e] != nullptr;
 }
 
+bool Backend::signal_has_bucket(Signal sig, Edge e) const {
+    const auto i = static_cast<uint32_t>(sig);
+    const auto k = static_cast<uint32_t>(e);
+    return wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr || vif_wait_[i][k] ||
+           trigger_id(sig, k) >= 0;
+}
+
 // Load a signal's packed must|may state word (field 0 of the slot struct).
 llvm::Value* Backend::load_mm(Signal sig) {
     const SignalSlot& s      = slot_of(sig);
@@ -903,6 +910,17 @@ Backend::ServiceSnapshot Backend::service_snapshot(const LValue& lv) {
     if (!lv.is_signal || !signal_has_waiters(lv.sig)) {
         return {};
     }
+    // A store through the wide-select path writes only the words around its offset.
+    // Loading and comparing the whole slot, as below, is O(width) for a one-bit
+    // store: 16 Kbytes of loads and a 131072-bit compare for a 64 Kbit 4-state
+    // vector. wide_window_snapshot takes just the words the store can touch.
+    if (lv.wide_dyn) {
+        if (std::optional<WideWindow> win = wide_window_snapshot(lv)) {
+            ServiceSnapshot old;
+            old.wide = std::move(win);
+            return old;
+        }
+    }
     ServiceSnapshot old;
     old.mm = load_lv_mm(lv);
     if (lv.has_z && signal_has_level_waiters(lv.sig)) {
@@ -916,6 +934,8 @@ void Backend::service_after_write(const LValue& lv, ServiceSnapshot old) {
         str_chg_after(lv, old.str);
     } else if (old.container) {
         notify_container_mutation(lv);
+    } else if (old.wide) {
+        service_wide_window(lv, *old.wide);
     } else if (old.mm != nullptr && lv.chg != nullptr) {
         service_change_notify(lv, old.mm, load_lv_mm(lv), old.z, old.z != nullptr ? load_lv_z(lv) : nullptr);
     } else if (old.mm != nullptr) {
@@ -951,28 +971,16 @@ Backend::EdgeFacts Backend::emit_edge_facts(llvm::Value* old_mm,
     auto*     i1 = b_.getInt1Ty();
     EdgeFacts f;
     if (need_pos || need_neg) {
-        llvm::Value* old_m = b_.CreateTrunc(old_mm, i1); // must LSB
-        llvm::Value* new_m = b_.CreateTrunc(new_mm, i1);
+        llvm::Value* old_m   = b_.CreateTrunc(old_mm, i1); // must LSB
+        llvm::Value* new_m   = b_.CreateTrunc(new_mm, i1);
+        llvm::Value* old_may = nullptr;
+        llvm::Value* new_may = nullptr;
         if (four_state) {
-            auto*        sh      = llvm::ConstantInt::get(old_mm->getType(), width);
-            llvm::Value* old_may = b_.CreateTrunc(b_.CreateLShr(old_mm, sh), i1);
-            llvm::Value* new_may = b_.CreateTrunc(b_.CreateLShr(new_mm, sh), i1);
-            if (need_pos) {
-                f.pos = b_.CreateAnd(b_.CreateAnd(b_.CreateNot(old_m), new_may),
-                                     b_.CreateOr(b_.CreateNot(old_may), new_m));
-            }
-            if (need_neg) {
-                f.neg = b_.CreateAnd(b_.CreateAnd(old_may, b_.CreateNot(new_m)),
-                                     b_.CreateOr(b_.CreateNot(new_may), old_m));
-            }
-        } else {
-            if (need_pos) {
-                f.pos = b_.CreateAnd(b_.CreateNot(old_m), new_m);
-            }
-            if (need_neg) {
-                f.neg = b_.CreateAnd(old_m, b_.CreateNot(new_m));
-            }
+            auto* sh = llvm::ConstantInt::get(old_mm->getType(), width);
+            old_may  = b_.CreateTrunc(b_.CreateLShr(old_mm, sh), i1);
+            new_may  = b_.CreateTrunc(b_.CreateLShr(new_mm, sh), i1);
         }
+        f = emit_edge_bits(old_m, new_m, old_may, new_may, need_pos, need_neg);
     }
     if (need_any) {
         f.changed = b_.CreateICmpNE(old_mm, new_mm);
@@ -981,6 +989,149 @@ Backend::EdgeFacts Backend::emit_edge_facts(llvm::Value* old_mm,
         }
     }
     return f;
+}
+
+// Table 9-2 posedge / negedge from the LSBs of the must and may planes before and
+// after a store (see emit_edge_facts for the lattice). `old_may` / `new_may` are
+// null for a 2-state slot, which cannot hold x, so it is the plain 0 <-> 1 compare.
+Backend::EdgeFacts Backend::emit_edge_bits(llvm::Value* old_m,
+                                           llvm::Value* new_m,
+                                           llvm::Value* old_may,
+                                           llvm::Value* new_may,
+                                           bool         need_pos,
+                                           bool         need_neg) {
+    EdgeFacts f;
+    if (old_may != nullptr) {
+        if (need_pos) {
+            f.pos = b_.CreateAnd(b_.CreateAnd(b_.CreateNot(old_m), new_may),
+                                 b_.CreateOr(b_.CreateNot(old_may), new_m));
+        }
+        if (need_neg) {
+            f.neg = b_.CreateAnd(b_.CreateAnd(old_may, b_.CreateNot(new_m)),
+                                 b_.CreateOr(b_.CreateNot(new_may), old_m));
+        }
+    } else {
+        if (need_pos) {
+            f.pos = b_.CreateAnd(b_.CreateNot(old_m), new_m);
+        }
+        if (need_neg) {
+            f.neg = b_.CreateAnd(old_m, b_.CreateNot(new_m));
+        }
+    }
+    return f;
+}
+
+// The part of a wide-select store's target that the store can change, for
+// service_snapshot to take in place of the whole slot. The store (rt_wide_ins)
+// writes only the bits [off, off + n) that lie inside its container and the vector,
+// so they all sit in K = ((n + 62) >> 6) + 1 consecutive 64-bit words of each
+// plane (the most words an n-bit run can span) starting at the word of the offset.
+// The offset is clamped into the vector and the window into the plane, so the
+// loads stay inside the slot for ANY offset: a store that is out of range, has an
+// x/z index or hangs off an end writes nothing outside the clamped window (or
+// nothing at all), and its window compares equal. A select as wide as the vector
+// leaves no window to save (nullopt: the caller takes the whole slot).
+//
+// A 4-state slot is { mm: must in bits [0, W), may in [W, 2W) ; z }: the may plane
+// gets a window of its own, and so does the z field when a level waiter consumes it
+// (the same condition the whole-slot snapshot uses). The `changed` fact compares
+// exactly these. An edge reads only bit 0 of the must and may planes (LRM 9.4.2),
+// so those two words are snapshotted at their fixed place instead of being found
+// in the window, which keeps the edge facts independent of where the window is: the
+// store reaches bit 0 only through a clamped offset of 0, i.e. a window that starts
+// at word 0, so `pos` / `neg` still imply `changed`.
+std::optional<Backend::WideWindow> Backend::wide_window_snapshot(const LValue& lv) {
+    const uint32_t W     = lv.store_width;
+    const uint32_t K     = ((lv.width + 62) >> 6) + 1;
+    const uint32_t nw    = (W + 63) / 64; // words of one W-bit plane
+    const uint32_t total = lv.narrow ? nw : (2 * W + 63) / 64;
+    if (K > nw) {
+        return std::nullopt;
+    }
+    WideWindow w;
+    w.words     = K;
+    w.width     = W;
+    w.four      = !lv.narrow;
+    w.need_any  = signal_has_bucket(lv.sig, Edge::Any);
+    w.need_edge = signal_has_bucket(lv.sig, Edge::Positive) || signal_has_bucket(lv.sig, Edge::Negative);
+
+    auto*        i64 = b_.getInt64Ty();
+    llvm::Value* mm  = lv_mm_ptr(lv);
+    const auto   at  = [&](llvm::Value* base, llvm::Value* word) {
+        return b_.CreateInBoundsGEP(i64, base, word);
+    };
+    if (w.need_any) {
+        llvm::Value* off = b_.CreateSExt(lv.bit_off, i64);
+        llvm::Value* o   = smax(smin(off, llvm::ConstantInt::get(i64, W - 1)), llvm::ConstantInt::get(i64, 0));
+        const auto   clamp = [&](llvm::Value* word, uint32_t last) {
+            llvm::Value* hi = llvm::ConstantInt::get(i64, last);
+            return b_.CreateSelect(b_.CreateICmpULT(word, hi), word, hi);
+        };
+        llvm::Value* wm = clamp(b_.CreateLShr(o, 6), nw - K);
+        w.mm_ptr        = at(mm, wm);
+        if (w.four) {
+            w.may_ptr = at(mm, clamp(b_.CreateLShr(b_.CreateAdd(o, llvm::ConstantInt::get(i64, W)), 6), total - K));
+        }
+        if (lv.has_z && signal_has_level_waiters(lv.sig)) {
+            w.z_ptr = at(lv_z_ptr(lv), wm);
+        }
+    }
+    if (w.need_edge) {
+        w.lsb_mm_ptr = mm;
+        if (w.four) {
+            w.lsb_may_ptr = at(mm, llvm::ConstantInt::get(i64, W >> 6));
+        }
+    }
+    load_wide_window(w);
+    return w;
+}
+
+// Load every plane window of `w` through its pointer into its value field.
+void Backend::load_wide_window(WideWindow& w) {
+    const auto load = [&](llvm::Value* p, uint32_t words) {
+        return b_.CreateAlignedLoad(int_ty(64 * words), p, llvm::Align(8));
+    };
+    w.mm      = w.mm_ptr != nullptr ? load(w.mm_ptr, w.words) : nullptr;
+    w.may     = w.may_ptr != nullptr ? load(w.may_ptr, w.words) : nullptr;
+    w.z       = w.z_ptr != nullptr ? load(w.z_ptr, w.words) : nullptr;
+    w.lsb_mm  = w.lsb_mm_ptr != nullptr ? load(w.lsb_mm_ptr, 1) : nullptr;
+    w.lsb_may = w.lsb_may_ptr != nullptr ? load(w.lsb_may_ptr, 1) : nullptr;
+}
+
+// service_wait_queue for a windowed snapshot: the same wake facts, from the words
+// the store could touch (wide_window_snapshot) rather than the whole slot.
+void Backend::service_wide_window(const LValue& lv, const WideWindow& old) {
+    WideWindow now = old;
+    load_wide_window(now);
+
+    EdgeFacts f;
+    if (old.need_any) {
+        f.changed = b_.CreateICmpNE(old.mm, now.mm);
+        if (old.may != nullptr) {
+            f.changed = b_.CreateOr(f.changed, b_.CreateICmpNE(old.may, now.may));
+        }
+        if (old.z != nullptr) {
+            f.changed = b_.CreateOr(f.changed, b_.CreateICmpNE(old.z, now.z));
+        }
+    }
+    if (old.need_edge) {
+        auto*        i1      = b_.getInt1Ty();
+        llvm::Value* old_m   = b_.CreateTrunc(old.lsb_mm, i1);
+        llvm::Value* new_m   = b_.CreateTrunc(now.lsb_mm, i1);
+        llvm::Value* old_may = nullptr;
+        llvm::Value* new_may = nullptr;
+        if (old.four) {
+            auto* sh = llvm::ConstantInt::get(b_.getInt64Ty(), old.width & 63);
+            old_may  = b_.CreateTrunc(b_.CreateLShr(old.lsb_may, sh), i1);
+            new_may  = b_.CreateTrunc(b_.CreateLShr(now.lsb_may, sh), i1);
+        }
+        const EdgeFacts e = emit_edge_bits(old_m, new_m, old_may, new_may,
+                                           signal_has_bucket(lv.sig, Edge::Positive),
+                                           signal_has_bucket(lv.sig, Edge::Negative));
+        f.pos = e.pos;
+        f.neg = e.neg;
+    }
+    service_wake_buckets(lv.sig, f);
 }
 
 // Service a signal's wait queues after a blocking assignment to it. Computes
@@ -997,20 +1148,20 @@ void Backend::service_wait_queue(Signal       sig,
                                  llvm::Value* new_mm,
                                  llvm::Value* old_z,
                                  llvm::Value* new_z) {
-    const auto i = static_cast<uint32_t>(sig);
     if (!signal_has_waiters(sig)) {
         return;
     }
-    const auto has_bucket = [&](Edge e) {
-        const auto k = static_cast<uint32_t>(e);
-        return wait_sta_gv_[i][k] != nullptr || wait_dyn_gv_[i][k] != nullptr ||
-               vif_wait_[i][k] || trigger_id(sig, k) >= 0;
-    };
     const SignalSlot& slot = slot_of(sig);
     const EdgeFacts   f =
       emit_edge_facts(old_mm, new_mm, slot.width, slot.four_state, old_z, new_z,
-                      has_bucket(Edge::Positive), has_bucket(Edge::Negative),
-                      has_bucket(Edge::Any));
+                      signal_has_bucket(sig, Edge::Positive), signal_has_bucket(sig, Edge::Negative),
+                      signal_has_bucket(sig, Edge::Any));
+    service_wake_buckets(sig, f);
+}
+
+// Fire each of `sig`'s per-edge buckets that exists behind one branch on its fact.
+void Backend::service_wake_buckets(Signal sig, const EdgeFacts& f) {
+    const auto i = static_cast<uint32_t>(sig);
 
     // Bucket -> matching fact. `pos`/`neg` each imply `changed`, so the Any
     // bucket also fires on an LSB transition.

@@ -1961,9 +1961,7 @@ void Backend::emit_intra_nba_arm(const LValue& lv, Plane rhs, llvm::Value* ticks
     // that happens to be zero branches to the same immediate path.
     auto* nullp     = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     auto  schedule  = [&] {
-        llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
-        b_.CreateCall(wheel_schedule_fn(),
-                      { wheel_, rec, b_.CreateAdd(now, ticks), intra_cb_trampoline() });
+        b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, rec, ticks, intra_cb_trampoline() });
     };
     auto immediate = [&] { b_.CreateCall(intra_cb_fn(), { rec, nullp }); };
 
@@ -2085,9 +2083,7 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
     // an immediate callback (the epoch guard passes — ep is the freshest stamp).
     auto* nullp    = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     auto  schedule = [&] {
-        llvm::Value* now = b_.CreateCall(wheel_now_fn(), { wheel_ });
-        b_.CreateCall(wheel_schedule_fn(),
-                      { wheel_, rec, b_.CreateAdd(now, ticks), inertial_cb_trampoline() });
+        b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, rec, ticks, inertial_cb_trampoline() });
     };
     auto immediate = [&] { b_.CreateCall(inertial_cb_fn(), { rec, nullp }); };
 

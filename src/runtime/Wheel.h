@@ -101,7 +101,8 @@ public:
     Timer* advance();
 
     // Tick of the earliest scheduled timer, or `never` when nothing is
-    // scheduled. Moves nothing.
+    // scheduled. Moves nothing. `never` is also a legal tick, the last instant, so
+    // a caller that must tell an idle wheel from a timer there asks empty().
     static constexpr uint64_t never = ~0ull;
     uint64_t                  next_tick() const;
 

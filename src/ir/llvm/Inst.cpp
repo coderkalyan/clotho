@@ -972,11 +972,10 @@ void Backend::lower_inst(Index i) {
             if (at.kind == Type::Kind::Queue) {
                 // Queue (LRM 7.10): the base lvalue addresses the
                 // { base, head, len, cap } ring handle. Element i lives at the
-                // physical slot (head + i) mod cap; build a fresh element
-                // lvalue over `[0 x elemslot]` at that physical index with the
-                // in-range predicate i < len (an empty queue has len == 0, so
-                // the modulo divisor is clamped to 1 to keep it defined on the
-                // never-taken out-of-range path).
+                // physical slot (head + i) mod cap (queue_ring_slot); build a fresh
+                // element lvalue over `[0 x elemslot]` at that physical index with
+                // the in-range predicate i < len. The slot is only addressed when
+                // that holds, and is a plain defined integer when it does not.
                 const DynElem e       = dynarr_elem(es.array_type);
                 llvm::Value*  handle  = lv_handle_ptr(lv, es.for_write != 0 ? HandleUse::Mutate : HandleUse::Read);
                 llvm::Value*  baseptr = b_.CreateLoad(
@@ -999,9 +998,7 @@ void Backend::lower_inst(Index i) {
                 llvm::Value*    idx64   = ei.idx64;
                 llvm::Value*    unknown = any_unknown(idxp);
                 llvm::Value*    inrange = b_.CreateAnd(ei.below, b_.CreateNot(unknown));
-                llvm::Value* safe_cap =
-                  b_.CreateSelect(b_.CreateICmpEQ(cap, b_.getInt64(0)), b_.getInt64(1), cap);
-                llvm::Value* phys = b_.CreateURem(b_.CreateAdd(head, idx64), safe_cap);
+                llvm::Value* phys = queue_ring_slot(head, idx64, cap);
                 if (e.is_string) {
                     LValue sel;
                     sel.base          = baseptr;
@@ -2459,14 +2456,14 @@ void Backend::lower_inst(Index i) {
             // the event `d` ticks from now. The process does not block. The timer
             // node carries the handle, so ONE thunk serves the whole design (the
             // target may be any event expression, not a fixed declared one).
-            llvm::Value* handle   = must_of(value_of(p.binary.r));
-            llvm::Value* ticks    = cast(must_of(value_of(p.binary.l)), 64, false);
-            llvm::Value* deadline = b_.CreateAdd(b_.CreateCall(wheel_now_fn(), { wheel_ }), ticks);
-            auto*        nty      = event_timer_ty();
-            llvm::Value* node     = b_.CreateCall(
+            llvm::Value* handle = must_of(value_of(p.binary.r));
+            llvm::Value* ticks  = cast(must_of(value_of(p.binary.l)), 64, false);
+            auto*        nty    = event_timer_ty();
+            llvm::Value* node   = b_.CreateCall(
               alloc_fn(), { b_.getInt64(env_->llmod.getDataLayout().getTypeAllocSize(nty)) });
             b_.CreateStore(handle, b_.CreateStructGEP(nty, node, 2));
-            b_.CreateCall(wheel_schedule_fn(), { wheel_, node, deadline, event_delay_thunk() });
+            // Relative, so the runtime's saturating `now + ticks` applies.
+            b_.CreateCall(wheel_schedule_rel_fn(), { wheel_, node, ticks, event_delay_thunk() });
             return;
         }
 
