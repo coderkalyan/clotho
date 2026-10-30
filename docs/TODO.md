@@ -485,6 +485,12 @@ Milestones, in order; lower ones unblock higher ones:
 - [~] **Garbage collection** (8.4) — collector coverage and policy still missing.
   - [ ] **Collector tracing of event, `mailbox`, `semaphore` and
     `std::weak_reference` handles** (8.4) — not yet described to the collector.
+  - [ ] **Collection inside a delay-free loop** (8.4) — a loop that allocates and never
+    suspends grows the heap without bound; the collector runs only at time-step boundaries.
+  - [ ] **Collection trigger counts buffers owned by objects** (8.4) — the trigger sees only
+    object bytes, so objects owning large strings or containers can fill memory before one runs.
+  - [ ] **Covergroup instances are freed only at exit** (19.3) — an instance created in a loop
+    is never reclaimed during the run.
   - [ ] **Evacuating collection (performance)** — the heap is non-moving.
   - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.
 - [ ] **Vtable-forced method with an unlowerable signature** — a return or formal type that
