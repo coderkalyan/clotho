@@ -491,3 +491,15 @@ order), and splitting every `assign` / `always_comb` cone to avoid it cost 1.9x 
 mixed design.
 
 Code: `src/ir/llvm/Scheduler.cpp` (`emit_active_run`, `deferred_comb`), `src/ir/Module.h` (`Process::starts_after_procedures`), `src/lower/Statements.cpp` (`lower_procedural_block`). Tests: `tests/comb_fusion_test.cpp` ("always_comb and always_latch run once at time zero after every initial has started").
+
+## 45. Width of an untyped parameter set to an unbased unsized literal (6.20.2, 5.7.1)
+
+`parameter P = '1;` meets two rules. 5.7.1 makes `'1` "an unsized unsigned
+single-bit value" that "in a self-determined context ... shall have a width of 1
+bit". 6.20.2 gives a parameter with no type or range "for which the final value
+assigned to it is unsized" an implied range whose MSB is "an
+implementation-dependent value of at least 31". Clotho applies 6.20.2, the rule
+written for this declaration, so `P` is 32 bits of ones. slang folds the
+parameter the same way. iverilog and Verilator make `P` one bit wide.
+
+Code: slang's parameter elaboration (no Clotho code). Tests: `tests/unbased_test.cpp` ("an untyped parameter set to '1 is at least 32 bits of ones").

@@ -303,3 +303,16 @@ TEST_CASE("an unsized x or z literal connected to a wide port fills the port") {
         endmodule
     )") == "xxxxxxxxxxxxxxxxxxxxxxxxx zzzzzzzzzzzzzzzzzzzzzzzzz\n");
 }
+
+// An untyped parameter whose value is unsized takes an implementation-dependent
+// width of at least 32 bits (LRM 6.20.2), although `'1` alone is one bit wide in
+// a self-determined context (5.7.1). docs/LRM_NOTES.md note 45.
+TEST_CASE("an untyped parameter set to '1 is at least 32 bits of ones") {
+    const std::string out = run_capture(R"(
+        module m;
+            parameter P = '1;
+            initial $display("%0d %h", $bits(P), P);
+        endmodule
+    )");
+    CHECK(out == "32 ffffffff\n");
+}
