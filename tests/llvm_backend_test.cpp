@@ -2146,6 +2146,65 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     CHECK(count_substr(co, ".f2(ptr %state") == 1);
 }
 
+// A fused coroutine is ONE function over ONE frame, so unlike a thunk group it
+// cannot be split into per-member functions when its members live in different
+// instances: a process that is not a thunk fuses only within its own instance.
+// The four clocked blocks below share one sensitivity (the interface's clk) and
+// belong to two instances.
+TEST_CASE("a coroutine fusion group stays inside one instance") {
+    SUBCASE("under --no-thunk every group is a coroutine") {
+        constexpr std::string_view src = R"(
+            interface bus_if; logic clk = 0; endinterface
+            module leaf(bus_if b);
+                reg [7:0] x = 0, y = 0;
+                always @(posedge b.clk) x <= x + 8'd1;
+                always @(posedge b.clk) y <= y + 8'd2;
+            endmodule
+            module top;
+                bus_if bus();
+                leaf u0(bus);
+                leaf u1(bus);
+                initial begin
+                    #1 bus.clk = 1; #1 bus.clk = 0; #1 bus.clk = 1;
+                    #1 $display("%0d %0d %0d %0d", u0.x, u0.y, u1.x, u1.y);
+                end
+            endmodule
+        )";
+        const std::string co = emit(src, { .thunk = false });
+        CHECK(count_substr(co, ".f4(ptr %state") == 0);
+        CHECK(count_substr(co, ".f2(ptr %state") == 2);
+        CHECK(run_capture(src, { .thunk = false }) == "2 4 2 4\n");
+        CHECK(run_capture(src) == "2 4 2 4\n");
+    }
+    SUBCASE("a process that reaches a draw never joins a thunk group") {
+        // The draw is reached through a call, so the process is a coroutine
+        // even though its body is suspension-free; its draw-free siblings in
+        // both instances still fuse with each other.
+        constexpr std::string_view src = R"(
+            interface bus_if; logic clk = 0; endinterface
+            module leaf(bus_if b);
+                reg [7:0] r = 0, c = 0;
+                function automatic int rnd(); return $urandom; endfunction
+                always @(posedge b.clk) r <= rnd();
+                always @(posedge b.clk) c <= c + 8'd1;
+            endmodule
+            module top;
+                bus_if bus();
+                leaf u0(bus);
+                leaf u1(bus);
+                initial begin
+                    #1 bus.clk = 1; #1 bus.clk = 0; #1 bus.clk = 1;
+                    #1 $display("%0d %0d", u0.c, u1.c);
+                end
+            endmodule
+        )";
+        const std::string ir = emit(src);
+        CHECK(count_substr(ir, ".f4(ptr %state") == 0);
+        CHECK(count_substr(ir, ".f2.thunk(ptr noalias %state") == 1);
+        CHECK(run_capture(src) == "2 2\n");
+    }
+}
+
 // Regression: a single-operand concat ({x}) and a single replication ({1{x}})
 // once shifted the accumulator by the full result width, which is poison in LLVM
 // (shift >= bitwidth). Replication wraps its operand in a single-element concat,

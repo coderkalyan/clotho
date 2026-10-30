@@ -1326,10 +1326,40 @@ void Backend::compute_fusion_groups() {
         return key;
     };
 
+    // Whether process k can lower into a thunk group: a suspension-free
+    // always-with-sensitivity (is_simple_always) the thunk lowering may take.
+    //
+    // A member that can reach a $urandom draw is excluded whatever its shape:
+    // a thunk has no frame to keep the xoshiro state in, so its stream would
+    // restart on every activation. is_simple_always already rejects a body
+    // holding a draw ITSELF (tag_info().blocks_thunk); this covers the ones
+    // that reach one through a call.
+    //
+    // A reactive-home process is excluded too, for a tagged-pointer reason: its
+    // static subscription has to carry kReactiveHomeTag (bit 1) so the wake
+    // path picks the reactive ring, and a thunk "handle" is a function pointer
+    // carrying the thunk tag (bit 0). The two tags are mutually exclusive by
+    // construction -- see kReactiveHomeTag -- so a pointer holding both would
+    // read as neither reactive (the test is bit 1 set AND bit 0 clear) nor as a
+    // maskable thunk, and the drain would call two bytes past the function.
+    // Costs a coroutine frame for each of a program's continuous assigns, a
+    // handful of processes in a testbench; the thunk path exists for wide
+    // combinational designs, which are Active-home by definition.
+    //
+    // The verdict is part of every fusion key below, so a group is a thunk
+    // exactly when its members are. A group that is not runs as ONE coroutine
+    // over one frame, and a group spanning instances lowers as one function per
+    // member called by a dispatcher (lower_group), which a coroutine cannot be:
+    // such a process fuses only within its own instance scope.
+    const auto thunkable = [&](uint32_t k) {
+        return config_.thunk && facts_.processes[k].simple_always && !all[k].reactive_home && !rng_procs_[k];
+    };
+
     // Bucket fusable processes by (canonical events, self_start,
-    // reactive_home), preserving first-seen order; everything else is its own
-    // singleton group. Group size is capped so one fused coroutine cannot grow
-    // arbitrarily large (function size / frame size / compile time).
+    // reactive_home, thunkable, and the instance scope of one that is not),
+    // preserving first-seen order; everything else is its own singleton group.
+    // Group size is capped so one fused coroutine cannot grow arbitrarily large
+    // (function size / frame size / compile time).
     //
     // reactive_home is part of the key because a group is ONE function pushed
     // onto ONE ring: the seed loop makes a single push decision for it and its
@@ -1338,12 +1368,14 @@ void Backend::compute_fusion_groups() {
     // run half the group in the wrong region. A reactive-only group is fine --
     // both rings drain the same handle shapes.
     constexpr size_t group_cap = 256;
-    std::map<std::tuple<std::vector<std::pair<uint32_t, uint32_t>>, bool, bool>, uint32_t> by_key;
+    std::map<std::tuple<std::vector<std::pair<uint32_t, uint32_t>>, bool, bool, bool, uint32_t>, uint32_t> by_key;
     for (uint32_t k = 0; k < nprocs; ++k) {
         const Process& p = all[k];
         if (config_.fuse && facts_.processes[k].simple_always) {
-            const auto key = std::make_tuple(canonical(p.wait_events), p.self_start, p.reactive_home);
-            const auto it  = by_key.find(key);
+            const bool thunk = thunkable(k);
+            const auto key   = std::make_tuple(canonical(p.wait_events), p.self_start, p.reactive_home, thunk,
+                                               thunk ? 0u : p.scope);
+            const auto it    = by_key.find(key);
             if (it != by_key.end() && groups_[it->second].size() < group_cap) {
                 groups_[it->second].push_back(k);
                 group_of_[k] = it->second;
@@ -1423,7 +1455,8 @@ void Backend::compute_fusion_groups() {
         // reactive_home must both match: the group makes one seed decision and
         // has one home ring (see the bucket key above). Comb populations are
         // uniformly self_start and Active-home in practice; a mismatch just
-        // splits.
+        // splits. A thunkable and a coroutine process never join, and
+        // coroutine ones only within one instance scope (see `thunkable`).
         std::vector<uint32_t> uf(nprocs);
         for (uint32_t k = 0; k < nprocs; ++k) {
             uf[k] = k;
@@ -1439,9 +1472,11 @@ void Backend::compute_fusion_groups() {
             if (cand[k] == 0) {
                 continue;
             }
+            const bool thunk = thunkable(k);
             for (const uint32_t q : wake_adj_[k]) {
                 if (cand[q] != 0 && all[q].self_start == all[k].self_start &&
-                    all[q].reactive_home == all[k].reactive_home) {
+                    all[q].reactive_home == all[k].reactive_home && thunkable(q) == thunk &&
+                    (thunk || all[q].scope == all[k].scope)) {
                     uf[find(k)] = find(q);
                 }
             }
@@ -1529,34 +1564,18 @@ void Backend::compute_fusion_groups() {
         }
     }
 
-    // A group is thunk-eligible when its (front) member is a suspension-free
-    // always-with-sensitivity: fused members all passed is_simple_always, so
-    // the front's verdict holds for the group. Computed here so lower_group
-    // and the seed/drain read one table. Empty is fine when --no-thunk.
-    //
-    // A member that can reach a $urandom draw is excluded whatever its shape:
-    // a thunk has no frame to keep the xoshiro state in, so its stream would
-    // restart on every activation. is_simple_always already rejects a body
-    // holding a draw ITSELF (tag_info().blocks_thunk); this covers the ones
-    // that reach one through a call.
-    //
-    // A reactive-home group is excluded too, for a tagged-pointer reason: its
-    // static subscription has to carry kReactiveHomeTag (bit 1) so the wake
-    // path picks the reactive ring, and a thunk "handle" is a function pointer
-    // carrying the thunk tag (bit 0). The two tags are mutually exclusive by
-    // construction -- see kReactiveHomeTag -- so a pointer holding both would
-    // read as neither reactive (the test is bit 1 set AND bit 0 clear) nor as a
-    // maskable thunk, and the drain would call two bytes past the function.
-    // Costs a coroutine frame for each of a program's continuous assigns, a
-    // handful of processes in a testbench; the thunk path exists for wide
-    // combinational designs, which are Active-home by definition.
+    // A group is a thunk exactly when its members are: the keys above never
+    // put a thunkable and a coroutine process together, so the front member's
+    // verdict holds for the group. Computed here so lower_group and the
+    // seed/drain read one table. All false with --no-thunk.
     thunk_group_.assign(groups_.size(), false);
-    if (config_.thunk) {
-        for (uint32_t g = 0; g < groups_.size(); ++g) {
-            thunk_group_[g] =
-              facts_.processes[groups_[g].front()].simple_always && !all[groups_[g].front()].reactive_home &&
-              std::none_of(groups_[g].begin(), groups_[g].end(), [&](uint32_t m) { return rng_procs_[m]; });
-        }
+    for (uint32_t g = 0; g < groups_.size(); ++g) {
+        thunk_group_[g] = thunkable(groups_[g].front());
+        assert(std::ranges::all_of(groups_[g], [&](uint32_t m) { return thunkable(m) == thunk_group_[g]; }) &&
+               "a fusion group mixes thunk and coroutine members");
+        assert((thunk_group_[g] ||
+                std::ranges::all_of(groups_[g], [&](uint32_t m) { return all[m].scope == all[groups_[g].front()].scope; })) &&
+               "a coroutine group spans instance scopes");
     }
 }
 
