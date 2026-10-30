@@ -220,14 +220,17 @@ void Lowerer::lower_procedural_block(const ProceduralBlockSymbol& sym) {
     module_.add_process(ir::Process{ .activation  = activation,
                                      .wait_events = std::move(wait_events),
                                      .self_start  = self_start,
+                                     // LRM 9.2.2.2: the time-zero run of always_comb /
+                                     // always_latch follows every initial / always start.
+                                     .starts_after_procedures = self_start,
                                      // LRM 13.4.4: an `initial` / `always` procedure is a thread
                                      // whose calls may spawn background processes. A `final`
                                      // block is not one of the two, and its children could never
                                      // run anyway (the drain has ended by then).
-                                     .spawn_root  = activation != ir::Activation::Final,
-                                     .span        = span_of(sym),
-                                     .ir          = std::move(body_ir),
-                                     .scope       = cur_scope_id() });
+                                     .spawn_root = activation != ir::Activation::Final,
+                                     .span       = span_of(sym),
+                                     .ir         = std::move(body_ir),
+                                     .scope      = cur_scope_id() });
 }
 
 void Lowerer::lower_stmt(const Statement& stmt, ir::Builder& b) {

@@ -1316,9 +1316,9 @@ void Backend::compute_fusion_groups() {
     };
 
     // Bucket fusable processes by (canonical events, self_start,
-    // reactive_home), preserving first-seen order; everything else is its own
-    // singleton group. Group size is capped so one fused coroutine cannot grow
-    // arbitrarily large (function size / frame size / compile time).
+    // starts_after_procedures, reactive_home), preserving first-seen order; everything
+    // else is its own singleton group. Group size is capped so one fused coroutine
+    // cannot grow arbitrarily large (function size / frame size / compile time).
     //
     // reactive_home is part of the key because a group is ONE function pushed
     // onto ONE ring: the seed loop makes a single push decision for it and its
@@ -1327,11 +1327,12 @@ void Backend::compute_fusion_groups() {
     // run half the group in the wrong region. A reactive-only group is fine --
     // both rings drain the same handle shapes.
     constexpr size_t group_cap = 256;
-    std::map<std::tuple<std::vector<std::pair<uint32_t, uint32_t>>, bool, bool>, uint32_t> by_key;
+    std::map<std::tuple<std::vector<std::pair<uint32_t, uint32_t>>, bool, bool, bool>, uint32_t> by_key;
     for (uint32_t k = 0; k < nprocs; ++k) {
         const Process& p = all[k];
         if (config_.fuse && facts_.processes[k].simple_always) {
-            const auto key = std::make_tuple(canonical(p.wait_events), p.self_start, p.reactive_home);
+            const auto key =
+              std::make_tuple(canonical(p.wait_events), p.self_start, p.starts_after_procedures, p.reactive_home);
             const auto it  = by_key.find(key);
             if (it != by_key.end() && groups_[it->second].size() < group_cap) {
                 groups_[it->second].push_back(k);
@@ -1430,6 +1431,7 @@ void Backend::compute_fusion_groups() {
             }
             for (const uint32_t q : wake_adj_[k]) {
                 if (cand[q] != 0 && all[q].self_start == all[k].self_start &&
+                    all[q].starts_after_procedures == all[k].starts_after_procedures &&
                     all[q].reactive_home == all[k].reactive_home) {
                     uf[find(k)] = find(q);
                 }

@@ -254,3 +254,69 @@ endmodule
     // the pair from fusion must not cost the fixpoint.
     check_all_lowerings(src, "1 5 5 5\n");
 }
+
+// LRM 9.2.2.2 (and 9.2.2.3 for always_latch): an always_comb "is automatically
+// triggered once at time zero, after all initial and always procedures have been
+// started". The time-zero run used to be queued in source order with everything else,
+// so a comb written above an `initial` ran first. A disable of a block that has not
+// been started is a no-op (9.6.2), so `disable blk` ran before `blk` existed and the
+// block went on to print. Oracle: iverilog 13, which runs it last.
+TEST_CASE("always_comb and always_latch run once at time zero after every initial has started") {
+    SUBCASE("disable of a block of a later initial, always_comb") {
+        check_all_lowerings(R"(
+            module t;
+                always_comb disable blk;
+                initial begin : blk
+                    #1 $display("FAILED: blk not disabled");
+                end
+                initial #2 $display("done");
+            endmodule)",
+                            "done\n");
+    }
+    SUBCASE("disable of a block of a later initial, always_latch") {
+        check_all_lowerings(R"(
+            module t;
+                always_latch disable blk;
+                initial begin : blk
+                    #1 $display("FAILED: blk not disabled");
+                end
+                initial #2 $display("done");
+            endmodule)",
+                            "done\n");
+    }
+    SUBCASE("a comb that reads something runs after the initial that wrote it") {
+        check_all_lowerings(R"(
+            module t;
+                logic a, y;
+                always_comb y = a;
+                initial a = 1'b1;
+                initial #1 $display("y=%b", y);
+            endmodule)",
+                            "y=1\n");
+    }
+    SUBCASE("source order does not matter, in either direction") {
+        const std::string comb_first = R"(
+            module t;
+                logic y;
+                always_comb y = 1'b0;
+                initial $display("y=%b", y);
+            endmodule)";
+        const std::string comb_last  = R"(
+            module t;
+                logic y;
+                initial $display("y=%b", y);
+                always_comb y = 1'b0;
+            endmodule)";
+        check_all_lowerings(comb_first, "y=x\n");
+        check_all_lowerings(comb_last, "y=x\n");
+    }
+    SUBCASE("a continuous assignment keeps its place: it is not a procedure") {
+        check_all_lowerings(R"(
+            module t;
+                logic y;
+                assign y = 1'b1;
+                initial #0 $display("y=%b", y);
+            endmodule)",
+                            "y=1\n");
+    }
+}

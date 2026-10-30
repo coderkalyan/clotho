@@ -1485,6 +1485,8 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
     // One handle per fusion group; a group's activation facts come from its
     // first member (identical across fused members by the group key).
     std::vector<llvm::Value*> hdls(procs.size(), nullptr);
+    // Groups of always_comb / always_latch, seeded after every other body (below).
+    std::vector<uint32_t> deferred_comb;
     for (uint32_t g = 0; g < procs.size(); ++g) {
         const uint32_t k = groups_[g].front();
         const Process& p = all[k];
@@ -1541,7 +1543,11 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
                 // own sentence. A ring entry is a bare handle either way: the
                 // home tag belongs to a PARKED handle, and the seed loop created
                 // this one so it knows the ring without reading a tag back.
-                if (p.reactive_home) {
+                if (p.starts_after_procedures) {
+                    // always_comb / always_latch (LRM 9.2.2.2): enqueued behind every
+                    // other body, below, so it runs once they have all started.
+                    deferred_comb.push_back(g);
+                } else if (p.reactive_home) {
                     emit_reactive_push(b_, hdl);
                 } else {
                     emit_active_push(b_, hdl);
@@ -1568,8 +1574,25 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
             // parked" holds for this arm exactly as it does for an always loop.
             b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_flag_ptr(k));
             emit_reactive_push(b_, hdl);
+        } else if (p.starts_after_procedures) {
+            // An always_comb / always_latch that reads nothing has no wait list, so
+            // the arm above never sees it; it still runs once, after the others.
+            deferred_comb.push_back(g);
         } else {
             emit_active_push(b_, hdl);
+        }
+    }
+
+    // The time-zero run of an always_comb / always_latch (LRM 9.2.2.2, 9.2.2.3): "after
+    // all initial and always procedures have been started so that the outputs of the
+    // procedure are consistent with the inputs". Both rings are FIFO, so enqueuing
+    // these after every other body makes each of them run after those have started.
+    // A continuous assignment is not a procedure and keeps its source position above.
+    for (const uint32_t g : deferred_comb) {
+        if (all[groups_[g].front()].reactive_home) {
+            emit_reactive_push(b_, hdls[g]);
+        } else {
+            emit_active_push(b_, hdls[g]);
         }
     }
 

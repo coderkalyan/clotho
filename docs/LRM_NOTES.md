@@ -405,3 +405,21 @@ number, scaled by the unit conversion and padded to the precision (`x000`,
 `0 ns` for an unknown value.
 
 Code: `src/runtime/Format.cpp` (`unknown_decimal_char`, `render_arg`, `coerce_dyn_arg`), `src/lower/Assign.cpp` (`scale_to_ticks`). Tests: `tests/llvm_backend_test.cpp` ("%t of an operand with an x or z bit prints one character, in a constant and in a runtime format").
+
+## 42. The time-zero run of `always_comb` / `always_latch` (9.2.2.2, 9.2.2.3)
+
+9.2.2.2: the procedure "is automatically triggered once at time zero, after all
+initial and always procedures have been started so that the outputs of the procedure
+are consistent with the inputs"; 9.2.2.3 applies it to `always_latch`. "Started"
+does not say how far the other procedures have run, so Clotho takes the simple
+reading its FIFO active ring gives: every `initial` and sensitivity-less `always`
+runs up to its first suspension, then each `always_comb` / `always_latch` runs once,
+whatever the source order. A comb written above an `initial` that reads its output
+at time zero therefore reads the unsettled value (`x`), and a `disable` of a block
+of a later `initial` finds the block started and parked, so it ends it (9.6.2).
+iverilog does the same.
+
+A continuous assignment also evaluates once at time zero but is not a procedure,
+so it is not deferred; 4.9.1 leaves its order against the procedures open.
+
+Code: `src/ir/llvm/Scheduler.cpp` (`emit_active_run`, `deferred_comb`), `src/ir/Module.h` (`Process::starts_after_procedures`), `src/lower/Statements.cpp` (`lower_procedural_block`). Tests: `tests/comb_fusion_test.cpp` ("always_comb and always_latch run once at time zero after every initial has started").

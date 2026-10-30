@@ -221,6 +221,13 @@ struct Process {
     // false: it runs only when a wait event fires. Only meaningful with a non-empty
     // wait list (a sensitivity-less process already runs once via the seed loop).
     bool self_start = false;
+    // An always_comb / always_latch procedure (LRM 9.2.2.2, 9.2.2.3): its time-zero run
+    // happens "after all initial and always procedures have been started", so that its
+    // outputs are consistent with their effects on its inputs. The seed loop enqueues
+    // such a process behind every other body instead of in source order. A continuous
+    // assignment is also `self_start` but is not a procedure, so it keeps its place
+    // (LRM 4.9.1 leaves its time-zero order open). Meaningful only with `self_start`.
+    bool starts_after_procedures = false;
     // A continuously-active process whose home region is the reactive region set
     // rather than the active one: a continuous construct declared inside a
     // `program` (LRM 24.3.1 -- "The continuous assignment assign tclk = clk;

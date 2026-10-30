@@ -89,6 +89,7 @@ void Backend::report_dedup_stat() {
 
         put32(static_cast<uint32_t>(p.activation));
         put32(p.self_start ? 1u : 0u);
+        put32(p.starts_after_procedures ? 1u : 0u);
         for (const WaitEvent& w : p.wait_events) {
             canon_signal(w.signal);
             put32(static_cast<uint32_t>(w.edge));
