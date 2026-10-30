@@ -365,11 +365,23 @@ code go.
      root struct into the instance's.
    - **3b, instance records.** Every unit instance gets a record; unit code
      addresses its own storage, ids and name through it and other units'
-     storage and instances through its bindings.
+     storage and instances through its bindings. Landed so far: every
+     instance scope has a record, and a single-scope group and each member of
+     a group spanning instances address their own storage, shadow, sched
+     flags, wait buckets, dump-var index and NBA block ids through it (block
+     ids at the record's field for the function's def-local process ordinal).
+     Other instances' signals stay absolute, and array, trigger and name ids
+     are not in the record yet.
    - **3c, code once per unit.** Each unit's processes and functions are
      lowered once from the unit's IR, taking the record, into the unit's module.
      Fusion runs within a unit; groups spanning instances become dispatch
-     table rows. `share_twin_groups` and outlining go.
+     table rows. `share_twin_groups` and outlining go. Landed ahead of
+     code-once: a group spanning instances is always the dispatch form (a
+     root dispatcher over one member function per member taking its instance
+     record; no member cap; with or without split emission), a coroutine
+     group fuses only within one instance, and `SimulationConfig::outline` is
+     gone. Members are still emitted once per instance; `--stat=unit-code`
+     compares them across the instances of a unit.
    - **3d, wake and NBA as data.** A writer reads its wake buckets' base and
      capacity from the record, a subscription carries its trigger bits, the
      ring mask is a root global, NBA and trigger ids are record base plus
