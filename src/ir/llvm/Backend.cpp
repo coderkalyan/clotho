@@ -297,6 +297,11 @@ ModuleEnv& Backend::unit_env(const Anchor& a) {
     return *it->second;
 }
 
+// Every value's width reaches here through the frontend's check against this limit, so the
+// integer types built from it fit LLVM's own; the two numbers are one fact.
+static_assert(max_integer_bits == static_cast<uint32_t>(llvm::IntegerType::MAX_INT_BITS),
+              "ir::max_integer_bits is LLVM's IntegerType::MAX_INT_BITS");
+
 llvm::IntegerType* Backend::int_ty(uint32_t width) const {
     return llvm::IntegerType::get(ctx_, width == 0 ? 1 : width);
 }

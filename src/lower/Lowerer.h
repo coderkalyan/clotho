@@ -1069,6 +1069,12 @@ private:
 
     [[noreturn]] void fail(std::string msg);
 
+    // Refuse, at `where`, a value of `width` bits that no LLVM integer can hold
+    // (ir::max_integer_bits; a 4-state value takes twice its width), which would
+    // otherwise crash inside LLVM. LRM 6.9.1 and 7.4.1 let an implementation limit the
+    // length of a vector or packed array, as long as the limit is at least 65536 bits.
+    void check_value_width(uint32_t width, bool four_state, slang::SourceRange where);
+
     // Run one behavioural member's lowering, and on a guard failure record the
     // diagnostic and carry on with the next member instead of abandoning the
     // whole design. This is what turns "one error per invocation" into "every

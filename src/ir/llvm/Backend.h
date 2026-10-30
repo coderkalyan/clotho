@@ -285,11 +285,21 @@ struct BoundsCheck {
 };
 
 // Storage width above which a runtime-offset bit / part select is done by the
-// runtime (word-indexed) instead of inline (whole-value variable shift). See
-// wide_dyn_storage for the measurements behind the number: the inline form is
-// linear-ish to a few thousand bits and then quadratic, so this sits an octave
-// inside the safe region.
-constexpr uint32_t wide_dyn_select_bits = 4096;
+// runtime (word-indexed) instead of inline (whole-value variable shift). The inline
+// form costs O(width) instructions and the helper a flat 182-311 (2-/4-state, read /
+// write); they cross between 190 and 290 bits, so 256 puts the helper where it wins at
+// every width above it (wide_dyn_storage has the measurements). A select with a
+// constant offset never reaches the helper's call.
+constexpr uint32_t wide_dyn_select_bits = 256;
+
+// Operand width above which multiply, divide and modulo are runtime calls
+// (rt_wide_mul, rt_wide_udiv, ...) instead of LLVM's own lowering; at or below it
+// they are native two-register arithmetic. LLVM lowers a wider `udiv` to a bit-serial
+// loop (3.5 us at 256 bits against 34 ns at 128, 3.3 ms at 4096) and a wider `mul` to
+// every partial product, whose compile time grows 12x per doubling past 4096 bits.
+// One threshold serves all three: a 128-bit value is two registers, and the runtime
+// call costs more than the native sequence there.
+constexpr uint32_t wide_arith_bits = 128;
 
 // A resolved assignment target: a `{ i(2W) must|may, iW z }` slot somewhere in
 // typed storage (the module state struct for a signal, or the per-call frame
@@ -2156,6 +2166,7 @@ private:
 
     llvm::FunctionCallee wide_sel_fn();
     llvm::FunctionCallee wide_ins_fn();
+    llvm::FunctionCallee wide_arith_fn(const char* name);
 
     llvm::StructType* null_site_ty();
     llvm::FunctionCallee null_handle_fn();
@@ -3390,6 +3401,13 @@ private:
     Plane lower_arith(Inst::Tag tag, Plane a, Plane b);
 
     Plane lower_divmod(Inst::Tag tag, Plane a, Plane b);
+
+    // A multiply, divide or modulo of two iW values through the runtime routine `routine`
+    // (rt_wide_mul, rt_wide_udiv, ...): spill both to word buffers, call, reload.
+    llvm::Value* wide_arith(const char* routine, llvm::Value* a, llvm::Value* b);
+
+    // a * b as iW, wrapping: LLVM's `mul` up to `wide_arith_bits`, rt_wide_mul above.
+    llvm::Value* lower_mul(llvm::Value* a, llvm::Value* b);
 
     Plane lower_pow(Plane a, Plane b, bool base_signed, bool exp_signed);
 
