@@ -653,6 +653,47 @@ TEST_CASE("undriven bits of a partially-driven net power on z, not x") {
     CHECK(out == "zz10zz11 zzzz1zz1 zzzzzzzz\n");
 }
 
+// The undriven bits of a partially driven net read as z, whatever reads them.
+// The may-z analysis has to know the net can hold z, or a reader proven never-z
+// drops its z word and stores x: a continuous, delayed, concatenating,
+// replicating, sign-casting, blocking, nonblocking or resolving reader is checked
+// below (ivtest br_gh99m..w, pr2837451). Oracle: iverilog 13 prints these lines
+// for this source.
+TEST_CASE("readers of a partially-driven net keep its undriven bits at z") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [7:0] a;
+          assign a[3:0] = 4'd2;          // a[7:4] undriven -> z
+          wire [7:0]  cont = a;
+          wire [7:0]  dly;
+          assign #1 dly = a;
+          wire [9:0]  cat = {1'b0, a, 1'b1};
+          wire [15:0] rep = {2{a}};
+          wire [9:0]  sgn = $signed(a);
+          logic [7:0] blk, nba;
+          wire [1:0]  c;
+          assign c[1] = 1'b1;            // c[0] undriven -> z
+          wire e;
+          assign e = c[0];               // z resolved with 0 -> 0
+          assign e = 1'b0;
+          initial begin
+            #2;
+            blk = a;
+            nba <= a;
+            #1;
+            $display("%b %b %b", a, cont, dly);
+            $display("%b %b %b", cat, rep, sgn);
+            $display("%b %b", blk, nba);
+            $display("%b %b", c, e);
+          end
+        endmodule
+    )");
+    CHECK(out == "zzzz0010 zzzz0010 zzzz0010\n"
+                 "0zzzz00101 zzzz0010zzzz0010 zzzzzz0010\n"
+                 "zzzz0010 zzzz0010\n"
+                 "1z 0\n");
+}
+
 // -- 2-state driver regions --
 //
 // A driver slot is cut from the NET's type, so it is always 4-state and always

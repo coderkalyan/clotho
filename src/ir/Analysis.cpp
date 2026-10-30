@@ -1922,10 +1922,15 @@ DesignFacts analyze(const Module& m) {
         }
     }
 
-    // Seed 1: an undriven 4-state net holds its default value z (LRM 6.6). The
-    // backend initializes exactly these to z.
+    // Seed 1: a net holds its default value z (LRM 6.6) wherever nothing drives
+    // it, and the backend initializes exactly those bits to z: every bit of an
+    // undriven 4-state net, and the undriven bits of a partially driven one
+    // (the mask computed above). A reader of either must keep its z word.
     for (uint32_t i = 0; i < nsig; ++i) {
-        if (facts.undriven[i] && m.signals()[i].is_net && m.pool.layout(m.signals()[i].type).domain == Domain::Four) {
+        if (!m.signals()[i].is_net || m.pool.layout(m.signals()[i].type).domain != Domain::Four) {
+            continue;
+        }
+        if (facts.undriven[i] || !facts.undriven_mask(static_cast<Signal>(i)).empty()) {
             vs.sig_z[i] = 1;
         }
     }

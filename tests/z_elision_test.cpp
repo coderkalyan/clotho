@@ -81,6 +81,30 @@ TEST_CASE("an undriven 4-state net defaults to z and seeds the analysis (LRM 6.6
     CHECK(!a.z("w2"));
 }
 
+// The per-bit counterpart of the seed above: the undriven bits of a partially
+// driven net power on z, so the net and everything that copies it may hold z.
+TEST_CASE("a partially-driven net holds z in its undriven bits and seeds the analysis (LRM 6.6)") {
+    const Analyzed a = analyze(R"(
+        module top;
+            wire [7:0] part;
+            assign part[3:0] = 4'd2;
+            wire [7:0] copy = part;
+            logic [7:0] var_copy;
+            always @* var_copy = part;
+            wire [3:0] covered;
+            assign covered[1:0] = 2'd1;
+            assign covered[3:2] = 2'd2;
+            wire [3:0] covered_copy = covered;
+        endmodule
+    )");
+    CHECK(a.z("part"));
+    CHECK(a.z("copy"));
+    CHECK(a.z("var_copy"));
+    // Disjoint drivers that together cover every bit leave nothing at z.
+    CHECK(!a.z("covered"));
+    CHECK(!a.z("covered_copy"));
+}
+
 TEST_CASE("a z literal marks its target and transitive copies") {
     const Analyzed a = analyze(R"(
         module top;
