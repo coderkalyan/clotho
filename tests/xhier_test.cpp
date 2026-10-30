@@ -360,7 +360,7 @@ TEST_CASE("defparam: a real value onto an implicitly typed integer parameter is 
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK_MESSAGE(r.diagnostic_text().find("parameter 'lwrval' is given a value of a different type") !=
+    CHECK_MESSAGE(r.diagnostic_text().find("a defparam gives parameter 'lwrval' a value of type 'real'") !=
                     std::string::npos,
                   r.diagnostic_text());
 }
@@ -380,6 +380,27 @@ TEST_CASE("defparam: a narrower value is refused even where only a width reads i
         endmodule
     )");
     CHECK_FALSE(r.ok);
-    CHECK_MESSAGE(r.diagnostic_text().find("parameter 'w' is given a value of a different type") != std::string::npos,
+    CHECK_MESSAGE(r.diagnostic_text().find("a defparam gives parameter 'w' a value of type") != std::string::npos,
                   r.diagnostic_text());
+}
+
+TEST_CASE("defparam check: a localparam computed by a function using %= simulates") {
+    // No defparam here. slang's constant evaluation of `x %= 2` returns a value
+    // whose width and signedness differ from the localparam's type, which an
+    // earlier check on the value refused (ivtest cfunc_assign_op_vec). Icarus
+    // Verilog 13 prints "1 1".
+    CHECK(run_capture(R"(
+        module top;
+          function integer mod2(input integer x);
+            x %= 2;
+            mod2 = x;
+          endfunction
+          function integer mod2b(input integer x);
+            mod2b = x % 2;
+          endfunction
+          localparam a = mod2(5);
+          localparam b = mod2b(5);
+          initial $display("%0d %0d", a, b);
+        endmodule
+    )") == "1 1\n");
 }

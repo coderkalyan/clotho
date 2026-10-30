@@ -777,16 +777,16 @@ void Lowerer::lower_members(const Scope&       scope,
                     });
                 }
                 break;
-            // slang resolves a parameter, but its value is checked against its
-            // type here, so a defparam that retypes one is refused even when no
-            // reference to it reaches lowering (a width, another parameter).
-            case SymbolKind::Parameter:
-                if (emit)
-                    recover([&] { check_param_value_type(m.as<ParameterSymbol>()); });
+            // slang resolves a defparam, but the type it gives its target is
+            // checked here; see check_defparam_type. In Collect, so the whole
+            // design knows which parameters are refused before Emit reads any.
+            case SymbolKind::DefParam:
+                if (pass == Pass::Collect)
+                    recover([&] { check_defparam_type(m.as<DefParamSymbol>()); });
                 break;
             // Known-inert members: elaboration artifacts and declarations
             // that bear no simulation behavior of their own. Ports are wired
-            // by wire_ports; types/genvars are resolved by slang;
+            // by wire_ports; parameters/types/genvars are resolved by slang;
             // subroutines lower on demand at call sites; statement blocks
             // lower with their enclosing procedure; elab system tasks were
             // already issued as elaboration diagnostics.
@@ -800,6 +800,7 @@ void Lowerer::lower_members(const Scope&       scope,
             case SymbolKind::Modport:
             case SymbolKind::InterfacePort:
             case SymbolKind::ModportPort:
+            case SymbolKind::Parameter:
             case SymbolKind::TypeParameter:
             case SymbolKind::TypeAlias:
             // `typedef class C;` (LRM 6.18 / 8.27): pure elaboration-time name
@@ -833,7 +834,6 @@ void Lowerer::lower_members(const Scope&       scope,
             case SymbolKind::EmptyMember:
             case SymbolKind::ElabSystemTask:
             case SymbolKind::Specparam:
-            case SymbolKind::DefParam:
             // A named `sequence` / `property` declaration is a template, not
             // a member with behavior of its own: nothing elaborates until it
             // is instantiated, and slang expands the body with the actual

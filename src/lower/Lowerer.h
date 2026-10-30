@@ -1533,12 +1533,11 @@ private:
 
     ir::Ref lower_constant(const slang::ConstantValue& cv, const slang::ast::Type& type);
 
-    // Refuses a parameter whose value is not of its own type: a defparam onto an
-    // implicitly typed parameter (see the NOTE at the definition).
-    void check_param_value_type(const slang::ast::ParameterSymbol& p);
+    // Refuses a defparam that gives an implicitly typed parameter a value of
+    // another type (see the NOTE at the definition), recording the parameter in
+    // refused_params_.
+    void check_defparam_type(const slang::ast::DefParamSymbol& d);
 
-    // A parameter's value as a constant of `type`, the type slang gave the
-    // reference, after check_param_value_type.
     ir::Ref lower_param_constant(const slang::ast::ParameterSymbol& p, const slang::ast::Type& type);
 
     void append_svint_bytes(const slang::SVInt& src, ir::Ref ty, std::vector<uint8_t>& out);
@@ -5217,6 +5216,9 @@ private:
     // compiles to a warning plus a run-time fatal stub instead of refusing the
     // design. False on the direct-call path, whose compile diagnostics stand.
     bool stub_unsupported_bodies_ = false;
+    // Parameters a refused defparam targets (check_defparam_type, Collect pass):
+    // their value is not of their type, so a reference to one is refused too.
+    ankerl::unordered_dense::set<const slang::ast::ParameterSymbol*> refused_params_;
     // Canonical slang struct/union type -> its lowered ir::Ref, so a type used by
     // many variables (e.g. a bus of the same struct) interns its field table
     // once. The pool's own structural dedup can't do this: two independently
