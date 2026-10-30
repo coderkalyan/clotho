@@ -1316,7 +1316,8 @@ void Lowerer::build_task(const SubroutineSymbol& sub, ir::FunctionId id) {
 // Returns the reserved FunctionId.
 ir::FunctionId Lowerer::build_fork_child(const Statement&                    body,
                                          std::span<const ValueSymbol* const> captures,
-                                         ir::ForkKind                        kind) {
+                                         ir::ForkKind                        kind,
+                                         const std::vector<OpenBlock>&       enclosing) {
     const ir::FunctionId id = module_.reserve_function();
 
     FnCtx ctx;
@@ -1324,6 +1325,16 @@ ir::FunctionId Lowerer::build_fork_child(const Statement&                    bod
     ctx.invoking_scope = hier_name();
     ctx.is_task     = true;
     const FnScope fn_scope(*this, &ctx);
+    // The child is an activation of every targeted block it was forked inside (LRM
+    // 9.6.2), so a `disable` of one can find and end it, and its own `disable` of one
+    // can still resolve the target. FnScope emptied the stack above; the frames are
+    // marked inherited, so they do not repeat the parent's names in %m.
+    named_blocks_ = enclosing;
+    std::vector<uint32_t> fork_targets;
+    fork_targets.reserve(enclosing.size());
+    for (const OpenBlock& ob : enclosing) {
+        fork_targets.push_back(ob.label);
+    }
 
     // Formals first, so formal k == Local k (the invariant build_task maintains
     // and the backend's prologue / ref binding rely on).
@@ -1390,6 +1401,7 @@ ir::FunctionId Lowerer::build_fork_child(const Statement&                    bod
                                        .is_task       = true,
                                        .is_fork_child = true,
                                        .fork_kind     = kind,
+                                       .fork_targets  = std::move(fork_targets),
                                        .ir            = b.finish() });
     if (failure) {
         throw *failure;

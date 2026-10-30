@@ -98,7 +98,8 @@ Milestones, in order; lower ones unblock higher ones:
 ### Procedural control
 
 - [ ] **`disable` of a target that can suspend in a callee** (9.6.2) — a target parked in a
-  time-consuming task call, a `fork` or an `expect` cannot be aborted down the enable chain.
+  time-consuming task call or an `expect`, or a task that forks, cannot be aborted. A block
+  whose body calls a subroutine that forks is refused too: those children are not in it.
 
 ## M2 — Icarus Verilog parity
 

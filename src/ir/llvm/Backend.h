@@ -3690,7 +3690,7 @@ private:
 
     llvm::Value* disable_head_ptr(llvm::IRBuilder<>& b, uint32_t t);
 
-    void emit_disable_link(uint32_t target, llvm::Value* node);
+    void emit_disable_link(uint32_t target, llvm::Value* node, llvm::Value* flag = nullptr);
 
     void emit_disable_unlink(uint32_t target, llvm::Value* node);
 
@@ -3971,6 +3971,13 @@ private:
     // This activation's node on its task's `disable` list, or null when the task
     // being lowered is not a target. Frame-resident (hoisted after coro.begin).
     llvm::Value*            disable_node_     = nullptr;
+    // The nodes a fork child links in its RAMP, one per enclosing targeted block
+    // (ir::Function::fork_targets), with the target id each is on. Empty outside a
+    // fork child. Until the body starts they publish `spawn_sched_`, a word held at 1,
+    // as their scheduled flag, so a `disable` that lands while the child is only
+    // queued marks it without pushing it a second time.
+    std::vector<std::pair<uint32_t, llvm::Value*>> fork_disable_nodes_;
+    llvm::Value*                                   spawn_sched_ = nullptr;
     // Per targeted named block in the body being lowered: its frame-resident list
     // node. Reset per function alongside disable_node_.
     ankerl::unordered_dense::map<uint32_t, llvm::Value*> block_nodes_;

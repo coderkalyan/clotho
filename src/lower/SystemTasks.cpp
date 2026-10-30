@@ -1691,6 +1691,9 @@ std::string Lowerer::hier_name() const {
         }
     }
     for (const OpenBlock& nb : named_blocks_) {
+        if (nb.inherited) {
+            continue; // already in invoking_scope
+        }
         path += '.';
         path += nb.sym->name;
     }

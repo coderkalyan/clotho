@@ -621,6 +621,12 @@ struct Function {
     // the record is heap-allocated and reference-counted and the last one out frees
     // it (lower_fork_inst).
     ForkKind fork_kind = ForkKind::Join;
+    // The `disable` target ids of every named block this fork child was forked
+    // inside, innermost last (LRM 9.6.2: a block's forked children are activity
+    // within it). Only meaningful with is_fork_child. The child links one node onto
+    // each target's list in its RAMP, before it has run, so a `disable` that lands
+    // while it is still queued (a `join_none` / `join_any` sibling) still ends it.
+    std::vector<uint32_t> fork_targets;
     // A DPI-C import (LRM 35): the body is native C resolved at JIT link time by
     // extern_name, not lowered from IR. The backend emits an external declaration
     // (dpi_arg_ctypes / dpi_ret_ctype give the native C signature) and marshals

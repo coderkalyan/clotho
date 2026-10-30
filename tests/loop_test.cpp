@@ -1068,6 +1068,275 @@ TEST_CASE("a target that parks on a time-consuming call is still refused") {
     CHECK(task_park.diagnostic_text().find("cannot claim that park") != std::string::npos);
 }
 
+// LRM 9.6.2: disabling a named block ends "all activities enabled within the named
+// block", and a named `fork` is a block whose activity is its children. `disable F`
+// used to walk an empty list, so it was a silent no-op from inside the fork and from
+// another process alike, and the join waited out every child. A child is now an
+// activation of each targeted block it was forked inside, linked when it is spawned,
+// so a child that is only queued (join_none, join_any) is ended too. Oracle: iverilog
+// 13 on every design here.
+TEST_CASE("disable of a named fork ends its children") {
+    SUBCASE("from one of its own branches, join") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    fork : F
+                        #50 $display("A alive %0t", $time);
+                        #5 disable F;
+                    join
+                    $display("after F %0t", $time);
+                end
+            endmodule
+        )") == "after F 5\n");
+    }
+    SUBCASE("from another process, join") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    fork : F
+                        #50 $display("A alive %0t", $time);
+                        #60 $display("B alive %0t", $time);
+                    join
+                    $display("after F %0t", $time);
+                end
+                initial #5 disable t.F;
+            endmodule
+        )") == "after F 5\n");
+    }
+    SUBCASE("join_any: the children still running are ended") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    fork : F
+                        #50 $display("A alive %0t", $time);
+                        #5 $display("B done %0t", $time);
+                    join_any
+                    $display("after F %0t", $time);
+                    #5 disable F;
+                    #100 $display("end %0t", $time);
+                end
+            endmodule
+        )") == "B done 5\nafter F 5\nend 110\n");
+    }
+    SUBCASE("join_any, disabled from another process while the parent has moved on") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    fork : F
+                        #50 $display("A alive %0t", $time);
+                        #5 $display("B done %0t", $time);
+                    join_any
+                    $display("after F %0t", $time);
+                    #200 $display("end %0t", $time);
+                end
+                initial #10 disable t.F;
+            endmodule
+        )") == "B done 5\nafter F 5\nend 205\n");
+    }
+    SUBCASE("join_none, from the parent and from another process") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    fork : F
+                        #50 $display("A alive %0t", $time);
+                    join_none
+                    $display("after F %0t", $time);
+                    #5 disable F;
+                    #100 $display("end %0t", $time);
+                end
+            endmodule
+        )") == "after F 0\nend 105\n");
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    fork : F
+                        #50 $display("A alive %0t", $time);
+                    join_none
+                    $display("after F %0t", $time);
+                    #100 $display("end %0t", $time);
+                end
+                initial #5 disable t.F;
+            endmodule
+        )") == "after F 0\nend 100\n");
+    }
+    SUBCASE("a child that has not started yet never runs") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    fork : F
+                        $display("child ran %0t", $time);
+                    join_none
+                    disable F;
+                    #10 $display("end %0t", $time);
+                end
+            endmodule
+        )") == "end 10\n");
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    fork : F
+                        begin #5 $display("child ran %0t", $time); end
+                    join_none
+                    #1 disable F;
+                    #10 $display("end %0t", $time);
+                end
+            endmodule
+        )") == "end 11\n");
+    }
+    SUBCASE("a child parked on an event is not woken by it afterwards") {
+        CHECK(run_capture(R"(
+            module t;
+                event e;
+                initial begin
+                    fork : F
+                        @e $display("A woke");
+                        #5 $display("B done %0t", $time);
+                    join_any
+                    disable F;
+                    #1 -> e;
+                    #10 $display("end %0t", $time);
+                end
+            endmodule
+        )") == "B done 5\nend 16\n");
+    }
+    SUBCASE("a block that is entered again is disabled again") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    for (int i = 0; i < 2; i++) begin
+                        fork : F
+                            #50 $display("A alive i=%0d %0t", i, $time);
+                            #5 disable F;
+                        join
+                        $display("after F i=%0d %0t", i, $time);
+                    end
+                    #100 $display("end %0t", $time);
+                end
+            endmodule
+        )") == "after F i=0 5\nafter F i=1 10\nend 110\n");
+    }
+    SUBCASE("two instances: each disable reaches its own instance's children") {
+        CHECK(run_capture(R"(
+            module sub #(parameter D = 5);
+                initial begin
+                    fork : F
+                        #50 $display("%m alive");
+                        #D disable F;
+                    join
+                    $display("%m after %0t", $time);
+                end
+            endmodule
+            module t; sub #(5) a(); sub #(7) b(); endmodule
+        )") == "t.a after 5\nt.b after 7\n");
+    }
+    SUBCASE("a fork nested in a child of the disabled fork") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    fork : F
+                        begin
+                            fork
+                                #50 $display("G alive %0t", $time);
+                            join
+                            $display("child after inner %0t", $time);
+                        end
+                        #5 disable F;
+                    join
+                    $display("after F %0t", $time);
+                end
+            endmodule
+        )") == "after F 5\n");
+    }
+}
+
+// The sibling construct: a `begin` block with a fork in it. Its children are activity
+// within it, so a lexical disable has to end them as well as leave the block, and a
+// disable from one of those children, or from another process while the parent is
+// parked at the join, ends the whole block.
+TEST_CASE("disable of a begin block ends the children forked inside it") {
+    SUBCASE("lexically, from the parent") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    begin : B
+                        fork
+                            #50 $display("child alive %0t", $time);
+                        join_none
+                        #5 disable B;
+                        $display("not reached");
+                    end
+                    $display("after B %0t", $time);
+                    #100 $display("end %0t", $time);
+                end
+            endmodule
+        )") == "after B 5\nend 105\n");
+    }
+    SUBCASE("from a forked child, the parent parked at the join") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin
+                    begin : B
+                        fork
+                            #5 disable B;
+                            #50 $display("A alive %0t", $time);
+                        join
+                        $display("not reached %0t", $time);
+                    end
+                    $display("after B %0t", $time);
+                end
+            endmodule
+        )") == "after B 5\n");
+    }
+    SUBCASE("from another process, the parent parked at the join") {
+        CHECK(run_capture(R"(
+            module t;
+                initial begin : P
+                    begin : B
+                        #1;
+                        fork
+                            #50 $display("A alive %0t", $time);
+                        join
+                        $display("not reached %0t", $time);
+                    end
+                    $display("after B %0t", $time);
+                end
+                initial #5 disable t.P.B;
+            endmodule
+        )") == "after B 5\n");
+    }
+}
+
+// What is still refused is a park the abort cannot claim, or children the block does
+// not hold.
+TEST_CASE("disable of a block with forked children that park in a call is refused") {
+    const LowerResult call_park = lower_text(R"(
+        module t;
+            task automatic tk(input int n); #n; endtask
+            initial begin
+                fork : F
+                    tk(50);
+                    #5 disable F;
+                join
+            end
+        endmodule
+    )");
+    CHECK_FALSE(call_park.ok);
+    CHECK(call_park.diagnostic_text().find("cannot claim that park") != std::string::npos);
+
+    const LowerResult via_call = lower_text(R"(
+        module t;
+            task automatic spawn; fork #50 $display("x"); join_none endtask
+            initial begin : B
+                spawn();
+                #5;
+            end
+            initial #1 disable B;
+        endmodule
+    )");
+    CHECK_FALSE(via_call.ok);
+    CHECK(via_call.diagnostic_text().find("calls a subroutine that forks") != std::string::npos);
+}
+
 // An assertion action block is an ordinary body to the remote form: it marks the
 // target's activations and pushes their handles, which needs no coroutine of its
 // own and no region correction. The failing attempt at the first posedge ends the

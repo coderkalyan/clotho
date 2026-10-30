@@ -375,6 +375,13 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
         uint32_t                                         fork_depth = 0;
         uint32_t                                         sub_depth  = 0;
         ankerl::unordered_dense::set<const SubroutineSymbol*> entered;
+        // The named blocks a `fork` sits in, directly (`fork_in`) or inside a
+        // subroutine they call (`via_call`). `forks_seen` lets a call tell whether
+        // its callee forked; `sub_forks` remembers the answer per subroutine.
+        std::vector<const Symbol*>                                  fork_in;
+        std::vector<const Symbol*>                                  via_call;
+        uint32_t                                                    forks_seen = 0;
+        ankerl::unordered_dense::map<const SubroutineSymbol*, bool> sub_forks;
 
         // Follow a user subroutine once. `sub_depth` marks everything found
         // inside as multi-activation; `open` is swapped empty, because a
@@ -385,15 +392,29 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
                 return;
             }
             const auto* sub = std::get<const SubroutineSymbol*>(c.subroutine);
-            if (sub == nullptr || !entered.insert(sub).second) {
-                return; // recursion, or already walked
+            if (sub == nullptr) {
+                return;
             }
-            std::vector<const Symbol*> saved;
-            saved.swap(open);
-            ++sub_depth;
-            sub->getBody().visit(*this);
-            --sub_depth;
-            open.swap(saved);
+            bool forks = false;
+            if (const auto known = sub_forks.find(sub); known != sub_forks.end()) {
+                forks = known->second; // already walked
+            } else if (entered.insert(sub).second) {
+                std::vector<const Symbol*> saved;
+                saved.swap(open);
+                ++sub_depth;
+                const uint32_t before = forks_seen;
+                sub->getBody().visit(*this);
+                forks = forks_seen != before;
+                --sub_depth;
+                open.swap(saved);
+                sub_forks[sub] = forks;
+            } else {
+                return; // recursion in progress
+            }
+            if (forks) {
+                ++forks_seen;
+                via_call.insert(via_call.end(), open.begin(), open.end());
+            }
         }
         void handle(const BlockStatement& s) {
             const bool forks  = s.blockKind != StatementBlockKind::Sequential;
@@ -405,6 +426,12 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
                     multi.push_back(s.blockSymbol);
                 }
                 bodies.emplace_back(s.blockSymbol, &s.body);
+            }
+            if (forks) {
+                // This fork's children are activity within every block open here,
+                // including the fork block itself when it is named.
+                ++forks_seen;
+                fork_in.insert(fork_in.end(), open.begin(), open.end());
             }
             visitDefault(s);
             if (named) {
@@ -451,8 +478,17 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
     for (const Symbol* t : v.multi) {
         disable_multi_.insert(t);
     }
+    for (const Symbol* t : v.fork_in) {
+        disable_forked_.insert(t);
+    }
+    for (const Symbol* t : v.via_call) {
+        disable_fork_via_call_.insert(t);
+    }
     for (const auto& [sym, body] : v.bodies) {
-        if (hard_park(*body)) {
+        // A fork inside a named block parks its parent at the join, but its children are
+        // activations of the block too (build_fork_child) and end with it, so the join
+        // is released by them: not a park the abort cannot claim.
+        if (hard_park(*body, /*forked_children_are_occupants=*/true)) {
             disable_hard_.insert(sym);
         }
     }
@@ -480,7 +516,10 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
                 }
                 continue;
             }
-            if (set == &v.remote) {
+            // A block with a `fork` inside needs the occupant bookkeeping too, even
+            // when only its own body disables it: the forked children are
+            // activations of it, and the lexical exit alone would leave them running.
+            if (set == &v.remote || disable_forked_.contains(t)) {
                 disable_remote_.insert(t);
             }
         }
@@ -497,13 +536,14 @@ void Lowerer::scan_disable_targets(const ProceduralBlockSymbol& blk) {
 // would resume it
 // a second time; an `expect` parks on a reactive verdict. Refused rather than
 // silently double-woken.
-bool Lowerer::hard_park(const Statement& body) {
+bool Lowerer::hard_park(const Statement& body, bool forked_children_are_occupants) {
     struct Park : ASTVisitor<Park, VisitFlags::AllGood> {
-        Lowerer* self  = nullptr;
-        bool     found = false;
+        Lowerer* self         = nullptr;
+        bool     found        = false;
+        bool     fork_is_hard = true;
 
         void handle(const BlockStatement& s) {
-            found = found || s.blockKind != StatementBlockKind::Sequential;
+            found = found || (fork_is_hard && s.blockKind != StatementBlockKind::Sequential);
             visitDefault(s);
         }
         void handle(const slang::ast::ConcurrentAssertionStatement& s) {
@@ -531,7 +571,8 @@ bool Lowerer::hard_park(const Statement& body) {
         }
     };
     Park p;
-    p.self = this;
+    p.self         = this;
+    p.fork_is_hard = !forked_children_are_occupants;
     body.visit(p);
 
     return p.found;

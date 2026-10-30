@@ -448,18 +448,38 @@ void Lowerer::lower_disable(const slang::ast::DisableStatement& s, ir::Builder& 
         }
         return;
     }
-    bool     found = false;
-    uint32_t label = kNoBlockLabel;
+    if (disable_fork_via_call_.contains(&target)) {
+        // TODO: a block whose body calls a subroutine that forks. LRM 9.6.2 ends "all
+        // activities enabled within the named block", but those children are built
+        // in the callee, outside the block, so no activation list names them and the
+        // disable would leave them running.
+        fail("disable of a block whose body calls a subroutine that forks is not supported "
+             "yet (the forked processes are not in the block)");
+    }
+    bool     found     = false;
+    bool     inherited = false;
+    uint32_t label     = kNoBlockLabel;
     for (size_t n = named_blocks_.size(); n > 0 && !found; --n) {
         if (named_blocks_[n - 1].sym == &target) {
-            found = true;
-            label = named_blocks_[n - 1].label;
+            found     = true;
+            label     = named_blocks_[n - 1].label;
+            inherited = named_blocks_[n - 1].inherited;
         }
     }
 
-    if (found && fn_ctx_ != nullptr) {
+    if (found && (inherited || disable_forked_.contains(&target)) && disable_hard_.contains(&target)) {
+        // TODO: a block with forked children whose body can park behind a
+        // time-consuming task call or an `expect`. A child is woken by a `disable`
+        // exactly as a block occupant is, and the abort cannot claim those parks (the
+        // call's completion would resume it a second time).
+        fail("disable of a block with forked children whose body can park on a "
+             "time-consuming task call or an expect is not supported yet (the abort cannot "
+             "claim that park)");
+    }
+    if (found && (fn_ctx_ != nullptr || disable_forked_.contains(&target))) {
         // A block that encloses this statement inside a body that can have
-        // several activations. A bare branch would end only the one running it,
+        // several activations, or that has a fork in it, whose children are
+        // activations of it too. A bare branch would end only the one running it,
         // and LRM 9.6.2 ends them all — so mark every activation on the list
         // first (the walk skips this one, which is running, not parked) and then
         // take the ordinary structured exit out of our own copy.
@@ -491,6 +511,13 @@ void Lowerer::lower_disable(const slang::ast::DisableStatement& s, ir::Builder& 
     }
     if (label == kNoBlockLabel) {
         fail("internal: disable target was not labelled in the Collect pass");
+    }
+    if (inherited) {
+        // This body is a fork child of the target's, an activation of it with no
+        // region of its own to leave: it ends itself, after the walk above marked
+        // every other activation (LRM 9.6.2 example 4's shape, for a block).
+        b.disable_abort(loc(s));
+        return;
     }
     if (&target == proc_root_block_ && disable_flushes_.contains(&target)) {
         // LRM 16.4.4 / 16.14.6.4: disabling the OUTERMOST scope of a procedure
@@ -658,8 +685,23 @@ void Lowerer::lower_fork(const BlockStatement& blk, ir::Builder& b) {
 
     std::vector<ir::FunctionId> ids;
     ids.reserve(children.size());
+    // The targeted blocks every child is activity within (LRM 9.6.2: "all activities
+    // enabled within the named block ... shall be terminated as well"): the ones
+    // open around this fork, and the fork block itself when a `disable` names it.
+    // Each child becomes an activation of them (build_fork_child).
+    std::vector<OpenBlock> enclosing;
+    for (const OpenBlock& ob : named_blocks_) {
+        if (ob.label != kNoBlockLabel) {
+            enclosing.push_back({ ob.sym, ob.label, true });
+        }
+    }
+    if (blk.blockSymbol != nullptr && !blk.blockSymbol->name.empty()) {
+        if (const auto own = disable_targets_.find(blk.blockSymbol); own != disable_targets_.end()) {
+            enclosing.push_back({ blk.blockSymbol, own->second, true });
+        }
+    }
     for (const Statement* c : children) {
-        ids.push_back(build_fork_child(*c, captures, kind));
+        ids.push_back(build_fork_child(*c, captures, kind, enclosing));
     }
 
     // The capture actuals, in the order the children took their formals: each is
