@@ -295,6 +295,8 @@ Milestones, in order; lower ones unblock higher ones:
     become one net; needs merging the nets of one scope.
 - [ ] **Port expression that is not a select of one internal net** (23.2.2.1, 23.2.2.2) — a
   non-ANSI concatenation port `module m({a, b})` and an ANSI `.p(expr)` port are refused.
+- [ ] **`` `unconnected_drive `` on an unconnected input variable, aggregate or select port**
+  (22.9) — only a whole packed net port is pulled; the others are refused.
 
 ### Timing checks (basic)
 

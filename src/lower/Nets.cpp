@@ -1810,6 +1810,19 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
     if (sym.kind != SymbolKind::Net) {
         fail("pullup/pulldown target must be a net");
     }
+    // Default pull strength (LRM 28.11) is Pull; an explicit strength overrides
+    // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
+    const auto [ds0, ds1] = gi.getDriveStrength();
+    const uint8_t driven = up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
+    emit_pull_driver(sym, up, driven, to_source_loc(gi.location), /*program_driver=*/false);
+}
+
+// A permanent driver of all ones (`up`) or all zeros on a whole net at drive
+// strength `level`, lowered as a strength driver slot so it folds against any
+// real driver: a stronger driver wins, else the net holds the pull value. The
+// source a pullup / pulldown primitive (LRM 28.5) is, and an unconnected input
+// port under `unconnected_drive (LRM 22.9) is.
+void Lowerer::emit_pull_driver(const ValueSymbol& sym, bool up, uint8_t level, ir::SourceLoc l, bool program_driver) {
     if (cur_pass_ == Pass::Classify) {
         record_net_driver_whole(sym);
         force_net_resolved(signal_of(sym));
@@ -1818,23 +1831,39 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
     if (cur_pass_ != Pass::Emit) {
         return;
     }
-    const ir::Signal    net = signal_of(sym);
-    const ir::SourceLoc l   = to_source_loc(gi.location);
-    const uint32_t      w   = module_.pool.layout(module_.signal(net).type).width;
-    // Default pull strength (LRM 28.11) is Pull; an explicit strength overrides
-    // the driven side. pullup drives only 1 (highz0), pulldown only 0 (highz1).
-    const auto [ds0, ds1] = gi.getDriveStrength();
-    const uint8_t driven =
-      up ? (ds1 ? strength_level(ds1) : uint8_t{ 2 }) : (ds0 ? strength_level(ds0) : uint8_t{ 2 });
-    const uint16_t   strength = up ? static_cast<uint16_t>(driven)       // (highz0, drivenN)
-                                   : static_cast<uint16_t>(driven << 8); // (drivenN, highz1)
+    const ir::Signal net = signal_of(sym);
+    const uint32_t   w   = module_.pool.layout(module_.signal(net).type).width;
+    // (highz0, level1) for a pull up, (level0, highz1) for a pull down.
+    const uint16_t   strength = up ? static_cast<uint16_t>(level) : static_cast<uint16_t>(level << 8);
     ir::Builder      b(module_.pool);
-    const ir::Signal slot = alloc_driver_slot(net, l, strength);
+    const ir::Signal slot = alloc_driver_slot(net, l, strength, program_driver);
     const ir::Index  dst  = b.signal(slot, l);
     const ir::Index  val  = b.constant(def_constant_ref(w, up), l);
     b.binary(ir::Inst::Tag::Store, dst, val, l);
     // A permanent source: self-starting, never re-evaluated (empty sensitivity).
-    add_continuous_process({}, l, b);
+    add_continuous_process({}, l, b, program_driver);
+}
+
+// An unconnected input port of a module declared under `unconnected_drive pull0 /
+// pull1 (LRM 22.9) is pulled down / up instead of floating: a Pull-strength
+// driver of its net, so a driver of the child's own beats it. Only a whole
+// packed net port is pulled. LRM 22.9 says nothing of what pulling a variable
+// means (23.3.3.2 gives an unconnected input variable its data type's default),
+// so a variable, an aggregate and a select port are refused; an event is not
+// driven and has nothing to pull.
+void Lowerer::lower_unconnected_drive(const PortSymbol& p, bool up, bool program_driver) {
+    const ValueSymbol& sym = p.internalSymbol->as<ValueSymbol>();
+    if (sym.getType().isEvent()) {
+        return;
+    }
+    if (sym.kind != SymbolKind::Net || p.getInternalExpr() != nullptr || is_aggregate(sym.getType()) ||
+        is_unpacked_array_type(sym.getType())) {
+        // TODO: `unconnected_drive on an unconnected input variable, aggregate
+        // or select port.
+        fail("`unconnected_drive on an unconnected input port that is not a whole packed net is not "
+             "supported");
+    }
+    emit_pull_driver(sym, up, /*level=*/2, to_source_loc(p.location), program_driver);
 }
 
 // A cmos / rcmos switch (LRM 28.9). The LRM defines it purely by

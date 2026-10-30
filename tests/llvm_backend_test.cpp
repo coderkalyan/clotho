@@ -4171,6 +4171,85 @@ TEST_CASE("an unconnected child input port reads z inside the child") {
     CHECK(run_capture(src) == "zzzz\n");
 }
 
+// LRM 22.9: every unconnected input port of a module declared between
+// `unconnected_drive and `nounconnected_drive is pulled up (pull1) or down (pull0)
+// instead of floating at z. The directive belongs to the declaration, so a module
+// before or after it floats as ever; a connected port, a port with a default
+// value and an inout port are not unconnected input ports. Expected values from
+// the LRM; iverilog 13 prints the same.
+TEST_CASE("unconnected_drive pulls an unconnected input port (LRM 22.9)") {
+    constexpr std::string_view src = R"(
+        module plain(input in);
+        endmodule
+        `unconnected_drive pull0
+        module lo(input [3:0] in, input a, input b = 1'b1, inout io);
+        endmodule
+        `unconnected_drive pull1
+        module hi(input [3:0] in, input [15:0] w16, input e);
+        endmodule
+        `nounconnected_drive
+        module after(input in);
+        endmodule
+        module top;
+            reg drv = 1'b1;
+            plain p();
+            lo    l(.a(drv), .io());
+            hi    h();
+            after f();
+            initial #1 $display("%b %b %b %b %b %b %h %b %b", p.in, l.in, l.a, l.b, l.io, h.in, h.w16, h.e, f.in);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "z 0000 1 1 z 1111 ffff 1 z\n");
+}
+
+// A pull is a Pull-strength driver, so a driver of the child's own beats it
+// (here the port is coerced to inout, LRM 23.3.3.1) and the drivers resolve.
+TEST_CASE("an unconnected_drive pull loses to a stronger driver of the port net") {
+    constexpr std::string_view src = R"(
+        `unconnected_drive pull1
+        module m(input in, input in2);
+            assign in2 = 1'b0;
+        endmodule
+        `nounconnected_drive
+        module top;
+            m u();
+            initial #1 $display("%b %b", u.in, u.in2);
+        endmodule
+    )";
+    CHECK(run_capture(src) == "1 0\n");
+}
+
+// An input variable has no net to pull, and LRM 22.9 does not say what pulling it
+// means (23.3.3.2 gives it its data type's default), so it is refused; an event
+// is not driven at all and has nothing to pull.
+TEST_CASE("unconnected_drive on an unconnected input variable port fails loudly") {
+    SUBCASE("a variable") {
+        const LowerResult r = lower_text(R"(
+            `unconnected_drive pull1
+            module m(input var logic v);
+            endmodule
+            `nounconnected_drive
+            module top;
+                m u();
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("unconnected_drive") != std::string::npos);
+    }
+    SUBCASE("an event port is left alone") {
+        const LowerResult r = lower_text(R"(
+            `unconnected_drive pull1
+            module m(input event e);
+            endmodule
+            `nounconnected_drive
+            module top;
+                m u();
+            endmodule
+        )");
+        CHECK_MESSAGE(r.ok, r.diagnostic_text());
+    }
+}
+
 TEST_CASE("unmodeled net kinds fail loudly") {
     // wire/tri/uwire/wand/wor/tri0/tri1 are modeled; trireg/supply* carry charge
     // or strength semantics clotho does not implement.

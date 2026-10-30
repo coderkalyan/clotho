@@ -1041,9 +1041,17 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
             // no copy process. An unconnected input leaves the child's internal
             // net with no driver, so it holds the undriven default from
             // init_state (z for a 4-state net per LRM 6.6, x for a variable,
-            // 0 for 2-state). A port carrying an explicit default value
-            // arrives here with a non-null expression, so a null expression
-            // means there is genuinely nothing to drive.
+            // 0 for 2-state), unless its module was declared under
+            // `unconnected_drive (LRM 22.9), which pulls it up or down. A port
+            // carrying an explicit default value arrives here with a non-null
+            // expression, so a null expression means there is genuinely nothing
+            // to connect.
+            if (p.direction == slang::ast::ArgumentDirection::In) {
+                const slang::ast::UnconnectedDrive drive = child.getDefinition().unconnectedDrive;
+                if (drive != slang::ast::UnconnectedDrive::None) {
+                    lower_unconnected_drive(p, drive == slang::ast::UnconnectedDrive::Pull1, child_is_program);
+                }
+            }
             continue;
         }
 
