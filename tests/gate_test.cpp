@@ -895,34 +895,102 @@ TEST_CASE("a single gate driving a packed-net member is rejected") {
 
 // LRM 28.13 / 28.14: a MOS switch passes the strength of its data input to its
 // output, and a resistive one reduces it. Clotho has no strength on a net value,
-// so a switch always drives strong; that only shows when the output net resolves
-// the switch against another driver, and then the design is refused instead of
-// resolved wrongly (docs/LRM_NOTES.md note 38). Oracle: iverilog 13 prints b=1
-// c=1 / q=0 r=0 for the first two sources, where Clotho used to print x.
+// so a switch always drives strong; that is exact when nothing the strength could
+// be compared with is there, or every strength involved orders as strong does.
+// Every other design is refused instead of resolved wrongly (docs/LRM_NOTES.md
+// note 38). Where iverilog 13 ran a source it printed the LRM's value in the
+// comment (the refusals) or the value the accepted designs below check.
 TEST_CASE("a MOS switch whose strength matters is refused, not resolved wrongly") {
     const auto refused = [](std::string_view body, std::string_view what) {
         const LowerResult r = lower_text("module m;\n" + std::string(body) + "\nendmodule");
         CHECK_FALSE(r.ok);
         CHECK_MESSAGE(r.diagnostic_text().find(what) != std::string::npos, r.diagnostic_text());
     };
-    // A weak data input (explicit drive strength), through nmos and cmos.
-    refused("wire a, b, c;\n assign (strong1, weak0) a = 1'b0;\n nmos n(b, a, 1'b1);\n assign b = 1'b1;", "LRM 28.13");
-    refused("wire a, c;\n assign (strong1, weak0) a = 1'b0;\n cmos n(c, a, 1'b1, 1'b0);\n assign c = 1'b1;",
-            "LRM 28.13");
-    // A pulled data input, through pmos.
-    refused("wire w, q;\n pullup (w);\n pmos (q, w, 1'b0);\n buf (q, 1'b0);", "LRM 28.13");
-    refused("tri1 w;\n wire q;\n nmos (q, w, 1'b1);\n assign q = 1'b0;", "LRM 28.13");
-    // A resistive switch, whatever its input.
+    constexpr std::string_view mos = "MOS switch";
+    // A data input driven weaker than strong: an assign, a net declaration
+    // assignment (iverilog: b=1), a gate, a driver in a concatenation.
+    refused("wire a, b;\n assign (strong1, weak0) a = 1'b0;\n nmos n(b, a, 1'b1);\n assign b = 1'b1;", mos);
+    refused("wire (strong1, weak0) a = 1'b0;\n wire b;\n nmos n(b, a, 1'b1);\n assign b = 1'b1;", mos);
+    refused("wire a, c;\n assign (strong1, weak0) a = 1'b0;\n cmos n(c, a, 1'b1, 1'b0);\n assign c = 1'b1;", mos);
+    refused("wire a, b;\n buf (weak0, weak1) g(a, 1'b0);\n nmos n(b, a, 1'b1);\n assign b = 1'b1;", mos);
+    refused("wire a, b, q;\n assign (weak1, weak0) {a, b} = 2'b00;\n nmos n(q, a, 1'b1);\n assign q = 1'b1;", mos);
+    // An element of a net array is no static terminal, so its strength is unknown.
+    refused(
+      "wire a [0:1];\n assign (strong1, weak0) a[0] = 1'b0;\n wire b;\n nmos n(b, a[0], 1'b1);\n assign b = 1'b1;",
+      mos);
+    // A pulled data input: pullup, tri1, a bit of a tri1 vector.
+    refused("wire w, q;\n pullup (w);\n pmos (q, w, 1'b0);\n buf (q, 1'b0);", mos);
+    refused("tri1 w;\n wire q;\n nmos (q, w, 1'b1);\n assign q = 1'b0;", mos);
+    refused("tri1 [1:0] v;\n wire q;\n nmos (q, v[1], 1'b1);\n assign q = 1'b0;", mos);
+    // A weak input that reaches the switch through an inout port (iverilog: q=0)
+    // or through another switch, resistive or not (iverilog: q=0).
+    constexpr std::string_view inout_design = R"(
+        module sub(inout io, inout q);
+          nmos n(q, io, 1'b1);
+        endmodule
+        module m;
+          tri1 w;
+          wire q;
+          sub s(w, q);
+          assign q = 1'b0;
+        endmodule)";
+    const LowerResult          r_inout      = lower_text(inout_design);
+    CHECK_FALSE(r_inout.ok);
+    CHECK(r_inout.diagnostic_text().find(mos) != std::string::npos);
+    refused("tri1 w;\n wire m, q;\n nmos n1(m, w, 1'b1);\n nmos n2(q, m, 1'b1);\n assign q = 1'b0;", mos);
+    refused("wire c, r, q;\n assign c = 1'b1;\n rnmos rn(r, c, 1'b1);\n nmos n(q, r, 1'b1);\n assign q = 1'b0;", mos);
+    // A resistive switch beside a driver that is not one (iverilog: 0).
     refused("wire c, r;\n assign c = 1'b1;\n rnmos (r, c, 1'b1);\n assign r = 1'b0;", "LRM 28.14");
     refused("reg d;\n wire r;\n rpmos (r, d, 1'b0);\n assign r = 1'b0;", "LRM 28.14");
-    // A strong input into a shared net, and a switch alone on its net, are exact.
-    const LowerResult ok = lower_text(R"(
-        module m;
-          reg d;
-          wire q, r;
-          nmos (q, d, 1'b1);
-          assign q = 1'b0;
-          rnmos (r, d, 1'b1);
-        endmodule)");
-    CHECK_MESSAGE(ok.ok, ok.diagnostic_text());
+    refused("wire c, r;\n assign c = 1'b1;\n rcmos g(r, c, 1'b1, 1'b0);\n assign r = 1'b0;", "LRM 28.14");
+    // Resistive and nonresistive switches on one net do not order as strong does.
+    refused("reg d;\n wire r;\n rnmos (r, d, 1'b1);\n nmos (r, d, 1'b1);", mos);
+    // The same switch on a pulled net: pull strength against a reduced one.
+    refused("reg d;\n tri1 r;\n rnmos (r, d, 1'b1);", mos);
+}
+
+// What the check lets through is exact, as iverilog 13 confirms for each source:
+// a strong or supply input beside any other driver, a weak driver on the output
+// net (the strong switch wins either way), resistive switches that are the only
+// drivers of their net (each bit of the ivtest test_mos_strength_reduction),
+// chains of them that reach the net at one strength, and a switch alone on its net.
+TEST_CASE("a MOS switch whose strength cannot change the result is simulated") {
+    CHECK(run_capture(R"(
+        module top;
+          reg d = 1'b1;
+          wire q;
+          assign (weak1, weak0) q = 1'b0;
+          nmos n(q, d, 1'b1);
+          supply1 vdd;
+          wire q2;
+          nmos n2(q2, vdd, 1'b1);
+          assign q2 = 1'b0;
+          tri1 q4;
+          nmos n3(q4, d, 1'b1);
+          initial #1 $display("q=%b q2=%b q4=%b", q, q2, q4);
+        endmodule)") == "q=1 q2=x q4=1\n");
+    CHECK(run_capture(R"(
+        module top;
+          reg vdd = 1'b1, gnd = 1'b0, c0, c1;
+          wire n1, p1, o;
+          rnmos rn0 (n1, gnd, c0);
+          rnmos rn1 (o, n1, c0);
+          rpmos rp0 (p1, vdd, c1);
+          rpmos rp1 (o, p1, c1);
+          initial begin
+            c0 = 1; c1 = 1; #1 $display("%b", o);
+            c0 = 0; c1 = 0; #1 $display("%b", o);
+            c0 = 1; c1 = 0; #1 $display("%b", o);
+            c0 = 0; c1 = 1; #1 $display("%b", o);
+          end
+        endmodule)") == "0\n1\nx\nz\n");
+    CHECK(run_capture(R"(
+        module top;
+          reg d = 1'b1;
+          wire r, s;
+          rnmos n(r, d, 1'b1);
+          cmos cm(s, d, 1'b1, 1'b0);
+          assign (weak1, weak0) s = 1'b0;
+          initial #1 $display("r=%b s=%b", r, s);
+        endmodule)") == "r=1 s=1\n");
 }

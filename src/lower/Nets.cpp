@@ -2,7 +2,53 @@
 
 #include "lower/Lowerer.h"
 
+#include <bit>
+#include <cassert>
+
 namespace clotho::lower {
+
+namespace {
+
+// Strength levels the MOS check tracks, as one bit each, low to high: the
+// charge-like small and medium exist only as results of the reduction in LRM
+// Table 28-8, the others are the drive strengths of 28.11. A strength level here
+// is the strength a switch's data input arrives with.
+constexpr uint8_t kSmall    = 1 << 0;
+constexpr uint8_t kMedium   = 1 << 1;
+constexpr uint8_t kWeak     = 1 << 2;
+constexpr uint8_t kPull     = 1 << 3;
+constexpr uint8_t kStrong   = 1 << 4;
+constexpr uint8_t kSupply   = 1 << 5;
+constexpr uint8_t kAnyLevel = kSmall | kMedium | kWeak | kPull | kStrong | kSupply;
+
+// What nmos, pmos and cmos do to a strength (LRM 28.13): pass it on, except that
+// supply becomes strong.
+uint8_t mos_pass_levels(uint8_t in) {
+    return static_cast<uint8_t>((in & ~kSupply) | ((in & kSupply) != 0 ? kStrong : 0));
+}
+
+// What the resistive switches do (LRM 28.14, Table 28-8): supply and strong become
+// pull, pull weak, weak medium, medium and small small.
+uint8_t mos_reduce_levels(uint8_t in) {
+    uint8_t out = 0;
+    out |= (in & (kSupply | kStrong)) != 0 ? kPull : 0;
+    out |= (in & kPull) != 0 ? kWeak : 0;
+    out |= (in & kWeak) != 0 ? kMedium : 0;
+    out |= (in & (kMedium | kSmall)) != 0 ? kSmall : 0;
+
+    return out;
+}
+
+// Whether a packed drive strength pair can drive a value weaker than strong: a side
+// that drives (not highz) at weak or pull. Supply is reduced to strong by a MOS
+// switch (LRM 28.13), so it is not weak here.
+bool strength_may_be_weak(uint16_t packed) {
+    const auto weak = [](uint32_t level) { return level == 1 || level == 2; };
+
+    return weak(packed & 0xFF) || weak(packed >> 8);
+}
+
+} // namespace
 
 // The multi-driver reducer for a net kind: wire/tri/uwire resolve to X on a
 // 0-vs-1 conflict; wand/triand fold wired-AND, wor/trior wired-OR (LRM 6.6).
@@ -890,7 +936,7 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
 
     if (cur_pass_ == Pass::Classify) {
         record_net_driver(left);
-        if (strength != 0x0303) {
+        if (strength_may_be_weak(strength)) {
             note_weak_driver(left);
         }
         return;
@@ -1492,6 +1538,9 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
     }
     if (cur_pass_ == Pass::Classify) {
         record_net_driver_whole(ns);
+        if (strength_may_be_weak(pack_strength(ns.getDriveStrength()))) {
+            weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(ns)));
+        }
         return;
     }
     const bool resolved = resolved_nets_.contains(static_cast<uint32_t>(signal_of(ns)));
@@ -1865,7 +1914,13 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
     if (cur_pass_ == Pass::Classify) {
         record_net_driver_whole(sym);
         force_net_resolved(signal_of(sym));
-        weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(sym)));
+        // The same strength the Emit path below drives: Pull unless overridden.
+        const auto [pds0, pds1] = gi.getDriveStrength();
+        const uint8_t pulled =
+          up ? (pds1 ? strength_level(pds1) : uint8_t{ 2 }) : (pds0 ? strength_level(pds0) : uint8_t{ 2 });
+        if (pulled != 4) {
+            weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(sym)));
+        }
         return;
     }
     if (cur_pass_ != Pass::Emit) {
@@ -1911,15 +1966,13 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
         // is what marks the net resolved.
         record_net_driver(left);
         record_net_driver(left);
-        if (pack_strength(gi.getDriveStrength()) != 0x0303) {
-            note_weak_driver(left);
-        }
+        note_mos_switch(gi);
         return;
     }
     if (cur_pass_ != Pass::Emit) {
         return;
     }
-    reject_unmodeled_switch_strength(gi.primitiveType.name, left, *conns[1], 2);
+    check_mos_switch_strength(gi, left);
     const TimingControl* cmos_delay = gi.getDelay();
     if (cmos_delay != nullptr && cmos_delay->kind != TimingControlKind::Delay) {
         // TODO: cmos/rcmos rise/fall/turn-off delay triples #(a,b,c) (LRM 28.16)
@@ -1967,54 +2020,206 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
     emit_half(TriGate{ .active_high = false, .invert = false }, pctrl);
 }
 
-// Record that `lhs` is driven at a strength other than the default Strong.
+// Record that `lhs` is driven at a weak strength: every net it names, through
+// concatenations and conversions like record_net_driver.
 void Lowerer::note_weak_driver(const Expression& lhs) {
+    switch (lhs.kind) {
+        case ExpressionKind::Concatenation:
+            for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+                note_weak_driver(*op);
+            }
+            return;
+        case ExpressionKind::Conversion:
+            note_weak_driver(lhs.as<ConversionExpression>().operand());
+            return;
+        default:
+            break;
+    }
     const ValueSymbol* root = lvalue_root(lhs);
     if (root != nullptr && canonical_value_symbol(*root).kind == SymbolKind::Net) {
         weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(canonical_value_symbol(*root))));
     }
 }
 
-// MOS switches pass the strength of their data input to the output (LRM 28.13),
-// and the resistive ones reduce it (28.14). Clotho has no strength on a net's
-// value, so a switch always drives at its own, strong, strength. That is only
-// visible when the output net resolves the switch against another driver, and
-// then only for a resistive switch or a data input that may be weaker than
-// strong: a net with a driver of explicit strength, a pullup / pulldown, or a
-// tri0 / tri1 net. Those cases are refused instead of resolved wrongly.
-// TODO: pass the data input's strength through MOS switches (LRM 28.13, 28.14).
-void Lowerer::reject_unmodeled_switch_strength(std::string_view  name,
-                                               const Expression& out_left,
-                                               const Expression& data,
-                                               size_t            own_drivers) {
-    const std::optional<ir::Signal> net = resolved_net_of(out_left);
-    if (!net) {
-        return;
+// What a MOS switch instance (nmos, pmos, cmos and their resistive forms) drives
+// and reads, or nullopt for any other primitive or a terminal that is not a net.
+std::optional<Lowerer::MosSwitch> Lowerer::mos_switch_info(const PrimitiveInstanceSymbol& gi) {
+    const std::string_view name = gi.primitiveType.name;
+    const bool             cmos = name == "cmos" || name == "rcmos";
+    if (!cmos && !mos_switch_of(name)) {
+        return std::nullopt;
     }
-    // A switch alone on its net (a cmos is two drivers of its own) competes with
-    // nothing, unless the net pulls.
-    const auto driven = net_driven_.find(static_cast<uint32_t>(*net));
-    if ((driven == net_driven_.end() || driven->second.size() <= own_drivers) &&
-        !net_pull_.contains(static_cast<uint32_t>(*net))) {
-        return;
+    const auto conns = gi.getPortConnections();
+    if (conns.size() < 2 || conns[0] == nullptr || conns[1] == nullptr ||
+        conns[0]->kind != ExpressionKind::Assignment) {
+        return std::nullopt; // slang has diagnosed the terminal list
     }
-    bool               weak_input = false;
-    const ValueSymbol* root       = lvalue_root(data);
-    if (root != nullptr) {
-        const ValueSymbol& sym = canonical_value_symbol(*root);
-        if (sym.kind == SymbolKind::Net) {
-            const NetType::NetKind k = sym.as<NetSymbol>().netType.netKind;
-            weak_input               = k == NetType::Tri0 || k == NetType::Tri1 ||
-                                       weak_driven_nets_.contains(static_cast<uint32_t>(signal_of(sym)));
+    const ValueSymbol* root = lvalue_root(conns[0]->as<AssignmentExpression>().left());
+    if (root == nullptr || canonical_value_symbol(*root).kind != SymbolKind::Net) {
+        return std::nullopt;
+    }
+    MosSwitch sw{ .out         = signal_of(canonical_value_symbol(*root)),
+                  .data        = std::nullopt,
+                  .data_opaque = false,
+                  .resistive   = name.starts_with('r'),
+                  .drivers     = cmos ? 2u : 1u };
+    // A data input that is a net bit passes that net's strength; a constant, a
+    // variable or an expression is a strong driver. A net reached some other way
+    // (an element of a net array) is lowered as an expression, so its strength is
+    // not known here.
+    if (const auto term = gate_static_term(*conns[1])) {
+        if (module_.signal(term->sig).is_net) {
+            sw.data = term->sig;
+        }
+    } else if (const ValueSymbol* in = lvalue_root(*conns[1]);
+               in != nullptr && canonical_value_symbol(*in).kind == SymbolKind::Net) {
+        sw.data_opaque = true;
+    }
+
+    return sw;
+}
+
+void Lowerer::note_mos_switch(const PrimitiveInstanceSymbol& gi) {
+    if (const std::optional<MosSwitch> sw = mos_switch_info(gi)) {
+        mos_switches_.push_back(*sw);
+        mos_strength_.reset();
+    }
+}
+
+// The strength levels each recorded switch can drive, by propagation to a fixed
+// point over the switches (a switch's output feeds the next one's data input).
+//
+// A net's levels, as seen by a switch reading it:
+//  - any level, when some driver of it can be weak (weak_driven_nets_) or it has a
+//    tri0 / tri1 pull: the strength then depends on which driver is active;
+//  - otherwise strong, when it has a driver that is not a switch (every such
+//    driver is strong or supply, which a switch treats alike), a supply pull or
+//    no driver at all, plus what each switch driving it can output.
+// A switch outputs the pass or the reduction of its input's levels; its input is
+// strong when it is not a net.
+const Lowerer::MosStrength& Lowerer::mos_strength() {
+    if (mos_strength_) {
+        return *mos_strength_;
+    }
+    MosStrength  r;
+    const size_t n = mos_switches_.size();
+    r.levels.assign(n, 0);
+    ankerl::unordered_dense::map<uint32_t, std::vector<uint32_t>> readers; // data net -> switches
+    for (uint32_t i = 0; i < n; ++i) {
+        r.by_out[static_cast<uint32_t>(mos_switches_[i].out)].push_back(i);
+        if (mos_switches_[i].data) {
+            readers[static_cast<uint32_t>(*mos_switches_[i].data)].push_back(i);
         }
     }
-    const bool resistive = name.starts_with('r');
-    if (resistive || weak_input) {
-        fail("MOS switch '" + std::string(name) + "' shares its output net with another driver and " +
-             (resistive ? "reduces its input strength (LRM 28.14)"
-                        : "passes a weaker-than-strong input strength (LRM 28.13)") +
-             ", which is not supported: Clotho has no strength on a net value");
+    const auto net_levels = [&](uint32_t net) -> uint8_t {
+        if (weak_driven_nets_.contains(net)) {
+            return kAnyLevel;
+        }
+        const auto pull = net_pull_.find(net);
+        if (pull != net_pull_.end() && pull->second.strength < 4) {
+            return kAnyLevel;
+        }
+        uint8_t  levels      = 0;
+        uint32_t switch_drvs = 0;
+        if (const auto it = r.by_out.find(net); it != r.by_out.end()) {
+            for (const uint32_t i : it->second) {
+                levels |= r.levels[i];
+                switch_drvs += mos_switches_[i].drivers;
+            }
+        }
+        const auto   driven = net_driven_.find(net);
+        const size_t total  = driven != net_driven_.end() ? driven->second.size() : 0;
+        if (total > switch_drvs || total == 0 || pull != net_pull_.end()) {
+            levels |= kStrong;
+        }
+
+        return levels;
+    };
+
+    // A worklist: a switch is revisited when a switch driving its data net grew.
+    // Each switch's level set only gains bits (at most six), so the number of
+    // visits is bounded by the switch count plus six per reader edge.
+    std::vector<uint32_t> work;
+    std::vector<bool>     queued(n, true);
+    size_t                edges = 0;
+    for (const auto& [net, rs] : readers) {
+        edges += rs.size();
     }
+    work.reserve(n);
+    for (uint32_t i = n; i-- > 0;) {
+        work.push_back(i);
+    }
+    size_t budget = n + 6 * edges + 1;
+    while (!work.empty()) {
+        assert(budget > 0 && "MOS strength propagation did not converge");
+        --budget;
+        const uint32_t i = work.back();
+        work.pop_back();
+        queued[i]           = false;
+        const MosSwitch& sw = mos_switches_[i];
+        const uint8_t in = sw.data_opaque ? kAnyLevel : sw.data ? net_levels(static_cast<uint32_t>(*sw.data)) : kStrong;
+        const uint8_t out = sw.resistive ? mos_reduce_levels(in) : mos_pass_levels(in);
+        if ((r.levels[i] | out) == r.levels[i]) {
+            continue;
+        }
+        r.levels[i] |= out;
+        if (const auto it = readers.find(static_cast<uint32_t>(sw.out)); it != readers.end()) {
+            for (const uint32_t j : it->second) {
+                if (!queued[j]) {
+                    queued[j] = true;
+                    work.push_back(j);
+                }
+            }
+        }
+    }
+    mos_strength_ = std::move(r);
+
+    return *mos_strength_;
+}
+
+// The Emit-time verdict for one MOS switch whose output is `out_left`. Clotho
+// drives every switch strong (see the block comment in Lowerer.h), which is exact
+// when nothing the switch's strength could be compared with is there:
+//  - the output net is not resolved: the switch alone drives it and no pull does;
+//  - the switch is the only driver of its net and the net has no weak pull;
+//  - every switch on the net outputs exactly strong: it orders against any other
+//    driver or pull as strong does;
+//  - every driver is a switch outputting the same single level and no weak pull
+//    competes: the whole net shifts by one step and orders as it did.
+// Anything else is refused instead of resolved wrongly.
+// TODO: carry a strength with a net's value (LRM 28.13, 28.14).
+void Lowerer::check_mos_switch_strength(const PrimitiveInstanceSymbol& gi, const Expression& out_left) {
+    const std::optional<MosSwitch>  sw  = mos_switch_info(gi);
+    const std::optional<ir::Signal> net = resolved_net_of(out_left);
+    if (!sw || !net) {
+        return;
+    }
+    const MosStrength& st     = mos_strength();
+    const auto         net_u  = static_cast<uint32_t>(*net);
+    const auto         on_net = st.by_out.find(net_u);
+    if (on_net == st.by_out.end()) {
+        return;
+    }
+    uint32_t switch_drvs = 0;
+    bool     all_strong  = true;
+    bool     uniform     = true;
+    for (const uint32_t i : on_net->second) {
+        switch_drvs += mos_switches_[i].drivers;
+        all_strong = all_strong && st.levels[i] == kStrong;
+        uniform    = uniform && st.levels[i] == st.levels[on_net->second.front()] && std::has_single_bit(st.levels[i]);
+    }
+    const auto   driven    = net_driven_.find(net_u);
+    const size_t total     = driven != net_driven_.end() ? driven->second.size() : 0;
+    const auto   pull      = net_pull_.find(net_u);
+    const bool   weak_pull = pull != net_pull_.end() && pull->second.strength < 4;
+    const bool   others    = total > switch_drvs;
+    if (all_strong || (!others && !weak_pull && (on_net->second.size() == 1 || uniform))) {
+        return;
+    }
+    fail("MOS switch '" + std::string(gi.primitiveType.name) +
+         "' shares its output net with another driver or a pull, and its output strength is not known to order "
+         "like strong there (LRM 28.13: it passes its data input's strength; LRM 28.14: a resistive switch "
+         "reduces it), which is not supported: Clotho has no strength on a net value");
 }
 
 void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
@@ -2074,16 +2279,18 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
         for (const Expression* out : output_span) {
             if (out->kind == ExpressionKind::Assignment) {
                 record_net_driver(out->as<AssignmentExpression>().left());
-                if (gate_strength != 0x0303) {
+                if (strength_may_be_weak(gate_strength)) {
                     note_weak_driver(out->as<AssignmentExpression>().left());
                 }
             }
         }
+        if (mos) {
+            note_mos_switch(gi);
+        }
         return;
     }
     if (mos) {
-        reject_unmodeled_switch_strength(
-          prim.name, output_span[0]->as<AssignmentExpression>().left(), *input_span[0], 1);
+        check_mos_switch_strength(gi, output_span[0]->as<AssignmentExpression>().left());
     }
     std::vector<GateInput> inputs;
     inputs.reserve(input_span.size());

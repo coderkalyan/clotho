@@ -276,9 +276,9 @@ Milestones, in order; lower ones unblock higher ones:
     definite value where the range model yields x.
   - [ ] **Drive strength on `wand` / `wor` nets**.
   - [ ] **`pullup` / `pulldown` on a bit- or part-select target** (28.5).
-  - [ ] **Strength reduction through gates** — MOS switches drive strong whatever their
-    input (28.13) and the r-variants do not reduce it (28.14); refused when the output net
-    is resolved against another driver and the strength matters (LRM_NOTES note 38).
+  - [ ] **Strength through MOS switches** (28.13, 28.14) — switches drive strong and the
+    r-variants do not reduce it; refused when the output net is resolved against a
+    driver or weak pull and the strengths do not order as strong (LRM_NOTES note 38).
 
 ### Hierarchy reach
 

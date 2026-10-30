@@ -1687,12 +1687,47 @@ private:
 
     void emit_wire_resolvers();
 
+    // -- MOS switch strength (LRM 28.13, 28.14) --
+    //
+    // A MOS switch passes the strength of its data input to its output, and a
+    // resistive one reduces it. Clotho has no strength on a net's value, so every
+    // switch drives strong. That is exact whenever no other driver or pull
+    // competes with the switch's strength, or the strengths involved order the same
+    // as strong does; check_mos_switch_strength refuses the rest. Classify records
+    // what it needs (note_weak_driver, note_mos_switch); the verdict runs in Emit,
+    // once Classify has seen every driver of the design.
+    struct MosSwitch {
+        // The net the switch drives, and the net its data input reads (empty for a
+        // constant, a variable or an expression: those drive strong).
+        ir::Signal                out;
+        std::optional<ir::Signal> data;
+        // The data input names a net in a shape the switch lowering reads as an
+        // expression (an element of a net array): the strength it would pass is
+        // then unknown.
+        bool data_opaque;
+        bool resistive;
+        // Drivers the switch makes on `out`: 1, or 2 for a cmos (its two halves).
+        uint32_t drivers;
+    };
+    // Per-switch and per-net results of the strength propagation over every
+    // switch Classify recorded; built on first use by mos_strength().
+    struct MosStrength {
+        // Possible strength levels (a bit set, see Nets.cpp) of each switch's output,
+        // parallel to mos_switches_.
+        std::vector<uint8_t> levels;
+        // Output net -> indices of the switches driving it.
+        ankerl::unordered_dense::map<uint32_t, std::vector<uint32_t>> by_out;
+    };
+
     void note_weak_driver(const Expression& lhs);
 
-    void reject_unmodeled_switch_strength(std::string_view  name,
-                                          const Expression& out_left,
-                                          const Expression& data,
-                                          size_t            own_drivers);
+    std::optional<MosSwitch> mos_switch_info(const PrimitiveInstanceSymbol& gi);
+
+    void note_mos_switch(const PrimitiveInstanceSymbol& gi);
+
+    const MosStrength& mos_strength();
+
+    void check_mos_switch_strength(const PrimitiveInstanceSymbol& gi, const Expression& out_left);
 
     void store_every_element(ir::Index lv, ir::Ref ty, ir::Index val, ir::Builder& b, ir::SourceLoc l);
 
@@ -5117,11 +5152,14 @@ private:
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;
-    // Nets some driver drives below the default strength (an `assign` or gate with
-    // an explicit drive strength, a pullup / pulldown), recorded by the Classify
-    // pass. A MOS switch passes such a strength through (LRM 28.13), which Clotho
-    // does not model, so reject_unmodeled_switch_strength consults it.
+    // Nets some driver can drive weaker than strong (an `assign`, net declaration
+    // assignment or gate with an explicit weak or pull drive strength, a pullup /
+    // pulldown), recorded by the Classify pass for check_mos_switch_strength.
     ankerl::unordered_dense::set<uint32_t> weak_driven_nets_;
+    // Every MOS switch Classify saw, in source order, and the propagation result
+    // over them (reset whenever one is added).
+    std::vector<MosSwitch>     mos_switches_;
+    std::optional<MosStrength> mos_strength_;
     // The subset of resolved_nets_ with at least one PROGRAM-side driver: a
     // driver lowered while in_program_ (a program's hierarchical `assign`, a
     // net declaration assignment, a `force`) or a wire_ports port copy for a
