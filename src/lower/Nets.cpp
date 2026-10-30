@@ -1159,6 +1159,13 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
     if (sit == sigmap_.end()) {
         return; // hierarchical / not-yet-collected: guarded loud
     }
+    if (!lhs.type->getCanonicalType().isIntegral()) {
+        // A whole unpacked array or struct net: its layout width is one element's, so
+        // a site over it would force element 0 only. Left unregistered, lower_proc_assign
+        // refuses it.
+        // TODO: force / release of an unpacked-aggregate net.
+        return;
+    }
     const auto     net_u = static_cast<uint32_t>(sit->second);
     const uint32_t net_w = module_.pool.layout(module_.signal(sit->second).type).width;
 

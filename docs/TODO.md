@@ -181,6 +181,7 @@ Milestones, in order; lower ones unblock higher ones:
   be decided when the deferred update commits, but the deferred record carries no gate.
 - [ ] **`force` / `release` of a concatenation** (10.6.2) — a concatenation of nets or net
   bit/part-selects as the target.
+- [ ] **`force` / `release` of an unpacked array or aggregate net** (10.6.2) — refused.
 
 ### Real numbers
 

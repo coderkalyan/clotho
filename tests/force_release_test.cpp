@@ -748,3 +748,19 @@ TEST_CASE("release of part of an active forced range stops the run") {
     CHECK(test::design_exit_code(run) != 0);
     CHECK(run.err.find("release of part of an active force is not supported") != std::string::npos);
 }
+
+// `force a = '{..}` of a whole unpacked net array registered a force site as wide as
+// ONE element, so it forced element 0 with a garbled value and left the rest
+// (a=0xx1 xxxx where the LRM gives 0011 0101). iverilog 13 asserts on it. The
+// target is refused, like a force of a select of an unpacked array.
+TEST_CASE("force of a whole unpacked net array is rejected") {
+    const std::string err = lower_error(R"(
+        module m;
+            wire [3:0] a [0:1];
+            initial begin
+                #1 force a = '{4'h3, 4'h5};
+                #1 release a;
+            end
+        endmodule)");
+    CHECK(err.find("force is only supported on a whole variable/net") != std::string::npos);
+}
