@@ -2335,6 +2335,7 @@ private:
     llvm::FunctionCallee proc_adopt_fn();
     llvm::FunctionCallee proc_thread_done_fn();
     llvm::FunctionCallee proc_obj_retain_fn();
+    llvm::FunctionCallee proc_obj_release_fn();
     llvm::FunctionCallee proc_await_self_fn();
     llvm::FunctionCallee proc_randstate_get_fn();
     llvm::FunctionCallee proc_randstate_set_fn();

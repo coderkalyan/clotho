@@ -1840,9 +1840,16 @@ void rt_proc_adopt(void* to, void* from);
 // reference this was.
 void rt_proc_thread_done(void* pcb);
 
-// Take / drop the reference a `process` object holds on the block it names.
+// Take / drop the reference a `process` object holds on the block it names. The
+// drop runs from the object's finalizer: `obj` is the object being reclaimed, and
+// the block's weak memo of it is cleared so a later `self()` mints a fresh object.
 void rt_proc_obj_retain(void* pcb);
-void rt_proc_obj_release(void* pcb);
+void rt_proc_obj_release(void* pcb, void* obj);
+
+// Pooled blocks carved out of the chunk pool so far: a high-water mark, since a
+// released block returns to the freelist rather than to the allocator. Bounded
+// across a loop of fork children exactly when their blocks are released.
+uint32_t rt_proc_pool_blocks(void);
 
 // LRM 9.7 makes `p.await()` on the current process an error; the check is dynamic
 // (the target is a handle value), so this is its located fatal.

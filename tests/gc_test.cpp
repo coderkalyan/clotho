@@ -10,6 +10,7 @@
 #include "ir/Jit.h"
 #include "ir/SimConfig.h"
 #include "runtime/Gc.h"
+#include "runtime/Runtime.h"
 
 using namespace clotho;
 
@@ -3457,4 +3458,179 @@ TEST_CASE("gc: an object rooted only by an interface-class handle survives") {
         endmodule
     )";
     check_both_cadences(src, "320 319 churn\n");
+}
+
+// -- 8. Built-in handle kinds: the `process` object ------------------------------
+//
+// docs/design/architecture.md, Memory: every built-in handle kind is a collected object
+// with a finalizer for any native resource it owns. A `process` object (LRM 9.7) is a
+// handle onto a thread's control block, a native record the collector never scans; the
+// object is the collected half, and its finalizer drops the reference it holds on the
+// block and clears the block's weak memo of it (docs/design/process-class.md §4.2).
+//
+// The object used to be allocated outside the heap yet typed as a class handle, so the
+// first collection that found one in design state, a class property or a container was
+// a fatal ("a precise GC root does not name a class object"), and nothing ever released
+// a block. Each location below holds the object through a window in which the collector
+// runs, with `Junk` recycling and poisoning every line a wrong collection frees.
+
+// One process handle per kind of location a collector walks: design state, a class
+// property, a queue element and an associative-array value. Each handle is the only
+// reference to a distinct fork child's object, and the child has finished, so the control
+// block is kept alive by the object alone: a status that still reads FINISHED afterwards
+// shows the object, the block it names and the memo all survived.
+TEST_CASE("gc: a process handle held only by design state, a class property, a queue or an assoc survives") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Holder; process p; endclass
+            class Junk; int v; string tag; endclass
+            process pmod;
+            Holder  h;
+            process q[$];
+            process byname[string];
+            Junk    sink;
+            bit     clk;
+            initial begin
+                clk = 0;
+                for (int i = 0; i < 32; i++) #5 clk = ~clk;
+            end
+            always @(negedge clk) begin
+                for (int i = 0; i < 64; i++) begin
+                    sink = new;
+                    sink.v   = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+            end
+            initial begin
+                h = new;
+                fork
+                    pmod = process::self();
+                    h.p = process::self();
+                    q.push_back(process::self());
+                    byname["k"] = process::self();
+                join
+                repeat (6) @(posedge clk);
+                $display("%0d %0d %0d %0d", pmod.status(), h.p.status(), q[0].status(),
+                         byname["k"].status());
+                $display("%0d", pmod != h.p && pmod != q[0] && pmod != byname["k"] &&
+                                h.p != q[0] && h.p != byname["k"] && q[0] != byname["k"]);
+            end
+        endmodule
+    )";
+    check_both_cadences(src, "0 0 0 0\n1\n");
+    const rt_gc_stats st = run_stats(src, "0 0 0 0\n1\n", cadence_stress);
+    CHECK(st.collections > 0);
+}
+
+// A process handle in the automatic local of a blocking task, the conservative frame-root
+// path: a process body's own locals are design state, so it takes a task's coroutine frame
+// to put the handle where only the frame scan sees it. `self()` must also keep naming the
+// same object for as long as a handle exists: the block's memo is weak, so a collection
+// that cleared it while `me` was live would make the second `self()` mint a new object,
+// and the comparison would read 0.
+TEST_CASE("gc: a process handle in a suspended task frame survives and stays the thread's identity") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Junk; int v; string tag; endclass
+            bit  clk;
+            Junk sink;
+            initial begin
+                clk = 0;
+                for (int i = 0; i < 32; i++) #5 clk = ~clk;
+            end
+            always @(negedge clk) begin
+                for (int i = 0; i < 64; i++) begin
+                    sink = new;
+                    sink.v   = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+            end
+            task automatic hold();
+                automatic process me = process::self();
+                repeat (3) @(posedge clk);
+                $display("%0d %0d", me.status(), process::self() == me);
+            endtask
+            always @(posedge clk) hold();
+        endmodule
+    )";
+    const std::string expected = "1 1\n1 1\n1 1\n1 1\n";
+    check_both_cadences(src, expected);
+    // Negative space: nothing precise designates the object, so a run that reports no
+    // conservative pin did not reach it through the frame registry and this case has
+    // stopped testing what it names.
+    const rt_gc_stats st = run_stats(src, expected, cadence_stress);
+    CHECK(st.collections > 0);
+    CHECK(st.conservative_pins > 0);
+}
+
+// A handle captured by a fork child that outlives the frame it was declared in. The
+// capture lives in a heap box, a class body whose trace map names the handle field, so
+// this is the "a class field names a process object" shape with the parent gone.
+TEST_CASE("gc: a process handle captured by a fork child outliving its frame survives") {
+    constexpr std::string_view src = R"(
+        module m;
+            class Junk; int v; string tag; endclass
+            bit  clk;
+            Junk sink;
+            initial begin
+                clk = 0;
+                for (int i = 0; i < 32; i++) #5 clk = ~clk;
+            end
+            always @(negedge clk) begin
+                for (int i = 0; i < 64; i++) begin
+                    sink = new;
+                    sink.v   = 32'h5A5A5A5A;
+                    sink.tag = "junk";
+                end
+            end
+            task automatic spawn();
+                automatic process me = process::self();
+                fork
+                    begin
+                        repeat (4) @(posedge clk);
+                        $display("box %0d", me.status());
+                    end
+                join_none
+            endtask
+            initial spawn();
+        endmodule
+    )";
+    check_both_cadences(src, "box 0\n");
+}
+
+// The leak: every fork child that asked for its handle took a control block and an
+// object, and neither was ever released (~176 B per child, linear). With the object
+// collected, its finalizer returns the block to the pool, so the pool's high-water mark
+// tracks the children outstanding between two collections instead of the children ever
+// spawned. 12000 children against bounds of ~2000 (a 32 KiB nursery holds ~1000 of these
+// objects) and ~500 (stress collects every time step, and 100 children run in each).
+TEST_CASE("gc: the control blocks of fork children are released with their process objects") {
+    constexpr std::string_view src = R"(
+        module m;
+            int done;
+            initial begin
+                for (int i = 0; i < 12000; i++) begin
+                    fork
+                        begin
+                            automatic process p = process::self();
+                            automatic int s = p.status();
+                            if (s == 1) done++;
+                        end
+                    join_none
+                    if (i % 100 == 99) #1;
+                end
+                #1;
+                $display("done=%0d", done);
+            end
+        endmodule
+    )";
+    const rt_gc_stats ordinary = run_stats(src, "done=12000\n", cadence_ordinary);
+    CHECK(ordinary.collections >= 5u);
+    CHECK(ordinary.objects_allocated >= 12000u);
+    CHECK(ordinary.finalized >= 8000u);
+    CHECK(rt_proc_pool_blocks() <= 2048u);
+
+    const rt_gc_stats stress = run_stats(src, "done=12000\n", cadence_stress);
+    CHECK(stress.finalized >= 11000u);
+    CHECK(rt_proc_pool_blocks() <= 512u);
 }

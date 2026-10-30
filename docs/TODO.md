@@ -483,7 +483,7 @@ Milestones, in order; lower ones unblock higher ones:
 ### Full object orientation
 
 - [~] **Garbage collection** (8.4) — collector coverage and policy still missing.
-  - [ ] **Collector tracing of event, `mailbox`, `semaphore`, `process` and
+  - [ ] **Collector tracing of event, `mailbox`, `semaphore` and
     `std::weak_reference` handles** (8.4) — not yet described to the collector.
   - [ ] **Evacuating collection (performance)** — the heap is non-moving.
   - [ ] **Multi-mutator collection (performance)** — collection assumes one mutator.

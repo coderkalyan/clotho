@@ -1353,7 +1353,12 @@ extern "C" void rt_proc_obj_retain(void* pcb) {
     static_cast<rt_proc*>(pcb)->refs += 1;
 }
 
-extern "C" void rt_proc_obj_release(void* pcb) {
+// The finalizer's half of the object <-> block pair (docs/design/process-class.md
+// §4.2): the object is being reclaimed, so the block's weak memo of it stops naming
+// it -- a later `self()` then mints a fresh object instead of returning a dead one --
+// and the reference the object held on the block drops. The block returns to the
+// pool when that was the last reference, i.e. the thread has completed too.
+extern "C" void rt_proc_obj_release(void* pcb, [[maybe_unused]] void* obj) {
     auto* p = static_cast<rt_proc*>(pcb);
     if (p->refs != 0) {
         p->refs -= 1;
@@ -1379,12 +1384,23 @@ extern "C" void* rt_alloc(uint64_t size) {
     return base + kFrameAlign;
 }
 
+    // emit_proc_object mints an object only while the memo is null, so the memo names
+    // the finalizing object from its creation until here.
+    assert(p->obj == obj && "a process object finalizes while it is its block's memo");
+    p->obj = nullptr;
 extern "C" void rt_free(void* p) {
     if (p == nullptr) {
         return;
     }
     uint8_t* base = static_cast<uint8_t*>(p) - kFrameAlign;
     uint64_t size = 0;
+extern "C" uint32_t rt_proc_pool_blocks(void) {
+    if (g_proc_chunks.empty()) {
+        return 0;
+    }
+    return static_cast<uint32_t>((g_proc_chunks.size() - 1) * kProcChunk + g_proc_used);
+}
+
     std::memcpy(&size, base, sizeof size);
     std::memset(p, kFreedFrame, static_cast<size_t>(size));
     clotho::rt::os_aligned_free(base);

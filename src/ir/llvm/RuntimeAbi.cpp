@@ -1115,6 +1115,10 @@ llvm::FunctionCallee Backend::proc_obj_retain_fn() {
     return rt_fn("rt_proc_obj_retain", b_.getVoidTy(), { raw_ptr_ty() });
 }
 
+llvm::FunctionCallee Backend::proc_obj_release_fn() {
+    return rt_fn("rt_proc_obj_release", b_.getVoidTy(), { raw_ptr_ty(), raw_ptr_ty() });
+}
+
 llvm::FunctionCallee Backend::proc_await_self_fn() {
     return rt_fn("rt_proc_await_self", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt64Ty() });
 }

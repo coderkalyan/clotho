@@ -733,7 +733,14 @@ void Backend::emit_proc_state(uint32_t from, uint32_t to) {
 // block. One object per thread is what makes handle identity a pointer compare:
 // `process::self() == process::self()` has to hold, and clotho compares class
 // handles with a bare icmp (docs/design/process-class.md §5.1).
+//
+// The object is a collected class body like any other (§4.2): the allocator returns
+// the handle with the body zeroed and the GC word written, FINALIZE included, and its
+// finalizer (class_finalizer_fn) drops the reference the object takes on the block
+// below and clears the memo. The memo is weak -- a PCB is native storage the collector
+// never scans -- so a handle the program drops lets the object die.
 llvm::Value* Backend::emit_proc_object(llvm::Value* pcb, Ref class_ref) {
+    assert(mod_.is_process_class(class_ref) && "a process object is an instance of the process class");
     auto* fn    = b_.GetInsertBlock()->getParent();
     auto* ptr   = llvm::PointerType::getUnqual(ctx_);
     auto* null  = llvm::ConstantPointerNull::get(ptr);
@@ -745,22 +752,22 @@ llvm::Value* Backend::emit_proc_object(llvm::Value* pcb, Ref class_ref) {
     b_.CreateCondBr(b_.CreateICmpEQ(have, null), make, done);
 
     b_.SetInsertPoint(make);
-    llvm::Type*    body_ty = class_body_ty(class_ref);
-    const uint64_t size    = env_->llmod.getDataLayout().getTypeAllocSize(body_ty);
-    llvm::Value*   obj     = b_.CreateCall(alloc_fn(), { b_.getInt64(size) });
-    b_.CreateMemSet(obj, b_.getInt8(0), b_.getInt64(size), llvm::MaybeAlign(64));
+    llvm::Type*  body_ty = class_body_ty(class_ref);
+    llvm::Value* obj     = emit_gc_alloc_fast(class_ref);
     b_.CreateStore(class_vptr(class_ref), b_.CreateStructGEP(body_ty, obj, 0));
     // The one body field: the block this handle names (a chandle-shaped word, so
     // no collector ever follows it).
     b_.CreateStore(b_.CreatePtrToInt(pcb, b_.getInt64Ty()), b_.CreateStructGEP(body_ty, obj, 1));
     b_.CreateStore(obj, slot);
     b_.CreateCall(proc_obj_retain_fn(), { pcb });
+    // The inlined allocation ends on its own join block, not on `make`.
+    auto* made = b_.GetInsertBlock();
     b_.CreateBr(done);
 
     b_.SetInsertPoint(done);
     llvm::PHINode* result = b_.CreatePHI(ptr, 2);
     result->addIncoming(have, entry);
-    result->addIncoming(obj, make);
+    result->addIncoming(obj, made);
     return b_.CreatePtrToInt(result, b_.getInt64Ty());
 }
 

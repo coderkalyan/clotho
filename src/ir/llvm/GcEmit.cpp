@@ -475,11 +475,16 @@ std::vector<llvm::Constant*> Backend::class_elem_leaves(Ref class_ref) {
 // The per-class finalizer, `clotho.classfini.<Ref>`: a void(ptr body) that tears
 // down the class's managed properties (string / dynamic array / queue / assoc)
 // through exactly the per-property emit_agg_deinit walk deinit_body_strings runs
-// for a frame slot. Null when the class owns no managed property.
+// for a frame slot. Null when the class owns nothing to release.
 //
 // This is what closes the second-order leak: emit_class_body_init initialises
 // string and container properties on every `new` and, before the collector,
 // nothing ever tore them down (docs/design/garbage-collection.md §0).
+//
+// The built-in `process` class is the one class that owns a native resource instead
+// of a managed property: a reference on the control block its object names, which
+// the finalizer drops and the block's weak memo of the object goes with
+// (docs/design/process-class.md §4.2).
 //
 // It RUNS DURING A COLLECTION, from rt_gc_collect's finalize pass, so it must
 // not allocate (the heap is mid-sweep and the mutator's bump range is not the
@@ -496,7 +501,8 @@ llvm::Constant* Backend::class_finalizer_fn(Ref class_ref) {
     const auto flds = mod_.pool.struct_fields(t.fields_id);
     const bool managed =
       std::ranges::any_of(flds, [&](const Field& f) { return has_heap_leaf(f.type); });
-    if (!managed) {
+    const bool process = mod_.is_process_class(class_ref);
+    if (!managed && !process) {
         return llvm::Constant::getNullValue(raw_ptr_ty());
     }
     // Emitted lazily from a descriptor request, which can happen mid-body, so the
@@ -511,6 +517,12 @@ llvm::Constant* Backend::class_finalizer_fn(Ref class_ref) {
     llvm::Value*   body    = fn->getArg(0);
     const uint32_t hdr     = class_header_words(class_ref);
     uint32_t       f       = 0;
+    if (process) {
+        // Field 0 is the vptr and field 1 the block pointer, stored as a 2-state word
+        // so no collector ever follows it (emit_proc_object).
+        llvm::Value* w = b_.CreateLoad(b_.getInt64Ty(), b_.CreateStructGEP(root_ty, body, hdr));
+        b_.CreateCall(proc_obj_release_fn(), { b_.CreateIntToPtr(w, raw_ptr_ty()), body });
+    }
     for (const Field& fld : flds) {
         const uint32_t idx = hdr + f++;
         if (!has_heap_leaf(fld.type)) {
