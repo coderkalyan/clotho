@@ -297,7 +297,7 @@ Everything else about an interface-typed value follows for free: `layout` report
 the same 64-bit two-state handle (`src/ir/InternPool.cpp:177-182`), so a variable, a
 formal, a property, a queue element and a mailbox message of interface type reuse
 the entire scalar path; `coerce` routes a class-to-interface assignment to
-`b.resize` (`src/lower/Lowerer.cpp, coerce`), which is a no-op between two width-64 refs;
+`b.convert` (`src/lower/Lowerer.cpp, coerce`), which emits nothing between two width-64 refs;
 and the GC traces an interface-typed word because it is `Kind::Class`, with the
 concrete object's own trace map applying at the other end.
 
