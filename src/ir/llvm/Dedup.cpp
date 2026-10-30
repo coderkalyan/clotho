@@ -1,6 +1,7 @@
-// Module deduplication: twin-group sharing and the dedup and fusion statistics.
+// Module deduplication: twin-group sharing, the check of shared code, and the dedup and fusion statistics.
 
 #include "ir/llvm/Backend.h"
+#include "ir/llvm/CodeText.h"
 
 namespace clotho::ir::backend {
 
@@ -309,6 +310,131 @@ void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
                  (unsigned long long)unit_groups.size(), (unsigned long long)instance_groups,
                  (unsigned long long)emitted.size(), (unsigned long long)coroutines, (unsigned long long)shared,
                  (unsigned long long)rows, (unsigned long long)unanchored, why.c_str());
+    if (config_.verify_shared_code) {
+        std::fprintf(stderr,
+                     "unit-code: %llu shared groups lowered again for their own instance and compared with "
+                     "the code they share, %lld ms\n",
+                     (unsigned long long)verified_groups_,
+                     (long long)std::chrono::duration_cast<std::chrono::milliseconds>(verify_time_).count());
+    }
+}
+
+// -- Verifying shared code --
+//
+// SimulationConfig::verify_shared_code. A unit's group is lowered once and run
+// by every instance whose imports are alike, so what an instance's own lowering
+// would have baked (and the taint list missed) is silently wrong code for the
+// others. The check lowers the group again for each such instance, the way it
+// was lowered before groups were shared, and compares.
+
+// Lower group `g` for its own instance into a scratch module and take back out
+// of the backend what lowering registers outside it. The function stays in the
+// scratch module (see verify_modules_).
+Backend::OwnLowering Backend::lower_for_own_instance(uint32_t g) {
+    Anchor&        a = anchors_[group_unit_anchor_[g]];
+    llvm::Module&  scratch = *verify_modules_.emplace_back(std::make_unique<llvm::Module>("clotho.verify", ctx_));
+    scratch.setTargetTriple(root_env_->llmod.getTargetTriple());
+    scratch.setDataLayout(root_env_->llmod.getDataLayout());
+    ModuleEnv* const           real_env = env_;
+    env_                                = verify_envs_.emplace_back(std::make_unique<ModuleEnv>(scratch)).get();
+    const auto                 block_lo = static_cast<std::ptrdiff_t>(block_commits_.size());
+    const auto                 fill_lo  = static_cast<std::ptrdiff_t>(ctx_blk_fills_.size());
+    const std::vector<uint8_t> bound    = a.bind_used;
+    verifying_                          = true;
+    share_active_                       = true;
+    taint_why_                          = nullptr;
+    OwnLowering own;
+    own.fn        = lower_group(groups_[g]);
+    own.taint     = std::exchange(taint_why_, nullptr);
+    verifying_    = false;
+    share_active_ = false;
+    env_          = real_env;
+    own.blocks.assign(std::make_move_iterator(block_commits_.begin() + block_lo),
+                      std::make_move_iterator(block_commits_.end()));
+    block_commits_.erase(block_commits_.begin() + block_lo, block_commits_.end());
+    own.fills.assign(ctx_blk_fills_.begin() + fill_lo, ctx_blk_fills_.end());
+    ctx_blk_fills_.erase(ctx_blk_fills_.begin() + fill_lo, ctx_blk_fills_.end());
+    a.bind_used = bound;
+    return own;
+}
+
+// How the own lowering of group `g` differs from the code its instance runs when
+// it shares `rep`'s: the printed code, the NBA blocks the shared code registers
+// for it against the ones it registers itself, and the record fields that hold
+// their first ids. Empty when it does not.
+std::string Backend::shared_code_differs(uint32_t g, SharedGroup& rep, const OwnLowering& own) {
+    const uint32_t ua = group_unit_anchor_[g];
+    std::string    differs;
+    if (own.taint != nullptr) {
+        differs += std::format("  lowered for itself, the group bakes something of its instance: {}\n", own.taint);
+    }
+    if (rep.text.empty()) {
+        rep.text = CodeText(rep.fn).joined();
+    }
+    const CodeText own_text(own.fn);
+    if (own_text.joined() != rep.text) {
+        differs += "  " + CodeText::difference(CodeText(rep.fn), own_text);
+    }
+    const std::vector<BlockCommit> shared = shared_blocks(rep, ua);
+    const auto                     describe = [&](const BlockCommit& bc) {
+        std::string out = "{";
+        for (const BlockSig& bs : bc.sigs) {
+            out += std::format("{}{} #{}{}", out.size() > 1 ? ", " : "", mod_.signals()[static_cast<size_t>(bs.sig)].name,
+                               static_cast<uint32_t>(bs.sig), bs.dynamic ? " (dynamic mask)" : "");
+        }
+        return out + "}";
+    };
+    const auto same_block = [](const BlockCommit& x, const BlockCommit& y) {
+        return x.sigs.size() == y.sigs.size() &&
+               std::equal(x.sigs.begin(), x.sigs.end(), y.sigs.begin(), [](const BlockSig& p, const BlockSig& q) {
+                   return p.sig == q.sig && p.dynamic == q.dynamic && p.mask.getBitWidth() == q.mask.getBitWidth() &&
+                          p.mask == q.mask;
+               });
+    };
+    if (shared.size() != own.blocks.size()) {
+        differs += std::format("  it registers {} NBA blocks, and the shared code {}\n", own.blocks.size(), shared.size());
+    }
+    for (size_t b = 0; b < shared.size() && b < own.blocks.size(); ++b) {
+        if (!same_block(shared[b], own.blocks[b])) {
+            differs += std::format("  NBA block {} of the group commits {} for it, and its own lowering {}\n", b,
+                                   describe(shared[b]), describe(own.blocks[b]));
+            break;
+        }
+    }
+    // Its own lowering numbered its blocks from where the backend stood.
+    if (shared_fills(rep, ua, static_cast<uint32_t>(block_commits_.size())) != own.fills) {
+        differs += "  the record fields that hold the first id of its NBA blocks differ from the ones the shared "
+                   "code's blocks are filled into\n";
+    }
+    return differs;
+}
+
+void Backend::verify_shared_group(uint32_t g, SharedGroup& rep) {
+    const auto         started = std::chrono::steady_clock::now();
+    const OwnLowering  own     = lower_for_own_instance(g);
+    const std::string  differs = shared_code_differs(g, rep, own);
+    ++verified_groups_;
+    verify_time_ += std::chrono::steady_clock::now() - started;
+    if (differs.empty()) {
+        return;
+    }
+    const Anchor& a    = anchors_[group_unit_anchor_[g]];
+    std::string   unit = a.ty->getName().str();
+    if (unit.ends_with(".state")) {
+        unit.resize(unit.size() - 6);
+    }
+    const Process& first = mod_.processes()[groups_[g].front()];
+    std::string    at;
+    if (resolve_ && first.span.valid()) {
+        at = " (" + resolve_(first.span).where + ")";
+    }
+    throw BackendError{ std::format("internal: the code shared by the instances of unit '{}' is not what instance '{}' "
+                                    "lowers for itself\n  group {}{}, lowered once for '{}' and run by '{}' too\n{}"
+                                    "  a fact of one instance is baked into code the others run: move it into the "
+                                    "instance record, or taint the lowering (Backend::taint)",
+                                    unit, a.name, group_unit_ordinal_[g], at, anchors_[group_unit_anchor_[rep.g]].name,
+                                    a.name, differs),
+                        first.span };
 }
 
 void Backend::report_finish_stat() const {

@@ -4973,6 +4973,61 @@ private:
         llvm::Function*       fn = nullptr; // monomorphized commit, void(state)
     };
     std::vector<BlockCommit>                    block_commits_;
+
+    // A group lowered once for sharing (Backend::run): the function the first
+    // instance of its unit whose imports are alike lowered for it, and what that
+    // lowering registered, which every other instance repeats for its own
+    // signals (shared_blocks, and the fills of the record's block fields).
+    struct SharedGroup {
+        uint32_t        g;                  // the group, of the instance that lowered it
+        llvm::Function* fn;
+        uint32_t        block_lo, block_hi; // the NBA blocks it registered
+        size_t          fill_lo, fill_hi;   // its record fills of their first ids
+        std::string     text;               // canonical_text(fn), set by the first check
+    };
+
+    // The NBA blocks an instance registers when it runs the code `rep` lowered:
+    // the same blocks, of its own signals.
+    std::vector<BlockCommit> shared_blocks(const SharedGroup& rep, uint32_t anchor) const;
+
+    // The record fills of the first ids of those blocks, for an instance whose
+    // blocks start at id `base`.
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> shared_fills(const SharedGroup& rep, uint32_t anchor,
+                                                                       uint32_t base) const;
+
+    // `SimulationConfig::verify_shared_code`: lower group `g` for its own
+    // instance, as it would have been without sharing, and check it is the code
+    // `rep` shares with it, including the blocks and record fills it registers.
+    // Throws a BackendError naming the difference. Leaves the backend as it
+    // found it.
+    void verify_shared_group(uint32_t g, SharedGroup& rep);
+
+    // What lowering group `g` for its own instance gives: the function, in a
+    // scratch module, why it could not have been shared, and what it registered
+    // (`lower_for_own_instance` takes that back out of the backend).
+    struct OwnLowering {
+        llvm::Function*                                       fn    = nullptr;
+        const char*                                           taint = nullptr;
+        std::vector<BlockCommit>                              blocks;
+        std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> fills;
+    };
+    OwnLowering lower_for_own_instance(uint32_t g);
+
+    // How `own`, the lowering of group `g`, differs from what the instance runs
+    // when it shares `rep`; empty when it does not.
+    std::string shared_code_differs(uint32_t g, SharedGroup& rep, const OwnLowering& own);
+
+    // The scratch modules the verification lowers into, kept until run() ends:
+    // lowering caches instructions of the functions it builds (event_wait_node,
+    // gc_mutator_cur), which a deleted function would leave dangling. While a
+    // group is lowered into one, `sym` does not promote what it names to
+    // external linkage, so the real modules are untouched.
+    std::vector<std::unique_ptr<llvm::Module>> verify_modules_;
+    std::vector<std::unique_ptr<ModuleEnv>>    verify_envs_;
+    bool                                       verifying_       = false;
+    uint64_t                                   verified_groups_ = 0;
+    std::chrono::nanoseconds                   verify_time_{};
+
     // Source-IR straight-line segment counter, bumped at every structured-region
     // boundary (lower_region entry/exit) and in-region suspend (Delay / Wait /
     // TaskCall). NBAs sharing an epoch are unconditionally co-executed with no

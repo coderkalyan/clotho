@@ -2280,6 +2280,49 @@ TEST_CASE("a group spanning instances dispatches whatever its size and layout") 
     }
 }
 
+// SimulationConfig::verify_shared_code lowers each group again for every
+// instance that shares it, into scratch modules, and must leave nothing behind:
+// the emitted modules and the run are the same with it on and off. The design
+// has what the lowering registers or names besides code: nonblocking blocks, an
+// array and a struct (types made at each use), a string constant, a function
+// copy and a name per instance (which keep their groups per instance).
+TEST_CASE("verifying shared code changes nothing in the emitted modules or the run") {
+    constexpr std::string_view src = R"(
+        typedef struct { logic [3:0] lo; logic [3:0] hi; } pair_t;
+        module child #(parameter int K = 1)(input logic clk, input logic [7:0] d, output logic [7:0] q);
+            logic [7:0] x = 0;
+            logic [7:0] mem [4];
+            pair_t p;
+            string s = "";
+            function automatic logic [7:0] twice(input logic [7:0] v); return v + v; endfunction
+            always @(posedge clk) begin
+                x <= x + K;
+                mem[x[1:0]] <= x;
+                p.lo <= d[3:0];
+                p.hi <= p.lo;
+                q <= mem[0] + {p.hi, p.lo} + d;
+                s = {s, "a"};
+            end
+            always @(posedge clk) $display("%m %0d %s", twice(x), s);
+        endmodule
+        module top;
+            logic clk = 0;
+            logic [7:0] d = 5;
+            wire [7:0] qa, qb, qc;
+            child #(1) a(clk, d, qa);
+            child #(1) b(clk, 8'd9, qb);
+            child #(2) c(clk, d, qc);
+            always #5 clk = ~clk;
+            initial begin #22 $display("%0d %0d %0d", qa, qb, qc); $finish; end
+        endmodule
+    )";
+    for (const bool thunk : { true, false }) {
+        CHECK(emit(src, { .thunk = thunk, .verify_shared_code = true }) ==
+              emit(src, { .thunk = thunk, .verify_shared_code = false }));
+        CHECK(run_capture(src, { .thunk = thunk, .verify_shared_code = true }) ==
+              run_capture(src, { .thunk = thunk, .verify_shared_code = false }));
+    }
+}
 // Regression: a single-operand concat ({x}) and a single replication ({1{x}})
 // once shifted the accumulator by the full result width, which is poison in LLVM
 // (shift >= bitwidth). Replication wraps its operand in a single-element concat,

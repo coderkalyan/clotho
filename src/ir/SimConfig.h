@@ -172,6 +172,23 @@ struct SimulationConfig {
     // gate is literal post-lowering IR identity, so semantics are byte-identical
     // either way. Disable for bisection / debugging.
     bool dedup = true;
+    // Check the code a unit's groups share. A group is lowered once, from the
+    // first instance of its unit whose imports are alike, and every other
+    // instance runs that code with its own record; a lowering that bakes
+    // something of its instance is kept off that path by a list of the things
+    // known to (Backend::taint), which can miss one. With this on, each
+    // instance that shares a group also lowers it for itself, into a scratch
+    // module, and the two must be the same code up to what legitimately differs
+    // (the function's name, the numbering of constants and attribute groups); a
+    // difference fails the build with the unit, the group, both instances and
+    // the first line that differs. The emitted modules are unchanged. It costs
+    // compile time, so it is one of the checks too slow to ship: on with
+    // CLOTHO_EXTRA_ASSERTS (Debug and CI), off otherwise.
+#ifdef CLOTHO_EXTRA_ASSERTS
+    bool verify_shared_code = true;
+#else
+    bool verify_shared_code = false;
+#endif
     // Emit one llvm::Module per elaborated definition (unit = the definition
     // state-struct identity) holding its instances' process groups and the entry
     // of a schedule group that runs just one of them, plus a root module with

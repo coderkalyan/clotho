@@ -51,6 +51,12 @@ VCD, not only what a test prints.
   `assert()`. The backend asserts what the rules state; it repairs none of it.
 - **Internal errors.** A crash or failed assertion reports itself as a bug in
   Clotho and says where to report it, never as a bare abort.
+- **Shared code.** A unit's groups are lowered once and run by every instance
+  whose imports are alike. With `CLOTHO_EXTRA_ASSERTS` the backend also lowers
+  each group for each instance that shares it and fails the build, naming the
+  unit, the group, the instances and the first differing line, if that is not
+  the code shared (`SimulationConfig::verify_shared_code`,
+  docs/design/modular-compilation.md).
 - **Sanitizers.** ASan and UBSan over the full suite and test corpus.
 - **sv-tests.** Outcomes are classified as pass, refused, crash or fail; the
   crash count is zero. A pass there means only that nothing failed, not that

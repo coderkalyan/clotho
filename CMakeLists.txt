@@ -538,6 +538,7 @@ add_library(clotho_ir STATIC
   src/ir/llvm/Analyses.cpp
   src/ir/llvm/AssocArrays.cpp
   src/ir/llvm/Backend.cpp
+  src/ir/llvm/CodeText.cpp
   src/ir/llvm/Containers.cpp
   src/ir/llvm/Dedup.cpp
   src/ir/llvm/Dpi.cpp
@@ -1072,6 +1073,7 @@ set(CLOTHO_TEST_SOURCES
   tests/gate_test.cpp
   tests/net_resolution_test.cpp
   tests/llvm_backend_test.cpp
+  tests/code_text_test.cpp
   tests/two_state_test.cpp
   tests/real_test.cpp
   tests/wheel_test.cpp

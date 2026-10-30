@@ -415,6 +415,24 @@ code go.
      stopped sharing. Comb fusion stays within one instance (combchain
      regresses; accepted until fusion across instances is revisited). Functions
      and tasks are still emitted once per instance, in root.
+
+     The taint list is a claim that the lowering of one instance is the lowering
+     of all, and the frontend's equivalent (partition merging) compares, so the
+     backend is checked too: `SimulationConfig::verify_shared_code`, on with
+     `CLOTHO_EXTRA_ASSERTS` (Debug builds and CI; the suite's build passes it,
+     so the whole suite runs through it) and off otherwise, lowers every group
+     again for each instance that shares it, into a scratch module, and
+     compares it with the shared code. What is compared is
+     the printed code with the function's name, the names and contents of
+     private constants, the names and bodies of struct types and the numbering
+     of attribute groups normalized (`CodeText`, ir/llvm/CodeText.h), and the
+     NBA blocks and the record fills the sharing instance gets against the ones
+     its own lowering registers. A difference, or an own lowering that taints,
+     fails the build and names the unit, the group, both instances and the first
+     line that differs; the emitted modules are the same with the check on and
+     off. A difference is a bake the taint list missed: move the fact into the
+     instance record, or taint the lowering if it is genuinely per-instance.
+     `--stat=unit-code` reports how many groups were checked and what it cost.
    - **3d, wake and NBA as data.** A writer reads its wake buckets' base and
      capacity from the record, a subscription carries its trigger bits, the
      ring mask is a root global, NBA and trigger ids are record base plus

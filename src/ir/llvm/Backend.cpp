@@ -128,13 +128,7 @@ void Backend::run() {
     std::vector<std::pair<uint32_t, uint32_t>> shares; // (instance, the instance whose code it runs)
     // The first instance lowered for each (unit, group, code key): thunk groups
     // of the other instances run its function with their own record.
-    struct Lowered {
-        uint32_t g;
-        uint32_t block_lo, block_hi; // the NBA blocks it registered
-        size_t   fill_lo, fill_hi;   // its record fills of their first ids
-        bool     shared = false;
-    };
-    std::map<std::tuple<uint32_t, uint32_t, std::vector<uint64_t>>, Lowered> once;
+    std::map<std::tuple<uint32_t, uint32_t, std::vector<uint64_t>>, SharedGroup> once;
     for (uint32_t g = 0; g < groups_.size(); ++g) {
         const uint32_t ua = group_unit_anchor_[g];
         env_ = config_.split && ua != SignalSlot::no_anchor ? &unit_env(anchors_[ua])
@@ -150,24 +144,19 @@ void Backend::run() {
             // Another instance of the unit lowered this group already: run its
             // function with this instance's record, which needs the same
             // bindings filled, and NBA blocks of its own signals.
-            Lowered& rep = it->second;
-            llvm::Function* fn = group_fns[rep.g];
-            fn->addFnAttr(llvm::Attribute::NoInline);
-            group_fns.push_back(fn);
+            SharedGroup& rep = it->second;
+            if (config_.verify_shared_code) {
+                verify_shared_group(g, rep);
+            }
+            rep.fn->addFnAttr(llvm::Attribute::NoInline);
+            group_fns.push_back(rep.fn);
             shares.emplace_back(ua, group_unit_anchor_[rep.g]);
             const auto base = static_cast<uint32_t>(block_commits_.size());
-            for (uint32_t b = rep.block_lo; b < rep.block_hi; ++b) {
-                BlockCommit bc;
-                for (const BlockSig& bs : block_commits_[b].sigs) {
-                    const uint32_t field = slots_[static_cast<uint32_t>(bs.sig)].path.back();
-                    bc.sigs.push_back({ anchor_signals_[ua][field], bs.mask, bs.dynamic });
-                }
+            for (BlockCommit& bc : shared_blocks(rep, ua)) {
                 block_commits_.push_back(std::move(bc));
             }
-            for (size_t f = rep.fill_lo; f < rep.fill_hi; ++f) {
-                const uint32_t field = std::get<1>(ctx_blk_fills_[f]);
-                const uint32_t first = std::get<2>(ctx_blk_fills_[f]);
-                ctx_blk_fills_.emplace_back(ua, field, base + (first - rep.block_lo));
+            for (auto& fill : shared_fills(rep, ua, base)) {
+                ctx_blk_fills_.push_back(std::move(fill));
             }
             continue;
         }
@@ -179,8 +168,8 @@ void Backend::run() {
         share_active_       = false;
         group_fns.push_back(fn);
         if (taint_why_ == nullptr) {
-            once.emplace(std::move(key), Lowered{ g, block_lo, static_cast<uint32_t>(block_commits_.size()), fill_lo,
-                                                  ctx_blk_fills_.size() });
+            once.emplace(std::move(key), SharedGroup{ g, fn, block_lo, static_cast<uint32_t>(block_commits_.size()),
+                                                      fill_lo, ctx_blk_fills_.size(), {} });
         } else if (unit_instances[anchors_[ua].unit] >= 2) {
             ++unshared_[taint_why_];
         }
@@ -220,6 +209,10 @@ void Backend::run() {
     // Export thunks come last: they reference @clotho.state (created in
     // emit_main) and every SV function's declaration.
     emit_dpi_exports();
+    // The scratch modules of the verification (see verify_modules_): nothing
+    // below run() reads what lowering cached in them.
+    verify_envs_.clear();
+    verify_modules_.clear();
 }
 
 // Use a global (defined in whichever unit created it) as an operand in the
@@ -238,8 +231,10 @@ llvm::Function* Backend::sym(llvm::Function* f) {
     auto [it, inserted] = env_->decls.try_emplace(f, nullptr);
     if (inserted) {
         // First cross-unit use: the definition must be visible to the JIT
-        // linker, so promote it out of local linkage.
-        if (f->hasLocalLinkage()) {
+        // linker, so promote it out of local linkage. Not for a scratch module
+        // (verify_shared_group): it is never linked, and the definition is the
+        // real modules' business.
+        if (f->hasLocalLinkage() && !verifying_) {
             f->setLinkage(llvm::GlobalValue::ExternalLinkage);
         }
         auto* decl = llvm::Function::Create(f->getFunctionType(), llvm::GlobalValue::ExternalLinkage,
@@ -264,7 +259,7 @@ llvm::GlobalVariable* Backend::sym(llvm::GlobalVariable* g) {
     }
     auto [it, inserted] = env_->decls.try_emplace(g, nullptr);
     if (inserted) {
-        if (g->hasLocalLinkage()) {
+        if (g->hasLocalLinkage() && !verifying_) {
             g->setLinkage(llvm::GlobalValue::ExternalLinkage);
         }
         auto* decl = new llvm::GlobalVariable(env_->llmod, g->getValueType(), g->isConstant(),
@@ -375,6 +370,37 @@ std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
         key.push_back(s.path.empty() ? ~uint64_t{ 0 } : s.path.back());
     }
     return key;
+}
+
+// The NBA blocks an instance registers when it runs the code `rep` lowered: the
+// same blocks, of the signals that sit at the same def-local fields of its own
+// instance.
+std::vector<Backend::BlockCommit> Backend::shared_blocks(const SharedGroup& rep, uint32_t anchor) const {
+    std::vector<BlockCommit> blocks;
+    blocks.reserve(rep.block_hi - rep.block_lo);
+    for (uint32_t b = rep.block_lo; b < rep.block_hi; ++b) {
+        BlockCommit bc;
+        for (const BlockSig& bs : block_commits_[b].sigs) {
+            const uint32_t field = slots_[static_cast<uint32_t>(bs.sig)].path.back();
+            bc.sigs.push_back({ anchor_signals_[anchor][field], bs.mask, bs.dynamic });
+        }
+        blocks.push_back(std::move(bc));
+    }
+    return blocks;
+}
+
+// The record fills of those blocks' first ids, for an instance whose blocks
+// start at id `base`: the field of the same def-local process ordinal, in the
+// instance's own record.
+std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> Backend::shared_fills(const SharedGroup& rep, uint32_t anchor,
+                                                                            uint32_t base) const {
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> fills;
+    fills.reserve(rep.fill_hi - rep.fill_lo);
+    for (size_t f = rep.fill_lo; f < rep.fill_hi; ++f) {
+        const auto& fill = ctx_blk_fills_[f];
+        fills.emplace_back(anchor, std::get<1>(fill), base + (std::get<2>(fill) - rep.block_lo));
+    }
+    return fills;
 }
 
 // The definition unit's env for an anchored scope, created (with its

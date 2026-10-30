@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "Subprocess.h"
+#include "ir/SimConfig.h"
 
 #if !defined(_WIN32)
 
@@ -610,6 +611,11 @@ TEST_CASE("cli: --stat=unit-code counts the functions emitted for the groups of 
     CHECK(r.code == 0);
     CHECK(contains(r.err, "2 groups of multi-instance units over 6 instances' groups, 2 functions emitted (3 of the groups are coroutines"));
     CHECK(contains(r.err, "1 schedule groups run several groups (3 rows)"));
+    // Where a build verifies shared code (CLOTHO_EXTRA_ASSERTS), the line says what
+    // it lowered again to compare: u1 and u2 each run both groups of the unit.
+    if (clotho::ir::SimulationConfig{}.verify_shared_code) {
+        CHECK(contains(r.err, "4 shared groups lowered again for their own instance and compared with the code they share"));
+    }
 }
 
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
