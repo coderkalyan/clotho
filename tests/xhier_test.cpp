@@ -524,3 +524,140 @@ TEST_CASE("two ports bound to one internal net connect each (LRM 23.2.2.1)") {
     )");
     CHECK(out == "x 1 1 1 0\n");
 }
+
+// Port coercion (LRM 23.3.3.1: a port "declared as input (output) but used as an
+// output (input) or inout may be coerced to inout"). Clotho copies the value across
+// an input or output port and coerces only under --allow-port-coercion, and only a
+// port whose coercion the design could observe: an input the module drives, or an
+// output whose net has other drivers while the module reads it. Expected values from
+// the LRM (a coerced port is one net with its connection); iverilog 13, which always
+// coerces, prints the same.
+namespace {
+
+LowerResult lower_coerced(std::string_view source) {
+    return lower_text(source, nullptr, ir::SystemAccess::Off, /*allow_port_coercion=*/true);
+}
+
+std::string run_coerced(std::string_view source) {
+    const LowerResult r = lower_coerced(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    std::FILE* tmp = std::tmpfile();
+    REQUIRE(tmp != nullptr);
+    std::fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    dup2(fileno(tmp), fileno(stdout));
+    ir::run_jit(*r.module);
+    std::fflush(stdout);
+    dup2(saved, fileno(stdout));
+    close(saved);
+    std::rewind(tmp);
+    std::string out;
+    char        buf[256];
+    size_t      n;
+    while ((n = std::fread(buf, 1, sizeof(buf), tmp)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(tmp);
+    return out;
+}
+
+constexpr std::string_view kInputDrivenInside = R"(
+    module m(input a); assign a = 1'b1; endmodule
+    module top; wire w; m u(w); initial #1 $display("%b", w); endmodule
+)";
+
+constexpr std::string_view kOutputReadWhileDriven = R"(
+    module m(output o); assign o = 1'b0; wire r = o; endmodule
+    module top; wire w; assign w = 1'b1; m u(w); initial #1 $display("w=%b m sees %b", w, u.r); endmodule
+)";
+
+} // namespace
+
+TEST_CASE("an input port the module drives is refused unless coercion is allowed") {
+    const LowerResult r = lower_text(kInputDrivenInside);
+    CHECK_FALSE(r.ok);
+    const std::string text = r.diagnostic_text();
+    CHECK(text.find("input port 'a' is driven from inside the module") != std::string::npos);
+    CHECK(text.find("--allow-port-coercion") != std::string::npos);
+    // slang's own warning says Clotho coerced the port, which it did not.
+    CHECK(text.find("coerced to 'inout'") == std::string::npos);
+    // With the flag the two nets are one net: the module's driver reaches `w`.
+    CHECK(run_coerced(kInputDrivenInside) == "1\n");
+}
+
+TEST_CASE("an output port read by its module while its net has other drivers is refused unless coercion is allowed") {
+    const LowerResult r = lower_text(kOutputReadWhileDriven);
+    CHECK_FALSE(r.ok);
+    const std::string text = r.diagnostic_text();
+    CHECK(text.find("output port 'o' is read inside the module while its net has other drivers") != std::string::npos);
+    CHECK(text.find("--allow-port-coercion") != std::string::npos);
+    CHECK(text.find("coerced to 'inout'") == std::string::npos);
+    // Coerced, the module's `0` and the parent's `1` resolve on one net it reads too.
+    CHECK(run_coerced(kOutputReadWhileDriven) == "w=x m sees x\n");
+}
+
+TEST_CASE("ports whose coercion changes nothing are accepted by default") {
+    // A bus of output ports (LRM 23.3.3.2), a module that reads an output nobody else
+    // drives, a module that only drives an output the parent also drives, and an
+    // unconnected input the module drives: none can tell a copy from one net.
+    constexpr std::string_view src      = R"(
+        module drv(input en, input v, output o); assign o = en ? v : 1'bz; endmodule
+        module rd(output o); assign o = 1'b1; wire r = o; endmodule
+        module wr(output o); assign o = 1'b0; endmodule
+        module un(input a); assign a = 1'b1; endmodule
+        module top;
+            reg e1 = 1, e2 = 0;
+            wire bus, w2, w3;
+            assign w3 = 1'b1;
+            drv a(e1, 1'b1, bus);
+            drv b(e2, 1'b0, bus);
+            rd  c(w2);
+            wr  d(w3);
+            un  e();
+            initial #1 $display("bus=%b w2=%b w3=%b c.r=%b e.a=%b", bus, w2, w3, c.r, e.a);
+        endmodule
+    )";
+    const std::string          expected = "bus=1 w2=1 w3=x c.r=1 e.a=1\n";
+    CHECK(run_capture(src) == expected);
+    CHECK(run_coerced(src) == expected);
+}
+
+TEST_CASE("coercion covers non-ANSI ports and every instance") {
+    constexpr std::string_view src = R"(
+        module m(a); input a; assign a = 1'b1; endmodule
+        module top; wire w, x; m u(w); m v(x); initial #1 $display("%b%b", w, x); endmodule
+    )";
+    const LowerResult          r   = lower_text(src);
+    CHECK_FALSE(r.ok);
+    CHECK(r.diagnostic_text().find("input port 'a' is driven from inside the module") != std::string::npos);
+    CHECK(run_coerced(src) == "11\n");
+}
+
+TEST_CASE("a port that needs coercion but cannot be coerced is an error with the flag") {
+    SUBCASE("a variable connection") {
+        const LowerResult r = lower_coerced(R"(
+            module m(input a); assign a = 1'b1; endmodule
+            module top; logic v; m u(v); endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("a variable cannot be connected to an inout port") != std::string::npos);
+    }
+    SUBCASE("a connection of another width") {
+        const LowerResult r = lower_coerced(R"(
+            module m(input [3:0] a); assign a = 4'b1; endmodule
+            module top; wire [1:0] w; m u(w); endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("only supported for a port connected to a whole net of the same width") !=
+              std::string::npos);
+    }
+    SUBCASE("a select connection") {
+        const LowerResult r = lower_coerced(R"(
+            module m(input a); assign a = 1'b1; endmodule
+            module top; wire [3:0] w; m u(w[0]); endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("only supported for a port connected to a whole net of the same width") !=
+              std::string::npos);
+    }
+}

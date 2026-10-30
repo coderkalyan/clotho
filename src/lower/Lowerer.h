@@ -973,6 +973,11 @@ public:
         inferred_clocks_ = clocks;
     }
 
+    // Whether `--allow-port-coercion` is given (LRM 23.3.3.1).
+    void set_allow_port_coercion(bool allow) {
+        allow_port_coercion_ = allow;
+    }
+
     // Point this Lowerer at the design-wide class id table. `ids` must outlive
     // every call made through this Lowerer.
     // Design-wide: some assignment can retarget an event variable, so no event's
@@ -1567,6 +1572,16 @@ private:
     void init_global_scope_signals(const Scope& scope);
 
     void build_inout_aliases(const InstanceSymbol& inst);
+
+    bool needs_port_coercion(const PortConnection& pc, const PortSymbol& p);
+
+    bool net_is_read(const ValueSymbol& sym);
+
+    bool port_driven_inside(const PortSymbol& p);
+
+    bool other_driver_of(const Expression& own_target);
+
+    void scan_net_uses();
 
     void collect_signals(const InstanceBodySymbol& body);
 
@@ -5377,6 +5392,19 @@ private:
     // Inference verdicts for concurrent assertions (see set_inferred_clocks).
     // Null when nothing populated it.
     const InferredClockMap* inferred_clocks_ = nullptr;
+    // Port coercion (LRM 23.3.3.1); see set_allow_port_coercion.
+    bool allow_port_coercion_ = false;
+    // The ports build_inout_aliases coerced to inout: wire_ports copies nothing for them.
+    ankerl::unordered_dense::set<const PortSymbol*> coerced_ports_;
+    // Every write target in this top's hierarchy, by the value symbol it roots at, and
+    // the instance body each one is written in.
+    ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, std::vector<const Expression*>> writes_;
+    ankerl::unordered_dense::map<const Expression*, const slang::ast::InstanceBodySymbol*>       write_in_;
+    // Every value symbol this top's hierarchy reads somewhere (net_is_read), built on
+    // the first question and valid for the top lower_top was given.
+    const InstanceSymbol*                                        top_inst_      = nullptr;
+    bool                                                         reads_scanned_ = false;
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> read_syms_;
     // The event control of the procedure currently being lowered, or null when it
     // has none. Set by lower_procedural_block; read by lower_concurrent_assertion
     // to resolve an inferred clock inside the instance being lowered.

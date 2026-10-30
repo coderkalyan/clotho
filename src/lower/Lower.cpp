@@ -457,7 +457,9 @@ LowerResult lower_design(slang::ast::Compilation&                            com
                          const std::shared_ptr<slang::TextDiagnosticClient>& client,
                          Timings*                                            timings,
                          ir::SystemAccess                                    allow_system,
-                         bool                                                partial) {
+                         bool                                                partial,
+                         bool                                                allow_port_coercion) {
+    // (allow_port_coercion reaches each Lowerer below.)
     LowerResult result;
     // Attached first so EVERY return path below carries it: `sources` is documented
     // as never null, and there are a dozen early returns.
@@ -591,6 +593,12 @@ LowerResult lower_design(slang::ast::Compilation&                            com
             });
             analysis.analyze(comp);
             for (const slang::Diagnostic& d : analysis.getDiagnostics()) {
+                // LRM 23.3.3.1 port coercion: slang says "coerced to 'inout'", which Clotho does
+                // not do, and flags every net with a port driver beside another driver.
+                // Lowerer::needs_port_coercion decides, and says it in its own words.
+                if (d.code == slang::diag::InputPortCoercion || d.code == slang::diag::OutputPortCoercion) {
+                    continue;
+                }
                 harvest(d);
             }
             comp.unfreeze();
@@ -737,6 +745,7 @@ LowerResult lower_design(slang::ast::Compilation&                            com
         for (const InstanceSymbol* top : root.topInstances) {
             const std::string prefix = single ? std::string() : std::string(top->name) + ".";
             Lowerer           lw(*module, *result.sources, tick_fs, allow_system);
+            lw.set_allow_port_coercion(allow_port_coercion);
             lw.seed_signals(globals.sigmap());
             lw.set_globals(&globals);
             lw.set_class_ids(&class_ids);
@@ -955,11 +964,13 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
                               std::shared_ptr<SourceContext> ctx,
                               Timings*                       timings,
                               ir::SystemAccess               allow_system,
-                              bool                           partial = false,
-                              DiagStyle                      style   = {}) {
+                              bool                           partial             = false,
+                              DiagStyle                      style               = {},
+                              bool                           allow_port_coercion = false) {
     const slang::SourceManager* const sm = comp.getSourceManager();
     if (sm == nullptr) {
-        return lower_design(comp, std::move(ctx), nullptr, nullptr, timings, allow_system, partial);
+        return lower_design(
+          comp, std::move(ctx), nullptr, nullptr, timings, allow_system, partial, allow_port_coercion);
     }
 
     slang::DiagnosticEngine engine(*sm);
@@ -967,7 +978,8 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
         style.client = std::make_shared<slang::TextDiagnosticClient>();
     }
     engine.addClient(style.client);
-    LowerResult result = lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial);
+    LowerResult result =
+      lower_design(comp, std::move(ctx), &engine, style.client, timings, allow_system, partial, allow_port_coercion);
 
     // slang's own items arrive rendered (lower_design harvests them one by one).
     // What is left is Clotho's: lowering guards, post-lowering checks and the
@@ -983,7 +995,10 @@ LowerResult lower_compilation(slang::ast::Compilation&       comp,
 
 } // namespace
 
-LowerResult lower_files(std::span<const std::string_view> paths, Timings* timings, ir::SystemAccess allow_system) {
+LowerResult lower_files(std::span<const std::string_view> paths,
+                        Timings*                          timings,
+                        ir::SystemAccess                  allow_system,
+                        bool                              allow_port_coercion) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // One SourceManager shared across every tree so the Compilation's diagnostics
@@ -1018,13 +1033,14 @@ LowerResult lower_files(std::span<const std::string_view> paths, Timings* timing
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(comp, std::move(ctx), timings, allow_system);
+    return lower_compilation(comp, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion);
 }
 
 LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
                          Timings*                               timings,
                          ir::SystemAccess                       allow_system,
-                         PathPrefixMap                          path_prefix_map) {
+                         PathPrefixMap                          path_prefix_map,
+                         bool                                   allow_port_coercion) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // The Driver owns source loading (incl. `-f` command files, `-y`/`-v`
@@ -1081,10 +1097,14 @@ LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
     // The design's diagnostics are rendered the way the Driver renders its own, so
     // colour and `--diag-source`, `--diag-column`, `--diag-location`, ... apply to
     // them alike.
-    return lower_compilation(cr, std::move(ctx), timings, allow_system, /*partial=*/false, style_of(dr));
+    return lower_compilation(
+      cr, std::move(ctx), timings, allow_system, /*partial=*/false, style_of(dr), allow_port_coercion);
 }
 
-LowerResult lower_sources(std::span<const std::string_view> args, Timings* timings, ir::SystemAccess allow_system) {
+LowerResult lower_sources(std::span<const std::string_view> args,
+                          Timings*                          timings,
+                          ir::SystemAccess                  allow_system,
+                          bool                              allow_port_coercion) {
     auto                   driver = std::make_unique<slang::driver::Driver>();
     slang::driver::Driver& dr     = *driver;
     dr.addStandardArgs();
@@ -1117,10 +1137,13 @@ LowerResult lower_sources(std::span<const std::string_view> args, Timings* timin
                                                  .reported = true });
         return result;
     }
-    return lower_driver(std::move(driver), timings, allow_system);
+    return lower_driver(std::move(driver), timings, allow_system, {}, allow_port_coercion);
 }
 
-LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAccess allow_system) {
+LowerResult lower_text(std::string_view source,
+                       Timings*         timings,
+                       ir::SystemAccess allow_system,
+                       bool             allow_port_coercion) {
     const auto t_parse = std::chrono::steady_clock::now();
 
     // `SyntaxTree::fromText` uses slang's process-wide default SourceManager, so
@@ -1136,7 +1159,7 @@ LowerResult lower_text(std::string_view source, Timings* timings, ir::SystemAcce
         timings->frontend_ms += ms_since(t_parse);
     }
 
-    return lower_compilation(cr, std::move(ctx), timings, allow_system);
+    return lower_compilation(cr, std::move(ctx), timings, allow_system, false, {}, allow_port_coercion);
 }
 
 LowerResult lower_buffer(std::string_view path,

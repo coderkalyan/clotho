@@ -457,7 +457,9 @@ std::optional<ir::Signal> Lowerer::vif_member_signal(const slang::ast::Symbol&  
 // gives every top a "<name>." prefix, so gating on an empty prefix would drop
 // all initializers (each top gets its own Lowerer, so this covers each one).
 void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
-    top_elided_ = prefix.empty();
+    top_elided_    = prefix.empty();
+    top_inst_      = &top;
+    reads_scanned_ = false;
     lower_instance(top, prefix, Pass::Collect, nullptr, top.name);
     // Between the passes: Collect has just enumerated every assertion and
     // said whether the design calls an LRM 20.12 control task, and the
@@ -1021,12 +1023,13 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
             fail("unsupported port connection kind");
         }
         const PortSymbol& p = pc->port.as<PortSymbol>();
-        if (p.direction == slang::ast::ArgumentDirection::InOut ||
-            p.direction == slang::ast::ArgumentDirection::Ref) {
+        if (p.direction == slang::ast::ArgumentDirection::InOut || p.direction == slang::ast::ArgumentDirection::Ref ||
+            coerced_ports_.contains(&p)) {
             // inout / ref ports share storage via build_inout_aliases (the child
             // internal net/var aliases the parent signal), so there is no
             // one-way copy to wire here — both sides already reference one
-            // signal and any drivers fold through net resolution.
+            // signal and any drivers fold through net resolution. A port coerced to
+            // inout (needs_port_coercion) is aliased the same way.
             continue;
         }
         if (p.internalSymbol == nullptr) {

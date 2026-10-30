@@ -297,6 +297,9 @@ Milestones, in order; lower ones unblock higher ones:
   non-ANSI concatenation port `module m({a, b})` and an ANSI `.p(expr)` port are refused.
 - [ ] **`` `unconnected_drive `` on an unconnected input variable, aggregate or select port**
   (22.9) — only a whole packed net port is pulled; the others are refused.
+- [ ] **Port coercion to inout of a port that is not a whole net of its own width** (23.3.3.1)
+  — with `--allow-port-coercion`, a connection to a select, concatenation, expression or net
+  of another width is refused.
 
 ### Timing checks (basic)
 

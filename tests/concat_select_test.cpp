@@ -269,18 +269,19 @@ TEST_CASE("a non-ANSI port reference with a select connects only those bits") {
 }
 
 // The select port's bits drive the net like any other partial driver, so they
-// resolve against a driver of the same bits made inside the child: here the
-// connection (1z) and the child's own `assign` (z1) fold to 11, and the bits no
-// driver reaches stay z.
-TEST_CASE("a select port resolves against a child driver of the same bits") {
+// resolve against another driver of the same bits (here a hierarchical `assign`
+// from the parent; one made by the module itself is a port coercion, LRM 23.3.3.1):
+// the connection (1z) and the assign (z1) fold to 11, and the bits no driver reaches
+// stay z.
+TEST_CASE("a select port resolves against another driver of the same bits") {
     const std::string out = run_capture(R"(
         module p_res(arg[1:0]);
             input [3:0] arg;
-            assign arg[1:0] = 2'bz1;
         endmodule
         module top;
             reg [1:0] a = 2'b1z;
             p_res u(a);
+            assign u.arg[1:0] = 2'bz1;
             initial #1 $display("%b", u.arg);
         endmodule
     )");
