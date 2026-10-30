@@ -32,9 +32,12 @@
 #include <string_view>
 #include <vector>
 
+#include <llvm/Support/raw_ostream.h>
+
 #include "Lower.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
+#include "ir/LlvmBackend.h"
 #include "runtime/Runtime.h"
 
 using namespace clotho;
@@ -72,6 +75,14 @@ std::string run_capture(std::string_view source) {
     }
     std::fclose(tmp);
     return out;
+}
+
+std::string emit_ir(std::string_view source) {
+    const LowerResult r = lower_ok(source);
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*r.module, os));
+    return text;
 }
 
 } // namespace
@@ -568,4 +579,157 @@ TEST_CASE("the wide select kernels touch only bits inside the vector, whatever c
             }
         }
     }
+}
+
+// A watched vector wakes its waiters from the transition of what a wide-select store
+// actually wrote. The store's change detection looks only at the 64-bit words the
+// store can touch (plus the two words that hold bit 0 of the planes, which is all an
+// edge reads, LRM 9.4.2), not at the whole 64 Kbit vector, so what must hold is that
+// every kind of store still wakes the right waiters: an Any-edge waiter on any value
+// change, including a z-only one (x -> z is a change although must and may agree)
+// and one in a word nowhere near bit 0; posedge / negedge only when bit 0 moves up or
+// down the 0 < x/z < 1 lattice of Table 9-2, a store high in the vector never; and
+// none of them for a write that changes nothing, lands out of range, is dropped for an
+// x/z index, or hangs off an end of the vector and changes only the bits inside it.
+// The 2-state twin `b` has no x, z or may plane. The expected counts are iverilog
+// 13's (the same design, line for line).
+TEST_CASE("a watched wide vector wakes the right waiters for every kind of select store") {
+    const std::string out = run_capture(R"(
+        module m;
+          logic [65535:0] v;
+          bit   [65535:0] b;
+          integer anyv, posv, negv, anyb, posb, negb;
+          integer i;
+          reg [31:0] ix;
+          always @(v)         anyv = anyv + 1;
+          always @(posedge v) posv = posv + 1;
+          always @(negedge v) negv = negv + 1;
+          always @(b)         anyb = anyb + 1;
+          always @(posedge b) posb = posb + 1;
+          always @(negedge b) negb = negb + 1;
+          task report(input [8*14:1] tag);
+            $display("%0s v: any=%0d pos=%0d neg=%0d  b: any=%0d pos=%0d neg=%0d",
+                     tag, anyv, posv, negv, anyb, posb, negb);
+          endtask
+          initial begin
+            v = {65536{1'b0}}; b = 0; #1;
+            anyv = 0; posv = 0; negv = 0; anyb = 0; posb = 0; negb = 0;
+            i = 0;     v[i] = 1; b[i] = 1; #1 report("lsb 0->1");
+            i = 0;     v[i] = 1; b[i] = 1; #1 report("lsb same");
+            i = 40000; v[i] = 1; b[i] = 1; #1 report("high bit set");
+            i = 64;    v[i] = 1; b[i] = 1; #1 report("word edge 64");
+            i = 63;    v[i] = 1; b[i] = 1; #1 report("word edge 63");
+            i = 40000; v[i] = 0; b[i] = 0; #1 report("high bit clr");
+            i = 0;     v[i] = 0; b[i] = 0; #1 report("lsb 1->0");
+            i = 0;     v[i] = 1'bx; #1 report("lsb 0->x");
+            i = 0;     v[i] = 1'bz; #1 report("lsb x->z");
+            i = 0;     v[i] = 1; #1 report("lsb z->1");
+            i = 0;     v[i] = 1'bx; #1 report("lsb 1->x");
+            i = 0;     v[i] = 0; #1 report("lsb x->0");
+            i = 5;     v[i] = 1'bx; #1 report("bit5 0->x");
+            i = 5;     v[i] = 1'bz; #1 report("bit5 x->z");
+            i = 65000; v[i] = 1'bz; #1 report("bit65000 z");
+            i = 70000; v[i] = 1; b[i] = 1; #1 report("oor high");
+            i = -1;    v[i] = 1; b[i] = 1; #1 report("oor neg");
+            ix = 32'bx; v[ix] = 1; b[ix] = 1; #1 report("x index");
+            i = 65532; v[i +: 8] = 8'hff; b[i +: 8] = 8'hff; #1 report("part hi hang");
+            i = -4;    v[i +: 8] = 8'hff; b[i +: 8] = 8'hff; #1 report("part lo hang");
+            i = -4;    v[i +: 8] = 8'hff; b[i +: 8] = 8'hff; #1 report("part lo again");
+            i = 100;   v[i +: 200] = {200{1'b1}}; b[i +: 200] = {200{1'b1}}; #1 report("wide part");
+            i = 100;   v[i +: 200] = {200{1'b0}}; b[i +: 200] = {200{1'b0}}; #1 report("wide part clr");
+            i = 0;     v[i +: 4] = 4'b0001; b[i +: 4] = 4'b0001; #1 report("lsb via part");
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "lsb 0->1 v: any=1 pos=1 neg=0  b: any=1 pos=1 neg=0\n"
+          "lsb same v: any=1 pos=1 neg=0  b: any=1 pos=1 neg=0\n"
+          "high bit set v: any=2 pos=1 neg=0  b: any=2 pos=1 neg=0\n"
+          "word edge 64 v: any=3 pos=1 neg=0  b: any=3 pos=1 neg=0\n"
+          "word edge 63 v: any=4 pos=1 neg=0  b: any=4 pos=1 neg=0\n"
+          "high bit clr v: any=5 pos=1 neg=0  b: any=5 pos=1 neg=0\n"
+          "lsb 1->0 v: any=6 pos=1 neg=1  b: any=6 pos=1 neg=1\n"
+          "lsb 0->x v: any=7 pos=2 neg=1  b: any=6 pos=1 neg=1\n"
+          "lsb x->z v: any=8 pos=2 neg=1  b: any=6 pos=1 neg=1\n"
+          "lsb z->1 v: any=9 pos=3 neg=1  b: any=6 pos=1 neg=1\n"
+          "lsb 1->x v: any=10 pos=3 neg=2  b: any=6 pos=1 neg=1\n"
+          "lsb x->0 v: any=11 pos=3 neg=3  b: any=6 pos=1 neg=1\n"
+          "bit5 0->x v: any=12 pos=3 neg=3  b: any=6 pos=1 neg=1\n"
+          "bit5 x->z v: any=13 pos=3 neg=3  b: any=6 pos=1 neg=1\n"
+          "bit65000 z v: any=14 pos=3 neg=3  b: any=6 pos=1 neg=1\n"
+          "oor high v: any=14 pos=3 neg=3  b: any=6 pos=1 neg=1\n"
+          "oor neg v: any=14 pos=3 neg=3  b: any=6 pos=1 neg=1\n"
+          "x index v: any=14 pos=3 neg=3  b: any=6 pos=1 neg=1\n"
+          "part hi hang v: any=15 pos=3 neg=3  b: any=7 pos=1 neg=1\n"
+          "part lo hang v: any=16 pos=4 neg=3  b: any=8 pos=2 neg=1\n"
+          "part lo again v: any=16 pos=4 neg=3  b: any=8 pos=2 neg=1\n"
+          "wide part v: any=17 pos=4 neg=3  b: any=9 pos=2 neg=1\n"
+          "wide part clr v: any=18 pos=4 neg=3  b: any=10 pos=2 neg=1\n"
+          "lsb via part v: any=19 pos=4 neg=3  b: any=11 pos=2 neg=1\n");
+}
+
+// The same for a select nested in an element of a wide packed array: its offset is
+// the enclosing element's plus its own, and an index outside its element (or an
+// element that does not exist) writes nothing, so it wakes nothing. No oracle: iverilog
+// takes no variable index there; the counts are LRM 11.5.1 / 9.4.2 worked by hand
+// and equal what the whole-vector change detection gave before.
+TEST_CASE("a watched wide packed array wakes the right waiters for a nested select store") {
+    const std::string out = run_capture(R"(
+        module m;
+          logic [3:0][8191:0] pk;
+          integer anyp, posp, negp;
+          integer i, j;
+          always @(pk)         anyp = anyp + 1;
+          always @(posedge pk) posp = posp + 1;
+          always @(negedge pk) negp = negp + 1;
+          task report(input [8*14:1] tag);
+            $display("%0s any=%0d pos=%0d neg=%0d", tag, anyp, posp, negp);
+          endtask
+          initial begin
+            pk = {4{8192'b0}}; #1;
+            anyp = 0; posp = 0; negp = 0;
+            i = 0; j = 0;    pk[i][j] = 1; #1 report("elem0 bit0");
+            i = 1; j = 0;    pk[i][j] = 1; #1 report("elem1 bit0");
+            i = 3; j = 8191; pk[i][j] = 1; #1 report("elem3 top");
+            i = 1; j = 8192; pk[i][j] = 1; #1 report("j past elem");
+            i = 1; j = -1;   pk[i][j] = 1; #1 report("j neg");
+            i = 4; j = 0;    pk[i][j] = 1; #1 report("i past");
+            i = -1; j = 0;   pk[i][j] = 1; #1 report("i neg");
+            i = 0; j = 0;    pk[i][j] = 0; #1 report("elem0 bit0 clr");
+            i = 2; j = 4000; pk[i][j +: 64] = 64'hf0f0f0f0f0f0f0f0; #1 report("elem2 part");
+          end
+        endmodule
+    )");
+    CHECK(out ==
+          "elem0 bit0 any=1 pos=1 neg=0\n"
+          "elem1 bit0 any=2 pos=1 neg=0\n"
+          "elem3 top any=3 pos=1 neg=0\n"
+          "j past elem any=3 pos=1 neg=0\n"
+          "j neg any=3 pos=1 neg=0\n"
+          "i past any=3 pos=1 neg=0\n"
+          "i neg any=3 pos=1 neg=0\n"
+          "elem0 bit0 clr any=4 pos=1 neg=1\n"
+          "elem2 part any=5 pos=1 neg=1\n");
+}
+
+// The change detection around a wide-select store must not load and compare the
+// whole vector: for a one-bit store to a watched 64 Kbit vector that was a load and
+// a compare of the whole 131072-bit must|may word, before and after the store. The
+// design has no whole-vector store, so any i131072 load or compare left in the
+// module is the select store's bracket.
+TEST_CASE("a watched wide select store does not load or compare the whole vector") {
+    const std::string ir = emit_ir(R"(
+        module m;
+          logic [65535:0] v;
+          integer i;
+          always @(v) $display("any");
+          always @(posedge v) $display("pos");
+          initial begin
+            i = $urandom;
+            v[i] = 1'b1;
+          end
+        endmodule
+    )");
+    CHECK(ir.find("load i131072") == std::string::npos);
+    CHECK(ir.find("icmp ne i131072") == std::string::npos);
 }

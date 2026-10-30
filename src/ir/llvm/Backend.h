@@ -1755,6 +1755,10 @@ private:
 
     bool signal_has_level_waiters(Signal sig) const;
 
+    // Whether some waiter of `sig` (a static or dynamic queue entry, a virtual
+    // interface waiter, or a `<= @e` trigger) is subscribed to `edge`.
+    bool signal_has_bucket(Signal sig, Edge e) const;
+
     llvm::Value* load_mm(Signal sig);
 
     uint32_t slot_mm_bits(const LValue& lv) const;
@@ -1762,6 +1766,31 @@ private:
     llvm::Value* load_lv_mm(const LValue& lv);
 
     llvm::Value* load_lv_z(const LValue& lv);
+
+    // What a store through the wide-select path (LValue::wide_dyn) can change of its
+    // target, snapshotted in place of the whole slot: K consecutive 64-bit words
+    // around the select's offset in each plane that matters, plus the two words
+    // that hold bit 0 of the must and may planes, which is all an edge reads
+    // (LRM 9.4.2). A pointer is null for a plane or fact nobody consumes; `mm`,
+    // `may`, `z`, `lsb_mm` and `lsb_may` are the values loaded through them
+    // (wide_window_snapshot, service_wide_window).
+    struct WideWindow {
+        uint32_t     words     = 0;
+        uint32_t     width     = 0; // the slot's value width W
+        bool         four      = false;
+        bool         need_any  = false;
+        bool         need_edge = false;
+        llvm::Value* mm_ptr    = nullptr;
+        llvm::Value* may_ptr   = nullptr;
+        llvm::Value* z_ptr     = nullptr;
+        llvm::Value* lsb_mm_ptr  = nullptr;
+        llvm::Value* lsb_may_ptr = nullptr;
+        llvm::Value* mm        = nullptr;
+        llvm::Value* may       = nullptr;
+        llvm::Value* z         = nullptr;
+        llvm::Value* lsb_mm    = nullptr;
+        llvm::Value* lsb_may   = nullptr;
+    };
 
     // Pre-write snapshot of an lvalue's selected storage, taken so wait-queue
     // servicing can classify the old -> new transition. `mm` is null when the
@@ -1788,11 +1817,20 @@ private:
         // rt_string_cmp after the write (str_chg_snapshot). Non-null only for a
         // string place carrying a notifier.
         llvm::Value* str = nullptr;
+        // The words of a wide-select store's target it can touch, in place of `mm` /
+        // `z`, which stay null (wide_window_snapshot).
+        std::optional<WideWindow> wide;
     };
 
     ServiceSnapshot service_snapshot(const LValue& lv);
 
     void service_after_write(const LValue& lv, ServiceSnapshot old);
+
+    std::optional<WideWindow> wide_window_snapshot(const LValue& lv);
+
+    void load_wide_window(WideWindow& w);
+
+    void service_wide_window(const LValue& lv, const WideWindow& old);
 
     // One old -> new transition's wake facts: which edge buckets fire. A fact is
     // null when its bucket was not requested (no waiters of that kind).
@@ -1806,8 +1844,16 @@ private:
                               bool four_state, llvm::Value* old_z, llvm::Value* new_z,
                               bool need_pos, bool need_neg, bool need_any);
 
+    // Table 9-2 posedge / negedge from the LSBs of the must and may planes before
+    // and after a store (`old_may` / `new_may` are null for a 2-state slot).
+    EdgeFacts emit_edge_bits(llvm::Value* old_m, llvm::Value* new_m, llvm::Value* old_may,
+                             llvm::Value* new_may, bool need_pos, bool need_neg);
+
     void service_wait_queue(Signal sig, llvm::Value* old_mm, llvm::Value* new_mm,
                             llvm::Value* old_z, llvm::Value* new_z);
+
+    // Fire the buckets a transition's facts select.
+    void service_wake_buckets(Signal sig, const EdgeFacts& f);
 
     void service_change_notify(const LValue& lv,
                                llvm::Value*  old_mm,
