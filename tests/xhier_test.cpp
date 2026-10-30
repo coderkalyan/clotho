@@ -458,3 +458,69 @@ TEST_CASE("an inout port connected to a net of another width fails loudly") {
         CHECK(r.diagnostic_text().find("net of another width (2 and 3 bits)") != std::string::npos);
     }
 }
+
+// LRM 23.2.2.1 Example 4 and Example 6: two ports of one module bound to one
+// internal net. The two nets they connect become one net, which an alias (one
+// target per internal net) cannot express: the second port used to replace the
+// first, leaving one of the nets unconnected.
+TEST_CASE("two inout ports bound to one internal net fail loudly") {
+    SUBCASE("implicit ports (a, a)") {
+        const LowerResult r = lower_text(R"(
+            module id(a, a);
+              inout a;
+            endmodule
+            module top;
+              wire b, c;
+              id i1(b, c);
+              assign b = 1'b0;
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("two inout/ref ports bound to one net") != std::string::npos);
+    }
+    SUBCASE("explicitly named ports (.p(i), .q(i))") {
+        const LowerResult r = lower_text(R"(
+            module same_port(.p(i), .q(i));
+              inout i;
+            endmodule
+            module top;
+              wire b, c;
+              same_port u(.p(b), .q(c));
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("two inout/ref ports bound to one net") != std::string::npos);
+    }
+}
+
+// The other directions need no merge and always worked: two input connections
+// drive the one net, which resolves them ("The inputs are tied together", LRM
+// 23.2.2.1 Example 6), two output connections each receive its value, and an
+// inout whose second port is left unconnected is one connection. iverilog 13
+// prints the same.
+TEST_CASE("two ports bound to one internal net connect each (LRM 23.2.2.1)") {
+    const std::string out = run_capture(R"(
+        module same_input(a, a);
+          input a;
+        endmodule
+        module same_output(o, o);
+          output o;
+          assign o = 1'b1;
+        endmodule
+        module one_side(a, a);
+          inout a;
+        endmodule
+        module top;
+          reg  p = 1'b0, q = 1'b1, r = 1'b1, s = 1'b1;
+          wire o1, o2;
+          wire b;
+          same_input  i1(p, q);
+          same_input  i2(r, s);
+          same_output i3(o1, o2);
+          one_side    i4(b, );
+          assign b = 1'b0;
+          initial #1 $display("%b %b %b %b %b", i1.a, i2.a, o1, o2, i4.a);
+        endmodule
+    )");
+    CHECK(out == "x 1 1 1 0\n");
+}

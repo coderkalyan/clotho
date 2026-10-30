@@ -291,6 +291,8 @@ Milestones, in order; lower ones unblock higher ones:
     sub-signal aliasing.
   - [ ] **Connection to a net of another width** — the bits they share connect and the rest of
     the wider side is unconnected; needs sub-signal aliasing.
+  - [ ] **Two ports bound to one internal net** (`module m(a, a)`) — the two connected nets
+    become one net; needs merging the nets of one scope.
 - [ ] **Port expression that is not a select of one internal net** (23.2.2.1, 23.2.2.2) — a
   non-ANSI concatenation port `module m({a, b})` and an ANSI `.p(expr)` port are refused.
 
