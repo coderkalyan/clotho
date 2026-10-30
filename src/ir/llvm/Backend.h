@@ -4270,6 +4270,10 @@ private:
     // spanning instances (its own function registers blocks), ~0 for any other
     // process. Drawn from the same per-anchor counter as group_def_ordinal_.
     std::vector<uint32_t> member_blk_ordinal_;
+    // The member function of every group spanning instances with the process
+    // it runs, in lowering order (report_unit_code compares them across the
+    // instances of a unit).
+    std::vector<std::pair<uint32_t, llvm::Function*>> member_fns_;
     // Owning scope anchor of ANY single-scope group, no_anchor for
     // cross-instance / unscoped groups, and the group's dense def-local
     // ordinal among them: the split-emission unit assignment (see unit_env /

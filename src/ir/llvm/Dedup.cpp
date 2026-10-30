@@ -254,12 +254,14 @@ void Backend::report_dedup_shapes(const std::vector<llvm::Function*>& group_fns)
 
 // `--stat=unit-code`: how far the backend is from compiling each unit once
 // (docs/design/modular-compilation.md, step 3). For every unit with several
-// instances, compares each of its single-scope groups across the instances
-// after numbering every design symbol (`@clotho.*`) by first occurrence: what
-// such a symbol names an instance record binding could supply, so a mismatch
-// left is an immediate or a code shape baked per instance. Groups spanning
-// instances and processes outside any instance have no unit to compare in and
-// are counted apart.
+// instances, compares each of its single-scope groups, and each member
+// function of a group spanning instances (keyed by the unit and the member's
+// def-local process ordinal), across the instances after numbering every
+// design symbol (`@clotho.*`) by first occurrence: what such a symbol names an
+// instance record binding could supply, so a mismatch left is an immediate or
+// a code shape baked per instance. The dispatcher of a group spanning
+// instances is root glue with no unit to compare in, and processes outside any
+// instance have none either; both are counted apart.
 void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
     const auto normalize = [](llvm::Function* fn) {
         std::string raw;
@@ -297,9 +299,13 @@ void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
         return out;
     };
 
-    // (unit, unit-local group ordinal) -> the group in each instance.
-    ankerl::unordered_dense::map<uint64_t, std::vector<uint32_t>> by_slot;
-    ankerl::unordered_dense::map<uint32_t, uint32_t>              instances;
+    // (unit, unit-local ordinal) -> the function in each instance: a
+    // single-scope group by its group ordinal, a member function by its
+    // process ordinal.
+    using Slots = ankerl::unordered_dense::map<uint64_t, std::vector<llvm::Function*>>;
+    Slots                                            group_slots;
+    Slots                                            member_slots;
+    ankerl::unordered_dense::map<uint32_t, uint32_t> instances;
     for (const Anchor& a : anchors_) {
         if (a.unit != InstanceScope::no_unit) {
             ++instances[a.unit];
@@ -322,45 +328,70 @@ void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
         if (unit == InstanceScope::no_unit || instances[unit] < 2) {
             continue;
         }
-        by_slot[(static_cast<uint64_t>(unit) << 32) | group_unit_ordinal_[g]].push_back(g);
+        group_slots[(static_cast<uint64_t>(unit) << 32) | group_unit_ordinal_[g]].push_back(group_fns[g]);
     }
-
-    uint64_t    compared = 0, same = 0;
-    unsigned    shown = 0;
-    std::string samples;
-    for (const auto& [key, gs] : by_slot) {
-        if (gs.size() < 2) {
+    for (const auto& [m, fn] : member_fns_) {
+        const uint32_t aid = proc_sched_anchor_[m];
+        if (aid == SignalSlot::no_anchor) {
             continue;
         }
-        ++compared;
-        const std::string first = normalize(group_fns[gs.front()]);
-        bool              equal = true;
-        for (size_t m = 1; m < gs.size() && equal; ++m) {
-            const std::string other = normalize(group_fns[gs[m]]);
-            if (other == first) {
+        const uint32_t unit = anchors_[aid].unit;
+        if (unit == InstanceScope::no_unit || instances[unit] < 2) {
+            continue;
+        }
+        member_slots[(static_cast<uint64_t>(unit) << 32) | proc_sched_ord_[m]].push_back(fn);
+    }
+
+    // Compare each slot's functions pairwise against the first; returns the
+    // slots compared (two or more instances) and how many were identical, and
+    // appends the first few mismatches to `samples`.
+    const auto compare = [&](const Slots& slots, std::string& samples) {
+        uint64_t compared = 0, same = 0;
+        unsigned shown = 0;
+        for (const auto& [key, fns] : slots) {
+            if (fns.size() < 2) {
                 continue;
             }
-            equal = false;
-            if (shown++ < 8) {
-                std::istringstream a(first), b(other);
-                std::string        la, lb;
-                while (std::getline(a, la) && std::getline(b, lb) && la == lb) {
+            ++compared;
+            const std::string first = normalize(fns.front());
+            bool              equal = true;
+            for (size_t i = 1; i < fns.size() && equal; ++i) {
+                const std::string other = normalize(fns[i]);
+                if (other == first) {
+                    continue;
                 }
-                samples += "  " + group_fns[gs.front()]->getName().str() + " vs " + group_fns[gs[m]]->getName().str() +
-                           ":\n    " + la + "\n    " + lb + "\n";
+                equal = false;
+                if (shown++ < 8) {
+                    std::istringstream a(first), b(other);
+                    std::string        la, lb;
+                    while (std::getline(a, la) && std::getline(b, lb) && la == lb) {
+                    }
+                    samples += "  " + fns.front()->getName().str() + " vs " + fns[i]->getName().str() + ":\n    " +
+                               la + "\n    " + lb + "\n";
+                }
             }
+            same += equal ? 1 : 0;
         }
-        same += equal ? 1 : 0;
-    }
+        return std::pair{ compared, same };
+    };
+    std::string       group_samples, member_samples;
+    const auto [compared, same]                 = compare(group_slots, group_samples);
+    const auto [members_compared, members_same] = compare(member_slots, member_samples);
     std::fprintf(stderr,
                  "unit-code: %llu groups of multi-instance units compared, %llu identical up to design "
-                 "symbols; %llu groups span instances (%llu members), %llu belong to no instance\n%s",
+                 "symbols; %llu groups span instances (%llu members), %llu belong to no instance\n"
+                 "unit-code: %llu member functions (by unit and process) of groups spanning instances "
+                 "compared across instances, %llu identical up to design symbols; %llu members in all\n%s%s",
                  (unsigned long long)compared,
                  (unsigned long long)same,
                  (unsigned long long)cross,
                  (unsigned long long)cross_members,
                  (unsigned long long)unanchored,
-                 samples.c_str());
+                 (unsigned long long)members_compared,
+                 (unsigned long long)members_same,
+                 (unsigned long long)member_fns_.size(),
+                 group_samples.c_str(),
+                 member_samples.c_str());
 }
 
 // The single @clotho.inst.* global a function references, or null when it

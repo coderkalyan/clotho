@@ -265,6 +265,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             deinit_body_strings();
             b_.CreateRetVoid();
             member_fns.push_back(fn_);
+            member_fns_.emplace_back(m, fn_);
         }
         own_anchor_        = SignalSlot::no_anchor;
         own_ctx_           = nullptr;

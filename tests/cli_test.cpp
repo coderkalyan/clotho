@@ -586,6 +586,31 @@ TEST_CASE("cli: build and run accept the code-generation options") {
     }
 }
 
+TEST_CASE("cli: --stat=unit-code compares the members of a group spanning instances") {
+    // Three instances of one block wait on the clock of one interface, so their
+    // processes are one group spanning instances: one function per member, the
+    // same function in every instance up to the design symbols it names.
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        interface bus_if; logic clk = 0; endinterface
+        module leaf(bus_if b);
+            reg [7:0] n = 0;
+            always @(posedge b.clk) n <= n + 8'd1;
+        endmodule
+        module top;
+            bus_if bus();
+            leaf u0(bus);
+            leaf u1(bus);
+            leaf u2(bus);
+            initial #1 bus.clk = 1;
+        endmodule
+    )");
+    const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(contains(r.err, "1 groups span instances (3 members)"));
+    CHECK(contains(r.err, "1 identical up to design symbols; 3 members in all"));
+}
+
 TEST_CASE("cli: -G overrides a parameter of the top-level module") {
     const Scratch  s;
     const fs::path design = s.write("design.sv", kParamDesign);
