@@ -472,7 +472,8 @@ ir::Index Lowerer::lower_short_circuit(const BinaryExpression& bin, ir::Builder&
     using T                 = ir::Inst::Tag;
     using B                 = slang::ast::BinaryOperator;
     const ir::SourceLoc l   = loc(bin);
-    const ir::Ref       bit = make_int_type(1, true, false);
+    // A real operand reduces to a 2-state truth bit (FNe) below.
+    const ir::Ref bit = make_int_type(1, false, false);
 
     // A real operand reduces to its own definite truth bit (!= 0.0, reals
     // carry no x/z) before the integer machinery below (LRM 11.4.7).
@@ -496,7 +497,8 @@ ir::Index Lowerer::lower_short_circuit(const BinaryExpression& bin, ir::Builder&
         pred                 = b.unary(T::Lnot, b.binary(T::CaseEq, lhs, zero, l), l);
     } else {
         const ir::Index ror = b.unary(T::RedOr, lhs, l);
-        const ir::Index one = b.constant(module_.pool.put_int(bit, 1), l);
+        const ir::Index one =
+          b.constant(module_.pool.put_int(make_int_type(1, b.type_of(ror).four_state, false), 1), l);
         pred                = b.unary(T::Lnot, b.binary(T::CaseEq, ror, one, l), l);
     }
 
@@ -531,7 +533,9 @@ ir::Index Lowerer::lower_short_circuit(const BinaryExpression& bin, ir::Builder&
     const ir::ExtraSlice then_region = b.close_region();
 
     b.open_region();
-    const ir::Index      dom         = b.constant(module_.pool.put_int(bit, dom_val), l);
+    // The skipped branch's value has the domain of the combined one.
+    const ir::Ref        dom_ty      = make_int_type(1, b.type_of(combined).four_state, false);
+    const ir::Index      dom         = b.constant(module_.pool.put_int(dom_ty, dom_val), l);
     const ir::ExtraSlice else_region = b.close_region();
 
     return b.select_lazy(pred, then_region, combined, else_region, dom, l);
@@ -550,7 +554,8 @@ ir::Index Lowerer::lower_short_circuit(const BinaryExpression& bin, ir::Builder&
 ir::Index Lowerer::lower_lazy_conditional(const ConditionalExpression& c, ir::Index pred, ir::Builder& b) {
     using T                 = ir::Inst::Tag;
     const ir::SourceLoc l   = loc(c);
-    const ir::Ref       bit = make_int_type(1, true, false);
+    // The condition's own domain: a 2-state one compares against 2-state constants.
+    const ir::Ref bit = make_int_type(1, b.type_of(pred).four_state, false);
 
     const ir::Index one     = b.constant(module_.pool.put_int(bit, 1), l);
     const ir::Index zero    = b.constant(module_.pool.put_int(bit, 0), l);
