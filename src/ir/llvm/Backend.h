@@ -930,10 +930,10 @@ struct SignalSlot {
 // signal access is `scope global + def-local offset`: a real symbol plus a
 // def-content-derived addend, the relocation shape per-definition compilation
 // units and object caching need. A definition's code never embeds
-// whole-design layout. Unique-definition instances bake the symbol directly
-// (link-time constant, free at run time); a scope of a reused definition
-// loads a base pointer main stores at startup when the body is shareable
-// (one shared body cannot bake N instance symbols).
+// whole-design layout. An instance's own single-scope groups address through
+// its instance context, whatever the instance count of its unit, so a unit's
+// code does not depend on how many times it is instantiated
+// (docs/design/modular-compilation.md, "Code generation").
 struct Anchor {
     // The scope's own state global (@clotho.inst.<hier>.state), created by
     // emit_state_global.
@@ -942,9 +942,6 @@ struct Anchor {
     llvm::StructType* ty = nullptr;
     // Hierarchical instance name (diagnostic / symbol naming).
     std::string name;
-    // True when the scope's definition state type is instantiated more than
-    // once: def-relative code addresses through the instance context.
-    bool indirect = false;
     // Lowest process index owned by this scope (~0 when it owns none).
     uint32_t first_proc = ~0u;
     // This scope's own scheduled-flag array (@clotho.inst.<hier>.sched,
@@ -970,11 +967,11 @@ struct Anchor {
     // Touch sites address a dumped signal as vcd base + def-local offset.
     int32_t first_vcd = -1;
 
-    // Instance context (reused definitions): ONE per-instance global
-    // (@clotho.inst.<hier>.ctx) holding every base a def-relative body needs,
-    // laid out per definition so twin instances load identical field
-    // constants — the single symbol a shared body later swaps for a
-    // parameter. Filled by main at startup. Layout:
+    // Instance context: ONE per-instance global (@clotho.inst.<hier>.ctx)
+    // holding every base a def-relative body needs, laid out per definition so
+    // twin instances load identical field constants — the single symbol a
+    // shared body later swaps for a parameter. Filled by main at startup.
+    // Layout:
     //   0             ptr  state base (the scope's storage)
     //   1             ptr  shadow sub-struct base (null when no NBA shadows)
     //   2             ptr  the scope's sched-flag array base (Anchor::sched_gv)

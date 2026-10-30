@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -163,6 +164,20 @@ size_t count_substr(const std::string& hay, std::string_view needle) {
     return n;
 }
 
+// The argument count of the one call `ir` makes to `callee` (e.g.
+// "@m.fn.f"), or ~0 when it makes none or several.
+size_t call_arity(const std::string& ir, std::string_view callee) {
+    const std::string head = "call void " + std::string(callee) + "(";
+    const size_t      at   = ir.find(head);
+    if (at == std::string::npos || ir.find(head, at + head.size()) != std::string::npos) {
+        return ~size_t{ 0 };
+    }
+    const size_t open  = at + head.size();
+    const size_t close = ir.find(')', open);
+    return 1 + static_cast<size_t>(std::count(
+                 ir.begin() + static_cast<std::ptrdiff_t>(open), ir.begin() + static_cast<std::ptrdiff_t>(close), ','));
+}
+
 constexpr std::string_view kAlu = R"(
     module alu(
         input            clk,
@@ -286,9 +301,6 @@ TEST_CASE("instance state structs replicate per instantiation as per-scope globa
     // drops it).
     CHECK(raw.find("%leaf.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
     CHECK(raw.find("%top.state = type { %logic.nz.1, %logic.nz.8, %logic.nz.8 }") != std::string::npos);
-    // Referenced from the definition-unit modules, so the split emission
-    // promotes them out of internal linkage (plain external `global`).
-    CHECK(raw.find("@clotho.inst.top.state = dso_local global %top.state") != std::string::npos);
     CHECK(raw.find("@clotho.inst.top.u0.state = dso_local global %leaf.state") != std::string::npos);
     CHECK(raw.find("@clotho.inst.top.u1.state = dso_local global %leaf.state") != std::string::npos);
     CHECK(raw.find("@clotho.inst.top.u0.shadow = internal global %leaf.state.shadow") != std::string::npos);
@@ -1247,13 +1259,11 @@ TEST_CASE("event waits emit wait queues, always loops, and queue servicing") {
     // doubled's dynamic any-change bucket (with a length). Each queue is named for
     // its edge and emitted only when used; the per-process scheduled-flag array
     // backs the wake-once dedup.
-    // Root-defined, promoted to external (dso_local) linkage where the
-    // definition-unit module's bodies reference them (split emission).
-    CHECK(ir.find("@clotho.wait.clk.sta.pos = dso_local global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.d.sta.any = dso_local global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.q.sta.any = dso_local global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.doubled.dyn.any = dso_local global") != std::string::npos);
-    CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = dso_local global") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.clk.sta.pos = ") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.d.sta.any = ") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.q.sta.any = ") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.doubled.dyn.any = ") != std::string::npos);
+    CHECK(ir.find("@clotho.wait.doubled.dyn.any.len = ") != std::string::npos);
     CHECK(ir.find("@clotho.proc_sched = internal global") != std::string::npos);
     // Both always blocks are suspension-free, so by default they lower to plain
     // per-activation thunks (no forever wait loop); servicing still has a static
@@ -5240,7 +5250,8 @@ TEST_CASE("a ref to a place that cannot move is one pointer, with no epoch check
             initial begin v = 5; f(v); $display("%0d", v); end
         endmodule
     )");
-    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 1);
+    // state, rng, the one-pointer ref.
+    CHECK(call_arity(ir, "@m.fn.f") == 3);
     CHECK(count_substr(ir, "rt_ref_stale") == 0);
     CHECK(run_capture(R"(
         module m;
@@ -5262,7 +5273,7 @@ TEST_CASE("a ref to a whole container handle is one pointer") {
             initial begin q.push_back(5); f(q); $display("%0d", q.size()); end
         endmodule
     )");
-    CHECK(count_substr(ir, "call void @m.fn.f(ptr %state, ptr @clotho.rng, ptr @clotho.inst.m.state)") == 1);
+    CHECK(call_arity(ir, "@m.fn.f") == 3);
 }
 
 TEST_CASE("a ref to a container element keeps the epoch words") {

@@ -436,15 +436,6 @@ void Backend::build_state_types() {
     for (const InstanceScope& top : mod_.tops()) {
         scope_type(top, claimed, top.name);
     }
-    // A definition state type produced by more than one scope occurrence is
-    // a reused module: those instances address indirectly (see Anchor).
-    for (Anchor& a : anchors_) {
-        uint32_t uses = 0;
-        for (const Anchor& b : anchors_) {
-            uses += b.ty == a.ty ? 1u : 0u;
-        }
-        a.indirect = uses > 1;
-    }
     for (uint32_t i = 0; i < sigs.size(); ++i) {
         if (!claimed[i]) {
             slots_[i].path = { static_cast<uint32_t>(root_fields.size()) };
@@ -560,9 +551,8 @@ llvm::Value* Backend::storage_ptr(const SignalSlot& s) {
         return b_.CreateInBoundsGEP(state_ty_, sym(state_global_), idx);
     }
     Anchor&      a    = anchors_[s.anchor];
-    llvm::Value* base = (a.indirect || ctx_override_for(s)) && def_relative_for(s)
-                          ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
-                          : static_cast<llvm::Value*>(sym(a.state_gv));
+    llvm::Value* base = def_relative_for(s) ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
+                                            : static_cast<llvm::Value*>(sym(a.state_gv));
     for (const uint32_t f : s.path) {
         idx.push_back(b_.getInt32(f));
     }
@@ -581,11 +571,10 @@ llvm::Value* Backend::vif_head_ptr(Signal sig, uint32_t edge) {
         throw BackendError{ "internal: no virtual-interface waiter head for this member" };
     }
     Anchor&      a    = anchors_[s.anchor];
-    // Exactly storage_ptr's base rule: a shared body of a reused definition
-    // must load its instance base rather than bake one instance's symbol.
-    llvm::Value* base = (a.indirect || ctx_override_for(s)) && def_relative_for(s)
-                          ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
-                          : static_cast<llvm::Value*>(sym(a.state_gv));
+    // Exactly storage_ptr's base rule: an instance's own group loads its
+    // instance base rather than bake the instance's symbol.
+    llvm::Value* base = def_relative_for(s) ? ctx_field(a, 0, llvm::PointerType::getUnqual(ctx_))
+                                            : static_cast<llvm::Value*>(sym(a.state_gv));
     return b_.CreateInBoundsGEP(a.ty, base,
                                 { b_.getInt32(0), b_.getInt32(a.vif_head_base + ord) });
 }
@@ -632,9 +621,7 @@ llvm::Value* Backend::shadow_ptr(const SignalSlot& owner, uint32_t field) {
         // An NBA target's anchor always carries a shadow struct (the
         // fields were assigned per anchor in build_state_types).
         Anchor&      a    = anchors_[owner.anchor];
-        llvm::Value* base = (a.indirect || ctx_override_for(owner)) && def_relative_for(owner)
-                              ? ctx_field(a, 1, ptr)
-                              : b_.CreateLoad(ptr, anchor_shadow_base(a));
+        llvm::Value* base = def_relative_for(owner) ? ctx_field(a, 1, ptr) : b_.CreateLoad(ptr, anchor_shadow_base(a));
         return b_.CreateInBoundsGEP(a.shadow_ty, base, { b_.getInt32(0), b_.getInt32(field) });
     }
     llvm::Value* base = b_.CreateLoad(ptr, shadow_base_gv());
@@ -983,11 +970,11 @@ void Backend::build_instance_ctx_layout() {
             continue;
         }
         const uint32_t aid = anchor_of_scope_[sc];
-        // Any single-scope group belongs to its definition's emission
-        // unit (split mode), whether or not the definition is reused.
+        // Any single-scope group belongs to its definition's emission unit
+        // and addresses its instance through the instance context.
         group_unit_anchor_[g]  = aid;
         group_unit_ordinal_[g] = unit_counter[aid]++;
-        if (!anchors_[aid].indirect || anchors_[aid].first_proc == ~0u) {
+        if (anchors_[aid].first_proc == ~0u) {
             continue;
         }
         group_anchor_of_[g]   = aid;
@@ -1006,16 +993,6 @@ void Backend::build_instance_ctx_layout() {
     auto* i32 = b_.getInt32Ty();
     ankerl::unordered_dense::map<llvm::StructType*, llvm::StructType*> def_ctx;
     for (Anchor& a : anchors_) {
-        // A virtual interface addresses its target instance through this
-        // record whatever the definition's instance count, so an interface a
-        // handle can name needs the layout even when it is unique.
-        const bool vif_anchor =
-          std::ranges::any_of(anchor_signals_[&a - anchors_.data()], [&](Signal sj) {
-              return sj != Signal{ ~0u } && vif_sig_[static_cast<uint32_t>(sj)];
-          });
-        if (!a.indirect && !vif_anchor) {
-            continue;
-        }
         a.n_groups     = def_groups[a.ty];
         a.ctx_blk_base = 4;
         uint32_t nwait = 0;

@@ -135,13 +135,13 @@ void Backend::vcd_index_signal(Signal sig, uint32_t& next) {
 }
 
 // The rt_vcd_touch index of a dumped signal: def-relative (instance vcd base
-// + def-local offset) when the owner is a reused instance, the folded
-// constant otherwise — dedup prep, same split as storage / sched anchors.
+// + def-local offset) inside the owner's own group, the folded constant
+// otherwise — the same split as storage / sched anchors.
 llvm::Value* Backend::vcd_index_value(Signal sig, int32_t base) {
     const SignalSlot& s = slot_of(sig);
     if (s.anchor != SignalSlot::no_anchor && def_relative_for(s)) {
         Anchor& a = anchors_[s.anchor];
-        if ((a.indirect || ctx_override_for(s)) && a.first_vcd >= 0) {
+        if (a.first_vcd >= 0) {
             llvm::Value* b0 = ctx_field(a, 3, b_.getInt32Ty());
             return b_.CreateAdd(b0, b_.getInt32(static_cast<uint32_t>(base - a.first_vcd)));
         }

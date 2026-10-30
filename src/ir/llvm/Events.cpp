@@ -797,16 +797,6 @@ void Backend::build_wait_queues() {
     wait_slot_dyn_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
     wait_slot_len_.assign(sigs.size(), { no_wait_slot, no_wait_slot, no_wait_slot });
     for (uint32_t a = 0; a < anchors_.size(); ++a) {
-        // A virtual interface reaches an instance chosen at run time, so its
-        // buckets have to be addressable through the context record even when
-        // the definition is instantiated once and its own body bakes symbols.
-        const bool vif_anchor =
-          std::ranges::any_of(by_anchor[a], [&](Signal sj) {
-              return sj != Signal{ ~0u } && vif_sig_[static_cast<uint32_t>(sj)];
-          });
-        if (!anchors_[a].indirect && !vif_anchor) {
-            continue;
-        }
         uint32_t next = 0;
         for (const Signal sj : by_anchor[a]) {
             if (sj == Signal{ ~0u }) {

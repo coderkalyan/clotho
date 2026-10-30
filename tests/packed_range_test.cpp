@@ -763,6 +763,13 @@ size_t count_of(const std::string& hay, std::string_view needle) {
     return n;
 }
 
+// Loads of data. A load of a pointer reads a signal's address out of the instance's
+// record before the select says whether any access follows, so it is an address that
+// the optimizer drops, not an access.
+size_t data_loads(const std::string& ir) {
+    return count_of(ir, " = load ") - count_of(ir, " = load ptr");
+}
+
 } // namespace
 
 // kernel.md: constant indices are specialized in the backend. An in-range constant
@@ -785,7 +792,7 @@ TEST_CASE("a constant select is settled at compile time, not by a bounds sequenc
     // Out of range: a write emits nothing, a read loads nothing (it is the default).
     const std::string outside = process_body(design(
       "a[40] = 1'b1; a[-1] <= 1'b1; w[300] = 1'b0; mem[5] = 8'h1; mem[5][1] = 1'b1; r1 = a[40]; r1 = mem[5][0];\n"));
-    CHECK(count_of(outside, " = load ") == count_of(in_range, " = load "));
+    CHECK(data_loads(outside) == data_loads(in_range));
     CHECK(count_of(outside, "store ") == count_of(in_range, "store ") + 2); // the two reads' defaults
     CHECK(outside.find("valid.") == std::string::npos);
 }
