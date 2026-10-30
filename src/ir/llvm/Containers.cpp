@@ -277,7 +277,8 @@ llvm::Constant* Backend::elem_ops_for(Ref elem_type) {
         leaves, b_.getInt32(static_cast<uint32_t>(handle_offs.size())),
         b_.getInt32(static_cast<uint32_t>(key_handle_offs.size())),
         gc_offsets_global(handle_offs, "clotho.elem.handles"),
-        gc_offsets_global(key_handle_offs, "clotho.elem.keyhandles") });
+        gc_offsets_global(key_handle_offs, "clotho.elem.keyhandles"),
+        llvm::Constant::getNullValue(raw_ptr_ty()), llvm::Constant::getNullValue(raw_ptr_ty()) });
     auto* gv = new llvm::GlobalVariable(env_->llmod, elem_ops_ty(), /*isConstant=*/true,
                                         llvm::GlobalValue::InternalLinkage, init,
                                         "clotho.elem.ops");
@@ -849,7 +850,7 @@ void Backend::lower_queue_push(Index i, bool front) {
     const auto&   p     = ir_->payload(i).op_extra;
     const auto    qa    = ir_->extra_data<QueueArg>(p.extra);
     const DynElem e     = dynarr_elem(qa.queue_type);
-    llvm::Value*  ops   = elem_ops_global(qa.queue_type);
+    llvm::Value*  ops   = queue_elem_ops(qa.queue_type);
     llvm::Value*  bound = b_.getInt64(std::get<Type>(mod_.pool.get(qa.queue_type)).left);
     // The write barrier for a container mutation reached through a class property
     // (§7). The barrier goes on the OWNING OBJECT rather than on the container,
@@ -981,7 +982,7 @@ void Backend::lower_queue_insert(Index i) {
     const auto&   p     = ir_->payload(i).op_extra;
     const auto    qi    = ir_->extra_data<QueueInsertInfo>(p.extra);
     const DynElem e     = dynarr_elem(qi.queue_type);
-    llvm::Value*  ops   = elem_ops_global(qi.queue_type);
+    llvm::Value*  ops   = queue_elem_ops(qi.queue_type);
     llvm::Value*  idx   = cast(must_of(value_of(qi.idx)), 64, false);
     llvm::Value*  bound = b_.getInt64(std::get<Type>(mod_.pool.get(qi.queue_type)).left);
     const LValue& qlv   = lvalue_of(p.op);
@@ -1014,7 +1015,7 @@ void Backend::lower_queue_delete_idx(Index i) {
     const LValue& qlv    = lvalue_of(p.op);
     llvm::Value*  handle = lv_handle_ptr(qlv, HandleUse::Mutate);
     emit_queue_bounds_check(i, handle, qa.arg, qlv, /*allow_append=*/false);
-    b_.CreateCall(queue_delete_idx_fn(), { handle, elem_ops_global(qa.queue_type), idx });
+    b_.CreateCall(queue_delete_idx_fn(), { handle, queue_elem_ops(qa.queue_type), idx });
 }
 
 void Backend::lower_queue_delete_all(Index i) {
@@ -1061,7 +1062,7 @@ void Backend::lower_queue_append_range(Index i) {
     b_.CreateCall(queue_append_range_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     lv_handle_ptr(lvalue_of(qs.src), HandleUse::Read),
-                    elem_ops_global(qs.queue_type),
+                    queue_elem_ops(qs.queue_type),
                     bound,
                     lo,
                     hi,

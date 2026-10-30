@@ -20,7 +20,7 @@ namespace {
 // where noted: iverilog's 2-state queue support crashes and its `int` queue is
 // internally 4-state, so empty/out-of-range defaults use a 4-state (`logic`)
 // element for the oracle and a separate 2-state check for the LRM default.
-std::string run_capture(std::string_view source) {
+std::string run_capture(std::string_view source, const ir::SimulationConfig& config = {}) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
@@ -32,7 +32,7 @@ std::string run_capture(std::string_view source) {
     const int saved = dup(fileno(stdout));
     dup2(fileno(tmp), fileno(stdout));
 
-    ir::run_jit(*r.module);
+    ir::run_jit(*r.module, nullptr, config);
 
     std::fflush(stdout);
     dup2(saved, fileno(stdout));
@@ -59,13 +59,13 @@ void expect_fail(std::string_view source, std::string_view needle) {
 }
 
 // The optimized LLVM IR of `source`.
-std::string emit_ir(std::string_view source) {
+std::string emit_ir(std::string_view source, const ir::SimulationConfig& config = {}) {
     const LowerResult r = lower_text(source);
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     REQUIRE(r.module != nullptr);
     std::string              text;
     llvm::raw_string_ostream os(text);
-    REQUIRE(ir::emit_llvm(*r.module, os));
+    REQUIRE(ir::emit_llvm(*r.module, os, config));
     return text;
 }
 
@@ -2122,4 +2122,135 @@ TEST_CASE("a signed narrow or very wide index into a queue is compared at its ow
         endmodule
     )";
     CHECK(run_capture(src) == "xx 00\n34 34\nxx 00\n32 32\n32 33\n");
+}
+
+// -- The runtime's queue engine as bitcode (SimulationConfig::rt_bitcode) -------
+//
+// With the gate on the engine's push / pop / insert / delete / append are linked into
+// the design and inlined, and every element that owns heap is copied and destroyed by
+// kernels the backend generated; with it off they are calls into the runtime that
+// interpret the element descriptor. Either way the design computes the same thing,
+// and these cases hold the gate to that on every element shape the descriptor has
+// (plain bytes, string, aggregate with a string, nested container, event), on a ring
+// that wraps and a bound that truncates, then look at the IR to see that the engine
+// really is in the design.
+
+TEST_CASE("the runtime bitcode gate changes no queue result") {
+    constexpr std::string_view src = R"(
+        typedef struct { int id; string name; } rec_t;
+        module m;
+            int   q[$], b[$:2], sl[$];
+            logic [20:0] w[$];
+            real  rq[$];
+            string s[$];
+            rec_t r[$];
+            int   qq[$][$], inner[$];
+            event e[$];
+            event ev;
+            int    v;
+            string t;
+            rec_t  x;
+            initial begin
+                // Plain bytes: both ends, a wrapped ring, the middle.
+                for (int i = 0; i < 6; i++) begin q.push_back(i); q.push_front(100 + i); end
+                v = q.pop_front(); v = q.pop_back();
+                q.insert(3, 77); q.delete(1);
+                $display("q %0d %0d %0d %0d", q.size(), q[0], q[$], q[3]);
+                sl = q[1:3];
+                $display("slice %0d %0d %0d", sl.size(), sl[0], sl[$]);
+                // 4-state and real elements.
+                for (int i = 0; i < 5; i++) begin w.push_back(i); rq.push_front(i * 1.5); end
+                w.insert(2, 21'hx); w.delete(0);
+                $display("w %0d %h %h rq %0d %f", w.size(), w[0], w[1], rq.size(), rq[0]);
+                // A bound drops from the tail, whichever end pushed.
+                for (int i = 0; i < 5; i++) b.push_back(i);
+                b.push_front(9);
+                $display("b %0d %0d %0d %0d", b.size(), b[0], b[1], b[2]);
+                // Strings, long enough to live on the heap.
+                for (int i = 0; i < 5; i++) s.push_back($sformatf("str-%0d-with-a-heap-tail-long-enough", i));
+                s.insert(2, "mid"); s.delete(0);
+                t = s.pop_front();
+                $display("s %0d %s %s %s", s.size(), t, s[0], s[$]);
+                // A struct with a string member.
+                for (int i = 0; i < 4; i++) begin
+                    x.id = i; x.name = $sformatf("name-%0d-heap-heap-heap-heap-heap", i); r.push_back(x);
+                end
+                x.id = 9; x.name = "inserted"; r.insert(1, x); r.delete(0);
+                x = r.pop_back();
+                $display("r %0d %0d %s %s", r.size(), x.id, x.name, r[0].name);
+                // Containers of containers.
+                for (int i = 0; i < 3; i++) begin inner.push_back(i); qq.push_back(inner); end
+                qq.insert(1, inner); qq.delete(0);
+                $display("qq %0d %0d %0d", qq.size(), qq[0].size(), qq[$].size());
+                // Events: a slot per push, one object across a copy.
+                e.push_back(ev); e.push_back(ev); e.insert(1, ev); e.delete(0);
+                $display("e %0d", e.size());
+                $finish;
+            end
+        endmodule
+    )";
+    const std::string on  = run_capture(src, { .rt_bitcode = true });
+    const std::string off = run_capture(src, { .rt_bitcode = false });
+    CHECK(!on.empty());
+    CHECK(on == off);
+}
+
+TEST_CASE("the runtime bitcode inlines the engine and leaves the growth call") {
+    constexpr std::string_view src = R"(
+        module m;
+            int q[$];
+            int v;
+            initial begin
+                q.push_back(1); q.push_front(2);
+                v = q.pop_back(); v = q.pop_front();
+                q.insert(0, 3); q.delete(0);
+                $display("%0d", v);
+            end
+        endmodule
+    )";
+    const std::string on  = emit_ir(src, { .rt_bitcode = true });
+    const std::string off = emit_ir(src, { .rt_bitcode = false });
+    // Off: the runtime's functions, called opaquely.
+    CHECK(off.find("call void @rt_queue_push_back") != std::string::npos);
+    CHECK(off.find("call void @rt_queue_grow") == std::string::npos);
+    // On: none of the engine's entry points is left, a push still reaches the runtime
+    // to grow the ring (and only for that), and the global DCE took what became dead.
+    for (const char* name : { "@rt_queue_push_back", "@rt_queue_push_front", "@rt_queue_pop_back",
+                              "@rt_queue_pop_front", "@rt_queue_insert", "@rt_queue_delete_idx" }) {
+        CAPTURE(name);
+        CHECK(on.find(name) == std::string::npos);
+    }
+    CHECK(on.find("call void @rt_queue_grow") != std::string::npos);
+}
+
+TEST_CASE("the runtime bitcode calls a string element's copy directly") {
+    constexpr std::string_view src = R"(
+        module m;
+            string q[$];
+            string t;
+            initial begin
+                q.push_back("hello");
+                t = q.pop_front();
+                $display("%s", t);
+            end
+        endmodule
+    )";
+    const std::string on = emit_ir(src, { .rt_bitcode = true });
+    // The kernel was reached through the descriptor, a constant pointer, and was
+    // inlined where the push was: what is left is rt_string_assign itself, and no
+    // kernel function (the plain descriptor stays, for the teardown's delete_all).
+    CHECK(on.find("@rt_queue_push_back") == std::string::npos);
+    CHECK(on.find("call void @rt_string_assign") != std::string::npos);
+    CHECK(on.find("clotho.elem.ops.copy") == std::string::npos);
+    CHECK(on.find("clotho.elem.ops.destroy") == std::string::npos);
+}
+
+TEST_CASE("a design with no queue links no runtime bitcode") {
+    constexpr std::string_view src = R"(
+        module m;
+            int a;
+            initial begin a = 1; $display("%0d", a); end
+        endmodule
+    )";
+    CHECK(emit_ir(src, { .rt_bitcode = true }) == emit_ir(src, { .rt_bitcode = false }));
 }

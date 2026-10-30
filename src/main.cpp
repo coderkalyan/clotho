@@ -381,6 +381,7 @@ struct Options {
     std::vector<std::string>   sanitizers;
     std::optional<std::string> coverage;
     std::optional<bool>        gc_stress;
+    std::optional<bool>        no_rt_bitcode;
     std::optional<bool>        gc_stats;
     std::optional<uint64_t>    gc_nursery_bytes;
     std::optional<uint64_t>    gc_heap_bytes_max;
@@ -478,6 +479,11 @@ void register_options(Registry& r, Options& o) {
                     "design has created enough of them. Slow by design: it turns an object Clotho failed "
                     "to keep into an immediate wrong answer rather than a rare one, so it is for working "
                     "on clotho itself. An executable keeps the setting `build` was given");
+    r.add_developer(kBuildRun,
+                    "--no-rt-bitcode",
+                    o.no_rt_bitcode,
+                    "Call the runtime's queue functions instead of linking them into the design, "
+                    "for comparing the two. Same results, slower queues");
     r.add(kBuildRun,
           "--gc-stats",
           o.gc_stats,
@@ -1336,6 +1342,7 @@ int main(int argc, char** argv) {
     // the collector, and every one of these is compiled into the artifact, so a
     // `build` and the `run` of what it built must be given the same values.
     config.gc_stress = options.gc_stress == true;
+    config.rt_bitcode = options.no_rt_bitcode != true;
     config.gc_stats  = options.gc_stats == true;
     // A zero nursery would make a collection due at every safepoint, which is
     // --gc-stress spelled obscurely; and 0 means "no limit" for --gc-heap-max, so

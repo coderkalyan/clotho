@@ -391,6 +391,7 @@ add_library(clotho_runtime STATIC
   src/runtime/Containers.cpp
   src/runtime/Format.cpp
   src/runtime/Io.cpp
+  src/runtime/Queue.cpp
   src/runtime/Random.cpp
   src/runtime/Reports.cpp
   src/runtime/Scheduler.cpp
@@ -492,6 +493,7 @@ add_library(clotho_ir STATIC
   src/ir/llvm/Containers.cpp
   src/ir/llvm/Dedup.cpp
   src/ir/llvm/Dpi.cpp
+  src/ir/llvm/ElemKernels.cpp
   src/ir/llvm/Events.cpp
   src/ir/llvm/GcEmit.cpp
   src/ir/llvm/Inst.cpp
@@ -499,6 +501,7 @@ add_library(clotho_ir STATIC
   src/ir/llvm/Ops.cpp
   src/ir/llvm/Processes.cpp
   src/ir/llvm/RuntimeAbi.cpp
+  src/ir/llvm/RuntimeBitcode.cpp
   src/ir/llvm/Sanitizers.cpp
   src/ir/llvm/Scheduler.cpp
   src/ir/llvm/StateLayout.cpp
@@ -749,6 +752,7 @@ add_library(clotho_runtime_exe STATIC
   src/runtime/Containers.cpp
   src/runtime/Format.cpp
   src/runtime/Io.cpp
+  src/runtime/Queue.cpp
   src/runtime/Random.cpp
   src/runtime/Reports.cpp
   src/runtime/Scheduler.cpp
@@ -800,6 +804,52 @@ if(NOT EXISTS "${clotho_builtins}")
   message(FATAL_ERROR "compiler-rt's builtins were not found at '${clotho_builtins}'; install them "
                       "(Debian/Ubuntu: libclang-rt-${LLVM_VERSION_MAJOR}-dev)")
 endif()
+
+# The runtime's queue engine as bitcode (src/runtime/Queue.cpp, built with
+# CLOTHO_RT_BITCODE): clang compiles it here, once, and the result is embedded in
+# clotho, so the backend can link the engine into each design that calls it and the
+# optimizer sees through the element descriptor it is called with
+# (ir/llvm/RuntimeBitcode.cpp). The compiler that builds the rest may be GCC, which
+# writes no bitcode, so it is the clang that matches LLVM, as for the kit above, with
+# the executable runtime's header setup: libc++'s headers, no exceptions, no RTTI.
+#
+# -O2, and none of what a distribution's clang turns on by default (stack protector,
+# PIC, control-flow protection, unwind tables): each leaves a function attribute or a
+# module flag that the inliner then spreads into every function the engine lands in.
+set(clotho_rt_bitcode "${CMAKE_CURRENT_BINARY_DIR}/rt_queue.bc")
+set(clotho_rt_bitcode_flags -std=c++23 -O2 -DNDEBUG -DCLOTHO_RT_BITCODE -fno-exceptions -fno-rtti
+    -fno-stack-protector -fno-pic -fno-pie -fno-unwind-tables -fno-asynchronous-unwind-tables
+    -Wno-unused-command-line-argument -nostdinc++ -isystem "${clotho_libcxx_config_dir}"
+    -isystem "${CLOTHO_LIBCXX_INCLUDE_DIR}")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
+  list(APPEND clotho_rt_bitcode_flags -fcf-protection=none)
+endif()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+  list(APPEND clotho_rt_bitcode_flags -mbranch-protection=none)
+endif()
+if(CMAKE_OSX_SYSROOT)
+  list(APPEND clotho_rt_bitcode_flags -isysroot "${CMAKE_OSX_SYSROOT}")
+endif()
+add_custom_command(
+  OUTPUT "${clotho_rt_bitcode}"
+  COMMAND "${CLOTHO_CLANG}" ${clotho_rt_bitcode_flags} -emit-llvm -c
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/Queue.cpp" -o "${clotho_rt_bitcode}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/Queue.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/Runtime.h"
+  VERBATIM)
+# Embedded the way the kit is, and for the same reason copied from a template on every
+# change to the embedded file: #embed is not a dependency the build tool sees.
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp.in" CONTENT
+"#include \"ir/llvm/RuntimeBitcode.h\"\n\nnamespace clotho::ir {\nnamespace {\n\nalignas(16) const unsigned char kImage[] = {\n#embed \"${clotho_rt_bitcode}\"\n};\n\n} // namespace\n\nstd::span<const unsigned char> runtime_bitcode_image() {\n    return kImage;\n}\n\n} // namespace clotho::ir\n")
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp.in"
+          "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp"
+  DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp.in" "${clotho_rt_bitcode}"
+  VERBATIM)
+target_sources(clotho_ir PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp")
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/RuntimeBitcodeImage.cpp" TARGET_DIRECTORY clotho_ir PROPERTIES
+  SKIP_PRECOMPILE_HEADERS ON
+  COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-c23-extensions>")
 
 # `name=path` for one embedded file, found where the C compiler driver finds it.
 function(clotho_kit_file out file)

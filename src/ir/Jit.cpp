@@ -377,6 +377,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_dynarr_sort", &rt_dynarr_sort);
     expose("rt_dynarr_shuffle", &rt_dynarr_shuffle);
     expose("rt_queue_push_back", &rt_queue_push_back);
+    expose("rt_queue_grow", &rt_queue_grow);
     expose("rt_queue_push_front", &rt_queue_push_front);
     expose("rt_queue_pop_back", &rt_queue_pop_back);
     expose("rt_queue_pop_front", &rt_queue_pop_front);
@@ -648,7 +649,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
                     fail("jit: parallel module reload failed: " + llvm::toString(parsed.takeError()));
                     return;
                 }
-                if (!optimize_module(**parsed, config.o3)) {
+                if (!optimize_module(**parsed, config)) {
                     fail("jit: parallel module optimize failed");
                     return;
                 }
@@ -703,7 +704,7 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     } else {
         llvm::orc::ThreadSafeContext tsc(std::move(ctx));
         for (auto& mod : built.modules) {
-            if (!optimize_module(*mod, config.o3)) {
+            if (!optimize_module(*mod, config)) {
                 llvm::errs() << "jit: module optimize failed\n";
                 return -1;
             }

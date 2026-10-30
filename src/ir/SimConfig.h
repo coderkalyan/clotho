@@ -176,6 +176,15 @@ struct SimulationConfig {
     // identical either way. Disable for bisection / debugging (one module,
     // exactly the pre-split emission).
     bool split = true;
+    // Link the runtime's queue engine into each module that calls it, as bitcode
+    // (src/runtime/Queue.cpp built with CLOTHO_RT_BITCODE, ir/llvm/RuntimeBitcode.cpp),
+    // so push, pop, insert and delete inline into the design with the element
+    // descriptor folded to constants, and give every element that owns heap its own
+    // copy and destroy kernels (ir/llvm/ElemKernels.cpp) for the engine to call
+    // through the descriptor. Off calls the runtime's own rt_queue_* functions, which
+    // interpret the descriptor. Semantics are identical either way, which is what the
+    // differential tests A/B. Disable for bisection / debugging.
+    bool rt_bitcode = true;
     // Register LLVM's perf JITEventListener on the object-linking layer so the
     // JIT'd design's functions show up in `perf` with real symbols. Emits a
     // jitdump (`$JITDUMPDIR/jit-<pid>.dump`) consumed by `perf inject --jit`.

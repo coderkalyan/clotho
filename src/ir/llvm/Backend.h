@@ -887,6 +887,10 @@ struct ModuleEnv {
     // and the write-only string sink. Memoized per env so each unit creates
     // its own copies.
     ankerl::unordered_dense::map<uint32_t, llvm::Constant*> elem_ops;
+    // The same descriptors with their copy / destroy kernels filled in, for the
+    // elements a queue operation passes to the runtime's bitcode engine, keyed by
+    // element type Ref (queue_elem_ops). A plain-bytes element has none.
+    ankerl::unordered_dense::map<uint32_t, llvm::Constant*> elem_ops_kernels;
     llvm::GlobalVariable* str_sink  = nullptr;
     // The read-only empty-string image an ambiguous string ternary yields
     // (str_empty_global).
@@ -1102,6 +1106,21 @@ private:
 
     llvm::Constant* elem_ops_for(Ref elem_type);
     llvm::Constant* elem_ops_global(Ref container_type);
+
+    // The descriptor a queue operation implemented by the runtime bitcode passes:
+    // elem_ops_global plus the element's kernels when config_.rt_bitcode is on
+    // (ir/llvm/ElemKernels.cpp).
+    llvm::Constant* queue_elem_ops(Ref queue_type);
+    // void copy(dst, src, site) / void destroy(slot) for the element `ops` describes.
+    llvm::Function* elem_copy_kernel(const llvm::GlobalVariable* ops);
+    llvm::Function* elem_destroy_kernel(const llvm::GlobalVariable* ops);
+    // The kernels' bodies: the runtime's rt_elem_init / rt_elem_copy / rt_elem_deinit,
+    // specialized to one descriptor.
+    void emit_elem_init(const llvm::GlobalVariable* ops, llvm::Value* p);
+    void emit_elem_copy(const llvm::GlobalVariable* ops, llvm::Value* dst, llvm::Value* src, llvm::Value* site);
+    void emit_elem_copy_aggregate(const llvm::GlobalVariable* ops, llvm::Value* dst, llvm::Value* src, llvm::Value* site);
+    void emit_elem_deinit(const llvm::GlobalVariable* ops, llvm::Value* p);
+    llvm::Value* elem_byte_ptr(llvm::Value* base, uint64_t offset);
 
     // Sort comparator descriptor for the element of `array_type` (LRM 7.12.2
     // sort()/rsort()). `kind`: 0 = unsigned integral, 1 = signed integral,

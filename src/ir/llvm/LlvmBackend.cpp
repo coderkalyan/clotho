@@ -3,6 +3,7 @@
 #include "ir/llvm/Backend.h"
 
 #include "ir/Verify.h"
+#include "ir/llvm/RuntimeBitcode.h"
 
 namespace clotho::ir {
 
@@ -135,7 +136,15 @@ void clamp_unproven_align(llvm::Module& m) {
 // non-canonical IR. Returns false (reason on errs()) only if the pipeline
 // string is rejected. Exposed (not file-local) so Jit.cpp can run it per
 // module after a bitcode context migration (parallel compilation).
-bool optimize_module(llvm::Module& m, bool o3) {
+bool optimize_module(llvm::Module& m, const SimulationConfig& config) {
+    // The runtime's own functions the module calls come in first, so the pipeline
+    // inlines them and folds what they are called with. What the design then
+    // inlines away is left dead (an element descriptor still points at the kernels
+    // that only the inlined engine called, and nothing reads the descriptor), which
+    // tier 0 does not sweep on its own, so it ends with a global DCE exactly when
+    // something was linked.
+    const bool linked = config.rt_bitcode && link_runtime_bitcode(m);
+
     llvm::PassBuilder         pb;
     llvm::LoopAnalysisManager     lam;
     llvm::FunctionAnalysisManager fam;
@@ -148,17 +157,17 @@ bool optimize_module(llvm::Module& m, bool o3) {
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
     llvm::ModulePassManager mpm;
-    if (o3) {
+    if (config.o3) {
         // Aggressive tier: LLVM's full default<O3> pipeline, which contains
         // the mandatory coro passes (CoroEarly / CoroSplit in the CGSCC nest /
         // CoroCleanup) plus the loop/GVN/vectorizer stack tier 0 omits.
         mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
     }
     else if (auto err = pb.parsePassPipeline(mpm,
-                                        "coro-early,"
+                                        std::string("coro-early,"
                                         "cgscc(inline,function(sroa,early-cse,simplifycfg,instcombine<no-verify-fixpoint>),coro-split),"
                                         "function(simplifycfg,instcombine<no-verify-fixpoint>,dce),"
-                                        "coro-cleanup")) {
+                                        "coro-cleanup") + (linked ? ",globaldce" : ""))) {
         llvm::errs() << "llvm backend: bad coroutine pipeline: " << llvm::toString(std::move(err)) << "\n";
         return false;
     }
@@ -234,7 +243,7 @@ BuiltDesign build_modules(const Module& m, llvm::LLVMContext& ctx, const llvm::T
     // Lower the coroutines per module and verify again — the second pass
     // guards against malformed coro lowering.
     for (const auto& mod : built.modules) {
-        if (!optimize_module(*mod, config.o3)) {
+        if (!optimize_module(*mod, config)) {
             return {};
         }
         if (llvm::verifyModule(*mod, &llvm::errs())) {
