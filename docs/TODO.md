@@ -172,6 +172,9 @@ Milestones, in order; lower ones unblock higher ones:
 
 ### Procedural continuous assignment & force
 
+- [ ] **`release` of part of a wider net force** (10.6.2) — `force n = v; release n[0];`
+  should free only bit 0; a force site is released as a unit, so executing the release
+  while that force is active stops the run with a fatal error.
 - [ ] **`force` of an input or inout port target** (10.6.2) — the port-copy driver does not
   honour the force.
 - [ ] **Intra-assignment timing on a write to a `force` target** (10.6.2) — suppression must

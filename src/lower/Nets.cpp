@@ -1508,6 +1508,31 @@ void Lowerer::release_net(const Expression& lv, const ValueSymbol& root, ir::Bui
         rlo = r->first;
         rhi = r->second;
     }
+    // A force site is one `force` statement's whole range, active as a unit. A
+    // release of part of an ACTIVE site (LRM 10.6.2: the released bits take their
+    // drivers' value, the rest stay forced) has no representation, so it stops the
+    // run with a diagnostic instead of releasing all of it, or none. Whether the
+    // site is active is a run-time fact: a release that only overlaps a site not
+    // forced at that moment (ivtest force_release_wire_pv forces [2:1] after it has
+    // released [3:2]) is exact.
+    // TODO: per-bit release of a wider force site (needs per-segment active flags
+    // fixed at Collect, from every release range of the net).
+    for (const NetForceSite& site : fs->second) {
+        if (site.lo <= rhi && rlo <= site.hi && !(site.lo >= rlo && site.hi <= rhi)) {
+            const std::string banner = banner_at(lv.sourceRange.start());
+            b.open_region();
+            b.severity(static_cast<uint32_t>(ir::Severity::Fatal),
+                       severity_banner(lv.sourceRange.start()),
+                       "release of part of an active force is not supported (LRM 10.6.2)",
+                       {},
+                       l);
+            b.finish(banner + "release", 1, l);
+            const ir::ExtraSlice then_r = b.close_region();
+            b.open_region();
+            const ir::ExtraSlice else_r = b.close_region();
+            b.cond(site_is(site.active, 1, b, l), then_r, else_r, l, /*unlikely=*/true);
+        }
+    }
     bool released = false;
     for (const NetForceSite& site : fs->second) {
         if (site.lo >= rlo && site.hi <= rhi) {

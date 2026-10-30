@@ -168,7 +168,9 @@ deferred record rather than the sampling site.
   driver fold to the net, then for each site emits `if (active) net[hi:lo] = val` (a
   positioned store to the net *signal*, an lvalue — a bitwise mask/or would corrupt z).
   A released site (`active == 0`) is skipped, so re-running the resolver reverts those
-  bits to the fold; `release net[hi:lo]` clears every site whose range is covered.
+  bits to the fold; `release net[hi:lo]` clears every site whose range is covered; a release that overlaps a
+  site without covering it is a fatal run-time error while that site is active, since a
+  site is released as a unit.
   Non-overlapping sites are exact; simultaneously-active overlapping partial forces are
   order-dependent (rare, LRM-unspecified). Byte-identical to iverilog.
   - **Not** the sorted-range `VlForceVec`: constant selects give compile-time-known

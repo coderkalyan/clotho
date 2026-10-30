@@ -718,3 +718,33 @@ TEST_CASE("release of a net inside a function and a class method function") {
     CHECK(out.find("top.a dbus=0001\n") != std::string::npos);
     CHECK(out.find("top.b dbus=0110\n") != std::string::npos);
 }
+
+// LRM 10.6.2: releasing a bit or part of a forced range frees only those bits, the
+// rest stay forced. A force site is released as a unit, so executing a release
+// that overlaps an ACTIVE site without covering all of it stops the run with a
+// diagnostic, instead of releasing all of it (or none: `force bus = ..; release
+// bus[0];` read 1111 where iverilog 13 prints 1110). A release that covers the
+// site, misses it or meets a site that is not forced at that moment is exact, as
+// before: the overlap below is a force that happens after the release.
+TEST_CASE("release of part of an active forced range stops the run") {
+    const test::DesignRun run = test::run_design_captured(R"(
+        module m;
+            logic [3:0] in = 4'b0;
+            wire [3:0] bus = in;
+            initial begin
+                #1 force bus[3:2] = 2'b11;
+                #1 release bus[3:2];
+                $display("ok %b", bus);
+                #1 force bus[2:1] = 2'b11;
+                #1 release bus[2:1];
+                $display("again %b", bus);
+                #1 force bus = 4'b1111;
+                #1 release bus[0];
+                $display("not reached %b", bus);
+                $finish;
+            end
+        endmodule)");
+    CHECK(run.out == "ok 0000\nagain 0000\n");
+    CHECK(test::design_exit_code(run) != 0);
+    CHECK(run.err.find("release of part of an active force is not supported") != std::string::npos);
+}
