@@ -243,6 +243,9 @@ Milestones, in order; lower ones unblock higher ones:
   and `build` links every module into one and generates its code on one thread.
 - [ ] **Compilation caching across runs (performance)** — syntax trees, lowered units and
   objects are rebuilt each run; needs content-addressed caches.
+- [ ] **Process fusion across instances (performance)** — groups fuse only within one
+  instance, and comb-fused groups never share a subscription across instances, so a comb
+  chain through many instances runs one wake per instance (docs/design/comb-fusion.md).
 
 ### File and string I/O
 
