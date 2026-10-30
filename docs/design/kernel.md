@@ -103,9 +103,9 @@ when it does.
   **Not yet:** each consumer applies a carried validity flag.
 - Change detection after a blocking store compares the whole slot before and
   after; through the wide-select path it compares only the words the store
-  touches. **Not yet:** the whole slot always.
+  touches.
 - A queue element's physical slot is `head + i`, minus the capacity once it
-  reaches it. **Not yet:** a 64-bit remainder.
+  reaches it.
 - An associative-array select carries its key; the read resolves without
   creating an entry, the write creates it.
 
