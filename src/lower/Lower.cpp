@@ -126,7 +126,6 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     // Most are errors in slang's own driver without --compat, but Clotho issues
     // diagnostics through its own engine, which starts from slang's defaults.
     for (const slang::DiagCode code : {
-           slang::diag::UnsizedInConcat,               // 11.4.12
            slang::diag::EnumRangeLiteral,              // 6.19.2
            slang::diag::EmptyUdpPort,                  // A.5.4
            slang::diag::LifetimeForPrototype,          // A.2.6
@@ -138,7 +137,6 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
            slang::diag::SolveBeforeDisallowed,         // A.1.10
            slang::diag::DynamicNotProcedural,          // 6.21
            slang::diag::NonstandardStringConcat,       // 6.16
-           slang::diag::MultipleAlwaysAssigns,         // 9.2.2.2
            slang::diag::MisplacedTrailingSeparator,    // A.1.3
            slang::diag::QualifiersOnOutOfBlock,        // 8.24
            slang::diag::InitializerRequired,           // 6.3.2
@@ -163,6 +161,11 @@ void apply_severity_policy(slang::DiagnosticEngine& engine, DiagnosticPolicy pol
     // NOTE: SeqNoMatch stays a warning although LRM 16.12.22 forbids a degenerate
     // sequence as a property: slang reports it for sequences that can match, such
     // as `(a ##[1:$] b) intersect (c ##[1:2] d)`, whose lengths meet at 2 and 3.
+    // NOTE: Three more stay warnings, as common idioms Clotho simulates as
+    // written. StaticInitializerMustBeExplicit (6.21): `int i = 0;` in an initial
+    // block. MultipleAlwaysAssigns (9.2.2.2): an FPGA power-on value set by an
+    // initial block for an always_ff variable. UnsizedInConcat (11.4.12): `{'0, x}`,
+    // whose `'0` is one bit wide in a self-determined context (5.7.1).
 
     // Legal source slang elaborates differently from the LRM, warning as it does.
     // Accepting it would simulate something other than what was written.
