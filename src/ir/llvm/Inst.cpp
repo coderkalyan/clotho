@@ -2472,6 +2472,7 @@ uint32_t Backend::body_scope() const {
 // handle in a field and read it from there, which is why the instruction exists at
 // all -- and why nothing may write through the handle.
 llvm::Value* Backend::inst_path_handle(uint32_t scope) {
+    taint("reads the name of its instance");
     if (scope == Process::no_scope || scope >= anchor_of_scope_.size() ||
         anchor_of_scope_[scope] == SignalSlot::no_anchor) {
         throw BackendError{ "internal: inst_path in a body that belongs to no instance" };

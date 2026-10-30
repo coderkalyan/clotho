@@ -230,7 +230,7 @@ TEST_CASE("alu emits verifiable llvm ir") {
     CHECK(ir.find("(ptr noalias %state, ptr %wheel)") != std::string::npos);
     const std::string co = emit(kAlu, { .thunk = false });
     CHECK(count_substr(co, "define ptr @clotho.inst.alu.p") == 3);
-    CHECK(co.find("(ptr %state, ptr %wheel)") != std::string::npos);
+    CHECK(co.find("(ptr %ctx, ptr %wheel)") != std::string::npos);
 
     // Datapath ops present.
     CHECK(ir.find(" add ") != std::string::npos);
@@ -2148,8 +2148,8 @@ TEST_CASE("repeated instantiation emits distinct process symbols") {
     CHECK(count_substr(ir, ".thunk(ptr noalias %state") == 5);
     CHECK(count_substr(ir, ".f2.thunk(ptr noalias %state") == 1);
     const std::string co = emit(src, { .thunk = false });
-    CHECK(count_substr(co, "define ptr @clotho.inst.top.") == 5);
-    CHECK(count_substr(co, ".f2(ptr %state") == 1);
+    CHECK(count_substr(co, "define ptr @clotho.inst.top.") == 4);
+    CHECK(count_substr(co, ".f2(ptr %ctx") == 1);
 }
 
 // A fused coroutine is ONE function over ONE frame, so unlike a thunk group it
@@ -2177,8 +2177,9 @@ TEST_CASE("a coroutine fusion group stays inside one instance") {
             endmodule
         )";
         const std::string co = emit(src, { .thunk = false });
-        CHECK(count_substr(co, ".f4(ptr %state") == 0);
-        CHECK(count_substr(co, ".f2(ptr %state") == 2);
+        CHECK(count_substr(co, ".f4(ptr noalias %ctx") == 0);
+        // One fused ramp for the two instances: each runs it with its own record.
+        CHECK(count_substr(co, ".f2(ptr %ctx") == 1);
         CHECK(run_capture(src, { .thunk = false }) == "2 4 2 4\n");
         CHECK(run_capture(src) == "2 4 2 4\n");
     }
@@ -2250,7 +2251,7 @@ TEST_CASE("members of a group spanning instances address their own instance") {
 // Every group spanning instances dispatches: whatever its size (there is no
 // member cap) and whether or not emission is split into per-definition modules.
 // Twenty instances of one block sharing a clock make one twenty-member group,
-// run as twenty member functions behind one dispatcher; the schedule is
+// run as twenty rows of one function behind one dispatcher; the schedule is
 // untouched, so fused, unfused and unsplit runs print the same lines.
 TEST_CASE("a group spanning instances dispatches whatever its size and layout") {
     constexpr std::string_view src = R"(
@@ -2273,9 +2274,9 @@ TEST_CASE("a group spanning instances dispatches whatever its size and layout") 
     for (const bool split : { true, false }) {
         const std::string ir = emit(src, { .split = split });
         CHECK(count_substr(ir, ".f20.thunk(ptr noalias %state") == 1);
-        // Split, each row is a function of its own unit; unsplit, the one
-        // module's inliner folds the internal rows into the dispatcher.
-        CHECK(count_substr(ir, "(ptr noalias %ctx, ptr %wheel)") == (split ? 20u : 0u));
+        // The twenty instances run one row function of their unit, each with its
+        // own record.
+        CHECK(count_substr(ir, "(ptr noalias %ctx, ptr %wheel)") == 1);
     }
 }
 
@@ -5287,7 +5288,7 @@ TEST_CASE("identical-sensitivity clocked processes fuse and stay correct") {
     // All three lower into one fused unit: a thunk by default (suspension-free),
     // a coroutine under --no-thunk.
     CHECK(count_substr(emit(src), ".f3.thunk(ptr noalias %state") == 1);
-    CHECK(count_substr(emit(src, { .thunk = false }), ".f3(ptr %state") == 1);
+    CHECK(count_substr(emit(src, { .thunk = false }), ".f3(ptr %ctx") == 1);
 }
 
 TEST_CASE("thunk lowering: eligibility matrix and coroutine equivalence") {

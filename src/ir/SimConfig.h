@@ -32,7 +32,7 @@ enum class SystemAccess : uint8_t {
 // and changes nothing about the emitted code.
 enum class Stat : uint32_t {
     // Twin-group dedup: how many groups collapsed onto a shared body, and the
-    // time the comparison took (see merge_twin_bodies).
+    // time the comparison took.
     Dedup = 1u << 0,
     // Dedup, plus the member sets behind each identity key.
     DedupSets = 1u << 1,
@@ -168,7 +168,7 @@ struct SimulationConfig {
     // Share one compiled body across twin instances of a reused module
     // definition: thunk groups of one unit whose lowered functions print
     // identically, symbols included, collapse onto ONE function (each instance
-    // passes its own record), see merge_twin_bodies in ir/llvm/Dedup.cpp. The
+    // passes its own record), see the code-once lowering in Backend::run. The
     // gate is literal post-lowering IR identity, so semantics are byte-identical
     // either way. Disable for bisection / debugging.
     bool dedup = true;

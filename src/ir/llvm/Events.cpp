@@ -474,6 +474,7 @@ llvm::StructType* Backend::event_node_ty() {
 // signal, its own slot, and its own object. The previous per-event named
 // globals relied on exactly the same property.
 llvm::Value* Backend::event_obj(Signal sig) {
+    taint("names an event object of its instance");
     const auto slot = event_slot_[static_cast<uint32_t>(sig)];
     return b_.CreateInBoundsGEP(events_arr_ty_, sym(events_gv_),
                                 { b_.getInt32(0), b_.getInt32(slot) });
@@ -1381,6 +1382,9 @@ void Backend::emit_trigger_fire(llvm::Value* trig_id) {
 // otherwise. Commit functions / the seed loop keep the globals directly.
 llvm::Value* Backend::wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig) {
     if (slot == no_wait_slot || !def_relative_for(slots_[sig])) {
+        if (slots_[sig].anchor != SignalSlot::no_anchor) {
+            taint("names a wait bucket of one instance");
+        }
         return sym(llvm::cast<llvm::GlobalVariable>(gv));
     }
     Anchor& a = anchors_[slots_[sig].anchor];

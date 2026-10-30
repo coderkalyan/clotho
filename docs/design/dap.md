@@ -521,9 +521,10 @@ Consequences worth stating plainly:
 Four transforms are on by default and each breaks a debugger assumption:
 `fuse` (N processes → one coroutine), `comb_fuse` (dependent combinational
 processes merged), `thunk` (suspension-free process → a frameless function
-pointer), `dedup` (one body shared across twin instances). A fused group that
-spans instances is split into per-member functions behind a dispatcher, but
-only `fuse` and `comb_fuse` make such a group, so turning them off covers it.
+pointer), `dedup` (one function per unit group, run by every instance with its
+own record). A schedule group that spans instances calls one row per instance
+from a dispatcher, and only `fuse` and `comb_fuse` form groups to share, so
+turning them off covers it.
 Above them, `inline` runs even at
 tier 0 (`ir/llvm/LlvmBackend.cpp, optimize_module`), and `sroa`/`instcombine`/`dce` destroy frame
 locals.

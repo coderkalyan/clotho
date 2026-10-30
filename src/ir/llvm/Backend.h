@@ -2039,9 +2039,20 @@ private:
 
     void report_unit_code(const std::vector<llvm::Function*>& group_fns);
 
-    // -- Twin bodies --
+    // -- Code once --
 
-    void merge_twin_bodies(std::vector<llvm::Function*>& group_fns);
+    // The code of a unit's group is lowered once, from the first instance whose
+    // imports are alike, and every instance runs it with its own record.
+    // Lowering that bakes something of the instance it is lowered for (a symbol
+    // of its storage, a function copy only it calls, its name, a covergroup
+    // index) cannot be shared: it taints the lowering, and the instances lower
+    // their own. `taint` is a no-op outside a shared lowering.
+    void taint(const char* why);
+
+    // What decides the code of the groups of the instance of `anchor`: the
+    // owner and position of every signal its bindings name, and which of them
+    // alias. Instances with equal keys lower alike.
+    std::vector<uint64_t> code_key(uint32_t anchor) const;
 
     static bool scan_finish(const Ir& ir, std::vector<FunctionId>* out);
 
@@ -2486,6 +2497,8 @@ private:
     void emit_nba_commit(llvm::Value* state, llvm::Value* wheel);
 
     void emit_active_run(llvm::Value* state, llvm::Value* wheel, const std::vector<llvm::Function*>& procs);
+
+    llvm::Value* ramp_arg(uint32_t sched, llvm::Value* state);
 
     // -- Coroutine intrinsics / frame allocator --
 
@@ -4289,6 +4302,14 @@ private:
     std::vector<std::array<uint32_t, kIdFamilies>> id_ord_;
     std::vector<std::array<uint32_t, kIdFamilies>> id_val_;
     llvm::IRBuilder<>       b_;
+    // Set while a group is lowered for sharing (taint); why it cannot be.
+    bool                                                 share_active_ = false;
+    const char*                                          taint_why_    = nullptr;
+    // Thunk groups lowered per instance after all, by what stopped sharing them.
+    std::map<std::string, uint64_t>                      unshared_;
+    // Declarations of the functions that belong to an instance (flatten copies
+    // each function per instance), which a shared group cannot name.
+    ankerl::unordered_dense::set<const llvm::Function*> instance_fns_;
     // The root `%clotho.state` struct: unscoped signals only (instance scopes
     // own their own state globals, see Anchor::state_gv).
     llvm::StructType*       state_ty_ = nullptr;

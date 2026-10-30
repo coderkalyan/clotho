@@ -541,13 +541,12 @@ Available machinery:
   `docs/design/disable.md`). `$exit` and 24.3's implicit kill are that operation
   with a program instance as the root set.
 
-The obstacle this section expected — **module dedup** — turns out not to exist,
-and the paragraph that claimed it did was wrong. Two instances of one program
-definition do *not* share a lowered body: the only body sharing in the backend is
-`share_twin_groups`, which takes **thunk groups only** (`thunk_group_[g]`), and
-thunk eligibility is `is_simple_always`, which requires `Activation::Always`
-(`src/ir/Analysis.cpp:1628`). An `Activation::Reactive` process is therefore
-always a coroutine of its own, one per instance — the same property
+The obstacle this section expected — **module dedup** — does not exist for
+program instances. The backend lowers each unit group once and every instance
+runs it with its own record, but a program `initial` names its program instance
+by a constant, so lowering one taints the group (`belongs to a program
+instance`) and every instance lowers its own copy: an `Activation::Reactive`
+process is a coroutine of its own, one per instance — the same property
 `lower_group`'s deferred-assertion note already relies on for its per-group
 generation counter. So the program-instance index is a **compile-time constant
 folded into each body**, and no instance-context plumbing is needed.

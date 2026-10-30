@@ -243,9 +243,10 @@ re-decided on measurement before any merge to main.
 
 ## Known landmines
 
-- Twin merging (`merge_twin_bodies`) compares printed function text, symbols
-  included, and runs within one def module (its groups are same-def by
-  construction); keep it env-local.
+- A unit's group is lowered once and shared by the unit's instances
+  (Backend::run, "code once"); the instances' groups live in one def module, so
+  the shared function is env-local. A lowering that names something of the
+  instance it ran for (`taint`) is not shared.
 - `wait_base` / seed loop / NBA meta initializer assume queue globals resolve
   as constants — in split form these are root-defined, def-declared; the meta
   table itself stays root-side.

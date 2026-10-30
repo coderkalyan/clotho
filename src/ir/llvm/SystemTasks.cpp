@@ -546,6 +546,7 @@ void Backend::lower_system(Index i) {
 // design (LRM 19.11.3 aggregates dropped instances), so its handle is an
 // opaque 2-state 64-bit word and never a traced root.
 void Backend::lower_cover_query(Index i) {
+    taint("uses a covergroup type index of its instance");
     const auto info = ir_->extra_data<CoverInfo>(ir_->payload(i).extra);
     const auto args = ir_->region(info.args);
     auto*      i32  = b_.getInt32Ty();
@@ -636,6 +637,7 @@ void Backend::lower_cover_query(Index i) {
 }
 
 void Backend::lower_cover_ctl(Index i) {
+    taint("uses a covergroup type index of its instance");
     const auto info = ir_->extra_data<CoverInfo>(ir_->payload(i).extra);
     const auto args = ir_->region(info.args);
     if (args.empty()) {

@@ -649,6 +649,7 @@ llvm::GlobalVariable* Backend::proc_pcb_table() {
 }
 
 llvm::Value* Backend::proc_pcb_slot(uint32_t proc_index) {
+    taint("names the control block of its process");
     auto* gv = proc_pcb_table();
     return b_.CreateInBoundsGEP(proc_pcb_arr_ty_, sym(gv),
                                 { b_.getInt32(0), b_.getInt32(proc_index) });
@@ -1731,6 +1732,7 @@ llvm::Value* Backend::disable_slot(llvm::IRBuilder<>&     b,
                                    llvm::Type*            elem,
                                    llvm::Constant*        init,
                                    uint32_t               target) {
+    taint("names a disable target of its instance");
     auto* ty = llvm::ArrayType::get(elem, static_cast<size_t>(mod_.disable_targets));
     return b.CreateInBoundsGEP(ty, sym(disable_table(gv, name, elem, init)),
                                { b.getInt32(0), b.getInt32(target) });

@@ -585,6 +585,9 @@ void Backend::build_nba_state() {
 // LLVM insert block, so back-to-back fused members that share one block coalesce
 // into a single enqueue + commit.
 void Backend::block_register(Signal sig, const llvm::APInt& mask, bool dynamic) {
+    if (own_anchor_ != SignalSlot::no_anchor && slot_of(sig).anchor != own_anchor_) {
+        taint("stages a nonblocking write into another instance");
+    }
     // Open a new block on the first NBA of a segment (the enqueue call is emitted
     // once, here, at that first store's insert point; it runs unconditionally
     // because same-epoch stores are straight-line co-executed).

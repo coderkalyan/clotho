@@ -99,6 +99,9 @@ void Backend::run() {
     fn_decls_.assign(nf, nullptr);
     for (uint32_t i = 0; i < nf; ++i) {
         fn_decls_[i] = declare_function(static_cast<FunctionId>(i));
+        if (mod_.function(static_cast<FunctionId>(i)).scope != Process::no_scope) {
+            instance_fns_.insert(fn_decls_[i]);
+        }
     }
     for (uint32_t i = 0; i < nf; ++i) {
         if (mod_.function(static_cast<FunctionId>(i)).is_task) {
@@ -116,11 +119,79 @@ void Backend::run() {
     // continuous `assign`, whose RHS sensitivity is not yet inferred) still
     // runs its body just once — it does not re-trigger on input changes.
     std::vector<llvm::Function*> group_fns;
+    ankerl::unordered_dense::map<uint32_t, uint32_t> unit_instances;
+    for (const Anchor& a : anchors_) {
+        if (a.unit != InstanceScope::no_unit) {
+            ++unit_instances[a.unit];
+        }
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> shares; // (instance, the instance whose code it runs)
+    // The first instance lowered for each (unit, group, code key): thunk groups
+    // of the other instances run its function with their own record.
+    struct Lowered {
+        uint32_t g;
+        uint32_t block_lo, block_hi; // the NBA blocks it registered
+        size_t   fill_lo, fill_hi;   // its record fills of their first ids
+        bool     shared = false;
+    };
+    std::map<std::tuple<uint32_t, uint32_t, std::vector<uint64_t>>, Lowered> once;
     for (uint32_t g = 0; g < groups_.size(); ++g) {
         const uint32_t ua = group_unit_anchor_[g];
         env_ = config_.split && ua != SignalSlot::no_anchor ? &unit_env(anchors_[ua])
                                                             : root_env_.get();
-        group_fns.push_back(lower_group(groups_[g]));
+        const bool candidate = config_.dedup && ua != SignalSlot::no_anchor &&
+                               anchors_[ua].unit != InstanceScope::no_unit;
+        if (!candidate) {
+            group_fns.push_back(lower_group(groups_[g]));
+            continue;
+        }
+        auto key = std::make_tuple(anchors_[ua].unit, group_unit_ordinal_[g], code_key(ua));
+        if (const auto it = once.find(key); it != once.end()) {
+            // Another instance of the unit lowered this group already: run its
+            // function with this instance's record, which needs the same
+            // bindings filled, and NBA blocks of its own signals.
+            Lowered& rep = it->second;
+            llvm::Function* fn = group_fns[rep.g];
+            fn->addFnAttr(llvm::Attribute::NoInline);
+            group_fns.push_back(fn);
+            shares.emplace_back(ua, group_unit_anchor_[rep.g]);
+            const auto base = static_cast<uint32_t>(block_commits_.size());
+            for (uint32_t b = rep.block_lo; b < rep.block_hi; ++b) {
+                BlockCommit bc;
+                for (const BlockSig& bs : block_commits_[b].sigs) {
+                    const uint32_t field = slots_[static_cast<uint32_t>(bs.sig)].path.back();
+                    bc.sigs.push_back({ anchor_signals_[ua][field], bs.mask, bs.dynamic });
+                }
+                block_commits_.push_back(std::move(bc));
+            }
+            for (size_t f = rep.fill_lo; f < rep.fill_hi; ++f) {
+                const uint32_t field = std::get<1>(ctx_blk_fills_[f]);
+                const uint32_t first = std::get<2>(ctx_blk_fills_[f]);
+                ctx_blk_fills_.emplace_back(ua, field, base + (first - rep.block_lo));
+            }
+            continue;
+        }
+        const auto block_lo = static_cast<uint32_t>(block_commits_.size());
+        const auto fill_lo  = ctx_blk_fills_.size();
+        share_active_       = true;
+        taint_why_          = nullptr;
+        llvm::Function* fn  = lower_group(groups_[g]);
+        share_active_       = false;
+        group_fns.push_back(fn);
+        if (taint_why_ == nullptr) {
+            once.emplace(std::move(key), Lowered{ g, block_lo, static_cast<uint32_t>(block_commits_.size()), fill_lo,
+                                                  ctx_blk_fills_.size() });
+        } else if (unit_instances[anchors_[ua].unit] >= 2) {
+            ++unshared_[taint_why_];
+        }
+    }
+    // An instance that runs another's code reads the bindings that code reads.
+    for (const auto& [ua, ra] : shares) {
+        Anchor& a = anchors_[ua];
+        a.bind_used.resize(a.externs.size(), 0);
+        for (size_t k = 0; k < anchors_[ra].bind_used.size(); ++k) {
+            a.bind_used[k] |= anchors_[ra].bind_used[k];
+        }
     }
     env_ = root_env_.get();
     if (!shape_sets_.empty()) {
@@ -128,9 +199,6 @@ void Backend::run() {
     }
     if (stat_on(config_.stats, Stat::UnitCode)) {
         report_unit_code(group_fns);
-    }
-    if (config_.dedup && config_.thunk) {
-        merge_twin_bodies(group_fns);
     }
     // What the scheduler holds: each coroutine group's ramp, and for every
     // thunk schedule group the entry that runs its rows.
@@ -161,6 +229,9 @@ void Backend::run() {
 // Every use of a cached GlobalVariable*/Function* member as an IR operand
 // must route through here so the per-definition split can relink it.
 llvm::Function* Backend::sym(llvm::Function* f) {
+    if (share_active_ && instance_fns_.contains(f)) {
+        taint("calls a function copy of its instance");
+    }
     if (f->getParent() == &env_->llmod) {
         return f;
     }
@@ -183,6 +254,11 @@ llvm::Function* Backend::sym(llvm::Function* f) {
 }
 
 llvm::GlobalVariable* Backend::sym(llvm::GlobalVariable* g) {
+    // A global of one instance (its state, record, flags, shadow): shared code
+    // names it only through a record.
+    if (share_active_ && g->getName().starts_with("clotho.inst.")) {
+        taint("names a symbol of one instance");
+    }
     if (g->getParent() == &env_->llmod) {
         return g;
     }
@@ -257,13 +333,48 @@ llvm::Value* Backend::intra_id_value(Signal sig) {
 // executes), which is what emit_event_fire counts down.
 llvm::Value* Backend::trigger_id_value(Signal sig, uint32_t edge) {
     if (event_slot_[static_cast<uint32_t>(sig)] != 0) {
-        llvm::Value* slot = event_is_mono(sig)
-                              ? static_cast<llvm::Value*>(b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]))
-                              : b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
+        llvm::Value* slot = nullptr;
+        if (event_is_mono(sig)) {
+            // The slot is a design-wide number of this instance's event object.
+            // TODO: a record field at a def-local ordinal, like the NBA ids.
+            taint("an event's slot number");
+            slot = b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]);
+        } else {
+            slot = b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
+        }
         return b_.CreateOr(slot, b_.getInt32(RT_TRIG_EVENT));
     }
     return id_value(sig, static_cast<IdFamily>(static_cast<uint32_t>(IdFamily::TrigPos) + edge),
                     static_cast<uint32_t>(trigger_id(sig, edge)));
+}
+
+// A lowering for sharing found something it cannot share (see `taint`).
+void Backend::taint(const char* why) {
+    if (share_active_ && taint_why_ == nullptr) {
+        taint_why_ = why;
+    }
+}
+
+// What decides the code of the groups of the instance of `anchor`, besides the
+// unit: for each binding, which declaration stands for it (declarations that
+// name one signal in one instance are one binding), and the owner definition and
+// def-local position of the signal it names, whose layout the code addresses
+// the owner's record and wake buckets by. Bindings that name the same member of
+// the same owner (a child's port) agree in every instance; a port the parent
+// binds to a net of its own choosing (an inout, a driver slot) does not.
+std::vector<uint64_t> Backend::code_key(uint32_t anchor) const {
+    const Anchor&         a = anchors_[anchor];
+    std::vector<uint64_t> key;
+    key.reserve(2 * a.externs.size());
+    for (uint32_t k = 0; k < a.externs.size(); ++k) {
+        const SignalSlot& s = slot_of(a.externs[k]);
+        key.push_back(a.bind_of.at(static_cast<uint32_t>(a.externs[k])));
+        key.push_back(s.anchor == SignalSlot::no_anchor
+                        ? ~uint64_t{ 0 }
+                        : reinterpret_cast<uintptr_t>(anchors_[s.anchor].ctx_ty));
+        key.push_back(s.path.empty() ? ~uint64_t{ 0 } : s.path.back());
+    }
+    return key;
 }
 
 // The definition unit's env for an anchored scope, created (with its

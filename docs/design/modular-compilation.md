@@ -391,8 +391,8 @@ code go.
    - **3c, code once per unit.** Each unit's processes and functions are
      lowered once from the unit's IR, taking the record, into the unit's module.
      Fusion runs within a unit; groups spanning instances become dispatch
-     table rows. `share_twin_groups` and outlining go. Landed ahead of
-     code-once: fusion groups are formed per unit (`compute_fusion_groups`,
+     table rows. `share_twin_groups` and outlining go. Landed: fusion groups
+     are formed per unit (`compute_fusion_groups`,
      ir/llvm/Groups.cpp). A group is a list of def-local process ordinals,
      the same in every instance and never mixing instances, decided on the
      unit's processes and facts joined over its instances, never on an
@@ -400,14 +400,21 @@ code go.
      record, a row; the rows of the groups that wait on the same (signal,
      edge) set, in any instances, share one subscription as a schedule group,
      whose entry (a dispatcher in root, or in the unit module for one row)
-     owns the flag, runs the rows and re-arms. Twin rows whose functions
-     print identically are merged (`merge_twin_bodies`); `share_twin_groups`
-     and `SimulationConfig::outline` are gone. Comb fusion therefore stays
-     within one instance (combchain, a chain of one-process instances,
-     regresses; accepted until fusion across instances is revisited).
-     Functions are still emitted once per instance; `--stat=unit-code`
-     compares every group across the instances of a unit (rocket-chip: all
-     1021 compared groups identical up to design symbols).
+     owns the flag, runs the rows and re-arms. Each group is lowered once, from
+     the first instance whose imports are alike (`code_key`: which bindings
+     alias, and the owner and position of what each names), and every other
+     instance gets a row of that function with its own record, plus NBA blocks
+     of its own signals; a coroutine ramp takes the record as its first argument
+     too. `merge_twin_bodies`, `share_twin_groups` and
+     `SimulationConfig::outline` are gone. A lowering that bakes something of the
+     instance it ran for (a symbol of its storage or wait buckets, a function
+     copy only it calls, its name, a covergroup index, a disable target, a
+     program instance, a process control block or random stream, nonblocking
+     staging into another instance) taints itself and each instance lowers its
+     own; `--stat=unit-code` reports unit groups, functions emitted and what
+     stopped sharing. Comb fusion stays within one instance (combchain
+     regresses; accepted until fusion across instances is revisited). Functions
+     and tasks are still emitted once per instance, in root.
    - **3d, wake and NBA as data.** A writer reads its wake buckets' base and
      capacity from the record, a subscription carries its trigger bits, the
      ring mask is a root global, NBA and trigger ids are record base plus

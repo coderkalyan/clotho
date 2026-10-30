@@ -179,6 +179,18 @@ void Backend::emit_suspend(const char* label) {
     emit_proc_state(kProcWaiting, kProcRunning);
 }
 
+// The first argument of the ramp of schedule group `s`: the record of the
+// instance a coroutine group of an instance runs for, which is what lets one
+// ramp serve every instance of its unit; the state pointer for a group of no
+// instance. (A thunk group is not ramped.)
+llvm::Value* Backend::ramp_arg(uint32_t s, llvm::Value* state) {
+    const uint32_t aid = group_unit_anchor_[sched_[s].rows.front()];
+    if (sched_[s].thunk || aid == SignalSlot::no_anchor) {
+        return state;
+    }
+    return ensure_ctx(anchors_[aid]);
+}
+
 // Run every `final` block once, in source order, at the end of simulation
 // (LRM 9.2.3). A final block is zero-time, so — like the pre-init pass — one
 // resume runs its body to completion; destroy reclaims the frame. Emitted as
@@ -192,7 +204,7 @@ void Backend::emit_finals_run(llvm::Value* state, llvm::Value* wheel, const std:
         if (all[sched_[g].front].activation != Activation::Final) {
             continue;
         }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
+        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
     }
@@ -224,7 +236,7 @@ void Backend::emit_preponed_run(llvm::Value* state, llvm::Value* wheel, const st
         if (all[sched_[g].front].activation != Activation::Preponed) {
             continue;
         }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
+        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
     }
@@ -308,7 +320,7 @@ void Backend::emit_observed_run(llvm::Value* state, llvm::Value* wheel, const st
         if (all[sched_[g].front].activation != Activation::Observed) {
             continue;
         }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
+        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
     }
@@ -341,7 +353,7 @@ void Backend::emit_renba_run(llvm::Value* state, llvm::Value* wheel, const std::
         if (all[sched_[g].front].activation != Activation::ReNba) {
             continue;
         }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
+        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
     }
@@ -389,7 +401,7 @@ llvm::Constant* Backend::program_live_ptr() {
 //
 // The instance index is folded into each body as a COMPILE-TIME constant. That
 // is sound because a program `initial` body is never shared between instances:
-// the only body sharing in the backend is merge_twin_bodies, which takes only
+// the only body sharing in the backend is the code-once lowering (Backend::run), which takes only
 // thunk groups, and thunk eligibility is is_simple_always, which requires
 // Activation::Always (src/ir/Analysis.cpp) -- so an Activation::Reactive
 // process is always a coroutine of its own, one per instance, exactly as
@@ -1633,7 +1645,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         if (all[sched_[g].front].activation != Activation::PreInit) {
             continue;
         }
-        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
+        llvm::Value* hdl = b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { hdl });
         b_.CreateCall(coro_intr(llvm::Intrinsic::coro_destroy), { hdl });
     }
@@ -1690,7 +1702,7 @@ void Backend::emit_active_run(llvm::Value* state, llvm::Value* wheel, const std:
         llvm::Value* hdl = sched_[g].thunk
           ? b_.CreateIntToPtr(
               b_.CreateOr(b_.CreatePtrToInt(sym(procs[g]), b_.getInt64Ty()), b_.getInt64(1)), ptr_ty)
-          : b_.CreateCall(proc_fnty, sym(procs[g]), { state, wheel });
+          : b_.CreateCall(proc_fnty, sym(procs[g]), { ramp_arg(g, state), wheel });
         hdls[g]          = hdl;
         if (p.activation == Activation::Always && !p.wait_events.empty()) {
             // Subscribed in the topo-ordered pass below.

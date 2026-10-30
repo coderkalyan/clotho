@@ -611,7 +611,7 @@ With the feature used, the cost is:
 | `mbx.num()` | inline `queue_size` (no call) |
 | `mbx.try_put` / `try_get` | the existing `rt_queue_push_back` / `rt_queue_pop_front` call plus one bound or length compare, plus one/two wake walks |
 | `mbx.try_peek` | inline ring math (`fifo[0]`) |
-| any body containing any of these | forced to a real coroutine (`blocks_thunk`), which also removes it from `share_twin_groups` |
+| any body containing any of these | forced to a real coroutine (`blocks_thunk`), which also takes it out of the thunk groups (it is still lowered once per unit unless it names something of its instance, see `--stat=unit-code`) |
 | `--gc` on | one leaf-table entry per mailbox class; the collector walks a mailbox's ring like any other queue |
 
 No ring resizing, no wheel change, no static tables, no ABI change, no new runtime

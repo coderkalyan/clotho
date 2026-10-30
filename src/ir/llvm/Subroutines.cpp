@@ -46,6 +46,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     if (std::any_of(members.begin(), members.end(),
                     [&](uint32_t m) { return facts_.processes[m].deferred_severity; })) {
         cur_defer_group_ = static_cast<int32_t>(g_);
+        taint("holds deferred assertions");
     }
 
     // Same-eligibility NBA prep: the function's block registrations pass
@@ -267,8 +268,17 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     fn_          = llvm::Function::Create(fnty, llvm::Function::ExternalLinkage, name, env_->llmod);
     // Mark it pre-split so the CoroSplit pass picks it up.
     fn_->setPresplitCoroutine();
-    state_ = fn_->getArg(0);
-    state_->setName("state");
+    // The ramp of a group of an instance takes the record of the instance it
+    // runs for (ramp_arg), like a thunk row, so one ramp serves every instance of
+    // its unit; any other group takes the root state pointer.
+    if (own_anchor_ != SignalSlot::no_anchor) {
+        own_ctx_ = fn_->getArg(0);
+        own_ctx_->setName("ctx");
+        state_ = sym(state_global_);
+    } else {
+        state_ = fn_->getArg(0);
+        state_->setName("state");
+    }
     wheel_ = fn_->getArg(1);
     wheel_->setName("wheel");
     // The state pointer is the sole module memory the process touches; noalias
@@ -412,6 +422,9 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // and a fork child get theirs from the owner closure instead (build_function
     // / lower_task).
     cur_program_inst_ = in_program_body_ ? program_inst_of(proc_index) : kNoProgramInst;
+    if (in_program_body_) {
+        taint("belongs to a program instance");
+    }
 
     b_.SetInsertPoint(coro_cleanup_bb_);
     if (gc_frame) {
@@ -455,6 +468,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // forks or a deferred body it ramps) materializes nothing and passes the
     // module-wide state along, which by that proof nothing dereferences.
     if (rng_procs_[proc_index]) {
+        taint("draws from a per-process random stream");
         rng_slot_ = b_.CreateAlloca(llvm::ArrayType::get(b_.getInt64Ty(), 4), nullptr, "urng");
         b_.CreateCall(urandom_seed_fn(), { rng_slot_, b_.getInt64(proc_index) });
     } else {
@@ -565,6 +579,7 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     // lowering, the event_wait_node hazard: proc_abort_exit reads this one.
     program_end_bb_   = nullptr;
     cur_program_inst_ = kNoProgramInst;
+    own_ctx_ = nullptr;
     return fn_;
 }
 

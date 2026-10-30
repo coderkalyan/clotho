@@ -256,63 +256,26 @@ void Backend::report_dedup_shapes(const std::vector<llvm::Function*>& group_fns)
                  (unsigned long long)skipped);
 }
 
-// `--stat=unit-code`: how far the backend is from compiling each unit once
-// (docs/design/modular-compilation.md, step 3). For every unit with several
-// instances, compares each of its fusion groups, keyed by the unit and the
-// group's position among the unit's groups, across the instances after
-// numbering every design symbol (`@clotho.*`) by first occurrence: what such a
-// symbol names an instance record binding could supply, so a mismatch left is
-// an immediate or a code shape baked per instance. A thunk group's function is
-// its row (what a schedule group calls with the instance's record), a coroutine
-// group's its ramp. The entry or dispatcher of a schedule group is link glue
-// with no unit to compare in, and a group of no instance has no twin; both are
-// counted apart.
+// `--stat=unit-code`: what is still emitted once per instance of a unit rather
+// than once per unit (docs/design/modular-compilation.md, step 3). For every
+// unit with several instances, the groups are counted per unit (its fusion
+// groups) and per instance, with the functions emitted for them: a group is
+// lowered once per unit and every instance runs it with its own record, so the
+// two numbers agree unless the code names something of the instance it was
+// lowered for (a function copy only it calls, its name, a covergroup index, a
+// disable target, another instance's nonblocking staging, a process-local
+// stream or control block). Those are counted by what stopped sharing. A group
+// of no instance has no unit to share in and is counted apart.
 void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
-    const auto normalize = [](llvm::Function* fn) {
-        std::string raw;
-        {
-            llvm::raw_string_ostream os(raw);
-            fn->print(os);
-        }
-        const auto ident = [](char c) {
-            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
-                   c == '$' || c == '-';
-        };
-        ankerl::unordered_dense::map<std::string, uint32_t> ids;
-        std::string                                         out;
-        size_t                                              i = 0;
-        while (i < raw.size()) {
-            if (raw[i] != '@') {
-                out += raw[i++];
-                continue;
-            }
-            size_t j = i + 1;
-            while (j < raw.size() && ident(raw[j])) {
-                ++j;
-            }
-            const std::string tok = raw.substr(i, j - i);
-            if (tok == "@" + fn->getName().str()) {
-                out += "@FN";
-            } else if (tok.starts_with("@clotho.")) {
-                const auto [it, fresh] = ids.try_emplace(tok, static_cast<uint32_t>(ids.size()));
-                out += "@SYM" + std::to_string(it->second);
-            } else {
-                out += tok;
-            }
-            i = j;
-        }
-        return out;
-    };
-
-    // (unit, position in the unit) -> the group's function in each instance.
-    ankerl::unordered_dense::map<uint64_t, std::vector<llvm::Function*>> slots;
-    ankerl::unordered_dense::map<uint32_t, uint32_t>                     instances;
+    ankerl::unordered_dense::map<uint32_t, uint32_t> instances;
     for (const Anchor& a : anchors_) {
         if (a.unit != InstanceScope::no_unit) {
             ++instances[a.unit];
         }
     }
-    uint64_t unanchored = 0;
+    ankerl::unordered_dense::set<uint64_t>            unit_groups;
+    ankerl::unordered_dense::set<llvm::Function*>     emitted;
+    uint64_t                                          instance_groups = 0, coroutines = 0, unanchored = 0;
     for (uint32_t g = 0; g < groups_.size(); ++g) {
         const uint32_t aid = group_unit_anchor_[g];
         if (aid == SignalSlot::no_anchor) {
@@ -323,37 +286,10 @@ void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
         if (unit == InstanceScope::no_unit || instances[unit] < 2) {
             continue;
         }
-        slots[(static_cast<uint64_t>(unit) << 32) | group_unit_ordinal_[g]].push_back(group_fns[g]);
-    }
-
-    // Compare each slot's functions against the first: the slots compared (two
-    // or more instances), how many were identical, and the first few mismatches.
-    uint64_t    compared = 0, same = 0;
-    unsigned    shown = 0;
-    std::string samples;
-    for (const auto& [key, fns] : slots) {
-        if (fns.size() < 2) {
-            continue;
-        }
-        ++compared;
-        const std::string first = normalize(fns.front());
-        bool              equal = true;
-        for (size_t i = 1; i < fns.size() && equal; ++i) {
-            const std::string other = normalize(fns[i]);
-            if (other == first) {
-                continue;
-            }
-            equal = false;
-            if (shown++ < 8) {
-                std::istringstream a(first), b(other);
-                std::string        la, lb;
-                while (std::getline(a, la) && std::getline(b, lb) && la == lb) {
-                }
-                samples += "  " + fns.front()->getName().str() + " vs " + fns[i]->getName().str() + ":\n    " +
-                           la + "\n    " + lb + "\n";
-            }
-        }
-        same += equal ? 1 : 0;
+        unit_groups.insert((static_cast<uint64_t>(unit) << 32) | group_unit_ordinal_[g]);
+        emitted.insert(group_fns[g]);
+        ++instance_groups;
+        coroutines += thunk_group_[g] ? 0 : 1;
     }
     uint64_t shared = 0, rows = 0;
     for (const SchedGroup& sg : sched_) {
@@ -362,95 +298,17 @@ void Backend::report_unit_code(const std::vector<llvm::Function*>& group_fns) {
             rows += sg.rows.size();
         }
     }
+    std::string why;
+    for (const auto& [reason, n] : unshared_) {
+        why += std::format("\n  {} groups lowered per instance: {}", n, reason);
+    }
     std::fprintf(stderr,
-                 "unit-code: %llu groups of multi-instance units compared, %llu identical up to design "
-                 "symbols; %llu schedule groups run several groups (%llu rows), %llu groups belong to no "
-                 "instance\n%s",
-                 (unsigned long long)compared, (unsigned long long)same, (unsigned long long)shared,
-                 (unsigned long long)rows, (unsigned long long)unanchored, samples.c_str());
-}
-
-// Twin groups of a unit whose functions print the very same text run ONE
-// function. A thunk group's function takes its instance's record and addresses
-// the instance through it, so two instances' that are identical -- the same code
-// down to every symbol it names -- need only be compiled once: each row passes
-// its own record. The gate is the text itself, symbols included: unlike the
-// comparison up to design symbols (report_unit_code), identical text cannot name
-// two instances' storage. The shared function is noinline, or the inliner would
-// expand it into every entry and undo the compile-time win. Runs before the
-// entries exist, so nothing references a row yet. Disabled by --no-dedup.
-void Backend::merge_twin_bodies(std::vector<llvm::Function*>& group_fns) {
-    const auto t0 = std::chrono::steady_clock::now();
-    // Cheap structural pre-key: the module and size counts. Only pre-buckets of
-    // >= 2 pay the IR print -- a lone function can merge with nothing.
-    struct PreKey {
-        const llvm::Module* mod;
-        uint64_t            sizes;
-        bool                operator==(const PreKey&) const = default;
-    };
-    struct PreKeyHash {
-        uint64_t operator()(const PreKey& k) const {
-            return ankerl::unordered_dense::detail::wyhash::hash(reinterpret_cast<uintptr_t>(k.mod) ^ k.sizes);
-        }
-    };
-    ankerl::unordered_dense::map<PreKey, std::vector<uint32_t>, PreKeyHash> pre;
-    uint64_t                                                                eligible = 0;
-    for (uint32_t g = 0; g < groups_.size(); ++g) {
-        if (!thunk_group_[g] || group_unit_anchor_[g] == SignalSlot::no_anchor) {
-            continue;
-        }
-        ++eligible;
-        uint64_t insts = 0, bbs = 0;
-        for (const llvm::BasicBlock& bb : *group_fns[g]) {
-            ++bbs;
-            insts += bb.size();
-        }
-        pre[PreKey{ group_fns[g]->getParent(), bbs << 24 | insts << 40 }].push_back(g);
-    }
-    ankerl::unordered_dense::map<const llvm::Module*, std::unique_ptr<llvm::ModuleSlotTracker>> trackers;
-    std::vector<std::vector<uint32_t>>                                                         twins;
-    for (const auto& [key, gs] : pre) {
-        if (gs.size() < 2) {
-            continue;
-        }
-        auto& mst = trackers[key.mod];
-        if (mst == nullptr) {
-            mst = std::make_unique<llvm::ModuleSlotTracker>(key.mod, /*ShouldInitializeAllMetadata=*/false);
-        }
-        ankerl::unordered_dense::map<std::string, std::vector<uint32_t>> by_text;
-        for (const uint32_t g : gs) {
-            by_text[normalize_shape(group_fns[g], mst.get(), /*number_inst_symbols=*/false)].push_back(g);
-        }
-        for (auto& [text, same] : by_text) {
-            if (same.size() >= 2) {
-                twins.push_back(std::move(same));
-            }
-        }
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-    uint64_t   sets = 0, members = 0;
-    for (std::vector<uint32_t>& twin : twins) {
-        std::sort(twin.begin(), twin.end());
-        ++sets;
-        members += twin.size();
-        llvm::Function* shared = group_fns[twin.front()];
-        shared->addFnAttr(llvm::Attribute::NoInline);
-        for (size_t i = 1; i < twin.size(); ++i) {
-            group_fns[twin[i]]->eraseFromParent();
-            group_fns[twin[i]] = shared;
-        }
-    }
-    if (stat_on(config_.stats, Stat::Dedup)) {
-        const auto t2 = std::chrono::steady_clock::now();
-        const auto ms = [](auto d) {
-            return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
-        };
-        std::fprintf(stderr,
-                     "dedup-share: %llu bodies -> %llu shared (%llu eligible; bucket %lld ms, "
-                     "merge %lld ms)\n",
-                     (unsigned long long)members, (unsigned long long)sets,
-                     (unsigned long long)eligible, (long long)ms(t1 - t0), (long long)ms(t2 - t1));
-    }
+                 "unit-code: %llu groups of multi-instance units over %llu instances' groups, %llu functions "
+                 "emitted (%llu of the groups are coroutines); %llu schedule groups run several "
+                 "groups (%llu rows), %llu groups belong to no instance%s\n",
+                 (unsigned long long)unit_groups.size(), (unsigned long long)instance_groups,
+                 (unsigned long long)emitted.size(), (unsigned long long)coroutines, (unsigned long long)shared,
+                 (unsigned long long)rows, (unsigned long long)unanchored, why.c_str());
 }
 
 void Backend::report_finish_stat() const {

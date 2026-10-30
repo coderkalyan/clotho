@@ -586,11 +586,11 @@ TEST_CASE("cli: build and run accept the code-generation options") {
     }
 }
 
-TEST_CASE("cli: --stat=unit-code compares the groups of the instances of a unit") {
+TEST_CASE("cli: --stat=unit-code counts the functions emitted for the groups of a unit") {
     // Three instances of one block wait on the clock of one interface: their
     // groups are rows of one schedule group sharing one subscription, and each
-    // of the unit's groups (that one and the instance's own PreInit) is the
-    // same in every instance up to the design symbols it names.
+    // of the unit's groups (that one and the instance's own PreInit) is one
+    // function that all three instances run with their own record.
     const Scratch  s;
     const fs::path design = s.write("design.sv", R"(
         interface bus_if; logic clk = 0; endinterface
@@ -608,7 +608,7 @@ TEST_CASE("cli: --stat=unit-code compares the groups of the instances of a unit"
     )");
     const Result r = s.run(std::format("build --emit=llvm --stat=unit-code -o /dev/null \"{}\"", design.string()));
     CHECK(r.code == 0);
-    CHECK(contains(r.err, "2 groups of multi-instance units compared, 2 identical up to design symbols"));
+    CHECK(contains(r.err, "2 groups of multi-instance units over 6 instances' groups, 2 functions emitted (3 of the groups are coroutines"));
     CHECK(contains(r.err, "1 schedule groups run several groups (3 rows)"));
 }
 

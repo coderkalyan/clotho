@@ -345,9 +345,10 @@ Consequences that must be handled rather than discovered:
   `NamedBlock(remote)` / `DisableRemote`). A *killable* process is by definition one
   whose handle escaped through `self()`, so the payload test is sufficient — there
   is no need to deoptimise every process in the design.
-- **Thunk groups are the only bodies shared across instances**
-  (`share_twin_groups`, `:7280-7325`), so forcing a coroutine also removes the
-  cross-instance sharing question for PCB-bearing bodies.
+- **A body that names a process control block is lowered per instance**: unit
+  groups are lowered once and run by every instance with its own record, but a
+  PCB slot is a process index, so lowering one (`proc_pcb_slot`) taints the
+  group and each instance lowers its own.
 - **Non-Active processes get PCBs too** (PreInit, Preponed, Observed, ReNba,
   Final, Reactive — `src/ir/Module.h:100-172`). They are processes; `self()` inside
   one is legal and rare. Cost is `nproc` objects at startup.
