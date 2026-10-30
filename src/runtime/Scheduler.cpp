@@ -1303,6 +1303,35 @@ extern "C" void rt_proc_obj_release(void* pcb) {
     proc_maybe_free(p);
 }
 
+#ifdef CLOTHO_EXTRA_ASSERTS
+// NOTE: Under extra asserts a frame carries its size in a kFrameAlign-byte
+// header, and rt_free overwrites the whole frame with kFreedFrame before
+// releasing it. Code that reads a frame after its coroutine was destroyed then
+// reads a non-null wild pointer and fails at once, instead of depending on
+// whether something reused the memory in between.
+constexpr uint8_t kFreedFrame = 0xA5;
+
+extern "C" void* rt_alloc(uint64_t size) {
+    auto* base =
+      static_cast<uint8_t*>(clotho::rt::os_aligned_alloc(static_cast<size_t>(size) + kFrameAlign, kFrameAlign));
+    if (base == nullptr) {
+        return nullptr;
+    }
+    std::memcpy(base, &size, sizeof size);
+    return base + kFrameAlign;
+}
+
+extern "C" void rt_free(void* p) {
+    if (p == nullptr) {
+        return;
+    }
+    uint8_t* base = static_cast<uint8_t*>(p) - kFrameAlign;
+    uint64_t size = 0;
+    std::memcpy(&size, base, sizeof size);
+    std::memset(p, kFreedFrame, static_cast<size_t>(size));
+    clotho::rt::os_aligned_free(base);
+}
+#else
 extern "C" void* rt_alloc(uint64_t size) {
     return clotho::rt::os_aligned_alloc(static_cast<size_t>(size), kFrameAlign);
 }
@@ -1310,6 +1339,7 @@ extern "C" void* rt_alloc(uint64_t size) {
 extern "C" void rt_free(void* p) {
     clotho::rt::os_aligned_free(p);
 }
+#endif
 
 // ---- Host entry ----
 
