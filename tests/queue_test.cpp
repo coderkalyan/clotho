@@ -4,9 +4,12 @@
 #include <string>
 #include <string_view>
 
+#include <llvm/Support/raw_ostream.h>
+
 #include "Lower.h"
 #include "PosixIo.h"
 #include "ir/Jit.h"
+#include "ir/LlvmBackend.h"
 
 using namespace clotho;
 
@@ -53,6 +56,17 @@ void expect_fail(std::string_view source, std::string_view needle) {
     CHECK_FALSE(r.ok);
     CAPTURE(r.diagnostic_text());
     CHECK(r.diagnostic_text().find(needle) != std::string::npos);
+}
+
+// The optimized LLVM IR of `source`.
+std::string emit_ir(std::string_view source) {
+    const LowerResult r = lower_text(source);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    REQUIRE(r.module != nullptr);
+    std::string              text;
+    llvm::raw_string_ostream os(text);
+    REQUIRE(ir::emit_llvm(*r.module, os));
+    return text;
 }
 
 } // namespace
@@ -195,6 +209,119 @@ TEST_CASE("queue pop from empty 2-state queue is default 0") {
         endmodule
     )";
     CHECK(run_capture(src) == "popempty=0 size=0\n");
+}
+
+// Logical element i of a queue is physical slot (head + i) mod cap, and the
+// element access is a compare-and-subtract on that (not a remainder), valid because
+// i < len <= cap and head < cap. This walks every shape of it through a ring whose
+// head has wrapped: reads and writes at static and dynamic indices, the out-of-
+// range index (past the end, negative as an int and as a 64-bit value, huge) that
+// must read the default and write nothing, a head that wraps below zero on
+// push_front, insert / delete / reverse / sort / pop across the wrap, a queue with
+// no capacity at all, and the string and aggregate element lvalues, which index
+// the same way. Expected values are the LRM's (7.10, 7.4.5), worked out by hand;
+// iverilog has no `%p`, reverse / sort or unpacked structs, so it is not an oracle
+// for this one.
+TEST_CASE("queue indexing across a wrapped ring") {
+    constexpr std::string_view src = R"(
+        module m;
+            typedef struct { int a; logic [7:0] b; } rec_t;
+            int q[$];
+            string sq[$];
+            rec_t rq[$];
+            int i, k;
+            longint li;
+            rec_t r;
+            initial begin
+                // Wrap the head: fill four slots, drop two from the front, add two.
+                for (k = 0; k < 4; k++) q.push_back(10 + k);
+                void'(q.pop_front());
+                void'(q.pop_front());
+                q.push_back(14);
+                q.push_back(15);
+                for (i = 0; i < q.size(); i++) $display("q[%0d]=%0d", i, q[i]);
+                for (i = 0; i < q.size(); i++) q[i] = q[i] + 100;
+                q[3] = q[3] + 1000;
+                $display("%p", q);
+                i = 4;  $display("oob %0d", q[i]);
+                i = -1; $display("neg %0d", q[i]);
+                li = 64'h8000_0000_0000_0003; $display("huge %0d", q[li]);
+                i = 4;  q[i] = 99;
+                li = -1; q[li] = 98;
+                $display("size %0d %p", q.size(), q);
+                // The head wraps below zero once the ring has room to wrap into.
+                q.push_front(9); q.push_front(8); q.push_front(7); q.push_front(6);
+                $display("front %p size %0d", q, q.size());
+                for (i = 0; i < q.size(); i++) q[i] = q[i] + 1;
+                $display("front+1 %p", q);
+                q.insert(2, 500);
+                q.delete(5);
+                q.reverse();
+                $display("rev %p", q);
+                q.sort();
+                $display("sort %p", q);
+                $display("pop %0d %0d", q.pop_back(), q.pop_front());
+                // A queue with no ring has no element 0 to read or write.
+                q.delete();
+                i = 0; $display("empty %0d size %0d", q[i], q.size());
+                q[i] = 5; $display("still empty size %0d", q.size());
+                for (k = 0; k < 4; k++) sq.push_back($sformatf("s%0d", k));
+                void'(sq.pop_front()); void'(sq.pop_front());
+                sq.push_back("s4"); sq.push_back("s5");
+                for (i = 0; i < sq.size(); i++) begin
+                    sq[i] = {sq[i], "!"};
+                    $display("sq[%0d]=%s", i, sq[i]);
+                end
+                i = 4; $display("sq oob '%s'", sq[i]);
+                for (k = 0; k < 4; k++) begin r.a = k; r.b = (k * 3) & 8'hFF; rq.push_back(r); end
+                r = rq.pop_front(); r = rq.pop_front();
+                r.a = 4; r.b = 12; rq.push_back(r);
+                r.a = 5; r.b = 15; rq.push_back(r);
+                for (i = 0; i < rq.size(); i++) begin
+                    rq[i].a = rq[i].a * 10;
+                    $display("rq[%0d]=%0d,%0d", i, rq[i].a, rq[i].b);
+                end
+                i = 4; $display("rq oob %0d", rq[i].a);
+            end
+        endmodule
+    )";
+    CHECK(run_capture(src) ==
+          "q[0]=12\nq[1]=13\nq[2]=14\nq[3]=15\n"
+          "'{112, 113, 114, 1115}\n"
+          "oob 0\nneg 0\nhuge 0\n"
+          "size 4 '{112, 113, 114, 1115}\n"
+          "front '{6, 7, 8, 9, 112, 113, 114, 1115} size 8\n"
+          "front+1 '{7, 8, 9, 10, 113, 114, 115, 1116}\n"
+          "rev '{1116, 115, 114, 10, 9, 500, 8, 7}\n"
+          "sort '{7, 8, 9, 10, 114, 115, 500, 1116}\n"
+          "pop 1116 7\n"
+          "empty 0 size 0\nstill empty size 0\n"
+          "sq[0]=s2!\nsq[1]=s3!\nsq[2]=s4!\nsq[3]=s5!\nsq oob ''\n"
+          "rq[0]=20,6\nrq[1]=30,9\nrq[2]=40,12\nrq[3]=50,15\nrq oob 0\n");
+}
+
+// The physical slot of a queue element is head + i less cap when it reaches it,
+// not a 64-bit remainder on every element access (and no clamp of a zero
+// capacity, since an empty queue has no in-range index). The remainder was a
+// `urem i64` in the optimized IR of every queue element select, plain and string.
+TEST_CASE("a queue element select has no remainder in its address") {
+    const std::string ir = emit_ir(R"(
+        module m;
+            int q[$];
+            string sq[$];
+            int i;
+            initial begin
+                q.push_back(1);
+                sq.push_back("a");
+                i = $urandom;
+                $display("%0d %s", q[i], sq[i]);
+                q[i] = 7;
+                sq[i] = "b";
+            end
+        endmodule
+    )");
+    CHECK(ir.find("urem") == std::string::npos);
+    CHECK(ir.find("udiv") == std::string::npos);
 }
 
 // A bounded queue `q[$:N]` holds at most N+1 elements (LRM 7.10.4). A push onto

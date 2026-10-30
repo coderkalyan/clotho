@@ -525,13 +525,13 @@ namespace {
 // -- Queues (LRM 7.10) --
 //
 // A queue is a growable ring buffer: `base` holds `cap` element slots, the `len`
-// live elements at physical positions (head + i) mod cap. All indexing is via
-// q_elem; growth linearises to head == 0.
+// live elements at physical positions (head + i) mod cap, computed by
+// rt_queue_slot. All indexing is via q_elem; growth linearises to head == 0.
 
-// Address of logical element `i` (0-based) in the ring. Requires cap > 0.
+// Address of logical element `i` (0-based) in the ring. Requires cap > 0 and
+// i < cap.
 uint8_t* q_elem(const rt_queue* h, uint64_t stride, uint64_t i) {
-    const uint64_t phys = (h->head + i) % h->cap;
-    return static_cast<uint8_t*>(h->base) + phys * stride;
+    return static_cast<uint8_t*>(h->base) + rt_queue_slot(h, i) * stride;
 }
 
 // Ensure capacity for at least `need` elements, relocating the live elements to
@@ -611,7 +611,7 @@ extern "C" void rt_queue_push_front(rt_queue* h, const rt_elem_ops* ops, uint64_
                                     const void* elem, const rt_alloc_site* site) {
     const uint64_t stride = ops->stride;
     q_reserve(h, stride, h->len + 1, site);
-    h->head = (h->head + h->cap - 1) % h->cap;
+    h->head = h->head == 0 ? h->cap - 1 : h->head - 1;
     void* slot = q_elem(h, stride, 0);
     if (ops->kind == rt_elem_pod) {
         std::memcpy(slot, elem, static_cast<size_t>(stride));
@@ -642,7 +642,7 @@ extern "C" void rt_queue_pop_front(rt_queue* h, const rt_elem_ops* ops, void* ou
         return;
     }
     std::memcpy(out, q_elem(h, ops->stride, 0), static_cast<size_t>(ops->stride));
-    h->head = (h->head + 1) % h->cap;
+    h->head = h->head + 1 == h->cap ? 0 : h->head + 1;
     h->len -= 1;
     ++h->epoch;
 }

@@ -1465,10 +1465,11 @@ void walk_dynarr(const rt_dynarr* h, const rt_elem_ops* cops) {
     }
 }
 
-// One queue, in RING order: element i sits at base + ((head + i) % cap) * stride
-// (Runtime.h:1048-1056). A walk that ignored the wraparound would silently miss
-// exactly the elements a push_front wrapped past the end of the buffer, and a
-// reachable handle the collector misses is a use-after-free, not a lost element.
+// One queue, in RING order: element i sits at base + rt_queue_slot(h, i) * stride,
+// i.e. (head + i) mod cap (Runtime.h:1048-1056). A walk that ignored the
+// wraparound would silently miss exactly the elements a push_front wrapped past
+// the end of the buffer, and a reachable handle the collector misses is a
+// use-after-free, not a lost element.
 void walk_queue(const rt_queue* h, const rt_elem_ops* cops) {
     assert(h != nullptr && "a queue walk needs its handle");
     assert(cops != nullptr && "a queue walk needs a container descriptor");
@@ -1478,13 +1479,13 @@ void walk_queue(const rt_queue* h, const rt_elem_ops* cops) {
     assert((h->cap == 0 || h->head < h->cap) && "the head is a ring slot index");
     assert(h->cap <= kContainerElemsMax && "an implausible queue capacity");
     if (h->len == 0 || h->cap == 0) {
-        return;  // empty, and also what keeps the modulo below off a zero capacity
+        return;  // empty; also keeps a zero capacity out of the ring arithmetic
     }
     const rt_elem_ops* eops = cops->inner;
     assert_elem_ops(eops);
     uint8_t* base = static_cast<uint8_t*>(h->base);
     for (uint64_t i = 0; i < h->len; ++i) {
-        const uint64_t slot = (h->head + i) % h->cap;
+        const uint64_t slot = rt_queue_slot(h, i);
         visit_elem_image(base + slot * eops->stride, eops);
     }
 }

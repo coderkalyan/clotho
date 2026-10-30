@@ -3420,6 +3420,8 @@ private:
 
     std::pair<llvm::Value*, llvm::Value*> container_len_base(llvm::Value* handle, Ref type);
 
+    llvm::Value* queue_ring_slot(llvm::Value* head, llvm::Value* idx, llvm::Value* cap);
+
     LValue container_elem_lvalue(llvm::Value* handle, llvm::Value* data, Ref type, const DynElem& e, llvm::Value* idx);
 
     LValue tmp_elem_lvalue(llvm::Value* data, const DynElem& e, llvm::Value* idx);
