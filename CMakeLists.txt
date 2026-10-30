@@ -251,6 +251,14 @@ FetchContent_Declare(
   # code block once per prod, which bound its statements N times and
   # desynchronized createRule's positional pairing for a rule with two or more
   # code-block prods. See docs/design/randsequence.md §13.
+  #
+  # slang-unsized-xz-extend: LRM 5.7.1 says an unsized unsigned literal whose
+  # high-order bit is x or z "shall be extended to the size of the expression
+  # containing the literal constant", with x or z. slang only zero-extended, so
+  # `reg [63:0] r = 'bx` held 32 x bits under 32 zeros, in the AST Clotho lowers
+  # and in every value slang folds (parameters, enum members, constant
+  # functions, case labels). This is upstream slang commit 0f89ca18 verbatim
+  # (IntegerLiteral::propagateType); drop it on the first bump past that commit.
   PATCH_COMMAND  ${CMAKE_COMMAND} "-DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplySlangPatch.cmake"
 )

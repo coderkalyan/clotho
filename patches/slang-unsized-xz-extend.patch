@@ -1,0 +1,97 @@
+diff --git a/include/slang/ast/expressions/LiteralExpressions.h b/include/slang/ast/expressions/LiteralExpressions.h
+index 0c5257564..ee30ef8ee 100644
+--- a/include/slang/ast/expressions/LiteralExpressions.h
++++ b/include/slang/ast/expressions/LiteralExpressions.h
+@@ -28,6 +28,8 @@ class SLANG_EXPORT IntegerLiteral final : public Expression {
+     SVInt getValue() const { return valueStorage; }
+ 
+     ConstantValue evalImpl(EvalContext& context) const;
++    bool propagateType(const ASTContext& context, const Type& newType, SourceRange opRange,
++                       ConversionKind conversionKind);
+     std::optional<bitwidth_t> getEffectiveWidthImpl() const;
+     EffectiveSign getEffectiveSignImpl(bool isForConversion) const;
+     bool isEquivalentImpl(const IntegerLiteral& rhs) const;
+@@ -43,6 +45,8 @@ class SLANG_EXPORT IntegerLiteral final : public Expression {
+     static bool isKind(ExpressionKind kind) { return kind == ExpressionKind::IntegerLiteral; }
+ 
+ private:
++    void setValue(BumpAllocator& alloc, const SVInt& value);
++
+     SVIntStorage valueStorage;
+ };
+ 
+diff --git a/source/ast/expressions/LiteralExpressions.cpp b/source/ast/expressions/LiteralExpressions.cpp
+index 73cdbed21..1a6ca7e98 100644
+--- a/source/ast/expressions/LiteralExpressions.cpp
++++ b/source/ast/expressions/LiteralExpressions.cpp
+@@ -23,9 +23,12 @@ using namespace syntax;
+ IntegerLiteral::IntegerLiteral(BumpAllocator& alloc, const Type& type, const SVInt& value,
+                                bool isDeclaredUnsized, SourceRange sourceRange) :
+     Expression(ExpressionKind::IntegerLiteral, type, sourceRange),
+-    isDeclaredUnsized(isDeclaredUnsized),
+-    valueStorage(value.getBitWidth(), value.isSigned(), value.hasUnknown()) {
++    isDeclaredUnsized(isDeclaredUnsized) {
++    setValue(alloc, value);
++}
+ 
++void IntegerLiteral::setValue(BumpAllocator& alloc, const SVInt& value) {
++    valueStorage = SVIntStorage(value.getBitWidth(), value.isSigned(), value.hasUnknown());
+     if (value.isSingleWord())
+         valueStorage.val = *value.getRawPtr();
+     else {
+@@ -89,6 +92,30 @@ ConstantValue IntegerLiteral::evalImpl(EvalContext&) const {
+     return result;
+ }
+ 
++bool IntegerLiteral::propagateType(const ASTContext& context, const Type& newType, SourceRange,
++                                   ConversionKind) {
++    // [5.7.1] says that unsized unsigned literals whose high order bit
++    // is x or z are extended with x or z to the size of the expression.
++    // The LRM doesn't say the same for signed literals, but they get
++    // sign extended in signed contexts anyway, and all other tools also
++    // extend them in unsigned contexts, so we do the same.
++    // A two-state type would flatten those bits back to zero, so in that
++    // case we can just let a normal conversion happen.
++    auto value = getValue();
++    const bitwidth_t width = value.getBitWidth();
++    if (!isDeclaredUnsized || !newType.isFourState() || newType.getBitWidth() <= width ||
++        !value[int32_t(width - 1)].isUnknown()) {
++        return false;
++    }
++
++    // Sign extending copies the x or z of the high order bit.
++    value = value.sext(newType.getBitWidth());
++    value.setSigned(newType.isSigned());
++    setValue(context.getCompilation(), value);
++    type = &newType;
++    return true;
++}
++
+ std::optional<bitwidth_t> IntegerLiteral::getEffectiveWidthImpl() const {
+     return ConstantValue(getValue()).getEffectiveWidth();
+ }
+diff --git a/tests/unittests/ast/EvalTests.cpp b/tests/unittests/ast/EvalTests.cpp
+index be8122e5e..8d65c4bbd 100644
+--- a/tests/unittests/ast/EvalTests.cpp
++++ b/tests/unittests/ast/EvalTests.cpp
+@@ -246,6 +246,20 @@ TEST_CASE("Integer operators") {
+     EVAL("5'bz01", "5'bzzz01"_si);
+     EVAL("68'bz0000", "68'hzzzzzzzzzzzzzzzzz0"_si);
+ 
++    // Unsized literals with an unknown high order bit extend to the expression size
++    EVAL("'hx3 | 64'h0", "64'hxxxxxxxxxxxxxxx3"_si);
++    EVAL("1 ? 'hz : 40'h0", "40'hzzzzzzzzzz"_si);
++    EVAL("1 ? 'h3 : 40'h0", "40'h3"_si);
++    EVAL("64'('hx3)", "64'hxxxxxxxxxxxxxxx3"_si);
++    EVAL("1 ? 'hx3 : 40'h0", "40'hxxxxxxxxx3"_si);
++    EVAL("'shx3 | 64'h0", "64'hxxxxxxxxxxxxxxx3"_si);
++    EVAL("'shx3 | 64'sh0", "64'shxxxxxxxxxxxxxxx3"_si);
++    EVAL("1 ? 'shz : 40'h0", "40'hzzzzzzzzzz"_si);
++    session.eval("logic [63:0] xlit = 'hx3;");
++    session.eval("bit [63:0] blit = 'hx3;");
++    EVAL("xlit", "64'hxxxxxxxxxxxxxxx3"_si);
++    EVAL("blit", "64'h3"_si);
++
+     // Unbased unsized literals
+     EVAL("1 << '1", 2);
+     EVAL("'1 + 65'b0", "65'h1ffffffffffffffff"_si);
