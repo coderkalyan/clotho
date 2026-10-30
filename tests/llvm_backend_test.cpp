@@ -1471,6 +1471,47 @@ TEST_CASE("$finish inside a function reports the current simulation time") {
     CHECK(run_capture_stderr(src) == "source:5: $finish called at 7 ns\n");
 }
 
+// A $finish ends the settle wave it is in: the processes it woke before it ran
+// do not run afterwards (lower_finish empties the active ring). The function is
+// lowered before anything that pushes onto that ring, so the reset cannot depend
+// on the ring having been made by something lowered earlier.
+TEST_CASE("$finish inside a function leaves nothing queued to run after it") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a = 0;
+            function void stop(); $finish; endfunction
+            always @(a) $display("ran after $finish");
+            initial begin #1 a = 1; stop(); end
+        endmodule
+    )";
+    CHECK(run_capture(src).empty());
+}
+
+// The same body in two instances of one unit is one code, whatever was lowered
+// between them: the second instance's $finish is not lowered after a push onto
+// the ring that the first was lowered before. Whichever instance finishes
+// first, the other is queued and does not run.
+TEST_CASE("instances of a unit that finishes run the same code") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic clk = 0, en = 0;
+            int hits = 0;
+            initial forever begin
+                @(posedge clk iff en);
+                hits++;
+                if (hits == 2) begin $display("hits=%0d", hits); $finish; end
+            end
+            initial begin
+                en = 0; clk = 1; #1 clk = 0; #1;
+                en = 1; clk = 1; #1 clk = 0; #1;
+                clk = 1; #1 clk = 0; #1;
+            end
+        endmodule
+        module top; m u0(); m u1(); endmodule
+    )";
+    CHECK(run_capture(src) == "hits=2\n");
+}
+
 TEST_CASE("$time and $stime read the simulation clock") {
     // With no timescale the wheel tick count is the time-unit-scaled value, so
     // $time returns the raw clock and $stime mirrors it (truncated to 32 bits).

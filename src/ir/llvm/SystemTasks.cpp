@@ -408,10 +408,12 @@ void Backend::lower_finish(Index i) {
     // the drain's existing head != tail test falls through to its finished
     // edge, so no queued process runs after the $finish and the hot path
     // needs no test of its own.
-    if (active_head_gv_ != nullptr) {
-        b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(active_tail_gv_)),
-                       sym(active_head_gv_));
-    }
+    // The ring exists in every design (emit_active_run makes it), so it is made
+    // here rather than tested for: a body lowered before the first push to it
+    // would otherwise lack this reset, and two instances of one unit lowered
+    // either side of that push would be different code.
+    ensure_active_queue();
+    b_.CreateStore(b_.CreateLoad(b_.getInt32Ty(), sym(active_tail_gv_)), sym(active_head_gv_));
     // Same for the reactive rings and the batch: a $fatal in an action block
     // would otherwise leave the rest of this instant's pass/fail code queued,
     // and the reactive drain tests the finish flag only on its empty edge.
