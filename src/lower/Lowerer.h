@@ -1687,6 +1687,13 @@ private:
 
     void emit_wire_resolvers();
 
+    void note_weak_driver(const Expression& lhs);
+
+    void reject_unmodeled_switch_strength(std::string_view  name,
+                                          const Expression& out_left,
+                                          const Expression& data,
+                                          size_t            own_drivers);
+
     void store_every_element(ir::Index lv, ir::Ref ty, ir::Index val, ir::Builder& b, ir::SourceLoc l);
 
     // -- Processes --
@@ -5109,6 +5116,11 @@ private:
     // Net signals Classify found to have >= 2 overlapping continuous drivers, so
     // Emit routes every driver to a slot and emit_wire_resolvers folds them.
     ankerl::unordered_dense::set<uint32_t> resolved_nets_;
+    // Nets some driver drives below the default strength (an `assign` or gate with
+    // an explicit drive strength, a pullup / pulldown), recorded by the Classify
+    // pass. A MOS switch passes such a strength through (LRM 28.13), which Clotho
+    // does not model, so reject_unmodeled_switch_strength consults it.
+    ankerl::unordered_dense::set<uint32_t> weak_driven_nets_;
     // The subset of resolved_nets_ with at least one PROGRAM-side driver: a
     // driver lowered while in_program_ (a program's hierarchical `assign`, a
     // net declaration assignment, a `force`) or a wire_ports port copy for a

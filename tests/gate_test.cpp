@@ -892,3 +892,37 @@ TEST_CASE("a single gate driving a packed-net member is rejected") {
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("unsupported gate output terminal") != std::string::npos);
 }
+
+// LRM 28.13 / 28.14: a MOS switch passes the strength of its data input to its
+// output, and a resistive one reduces it. Clotho has no strength on a net value,
+// so a switch always drives strong; that only shows when the output net resolves
+// the switch against another driver, and then the design is refused instead of
+// resolved wrongly (docs/LRM_NOTES.md note 38). Oracle: iverilog 13 prints b=1
+// c=1 / q=0 r=0 for the first two sources, where Clotho used to print x.
+TEST_CASE("a MOS switch whose strength matters is refused, not resolved wrongly") {
+    const auto refused = [](std::string_view body, std::string_view what) {
+        const LowerResult r = lower_text("module m;\n" + std::string(body) + "\nendmodule");
+        CHECK_FALSE(r.ok);
+        CHECK_MESSAGE(r.diagnostic_text().find(what) != std::string::npos, r.diagnostic_text());
+    };
+    // A weak data input (explicit drive strength), through nmos and cmos.
+    refused("wire a, b, c;\n assign (strong1, weak0) a = 1'b0;\n nmos n(b, a, 1'b1);\n assign b = 1'b1;", "LRM 28.13");
+    refused("wire a, c;\n assign (strong1, weak0) a = 1'b0;\n cmos n(c, a, 1'b1, 1'b0);\n assign c = 1'b1;",
+            "LRM 28.13");
+    // A pulled data input, through pmos.
+    refused("wire w, q;\n pullup (w);\n pmos (q, w, 1'b0);\n buf (q, 1'b0);", "LRM 28.13");
+    refused("tri1 w;\n wire q;\n nmos (q, w, 1'b1);\n assign q = 1'b0;", "LRM 28.13");
+    // A resistive switch, whatever its input.
+    refused("wire c, r;\n assign c = 1'b1;\n rnmos (r, c, 1'b1);\n assign r = 1'b0;", "LRM 28.14");
+    refused("reg d;\n wire r;\n rpmos (r, d, 1'b0);\n assign r = 1'b0;", "LRM 28.14");
+    // A strong input into a shared net, and a switch alone on its net, are exact.
+    const LowerResult ok = lower_text(R"(
+        module m;
+          reg d;
+          wire q, r;
+          nmos (q, d, 1'b1);
+          assign q = 1'b0;
+          rnmos (r, d, 1'b1);
+        endmodule)");
+    CHECK_MESSAGE(ok.ok, ok.diagnostic_text());
+}

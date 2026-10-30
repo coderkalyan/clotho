@@ -347,7 +347,13 @@ Code: `src/lower/Nets.cpp` (`gate_tristate_value`). Tests: `tests/gate_test.cpp`
 
 Deviation: with no strength model there is nothing for the strength reduction of
 28.14 to act on, so `rnmos`, `rpmos` and `rcmos` behave exactly as `nmos`, `pmos`
-and `cmos`. Not gated.
+and `cmos`, and every MOS switch drives strong instead of passing the strength of
+its data input (28.13). That is only visible when the output net resolves the
+switch against another driver, and then it is gated: such a switch is refused when
+it is resistive, or when its data input is a net with a driver of explicit
+strength, a pullup / pulldown or a tri0 / tri1 net. Not gated: a resistive switch
+alone on its net, and a weak data input that reaches the switch through another
+switch's output.
 
 Code: `src/lower/Nets.cpp` (`mos_switch_of`, `lower_cmos_switch`). Tests: `tests/gate_test.cpp` ("MOS switch truth tables match LRM table 28-6, including the z pass-through", "a cmos switch drives its output from both halves independently").
 

@@ -887,6 +887,9 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
 
     if (cur_pass_ == Pass::Classify) {
         record_net_driver(left);
+        if (strength != 0x0303) {
+            note_weak_driver(left);
+        }
         return;
     }
 
@@ -1859,6 +1862,7 @@ void Lowerer::lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up) {
     if (cur_pass_ == Pass::Classify) {
         record_net_driver_whole(sym);
         force_net_resolved(signal_of(sym));
+        weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(sym)));
         return;
     }
     if (cur_pass_ != Pass::Emit) {
@@ -1904,11 +1908,15 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
         // is what marks the net resolved.
         record_net_driver(left);
         record_net_driver(left);
+        if (pack_strength(gi.getDriveStrength()) != 0x0303) {
+            note_weak_driver(left);
+        }
         return;
     }
     if (cur_pass_ != Pass::Emit) {
         return;
     }
+    reject_unmodeled_switch_strength(gi.primitiveType.name, left, *conns[1], 2);
     const TimingControl* cmos_delay = gi.getDelay();
     if (cmos_delay != nullptr && cmos_delay->kind != TimingControlKind::Delay) {
         // TODO: cmos/rcmos rise/fall/turn-off delay triples #(a,b,c) (LRM 28.16)
@@ -1954,6 +1962,56 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
     };
     emit_half(TriGate{ .active_high = true, .invert = false }, nctrl);
     emit_half(TriGate{ .active_high = false, .invert = false }, pctrl);
+}
+
+// Record that `lhs` is driven at a strength other than the default Strong.
+void Lowerer::note_weak_driver(const Expression& lhs) {
+    const ValueSymbol* root = lvalue_root(lhs);
+    if (root != nullptr && canonical_value_symbol(*root).kind == SymbolKind::Net) {
+        weak_driven_nets_.insert(static_cast<uint32_t>(signal_of(canonical_value_symbol(*root))));
+    }
+}
+
+// MOS switches pass the strength of their data input to the output (LRM 28.13),
+// and the resistive ones reduce it (28.14). Clotho has no strength on a net's
+// value, so a switch always drives at its own, strong, strength. That is only
+// visible when the output net resolves the switch against another driver, and
+// then only for a resistive switch or a data input that may be weaker than
+// strong: a net with a driver of explicit strength, a pullup / pulldown, or a
+// tri0 / tri1 net. Those cases are refused instead of resolved wrongly.
+// TODO: pass the data input's strength through MOS switches (LRM 28.13, 28.14).
+void Lowerer::reject_unmodeled_switch_strength(std::string_view  name,
+                                               const Expression& out_left,
+                                               const Expression& data,
+                                               size_t            own_drivers) {
+    const std::optional<ir::Signal> net = resolved_net_of(out_left);
+    if (!net) {
+        return;
+    }
+    // A switch alone on its net (a cmos is two drivers of its own) competes with
+    // nothing, unless the net pulls.
+    const auto driven = net_driven_.find(static_cast<uint32_t>(*net));
+    if ((driven == net_driven_.end() || driven->second.size() <= own_drivers) &&
+        !net_pull_.contains(static_cast<uint32_t>(*net))) {
+        return;
+    }
+    bool               weak_input = false;
+    const ValueSymbol* root       = lvalue_root(data);
+    if (root != nullptr) {
+        const ValueSymbol& sym = canonical_value_symbol(*root);
+        if (sym.kind == SymbolKind::Net) {
+            const NetType::NetKind k = sym.as<NetSymbol>().netType.netKind;
+            weak_input               = k == NetType::Tri0 || k == NetType::Tri1 ||
+                                       weak_driven_nets_.contains(static_cast<uint32_t>(signal_of(sym)));
+        }
+    }
+    const bool resistive = name.starts_with('r');
+    if (resistive || weak_input) {
+        fail("MOS switch '" + std::string(name) + "' shares its output net with another driver and " +
+             (resistive ? "reduces its input strength (LRM 28.14)"
+                        : "passes a weaker-than-strong input strength (LRM 28.13)") +
+             ", which is not supported: Clotho has no strength on a net value");
+    }
 }
 
 void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
@@ -2013,9 +2071,16 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
         for (const Expression* out : output_span) {
             if (out->kind == ExpressionKind::Assignment) {
                 record_net_driver(out->as<AssignmentExpression>().left());
+                if (gate_strength != 0x0303) {
+                    note_weak_driver(out->as<AssignmentExpression>().left());
+                }
             }
         }
         return;
+    }
+    if (mos) {
+        reject_unmodeled_switch_strength(
+          prim.name, output_span[0]->as<AssignmentExpression>().left(), *input_span[0], 1);
     }
     std::vector<GateInput> inputs;
     inputs.reserve(input_span.size());
