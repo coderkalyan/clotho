@@ -514,3 +514,14 @@ aborts whatever it is waiting on, and resumes it after the block, so a loop left
 `break` runs again. Clotho follows the LRM.
 
 Code: `src/ir/llvm/Inst.cpp` (`leave_blocks`). Tests: `tests/loop_test.cpp` ("an exit that skips a block's end takes the activation off its list", subcase "a `break` out of a block that a later disable names"). Oracle: iverilog 13 disagrees, as above.
+
+## 47. `foreach` with every loop variable omitted (12.7.3)
+
+12.7.3 lets any loop variable be omitted "to indicate no iteration over that
+dimension", and its example skips one dimension without changing how often the
+body runs. Taken to the case with no loop variables at all, that rule runs the body
+once, even over an empty array. The LRM never states this case. iverilog and
+Verilator both run the body zero times, and so does Clotho, with a
+`foreach-no-loop-variables` warning that the loop is poorly formed.
+
+Code: `src/lower/Statements.cpp` (`lower_foreach`). Tests: `tests/loop_test.cpp` ("foreach with no loop variables never runs its body and warns"). Oracle: iverilog 13 and Verilator 5.050 agree.

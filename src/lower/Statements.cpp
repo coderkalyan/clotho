@@ -1266,6 +1266,18 @@ void Lowerer::lower_repeat(const RepeatLoopStatement& r, ir::Builder& b) {
 // whatever indexing the body performs on the result is ordinary,
 // pre-existing ElemSelect/BitSelect lowering, untouched by this loop nest.
 void Lowerer::lower_foreach(const ForeachLoopStatement& f, ir::Builder& b) {
+    // NOTE: With every loop variable omitted, 12.7.3's skipped-dimension rule
+    // would run the body once, even over an empty array. The LRM never states the
+    // case; iverilog and Verilator both run it zero times, and so does Clotho
+    // (docs/LRM_NOTES.md note 47).
+    if (std::ranges::none_of(f.loopDims, [](const ForeachLoopStatement::LoopDim& d) { return d.loopVar != nullptr; })) {
+        report(Severity::Warning,
+               "foreach-no-loop-variables",
+               "foreach with no loop variables iterates no dimension; the LRM does not define it (12.7.3), "
+               "and its body never runs",
+               to_source_span(f.sourceRange));
+        return;
+    }
     const Restore<uint32_t> depth(loop_depth_, loop_depth_ + 1);
     lower_foreach_dim(f, 0, b);
 }

@@ -1886,6 +1886,32 @@ TEST_CASE("foreach with a skipped dimension does not iterate over it") {
     )") == "8\n");
 }
 
+// With every loop variable omitted the LRM does not define the loop (12.7.3);
+// Clotho runs it zero times, as iverilog and Verilator do, and warns.
+TEST_CASE("foreach with no loop variables never runs its body and warns") {
+    const char*       src = R"(
+        module m;
+            int d[]; int q[$]; int f[3]; int g[2][3];
+            initial begin
+                d = new[2];
+                foreach (d[]) $display("dyn");
+                foreach (q[]) $display("queue");
+                foreach (f[]) $display("fixed");
+                foreach (g[ , ]) $display("2-D");
+                $display("done");
+            end
+        endmodule
+    )";
+    const LowerResult r   = lower_text(src);
+    REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
+    size_t warnings = 0;
+    for (const Diagnostic& d : r.diagnostics) {
+        warnings += d.code == "foreach-no-loop-variables" ? 1 : 0;
+    }
+    CHECK(warnings == 4);
+    CHECK(run_capture(src) == "done\n");
+}
+
 // continue in a nested foreach applies to the innermost dimension only.
 TEST_CASE("continue in a nested foreach skips only the innermost iteration") {
     CHECK(run_capture(R"(
