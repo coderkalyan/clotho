@@ -322,7 +322,7 @@ public:
     // `fmt_fallback` set, a value matching no member renders as a decimal leaf
     // instead of "" — LRM 21.2.1.6's rule for `%p` of an enum, as against LRM
     // 6.19.2's "" for `.name()`.
-    Index enum_name(Index val, std::span<const EnumNameRow> members, bool fmt_fallback, SourceLoc loc);
+    Index enum_name(Index val, std::span<const EnumNameRow> members, bool fmt_fallback, bool is_signed, SourceLoc loc);
     // Guard a tagged-union member access against the union's current tag (LRM
     // 11.9). `tag` is the extracted tag value, `expected` the accessed member's
     // fieldIndex, `is_write` true for an assignment, `member` the accessed
@@ -473,10 +473,10 @@ public:
     // $display / $write: a literal format string, a newline flag (true for
     // $display), and the already-lowered value args its specifiers consume. The
     // backend writes to standard output.
-    Index display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
+    Index display(std::string_view fmt, bool newline, std::span<const FmtArg> args, SourceLoc loc);
     // $fdisplay / $fwrite: like display, but `fd` selects the destination
     // descriptor (an MCD or FD value).
-    Index fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc);
+    Index fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const FmtArg> args, SourceLoc loc);
     // $strobe / $strobeb / $strobeo / $strobeh (LRM 21.2.2): register the
     // zero-formal deferred-print task `func` to run once in the Postponed
     // region of the current time step. A statement, never a value.
@@ -500,7 +500,7 @@ public:
     Index monitor_set(FunctionId func, SourceLoc loc);
     // The change-detecting print inside a monitor body: render `fmt`+`args` and
     // emit to `fd` only if the rendered output changed since the last emit.
-    Index monitor_emit(Index fd, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    Index monitor_emit(Index fd, std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc);
     // $monitoron (on=true) / $monitoroff (on=false): enable / disable the monitor.
     Index monitor_enable(bool on, SourceLoc loc);
     // Two-argument $fopen: open `name` with the C stdio mode string `mode`,
@@ -523,18 +523,17 @@ public:
     Index fgets(Index dst, Index fd, SourceLoc loc);
     // $sformat / $swrite: format `args` per `fmt` and store the result into the
     // string lvalue `dst`. No value.
-    Index sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    Index sformat(Index dst, std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc);
     // $sformatf: format `args` per `fmt`. Yields a new string value.
-    Index sformatf(std::string_view fmt, std::span<const Index> args, SourceLoc loc);
+    Index sformatf(std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc);
     // The two above with a format that only exists at run time: `fmt_value` is a
     // string value the runtime renderer parses, not text known here (LRM §21.3.3
     // exempts $sformat / $sformatf from the literal-format rule). `tick_scale` is
     // the calling module's ticks-per-time-unit, which a %t operand needs and the
     // frontend can no longer pre-apply because it does not know which argument
     // will meet a %t.
-    Index sformat_dyn(Index dst, Index fmt_value, std::span<const Index> args, uint64_t tick_scale,
-                      SourceLoc loc);
-    Index sformatf_dyn(Index fmt_value, std::span<const Index> args, uint64_t tick_scale, SourceLoc loc);
+    Index sformat_dyn(Index dst, Index fmt_value, std::span<const FmtArg> args, uint64_t tick_scale, SourceLoc loc);
+    Index sformatf_dyn(Index fmt_value, std::span<const FmtArg> args, uint64_t tick_scale, SourceLoc loc);
     // %p of a queue / dynamic array: render `'{e0, e1, ...}` over the runtime
     // element count. `handle` is the container lvalue, `container_type` the
     // interned Queue / DynArray type. Yields a new string value.
@@ -571,12 +570,12 @@ public:
     // label; `banner` the compile-time prefix "<file>:<line>: "; `fmt` + `args`
     // the $display-style message (both empty for a bare `$error;`). Non-fatal,
     // renders and returns; $fatal's termination is a following finish().
-    Index severity(uint32_t               level,
-                   std::string_view       banner,
-                   std::string_view       fmt,
-                   std::span<const Index> args,
-                   SourceLoc              loc,
-                   uint32_t               defer = 0);
+    Index severity(uint32_t                level,
+                   std::string_view        banner,
+                   std::string_view        fmt,
+                   std::span<const FmtArg> args,
+                   SourceLoc               loc,
+                   uint32_t                defer = 0);
     // $fflush: flush the descriptor `handle`'s output buffers. The no-argument
     // form passes a constant 0 (the runtime flushes every open stream).
     Index fflush(Index handle, SourceLoc loc);
@@ -712,7 +711,11 @@ public:
 private:
     // Shared body of display / fdisplay: pack the format bytes, the value-arg
     // slice, and the DisplayInfo record into the extra buffer.
-    ExtraIndex display_info(std::string_view fmt, bool newline, std::span<const Index> args);
+    ExtraIndex display_info(std::string_view fmt, bool newline, std::span<const FmtArg> args);
+
+    // The operand slice of a format-family op, with one flag word per operand in
+    // `signs`.
+    ExtraSlice add_fmt_args(std::span<const FmtArg> args, ExtraSlice& signs);
 
     Index emit(const Inst& inst, SourceLoc loc) {
         const auto index = static_cast<uint32_t>(tags_.size());

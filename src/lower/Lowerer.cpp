@@ -38,9 +38,18 @@ ir::SourceLoc Lowerer::loc(const Statement& s) const {
 // rather than point at -- `--sanitize=bounds` highlights the whole index the
 // user wrote -- and the extent is sparse in the IR, so only these get one.
 ir::Index Lowerer::lower_index(const Expression& e, ir::Builder& b) {
-    const ir::Index i = lower_expr(e, b);
+    const ir::Index i = as_signed_number(lower_expr(e, b), *e.type, b, loc(e));
     b.set_end(i, to_source_loc(e.sourceRange.end()));
     return i;
+}
+
+ir::Index Lowerer::as_signed_number(ir::Index v, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l) {
+    if (t.isSigned()) {
+        return v;
+    }
+    const uint32_t width = std::max(64u, static_cast<uint32_t>(t.getBitWidth()) + 1);
+
+    return b.resize(v, make_int_type(width, t.isFourState(), /*is_signed=*/false), l);
 }
 
 // Full source extent of a symbol's declaring syntax, or a degenerate span at

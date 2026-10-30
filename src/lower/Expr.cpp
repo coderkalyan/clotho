@@ -163,7 +163,7 @@ ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
             // "Non-constant string replication count" in docs/TODO.md.
             if (is_string_expr(expr)) {
                 const ir::Index text  = lower_expr(r.concat(), b);
-                const ir::Index times = lower_expr(r.count(), b);
+                const ir::Index times = as_signed_number(lower_expr(r.count(), b), *r.count().type, b, l);
                 return b.binary(ir::Inst::Tag::StrRepl, text, times, l);
             }
             const uint64_t count = const_uint(

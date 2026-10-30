@@ -664,11 +664,11 @@ void Backend::build_agg_elem_temps() {
 void Backend::lower_dyn_array_new(Index i) {
     const auto&   p  = ir_->payload(i).op_extra;
     const auto    da = ir_->extra_data<DynArrayArg>(p.extra);
-    // A signed count sign-extends so the runtime sees the negative the design
-    // actually wrote and can reject it (LRM 7.5.1); zero-extending would turn
-    // `new[-1]` on a 32-bit int into a 4294967295-element request. An unsigned
-    // count still zero-extends.
-    llvm::Value* n = cast(must_of(value_of(da.arg)), 64, type_of(da.arg).is_signed);
+    // The count is a signed number: it sign-extends so the runtime sees the
+    // negative the design actually wrote and can reject it (LRM 7.5.1);
+    // zero-extending would turn `new[-1]` on a 32-bit int into a 4294967295-element
+    // request. The frontend zero-extends an unsigned count past its top bit.
+    llvm::Value* n = cast(must_of(value_of(da.arg)), 64, true);
     b_.CreateCall(dynarr_new_fn(),
                   { lv_handle_ptr(lvalue_of(p.op), HandleUse::Mutate),
                     elem_ops_global(da.array_type),
@@ -680,7 +680,7 @@ void Backend::lower_dyn_array_new_init(Index i) {
     const auto&   p  = ir_->payload(i).op_extra;
     const auto    da = ir_->extra_data<DynArrayNewInitInfo>(p.extra);
     // Sign-extend a signed count, as in lower_dyn_array_new.
-    llvm::Value* n = cast(must_of(value_of(da.size)), 64, type_of(da.size).is_signed);
+    llvm::Value* n = cast(must_of(value_of(da.size)), 64, true);
     // `new[n](src)` copies src's elements in, so the owner acquires every reference
     // src held. Plain `new[n]` (lower_dyn_array_new) is deliberately bare: it
     // preserves or drops elements and adds no reference. See lower_queue_push.

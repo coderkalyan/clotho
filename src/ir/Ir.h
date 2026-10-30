@@ -819,6 +819,16 @@ struct SwitchInfo {
     uint32_t pragmas;
 };
 
+// One value operand of a format-family op ($display, $sformat, $sformatf, the
+// severity tasks, ...): the value, and whether the decimal conversions print it as
+// a signed number (LRM 21.2.1.2). Signedness is the language's, not a property of
+// the value's bits, so the frontend says it here rather than the backend guessing it
+// from a type.
+struct FmtArg {
+    Index value;
+    bool  is_signed = false;
+};
+
 // Extra payload for `display` / `fdisplay`: a $display / $write / $fdisplay /
 // $fwrite system task. The format-string bytes live packed little-endian
 // (4 chars per u32 word) at `fmt` for `fmt_len` bytes; `args` is the slice of
@@ -835,6 +845,8 @@ struct DisplayInfo {
     uint32_t newline;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // One word per operand of `args`: 1 when it prints as a signed number.
+    ExtraSlice signs;
 };
 
 // Extra payload for `finish`: a $finish / $stop. `arg` is the diagnostic level
@@ -938,6 +950,8 @@ struct SeverityInfo {
     uint32_t defer;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // As DisplayInfo::signs.
+    ExtraSlice signs;
 };
 
 // Extra payload for `fseek`: $fseek(fd, offset, operation) — the descriptor is
@@ -1016,6 +1030,8 @@ struct SformatInfo {
     uint32_t fmt_len;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // As DisplayInfo::signs.
+    ExtraSlice signs;
     // The format as a runtime STRING VALUE, for the $sformat form LRM §21.3.3
     // exempts from the literal-format rule; kNoFormatValue on the ordinary path,
     // where `fmt` / `fmt_len` carry the text instead. Never both.
@@ -1035,6 +1051,8 @@ struct SformatfInfo {
     uint32_t fmt_len;
     // Value operands consumed by the format specifiers.
     ExtraSlice args;
+    // As DisplayInfo::signs.
+    ExtraSlice signs;
     // As SformatInfo::fmt_value.
     Index fmt_value;
     // As SformatInfo::tick_scale.
@@ -1156,6 +1174,9 @@ struct EnumNameInfo {
     // — LRM 21.2.1.6's rule for `%p` of an enum, against LRM 6.19.2's "" for
     // `.name()`.
     uint32_t fmt_fallback;
+    // Nonzero when the enum's base type is signed, so the decimal fallback prints
+    // a negative value with its sign.
+    uint32_t is_signed;
 };
 
 // One member of a tagged union's name table, in tag order (its slang
@@ -3140,6 +3161,13 @@ public:
     // The instructions of a region (e.g. a cond's then/else branch), in order.
     std::span<const Index> region(ExtraSlice r) const {
         return index_slice(r);
+    }
+
+    // A slice of the extra table holding plain words rather than operands (the
+    // per-operand flags of a format-family op).
+    std::span<const uint32_t> words(ExtraSlice r) const {
+        const auto a = static_cast<uint32_t>(r.start);
+        return { extra_.data() + a, static_cast<uint32_t>(r.end) - a };
     }
 
     // Decode a struct previously written with Builder::add_extra.

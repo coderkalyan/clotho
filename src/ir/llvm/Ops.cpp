@@ -129,14 +129,13 @@ Backend::SelectVerdict Backend::set_select_bounds(LValue&      lv,
 // reaches. The frontend hands over an operand wider than 32 bits only when a
 // 32-bit offset could not hold its arithmetic.
 llvm::Value* Backend::select_index(Plane idx, ValueType t) {
+    // An offset is a signed number: the frontend zero-extends an unsigned index
+    // past its top bit, and builds a wide offset in a signed type.
     llvm::Value* m = must_of(idx);
     if (t.width <= 32) {
-        return cast(m, 32, t.is_signed);
+        return cast(m, 32, true);
     }
     llvm::Value* hi = llvm::ConstantInt::get(m->getType(), INT32_MAX);
-    if (!t.is_signed) {
-        return cast(b_.CreateSelect(b_.CreateICmpULT(m, hi), m, hi), 32, false);
-    }
     return cast(smax(smin(m, hi), llvm::ConstantInt::getSigned(m->getType(), INT32_MIN)), 32, false);
 }
 
@@ -149,7 +148,7 @@ Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValueType t, uint32_t left, 
     const bool     ascending = left <= right;
     const uint32_t count     = (ascending ? right - left : left - right) + 1;
     const uint32_t ew        = std::max(64u, t.width + 2);
-    llvm::Value*   v         = cast(must_of(idx), ew, t.is_signed);
+    llvm::Value*   v         = cast(must_of(idx), ew, true);
     llvm::Value*   bound     = llvm::ConstantInt::getSigned(int_ty(ew), static_cast<int32_t>(left));
     llvm::Value*   norm      = ascending ? b_.CreateSub(v, bound) : b_.CreateSub(bound, v);
     // An unsigned compare also rejects a normalized index that went negative.
@@ -162,7 +161,7 @@ Backend::ElemPos Backend::fixed_elem_pos(Plane idx, ValueType t, uint32_t left, 
 Backend::ElemBelow Backend::elem_index_below(Plane idx, ValueType t, llvm::Value* len) {
     llvm::Value* m = must_of(idx);
     if (t.width <= 64) {
-        llvm::Value* idx64 = cast(m, 64, t.is_signed);
+        llvm::Value* idx64 = cast(m, 64, true);
         return { idx64, b_.CreateICmpULT(idx64, len) };
     }
     // Wider than the length: compare there, so the dropped high bits count.

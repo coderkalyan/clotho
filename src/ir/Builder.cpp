@@ -561,8 +561,11 @@ Index Builder::str_to_packed(Index str, Ref type, SourceLoc loc) {
     return emit({ Inst::Tag::StrToPacked, Inst::Payload{ .op_type = { str, type } } }, loc);
 }
 
-Index Builder::enum_name(Index val, std::span<const EnumNameRow> members, bool fmt_fallback,
-                         SourceLoc loc) {
+Index Builder::enum_name(Index                        val,
+                         std::span<const EnumNameRow> members,
+                         bool                         fmt_fallback,
+                         bool                         is_signed,
+                         SourceLoc                    loc) {
     // Pack each member's value + name bytes first, remembering where they landed,
     // then pack the entry records contiguously so they form one ExtraSlice. The
     // byte payloads and the records share the extra buffer but never overlap.
@@ -588,7 +591,7 @@ Index Builder::enum_name(Index val, std::span<const EnumNameRow> members, bool f
     const auto end = static_cast<ExtraIndex>(extra_.size());
 
     const ExtraIndex extra =
-      add_extra(EnumNameInfo{ ExtraSlice{ start, end }, fmt_fallback ? 1u : 0u });
+      add_extra(EnumNameInfo{ ExtraSlice{ start, end }, fmt_fallback ? 1u : 0u, is_signed ? 1u : 0u });
 
     return emit({ Inst::Tag::EnumName, Inst::Payload{ .op_extra = { val, extra } } }, loc);
 }
@@ -783,12 +786,12 @@ Index Builder::sync_ctl(SyncOp op, uint32_t site, std::span<const Index> args, S
     return emit({ Inst::Tag::SyncCtl, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::display(std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
+Index Builder::display(std::string_view fmt, bool newline, std::span<const FmtArg> args, SourceLoc loc) {
     // $display / $write: no descriptor operand; the backend targets standard output.
     return emit({ Inst::Tag::Display, pay(&Inst::Payload::extra, display_info(fmt, newline, args)) }, loc);
 }
 
-Index Builder::fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const Index> args, SourceLoc loc) {
+Index Builder::fdisplay(Index fd, std::string_view fmt, bool newline, std::span<const FmtArg> args, SourceLoc loc) {
     // $fdisplay / $fwrite: `fd` selects the destination descriptor.
     return emit({ Inst::Tag::FDisplay, Inst::Payload{ .op_extra = { fd, display_info(fmt, newline, args) } } }, loc);
 }
@@ -813,7 +816,7 @@ Index Builder::monitor_set(FunctionId func, SourceLoc loc) {
     return emit({ Inst::Tag::MonitorSet, pay(&Inst::Payload::extra, add_extra(StrobePendInfo{ func })) }, loc);
 }
 
-Index Builder::monitor_emit(Index fd, std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
+Index Builder::monitor_emit(Index fd, std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc) {
     return emit(
       { Inst::Tag::MonitorEmit, Inst::Payload{ .op_extra = { fd, display_info(fmt, /*newline=*/true, args) } } }, loc);
 }
@@ -822,13 +825,28 @@ Index Builder::monitor_enable(bool on, SourceLoc loc) {
     return emit({ on ? Inst::Tag::MonitorOn : Inst::Tag::MonitorOff, Inst::Payload{} }, loc);
 }
 
-ExtraIndex Builder::display_info(std::string_view fmt, bool newline, std::span<const Index> args) {
-    // Order in the extra buffer: format bytes, then the arg-index slice, then the
-    // DisplayInfo record pointing at both. None of the three regions overlap.
-    const ExtraIndex fmt_at = add_bytes(fmt);
-    const ExtraSlice slice  = add_slice(args);
+ExtraSlice Builder::add_fmt_args(std::span<const FmtArg> args, ExtraSlice& signs) {
+    std::vector<Index>    values;
+    std::vector<uint32_t> flags;
+    values.reserve(args.size());
+    flags.reserve(args.size());
+    for (const FmtArg& a : args) {
+        values.push_back(a.value);
+        flags.push_back(a.is_signed ? 1u : 0u);
+    }
+    signs = add_u32_slice(flags);
 
-    return add_extra(DisplayInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, slice });
+    return add_slice(values);
+}
+
+ExtraIndex Builder::display_info(std::string_view fmt, bool newline, std::span<const FmtArg> args) {
+    // Order in the extra buffer: format bytes, then the arg-index slice and its
+    // flags, then the DisplayInfo record pointing at all three.
+    const ExtraIndex fmt_at = add_bytes(fmt);
+    ExtraSlice       signs;
+    const ExtraSlice slice = add_fmt_args(args, signs);
+
+    return add_extra(DisplayInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), newline ? 1u : 0u, slice, signs });
 }
 
 Index Builder::fopen_fd(Index name, Index mode, SourceLoc loc) {
@@ -853,42 +871,48 @@ Index Builder::fgets(Index dst, Index fd, SourceLoc loc) {
     return emit({ Inst::Tag::Fgets, Inst::Payload{ .binary = { dst, fd } } }, loc);
 }
 
-Index Builder::sformat(Index dst, std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
-    // Order in the extra buffer: format bytes, then the arg-index slice, then the
-    // SformatInfo record pointing at both.
+Index Builder::sformat(Index dst, std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc) {
+    // Order in the extra buffer: format bytes, then the arg-index slice and its
+    // flags, then the SformatInfo record pointing at all three.
     const ExtraIndex fmt_at = add_bytes(fmt);
-    const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra  = add_extra(SformatInfo{ dst, fmt_at, static_cast<uint32_t>(fmt.size()), slice,
-                                                     kNoFormatValue, TickScale::of(1) });
+    ExtraSlice       signs;
+    const ExtraSlice slice = add_fmt_args(args, signs);
+    const ExtraIndex extra = add_extra(
+      SformatInfo{ dst, fmt_at, static_cast<uint32_t>(fmt.size()), slice, signs, kNoFormatValue, TickScale::of(1) });
 
     return emit({ Inst::Tag::Sformat, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::sformatf(std::string_view fmt, std::span<const Index> args, SourceLoc loc) {
+Index Builder::sformatf(std::string_view fmt, std::span<const FmtArg> args, SourceLoc loc) {
     const ExtraIndex fmt_at = add_bytes(fmt);
-    const ExtraSlice slice  = add_slice(args);
-    const ExtraIndex extra  = add_extra(SformatfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), slice,
-                                                      kNoFormatValue, TickScale::of(1) });
+    ExtraSlice       signs;
+    const ExtraSlice slice = add_fmt_args(args, signs);
+    const ExtraIndex extra = add_extra(
+      SformatfInfo{ fmt_at, static_cast<uint32_t>(fmt.size()), slice, signs, kNoFormatValue, TickScale::of(1) });
 
     return emit({ Inst::Tag::Sformatf, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::sformat_dyn(Index dst, Index fmt_value, std::span<const Index> args, uint64_t tick_scale,
-                           SourceLoc loc) {
+Index Builder::sformat_dyn(Index                   dst,
+                           Index                   fmt_value,
+                           std::span<const FmtArg> args,
+                           uint64_t                tick_scale,
+                           SourceLoc               loc) {
     // No format bytes to add: `fmt` / `fmt_len` name an empty run, and fmt_value
     // carries the format instead.
-    const ExtraSlice slice = add_slice(args);
-    const ExtraIndex extra = add_extra(
-      SformatInfo{ dst, ExtraIndex{ 0 }, 0, slice, fmt_value, TickScale::of(tick_scale) });
+    ExtraSlice       signs;
+    const ExtraSlice slice = add_fmt_args(args, signs);
+    const ExtraIndex extra =
+      add_extra(SformatInfo{ dst, ExtraIndex{ 0 }, 0, slice, signs, fmt_value, TickScale::of(tick_scale) });
 
     return emit({ Inst::Tag::Sformat, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::sformatf_dyn(Index fmt_value, std::span<const Index> args, uint64_t tick_scale,
-                            SourceLoc loc) {
-    const ExtraSlice slice = add_slice(args);
+Index Builder::sformatf_dyn(Index fmt_value, std::span<const FmtArg> args, uint64_t tick_scale, SourceLoc loc) {
+    ExtraSlice       signs;
+    const ExtraSlice slice = add_fmt_args(args, signs);
     const ExtraIndex extra =
-      add_extra(SformatfInfo{ ExtraIndex{ 0 }, 0, slice, fmt_value, TickScale::of(tick_scale) });
+      add_extra(SformatfInfo{ ExtraIndex{ 0 }, 0, slice, signs, fmt_value, TickScale::of(tick_scale) });
 
     return emit({ Inst::Tag::Sformatf, pay(&Inst::Payload::extra, extra) }, loc);
 }
@@ -943,24 +967,26 @@ Index Builder::case_violation(std::string_view banner, uint32_t kind, SourceLoc 
     return emit({ Inst::Tag::CaseViol, pay(&Inst::Payload::extra, extra) }, loc);
 }
 
-Index Builder::severity(uint32_t               level,
-                        std::string_view       banner,
-                        std::string_view       fmt,
-                        std::span<const Index> args,
-                        SourceLoc              loc,
-                        uint32_t               defer) {
+Index Builder::severity(uint32_t                level,
+                        std::string_view        banner,
+                        std::string_view        fmt,
+                        std::span<const FmtArg> args,
+                        SourceLoc               loc,
+                        uint32_t                defer) {
     // Order in the extra buffer: banner bytes, format bytes, then the arg-index
-    // slice, then the SeverityInfo record pointing at all three.
+    // slice and its flags, then the SeverityInfo record pointing at all of them.
     const ExtraIndex banner_at = add_bytes(banner);
     const ExtraIndex fmt_at    = add_bytes(fmt);
-    const ExtraSlice slice     = add_slice(args);
-    const ExtraIndex extra     = add_extra(SeverityInfo{ banner_at,
-                                                         static_cast<uint32_t>(banner.size()),
-                                                         fmt_at,
-                                                         static_cast<uint32_t>(fmt.size()),
-                                                         level,
-                                                         defer,
-                                                         slice });
+    ExtraSlice       signs;
+    const ExtraSlice slice = add_fmt_args(args, signs);
+    const ExtraIndex extra = add_extra(SeverityInfo{ banner_at,
+                                                     static_cast<uint32_t>(banner.size()),
+                                                     fmt_at,
+                                                     static_cast<uint32_t>(fmt.size()),
+                                                     level,
+                                                     defer,
+                                                     slice,
+                                                     signs });
     return emit({ Inst::Tag::Severity, pay(&Inst::Payload::extra, extra) }, loc);
 }
 

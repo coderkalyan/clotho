@@ -2327,8 +2327,9 @@ void Backend::lower_task_call_inst(Index i) {
 // fields point into that buffer, so an operand of any width is passed in full.
 // Returns the descriptor array pointer (null when there are no operands).
 // `who` is unused now that no width is rejected; kept for call-site clarity.
-llvm::Value* Backend::build_rt_args(std::span<const Index> args, const char* /*who*/) {
+llvm::Value* Backend::build_rt_args(std::span<const Index> args, std::span<const uint32_t> signs) {
     const auto n = static_cast<uint32_t>(args.size());
+    assert(signs.size() == args.size());
     if (n == 0) {
         return llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx_));
     }
@@ -2401,7 +2402,7 @@ llvm::Value* Backend::build_rt_args(std::span<const Index> args, const char* /*w
         llvm::Value* must = must_of(p);
         llvm::Value* xz   = b_.CreateXor(must, may_of(p));
         store_field(sty, elt, 0, b_.getInt32(t.width));
-        store_field(sty, elt, 1, b_.getInt32(t.is_signed ? 1u : 0u));
+        store_field(sty, elt, 1, b_.getInt32(signs[k] != 0 ? 1u : 0u));
         store_field(sty, elt, 2, put(must, words[k]));
         store_field(sty, elt, 3, put(xz, words[k]));
         store_field(sty, elt, 4, put(z_of(p), words[k]));

@@ -448,7 +448,7 @@ void Backend::lower_severity(Index i) {
     const std::string fmt    = ir_->extra_bytes(info.fmt, info.fmt_len);
 
     const std::span<const Index> args = ir_->region(info.args);
-    llvm::Value*                 arr  = build_rt_args(args, "severity task");
+    llvm::Value*                 arr  = build_rt_args(args, ir_->words(info.signs));
     if (info.defer == 0) {
         b_.CreateCall(severity_fn(), { b_.getInt32(static_cast<int32_t>(info.level)),
                                        b_.CreateGlobalString(banner), b_.CreateGlobalString(fmt),
@@ -757,7 +757,7 @@ void Backend::lower_sformat(Index i) {
     const auto info = ir_->extra_data<SformatInfo>(ir_->payload(i).extra);
 
     const std::span<const Index> args = ir_->region(info.args);
-    llvm::Value*                 arr  = build_rt_args(args, "$sformat / $swrite");
+    llvm::Value*                 arr  = build_rt_args(args, ir_->words(info.signs));
     llvm::Value*                 argc = b_.getInt32(static_cast<uint32_t>(args.size()));
     const FormatArg f = format_arg(i, info.fmt_value, info.fmt, info.fmt_len, info.tick_scale);
     const LValue&   lv = lvalue_of(info.dst);
@@ -780,7 +780,7 @@ void Backend::lower_sformatf(Index i) {
     const auto info = ir_->extra_data<SformatfInfo>(ir_->payload(i).extra);
 
     const std::span<const Index> args = ir_->region(info.args);
-    llvm::Value*                 arr  = build_rt_args(args, "$sformatf");
+    llvm::Value*                 arr  = build_rt_args(args, ir_->words(info.signs));
     const FormatArg f = format_arg(i, info.fmt_value, info.fmt, info.fmt_len, info.tick_scale);
     b_.CreateCall(sformat_str_fn(),
                   { str_of(i), f.fmt, b_.getInt32(static_cast<uint32_t>(args.size())), arr,
@@ -1206,7 +1206,7 @@ void Backend::emit_display_to(const DisplayInfo& info, llvm::Value* desc, llvm::
         fmt += '\n';
     }
     const std::span<const Index> args    = ir_->region(info.args);
-    llvm::Value*                 arr     = build_rt_args(args, "$display / $write");
+    llvm::Value*                 arr     = build_rt_args(args, ir_->words(info.signs));
     llvm::Value*                 fmt_ptr = b_.CreateGlobalString(fmt);
     b_.CreateCall(sink, { desc, fmt_ptr, b_.getInt32(static_cast<uint32_t>(args.size())), arr });
 }

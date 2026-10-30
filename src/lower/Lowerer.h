@@ -1133,6 +1133,13 @@ private:
 
     ir::Index lower_index(const Expression& e, ir::Builder& b);
 
+    // An operand the backend reads as a SIGNED number -- an index, a size, a count.
+    // A signed value passes through, and the backend sign-extends it; an unsigned
+    // one is zero-extended one bit past its width (at least to 64 bits first), so
+    // that reading is exact and the top bit of an unsigned value is never taken for
+    // a sign.
+    ir::Index as_signed_number(ir::Index v, const slang::ast::Type& t, ir::Builder& b, ir::SourceLoc l);
+
     static ir::SourceSpan span_of(const Symbol& sym);
 
     std::string finish_banner(const Expression& call, std::string_view task) const;
@@ -3509,37 +3516,37 @@ private:
 
     void append_format_literal(std::string& fmt, std::string_view text, std::vector<char>& pending);
 
-    void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args, ir::Builder& b);
+    void expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::FmtArg>& args, ir::Builder& b);
 
     static const Scope& union_scope(const slang::ast::Type& ct);
 
     ir::Index packed_slice(ir::Index v, uint32_t lsb, ir::Ref fty, ir::Builder& b, ir::SourceLoc l);
 
-    bool expand_p_packed(ir::Index               v,
-                         const slang::ast::Type& sty,
-                         std::string&            frag,
-                         std::vector<ir::Index>& args,
-                         ir::Builder&            b,
-                         ir::SourceLoc           l);
+    bool expand_p_packed(ir::Index                v,
+                         const slang::ast::Type&  sty,
+                         std::string&             frag,
+                         std::vector<ir::FmtArg>& args,
+                         ir::Builder&             b,
+                         ir::SourceLoc            l);
 
     static std::optional<std::string_view> handle_p_name(const slang::ast::Type& ct);
 
     ir::Index handle_p_render(ir::Index v, std::string_view name, ir::Builder& b, ir::SourceLoc l);
 
-    void expand_p_scalar(ir::Index               v,
-                         const slang::ast::Type& sty,
-                         std::string&            frag,
-                         std::vector<ir::Index>& args,
-                         ir::Builder&            b,
-                         ir::SourceLoc           l);
+    void expand_p_scalar(ir::Index                v,
+                         const slang::ast::Type&  sty,
+                         std::string&             frag,
+                         std::vector<ir::FmtArg>& args,
+                         ir::Builder&             b,
+                         ir::SourceLoc            l);
 
-    void expand_p_lvalue(ir::Index               lv,
-                         ir::Ref                 ty,
-                         const slang::ast::Type* sty,
-                         std::string&            frag,
-                         std::vector<ir::Index>& args,
-                         ir::Builder&            b,
-                         ir::SourceLoc           l);
+    void expand_p_lvalue(ir::Index                lv,
+                         ir::Ref                  ty,
+                         const slang::ast::Type*  sty,
+                         std::string&             frag,
+                         std::vector<ir::FmtArg>& args,
+                         ir::Builder&             b,
+                         ir::SourceLoc            l);
 
     ir::Index build_container_p_string(ir::Index               lv,
                                        ir::Ref                 ty,
@@ -3559,7 +3566,7 @@ private:
 
     void build_format(std::span<const Expression* const> format_args,
                       std::string&                       fmt,
-                      std::vector<ir::Index>&            args,
+                      std::vector<ir::FmtArg>&           args,
                       ir::Builder&                       b,
                       char                               default_conv = 'd',
                       std::string_view                   lead_text    = {});
@@ -3589,7 +3596,7 @@ private:
     ir::Index lower_dynamic_format(const Expression&                  fmt_expr,
                                    std::span<const Expression* const> value_args,
                                    size_t                             first_pos,
-                                   std::vector<ir::Index>&            args,
+                                   std::vector<ir::FmtArg>&           args,
                                    ir::Builder&                       b,
                                    std::string_view                   who);
 

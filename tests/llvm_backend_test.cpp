@@ -3919,11 +3919,13 @@ TEST_CASE("backend lowers string signals, constants, and string ops (hand-built 
     b.binary(Inst::Tag::Store, sig, k, loc);
     const Index v   = b.unary(Inst::Tag::Load, sig, loc);
     const Index len = b.unary(Inst::Tag::StrLen, v, loc);
-    b.display("%0d", true, std::span<const Index>{ &len, 1 }, loc);
+    const FmtArg len_arg{ len, /*is_signed=*/true };
+    b.display("%0d", true, std::span<const FmtArg>{ &len_arg, 1 }, loc);
     const Index up  = b.unary(Inst::Tag::StrUpper, v, loc);
     const Index idx = b.constant(mod->pool.put_int(int_ty, 4), loc);
     const Index ch  = b.binary(Inst::Tag::StrGetc, up, idx, loc);
-    b.display("%c", true, std::span<const Index>{ &ch, 1 }, loc);
+    const FmtArg ch_arg{ ch, /*is_signed=*/true };
+    b.display("%c", true, std::span<const FmtArg>{ &ch_arg, 1 }, loc);
 
     mod->add_process(Process{ .activation = Activation::Initial, .ir = b.finish() });
 
@@ -4124,7 +4126,7 @@ constexpr auto kLoc = static_cast<ir::SourceLoc>(0);
 
 // Append an initial process that %0d-displays `v` (an int-typed value in `b`).
 void display_int(ir::Builder& b, ir::Index v) {
-    const std::array<ir::Index, 1> args{ v };
+    const std::array<ir::FmtArg, 1> args{ ir::FmtArg{ v, /*is_signed=*/true } };
     b.display("%0d", true, args, kLoc);
 }
 
@@ -4313,12 +4315,12 @@ TEST_CASE("real display marshals through rt_fwrite with %g / %f") {
     ir::Builder b(m);
     const auto real = [&](double v) { return b.constant(m.pool.put_real(m.pool.real_type, v), kLoc); };
 
-    const std::array<ir::Index, 2> args{ real(3.6), real(0.25) };
+    const std::array<ir::FmtArg, 2> args{ ir::FmtArg{ real(3.6) }, ir::FmtArg{ real(0.25) } };
     b.display("%g %f", true, args, kLoc);
 
     // A shortreal marshals by widening to double.
     const ir::Index sr = b.float_cvt(ir::Inst::Tag::FResize, real(1.5), m.pool.shortreal_type, kLoc);
-    const std::array<ir::Index, 1> args2{ sr };
+    const std::array<ir::FmtArg, 1> args2{ ir::FmtArg{ sr } };
     b.display("%g", true, args2, kLoc);
 
     m.add_process(ir::Process{ .activation = ir::Activation::Initial, .span = { kLoc, kLoc }, .ir = b.finish() });

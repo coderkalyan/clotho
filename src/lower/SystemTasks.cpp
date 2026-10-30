@@ -510,8 +510,11 @@ ir::Index Lowerer::lower_enum_method(std::string_view            name,
         // `.name()` yields "" for a non-member value (LRM 6.19.2), so no
         // format fallback — that is `%p`'s rule, not this method's.
         const EnumNameTable tbl = enum_name_table(et);
-        return b.enum_name(lower_expr(*call.arguments()[0], b), tbl.rows,
-                           /*fmt_fallback=*/false, l);
+        return b.enum_name(lower_expr(*call.arguments()[0], b),
+                           tbl.rows,
+                           /*fmt_fallback=*/false,
+                           call.arguments()[0]->type->isSigned(),
+                           l);
     }
 
     // next(N)/prev(N) (LRM 6.19.5): the Nth member after/before the current
@@ -1802,7 +1805,7 @@ void Lowerer::append_format_literal(std::string& fmt, std::string_view text, std
 // lowered one because taggedness, member names, and enum membership live only in
 // the AST — `ir::Type` keeps a tagged union indistinguishable from a plain packed
 // union by design (docs/design/tagged-unions.md).
-void Lowerer::expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::Index>& args, ir::Builder& b) {
+void Lowerer::expand_p_arg(const Expression& arg, std::string& frag, std::vector<ir::FmtArg>& args, ir::Builder& b) {
     if (const Expression& src = unwrap_conversion(arg); src.kind == ExpressionKind::StringLiteral) {
         // "A string data type or string literal shall print its value as a string
         // enclosed in quotes." A bare literal is an integral packed value (LRM
@@ -1863,12 +1866,12 @@ ir::Index Lowerer::packed_slice(ir::Index v, uint32_t lsb, ir::Ref fty, ir::Buil
 // Render a singular (packed) operand under `%p` from its rvalue, for the four
 // cases LRM 21.2.1.6 names explicitly. Returns false for anything else, which
 // the caller renders as an ordinary integral / real leaf.
-bool Lowerer::expand_p_packed(ir::Index               v,
-                              const slang::ast::Type& sty,
-                              std::string&            frag,
-                              std::vector<ir::Index>& args,
-                              ir::Builder&            b,
-                              ir::SourceLoc           l) {
+bool Lowerer::expand_p_packed(ir::Index                v,
+                              const slang::ast::Type&  sty,
+                              std::string&             frag,
+                              std::vector<ir::FmtArg>& args,
+                              ir::Builder&             b,
+                              ir::SourceLoc            l) {
     const slang::ast::Type& ct = sty.getCanonicalType();
     if (ct.isTaggedUnion()) {
         // "In the case of a tagged union, it shall print "tag:value" along with
@@ -1884,8 +1887,8 @@ bool Lowerer::expand_p_packed(ir::Index               v,
             rows.push_back({ f.name, mt.isVoid() ? 0u : static_cast<uint32_t>(mt.getBitWidth()), mt.isSigned() });
         }
         frag += "'{%s}";
-        args.push_back(b.tagged_fmt_p(v, module_.pool.layout(lower_type(sty)).width,
-                                      union_tag_bits(ct), rows, l));
+        args.push_back(
+          { b.tagged_fmt_p(v, module_.pool.layout(lower_type(sty)).width, union_tag_bits(ct), rows, l), false });
         return true;
     }
     if (ct.isPackedUnion() || ct.isUnpackedUnion()) {
@@ -1934,7 +1937,7 @@ bool Lowerer::expand_p_packed(ir::Index               v,
         // runtime applies when no member matches.
         frag += "%s";
         const EnumNameTable tbl = enum_name_table(ct.as<slang::ast::EnumType>());
-        args.push_back(b.enum_name(v, tbl.rows, /*fmt_fallback=*/true, l));
+        args.push_back({ b.enum_name(v, tbl.rows, /*fmt_fallback=*/true, sty.isSigned(), l), false });
         return true;
     }
     return false;
@@ -1998,12 +2001,12 @@ ir::Index Lowerer::handle_p_render(ir::Index v, std::string_view name, ir::Build
 // integral leaf prints "as [it] would unformatted", i.e. minimal decimal signed
 // with the operand's own signedness (21.2.1.1); a real the same way (%g, note
 // 26); a string "as a string enclosed in quotes".
-void Lowerer::expand_p_scalar(ir::Index               v,
-                              const slang::ast::Type& sty,
-                              std::string&            frag,
-                              std::vector<ir::Index>& args,
-                              ir::Builder&            b,
-                              ir::SourceLoc           l) {
+void Lowerer::expand_p_scalar(ir::Index                v,
+                              const slang::ast::Type&  sty,
+                              std::string&             frag,
+                              std::vector<ir::FmtArg>& args,
+                              ir::Builder&             b,
+                              ir::SourceLoc            l) {
     if (expand_p_packed(v, sty, frag, args, b, l)) {
         return;
     }
@@ -2054,7 +2057,7 @@ void Lowerer::expand_p_scalar(ir::Index               v,
             // one depth where a cycle cannot be reached in one step), leaving
             // nested handles as names.
             frag += "%s";
-            args.push_back(handle_p_render(v, *hn, b, l));
+            args.push_back({ handle_p_render(v, *hn, b, l), false });
             return;
         }
         if (is_handle_ref(cl) || is_agg_abi_ref(cl)) {
@@ -2074,7 +2077,7 @@ void Lowerer::expand_p_scalar(ir::Index               v,
     } else {
         frag += "%0d";
     }
-    args.push_back(v);
+    args.push_back({ v, sty.isSigned() });
 }
 
 // `sty`, when non-null, is the slang type matching `ty`; it is threaded down so
@@ -2082,13 +2085,13 @@ void Lowerer::expand_p_scalar(ir::Index               v,
 // rendered per LRM 21.2.1.6 (none of which `ir::Type` can distinguish). Null
 // only where the slang type is genuinely unavailable, which falls back to the
 // plain integral leaf.
-void Lowerer::expand_p_lvalue(ir::Index               lv,
-                              ir::Ref                 ty,
-                              const slang::ast::Type* sty,
-                              std::string&            frag,
-                              std::vector<ir::Index>& args,
-                              ir::Builder&            b,
-                              ir::SourceLoc           l) {
+void Lowerer::expand_p_lvalue(ir::Index                lv,
+                              ir::Ref                  ty,
+                              const slang::ast::Type*  sty,
+                              std::string&             frag,
+                              std::vector<ir::FmtArg>& args,
+                              ir::Builder&             b,
+                              ir::SourceLoc            l) {
     const ir::Type t = std::get<ir::Type>(module_.pool.get(ty));
     if (t.kind == ir::Type::Kind::UnpackedArray) {
         const slang::ast::Type* est =
@@ -2165,12 +2168,12 @@ void Lowerer::expand_p_lvalue(ir::Index               lv,
                                               elem_is_handle ||
                                               (est != nullptr && est->isTaggedUnion());
         if (loop_render && value_cat(t.element) != ValueCat::string) {
-            args.push_back(build_container_p_string(lv, ty, t, sty, b, l));
+            args.push_back({ build_container_p_string(lv, ty, t, sty, b, l), false });
             return;
         }
         // What is left is exactly what the flat descriptor describes: a scalar
         // of one word or less, a real, or a string.
-        args.push_back(b.container_fmt_p(lv, ty, l));
+        args.push_back({ b.container_fmt_p(lv, ty, l), false });
         return;
     }
     if (t.kind == ir::Type::Kind::Assoc) {
@@ -2182,7 +2185,7 @@ void Lowerer::expand_p_lvalue(ir::Index               lv,
         // So it takes the same IR-loop render a container with a non-flat element
         // already takes -- see build_assoc_p_string.
         frag += "%s";
-        args.push_back(build_assoc_p_string(lv, ty, t, sty, b, l));
+        args.push_back({ build_assoc_p_string(lv, ty, t, sty, b, l), false });
         return;
     }
     if (value_cat(ty) != ValueCat::scalar && value_cat(ty) != ValueCat::string) {
@@ -2199,7 +2202,8 @@ void Lowerer::expand_p_lvalue(ir::Index               lv,
         return;
     }
     frag += module_.pool.is_float(ty) ? "%g" : value_cat(ty) == ValueCat::string ? "\"%s\"" : "%0d";
-    args.push_back(v);
+    // No slang type: a leaf the walk could not name, which prints as an unsigned number.
+    args.push_back({ v, false });
 }
 
 // `%p` of a container whose element is an aggregate or a nested container, as a
@@ -2258,7 +2262,7 @@ ir::Index Lowerer::build_container_p_string(ir::Index               lv,
     const ir::ExtraSlice nosep_r = b.close_region();
     b.cond(b.binary(T::Ne, k, b.constant(module_.pool.put_int(i32, 0), l), l), sep_r, nosep_r, l);
     std::string            efrag;
-    std::vector<ir::Index> eargs;
+    std::vector<ir::FmtArg> eargs;
     expand_p_lvalue(b.elem_select(lv, k, ty, l), t.element, est, efrag, eargs, b, l);
     append(b.sformatf(efrag, eargs, l));
     const ir::ExtraSlice body = b.close_region();
@@ -2349,7 +2353,7 @@ ir::Index Lowerer::build_assoc_p_string(ir::Index               lv,
     const ir::Index more_one    = b.constant(module_.pool.put_int(bit1, 1), l);
     b.binary(T::Store, more_set_lv, more_one, l);
     std::string            efrag;
-    std::vector<ir::Index> eargs;
+    std::vector<ir::FmtArg> eargs;
     // The key prints by the same leaf rules as any other %p element, so an enum
     // key prints its name and a string key prints quoted. An unpacked struct /
     // fixed array key has no plane value to Load -- same split key_operand()
@@ -2364,7 +2368,8 @@ ir::Index Lowerer::build_assoc_p_string(ir::Index               lv,
     // which types are legal KEYS.
     if (kst == nullptr) {
         efrag += "%0d";
-        eargs.push_back(b.unary(T::Load, key.lv(b, l), l));
+        // A wildcard index (`[*]`) has no slang type; its keys are unsigned.
+        eargs.push_back({ b.unary(T::Load, key.lv(b, l), l), false });
     } else if (is_agg_abi_ref(kr)) {
         expand_p_lvalue(key.lv(b, l), kr, kst, efrag, eargs, b, l);
     } else {
@@ -2420,7 +2425,7 @@ std::pair<size_t, size_t> Lowerer::find_p_spec(std::string_view fmt) {
 // expansion, and queues its specifiers for the value args that follow.
 void Lowerer::build_format(std::span<const Expression* const> format_args,
                            std::string&                       fmt,
-                           std::vector<ir::Index>&            args,
+                           std::vector<ir::FmtArg>&           args,
                            ir::Builder&                       b,
                            char                               default_conv,
                            std::string_view                   lead_text) {
@@ -2489,6 +2494,9 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
             const bool          real_conv =
               conv == 'e' || conv == 'E' || conv == 'f' || conv == 'F' || conv == 'g' || conv == 'G';
             ir::Index v = lower_expr(*arg, b);
+            // Whether the decimal conversions print `v` as a signed number: the
+            // argument's own signedness, unless it is converted below.
+            bool v_signed = arg->type->isSigned();
             if (fl && !real_conv) {
                 switch (conv) {
                     case 'd':
@@ -2506,7 +2514,8 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                         // shared integer path below. Signed 64-bit keeps
                         // negatives printing as two's complement (matches
                         // iverilog: -3.7 under %h is fffffffffffffffc).
-                        v = b.float_cvt(ir::Inst::Tag::FtoI, v, make_int_type(64, false, true), al);
+                        v        = b.float_cvt(ir::Inst::Tag::FtoI, v, make_int_type(64, false, true), al);
+                        v_signed = true;
                         break;
                     case 't':
                         break; // scale_to_ticks below has the real path
@@ -2523,9 +2532,11 @@ void Lowerer::build_format(std::span<const Expression* const> format_args,
                   arg->type->isSigned() ? ir::Inst::Tag::SItoF : ir::Inst::Tag::UItoF, v, module_.pool.real_type, al);
             }
             if (conv == 't') {
-                v = scale_to_ticks(*arg, v, b);
+                // The scaled tick count is an unsigned 64-bit value.
+                v        = scale_to_ticks(*arg, v, b);
+                v_signed = false;
             }
-            args.push_back(v);
+            args.push_back({ v, v_signed });
         }
     }
     if (next < pending.size()) {
@@ -2560,7 +2571,7 @@ void Lowerer::emit_severity(ir::Severity                       level,
                             const CallExpression&              call,
                             ir::Builder&                       b) {
     std::string            fmt;
-    std::vector<ir::Index> args;
+    std::vector<ir::FmtArg> args;
     build_format(msg_args, fmt, args, b);
     b.severity(static_cast<uint32_t>(level), banner, fmt, args, loc(call));
 }
@@ -2596,7 +2607,7 @@ void Lowerer::lower_severity_task(const CallExpression& call, std::string_view n
 
 void Lowerer::lower_display(const CallExpression& call, bool newline, ir::Builder& b, char default_conv) {
     std::string            fmt;
-    std::vector<ir::Index> args;
+    std::vector<ir::FmtArg> args;
     build_format(call.arguments(), fmt, args, b, default_conv);
     b.display(fmt, newline, args, loc(call));
 }
@@ -2647,7 +2658,7 @@ void Lowerer::lower_fdisplay(const CallExpression& call, bool newline, ir::Build
     }
     const ir::Index        fd = lower_expr(*args_in[0], b);
     std::string            fmt;
-    std::vector<ir::Index> args;
+    std::vector<ir::FmtArg> args;
     build_format(args_in.subspan(1), fmt, args, b, default_conv);
     b.fdisplay(fd, fmt, newline, args, loc(call));
 }
@@ -2734,7 +2745,7 @@ std::string_view Lowerer::value_type_noun(const slang::ast::Type& t) {
 ir::Index Lowerer::lower_dynamic_format(const Expression&                  fmt_expr,
                                         std::span<const Expression* const> value_args,
                                         size_t                             first_pos,
-                                        std::vector<ir::Index>&            args,
+                                        std::vector<ir::FmtArg>&           args,
                                         ir::Builder&                       b,
                                         std::string_view                   who) {
     if (!is_string_expr(fmt_expr) && !fmt_expr.type->isIntegral()) {
@@ -2789,7 +2800,7 @@ ir::Index Lowerer::lower_dynamic_format(const Expression&                  fmt_e
                  "which specifier the argument will meet, so it cannot expand %p "
                  "either (LRM 21.2.1.6)");
         }
-        args.push_back(lower_expr(arg, b));
+        args.push_back({ lower_expr(arg, b), arg.type->isSigned() });
     }
     return fv;
 }
@@ -2808,7 +2819,7 @@ void Lowerer::lower_sformat(const CallExpression& call, bool is_sformat, ir::Bui
         fail("$sformat / $swrite requires a destination string argument");
     }
     std::string            fmt;
-    std::vector<ir::Index> values;
+    std::vector<ir::FmtArg> values;
     if (!is_sformat) {
         const ir::Index dst = lower_lvalue(*args[0], b);
         build_format(args.subspan(1), fmt, values, b, default_conv);
@@ -2850,7 +2861,7 @@ ir::Index Lowerer::lower_sformatf(const CallExpression& call, ir::Builder& b) {
         lit = &lit->as<ConversionExpression>().operand();
     }
     std::string            fmt;
-    std::vector<ir::Index> values;
+    std::vector<ir::FmtArg> values;
     if (lit->kind == ExpressionKind::StringLiteral) {
         build_format(args, fmt, values, b);
         return b.sformatf(fmt, values, loc(call));

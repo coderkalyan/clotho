@@ -3284,7 +3284,7 @@ private:
 
     void lower_task_call_inst(Index i);
 
-    llvm::Value* build_rt_args(std::span<const Index> args, const char* /*who*/);
+    llvm::Value* build_rt_args(std::span<const Index> args, std::span<const uint32_t> signs);
 
     void lower_display(Index i);
 

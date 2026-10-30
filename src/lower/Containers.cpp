@@ -21,7 +21,7 @@ void Lowerer::emit_dyn_array_new_expr(ir::Index                             dst,
                                       ir::Ref                               aty,
                                       ir::Builder&                          b,
                                       ir::SourceLoc                         l) {
-    const ir::Index   size = lower_expr(na.sizeExpr(), b);
+    const ir::Index   size = as_signed_number(lower_expr(na.sizeExpr(), b), *na.sizeExpr().type, b, l);
     const Expression* init = na.initExpr();
     if (init != nullptr && as_assignment_pattern(*init) != nullptr) {
         // `new[N]('{...}')`: allocate N default-filled, then store each

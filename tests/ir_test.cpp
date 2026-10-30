@@ -828,3 +828,24 @@ endmodule
     CHECK(ir.find("\n  class outer {i:class inner}\n") != std::string::npos);
     CHECK(ir.find("\n  class inner {y:signed bit[31:0]}\n") != std::string::npos);
 }
+
+TEST_CASE("a format-family op carries one sign flag per argument") {
+    Module          m;
+    Builder         b(m);
+    const SourceLoc loc{ 1 };
+
+    const Index                 x = b.constant(konst(m.pool, 1), loc);
+    const Index                 y = b.constant(konst(m.pool, 2), loc);
+    const std::array<FmtArg, 2> args{ FmtArg{ x, /*is_signed=*/true }, FmtArg{ y, /*is_signed=*/false } };
+    const Index                 d = b.display("%0d %0d", /*newline=*/true, args, loc);
+
+    const Ir   ir   = b.finish();
+    const auto info = ir.extra_data<DisplayInfo>(ir.payload(d).extra);
+    REQUIRE(ir.region(info.args).size() == 2);
+    CHECK(ir.region(info.args)[0] == x);
+    CHECK(ir.region(info.args)[1] == y);
+    const std::span<const uint32_t> signs = ir.words(info.signs);
+    REQUIRE(signs.size() == 2);
+    CHECK(signs[0] == 1);
+    CHECK(signs[1] == 0);
+}

@@ -1453,7 +1453,7 @@ ir::FunctionId Lowerer::build_deferred_body(std::span<const Expression* const> a
             args = args.subspan(1);
         }
         std::string            fmt;
-        std::vector<ir::Index> fargs;
+        std::vector<ir::FmtArg> fargs;
         build_format(args, fmt, fargs, b, default_conv);
         if (monitor) {
             b.monitor_emit(desc, fmt, fargs, l);

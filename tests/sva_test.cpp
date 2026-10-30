@@ -235,9 +235,8 @@ TEST_CASE("counting a trigger's attempts leaves a single-cycle antecedent alone"
 
     REQUIRE(m.monitors.size() == 1);
     REQUIRE(m.monitors[0].tracking == ir::AssertionTracking::Counted);
-    CHECK(monitor_shape(m) ==
-          "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.cnt1 sva.0.clk "
-          "step:117:2287638562261415009 final:18:4882243356384050962 ");
+    CHECK(monitor_shape(m) == "sva.shadow.a sva.shadow.b sva.0.trig sva.0.fired sva.0.cnt1 sva.0.clk "
+                              "step:117:2287638562261415009 final:18:785728055792284918 ");
 }
 
 TEST_CASE("an overlapping implication differs only in when it seeds") {

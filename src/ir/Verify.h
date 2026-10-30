@@ -49,6 +49,14 @@ enum class Rule : uint8_t {
     // and InsideSet's flags) differs from its operand's type. A check on the
     // frontend's choice of opcode, in force while the IR's types still carry a sign.
     OpSign,
+    // An operand the backend reads as a signed number (an index, a size, a
+    // count) is an unsigned value narrower than the width it is extended to, so
+    // its top bit would be misread as a sign. The frontend zero-extends it.
+    SignedOperand,
+    // The sign flag of a format-family argument ($display, $sformatf, severity,
+    // ...) disagrees with its value's type. Both rules are checks on the
+    // frontend's choice while the IR's types still carry a sign.
+    FmtArgSign,
     // Add Sub Mul Band Bor Bxor Bxnor: operand signedness agrees, because the
     // result's signedness is the LEFT operand's (compute_type).
     ResultSign,

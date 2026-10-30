@@ -62,7 +62,7 @@ void Lowerer::emit_deferred_action(const Statement*      action,
              "' is not supported (only $error / $warning / $info) — Phase 1");
     }
     std::string            fmt;
-    std::vector<ir::Index> args;
+    std::vector<ir::FmtArg> args;
     build_format(call->arguments(), fmt, args, b);
     b.severity(static_cast<uint32_t>(sev), severity_banner(call->sourceRange.start()), fmt, args, loc(*call),
                defer_mode);

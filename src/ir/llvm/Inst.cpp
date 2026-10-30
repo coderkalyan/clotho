@@ -1607,7 +1607,7 @@ void Backend::lower_inst(Index i) {
                 b_.CreateUnreachable();
                 b_.SetInsertPoint(cont);
             }
-            llvm::Value* n = cast(must_of(count), 64, type_of(p.binary.r).is_signed);
+            llvm::Value* n = cast(must_of(count), 64, true);
             b_.CreateCall(str_repl_fn(), { str_of(i), str_of(p.binary.l), n, site });
             return;
         }
@@ -1644,8 +1644,7 @@ void Backend::lower_inst(Index i) {
         }
         case Inst::Tag::StrGetc: {
             llvm::Value* str = str_of(p.binary.l);
-            llvm::Value* idx =
-              cast(must_of(value_of(p.binary.r)), 32, type_of(p.binary.r).is_signed);
+            llvm::Value* idx = cast(must_of(value_of(p.binary.r)), 32, true);
             emit_string_bounds_check(i, str, p.binary.r, "<string>", /*is_write=*/false);
             llvm::Value* c = b_.CreateCall(str_getc_fn(), { str, idx });
             llvm::Value* v = b_.CreateTrunc(c, int_ty(8));
@@ -1658,8 +1657,7 @@ void Backend::lower_inst(Index i) {
             emit_bounds_reports(lv, /*is_write=*/true);
             llvm::Value*  snap = str_chg_snapshot(lv);
             llvm::Value*  str  = lv_string_ptr(lv, StringUse::Write);
-            llvm::Value*  idx =
-              cast(must_of(value_of(sp.index)), 32, type_of(sp.index).is_signed);
+            llvm::Value*  idx  = cast(must_of(value_of(sp.index)), 32, true);
             llvm::Value* ch = cast(must_of(value_of(sp.ch)), 32, false);
             emit_string_bounds_check(i, str, sp.index, bounds_name(lv), /*is_write=*/true);
             b_.CreateCall(str_putc_fn(), { str, idx, ch });
@@ -1696,8 +1694,7 @@ void Backend::lower_inst(Index i) {
                               : tag == T::StrOctoa    ? str_octtoa_fn()
                                                       : str_bintoa_fn();
             const LValue& lv = lvalue_of(p.binary.l);
-            llvm::Value*  v =
-              cast(must_of(value_of(p.binary.r)), 32, type_of(p.binary.r).is_signed);
+            llvm::Value*  v        = cast(must_of(value_of(p.binary.r)), 32, true);
             llvm::Value* snap = str_chg_snapshot(lv);
             b_.CreateCall(
               fn, { lv_string_ptr(lv, StringUse::Write), v, alloc_site_global(loc_text(i), "string") });
@@ -1729,8 +1726,8 @@ void Backend::lower_inst(Index i) {
         }
         case Inst::Tag::StrSubstr: {
             const auto   ss = ir_->extra_data<StrSubstrInfo>(p.op_extra.extra);
-            llvm::Value* si = cast(must_of(value_of(ss.i)), 32, type_of(ss.i).is_signed);
-            llvm::Value* sj = cast(must_of(value_of(ss.j)), 32, type_of(ss.j).is_signed);
+            llvm::Value* si = cast(must_of(value_of(ss.i)), 32, true);
+            llvm::Value* sj = cast(must_of(value_of(ss.j)), 32, true);
             b_.CreateCall(str_substr_fn(), { str_of(i), str_of(p.op_extra.op), si, sj,
                                              alloc_site_global(loc_text(i), "string") });
             return;
@@ -1769,12 +1766,18 @@ void Backend::lower_inst(Index i) {
             const uint32_t spill  = plane_bytes(type_of(p.op_extra.op).width);
             llvm::Value*   valbuf = b_.CreateAlloca(b_.getInt8Ty(), b_.getInt32(spill), "enum.val");
             b_.CreateAlignedStore(must_of(value_of(p.op_extra.op)), valbuf, llvm::Align(1));
-            b_.CreateCall(enum_name_fn(), { str_of(i), valbuf, b_.getInt32(vbytes),
-                                            b_.getInt32(count), vg, ng, lg,
-                                            b_.getInt32(type_of(p.op_extra.op).width),
-                                            b_.getInt32(info.fmt_fallback),
-                                            b_.getInt32(type_of(p.op_extra.op).is_signed ? 1 : 0),
-                                            alloc_site_global(loc_text(i), "string") });
+            b_.CreateCall(enum_name_fn(),
+                          { str_of(i),
+                            valbuf,
+                            b_.getInt32(vbytes),
+                            b_.getInt32(count),
+                            vg,
+                            ng,
+                            lg,
+                            b_.getInt32(type_of(p.op_extra.op).width),
+                            b_.getInt32(info.fmt_fallback),
+                            b_.getInt32(info.is_signed),
+                            alloc_site_global(loc_text(i), "string") });
             return;
         }
         case Inst::Tag::ContainerFmtP: {
@@ -1803,7 +1806,10 @@ void Backend::lower_inst(Index i) {
             // path (planes of any width) and let the runtime pick the member.
             const auto  info = ir_->extra_data<TaggedFmtInfo>(p.op_extra.extra);
             const Index val  = p.op_extra.op;
-            llvm::Value* const arr = build_rt_args({ &val, 1 }, "%p of a tagged union");
+            // The runtime picks the member by tag and formats it by that member's own
+            // sign (the table below), so the flat value's own is not consulted.
+            const uint32_t     unsigned_flat = 0;
+            llvm::Value* const arr           = build_rt_args({ &val, 1 }, { &unsigned_flat, 1 });
 
             constexpr uint32_t stride = sizeof(TaggedFmtEntry) / sizeof(uint32_t);
             llvm::Type* const  i32    = b_.getInt32Ty();

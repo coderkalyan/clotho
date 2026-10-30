@@ -159,6 +159,54 @@ private:
             case Tag::StoreNbEvent:
                 check_store(i, p.op_extra.op, ir_.extra_data<StoreNbEventInfo>(p.op_extra.extra).value);
                 return;
+            case Tag::ElemSelect:
+                check_signed_number(i, ir_.extra_data<ElemSelect>(p.op_extra.extra).index, 64);
+                return;
+            case Tag::StrGetc:
+            case Tag::StrItoa:
+            case Tag::StrHextoa:
+            case Tag::StrOctoa:
+            case Tag::StrBintoa:
+                check_signed_number(i, p.binary.r, 32);
+                return;
+            case Tag::StrRepl:
+                check_signed_number(i, p.binary.r, 64);
+                return;
+            case Tag::StrPutc:
+                check_signed_number(i, ir_.extra_data<StrPutcInfo>(p.op_extra.extra).index, 32);
+                return;
+            case Tag::StrSubstr:
+                check_signed_number(i, ir_.extra_data<StrSubstrInfo>(p.op_extra.extra).i, 32);
+                check_signed_number(i, ir_.extra_data<StrSubstrInfo>(p.op_extra.extra).j, 32);
+                return;
+            case Tag::DynArrayNew:
+                check_signed_number(i, ir_.extra_data<DynArrayArg>(p.op_extra.extra).arg, 64);
+                return;
+            case Tag::DynArrayNewInit:
+                check_signed_number(i, ir_.extra_data<DynArrayNewInitInfo>(p.op_extra.extra).size, 64);
+                return;
+            case Tag::Display:
+                check_fmt_signs(
+                  i, ir_.extra_data<DisplayInfo>(p.extra).args, ir_.extra_data<DisplayInfo>(p.extra).signs);
+                return;
+            case Tag::FDisplay:
+            case Tag::MonitorEmit:
+                check_fmt_signs(i,
+                                ir_.extra_data<DisplayInfo>(p.op_extra.extra).args,
+                                ir_.extra_data<DisplayInfo>(p.op_extra.extra).signs);
+                return;
+            case Tag::Sformat:
+                check_fmt_signs(
+                  i, ir_.extra_data<SformatInfo>(p.extra).args, ir_.extra_data<SformatInfo>(p.extra).signs);
+                return;
+            case Tag::Sformatf:
+                check_fmt_signs(
+                  i, ir_.extra_data<SformatfInfo>(p.extra).args, ir_.extra_data<SformatfInfo>(p.extra).signs);
+                return;
+            case Tag::Severity:
+                check_fmt_signs(
+                  i, ir_.extra_data<SeverityInfo>(p.extra).args, ir_.extra_data<SeverityInfo>(p.extra).signs);
+                return;
             case Tag::Resize:
                 check_resize(i);
                 return;
@@ -199,6 +247,29 @@ private:
         const ValueType a = ty(operand);
         if (is_scalar(a) && a.is_signed != asserted_signed) {
             report(Rule::OpSign, i, a);
+        }
+    }
+
+    // An operand the backend reads as a signed number (an index, a size, a count)
+    // is not an unsigned value narrower than the width the backend extends it to:
+    // its top bit would be taken for a sign. Constants are exempt: they are
+    // synthesized small numbers. Types carry a sign until the IR goes signless.
+    void check_signed_number(Index i, Index operand, uint32_t extended_width) {
+        const ValueType a = ty(operand);
+        if (is_scalar(a) && !a.is_signed && a.width < extended_width && ir_.tag(operand) != Tag::Constant) {
+            report(Rule::SignedOperand, i, a);
+        }
+    }
+
+    // The explicit sign of every format argument agrees with its value's type.
+    void check_fmt_signs(Index i, ExtraSlice args, ExtraSlice signs) {
+        const std::span<const Index>    values = ir_.region(args);
+        const std::span<const uint32_t> flags  = ir_.words(signs);
+        for (size_t k = 0; k < values.size() && k < flags.size(); ++k) {
+            const ValueType a = ty(values[k]);
+            if (is_scalar(a) && a.is_signed != (flags[k] != 0)) {
+                report(Rule::FmtArgSign, i, a);
+            }
         }
     }
 
@@ -529,6 +600,10 @@ const char* rule_name(Rule rule) {
             return "operand-sign";
         case Rule::OpSign:
             return "op-sign";
+        case Rule::SignedOperand:
+            return "signed-operand";
+        case Rule::FmtArgSign:
+            return "fmt-arg-sign";
         case Rule::ResultSign:
             return "result-sign";
         case Rule::ResultDomain:
