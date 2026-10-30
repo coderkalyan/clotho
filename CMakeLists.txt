@@ -461,6 +461,8 @@ add_library(clotho_ir_core STATIC
   src/ir/Ir.cpp
   src/ir/Builder.cpp
   src/ir/Printer.cpp
+  src/ir/Typing.cpp
+  src/ir/Verify.cpp
   src/ir/Analysis.cpp
   src/ir/Eval.cpp
 )
@@ -885,6 +887,7 @@ set(CLOTHO_TEST_SOURCES
   tests/sva_test.cpp
   tests/coverage_test.cpp
   tests/ir_test.cpp
+  tests/verify_test.cpp
   tests/operands_test.cpp
   tests/sourcemap_test.cpp
   tests/lower_test.cpp
