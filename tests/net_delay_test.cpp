@@ -661,3 +661,45 @@ TEST_CASE("net delay: no delay on a net declaration still lowers") {
     )");
     CHECK_MESSAGE(rq.ok, rq.diagnostic_text());
 }
+
+// LRM 28.16: "When one delay value is given, then this value shall be used for all
+// propagation delays", so `#(5)` is `#5`. slang binds the parenthesized form as a
+// three-delay control with one value, which was refused as a "triple". Both spellings of the
+// net delay, and of a delay in the net declaration assignment (a driver delay, 10.3.3),
+// give the lines of their existing tests above.
+TEST_CASE("net delay: a single value in parentheses is the same delay") {
+    for (const std::string_view spelling : { "#5", "#(5)" }) {
+        const std::string net_delay = "module m; logic a; wire " + std::string(spelling) +
+                                      " w; assign w = a;\n"
+                                      " initial begin a = 0; #1 $display(\"t=%0t w=%b\", $time, w); a = 1;\n"
+                                      " #6 $display(\"t=%0t w=%b\", $time, w); #5 $finish; end endmodule";
+        CHECK_MESSAGE(run_capture_finish(net_delay) == "t=1 w=x\nt=7 w=1\n", spelling);
+
+        const std::string decl_delay = "module m; logic a; wire " + std::string(spelling) +
+                                       " w = a;\n"
+                                       " initial begin a = 0; #1 $display(\"t=%0t w=%b\", $time, w); a = 1;\n"
+                                       " #7 $display(\"t=%0t w=%b\", $time, w); #5 $finish; end endmodule";
+        CHECK_MESSAGE(run_capture_finish(decl_delay) == "t=1 w=x\nt=8 w=1\n", spelling);
+    }
+}
+
+// A real value scales as it does without the parentheses: 1.5 ns on a 1 ps precision.
+TEST_CASE("net delay: a real single value in parentheses is scaled like the bare one") {
+    for (const std::string_view spelling : { "#1.5", "#(1.5)" }) {
+        const std::string src = "`timescale 1ns/1ps\n module m; logic a; wire " + std::string(spelling) +
+                                " w; assign w = a;\n"
+                                " initial begin a = 0; #1 $display(\"%0.3f w=%b\", $realtime, w);\n"
+                                " #1 $display(\"%0.3f w=%b\", $realtime, w); #1 $finish; end endmodule";
+        CHECK_MESSAGE(run_capture_finish(src) == "1.000 w=x\n2.000 w=0\n", spelling);
+    }
+}
+
+// Two values are a rise and a fall delay, which stay refused: the single-value helper must not
+// take the first of them for the delay.
+TEST_CASE("net delay: two values in parentheses are still rejected, on a net and on a declaration assignment") {
+    for (const std::string_view src : { "module m; logic a; wire #(1,2) w; assign w = a; endmodule",
+                                        "module m; logic a; wire #(1,2) w = a; endmodule" }) {
+        const std::string err = lower_error(src);
+        CHECK_MESSAGE(err.find("rise/fall/turn-off") != std::string::npos, err, " for ", src);
+    }
+}

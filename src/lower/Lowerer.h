@@ -106,6 +106,13 @@ uint64_t tsv_to_fs(slang::TimeScaleValue v);
 
 bool delay_is_real(const TimingControl* tc);
 
+// The one delay value a `#d` or `#(d)` on a net, continuous assignment or gate gives
+// every transition: LRM 28.16, "When one delay value is given, then this value shall be
+// used for all propagation delays". slang binds `#d` as a DelayControl and `#(d)` as a
+// Delay3Control with no second or third value. Null for two or three values (a rise/fall/
+// turn-off selection Clotho does not represent) and for a control that is no delay.
+const Expression* single_delay_expr(const TimingControl& tc);
+
 // Walks a procedural block body for any real (`#1.5`-style) delay: a `#delay`
 // statement or an intra-assignment delay whose amount is floating. Existence-only
 // (stops mattering once `found` is set), so it never needs to descend further,

@@ -974,11 +974,13 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
     const AssignmentExpression& a    = e.as<AssignmentExpression>();
     const Expression&           left = a.left();
 
-    // `assign #d lhs = rhs;` carries an inertial net delay (LRM 10.3.3). Only a
-    // single `#d` DelayControl is lowered; a rise/fall/turn-off triple selects
-    // a per-transition delay Clotho has no representation for.
-    const TimingControl* delay = sym.getDelay();
-    if (delay != nullptr && delay->kind != TimingControlKind::Delay) {
+    // `assign #d lhs = rhs;` carries an inertial net delay (LRM 10.3.3). One delay
+    // value, `#d` or `#(d)`, applies to every transition (LRM 28.16: "When one delay
+    // value is given, then this value shall be used for all propagation delays"); two
+    // or three select a per-transition delay Clotho has no representation for.
+    const TimingControl* delay_tc = sym.getDelay();
+    const Expression*    delay    = delay_tc != nullptr ? single_delay_expr(*delay_tc) : nullptr;
+    if (delay_tc != nullptr && delay == nullptr) {
         // TODO: continuous-assign rise/fall/turn-off (vector-net transition)
         // delays, LRM 10.3.3 / 28.16.
         fail("continuous assignment rise/fall/turn-off delays (assign #(a,b,c)) are "
@@ -1006,8 +1008,7 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
         // net through `in_program_` so emit_wire_resolvers folds it from a
         // reactive-home resolver as well (LRM 24.3.2). What that costs the
         // net's design-side drivers is stated at that fold.
-        emit_resolved_driver(
-          *net, a, left, b, l, strength, delay != nullptr ? &delay->as<DelayControl>().expr : nullptr);
+        emit_resolved_driver(*net, a, left, b, l, strength, delay);
         return;
     }
     // A concatenation lvalue has no single root, so resolved_net_of misses
@@ -1040,7 +1041,7 @@ void Lowerer::lower_continuous_assign(const ContinuousAssignSymbol& sym) {
             fail("continuous assignment delay on a force-target variable is not supported");
         }
         const ir::Index rhs   = lower_expr(a.right(), b);
-        const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
+        const ir::Index ticks = scaled_delay(*delay, b);
         b.store_inertial_delay(lower_lvalue(left, b), rhs, ticks, l);
         add_continuous_process(continuous_events(e), l, b);
         return;
@@ -1737,8 +1738,9 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
     // exactly like a bare `assign #d`. The LHS is always the whole net here —
     // a net_decl_assignment forbids any indexing (LRM 10.3.1) — so unlike
     // lower_continuous_assign there is no "whole scalar" shape to check.
-    const TimingControl* delay = ns.getDelay();
-    if (delay != nullptr && delay->kind != TimingControlKind::Delay) {
+    const TimingControl* delay_tc = ns.getDelay();
+    const Expression*    delay    = delay_tc != nullptr ? single_delay_expr(*delay_tc) : nullptr;
+    if (delay_tc != nullptr && delay == nullptr) {
         // TODO: net declaration assignment rise/fall/turn-off delays
         // (`wire #(a,b,c) w = ...;`) — same gap as `assign #(a,b,c)`.
         fail("net declaration assignment rise/fall/turn-off delays (wire #(a,b,c) w = ...) "
@@ -1753,7 +1755,7 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
         const ir::Index  val  = b.convert(lower_expr(*init, b), lower_type(ns.getType()), ns.getType().isSigned(), l);
         if (delay != nullptr) {
             const ir::Index dst   = b.signal(slot, l);
-            const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
+            const ir::Index ticks = scaled_delay(*delay, b);
             b.store_inertial_delay(dst, val, ticks, l);
         } else {
             b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
@@ -1764,7 +1766,7 @@ void Lowerer::lower_net_initializer(const NetSymbol& ns) {
     if (delay != nullptr) {
         const ir::Index dst   = value_lvalue(ns, b, l);
         const ir::Index rhs   = lower_expr(*init, b);
-        const ir::Index ticks = scaled_delay(delay->as<DelayControl>().expr, b);
+        const ir::Index ticks = scaled_delay(*delay, b);
         b.store_inertial_delay(dst, rhs, ticks, l);
         add_continuous_process(continuous_events(*init), to_source_loc(ns.location), b);
         return;
@@ -2161,8 +2163,9 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
         return;
     }
     check_mos_switch_strength(gi, left);
-    const TimingControl* cmos_delay = gi.getDelay();
-    if (cmos_delay != nullptr && cmos_delay->kind != TimingControlKind::Delay) {
+    const TimingControl* cmos_delay_tc = gi.getDelay();
+    const Expression*    cmos_delay    = cmos_delay_tc != nullptr ? single_delay_expr(*cmos_delay_tc) : nullptr;
+    if (cmos_delay_tc != nullptr && cmos_delay == nullptr) {
         // TODO: cmos/rcmos rise/fall/turn-off delay triples #(a,b,c) (LRM 28.16)
         // — needs the per-transition delay selection Clotho has no
         // representation for. A single #d is lowered onto each half below.
@@ -2195,14 +2198,7 @@ void Lowerer::lower_cmos_switch(const PrimitiveInstanceSymbol& gi) {
         std::vector<ir::WaitEvent> wait_events;
         const ir::Index            folded = gate_tristate_value(tg, data, ctrl, wait_events, b, l, /*pass_z=*/true);
         const ir::Index            val    = gate_output_value(left, folded, b, l);
-        emit_gate_resolved_driver(left,
-                                  *net,
-                                  val,
-                                  std::move(wait_events),
-                                  b,
-                                  l,
-                                  gate_strength,
-                                  cmos_delay != nullptr ? &cmos_delay->as<DelayControl>().expr : nullptr);
+        emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, l, gate_strength, cmos_delay);
     };
     emit_half(TriGate{ .active_high = true, .invert = false }, nctrl);
     emit_half(TriGate{ .active_high = false, .invert = false }, pctrl);
@@ -2463,11 +2459,12 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
         // Fixed — so this family must be recognized by name, not by kind.
         fail("gate primitive '" + std::string(prim.name) + "' is not supported");
     }
-    const TimingControl* gate_delay = gi.getDelay();
-    if (gate_delay != nullptr && gate_delay->kind != TimingControlKind::Delay) {
+    const TimingControl* gate_delay_tc = gi.getDelay();
+    const Expression*    gate_delay    = gate_delay_tc != nullptr ? single_delay_expr(*gate_delay_tc) : nullptr;
+    if (gate_delay_tc != nullptr && gate_delay == nullptr) {
         // TODO: gate rise/fall/turn-off delay triples #(a,b,c) (LRM 28.16) —
         // needs the per-transition delay selection Clotho has no representation
-        // for. A single #d delay is lowered below.
+        // for. A single #d or #(d) delay is lowered below.
         fail("gate rise/fall/turn-off delays (#(a,b,c)) are not supported");
     }
     const uint16_t gate_strength = pack_strength(gi.getDriveStrength());
@@ -2537,14 +2534,7 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
             // 28.16): this gate's own contribution transitions inertially and
             // the resolver re-runs when the slot lands, so it rides the slot
             // store rather than the resolved net.
-            emit_gate_resolved_driver(left,
-                                      *net,
-                                      val,
-                                      std::move(wait_events),
-                                      b,
-                                      loc,
-                                      gate_strength,
-                                      gate_delay != nullptr ? &gate_delay->as<DelayControl>().expr : nullptr);
+            emit_gate_resolved_driver(left, *net, val, std::move(wait_events), b, loc, gate_strength, gate_delay);
         } else {
             const GateTerm output = lower_gate_output(*out);
             if (gate_delay != nullptr && module_.pool.layout(module_.signal(output.sig).type).width != 1) {
@@ -2553,12 +2543,7 @@ void Lowerer::lower_gate(const PrimitiveInstanceSymbol& gi) {
                 // signal lvalue. TODO: bit-addressed gate output with a delay.
                 fail("gate delay is only supported for a whole scalar output");
             }
-            emit_gate_as_process(output,
-                                 val,
-                                 std::move(wait_events),
-                                 b,
-                                 loc,
-                                 gate_delay != nullptr ? &gate_delay->as<DelayControl>().expr : nullptr);
+            emit_gate_as_process(output, val, std::move(wait_events), b, loc, gate_delay);
         }
     }
 }
