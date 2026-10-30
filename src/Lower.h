@@ -70,13 +70,19 @@ struct LowerResult {
 // compile-time gate can refuse (or constant-check) a shell-exec task. Defaults
 // to Off — $system is a hard error unless the caller opts in.
 
+// `allow_port_coercion` (`--allow-port-coercion`) coerces the ports LRM 23.3.3.1 lets a
+// tool coerce to inout, where doing so changes what the design observes; by default
+// such a port is an error (Lowerer::needs_port_coercion). Every entry point takes it
+// last and defaults to refusing, `lower_buffer` (the language server) included.
+
 // Lower several source files compiled together into one design. Paths are
 // parsed in order and added to a single Compilation before elaboration. No
 // preprocessor options; for command-line defines/include-dirs/library flags use
 // `lower_sources`.
 LowerResult lower_files(std::span<const std::string_view> paths,
-                        Timings*                          timings      = nullptr,
-                        ir::SystemAccess                  allow_system = ir::SystemAccess::Off);
+                        Timings*                          timings             = nullptr,
+                        ir::SystemAccess                  allow_system        = ir::SystemAccess::Off,
+                        bool                              allow_port_coercion = false);
 
 // Lower a design described by slang command-line arguments (source files plus
 // `-D`/`+define+`, `-I`/`+incdir+`, `-f` command files, `-y`/`-v` libraries,
@@ -85,8 +91,9 @@ LowerResult lower_files(std::span<const std::string_view> paths,
 // unit (LRM 3.12, single-unit: `` `define `` macros and `$unit` declarations span
 // files). `args` must exclude runtime plusargs, which slang would reject.
 LowerResult lower_sources(std::span<const std::string_view> args,
-                          Timings*                          timings      = nullptr,
-                          ir::SystemAccess                  allow_system = ir::SystemAccess::Off);
+                          Timings*                          timings             = nullptr,
+                          ir::SystemAccess                  allow_system        = ir::SystemAccess::Off,
+                          bool                              allow_port_coercion = false);
 
 // Lower a design from a Driver the caller built and already parsed with
 // `parseCommandLine`. This is the entry the CLI uses: `clotho` registers its own
@@ -96,15 +103,17 @@ LowerResult lower_sources(std::span<const std::string_view> args,
 // `SourceLoc` stays resolvable. `path_prefix_map` changes how the simulation's
 // messages show source paths (SourceContext::shown_file).
 LowerResult lower_driver(std::unique_ptr<slang::driver::Driver> driver,
-                         Timings*                               timings         = nullptr,
-                         ir::SystemAccess                       allow_system    = ir::SystemAccess::Off,
-                         PathPrefixMap                          path_prefix_map = {});
+                         Timings*                               timings             = nullptr,
+                         ir::SystemAccess                       allow_system        = ir::SystemAccess::Off,
+                         PathPrefixMap                          path_prefix_map     = {},
+                         bool                                   allow_port_coercion = false);
 
 // Lower a SystemVerilog source fragment held in memory. If `timings` is non-null,
 // the front-end and analysis phase durations are accumulated into it.
 LowerResult lower_text(std::string_view source,
-                       Timings*         timings      = nullptr,
-                       ir::SystemAccess allow_system = ir::SystemAccess::Off);
+                       Timings*         timings             = nullptr,
+                       ir::SystemAccess allow_system        = ir::SystemAccess::Off,
+                       bool             allow_port_coercion = false);
 
 // Lower an editor's in-memory buffer, named `path` so its diagnostics can be
 // attributed back to the file the client has open.

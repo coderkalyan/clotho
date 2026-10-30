@@ -457,7 +457,9 @@ std::optional<ir::Signal> Lowerer::vif_member_signal(const slang::ast::Symbol&  
 // gives every top a "<name>." prefix, so gating on an empty prefix would drop
 // all initializers (each top gets its own Lowerer, so this covers each one).
 void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
-    top_elided_ = prefix.empty();
+    top_elided_    = prefix.empty();
+    top_inst_      = &top;
+    reads_scanned_ = false;
     lower_instance(top, prefix, Pass::Collect, nullptr, top.name);
     // Between the passes: Collect has just enumerated every assertion and
     // said whether the design calls an LRM 20.12 control task, and the
@@ -1048,12 +1050,13 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
             fail("unsupported port connection kind");
         }
         const PortSymbol& p = pc->port.as<PortSymbol>();
-        if (p.direction == slang::ast::ArgumentDirection::InOut ||
-            p.direction == slang::ast::ArgumentDirection::Ref) {
+        if (p.direction == slang::ast::ArgumentDirection::InOut || p.direction == slang::ast::ArgumentDirection::Ref ||
+            coerced_ports_.contains(&p)) {
             // inout / ref ports share storage via build_inout_aliases (the child
             // internal net/var aliases the parent signal), so there is no
             // one-way copy to wire here — both sides already reference one
-            // signal and any drivers fold through net resolution.
+            // signal and any drivers fold through net resolution. A port coerced to
+            // inout (needs_port_coercion) is aliased the same way.
             continue;
         }
         if (p.internalSymbol == nullptr) {
@@ -1068,17 +1071,35 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
             // no copy process. An unconnected input leaves the child's internal
             // net with no driver, so it holds the undriven default from
             // init_state (z for a 4-state net per LRM 6.6, x for a variable,
-            // 0 for 2-state). A port carrying an explicit default value
-            // arrives here with a non-null expression, so a null expression
-            // means there is genuinely nothing to drive.
+            // 0 for 2-state), unless its module was declared under
+            // `unconnected_drive (LRM 22.9), which pulls it up or down. A port
+            // carrying an explicit default value arrives here with a non-null
+            // expression, so a null expression means there is genuinely nothing
+            // to connect.
+            if (p.direction == slang::ast::ArgumentDirection::In) {
+                const slang::ast::UnconnectedDrive drive = child.getDefinition().unconnectedDrive;
+                if (drive != slang::ast::UnconnectedDrive::None) {
+                    lower_unconnected_drive(p, drive == slang::ast::UnconnectedDrive::Pull1, child_is_program);
+                }
+            }
             continue;
         }
 
+        // A non-ANSI port reference with a constant select (`module m(a[3:2])`,
+        // LRM 23.2.2.1) is those bits of its internal symbol and nothing else; any
+        // other port is the whole symbol. p.getType() is the port's own type
+        // either way: the connection is converted to it, and an output port's
+        // value has it.
+        const Expression* sel = p.getInternalExpr();
+
         if (cur_pass_ == Pass::Classify) {
             // The connection is a continuous driver: an output drives the
-            // parent-side lvalue, an input drives the whole child net.
+            // parent-side lvalue, an input drives the port's own bits of the
+            // child net.
             if (expr->kind == ExpressionKind::Assignment) {
                 record_net_driver(expr->as<AssignmentExpression>().left());
+            } else if (sel != nullptr) {
+                record_net_driver(*sel);
             } else {
                 record_net_driver_whole(p.internalSymbol->as<ValueSymbol>());
             }
@@ -1089,6 +1110,13 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         const ir::SourceLoc        l         = to_source_loc(p.location);
         ir::Builder                b(module_.pool);
         std::vector<ir::WaitEvent> sens;
+        const slang::ast::Type&    ptype = p.getType();
+        // The port's own storage: the child net, or the bits of it a select port
+        // names.
+        const auto port_rvalue = [&] {
+            return sel != nullptr ? lower_expr(*sel, b) : b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+        };
+        const auto port_lvalue = [&] { return sel != nullptr ? lower_lvalue(*sel, b) : b.signal(child_sig, l); };
         // A connected container port. The port copy is a continuous assignment,
         // so it would have to deep-copy the handle whenever the source changes
         // (value semantics, LRM 7.5 / 7.9 / 7.10) and detect that change through
@@ -1102,15 +1130,16 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         // a backend error with no source location instead of a diagnostic.
         // TODO: container ports (a handle-aware continuous copy). Reached by a
         // `program` port too, hence no "module" in the message.
-        if (ir::types::is_container(module_.pool, lower_type(p.internalSymbol->as<ValueSymbol>().getType()))) {
+        if (ir::types::is_container(module_.pool, lower_type(ptype))) {
             fail("a dynamic-array, queue or associative-array port connection "
                  "is not supported");
         }
         if (expr->kind == ExpressionKind::Assignment) {
             // Output: parent_target = child_net. slang gives an assignment whose
-            // LHS is the parent target and whose RHS is an EmptyArgument
-            // placeholder for the port value, so read the child net directly and
-            // resize it to the target width. Wakes on the child net.
+            // LHS is the parent target and whose RHS is the port value, a
+            // placeholder (EmptyArgument) in the implicit conversion to the target
+            // type, so read the child net directly and convert it by that
+            // conversion (lower_port_output). Wakes on the child net.
             const AssignmentExpression& a = expr->as<AssignmentExpression>();
             if (const std::optional<ir::Signal> net = resolved_net_of(a.left())) {
                 // The parent net has multiple drivers: stage this child's
@@ -1129,9 +1158,7 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                     // TODO: aggregate driver of a multiply-driven net.
                     fail("aggregate driver of a multiply-driven net is not supported");
                 }
-                const ir::Ref   ty = lower_type(*a.left().type);
-                const ir::Index child_val =
-                  coerce(b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
+                const ir::Index  child_val = lower_port_output(a, port_rvalue(), b);
                 const ir::Index  val  = build_driver_slot_value(*net, a.left(), child_val, b, l);
                 const ir::Signal slot = alloc_driver_slot(*net, l, /*strength=*/0x0303, child_is_program);
                 b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
@@ -1146,30 +1173,27 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                 // share the recursive storage layout (a plain unpacked array is
                 // trivially copyable, so emit_port_agg_copy memcpy's it).
                 const ir::Index dst = lower_lvalue(a.left(), b);
-                const ir::Index src = b.signal(child_sig, l);
+                const ir::Index src = port_lvalue();
                 emit_port_agg_copy(dst, src, lower_type(*a.left().type), b, l);
             } else if (a.left().kind == ExpressionKind::Concatenation) {
                 // Output connected to a concatenation target `.o({a,b})`:
                 // sample the child net once and scatter it MSB-first into the
                 // operands, the same destructure as `{a,b} = x` (store_concat).
                 reject_concat_resolved_driver(a.left());
-                const ir::Ref   ty = lower_type(*a.left().type);
-                const ir::Index val =
-                  coerce(b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
+                const ir::Index val = lower_port_output(a, port_rvalue(), b);
                 store_concat(a.left().as<ConcatenationExpression>(), val, ir::Inst::Tag::Store, b, l);
             } else {
-                const ir::Ref   ty  = lower_type(*a.left().type);
-                const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
+                const ir::Index val = port_rvalue();
                 const ir::Index dst = lower_lvalue(a.left(), b);
-                const ir::Index src = coerce(val, *a.right().type, ty, b, l);
+                const ir::Index src = lower_port_output(a, val, b);
                 b.binary(ir::Inst::Tag::Store, dst, src, l);
             }
             sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
         } else {
             // Input: drive the child net from the source rvalue, resized to the
             // port width; wakes on the source's reads. The copy is a continuous
-            // driver of the whole child-side net.
-            const slang::ast::Type& itype = p.internalSymbol->as<ValueSymbol>().getType();
+            // driver of the port's own bits of the child-side net: all of it, or
+            // the bits a select port names.
             if (resolved_nets_.contains(static_cast<uint32_t>(child_sig))) {
                 // The child net has more than one driver total: this input
                 // copy plus at least one other, possibly reached from a
@@ -1195,21 +1219,24 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                 // 24.3 makes a design reference to a program signal an error
                 // but explicitly allows "hierarchical references to extend
                 // from one program scope to another program scope".
-                if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
+                if (is_aggregate(ptype) || is_unpacked_array_type(ptype)) {
                     // TODO: aggregate driver of a multiply-driven net (matches
                     // the OUTPUT port and continuous-assign refusals above).
                     fail("aggregate driver of a multiply-driven net is not supported");
                 }
-                const ir::Ref    ty   = lower_type(itype);
-                const ir::Index  val  = coerce(lower_expr(*expr, b), *expr->type, ty, b, l);
+                const ir::Ref   ty     = lower_type(ptype);
+                const ir::Index driven = coerce(lower_expr(*expr, b), *expr->type, ty, b, l);
+                // A select port drives its bits only: its slot holds z, the
+                // resolution identity, in the rest.
+                const ir::Index  val = sel != nullptr ? build_driver_slot_value(child_sig, *sel, driven, b, l) : driven;
                 const ir::Signal slot = alloc_driver_slot(child_sig, l, /*strength=*/0x0303, child_is_program);
                 b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
                 collect_expr_reads(*expr, sens);
                 add_continuous_process(std::move(sens), l, b, child_is_program);
                 continue;
             }
-            const ir::Ref ty = lower_type(itype);
-            if (is_aggregate(itype) || is_unpacked_array_type(itype)) {
+            const ir::Ref ty = lower_type(ptype);
+            if (is_aggregate(ptype) || is_unpacked_array_type(ptype)) {
                 // A whole unpacked-struct / unpacked-array / aggregate input
                 // port: whole-object copy of the source into the child net (a
                 // plain unpacked array memcpy's via emit_port_agg_copy). An
@@ -1226,9 +1253,9 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                 const Expression& src = unwrap_conversion(*expr);
                 const ir::Index   av  = is_struct_lvalue_shape(src) ? lower_lvalue(src, b)
                                                                    : agg_input_actual(src, ty, b, l);
-                emit_port_agg_copy(b.signal(child_sig, l), av, ty, b, l);
+                emit_port_agg_copy(port_lvalue(), av, ty, b, l);
             } else {
-                const ir::Index dst = b.signal(child_sig, l);
+                const ir::Index dst = port_lvalue();
                 const ir::Index val = coerce(lower_expr(*expr, b), *expr->type, ty, b, l);
                 b.binary(ir::Inst::Tag::Store, dst, val, l);
             }
@@ -1239,6 +1266,28 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         // parent signal never changes afterward (LRM 23.3.3).
         add_continuous_process(std::move(sens), l, b, child_is_program);
     }
+}
+
+// An output port's value as the connected expression receives it. slang builds
+// the connection as `connected = <port>`: the port is an EmptyArgument typed as
+// the port, inside the implicit conversions that every assignment gets (LRM
+// 23.3.3.8: "assigned to the object on the other side of the port using the same
+// rules as an assignment"). Lowering that right-hand side with the port's value
+// bound to the placeholder applies each conversion as any assignment does: a
+// narrower value extends by the port's own sign (LRM 10.7; a signed port is
+// sign-extended whatever the connected net's sign), and a real becomes integral
+// or the reverse. The type of `a.right()` is already the converted one, so
+// coerce() by it would extend by the connected expression's sign.
+ir::Index Lowerer::lower_port_output(const AssignmentExpression& a, ir::Index port_value, ir::Builder& b) {
+    const Expression* leaf = &a.right();
+    while (leaf->kind == ExpressionKind::Conversion) {
+        leaf = &leaf->as<ConversionExpression>().operand();
+    }
+    if (leaf->kind != ExpressionKind::EmptyArgument) {
+        fail("malformed output port connection");
+    }
+    const Restore<std::optional<ir::Index>> bind(port_value_, port_value);
+    return lower_expr(a.right(), b);
 }
 
 // Append the sensitivity of an rvalue expression (each signal it reads, as an

@@ -444,3 +444,16 @@ iverilog 13 and Verilator 5.050 reset the variable on every call (iverilog keeps
 queue return value and resets an `int`), so neither is followed.
 
 Code: `src/lower/Subroutines.cpp` (`declare_static_return`, `implicit_return_ref`, `build_function`), `src/lower/Scans.cpp` (`static_return_needs_storage`). Tests: `tests/function_test.cpp` ("the implicit return variable of a static function keeps its value between calls" and the tests after it).
+
+## 43. Port coercion to inout (23.3.3.1)
+
+"A port that is declared as input (output) but used as an output (input) or inout may be coerced to inout. If not coerced to inout, a warning shall be issued." Clotho copies the value across an input or output port (23.3.3: "a continuous assignment from source to sink") and does not coerce by default. A coerced port makes its inner and outer net one net, so a copy and a coercion differ only where a value travels against the port's direction. A net port is therefore an error, not a warning, in exactly two cases:
+
+- an **input** port whose net the module drives itself (an `assign`, a gate output, a child's output port): the outer net sees that driver when coerced and does not when copied;
+- an **output** port whose outer net has other drivers (another assignment, gate or output port reaching the same bits, or the pull of a `tri0` / `tri1` / supply net), when the module **reads** its own net: it sees the resolved value when coerced and only its own drivers when copied.
+
+A module that only drives its output net cannot tell, and any number of output ports driving one net is the multiple-driver case 23.3.3.2 permits, so those are accepted. A variable port is never coerced (23.3.3.2), and an unconnected port has no outer net. The message says which case it is and names `--allow-port-coercion`.
+
+`--allow-port-coercion` coerces exactly those ports: the inner net takes the outer net's storage, as for an `inout` port, so every driver of both resolves together. It needs a port connected to a whole net of its own width; a variable, a select, a concatenation, an expression or another width is an error. slang's own `port-coercion` warnings ("coerced to 'inout'") are not shown, since they flag every net with a port driver beside another driver and claim a coercion that did not happen. iverilog always coerces, so it matches the flag and not the default.
+
+Code: `src/lower/Types.cpp` (`needs_port_coercion`, `build_inout_aliases`). Tests: `tests/xhier_test.cpp` ("an input port the module drives is refused unless coercion is allowed", "an output port read by its module while its net has other drivers is refused unless coercion is allowed", "ports whose coercion changes nothing are accepted by default"). Design: `docs/design/cli.md` (Options).

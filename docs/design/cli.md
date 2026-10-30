@@ -103,6 +103,7 @@ see "One parser".
 | `--gc-heap-max <bytes>` | both | soft ceiling in bytes: reaching it asks for a collection at the next opportunity, and passing it anyway is reported rather than refused, since a process may allocate without ever suspending (garbage-collection.md §6.1). `0`, the default, sets no ceiling |
 | `--gc-full-every <n>` | both | collect the whole heap on every Nth collection instead of only the objects created since the last one; only a whole-heap pass frees objects that already survived a collection. `0`, the default, lets the runtime decide from how fast the heap is growing |
 | `--allow-system <const\|full>` | build, run, lint, synth | permit `$system` (LRM 20.17.1); refused by default |
+| `--allow-port-coercion` | build, run, lint, synth | coerce to inout an input port the module drives, or an output port whose net has other drivers while the module reads it (LRM 23.3.3.1); an error by default (LRM_NOTES.md note 43). Only a port connected to a whole net of its own width can be coerced |
 | `--loose-timescale` | build, run, lint, synth | accept a design that mixes elements declaring a time scale with elements that do not (slang's `MissingTimeScale`, LRM 3.14.2.2); the un-annotated ones take `--timescale`'s value, or `1ns/1ns`. Refused by default |
 | `-j, --threads <n>` | build, run, lint, synth | slang's own option; sizes its parser **and** the LLVM compile pool |
 | `--dpi-lib <path>` | both | DPI-C library, repeatable. `run`: `.o`/`.a` linked into the JIT, `.so` dlopen'd (imports only). `build`: linked into the executable, `.so` dynamically with an rpath and, for a design with DPI exports, the executable's symbols exported to it; refused for any target but `exe` |
@@ -166,7 +167,7 @@ a `+` command slang gained through `--cmd-rename`.
 `--help` is built from the same registrations, in three views:
 
 - `clotho --help`: the command list, then the options every command that reads
-  source takes (`--time`, `--allow-system`, `--loose-timescale`, `--help`,
+  source takes (`--time`, `--allow-system`, `--allow-port-coercion`, `--loose-timescale`, `--help`,
   `--help-all`, `--version`) and the common source options below.
 - `clotho <command> --help`: usage (`clotho <command> [options] <files>...`, plus
   `[+plusarg...]` for `run`), then only the options that command takes, then the

@@ -987,32 +987,370 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
         // the handle instead would be wrong -- a later merge on one side would
         // not be seen on the other -- and there is nothing to propagate, since
         // an event carries occurrences rather than a value.
-        const bool event_port =
-          p.internalSymbol != nullptr && p.internalSymbol->kind == SymbolKind::Variable &&
-          p.internalSymbol->as<VariableSymbol>().getType().isEvent();
-        if (!event_port && p.direction != slang::ast::ArgumentDirection::InOut &&
-            p.direction != slang::ast::ArgumentDirection::Ref) {
-            continue;
-        }
+        const bool event_port = p.internalSymbol != nullptr && p.internalSymbol->kind == SymbolKind::Variable &&
+                                p.internalSymbol->as<VariableSymbol>().getType().isEvent();
         if (p.internalSymbol == nullptr) {
             continue;
         }
         const Expression* expr = pc->getExpression();
+        // An input or output port that LRM 23.3.3.1 lets a tool coerce to inout, and
+        // that coercion would change what the design observes (needs_port_coercion).
+        const bool coerced =
+          !event_port &&
+          (p.direction == slang::ast::ArgumentDirection::In || p.direction == slang::ast::ArgumentDirection::Out) &&
+          needs_port_coercion(*pc, p);
+        if (!event_port && !coerced && p.direction != slang::ast::ArgumentDirection::InOut &&
+            p.direction != slang::ast::ArgumentDirection::Ref) {
+            continue;
+        }
         if (expr == nullptr) {
             continue; // unconnected inout/ref: the child net stands alone
+        }
+        if (coerced) {
+            const bool input       = p.direction == slang::ast::ArgumentDirection::In;
+            cur_range_             = input ? slang::SourceRange{ p.location, p.location } : expr->sourceRange;
+            const std::string port = std::string(input ? "input" : "output") + " port '" +
+                                     std::string(p.name.empty() ? p.internalSymbol->name : p.name) + "'";
+            if (!allow_port_coercion_) {
+                fail(port +
+                     (input ? " is driven from inside the module"
+                            : " is read inside the module while its net has other drivers") +
+                     "; Clotho does not coerce ports to inout by default (LRM 23.3.3.1); pass --allow-port-coercion to "
+                     "coerce it");
+            }
+            const Expression& c =
+              expr->kind == ExpressionKind::Assignment ? expr->as<AssignmentExpression>().left() : *expr;
+            // TODO: coercing a port connected to a select, a concatenation or an
+            // expression, or of another width than its net (LRM 23.3.3.1): the
+            // two nets become one net, which needs sub-signal aliasing.
+            if ((c.kind != ExpressionKind::NamedValue && c.kind != ExpressionKind::HierarchicalValue) ||
+                p.getInternalExpr() != nullptr || !c.type->isIntegral() ||
+                c.type->getBitWidth() != p.getType().getBitWidth()) {
+                fail(port +
+                     " needs coercion to inout (LRM 23.3.3.1), which is only supported for a port connected to a "
+                     "whole net of the same width");
+            }
+            if (canonical_value_symbol(c.as<ValueExpressionBase>().symbol).kind != SymbolKind::Net) {
+                fail(port + " needs coercion to inout (LRM 23.3.3.1), but a variable cannot be connected to an inout "
+                            "port (LRM 23.3.3.2)");
+            }
+            coerced_ports_.insert(&p);
+        }
+        if (p.getInternalExpr() != nullptr) {
+            // TODO: an inout/ref port that is a select of its net (`module
+            // m(io[1:0])`, LRM 23.2.2.1) connects those bits only; aliasing the
+            // whole net would put the connection's storage under all of it.
+            fail("inout/ref port with a select port expression is not supported");
         }
         // slang may wrap the connection in an AssignmentExpression; the shared
         // net is the underlying value reference.
         const Expression& conn =
           expr->kind == ExpressionKind::Assignment ? expr->as<AssignmentExpression>().left() : *expr;
+        // The port and its connection share one storage (below), so they must be
+        // as wide as each other. Connected in the bits they share, the rest of
+        // the wider side unconnected, a port and a net of another width have no
+        // common storage: aliasing put a 64-bit port over a 1-bit slot, and the
+        // child's writes landed on the variables declared next to it.
+        // TODO: an inout/ref port and a net of different widths (LRM 23.3.3);
+        // needs sub-signal aliasing.
+        const slang::ast::Type& port_type = p.getType();
+        if (port_type.isIntegral() && conn.type->isIntegral() && port_type.getBitWidth() != conn.type->getBitWidth()) {
+            fail("inout/ref port connected to a net of another width (" + std::to_string(port_type.getBitWidth()) +
+                 " and " + std::to_string(conn.type->getBitWidth()) + " bits) is not supported");
+        }
         if (conn.kind != ExpressionKind::NamedValue && conn.kind != ExpressionKind::HierarchicalValue) {
             // TODO: inout/ref port with a bit/part-select or concat connection
             // (per-bit collapse or resolved-net partial-driver slots).
             fail("inout/ref port with a non-whole-signal connection is not supported");
         }
-        const ValueSymbol& parent      = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
-        inout_alias_[p.internalSymbol] = signal_of(parent);
+        const ValueSymbol& parent = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
+        const ir::Signal   target = signal_of(parent);
+        // Two ports bound to one internal net (`module m(a, a)`, LRM 23.2.2.1) connected
+        // to one parent net share that net's alias target; connected to different nets
+        // they would make those one net, which the one target cannot express.
+        // TODO: two connected inout/ref ports bound to one net, connected to different
+        // nets: the nets they connect become one net.
+        if (const auto prior = inout_alias_.find(p.internalSymbol);
+            prior != inout_alias_.end() && prior->second != target) {
+            fail("two inout/ref ports bound to one net, connected to different nets, are not supported");
+        }
+        inout_alias_[p.internalSymbol] = target;
     }
+}
+
+// Whether coercing the net port `p` of one instance to inout (LRM 23.3.3.1: "A port
+// that is declared as input (output) but used as an output (input) or inout may be
+// coerced to inout") would change what the design observes.
+//
+// NOTE: Clotho copies the value across an input or output port (LRM 23.3.3: "a
+// continuous assignment from source to sink") and does not coerce unless asked
+// (--allow-port-coercion). A coerced port makes its inner and outer net one net, so
+// the two differ only where a value travels against the port's direction:
+//  - an input port whose net the module drives itself: the outer net sees that
+//    driver when coerced and does not when copied;
+//  - an output port whose outer net has other drivers, when the module reads its
+//    own net: it sees the resolved value when coerced and only its own drivers when
+//    copied. A module that only drives its output net cannot tell, and any number
+//    of output ports driving one net is the multiple-driver case LRM 23.3.3.2
+//    permits, so that stays accepted.
+// Only those ports are refused or coerced. A variable port is never coerced (LRM
+// 23.3.3.2), and an unconnected port has no outer net. The drivers and reads are
+// found by scanning the top's hierarchy (scan_net_uses), not taken from slang's
+// port-coercion warnings, which say "coerced to 'inout'" and flag every net with a
+// port driver beside another driver; those are not shown.
+bool Lowerer::needs_port_coercion(const PortConnection& pc, const PortSymbol& p) {
+    if (p.internalSymbol == nullptr || p.internalSymbol->kind != SymbolKind::Net || pc.getExpression() == nullptr) {
+        return false;
+    }
+    const ValueSymbol& inner = p.internalSymbol->as<ValueSymbol>();
+    if (p.direction == slang::ast::ArgumentDirection::In) {
+        return port_driven_inside(p);
+    }
+    const Expression& e = *pc.getExpression();
+    if (p.direction != slang::ast::ArgumentDirection::Out || e.kind != ExpressionKind::Assignment ||
+        !net_is_read(inner)) {
+        return false;
+    }
+    const auto shared = [&](auto&& self, const Expression& lhs) -> bool {
+        if (lhs.kind == ExpressionKind::Concatenation) {
+            for (const Expression* op : lhs.as<ConcatenationExpression>().operands()) {
+                if (self(self, *op)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return other_driver_of(lhs);
+    };
+    return shared(shared, e.as<AssignmentExpression>().left());
+}
+
+namespace {
+
+using WriteMap = ankerl::unordered_dense::map<const ValueSymbol*, std::vector<const Expression*>>;
+
+// Every value symbol a hierarchy reads, and every target it writes by root symbol. A
+// reference is a read but for the root of an assignment target (a select's index and
+// a compound assignment's target are reads). An output port connection and a gate
+// output terminal are assignments too.
+struct NetUseScan : ASTVisitor<NetUseScan, VisitFlags::AllGood> {
+    ankerl::unordered_dense::set<const ValueSymbol*>*                           reads  = nullptr;
+    WriteMap*                                                                   writes = nullptr;
+    ankerl::unordered_dense::map<const Expression*, const InstanceBodySymbol*>* in     = nullptr;
+    const InstanceBodySymbol*                                                   body   = nullptr;
+
+    // `whole` is the target as written, which a select or conversion only narrows.
+    void target(const Expression& e, const Expression& whole) {
+        switch (e.kind) {
+            case ExpressionKind::NamedValue:
+                (*writes)[&e.as<NamedValueExpression>().symbol].push_back(&whole);
+                return;
+            case ExpressionKind::HierarchicalValue:
+                (*writes)[&e.as<HierarchicalValueExpression>().symbol].push_back(&whole);
+                return;
+            case ExpressionKind::ElementSelect:
+                target(e.as<ElementSelectExpression>().value(), whole);
+                e.as<ElementSelectExpression>().selector().visit(*this);
+                return;
+            case ExpressionKind::RangeSelect:
+                target(e.as<RangeSelectExpression>().value(), whole);
+                e.as<RangeSelectExpression>().left().visit(*this);
+                e.as<RangeSelectExpression>().right().visit(*this);
+                return;
+            case ExpressionKind::MemberAccess:
+                target(e.as<MemberAccessExpression>().value(), whole);
+                return;
+            case ExpressionKind::Conversion:
+                target(e.as<ConversionExpression>().operand(), whole);
+                return;
+            case ExpressionKind::Concatenation:
+                for (const Expression* op : e.as<ConcatenationExpression>().operands()) {
+                    (*in)[op] = body;
+                    target(*op, *op);
+                }
+                return;
+            default:
+                e.visit(*this);
+                return;
+        }
+    }
+
+    void handle(const AssignmentExpression& a) {
+        if (a.isCompound()) {
+            visitDefault(a);
+            return;
+        }
+        (*in)[&a.left()] = body;
+        target(a.left(), a.left());
+        a.right().visit(*this);
+    }
+
+    // The connections are written in the instantiating body, the members in the child's.
+    void handle(const InstanceSymbol& i) {
+        for (const PortConnection* pc : i.getPortConnections()) {
+            if (const Expression* e = pc->getExpression()) {
+                e->visit(*this);
+            }
+        }
+        const InstanceBodySymbol* saved = body;
+        body                            = &i.body;
+        i.body.visit(*this);
+        body = saved;
+    }
+
+    // `force` and `release` override a net and are not drivers of it.
+    void handle(const ProceduralAssignStatement& s) {
+        if (const auto* a = s.assignment.as_if<AssignmentExpression>()) {
+            a->right().visit(*this);
+        }
+    }
+
+    void handle(const ProceduralDeassignStatement&) {}
+
+    void handle(const NamedValueExpression& nv) {
+        reads->insert(&nv.symbol);
+    }
+
+    void handle(const HierarchicalValueExpression& hv) {
+        reads->insert(&hv.symbol);
+    }
+};
+
+// The bits (offsets from the LSB) a constant bit or part select of a vector names, or
+// nothing when the target is not such a select.
+std::optional<std::pair<int64_t, int64_t>> select_span(const Expression& t) {
+    const Expression* base = nullptr;
+    int64_t           l    = 0;
+    int64_t           r    = 0;
+    const auto        cst  = [](const Expression& x) -> std::optional<int64_t> {
+        const slang::ConstantValue* c = x.getConstant();
+        return c != nullptr && c->isInteger() && !c->integer().hasUnknown() ? c->integer().as<int64_t>() : std::nullopt;
+    };
+    if (t.kind == ExpressionKind::ElementSelect) {
+        const auto& s = t.as<ElementSelectExpression>();
+        base          = &s.value();
+        const auto i  = cst(s.selector());
+        if (!i) {
+            return std::nullopt;
+        }
+        l = r = *i;
+    } else if (t.kind == ExpressionKind::RangeSelect &&
+               t.as<RangeSelectExpression>().getSelectionKind() == RangeSelectionKind::Simple) {
+        const auto& s = t.as<RangeSelectExpression>();
+        base          = &s.value();
+        const auto lo = cst(s.left());
+        const auto hi = cst(s.right());
+        if (!lo || !hi) {
+            return std::nullopt;
+        }
+        l = *lo;
+        r = *hi;
+    } else {
+        return std::nullopt;
+    }
+    const slang::ast::Type& ty = base->type->getCanonicalType();
+    if ((base->kind != ExpressionKind::NamedValue && base->kind != ExpressionKind::HierarchicalValue) ||
+        !ty.isIntegral() || ty.isUnpackedArray()) {
+        return std::nullopt;
+    }
+    const slang::ConstantRange range = ty.getFixedRange();
+    if (range.width() != ty.getBitWidth()) {
+        return std::nullopt;
+    }
+    const int64_t a = range.translateIndex(static_cast<int32_t>(l));
+    const int64_t b = range.translateIndex(static_cast<int32_t>(r));
+    return std::make_pair(std::min(a, b), std::max(a, b));
+}
+
+} // namespace
+
+void Lowerer::scan_net_uses() {
+    if (reads_scanned_) {
+        return;
+    }
+    read_syms_.clear();
+    writes_.clear();
+    write_in_.clear();
+    NetUseScan scan;
+    scan.reads  = &read_syms_;
+    scan.writes = &writes_;
+    scan.in     = &write_in_;
+    top_inst_->visit(scan);
+    reads_scanned_ = true;
+}
+
+// Whether anything in the top's hierarchy reads `sym`: its own module, a child it is
+// passed to, or a hierarchical reference from outside. Fails closed (true) when no
+// top is known.
+bool Lowerer::net_is_read(const ValueSymbol& sym) {
+    if (top_inst_ == nullptr) {
+        return true;
+    }
+    scan_net_uses();
+    return read_syms_.contains(&sym);
+}
+
+// Whether the module the port `p` belongs to drives the net behind it itself: an
+// assignment, gate output or child output port written in the module's own body, to
+// bits the port connects. A driver from outside (a hierarchical assignment) is not
+// the module's, and the port's own copy is not an assignment at all. Fails closed
+// (true) when no top is known.
+bool Lowerer::port_driven_inside(const PortSymbol& p) {
+    if (top_inst_ == nullptr) {
+        return true;
+    }
+    scan_net_uses();
+    const auto it = writes_.find(&p.internalSymbol->as<ValueSymbol>());
+    if (it == writes_.end()) {
+        return false;
+    }
+    const Symbol*     body = &p.getParentScope()->asSymbol();
+    const Expression* sel  = p.getInternalExpr();
+    const auto        mine = sel != nullptr ? select_span(*sel) : std::nullopt;
+    for (const Expression* w : it->second) {
+        const auto where = write_in_.find(w);
+        if (where == write_in_.end() || static_cast<const Symbol*>(where->second) != body) {
+            continue;
+        }
+        if (sel == nullptr) {
+            return true;
+        }
+        const auto theirs = select_span(*w);
+        if (!mine || !theirs || (mine->first <= theirs->second && theirs->first <= mine->second)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether the net `own` (one target of an output port connection) roots at has a
+// driver besides this connection that can reach the same bits: another assignment,
+// gate output or port connection, or the pull of its net type. Fails closed (true)
+// when no top is known.
+bool Lowerer::other_driver_of(const Expression& own) {
+    const ValueSymbol* root = lvalue_root(own);
+    if (root == nullptr || root->kind != SymbolKind::Net) {
+        return false;
+    }
+    if (top_inst_ == nullptr || net_pull_value(root->as<NetSymbol>().netType.netKind).has_value()) {
+        return true;
+    }
+    scan_net_uses();
+    const auto it = writes_.find(root);
+    if (it == writes_.end()) {
+        return false;
+    }
+    const auto mine = select_span(own);
+    for (const Expression* w : it->second) {
+        if (w == &own) {
+            continue;
+        }
+        const auto theirs = select_span(*w);
+        if (!mine || !theirs || (mine->first <= theirs->second && theirs->first <= mine->second)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void Lowerer::collect_signals(const InstanceBodySymbol& body) {
@@ -1024,6 +1362,12 @@ void Lowerer::collect_signals(const InstanceBodySymbol& body) {
             const PortSymbol& p = m.as<PortSymbol>();
             if (p.internalSymbol) {
                 port_dir[p.internalSymbol] = direction_of(p.direction);
+                // Only a variable output port may carry an initializer; an input's
+                // is its default connection (LRM 23.2.2.4), which slang already
+                // substitutes into the port connection.
+                if (p.direction == slang::ast::ArgumentDirection::Out && p.hasInitializer()) {
+                    port_initializers_.emplace(p.internalSymbol, &p);
+                }
             }
         }
     }

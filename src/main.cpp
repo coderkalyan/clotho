@@ -388,6 +388,7 @@ struct Options {
     std::optional<uint64_t>    gc_heap_bytes_max;
     std::optional<uint32_t>    gc_full_every;
     std::optional<std::string> allow_system;
+    std::optional<bool>        allow_port_coercion;
     std::optional<bool>        loose_timescale;
     std::optional<bool>        loose_stale_ref;
     std::optional<std::string> stop_time;
@@ -519,6 +520,12 @@ void register_options(Registry& r, Options& o) {
           "only commands written literally in the source, 'full' allows any command the design "
           "builds while it runs",
           "<tier>");
+    r.add(kSource,
+          "--allow-port-coercion",
+          o.allow_port_coercion,
+          "Coerce an input port the module drives, or an output port whose net has other drivers while the "
+          "module reads it, to inout (LRM 23.3.3.1), refused by default: the inner and outer nets become one "
+          "net. Only a port connected to a whole net of its own width can be coerced");
     r.add(kSource,
           "--loose-timescale",
           o.loose_timescale,
@@ -1423,8 +1430,8 @@ int main(int argc, char** argv) {
         path_prefix_map.emplace_back(std::move(dir), entry.substr(eq + 1));
     }
 
-    const clotho::LowerResult result =
-      clotho::lower_driver(std::move(driver), tp, config.allow_system, std::move(path_prefix_map));
+    const clotho::LowerResult result = clotho::lower_driver(
+      std::move(driver), tp, config.allow_system, std::move(path_prefix_map), options.allow_port_coercion == true);
     if (!result.diagnostics.empty()) {
         std::print(stderr, "{}", result.diagnostic_text());
     }

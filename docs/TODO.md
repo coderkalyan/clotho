@@ -287,8 +287,23 @@ Milestones, in order; lower ones unblock higher ones:
   its own signal map.
 - [ ] **Hierarchical path through a generate-block instance or an instance-array element**
   — `g.u.sig` and `arr[i].sig` fail at elaboration.
-- [ ] **`inout` / `ref` port connected to a select or concatenation** (23.3.3) — needs
-  sub-signal aliasing.
+- [~] **`inout` / `ref` port aliasing** (23.2.2.1, 23.3.3) — a port and its connection must be
+  one whole net each, of one width; missing pieces:
+  - [ ] **Port that is a select, or connection that is a select or concatenation** — needs
+    sub-signal aliasing.
+  - [ ] **Connection to a net of another width** — the bits they share connect and the rest of
+    the wider side is unconnected; needs sub-signal aliasing.
+  - [ ] **Two ports bound to one internal net, connected to different nets** (`module m(a, a)`)
+    — the two connected nets become one net; needs merging the nets of one scope.
+- [ ] **Port expression that is not a select of one internal net** (23.2.2.1, 23.2.2.2) — a
+  non-ANSI concatenation port `module m({a, b})` and an ANSI `.p(expr)` port are refused.
+- [ ] **`` `unconnected_drive `` on an unconnected input variable, aggregate or select port**
+  (22.9) — only a whole packed net port is pulled; the others are refused.
+- [ ] **Port coercion to inout of a port that is not a whole net of its own width** (23.3.3.1)
+  — with `--allow-port-coercion`, a connection to a select, concatenation, expression or net
+  of another width is refused.
+- [ ] **Initializer on a select port whose variable is declared apart from the port** (23.2.2.2)
+  — `output x = 1;` with a later `reg [3:0] x;` under `module m(x[3:2])` is refused.
 
 ### Timing checks (basic)
 

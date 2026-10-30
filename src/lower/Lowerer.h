@@ -1011,6 +1011,11 @@ public:
         inferred_clocks_ = clocks;
     }
 
+    // Whether `--allow-port-coercion` is given (LRM 23.3.3.1).
+    void set_allow_port_coercion(bool allow) {
+        allow_port_coercion_ = allow;
+    }
+
     // Point this Lowerer at the design-wide class id table. `ids` must outlive
     // every call made through this Lowerer.
     // Design-wide: some assignment can retarget an event variable, so no event's
@@ -1627,6 +1632,16 @@ private:
 
     void build_inout_aliases(const InstanceSymbol& inst);
 
+    bool needs_port_coercion(const PortConnection& pc, const PortSymbol& p);
+
+    bool net_is_read(const ValueSymbol& sym);
+
+    bool port_driven_inside(const PortSymbol& p);
+
+    bool other_driver_of(const Expression& own_target);
+
+    void scan_net_uses();
+
     void collect_signals(const InstanceBodySymbol& body);
 
     void collect_scope_signals(const Scope&                                                                  scope,
@@ -1929,6 +1944,10 @@ private:
 
     void lower_pull_source(const PrimitiveInstanceSymbol& gi, bool up);
 
+    void emit_pull_driver(const ValueSymbol& net, bool up, uint8_t level, ir::SourceLoc l, bool program_driver);
+
+    void lower_unconnected_drive(const PortSymbol& p, bool up, bool program_driver);
+
     void lower_cmos_switch(const PrimitiveInstanceSymbol& gi);
 
     void lower_gate(const PrimitiveInstanceSymbol& gi);
@@ -1974,6 +1993,8 @@ private:
     void wire_ports(const InstanceSymbol& child);
 
     void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out);
+
+    ir::Index lower_port_output(const AssignmentExpression& a, ir::Index port_value, ir::Builder& b);
 
     static const Statement& unwrap_blocks(const Statement& stmt);
 
@@ -2757,6 +2778,8 @@ private:
     void emit_default_init(ir::Index lv, ir::Ref ty, ir::Builder& b, ir::SourceLoc l);
 
     void lower_var_initializer(const VariableSymbol& vs);
+
+    const Expression* declaration_initializer(const VariableSymbol& vs);
 
     void finalize_preinit();
 
@@ -5124,6 +5147,11 @@ private:
     // of allocating fresh storage. Both sides then read/write one signal and
     // multi-driver resolution folds competing drivers.
     ankerl::unordered_dense::map<const Symbol*, ir::Signal> inout_alias_;
+    // The variable output ports (LRM 23.2.2.2) whose declaration carries an
+    // initializer, by the variable each declares. slang keeps that initializer on
+    // the PortSymbol and not on the variable, so declaration_initializer finds it
+    // here. Filled by collect_signals for every instance body.
+    ankerl::unordered_dense::map<const Symbol*, const PortSymbol*> port_initializers_;
     // Continuous-driver coverage per net signal: the closed regions already
     // driven, checked for overlap by record_net_driver_region (NetRegion defined
     // in the net-driver-tracking section).
@@ -5454,6 +5482,19 @@ private:
     // Inference verdicts for concurrent assertions (see set_inferred_clocks).
     // Null when nothing populated it.
     const InferredClockMap* inferred_clocks_ = nullptr;
+    // Port coercion (LRM 23.3.3.1); see set_allow_port_coercion.
+    bool allow_port_coercion_ = false;
+    // The ports build_inout_aliases coerced to inout: wire_ports copies nothing for them.
+    ankerl::unordered_dense::set<const PortSymbol*> coerced_ports_;
+    // Every write target in this top's hierarchy, by the value symbol it roots at, and
+    // the instance body each one is written in.
+    ankerl::unordered_dense::map<const slang::ast::ValueSymbol*, std::vector<const Expression*>> writes_;
+    ankerl::unordered_dense::map<const Expression*, const slang::ast::InstanceBodySymbol*>       write_in_;
+    // Every value symbol this top's hierarchy reads somewhere (net_is_read), built on
+    // the first question and valid for the top lower_top was given.
+    const InstanceSymbol*                                        top_inst_      = nullptr;
+    bool                                                         reads_scanned_ = false;
+    ankerl::unordered_dense::set<const slang::ast::ValueSymbol*> read_syms_;
     // The event control of the procedure currently being lowered, or null when it
     // has none. Set by lower_procedural_block; read by lower_concurrent_assertion
     // to resolve an inferred clock inside the instance being lowered.
@@ -5465,6 +5506,10 @@ private:
     // the LValueReferenceExpression slang embeds in its rewritten RHS. Null
     // outside a compound assignment.
     std::optional<ir::Index> compound_lv_;
+    // The value an output port's connection assigns, read by the EmptyArgument
+    // slang leaves for it in the connection's right-hand side (lower_port_output).
+    // Nullopt outside one; scoped by Restore, never assigned bare.
+    std::optional<ir::Index> port_value_;
     // The queue `$` resolves against inside a queue range-select's bounds (see
     // QueueDollarCtx). Nullopt outside one; scoped by Restore, never assigned
     // bare.
