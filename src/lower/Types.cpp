@@ -1143,10 +1143,10 @@ struct NetUseScan : ASTVisitor<NetUseScan, VisitFlags::AllGood> {
     void target(const Expression& e, const Expression& whole) {
         switch (e.kind) {
             case ExpressionKind::NamedValue:
-                (*writes)[&e.as<NamedValueExpression>().symbol].push_back(&whole);
+                (*writes)[&canonical_value_symbol(e.as<NamedValueExpression>().symbol)].push_back(&whole);
                 return;
             case ExpressionKind::HierarchicalValue:
-                (*writes)[&e.as<HierarchicalValueExpression>().symbol].push_back(&whole);
+                (*writes)[&canonical_value_symbol(e.as<HierarchicalValueExpression>().symbol)].push_back(&whole);
                 return;
             case ExpressionKind::ElementSelect:
                 target(e.as<ElementSelectExpression>().value(), whole);
@@ -1208,59 +1208,13 @@ struct NetUseScan : ASTVisitor<NetUseScan, VisitFlags::AllGood> {
     void handle(const ProceduralDeassignStatement&) {}
 
     void handle(const NamedValueExpression& nv) {
-        reads->insert(&nv.symbol);
+        reads->insert(&canonical_value_symbol(nv.symbol));
     }
 
     void handle(const HierarchicalValueExpression& hv) {
-        reads->insert(&hv.symbol);
+        reads->insert(&canonical_value_symbol(hv.symbol));
     }
 };
-
-// The bits (offsets from the LSB) a constant bit or part select of a vector names, or
-// nothing when the target is not such a select.
-std::optional<std::pair<int64_t, int64_t>> select_span(const Expression& t) {
-    const Expression* base = nullptr;
-    int64_t           l    = 0;
-    int64_t           r    = 0;
-    const auto        cst  = [](const Expression& x) -> std::optional<int64_t> {
-        const slang::ConstantValue* c = x.getConstant();
-        return c != nullptr && c->isInteger() && !c->integer().hasUnknown() ? c->integer().as<int64_t>() : std::nullopt;
-    };
-    if (t.kind == ExpressionKind::ElementSelect) {
-        const auto& s = t.as<ElementSelectExpression>();
-        base          = &s.value();
-        const auto i  = cst(s.selector());
-        if (!i) {
-            return std::nullopt;
-        }
-        l = r = *i;
-    } else if (t.kind == ExpressionKind::RangeSelect &&
-               t.as<RangeSelectExpression>().getSelectionKind() == RangeSelectionKind::Simple) {
-        const auto& s = t.as<RangeSelectExpression>();
-        base          = &s.value();
-        const auto lo = cst(s.left());
-        const auto hi = cst(s.right());
-        if (!lo || !hi) {
-            return std::nullopt;
-        }
-        l = *lo;
-        r = *hi;
-    } else {
-        return std::nullopt;
-    }
-    const slang::ast::Type& ty = base->type->getCanonicalType();
-    if ((base->kind != ExpressionKind::NamedValue && base->kind != ExpressionKind::HierarchicalValue) ||
-        !ty.isIntegral() || ty.isUnpackedArray()) {
-        return std::nullopt;
-    }
-    const slang::ConstantRange range = ty.getFixedRange();
-    if (range.width() != ty.getBitWidth()) {
-        return std::nullopt;
-    }
-    const int64_t a = range.translateIndex(static_cast<int32_t>(l));
-    const int64_t b = range.translateIndex(static_cast<int32_t>(r));
-    return std::make_pair(std::min(a, b), std::max(a, b));
-}
 
 } // namespace
 
@@ -1293,30 +1247,29 @@ bool Lowerer::net_is_read(const ValueSymbol& sym) {
 // Whether the module the port `p` belongs to drives the net behind it itself: an
 // assignment, gate output or child output port written in the module's own body, to
 // bits the port connects. A driver from outside (a hierarchical assignment) is not
-// the module's, and the port's own copy is not an assignment at all. Fails closed
-// (true) when no top is known.
+// the module's, and the port's own copy is not an assignment at all. Bits are
+// compared as the driver tracking does (net_region_of): constant and genvar selects
+// of packed, multi-dimensional and unpacked-array nets are told apart, and a
+// run-time index covers the whole net. Fails closed (true) when no top is known.
 bool Lowerer::port_driven_inside(const PortSymbol& p) {
     if (top_inst_ == nullptr) {
         return true;
     }
     scan_net_uses();
-    const auto it = writes_.find(&p.internalSymbol->as<ValueSymbol>());
+    const ValueSymbol& net = canonical_value_symbol(p.internalSymbol->as<ValueSymbol>());
+    const auto         it  = writes_.find(&net);
     if (it == writes_.end()) {
         return false;
     }
     const Symbol*     body = &p.getParentScope()->asSymbol();
     const Expression* sel  = p.getInternalExpr();
-    const auto        mine = sel != nullptr ? select_span(*sel) : std::nullopt;
+    const NetRegion   mine = sel != nullptr ? net_region_of(*sel, net) : kWholeNet;
     for (const Expression* w : it->second) {
         const auto where = write_in_.find(w);
         if (where == write_in_.end() || static_cast<const Symbol*>(where->second) != body) {
             continue;
         }
-        if (sel == nullptr) {
-            return true;
-        }
-        const auto theirs = select_span(*w);
-        if (!mine || !theirs || (mine->first <= theirs->second && theirs->first <= mine->second)) {
+        if (mine.overlaps(net_region_of(*w, net))) {
             return true;
         }
     }
@@ -1325,28 +1278,30 @@ bool Lowerer::port_driven_inside(const PortSymbol& p) {
 
 // Whether the net `own` (one target of an output port connection) roots at has a
 // driver besides this connection that can reach the same bits: another assignment,
-// gate output or port connection, or the pull of its net type. Fails closed (true)
-// when no top is known.
+// gate output or port connection, or the pull of its net type. Bits are compared as
+// the driver tracking does (net_region_of), so the instances of a generate loop that
+// each drive a constant slice of one net do not count against each other; a
+// run-time index covers the whole net. Fails closed (true) when no top is known.
 bool Lowerer::other_driver_of(const Expression& own) {
-    const ValueSymbol* root = lvalue_root(own);
-    if (root == nullptr || root->kind != SymbolKind::Net) {
+    const ValueSymbol* raw = lvalue_root(own);
+    if (raw == nullptr) {
         return false;
     }
-    if (top_inst_ == nullptr || net_pull_value(root->as<NetSymbol>().netType.netKind).has_value()) {
+    const ValueSymbol& root = canonical_value_symbol(*raw);
+    if (root.kind != SymbolKind::Net) {
+        return false;
+    }
+    if (top_inst_ == nullptr || net_pull_value(root.as<NetSymbol>().netType.netKind).has_value()) {
         return true;
     }
     scan_net_uses();
-    const auto it = writes_.find(root);
+    const auto it = writes_.find(&root);
     if (it == writes_.end()) {
         return false;
     }
-    const auto mine = select_span(own);
+    const NetRegion mine = net_region_of(own, root);
     for (const Expression* w : it->second) {
-        if (w == &own) {
-            continue;
-        }
-        const auto theirs = select_span(*w);
-        if (!mine || !theirs || (mine->first <= theirs->second && theirs->first <= mine->second)) {
+        if (w != &own && mine.overlaps(net_region_of(*w, root))) {
             return true;
         }
     }
