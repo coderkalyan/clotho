@@ -94,6 +94,33 @@ TEST_CASE("inertial CA delay: 64-bit 2-state net") {
     CHECK(run_capture_finish(src) == "y=deadbeef00000001\n");
 }
 
+// LRM 9.4.1: a delay that evaluates to an unknown value "shall be interpreted as
+// zero delay". 10.3.3 does not repeat it for a continuous assignment's delay, which
+// takes the same delay_value (see scaled_delay), so any x or z bit zeroes it: with
+// `D = 4'b1x01` the assignments below waited 9 and now update in the same instant
+// (the NBA region of t=10, seen at t=11), as a delay of 0 does. A net-declaration
+// assignment (`wire #D w = a`) is one too. Byte-identical to iverilog 13.
+TEST_CASE("inertial CA delay: a delay with an x or z bit is a zero delay") {
+    constexpr std::string_view src = R"(
+        `timescale 1ns/1ns
+        module m;
+            localparam logic [3:0] D = 4'b1x01;
+            logic [3:0] dx = 4'b1x01;
+            logic a;
+            wire wa, wv;
+            assign #D  wa = a;
+            assign #dx wv = a;
+            wire #D wd = a;
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #1  $display("t=%0t wa=%b wv=%b wd=%b", $time, wa, wv, wd);
+                #30 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "t=11 wa=1 wv=1 wd=1\n");
+}
+
 // Guard: a rise/fall/turn-off delay triple `#(a,b,c)` on a net has no Clotho
 // representation and must fail loud (LRM 10.3.3 vector-net transition delays).
 TEST_CASE("inertial CA delay: multi-value delay is rejected") {

@@ -350,3 +350,38 @@ Deviation: with no strength model there is nothing for the strength reduction of
 and `cmos`. Not gated.
 
 Code: `src/lower/Nets.cpp` (`mos_switch_of`, `lower_cmos_switch`). Tests: `tests/gate_test.cpp` ("MOS switch truth tables match LRM table 28-6, including the z pass-through", "a cmos switch drives its output from both halves independently").
+
+## 39. Delay with an unknown bit (9.4.1)
+
+9.4.1 reads a delay that "evaluates to an unknown or high-impedance value" as a
+zero delay, and does not say whether a value with only some bits x or z is
+unknown. Clotho reads any x or z bit as making it so, as 11.4.4 does for an
+operand that "contains an unknown (x) or high-impedance (z) value", so
+`#(4'b1x01)` waits 0 and not the 9 its known bits spell. The rule covers every
+delay form, though only the procedural delay control states it: the
+intra-assignment delay (9.4.5) and the `->>` delay (15.5.1) are that control,
+and the continuous-assignment, gate and net delays (10.3.3, 28.16) take the same
+`delay_value` without restating it. A compile-time unknown nonblocking
+intra-assignment delay is a plain `<=`, as a compile-time `#0` is.
+
+Code: `src/lower/SystemTasks.cpp` (`scaled_delay`), `src/lower/Assign.cpp` (`intra_nb_delay_is_const_zero`). Tests: `tests/llvm_backend_test.cpp` ("a delay with an x or z bit is a zero delay", "an unknown delay is zero before the time unit multiplier"), `tests/event_test.cpp` ("->> #(x) e: a delay with an x or z bit is a zero delay"), `tests/continuous_assign_delay_test.cpp`, `tests/gate_test.cpp` and `tests/net_delay_test.cpp` (one case each). Oracle: iverilog 13 for the procedural, intra-assignment, `assign` and gate forms; it implements no net delay and no `->>`.
+
+## 40. Sign and range of a `%t` operand (21.2.1.1, 20.4.3)
+
+Table 21-1 describes `%t` only as "Display in current time format", and 20.4.3
+says what `$timeformat` sets (units, precision, suffix, minimum width); neither
+says what a negative operand prints, or a time too large to count. Clotho reads
+the argument as the value it is: a negative signed or real operand is a negative
+time, written with a `-` that counts toward the field width, as for `%d`. The
+sign is the operand's signedness, not its top bit, so an unsigned all-ones
+operand stays positive. A constant and a runtime format string print the same
+text, and so does iverilog.
+
+A time whose tick count (the operand times the module's ticks per unit) does not
+fit 63 bits is shown as the largest count of its sign, +-(2**63 - 1) ticks, for an
+integral operand of any width and for a real alike, as a real delay beyond that
+count saturates (`saturating_ticks`), instead of keeping the low 64 bits of the
+product. iverilog prints the exact count. An x or z bit of the operand reads as 0
+(iverilog prints x).
+
+Code: `src/lower/Assign.cpp` (`scale_to_ticks`), `src/lower/SystemTasks.cpp` (`saturating_ticks`), `src/runtime/Format.cpp` (`render_time`, `coerce_dyn_arg`, `integral_time_ticks`, `real_time_ticks`). Tests: `tests/llvm_backend_test.cpp` ("%t of a negative operand prints its sign in a constant and in a runtime format", "%t of a time beyond 2**63 ticks saturates in a constant and in a runtime format"), `tests/real_test.cpp` ("a real delay beyond 2**63 ticks saturates instead of wrapping into an early event").

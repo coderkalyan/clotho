@@ -211,6 +211,14 @@ block, the event fires `d` ticks later, runtime (non-constant) delays work, and
 1000 concurrent detached timers run and free cleanly. iverilog implements no
 `->>`, so pinned to the LRM.
 
+A zero delay (`->> #0 e`, or a runtime delay that is 0) never reaches the wheel,
+which holds only timers due at a later tick (`rt_wheel_schedule_rel` takes a delay
+above 0). LRM 15.5.1 makes the update event an NBA-region event "in the time in
+which the delay control expires", and a zero delay expires in the current slot, so
+it is `->> e`: the event goes onto the NBA pending chain. The delay reaches the
+backend as arithmetic over a constant, not as a constant, so every design with a
+`->> #d` sets `design_uses_nb_events_` and pays one pointer test per NBA check.
+
 ## Superseded: event handles, `->> @(x) e`, `wait_order`, ports
 
 These were deferred here with a captured design (Options A/B) built on the
