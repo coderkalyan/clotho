@@ -671,6 +671,30 @@ Plane Backend::lower_real_math_binary(Index i) {
     }
 }
 
+// A multiply, divide or modulo of two iW values through the runtime routine `routine`
+// (rt_wide_mul, rt_wide_udiv, ...). Both operands are spilled zero-extended to whole
+// words, which is the layout the routine reads and leaves nothing set above W, and the
+// result is reloaded from a third buffer. The buffers are entry allocas, like the
+// wide-select helpers', and the three accesses have no suspension point between them.
+llvm::Value* Backend::wide_arith(const char* routine, llvm::Value* a, llvm::Value* b) {
+    const uint32_t w    = bits_of(a);
+    const uint32_t bits = sel_buf_bits(w);
+    assert(w > wide_arith_bits);
+    assert(bits_of(b) == w);
+    auto*        buf_ty = int_ty(bits);
+    llvm::Value* out    = entry_alloca(buf_ty, "warith.out");
+    llvm::Value* a_buf  = entry_alloca(buf_ty, "warith.a");
+    llvm::Value* b_buf  = entry_alloca(buf_ty, "warith.b");
+    b_.CreateStore(cast(a, bits, false), a_buf);
+    b_.CreateStore(cast(b, bits, false), b_buf);
+    b_.CreateCall(wide_arith_fn(routine), { out, a_buf, b_buf, b_.getInt32(w) });
+    return cast(b_.CreateLoad(buf_ty, out), w, false);
+}
+
+llvm::Value* Backend::lower_mul(llvm::Value* a, llvm::Value* b) {
+    return bits_of(a) > wide_arith_bits ? wide_arith("rt_wide_mul", a, b) : b_.CreateMul(a, b);
+}
+
 Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
     const uint32_t w    = width_of(a);
 
@@ -684,7 +708,7 @@ Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
         switch (tag) {
             case Inst::Tag::Add: return two_val(b_.CreateAdd(a.mm, b.mm));
             case Inst::Tag::Sub: return two_val(b_.CreateSub(a.mm, b.mm));
-            default:             return two_val(b_.CreateMul(a.mm, b.mm)); // Mul
+            default:             return two_val(lower_mul(a.mm, b.mm)); // Mul
         }
     }
 
@@ -731,7 +755,7 @@ Plane Backend::lower_arith(Inst::Tag tag, Plane a, Plane b) {
             r = b_.CreateSub(am, bm);
             break;
         default:
-            r = b_.CreateMul(am, bm);
+            r = lower_mul(am, bm);
             break;
     }
     llvm::Value* val_mm = packed(r, r, zero(w)).mm;
@@ -752,6 +776,10 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b) {
     const bool     is_div = tag == Inst::Tag::UDiv || tag == Inst::Tag::SDiv;
     const bool     sign   = tag == Inst::Tag::SDiv || tag == Inst::Tag::SMod;
 
+    // The runtime routine for operands wider than `wide_arith_bits`.
+    const char* const wide_routine = sign ? (is_div ? "rt_wide_sdiv" : "rt_wide_smod")
+                                          : (is_div ? "rt_wide_udiv" : "rt_wide_umod");
+
     // 2-state: divide/modulo by zero is x, which collapses to 0 in a 2-state
     // result (verified against iverilog: `int`/`bit` div/mod by 0 -> 0). Guard
     // the divisor to avoid poison, then select 0 on a zero divisor. Signed
@@ -763,6 +791,11 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b) {
     // constant folder, so it is an assertion, not a repair.
     assert(a.two == b.two && "divide / modulo operands share a domain (ir::verify: operand-domain)");
     if (a.two) {
+        if (w > wide_arith_bits) {
+            // The routine gives 0 for a zero divisor and wraps MIN / -1 itself, so the
+            // operands go in as they are.
+            return two_val(wide_arith(wide_routine, a.mm, b.mm));
+        }
         llvm::Value* dz = b_.CreateICmpEQ(b.mm, zero(w));
         llvm::Value* r;
         if (!sign) {
@@ -814,7 +847,12 @@ Plane Backend::lower_divmod(Inst::Tag tag, Plane a, Plane b) {
     // two's-complement overflow value at width W.
     b_.SetInsertPoint(val_bb);
     llvm::Value* r = nullptr;
-    if (!sign) {
+    if (w > wide_arith_bits) {
+        // The branch above sent a zero divisor to x, and the routine wraps MIN / -1
+        // itself, so the operands go in as they are.
+        r = wide_arith(wide_routine, am, bm);
+    }
+    else if (!sign) {
         r = is_div ? b_.CreateUDiv(am, bm) : b_.CreateURem(am, bm);
     }
     else {
@@ -952,9 +990,9 @@ Plane Backend::lower_pow(Plane a, Plane b, bool base_signed, bool exp_signed) {
     // Multiply result by base when the low exponent bit is set; always square
     // the base and shift the exponent down.
     llvm::Value* odd      = b_.CreateTrunc(exp, b_.getInt1Ty());
-    llvm::Value* product  = b_.CreateMul(result, base);
+    llvm::Value* product  = lower_mul(result, base);
     llvm::Value* next_res = b_.CreateSelect(odd, product, result);
-    llvm::Value* next_bas = b_.CreateMul(base, base);
+    llvm::Value* next_bas = lower_mul(base, base);
     llvm::Value* next_exp = b_.CreateLShr(exp, llvm::ConstantInt::get(ety, 1));
     llvm::Value* more     = b_.CreateICmpNE(next_exp, zero(ew));
 
