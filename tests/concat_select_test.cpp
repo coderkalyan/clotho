@@ -308,3 +308,57 @@ TEST_CASE("a variable's initializer holds when its port is a select of it") {
     )");
     CHECK(out == "w=10 u.x=1001 wb=1 v.b=a5 wi=78 t.i=12345678 hi=10 all=1001 s.x=1001\n");
 }
+
+// Select ports naming an element of an unpacked array: the port is that element, in
+// both directions, and two ports may split one array. iverilog rejects this port
+// form, so the values are derived from LRM 23.2.2.1 (a select of a vector declared
+// in the module).
+TEST_CASE("a non-ANSI port that is an element of an unpacked array") {
+    const std::string out = run_capture(R"(
+        module m_in(a[1]);
+            input [3:0] a [0:3];
+        endmodule
+        module m_out(a[2]);
+            output [3:0] a [0:3];
+            assign a[2] = 4'b1010;
+        endmodule
+        module m_outv(r[3]);
+            output reg [3:0] r [0:3];
+            initial r[3] = 4'b0110;
+        endmodule
+        module m_two(a[0], a[3]);
+            input [3:0] a [0:3];
+        endmodule
+        module top;
+            reg  [3:0] s = 4'b1100;
+            reg  [3:0] t = 4'b0011;
+            wire [3:0] o1, o2;
+            m_in   u1(s);
+            m_out  u2(o1);
+            m_outv u3(o2);
+            m_two  u4(s, t);
+            initial #1 $display("%b %b %b %b %b", u1.a[1], o1, o2, u4.a[0], u4.a[3]);
+        endmodule
+    )");
+    CHECK(out == "1100 1010 0110 1100 0011\n");
+}
+
+// The resolved-parent-net output copy extends by the port's sign too (LRM 10.7,
+// 23.3.3.8): two signed outputs and a `z` driver on one net, whole and by select.
+TEST_CASE("a signed output port sign-extends onto a multiply driven net") {
+    const std::string out = run_capture(R"(
+        module s_neg(output signed [3:0] o);
+            assign o = -4'sd1;
+        endmodule
+        module top;
+            wire [7:0] w;
+            s_neg u1(w);
+            s_neg u2(w);
+            wire [7:0] w2;
+            s_neg u3(w2[7:0]);
+            assign w2 = 8'bzzzzzzzz;
+            initial #1 $display("w=%b w2=%b", w, w2);
+        endmodule
+    )");
+    CHECK(out == "w=11111111 w2=11111111\n");
+}

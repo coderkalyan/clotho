@@ -4236,6 +4236,33 @@ TEST_CASE("unconnected_drive on an unconnected input variable port fails loudly"
         CHECK_FALSE(r.ok);
         CHECK(r.diagnostic_text().find("unconnected_drive") != std::string::npos);
     }
+    SUBCASE("a select port") {
+        const LowerResult r = lower_text(R"(
+            `unconnected_drive pull1
+            module m(a[1:0]);
+                input [3:0] a;
+            endmodule
+            `nounconnected_drive
+            module top;
+                m u();
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("unconnected_drive") != std::string::npos);
+    }
+    SUBCASE("an aggregate port") {
+        const LowerResult r = lower_text(R"(
+            `unconnected_drive pull1
+            module m(input wire [3:0] a [0:1]);
+            endmodule
+            `nounconnected_drive
+            module top;
+                m u();
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("unconnected_drive") != std::string::npos);
+    }
     SUBCASE("an event port is left alone") {
         const LowerResult r = lower_text(R"(
             `unconnected_drive pull1
