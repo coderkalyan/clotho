@@ -1247,6 +1247,7 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         const Expression* sel = p.getInternalExpr();
 
         if (cur_pass_ == Pass::Classify) {
+            check_value_port_nets(p, *expr);
             // The connection is a continuous driver: an output drives the
             // parent-side lvalue, an input drives the port's own bits of the
             // child net.

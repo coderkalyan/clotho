@@ -1723,3 +1723,29 @@ TEST_CASE("a uwire on either side of an inout port is a frontend error") {
     CHECK_FALSE(external.ok);
     CHECK(external.diagnostic_text().find("'uwire' net 'w' cannot be connected to 'inout' port") != std::string::npos);
 }
+
+// 23.3.3 makes an input or output port a continuous assignment from source to
+// sink, and 23.3.3.7 only lets the nets on both sides take one type ("it is
+// permissible to merge"). Clotho keeps them apart (check_value_port_nets in
+// src/lower/Nets.cpp), so the sink resolves by its own type. Both values below
+// hold merged or not, and iverilog 13, which merges, agrees.
+TEST_CASE("input and output ports resolve the sink net by its own type") {
+    const std::string out = run_capture(R"(
+        module c(input tri1 a);
+          initial #1 $display("child sees %b", a);
+        endmodule
+        module drv(output wire o, input logic v);
+          assign o = v;
+        endmodule
+        module top;
+          wire w;
+          wand wa;
+          logic a = 1, b = 0;
+          c u(w);
+          drv d1(wa, a);
+          drv d2(wa, b);
+          initial #2 $display("wand=%b", wa);
+        endmodule
+    )");
+    CHECK(out == "child sees 1\nwand=0\n");
+}

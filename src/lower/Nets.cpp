@@ -242,6 +242,39 @@ void Lowerer::finalize_sim_nets() {
     }
 }
 
+// Input and output ports against LRM 23.3.3.7.
+//
+// 23.3.3 makes an input or output port "a continuous assignment from source to
+// sink", and wire_ports lowers exactly that: the sink net keeps its own type and
+// resolves its drivers, the port copy among them, as that type says. 23.3.3.7
+// only lets the nets on both sides of a port "take on the same type" and calls
+// merging them "permissible", so an implementation that keeps them apart
+// conforms, and where the LRM allows both behaviors Clotho takes the fastest
+// and simplest (docs/PRINCIPLES.md): no merge, no second net type to track per
+// port, nothing for a design whose ports connect similar nets. What the LRM
+// attaches to not merging is warnings. Table 23-1's `warn` cells are slang's
+// (`net-inconsistent`, for a port of any direction); 23.3.3.6 is this one: "If
+// the net on either side of a port has the net type uwire, a warning shall be
+// issued if the nets are not merged into a single net, as described in
+// 23.3.3.7." (inout ports do merge, collapse_port_net, and slang rejects a uwire
+// on them.)
+void Lowerer::check_value_port_nets(const PortSymbol& p, const Expression& expr) {
+    slang::SmallVector<PortSymbol::NetTypeRange, 4> internal;
+    p.getNetTypes(internal);
+    slang::SmallVector<PortSymbol::NetTypeRange, 4> external;
+    PortSymbol::getNetRanges(expr, external);
+    const auto is_uwire = [](const PortSymbol::NetTypeRange& r) { return r.netType->netKind == NetType::UWire; };
+    if (std::ranges::none_of(internal, is_uwire) && std::ranges::none_of(external, is_uwire)) {
+        return;
+    }
+    report_once(Severity::Warning,
+                "uwire-port-not-merged",
+                "the nets of port '" + std::string(p.name) +
+                  "' are not merged, so the single-driver restriction of the uwire net on this connection (LRM 6.6.2) "
+                  "is not enforced across it (LRM 23.3.3.6)",
+                to_source_span(expr.sourceRange));
+}
+
 // Record that `reg` of a net gained a continuous driver; fail on overlap
 // with a previously recorded driver. Two regions overlap iff their element
 // bands intersect AND their bit ranges intersect. Non-net symbols are

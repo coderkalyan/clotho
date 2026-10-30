@@ -2186,6 +2186,8 @@ private:
 
     void wire_ports(const InstanceSymbol& child);
 
+    void check_value_port_nets(const PortSymbol& p, const Expression& expr);
+
     void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out);
 
     ir::Index lower_port_output(const AssignmentExpression& a, ir::Index port_value, ir::Builder& b);

@@ -213,7 +213,7 @@ a direct store or a slot owned by the driver gave.
 ### Net types across ports
 
 LRM 23.3.3.7 lets the nets on both sides of a port "take on the same type", and
-Table 23-1 gives which.
+Table 23-1 gives which. How Clotho reads it depends on the direction.
 
 **Inout.** The port merges the two nets (both symbols share one signal), and the
 merged **simulated net** has the type the table gives for the pair (the
@@ -248,6 +248,16 @@ readings open, decided in `collapse_port_net`:
 - A simulated net of a type Clotho does not model (a trireg that dominates)
   fails loudly, and so does a net delay on a collapsed net that dominates its
   owner, which would need the declaring module's time unit.
+
+**Input and output.** 23.3.3 makes the port "a continuous assignment from source
+to sink", and that is what Clotho lowers: the sink net keeps its own type and
+resolves its drivers, the port copy among them, as that type says. 23.3.3.7 only
+calls merging the two nets "permissible", so a design that connects dissimilar
+nets through an input or output port is conforming without it, and where the LRM
+allows both behaviors Clotho takes the cheaper. What the LRM attaches to not
+merging is warnings: Table 23-1's `warn` cells are slang's, for a port of any
+direction, and 23.3.3.6 asks for one when a uwire is on either side of a port
+whose nets are not merged (`uwire-port-not-merged`).
 
 ## Inbound facts and summaries
 
