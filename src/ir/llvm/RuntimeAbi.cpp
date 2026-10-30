@@ -1072,6 +1072,10 @@ llvm::FunctionCallee Backend::event_ptr_fn() {
     return rt_fn("rt_event_ptr", raw_ptr_ty(), { b_.getInt32Ty() });
 }
 
+llvm::FunctionCallee Backend::event_trig_id_fn() {
+    return rt_fn("rt_event_trig_id", b_.getInt32Ty(), { raw_ptr_ty() });
+}
+
 llvm::FunctionCallee Backend::run_init_fn() {
     return rt_fn("rt_run_init", b_.getVoidTy(), { raw_ptr_ty(), b_.getInt32Ty() });
 }

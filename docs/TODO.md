@@ -100,7 +100,11 @@ Milestones, in order; lower ones unblock higher ones:
 ### Procedural control
 
 - [ ] **`disable` of a target that can suspend in a callee** (9.6.2) — a target parked in a
-  time-consuming task call, a `fork` or an `expect` cannot be aborted down the enable chain.
+  time-consuming task call or an `expect`, or a task that forks, cannot be aborted. A block
+  whose body calls a subroutine that forks is refused too: those children are not in it.
+- [ ] **Order of an event-controlled `<=` against plain NBAs** (4.6, 10.4.2) — the update of
+  `x <= @e v` or `x <= @(posedge c) v` commits after the step's plain NBAs, not in the order
+  its event occurred, so a plain `x <= w` executed after the trigger loses to it.
 
 ## M2 — Icarus Verilog parity
 

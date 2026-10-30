@@ -261,6 +261,8 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         fork_record_      = nullptr;
         fork_live_        = nullptr;
         disable_node_     = nullptr;
+        fork_disable_nodes_.clear();
+        spawn_sched_ = nullptr;
         block_nodes_.clear();
         event_wait_nodes_.clear();
     sync_nodes_.clear();
@@ -319,6 +321,8 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     fork_record_      = nullptr;
     fork_live_        = nullptr;
     disable_node_     = nullptr;
+    fork_disable_nodes_.clear();
+    spawn_sched_      = nullptr;
     cur_is_task_      = false;
     // PreInit applies declaration initializers and Preponed captures sampled
     // values; neither is a design-visible write, so neither may wake a
@@ -1388,6 +1392,8 @@ void Backend::lower_task(FunctionId id) {
     // body's alloca would name storage in another function.
     fork_record_ = nullptr;
     disable_node_ = nullptr;
+    fork_disable_nodes_.clear();
+    spawn_sched_ = nullptr;
     block_nodes_.clear();
     event_wait_nodes_.clear();
     sync_nodes_.clear();
@@ -1498,6 +1504,26 @@ void Backend::lower_task(FunctionId id) {
     }
     acts_node_ = nullptr;
     fork_live_ = nullptr;
+    // A fork child enclosed in targeted blocks (Function::fork_targets) is an
+    // activation of each of them (LRM 9.6.2: "all activities enabled within the named
+    // block ... shall be terminated as well"), so it joins their lists HERE, in the
+    // ramp, not when its body starts: a `join_none` / `join_any` sibling sits queued
+    // before it has run, and a `disable` landing then must still find it. The nodes
+    // publish a word held at 1 as their scheduled flag for that window, so the
+    // force-wake marks the child without pushing it onto a ring it is already on; the
+    // body replaces it with the real flag when it starts.
+    if (f.is_fork_child && design_uses_disable_ && !f.fork_targets.empty()) {
+        llvm::IRBuilder<> ab(coro_begin_->getParent(), std::next(coro_begin_->getIterator()));
+        spawn_sched_ = ab.CreateAlloca(sched_word_ty(), nullptr, "spawn_sched");
+        b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), spawn_sched_);
+        for (const uint32_t target : f.fork_targets) {
+            llvm::Value* node = ab.CreateAlloca(disable_node_ty(), nullptr, "fork_node");
+            emit_disable_link(target, node, spawn_sched_);
+            fork_disable_nodes_.emplace_back(target, node);
+        }
+        // The link splits the ramp's block; the initial suspend below goes at its end.
+        begin_bb = b_.GetInsertBlock();
+    }
 
     auto* trap_bb    = llvm::BasicBlock::Create(ctx_, "coro.trap", fn_);
     auto* free_bb    = llvm::BasicBlock::Create(ctx_, "coro.free", fn_);
@@ -1555,6 +1581,22 @@ void Backend::lower_task(FunctionId id) {
         emit_disable_link(f.disable_target, disable_node_);
     }
     emit_pcb_acts_link();
+    if (!fork_disable_nodes_.empty()) {
+        // The body is starting: publish the real scheduled flag in place of the one the
+        // ramp held at 1 ...
+        for (const auto& [target, node] : fork_disable_nodes_) {
+            b_.CreateStore(sched_ptr_, b_.CreateStructGEP(disable_node_ty(), node, 4));
+        }
+        // ... and give up at once if a `disable` already ended this child while it was
+        // queued. The mark is the only thing that reached it: it never parked, so no
+        // other abort poll would run before its first statement.
+        for (const auto& [target, node] : fork_disable_nodes_) {
+            auto*        alive = llvm::BasicBlock::Create(ctx_, "fork.child.enabled", fn_);
+            llvm::Value* mark  = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), node, 5));
+            b_.CreateCondBr(b_.CreateICmpNE(mark, b_.getInt32(0)), epilogue_bb, alive);
+            b_.SetInsertPoint(alive);
+        }
+    }
     // A thread can be aborted before it has ever run: `kill`, `disable fork` and
     // LRM 24.3's program termination all mark a just-ramped fork child whose body
     // has not started, and the mark walk finds no activation to force-wake for it
@@ -1582,6 +1624,10 @@ void Backend::lower_task(FunctionId id) {
     // suspending, so we push it onto the ring that handle names -- the caller
     // may be reactive code, and emit_wake_push is what reads which.
     b_.SetInsertPoint(epilogue_bb);
+    // Off every list this child joined in its ramp, before anything can wake it.
+    for (const auto& [target, node] : fork_disable_nodes_) {
+        emit_disable_unlink(target, node);
+    }
     if (f.disable_target != kNoDisableTarget) {
         emit_disable_unlink(f.disable_target, disable_node_);
         // A disabled activation skips copy-out and nothing else: LRM 9.6.2 leaves
@@ -1804,7 +1850,7 @@ void Backend::emit_copyout(const Function& f) {
 // body's strings, and returns void.
 void Backend::lower_ret_void() {
     if (cur_is_task_) {
-        b_.CreateBr(task_epilogue_bb_);
+        b_.CreateBr(leave_blocks(0, task_epilogue_bb_));
         return;
     }
     emit_copyout(*cur_fn_);
@@ -2297,6 +2343,15 @@ void Backend::lower_task_call_inst(Index i) {
     argv.push_back(record);
 
     llvm::Value* task_hdl = b_.CreateCall(fnty, cf, argv);
+    // The callee runs INLINE, with this body on the stack and its scheduled flag clear. A
+    // `disable` of a block this body is an occupant of, or a `kill` of this thread, issued
+    // by the callee would force-wake it -- push its handle while it is running -- and the
+    // drain would resume it a second time. Hold the flag set, as a fork's inline run does
+    // (lower_fork_inst): the wake stands down, only the mark lands, and the poll after the
+    // call takes the exit. Every later park re-arms it before it suspends.
+    if (park_claim_wanted() && sched_ptr_ != nullptr) {
+        b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
+    }
     b_.CreateCall(coro_intr(llvm::Intrinsic::coro_resume), { task_hdl });
     llvm::Value* done = b_.CreateCall(coro_intr(llvm::Intrinsic::coro_done), { task_hdl });
 

@@ -265,8 +265,17 @@ llvm::Value* Backend::intra_id_value(Signal sig) {
     return b_.getInt32(id);
 }
 
-// Dense `<= @e` trigger id of (signal, edge), as an IR value.
+// Trigger id of (signal, edge), as an IR value. A dense `<= @e` id for a value
+// signal. For a declared event it is RT_TRIG_EVENT | the slot of the object the
+// variable names NOW (LRM 15.5.5.1: a control captures the object when it
+// executes), which is what emit_event_fire counts down.
 llvm::Value* Backend::trigger_id_value(Signal sig, uint32_t edge) {
+    if (event_slot_[static_cast<uint32_t>(sig)] != 0) {
+        llvm::Value* slot = event_is_mono(sig)
+                              ? static_cast<llvm::Value*>(b_.getInt32(event_slot_[static_cast<uint32_t>(sig)]))
+                              : b_.CreateTrunc(load_event_handle(sig), b_.getInt32Ty());
+        return b_.CreateOr(slot, b_.getInt32(RT_TRIG_EVENT));
+    }
     const auto        id = static_cast<uint32_t>(trigger_id(sig, edge));
     const SignalSlot& s  = slot_of(sig);
     if (abs_id_eligible(s)) {

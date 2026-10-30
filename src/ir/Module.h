@@ -221,6 +221,15 @@ struct Process {
     // false: it runs only when a wait event fires. Only meaningful with a non-empty
     // wait list (a sensitivity-less process already runs once via the seed loop).
     bool self_start = false;
+    // An always_comb / always_latch procedure (LRM 9.2.2.2, 9.2.2.3): its time-zero run
+    // happens "after all initial and always procedures have been started", so that its
+    // outputs are consistent with their effects on its inputs. The seed loop enqueues
+    // such a process behind every other body instead of in source order. A continuous
+    // assignment is also `self_start` but is not a procedure, so alone it keeps its place
+    // (LRM 4.9.1 leaves its time-zero order open); fused into one group with such a
+    // procedure it starts with it, a group being one body. Meaningful only with
+    // `self_start`.
+    bool starts_after_procedures = false;
     // A continuously-active process whose home region is the reactive region set
     // rather than the active one: a continuous construct declared inside a
     // `program` (LRM 24.3.1 -- "The continuous assignment assign tclk = clk;
@@ -614,6 +623,12 @@ struct Function {
     // the record is heap-allocated and reference-counted and the last one out frees
     // it (lower_fork_inst).
     ForkKind fork_kind = ForkKind::Join;
+    // The `disable` target ids of every named block this fork child was forked
+    // inside, innermost last (LRM 9.6.2: a block's forked children are activity
+    // within it). Only meaningful with is_fork_child. The child links one node onto
+    // each target's list in its RAMP, before it has run, so a `disable` that lands
+    // while it is still queued (a `join_none` / `join_any` sibling) still ends it.
+    std::vector<uint32_t> fork_targets;
     // A DPI-C import (LRM 35): the body is native C resolved at JIT link time by
     // extern_name, not lowered from IR. The backend emits an external declaration
     // (dpi_arg_ctypes / dpi_ret_ctype give the native C signature) and marshals

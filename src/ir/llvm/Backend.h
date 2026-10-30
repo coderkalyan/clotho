@@ -1863,6 +1863,7 @@ private:
                                llvm::Value*  new_z);
 
     void fire_event_trigger(Signal sig, uint32_t edge);
+    void emit_trigger_fire(llvm::Value* trig_id);
 
     llvm::Value* wait_base(uint32_t slot, llvm::Constant* gv, uint32_t sig);
 
@@ -1880,7 +1881,7 @@ private:
 
     void emit_event_pend_drain(llvm::Value* wheel);
 
-    void emit_event_fire(llvm::Value* obj, llvm::Value* wheel);
+    void emit_event_fire(llvm::Value* obj, llvm::Value* wheel, llvm::Value* trig_id = nullptr);
 
     void emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel);
 
@@ -2328,6 +2329,7 @@ private:
     llvm::FunctionCallee event_detach_ready_fn();
     llvm::FunctionCallee event_new_fn();
     llvm::FunctionCallee event_ptr_fn();
+    llvm::FunctionCallee event_trig_id_fn();
     llvm::FunctionCallee run_init_fn();
 
     llvm::FunctionCallee proc_alloc_fn();
@@ -3689,11 +3691,15 @@ private:
 
     llvm::Value* disable_head_ptr(llvm::IRBuilder<>& b, uint32_t t);
 
-    void emit_disable_link(uint32_t target, llvm::Value* node);
+    void emit_disable_link(uint32_t target, llvm::Value* node, llvm::Value* flag = nullptr);
 
     void emit_disable_unlink(uint32_t target, llvm::Value* node);
 
-    llvm::BasicBlock* block_end(uint32_t label) const;
+    size_t block_index(uint32_t label) const;
+
+    llvm::BasicBlock* leave_blocks(size_t floor, llvm::BasicBlock* to);
+
+    llvm::BasicBlock* leave_from(size_t top, size_t floor, llvm::BasicBlock* to);
 
     // -- State --
 
@@ -3953,6 +3959,9 @@ private:
     // Innermost-first stack of the enclosing loops' (step, exit) blocks; a
     // `continue` branches to `.first`, a `break` to `.second`.
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loop_targets_;
+    // block_targets_.size() when each loop of loop_targets_ was entered: a `break` or
+    // `continue` leaves every targeted block opened inside the loop (leave_blocks).
+    std::vector<size_t> loop_block_depth_;
     // Innermost-first stack of the enclosing named blocks' end blocks; a `disable`
     // branches to the end block of the id it carries. Empty unless the unit
     // contains a `disable` (only a targeted block is emitted at all). `remote` is
@@ -3964,12 +3973,28 @@ private:
         uint32_t          remote;
         llvm::Value*      node;
         llvm::BasicBlock* end;
+        // Paths that leave this block, and every remotely-named block opened inside
+        // it, to a continuation: built lazily by leave_from and shared by every exit
+        // with the same continuation.
+        struct Landing {
+            llvm::BasicBlock* to;
+            size_t            floor;
+            llvm::BasicBlock* landing;
+        };
+        std::vector<Landing> leave = {};
     };
     std::vector<OpenNamedBlock> block_targets_;
     llvm::AllocaInst*       record_           = nullptr;
     // This activation's node on its task's `disable` list, or null when the task
     // being lowered is not a target. Frame-resident (hoisted after coro.begin).
     llvm::Value*            disable_node_     = nullptr;
+    // The nodes a fork child links in its RAMP, one per enclosing targeted block
+    // (ir::Function::fork_targets), with the target id each is on. Empty outside a
+    // fork child. Until the body starts they publish `spawn_sched_`, a word held at 1,
+    // as their scheduled flag, so a `disable` that lands while the child is only
+    // queued marks it without pushing it a second time.
+    std::vector<std::pair<uint32_t, llvm::Value*>> fork_disable_nodes_;
+    llvm::Value*                                   spawn_sched_ = nullptr;
     // Per targeted named block in the body being lowered: its frame-resident list
     // node. Reset per function alongside disable_node_.
     ankerl::unordered_dense::map<uint32_t, llvm::Value*> block_nodes_;
@@ -4219,6 +4244,10 @@ private:
     // True when the design contains any `->> @(x) e`, so a signal wake also drains
     // the detached-subscription list for its (signal, edge).
     bool                                               design_uses_detached_events_ = false;
+    // True when some `x <= @e v` or `->> @(e) f` names a declared event as its
+    // control. An event wakes through its object, not a signal edge, so every event
+    // fire then also counts down the records registered on that object's trigger id.
+    bool design_uses_event_triggers_ = false;
     // Head of the NBA pending chain (clotho.event_pend_head).
     llvm::GlobalVariable*                              event_pend_head_gv_ = nullptr;
     // The design's single detached `->> #d e` on-expiry thunk (clotho.ev_delay).

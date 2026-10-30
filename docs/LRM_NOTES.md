@@ -469,3 +469,25 @@ A module that only drives its output net cannot tell, and any number of output p
 `--allow-port-coercion` coerces exactly those ports: the inner net takes the outer net's storage, as for an `inout` port, so every driver of both resolves together. It needs a port connected to a whole net of its own width; a variable, a select, a concatenation, an expression or another width is an error. slang's own `port-coercion` warnings ("coerced to 'inout'") are not shown, since they flag every net with a port driver beside another driver and claim a coercion that did not happen. iverilog always coerces, so it matches the flag and not the default.
 
 Code: `src/lower/Types.cpp` (`needs_port_coercion`, `build_inout_aliases`). Tests: `tests/xhier_test.cpp` ("an input port the module drives is refused unless coercion is allowed", "an output port read by its module while its net has other drivers is refused unless coercion is allowed", "ports whose coercion changes nothing are accepted by default"). Design: `docs/design/cli.md` (Options).
+
+## 44. The time-zero run of `always_comb` / `always_latch` (9.2.2.2, 9.2.2.3)
+
+9.2.2.2: the procedure "is automatically triggered once at time zero, after all
+initial and always procedures have been started so that the outputs of the procedure
+are consistent with the inputs"; 9.2.2.3 applies it to `always_latch`. "Started"
+does not say how far the other procedures have run, so Clotho takes the simple
+reading its FIFO active ring gives: every `initial` and sensitivity-less `always`
+runs up to its first suspension, then each `always_comb` / `always_latch` runs once,
+whatever the source order. A comb written above an `initial` that reads its output
+at time zero therefore reads the unsettled value (`x`), and a `disable` of a block
+of a later `initial` finds the block started and parked, so it ends it (9.6.2).
+iverilog does the same.
+
+A continuous assignment also evaluates once at time zero but is not a procedure,
+so alone it is not deferred; 4.9.1 leaves its order against the procedures open. One
+that comb fusion puts in the same group as an `always_comb` starts with it, because a
+group is one body: that is inside the same freedom (4.7 lets active events run in any
+order), and splitting every `assign` / `always_comb` cone to avoid it cost 1.9x on a
+mixed design.
+
+Code: `src/ir/llvm/Scheduler.cpp` (`emit_active_run`, `deferred_comb`), `src/ir/Module.h` (`Process::starts_after_procedures`), `src/lower/Statements.cpp` (`lower_procedural_block`). Tests: `tests/comb_fusion_test.cpp` ("always_comb and always_latch run once at time zero after every initial has started").

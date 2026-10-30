@@ -1684,11 +1684,12 @@ typedef struct rt_event {
 void rt_run_init(void* event_static_block, uint32_t event_static_count);
 
 // Detached one-shot event subscriptions (`->> @(x) e`, LRM 15.5.1), keyed by the
-// dense (signal, edge) trigger id. Growable: a `->> @(x) e` in a loop makes one
-// registration per pass, which no static wait bucket can bound. `count` is the
-// `repeat (n)` countdown; the edge decrements and only a record reaching zero
-// fires. rt_event_detach_fire moves the matured handles to a ready list the caller
-// reads back with rt_event_detach_ready.
+// trigger id of the control: a dense (signal, edge) id, or RT_TRIG_EVENT | slot
+// when the control names an event (see rt_intra_event_register). Growable: a
+// `->> @(x) e` in a loop makes one registration per pass, which no static wait
+// bucket can bound. `count` is the `repeat (n)` countdown; the trigger decrements
+// and only a record reaching zero fires. rt_event_detach_fire moves the matured
+// handles to a ready list the caller reads back with rt_event_detach_ready.
 void     rt_event_detach_register(uint32_t trig_id, uint64_t handle, uint32_t count);
 uint32_t rt_event_detach_fire(uint32_t trig_id);
 uint64_t rt_event_detach_ready(uint32_t i);
@@ -2038,12 +2039,24 @@ void rt_inertial_cb(rt_timer* timer, void* ctx);
 
 // -- Event-triggered deferred stores (`x <= @e y` / `x <= repeat(N) @e y`) --
 //
-// Same records and NBA-region commit as the `#d` path, but fired by a signal edge
-// instead of the wheel. A `<= @e` site registers its record on a dense trigger id
-// `trig_id` (a distinct (trigger-signal, edge) pair); when that edge fires (from a
-// blocking store or an NBA commit), the backend calls rt_intra_event_fire, which
-// counts the record down and, at zero, moves it to its target's ready list for the
-// NBA region. `count` is N for `repeat(N) @e`, 1 for a plain `@e`.
+// Same records and NBA-region commit as the `#d` path, but fired by an event
+// control instead of the wheel. A `<= @e` site registers its record on a trigger
+// id `trig_id`; when that trigger fires, the backend calls rt_intra_event_fire,
+// which counts the record down and, at zero, moves it to its target's ready list
+// for the NBA region. `count` is N for `repeat(N) @e`, 1 for a plain `@e`.
+//
+// A trigger id names one of two things. Without RT_TRIG_EVENT it is the backend's
+// dense (signal, edge) id, fired from both signal wake paths (a blocking store and
+// an NBA commit). With RT_TRIG_EVENT, the low bits are the slot of a named event
+// OBJECT, fired wherever that object is triggered (`-> e`, and the NBA-region
+// service of `->> e`): an event wakes through its object, not through a value
+// change, and the record waits on the object its variable named when the
+// statement executed (LRM 15.5.5.1). Object slots are never reused, so the key
+// cannot go stale.
+enum { RT_TRIG_EVENT = 0x80000000u };
+
+// The trigger id of the event object at `obj`: RT_TRIG_EVENT | its slot.
+uint32_t rt_event_trig_id(const void* obj);
 
 // Register `rec` (its idx/seq/count already filled) to fire on trigger `trig_id`.
 void rt_intra_event_register(uint32_t trig_id, void* rec);

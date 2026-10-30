@@ -200,6 +200,12 @@ void Backend::nba_classify_ir(const Ir& ir) {
             // nothing else is sensitive to still has to be watched.
             const auto trigs = ir.intra_trigs(ir.payload(idx).op_extra.extra);
             for (const IntraTrigger& tr : trigs) {
+                if (mod_.signals()[static_cast<uint32_t>(tr.signal)].is_event) {
+                    // Waits on the event OBJECT (trigger_id_value), so it takes no
+                    // dense id and needs no signal-edge detection.
+                    design_uses_event_triggers_ = true;
+                    continue;
+                }
                 int32_t& tid = trigger_id_[static_cast<uint32_t>(tr.signal)][tr.edge];
                 if (tid < 0) {
                     tid = static_cast<int32_t>(n_triggers_++);
@@ -214,9 +220,13 @@ void Backend::nba_classify_ir(const Ir& ir) {
             // edge) -- the same id space the intra-assignment event mechanism
             // uses -- so the wake can find its registrations.
             const auto info = ir.extra_data<EventDetachInfo>(ir.payload(idx).op_extra.extra);
-            int32_t&   tid  = trigger_id_[static_cast<uint32_t>(info.signal)][info.edge];
-            if (tid < 0) {
-                tid = static_cast<int32_t>(n_triggers_++);
+            if (mod_.signals()[static_cast<uint32_t>(info.signal)].is_event) {
+                design_uses_event_triggers_ = true;
+            } else {
+                int32_t& tid = trigger_id_[static_cast<uint32_t>(info.signal)][info.edge];
+                if (tid < 0) {
+                    tid = static_cast<int32_t>(n_triggers_++);
+                }
             }
             design_uses_detached_events_ = true;
             design_uses_nb_events_       = true; // it pends into the NBA region

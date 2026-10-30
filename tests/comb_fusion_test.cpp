@@ -254,3 +254,74 @@ endmodule
     // the pair from fusion must not cost the fixpoint.
     check_all_lowerings(src, "1 5 5 5\n");
 }
+
+// LRM 9.2.2.2 (and 9.2.2.3 for always_latch): an always_comb "is automatically
+// triggered once at time zero, after all initial and always procedures have been
+// started". The time-zero run used to be queued in source order with everything else,
+// so a comb written above an `initial` ran first. A disable of a block that has not
+// been started is a no-op (9.6.2), so `disable blk` ran before `blk` existed and the
+// block went on to print. Oracle: iverilog 13, which runs it last.
+TEST_CASE("always_comb and always_latch run once at time zero after every initial has started") {
+    SUBCASE("disable of a block of a later initial, always_comb") {
+        check_all_lowerings(R"(
+            module t;
+                always_comb disable blk;
+                initial begin : blk
+                    #1 $display("FAILED: blk not disabled");
+                end
+                initial #2 $display("done");
+            endmodule)",
+                            "done\n");
+    }
+    SUBCASE("disable of a block of a later initial, always_latch") {
+        check_all_lowerings(R"(
+            module t;
+                always_latch disable blk;
+                initial begin : blk
+                    #1 $display("FAILED: blk not disabled");
+                end
+                initial #2 $display("done");
+            endmodule)",
+                            "done\n");
+    }
+    SUBCASE("source order does not matter, in either direction") {
+        const std::string comb_first = R"(
+            module t;
+                logic y;
+                always_comb y = 1'b0;
+                initial $display("y=%b", y);
+            endmodule)";
+        const std::string comb_last  = R"(
+            module t;
+                logic y;
+                initial $display("y=%b", y);
+                always_comb y = 1'b0;
+            endmodule)";
+        check_all_lowerings(comb_first, "y=x\n");
+        check_all_lowerings(comb_last, "y=x\n");
+    }
+}
+
+// Deferring an always_comb's time-zero run (above) must not cost the fusion of an
+// assign / always_comb cone: a fused group is one body, deferred as a whole, which 4.9.1
+// and 4.7 allow for the continuous assignments in it. Splitting the cone for the whole
+// run made a mixed design 1.9x slower. The cone is `a -> b -> c -> d -> e` with the
+// source `a` written by an initial, so `c`, `d` and `e` are the interior members of one
+// group of three, two of them procedures and one an assign.
+TEST_CASE("an assign and always_comb cone still fuses, and starts after the initials") {
+    constexpr std::string_view src = R"(
+        module t;
+            logic [7:0] a = 0, b, c, d, e;
+            assign b = a + 8'd1;
+            always_comb c = b ^ 8'h5a;
+            assign d = c + b;
+            always_comb e = d - 8'd1;
+            initial begin
+                #1 a = 8'd9;
+                #1 $display("%0d %0d %0d %0d", b, c, d, e);
+            end
+        endmodule
+    )";
+    CHECK(count_substr(emit(src), ".f3.thunk(ptr noalias %state") == 1);
+    check_all_lowerings(src, "10 80 90 89\n");
+}

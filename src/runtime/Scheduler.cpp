@@ -127,7 +127,28 @@ struct IntraPending {
     uint32_t        n;
 };
 
+// Pending lists by trigger id. A dense (signal, edge) id indexes `intra_event_pending`;
+// an RT_TRIG_EVENT id indexes `intra_event_pending_obj` by event slot, so the sparse
+// high bit never sizes a vector.
 std::vector<std::vector<IntraPending>> intra_event_pending;
+std::vector<std::vector<IntraPending>> intra_event_pending_obj;
+
+// The list for `id`, or null when nothing was ever registered on it. Callers must not
+// hold the pointer across a call that can register or drop on another id.
+std::vector<IntraPending>* intra_list_find(uint32_t id) {
+    auto&          v   = (id & RT_TRIG_EVENT) != 0 ? intra_event_pending_obj : intra_event_pending;
+    const uint32_t idx = id & ~static_cast<uint32_t>(RT_TRIG_EVENT);
+    return idx < v.size() ? &v[idx] : nullptr;
+}
+
+std::vector<IntraPending>& intra_list_get(uint32_t id) {
+    auto&          v   = (id & RT_TRIG_EVENT) != 0 ? intra_event_pending_obj : intra_event_pending;
+    const uint32_t idx = id & ~static_cast<uint32_t>(RT_TRIG_EVENT);
+    if (idx >= v.size()) {
+        v.resize(idx + 1);
+    }
+    return v[idx];
+}
 
 // Drop `rec` from trigger `trig_id`'s pending list by pointer identity, keeping
 // the survivors' order. Used for first-fire-wins removal across a multi-signal
@@ -135,17 +156,17 @@ std::vector<std::vector<IntraPending>> intra_event_pending;
 // counted down again -- and cannot merely be MARKED, because a committed record
 // returns to its site freelist and a stale pointer would later match a reused one.
 void intra_event_drop(uint32_t trig_id, const void* rec) {
-    if (trig_id >= intra_event_pending.size()) {
+    std::vector<IntraPending>* list = intra_list_find(trig_id);
+    if (list == nullptr) {
         return;
     }
-    std::vector<IntraPending>& list = intra_event_pending[trig_id];
-    size_t                     w    = 0;
-    for (const IntraPending& e : list) {
+    size_t w = 0;
+    for (const IntraPending& e : *list) {
         if (e.rec != rec) {
-            list[w++] = e;
+            (*list)[w++] = e;
         }
     }
-    list.resize(w);
+    list->resize(w);
 }
 
 // Move a fired record onto its target's ready list, keeping the list in ascending
@@ -266,26 +287,42 @@ struct EventDetach {
     uint32_t count;
 };
 
+// Indexed like intra_event_pending: dense (signal, edge) ids in one vector, event-object
+// ids (RT_TRIG_EVENT | slot) in the other by slot.
 std::vector<std::vector<EventDetach>> event_detach_pending;
+std::vector<std::vector<EventDetach>> event_detach_pending_obj;
 std::vector<uint64_t>                 event_detach_ready;
+
+std::vector<EventDetach>* detach_list_find(uint32_t id) {
+    auto&          v   = (id & RT_TRIG_EVENT) != 0 ? event_detach_pending_obj : event_detach_pending;
+    const uint32_t idx = id & ~static_cast<uint32_t>(RT_TRIG_EVENT);
+    return idx < v.size() ? &v[idx] : nullptr;
+}
+
+std::vector<EventDetach>& detach_list_get(uint32_t id) {
+    auto&          v   = (id & RT_TRIG_EVENT) != 0 ? event_detach_pending_obj : event_detach_pending;
+    const uint32_t idx = id & ~static_cast<uint32_t>(RT_TRIG_EVENT);
+    if (idx >= v.size()) {
+        v.resize(idx + 1);
+    }
+    return v[idx];
+}
 
 } // namespace
 
 extern "C" void rt_event_detach_register(uint32_t trig_id, uint64_t handle, uint32_t count) {
-    if (trig_id >= event_detach_pending.size()) {
-        event_detach_pending.resize(trig_id + 1);
-    }
-    event_detach_pending[trig_id].push_back(EventDetach{ handle, count == 0 ? 1u : count });
+    detach_list_get(trig_id).push_back(EventDetach{ handle, count == 0 ? 1u : count });
 }
 
 // The edge fired: decrement every record on this id, move the matured ones to the
 // ready list and compact the rest. Returns how many matured.
 extern "C" uint32_t rt_event_detach_fire(uint32_t trig_id) {
     event_detach_ready.clear();
-    if (trig_id >= event_detach_pending.size()) {
+    std::vector<EventDetach>* found = detach_list_find(trig_id);
+    if (found == nullptr) {
         return 0;
     }
-    auto&  list = event_detach_pending[trig_id];
+    auto&  list = *found;
     size_t w    = 0;
     for (size_t i = 0; i < list.size(); ++i) {
         if (--list[i].count == 0) {
@@ -303,36 +340,39 @@ extern "C" uint64_t rt_event_detach_ready(uint32_t i) {
 }
 
 extern "C" void rt_intra_event_register(uint32_t trig_id, void* rec) {
-    if (trig_id >= intra_event_pending.size()) {
-        intra_event_pending.resize(trig_id + 1);
-    }
-    intra_event_pending[trig_id].push_back(IntraPending{ rec, nullptr, 0 });
+    intra_list_get(trig_id).push_back(IntraPending{ rec, nullptr, 0 });
 }
 
 extern "C" void rt_intra_event_register_group(const uint32_t* ids, uint32_t n, void* rec) {
     for (uint32_t k = 0; k < n; ++k) {
-        if (ids[k] >= intra_event_pending.size()) {
-            intra_event_pending.resize(ids[k] + 1);
+        // Two listed events can be the SAME object (LRM 15.5.5.1: `event b = a;`, or
+        // `b = a`), and one occurrence must count the record down once, not once per
+        // name. The second entry would wrap its countdown below zero and later mature a
+        // reused record of the same target early.
+        bool seen = false;
+        for (uint32_t j = 0; j < k; ++j) {
+            seen = seen || ids[j] == ids[k];
         }
-        intra_event_pending[ids[k]].push_back(IntraPending{ rec, ids, n });
+        if (!seen) {
+            intra_list_get(ids[k]).push_back(IntraPending{ rec, ids, n });
+        }
     }
 }
 
 extern "C" void rt_intra_event_fire(uint32_t trig_id) {
-    if (trig_id >= intra_event_pending.size()) {
+    if (intra_list_find(trig_id) == nullptr) {
         return;
     }
     size_t w = 0; // survivors compacted in place
-    // Indexed, not range-based: a maturing multi-trigger record drops itself from
-    // its OTHER lists, and while that never touches this one (the removal skips
-    // trig_id), a registration cannot be held as a reference across it -- another
-    // list's resize is fine, but re-reading the vector each step keeps the
-    // invariant local instead of depending on which vector got touched.
-    for (size_t i = 0; i < intra_event_pending[trig_id].size(); ++i) {
-        const IntraPending e   = intra_event_pending[trig_id][i];
+    // Indexed, and the list re-found each step: a maturing multi-trigger record drops
+    // itself from its OTHER lists, and while that never touches this one (the removal
+    // skips trig_id), a reference held across it would depend on which vector got
+    // touched. Re-finding keeps the invariant local.
+    for (size_t i = 0; i < intra_list_find(trig_id)->size(); ++i) {
+        const IntraPending e   = (*intra_list_find(trig_id))[i];
         auto*              rec = reinterpret_cast<rt_intra_rec*>(e.rec);
         if (--rec->count != 0) {
-            intra_event_pending[trig_id][w++] = e; // more edges to wait for
+            (*intra_list_find(trig_id))[w++] = e; // more edges to wait for
             continue;
         }
         intra_ready_push(rec); // last awaited edge -> commit this instant
@@ -344,7 +384,7 @@ extern "C" void rt_intra_event_fire(uint32_t trig_id) {
             }
         }
     }
-    intra_event_pending[trig_id].resize(w);
+    intra_list_find(trig_id)->resize(w);
 }
 
 extern "C" void* rt_intra_ready_base(uint32_t idx) {
@@ -385,6 +425,9 @@ extern "C" void rt_intra_reset(void) {
     // rt_intra_alloc notice that this site's pooled records are the wrong size and
     // retire them, instead of filling a narrower block.
     for (std::vector<IntraPending>& pend : intra_event_pending) {
+        pend.clear();
+    }
+    for (std::vector<IntraPending>& pend : intra_event_pending_obj) {
         pend.clear();
     }
     // A fresh simulation has no pending inertial store and starts at epoch 0.
@@ -1024,6 +1067,20 @@ extern "C" uint64_t rt_event_new(void) {
     // generation never advances.
     return static_cast<uint64_t>(g_event_static + i);
 }
+
+extern "C" uint32_t rt_event_trig_id(const void* obj) {
+    const auto* p = static_cast<const rt_event*>(obj);
+    if (p >= g_event_chunks[0] && p < g_event_chunks[0] + g_event_static) {
+        return RT_TRIG_EVENT | static_cast<uint32_t>(p - g_event_chunks[0]);
+    }
+    for (size_t c = 1; c < g_event_chunks.size(); ++c) {
+        if (p >= g_event_chunks[c] && p < g_event_chunks[c] + kEventChunk) {
+            const auto within = static_cast<uint32_t>(p - g_event_chunks[c]);
+            return RT_TRIG_EVENT | (g_event_static + static_cast<uint32_t>(c - 1) * kEventChunk + within);
+        }
+    }
+    return RT_TRIG_EVENT; // unreachable for an object the pool handed out
+}
 namespace {
 
 // -- Process control blocks (the `process` class, LRM 9.7) --
@@ -1148,6 +1205,7 @@ extern "C" void rt_run_init(void* event_static_block, uint32_t event_static_coun
     // rt_event_detach_fire (:2594) hand rt_event_detach_ready a handle minted by
     // the destroyed module.
     event_detach_pending.clear();
+    event_detach_pending_obj.clear();
     event_detach_ready.clear();
 
     // 4, 5. The two queues the drain prologue also resets, conditionally

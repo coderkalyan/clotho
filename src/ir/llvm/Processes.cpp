@@ -221,9 +221,36 @@ void Backend::lower_fork_inst(Index i) {
     }
     argv.push_back(rec);
 
+    // A child forked inside a targeted block links itself onto that block's list in
+    // its ramp (Function::fork_targets). When any exists, ramp EVERY sibling before
+    // running one, so a `disable` issued by an earlier child that runs inline at the
+    // spawn still finds the later ones (LRM 9.6.2). Otherwise each is ramped just
+    // before it runs, exactly as before.
+    const bool ramp_first =
+      !kids.empty() && !mod_.function(static_cast<FunctionId>(static_cast<uint32_t>(kids[0]))).fork_targets.empty();
+    const auto ramp = [&](Index kid) {
+        llvm::Function* cf = sym(fn_decls_[static_cast<uint32_t>(kid)]);
+        return b_.CreateCall(cf->getFunctionType(), cf, argv);
+    };
+    std::vector<llvm::Value*> ramped;
+    if (ramp_first) {
+        for (const Index kid : kids) {
+            ramped.push_back(ramp(kid));
+        }
+    }
+    // The children below that RUN INLINE (`join`, and `join_any` up to its first
+    // completion) execute while this body is on the stack with its scheduled flag clear.
+    // A child's `disable` of a block this body is an occupant of, or a `kill` of this
+    // thread, would then force-wake it -- push its handle while it is running -- and the
+    // drain would resume it a second time. Hold the flag set, as the join park below
+    // does: the wake stands down, only the mark lands, and the polls after the Fork take
+    // the exit. Every later park re-arms it before suspending.
+    if (!none && park_claim_wanted() && sched_ptr_ != nullptr) {
+        b_.CreateStore(b_.getInt64(1 | unclassified_trig_bits()), sched_ptr_);
+    }
+    uint32_t next_child = 0;
     for (const Index kid : kids) {
-        llvm::Function* cf  = sym(fn_decls_[static_cast<uint32_t>(kid)]);
-        llvm::Value*    hdl = b_.CreateCall(cf->getFunctionType(), cf, argv);
+        llvm::Value* hdl = ramp_first ? ramped[next_child++] : ramp(kid);
         if (none) {
             // Ramped and parked at its initial suspend; the drain resumes it (and
             // destroys it when it completes, like any other ring handle). Pushed
@@ -441,14 +468,24 @@ void Backend::lower_disable_list(uint32_t target) {
 // Back from a park inside a targeted task: if a `disable` marked this
 // activation, leave through the epilogue, which skips copy-out for it.
 void Backend::emit_task_abort_poll() {
-    if (disable_node_ == nullptr) {
+    if (disable_node_ == nullptr && fork_disable_nodes_.empty()) {
         return;
     }
-    auto*        fn    = b_.GetInsertBlock()->getParent();
-    llvm::Value* abort = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), disable_node_, 5));
-    auto*        cont  = llvm::BasicBlock::Create(ctx_, "disable.task.resume", fn);
-    b_.CreateCondBr(b_.CreateICmpNE(abort, b_.getInt32(0)), task_epilogue_bb_, cont);
-    b_.SetInsertPoint(cont);
+    auto*      fn   = b_.GetInsertBlock()->getParent();
+    const auto poll = [&](llvm::Value* node) {
+        llvm::Value* abort = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), node, 5));
+        auto*        cont  = llvm::BasicBlock::Create(ctx_, "disable.task.resume", fn);
+        b_.CreateCondBr(b_.CreateICmpNE(abort, b_.getInt32(0)), leave_blocks(0, task_epilogue_bb_), cont);
+        b_.SetInsertPoint(cont);
+    };
+    if (disable_node_ != nullptr) {
+        poll(disable_node_);
+    }
+    // A fork child is an activation of every targeted block it was forked inside:
+    // a `disable` of any of them marks its node here.
+    for (const auto& [target, node] : fork_disable_nodes_) {
+        poll(node);
+    }
 }
 
 // After a suspend inside one or more remotely-named blocks: if a `disable`
@@ -464,14 +501,17 @@ void Backend::emit_task_abort_poll() {
 // here and not inside emit_suspend.
 void Backend::emit_disable_poll() {
     auto* fn = b_.GetInsertBlock()->getParent();
-    for (const OpenNamedBlock& blk : block_targets_) {
-        if (blk.remote == kNoDisableTarget) {
+    // Index-based: leave_blocks caches its landings in the entries.
+    for (size_t j = 0; j < block_targets_.size(); ++j) {
+        if (block_targets_[j].remote == kNoDisableTarget) {
             continue;
         }
         llvm::Value* pend =
-          b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), blk.node, 5));
+          b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), block_targets_[j].node, 5));
         auto* cont = llvm::BasicBlock::Create(ctx_, "disable.resume", fn);
-        b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt32(0)), blk.end, cont);
+        // Leaving block j also leaves every remotely-named block opened inside it,
+        // whose end blocks this branch skips (leave_blocks).
+        b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt32(0)), leave_blocks(j + 1, block_targets_[j].end), cont);
 
         b_.SetInsertPoint(cont);
     }
@@ -525,6 +565,9 @@ llvm::Value* Backend::emit_abort_pending() {
         };
         if (disable_node_ != nullptr) {
             node_abort(disable_node_);
+        }
+        for (const auto& [target, node] : fork_disable_nodes_) {
+            node_abort(node);
         }
         for (const OpenNamedBlock& blk : block_targets_) {
             if (blk.remote != kNoDisableTarget) {
@@ -912,7 +955,7 @@ void Backend::emit_proc_abort_poll() {
     llvm::Value* ctl  = b_.CreateLoad(b_.getInt32Ty(), pcb_field(pcb_, kPcbCtl));
     llvm::Value* kill = b_.CreateAnd(ctl, b_.getInt32(kProcAbort));
     auto*        cont = llvm::BasicBlock::Create(ctx_, "proc.alive", fn);
-    b_.CreateCondBr(b_.CreateICmpNE(kill, b_.getInt32(0)), exit, cont);
+    b_.CreateCondBr(b_.CreateICmpNE(kill, b_.getInt32(0)), leave_blocks(0, exit), cont);
     b_.SetInsertPoint(cont);
     // Suspended while we were parked (LRM 9.7): park again, remembering that the
     // wake already arrived, until `resume`.
@@ -973,7 +1016,7 @@ void Backend::lower_proc_kill(llvm::Value* target, bool with_self, bool branch_o
     // resume us to notice the mark.
     if (with_self && branch_on_self && pcb_ != nullptr && proc_abort_exit() != nullptr) {
         auto* cont = llvm::BasicBlock::Create(ctx_, "kill.other", fn);
-        b_.CreateCondBr(b_.CreateICmpEQ(target, pcb_), proc_abort_exit(), cont);
+        b_.CreateCondBr(b_.CreateICmpEQ(target, pcb_), leave_blocks(0, proc_abort_exit()), cont);
         b_.SetInsertPoint(cont);
     }
 }
@@ -1707,7 +1750,7 @@ llvm::Value* Backend::disable_head_ptr(llvm::IRBuilder<>& b, uint32_t t) {
 
 // Link this activation at the head of its target's list. Emitted in the task
 // prologue, right after the frame exists.
-void Backend::emit_disable_link(uint32_t target, llvm::Value* node) {
+void Backend::emit_disable_link(uint32_t target, llvm::Value* node, llvm::Value* flag) {
     auto* nty  = disable_node_ty();
     auto* ptr  = llvm::PointerType::getUnqual(ctx_);
     auto* null = llvm::ConstantPointerNull::get(ptr);
@@ -1717,7 +1760,7 @@ void Backend::emit_disable_link(uint32_t target, llvm::Value* node) {
     llvm::Value* old  = b_.CreateLoad(ptr, head);
     b_.CreateStore(parked_handle(b_, hdl_), b_.CreateStructGEP(nty, node, 2));
     b_.CreateStore(awaiter(), b_.CreateStructGEP(nty, node, 3));
-    b_.CreateStore(sched_ptr_, b_.CreateStructGEP(nty, node, 4));
+    b_.CreateStore(flag != nullptr ? flag : sched_ptr_, b_.CreateStructGEP(nty, node, 4));
     b_.CreateStore(b_.getInt32(0), b_.CreateStructGEP(nty, node, 5));
     b_.CreateStore(old, b_.CreateStructGEP(nty, node, 0));
     b_.CreateStore(null, b_.CreateStructGEP(nty, node, 1));

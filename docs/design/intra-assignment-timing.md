@@ -316,6 +316,16 @@ still needs edge detection, so `signal_has_waiters` (and `has_bucket`) treat any
 `trig_id >= 0` (sig, edge) as a waiter. Everything is gated on `trigger_id_`
 being non-empty, so a design without `<= @e` gets identical codegen.
 
+**A named event as the control** (`x <= @e v`, `->> @(e) f`) does not wake through a
+value change at all: `-> e` and the NBA-region service of `->> e` fire the event's
+object waiter list, and never reach the signal wake paths above. So the record is keyed
+by the OBJECT instead of a dense `trig_id`: `RT_TRIG_EVENT | slot`, computed when the
+statement executes from the object the variable names then (LRM 15.5.5.1), and counted
+down by `emit_event_fire`, the one place every trigger form converges. The runtime keeps
+these lists in a separate slot-indexed vector so the id's high bit never sizes one.
+`design_uses_event_triggers_` gates the extra call, so a design with no such control
+emits nothing new.
+
 Deferred follow-ups are scoped in full in the next section.
 
 ## The remainder (scoped, not implemented)

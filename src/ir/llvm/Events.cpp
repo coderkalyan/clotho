@@ -1255,12 +1255,19 @@ void Backend::service_change_notify(const LValue& lv,
 // move any that reach zero to their target ready lists (rt_intra_event_fire).
 // Called from both wake paths inside a block already guarded by the edge fact.
 void Backend::fire_event_trigger(Signal sig, uint32_t edge) {
-    const int32_t tid = trigger_id(sig, edge);
-    if (tid < 0) {
+    if (trigger_id(sig, edge) < 0) {
         return;
     }
-    b_.CreateCall(intra_event_fire_fn(), { trigger_id_value(sig, edge) });
-    // Detached `->> @(x) e` subscriptions on the same (signal, edge): count them
+    emit_trigger_fire(trigger_id_value(sig, edge));
+}
+
+// Count down the `<= @e` records and the detached `->> @(x) e` subscriptions
+// registered on `trig_id` (a dense (signal, edge) id, or an event-object id, see
+// rt_intra_event_register). Shared by the two signal wake paths and by the
+// event-object fire, so every way a control can occur reaches the same records.
+void Backend::emit_trigger_fire(llvm::Value* trig_id) {
+    b_.CreateCall(intra_event_fire_fn(), { trig_id });
+    // Detached `->> @(x) e` subscriptions on the same trigger: count them
     // down and pend every event whose countdown reached zero. The wake is
     // NONBLOCKING (LRM 15.5.1: the update event triggers the referenced event in
     // the NBA region), so this pends rather than fires.
@@ -1272,7 +1279,7 @@ void Backend::fire_event_trigger(Signal sig, uint32_t edge) {
     auto* head = llvm::BasicBlock::Create(ctx_, "evdet.head", fn);
     auto* body = llvm::BasicBlock::Create(ctx_, "evdet.body", fn);
     auto* done = llvm::BasicBlock::Create(ctx_, "evdet.done", fn);
-    llvm::Value* n = b_.CreateCall(event_detach_fire_fn(), { trigger_id_value(sig, edge) });
+    llvm::Value* n     = b_.CreateCall(event_detach_fire_fn(), { trig_id });
     auto* entry = b_.GetInsertBlock();
     b_.CreateBr(head);
     b_.SetInsertPoint(head);
@@ -1456,10 +1463,19 @@ void Backend::emit_event_pend_drain(llvm::Value* wheel) {
 // object's list. Shared by `-> e` in a process body (wheel_), the NBA-region
 // `->> e` service (the drain's local wheel — wheel_ is stale there, so it must
 // be passed in).
-void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel) {
+//
+// `trig_id` is the object's RT_TRIG_EVENT id when the caller has it: a handle names its
+// slot in its low half, so `-> e` gets it for free. The NBA service has only the object
+// and asks the runtime.
+void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel, llvm::Value* trig_id) {
     b_.CreateStore(b_.CreateCall(wheel_now_fn(), { wheel }), event_field(obj, kEventTrig));
     vcd_touch_event_obj(obj);
     emit_event_wake_list(obj);
+    // An event is also a control for `x <= @e v` / `->> @(e) f`, which wait on the
+    // object rather than on a signal edge. Every trigger form converges here.
+    if (design_uses_event_triggers_) {
+        emit_trigger_fire(trig_id != nullptr ? trig_id : b_.CreateCall(event_trig_id_fn(), { obj }));
+    }
 }
 
 // `-> null` / `->> null` is a no-op (LRM 15.5.5): a null handle names nothing to
@@ -1470,8 +1486,14 @@ void Backend::emit_event_fire(llvm::Value* obj, llvm::Value* wheel) {
 // Emitted only where the handle is not a compile-time non-null constant, so a
 // plain `-> e` on a declared event pays nothing.
 void Backend::emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel) {
+    // The object's trigger id, from the slot in the handle's low half.
+    const auto trig = [&]() -> llvm::Value* {
+        return design_uses_event_triggers_
+                 ? b_.CreateOr(b_.CreateTrunc(handle, b_.getInt32Ty()), b_.getInt32(RT_TRIG_EVENT))
+                 : nullptr;
+    };
     if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(handle); c != nullptr && !c->isZero()) {
-        emit_event_fire(event_obj_of(handle), wheel);
+        emit_event_fire(event_obj_of(handle), wheel, trig());
         return;
     }
     auto* fn   = b_.GetInsertBlock()->getParent();
@@ -1479,7 +1501,7 @@ void Backend::emit_event_fire_guarded(llvm::Value* handle, llvm::Value* wheel) {
     auto* skip = llvm::BasicBlock::Create(ctx_, "ev.null", fn);
     b_.CreateCondBr(b_.CreateICmpNE(handle, b_.getInt64(0)), fire, skip);
     b_.SetInsertPoint(fire);
-    emit_event_fire(event_obj_of(handle), wheel);
+    emit_event_fire(event_obj_of(handle), wheel, trig());
     b_.CreateBr(skip);
     b_.SetInsertPoint(skip);
 }

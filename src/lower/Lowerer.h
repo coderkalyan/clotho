@@ -2274,9 +2274,11 @@ private:
 
     void scan_disable_targets(const ProceduralBlockSymbol& blk);
 
-    bool hard_park(const Statement& body);
+    bool hard_park(const Statement& body, bool forked_children_are_occupants = false);
 
     bool subroutine_parks(const SubroutineSymbol& sub);
+
+    bool design_virtual_forks(slang::ast::Compilation& comp);
 
     void record_assert_site(const slang::ast::ConcurrentAssertionStatement& s,
                             const Symbol*                                  owner,
@@ -3217,6 +3219,7 @@ private:
     // take them by reference.
     struct FnCtx;
     struct CopyOutArg;
+    struct OpenBlock;
 
     struct RandSeqCtx {
         // Production -> the ir::Function it lowered to.
@@ -4815,7 +4818,8 @@ private:
 
     ir::FunctionId build_fork_child(const Statement&                    body,
                                     std::span<const ValueSymbol* const> captures,
-                                    ir::ForkKind                        kind);
+                                    ir::ForkKind                        kind,
+                                    const std::vector<OpenBlock>&       enclosing);
 
     ir::FunctionId build_deferred_body(std::span<const Expression* const> args,
                                        char                               default_conv,
@@ -5257,6 +5261,17 @@ private:
     // child, or one declared in a subroutine body. Each activation is its own
     // occupant with its own frame, so the remote form refuses these.
     ankerl::unordered_dense::set<const Symbol*> disable_multi_;
+    // Named blocks that enclose a `fork`, anywhere in their body. The forked children
+    // are activity "enabled within" the block (LRM 9.6.2), so each child is an
+    // activation of every enclosing targeted block (build_fork_child), and a `disable`
+    // of one has to walk the list even from inside a single-activation process body.
+    ankerl::unordered_dense::set<const Symbol*> disable_forked_;
+    // Named blocks whose body calls a subroutine that forks. The children are not
+    // lexically inside the block, so a `disable` cannot end them; refused.
+    ankerl::unordered_dense::set<const Symbol*> disable_fork_via_call_;
+    // Whether any user virtual method of the design forks (design_virtual_forks);
+    // computed on first use.
+    std::optional<bool> design_virtual_forks_;
     // Named blocks whose body can park in a way the abort cannot claim (a `#0` or
     // runtime-valued delay, a time-consuming task call, a fork, an `expect`); see
     // hard_park. The remote form refuses one, the lexical form does not care -- it
@@ -5348,6 +5363,12 @@ private:
         // ir::BlockInfo label when some `disable` targets this block, else
         // kNoBlockLabel: an untargeted block emits no instruction at all.
         uint32_t label;
+        // True for a frame of the PARENT body that a fork child re-pushes so its
+        // own `disable` can still find the target (build_fork_child). The child is
+        // an activation of that block but not lexically inside a region of it, so
+        // it leaves by aborting itself, and %m does not repeat the parent's name
+        // (the child's invoking scope already carries it).
+        bool inherited = false;
     };
     static constexpr uint32_t kNoBlockLabel = UINT32_MAX;
     std::vector<OpenBlock>    named_blocks_;
