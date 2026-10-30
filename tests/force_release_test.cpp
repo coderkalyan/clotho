@@ -325,6 +325,61 @@ TEST_CASE("force: net bit/part-select overlay, z-preserving, range release") {
     CHECK(run_capture_finish(src) == "0001\n1101\n11z1\n11z0\n00z0\n0x10\n");
 }
 
+// LRM 10.6.2: a force on a net "shall override all drivers of the net", so while it
+// is active a driver changing changes nothing a reader of the net can observe: the
+// net holds the forced value and no value change event occurs. The resolver folded
+// the drivers into the net and only then laid the force over the result, and each of
+// the two stores woke the net's waiters on its own old -> new transition, so every
+// driver change under a force gave an edge reader a negedge and a posedge (pos=3
+// neg=4 where the force makes one real posedge and the x -> 0 at time 0 one real
+// negedge). Oracle: iverilog 13 prints pos=1 neg=1.
+TEST_CASE("force: a driver changing under a forced net gives its readers no event") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a;
+            wire w;
+            assign w = a;
+            int pos, neg;
+            always @(posedge w) pos++;
+            always @(negedge w) neg++;
+            initial begin
+                a = 0;
+                #1 force w = 1'b1;
+                #1 a = 1;
+                #1 a = 0;
+                #1 a = 1;
+                #1 a = 0;
+                #1 $display("pos=%0d neg=%0d w=%b", pos, neg, w);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "pos=1 neg=1 w=1\n");
+}
+
+// The same transient seen by a change reader when a driver's own delay lands under the
+// force: `wire #5 w = a` is that driver's continuous-assignment delay, not a net delay
+// (LRM 10.3.3), so a=1 at 10 reaches the net's resolver at 15 and re-runs it under the
+// force taken at 12. `always @(w)` printed a change at 15 although w stayed z. Release
+// at 20 then shows the driver's value. Oracle: iverilog 13, byte-identical.
+TEST_CASE("force: a delayed driver landing under a forced net gives its readers no event") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic a;
+            wire #5 w = a;
+            always @(w) $display("%0t chg w=%b", $time, w);
+            initial begin
+                a = 0;
+                #10 a = 1;
+                #2 force w = 1'bz;
+                #6 $strobe("%0t s w=%b", $time, w);
+                #2 release w;
+                $strobe("%0t s w=%b", $time, w);
+                #10 $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "5 chg w=0\n12 chg w=z\n18 s w=z\n20 chg w=1\n20 s w=1\n");
+}
+
 // force / assign target an OUTPUT-port variable driven internally (an input/inout
 // port is the guarded case). sv-tests 10.6.1 / 10.6.2 shape.
 TEST_CASE("force: output-port variable is forceable") {

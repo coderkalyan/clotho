@@ -164,9 +164,12 @@ deferred record rather than the sampling site.
   over single-driver, gate-driven, multi-driver/resolved, and undriven nets.
 - **Phase 2** (landed for nets): constant **bit/part-select force of a net**. Each
   `force` statement on a net (whole or a constant select) registers a `NetForceSite
-  {active, val, [lo,hi]}` — `val` is exactly range-wide. The net resolver stores the
-  driver fold to the net, then for each site emits `if (active) net[hi:lo] = val` (a
-  positioned store to the net *signal*, an lvalue — a bitwise mask/or would corrupt z).
+  {active, val, [lo,hi]}` — `val` is exactly range-wide. The net resolver builds the net's
+  value in a frame cell of its function: the driver fold, then for each site
+  `if (active) cell[hi:lo] = val` (a positioned store to the cell, an lvalue — a bitwise
+  mask/or would corrupt z), and the net takes the cell in ONE store. A store wakes the
+  net's waiters from the transition it makes, so storing the fold and then the forced bits
+  over it would show readers the fold for an instant: an edge and a change the force forbids.
   A released site (`active == 0`) is skipped, so re-running the resolver reverts those
   bits to the fold; `release net[hi:lo]` clears every site whose range is covered; a release that overlaps a
   site without covering it is a fatal run-time error while that site is active, since a

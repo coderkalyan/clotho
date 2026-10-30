@@ -823,44 +823,60 @@ void Lowerer::emit_wire_resolvers() {
         if (pi != net_pull_.end() && !pull_injected) {
             acc = b.net_pull(acc, static_cast<uint32_t>(pi->second.value), l);
         }
-        // Store the resolved driver fold, then overlay every active force site
-        // (LRM 10.6.2). Net force writes the net storage in place at each site's
-        // range [lo, hi], so unforced bits keep the fold and z is preserved (a
-        // positioned store, not a bitwise mask). A released site (active === 0) is
-        // skipped, so re-running the resolver reverts those bits to the fold. Each
-        // site's active/val join the sensitivity so force apply and release re-run
-        // this process.
+        // Store the resolved driver fold under every active force site (LRM 10.6.2).
+        // Net force writes at each site's range [lo, hi], so unforced bits keep the
+        // fold and z is preserved (a positioned store, not a bitwise mask). A released
+        // site (active === 0) is skipped, so re-running the resolver reverts those
+        // bits to the fold. Each site's active/val join the sensitivity so force apply
+        // and release re-run this process.
+        //
+        // A forced net takes its value in ONE store. A store wakes the net's waiters
+        // from the transition it makes, so storing the fold and then the forced bits
+        // over it showed them the fold for an instant: an edge and a change the force
+        // forbids, since under a force the drivers change nothing a reader can see.
+        // The overlay is built in a frame cell of the resolver function instead.
         const auto                          fs_it = net_force_sites_.find(net_u);
         const std::span<const NetForceSite> sites = fs_it != net_force_sites_.end()
                                                       ? std::span<const NetForceSite>(fs_it->second)
                                                       : std::span<const NetForceSite>();
+        // Lay every site over the lvalue `base()` makes, a fresh one per use.
+        const auto overlay = [&](const auto& base) {
+            for (const NetForceSite& site : sites) {
+                const ir::Index lv =
+                  (site.lo == 0 && site.hi == net_w - 1) ? base() : b.part_select(base(), site.hi, site.lo, l);
+                b.open_region();
+                b.binary(ir::Inst::Tag::Store, lv, b.unary(ir::Inst::Tag::Load, b.signal(site.val, l), l), l);
+                const ir::ExtraSlice then_r = b.close_region();
+                b.open_region();
+                const ir::ExtraSlice else_r = b.close_region();
+                b.cond(site_is(site.active, 1, b, l), then_r, else_r, l);
+            }
+        };
         // A net delay (LRM 28.16, `wire #5 w;`) delays the resolved fold
         // itself, not any one driver's slot -- "the time it takes from any
         // driver on the net changing value to the time when the net value
         // is updated". It rides this store alone; the force overlay below
         // stays immediate (force is an override, not a driver LRM 28.16
         // times).
-        const auto nd_it = net_delay_.find(net_u);
-        if (nd_it != net_delay_.end()) {
+        const auto nd_it   = net_delay_.find(net_u);
+        const bool delayed = nd_it != net_delay_.end();
+        const bool staged  = !delayed && !sites.empty();
+        if (delayed) {
             const ir::Index dst   = b.signal(net, l);
             const ir::Index ticks = scaled_delay(*nd_it->second, b);
             b.store_inertial_delay(dst, acc, ticks, l);
+            overlay([&] { return b.signal(net, l); });
+        } else if (staged) {
+            const ir::Ref net_ty = module_.signal(net).type;
+            const auto    cell   = [&] { return b.local(0, net_ty, l); };
+            b.binary(ir::Inst::Tag::Store, cell(), acc, l);
+            overlay(cell);
+            b.binary(ir::Inst::Tag::Store, b.signal(net, l), b.unary(ir::Inst::Tag::Load, cell(), l), l);
         } else {
             // An unpacked array net reaches here only when nothing drives it (a
             // driver's slot is refused for one), and the pull, or the z, of a
             // driverless net lands in every element alike.
             store_every_element(b.signal(net, l), module_.signal(net).type, acc, b, l);
-        }
-        for (const NetForceSite& site : sites) {
-            const ir::Index net_lv = (site.lo == 0 && site.hi == net_w - 1)
-                                       ? b.signal(net, l)
-                                       : b.part_select(b.signal(net, l), site.hi, site.lo, l);
-            b.open_region();
-            b.binary(ir::Inst::Tag::Store, net_lv, b.unary(ir::Inst::Tag::Load, b.signal(site.val, l), l), l);
-            const ir::ExtraSlice then_r = b.close_region();
-            b.open_region();
-            const ir::ExtraSlice else_r = b.close_region();
-            b.cond(site_is(site.active, 1, b, l), then_r, else_r, l);
         }
 
         std::vector<ir::WaitEvent> wait_events;
@@ -906,7 +922,8 @@ void Lowerer::emit_wire_resolvers() {
                                                .return_type = module_.pool.void_type,
                                                .param_types = {},
                                                .arg_dirs    = {},
-                                               .local_types = {},
+                                               .local_types = staged ? std::vector<ir::Ref>{ module_.signal(net).type }
+                                                                     : std::vector<ir::Ref>{},
                                                .is_task     = false,
                                                .ir          = b.finish() });
             ir::Builder pb(module_);
