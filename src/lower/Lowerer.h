@@ -3171,6 +3171,8 @@ private:
 
     ir::Signal declare_temp(ir::Ref type, std::string_view role);
 
+    uint32_t next_temp_id();
+
     void lower_for_step(const Expression& e, ir::Builder& b);
 
     // The width/four-state/signedness a case's selector and labels are
@@ -5676,11 +5678,14 @@ private:
     // ticks (time_mul_ == unit/precision * prec_over_tick_). Always 1 when
     // unitless. Saved / restored alongside time_mul_.
     uint64_t prec_over_tick_ = 1;
-    // Monotonic counter naming hidden compiler temporaries backed by a module
-    // signal (a synthesized event net, a force site, a gate input, and the loop
-    // cells of a process, which has no frame to put them in) so their flattened
-    // signal names stay unique.
-    uint32_t temp_id_ = 0;
+    // Ordinals naming hidden compiler temporaries backed by a module signal (a
+    // synthesized event net, a force site, a gate input, a task-argument temp, an
+    // unnamed clocking block, and the loop cells of a process, which has no frame
+    // to put them in), counted per name prefix (prefix_, next_temp_id): every
+    // instance and generate block numbers its own from 0, so the instances of one
+    // specialization name their temporaries alike, and the prefix keeps the flat
+    // names unique.
+    ankerl::unordered_dense::map<std::string, uint32_t> temp_ids_;
     // Subroutine -> its lowered FunctionId, so each function is lowered once and
     // shared across call sites (and a recursive call resolves its own id).
     // Package/$unit-scope subroutines never populate this map directly on a
@@ -5908,9 +5913,6 @@ private:
     // default is the innermost context, and the object under construction is a
     // different object whenever the receiver was spelled out.
     std::optional<CtorThis> default_arg_this_;
-    // Monotonic counter naming anonymous output / inout task-argument temps created
-    // in a process body (where temps are module signals, not frame locals).
-    uint32_t task_temp_seq_ = 0;
     // Accumulates static variable declaration initializers (LRM 6.8) across the
     // whole instance hierarchy into one run-once pre-init process, finalized at the
     // end of the top instance. Lazily engaged: absent when no initializer exists.

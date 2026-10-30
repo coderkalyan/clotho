@@ -2287,7 +2287,7 @@ ir::Index Lowerer::make_arg_temp(ir::Ref type, ir::Builder& b, ir::SourceLoc l) 
         return b.local(idx, type, l);
     }
     ir::SignalInfo info;
-    info.name = prefix_ + "__taskarg" + std::to_string(task_temp_seq_++);
+    info.name = prefix_ + "__taskarg" + std::to_string(next_temp_id());
     info.type = type;
     info.dir  = ir::SignalInfo::Direction::Internal;
     return b.signal(register_signal(std::move(info)), l);
@@ -2305,7 +2305,7 @@ ir::Index Lowerer::make_canonical_agg_temp(ir::Ref type, ir::Builder& b, ir::Sou
         return b.local(idx, type, l);
     }
     ir::SignalInfo info;
-    info.name      = prefix_ + "__aggarg" + std::to_string(task_temp_seq_++);
+    info.name      = prefix_ + "__aggarg" + std::to_string(next_temp_id());
     info.type      = type;
     info.dir       = ir::SignalInfo::Direction::Internal;
     info.force_agg = true;

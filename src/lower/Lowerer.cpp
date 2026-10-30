@@ -767,7 +767,7 @@ Lowerer::TempCell Lowerer::make_temp_cell(ir::Ref type, std::string_view role) {
         return TempCell{ .type = type, .is_local = true, .local = idx };
     }
     ir::SignalInfo info;
-    info.name = prefix_ + "__" + std::string(role) + std::to_string(temp_id_++);
+    info.name = prefix_ + "__" + std::string(role) + std::to_string(next_temp_id());
     info.type = type;
     info.dir  = ir::SignalInfo::Direction::Internal;
 
@@ -781,11 +781,19 @@ Lowerer::TempCell Lowerer::make_temp_cell(ir::Ref type, std::string_view role) {
 // the name is synthesized.
 ir::Signal Lowerer::declare_temp(ir::Ref type, std::string_view role) {
     ir::SignalInfo info;
-    info.name = prefix_ + "__" + std::string(role) + std::to_string(temp_id_++);
+    info.name = prefix_ + "__" + std::string(role) + std::to_string(next_temp_id());
     info.type = type;
     info.dir  = ir::SignalInfo::Direction::Internal;
 
     return register_signal(std::move(info));
+}
+
+// The next ordinal of a hidden temporary named under the current prefix. The count
+// is per prefix, so an instance (or generate block) numbers its temporaries from 0
+// whatever else was lowered before it: the instances of one specialization then
+// name them alike, and the prefix is what keeps the names unique across instances.
+uint32_t Lowerer::next_temp_id() {
+    return temp_ids_[prefix_]++;
 }
 
 // An integer constant of the given interned type.

@@ -967,6 +967,48 @@ TEST_CASE("cli: --stop-time is refused where nothing simulates") {
         CHECK(contains(r.err, std::format("--stop-time applies to 'run', not '{}'", command)));
     }
 }
+
+// How many specializations `--stat=units` reports as still lowering differently in
+// their instances (docs/design/modular-compilation.md, step 2c), or -1 when the
+// report is missing.
+long split_specializations(const std::string& report) {
+    const std::string tail = " specializations still split across instances";
+    const size_t      end  = report.find(tail);
+    if (end == std::string::npos) {
+        return -1;
+    }
+    const size_t start = report.rfind(' ', end - 1) + 1;
+    return std::strtol(report.c_str() + start, nullptr, 10);
+}
+
+// The instances of one module differ only in where they sit, so they are one unit:
+// the hidden storage a process body needs (a repeat's bound, a task call's output
+// argument) is numbered within its instance, never across the design.
+TEST_CASE("cli: instances of one module share a unit whatever hidden temporaries their bodies need") {
+    const Scratch  s;
+    const fs::path design = s.write("design.sv", R"(
+        module leaf;
+          int n = 0;
+          task automatic bump(output int o);
+            o = n + 1;
+          endtask
+          initial begin
+            int r;
+            repeat (3) n++;
+            bump(r);
+            $display("%m n=%0d r=%0d", n, r);
+          end
+        endmodule
+        module top;
+          leaf u1();
+          leaf u2();
+        endmodule
+    )");
+    const Result   r      = s.run(std::format("run --stat=units \"{}\"", design.string()));
+    CHECK(r.code == 0);
+    CHECK(r.out == "top.u1 n=3 r=4\ntop.u2 n=3 r=4\n");
+    CHECK(split_specializations(r.err) == 0);
+}
 #endif // !defined(_WIN32)
 
 TEST_CASE("cli: --sanitize=divzero reports a 2-state divide by zero and leaves the result alone") {

@@ -1256,7 +1256,7 @@ void Lowerer::collect_clocking_block(const ClockingBlockSymbol& cb) {
     // cannot be referenced (LRM 14.3), so this name reaches nothing but the
     // state field and the dump.
     const std::string base =
-      cb.name.empty() ? "__clocking" + std::to_string(temp_id_++) : std::string(cb.name);
+      cb.name.empty() ? "__clocking" + std::to_string(next_temp_id()) : std::string(cb.name);
     for (const Symbol& m : cb.members()) {
         if (m.kind != SymbolKind::ClockVar) {
             // TODO: an `assertion_item_declaration` inside a clocking block

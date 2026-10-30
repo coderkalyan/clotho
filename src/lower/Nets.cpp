@@ -1528,7 +1528,7 @@ void Lowerer::scan_force_targets(const Statement& body) {
 // `active`) that powers up to 0.
 ir::Signal Lowerer::new_pca_state(const char* tag, const ValueSymbol& sym) {
     ir::SignalInfo info;
-    info.name = prefix_ + tag + "." + std::string(sym.name) + "." + std::to_string(temp_id_++);
+    info.name = prefix_ + tag + "." + std::string(sym.name) + "." + std::to_string(next_temp_id());
     info.type = make_int_type(32, false);
     return register_signal(std::move(info));
 }
@@ -1582,7 +1582,7 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
     site.lo     = lo;
     site.hi     = hi;
     ir::SignalInfo vinfo;
-    vinfo.name = prefix_ + "$force_val." + std::string(root.name) + "." + std::to_string(temp_id_++);
+    vinfo.name = prefix_ + "$force_val." + std::string(root.name) + "." + std::to_string(next_temp_id());
     vinfo.type = make_int_type(hi - lo + 1, /*four_state=*/true);
     site.val   = register_signal(std::move(vinfo));
 
@@ -2359,7 +2359,7 @@ Lowerer::GateInput Lowerer::lower_gate_input(const Expression& e, std::string_vi
     // to the expression's reads, evaluated at time zero like any continuous
     // assign (mirrors lower_continuous_assign).
     ir::SignalInfo info;
-    info.name            = prefix_ + "$gate" + std::to_string(temp_id_++) + "." + std::string(inst_name) + ".in" +
+    info.name            = prefix_ + "$gate" + std::to_string(next_temp_id()) + "." + std::string(inst_name) + ".in" +
                            std::to_string(input_index);
     info.type            = module_.pool.logic_type;
     const ir::Signal tmp = module_.add_signal(std::move(info));
