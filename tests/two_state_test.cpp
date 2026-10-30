@@ -627,3 +627,27 @@ TEST_CASE("scalar formals and results of every domain cross calls intact") {
           "10 6\n"
           "15 105\n");
 }
+
+// The analysis is conservative about a virtual call's result (it may be any
+// override's, so it reports may-z), but a 2-state signal has no z plane to keep:
+// the slot is its domain's native iW whatever the analysis says of its writers.
+TEST_CASE("a 2-state signal written from a may-z source is still a single iW slot") {
+    constexpr std::string_view src = R"(
+        class B; virtual function bit [7:0] g(); return 8'd5; endfunction endclass
+        class D extends B; virtual function bit [7:0] g(); return 8'd9; endfunction endclass
+        module m;
+            bit [7:0] s;
+            initial begin
+                B b;
+                D d = new;
+                b = d;
+                s = b.g();
+                $display("%0d", s);
+            end
+        endmodule
+    )";
+    const std::string ir = emit(src);
+    CHECK(ir.find("%bit.8 = type { i8 }") != std::string::npos);
+    CHECK(ir.find("%bit.8 = type { i16, i8 }") == std::string::npos);
+    CHECK(run_capture(src) == "9\n");
+}

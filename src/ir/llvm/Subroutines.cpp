@@ -2107,7 +2107,7 @@ void Backend::lower_call_common(Index               i,
         if (t.is_real) {
             pl = real_plane(planes_to_real(pl, t.width));
         }
-        set_value(i, in_type_domain(pl, t));
+        set_value(i, pl);
     }
 }
 

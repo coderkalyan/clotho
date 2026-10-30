@@ -1096,8 +1096,9 @@ void Backend::lower_store(const LValue& lv, Plane rhs) {
         return;
     }
 
-    // The packed slot still holds i(2W); a 2-state RHS lifts to it.
-    rhs = to_four(rhs);
+    // A packed slot is a 4-state slot, and ir::verify's store-domain rule gives it a
+    // 4-state value.
+    assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
 
     // Whole-storage store: the frontend context-sizes the RHS to the lvalue
     // width (via an inserted conversion), so rhs already matches the storage width
@@ -1144,7 +1145,8 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
         if (m.narrow) {
             b_.CreateStore(must_of(rhs), shadow_ptr(s, m.sh_mm_field));
         } else {
-            const Plane f = to_four(rhs);
+            assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
+            const Plane& f = rhs;
             b_.CreateStore(f.mm, shadow_ptr(s, m.sh_mm_field));
             if (m.has_z) {
                 b_.CreateStore(f.z, shadow_ptr(s, m.sh_z_field));
@@ -1184,7 +1186,7 @@ void Backend::lower_store_nb(const LValue& lv, Plane rhs) {
         return;
     }
 
-    rhs                  = to_four(rhs);
+    assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
     // A never-z target stages no z shadow (and its commit loop skips z).
     llvm::Value* zp = s.has_z ? shadow_ptr(s, s.sh_z_field) : nullptr;
 
@@ -1608,7 +1610,8 @@ void Backend::emit_agg_nba(const LValue& lv, Plane rhs) {
     if (lv.narrow) {
         put(payload, place_val(lv, must_of(rhs), W), 0);
     } else {
-        const Plane f  = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
+        const Plane& f = rhs;
         llvm::Value* mm = packed(place_val(lv, must_of(f), W), place_val(lv, may_of(f), W),
                                  place_val(lv, f.z, W)).mm;
         put(payload, mm, 0);
@@ -1741,7 +1744,7 @@ void Backend::emit_array_nba(const LValue& lv, Plane rhs) {
     if (s.narrow) {
         mm_val = place_val(lv, must_of(rhs), W); // iW
     } else {
-        rhs               = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         llvm::Value* must = place_val(lv, must_of(rhs), W);
         llvm::Value* may  = place_val(lv, may_of(rhs), W);
         llvm::Value* zval = place_val(lv, rhs.z, W);
@@ -1798,7 +1801,7 @@ llvm::Value* Backend::intra_pack_mm(const SignalSlot& s, Plane& rhs) {
     if (s.narrow) {
         return must_of(rhs);
     }
-    rhs = to_four(rhs);
+    assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
     return rhs.mm;
 }
 
@@ -1842,7 +1845,7 @@ void Backend::fill_intra_payload(const LValue& lv, Plane rhs, llvm::StructType* 
     if (s.narrow) {
         mm_val = place_val(lv, must_of(rhs), W);
     } else {
-        rhs               = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         llvm::Value* must = place_val(lv, must_of(rhs), W);
         llvm::Value* may  = place_val(lv, may_of(rhs), W);
         llvm::Value* zval = place_val(lv, rhs.z, W);
@@ -1908,7 +1911,8 @@ void Backend::fill_intra_agg_payload(const LValue& lv, Plane rhs, llvm::StructTy
     if (lv.narrow) {
         put(payload, place_val(lv, must_of(rhs), W), 0);
     } else {
-        const Plane  f  = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
+        const Plane& f = rhs;
         llvm::Value* mm = packed(place_val(lv, must_of(f), W), place_val(lv, may_of(f), W),
                                  place_val(lv, f.z, W))
                             .mm;
@@ -2022,7 +2026,7 @@ void Backend::emit_inertial_arm(const LValue& lv, Plane rhs, llvm::Value* ticks)
     if (s.narrow) {
         mm_val = must_of(rhs);
     } else {
-        rhs    = to_four(rhs);
+        assert(!rhs.two && "a 4-state slot takes a 4-state value (ir::verify: store-domain)");
         mm_val = rhs.mm; // i2W: must | (may << W)
     }
     llvm::Value* z_val = s.has_z ? rhs.z : nullptr;

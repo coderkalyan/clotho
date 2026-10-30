@@ -110,10 +110,8 @@ struct Plane {
     // 2-state value never carries the redundant may/z half. For an instruction's
     // value the encoding is its IR type's domain, the single source of truth:
     // set_value asserts they agree and an operator never converts its operands.
-    // Where storage decides the encoding the tag is not the domain: a 2-state
-    // signal is stored packed when the may-z analysis gives it a z word
-    // (StateLayout), so a plane read from storage crosses into the type's domain
-    // in in_type_domain.
+    // Storage and the call ABI hold a value in the encoding of its type's domain
+    // too: a 2-state signal, local, member or element is the native iW slot.
     bool two = false;
     // Real / shortreal value (double / float). Exactly one of fp and mm is set:
     // a real SSA value carries fp only; its storage form is the raw bit pattern

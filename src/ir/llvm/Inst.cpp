@@ -73,10 +73,10 @@ Plane Backend::value_of(Index i) const {
 void Backend::set_value(Index i, Plane p) {
     // A value's encoding is its IR type's domain, which is the single source of
     // truth: the operator dispatch reads `two` as the domain of both operands, so
-    // a producer whose plane disagrees with type_of(i) is a backend bug. Producers
-    // that read storage or an ABI cross the boundary with in_type_domain. A real
-    // value stays fp-only; pack/unpack happens at the storage / ABI boundaries (see
-    // the real helpers).
+    // a producer whose plane disagrees with type_of(i) is a backend bug. No storage
+    // or ABI boundary holds a 2-state value packed, so a load, an argument and a
+    // call result arrive in their type's domain. A real value stays fp-only;
+    // pack/unpack happens at the storage / ABI boundaries (see the real helpers).
     [[maybe_unused]] const ValueType t = type_of(i);
     assert((t.is_string || t.is_real || p.two == !t.four_state) &&
            "a value's plane encoding follows its IR type's domain");
@@ -970,7 +970,7 @@ void Backend::lower_inst(Index i) {
             if (t.is_real) {
                 v = real_plane(planes_to_real(v, t.width));
             }
-            set_value(i, in_type_domain(v, t));
+            set_value(i, v);
             return;
         }
         case Inst::Tag::Store: {
@@ -2362,7 +2362,7 @@ void Backend::lower_inst(Index i) {
             if (t.is_real) {
                 v = real_plane(planes_to_real(v, t.width));
             }
-            set_value(i, in_type_domain(v, t));
+            set_value(i, v);
             return;
         }
         case Inst::Tag::Ret:
