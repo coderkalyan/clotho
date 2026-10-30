@@ -19,14 +19,16 @@ TimeFormat timeformat;
 // femtoseconds, then to the display unit (10^units s); since fs = 10^-15 s, a
 // display unit of 10^units s is 10^(units+15) fs. The number is printed with
 // `precision` fractional digits. Field justification (to $timeformat's
-// min_width or an explicit %t width) is the caller's job.
-void render_time(std::string& out, uint64_t ticks) {
+// min_width or an explicit %t width) is the caller's job. `negative` makes the
+// time minus `ticks`, written with a leading `-` that counts toward the field
+// width, as a negative %d does.
+void render_time(std::string& out, uint64_t ticks, bool negative) {
     const double fs      = static_cast<double>(ticks) * static_cast<double>(timeformat.tick_fs);
     double       divisor = 1.0;
     for (int32_t k = 0; k < timeformat.units + 15; ++k) {
         divisor *= 10.0;
     }
-    const double value = fs / divisor;
+    const double value = negative ? -(fs / divisor) : fs / divisor;
 
     const int32_t prec = timeformat.precision < 0 ? 0 : timeformat.precision;
     char          numbuf[64];
@@ -279,15 +281,18 @@ void render_arg(std::string& out, const rt_arg& a, const clotho::FormatSpec& spe
             field += static_cast<char>(a.val[0] & 0xff);
             break;
         case 't':
-        case 'T':
-            // The frontend scales a %t argument to design ticks, so the low word
-            // is the tick count; render_time converts it per the current
+        case 'T': {
+            // The frontend scales a %t argument to design ticks (scale_to_ticks), so
+            // the low word is the tick count and the descriptor's signedness says
+            // whether it is negative. render_time converts it per the current
             // $timeformat, whose min width is the default field width for %t.
-            render_time(field, a.val[0]);
+            const bool negative = (a.flags & 1u) != 0 && static_cast<int64_t>(a.val[0]) < 0;
+            render_time(field, negative ? uint64_t{ 0 } - a.val[0] : a.val[0], negative);
             if (!spec.has_width && timeformat.min_width > 0) {
                 target = static_cast<uint32_t>(timeformat.min_width);
             }
             break;
+        }
         case 's':
         case 'S':
             if ((a.flags & 2u) != 0) {
@@ -466,10 +471,11 @@ const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, co
         if (lc == 't') {
             // One step, not two: scale_to_ticks multiplies in the real domain and
             // rounds afterwards, so rounding first would quantize to whole time
-            // units before the multiply and report the wrong tick.
+            // units before the multiply and report the wrong tick. Signed, as a
+            // real is: a negative one is a negative time.
             scratch.val = static_cast<uint64_t>(sat_round_i64(
               std::bit_cast<double>(a.val[0]) * static_cast<double>(dyn->time_mul)));
-            return synth(/*is_signed=*/false);
+            return synth(/*is_signed=*/true);
         }
         if (int_conv) {
             // Table 21-1 gives these a common integral operand, reached from a
@@ -512,14 +518,18 @@ const rt_arg& coerce_dyn_arg(const rt_arg& a, char conv, CoercedArg& scratch, co
         return scratch.arg;
     }
     if (lc == 't') {
-        // scale_to_ticks resizes to an unsigned 64-bit and multiplies, so a
-        // narrower signed operand sign-extends first and the product wraps.
-        uint64_t ticks = a.val[0];
-        if ((a.flags & 1u) != 0 && a.width < 64 && ((ticks >> (a.width - 1)) & 1u) != 0) {
+        // scale_to_ticks's count: the operand extended to 64 bits by its own
+        // signedness, times the multiplier. A narrower signed operand sign-extends
+        // here by hand, and the descriptor goes on signed or not as the operand
+        // was, so a negative count renders with its sign
+        // (docs/LRM_NOTES.md, note 40).
+        const bool is_signed = (a.flags & 1u) != 0;
+        uint64_t   ticks     = a.val[0];
+        if (is_signed && a.width < 64 && ((ticks >> (a.width - 1)) & 1u) != 0) {
             ticks |= ~width_mask(a.width);
         }
         scratch.val = ticks * dyn->time_mul;
-        return synth(/*is_signed=*/false);
+        return synth(is_signed);
     }
     return a;
 }

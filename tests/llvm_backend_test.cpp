@@ -1728,6 +1728,68 @@ TEST_CASE("%t scales to ticks independent of the calling module time unit") {
     CHECK(out == "t:5000 ns\n");
 }
 
+// LRM 21.2.1.1 (Table 21-1: %t "Display in current time format") and 20.4.3
+// ($timeformat: units, precision, suffix and minimum width) say nothing about the
+// sign of a %t operand. The argument is a value, so a negative one is a negative
+// time, as for %d, and its sign is its signedness, not its top bit: an unsigned
+// all-ones operand stays positive (docs/LRM_NOTES.md, note 40). A constant format
+// zero-extended a negative operand narrower than 64 bits (`-1` printed 4294967295
+// units) and a runtime one sign-extended it and printed 2**64 - 1; a 64-bit, a
+// 128-bit and a real operand were unsigned on both. Each pair below is the constant
+// format then the runtime one, and both are now iverilog 13's text, byte for byte.
+// `#0.001` pins the design tick to 1ps, so the real keeps its fraction.
+TEST_CASE("%t of a negative operand prints its sign in a constant and in a runtime format") {
+    const std::string out = run_capture(R"(`timescale 1ns/1ps
+        module m;
+          string f;
+          int i;  byte by;  integer ig;  longint lg;  shortint si;
+          logic signed [127:0] w;
+          bit [31:0] u32;  bit [7:0] u8;  longint unsigned ul;
+          real r;
+          initial #0.001 ;
+          initial begin
+            f = "%0t";
+            i = -1;  by = -3;  ig = -5;  lg = -7;  si = -9;
+            w = -128'sd11;  r = -2.5;
+            u32 = 32'hFFFF_FFFF;  u8 = 8'hFF;  ul = 64'd3;
+            $display("int      [%0t] [%s]", i,   $sformatf(f, i));
+            $display("byte     [%0t] [%s]", by,  $sformatf(f, by));
+            $display("integer  [%0t] [%s]", ig,  $sformatf(f, ig));
+            $display("longint  [%0t] [%s]", lg,  $sformatf(f, lg));
+            $display("shortint [%0t] [%s]", si,  $sformatf(f, si));
+            $display("w128     [%0t] [%s]", w,   $sformatf(f, w));
+            $display("real     [%0t] [%s]", r,   $sformatf(f, r));
+            $display("u32 max  [%0t] [%s]", u32, $sformatf(f, u32));
+            $display("u8 0xFF  [%0t] [%s]", u8,  $sformatf(f, u8));
+            $display("ulongint [%0t] [%s]", ul,  $sformatf(f, ul));
+            $display("lit -1   [%0t] [%s]", -1,  $sformatf(f, -1));
+            $display("padded   [%t]", i);
+            f = "%t";
+            r = -1.5;
+            $timeformat(-9, 3, " ns", 14);
+            $display("[%t] [%s]", r, $sformatf(f, r));
+            $display("[%t] [%s]", i, $sformatf(f, i));
+            $display("[%10t]", i);
+          end
+        endmodule
+    )");
+    CHECK(out == "int      [-1000] [-1000]\n"
+                 "byte     [-3000] [-3000]\n"
+                 "integer  [-5000] [-5000]\n"
+                 "longint  [-7000] [-7000]\n"
+                 "shortint [-9000] [-9000]\n"
+                 "w128     [-11000] [-11000]\n"
+                 "real     [-2500] [-2500]\n"
+                 "u32 max  [4294967295000] [4294967295000]\n"
+                 "u8 0xFF  [255000] [255000]\n"
+                 "ulongint [3000] [3000]\n"
+                 "lit -1   [-1000] [-1000]\n"
+                 "padded   [               -1000]\n"
+                 "[     -1.500 ns] [     -1.500 ns]\n"
+                 "[     -1.000 ns] [     -1.000 ns]\n"
+                 "[ -1.000 ns]\n");
+}
+
 TEST_CASE("a later $timeformat changes the format mid-simulation") {
     const std::string out = run_capture(R"(`timescale 1ns/1ns
         module m;

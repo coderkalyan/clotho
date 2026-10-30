@@ -1381,9 +1381,15 @@ bool Lowerer::assoc_value_may_carry_xz(ir::Ref type) const {
 // timescale (LRM §20.4.3). A value in module units times this instance's
 // time-unit multiplier yields ticks; the result is widened to 64 bits so the
 // runtime reads the full tick count.
+//
+// The count keeps the operand's own sign. LRM 21.2.1.1 and 20.4.3 say nothing
+// about a negative %t operand; the argument is a value, so -1 is a time of minus
+// one unit (iverilog prints -1), and not 2**32 - 1 or 2**64 - 1. The sign is the
+// operand's signedness, not its top bit, so an unsigned all-ones operand stays
+// positive. The run-time-format path reaches the same count in
+// coerce_dyn_arg (docs/LRM_NOTES.md, note 40).
 ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builder& b) {
-    const ir::SourceLoc l   = loc(arg);
-    const ir::Ref       u64 = make_int_type(64, false, false);
+    const ir::SourceLoc l = loc(arg);
     if (arg.type->isFloating()) {
         // A real (realtime) argument scales in the real domain, then rounds
         // to the nearest tick (FtoI rounds half away from zero); only
@@ -1398,13 +1404,16 @@ ir::Index Lowerer::scale_to_ticks(const Expression& arg, ir::Index v, ir::Builde
               b.constant(module_.pool.put_real(module_.pool.real_type, static_cast<double>(time_mul_)), l);
             scaled = b.binary(ir::Inst::Tag::FMul, scaled, mul, l);
         }
-        return saturating_ticks(scaled, 1, b, l);
+        return saturating_ticks(scaled, 1, b, l, /*is_signed=*/true);
     }
-    const ir::Index w = b.resize(v, u64, l);
+    // A 64-bit type of the operand's own signedness: the resize sign-extends a
+    // signed operand, zero-extends an unsigned one and truncates a wider one.
+    const ir::Ref   ty = make_int_type(64, false, arg.type->isSigned());
+    const ir::Index w  = b.resize(v, ty, l);
     if (time_mul_ <= 1) {
         return w;
     }
-    const ir::Index mul = b.constant(module_.pool.put_int(u64, time_mul_), l);
+    const ir::Index mul = b.constant(module_.pool.put_int(ty, time_mul_), l);
     return b.binary(ir::Inst::Tag::Mul, w, mul, l);
 }
 

@@ -108,7 +108,7 @@ struct TimeFormat {
 // library; docs/design/executables.md).
 extern TimeFormat timeformat;
 
-void render_time(std::string& out, uint64_t ticks);
+void render_time(std::string& out, uint64_t ticks, bool negative);
 
 [[noreturn]] void format_fatal(const std::string& what);
 

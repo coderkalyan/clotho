@@ -365,3 +365,16 @@ and the continuous-assignment, gate and net delays (10.3.3, 28.16) take the same
 intra-assignment delay is a plain `<=`, as a compile-time `#0` is.
 
 Code: `src/lower/SystemTasks.cpp` (`scaled_delay`), `src/lower/Assign.cpp` (`intra_nb_delay_is_const_zero`). Tests: `tests/llvm_backend_test.cpp` ("a delay with an x or z bit is a zero delay", "an unknown delay is zero before the time unit multiplier"), `tests/event_test.cpp` ("->> #(x) e: a delay with an x or z bit is a zero delay"), `tests/continuous_assign_delay_test.cpp`, `tests/gate_test.cpp` and `tests/net_delay_test.cpp` (one case each). Oracle: iverilog 13 for the procedural, intra-assignment, `assign` and gate forms; it implements no net delay and no `->>`.
+
+## 40. Sign of a `%t` operand (21.2.1.1, 20.4.3)
+
+Table 21-1 describes `%t` only as "Display in current time format", and 20.4.3
+says what `$timeformat` sets (units, precision, suffix, minimum width); neither
+says what a negative operand prints. Clotho reads the argument as the value it
+is: a negative signed or real operand is a negative time, written with a `-` that
+counts toward the field width, as for `%d`. The sign is the operand's signedness,
+not its top bit, so an unsigned all-ones operand stays positive. A constant and a
+runtime format string print the same text, and so does iverilog. An x or z bit of
+the operand reads as 0 (iverilog prints x).
+
+Code: `src/lower/Assign.cpp` (`scale_to_ticks`), `src/runtime/Format.cpp` (`render_time`, `coerce_dyn_arg`). Tests: `tests/llvm_backend_test.cpp` ("%t of a negative operand prints its sign in a constant and in a runtime format"), `tests/real_test.cpp` ("a real delay beyond 2**63 ticks saturates instead of wrapping into an early event").

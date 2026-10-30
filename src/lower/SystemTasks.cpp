@@ -236,22 +236,36 @@ void Lowerer::lower_printtimescale(const CallExpression& call, ir::Builder& b) {
 // conversion's own answer, zero. A negative count inside the ceiling is left
 // alone: LRM 9.4.1 reads a negative delay as a two's-complement unsigned
 // integer, which is what the conversion's cast already gives.
-ir::Index Lowerer::saturating_ticks(ir::Index scaled, uint64_t tick_mul, ir::Builder& b, ir::SourceLoc l) {
+//
+// `is_signed` gives the count as a signed 64-bit one instead, for a %t operand
+// (scale_to_ticks). There a negative real is a negative time, not a delay read
+// as an unsigned integer, so it converts as signed and each sign saturates at
+// the ceiling of its own sign, -INT64_MAX and INT64_MAX.
+ir::Index Lowerer::saturating_ticks(ir::Index     scaled,
+                                    uint64_t      tick_mul,
+                                    ir::Builder&  b,
+                                    ir::SourceLoc l,
+                                    bool          is_signed) {
     using T                    = ir::Inst::Tag;
-    const ir::Ref      u64     = make_int_type(64, false, false);
+    const ir::Ref      ty      = make_int_type(64, false, is_signed);
     constexpr uint64_t ceiling = INT64_MAX;
     const uint64_t     mul     = std::max<uint64_t>(tick_mul, 1);
     const double       bound   = static_cast<double>(ceiling / mul);
     const ir::Ref      real_ty = module_.pool.real_type;
 
-    ir::Index ticks = b.float_cvt(T::FtoI, scaled, u64, l);
+    ir::Index ticks = b.float_cvt(T::FtoI, scaled, ty, l);
     if (mul > 1) {
-        ticks = b.binary(T::Mul, ticks, b.constant(module_.pool.put_int(u64, mul), l), l);
+        ticks = b.binary(T::Mul, ticks, b.constant(module_.pool.put_int(ty, mul), l), l);
     }
     const ir::Index above = b.binary(T::FGe, scaled, b.constant(module_.pool.put_real(real_ty, bound), l), l);
     const ir::Index below = b.binary(T::FLe, scaled, b.constant(module_.pool.put_real(real_ty, -bound), l), l);
-    const ir::Index huge  = b.binary(T::Lor, above, below, l);
-    return b.select(huge, b.constant(module_.pool.put_int(u64, ceiling), l), ticks, l);
+    const ir::Index top   = b.constant(module_.pool.put_int(ty, ceiling), l);
+    if (!is_signed) {
+        return b.select(b.binary(T::Lor, above, below, l), top, ticks, l);
+    }
+    const ir::Index bottom =
+      b.constant(module_.pool.put_int(ty, static_cast<uint64_t>(-static_cast<int64_t>(ceiling))), l);
+    return b.select(above, top, b.select(below, bottom, ticks, l), l);
 }
 
 // Lower a #delay amount, scaled from the module's time unit to wheel ticks.
