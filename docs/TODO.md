@@ -433,6 +433,8 @@ Milestones, in order; lower ones unblock higher ones:
   initializer of its own it silently reads the power-on default, not the member defaults.
 - [ ] **Class type identity across modules** — a `$unit` or package class referenced
   from two modules lowers as two distinct types.
+- [ ] **Monomorphic inline cache for virtual calls (performance)** (8.20) — every virtual
+  call dispatches through the method table; benchmark a per-call-site cache keyed on the class.
 
 ### Assertions (immediate)
 
