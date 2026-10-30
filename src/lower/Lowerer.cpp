@@ -499,9 +499,8 @@ Lowerer::MonitorState Lowerer::alloc_monitor_state(const ir::AssertionMonitor& m
         }
     }
     if (mon.kind == ir::AssertionKind::Cover) {
-        // Unsigned: a tally is never negative, and widening the 1-bit match
-        // flag into a signed target would sign-extend it to -1 (a Resize takes
-        // its signedness from the target type).
+        // Unsigned: a tally is never negative, and sign-extending the 1-bit match
+        // flag would make it -1.
         st.covered = new_monitor_state(base + "cov", mask_type(32), l);
     }
     if (mon.kind == ir::AssertionKind::Expect) {

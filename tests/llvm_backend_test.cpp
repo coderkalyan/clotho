@@ -963,11 +963,10 @@ TEST_CASE("a widening cast extends by the source's signedness, not the target's"
     // extension if, and only if, the type of the right-hand side is signed".
     // `bit` and `logic` are unsigned, so int'(1'b1) is 1.
     //
-    // Regression: the cast lowered to a single Resize, whose extension follows
-    // its TARGET type, so every unsigned source widened into a signed target
-    // sign-extended. slang splits an IMPLICIT assignment conversion into a
-    // widen-then-retag pair itself, which is why the plain assignments below
-    // were already right and only the cast was wrong. Every value here agrees
+    // Regression: the cast lowered to a single resize that took its extension from
+    // the TARGET type, so every unsigned source widened into a signed target
+    // sign-extended. The frontend now picks ZExt or SExt from the source (LRM 6.24.1,
+    // 11.8.3), and an IMPLICIT assignment conversion was already right. Every value here agrees
     // between iverilog 13 and Verilator 5.050.
     const std::string out = run_capture(R"(
         module m;

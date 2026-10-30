@@ -1378,9 +1378,8 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
             // container's handle instead.
             emit_struct_store(pb.signal(sig, il), pty, *init, ir::Inst::Tag::Store, pb, il);
         } else if (prop.getType().getCanonicalType().isString()) {
-            // A string assigns as a whole handle, never through coerce: its
-            // Resize rejects a string value outright (Resize truncates/extends
-            // planes). Mirrors emit_class_property_inits' string case.
+            // A string assigns as a whole handle, never through coerce: an integer
+            // conversion rejects a string value outright. Mirrors emit_class_property_inits' string case.
             const ir::Index dst = pb.signal(sig, il);
             const ir::Index val = lower_expr(*init, pb);
             pb.binary(ir::Inst::Tag::Store, dst, val, il);

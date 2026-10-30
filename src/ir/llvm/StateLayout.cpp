@@ -270,7 +270,7 @@ void Backend::build_state_types() {
     // A slot keeps its z word when the may-z analysis cannot prove it z-free
     // or the task ABI needs z storage behind it. Elision is analysis-driven,
     // not domain-driven: a 2-state signal assigned a z-carrying expression
-    // round-trips the z bit today (Resize does not clear z across domains),
+    // round-trips the z bit today (the may-z analysis keeps z across a ToTwo),
     // and that behavior is preserved — ordinary 2-state signals are never-z
     // through the analysis anyway.
     const std::vector<bool> may_z =
