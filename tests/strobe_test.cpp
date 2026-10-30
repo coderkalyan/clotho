@@ -286,3 +286,29 @@ TEST_CASE("$monitor in a function is rejected") {
     )",
                    "$monitor inside a function is not supported");
 }
+
+// Each `initial` pends its $strobe and runs off its end in the same time step, so
+// its frame is gone by Postponed; the `#20` keeps the simulation running past
+// it. The pended body once read its task record out of that frame and woke
+// whatever handle the freed memory held (ivtest pr3527694 segfaulted); under
+// CLOTHO_EXTRA_ASSERTS a freed frame is poisoned, which makes that read fail
+// every time. Icarus Verilog 13 prints the same.
+TEST_CASE("$strobe pended by a process that finishes in the same time step") {
+    CHECK(run_capture(R"(
+        module leaf;
+          wire [31:0] v = 32'h12;
+          initial $strobe("%m v=%h", v);
+        endmodule
+        module mid;
+          initial $display("%m");
+          leaf a();
+          leaf b();
+        endmodule
+        module top;
+          mid m0();
+          mid m1();
+          initial #20;
+        endmodule
+    )") == "top.m0\ntop.m1\ntop.m0.a v=00000012\ntop.m0.b v=00000012\ntop.m1.a v=00000012\n"
+           "top.m1.b v=00000012\n");
+}
