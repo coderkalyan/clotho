@@ -3925,3 +3925,168 @@ TEST_CASE("static property of a $unit class is shared by every top") {
     )") == "top2 8 8\n"
            "top1 8 8\n");
 }
+
+// The other direction. A `$unit` or package generic specialized with a class a
+// module declares (`Factory#(Packet)`) depends on that module, so it and the
+// class's statics and methods are the module's, however the class is reached: a
+// static property is one slot (LRM 8.9) and a function-static local one variable
+// (6.21) per class, not one per Lowerer that happened to lower a copy. The
+// constructor reached through the generic used to be built twice, once on the
+// package side and once in the module, each with its own `n` and its own `count`.
+TEST_CASE("a generic specialized with a module's class shares that class's statics") {
+    CHECK(run_capture(R"(
+        class Factory #(type T = int);
+            static function T create();
+                T obj = new;
+                return obj;
+            endfunction
+        endclass
+        module tb;
+            class Packet;
+                static int count;
+                int id;
+                function new(); static int n = 0; n++; count++; id = n; endfunction
+            endclass
+            Packet p1, p2, p3;
+            initial begin
+                p1 = Factory#(Packet)::create();
+                p2 = new;
+                p3 = Factory#(Packet)::create();
+                $display("ids %0d %0d %0d count=%0d", p1.id, p2.id, p3.id, Packet::count);
+            end
+        endmodule
+    )") == "ids 1 2 3 count=3\n");
+}
+
+// The generic reaches the module's property by handle and by scope, and writes it
+// too; a module variable the module's class method updates is the module's, so
+// that reaches it through the generic as well (it used to be refused as an unknown
+// signal).
+TEST_CASE("a package generic reads and writes a module class's static property and variables") {
+    CHECK(run_capture(R"(
+        class G #(type T = int);
+            static function void bump_h(T h); h.cnt = h.cnt + 1; endfunction
+            static function void bump_s(); T::cnt = T::cnt + 10; endfunction
+            static function int peek(); return T::cnt; endfunction
+            static function void go(T h); h.run(); endfunction
+        endclass
+        module m;
+            int hits;
+            class L;
+                static int cnt;
+                function void run(); hits++; endfunction
+            endclass
+            L l;
+            initial begin
+                l = new;
+                G#(L)::bump_h(l);
+                G#(L)::bump_s();
+                $display("%0d %0d %0d", L::cnt, l.cnt, G#(L)::peek());
+                L::cnt = 100;
+                $display("%0d", G#(L)::peek());
+                G#(L)::go(l);
+                l.run();
+                $display("hits=%0d", hits);
+            end
+        endmodule
+    )") == "11 11 11\n"
+           "100\n"
+           "hits=2\n");
+}
+
+// Each specialization is its own class, so each has its own statics, and one
+// named with a module's class, enum or a mix of those and a global class is
+// initialized once, at the start of the simulation, by the module that owns it.
+// A module-local class that extends a global one still shares the base's static.
+TEST_CASE("a generic specialized with a module's types initializes and counts per specialization") {
+    CHECK(run_capture(R"(
+        class GBase; static int gcount; function new(); gcount++; endfunction endclass
+        class GCls; static int gc; function new(); gc++; endfunction endclass
+        class Reg #(type T = int);
+            static int hits = 3;
+            static function void touch(); hits++; endfunction
+        endclass
+        class Pair #(type A = int, type B = int);
+            static int n;
+            static function int bump(); n++; return n; endfunction
+        endclass
+        class Wrap #(type F = int);
+            static function F make(); F f = new; return f; endfunction
+        endclass
+        class Factory #(type T = int);
+            static function T create(); T o = new; return o; endfunction
+        endclass
+        module tb;
+            typedef enum { RED, GREEN } color_t;
+            class LocalDerived extends GBase; endclass
+            class Packet; static int count; function new(); count++; endfunction endclass
+            initial begin
+                LocalDerived d;
+                Packet p;
+                d = Factory#(LocalDerived)::create();
+                d = Factory#(LocalDerived)::create();
+                p = Wrap#(Packet)::make();
+                p = Wrap#(Packet)::make();
+                Reg#(color_t)::touch();
+                Reg#(color_t)::touch();
+                Reg#(int)::touch();
+                void'(Pair#(GCls, Packet)::bump());
+                void'(Pair#(GCls, Packet)::bump());
+                void'(Pair#(GCls, int)::bump());
+                $display("gcount=%0d count=%0d color=%0d int=%0d pair=%0d %0d", GBase::gcount, Packet::count,
+                         Reg#(color_t)::hits, Reg#(int)::hits, Pair#(GCls, Packet)::n, Pair#(GCls, int)::n);
+            end
+        endmodule
+    )") == "gcount=2 count=2 color=5 int=4 pair=2 1\n");
+}
+
+// A static property initializer of a specialization named only by a module's own
+// typedef still runs at the start of the simulation, before anything reads it.
+TEST_CASE("a specialization with a module's class has its static initializer run") {
+    CHECK(run_capture(R"(
+        class Reg #(type T = int);
+            static int cnt = 5;
+            static int made;
+            static function void note(); made++; endfunction
+        endclass
+        module tb;
+            class L; endclass
+            typedef Reg#(L) R;
+            initial begin
+                R::note(); R::note();
+                $display("cnt=%0d made=%0d", R::cnt, R::made);
+            end
+        endmodule
+    )") == "cnt=5 made=2\n");
+}
+
+// Two modules each declare a `Packet`: two classes, so two specializations of the
+// one generic, and nothing is shared between them.
+TEST_CASE("each module's class gets its own specialization of a global generic") {
+    CHECK(run_capture(R"(
+        class Factory #(type T = int);
+            static int made;
+            static function T create();
+                T o = new; made++; return o;
+            endfunction
+        endclass
+        module top1;
+            class Packet; static int count; function new(); count++; endfunction endclass
+            Packet p;
+            initial begin
+                p = Factory#(Packet)::create();
+                p = Factory#(Packet)::create();
+                #1 $display("top1 count=%0d made=%0d", Packet::count, Factory#(Packet)::made);
+            end
+        endmodule
+        module top2;
+            class Packet; static int count; function new(); count++; endfunction endclass
+            Packet p;
+            initial begin
+                p = Factory#(Packet)::create();
+                #2 $display("top2 count=%0d made=%0d", Packet::count, Factory#(Packet)::made);
+            end
+        endmodule
+    )") == "top1 count=2 made=2\n"
+           "top2 count=1 made=1\n");
+}

@@ -559,23 +559,12 @@ std::vector<const ValueSymbol*> Lowerer::body_automatics(const SubroutineSymbol&
     return std::move(sc.out);
 }
 
-// True for a scope inside a package or `$unit` (no instance multiplicity, LRM
-// 6.8): walks up from `s`, stopping at the first Package/CompilationUnit
-// (global) or InstanceBody (module-scope, possibly through an intervening
-// generate block or a class declared there).
+// True for a scope that depends on no module instance: inside a package or
+// `$unit`, so it has no instance multiplicity (LRM 8.9, 6.21: one static property,
+// one set of function statics). A class declared in a module is not, and neither
+// is a `$unit` or package generic specialized with one (enclosing_instance_scope).
 bool Lowerer::is_global_scope(const Scope* s) {
-    while (s != nullptr) {
-        switch (s->asSymbol().kind) {
-            case SymbolKind::Package:
-            case SymbolKind::CompilationUnit:
-                return true;
-            case SymbolKind::InstanceBody:
-                return false;
-            default:
-                s = s->asSymbol().getParentScope();
-        }
-    }
-    return false;
+    return s != nullptr && enclosing_instance_scope(s) == nullptr;
 }
 
 // True for a subroutine declared directly in a package or `$unit` scope, or in
@@ -806,14 +795,13 @@ void Lowerer::build_dpi_open_array_arg(const slang::ast::DPIOpenArrayType& oa,
     arg_elem_cts.push_back(*ec);
 }
 
-// The root (top-level) instance whose hierarchy ultimately contains `sub`, or
-// null when the subroutine sits in no elaborated instance. A module's members
-// hang off an InstanceBodySymbol whose own parent scope is the *declaration*
-// site, so climbing a level steps across the body/InstanceSymbol pair through
+// The root (top-level) instance whose hierarchy ultimately contains `scope`, or
+// null when it sits in no elaborated instance. A module's members hang off an
+// InstanceBodySymbol whose own parent scope is the *declaration* site, so
+// climbing a level steps across the body/InstanceSymbol pair through
 // parentInstance — the same walk control_depth uses.
-const InstanceSymbol* Lowerer::owning_top(const SubroutineSymbol& sub) {
-    const InstanceSymbol* top   = nullptr;
-    const Scope*          scope = sub.getParentScope();
+const InstanceSymbol* Lowerer::owning_top(const Scope* scope) {
+    const InstanceSymbol* top = nullptr;
     while (scope != nullptr) {
         const Symbol& sym = scope->asSymbol();
         if (sym.kind != SymbolKind::InstanceBody) {
@@ -828,6 +816,10 @@ const InstanceSymbol* Lowerer::owning_top(const SubroutineSymbol& sub) {
         scope = parent->getParentScope();
     }
     return top;
+}
+
+const InstanceSymbol* Lowerer::owning_top(const SubroutineSymbol& sub) {
+    return owning_top(sub.getParentScope());
 }
 
 void Lowerer::collect_dpi_exports(const slang::ast::Compilation& comp,

@@ -455,6 +455,10 @@ struct UserCallScan : ASTVisitor<UserCallScan, VisitFlags::Expressions> {
 
 bool has_user_call(const slang::ast::Expression& e);
 
+// The module instance a scope depends on (its body, or the root for a scope outside
+// every instance and package), or null for a package or `$unit` scope. See Scans.cpp.
+const slang::ast::Scope* enclosing_instance_scope(const slang::ast::Scope* s);
+
 // Whether the implicit return variable of a STATIC function (LRM 13.4.1, 13.4.2)
 // has to be persistent storage. It keeps its value from call to call, but that is
 // only observable if some call can see the value an earlier one left: the body
@@ -976,6 +980,13 @@ public:
     void finalize_globals();
 
     void init_static_class_props(const Scope& scope);
+
+    // The same for the package / `$unit` generics `top` specializes with a class one
+    // of its modules declares: those belong to the module (is_global_scope), so the
+    // globals pass skips them and this one runs them on the top that owns them.
+    void init_local_class_specializations(const InstanceSymbol& top);
+
+    void init_static_props_of(const std::vector<const ClassType*>& classes);
 
     const ankerl::unordered_dense::map<const ValueSymbol*, ir::Signal>& sigmap() const {
         return sigmap_;
@@ -4644,6 +4655,8 @@ private:
                                   std::vector<ir::ArgDir>&            arg_dirs,
                                   std::vector<ir::DpiCType>&          arg_cts,
                                   std::vector<ir::DpiCType>&          arg_elem_cts);
+
+    static const InstanceSymbol* owning_top(const Scope* scope);
 
     static const InstanceSymbol* owning_top(const SubroutineSymbol& sub);
 

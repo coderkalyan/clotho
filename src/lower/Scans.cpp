@@ -916,6 +916,65 @@ bool has_user_call(const slang::ast::Expression& e) {
     return s.found;
 }
 
+// The module instance a scope depends on, or null when it depends on none: a
+// package or `$unit` scope. A class specialization depends on every type it is
+// specialized with, so a `$unit` generic named with a module's own class
+// (`Factory#(Packet)`) belongs to that module, not to the package scope it is
+// declared in, and so does a class nested in one. Returns the instance's body, or
+// the root for a scope outside every instance and package.
+const Scope* enclosing_instance_scope(const Scope* s);
+
+// The same for a type: the instance body of the first type it is built from that
+// a module declares (a class, an enum, a struct, a union, through any array or
+// queue of them), else null. Packed integer types depend on no instance: a
+// `logic [W-1:0]` is the same type wherever the same width comes from.
+static const Scope* instance_scope_of_type(const slang::ast::Type& t) {
+    const slang::ast::Type& ct = t.getCanonicalType();
+    if (const auto* cls = ct.as_if<ClassType>()) {
+        return enclosing_instance_scope(cls);
+    }
+    if (ct.isEnum() || ct.isStruct() || ct.isUnion()) {
+        return enclosing_instance_scope(ct.getParentScope());
+    }
+    if (const auto* aa = ct.as_if<slang::ast::AssociativeArrayType>()) {
+        if (const Scope* s = instance_scope_of_type(*aa->indexType)) {
+            return s;
+        }
+    }
+    if (ct.isUnpackedArray() || ct.isPackedArray()) {
+        return instance_scope_of_type(*ct.getArrayElementType());
+    }
+    return nullptr;
+}
+
+const Scope* enclosing_instance_scope(const Scope* s) {
+    while (s != nullptr) {
+        const Symbol& sym = s->asSymbol();
+        switch (sym.kind) {
+            case SymbolKind::Package:
+            case SymbolKind::CompilationUnit:
+                return nullptr;
+            case SymbolKind::InstanceBody:
+            case SymbolKind::Root:
+                return s;
+            case SymbolKind::ClassType:
+                if (sym.as<ClassType>().genericClass != nullptr) {
+                    for (const auto& tp : sym.as<ClassType>().membersOfType<TypeParameterSymbol>()) {
+                        if (const Scope* local = instance_scope_of_type(tp.targetType.getType())) {
+                            return local;
+                        }
+                    }
+                }
+                s = sym.getParentScope();
+                break;
+            default:
+                s = sym.getParentScope();
+                break;
+        }
+    }
+    return nullptr;
+}
+
 namespace {
 
 // Whether an expression names the variable other than as the whole target of a

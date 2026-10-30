@@ -1380,7 +1380,9 @@ ir::Signal Lowerer::declare_static_prop(const slang::ast::ClassPropertySymbol& p
         // Lowerer -- the same one that lowers the class's methods (function_id's
         // delegation). Declaring it here as well would give this top's accesses
         // (`obj.p`, `C::p`) a slot the methods never see. Cached locally so the
-        // lookup above hits next time.
+        // lookup above hits next time. A property of a generic specialized with a
+        // module's own class is not global (is_global_scope): it is this top's,
+        // like the methods that reach it.
         const Restore<const Scope*> scope(globals_->scope_, prop.getParentScope());
         const ir::Signal            sig = globals_->declare_static_prop(prop);
         sigmap_.emplace(&prop, sig);

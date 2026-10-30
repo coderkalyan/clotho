@@ -481,6 +481,9 @@ void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     prefix_ = prefix;
     scope_stack_.push_back(&top_scope_);
     init_static_class_props(top.body);
+    // And the package / $unit generics this top specializes with its own classes,
+    // which the globals pass left to it.
+    init_local_class_specializations(top);
     scope_stack_.pop_back();
     // Every body compute_vtable reserved while lowering this top's types, now
     // that the top's signals and scope tree are complete. Before the finalizers,
@@ -585,6 +588,32 @@ void Lowerer::finalize_globals() {
 // declare_static_prop appends the whole nested store first), so it observes the
 // initialized value, not the power-up one.
 void Lowerer::init_static_class_props(const Scope& scope) {
+    std::vector<const ClassType*> classes;
+    collect_class_types(scope, classes);
+    if (is_global_scope(&scope)) {
+        // A generic specialized with a module's own class is that module's.
+        std::erase_if(classes, [](const ClassType* cls) { return !is_global_scope(cls); });
+    }
+    init_static_props_of(classes);
+}
+
+void Lowerer::init_local_class_specializations(const InstanceSymbol& top) {
+    Compilation&                  comp = top.body.getCompilation();
+    std::vector<const ClassType*> classes;
+    for (const PackageSymbol* pkg : comp.getPackages()) {
+        collect_class_types(*pkg, classes);
+    }
+    for (const CompilationUnitSymbol* unit : comp.getRoot().compilationUnits) {
+        collect_class_types(*unit, classes);
+    }
+    std::erase_if(classes, [&](const ClassType* cls) {
+        const Scope* owner = enclosing_instance_scope(cls);
+        return owner == nullptr || owning_top(owner) != &top;
+    });
+    init_static_props_of(classes);
+}
+
+void Lowerer::init_static_props_of(const std::vector<const ClassType*>& classes) {
     // A static initializer's own call graph reserves class-method FunctionIds
     // the same way compute_vtable does (function_id / rand_body_id /
     // copy_thunk_id / pure_stub_id all grow module_'s function table with no
@@ -603,8 +632,6 @@ void Lowerer::init_static_class_props(const Scope& scope) {
     // calls into it) through a DIFFERENT, synchronous route that never turns
     // the flag on, so it needs the identical treatment.
     const Restore<bool> stub(stub_unsupported_bodies_, true);
-    std::vector<const ClassType*> classes;
-    collect_class_types(scope, classes);
     for (const ClassType* cls : classes) {
         scope_ = cls;
         for (const Symbol& m : cls->members()) {
