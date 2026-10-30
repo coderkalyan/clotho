@@ -1529,3 +1529,63 @@ TEST_CASE("aggregate and scalar locals of an automatic subroutine start at their
            "loop 0 5 5 [p] 1\n"
            "loop 1 5 5 [p] 1\n");
 }
+
+// A $finish reached through mutually recursive subroutines must unwind every
+// caller (docs/design/cooperative-finish.md). The may-finish closure used to be a
+// memoized DFS that, on meeting a cycle, left the in-progress callee with what it
+// had so far: with f -> {g, h}, g -> f and h finishing, g was closed before f
+// learned of h and stayed clean, so the call to g returned normally and the code
+// after it ran past the $finish. Oracle: none (iverilog keeps running the
+// finishing thread); the expected output follows from LRM 20.2, which ends the
+// simulation at $finish.
+TEST_CASE("$finish through mutually recursive functions stops the caller") {
+    CHECK(run_capture(R"(
+        module m;
+            bit never = 0;
+            function automatic void h();
+                $display("in h");
+                $finish(0);
+            endfunction
+            function automatic void f(int d);
+                if (d > 0) begin
+                    g(d - 1);
+                    h();
+                end
+            endfunction
+            function automatic void g(int d);
+                f(d);
+            endfunction
+            initial begin
+                if (never) f(0);
+                g(1);
+                $display("AFTER g");
+            end
+        endmodule
+    )") == "in h\n");
+}
+
+TEST_CASE("$finish through mutually recursive tasks stops the caller") {
+    CHECK(run_capture(R"(
+        module m;
+            bit never = 0;
+            task automatic h();
+                $display("in h");
+                $finish(0);
+            endtask
+            task automatic f(int d);
+                if (d > 0) begin
+                    g(d - 1);
+                    h();
+                end
+            endtask
+            task automatic g(int d);
+                f(d);
+            endtask
+            initial begin
+                if (never) f(0);
+                g(1);
+                $display("AFTER g");
+            end
+        endmodule
+    )") == "in h\n");
+}
