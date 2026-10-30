@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdio>
+#include <format>
 #include <string>
 #include <string_view>
 
@@ -1542,4 +1543,94 @@ TEST_CASE("priority case on a real reports a no-match") {
     )";
     CHECK(run_capture_stderr(src).find("no condition is true") != std::string::npos);
     CHECK(run_capture(src).empty());
+}
+
+// A negative 4-state signed selector against a negative signed label (LRM 12.5:
+// "If all of these expressions are signed, then they shall be treated as
+// signed"). The label's value is -1 at every width, so every form must match.
+// The jump-table path, taken while a 4-state compare fits 64 key bits (width
+// <= 32), keyed a negative label on its sign-extended 64-bit value instead of its
+// bits, so `-1` never equalled the selector. Widths straddle that boundary
+// (31/32 use it, 33 and up fall back to the compare chain). Expectations are the
+// LRM text; Icarus Verilog 13 and Verilator 5.050 agree.
+TEST_CASE("case on a negative 4-state signed value matches a signed label (LRM 12.5)") {
+    constexpr int widths[] = { 2, 3, 8, 16, 31, 32, 33, 64, 65 };
+    std::string   src;
+    std::string   expected;
+    int           t = 0;
+    for (const int n : widths) {
+        ++t;
+        src += std::format(R"(
+        module m{0};
+            logic signed [{0}-1:0] s;
+            bit c1, c2, c3, c4, c5, c6, c7, c8;
+            initial begin
+                #{1};
+                s = -1;
+                case (s) -{0}'sd1: c1 = 1; default: c1 = 0; endcase
+                case (s) -1: c2 = 1; default: c2 = 0; endcase
+                case (s) inside -1: c3 = 1; default: c3 = 0; endcase
+                unique case (s) 1, -1: c4 = 1; 2: c4 = 0; default: c4 = 0; endcase
+                casez (s) -1: c5 = 1; default: c5 = 0; endcase
+                casex (s) -1: c6 = 1; default: c6 = 0; endcase
+                s = 1;
+                case (s) 1: c7 = 1; default: c7 = 0; endcase
+                case (s) -1: c8 = 1; default: c8 = 0; endcase
+                $display("{0}: %b%b%b%b%b%b%b%b", c1, c2, c3, c4, c5, c6, c7, c8);
+            end
+        endmodule
+        )",
+                           n,
+                           t);
+        expected += std::format("{}: 11111110\n", n);
+    }
+    src += "module top;\n";
+    for (const int n : widths) {
+        src += std::format("    m{0} u{0}();\n", n);
+    }
+    src += "endmodule\n";
+    CHECK(run_capture(src) == expected);
+}
+
+// If any case expression is unsigned all are compared as unsigned (LRM 12.5), so
+// a negative signed selector zero-extends to the wider unsigned label's width.
+TEST_CASE("case with a mixed-sign label compares unsigned") {
+    CHECK(run_capture(R"(
+        module m;
+            logic signed [2:0] s;
+            initial begin
+                s = -1;
+                case (s) 4'b0111: $display("zero-extended"); default: $display("other"); endcase
+                case (s) 4'b1111: $display("sign-extended"); default: $display("other"); endcase
+                case (s) 3'b111: $display("same width"); default: $display("other"); endcase
+            end
+        endmodule
+    )") == "zero-extended\nother\nsame width\n");
+}
+
+// Labels of other widths and signs against a signed 4-state selector: the
+// comparison is made at the longest width, signed only if every operand is
+// (LRM 12.5). iverilog 13 gives the same ten answers.
+TEST_CASE("case compares at the longest width, signed only if all operands are") {
+    CHECK(run_capture(R"(
+        module m;
+            logic signed [7:0] s;
+            logic signed [2:0] n;
+            logic [2:0] u;
+            initial begin
+                s = -1; n = -1; u = 3'b111;
+                case (s) 3'sb111: $display("A match"); default: $display("A NO"); endcase
+                case (s) 3'b111: $display("B match"); default: $display("B NO"); endcase
+                case (n) 8'sb11111111: $display("C match"); default: $display("C NO"); endcase
+                case (n) 8'b00000111: $display("D match"); default: $display("D NO"); endcase
+                case (u) -1: $display("E match"); default: $display("E NO"); endcase
+                case (s) n: $display("F match"); default: $display("F NO"); endcase
+                case (s) -8'sd1, 5: $display("G match"); default: $display("G NO"); endcase
+                s = -128;
+                case (s) -128: $display("H match"); default: $display("H NO"); endcase
+                case (s) 8'sh80: $display("I match"); default: $display("I NO"); endcase
+                case (s) 8'h80: $display("J match"); default: $display("J NO"); endcase
+            end
+        endmodule
+    )") == "A match\nB NO\nC match\nD match\nE NO\nF match\nG match\nH match\nI match\nJ match\n");
 }

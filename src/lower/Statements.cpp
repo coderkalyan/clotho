@@ -2279,16 +2279,19 @@ std::optional<Lowerer::SwitchRun> Lowerer::find_switch_run(const CaseStatement& 
             if (v.getBitWidth() < width) {
                 v = v.extend(width, e->type->isSigned());
             }
-            const std::optional<uint64_t> u = v.as<uint64_t>();
-            if (!u) {
-                eligible = false;
-                break;
-            }
+            // The key is the label's `width` bits as the selector's plane holds
+            // them, not its numeric value: SVInt::as would sign-extend a negative
+            // signed label to 64 bits, which the backend truncates to the key
+            // width (2 * width for a 4-state selector), so the label's sign bits
+            // would land in the unknown half of the key and never match.
+            // key_width <= 64 bounds `width` to one word, which SVInt keeps with
+            // its unused high bits clear.
+            const uint64_t key = v.getRawPtr()[0];
             if (keep != nullptr) {
                 // case_dedup already guarantees this key is unique statement-wide.
-                keys.push_back(*u);
-            } else if (local_seen.insert(*u).second) {
-                keys.push_back(*u);
+                keys.push_back(key);
+            } else if (local_seen.insert(key).second) {
+                keys.push_back(key);
             }
         }
         if (!eligible) {
