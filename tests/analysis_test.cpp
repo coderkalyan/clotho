@@ -157,6 +157,22 @@ TEST_CASE("may_x is clean for 2-state storage and set by an x literal") {
     CHECK(x.facts.may_x[x.sig("b")]);
 }
 
+TEST_CASE("a 2-state conversion clears x as well as z") {
+    const Analyzed a = run(R"(
+        module top;
+            logic [3:0] l;
+            bit   [3:0] b;
+            initial begin
+                l = 4'bx0x0;
+                b = l;
+            end
+        endmodule
+    )");
+    CHECK(a.facts.may_x[a.sig("l")]);
+    // LRM 6.3.1: the 2-state target keeps only the must plane.
+    CHECK_FALSE(a.facts.may_x[a.sig("b")]);
+}
+
 TEST_CASE("design-wide use flags gate scheduler machinery") {
     const Analyzed plain = run("module top; initial $finish; endmodule");
     CHECK_FALSE(plain.facts.uses.strobe);

@@ -268,11 +268,9 @@ void Backend::build_state_types() {
     nba_classify();
 
     // A slot keeps its z word when the may-z analysis cannot prove it z-free
-    // or the task ABI needs z storage behind it. Elision is analysis-driven,
-    // not domain-driven: a 2-state signal assigned a z-carrying expression
-    // round-trips the z bit today (the may-z analysis keeps z across a ToTwo),
-    // and that behavior is preserved — ordinary 2-state signals are never-z
-    // through the analysis anyway.
+    // or the task ABI needs z storage behind it. A conversion to 2-state drops
+    // x and z (LRM 6.3.1), so a 2-state signal written from a z-capable source
+    // needs no z word of its own.
     const std::vector<bool> may_z =
       config_.z_elision ? facts_.may_z : std::vector<bool>(sigs.size(), true);
     const std::vector<bool>& ptr_arg = facts_.ptr_arg;

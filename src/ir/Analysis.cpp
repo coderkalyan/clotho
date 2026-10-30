@@ -1275,12 +1275,16 @@ struct ValueSweep {
                 case Inst::Tag::SExt:
                 case Inst::Tag::Trunc:
                 case Inst::Tag::ToFour:
-                case Inst::Tag::ToTwo:
-                    // Sign extension replicates a z MSB; truncation keeps low z
-                    // bits. ToTwo is treated like the others: its z plane is
-                    // conservatively kept (the analysis is a may-z over-approximation).
+                    // Sign extension replicates a z MSB; truncation keeps low z bits.
                     val_z[raw] = z_of(p.op_type.op);
                     val_x[raw] = operand_x(ir, i);
+                    break;
+                case Inst::Tag::ToTwo:
+                    // A 4-state value assigned to a 2-state target keeps only its must
+                    // plane (LRM 6.3.1), so x and z both become 0 and the result has
+                    // neither plane.
+                    val_z[raw] = 0;
+                    val_x[raw] = 0;
                     break;
 
                 // Seed 5: resolution can produce genuine Z (all drivers high-Z) or

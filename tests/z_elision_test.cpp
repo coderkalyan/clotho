@@ -299,3 +299,25 @@ TEST_CASE("a scanf z reaching a signal through a function local is seeded") {
     )");
     CHECK(a.z("s"));
 }
+
+TEST_CASE("a 2-state target takes the must plane alone, so a conversion clears z") {
+    const Analyzed a = analyze(R"(
+        module top;
+            logic [3:0] w = 4'bz01x;
+            bit   [3:0] b;
+            bit   [3:0] arr [0:1];
+            logic [3:0] widened;
+            initial begin
+                b       = w;
+                arr[1]  = w;
+                widened = b;
+            end
+        endmodule
+    )");
+    CHECK(a.z("w"));
+    // LRM 6.3.1: x and z become 0, so what a 2-state signal holds has no z plane,
+    // and neither has anything it is widened back to.
+    CHECK(!a.z("b"));
+    CHECK(!a.z("arr"));
+    CHECK(!a.z("widened"));
+}
