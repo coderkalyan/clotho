@@ -105,6 +105,14 @@ ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
             // rather than special-case the one shape that needs it.
             return narrow_to_declared(v, *expr.type, b, l);
         }
+        case ExpressionKind::EmptyArgument:
+            // slang's placeholder for an output port's value on the right of its
+            // connection assignment (lower_port_output); an empty $display
+            // argument is consumed by the format lowering and never reaches here.
+            if (!port_value_.has_value()) {
+                fail("empty argument outside an output port connection");
+            }
+            return *port_value_;
         case ExpressionKind::UnaryOp:
             return lower_unary(expr.as<UnaryExpression>(), b);
         case ExpressionKind::BinaryOp:

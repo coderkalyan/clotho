@@ -1081,9 +1081,10 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         }
         if (expr->kind == ExpressionKind::Assignment) {
             // Output: parent_target = child_net. slang gives an assignment whose
-            // LHS is the parent target and whose RHS is an EmptyArgument
-            // placeholder for the port value, so read the child net directly and
-            // resize it to the target width. Wakes on the child net.
+            // LHS is the parent target and whose RHS is the port value, a
+            // placeholder (EmptyArgument) in the implicit conversion to the target
+            // type, so read the child net directly and convert it by that
+            // conversion (lower_port_output). Wakes on the child net.
             const AssignmentExpression& a = expr->as<AssignmentExpression>();
             if (const std::optional<ir::Signal> net = resolved_net_of(a.left())) {
                 // The parent net has multiple drivers: stage this child's
@@ -1102,9 +1103,8 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                     // TODO: aggregate driver of a multiply-driven net.
                     fail("aggregate driver of a multiply-driven net is not supported");
                 }
-                const ir::Ref   ty = lower_type(*a.left().type);
                 const ir::Index child_val =
-                  coerce(b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
+                  lower_port_output(a, b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), b);
                 const ir::Index  val  = build_driver_slot_value(*net, a.left(), child_val, b, l);
                 const ir::Signal slot = alloc_driver_slot(*net, l, /*strength=*/0x0303, child_is_program);
                 b.binary(ir::Inst::Tag::Store, b.signal(slot, l), val, l);
@@ -1126,15 +1126,12 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
                 // sample the child net once and scatter it MSB-first into the
                 // operands, the same destructure as `{a,b} = x` (store_concat).
                 reject_concat_resolved_driver(a.left());
-                const ir::Ref   ty = lower_type(*a.left().type);
-                const ir::Index val =
-                  coerce(b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), *a.right().type, ty, b, l);
+                const ir::Index val = lower_port_output(a, b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l), b);
                 store_concat(a.left().as<ConcatenationExpression>(), val, ir::Inst::Tag::Store, b, l);
             } else {
-                const ir::Ref   ty  = lower_type(*a.left().type);
                 const ir::Index val = b.unary(ir::Inst::Tag::Load, b.signal(child_sig, l), l);
                 const ir::Index dst = lower_lvalue(a.left(), b);
-                const ir::Index src = coerce(val, *a.right().type, ty, b, l);
+                const ir::Index src = lower_port_output(a, val, b);
                 b.binary(ir::Inst::Tag::Store, dst, src, l);
             }
             sens.push_back(ir::WaitEvent{ .signal = child_sig, .edge = ir::Edge::Any });
@@ -1212,6 +1209,28 @@ void Lowerer::wire_ports(const InstanceSymbol& child) {
         // parent signal never changes afterward (LRM 23.3.3).
         add_continuous_process(std::move(sens), l, b, child_is_program);
     }
+}
+
+// An output port's value as the connected expression receives it. slang builds
+// the connection as `connected = <port>`: the port is an EmptyArgument typed as
+// the port, inside the implicit conversions that every assignment gets (LRM
+// 23.3.3.8: "assigned to the object on the other side of the port using the same
+// rules as an assignment"). Lowering that right-hand side with the port's value
+// bound to the placeholder applies each conversion as any assignment does: a
+// narrower value extends by the port's own sign (LRM 10.7; a signed port is
+// sign-extended whatever the connected net's sign), and a real becomes integral
+// or the reverse. The type of `a.right()` is already the converted one, so
+// coerce() by it would extend by the connected expression's sign.
+ir::Index Lowerer::lower_port_output(const AssignmentExpression& a, ir::Index port_value, ir::Builder& b) {
+    const Expression* leaf = &a.right();
+    while (leaf->kind == ExpressionKind::Conversion) {
+        leaf = &leaf->as<ConversionExpression>().operand();
+    }
+    if (leaf->kind != ExpressionKind::EmptyArgument) {
+        fail("malformed output port connection");
+    }
+    const Restore<std::optional<ir::Index>> bind(port_value_, port_value);
+    return lower_expr(a.right(), b);
 }
 
 // Append the sensitivity of an rvalue expression (each signal it reads, as an

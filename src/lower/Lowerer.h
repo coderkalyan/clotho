@@ -1913,6 +1913,8 @@ private:
 
     void collect_expr_reads(const Expression& expr, std::vector<ir::WaitEvent>& out);
 
+    ir::Index lower_port_output(const AssignmentExpression& a, ir::Index port_value, ir::Builder& b);
+
     static const Statement& unwrap_blocks(const Statement& stmt);
 
     static const Symbol* outermost_named_block(const Statement& body);
@@ -5382,6 +5384,10 @@ private:
     // the LValueReferenceExpression slang embeds in its rewritten RHS. Null
     // outside a compound assignment.
     std::optional<ir::Index> compound_lv_;
+    // The value an output port's connection assigns, read by the EmptyArgument
+    // slang leaves for it in the connection's right-hand side (lower_port_output).
+    // Nullopt outside one; scoped by Restore, never assigned bare.
+    std::optional<ir::Index> port_value_;
     // The queue `$` resolves against inside a queue range-select's bounds (see
     // QueueDollarCtx). Nullopt outside one; scoped by Restore, never assigned
     // bare.
