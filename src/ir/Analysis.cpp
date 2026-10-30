@@ -516,7 +516,27 @@ DriveRange drive_range(const Module& m, const Ir& ir, Index lv) {
                 lv = ir.payload(lv).op_extra.op;
                 break;
             }
-            case Inst::Tag::DynPartSelect:
+            case Inst::Tag::DynPartSelect: {
+                // A constant offset is a pinned window even though the frontend
+                // could not fold it into a PartSelect because it reaches past the
+                // vector: a write only affects the bits in range (LRM 11.5.1),
+                // and set_range clamps to the storage the same way. A wrapped
+                // negative offset stays unpinned.
+                const auto                    dps = ir.extra_data<DynPartSelect>(ir.payload(lv).op_extra.extra);
+                const std::optional<uint64_t> off = const_index(m, ir, dps.offset);
+                if (!off || *off > INT32_MAX) {
+                    dyn = true;
+                } else if (!have) {
+                    lo   = static_cast<uint32_t>(*off);
+                    hi   = lo + dps.width - 1;
+                    have = true;
+                } else {
+                    lo += static_cast<uint32_t>(*off);
+                    hi += static_cast<uint32_t>(*off);
+                }
+                lv = ir.payload(lv).op_extra.op;
+                break;
+            }
             case Inst::Tag::ArrSlice:
             case Inst::Tag::MemberSelect:
                 // Runtime-offset packed slice, a slice of an unpacked array, or an

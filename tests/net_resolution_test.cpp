@@ -781,6 +781,32 @@ TEST_CASE("a driverless tri0 / tri1 / supply net array pulls every element") {
                  "1111 1111 1111 1111 | 1111 1111 1111 1111\n");
 }
 
+// An indexed part-select with a constant base is a constant part-select (LRM
+// 11.5.1), so a net it drives powers its other bits on z, not x: `+:` and `-:`,
+// a multi-dim packed array (elements scaled by their width), and a reader of the
+// result. A window reaching past the vector only affects the bits in range, and
+// one wholly outside drives nothing (LRM text; iverilog 13 asserts on those two).
+// Oracle for the in-range lines: iverilog 13.
+TEST_CASE("a constant-base indexed part-select drives only its own bits") {
+    const std::string out = run_capture(R"(
+        module top;
+          wire [7:0] v;
+          assign v[2+:4] = 4'hf;
+          wire [3:0][3:0] a;
+          assign a[1+:2] = 8'h32;
+          wire [7:0] u;
+          assign u[5-:4] = 4'ha;
+          wire [7:0] cp = v;
+          wire [7:0] o;
+          assign o[6+:4] = 4'hf;         // bits 9:8 are out of range
+          wire [7:0] n;
+          assign n[9+:2] = 2'b11;        // wholly out of range: no driver effect
+          initial #1 $display("%b %b %b %b %b %b", v, a, u, cp, o, n);
+        endmodule
+    )");
+    CHECK(out == "zz1111zz zzzz00110010zzzz zz1010zz zz1111zz 11zzzzzz zzzzzzzz\n");
+}
+
 // -- 2-state driver regions --
 //
 // A driver slot is cut from the NET's type, so it is always 4-state and always

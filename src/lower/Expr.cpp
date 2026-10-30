@@ -1203,7 +1203,18 @@ ir::Index Lowerer::lower_range_select(const RangeSelectExpression& rs,
       const_uint(rs.right(), "an indexed part-select width (LRM 11.5.1)"));
     const bool      down  = rs.getSelectionKind() == RangeSelectionKind::IndexedDown;
     const int32_t   bias  = down == range.isDescending() ? static_cast<int32_t>(count) - 1 : 0;
-    const ir::Index off   = lower_packed_offset(rs.left(), range, bias, b, l, w);
+    // LRM 11.5.1: an indexed part-select whose base is constant too is a constant
+    // part-select. Inside the vector it lowers as one, so the driver analysis can
+    // pin the bits it drives; a window that reaches outside keeps the bounds-
+    // checked dynamic form.
+    if (const std::optional<int32_t> c = try_const_int(rs.left())) {
+        const int64_t lsb = (int64_t{ range.translateIndex(*c) } - bias) * w;
+        const int64_t msb = lsb + int64_t{ count } * w - 1;
+        if (lsb >= 0 && msb < static_cast<int64_t>(rs.value().type->getBitWidth())) {
+            return b.part_select(base, static_cast<uint32_t>(msb), static_cast<uint32_t>(lsb), l);
+        }
+    }
+    const ir::Index off = lower_packed_offset(rs.left(), range, bias, b, l, w);
     return b.dyn_part_select(base, off, count * w, l);
 }
 
