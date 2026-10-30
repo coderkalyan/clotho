@@ -222,29 +222,6 @@ void Backend::scope_type(const InstanceScope& scope, std::vector<bool>& claimed,
     anchors_[aid].ty = ty;
 }
 
-// Does a materialized constant table's image carry a z bit? The pool stores
-// canonical val / xz planes per element, where z is (xz & ~val); a table with
-// none can drop its z word like any never-z signal.
-bool Backend::const_image_has_z(const SignalInfo& info) const {
-    if (info.const_data == Ref::Invalid) {
-        return false;
-    }
-    const Layout lay = mod_.pool.layout(info.type);
-    if (lay.domain != Domain::Four || lay.width == 0) {
-        return false;
-    }
-    const std::span<const uint8_t> img = mod_.pool.bytes(info.const_data);
-    const uint32_t                 pb  = plane_bytes(lay.width);
-    for (size_t off = 0; off + 2 * pb <= img.size(); off += 2 * pb) {
-        for (uint32_t k = 0; k < pb; ++k) {
-            if ((img[off + pb + k] & ~img[off + k]) != 0) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 // Build the design's state types: per-signal slot / storage types, one
 // struct per module definition (own signals only — every instance scope
 // owns a separate state global, children own theirs), and the root
@@ -263,16 +240,14 @@ void Backend::build_state_types() {
     for (uint32_t i = 0; i < sigs.size(); ++i) {
         slots_[i].vif_rec = vif_nba_[i];
     }
-    // Classify NBA targets up front so the slot loop can keep an NBA-target
-    // 2-state signal on the packed word (its shadow / commit still expect it).
+    // Classify NBA targets up front: which signals nonblocking-assign decides
+    // their shadow and commit layout.
     nba_classify();
 
     // A slot keeps its z word when the may-z analysis cannot prove it z-free
-    // or the task ABI needs z storage behind it. Elision is analysis-driven,
-    // not domain-driven: a 2-state signal assigned a z-carrying expression
-    // round-trips the z bit today (the may-z analysis keeps z across a ToTwo),
-    // and that behavior is preserved — ordinary 2-state signals are never-z
-    // through the analysis anyway.
+    // or a pointer ABI (out / inout / ref) needs z storage behind it. The
+    // analysis owns every source of z, a constant table's image included
+    // (ir/Analysis.cpp).
     const std::vector<bool> may_z =
       config_.z_elision ? facts_.may_z : std::vector<bool>(sigs.size(), true);
     const std::vector<bool>& ptr_arg = facts_.ptr_arg;
@@ -369,40 +344,21 @@ void Backend::build_state_types() {
         if (!slot.init_z && slot.four_state && !pmask.empty()) {
             slot.undriven_mask.assign(pmask.begin(), pmask.end());
         }
-        // A materialized constant table has no store anywhere, so the may-z
-        // analysis proves it never-z from an empty seed set — but a parameter
-        // may itself hold z (`localparam logic [3:0] P[0:1] = '{4'bzzzz, 0}`).
-        // Its own image is the authority.
-        slot.has_z = may_z[i] || ptr_arg[i] || slot.init_z || !slot.undriven_mask.empty() ||
-                     const_image_has_z(sigs[i]);
-        // A 2-state signal drops the packed must|may word for a genuine iW slot
-        // (or `[N x { iW }]` memory). The only requirement is never-z: a 2-state
-        // value carries no z, and has_z is forced only by a task out/inout target
-        // (the packed pointer ABI) or a may-z analysis result — both of which
-        // keep the packed word. Every other 2-state path (scalar/array NBA
-        // shadow + commit, $readmem via rt_readmem) is width-driven off `narrow`.
-        slot.narrow = !slot.four_state && !slot.has_z;
-        // A `ref` actual overrides all of that with the CANONICAL type-derived
-        // shape: a ref formal ALIASES this storage rather than copying through
-        // it, and the formal's own shape is fixed by its type (the same rule an
-        // aggregate leaf follows), so the two only agree if the actual is shaped
-        // by type as well. Safe to override ptr_arg here because a user signal
-        // becomes ptr_arg ONLY by being a ref actual — an out / inout actual is
-        // passed as a compiler-materialized temp, never the variable itself
-        // (lower/Subroutines.cpp's make_arg_temp), and a temp is never a ref actual.
-        if (facts_.ref_arg[i]) {
-            slot.has_z  = slot.four_state;
-            slot.narrow = !slot.four_state;
-        }
-        // A member reachable through a virtual interface takes the same
-        // canonical, type-derived shape a `ref` actual does, and for the same
-        // reason: the access is emitted once per definition against a base
-        // chosen at run time, so it cannot depend on what the may-z analysis
-        // proved about one particular instance's writers (LRM 25.9).
-        if (vif_sig_[i]) {
-            slot.has_z  = slot.four_state;
-            slot.narrow = !slot.four_state;
-        }
+        // A signal is the slot its domain gives it. A 2-state signal is the native
+        // iW (or `[N x { iW }]` memory): it carries no z, whatever the may-z
+        // analysis says of the values written to it, so only a 4-state signal has a
+        // z word to elide. A 4-state signal keeps it unless the analysis proves it
+        // never z -- and always for an actual a callee reaches through a pointer
+        // (a `ref` actual, or the out / inout temp of a call; a user signal is
+        // ptr_arg only by being a ref actual, see make_arg_temp), and for a member
+        // reachable through a virtual interface (the access is emitted once per
+        // definition against a base chosen at run time, so it cannot depend on what
+        // the analysis proved about one instance's writers, LRM 25.9). Those take
+        // the CANONICAL type-derived shape, the same rule an aggregate leaf follows,
+        // so that both sides of an alias agree without either knowing the other.
+        slot.has_z  = slot.four_state && (may_z[i] || slot.init_z || !slot.undriven_mask.empty() ||
+                                          ptr_arg[i] || vif_sig_[i]);
+        slot.narrow = !slot.four_state;
         slot.slot_ty     = slot_type(slot.width, slot.four_state, slot.has_z, slot.narrow);
         if (ty.kind == Type::Kind::UnpackedArray) {
             slot.is_array   = true;

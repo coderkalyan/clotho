@@ -397,11 +397,10 @@ llvm::Value* Backend::fp_of(Plane a) {
     return a.fp;
 }
 
-// Bit pattern -> storage planes (must = may = pattern, z = 0).
+// A real's bit pattern as a value: the 2-state word its storage and its ABI hold.
 Plane Backend::real_to_planes(llvm::Value* fp) {
-    const uint32_t w   = fp->getType()->isDoubleTy() ? 64 : 32;
-    llvm::Value*   pat = b_.CreateBitCast(fp, int_ty(w));
-    return packed(pat, pat, zero(w));
+    const uint32_t w = fp->getType()->isDoubleTy() ? 64 : 32;
+    return two_val(b_.CreateBitCast(fp, int_ty(w)));
 }
 
 // Storage planes -> float value (the must half is the bit pattern).
@@ -1457,10 +1456,9 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
         return lower_real_compare(Inst::Tag::FEq, real_plane(planes_to_real(pa, vt.width)),
                                   real_plane(planes_to_real(pb, vt.width)));
     }
-    // Each leaf was read from its own storage, whose encoding is the signal's
-    // (a 2-state leaf of an aggregate written from a z-capable source is stored
-    // packed); the leaf's type says what its value is.
-    return lower_compare(Inst::Tag::Eq, in_type_domain(pa, vt), in_type_domain(pb, vt));
+    // Each leaf was read from its own storage, the native slot of its type.
+    assert(pa.two == !vt.four_state && pb.two == !vt.four_state);
+    return lower_compare(Inst::Tag::Eq, pa, pb);
 }
 
 Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b) {

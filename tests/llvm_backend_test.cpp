@@ -4120,10 +4120,11 @@ TEST_CASE("a function returning z feeds a z-capable target") {
     CHECK(run_capture(src) == "z011\n");
 }
 
-TEST_CASE("--no-z-elision keeps every slot's z word") {
+TEST_CASE("--no-z-elision keeps every 4-state slot's z word") {
     constexpr std::string_view src = R"(
-        module m(input bit [3:0] x, output bit [3:0] y);
-            initial y = x + 1;
+        module m(input logic [3:0] x, output logic [3:0] y);
+            bit [3:0] two;
+            initial begin y = x + 1; two = x[3:0]; end
         endmodule
     )";
     const LowerResult r = lower_text(src);
@@ -4131,8 +4132,10 @@ TEST_CASE("--no-z-elision keeps every slot's z word") {
     std::string              text;
     llvm::raw_string_ostream os(text);
     REQUIRE(ir::emit_llvm(*r.module, os, { .lower_coro = false, .z_elision = false }));
-    CHECK(text.find("%bit.4 = type { i8, i4 }") != std::string::npos);
+    CHECK(text.find("%logic.4 = type { i8, i4 }") != std::string::npos);
     CHECK(text.find(".nz.") == std::string::npos);
+    // A 2-state signal has no z word to keep.
+    CHECK(text.find("%bit.4 = type { i4 }") != std::string::npos);
 }
 
 TEST_CASE("an undriven 4-state net powers up z, an undriven variable x (LRM 6.6)") {
@@ -4932,14 +4935,15 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
         endmodule
     )";
     const std::string          ir  = emit_raw(src);
-    // Both bodies take the SAME parameter list: state, the object handle pair, then
-    // the three ref words. Compared as lists rather than as whole symbol names --
-    // LLVM's uniquing suffix on the second `g` shifts as the module gains unrelated
-    // functions, and that is not what this case is about.
+    // Both bodies take the SAME parameter list: state, rng, the object handle (one
+    // i64: a 2-state scalar crosses as one word), then the three ref words.
+    // Compared as lists rather than as whole symbol names -- LLVM's uniquing suffix
+    // on the second `g` shifts as the module gains unrelated functions, and that is
+    // not what this case is about.
     const std::vector<std::string> sigs = define_params(ir, "fn.g");
     REQUIRE(sigs.size() == 2);
     CHECK(sigs[0] == sigs[1]);
-    CHECK(sigs[0] == "(ptr noalias %state, ptr %rng, i128 %0, i64 %1, ptr %2, ptr %3, i64 %4)");
+    CHECK(sigs[0] == "(ptr noalias %state, ptr %rng, i64 %0, ptr %1, ptr %2, i64 %3)");
     CHECK(run_capture(src) == "2 7\n");
 
     // And with no heap-rooted actual at either site, the whole slot narrows.
@@ -4959,7 +4963,7 @@ TEST_CASE("virtual overrides sharing a vtable slot agree on the ref ABI") {
     const std::vector<std::string> nsigs = define_params(narrow, "fn.g");
     REQUIRE(nsigs.size() == 2);
     CHECK(nsigs[0] == nsigs[1]);
-    CHECK(nsigs[0] == "(ptr noalias %state, ptr %rng, i128 %0, i64 %1, ptr %2)");
+    CHECK(nsigs[0] == "(ptr noalias %state, ptr %rng, i64 %0, ptr %1)");
 }
 
 TEST_CASE("an emitted object defines clotho_main and clotho_design and no other name a C program could use") {
