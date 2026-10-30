@@ -577,6 +577,10 @@ void Lowerer::lower_top(const InstanceSymbol& top, std::string_view prefix) {
     top_inst_      = &top;
     reads_scanned_ = false;
     lower_instance(top, prefix, Pass::Collect, nullptr, top.name);
+    // Every inout port is met: the net type of each net they collapse is final
+    // (LRM 23.3.3.7), and nothing has consumed one yet but the registrations
+    // finalize_sim_nets corrects.
+    finalize_sim_nets();
     process_owner_ = ir::Owner{ .kind = ir::Owner::Kind::Scope, .index = top_scope_.id };
     for (const PendingIfacePort& p : iface_ports_) {
         for (const VifInstance& rec : vif_defs_->insts) {

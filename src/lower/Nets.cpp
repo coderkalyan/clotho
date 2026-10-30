@@ -89,6 +89,159 @@ uint8_t Lowerer::net_pull_strength(NetType::NetKind kind) {
     return (kind == NetType::Supply0 || kind == NetType::Supply1) ? 4 : 2;
 }
 
+// Whether Clotho models `kind`, so a net can have it. An allowlist with no
+// default: a kind slang gains has to be classified here (-Werror=switch).
+bool Lowerer::is_modeled_net_kind(NetType::NetKind kind) {
+    switch (kind) {
+        case NetType::Wire:
+        case NetType::Tri:
+        case NetType::UWire:
+        case NetType::WAnd:
+        case NetType::TriAnd:
+        case NetType::WOr:
+        case NetType::TriOr:
+        case NetType::Tri0:
+        case NetType::Tri1:
+        case NetType::Supply0:
+        case NetType::Supply1:
+            return true;
+        // TODO: trireg stores charge (LRM 6.6.4), interconnect is a net with no
+        // type of its own (6.6.8, 23.3.3.7.1) and a user-defined nettype
+        // resolves through its own function (6.6.7); Clotho models none of them.
+        case NetType::TriReg:
+        case NetType::Interconnect:
+        case NetType::UserDefined:
+        case NetType::Unknown:
+            return false;
+    }
+
+    return false;
+}
+
+// The net type `net` has: its simulated net's when an inout port collapsed a
+// net onto it (sim_nets_), else `declared`'s -- the symbol that declared it.
+NetType::NetKind Lowerer::simulated_kind(const NetSymbol& declared, ir::Signal net) const {
+    const auto it = sim_nets_.find(static_cast<uint32_t>(net));
+
+    return it != sim_nets_.end() ? it->second.type->netKind : declared.netType.netKind;
+}
+
+// LRM 23.3.3.7 and Table 23-1: the net type of the net an inout port collapses.
+//
+// An inout port is "a non-strength-reducing transistor connection" (23.3.3), and
+// 23.3.3.7 lets the nets on both sides of a port "take on the same type": the
+// two merge into one simulated net of the type the table gives for the
+// (internal, external) pair, "the delay specified for the dominating net"
+// included. build_inout_aliases makes the merge (both symbols share one
+// signal); this decides what the merged net is. That is a fact of the net's
+// OWNER, the symbol that declared the signal: the resolution function
+// (net_resolve_tag), the pull of a tri0/tri1/supply net and the net delay all
+// follow the simulated net, settled once Collect has met every port
+// (finalize_sim_nets). A child's IR never reads it -- its drivers store into
+// contributions the owner binds (contribute) -- so instances of one
+// specialization stay one unit whichever net they are connected to.
+//
+// What the clause leaves open, and how it is read here:
+//  - Several levels. A net reaches a leaf through a chain of inout ports: a net
+//    of the top, the port net of a middle module, the port net of a leaf. Each
+//    port is one pairwise collapse, and its external net, "the net specified in
+//    the module instantiation", is the net the ports above it have made, so the
+//    table is applied outside-in with the type the net has taken on so far as
+//    the external type. Collect meets the ports in that order (an instance's
+//    before any of its children's, siblings in declaration order), so the fold
+//    is a walk in Collect order.
+//  - Order. A pair where neither type dominates the other (wand against wor,
+//    tri0 against tri1, ...) goes to "external" and is a `warn` cell, so a result
+//    that depends on the fold order is always reported: over every (net, port,
+//    port) triple of the table, all 32 that fold differently when the two ports
+//    swap warn in both orders, and the 4 three-level chains whose inside-out
+//    fold differs from the outside-in one (a trireg over a wand or wor over a
+//    tri0 or tri1) warn in both.
+//  - Warnings. slang reports `net-inconsistent` at each port connection whose
+//    DECLARED types make a `warn` cell. The external type this fold uses can
+//    differ from the declared one below the first level; a pair that is a
+//    `warn` cell only for the former has not been reported, so it is here.
+//  - Dominating net. A pair the table gives to "external" keeps the dominating
+//    net the external one, so the net delay stays the external net's.
+//  - Interconnect (23.3.3.7.1). The merged net takes the other net's type, and
+//    NetType::getSimulatedNetType does that, so a port or a middle net declared
+//    `interconnect` is transparent. Clotho models no interconnect net, so an
+//    owner declared `interconnect` fails at its declaration
+//    (collect_scope_signals) and a simulated net is never one.
+//  - uwire. Never an inout port's net: slang rejects it on either side
+//    (InOutUWirePort, InOutUWireConn).
+//
+// NetType::getSimulatedNetType is the table: its type and warn flag agree with
+// all 81 cells of Table 23-1 as printed in the LRM.
+void Lowerer::collapse_port_net(const PortConnection& pc,
+                                const NetSymbol&      internal,
+                                const NetSymbol&      external,
+                                ir::Signal            target) {
+    SimNet& sim = sim_nets_.try_emplace(static_cast<uint32_t>(target), SimNet{ &external.netType, &external, &external })
+                    .first->second;
+
+    bool           pair_warns = false;
+    const NetType& result     = NetType::getSimulatedNetType(internal.netType, *sim.type, pair_warns);
+    bool           declared_warns = false;
+    NetType::getSimulatedNetType(internal.netType, external.netType, declared_warns);
+    if (pair_warns && !declared_warns) {
+        report_once(Severity::Warning,
+                    "net-type-conflict",
+                    "net type '" + std::string(internal.netType.name) + "' of port '" + std::string(pc.port.name) +
+                      "' is inconsistent with net type '" + std::string(sim.type->name) +
+                      "', which the net it is connected to has taken on through the ports above it (LRM 23.3.3.7, "
+                      "Table 23-1); the simulated net is '" +
+                      std::string(result.name) + "'",
+                    to_source_span(pc.getExpression()->sourceRange));
+    }
+    if (&result == &internal.netType && sim.type != &internal.netType) {
+        sim.type       = &internal.netType;
+        sim.dominating = &internal;
+    }
+}
+
+// The simulated nets once Collect has met every inout port: what each
+// signal's net type decides, taken from the net that dominates it.
+void Lowerer::finalize_sim_nets() {
+    for (const auto& [net_u, sim] : sim_nets_) {
+        const NetSymbol&       dominating = *sim.dominating;
+        const NetType::NetKind kind       = sim.type->netKind;
+        cur_range_                        = slang::SourceRange{ dominating.location, dominating.location };
+        if (!is_modeled_net_kind(kind)) {
+            fail(std::string(kUnmodeledNetType) + ": the simulated net of '" + std::string(dominating.name) +
+                 "' (LRM 23.3.3.7) is " + std::string(sim.type->name));
+        }
+
+        // The pull collect_scope_signals recorded is the owner's own.
+        net_pull_.erase(net_u);
+        if (const std::optional<int> pull = net_pull_value(kind)) {
+            const auto scope = signal_scope_.find(net_u);
+            if (scope == signal_scope_.end()) {
+                fail("internal: a simulated net's signal is in no instance scope");
+            }
+            net_pull_[net_u] = PullInfo{
+                *pull, scope->second, module_.signal(static_cast<ir::Signal>(net_u)).loc, net_pull_strength(kind)
+            };
+        }
+        // A net Collect already marked resolved (a force, a net delay) got the
+        // reducer of its declared kind.
+        if (resolved_nets_.contains(net_u)) {
+            net_resolve_op_[net_u] = net_resolve_tag(kind);
+        }
+        // "The simulated net shall take the delay specified for the dominating
+        // net": the owner's delay goes when another net dominates it.
+        if (sim.dominating != sim.owner) {
+            net_delay_.erase(net_u);
+            if (dominating.getDelay() != nullptr && dominating.getInitializer() == nullptr) {
+                // TODO: the net delay of a collapsed net that dominates its owner.
+                // net_delay_ lowers in the owner's context, which is not this
+                // net's module (its time unit).
+                fail("a net delay on a net that dominates the net its inout port connects to is not supported");
+            }
+        }
+    }
+}
+
 // Record that `reg` of a net gained a continuous driver; fail on overlap
 // with a previously recorded driver. Two regions overlap iff their element
 // bands intersect AND their bit ranges intersect. Non-net symbols are
@@ -102,12 +255,17 @@ void Lowerer::record_net_driver_region(const ValueSymbol& raw, const NetRegion& 
     if (sym.kind != SymbolKind::Net) {
         return;
     }
-    const auto       net  = static_cast<uint32_t>(signal_of(sym));
-    const NetSymbol& nsym = sym.as<NetSymbol>();
+    const ir::Signal sig  = signal_of(sym);
+    const auto       net  = static_cast<uint32_t>(sig);
+    // The net type is the signal's, not this driver's: a driver reached through
+    // an inout port names the child's net, whose type the simulated net (LRM
+    // 23.3.3.7) may have replaced, and which driver is met first is no basis
+    // for a resolution function.
+    const NetType::NetKind kind = simulated_kind(sym.as<NetSymbol>(), sig);
     // A tri0/tri1 net needs a resolver from its very first driver: a single
     // tri-state driver still pulls to 0/1 whenever it is off. Other kinds
     // resolve only once a second driver overlaps an existing one.
-    const bool has_pull = net_pull_value(nsym.netType.netKind).has_value();
+    const bool has_pull = net_pull_value(kind).has_value();
     auto&      regions  = net_driven_[net];
     bool       resolve  = has_pull;
     for (const NetRegion& p : regions) {
@@ -120,7 +278,7 @@ void Lowerer::record_net_driver_region(const ValueSymbol& raw, const NetRegion& 
         }
     }
     if (resolve && resolved_nets_.insert(net).second) {
-        net_resolve_op_[net] = net_resolve_tag(nsym.netType.netKind);
+        net_resolve_op_[net] = net_resolve_tag(kind);
     }
     regions.push_back(reg);
 }
@@ -1416,7 +1574,9 @@ void Lowerer::register_net_force_site(const ProceduralAssignStatement& s,
         }
     }
     if (resolved_nets_.insert(net_u).second) {
-        net_resolve_op_[net_u] = net_resolve_tag(canonical_value_symbol(root).as<NetSymbol>().netType.netKind);
+        // Collect has not met every port yet, so for a net an inout port reaches
+        // this is the kind folded so far; finalize_sim_nets sets the final one.
+        net_resolve_op_[net_u] = net_resolve_tag(simulated_kind(canonical_value_symbol(root).as<NetSymbol>(), sit->second));
     }
     if (in_program_) {
         // A `force` from program code drives this net as surely as a

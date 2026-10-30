@@ -1070,6 +1070,11 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
             }
             continue;
         }
+        // The two nets merge into one simulated net, whose type is not either's
+        // by default (LRM 23.3.3.7; collapse_port_net).
+        if (p.internalSymbol->kind == SymbolKind::Net && parent.kind == SymbolKind::Net) {
+            collapse_port_net(*pc, p.internalSymbol->as<NetSymbol>(), parent.as<NetSymbol>(), target);
+        }
         inout_alias_[p.internalSymbol] = target;
         // The child holds no storage for the port; partition binds it to the
         // parent's signal (ir::Attribution::port_aliases).
@@ -1362,30 +1367,19 @@ void Lowerer::collect_scope_signals(
                 ir::SignalInfo info;
                 if (m.kind == SymbolKind::Net) {
                     const NetSymbol& net = m.as<NetSymbol>();
-                    // Modeled net kinds: wire/tri (+ uwire, single-driver
-                    // per slang's MultipleUWireDrivers pass) resolve to X on
-                    // conflict; wand/triand and wor/trior carry wired-AND /
+                    // Modeled net kinds (is_modeled_net_kind): wire/tri (+ uwire,
+                    // single-driver per slang's MultipleUWireDrivers pass) resolve
+                    // to X on conflict; wand/triand and wor/trior carry wired-AND /
                     // wired-OR resolution (net_resolve_tag); tri0/tri1 carry a
                     // resistive pull to 0 / 1 (net_pull_value); supply0/supply1
                     // carry a Supply-strength pull. All Z-default when undriven,
                     // except tri0/tri1/supply0/supply1 which pull to 0 / 1.
+                    // This is the DECLARED kind: a net an inout port collapses
+                    // onto another takes the simulated net's type (collapse_port_net),
+                    // which finalize_sim_nets applies once Collect has met every port.
                     // TODO: trireg carries charge semantics clotho does not model.
-                    switch (net.netType.netKind) {
-                        case NetType::Wire:
-                        case NetType::Tri:
-                        case NetType::UWire:
-                        case NetType::WAnd:
-                        case NetType::TriAnd:
-                        case NetType::WOr:
-                        case NetType::TriOr:
-                        case NetType::Tri0:
-                        case NetType::Tri1:
-                        case NetType::Supply0:
-                        case NetType::Supply1:
-                            break;
-                        default:
-                            fail("unsupported net type (only wire/tri/uwire/wand/wor/tri0/tri1/"
-                                 "supply0/supply1 are modeled)");
+                    if (!is_modeled_net_kind(net.netType.netKind)) {
+                        fail(std::string(kUnmodeledNetType));
                     }
                     // A delay3 on the net_declaration syntax is either a
                     // true net delay (LRM 28.16, no net_decl_assignment) or,

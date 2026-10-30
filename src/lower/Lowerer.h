@@ -1162,6 +1162,11 @@ private:
 
     void report(Severity sev, std::string code, std::string msg, ir::SourceSpan span);
 
+    // report(), once per source location, code and text: every instance of a
+    // specialization lowers the same source once more, and a finding about that
+    // source is one finding.
+    void report_once(Severity sev, std::string code, std::string msg, ir::SourceSpan span);
+
     [[noreturn]] void fail(std::string msg);
 
     // Refuse, at `where`, a value of `width` bits that no LLVM integer can hold
@@ -1682,6 +1687,27 @@ private:
     bool other_driver_of(const Expression& own_target);
 
     void scan_net_uses();
+
+    // The simulated net of one alias class: the net type Table 23-1 gives the
+    // nets an inout port collapses, and the net that type (and its delay) is
+    // taken from.
+    struct SimNet {
+        const NetType*   type;       // the simulated net's type, folded so far
+        const NetSymbol* dominating; // the net `type` is that of
+        const NetSymbol* owner;      // the net that declared the signal
+    };
+
+    void collapse_port_net(const PortConnection& pc, const NetSymbol& internal, const NetSymbol& external, ir::Signal target);
+
+    void finalize_sim_nets();
+
+    static bool is_modeled_net_kind(NetType::NetKind kind);
+
+    // fail()'s text for a net type is_modeled_net_kind refuses.
+    static constexpr std::string_view kUnmodeledNetType =
+      "unsupported net type (only wire/tri/uwire/wand/wor/tri0/tri1/supply0/supply1 are modeled)";
+
+    NetType::NetKind simulated_kind(const NetSymbol& declared, ir::Signal net) const;
 
     void collect_signals(const InstanceBodySymbol& body);
 
@@ -5363,6 +5389,13 @@ private:
     // A continuous driver naming such a symbol from its own instance drives
     // through the port (contribute).
     ankerl::unordered_dense::map<const Symbol*, AliasSymbol> alias_syms_;
+    // The simulated net (LRM 23.3.3.7) of each signal some inout port aliases a
+    // net onto, by signal id, folded as Collect meets the ports (collapse_port_net)
+    // and final once Collect ends (finalize_sim_nets). A signal absent here is
+    // reached through no inout port: its net type is the declared one.
+    ankerl::unordered_dense::map<uint32_t, SimNet> sim_nets_;
+    // report_once's keys.
+    ankerl::unordered_dense::set<std::string> reported_once_;
     // "<InstanceScope::id>|<port>" -> contributions that instance has made
     // through the port (contribute).
     ankerl::unordered_dense::map<std::string, uint32_t> contribution_ordinals_;

@@ -210,8 +210,44 @@ children's interfaces, never on a descendant's body. `flatten` resolves the
 chain of `Port` imports to the net or the slot, so the flat module is the one
 a direct store or a slot owned by the driver gave.
 
-The resolution function is still the one the driver's net kind picks when the
-net becomes resolved, not LRM 23.3.3.7's Table 23-1.
+### Net types across ports
+
+LRM 23.3.3.7 lets the nets on both sides of a port "take on the same type", and
+Table 23-1 gives which.
+
+**Inout.** The port merges the two nets (both symbols share one signal), and the
+merged **simulated net** has the type the table gives for the pair (the
+external net's unless the table says internal) and the dominating net's delay.
+The simulated net is a fact of the net's owner, the symbol that declared the
+signal: its resolution function, the pull of a tri0/tri1 net, the strength of a
+supply net and its delay are all decided there, once every port is met
+(`finalize_sim_nets`), and no driver's own net type is consulted. A child never
+reads it, because its drivers store into contributions the owner binds, so
+instances of one specialization stay one unit however differently typed the nets
+they connect to are.
+
+`NetType::getSimulatedNetType` is the table; it agrees with all 81 cells of
+Table 23-1, type and `warn` flag, as printed in the LRM. The clause leaves some
+readings open, decided in `collapse_port_net`:
+
+- A net reaches a leaf through a chain of ports, and each is one pairwise
+  collapse whose external net is the net the ports above it have made: the
+  table is applied outside-in with the type so far as the external type. Ports
+  are met in elaboration order, an instance's before its children's and
+  siblings in declaration order.
+- A pair where neither type dominates (wand against wor, tri0 against tri1, a
+  trireg against a wand) goes to "external" and is a `warn` cell, so a result
+  that depends on the order is always reported. slang reports each port
+  connection whose declared types make a `warn` cell (`net-inconsistent`); a
+  pair that is one only for the type the net has taken on is reported by Clotho
+  (`net-type-conflict`). iverilog resolves such conflicts between siblings in
+  favor of the later port, which the LRM does not require.
+- A uwire never reaches an inout collapse (slang rejects it on either side). An
+  interconnect net merges with the other net's type (23.3.3.7.1), but Clotho
+  models none, so one that declares a signal fails at its declaration.
+- A simulated net of a type Clotho does not model (a trireg that dominates)
+  fails loudly, and so does a net delay on a collapsed net that dominates its
+  owner, which would need the declaring module's time unit.
 
 ## Inbound facts and summaries
 

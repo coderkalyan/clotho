@@ -21,6 +21,13 @@ void Lowerer::report(Severity sev, std::string code, std::string msg, ir::Source
                                  .span     = span });
 }
 
+void Lowerer::report_once(Severity sev, std::string code, std::string msg, ir::SourceSpan span) {
+    std::string key = std::to_string(static_cast<uint64_t>(span.start)) + '|' + code + '|' + msg;
+    if (reported_once_.insert(std::move(key)).second) {
+        report(sev, std::move(code), std::move(msg), span);
+    }
+}
+
 void Lowerer::fail(std::string msg) {
     throw LowerError{ std::move(msg), to_source_span(cur_range_) };
 }
