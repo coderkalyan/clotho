@@ -475,7 +475,7 @@ void Backend::emit_task_abort_poll() {
     const auto poll = [&](llvm::Value* node) {
         llvm::Value* abort = b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), node, 5));
         auto*        cont  = llvm::BasicBlock::Create(ctx_, "disable.task.resume", fn);
-        b_.CreateCondBr(b_.CreateICmpNE(abort, b_.getInt32(0)), task_epilogue_bb_, cont);
+        b_.CreateCondBr(b_.CreateICmpNE(abort, b_.getInt32(0)), leave_blocks(0, task_epilogue_bb_), cont);
         b_.SetInsertPoint(cont);
     };
     if (disable_node_ != nullptr) {
@@ -501,14 +501,17 @@ void Backend::emit_task_abort_poll() {
 // here and not inside emit_suspend.
 void Backend::emit_disable_poll() {
     auto* fn = b_.GetInsertBlock()->getParent();
-    for (const OpenNamedBlock& blk : block_targets_) {
-        if (blk.remote == kNoDisableTarget) {
+    // Index-based: leave_blocks caches its landings in the entries.
+    for (size_t j = 0; j < block_targets_.size(); ++j) {
+        if (block_targets_[j].remote == kNoDisableTarget) {
             continue;
         }
         llvm::Value* pend =
-          b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), blk.node, 5));
+          b_.CreateLoad(b_.getInt32Ty(), b_.CreateStructGEP(disable_node_ty(), block_targets_[j].node, 5));
         auto* cont = llvm::BasicBlock::Create(ctx_, "disable.resume", fn);
-        b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt32(0)), blk.end, cont);
+        // Leaving block j also leaves every remotely-named block opened inside it,
+        // whose end blocks this branch skips (leave_blocks).
+        b_.CreateCondBr(b_.CreateICmpNE(pend, b_.getInt32(0)), leave_blocks(j + 1, block_targets_[j].end), cont);
 
         b_.SetInsertPoint(cont);
     }
@@ -952,7 +955,7 @@ void Backend::emit_proc_abort_poll() {
     llvm::Value* ctl  = b_.CreateLoad(b_.getInt32Ty(), pcb_field(pcb_, kPcbCtl));
     llvm::Value* kill = b_.CreateAnd(ctl, b_.getInt32(kProcAbort));
     auto*        cont = llvm::BasicBlock::Create(ctx_, "proc.alive", fn);
-    b_.CreateCondBr(b_.CreateICmpNE(kill, b_.getInt32(0)), exit, cont);
+    b_.CreateCondBr(b_.CreateICmpNE(kill, b_.getInt32(0)), leave_blocks(0, exit), cont);
     b_.SetInsertPoint(cont);
     // Suspended while we were parked (LRM 9.7): park again, remembering that the
     // wake already arrived, until `resume`.
@@ -1013,7 +1016,7 @@ void Backend::lower_proc_kill(llvm::Value* target, bool with_self, bool branch_o
     // resume us to notice the mark.
     if (with_self && branch_on_self && pcb_ != nullptr && proc_abort_exit() != nullptr) {
         auto* cont = llvm::BasicBlock::Create(ctx_, "kill.other", fn);
-        b_.CreateCondBr(b_.CreateICmpEQ(target, pcb_), proc_abort_exit(), cont);
+        b_.CreateCondBr(b_.CreateICmpEQ(target, pcb_), leave_blocks(0, proc_abort_exit()), cont);
         b_.SetInsertPoint(cont);
     }
 }

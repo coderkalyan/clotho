@@ -3694,7 +3694,11 @@ private:
 
     void emit_disable_unlink(uint32_t target, llvm::Value* node);
 
-    llvm::BasicBlock* block_end(uint32_t label) const;
+    size_t block_index(uint32_t label) const;
+
+    llvm::BasicBlock* leave_blocks(size_t floor, llvm::BasicBlock* to);
+
+    llvm::BasicBlock* leave_from(size_t top, size_t floor, llvm::BasicBlock* to);
 
     // -- State --
 
@@ -3954,6 +3958,9 @@ private:
     // Innermost-first stack of the enclosing loops' (step, exit) blocks; a
     // `continue` branches to `.first`, a `break` to `.second`.
     std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loop_targets_;
+    // block_targets_.size() when each loop of loop_targets_ was entered: a `break` or
+    // `continue` leaves every targeted block opened inside the loop (leave_blocks).
+    std::vector<size_t> loop_block_depth_;
     // Innermost-first stack of the enclosing named blocks' end blocks; a `disable`
     // branches to the end block of the id it carries. Empty unless the unit
     // contains a `disable` (only a targeted block is emitted at all). `remote` is
@@ -3965,6 +3972,15 @@ private:
         uint32_t          remote;
         llvm::Value*      node;
         llvm::BasicBlock* end;
+        // Paths that leave this block, and every remotely-named block opened inside
+        // it, to a continuation: built lazily by leave_from and shared by every exit
+        // with the same continuation.
+        struct Landing {
+            llvm::BasicBlock* to;
+            size_t            floor;
+            llvm::BasicBlock* landing;
+        };
+        std::vector<Landing> leave = {};
     };
     std::vector<OpenNamedBlock> block_targets_;
     llvm::AllocaInst*       record_           = nullptr;

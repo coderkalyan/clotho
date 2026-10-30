@@ -1843,7 +1843,7 @@ void Backend::emit_copyout(const Function& f) {
 // body's strings, and returns void.
 void Backend::lower_ret_void() {
     if (cur_is_task_) {
-        b_.CreateBr(task_epilogue_bb_);
+        b_.CreateBr(leave_blocks(0, task_epilogue_bb_));
         return;
     }
     emit_copyout(*cur_fn_);

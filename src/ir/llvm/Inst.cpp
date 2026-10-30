@@ -2367,12 +2367,12 @@ void Backend::lower_inst(Index i) {
         case Inst::Tag::Break:
             // Terminator: branch to the innermost loop's exit block. slang
             // guarantees a break appears only inside a loop.
-            b_.CreateBr(loop_targets_.back().second);
+            b_.CreateBr(leave_blocks(loop_block_depth_.back(), loop_targets_.back().second));
             return;
         case Inst::Tag::Continue:
             // Terminator: branch to the innermost loop's step block (which
             // re-tests the predicate via the back-edge).
-            b_.CreateBr(loop_targets_.back().first);
+            b_.CreateBr(leave_blocks(loop_block_depth_.back(), loop_targets_.back().first));
             return;
 
         case Inst::Tag::NamedBlock:
@@ -2382,7 +2382,11 @@ void Backend::lower_inst(Index i) {
             // Terminator: branch to the end of the enclosing block carrying
             // this label (LRM 9.6.2). The frontend only emits a Disable for a
             // block it is lexically inside, so the label is always live here.
-            b_.CreateBr(block_end(p.label));
+            {
+                // Out of every remotely-named block opened inside the target as well.
+                const size_t j = block_index(p.label);
+                b_.CreateBr(leave_blocks(j + 1, block_targets_[j].end));
+            }
             return;
         case Inst::Tag::DisableRemote:
             // Not a terminator: the disabling process carries on, and the target
@@ -2405,7 +2409,7 @@ void Backend::lower_inst(Index i) {
             // Terminator: this activation was named by a `disable` it ran itself
             // (LRM 9.6.2 example 4). Leave through the epilogue, which sees the
             // abort mark and skips copy-out.
-            b_.CreateBr(task_epilogue_bb_);
+            b_.CreateBr(leave_blocks(0, task_epilogue_bb_));
             return;
 
         case Inst::Tag::Delay:
@@ -3430,7 +3434,9 @@ void Backend::lower_loop(Index i) {
 
     b_.SetInsertPoint(body_bb);
     loop_targets_.push_back({ step_bb, exit_bb });
+    loop_block_depth_.push_back(block_targets_.size());
     lower_region(ir_->region(lp.body));
+    loop_block_depth_.pop_back();
     loop_targets_.pop_back();
     branch_to(step_bb); // a `return`/`break`/`continue` in the body terminates it; don't double-branch
 
@@ -3495,17 +3501,58 @@ llvm::Value* Backend::block_node(uint32_t label) {
     return it->second;
 }
 
-// The end block of the enclosing named block with this label. Innermost
-// first, because a labelled block cannot enclose itself, so the first match
-// walking down is the one the `disable` names.
-llvm::BasicBlock* Backend::block_end(uint32_t label) const {
+// Index into block_targets_ of the innermost open block carrying `label`. Innermost
+// first, because a labelled block cannot enclose itself, so the first match walking
+// down is the one the `disable` names.
+size_t Backend::block_index(uint32_t label) const {
     for (size_t n = block_targets_.size(); n > 0; --n) {
         if (block_targets_[n - 1].label == label) {
-            return block_targets_[n - 1].end;
+            return n - 1;
         }
     }
 
     throw BackendError{ "internal: disable of a block that does not enclose it" };
+}
+
+// The path from the insertion point out of the open blocks block_targets_[floor..] to
+// `to`, which lies outside all of them. Every remotely-named block among them has this
+// activation's node on its occupant list, and the exits that skip a block's end block
+// -- a `disable` of an outer block, a `break` or `continue` out of a loop it is in, a
+// `return`, and every abort, which goes straight to the epilogue -- would leave that
+// node linked. Its frame is then freed or entered again, and the next walk of the list
+// follows a dangling pointer or goes round a cycle. So the path unlinks each such node,
+// innermost first, and clears its mark as the end block does.
+//
+// It is `to` itself when no remote block is open, so a design without one pays nothing.
+llvm::BasicBlock* Backend::leave_blocks(size_t floor, llvm::BasicBlock* to) {
+    return leave_from(block_targets_.size(), floor, to);
+}
+
+// The landing that takes block_targets_[top - 1] off its list and continues down to
+// `floor`: one per continuation, kept in the block's entry. Built with the insertion
+// point saved, because the caller is part-way through emitting its own branch.
+llvm::BasicBlock* Backend::leave_from(size_t top, size_t floor, llvm::BasicBlock* to) {
+    while (top > floor && block_targets_[top - 1].remote == kNoDisableTarget) {
+        --top;
+    }
+    if (top <= floor) {
+        return to;
+    }
+    OpenNamedBlock& blk = block_targets_[top - 1];
+    for (const OpenNamedBlock::Landing& l : blk.leave) {
+        if (l.to == to && l.floor == floor) {
+            return l.landing;
+        }
+    }
+    auto* landing = llvm::BasicBlock::Create(ctx_, "block.leave", b_.GetInsertBlock()->getParent());
+    blk.leave.push_back({ to, floor, landing });
+    llvm::BasicBlock*                     next = leave_from(top - 1, floor, to);
+    llvm::IRBuilderBase::InsertPointGuard guard(b_);
+    b_.SetInsertPoint(landing);
+    emit_disable_unlink(blk.remote, blk.node);
+    b_.CreateStore(b_.getInt32(0), b_.CreateStructGEP(disable_node_ty(), blk.node, 5));
+    b_.CreateBr(next);
+    return landing;
 }
 
 } // namespace clotho::ir::backend

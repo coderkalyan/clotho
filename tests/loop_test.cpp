@@ -1448,6 +1448,177 @@ TEST_CASE("a fork child that disables its parent's block before it suspends") {
     }
 }
 
+// A targeted block keeps this activation's node on its occupant list until its END
+// block unlinks it. Every exit that skips that block (a `disable` of an outer block, a
+// `break` / `continue` out of a loop it is in, a `return`, and every abort, which goes
+// straight to the epilogue) left the node linked. The frame was then freed or entered
+// again, and the next walk of the list followed a dangling pointer (a crash), went round
+// a cycle (a hang), or woke the process that had since moved on. Each exit now unlinks
+// the nodes it passes, innermost first. Oracle: iverilog 13, except where noted.
+TEST_CASE("an exit that skips a block's end takes the activation off its list") {
+    SUBCASE("a fork child ended while parked inside its own block, by a sibling") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              initial begin
+                for (int i = 0; i < 3; i++) begin : B
+                  fork
+                    begin : C
+                      #10;
+                      if (i != 0) disable C;
+                      $display("i=%0d C body after #10 at %0t", i, $time);
+                      #10;
+                    end
+                    #5 if (i == 0) disable B;
+                  join
+                  $display("after iteration %0d at %0t", i, $time);
+                end
+                $display("done at %0t", $time);
+              end
+            endmodule
+        )") == "after iteration 1 at 15\nafter iteration 2 at 25\ndone at 25\n");
+    }
+    SUBCASE("a fork child that ends its own enclosing block from inside a nested one") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              initial begin
+                for (int i = 0; i < 3; i++) begin : B
+                  fork
+                    begin : C
+                      #5;
+                      if (i == 0) disable B;
+                      if (i != 0) disable C;
+                      #10;
+                    end
+                  join
+                  $display("after iteration %0d at %0t", i, $time);
+                end
+                $display("done at %0t", $time);
+              end
+            endmodule
+        )") == "after iteration 1 at 10\nafter iteration 2 at 15\ndone at 15\n");
+    }
+    SUBCASE("`disable fork` of a child parked inside its own block") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              initial begin
+                for (int i = 0; i < 3; i++) begin
+                  fork
+                    begin : C
+                      #10;
+                      if (i != 0) disable C;
+                      #10;
+                    end
+                  join_none
+                  #5 if (i == 0) disable fork;
+                  wait fork;
+                  $display("after iteration %0d at %0t", i, $time);
+                end
+                $display("done at %0t", $time);
+              end
+            endmodule
+        )") == "after iteration 0 at 5\nafter iteration 1 at 15\nafter iteration 2 at 25\ndone at 25\n");
+    }
+    SUBCASE("a structured exit to an outer block from inside an inner remotely-named one") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              int i;
+              initial begin : P
+                for (i = 0; i < 3; i++) begin : B
+                  begin : C
+                    #5;
+                    if (i == 0) disable B;
+                    #10;
+                  end
+                end
+                $display("done at %0t", $time);
+              end
+              initial begin
+                #12 disable t.P.B.C;
+                $display("remote disable ran at %0t", $time);
+              end
+            endmodule
+        )") == "remote disable ran at 12\ndone at 27\n");
+    }
+    SUBCASE("a remote disable of an outer block while the process is parked in an inner one") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              initial begin : P
+                begin : OUT
+                  begin : IN
+                    #10;
+                  end
+                  #10 $display("FAILED: OUT continued");
+                end
+                $display("after OUT %0t", $time);
+                #100 $display("end %0t", $time);
+              end
+              initial begin #5 disable t.P.OUT; #2 disable t.P.OUT.IN; end
+            endmodule
+        )") == "after OUT 5\nend 105\n");
+    }
+    SUBCASE("a `return` from a task's block") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              task automatic tk(input int i);
+                begin : B
+                  if (i == 0) return;
+                  if (i == 2) begin #5 disable B; end
+                  #10 $display("FAILED: tk %0d survived at %0t", i, $time);
+                end
+              endtask
+              initial begin
+                tk(0);
+                fork tk(1); join_none
+                #1;
+                tk(2);
+                #10 $display("end %0t", $time);
+              end
+            endmodule
+        )") == "end 16\n");
+    }
+    SUBCASE("a `continue` out of a block that a later disable names") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              int i;
+              initial begin : P
+                for (i = 0; i < 3; i++) begin : L
+                  begin : B
+                    #5;
+                    if (i == 0) continue;
+                    #10;
+                  end
+                end
+                $display("after loop %0t", $time);
+                #100 $display("end %0t", $time);
+              end
+              initial #12 disable t.P.L.B;
+            endmodule
+        )") == "after loop 27\nend 127\n");
+    }
+    // LRM 12.8 ends the loop at the `break`, and 9.6.2 makes the later `disable` of a
+    // block that is not executing a no-op. iverilog 13 prints a second "after loop 42"
+    // for this design, which contradicts both clauses, so the expected value is the LRM's.
+    SUBCASE("a `break` out of a block that a later disable names") {
+        CHECK(run_capture_finish(R"(
+            module t;
+              int i;
+              initial begin : P
+                for (i = 0; i < 3; i++) begin : L
+                  begin : B
+                    #5;
+                    if (i == 0) break;
+                    #10;
+                  end
+                end
+                $display("after loop %0t", $time);
+                #100 $display("end %0t", $time);
+              end
+              initial #12 disable t.P.L.B;
+            endmodule
+        )") == "after loop 5\nend 105\n");
+    }
+}
+
 // An assertion action block is an ordinary body to the remote form: it marks the
 // target's activations and pushes their handles, which needs no coroutine of its
 // own and no region correction. The failing attempt at the first posedge ends the

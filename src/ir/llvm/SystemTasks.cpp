@@ -331,7 +331,7 @@ void Backend::emit_finish_exit() {
         if (hdl_ != nullptr) {
             // Process coroutine: the final suspend, exactly as running off the
             // end of the body does, so the resumer destroys the frame once.
-            b_.CreateBr(coro_final_bb_);
+            b_.CreateBr(leave_blocks(0, coro_final_bb_));
         } else {
             // Thunk-elided process: a plain void body.
             deinit_body_strings();
@@ -341,7 +341,7 @@ void Backend::emit_finish_exit() {
     }
     if (cur_is_task_) {
         // Task: the same epilogue an explicit `return` takes.
-        b_.CreateBr(task_epilogue_bb_);
+        b_.CreateBr(leave_blocks(0, task_epilogue_bb_));
         return;
     }
     // Function: no shared epilogue, so return here. The result is dead — the

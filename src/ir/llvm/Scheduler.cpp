@@ -582,7 +582,7 @@ void Backend::lower_program_exit(Index i) {
     // `initial` through program.end, which counts it down, a fork child or task
     // through its epilogue, which wakes its caller so the caller polls and aborts
     // in turn.
-    b_.CreateBr(exit);
+    b_.CreateBr(leave_blocks(0, exit));
     // The rest of the region is dead but still gets lowered, exactly as after a
     // $finish (lower_finish): park it in a block with no predecessors.
     b_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "exit.dead", fn_));
