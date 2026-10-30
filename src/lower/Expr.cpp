@@ -6,6 +6,21 @@ namespace clotho::lower {
 
 // Lower an expression as an rvalue, returning the SSA value index.
 ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
+    const ir::Index v = lower_expr_value(expr, b);
+    if (expr.type == nullptr || !expr.type->isIntegral()) {
+        return v;
+    }
+    const ir::ValueType have = b.type_of(v);
+    if (have.is_string || have.is_real || have.four_state == expr.type->isFourState()) {
+        return v;
+    }
+    const ir::SourceLoc l = loc(expr);
+    const ir::Ref       t = make_int_type(have.width, expr.type->isFourState());
+
+    return expr.type->isFourState() ? b.to_four(v, t, l) : b.to_two(v, t, l);
+}
+
+ir::Index Lowerer::lower_expr_value(const Expression& expr, ir::Builder& b) {
     cur_range_            = expr.sourceRange;
     const ir::SourceLoc l = loc(expr);
     switch (expr.kind) {

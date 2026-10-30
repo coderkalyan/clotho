@@ -694,8 +694,8 @@ void Lowerer::lower_wait_order(const slang::ast::WaitOrderStatement& s, ir::Buil
     const ir::SourceLoc l = loc(s);
     const auto          n = s.events.size();
 
-    const TempCell    failed = make_temp_cell(module_.pool.logic_type, "wait_order");
-    const ir::Index   zero   = b.constant(module_.pool.put_int(module_.pool.logic_type, 0), l);
+    const TempCell  failed = make_temp_cell(module_.pool.bit_type, "wait_order");
+    const ir::Index zero   = b.constant(module_.pool.put_int(module_.pool.bit_type, 0), l);
     b.binary(ir::Inst::Tag::Store, failed.lv(b, l), zero, l);
 
     for (size_t k = 0; k < n; ++k) {

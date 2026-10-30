@@ -38,11 +38,6 @@ enum class Rule : uint8_t {
     // lower_divmod and lower_bitwise promote the 2-state side (to_four);
     // lower_compare, lower_case_compare and lower_wildeq lift both sides.
     OperandDomain,
-    // Div Mod Pow over a 2-state left operand. slang types these results 4-state
-    // (they can be x) and every source-level one arrives so; a 2-state one is
-    // arithmetic the frontend synthesized, and is what the backend's separate
-    // 2-state divide / modulo path serves (kernel.md, "Operators"). A record.
-    ResultDomain,
     // Sll Srl Sra: a 4-state amount makes the LRM result 4-state, but the IR
     // result is the shifted operand's type. Also: the shifted operand or the
     // amount is not an integer.
@@ -84,7 +79,7 @@ enum class Rule : uint8_t {
 // Rules that record where the backend decides something implicitly, rather than
 // naming ill-typed IR.
 constexpr bool is_record(Rule rule) {
-    return rule == Rule::StoreDomain || rule == Rule::ResultDomain;
+    return rule == Rule::StoreDomain;
 }
 
 // Stable kebab-case name, for reports and for tests.

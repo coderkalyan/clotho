@@ -589,17 +589,15 @@ TEST_CASE("cli: build and run accept the code-generation options") {
 
 TEST_CASE("cli: --verify-ir reports typing findings to stderr and never changes the exit status") {
     const Scratch s;
-    SUBCASE("a store that changes domain is reported with its site, tag and types") {
-        // A member of a 4-state packed struct is stored through the struct's
-        // 4-state storage, while the member itself is a 2-state bit.
+    SUBCASE("a member of a 4-state packed struct stores in the struct's domain, so nothing is reported") {
+        // The member is a 2-state bit inside the struct's 4-state storage; the
+        // frontend converts the value to the storage's domain.
         const fs::path design = s.write("t.sv",
                                         "module t;\n  typedef struct packed { logic [3:0] a; bit [7:0] b; } s_t;\n"
                                         "  s_t x;\n  initial x.b = 8'hAB;\nendmodule\n");
         const Result   r      = s.run(std::format("build --emit=ir --verify-ir \"{}\"", design.string()));
         CHECK(r.code == 0);
-        CHECK(contains(r.err, "ir-verify: store-domain: process 0 %3 store(bit[8], logic[8]) at "));
-        CHECK(contains(r.err, "t.sv:4:"));
-        CHECK(contains(r.err, "ir-verify: 1 violation\n"));
+        CHECK(contains(r.err, "ir-verify: 0 violations\n"));
     }
     SUBCASE("a design with nothing to report says so") {
         const fs::path design = s.write("design.sv", kParamDesign);

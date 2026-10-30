@@ -64,24 +64,16 @@ private:
             case Tag::Add:
             case Tag::Sub:
             case Tag::Mul:
+            case Tag::UDiv:
+            case Tag::SDiv:
+            case Tag::UMod:
+            case Tag::SMod:
             case Tag::Band:
             case Tag::Bor:
             case Tag::Bxor:
             case Tag::Bxnor:
                 check_integer_pair(i, p.binary.l, p.binary.r);
                 return;
-            case Tag::UDiv:
-            case Tag::SDiv:
-            case Tag::UMod:
-            case Tag::SMod:
-                check_integer_pair(i, p.binary.l, p.binary.r);
-                check_forced_four_state(i, p.binary.l, p.binary.r);
-                return;
-            case Tag::Pow: {
-                const auto info = ir_.extra_data<PowInfo>(p.op_extra.extra);
-                check_forced_four_state(i, p.op_extra.op, info.exp);
-                return;
-            }
             case Tag::ULt:
             case Tag::SLt:
             case Tag::ULe:
@@ -190,14 +182,6 @@ private:
         }
         if (a.four_state != b.four_state) {
             report(Rule::OperandDomain, i, a, b);
-        }
-    }
-
-    // Div / Mod / Pow: the LRM result is 4-state because it can be x.
-    void check_forced_four_state(Index i, Index l, Index r) {
-        const ValueType a = ty(l);
-        if (is_scalar(a) && !a.four_state) {
-            report(Rule::ResultDomain, i, a, ty(r));
         }
     }
 
@@ -482,8 +466,6 @@ const char* rule_name(Rule rule) {
             return "operand-width";
         case Rule::OperandDomain:
             return "operand-domain";
-        case Rule::ResultDomain:
-            return "result-domain";
         case Rule::ShiftResult:
             return "shift-result";
         case Rule::SelectArmWidth:

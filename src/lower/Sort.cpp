@@ -163,10 +163,12 @@ ir::Index Lowerer::sort_right_wins(const SortIter& s, ir::Builder& b, ir::Source
     //
     // No x reaches the result even though `cmp` may be one: the bitwise ops are
     // monotone (LRM 11.4.7 tables give 0 & x == 0 and 1 | x == 1), and `cmp` is
-    // definite in exactly the case where it is the deciding operand. The Resize
-    // is the 2-state landing (LRM 6.3.1) for the `take` cell.
-    const ir::Index lu   = b.unary(T::IsUnknown, left, l);
-    const ir::Index ru   = b.unary(T::IsUnknown, right, l);
+    // definite in exactly the case where it is the deciding operand. The unknown
+    // tests are 2-state, so each is lifted to `cmp`'s domain, and the conversion
+    // at the end is the 2-state landing (LRM 6.3.1) for the `take` cell.
+    const ir::Ref   four1 = make_int_type(1, true);
+    const ir::Index lu    = b.to_four(b.unary(T::IsUnknown, left, l), four1, l);
+    const ir::Index ru    = b.to_four(b.unary(T::IsUnknown, right, l), four1, l);
     const ir::Index open = b.unary(T::Bnot, s.desc ? ru : lu, l);
     const ir::Index win  = b.binary(T::Bor, s.desc ? lu : ru, cmp, l);
     return b.convert(b.binary(T::Band, open, win, l), s.bit1, false, l);

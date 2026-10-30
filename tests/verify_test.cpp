@@ -117,23 +117,6 @@ TEST_CASE("verify: operand domain") {
     only(t.verified(), Rule::OperandDomain);
 }
 
-TEST_CASE("verify: div, mod and pow are 4-state in the LRM") {
-    Body      t;
-    const Ref u8 = t.bits(8);
-    t.b.binary(Inst::Tag::UDiv, t.konst(u8), t.konst(u8), kLoc);
-    t.b.pow(t.konst(u8), t.konst(t.bits(3)), false, false, kLoc);
-    const auto v = t.verified();
-    CHECK(count(v, Rule::ResultDomain) == 2);
-    CHECK(v.size() == 2);
-    CHECK(is_record(Rule::ResultDomain));
-
-    Body      ok;
-    const Ref l8 = ok.logic(8);
-    ok.b.binary(Inst::Tag::UDiv, ok.konst(l8), ok.konst(l8), kLoc);
-    ok.b.pow(ok.konst(l8), ok.konst(ok.bits(3)), false, false, kLoc);
-    CHECK(ok.verified().empty());
-}
-
 TEST_CASE("verify: an integer operator rejects a real operand") {
     Body t;
     t.b.binary(

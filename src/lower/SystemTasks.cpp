@@ -896,8 +896,8 @@ ir::Index Lowerer::lower_sysfunc(const CallExpression& call, ir::Builder& b) {
         const ir::Ref   i32s    = make_int_type(32, false);
         const ir::Index sh32    = b.constant(module_.pool.put_int(make_int_type(64, false), 32u), l);
         const ir::Index seed_lv = lower_lvalue(seed_lvalue_expr(seed_arg), b);
-        b.binary(
-          ir::Inst::Tag::Store, seed_lv, b.convert(b.binary(ir::Inst::Tag::Srl, packed, sh32, l), i32s, true, l), l);
+        const ir::Index seed    = b.convert(b.binary(ir::Inst::Tag::Srl, packed, sh32, l), i32s, true, l);
+        b.binary(ir::Inst::Tag::Store, seed_lv, in_lvalue_domain(seed_lv, seed, b, l), l);
         return b.convert(packed, i32s, true, l);
     };
 

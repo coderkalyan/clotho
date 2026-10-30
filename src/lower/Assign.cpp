@@ -7,12 +7,36 @@ namespace clotho::lower {
 // Emit one leaf store of an assignment. `t` null -- every caller but the
 // nonblocking intra-assignment one -- is the ordinary immediate / NBA store;
 // non-null defers this leaf through its own record (LRM 9.4.5).
+// The 1-bit constant `value` in the domain of the 1-bit value `like`, for a
+// case-equality against it: the IR compares operands of one domain.
+ir::Index Lowerer::bit_like(ir::Index like, uint64_t value, ir::Builder& b, ir::SourceLoc l) {
+    return b.constant(module_.pool.put_int(make_int_type(1, b.type_of(like).four_state), value), l);
+}
+
+// The value `v` in the domain of the storage `lv` names. A part of a wider
+// container shares the container's domain (ir/Typing.cpp): a 2-state member of a
+// 4-state packed struct is stored in 4-state planes, so its value, already
+// converted to the member's own type (LRM 6.3.1), gains a zero x/z plane here.
+// Widths already agree; only an integral plane value is touched.
+ir::Index Lowerer::in_lvalue_domain(ir::Index lv, ir::Index v, ir::Builder& b, ir::SourceLoc l) {
+    const ir::ValueType to   = b.type_of(lv);
+    const ir::ValueType have = b.type_of(v);
+    if (to.is_string || to.is_real || have.is_string || have.is_real || to.width != have.width ||
+        to.four_state == have.four_state) {
+        return v;
+    }
+    const ir::Ref t = make_int_type(have.width, to.four_state);
+
+    return to.four_state ? b.to_four(v, t, l) : b.to_two(v, t, l);
+}
+
 void Lowerer::store_leaf(ir::Inst::Tag        tag,
                          const IntraNbTiming* t,
                          ir::Index            lv,
-                         ir::Index            v,
+                         ir::Index            value,
                          ir::Builder&         b,
                          ir::SourceLoc        l) {
+    const ir::Index v = in_lvalue_domain(lv, value, b, l);
     if (t == nullptr) {
         b.binary(tag, lv, v, l);
         return;
@@ -535,17 +559,14 @@ void Lowerer::emit_agg_conditional(ir::Index                    lhs,
     // Case-equality against the definite bits gives the two definite branches,
     // exactly as lower_lazy_conditional does for an integral result; whatever
     // is left over is x or z and takes the ambiguous merge.
-    const ir::Ref   bit      = make_int_type(1, true);
-    const ir::Index one      = b.constant(module_.pool.put_int(bit, 1), l);
-    const ir::Index zero     = b.constant(module_.pool.put_int(bit, 0), l);
-    const ir::Index is_true  = b.binary(ir::Inst::Tag::CaseEq, pred, one, l);
+    const ir::Index is_true = b.binary(ir::Inst::Tag::CaseEq, pred, bit_like(pred, 1, b, l), l);
 
     b.open_region();
     emit_agg_store(lhs, type, c.left(), tag, b, l);
     const ir::ExtraSlice t_region = b.close_region();
 
     b.open_region();
-    const ir::Index is_false = b.binary(ir::Inst::Tag::CaseEq, pred, zero, l);
+    const ir::Index is_false = b.binary(ir::Inst::Tag::CaseEq, pred, bit_like(pred, 0, b, l), l);
 
     b.open_region();
     emit_agg_store(lhs, type, c.right(), tag, b, l);
@@ -617,10 +638,7 @@ void Lowerer::emit_agg_cond_ambiguous(ir::Index                    lhs,
     // "If that comparison is TRUE (1)". AggEq AND-reduces the per-leaf
     // compares with Land, which carries 11.4.5's X-propagation, so an x result
     // is not true and the test has to be the definite one.
-    b.cond(b.binary(ir::Inst::Tag::CaseEq, eq, b.constant(module_.pool.put_int(make_int_type(1, true), 1), l), l),
-           same,
-           diff,
-           l);
+    b.cond(b.binary(ir::Inst::Tag::CaseEq, eq, bit_like(eq, 1, b, l), l), same, diff, l);
 }
 
 // The array half of the ambiguous-condition rule (LRM 11.4.11): "For
@@ -687,10 +705,11 @@ void Lowerer::emit_agg_cond_elementwise(ir::Index               lhs,
 // compare that can be x is narrowed to a definite bit; a compare of 2-state
 // (or real, or string) operands is already definite and needs no narrowing.
 ir::Index Lowerer::agg_cond_elem_match(ir::Index a, ir::Index other, ir::Ref ety, ir::Builder& b, ir::SourceLoc l) {
-    const ir::Index one = b.constant(module_.pool.put_int(make_int_type(1, true), 1), l);
     if (is_agg_abi_ref(ety)) {
         guard_agg_eq_members(ety);
-        return b.binary(ir::Inst::Tag::CaseEq, b.agg_eq(a, other, ety, l), one, l);
+        const ir::Index eq = b.agg_eq(a, other, ety, l);
+
+        return b.binary(ir::Inst::Tag::CaseEq, eq, bit_like(eq, 1, b, l), l);
     }
     if (value_cat(ety) == ValueCat::handle) {
         // TODO: the ambiguous merge over a fixed array whose element is a
@@ -709,7 +728,7 @@ ir::Index Lowerer::agg_cond_elem_match(ir::Index a, ir::Index other, ir::Ref ety
     if (module_.pool.layout(ety).domain != ir::Domain::Four) {
         return cmp;
     }
-    return b.binary(ir::Inst::Tag::CaseEq, cmp, one, l);
+    return b.binary(ir::Inst::Tag::CaseEq, cmp, bit_like(cmp, 1, b, l), l);
 }
 
 // Write the LRM Table 7-1 (7.4.5) value for `ty` into `lv`.
@@ -1878,7 +1897,8 @@ ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
                     // intra_nb_delay_is_const_zero for why it stays on the
                     // block-commit path rather than the deferred record's.
                     const ir::Index val0 = lower_expr(a.right(), b);
-                    b.binary(ir::Inst::Tag::StoreNb, lower_lvalue(a.left(), b, /*is_write=*/true), val0, loc(a));
+                    const ir::Index lv0  = lower_lvalue(a.left(), b, /*is_write=*/true);
+                    b.binary(ir::Inst::Tag::StoreNb, lv0, in_lvalue_domain(lv0, val0, b, loc(a)), loc(a));
                     return val0;
                 }
                 // RHS before delay, the order this form has always used. The event
@@ -1889,7 +1909,8 @@ ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
                 // ("instead of after the delay"), not about the delay expression.
                 const ir::Index val   = lower_expr(a.right(), b);
                 const ir::Index delay = scaled_delay(delay_expr, b);
-                b.store_nb_delay(lower_lvalue(a.left(), b, /*is_write=*/true), val, delay, loc(a));
+                const ir::Index lvd   = lower_lvalue(a.left(), b, /*is_write=*/true);
+                b.store_nb_delay(lvd, in_lvalue_domain(lvd, val, b, loc(a)), delay, loc(a));
                 return val;
             }
             // Event / repeat-event form: `x <= @e y` / `x <= repeat(N) @e y`.
@@ -1919,7 +1940,8 @@ ir::Index Lowerer::lower_assign(const AssignmentExpression& a, ir::Builder& b) {
             store_concat(a.left().as<ConcatenationExpression>(), rhs, ir::Inst::Tag::Store, b, loc(a));
             return rhs;
         }
-        b.binary(ir::Inst::Tag::Store, lower_lvalue(a.left(), b, /*is_write=*/true), rhs, loc(a));
+        const ir::Index lvt = lower_lvalue(a.left(), b, /*is_write=*/true);
+        b.binary(ir::Inst::Tag::Store, lvt, in_lvalue_domain(lvt, rhs, b, loc(a)), loc(a));
         return rhs;
     }
     if (a.isNonBlocking() && fn_ctx_ != nullptr) {
@@ -2144,7 +2166,7 @@ ir::Index Lowerer::lower_compound_assign(const AssignmentExpression& a, ir::Buil
     // covers both; the write wording is the more specific of the two.
     const ir::Index lv  = lower_lvalue(a.left(), b, /*is_write=*/true);
     const ir::Index rhs = lower_compound_rhs(a, lv, b);
-    b.binary(ir::Inst::Tag::Store, lv, rhs, l);
+    b.binary(ir::Inst::Tag::Store, lv, in_lvalue_domain(lv, rhs, b, l), l);
     return rhs;
 }
 

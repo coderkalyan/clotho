@@ -1316,6 +1316,8 @@ private:
         bool           is_event = false;
     };
 
+    ir::Index bit_like(ir::Index like, uint64_t value, ir::Builder& b, ir::SourceLoc l);
+    ir::Index in_lvalue_domain(ir::Index lv, ir::Index v, ir::Builder& b, ir::SourceLoc l);
     void store_leaf(ir::Inst::Tag        tag,
                     const IntraNbTiming* t,
                     ir::Index            lv,
@@ -4134,7 +4136,11 @@ private:
                              ir::SourceLoc                           l,
                              const IntraNbTiming*                    nbt = nullptr);
 
+    // The value of `expr`. An integral expression is in the domain of its slang
+    // type (LRM 6.3.1), whichever domain its lowering found it in: a system
+    // function's result or a builtin method's return value is the usual case.
     ir::Index lower_expr(const Expression& expr, ir::Builder& b);
+    ir::Index lower_expr_value(const Expression& expr, ir::Builder& b);
 
     ir::Index lower_unary(const UnaryExpression& u, ir::Builder& b);
 
