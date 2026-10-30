@@ -808,7 +808,11 @@ void Lowerer::alloc_assert_control() {
         // Named by position in this table rather than by monitor id: the
         // monitor has no id yet (Emit hands those out), and an assertion
         // that later refuses to lower would leave a hole in that numbering.
-        const std::string base = "sva.ctl" + std::to_string(i) + ".";
+        uint32_t ordinal = 0;
+        for (uint32_t k = 0; k < i; ++k) {
+            ordinal += sites_[k].scope == site.scope ? 1 : 0;
+        }
+        const std::string base = "sva.ctl" + std::to_string(ordinal) + ".";
         scope_stack_.push_back(node);
         prefix_       = site.prefix;
         site.ctl.off  = new_monitor_state(base + "off", mask_type(1), site.loc);
@@ -1393,6 +1397,10 @@ void Lowerer::lower_concurrent_assertion(const slang::ast::ConcurrentAssertionSt
     // monitor would own, and there is none -- the roots are ordinary values
     // inside the process emitted here.
     const uint32_t    id    = static_cast<uint32_t>(module_.monitors.size());
+    if (monitors_per_scope_.size() <= cur_scope_id()) {
+        monitors_per_scope_.resize(cur_scope_id() + 1, 0);
+    }
+    monitor_ordinal_ = monitors_per_scope_[cur_scope_id()]++;
     const ExpectPorts ports = emit_monitor(lowered, monitor, id, actions, control_for(a));
     module_.monitors.push_back(std::move(monitor));
 

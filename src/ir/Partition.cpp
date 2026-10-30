@@ -853,12 +853,11 @@ private:
         return true;
     }
 
-    // Two units' own content, child units aside (same_subtree pairs those). A
-    // unit holding assertion monitors or covergroup types never merges yet:
-    // their records are not compared.
+    // Two units' own content, child units aside (same_subtree pairs those). Class
+    // descriptors and DPI exports still keep a unit to itself: one copy per instance
+    // would register one class or one C symbol several times.
     static bool same_unit(const Unit& a, const Unit& b) {
-        if (!a.monitors.empty() || !b.monitors.empty() || !a.cover_types.empty() || !b.cover_types.empty() ||
-            !a.class_descs.empty() || !b.class_descs.empty() || !a.dpi_exports.empty() || !b.dpi_exports.empty()) {
+        if (!a.class_descs.empty() || !b.class_descs.empty() || !a.dpi_exports.empty() || !b.dpi_exports.empty()) {
             return false;
         }
         if (a.kind != b.kind || a.def_name != b.def_name || a.children.size() != b.children.size()) {
@@ -873,7 +872,8 @@ private:
         }
         return a.signals == b.signals && a.functions == b.functions && a.processes == b.processes &&
                a.imports == b.imports && a.inst_refs == b.inst_refs && a.bound_ports == b.bound_ports &&
-               a.disable_targets == b.disable_targets;
+               a.disable_targets == b.disable_targets && a.monitors == b.monitors &&
+               a.cover_types == b.cover_types;
     }
 
     // Drop the merged units, renumbering the survivors and every reference to

@@ -389,6 +389,8 @@ enum class AssertionTracking : uint8_t { Ring, Counted };
 struct AssertionLiteral {
     uint32_t root = 0;
     bool negated = false;
+
+    bool operator==(const AssertionLiteral&) const = default;
 };
 
 // A guard cube: the conjunction of literals[start .. start + len). An empty cube
@@ -396,6 +398,8 @@ struct AssertionLiteral {
 struct AssertionCube {
     uint32_t start = 0;
     uint32_t len = 0;
+
+    bool operator==(const AssertionCube&) const = default;
 };
 
 // One automaton: a Glushkov position automaton. One state per letter occurrence,
@@ -424,6 +428,8 @@ struct AssertionAutomaton {
     // cubes.size() * words: per guard, the mask of states carrying it. Lets the
     // satisfied-state mask fold over guards instead of gathering per state.
     std::vector<uint64_t> guard_states;
+
+    bool operator==(const AssertionAutomaton&) const = default;
 };
 
 // What an abort does to the attempts it covers, once its condition holds. The
@@ -458,6 +464,8 @@ struct AssertionAbort {
     // state in here, which is what confines it to the cycles the property
     // beneath it is really being evaluated in.
     std::vector<uint64_t> mask;
+
+    bool operator==(const AssertionAbort&) const = default;
 };
 
 struct AssertionMonitor {
@@ -532,6 +540,8 @@ struct AssertionMonitor {
     // slang-free. The scope after it (the instance, which differs between instances,
     // and the assertion's label) is added where the report is emitted.
     std::string banner;
+
+    bool operator==(const AssertionMonitor&) const = default;
 };
 
 // Direction of a subroutine formal argument (LRM 13.5). Out / Inout copy the
@@ -751,6 +761,8 @@ struct ClassDesc {
 struct CoverRange {
     uint64_t lo;
     uint64_t hi;
+
+    bool operator==(const CoverRange&) const = default;
 };
 
 // Bin kinds, mirroring RT_COVER_BIN_* in src/runtime/Coverage.h.
@@ -771,6 +783,8 @@ struct CoverBin {
     std::string             name;
     CoverBinKind            kind = CoverBinKind::Normal;
     std::vector<CoverRange> ranges;
+
+    bool operator==(const CoverBin&) const = default;
 };
 
 struct CoverPoint {
@@ -788,6 +802,8 @@ struct CoverPoint {
     bool     is_auto    = false;
     uint32_t auto_total = 0;
     bool     is_signed  = false;
+
+    bool operator==(const CoverPoint&) const = default;
 };
 
 struct CoverType {
@@ -804,6 +820,8 @@ struct CoverType {
     uint32_t                weight       = 1;
     uint32_t                goal         = 100;
     bool                    per_instance = false;
+
+    bool operator==(const CoverType&) const = default;
 };
 
 // `ChangeNotify::field` entry for an edge no `@` / `wait` in the design asks for,

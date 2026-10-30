@@ -5943,6 +5943,11 @@ private:
     // Diagnostics from members that failed and were recovered past, in the order
     // the walk hit them. Drained by lower_compilation.
     std::vector<Diagnostic> diags_;
+    // The ordinal, within its instance, of the assertion being lowered: what its state
+    // signals are named by, so twin instances name them alike (the monitor id is
+    // design-wide). `monitors_per_scope_` counts them, indexed by scope id.
+    uint32_t              monitor_ordinal_ = 0;
+    std::vector<uint32_t> monitors_per_scope_;
     // Set once any member was abandoned. The module is still returned -- it is
     // analysable, and `clotho lint` still wants it -- but it is missing
     // behaviour, so it MUST NOT reach codegen. lower_compilation turns this into

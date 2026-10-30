@@ -366,7 +366,13 @@ ir::Signal Lowerer::sva_history_slot(ir::Signal live, const Expression* gate, ui
         // carries which; an ungated ring keeps the name every monitor without
         // a gate already emits.
         ir::SignalInfo info;
-        info.name = hist.base + "past." + module_.signal(live).name +
+        const std::string live_name = module_.signal(live).name;
+        const auto        pre       = scope_prefix_.find(cur_scope_id());
+        const std::string_view local =
+          pre != scope_prefix_.end() && live_name.starts_with(pre->second)
+            ? std::string_view(live_name).substr(pre->second.size())
+            : std::string_view(live_name);
+        info.name = hist.base + "past." + std::string(local) +
                     (gate != nullptr ? ".gate" + std::to_string(at) : std::string()) + "." +
                     std::to_string(entries.size());
         info.loc  = hist.loc;
@@ -864,8 +870,11 @@ Lowerer::ExpectPorts Lowerer::emit_monitor(const sva::Result&          lowered,
 
     // The $past rings this monitor needs, filled in on demand while the roots
     // below are evaluated: a sampled value function reaches them through
-    // sva_history_, and nothing else creates one.
-    SvaHistory hist{ .base = "sva." + std::to_string(id) + ".", .loc = l };
+    // sva_history_, and nothing else creates one. Named by the monitor's ordinal
+    // within its instance, never the design-wide id, so instances of one
+    // specialization name their state alike, under the instance's prefix like every
+    // signal it holds.
+    SvaHistory hist{ .base = prefix_ + "sva." + std::to_string(monitor_ordinal_) + ".", .loc = l };
 
     // Roots, one definite bit each. Every one reads the Preponed shadows of
     // the variables it names except the ones root_reads_live names: the

@@ -474,7 +474,7 @@ ir::Ref Lowerer::mask_type(uint32_t width) {
 Lowerer::MonitorState Lowerer::alloc_monitor_state(const ir::AssertionMonitor& mon,
                                                    uint32_t                    id,
                                                    const MonitorControl*       ctl) {
-    const std::string   base = "sva." + std::to_string(id) + ".";
+    const std::string   base = "sva." + std::to_string(monitor_ordinal_) + ".";
     const ir::SourceLoc l    = mon.span.start;
 
     MonitorState st;
