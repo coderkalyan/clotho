@@ -304,6 +304,29 @@ void rt_wide_ins(void* mm, void* z, uint32_t width, int64_t base, uint32_t cwidt
                  uint32_t n, uint32_t four, uint32_t has_z, uint32_t unknown,
                  const uint64_t* must, const uint64_t* may, const uint64_t* z_bits);
 
+// -- Multiply, divide and modulo of very wide integers --
+
+// out = a * b (rt_wide_mul), a / b (rt_wide_udiv, rt_wide_sdiv) or a % b (rt_wide_umod,
+// rt_wide_smod) of two `width`-bit values. The backend calls these for an operand wider
+// than `wide_arith_bits` (128), where LLVM's own lowering is a bit-serial divide and a
+// multiply whose compile time grows as width^2 (docs/design/kernel.md).
+//
+// `out`, `a` and `b` are little-endian arrays of ceil(width / 64) words, the in-memory
+// layout of an i(width), with the bits above `width` zero in both operands and in the
+// result. `out` overlaps neither operand; `a` and `b` may be one buffer.
+//
+// The result is what the LLVM operation at that width gives: wrapped modulo 2^width, with
+// the `s` forms reading two's complement, the quotient truncated toward zero and the
+// remainder taking the dividend's sign. A multiply needs no signed form, since the low
+// `width` bits of the product are the same either way. The 2-state divide rules hold: a
+// zero divisor gives 0, and the signed MIN / -1 wraps (quotient MIN, remainder 0). A
+// 4-state divide treats x and a zero divisor in generated code, so never passes one here.
+void rt_wide_mul(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+void rt_wide_udiv(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+void rt_wide_sdiv(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+void rt_wide_umod(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+void rt_wide_smod(uint64_t* out, const uint64_t* a, const uint64_t* b, uint32_t width);
+
 // -- Null class-handle dereference (LRM 8.4) --
 
 // The site of one guarded class-handle use — a property dereference or a virtual

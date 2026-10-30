@@ -986,6 +986,7 @@ set(CLOTHO_TEST_SOURCES
   tests/interface_test.cpp
   tests/concat_select_test.cpp
   tests/wide_select_test.cpp
+  tests/wide_arith_test.cpp
   tests/force_release_test.cpp
   tests/system_test.cpp
   tests/diagnostic_render_test.cpp

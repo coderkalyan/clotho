@@ -178,6 +178,15 @@ llvm::FunctionCallee Backend::wide_ins_fn() {
                    raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty() });
 }
 
+// -- Multiply, divide and modulo of very wide integers --
+
+// void rt_wide_mul / rt_wide_udiv / rt_wide_sdiv / rt_wide_umod / rt_wide_smod(
+//     u64* out, const u64* a, const u64* b, u32 width): all five share one shape.
+llvm::FunctionCallee Backend::wide_arith_fn(const char* name) {
+    return rt_fn(name, b_.getVoidTy(),
+                 { raw_ptr_ty(), raw_ptr_ty(), raw_ptr_ty(), b_.getInt32Ty() });
+}
+
 // -- Null class-handle dereference (LRM 8.4) --
 
 llvm::StructType* Backend::null_site_ty() {

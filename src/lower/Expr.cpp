@@ -23,6 +23,12 @@ ir::Index Lowerer::lower_expr(const Expression& expr, ir::Builder& b) {
 ir::Index Lowerer::lower_expr_value(const Expression& expr, ir::Builder& b) {
     cur_range_            = expr.sourceRange;
     const ir::SourceLoc l = loc(expr);
+    // A packed value is one LLVM integer, so no expression may be wider than one holds.
+    // Declarations are checked as their types lower; this catches what only an
+    // expression makes, a concatenation or replication of values that each fit.
+    if (expr.type != nullptr && expr.type->isIntegral()) {
+        check_value_width(expr.type->getBitWidth(), expr.type->isFourState(), expr.sourceRange);
+    }
     switch (expr.kind) {
         case ExpressionKind::IntegerLiteral:
             return b.constant(lower_int_literal(expr.as<IntegerLiteral>()), l);

@@ -41,9 +41,12 @@ when it does.
   result and lowers to a native compare; a case-equality is always 2-state.
 - A value's width and domain come from one function (`ir::value_types`) shared by
   the builder, the verifier and the backend, not stored on instructions.
-- Values of any width are LLVM integers of that width. If profiling shows compile
-  time or code quality falling off, or a width exceeds LLVM's limit, a ceiling
-  routes wider values to our own bigint. **Not yet:** no profiling, no ceiling.
+- Values of any width are LLVM integers of that width. Multiply, divide and modulo
+  above 128 bits call runtime word routines (`rt_wide_*`) in place of the native
+  operation, which LLVM lowers to a bit-serial loop (divide) or a quadratic
+  expansion (multiply); no other operator has a ceiling. A value whose integer would
+  pass LLVM's limit (2^23 bits; 2W for a 4-state value of width W) is refused with a
+  located error at the declaration or expression that introduces the width.
 - The constant pool keeps the frontend's encoding; the backend converts on read
   through one shared set of helpers.
 - The encoding's invariants are checked by assertions in debug builds at stores
@@ -107,10 +110,11 @@ when it does.
 - A dynamic select branches to a plain fast path when its index is known and in
   range; the mask path runs only otherwise. **Not yet:** a storage-wide mask on
   every access.
-- A runtime helper serves only runtime-indexed selects of storage above a fixed
-  threshold. It works a 64-bit word at a time and receives only the planes the
-  destination needs. **Not yet:** constant indices also call it, it loops per bit,
-  and all three planes are always passed.
+- A runtime helper serves only runtime-indexed selects of storage above 256 bits,
+  where it costs less than the inline shift (it is flat at 180-310 instructions; the
+  inline form grows with the width). It works a 64-bit word at a time and receives
+  only the planes the destination needs. **Not yet:** it loops per bit, and all three
+  planes are always passed.
 - A fixed unpacked array's declared range becomes a 0-based position in the
   backend, next to the range check.
 - An element access with an invalid index is guarded so only valid paths touch

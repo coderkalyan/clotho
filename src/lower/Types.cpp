@@ -336,6 +336,9 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         const bool   is_packed = !ct.isUnpackedStruct();
         const Scope& body      = is_packed ? static_cast<const Scope&>(ct.as<slang::ast::PackedStructType>())
                                            : static_cast<const Scope&>(ct.as<slang::ast::UnpackedStructType>());
+        if (is_packed) {
+            check_value_width(ct.getBitWidth(), ct.isFourState(), cur_range_);
+        }
         std::vector<ir::FieldRow> fields;
         for (const auto& f : body.membersOfType<slang::ast::FieldSymbol>()) {
             // Packed member: `bitOffset` is the field's bit position. Unpacked
@@ -381,6 +384,7 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         if (const auto cached = struct_type_cache_.find(&ct); cached != struct_type_cache_.end()) {
             return cached->second;
         }
+        check_value_width(ct.getBitWidth(), ct.isFourState(), cur_range_);
 
         // A tagged packed union (LRM 7.3.2) is still a flat bit-vector, just
         // with the tag reserved in the high `tagBits` bits — slang's
@@ -461,6 +465,7 @@ ir::Ref Lowerer::lower_type(const slang::ast::Type& type) {
         // unpacked union has no slang-dictated width. tagBits = ceil(log2 n).
         const uint32_t tag_bits =
           ut.isTagged && nmembers > 1 ? static_cast<uint32_t>(std::bit_width(nmembers - 1)) : 0;
+        check_value_width(max_width + tag_bits, four, cur_range_);
 
         ir::Type t;
         t.kind      = ir::Type::Kind::Struct;

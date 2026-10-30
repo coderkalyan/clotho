@@ -240,6 +240,11 @@ int run_jit(const Module& m, Timings* timings, const SimulationConfig& config,
     expose("rt_bounds_report", &rt_bounds_report);
     expose("rt_wide_sel", &rt_wide_sel);
     expose("rt_wide_ins", &rt_wide_ins);
+    expose("rt_wide_mul", &rt_wide_mul);
+    expose("rt_wide_udiv", &rt_wide_udiv);
+    expose("rt_wide_sdiv", &rt_wide_sdiv);
+    expose("rt_wide_umod", &rt_wide_umod);
+    expose("rt_wide_smod", &rt_wide_smod);
     expose("rt_null_handle", &rt_null_handle);
     expose("rt_tagged_access", &rt_tagged_access);
     expose("rt_ref_stale", &rt_ref_stale);

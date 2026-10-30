@@ -329,7 +329,11 @@ void Backend::lower_inst(Index i) {
             llvm::Value*       idx    = select_index(idxp, type_of(p.binary.r));
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, idx) : idx;
             lv.width   = 1;
-            const SelectVerdict sv = set_select_bounds(lv, cbase, cwidth, 1, any_unknown(idxp));
+            // A constant offset has no variable shift to legalize, so it stays inline on
+            // wide storage too; a base already on the runtime kernels keeps them.
+            const bool constant_window = llvm::isa<llvm::ConstantInt>(lv.bit_off) && !lv.wide_dyn;
+            const SelectVerdict sv =
+              set_select_bounds(lv, cbase, cwidth, 1, any_unknown(idxp), constant_window);
             add_select_bounds_check(lv, i, p.binary.r, sv, BoundsWhat::Bit, cwidth, 1);
             set_lvalue(i, lv);
             return;
@@ -376,8 +380,9 @@ void Backend::lower_inst(Index i) {
             llvm::Value*       off    = select_index(offp, type_of(dps.offset));
             lv.bit_off = lv.bit_off != nullptr ? b_.CreateAdd(lv.bit_off, off) : off;
             lv.width   = dps.width;
+            const bool constant_window = llvm::isa<llvm::ConstantInt>(lv.bit_off) && !lv.wide_dyn;
             const SelectVerdict sv =
-              set_select_bounds(lv, cbase, cwidth, dps.width, any_unknown(offp));
+              set_select_bounds(lv, cbase, cwidth, dps.width, any_unknown(offp), constant_window);
             add_select_bounds_check(lv, i, dps.offset, sv, BoundsWhat::Part, cwidth, dps.width);
             set_lvalue(i, lv);
             return;
