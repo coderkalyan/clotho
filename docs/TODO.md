@@ -285,8 +285,12 @@ Milestones, in order; lower ones unblock higher ones:
   its own signal map.
 - [ ] **Hierarchical path through a generate-block instance or an instance-array element**
   — `g.u.sig` and `arr[i].sig` fail at elaboration.
-- [ ] **`inout` / `ref` port that is a select, or connected to a select or concatenation**
-  (23.2.2.1, 23.3.3) — needs sub-signal aliasing.
+- [~] **`inout` / `ref` port aliasing** (23.2.2.1, 23.3.3) — a port and its connection must be
+  one whole net each, of one width; missing pieces:
+  - [ ] **Port that is a select, or connection that is a select or concatenation** — needs
+    sub-signal aliasing.
+  - [ ] **Connection to a net of another width** — the bits they share connect and the rest of
+    the wider side is unconnected; needs sub-signal aliasing.
 - [ ] **Port expression that is not a select of one internal net** (23.2.2.1, 23.2.2.2) — a
   non-ANSI concatenation port `module m({a, b})` and an ANSI `.p(expr)` port are refused.
 

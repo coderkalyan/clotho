@@ -421,3 +421,40 @@ TEST_CASE("an inout port that is a select of its net fails loudly") {
     CHECK_FALSE(r.ok);
     CHECK(r.diagnostic_text().find("select port expression") != std::string::npos);
 }
+
+// An inout port and the net it connects share one storage, and a port that is not
+// as wide as its net has none in common with it: LRM 23.3.3 makes the connection
+// of the bits they share a transistor, the rest of the wider side unconnected, and
+// aliasing put the whole port over the net's slot. A 64-bit port on a 1-bit net
+// wrote past it, onto the variables declared next to it (ivtest br_gh127b/e).
+TEST_CASE("an inout port connected to a net of another width fails loudly") {
+    SUBCASE("a wider port, with variables beside the net it used to overwrite") {
+        const LowerResult r = lower_text(R"(
+            module drv(inout [63:0] p);
+              assign p = 64'h1;
+            endmodule
+            module top;
+              wire w;
+              logic [7:0] v_post = 8'h22;
+              wire  [7:0] n = 8'h5a;
+              drv d(w);
+              initial #1 $display("%h %h", v_post, n);
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("net of another width (64 and 1 bits)") != std::string::npos);
+    }
+    SUBCASE("a narrower port") {
+        const LowerResult r = lower_text(R"(
+            module drv(inout [1:0] p);
+              assign p = 2'b01;
+            endmodule
+            module top;
+              wire [2:0] v;
+              drv d(v);
+            endmodule
+        )");
+        CHECK_FALSE(r.ok);
+        CHECK(r.diagnostic_text().find("net of another width (2 and 3 bits)") != std::string::npos);
+    }
+}

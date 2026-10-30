@@ -1011,6 +1011,18 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
         // net is the underlying value reference.
         const Expression& conn =
           expr->kind == ExpressionKind::Assignment ? expr->as<AssignmentExpression>().left() : *expr;
+        // The port and its connection share one storage (below), so they must be
+        // as wide as each other. Connected in the bits they share, the rest of
+        // the wider side unconnected, a port and a net of another width have no
+        // common storage: aliasing put a 64-bit port over a 1-bit slot, and the
+        // child's writes landed on the variables declared next to it.
+        // TODO: an inout/ref port and a net of different widths (LRM 23.3.3);
+        // needs sub-signal aliasing.
+        const slang::ast::Type& port_type = p.getType();
+        if (port_type.isIntegral() && conn.type->isIntegral() && port_type.getBitWidth() != conn.type->getBitWidth()) {
+            fail("inout/ref port connected to a net of another width (" + std::to_string(port_type.getBitWidth()) +
+                 " and " + std::to_string(conn.type->getBitWidth()) + " bits) is not supported");
+        }
         if (conn.kind != ExpressionKind::NamedValue && conn.kind != ExpressionKind::HierarchicalValue) {
             // TODO: inout/ref port with a bit/part-select or concat connection
             // (per-bit collapse or resolved-net partial-driver slots).
