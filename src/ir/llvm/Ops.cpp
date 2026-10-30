@@ -1097,12 +1097,21 @@ Plane Backend::lower_bnot(Plane a) {
 }
 
 Plane Backend::lower_reduce(Inst::Tag tag, Plane a) {
-    // Definite 4-state 1-bit result (compute_type); a 2-state operand lifts and
-    // the any_unknown terms fold away, leaving the native reduction.
-    a = to_four(a);
-    const uint32_t w  = width_of(a);
-    llvm::Value*   am = must_of(a);
-    llvm::Value*   aM = may_of(a);
+    const uint32_t w = width_of(a);
+    // 2-state operand: the result is a definite bit, one native reduction of the
+    // value.
+    if (a.two) {
+        switch (tag) {
+            case Inst::Tag::RedXor:
+                return two_val(b_.CreateTrunc(b_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, a.mm), int_ty(1)));
+            case Inst::Tag::RedAnd:
+                return two_val(b_.CreateICmpEQ(a.mm, ones(w)));
+            default: // RedOr
+                return two_val(b_.CreateICmpNE(a.mm, zero(w)));
+        }
+    }
+    llvm::Value* am = must_of(a);
+    llvm::Value* aM = may_of(a);
     if (tag == Inst::Tag::RedXor) {
         llvm::Value* unknown = any_unknown(a);
         llvm::Value* pop     = b_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, am);
@@ -1425,9 +1434,29 @@ Plane Backend::lower_agg_eq(const LValue& lhs, const LValue& rhs, Ref type) {
 }
 
 Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
-    // The result is always a definite 4-state bit (compute_type), so lift a
-    // 2-state operand into the packed encoding; with no x/z the any_unknown
-    // guards below fold to a single native icmp.
+    const auto predicate = [&] {
+        switch (tag) {
+            case Inst::Tag::Eq:
+                return llvm::CmpInst::ICMP_EQ;
+            case Inst::Tag::Ne:
+                return llvm::CmpInst::ICMP_NE;
+            case Inst::Tag::Lt:
+                return sign ? llvm::CmpInst::ICMP_SLT : llvm::CmpInst::ICMP_ULT;
+            case Inst::Tag::Le:
+                return sign ? llvm::CmpInst::ICMP_SLE : llvm::CmpInst::ICMP_ULE;
+            case Inst::Tag::Gt:
+                return sign ? llvm::CmpInst::ICMP_SGT : llvm::CmpInst::ICMP_UGT;
+            default:
+                return sign ? llvm::CmpInst::ICMP_SGE : llvm::CmpInst::ICMP_UGE;
+        }
+    };
+    // 2-state operands carry no x or z, so the result is a definite bit from one
+    // native compare.
+    if (a.two && b.two) {
+        return two_val(b_.CreateICmp(predicate(), a.mm, b.mm));
+    }
+    // A 4-state result. A 2-state operand next to a 4-state one is lifted into the
+    // packed encoding.
     a = to_four(a);
     b = to_four(b);
 
@@ -1468,21 +1497,7 @@ Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
     // unknown (x) or high-impedance (z) value, then the result shall be
     // 1'bx" — even when known high bits alone would decide the relation
     // (iverilog agrees). Do not "sharpen" this path.
-    llvm::CmpInst::Predicate pred;
-    switch (tag) {
-        case Inst::Tag::Lt:
-            pred = sign ? llvm::CmpInst::ICMP_SLT : llvm::CmpInst::ICMP_ULT;
-            break;
-        case Inst::Tag::Le:
-            pred = sign ? llvm::CmpInst::ICMP_SLE : llvm::CmpInst::ICMP_ULE;
-            break;
-        case Inst::Tag::Gt:
-            pred = sign ? llvm::CmpInst::ICMP_SGT : llvm::CmpInst::ICMP_UGT;
-            break;
-        default:
-            pred = sign ? llvm::CmpInst::ICMP_SGE : llvm::CmpInst::ICMP_UGE;
-            break;
-    }
+    const llvm::CmpInst::Predicate pred = predicate();
     llvm::Value* unknown = b_.CreateOr(any_unknown(a), any_unknown(b));
     return branchy_bit(
       unknown, [&] { return llvm::ConstantInt::get(int_ty(2), 0b10); },
@@ -1499,9 +1514,12 @@ Plane Backend::lower_compare(Inst::Tag tag, Plane a, Plane b, bool sign) {
 //             (mask = unknown_a | unknown_b, since both x and z have must!=may).
 Plane Backend::lower_case_compare(Inst::Tag tag, Plane a, Plane b) {
     const uint32_t w = std::max(width_of(a), width_of(b));
-    // The result is a definite 4-state bit; lift operands to the packed form the
-    // masking below needs (z / may planes materialized). 2-state operands carry
-    // no x/z, so the case forms collapse to a plain == after folding.
+    // 2-state operands carry no x or z, so every case form is a plain ==.
+    if (a.two && b.two) {
+        return two_val(b_.CreateICmpEQ(cast_plane(a, w, false).mm, cast_plane(b, w, false).mm));
+    }
+    // Lift operands to the packed form the masking below needs (z / may planes
+    // materialized).
     a = cast_plane(to_four(a), w, false);
     b = cast_plane(to_four(b), w, false);
 
@@ -1525,7 +1543,7 @@ Plane Backend::lower_case_compare(Inst::Tag tag, Plane a, Plane b) {
           b_.CreateICmpEQ(b_.CreateAnd(am, keep), b_.CreateAnd(bm, keep)),
           b_.CreateICmpEQ(b_.CreateAnd(aM, keep), b_.CreateAnd(bM, keep)));
     }
-    return bit_plane(eq, eq);
+    return two_val(eq);
 }
 
 // Wildcard equality `==?`. LRM 1800-2023 §11.4.6: x/z in the RIGHT operand are
@@ -1561,11 +1579,14 @@ Plane Backend::lower_inside_set(Index i) {
 }
 
 Plane Backend::lower_wildeq(Plane a, Plane b) {
-    const uint32_t w     = std::max(width_of(a), width_of(b));
-    // Definite 4-state bit result; lift operands. 2-state operands have no
-    // wildcard (x/z) bits, so ==? folds to a plain ==.
-    a                    = cast_plane(to_four(a), w, false);
-    b                    = cast_plane(to_four(b), w, false);
+    const uint32_t w = std::max(width_of(a), width_of(b));
+    // 2-state operands have no wildcard (x/z) bits, so ==? is a plain ==.
+    if (a.two && b.two) {
+        return two_val(b_.CreateICmpEQ(cast_plane(a, w, false).mm, cast_plane(b, w, false).mm));
+    }
+    // A 4-state result: lift operands.
+    a = cast_plane(to_four(a), w, false);
+    b = cast_plane(to_four(b), w, false);
     auto*          wide  = int_ty(2 * w);
     llvm::Value*   unkb  = b_.CreateXor(must_of(b), may_of(b)); // x/z bits of b
     llvm::Value*   keep  = b_.CreateNot(unkb);
@@ -1583,10 +1604,20 @@ Backend::Truth Backend::truth_of(Plane a) {
     return { t, f };
 }
 
+llvm::Value* Backend::nonzero(Plane a) {
+    return width_of(a) == 1 ? a.mm : b_.CreateICmpNE(a.mm, zero(width_of(a)));
+}
+
 Plane Backend::lower_logical(Inst::Tag tag, Plane a, Plane b) {
-    // Definite 4-state 1-bit result; lift operands (self-determined, so either
-    // may be 2-state) into the packed encoding. With no x/z the truth of each
-    // operand is just "nonzero" and the body folds to a native boolean op.
+    // 2-state operands carry no x or z: each truth is "nonzero" and the result is
+    // a definite bit.
+    if (a.two && b.two) {
+        llvm::Value* at = nonzero(a);
+        llvm::Value* bt = nonzero(b);
+        return two_val(tag == Inst::Tag::Land ? b_.CreateAnd(at, bt) : b_.CreateOr(at, bt));
+    }
+    // A 4-state result. The operands are self-determined, so one can be 2-state
+    // next to a 4-state one; lift it into the packed encoding.
     a = to_four(a);
     b = to_four(b);
 
@@ -1622,8 +1653,10 @@ Plane Backend::lower_logical(Inst::Tag tag, Plane a, Plane b) {
 }
 
 Plane Backend::lower_lnot(Plane a) {
-    // Definite 4-state 1-bit result; lift a 2-state operand (!a folds to a==0).
-    a = to_four(a);
+    // 2-state operand: !a is a == 0, a definite bit.
+    if (a.two) {
+        return two_val(b_.CreateNot(nonzero(a)));
+    }
     // At width 1, !a is the same operation as ~a (negate the single truth bit),
     // so reuse the bnot plane swap+complement — cheaper than a truth pair, and
     // already optimal (one not + one rotate), so no LUT is warranted.
@@ -1644,6 +1677,9 @@ Plane Backend::lower_lnot(Plane a) {
 // (either half of the OR is settled); definitely false only when a is
 // definitely true AND b is definitely false; x otherwise.
 Plane Backend::lower_limplies(Plane a, Plane b) {
+    if (a.two && b.two) {
+        return two_val(b_.CreateOr(b_.CreateNot(nonzero(a)), nonzero(b)));
+    }
     a = to_four(a);
     b = to_four(b);
     const Truth ta = truth_of(a);
@@ -1661,6 +1697,9 @@ Plane Backend::lower_limplies(Plane a, Plane b) {
 // differ, x whenever either operand is itself ambiguous (an ambiguous
 // operand's two possible resolutions give different equivalence answers).
 Plane Backend::lower_lequiv(Plane a, Plane b) {
+    if (a.two && b.two) {
+        return two_val(b_.CreateICmpEQ(nonzero(a), nonzero(b)));
+    }
     a = to_four(a);
     b = to_four(b);
     const Truth ta = truth_of(a);

@@ -331,27 +331,48 @@ ValueType compute_type(const Module& m, const IrView& ir, Index i, std::span<con
         case Inst::Tag::RandcNext:
             return { 32, false, false };
 
+        // A reduction or logical negation over a 2-state operand is a definite
+        // 2-state bit; over a 4-state one it can be x (LRM 11.4.9, 11.4.7).
         case Inst::Tag::RedAnd:
         case Inst::Tag::RedOr:
         case Inst::Tag::RedXor:
+        case Inst::Tag::Lnot:
+            return { 1, ty(p.unary).four_state, false };
+
+        // A comparison, a wildcard equality and a logical operator are 4-state when
+        // either operand is, and only then can the result be x (LRM 11.4.4, 11.4.5,
+        // 11.4.6, 11.4.7). The operands of the logical operators are self-determined,
+        // so their widths and domains are independent; the others pair equal ones.
         case Inst::Tag::Eq:
         case Inst::Tag::Ne:
         case Inst::Tag::Lt:
         case Inst::Tag::Le:
         case Inst::Tag::Gt:
         case Inst::Tag::Ge:
-        case Inst::Tag::CaseEq:
-        case Inst::Tag::CasezEq:
-        case Inst::Tag::CasexEq:
         case Inst::Tag::WildEq:
         case Inst::Tag::Land:
         case Inst::Tag::Lor:
-        case Inst::Tag::Lnot:
-        case Inst::Tag::AggEq:
-        case Inst::Tag::InsideSet:
         case Inst::Tag::Limplies:
         case Inst::Tag::Lequiv:
-            return { 1, true, false };
+            return { 1, ty(p.binary.l).four_state || ty(p.binary.r).four_state, false };
+
+        // Case equality compares the planes bit for bit and its result is always a
+        // known value (LRM 11.4.5), so it is a definite 2-state bit whatever the
+        // operands.
+        case Inst::Tag::CaseEq:
+        case Inst::Tag::CasezEq:
+        case Inst::Tag::CasexEq:
+            return { 1, false, false };
+
+        // An aggregate compare ANDs the leaf compares, so it can be x only when a
+        // leaf can carry x or z.
+        case Inst::Tag::AggEq:
+            return { 1, types::has_four_state_leaf(pool, ir.extra_data<AggEqInfo>(p.op_extra.extra).type), false };
+
+        // The selector decides: slang converts every member to its type, so a
+        // member is x-free exactly when the selector is.
+        case Inst::Tag::InsideSet:
+            return { 1, ty(p.op_extra.op).four_state, false };
 
         case Inst::Tag::ClassIsA:
         case Inst::Tag::ClassImplements:

@@ -3475,6 +3475,9 @@ private:
     };
     Truth truth_of(Plane a);
 
+    // i1: whether a 2-state value is nonzero, its truth in a logical operator.
+    llvm::Value* nonzero(Plane a);
+
     Plane lower_logical(Inst::Tag tag, Plane a, Plane b);
 
     Plane lower_lnot(Plane a);
