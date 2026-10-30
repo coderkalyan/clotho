@@ -1042,12 +1042,6 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
             // whole net would put the connection's storage under all of it.
             fail("inout/ref port with a select port expression is not supported");
         }
-        if (inout_alias_.contains(p.internalSymbol)) {
-            // TODO: two connected inout/ref ports bound to one net (`module
-            // m(a, a)`, LRM 23.2.2.1) make the two nets they connect one net;
-            // the net has one alias target.
-            fail("two inout/ref ports bound to one net are not supported");
-        }
         // slang may wrap the connection in an AssignmentExpression; the shared
         // net is the underlying value reference.
         const Expression& conn =
@@ -1069,8 +1063,18 @@ void Lowerer::build_inout_aliases(const InstanceSymbol& inst) {
             // (per-bit collapse or resolved-net partial-driver slots).
             fail("inout/ref port with a non-whole-signal connection is not supported");
         }
-        const ValueSymbol& parent      = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
-        inout_alias_[p.internalSymbol] = signal_of(parent);
+        const ValueSymbol& parent = canonical_value_symbol(conn.as<ValueExpressionBase>().symbol);
+        const ir::Signal   target = signal_of(parent);
+        // Two ports bound to one internal net (`module m(a, a)`, LRM 23.2.2.1) connected
+        // to one parent net share that net's alias target; connected to different nets
+        // they would make those one net, which the one target cannot express.
+        // TODO: two connected inout/ref ports bound to one net, connected to different
+        // nets: the nets they connect become one net.
+        if (const auto prior = inout_alias_.find(p.internalSymbol);
+            prior != inout_alias_.end() && prior->second != target) {
+            fail("two inout/ref ports bound to one net, connected to different nets, are not supported");
+        }
+        inout_alias_[p.internalSymbol] = target;
     }
 }
 

@@ -661,3 +661,22 @@ TEST_CASE("a port that needs coercion but cannot be coerced is an error with the
               std::string::npos);
     }
 }
+
+// Two inout ports bound to one internal net and connected to the SAME parent net
+// have one alias target, so nothing needs merging (LRM 23.2.2.1 Example 6): only
+// ports connected to different nets are refused. iverilog 13 prints the same.
+TEST_CASE("two inout ports bound to one internal net connect the same parent net") {
+    const std::string out = run_capture(R"(
+        module id(a, a);
+          inout a;
+          assign a = 1'bz;
+        endmodule
+        module top;
+          wire b;
+          id u(b, b);
+          assign b = 1'b1;
+          initial #1 $display("b=%b u.a=%b", b, u.a);
+        endmodule
+    )");
+    CHECK(out == "b=1 u.a=1\n");
+}
