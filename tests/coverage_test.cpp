@@ -814,3 +814,23 @@ TEST_CASE("the report lists every bin with its hit count") {
     CHECK(report.find("coverpoint cp") != std::string::npos);
     CHECK(report.find("100.00%") != std::string::npos);
 }
+
+// A covergroup instance is named by the hierarchical path of the module
+// instance that constructed it, top name included, so the report tells two
+// instances of one module apart (LRM 19.8 leaves the naming to the tool).
+TEST_CASE("the report names each covergroup instance by its module instance's path") {
+    const std::string report = report_of(R"(
+        module leaf;
+          bit [1:0] v = 0;
+          covergroup cg; coverpoint v; endgroup
+          cg c;
+          initial begin c = new; c.sample(); end
+        endmodule
+        module top;
+          leaf u1();
+          leaf u2();
+        endmodule
+    )");
+    CHECK(report.find("instance top.u1.cg ") != std::string::npos);
+    CHECK(report.find("instance top.u2.cg ") != std::string::npos);
+}
