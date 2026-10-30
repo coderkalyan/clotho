@@ -1738,6 +1738,14 @@ private:
     // Net handle -> its force sites (in registration order; the resolver blends
     // them in that order, exact for disjoint ranges).
     ankerl::unordered_dense::map<uint32_t, std::vector<NetForceSite>> net_force_sites_;
+    // Net handle -> the zero-formal task that re-folds the net's drivers and
+    // overlays its force sites. The resolver process calls it, and so does a
+    // `release` of the net, so the net takes its driven value at once (LRM
+    // 10.6.2) instead of when the resolver process next runs. Reserved on first
+    // use, filled by emit_wire_resolvers.
+    ankerl::unordered_dense::map<uint32_t, ir::FunctionId> net_resolver_task_;
+
+    ir::FunctionId net_resolver_task(uint32_t net);
     // A `force` statement -> (net handle, index into net_force_sites_) so the Emit
     // lowering reuses the site the Collect scan created.
     ankerl::unordered_dense::map<const void*, std::pair<uint32_t, uint32_t>> stmt_force_site_;

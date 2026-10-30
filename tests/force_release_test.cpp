@@ -627,3 +627,41 @@ TEST_CASE("force on an input port net drives it") {
         endmodule)";
     CHECK(run_capture_finish(src) == "p=1\np=5\n");
 }
+
+// LRM 10.6.2: "when released, the net shall immediately be assigned the value
+// determined by the drivers of the net". The statement right after a `release`
+// of a whole net, of one forced bit, of an undriven net (z) or of a resolved
+// net already sees the driven value, not the forced one. Oracle: iverilog 13
+// prints these lines for this source.
+TEST_CASE("release of a net takes the driven value at once") {
+    constexpr std::string_view src = R"(
+        module m;
+            logic [3:0] in = 4'b0000;
+            wire  [3:0] bus = in;
+            wire  [3:0] pb = in;
+            wire  [3:0] und;
+            wire  [3:0] md;
+            assign md = in;
+            assign md[1] = 1'b0;
+            initial begin
+                #1 force bus = 4'b1111;
+                #1 release bus;
+                $display("bus=%b", bus);
+                force pb[0] = 1'b1;
+                force pb[3] = 1'b1;
+                release pb[0];
+                $display("pb=%b", pb);
+                release pb[3];
+                $display("pb=%b", pb);
+                force und = 4'b1010;
+                release und;
+                $display("und=%b", und);
+                in = 4'b0100;
+                #1 force md = 4'b1111;
+                release md;
+                $display("md=%b", md);
+                $finish;
+            end
+        endmodule)";
+    CHECK(run_capture_finish(src) == "bus=0000\npb=1000\npb=0000\nund=zzzz\nmd=0100\n");
+}
