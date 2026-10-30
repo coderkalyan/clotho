@@ -774,7 +774,7 @@ void Backend::materialize_group_ctx() {
     }
     Anchor&      a    = anchors_[own_anchor_];
     llvm::Value* base = ctx_field(a, 2, llvm::PointerType::getUnqual(ctx_));
-    sched_ptr_ = b_.CreateInBoundsGEP(sched_word_ty(), base, b_.getInt32(sched_ordinal_));
+    sched_ptr_ = b_.CreateInBoundsGEP(sched_word_ty(), base, b_.getInt32(own_ordinal_));
 }
 
 // Global holding &state->shadow; created on first use, initialized in
@@ -973,21 +973,25 @@ llvm::Value* Backend::lv_z_ptr(const LValue& lv) {
 }
 
 // Compute each instance context's type (see Anchor): shared per definition,
-// fields sized from the def-local block-id ordinal count and wait-bucket
-// slots. Runs after fusion grouping and wait-queue sizing, before lowering.
-// Also attributes each fusion group to its scope anchor + def-local
-// ordinal (the shareable-group identity every def-relative site keys on), and
-// gives each member of a group spanning instances its own ordinal in its
-// instance's record: such a member is a function of its own, and its NBA
-// blocks are contiguous within it, so one field holds their first id.
+// fields sized from the instance's process count (one block-id field per
+// owned process) and wait-bucket slots. Runs after fusion grouping, wait-queue
+// sizing and build_sched_flags (the process ordinals), before lowering.
+// Also attributes each fusion group to its scope anchor and, for a
+// single-scope group, to its unit's dense group ordinal.
+//
+// The block-id field of a function (a single-scope group, or a member of a
+// group spanning instances) is indexed by the def-local ordinal of its process
+// (its front process, for a group), the same ordinal that names the function
+// and indexes its flag in the sched array. The function's NBA blocks are
+// contiguous, so one field holds their first id, and the field is the same in
+// every instance of a unit whichever fusion group its process fell into in
+// that instance: a counter over groups would number the same process
+// differently in twins whose fusion contexts differ.
 void Backend::build_instance_ctx_layout() {
     const auto all = mod_.processes();
     group_anchor_of_.assign(groups_.size(), SignalSlot::no_anchor);
-    group_def_ordinal_.assign(groups_.size(), ~0u);
     group_unit_anchor_.assign(groups_.size(), SignalSlot::no_anchor);
     group_unit_ordinal_.assign(groups_.size(), ~0u);
-    member_blk_ordinal_.assign(all.size(), ~0u);
-    std::vector<uint32_t> scope_counter(anchors_.size(), 0);
     std::vector<uint32_t> unit_counter(anchors_.size(), 0);
     for (uint32_t g = 0; g < groups_.size(); ++g) {
         const uint32_t sc   = all[groups_[g].front()].scope;
@@ -997,15 +1001,6 @@ void Backend::build_instance_ctx_layout() {
         }
         if (!same || sc >= anchor_of_scope_.size() ||
             anchor_of_scope_[sc] == SignalSlot::no_anchor) {
-            // A group spanning instances (more than one member, always a thunk
-            // group: see compute_fusion_groups) lowers as one function per member.
-            if (groups_[g].size() > 1) {
-                for (const uint32_t m : groups_[g]) {
-                    if (const uint32_t maid = process_anchor(all[m]); maid != SignalSlot::no_anchor) {
-                        member_blk_ordinal_[m] = scope_counter[maid]++;
-                    }
-                }
-            }
             continue;
         }
         const uint32_t aid = anchor_of_scope_[sc];
@@ -1016,16 +1011,15 @@ void Backend::build_instance_ctx_layout() {
         if (anchors_[aid].first_proc == ~0u) {
             continue;
         }
-        group_anchor_of_[g]   = aid;
-        group_def_ordinal_[g] = scope_counter[aid]++;
+        group_anchor_of_[g] = aid;
     }
-    // Twin instances see the same def-local ordinal count; size blk fields by
-    // the definition-wide maximum so layouts agree even if a member's group
-    // list degenerated (they should be equal by construction).
+    // Twin instances own the same number of processes; size blk fields by the
+    // definition-wide maximum so layouts agree even if one of them degenerated
+    // (they should be equal by construction).
     ankerl::unordered_dense::map<llvm::StructType*, uint32_t> def_blk;
-    for (uint32_t a = 0; a < anchors_.size(); ++a) {
-        auto& n = def_blk[anchors_[a].ty];
-        n       = std::max(n, scope_counter[a]);
+    for (const Anchor& a : anchors_) {
+        auto& n = def_blk[a.ty];
+        n       = std::max(n, a.sched_ty != nullptr ? static_cast<uint32_t>(a.sched_ty->getNumElements()) : 0u);
     }
 
     auto* ptr = llvm::PointerType::getUnqual(ctx_);

@@ -81,8 +81,8 @@ void Backend::run() {
     }
     build_vcd_index();       // before build_nba_state: fills vcd_index_ / design_uses_vcd_
     build_wait_queues();
-    build_instance_ctx_layout(); // after build_wait_queues: ctx sizes need wait slots
-    build_sched_flags();
+    build_sched_flags();         // before the record layout: one block-id field per process ordinal
+    build_instance_ctx_layout(); // after build_wait_queues (ctx sizes need wait slots) and build_sched_flags
     build_nba_state();
 
     // Functions and tasks: declare every one up front (so calls resolve,

@@ -538,9 +538,8 @@ void Backend::block_register(Signal sig, const llvm::APInt& mask, bool dynamic) 
             // ordinal -- a function's blocks are id-contiguous because they
             // open only while it lowers. main stores the first id once the
             // ids are known (ctx_blk_fills_).
-            assert(blk_ordinal_ != ~0u && "an instance-relative function has a block-id ordinal");
             Anchor&        a     = anchors_[own_anchor_];
-            const uint32_t field = a.ctx_blk_base + blk_ordinal_;
+            const uint32_t field = a.ctx_blk_base + own_ordinal_;
             if (group_first_block_ < 0) {
                 group_first_block_ = static_cast<int64_t>(cur_block_id_);
                 ctx_blk_fills_.emplace_back(own_anchor_, field, cur_block_id_);

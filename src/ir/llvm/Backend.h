@@ -977,10 +977,11 @@ struct Anchor {
     //   1             ptr  shadow sub-struct base (null when no NBA shadows)
     //   2             ptr  the scope's sched-flag array base (Anchor::sched_gv)
     //   3             i32  first_vcd
-    //   ctx_blk_base  i32  first NBA block id, one per def-local ordinal of a
-    //                      function that registers blocks: each single-scope
-    //                      group, then each member of a group spanning
-    //                      instances (0 when it registers none)
+    //   ctx_blk_base  i32  first NBA block id, one per process the instance
+    //                      owns, at its def-local process ordinal: the field
+    //                      of a single-scope group is its front process's, of
+    //                      a member of a group spanning instances its own
+    //                      (0 when the function registers none)
     //   ctx_wait_base ptr  wait bucket bases (sta / dyn / dyn-len), def-local
     //                      slot order from the bucket walk
     // ctx_ty is shared across instances of one definition; the global is
@@ -989,7 +990,7 @@ struct Anchor {
     llvm::GlobalVariable* ctx_gv        = nullptr;
     uint32_t              ctx_blk_base  = 0;
     uint32_t              ctx_wait_base = 0;
-    // Def-local count of block-id ordinals (sizes the blk fields).
+    // Def-local count of owned processes (sizes the blk fields).
     uint32_t n_blk = 0;
     // The Design unit the scope expands (InstanceScope::unit).
     uint32_t unit = InstanceScope::no_unit;
@@ -4262,14 +4263,9 @@ private:
     // `--stat=dedup-sets`, compared post-lowering by report_dedup_shapes.
     std::vector<std::vector<uint32_t>> shape_sets_;
     // Per fusion group: owning scope anchor (single-scope groups only, else
-    // no_anchor) and def-local block-id ordinal. Built by
-    // build_instance_ctx_layout; the shareable-group identity.
+    // no_anchor). Built by build_instance_ctx_layout; the shareable-group
+    // identity.
     std::vector<uint32_t> group_anchor_of_;
-    std::vector<uint32_t> group_def_ordinal_;
-    // Per process: the def-local block-id ordinal of a member of a group
-    // spanning instances (its own function registers blocks), ~0 for any other
-    // process. Drawn from the same per-anchor counter as group_def_ordinal_.
-    std::vector<uint32_t> member_blk_ordinal_;
     // The member function of every group spanning instances with the process
     // it runs, in lowering order (report_unit_code compares them across the
     // instances of a unit).
@@ -4605,14 +4601,13 @@ private:
     // or the instance of the member of a group spanning instances. no_anchor
     // addresses everything absolutely (functions, tasks, commit code, startup).
     // own_ctx_ is the record itself when the body takes it as a parameter (a
-    // member); null reads the instance's record global. blk_ordinal_ is the
-    // def-local ordinal of this function's block-id field in the record
-    // (block_register). sched_ordinal_ is the group's flag index in the
-    // instance's sched array (materialize_group_ctx).
-    uint32_t     own_anchor_    = SignalSlot::no_anchor;
-    llvm::Value* own_ctx_       = nullptr;
-    uint32_t     blk_ordinal_   = ~0u;
-    uint32_t     sched_ordinal_ = 0;
+    // member); null reads the instance's record global. own_ordinal_ is the
+    // def-local ordinal of the function's (front) process: its flag index in
+    // the instance's sched array (materialize_group_ctx) and its block-id field
+    // in the record (block_register).
+    uint32_t     own_anchor_  = SignalSlot::no_anchor;
+    llvm::Value* own_ctx_     = nullptr;
+    uint32_t     own_ordinal_ = 0;
     // First NBA block id of the function currently lowering (-1 until a block
     // opens); block_register keys its ctx-relative ids off it.
     int64_t group_first_block_ = -1;

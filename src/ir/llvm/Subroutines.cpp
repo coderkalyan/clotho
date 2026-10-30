@@ -28,12 +28,10 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
     const uint32_t g_ = group_of_[proc_index];
     own_anchor_       = SignalSlot::no_anchor;
     own_ctx_          = nullptr;
-    blk_ordinal_      = ~0u;
     const uint32_t gaid = group_anchor_of_[g_];
     if (gaid != SignalSlot::no_anchor) {
-        own_anchor_    = gaid;
-        sched_ordinal_ = proc_sched_ord_[proc_index];
-        blk_ordinal_   = group_def_ordinal_[g_];
+        own_anchor_  = gaid;
+        own_ordinal_ = proc_sched_ord_[proc_index];
     }
     sched_ptr_ = own_anchor_ != SignalSlot::no_anchor ? nullptr : sched_flag_ptr(proc_index);
 
@@ -249,11 +247,12 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
             // The record the member was handed stands for its instance; a
             // member that belongs to no instance has none. Member bodies
             // never touch the sched flag (the dispatcher owns the timeline),
-            // and their NBA block ids are record base + member-local ordinal,
-            // block ids member-contiguous (group_first_block_ reset per member).
+            // and their NBA block ids are the record's field for the member's
+            // process plus a member-local ordinal, block ids member-contiguous
+            // (group_first_block_ reset per member).
             own_anchor_        = aid;
             own_ctx_           = aid != ~0u ? fn_->getArg(0) : nullptr;
-            blk_ordinal_       = aid != ~0u ? member_blk_ordinal_[m] : ~0u;
+            own_ordinal_       = proc_sched_ord_[m];
             sched_ptr_         = nullptr;
             group_first_block_ = -1;
             select_member(m);
@@ -269,7 +268,6 @@ llvm::Function* Backend::lower_group(const std::vector<uint32_t>& members) {
         }
         own_anchor_        = SignalSlot::no_anchor;
         own_ctx_           = nullptr;
-        blk_ordinal_       = ~0u;
         sched_ptr_         = group_sched;
         group_first_block_ = -1;
 
