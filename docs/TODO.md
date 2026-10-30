@@ -92,6 +92,8 @@ Milestones, in order; lower ones unblock higher ones:
   - [ ] **Queue or associative-array parameter with aggregate elements** — cannot be seeded
     for a runtime read.
 - [ ] **`defparam` across top-level modules** — a path into another top is refused.
+- [ ] **`defparam` that changes an implicitly typed parameter's type** (6.20.2, 23.10.1) — the
+  parameter keeps its original initializer's type, so the override is refused.
 
 ### Procedural control
 

@@ -789,3 +789,22 @@ TEST_CASE("a nested randsequence rand join operand is refused by name") {
                       "endsequence end endmodule")
             .find("operand that is itself a rand join") != std::string::npos);
 }
+
+// A randsequence and its code blocks are anonymous scopes (LRM 18.17), so %m in a
+// production names the scope the randsequence sits in. The productions are
+// synthesized tasks, whose names once leaked as `top.randseq.first`. Neither
+// Icarus Verilog 13 (no randsequence) nor Verilator 5.050 (`top.__Vrs0_first`)
+// is an oracle here.
+TEST_CASE("%m in a production code block names the enclosing scope") {
+    CHECK(run_capture(R"(
+        module top;
+          initial begin : blk
+            randsequence (main)
+              main : first second;
+              first : { $display("first %m"); };
+              second : { $display("second %m"); };
+            endsequence
+          end
+        endmodule
+    )") == "first top.blk\nsecond top.blk\n");
+}

@@ -3772,3 +3772,37 @@ TEST_CASE("covergroup: a coverpoint may reference a property declared later in t
     REQUIRE_MESSAGE(r.ok, r.diagnostic_text());
     CHECK(r.diagnostic_text().find("used before its declaration") == std::string::npos);
 }
+
+// LRM 20.2: $finish ends the simulation, so nothing after it runs. Here it is
+// reached through a virtual call inside a non-virtual function, whose caller
+// once ran on past it and printed the value the abandoned call left behind
+// ("after r=-1974075551"). Icarus Verilog 13 prints "after r=11": it lets the
+// current thread run until it blocks, which Clotho's cooperative $finish does
+// not (docs/design/cooperative-finish.md).
+TEST_CASE("a $finish reached through a virtual call stops every caller") {
+    CHECK(run_capture(R"(
+        class Base;
+          virtual function int f();
+            return 1;
+          endfunction
+        endclass
+        class Der extends Base;
+          virtual function int f();
+            $finish;
+            return 2;
+          endfunction
+        endclass
+        module top;
+          function automatic int g(Base b);
+            return b.f() + 10;
+          endfunction
+          initial begin
+            static Der d = new;
+            int r;
+            $display("before");
+            r = g(d);
+            $display("after r=%0d", r);
+          end
+        endmodule
+    )") == "before\n");
+}

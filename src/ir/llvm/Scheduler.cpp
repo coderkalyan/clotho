@@ -1133,11 +1133,6 @@ void Backend::ensure_reactive_queue() {
                                                  llvm::ConstantInt::get(i32, 0), "clotho.reactive_head");
     reactive_tail_gv_ = new llvm::GlobalVariable(env_->llmod, i32, false, llvm::GlobalValue::InternalLinkage,
                                                  llvm::ConstantInt::get(i32, 0), "clotho.reactive_tail");
-    auto* ptr_ty        = llvm::PointerType::getUnqual(ctx_);
-    reactive_record_gv_ = new llvm::GlobalVariable(env_->llmod, ptr_ty, false,
-                                                   llvm::GlobalValue::InternalLinkage,
-                                                   llvm::ConstantPointerNull::get(ptr_ty),
-                                                   "clotho.reactive_record");
 }
 
 // The re-inactive batch (LRM 4.4.2.7): reactive code parked on a #0, the dual

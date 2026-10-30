@@ -286,3 +286,53 @@ TEST_CASE("$monitor in a function is rejected") {
     )",
                    "$monitor inside a function is not supported");
 }
+
+// Each `initial` pends its $strobe and runs off its end in the same time step, so
+// its frame is gone by Postponed; the `#20` keeps the simulation running past
+// it. The pended body once read its task record out of that frame and woke
+// whatever handle the freed memory held (ivtest pr3527694 segfaulted); under
+// CLOTHO_EXTRA_ASSERTS a freed frame is poisoned, which makes that read fail
+// every time. Icarus Verilog 13 prints the same.
+TEST_CASE("$strobe pended by a process that finishes in the same time step") {
+    CHECK(run_capture(R"(
+        module leaf;
+          wire [31:0] v = 32'h12;
+          initial $strobe("%m v=%h", v);
+        endmodule
+        module mid;
+          initial $display("%m");
+          leaf a();
+          leaf b();
+        endmodule
+        module top;
+          mid m0();
+          mid m1();
+          initial #20;
+        endmodule
+    )") == "top.m0\ntop.m1\ntop.m0.a v=00000012\ntop.m0.b v=00000012\ntop.m1.a v=00000012\n"
+           "top.m1.b v=00000012\n");
+}
+
+// %m names the scope that invokes the task (LRM 21.2.1.3): a deferred print and a
+// fork child are not scopes of their own, so the named block or task around them
+// is what %m reports. Icarus Verilog 13 prints the same four lines.
+TEST_CASE("%m in $strobe, $monitor and a fork child names the invoking scope") {
+    CHECK(run_capture(R"(
+        module leaf;
+          task automatic t;
+            $strobe("strobe-in-task %m");
+          endtask
+          initial begin : blk
+            $strobe("strobe %m");
+            fork
+              $display("fork %m");
+            join
+            t();
+          end
+          initial $monitor("monitor %m");
+        endmodule
+        module top;
+          leaf a();
+        endmodule
+    )") == "fork top.a.blk\nstrobe top.a.blk\nstrobe-in-task top.a.t\nmonitor top.a\n");
+}

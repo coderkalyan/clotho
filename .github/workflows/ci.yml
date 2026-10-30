@@ -410,7 +410,7 @@ jobs:
       - name: Summarize
         run: |
           set -o pipefail
-          python3 .github/scripts/sv-tests-summary.py sv-tests/out/report/report.csv \
+          python3 .github/scripts/sv-tests-summary.py sv-tests/out/report/report.csv sv-tests/out/logs \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the report

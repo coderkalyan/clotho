@@ -392,6 +392,7 @@ void Lowerer::build_production(const RsProd& p, const RandSeqCtx& rs, ir::Functi
 
     FnCtx ctx;
     ctx.name_prefix = "randseq." + std::string(p.name) + ".";
+    ctx.invoking_scope = hier_name();
     ctx.is_task     = rs.is_task;
     ctx.in_randseq  = true;
     // As build_function / build_task: an enclosing construction's or default
@@ -475,6 +476,7 @@ void Lowerer::build_production_plan(const RsProd& p, const RandSeqCtx& rs, ir::F
 
     FnCtx ctx;
     ctx.name_prefix = "randseq." + std::string(p.name) + ".plan.";
+    ctx.invoking_scope = hier_name();
     ctx.is_task     = rs.is_task;
     ctx.in_randseq  = true;
     const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);
@@ -564,6 +566,7 @@ void Lowerer::build_production_step(const RsProd& p, const RandSeqCtx& rs, ir::F
 
     FnCtx ctx;
     ctx.name_prefix = "randseq." + std::string(p.name) + ".step.";
+    ctx.invoking_scope = hier_name();
     ctx.is_task     = rs.is_task;
     ctx.in_randseq  = true;
     const Restore<std::optional<CtorThis>> no_ctor_this(ctor_this_, std::nullopt);

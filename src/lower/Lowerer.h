@@ -1538,6 +1538,13 @@ private:
 
     ir::Ref lower_constant(const slang::ConstantValue& cv, const slang::ast::Type& type);
 
+    // Refuses a defparam that gives an implicitly typed parameter a value of
+    // another type (see the NOTE at the definition), recording the parameter in
+    // refused_params_.
+    void check_defparam_type(const slang::ast::DefParamSymbol& d);
+
+    ir::Ref lower_param_constant(const slang::ast::ParameterSymbol& p, const slang::ast::Type& type);
+
     void append_svint_bytes(const slang::SVInt& src, ir::Ref ty, std::vector<uint8_t>& out);
 
     void append_const_image(const slang::ConstantValue& cv, ir::Ref ty, std::vector<uint8_t>& out);
@@ -4359,6 +4366,12 @@ private:
         // Name qualifier (e.g. "f.") prepended to a static local's signal name so
         // same-named statics in different functions stay distinct.
         std::string name_prefix;
+        // %m of a synthetic body that is not a scope of its own -- a fork child, a
+        // $strobe or $monitor print, an assertion action block, a randsequence
+        // production -- is that of the statement that created it (LRM 21.2.1.5:
+        // the scope that invokes the task). Unset for a subroutine, whose own
+        // name is part of its %m.
+        std::optional<std::string> invoking_scope;
         // True while lowering a task body (a coroutine): unlike a function, timing
         // controls and $time are allowed.
         bool is_task = false;
@@ -5215,6 +5228,9 @@ private:
     // compiles to a warning plus a run-time fatal stub instead of refusing the
     // design. False on the direct-call path, whose compile diagnostics stand.
     bool stub_unsupported_bodies_ = false;
+    // Parameters a refused defparam targets (check_defparam_type, Collect pass):
+    // their value is not of their type, so a reference to one is refused too.
+    ankerl::unordered_dense::set<const slang::ast::ParameterSymbol*> refused_params_;
     // Canonical slang struct/union type -> its lowered ir::Ref, so a type used by
     // many variables (e.g. a bus of the same struct) interns its field table
     // once. The pool's own structural dedup can't do this: two independently
